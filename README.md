@@ -5,8 +5,8 @@
 <h1 align="center">Open Assist</h1>
 
 <p align="center">
-  A macOS menu-bar assistant that can speak, type, and help inside your current app.<br/>
-  Assistant-first workflows, with local-first voice capture and dictation when you need it.
+  A macOS personal assistant that can speak, type, and help inside your current app.<br/>
+  Built as a personal assistant first, with local-first voice capture and dictation when you need it.
 </p>
 
 <p align="center">
@@ -20,7 +20,7 @@
 
 ## What Open Assist Is
 
-Open Assist is a menu-bar app for macOS.
+Open Assist is a personal assistant for macOS that lives in your menu bar.
 
 You can open the assistant for typed or spoken tasks, or use quick voice capture to insert text into the app you are using right now. It is built for low-friction help, local-first voice features, and fast text insertion.
 

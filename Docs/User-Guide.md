@@ -4,7 +4,7 @@ This guide is for end users who want to install Open Assist, configure it quickl
 
 ## 1. What Open Assist Does
 
-Open Assist is a macOS menu-bar assistant with built-in voice capture and dictation. You can open the assistant for typed or spoken tasks, or use a shortcut to speak and insert text into your active app.
+Open Assist is a personal assistant for macOS with built-in voice capture and dictation. It lives in your menu bar, and you can open it for typed or spoken tasks or use a shortcut to speak and insert text into your active app.
 
 Core capabilities:
 
