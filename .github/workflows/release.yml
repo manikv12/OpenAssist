@@ -1,0 +1,149 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+jobs:
+  build-and-release:
+    name: Build, Sign, Notarize & Release
+    runs-on: macos-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy-pages.outputs.page_url }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app
+
+      - name: Install create-dmg
+        run: npm install -g create-dmg
+
+      - name: Cache Swift build artifacts
+        uses: actions/cache@v4
+        with:
+          path: .build
+          key: ${{ runner.os }}-swift-${{ hashFiles('Package.swift', 'Package.resolved') }}
+          restore-keys: |
+            ${{ runner.os }}-swift-
+
+      - name: Import Developer ID certificate
+        env:
+          CERTIFICATE_P12_BASE64: ${{ secrets.CERTIFICATE_P12_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.CERTIFICATE_PASSWORD }}
+        run: |
+          KEYCHAIN_PATH="$RUNNER_TEMP/signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 16)"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          echo "$CERTIFICATE_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" \
+            -k "$KEYCHAIN_PATH" \
+            -P "$CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign \
+            -A
+          security list-keychains -d user -s "$KEYCHAIN_PATH" "$(security list-keychains -d user | sed s/\"//g)"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+      - name: Build & package DMG
+        env:
+          DEVELOPER_ID: ${{ secrets.DEVELOPER_ID }}
+        run: ./build.sh --make-dmg
+
+      - name: Notarize DMG
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: Scripts/notarize.sh dist/KeyScribe.dmg
+
+      - name: Extract version from tag
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Download Sparkle tools
+        run: |
+          SPARKLE_VERSION="2.6.0"
+          curl -sL "https://github.com/sparkle-project/Sparkle/releases/download/${SPARKLE_VERSION}/Sparkle-${SPARKLE_VERSION}.tar.xz" -o /tmp/sparkle.tar.xz
+          mkdir -p /tmp/sparkle
+          tar xf /tmp/sparkle.tar.xz -C /tmp/sparkle
+
+      - name: Sign DMG and generate appcast
+        env:
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          BUILD_NUMBER="$(git rev-list --count HEAD)"
+          DMG_FILE="dist/KeyScribe.dmg"
+          DOWNLOAD_URL="https://github.com/manikv12/KeyScribe/releases/download/${{ github.ref_name }}/KeyScribe.dmg"
+          SPARKLE_KEY_FILE="$(mktemp -t sparkle_ed25519)"
+          trap 'rm -f "$SPARKLE_KEY_FILE"' EXIT
+          printf "%s" "$SPARKLE_PRIVATE_KEY" > "$SPARKLE_KEY_FILE"
+          chmod 600 "$SPARKLE_KEY_FILE"
+
+          # Sign the DMG with Sparkle's EdDSA key
+          SIGNATURE=$(/tmp/sparkle/bin/sign_update "$DMG_FILE" --ed-key-file "$SPARKLE_KEY_FILE")
+
+          # Generate appcast.xml
+          # NOTE: sign_update outputs 'sparkle:edSignature="..." length="..."'
+          # so we do not add a separate length attribute.
+          cat > dist/appcast.xml <<'APPCAST_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" xmlns:dc="http://purl.org/dc/elements/1.1/">
+            <channel>
+              <title>KeyScribe Updates</title>
+              <link>https://manikv12.github.io/KeyScribe/appcast.xml</link>
+          APPCAST_EOF
+
+          cat >> dist/appcast.xml <<EOF
+              <item>
+                <title>Version ${VERSION}</title>
+                <sparkle:version>${BUILD_NUMBER}</sparkle:version>
+                <sparkle:shortVersionString>${VERSION}</sparkle:shortVersionString>
+                <pubDate>$(date -R)</pubDate>
+                <enclosure
+                  url="${DOWNLOAD_URL}"
+                  type="application/octet-stream"
+                  ${SIGNATURE}
+                />
+              </item>
+            </channel>
+          </rss>
+          EOF
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: KeyScribe ${{ github.ref_name }}
+          tag_name: ${{ github.ref_name }}
+          draft: true
+          generate_release_notes: true
+          files: dist/KeyScribe.dmg
+
+      - name: Prepare Pages content
+        run: |
+          mkdir -p pages
+          cp dist/appcast.xml pages/appcast.xml
+
+      - name: Upload appcast as Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: pages
+
+      - name: Deploy to GitHub Pages
+        id: deploy-pages
+        uses: actions/deploy-pages@v4

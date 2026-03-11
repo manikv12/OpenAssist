@@ -1,0 +1,24 @@
+/.build
+/.build-codex-check
+/.swiftpm
+.DS_Store
+.claude/
+KeyScribe.app/
+dist/
+Vendor/Whisper/
+
+# Local build scripts
+build
+build-local.sh
+
+# Dev artifacts
+preview_logo.html
+documentaion/
+Resources/old/
+
+# Code signing
+*.cer
+*.key
+*.csr
+*.certSigningRequest
+*.p12

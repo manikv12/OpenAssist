@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+    <dict>
+        <key>CFBundleIdentifier</key>
+        <string>com.manikvashith.OpenAssist</string>
+        <key>CFBundleName</key>
+        <string>Open Assist</string>
+        <key>CFBundleExecutable</key>
+        <string>OpenAssist</string>
+        <key>CFBundlePackageType</key>
+        <string>APPL</string>
+        <key>LSUIElement</key>
+        <true />
+        <key>NSMicrophoneUsageDescription</key>
+        <string>Open Assist needs microphone access to transcribe your voice.</string>
+        <key>NSSpeechRecognitionUsageDescription</key>
+        <string>Open Assist uses speech recognition so you can transcribe while holding the shortcut.</string>
+        <key>LSMinimumSystemVersion</key>
+        <string>13.3</string>
+        <key>CFBundleIconFile</key>
+        <string>AppIcon</string>
+        <key>NSHighResolutionCapable</key>
+        <true />
+        <key>CFBundleShortVersionString</key>
+        <string>1.0.7</string>
+        <key>CFBundleVersion</key>
+        <string>73</string>
+        <key>SUFeedURL</key>
+        <string>https://manikv12.github.io/OpenAssist/appcast.xml</string>
+        <key>SUEnableAutomaticChecks</key>
+        <true />
+        <key>SUPublicEDKey</key>
+        <string>GpMECN74Dihchnqk1zVDShhEzh1xk/ASPTMjm67FlLU=</string>
+    </dict>
+</plist>
