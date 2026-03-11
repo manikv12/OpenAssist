@@ -69,7 +69,7 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
-        run: Scripts/notarize.sh dist/KeyScribe.dmg
+        run: Scripts/notarize.sh "dist/Open Assist.dmg"
 
       - name: Extract version from tag
         id: version
@@ -88,8 +88,8 @@ jobs:
         run: |
           VERSION="${{ steps.version.outputs.version }}"
           BUILD_NUMBER="$(git rev-list --count HEAD)"
-          DMG_FILE="dist/KeyScribe.dmg"
-          DOWNLOAD_URL="https://github.com/manikv12/KeyScribe/releases/download/${{ github.ref_name }}/KeyScribe.dmg"
+          DMG_FILE="dist/Open Assist.dmg"
+          DOWNLOAD_URL="https://github.com/manikv12/OpenAssist/releases/download/${{ github.ref_name }}/Open%20Assist.dmg"
           SPARKLE_KEY_FILE="$(mktemp -t sparkle_ed25519)"
           trap 'rm -f "$SPARKLE_KEY_FILE"' EXIT
           printf "%s" "$SPARKLE_PRIVATE_KEY" > "$SPARKLE_KEY_FILE"
@@ -105,8 +105,8 @@ jobs:
           <?xml version="1.0" encoding="utf-8"?>
           <rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" xmlns:dc="http://purl.org/dc/elements/1.1/">
             <channel>
-              <title>KeyScribe Updates</title>
-              <link>https://manikv12.github.io/KeyScribe/appcast.xml</link>
+              <title>Open Assist Updates</title>
+              <link>https://manikv12.github.io/OpenAssist/appcast.xml</link>
           APPCAST_EOF
 
           cat >> dist/appcast.xml <<EOF
@@ -128,11 +128,11 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          name: KeyScribe ${{ github.ref_name }}
+          name: Open Assist ${{ github.ref_name }}
           tag_name: ${{ github.ref_name }}
           draft: true
           generate_release_notes: true
-          files: dist/KeyScribe.dmg
+          files: "dist/Open Assist.dmg"
 
       - name: Prepare Pages content
         run: |
