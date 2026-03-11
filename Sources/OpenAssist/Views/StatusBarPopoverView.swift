@@ -48,33 +48,6 @@ struct StatusBarPopoverView: View {
                     .padding(.bottom, 8)
 
                 VStack(alignment: .leading, spacing: 5) {
-                    sectionTitle("Quick Actions")
-                    PopoverMenuRow(
-                        icon: viewModel.isContinuousMode ? "stop.circle.fill" : "mic.circle.fill",
-                        label: viewModel.isContinuousMode ? "Stop Dictation" : "Start Dictation",
-                        shortcut: nil,
-                        iconTint: viewModel.isContinuousMode ? .red : AppVisualTheme.accentTint,
-                        isDisabled: !viewModel.permissionsReady
-                    ) {
-                        viewModel.onToggleDictation?()
-                    }
-
-                    PopoverMenuRow(
-                        icon: "doc.on.clipboard",
-                        label: "Paste Last Transcript",
-                        shortcut: "⌘⌥V",
-                        iconTint: AppVisualTheme.accentTint
-                    ) {
-                        viewModel.onPasteLastTranscript?()
-                    }
-                }
-                .padding(.horizontal, 8)
-                .padding(.bottom, 8)
-
-                Divider().overlay(Color.white.opacity(0.08))
-                    .padding(.bottom, 8)
-
-                VStack(alignment: .leading, spacing: 5) {
                     if viewModel.assistantEnabled {
                         sectionTitle("Assistant")
                         PopoverMenuRow(
@@ -106,6 +79,29 @@ struct StatusBarPopoverView: View {
                         Divider().overlay(Color.white.opacity(0.08))
                             .padding(.vertical, 8)
                     }
+
+                    sectionTitle("Voice & Dictation")
+                    PopoverMenuRow(
+                        icon: viewModel.isContinuousMode ? "stop.circle.fill" : "mic.circle.fill",
+                        label: viewModel.isContinuousMode ? "Stop Dictation" : "Start Dictation",
+                        shortcut: nil,
+                        iconTint: viewModel.isContinuousMode ? .red : AppVisualTheme.accentTint,
+                        isDisabled: !viewModel.permissionsReady
+                    ) {
+                        viewModel.onToggleDictation?()
+                    }
+
+                    PopoverMenuRow(
+                        icon: "doc.on.clipboard",
+                        label: "Paste Last Transcript",
+                        shortcut: "⌘⌥V",
+                        iconTint: AppVisualTheme.accentTint
+                    ) {
+                        viewModel.onPasteLastTranscript?()
+                    }
+
+                    Divider().overlay(Color.white.opacity(0.08))
+                        .padding(.vertical, 8)
 
                     sectionTitle("Open")
                     PopoverMenuRow(

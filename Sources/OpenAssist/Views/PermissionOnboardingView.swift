@@ -31,7 +31,7 @@ struct PermissionOnboardingView: View {
                     VStack(alignment: .leading, spacing: 6) {
                         Text("Finish Permission Setup")
                             .font(.title2.weight(.semibold))
-                        Text("Open Assist needs these permissions before dictation and global shortcuts can run.")
+                        Text("Open Assist needs these permissions before assistant voice capture, dictation, and global shortcuts can run.")
                             .font(.callout)
                             .foregroundStyle(.secondary)
                     }

@@ -3934,7 +3934,7 @@ struct SettingsView: View {
 
         var subtitle: String {
             switch self {
-            case .essentials: return "Daily controls and dictation feedback"
+            case .essentials: return "Daily assistant, voice capture, and feedback controls"
             case .shortcuts: return "Hold-to-talk and continuous toggle keys"
             case .speech: return "Microphone, engine, whisper models, timing, and text quality"
             case .aiModels: return "Prompt rewrite, memory assistant, and provider connections"
@@ -7127,13 +7127,13 @@ struct SettingsView: View {
     private var searchEntries: [SettingSearchEntry] {
         [
             .init(section: .essentials, title: "Accessibility access", detail: "Grant or verify accessibility permission", keywords: ["accessibility", "permission", "grant"]),
-            .init(section: .essentials, title: "Copy transcript to clipboard", detail: "Automatically copy dictation results", keywords: ["clipboard", "copy", "output"]),
+            .init(section: .essentials, title: "Copy transcript to clipboard", detail: "Automatically copy inserted voice results", keywords: ["clipboard", "copy", "output"]),
             .init(section: .essentials, title: "Dictation sound profile", detail: "Choose tones for start, stop, processing, and pasted cues", keywords: ["sound", "start", "listening", "feedback", "processing", "stop", "pasted"]),
             .init(section: .essentials, title: "Waveform theme", detail: "Choose visual waveform style", keywords: ["waveform", "theme", "appearance"]),
-            .init(section: .shortcuts, title: "Hold-to-talk shortcut", detail: "Set keys for press-and-hold dictation", keywords: ["hold", "shortcut", "keyboard"]),
+            .init(section: .shortcuts, title: "Hold-to-talk shortcut", detail: "Set keys for press-and-hold voice capture", keywords: ["hold", "shortcut", "keyboard"]),
             .init(section: .shortcuts, title: "Mute shortcut system sounds", detail: "Optionally suppress beeps while hold-to-talk is pressed", keywords: ["mute", "beep", "sound", "hold", "shortcut"]),
             .init(section: .shortcuts, title: "Manual shortcut map", detail: "Click modifiers and choose a key manually", keywords: ["manual", "map", "shortcut", "click", "keys"]),
-            .init(section: .shortcuts, title: "Continuous toggle shortcut", detail: "Set keys for start/stop dictation mode", keywords: ["continuous", "toggle", "shortcut"]),
+            .init(section: .shortcuts, title: "Continuous toggle shortcut", detail: "Set keys for start/stop continuous voice capture", keywords: ["continuous", "toggle", "shortcut"]),
             .init(section: .shortcuts, title: "Paste last transcript", detail: "Reserved shortcut: ⌥⌘V", keywords: ["paste", "last transcript", "reserved"]),
             .init(section: .speech, title: "Auto-detect microphone", detail: "Automatically use best available input", keywords: ["microphone", "input", "auto"]),
             .init(section: .speech, title: "Microphone device picker", detail: "Choose a specific microphone manually", keywords: ["microphone", "device", "picker"]),
@@ -7527,7 +7527,7 @@ struct SettingsView: View {
 
             settingsCard(
                 title: "Permissions",
-                subtitle: "Grant access for full dictation reliability.",
+                subtitle: "Grant access for assistant, voice capture, and reliable text insertion.",
                 symbol: "hand.raised.fill",
                 tint: AppVisualTheme.accentTint
             ) {
@@ -7886,7 +7886,7 @@ struct TranscriptHistoryView: View {
                     VStack(alignment: .leading, spacing: 3) {
                         Text("Transcript History")
                             .font(.title3.weight(.semibold))
-                        Text("Re-use recent dictation without recording again.")
+                        Text("Re-use recent voice capture or assistant drafting without recording again.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -7912,7 +7912,7 @@ struct TranscriptHistoryView: View {
                 if history.entries.isEmpty {
                     emptyState(
                         title: "No transcripts yet",
-                        message: "Your recent dictation will appear here automatically.",
+                        message: "Your recent voice captures will appear here automatically.",
                         systemImage: "text.bubble"
                     )
                 } else if filteredEntries.isEmpty {

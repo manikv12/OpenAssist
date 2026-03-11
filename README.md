@@ -5,8 +5,8 @@
 <h1 align="center">Open Assist</h1>
 
 <p align="center">
-  A macOS menu-bar dictation app that inserts text into your current app.<br/>
-  Local-first speech, optional AI help, and simple setup.
+  A macOS menu-bar assistant that can speak, type, and help inside your current app.<br/>
+  Assistant-first workflows, with local-first voice capture and dictation when you need it.
 </p>
 
 <p align="center">
@@ -22,12 +22,12 @@
 
 Open Assist is a menu-bar app for macOS.
 
-You press a shortcut, speak, and Open Assist inserts the text into the app you are using right now. It is built for fast dictation, low friction, and local-first use.
+You can open the assistant for typed or spoken tasks, or use quick voice capture to insert text into the app you are using right now. It is built for low-friction help, local-first voice features, and fast text insertion.
 
 Important behavior today:
 
 - It runs as a menu-bar utility with no Dock icon.
-- The menu-bar popover gives quick actions for dictation, history, AI Studio, and Settings.
+- The menu-bar popover gives quick actions for the assistant, voice capture, history, AI Studio, and Settings.
 - It can insert text directly, paste through a temporary clipboard, or fall back to typed keystrokes.
 - It keeps recent transcript history on your Mac.
 - It can learn from quick fixes you make after insertion.
@@ -37,7 +37,26 @@ Important behavior today:
 
 ## Current Features
 
-### Dictation
+### Assistant and AI Workflows
+
+- Open the assistant from the menu bar for typed or spoken tasks
+- Speak an assistant task directly from the quick-actions popover
+- Optional AI prompt correction before insertion
+- Suggestion preview when auto-insert is not used
+- Optional auto-insert for high-confidence suggestions
+- Optional Markdown-preserving output for structured suggestions
+- Rewrite provider options:
+  - Ollama (local)
+  - OpenAI
+  - Anthropic
+  - Google AI Studio (Gemini)
+  - Groq
+  - OpenRouter
+- Built-in **AI Studio** for provider setup, model selection, timeouts, and conversation controls
+- Rewrite style presets such as `Balanced`, `Formal`, `Casual`, `Architect`, and more
+- OpenAI and Anthropic OAuth support, plus API-key support where needed
+
+### Voice Capture and Dictation
 
 - **Apple Speech** with selectable recognition mode (`Local Only`, `Cloud Only`, `Automatic`)
 - **Local `whisper.cpp`** with curated model downloads, Core ML support, and idle unload controls
@@ -55,23 +74,6 @@ Important behavior today:
 - Hold-to-talk and continuous dictation modes
 - Paste last transcript shortcut
 - Transcript history window with search, copy, delete, and reinsert actions
-
-### AI Prompt Assistant
-
-- Optional AI prompt correction before insertion
-- Suggestion preview when auto-insert is not used
-- Optional auto-insert for high-confidence suggestions
-- Optional Markdown-preserving output for structured suggestions
-- Rewrite provider options:
-  - Ollama (local)
-  - OpenAI
-  - Anthropic
-  - Google AI Studio (Gemini)
-  - Groq
-  - OpenRouter
-- Built-in **AI Studio** for provider setup, model selection, timeouts, and conversation controls
-- Rewrite style presets such as `Balanced`, `Formal`, `Casual`, `Architect`, and more
-- OpenAI and Anthropic OAuth support, plus API-key support where needed
 
 ### Conversation and Memory Tools
 
@@ -92,7 +94,7 @@ Important behavior today:
 
 ## Privacy Notes
 
-- No account is required for local dictation
+- No account is required for local voice capture or local assistant flows
 - No telemetry is enabled by default
 - Settings, transcript history, and learned corrections stay on your Mac
 - API keys and OAuth sessions are stored in macOS Keychain
@@ -142,8 +144,9 @@ All shortcuts can be changed in Settings.
    - `Apple Speech` for built-in system speech
    - `whisper.cpp` for fully local speech after model install
    - `Cloud Providers` for OpenAI/Groq/Deepgram/Gemini transcription
-7. If you only want plain dictation, you can turn off **AI prompt correction** in **Settings -> AI & Models**.
-8. If you want AI rewrite, open **AI Studio** and either:
+7. If you want assistant help, open **AI Studio** and connect a cloud provider or install local AI.
+8. If you only want plain dictation, you can turn off **AI prompt correction** in **Settings -> AI & Models**.
+9. If you want AI rewrite, open **AI Studio** and either:
    - connect a cloud provider, or
    - install local AI with the built-in Ollama setup flow
 

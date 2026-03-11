@@ -4,14 +4,15 @@ This guide is for end users who want to install Open Assist, configure it quickl
 
 ## 1. What Open Assist Does
 
-Open Assist is a macOS menu-bar dictation app. You press a shortcut, speak, and text is inserted into your active app.
+Open Assist is a macOS menu-bar assistant with built-in voice capture and dictation. You can open the assistant for typed or spoken tasks, or use a shortcut to speak and insert text into your active app.
 
 Core capabilities:
 
-- Fast dictation with Apple Speech or local `whisper.cpp`
+- Assistant window for typed or spoken tasks
+- Fast voice capture and dictation with Apple Speech or local `whisper.cpp`
 - Hold-to-talk and continuous dictation modes
 - Optional AI rewrite before insertion
-- Conversation-aware rewrite context
+- Conversation-aware rewrite and assistant context
 - Local transcript history and adaptive corrections
 
 ## 2. Requirements
@@ -38,7 +39,13 @@ Open **Settings** from the menu bar and confirm:
 4. Speech Recognition = Granted (if using Apple Speech)
 5. Verify your shortcut settings in **Shortcuts**
 
-## 5. Daily Dictation Workflows
+## 5. Daily Assistant and Voice Workflows
+
+### Assistant tasks
+
+1. Open the menu bar popover.
+2. Choose **Open Assistant** for typed work, or **Speak Assistant Task** for voice-first requests.
+3. Continue in the assistant window and review the result before using it elsewhere.
 
 ### Hold-to-talk (default)
 
@@ -77,7 +84,7 @@ Use **Settings → Speech & Input → Whisper Model Install** to:
 - Enable/disable Core ML encoder use
 - Configure idle context unload behavior
 
-## 7. AI Rewrite (Optional)
+## 7. Assistant Drafting and AI Rewrite (Optional)
 
 Enable from **Settings → AI & Models**:
 
@@ -112,7 +119,7 @@ If local AI fails later, use **Repair Local AI** in AI Studio.
 
 ### Essentials
 
-- Dictation output behavior
+- Voice capture output behavior
 - Sound cues and feedback volume
 - App appearance and waveform theme
 
@@ -171,7 +178,7 @@ Stored data may include:
 - App settings
 - Recent transcript history
 - Learned adaptive corrections
-- Conversation context used for rewrite assistance
+- Conversation context used for assistant and rewrite assistance
 
 ## 12. Troubleshooting
 
@@ -217,4 +224,4 @@ Stored data may include:
 
 - User-facing overview and quick setup: `README.md`
 - Code and issue tracking: GitHub repository
-- If you file a bug, include your macOS version, speech engine, and a short reproduction flow.
+- If you file a bug, include your macOS version, whether you were using the assistant or dictation flow, and a short reproduction flow.
