@@ -29,7 +29,7 @@ final class AssistantMemoryRetrievalServiceTests: XCTestCase {
             ConversationThreadRecord(
                 id: "thread-1",
                 appName: "Open Assist",
-                bundleID: "com.manikvashith.OpenAssist",
+                bundleID: "com.developingadventures.OpenAssist",
                 logicalSurfaceKey: "assistant-thread-1",
                 screenLabel: "Assistant",
                 fieldLabel: "Chat",

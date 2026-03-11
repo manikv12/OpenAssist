@@ -4,7 +4,7 @@ set -euo pipefail
 
 APP_NAME="Open Assist"
 APP_EXECUTABLE="OpenAssist"
-APP_BUNDLE_ID="com.manikvashith.OpenAssist"
+APP_BUNDLE_ID="com.developingadventures.OpenAssist"
 APP_DIR="dist/${APP_NAME}.app"
 INSTALL_DIR="/Applications/${APP_NAME}.app"
 DMG_ROOT="dist/dmg-root"

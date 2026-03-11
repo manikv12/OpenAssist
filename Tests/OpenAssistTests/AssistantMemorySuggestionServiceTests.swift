@@ -26,7 +26,7 @@ final class AssistantMemorySuggestionServiceTests: XCTestCase {
 
         let scope = MemoryScopeContext(
             appName: "Open Assist",
-            bundleID: "com.manikvashith.OpenAssist",
+            bundleID: "com.developingadventures.OpenAssist",
             surfaceLabel: "Assistant",
             projectName: "OpenAssist",
             repositoryName: "OpenAssist",
@@ -76,7 +76,7 @@ final class AssistantMemorySuggestionServiceTests: XCTestCase {
 
         let scope = MemoryScopeContext(
             appName: "Open Assist",
-            bundleID: "com.manikvashith.OpenAssist",
+            bundleID: "com.developingadventures.OpenAssist",
             surfaceLabel: "Assistant",
             projectName: nil,
             repositoryName: nil,
@@ -119,7 +119,7 @@ final class AssistantMemorySuggestionServiceTests: XCTestCase {
 
         let scope = MemoryScopeContext(
             appName: "Open Assist",
-            bundleID: "com.manikvashith.OpenAssist",
+            bundleID: "com.developingadventures.OpenAssist",
             surfaceLabel: "Assistant",
             projectName: nil,
             repositoryName: nil,
@@ -154,7 +154,7 @@ final class AssistantMemorySuggestionServiceTests: XCTestCase {
 
         let scope = MemoryScopeContext(
             appName: "Open Assist",
-            bundleID: "com.manikvashith.OpenAssist",
+            bundleID: "com.developingadventures.OpenAssist",
             surfaceLabel: "Assistant",
             projectName: nil,
             repositoryName: nil,
@@ -189,7 +189,7 @@ final class AssistantMemorySuggestionServiceTests: XCTestCase {
 
         let scope = MemoryScopeContext(
             appName: "Open Assist",
-            bundleID: "com.manikvashith.OpenAssist",
+            bundleID: "com.developingadventures.OpenAssist",
             surfaceLabel: "Assistant",
             projectName: "OpenAssist",
             repositoryName: "OpenAssist",
@@ -225,7 +225,7 @@ final class AssistantMemorySuggestionServiceTests: XCTestCase {
 
         let scope = MemoryScopeContext(
             appName: "Open Assist",
-            bundleID: "com.manikvashith.OpenAssist",
+            bundleID: "com.developingadventures.OpenAssist",
             surfaceLabel: "Assistant",
             projectName: "OpenAssist",
             repositoryName: "OpenAssist",
@@ -276,7 +276,7 @@ final class AssistantMemorySuggestionServiceTests: XCTestCase {
 
         let scope = MemoryScopeContext(
             appName: "Open Assist",
-            bundleID: "com.manikvashith.OpenAssist",
+            bundleID: "com.developingadventures.OpenAssist",
             surfaceLabel: "Assistant",
             projectName: "OpenAssist",
             repositoryName: "OpenAssist",

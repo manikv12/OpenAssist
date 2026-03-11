@@ -28,7 +28,7 @@ actor MemoryIndexingService {
     private let maxFilesPerSource: Int
     private let maxEventsPerFile: Int
     private let apiThrottleDelay: TimeInterval
-    private let logger = Logger(subsystem: "com.manikvashith.OpenAssist", category: "MemoryIndexing")
+    private let logger = Logger(subsystem: "com.developingadventures.OpenAssist", category: "MemoryIndexing")
 
     init(
         fileManager: FileManager = .default,

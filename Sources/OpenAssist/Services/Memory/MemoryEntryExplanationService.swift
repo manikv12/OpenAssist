@@ -356,7 +356,7 @@ actor MemoryEntryExplanationService {
 
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: "com.manikvashith.OpenAssist",
+            kSecAttrService as String: "com.developingadventures.OpenAssist",
             kSecAttrAccount as String: providerAccount,
             kSecReturnData as String: true,
             kSecMatchLimit as String: kSecMatchLimitOne
@@ -366,7 +366,7 @@ actor MemoryEntryExplanationService {
         if status != errSecSuccess, providerMode == .openAI {
             let legacyQuery: [String: Any] = [
                 kSecClass as String: kSecClassGenericPassword,
-                kSecAttrService as String: "com.manikvashith.OpenAssist",
+                kSecAttrService as String: "com.developingadventures.OpenAssist",
                 kSecAttrAccount as String: "prompt-rewrite-openai-api-key",
                 kSecReturnData as String: true,
                 kSecMatchLimit as String: kSecMatchLimitOne

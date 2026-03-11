@@ -76,7 +76,7 @@ final class MemoryIndexingSettingsService {
     private let discoveryService: MemoryProviderDiscoveryService
     private let indexingService: MemoryIndexingService
     private let storeFactory: @Sendable () throws -> MemorySQLiteStore
-    private let logger = Logger(subsystem: "com.manikvashith.OpenAssist", category: "MemoryIndexing")
+    private let logger = Logger(subsystem: "com.developingadventures.OpenAssist", category: "MemoryIndexing")
     private var activeIndexTask: Task<Void, Never>?
     private var activeIndexTaskGeneration = 0
     private var activeIndexingRebuild = false

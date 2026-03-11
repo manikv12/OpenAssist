@@ -3,7 +3,7 @@
 <plist version="1.0">
     <dict>
         <key>CFBundleIdentifier</key>
-        <string>com.manikvashith.OpenAssist</string>
+        <string>com.developingadventures.OpenAssist</string>
         <key>CFBundleName</key>
         <string>Open Assist</string>
         <key>CFBundleExecutable</key>

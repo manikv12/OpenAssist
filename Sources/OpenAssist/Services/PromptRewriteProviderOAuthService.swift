@@ -39,7 +39,7 @@ struct PromptRewriteOAuthSession: Codable, Equatable {
 }
 
 enum PromptRewriteOAuthCredentialStore {
-    private static let keychainService = "com.manikvashith.OpenAssist"
+    private static let keychainService = "com.developingadventures.OpenAssist"
     private static let accountPrefix = "prompt-rewrite-provider-oauth"
 
     static func loadSession(for providerMode: PromptRewriteProviderMode) -> PromptRewriteOAuthSession? {

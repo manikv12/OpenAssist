@@ -2500,9 +2500,9 @@ final class SettingsStore: ObservableObject {
         return (resolvedModel, resolvedBaseURL)
     }
 
-    private static let cloudTranscriptionProviderAPIKeychainService = "com.manikvashith.OpenAssist"
+    private static let cloudTranscriptionProviderAPIKeychainService = "com.developingadventures.OpenAssist"
     private static let cloudTranscriptionProviderAPIKeychainAccountPrefix = "cloud-transcription-provider-api-key"
-    private static let automationAPIKeychainService = "com.manikvashith.OpenAssist"
+    private static let automationAPIKeychainService = "com.developingadventures.OpenAssist"
     private static let automationAPIKeychainAccount = "automation-api-bearer-token"
 
     private static func generateAutomationAPIToken() -> String {
@@ -2655,7 +2655,7 @@ final class SettingsStore: ObservableObject {
         }
     }
 
-    private static let promptRewriteProviderAPIKeychainService = "com.manikvashith.OpenAssist"
+    private static let promptRewriteProviderAPIKeychainService = "com.developingadventures.OpenAssist"
     private static let promptRewriteProviderAPIKeychainAccountPrefix = "prompt-rewrite-provider-api-key"
     private static let legacyPromptRewriteOpenAIAPIKeychainAccount = "prompt-rewrite-openai-api-key"
 
@@ -2791,12 +2791,12 @@ final class SettingsStore: ObservableObject {
             PromptRewriteOAuthCredentialStore.deleteAllSessions()
         }
 
-        let currentBundleID = Bundle.main.bundleIdentifier ?? "com.manikvashith.OpenAssist"
+        let currentBundleID = Bundle.main.bundleIdentifier ?? "com.developingadventures.OpenAssist"
         let appName = (Bundle.main.object(forInfoDictionaryKey: "CFBundleName") as? String) ?? "Open Assist"
         let bundleIDs = Array(
             Set([
                 currentBundleID,
-                "com.manikvashith.OpenAssist"
+                "com.developingadventures.OpenAssist"
             ])
         )
         let appRemovalPaths = Array(

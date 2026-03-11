@@ -238,7 +238,7 @@ final class AssistantMemoryRetrievalService {
     }
 
     func makeScopeContext(threadID: String, cwd: String?) -> MemoryScopeContext {
-        let bundleID = Bundle.main.bundleIdentifier ?? "com.manikvashith.OpenAssist"
+        let bundleID = Bundle.main.bundleIdentifier ?? "com.developingadventures.OpenAssist"
         let normalizedCWD = cwd?.trimmingCharacters(in: .whitespacesAndNewlines)
         let projectName = normalizedCWD.flatMap { path -> String? in
             let url = URL(fileURLWithPath: path, isDirectory: true)
