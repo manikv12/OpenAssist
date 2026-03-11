@@ -1,0 +1,132 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" width="512" height="512">
+    <defs>
+        <radialGradient id="bg" cx="38%" cy="34%" r="82%">
+            <stop offset="0%" stop-color="#20283A" />
+            <stop offset="56%" stop-color="#0A1120" />
+            <stop offset="100%" stop-color="#020305" />
+        </radialGradient>
+
+        <linearGradient id="gold" x1="0" y1="0" x2="1" y2="1">
+            <stop offset="0%" stop-color="#F4DE99" />
+            <stop offset="40%" stop-color="#D8B45A" />
+            <stop offset="64%" stop-color="#FFF0BF" />
+            <stop offset="100%" stop-color="#A47A21" />
+        </linearGradient>
+
+        <linearGradient id="headFill" x1="37" y1="32" x2="89" y2="84" gradientUnits="userSpaceOnUse">
+            <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.20" />
+            <stop offset="45%" stop-color="#C0D6F0" stop-opacity="0.12" />
+            <stop offset="100%" stop-color="#506888" stop-opacity="0.06" />
+        </linearGradient>
+
+        <linearGradient id="headStroke" x1="37" y1="30" x2="89" y2="84" gradientUnits="userSpaceOnUse">
+            <stop offset="0%" stop-color="#E8F2FF" />
+            <stop offset="50%" stop-color="#C0D8F0" />
+            <stop offset="100%" stop-color="#6A9FCF" />
+        </linearGradient>
+
+        <radialGradient id="faceGlow" cx="50%" cy="46%" r="40%">
+            <stop offset="0%" stop-color="#80C0FF" stop-opacity="0.55" />
+            <stop offset="40%" stop-color="#4A90D0" stop-opacity="0.25" />
+            <stop offset="75%" stop-color="#1A4A80" stop-opacity="0.08" />
+            <stop offset="100%" stop-color="#1A4A80" stop-opacity="0" />
+        </radialGradient>
+
+        <linearGradient id="lensFill" x1="0" y1="0" x2="0.3" y2="1">
+            <stop offset="0%" stop-color="#2A2A3E" />
+            <stop offset="50%" stop-color="#18182A" />
+            <stop offset="100%" stop-color="#101020" />
+        </linearGradient>
+
+        <linearGradient id="lensShine" x1="0" y1="0" x2="1" y2="1">
+            <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.25" />
+            <stop offset="40%" stop-color="#FFFFFF" stop-opacity="0.05" />
+            <stop offset="100%" stop-color="#FFFFFF" stop-opacity="0" />
+        </linearGradient>
+
+        <radialGradient id="vignette" cx="50%" cy="50%" r="52%">
+            <stop offset="0%" stop-color="#000000" stop-opacity="0" />
+            <stop offset="68%" stop-color="#000000" stop-opacity="0" />
+            <stop offset="85%" stop-color="#000000" stop-opacity="0.12" />
+            <stop offset="93%" stop-color="#000000" stop-opacity="0.24" />
+            <stop offset="100%" stop-color="#000000" stop-opacity="0.40" />
+        </radialGradient>
+
+        <filter id="softGlow">
+            <feGaussianBlur stdDeviation="3" />
+        </filter>
+
+        <clipPath id="clip">
+            <circle cx="60" cy="60" r="58.5" />
+        </clipPath>
+    </defs>
+
+    <!-- Blue background filling the full icon square -->
+    <rect width="120" height="120" fill="#0A1120" />
+
+    <!-- Scale circle down so it fits inside the macOS squircle -->
+    <g transform="translate(60,60) scale(0.82) translate(-60,-60)">
+    <circle cx="60" cy="60" r="58.5" fill="url(#bg)" stroke="url(#gold)" stroke-width="2.8" />
+
+    <g clip-path="url(#clip)">
+        <g transform="translate(60,58) scale(1.15) translate(-60,-58)">
+        <!-- Ambient glow behind bot -->
+        <ellipse cx="63" cy="57" rx="26" ry="23" fill="url(#faceGlow)" filter="url(#softGlow)" />
+
+        <!-- Bot head - centered chat bubble, no antenna -->
+        <path
+            d="M45 36
+               H76
+               C82 36 87 41 87 47
+               V68
+               C87 74 82 79 76 79
+               H67
+               L62 84.5
+               C60.8 86 58.3 85 58.3 83
+               V79
+               H45
+               C39 79 34 74 34 68
+               V47
+               C34 41 39 36 45 36 Z"
+            fill="url(#headFill)" />
+
+        <path
+            d="M45 36
+               H76
+               C82 36 87 41 87 47
+               V68
+               C87 74 82 79 76 79
+               H67
+               L62 84.5
+               C60.8 86 58.3 85 58.3 83
+               V79
+               H45
+               C39 79 34 74 34 68
+               V47
+               C34 41 39 36 45 36 Z"
+            fill="none" stroke="url(#gold)" stroke-width="1.8" stroke-linejoin="round" />
+
+        <!-- Sunglasses frame (gold accent) -->
+        <path d="M39 53 C39 51 40 50 42 50 H57 C58.5 50 59 50.5 60.5 51.5 C62 50.5 62.5 50 64 50 H79 C81 50 82 51 82 53 V58 C82 61.5 79 63.5 76 63.5 H67 C64 63.5 62 61.5 62 58 V55 C61 55.5 60 55.5 59 55 V58 C59 61.5 57 63.5 54 63.5 H45 C42 63.5 39 61.5 39 58 Z"
+            fill="#1A1A2A" stroke="url(#gold)" stroke-width="1.3" stroke-linejoin="round" />
+
+        <!-- Left lens -->
+        <rect x="40.5" y="51" width="17" height="11.5" rx="3" fill="url(#lensFill)" />
+        <rect x="40.5" y="51" width="17" height="11.5" rx="3" fill="url(#lensShine)" />
+
+        <!-- Right lens -->
+        <rect x="63" y="51" width="17" height="11.5" rx="3" fill="url(#lensFill)" />
+        <rect x="63" y="51" width="17" height="11.5" rx="3" fill="url(#lensShine)" />
+
+        <!-- Bridge (gold) -->
+        <path d="M57.5 54 C59 52.5 62 52.5 63.5 54" fill="none" stroke="url(#gold)" stroke-width="1.3" stroke-linecap="round" />
+
+        <!-- Subtle mouth -->
+        <path d="M53 67 C56 69.2 63 69.2 66 67" fill="none" stroke="#D0E4F5" stroke-opacity="0.40" stroke-width="1.5" stroke-linecap="round" />
+        </g>
+
+        <!-- Vignette -->
+        <circle cx="60" cy="60" r="56" fill="url(#vignette)" />
+    </g>
+    </g>
+</svg>
