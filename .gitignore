@@ -15,6 +15,7 @@ build-local.sh
 preview_logo.html
 documentaion/
 Resources/old/
+.goutputstream-*
 
 # Code signing
 *.cer

@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="Assets/AppLogo.png" alt="Open Assist" width="120" />
+  <img src="Assets/OpenAssistLogo.svg" alt="Open Assist" width="120" />
 </p>
 
 <h1 align="center">Open Assist</h1>
