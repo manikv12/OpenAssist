@@ -581,6 +581,9 @@ struct CodexSessionCatalog {
             updatedAt: accumulator.updatedAt ?? metadata?.createdAt,
             summary: nil,
             latestModel: accumulator.latestModel,
+            latestInteractionMode: accumulator.latestInteractionMode,
+            latestReasoningEffort: accumulator.latestReasoningEffort,
+            latestServiceTier: accumulator.latestServiceTier,
             latestUserMessage: truncate(latestUserText, limit: 220),
             latestAssistantMessage: truncate(latestAssistantText, limit: 280)
         )
@@ -601,9 +604,45 @@ struct CodexSessionCatalog {
 
             switch stringValue(json["type"]) {
             case "turn_context":
-                if let payload = dictionaryValue(json["payload"]),
-                   let model = firstNonEmptyString(stringValue(payload["model"])) {
-                    accumulator.latestModel = model
+                if let payload = dictionaryValue(json["payload"]) {
+                    let collaborationMode = dictionaryValue(payload["collaboration_mode"])
+                        ?? dictionaryValue(payload["collaborationMode"])
+                    let collaborationSettings = collaborationMode.flatMap { mode in
+                        dictionaryValue(mode["settings"])
+                    }
+
+                    if let model = firstNonEmptyString(
+                        stringValue(payload["model"]),
+                        collaborationSettings.flatMap { stringValue($0["model"]) }
+                    ) {
+                        accumulator.latestModel = model
+                    }
+
+                    if let mode = sessionInteractionMode(
+                        collaborationMode: collaborationMode,
+                        approvalPolicy: stringValue(payload["approval_policy"]) ?? stringValue(payload["approvalPolicy"]),
+                        sandboxPolicy: dictionaryValue(payload["sandbox_policy"]) ?? dictionaryValue(payload["sandboxPolicy"])
+                    ) {
+                        accumulator.latestInteractionMode = mode
+                    }
+
+                    if let effort = firstNonEmptyString(
+                        collaborationSettings.flatMap { stringValue($0["reasoning_effort"]) },
+                        collaborationSettings.flatMap { stringValue($0["reasoningEffort"]) },
+                        stringValue(payload["reasoning_effort"]),
+                        stringValue(payload["reasoningEffort"])
+                    ).flatMap(AssistantReasoningEffort.init(rawValue:)) {
+                        accumulator.latestReasoningEffort = effort
+                    }
+
+                    if let serviceTier = firstNonEmptyString(
+                        stringValue(payload["service_tier"]),
+                        stringValue(payload["serviceTier"]),
+                        collaborationSettings.flatMap { stringValue($0["service_tier"]) },
+                        collaborationSettings.flatMap { stringValue($0["serviceTier"]) }
+                    ) {
+                        accumulator.latestServiceTier = serviceTier
+                    }
                 }
 
             case "response_item":
@@ -2138,6 +2177,41 @@ struct CodexSessionCatalog {
         return nil
     }
 
+    private func sessionInteractionMode(
+        collaborationMode: [String: Any]?,
+        approvalPolicy: String?,
+        sandboxPolicy: [String: Any]?
+    ) -> AssistantInteractionMode? {
+        let collaborationModeKind = firstNonEmptyString(
+            stringValue(collaborationMode?["mode"])
+        )?.lowercased()
+        if collaborationModeKind == "plan" {
+            return .plan
+        }
+
+        let normalizedApprovalPolicy = approvalPolicy?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        if normalizedApprovalPolicy == "untrusted" {
+            return .conversational
+        }
+        if normalizedApprovalPolicy == "on-request" || normalizedApprovalPolicy == "never" {
+            return .agentic
+        }
+
+        let sandboxType = firstNonEmptyString(
+            stringValue(sandboxPolicy?["type"])
+        )?.lowercased()
+        if sandboxType == "read-only" || sandboxType == "readonly" {
+            return collaborationModeKind == "default" ? .conversational : nil
+        }
+        if sandboxType == "danger-full-access" || sandboxType == "dangerfullaccess" {
+            return .agentic
+        }
+
+        return nil
+    }
+
     private func jsonStringLine(_ object: [String: Any]) throws -> String {
         let data = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
         guard let line = String(data: data, encoding: .utf8) else {
@@ -2217,6 +2291,9 @@ private struct SessionTextSnapshot {
 private struct SessionSummaryAccumulator {
     var updatedAt: Date?
     var latestModel: String?
+    var latestInteractionMode: AssistantInteractionMode?
+    var latestReasoningEffort: AssistantReasoningEffort?
+    var latestServiceTier: String?
     var latestUser: SessionTextSnapshot?
     var latestAssistant: SessionTextSnapshot?
     var fallbackUser: SessionTextSnapshot?
@@ -2225,6 +2302,9 @@ private struct SessionSummaryAccumulator {
 
     var hasRelevantTailContent: Bool {
         latestModel != nil
+            || latestInteractionMode != nil
+            || latestReasoningEffort != nil
+            || latestServiceTier != nil
             || latestUser != nil
             || latestAssistant != nil
             || fallbackUser != nil

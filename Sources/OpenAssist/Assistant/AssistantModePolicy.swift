@@ -7,6 +7,12 @@ enum AssistantCommandSafetyClass: Equatable, Sendable {
 }
 
 enum AssistantModePolicy {
+    private static let restrictedDynamicToolNames: Set<String> = [
+        "computer_use",
+        "browser_use",
+        "app_action"
+    ]
+
     private static let simpleReadOnlyExecutables: Set<String> = [
         "pwd", "ls", "rg", "cat", "head", "tail", "grep",
         "sort", "uniq", "cut", "wc", "which", "mdfind", "stat",
@@ -32,6 +38,21 @@ enum AssistantModePolicy {
         "read", "summarize"
     ]
 
+    private static let shellWrapperPrefixes: [String] = [
+        "/bin/zsh -lc",
+        "/bin/zsh -c",
+        "zsh -lc",
+        "zsh -c",
+        "/bin/bash -lc",
+        "/bin/bash -c",
+        "bash -lc",
+        "bash -c",
+        "/bin/sh -lc",
+        "/bin/sh -c",
+        "sh -lc",
+        "sh -c"
+    ]
+
     private static func normalizedToolName(_ toolName: String?) -> String? {
         toolName?
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -40,21 +61,39 @@ enum AssistantModePolicy {
     }
 
     static func commandSafetyClass(for command: String) -> AssistantCommandSafetyClass {
-        let normalized = normalize(command)
-        guard !normalized.isEmpty else { return .mutatingOrUnknown }
+        classifyCommandSafety(for: normalize(command), shellWrapperDepth: 0)
+    }
 
-        if containsDisallowedShellSyntax(normalized) {
+    private static func classifyCommandSafety(
+        for normalized: String,
+        shellWrapperDepth: Int
+    ) -> AssistantCommandSafetyClass {
+        let sanitized = removingAllowedStderrRedirects(from: normalized)
+        guard !sanitized.isEmpty else { return .mutatingOrUnknown }
+
+        // Codex often runs read-only commands through `zsh -lc` or `bash -lc`.
+        // We unwrap those shells and classify the real inner command instead.
+        if shellWrapperDepth < 2,
+           let wrappedCommand = unwrapShellWrappedCommand(sanitized),
+           wrappedCommand != sanitized {
+            return classifyCommandSafety(
+                for: normalize(wrappedCommand),
+                shellWrapperDepth: shellWrapperDepth + 1
+            )
+        }
+
+        if containsDisallowedShellSyntax(sanitized) {
             return .mutatingOrUnknown
         }
 
-        if let stages = pipelineStages(from: normalized) {
+        if let stages = pipelineStages(from: sanitized) {
             guard !stages.isEmpty else { return .mutatingOrUnknown }
             return stages.allSatisfy({ classifySimpleCommand($0) == .readOnly })
                 ? .readOnly
                 : .mutatingOrUnknown
         }
 
-        return classifySimpleCommand(normalized)
+        return classifySimpleCommand(sanitized)
     }
 
     static func shouldAutoApproveCommandRequest(
@@ -126,7 +165,7 @@ enum AssistantModePolicy {
         command: String? = nil,
         toolName: String? = nil
     ) -> Bool {
-        if mode == .agentic {
+        if mode == .agentic || mode == .plan {
             return true
         }
 
@@ -136,19 +175,20 @@ enum AssistantModePolicy {
             switch mode {
             case .conversational:
                 return commandClass == .readOnly
-            case .plan:
-                // Plan mode allows read-only and validation (build/test) commands
-                // but blocks mutating commands to keep the focus on planning.
-                return commandClass == .readOnly || commandClass == .validation
             case .agentic:
+                return true
+            case .plan:
                 return true
             }
         case .webSearch:
             return true
         case .dynamicToolCall:
             switch mode {
-            case .conversational, .plan:
-                return normalizedToolName(toolName) != "computer_use"
+            case .conversational:
+                guard let normalizedTool = normalizedToolName(toolName) else { return true }
+                return !restrictedDynamicToolNames.contains(normalizedTool)
+            case .plan:
+                return true
             case .agentic:
                 return true
             }
@@ -181,7 +221,7 @@ enum AssistantModePolicy {
 
         switch mode {
         case .conversational:
-            if normalizedTitle?.lowercased() == "computer use" || normalizedTitle?.lowercased() == "browser" {
+            if ["computer use", "browser", "browser use", "app action"].contains(normalizedTitle?.lowercased() ?? "") {
                 return "I stopped\(activityPhrase) because Chat mode cannot inspect the live screen or browser with computer-control tools. Chat mode can still analyze an attached image when the selected model supports image input. Switch to Agentic mode for live screen or browser inspection."
             }
             if commandClass == .validation {
@@ -251,6 +291,42 @@ enum AssistantModePolicy {
             of: #"^[a-z_][a-z0-9_]*=.*$"#,
             options: [.regularExpression, .caseInsensitive]
         ) != nil
+    }
+
+    private static func unwrapShellWrappedCommand(_ command: String) -> String? {
+        for prefix in shellWrapperPrefixes {
+            guard command.hasPrefix(prefix) else { continue }
+            let remainder = command.dropFirst(prefix.count)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !remainder.isEmpty else { return nil }
+
+            return stripMatchingQuotes(from: String(remainder))
+        }
+
+        return nil
+    }
+
+    private static func stripMatchingQuotes(from text: String) -> String {
+        guard text.count >= 2,
+              let first = text.first,
+              let last = text.last,
+              first == last,
+              first == "\"" || first == "'" else {
+            return text
+        }
+
+        return String(text.dropFirst().dropLast())
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func removingAllowedStderrRedirects(from command: String) -> String {
+        command
+            .replacingOccurrences(
+                of: #"\s2>>?\s*/dev/null(?=\s|$)"#,
+                with: "",
+                options: .regularExpression
+            )
+            .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private static func isTrustedDirectObsidianReadOnlyCommand(_ tokens: [String]) -> Bool {

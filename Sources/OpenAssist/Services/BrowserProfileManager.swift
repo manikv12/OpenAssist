@@ -5,6 +5,7 @@ import Foundation
 enum SupportedBrowser: String, CaseIterable, Identifiable, Codable {
     case chrome = "Google Chrome"
     case brave = "Brave Browser"
+    case edge = "Microsoft Edge"
 
     var id: String { rawValue }
 
@@ -14,6 +15,7 @@ enum SupportedBrowser: String, CaseIterable, Identifiable, Codable {
         switch self {
         case .chrome: return "com.google.Chrome"
         case .brave: return "com.brave.Browser"
+        case .edge: return "com.microsoft.edgemac"
         }
     }
 
@@ -21,6 +23,7 @@ enum SupportedBrowser: String, CaseIterable, Identifiable, Codable {
         switch self {
         case .chrome: return "Google Chrome"
         case .brave: return "Brave Browser"
+        case .edge: return "Microsoft Edge"
         }
     }
 
@@ -28,6 +31,18 @@ enum SupportedBrowser: String, CaseIterable, Identifiable, Codable {
         switch self {
         case .chrome: return "chrome"
         case .brave: return "brave"
+        case .edge: return "msedge"
+        }
+    }
+
+    var appPath: String {
+        switch self {
+        case .chrome:
+            return "/Applications/Google Chrome.app"
+        case .brave:
+            return "/Applications/Brave Browser.app"
+        case .edge:
+            return "/Applications/Microsoft Edge.app"
         }
     }
 
@@ -38,6 +53,8 @@ enum SupportedBrowser: String, CaseIterable, Identifiable, Codable {
             return "\(home)/Library/Application Support/Google/Chrome/Local State"
         case .brave:
             return "\(home)/Library/Application Support/BraveSoftware/Brave-Browser/Local State"
+        case .edge:
+            return "\(home)/Library/Application Support/Microsoft Edge/Local State"
         }
     }
 
@@ -48,6 +65,8 @@ enum SupportedBrowser: String, CaseIterable, Identifiable, Codable {
             return "\(home)/Library/Application Support/Google/Chrome"
         case .brave:
             return "\(home)/Library/Application Support/BraveSoftware/Brave-Browser"
+        case .edge:
+            return "\(home)/Library/Application Support/Microsoft Edge"
         }
     }
 }

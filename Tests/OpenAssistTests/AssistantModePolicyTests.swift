@@ -37,6 +37,20 @@ final class AssistantModePolicyTests: XCTestCase {
             AssistantModePolicy.commandSafetyClass(for: "obsidian search query=OpenAssist"),
             .readOnly
         )
+        XCTAssertEqual(
+            AssistantModePolicy.commandSafetyClass(for: #"/bin/zsh -lc "rg -n \"plan mode\" Sources""#),
+            .readOnly
+        )
+        XCTAssertEqual(
+            AssistantModePolicy.commandSafetyClass(for: "bash -lc 'git diff --stat'"),
+            .readOnly
+        )
+        XCTAssertEqual(
+            AssistantModePolicy.commandSafetyClass(
+                for: #"/bin/zsh -lc "find /Users/manikvashith -maxdepth 4 -type d \( -iname 'OpenAssist' -o -iname 'open assist' -o -iname '*openassist*' -o -iname '*open-assist*' \) 2>/dev/null""#
+            ),
+            .readOnly
+        )
     }
 
     func testCommandSafetyClassifiesValidationCommands() {
@@ -50,6 +64,10 @@ final class AssistantModePolicyTests: XCTestCase {
         )
         XCTAssertEqual(
             AssistantModePolicy.commandSafetyClass(for: "xcodebuild test -scheme OpenAssist"),
+            .validation
+        )
+        XCTAssertEqual(
+            AssistantModePolicy.commandSafetyClass(for: #"/bin/zsh -lc "swift test""#),
             .validation
         )
     }
@@ -79,6 +97,18 @@ final class AssistantModePolicyTests: XCTestCase {
             AssistantModePolicy.commandSafetyClass(for: "custom-tool --flag"),
             .mutatingOrUnknown
         )
+        XCTAssertEqual(
+            AssistantModePolicy.commandSafetyClass(for: #"/bin/zsh -lc "rm -rf tmp""#),
+            .mutatingOrUnknown
+        )
+        XCTAssertEqual(
+            AssistantModePolicy.commandSafetyClass(for: #"/bin/zsh -lc "rg todo Sources > results.txt""#),
+            .mutatingOrUnknown
+        )
+        XCTAssertEqual(
+            AssistantModePolicy.commandSafetyClass(for: #"/bin/zsh -lc "find Sources 2> results.txt""#),
+            .mutatingOrUnknown
+        )
     }
 
     func testChatAutoApprovesTrustedReadOnlyCommandRequests() {
@@ -98,6 +128,18 @@ final class AssistantModePolicyTests: XCTestCase {
             AssistantModePolicy.shouldAutoApproveCommandRequest(
                 mode: .agentic,
                 command: "rg --files Sources"
+            )
+        )
+        XCTAssertTrue(
+            AssistantModePolicy.shouldAutoApproveCommandRequest(
+                mode: .plan,
+                command: #"/bin/zsh -lc "rg --files Sources""#
+            )
+        )
+        XCTAssertTrue(
+            AssistantModePolicy.shouldAutoApproveCommandRequest(
+                mode: .plan,
+                command: #"/bin/zsh -lc "find /Users/manikvashith -maxdepth 4 -type d -iname 'OpenAssist' 2>/dev/null""#
             )
         )
     }
@@ -130,19 +172,33 @@ final class AssistantModePolicyTests: XCTestCase {
                 command: "swift test"
             )
         )
-        XCTAssertFalse(
+        XCTAssertTrue(
+            AssistantModePolicy.isAllowed(
+                mode: .plan,
+                activityKind: .commandExecution,
+                command: #"/bin/zsh -lc "rg --files Sources""#
+            )
+        )
+        XCTAssertTrue(
+            AssistantModePolicy.isAllowed(
+                mode: .plan,
+                activityKind: .commandExecution,
+                command: #"/bin/zsh -lc "find /Users/manikvashith -maxdepth 4 -type d -iname 'OpenAssist' 2>/dev/null""#
+            )
+        )
+        XCTAssertTrue(
             AssistantModePolicy.isAllowed(
                 mode: .plan,
                 activityKind: .fileChange
             )
         )
-        XCTAssertFalse(
+        XCTAssertTrue(
             AssistantModePolicy.isAllowed(
                 mode: .plan,
                 activityKind: .browserAutomation
             )
         )
-        XCTAssertFalse(
+        XCTAssertTrue(
             AssistantModePolicy.isAllowed(
                 mode: .plan,
                 activityKind: .dynamicToolCall,
@@ -152,7 +208,27 @@ final class AssistantModePolicyTests: XCTestCase {
         XCTAssertTrue(
             AssistantModePolicy.isAllowed(
                 mode: .plan,
+                activityKind: .dynamicToolCall,
+                toolName: "browser_use"
+            )
+        )
+        XCTAssertTrue(
+            AssistantModePolicy.isAllowed(
+                mode: .plan,
+                activityKind: .dynamicToolCall,
+                toolName: "app_action"
+            )
+        )
+        XCTAssertTrue(
+            AssistantModePolicy.isAllowed(
+                mode: .plan,
                 activityKind: .mcpToolCall
+            )
+        )
+        XCTAssertTrue(
+            AssistantModePolicy.isAllowed(
+                mode: .plan,
+                activityKind: .subagent
             )
         )
         XCTAssertFalse(
@@ -172,6 +248,20 @@ final class AssistantModePolicyTests: XCTestCase {
                 mode: .conversational,
                 activityKind: .dynamicToolCall,
                 toolName: "computer_use"
+            )
+        )
+        XCTAssertFalse(
+            AssistantModePolicy.isAllowed(
+                mode: .conversational,
+                activityKind: .dynamicToolCall,
+                toolName: "browser_use"
+            )
+        )
+        XCTAssertFalse(
+            AssistantModePolicy.isAllowed(
+                mode: .conversational,
+                activityKind: .dynamicToolCall,
+                toolName: "app_action"
             )
         )
         XCTAssertTrue(

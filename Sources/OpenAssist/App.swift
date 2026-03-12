@@ -12,6 +12,9 @@ extension Notification.Name {
     static let openAssistOpenAssistantSetup = Notification.Name("OpenAssist.openAssistantSetup")
     static let openAssistStartAssistantVoiceCapture = Notification.Name("OpenAssist.startAssistantVoiceCapture")
     static let openAssistStopAssistantVoiceCapture = Notification.Name("OpenAssist.stopAssistantVoiceCapture")
+    static let openAssistStartCompactVoiceCapture = Notification.Name("OpenAssist.startCompactVoiceCapture")
+    static let openAssistStopCompactVoiceCapture = Notification.Name("OpenAssist.stopCompactVoiceCapture")
+    static let openAssistMinimizeAssistantToCompact = Notification.Name("OpenAssist.minimizeAssistantToCompact")
     static let openAssistStartOrbVoiceCapture = Notification.Name("OpenAssist.startOrbVoiceCapture")
     static let openAssistStopOrbVoiceCapture = Notification.Name("OpenAssist.stopOrbVoiceCapture")
     static let openAssistAssistantZoomIn = Notification.Name("OpenAssist.assistantZoomIn")
@@ -731,7 +734,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
     private var pasteLastTranscriptHotkeyManager: OneShotHotkeyManager?
     private let transcriptHistory = TranscriptHistoryStore.shared
     private var windowCoordinator: AppWindowCoordinator?
-    private var assistantOrbHUD: AssistantOrbHUDManager?
+    private var assistantCompactHUD: AssistantCompactPresenter?
     private var isAssistantWindowVisible = false
 
     private var statusItem: NSStatusItem?
@@ -745,7 +748,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
     private var assistantSetupRequestObserver: NSObjectProtocol?
     private var assistantStartVoiceCaptureObserver: NSObjectProtocol?
     private var assistantStopVoiceCaptureObserver: NSObjectProtocol?
-    private var assistantMinimizeToOrbObserver: NSObjectProtocol?
+    private var assistantMinimizeToCompactObserver: NSObjectProtocol?
     private var memoryPressureSource: DispatchSourceMemoryPressure?
     private var adaptiveCorrectionObserver: AnyCancellable?
     private var assistantHUDObserver: AnyCancellable?
@@ -767,7 +770,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
     private var lastAppliedSettingsSnapshot: SettingsApplySnapshot?
     private var lastAudioSetupHUDAlertAt: Date?
     private var assistantVoiceCaptureActive = false
-    private var orbVoiceCaptureActive = false
+    private var compactVoiceCaptureActive = false
     private var assistantVoiceSilenceStart: Date?
     private var assistantVoiceHasSpoken = false
     private var assistantVoiceBaselineNoise: Float = 0
@@ -810,7 +813,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
     }
 
     private var assistantVoiceStopMode: AssistantVoiceStopMode = .silenceAutoStop
-    private var orbVoiceStopMode: AssistantVoiceStopMode = .manualRelease
+    private var compactVoiceStopMode: AssistantVoiceStopMode = .manualRelease
 
     private enum PromptRewriteFailureChoice {
         case retry
@@ -1013,8 +1016,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         }
 
         setupStatusBar()
-        assistantOrbHUD = AssistantOrbHUDManager(controller: assistantController)
-        syncAssistantOrbVisibility()
+        assistantCompactHUD = AssistantCompactHUDManager(
+            controller: assistantController,
+            style: settings.assistantCompactPresentationStyle
+        )
+        syncAssistantCompactVisibility()
         assistantHUDObserver = assistantController.$hudState
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in
@@ -1038,7 +1044,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         )
         windowCoordinator?.onAssistantWindowVisibilityChanged = { [weak self] isVisible in
             self?.isAssistantWindowVisible = isVisible
-            self?.syncAssistantOrbVisibility()
+            self?.syncAssistantCompactVisibility()
         }
         automationAPICoordinator.setNotificationInteractionHandler { [weak self] source in
             guard let self else { return }
@@ -1151,15 +1157,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
                 self.waveform.updateLevel(level)
                 if self.assistantVoiceCaptureActive {
                     self.assistantController.updateVoiceCaptureLevel(level)
-                    self.assistantOrbHUD?.updateLevel(level)
+                    self.assistantCompactHUD?.updateLevel(level)
                     self.evaluateAssistantVoiceSilence(level: level)
-                } else if self.orbVoiceCaptureActive {
+                } else if self.compactVoiceCaptureActive {
                     self.assistantController.updateVoiceCaptureLevel(0)
-                    self.assistantOrbHUD?.updateLevel(level)
-                    self.evaluateOrbVoiceSilence(level: level)
+                    self.assistantCompactHUD?.updateLevel(level)
+                    self.evaluateCompactVoiceSilence(level: level)
                 } else {
                     self.assistantController.updateVoiceCaptureLevel(0)
-                    self.assistantOrbHUD?.updateLevel(0)
+                    self.assistantCompactHUD?.updateLevel(0)
                 }
                 self.updateMenuState()
             }
@@ -1180,6 +1186,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
                     self?.startStatusIconAnimation()
                     self?.updateMenuState()
                 }
+            }
+        }
+
+        transcriber.onAudioWaveformBins = { [weak self] bins in
+            Task { @MainActor in
+                self?.waveform.updateBars(bins)
             }
         }
 
@@ -1291,13 +1303,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             }
         }
 
-        assistantMinimizeToOrbObserver = NotificationCenter.default.addObserver(
+        assistantMinimizeToCompactObserver = NotificationCenter.default.addObserver(
+            forName: .openAssistMinimizeAssistantToCompact,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.minimizeAssistantToCompact()
+            }
+        }
+
+        NotificationCenter.default.addObserver(
+            forName: .openAssistStartCompactVoiceCapture,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.beginCompactVoiceCapture()
+            }
+        }
+
+        NotificationCenter.default.addObserver(
+            forName: .openAssistStopCompactVoiceCapture,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.stopCompactVoiceCapture()
+            }
+        }
+
+        NotificationCenter.default.addObserver(
             forName: .openAssistMinimizeAssistantToOrb,
             object: nil,
             queue: .main
         ) { [weak self] _ in
             Task { @MainActor in
-                self?.minimizeAssistantToOrb()
+                self?.minimizeAssistantToCompact()
             }
         }
 
@@ -1307,7 +1349,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             queue: .main
         ) { [weak self] _ in
             Task { @MainActor in
-                self?.beginOrbVoiceCapture()
+                self?.beginCompactVoiceCapture()
             }
         }
 
@@ -1317,7 +1359,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             queue: .main
         ) { [weak self] _ in
             Task { @MainActor in
-                self?.stopOrbVoiceCapture()
+                self?.stopCompactVoiceCapture()
             }
         }
 
@@ -1363,9 +1405,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             NotificationCenter.default.removeObserver(assistantStopVoiceCaptureObserver)
             self.assistantStopVoiceCaptureObserver = nil
         }
-        if let assistantMinimizeToOrbObserver {
-            NotificationCenter.default.removeObserver(assistantMinimizeToOrbObserver)
-            self.assistantMinimizeToOrbObserver = nil
+        if let assistantMinimizeToCompactObserver {
+            NotificationCenter.default.removeObserver(assistantMinimizeToCompactObserver)
+            self.assistantMinimizeToCompactObserver = nil
         }
         stopMemoryPressureMonitoring()
         settingsApplyWorkItem?.cancel()
@@ -1387,7 +1429,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         stopStatusIconAnimation()
         transcriber.stopRecording(emitFinalText: false)
         postInsertCorrectionMonitor.stopMonitoring(commitSession: false)
-        assistantOrbHUD?.hide()
+        assistantCompactHUD?.hide()
         waveform.hide()
         windowCoordinator?.closeAllWindows()
         windowCoordinator = nil
@@ -1617,7 +1659,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
     }
 
     private func currentPermissionSnapshot() -> PermissionCenter.Snapshot {
-        PermissionCenter.snapshot(using: settings)
+        PermissionCenter.snapshot(using: settings, includeExtendedPermissions: false)
     }
 
     private func updatePermissionGate(openOnboardingIfNeeded: Bool, reconfigureHotkeysIfReady: Bool = false) {
@@ -1822,42 +1864,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             return
         }
 
-        assistantOrbHUD?.hide()
+        isAssistantWindowVisible = true
+        syncAssistantCompactVisibility()
         windowCoordinator?.openAssistantWindow(
             rootView: AssistantWindowView(assistant: assistantController)
             .environmentObject(settings)
         )
     }
 
-    private func minimizeAssistantToOrb() {
+    private func minimizeAssistantToCompact() {
         guard settings.assistantFloatingHUDEnabled else { return }
+        assistantCompactHUD?.setPreferredScreen(windowCoordinator?.assistantWindowScreen)
         windowCoordinator?.closeAssistantWindow()
-        // The orb becomes visible via syncAssistantOrbVisibility (triggered by
-        // onAssistantWindowVisibilityChanged). If there's a selected session,
-        // show its follow-up preview on the orb.
+        // The compact assistant becomes visible via syncAssistantCompactVisibility
+        // (triggered by onAssistantWindowVisibilityChanged). If there is a selected
+        // session, show its follow-up preview in the compact view.
         if let sessionID = assistantController.selectedSessionID,
            let session = assistantController.sessions.first(where: { $0.id == sessionID }) {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
-                self?.assistantOrbHUD?.showFollowUp(for: session)
+                self?.assistantCompactHUD?.showFollowUp(for: session)
             }
         }
     }
 
-    private func syncAssistantOrbVisibility() {
-        let shouldEnableOrb =
+    private func syncAssistantCompactVisibility() {
+        assistantCompactHUD?.setPresentationStyle(settings.assistantCompactPresentationStyle)
+
+        let shouldEnableCompactAssistant =
             FeatureFlags.personalAssistantEnabled
             && settings.assistantBetaEnabled
             && settings.assistantFloatingHUDEnabled
             && !isAssistantWindowVisible
 
-        assistantOrbHUD?.isEnabled = shouldEnableOrb
+        assistantCompactHUD?.isEnabled = shouldEnableCompactAssistant
 
-        guard shouldEnableOrb else {
-            assistantOrbHUD?.hide()
+        guard shouldEnableCompactAssistant else {
+            assistantCompactHUD?.hide()
             return
         }
 
-        assistantOrbHUD?.update(state: assistantController.hudState)
+        assistantCompactHUD?.update(state: assistantController.hudState)
     }
 
     private func beginAssistantVoiceTaskCapture(stopMode: AssistantVoiceStopMode = .silenceAutoStop) {
@@ -1934,18 +1980,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         updateMenuState()
     }
 
-    // MARK: - Orb Voice Capture
+    // MARK: - Compact Voice Capture
 
-    private func beginOrbVoiceCapture(stopMode: AssistantVoiceStopMode = .manualRelease) {
+    private func beginCompactVoiceCapture(stopMode: AssistantVoiceStopMode = .manualRelease) {
         guard !isDictating else { return }
         guard permissionsReady else {
             updatePermissionGate(openOnboardingIfNeeded: true)
-            assistantOrbHUD?.receiveVoiceTranscript("")
+            assistantCompactHUD?.receiveVoiceTranscript("")
             return
         }
 
-        orbVoiceCaptureActive = true
-        orbVoiceStopMode = stopMode
+        compactVoiceCaptureActive = true
+        compactVoiceStopMode = stopMode
         assistantVoiceSilenceStart = nil
         assistantVoiceHasSpoken = false
         assistantVoiceBaselineSamples = []
@@ -1953,31 +1999,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         startRecording()
 
         if !isDictating {
-            orbVoiceCaptureActive = false
-            orbVoiceStopMode = .manualRelease
-            assistantOrbHUD?.receiveVoiceTranscript("")
+            compactVoiceCaptureActive = false
+            compactVoiceStopMode = .manualRelease
+            assistantCompactHUD?.receiveVoiceTranscript("")
         }
     }
 
-    private func stopOrbVoiceCapture() {
-        guard orbVoiceCaptureActive else { return }
-        // Keep orbVoiceCaptureActive = true so handleFinalTranscript routes to orb
-        orbVoiceStopMode = .manualRelease
+    private func stopCompactVoiceCapture() {
+        guard compactVoiceCaptureActive else { return }
+        // Keep compactVoiceCaptureActive = true so handleFinalTranscript routes to the compact assistant.
+        compactVoiceStopMode = .manualRelease
         assistantVoiceSilenceStart = nil
         assistantVoiceHasSpoken = false
         assistantVoiceBaselineSamples = []
         assistantVoiceBaselineCalibrated = false
-        assistantOrbHUD?.setVoiceRecording(false)
+        assistantCompactHUD?.setVoiceRecording(false)
         transcriber.stopRecording()
         isDictating = false
         currentAudioLevel = 0
-        assistantOrbHUD?.updateLevel(0)
+        assistantCompactHUD?.updateLevel(0)
         stopStatusIconAnimation()
         updateMenuState()
     }
 
-    private func evaluateOrbVoiceSilence(level: Float) {
-        guard orbVoiceStopMode == .silenceAutoStop else { return }
+    private func evaluateCompactVoiceSilence(level: Float) {
+        guard compactVoiceStopMode == .silenceAutoStop else { return }
 
         let calibrationSampleCount = 15
         let speechMultiplier: Float = 3.0
@@ -2010,7 +2056,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
 
         if let start = assistantVoiceSilenceStart,
            Date().timeIntervalSince(start) >= silenceDuration {
-            stopOrbVoiceCapture()
+            stopCompactVoiceCapture()
         }
     }
 
@@ -2056,14 +2102,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
     }
 
     private func stopAssistantFromMenuBar() {
-        if orbVoiceCaptureActive {
-            orbVoiceCaptureActive = false
-            orbVoiceStopMode = .manualRelease
+        if compactVoiceCaptureActive {
+            compactVoiceCaptureActive = false
+            compactVoiceStopMode = .manualRelease
             transcriber.stopRecording(emitFinalText: false)
             isDictating = false
             currentAudioLevel = 0
-            assistantOrbHUD?.updateLevel(0)
-            assistantOrbHUD?.receiveVoiceTranscript("")
+            assistantCompactHUD?.updateLevel(0)
+            assistantCompactHUD?.receiveVoiceTranscript("")
             stopStatusIconAnimation()
             setUIStatus(.ready)
             updateMenuState()
@@ -2104,7 +2150,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             assistantVoiceStopMode = .silenceAutoStop
             transcriber.stopRecording(emitFinalText: false)
         }
-        assistantOrbHUD?.hide()
+        assistantCompactHUD?.hide()
         Task { @MainActor in
             await assistantController.stopRuntime()
         }
@@ -2240,7 +2286,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             stopAssistantExperience()
         }
 
-        syncAssistantOrbVisibility()
+        syncAssistantCompactVisibility()
 
         automationAPICoordinator.applySettings(settings)
         lastAppliedSettingsSnapshot = currentSettingsApplySnapshot()
@@ -2400,18 +2446,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         case .assistantWindow:
             beginAssistantVoiceTaskCapture(stopMode: .manualRelease)
             return assistantVoiceCaptureActive
-        case .assistantOrb:
-            assistantOrbHUD?.setVoiceRecording(true)
-            beginOrbVoiceCapture(stopMode: .manualRelease)
-            return orbVoiceCaptureActive
+        case .assistantCompact:
+            assistantCompactHUD?.setVoiceRecording(true)
+            beginCompactVoiceCapture(stopMode: .manualRelease)
+            return compactVoiceCaptureActive
         case nil:
             return false
         }
     }
 
     private func stopVoiceCaptureForActiveAssistantComposerIfNeeded() -> Bool {
-        if orbVoiceCaptureActive {
-            stopOrbVoiceCapture()
+        if compactVoiceCaptureActive {
+            stopCompactVoiceCapture()
             return true
         }
 
@@ -2454,10 +2500,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
                 assistantVoiceStopMode = .silenceAutoStop
                 assistantController.failVoiceDraft("Assistant voice capture needs microphone and accessibility permissions.")
             }
-            if orbVoiceCaptureActive {
-                orbVoiceCaptureActive = false
-                orbVoiceStopMode = .manualRelease
-                assistantOrbHUD?.receiveVoiceTranscript("")
+            if compactVoiceCaptureActive {
+                compactVoiceCaptureActive = false
+                compactVoiceStopMode = .manualRelease
+                assistantCompactHUD?.receiveVoiceTranscript("")
             }
             return
         }
@@ -2478,7 +2524,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         if started {
             playDictationFeedbackSound(.startListening)
             setUIStatus(.listening)
-            if !assistantVoiceCaptureActive && !orbVoiceCaptureActive {
+            if !assistantVoiceCaptureActive && !compactVoiceCaptureActive {
                 waveform.show()
             }
             startStatusIconAnimation()
@@ -2488,10 +2534,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
                 assistantVoiceStopMode = .silenceAutoStop
                 assistantController.failVoiceDraft("Open Assist could not start voice capture.")
             }
-            if orbVoiceCaptureActive {
-                orbVoiceCaptureActive = false
-                orbVoiceStopMode = .manualRelease
-                assistantOrbHUD?.receiveVoiceTranscript("")
+            if compactVoiceCaptureActive {
+                compactVoiceCaptureActive = false
+                compactVoiceStopMode = .manualRelease
+                assistantCompactHUD?.receiveVoiceTranscript("")
             }
             waveform.hide()
             stopStatusIconAnimation()
@@ -2531,13 +2577,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
     private func handleFinalTranscript(_ text: String) async {
         let cleaned = TextCleanup.process(text, mode: settings.textCleanupMode)
 
-        if orbVoiceCaptureActive {
-            orbVoiceCaptureActive = false
-            orbVoiceStopMode = .manualRelease
+        if compactVoiceCaptureActive {
+            compactVoiceCaptureActive = false
+            compactVoiceStopMode = .manualRelease
             assistantVoiceBaselineSamples = []
             assistantVoiceBaselineCalibrated = false
             let refinedAssistantDraft = await refinedAssistantVoiceDraft(from: cleaned)
-            assistantOrbHUD?.receiveVoiceTranscript(refinedAssistantDraft)
+            assistantCompactHUD?.receiveVoiceTranscript(refinedAssistantDraft)
             setUIStatus(.ready)
             updateMenuState()
             return
@@ -3914,6 +3960,7 @@ struct SettingsView: View {
         case shortcuts
         case speech
         case aiModels
+        case computerControl
         case integrations
         case corrections
         case about
@@ -3926,6 +3973,7 @@ struct SettingsView: View {
             case .shortcuts: return "Shortcuts"
             case .speech: return "Speech & Input"
             case .aiModels: return "AI & Models"
+            case .computerControl: return "Computer Control"
             case .integrations: return "Integrations"
             case .corrections: return "Corrections"
             case .about: return "About & Permissions"
@@ -3938,6 +3986,7 @@ struct SettingsView: View {
             case .shortcuts: return "Hold-to-talk and continuous toggle keys"
             case .speech: return "Microphone, engine, whisper models, timing, and text quality"
             case .aiModels: return "Prompt rewrite, memory assistant, and provider connections"
+            case .computerControl: return "Local Mac permissions, helper status, browser profiles, and app actions"
             case .integrations: return "Local automation and agent notifications"
             case .corrections: return "Learn from and manage text fixes"
             case .about: return "Permission health, diagnostics, and uninstall"
@@ -3950,6 +3999,7 @@ struct SettingsView: View {
             case .shortcuts: return "keyboard"
             case .speech: return "waveform.and.mic"
             case .aiModels: return "shippingbox.fill"
+            case .computerControl: return "desktopcomputer.and.sparkles"
             case .integrations: return "point.3.connected.trianglepath.dotted"
             case .corrections: return "text.badge.checkmark"
             case .about: return "info.circle"
@@ -3966,6 +4016,8 @@ struct SettingsView: View {
                 return Color(red: 0.27, green: 0.72, blue: 0.54)
             case .aiModels:
                 return Color(red: 0.45, green: 0.56, blue: 0.92)
+            case .computerControl:
+                return Color(red: 0.23, green: 0.67, blue: 0.76)
             case .integrations:
                 return Color(red: 0.84, green: 0.52, blue: 0.28)
             case .corrections:
@@ -3985,6 +4037,8 @@ struct SettingsView: View {
                 return ["recognition", "engine", "punctuation", "context", "cleanup", "delay", "text quality", "speech", "whisper", "model", "download", "install", "core ml", "tiny", "base", "small", "medium", "large"]
             case .aiModels:
                 return ["ai", "prompt", "rewrite", "memory", "provider", "oauth", "api key", "openai", "anthropic", "google", "gemini", "studio", "style", "conversation", "history"]
+            case .computerControl:
+                return ["computer", "control", "browser", "browser profile", "screen recording", "automation", "apple events", "finder", "terminal", "calendar", "system settings", "helper"]
             case .integrations:
                 return ["integrations", "automation", "api", "localhost", "claude", "codex", "cloud", "hooks", "notification", "speech", "sound", "token", "port"]
             case .corrections:
@@ -4128,6 +4182,8 @@ struct SettingsView: View {
     @State private var showingCorrectionsListSheet = false
     @State private var correctionsSearchQuery = ""
     @State private var automationActionMessage: String?
+    @State private var computerPermissionSnapshot = PermissionCenter.snapshot(using: .shared)
+    @State private var computerControlStatus: HelperCapabilityStatus?
     @State private var installClaudeNotificationHook = false
     @State private var installClaudeStopHook = false
     @State private var installClaudeSubagentStopHook = false
@@ -4253,12 +4309,25 @@ struct SettingsView: View {
             if selectedSection != .integrations {
                 selectedIntegrationsPage = .overview
             }
+            if selectedSection == .computerControl || selectedSection == .about {
+                refreshComputerControlState()
+            }
         }
         .onAppear {
             sanitizePinnedConversationContextSelection()
+            refreshComputerControlState()
         }
         .onChange(of: promptRewriteConversationStore.contextSummaries) { _ in
             sanitizePinnedConversationContextSelection()
+        }
+        .onChange(of: settings.browserAutomationEnabled) { _ in
+            refreshComputerControlState()
+        }
+        .onChange(of: settings.browserSelectedProfileID) { _ in
+            refreshComputerControlState()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            refreshComputerControlState()
         }
         .onReceive(NotificationCenter.default.publisher(for: .openAssistOpenAssistantSetup)) { _ in
             NotificationCenter.default.post(name: .openAssistOpenAIMemoryStudio, object: nil)
@@ -4562,6 +4631,8 @@ struct SettingsView: View {
             speechSection
         case .aiModels:
             aiModelsSection
+        case .computerControl:
+            computerControlSection
         case .integrations:
             integrationsSection
         case .corrections:
@@ -7161,6 +7232,11 @@ struct SettingsView: View {
             .init(section: .aiModels, title: "Rewrite history source switch", detail: "Pin to a saved context or use automatic app/screen context", keywords: ["switch", "pin", "context", "history", "conversation"]),
             .init(section: .aiModels, title: "Provider connection status", detail: "See OAuth and API key status for OpenAI, Anthropic, and Google Gemini", keywords: ["provider", "oauth", "api key", "openai", "anthropic", "google", "gemini", "connection"]),
             .init(section: .aiModels, title: "AI Studio", detail: "Launch dedicated AI page for provider and prompt model controls", keywords: ["ai", "studio", "providers", "models", "rewrite"]),
+            .init(section: .computerControl, title: "Computer Control permissions", detail: "Review Accessibility, Screen Recording, Automation, and Full Disk Access", keywords: ["computer", "control", "screen recording", "automation", "apple events", "full disk"]),
+            .init(section: .computerControl, title: "Browser profile", detail: "Choose the Chrome, Brave, or Edge profile Open Assist should reuse", keywords: ["browser", "profile", "chrome", "brave", "edge", "session"]),
+            .init(section: .computerControl, title: "Helper status", detail: "See local automation helper readiness and current setup issues", keywords: ["helper", "status", "issues", "readiness"]),
+            .init(section: .computerControl, title: "Supported app actions", detail: "See Finder, Terminal, Calendar, and System Settings direct actions", keywords: ["finder", "terminal", "calendar", "system settings", "app action"]),
+            .init(section: .computerControl, title: "Approval behavior", detail: "Understand session approvals and high-risk confirmation rules", keywords: ["approval", "allow", "session", "confirmation", "risky"]),
             .init(section: .integrations, title: "Automation & notifications", detail: "Open the focused page for Claude Code, Codex CLI, and Codex Cloud alerts", keywords: ["automation", "notifications", "sources", "codex", "claude"], integrationsPage: .automationNotifications),
             .init(section: .integrations, title: "Enable automation API", detail: "Run a localhost API for Claude Code and Codex CLI", keywords: ["automation", "api", "localhost", "server", "claude", "codex"], integrationsPage: .automationNotifications),
             .init(section: .integrations, title: "Automation API token", detail: "Copy or rotate the local bearer token", keywords: ["token", "bearer", "auth", "copy", "rotate"], integrationsPage: .automationNotifications),
@@ -7342,12 +7418,215 @@ struct SettingsView: View {
         }
     }
 
+    @ViewBuilder
+    private var computerControlSection: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            settingsSectionHeader(for: .computerControl)
+
+            settingsCard(
+                title: "Computer Control Permissions",
+                subtitle: "Grant each Mac permission only for the capability that needs it.",
+                symbol: "hand.raised.fill",
+                tint: SettingsSection.computerControl.tint
+            ) {
+                VStack(alignment: .leading, spacing: 10) {
+                    permissionRow(
+                        name: "Accessibility",
+                        granted: computerPermissionSnapshot.accessibilityGranted,
+                        hint: "Needed for clicking, typing, keyboard shortcuts, and pointer control.",
+                        action: {
+                            PermissionCenter.requestAccessibilityPermission(
+                                using: settings,
+                                promptIfNeeded: true,
+                                openSettingsIfDenied: false
+                            )
+                            refreshComputerControlState()
+                        }
+                    )
+
+                    permissionRow(
+                        name: "Screen Recording",
+                        granted: computerPermissionSnapshot.screenRecordingGranted,
+                        hint: "Needed when Open Assist has to understand what is visible on screen.",
+                        action: {
+                            PermissionCenter.requestScreenRecordingPermission(openSettingsIfDenied: true)
+                            refreshComputerControlState()
+                        }
+                    )
+
+                    permissionRow(
+                        name: "Automation / Apple Events",
+                        granted: computerPermissionSnapshot.appleEventsGranted,
+                        hint: computerPermissionSnapshot.appleEventsKnown
+                            ? "Needed for direct browser and app scripting."
+                            : "Check this after you approve a browser or app action for the first time.",
+                        action: {
+                            PermissionCenter.requestAppleEventsPermission(openSettingsIfDenied: true)
+                            refreshComputerControlState()
+                        }
+                    )
+
+                    permissionRow(
+                        name: "Full Disk Access",
+                        granted: computerPermissionSnapshot.fullDiskAccessGranted,
+                        hint: computerPermissionSnapshot.fullDiskAccessKnown
+                            ? "Optional. Only needed for protected folders like Mail, Messages, or Safari data."
+                            : "Optional. Open this only when a protected location needs it.",
+                        action: {
+                            PermissionCenter.openPrivacySettingsPane(query: "Full Disk Access")
+                            refreshComputerControlState()
+                        }
+                    )
+                }
+
+                HStack(spacing: 8) {
+                    Button("Check Again") {
+                        refreshComputerControlState()
+                    }
+                    .buttonStyle(.bordered)
+
+                    Button("Open Privacy Settings") {
+                        PermissionCenter.openPrivacySettingsPane(query: "Privacy")
+                    }
+                    .buttonStyle(.bordered)
+                }
+            }
+
+            settingsCard(
+                title: "Local Helper Status",
+                subtitle: "See whether the local automation layer is ready to run browser and app actions.",
+                symbol: "desktopcomputer",
+                tint: SettingsSection.computerControl.tint
+            ) {
+                VStack(alignment: .leading, spacing: 10) {
+                    if let computerControlStatus {
+                        statusBadgeRow(
+                            title: computerControlStatus.helperName,
+                            detail: "\(computerControlStatus.executionMode) • \(computerControlStatus.available ? "Available" : "Unavailable")",
+                            color: computerControlStatus.available ? .green : .orange
+                        )
+
+                        if let selectedProfile = computerControlStatus.selectedBrowserProfileLabel?.nonEmpty {
+                            statusBadgeRow(
+                                title: "Selected Browser Profile",
+                                detail: selectedProfile,
+                                color: SettingsSection.computerControl.tint
+                            )
+                        }
+
+                        if computerControlStatus.issues.isEmpty {
+                            Text("Everything needed for local browser and app actions looks ready.")
+                                .font(.callout)
+                                .foregroundStyle(.secondary)
+                        } else {
+                            VStack(alignment: .leading, spacing: 6) {
+                                ForEach(computerControlStatus.issues, id: \.self) { issue in
+                                    HStack(alignment: .top, spacing: 8) {
+                                        Image(systemName: "exclamationmark.circle.fill")
+                                            .foregroundStyle(.orange)
+                                        Text(issue)
+                                            .font(.callout)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        HStack(spacing: 8) {
+                            ProgressView()
+                                .controlSize(.small)
+                            Text("Checking local automation helper status…")
+                                .font(.callout)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+            }
+
+            settingsCard(
+                title: "Browser Profile",
+                subtitle: "Reuse a real signed-in browser profile for Chrome, Brave, or Edge.",
+                symbol: "globe",
+                tint: SettingsSection.computerControl.tint
+            ) {
+                BrowserAutomationSettingsView(settings: settings)
+            }
+
+            settingsCard(
+                title: "Supported Direct App Actions",
+                subtitle: "These app actions use direct Mac automation before falling back to live computer control.",
+                symbol: "app.connected.to.app.below.fill",
+                tint: SettingsSection.computerControl.tint
+            ) {
+                VStack(alignment: .leading, spacing: 10) {
+                    statusBadgeRow(
+                        title: "Finder",
+                        detail: "Open folders, reveal files, and select items.",
+                        color: SettingsSection.computerControl.tint
+                    )
+                    statusBadgeRow(
+                        title: "Terminal",
+                        detail: "Open Terminal and run a command.",
+                        color: SettingsSection.computerControl.tint
+                    )
+                    statusBadgeRow(
+                        title: "Calendar",
+                        detail: "Prepare an event draft first, then create it when you confirm.",
+                        color: SettingsSection.computerControl.tint
+                    )
+                    statusBadgeRow(
+                        title: "System Settings",
+                        detail: "Jump directly to a settings page or search target.",
+                        color: SettingsSection.computerControl.tint
+                    )
+                }
+            }
+
+            settingsCard(
+                title: "Approval Behavior",
+                subtitle: "Open Assist keeps computer control in Agentic mode and explains what each approval means.",
+                symbol: "checkmark.shield.fill",
+                tint: SettingsSection.computerControl.tint
+            ) {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("`app_action`, `browser_use`, and `computer_use` only run in Agentic mode.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                    Text("“Allow for Session” remembers approval only for the current conversation and tool type.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                    Text("High-risk actions like send, post, submit, purchase, and delete always ask again.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+
     private func requestMicrophonePermission() {
         PermissionCenter.requestMicrophonePermission(openSettingsIfDenied: true)
     }
 
     private func requestSpeechRecognitionPermission() {
         PermissionCenter.requestSpeechRecognitionPermission(openSettingsIfDenied: true)
+    }
+
+    private var selectedComputerControlProfile: BrowserProfile? {
+        BrowserProfileManager.shared.profile(withID: settings.browserSelectedProfileID)
+    }
+
+    private func refreshComputerControlState() {
+        computerPermissionSnapshot = PermissionCenter.snapshot(using: settings)
+
+        Task {
+            let status = await LocalAutomationHelper.shared.capabilityStatus(
+                selectedBrowserProfile: selectedComputerControlProfile,
+                settings: settings
+            )
+            await MainActor.run {
+                computerControlStatus = status
+            }
+        }
     }
 
     private var holdToTalkShortcutSegments: [String] {
@@ -7562,6 +7841,36 @@ struct SettingsView: View {
                             : "Not required while whisper.cpp engine is selected",
                         action: {
                             requestSpeechRecognitionPermission()
+                        }
+                    )
+
+                    permissionRow(
+                        name: "Screen Recording",
+                        granted: computerPermissionSnapshot.screenRecordingGranted,
+                        hint: "Needed for live computer-control screen understanding",
+                        action: {
+                            PermissionCenter.requestScreenRecordingPermission(openSettingsIfDenied: true)
+                            refreshComputerControlState()
+                        }
+                    )
+
+                    permissionRow(
+                        name: "Automation / Apple Events",
+                        granted: computerPermissionSnapshot.appleEventsGranted,
+                        hint: "Needed for direct browser and app scripting",
+                        action: {
+                            PermissionCenter.requestAppleEventsPermission(openSettingsIfDenied: true)
+                            refreshComputerControlState()
+                        }
+                    )
+
+                    permissionRow(
+                        name: "Full Disk Access",
+                        granted: computerPermissionSnapshot.fullDiskAccessGranted,
+                        hint: "Optional for protected folders and app data",
+                        action: {
+                            PermissionCenter.openPrivacySettingsPane(query: "Full Disk Access")
+                            refreshComputerControlState()
                         }
                     )
                 }
@@ -7782,6 +8091,39 @@ struct SettingsView: View {
         let credentialText = uninstallDeleteProviderCredentials ? "delete provider credentials" : "keep provider credentials"
 
         return "This will reset permissions, remove settings, \(modelText), \(correctionText), \(memoryText), \(credentialText), and uninstall the app."
+    }
+
+    @ViewBuilder
+    private func statusBadgeRow(title: String, detail: String, color: Color) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            AppIconBadge(
+                symbol: "checkmark.circle.fill",
+                tint: color,
+                size: 24,
+                symbolSize: 10,
+                isEmphasized: true
+            )
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.system(size: 13, weight: .semibold, design: .rounded))
+                    .foregroundStyle(.white.opacity(0.94))
+                Text(detail)
+                    .font(.caption2)
+                    .foregroundStyle(AppVisualTheme.mutedText)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(Color.white.opacity(0.05))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .stroke(Color.white.opacity(0.10), lineWidth: 0.7)
+                )
+        )
     }
 
     @ViewBuilder

@@ -7,6 +7,7 @@ final class AppleSpeechTranscriber: NSObject {
     var onFinalText: ((String) -> Void)?
     var onStatusUpdate: ((String) -> Void)?
     var onAudioLevel: ((Float) -> Void)?
+    var onAudioWaveformBins: (([Float]) -> Void)?
     var onRecordingStateChange: ((Bool) -> Void)?
 
     private var audioEngine = AVAudioEngine()
@@ -271,8 +272,10 @@ final class AppleSpeechTranscriber: NSObject {
             self.recognitionRequest?.append(buffer)
 
             let audioLevel = self.normalizedAudioLevel(from: buffer)
+            let waveformBins = AudioWaveformShape.bins(from: buffer)
             DispatchQueue.main.async {
                 self.onAudioLevel?(audioLevel)
+                self.onAudioWaveformBins?(waveformBins)
             }
         }
 
@@ -291,6 +294,7 @@ final class AppleSpeechTranscriber: NSObject {
     private func stopRecordingOnMain(emitFinalText: Bool = true) {
         guard isRecording || isStopping else {
             onAudioLevel?(0)
+            onAudioWaveformBins?(Array(repeating: 0, count: AudioWaveformShape.defaultBinCount))
             onRecordingStateChange?(false)
             return
         }
@@ -306,6 +310,7 @@ final class AppleSpeechTranscriber: NSObject {
             audioEngine.stop()
             audioEngine.reset()
             onAudioLevel?(0)
+            onAudioWaveformBins?(Array(repeating: 0, count: AudioWaveformShape.defaultBinCount))
         }
 
         pendingFinalizeWorkItem?.cancel()
@@ -362,6 +367,7 @@ final class AppleSpeechTranscriber: NSObject {
             audioEngine.stop()
             audioEngine.reset()
             onAudioLevel?(0)
+            onAudioWaveformBins?(Array(repeating: 0, count: AudioWaveformShape.defaultBinCount))
         }
     }
 

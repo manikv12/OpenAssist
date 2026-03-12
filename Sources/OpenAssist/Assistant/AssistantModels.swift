@@ -10,6 +10,7 @@ enum AssistantPermissionGrantState: String, Codable, Sendable {
 
 struct AssistantPermissionSnapshot: Equatable, Sendable {
     var accessibility: AssistantPermissionGrantState
+    var screenRecording: AssistantPermissionGrantState
     var microphone: AssistantPermissionGrantState
     var speechRecognition: AssistantPermissionGrantState
     var appleEvents: AssistantPermissionGrantState
@@ -17,6 +18,7 @@ struct AssistantPermissionSnapshot: Equatable, Sendable {
 
     static let unknown = AssistantPermissionSnapshot(
         accessibility: .unknown,
+        screenRecording: .unknown,
         microphone: .unknown,
         speechRecognition: .unknown,
         appleEvents: .unknown,
@@ -278,7 +280,7 @@ enum SubagentStatus: String, Equatable, Sendable {
     }
 }
 
-enum AssistantReasoningEffort: String, CaseIterable, Sendable {
+enum AssistantReasoningEffort: String, CaseIterable, Codable, Sendable {
     case low
     case medium
     case high
@@ -399,6 +401,9 @@ struct AssistantSessionSummary: Identifiable, Equatable, Codable, Sendable {
     var updatedAt: Date?
     var summary: String?
     var latestModel: String?
+    var latestInteractionMode: AssistantInteractionMode?
+    var latestReasoningEffort: AssistantReasoningEffort?
+    var latestServiceTier: String?
     var latestUserMessage: String?
     var latestAssistantMessage: String?
 
@@ -412,6 +417,9 @@ struct AssistantSessionSummary: Identifiable, Equatable, Codable, Sendable {
         updatedAt: Date? = nil,
         summary: String? = nil,
         latestModel: String? = nil,
+        latestInteractionMode: AssistantInteractionMode? = nil,
+        latestReasoningEffort: AssistantReasoningEffort? = nil,
+        latestServiceTier: String? = nil,
         latestUserMessage: String? = nil,
         latestAssistantMessage: String? = nil
     ) {
@@ -424,6 +432,9 @@ struct AssistantSessionSummary: Identifiable, Equatable, Codable, Sendable {
         self.updatedAt = updatedAt
         self.summary = summary
         self.latestModel = latestModel
+        self.latestInteractionMode = latestInteractionMode
+        self.latestReasoningEffort = latestReasoningEffort
+        self.latestServiceTier = latestServiceTier
         self.latestUserMessage = latestUserMessage
         self.latestAssistantMessage = latestAssistantMessage
     }
@@ -452,6 +463,11 @@ struct AssistantSessionSummary: Identifiable, Equatable, Codable, Sendable {
         set { latestModel = newValue }
     }
 
+    var fastModeEnabled: Bool {
+        latestServiceTier?.trimmingCharacters(in: .whitespacesAndNewlines)
+            .caseInsensitiveCompare("fast") == .orderedSame
+    }
+
     var latestUserSnippet: String? {
         get { latestUserMessage }
         set { latestUserMessage = newValue }
@@ -467,7 +483,7 @@ struct AssistantSessionSummary: Identifiable, Equatable, Codable, Sendable {
 /// - `conversational`: Chat-only mode with no execution and no structured planning flow.
 /// - `plan`: Planning mode that proposes a plan without executing work.
 /// - `agentic`: The agent has full tool access to execute work (Codex Default mode).
-enum AssistantInteractionMode: String, CaseIterable, Sendable {
+enum AssistantInteractionMode: String, CaseIterable, Codable, Sendable {
     case conversational
     case plan
     case agentic
@@ -491,7 +507,7 @@ enum AssistantInteractionMode: String, CaseIterable, Sendable {
     var hint: String {
         switch self {
         case .conversational: return "Inspect files and search, but do not make changes"
-        case .plan: return "Inspect, search, and run checks before making a plan"
+        case .plan: return "Use Codex plan mode and ask for approval when execution is needed"
         case .agentic: return "Full tool access to inspect and make changes"
         }
     }
@@ -565,6 +581,20 @@ struct AssistantPermissionOption: Identifiable, Equatable, Codable, Sendable {
     let isDefault: Bool
 }
 
+struct AssistantUserInputQuestionOption: Identifiable, Equatable, Codable, Sendable {
+    let id: String
+    let label: String
+    let detail: String?
+}
+
+struct AssistantUserInputQuestion: Identifiable, Equatable, Codable, Sendable {
+    let id: String
+    let header: String
+    let prompt: String
+    let options: [AssistantUserInputQuestionOption]
+    let allowsCustomAnswer: Bool
+}
+
 struct AssistantPermissionRequest: Identifiable, Equatable, Codable, Sendable {
     let id: Int
     let sessionID: String
@@ -572,7 +602,32 @@ struct AssistantPermissionRequest: Identifiable, Equatable, Codable, Sendable {
     let toolKind: String?
     let rationale: String?
     let options: [AssistantPermissionOption]
+    let userInputQuestions: [AssistantUserInputQuestion]
     let rawPayloadSummary: String?
+
+    var hasStructuredUserInput: Bool {
+        toolKind == "userInput" && !userInputQuestions.isEmpty
+    }
+
+    init(
+        id: Int,
+        sessionID: String,
+        toolTitle: String,
+        toolKind: String?,
+        rationale: String?,
+        options: [AssistantPermissionOption],
+        userInputQuestions: [AssistantUserInputQuestion] = [],
+        rawPayloadSummary: String?
+    ) {
+        self.id = id
+        self.sessionID = sessionID
+        self.toolTitle = toolTitle
+        self.toolKind = toolKind
+        self.rationale = rationale
+        self.options = options
+        self.userInputQuestions = userInputQuestions
+        self.rawPayloadSummary = rawPayloadSummary
+    }
 }
 
 struct AssistantInstallGuidance: Equatable, Sendable {
@@ -794,6 +849,8 @@ final class AssistantStore: ObservableObject {
         didSet {
             guard oldValue != fastModeEnabled else { return }
             runtime.serviceTier = fastModeEnabled ? "fast" : nil
+            guard !isRestoringSessionConfiguration else { return }
+            updateVisibleSessionConfiguration()
             Task { @MainActor [weak self] in
                 await self?.refreshCurrentSessionConfigurationForModeChange()
             }
@@ -803,6 +860,8 @@ final class AssistantStore: ObservableObject {
         didSet {
             refreshModeSwitchSuggestion()
             guard oldValue != interactionMode else { return }
+            guard !isRestoringSessionConfiguration else { return }
+            updateVisibleSessionConfiguration()
             Task { @MainActor [weak self] in
                 await self?.refreshCurrentSessionConfigurationForModeChange()
             }
@@ -832,6 +891,7 @@ final class AssistantStore: ObservableObject {
     private var isSendingPrompt = false
     private var isRefreshingEnvironment = false
     private var isRefreshingSessions = false
+    private var isRestoringSessionConfiguration = false
     private var oneShotSessionInstructions: String?
     private var blockedModeSwitchSuggestion: AssistantModeSwitchSuggestion?
     private var proposedPlanSessionID: String?
@@ -962,9 +1022,11 @@ final class AssistantStore: ObservableObject {
         }
         self.runtime.onModelsUpdate = { [weak self] models in
             Task { @MainActor in
-                self?.availableModels = models
-                self?.applyPreferredModelSelection(using: models)
-                self?.isLoadingModels = false
+                guard let self else { return }
+                self.availableModels = models
+                self.applyPreferredModelSelection(using: models)
+                self.restoreSessionConfiguration(from: self.selectedSession)
+                self.isLoadingModels = false
             }
         }
         self.runtime.onProposedPlan = { [weak self] planText in
@@ -1174,6 +1236,8 @@ final class AssistantStore: ObservableObject {
             "browser",
             "brave",
             "chrome",
+            "edge",
+            "microsoft edge",
             "safari",
             "current tab",
             "front tab",
@@ -1452,6 +1516,7 @@ final class AssistantStore: ObservableObject {
                 selectedSessionID = preferredSessionID()
             }
 
+            restoreSessionConfiguration(from: selectedSession)
             await reloadSelectedSessionHistoryIfNeeded(force: transcript.isEmpty || timelineItems.isEmpty)
             refreshMemoryState(for: selectedSessionID)
         } catch {
@@ -1558,6 +1623,7 @@ final class AssistantStore: ObservableObject {
            sessionsMatch(transcriptSessionID, normalizedSessionID),
            sessionsMatch(timelineSessionID, normalizedSessionID),
            !isTransitioningSession {
+            restoreSessionConfiguration(from: session)
             refreshMemoryState(for: normalizedSessionID)
             return
         }
@@ -1565,6 +1631,7 @@ final class AssistantStore: ObservableObject {
         let requestID = UUID()
         sessionLoadRequestID = requestID
         selectedSessionID = normalizedSessionID
+        restoreSessionConfiguration(from: session)
 
         let cachedTimeline = timelineItemsBySessionID[normalizedSessionID] ?? []
         let cachedTranscript = transcriptEntriesBySessionID[normalizedSessionID] ?? []
@@ -1577,11 +1644,6 @@ final class AssistantStore: ObservableObject {
             isTransitioningSession = false
         } else {
             isTransitioningSession = true
-            timelineItems = []
-            timelineSessionID = nil
-            rebuildRenderItemsCache()
-            transcript = []
-            transcriptSessionID = nil
         }
 
         async let timelineTask = sessionCatalog.loadMergedTimeline(sessionID: normalizedSessionID)
@@ -1924,6 +1986,11 @@ final class AssistantStore: ObservableObject {
         pendingPermissionRequest = nil
     }
 
+    func resolvePermission(answers: [String: [String]]) async {
+        await runtime.respondToPermissionRequest(answers: answers)
+        pendingPermissionRequest = nil
+    }
+
     func cancelPermissionRequest() async {
         await runtime.cancelPendingPermissionRequest()
         pendingPermissionRequest = nil
@@ -2196,6 +2263,9 @@ final class AssistantStore: ObservableObject {
         runtime.interactionMode = interactionMode
         runtime.maxToolCallsPerTurn = settings.assistantMaxToolCallsPerTurn
         runtime.maxRepeatedCommandAttemptsPerTurn = settings.assistantMaxRepeatedCommandAttemptsPerTurn
+        if !isRestoringSessionConfiguration {
+            updateVisibleSessionConfiguration()
+        }
     }
 
     private func refreshCurrentSessionConfigurationForModeChange() async {
@@ -2309,6 +2379,10 @@ final class AssistantStore: ObservableObject {
         guard let sessionID, !sessionID.isEmpty else { return }
         if let existingIndex = sessions.firstIndex(where: { $0.id == sessionID }) {
             sessions[existingIndex].updatedAt = Date()
+            sessions[existingIndex].latestModel = selectedModelID
+            sessions[existingIndex].latestInteractionMode = interactionMode
+            sessions[existingIndex].latestReasoningEffort = reasoningEffort
+            sessions[existingIndex].latestServiceTier = fastModeEnabled ? "fast" : nil
             if let lastSubmittedPrompt {
                 sessions[existingIndex].latestUserMessage = lastSubmittedPrompt
                 if sessions[existingIndex].title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -2330,6 +2404,9 @@ final class AssistantStore: ObservableObject {
             updatedAt: Date(),
             summary: lastSubmittedPrompt,
             latestModel: selectedModelID,
+            latestInteractionMode: interactionMode,
+            latestReasoningEffort: reasoningEffort,
+            latestServiceTier: fastModeEnabled ? "fast" : nil,
             latestUserMessage: lastSubmittedPrompt,
             latestAssistantMessage: nil
         )
@@ -2770,7 +2847,7 @@ final class AssistantStore: ObservableObject {
             )
         }
 
-        if normalizedTitle == "browser" || normalizedTitle == "computer use" {
+        if ["browser", "browser use", "computer use", "app action"].contains(normalizedTitle ?? "") {
             return AssistantModeSwitchSuggestion(
                 source: .blocked,
                 originMode: event.mode,
@@ -2866,6 +2943,72 @@ final class AssistantStore: ObservableObject {
     private var selectedSession: AssistantSessionSummary? {
         guard let selectedSessionID else { return nil }
         return sessions.first(where: { $0.id == selectedSessionID })
+    }
+
+    struct ResolvedSessionConfiguration: Equatable {
+        let modelID: String?
+        let interactionMode: AssistantInteractionMode
+        let reasoningEffort: AssistantReasoningEffort
+        let fastModeEnabled: Bool
+    }
+
+    static func resolvedSessionConfiguration(
+        from session: AssistantSessionSummary?,
+        availableModels: [AssistantModelOption],
+        preferredModelID: String?
+    ) -> ResolvedSessionConfiguration {
+        let visibleModelIDs = Set(availableModels.filter { !$0.hidden }.map(\.id))
+
+        let preferredModelID = preferredModelID?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nonEmpty
+        let fallbackModelID = preferredModelID.flatMap { visibleModelIDs.contains($0) ? $0 : nil }
+        let restoredModelID = session?.modelID?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nonEmpty
+        let resolvedModelID = restoredModelID.flatMap { visibleModelIDs.contains($0) ? $0 : nil }
+            ?? fallbackModelID
+
+        return ResolvedSessionConfiguration(
+            modelID: resolvedModelID,
+            interactionMode: session?.latestInteractionMode ?? .conversational,
+            reasoningEffort: session?.latestReasoningEffort ?? .high,
+            fastModeEnabled: session?.fastModeEnabled ?? false
+        )
+    }
+
+    private func restoreSessionConfiguration(from session: AssistantSessionSummary?) {
+        guard let session else { return }
+
+        isRestoringSessionConfiguration = true
+        defer { isRestoringSessionConfiguration = false }
+
+        let resolvedConfiguration = Self.resolvedSessionConfiguration(
+            from: session,
+            availableModels: availableModels,
+            preferredModelID: settings.assistantPreferredModelID.nonEmpty
+        )
+
+        selectedModelID = resolvedConfiguration.modelID
+        runtime.setPreferredModelID(resolvedConfiguration.modelID)
+        runtimeHealth.selectedModelID = resolvedConfiguration.modelID
+        interactionMode = resolvedConfiguration.interactionMode
+        reasoningEffort = resolvedConfiguration.reasoningEffort
+        fastModeEnabled = resolvedConfiguration.fastModeEnabled
+        syncReasoningEffortWithSelectedModel(preferModelDefault: false)
+        syncRuntimeContext()
+    }
+
+    private func updateVisibleSessionConfiguration() {
+        guard let sessionID = selectedSessionID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty,
+              let sessionIndex = sessions.firstIndex(where: { sessionsMatch($0.id, sessionID) }) else {
+            return
+        }
+
+        sessions[sessionIndex].latestModel = selectedModelID
+        sessions[sessionIndex].latestInteractionMode = interactionMode
+        sessions[sessionIndex].latestReasoningEffort = reasoningEffort
+        sessions[sessionIndex].latestServiceTier = fastModeEnabled ? "fast" : nil
     }
 
     private func clearActiveProposedPlanIfNeeded(for sessionID: String?) {

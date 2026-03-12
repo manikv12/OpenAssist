@@ -12,6 +12,7 @@ final class SpeechTranscriber: NSObject {
     var onStatusUpdate: ((String) -> Void)?
     var onHUDAlert: ((SpeechTranscriberHUDAlert) -> Void)?
     var onAudioLevel: ((Float) -> Void)?
+    var onAudioWaveformBins: (([Float]) -> Void)?
     var onRecordingStateChange: ((Bool) -> Void)?
 
     private let appleTranscriber = AppleSpeechTranscriber()
@@ -282,6 +283,11 @@ final class SpeechTranscriber: NSObject {
             self.onAudioLevel?(level)
         }
 
+        appleTranscriber.onAudioWaveformBins = { [weak self] bins in
+            guard let self, self.currentEngineType == .appleSpeech else { return }
+            self.onAudioWaveformBins?(bins)
+        }
+
         appleTranscriber.onRecordingStateChange = { [weak self] recording in
             guard let self, self.currentEngineType == .appleSpeech else { return }
             self.isRecording = recording
@@ -308,6 +314,11 @@ final class SpeechTranscriber: NSObject {
             self.onAudioLevel?(level)
         }
 
+        whisperTranscriber.onAudioWaveformBins = { [weak self] bins in
+            guard let self, self.currentEngineType == .whisperCpp else { return }
+            self.onAudioWaveformBins?(bins)
+        }
+
         whisperTranscriber.onRecordingStateChange = { [weak self] recording in
             guard let self, self.currentEngineType == .whisperCpp else { return }
             self.isRecording = recording
@@ -332,6 +343,11 @@ final class SpeechTranscriber: NSObject {
         cloudTranscriber.onAudioLevel = { [weak self] level in
             guard let self, self.currentEngineType == .cloudProviders else { return }
             self.onAudioLevel?(level)
+        }
+
+        cloudTranscriber.onAudioWaveformBins = { [weak self] bins in
+            guard let self, self.currentEngineType == .cloudProviders else { return }
+            self.onAudioWaveformBins?(bins)
         }
 
         cloudTranscriber.onRecordingStateChange = { [weak self] recording in

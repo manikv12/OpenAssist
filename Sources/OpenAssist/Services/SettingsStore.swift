@@ -229,6 +229,22 @@ enum AppChromeStyle: String, CaseIterable, Identifiable {
     var id: Self { self }
 }
 
+enum AssistantCompactPresentationStyle: String, CaseIterable, Identifiable, Codable {
+    case orb = "orb"
+    case notch = "notch"
+
+    var id: Self { self }
+
+    var displayName: String {
+        switch self {
+        case .orb:
+            return "Orb"
+        case .notch:
+            return "Notch"
+        }
+    }
+}
+
 struct ColorPalette {
     let baseTint: Color
     let accentTint: Color
@@ -556,6 +572,7 @@ final class SettingsStore: ObservableObject {
         static let assistantBetaEnabled = "OpenAssist.assistantBetaEnabled"
         static let assistantVoiceTaskEntryEnabled = "OpenAssist.assistantVoiceTaskEntryEnabled"
         static let assistantFloatingHUDEnabled = "OpenAssist.assistantFloatingHUDEnabled"
+        static let assistantCompactPresentationStyle = "OpenAssist.assistantCompactPresentationStyle"
         static let assistantBetaWarningAcknowledged = "OpenAssist.assistantBetaWarningAcknowledged"
         static let assistantPreferredModelID = "OpenAssist.assistantPreferredModelID"
         static let assistantOwnedThreadIDs = "OpenAssist.assistantOwnedThreadIDs"
@@ -1193,6 +1210,12 @@ final class SettingsStore: ObservableObject {
         }
     }
 
+    @Published var assistantCompactPresentationStyleRawValue: String {
+        didSet {
+            save()
+        }
+    }
+
     @Published var assistantBetaWarningAcknowledged: Bool {
         didSet {
             save()
@@ -1821,6 +1844,10 @@ final class SettingsStore: ObservableObject {
             assistantFloatingHUDEnabled = defaults.bool(forKey: Keys.assistantFloatingHUDEnabled)
         }
 
+        assistantCompactPresentationStyleRawValue = Self.restoredAssistantCompactPresentationStyle(
+            defaults: defaults
+        ).rawValue
+
         if defaults.object(forKey: Keys.assistantBetaWarningAcknowledged) == nil {
             assistantBetaWarningAcknowledged = false
         } else {
@@ -2011,6 +2038,7 @@ final class SettingsStore: ObservableObject {
         defaults.set(assistantBetaEnabled, forKey: Keys.assistantBetaEnabled)
         defaults.set(assistantVoiceTaskEntryEnabled, forKey: Keys.assistantVoiceTaskEntryEnabled)
         defaults.set(assistantFloatingHUDEnabled, forKey: Keys.assistantFloatingHUDEnabled)
+        defaults.set(assistantCompactPresentationStyleRawValue, forKey: Keys.assistantCompactPresentationStyle)
         defaults.set(assistantBetaWarningAcknowledged, forKey: Keys.assistantBetaWarningAcknowledged)
         defaults.set(assistantPreferredModelID.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Keys.assistantPreferredModelID)
         defaults.set(Self.normalizedStringList(assistantOwnedThreadIDs), forKey: Keys.assistantOwnedThreadIDs)
@@ -2039,6 +2067,16 @@ final class SettingsStore: ObservableObject {
             return defaultValue
         }
         return stored.intValue
+    }
+
+    static func restoredAssistantCompactPresentationStyle(
+        defaults: UserDefaults = .standard
+    ) -> AssistantCompactPresentationStyle {
+        guard let storedValue = defaults.string(forKey: Keys.assistantCompactPresentationStyle),
+              let style = AssistantCompactPresentationStyle(rawValue: storedValue) else {
+            return .orb
+        }
+        return style
     }
 
     private func scheduleOnChangeNotificationIfNeeded() {
@@ -2096,6 +2134,11 @@ final class SettingsStore: ObservableObject {
     var appChromeStyle: AppChromeStyle {
         get { AppChromeStyle(rawValue: appChromeStyleRawValue) ?? .glassHighContrast }
         set { appChromeStyleRawValue = newValue.rawValue }
+    }
+
+    var assistantCompactPresentationStyle: AssistantCompactPresentationStyle {
+        get { AssistantCompactPresentationStyle(rawValue: assistantCompactPresentationStyleRawValue) ?? .orb }
+        set { assistantCompactPresentationStyleRawValue = newValue.rawValue }
     }
 
     var colorTheme: ColorTheme {

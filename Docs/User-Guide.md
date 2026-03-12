@@ -14,6 +14,7 @@ Core capabilities:
 - Optional AI rewrite before insertion
 - Conversation-aware rewrite and assistant context
 - Local transcript history and adaptive corrections
+- Local computer control for supported browser and app tasks in Agentic mode
 
 ## 2. Requirements
 
@@ -21,6 +22,11 @@ Core capabilities:
 - Microphone permission
 - Accessibility permission (for direct text insertion and global shortcuts)
 - Speech Recognition permission (only when using Apple Speech engine)
+
+For computer control features, you also need:
+
+- Screen Recording permission (so Open Assist can understand your screen)
+- Automation / Apple Events permission (so Open Assist can control supported apps directly)
 
 ## 3. Install and Launch
 
@@ -37,7 +43,11 @@ Open **Settings** from the menu bar and confirm:
 2. Accessibility = Granted
 3. Microphone = Granted
 4. Speech Recognition = Granted (if using Apple Speech)
-5. Verify your shortcut settings in **Shortcuts**
+5. Open **Computer Control**
+6. Screen Recording = Granted (for computer control)
+7. Automation / Apple Events = Allowed (for browser and app actions)
+8. Choose your browser profile if you want browser control
+9. Verify your shortcut settings in **Shortcuts**
 
 ## 5. Daily Assistant and Voice Workflows
 
@@ -46,6 +56,22 @@ Open **Settings** from the menu bar and confirm:
 1. Open the menu bar popover.
 2. Choose **Open Assistant** for typed work, or **Speak Assistant Task** for voice-first requests.
 3. Continue in the assistant window and review the result before using it elsewhere.
+
+### Computer control tasks
+
+Use these when you want Open Assist to work on your Mac for you.
+
+1. Open the assistant in **Agentic** mode.
+2. Ask for a browser or app task in simple words.
+3. Approve the action when Open Assist asks.
+4. Review the result and continue if needed.
+
+Examples:
+
+- "Open my project board in Chrome."
+- "Reveal the Downloads folder in Finder."
+- "Create a calendar event draft for tomorrow at 3 PM."
+- "Open Bluetooth settings."
 
 ### Hold-to-talk (default)
 
@@ -142,6 +168,13 @@ If local AI fails later, use **Repair Local AI** in AI Studio.
 - Provider keys/OAuth status
 - AI Studio entry point
 
+### Computer Control
+
+- Permission status for Screen Recording and Automation / Apple Events
+- Browser profile picker for Google Chrome, Brave, and Microsoft Edge
+- Supported direct app actions for Finder, Terminal, Calendar, and System Settings
+- Computer-control status and approval behavior summary
+
 ### Corrections
 
 - Adaptive correction learning
@@ -155,7 +188,28 @@ If local AI fails later, use **Repair Local AI** in AI Studio.
 - Check for updates
 - Uninstall options
 
-## 10. Updates and Version Info
+## 10. Computer Control Details
+
+Open **Settings → Computer Control** for all setup in one place.
+
+Browser support:
+
+- Google Chrome
+- Brave
+- Microsoft Edge
+
+Open Assist can use your real local browser profile, so it can work with sites where you are already signed in.
+
+Direct app actions:
+
+- Finder: open folders, reveal files, and select items
+- Terminal: open Terminal and run a command
+- Calendar: create event drafts for review before final action
+- System Settings: open the right settings page
+
+If a task is too complex for a direct action, Open Assist can fall back to general computer control.
+
+## 11. Updates and Version Info
 
 In **Settings → About & Permissions → App Info**:
 
@@ -165,7 +219,7 @@ In **Settings → About & Permissions → App Info**:
 
 If update checks fail, confirm the appcast feed is published and reachable by the app.
 
-## 11. Privacy and Local Data
+## 12. Privacy and Local Data
 
 Open Assist is local-first:
 
@@ -180,7 +234,7 @@ Stored data may include:
 - Learned adaptive corrections
 - Conversation context used for assistant and rewrite assistance
 
-## 12. Troubleshooting
+## 13. Troubleshooting
 
 ### No text is inserted
 
@@ -206,13 +260,21 @@ Stored data may include:
 2. Confirm model/provider selection in AI settings.
 3. For local AI, run **Repair Local AI** in AI Studio.
 
+### Computer control is not working
+
+1. Open **Settings → Computer Control**.
+2. Confirm **Screen Recording** is granted.
+3. Confirm **Automation / Apple Events** is allowed.
+4. If you are using browser control, make sure you selected the right profile for Chrome, Brave, or Microsoft Edge.
+5. Try the request again in **Agentic** mode.
+
 ### Update check shows error
 
 1. Check internet connectivity.
 2. Verify the appcast feed URL configured in the app build.
 3. If you are the maintainer, publish/update the appcast feed.
 
-## 13. Keyboard Shortcuts Reference
+## 14. Keyboard Shortcuts Reference
 
 | Action | Default |
 |---|---|
@@ -220,7 +282,7 @@ Stored data may include:
 | Toggle continuous mode | `⌃⌥⌘Space` |
 | Paste last transcript | `⌥⌘V` |
 
-## 14. Support and Contribution
+## 15. Support and Contribution
 
 - User-facing overview and quick setup: `README.md`
 - Code and issue tracking: GitHub repository

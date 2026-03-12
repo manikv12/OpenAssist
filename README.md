@@ -75,6 +75,21 @@ Important behavior today:
 - Paste last transcript shortcut
 - Transcript history window with search, copy, delete, and reinsert actions
 
+### Computer Control
+
+- A top-level **Computer Control** settings area for setup, browser profile choice, and computer-control status
+- Local computer control in Agentic mode for tasks on your real Mac
+- Browser control with your signed-in local profile for:
+  - Google Chrome
+  - Brave
+  - Microsoft Edge
+- Direct app actions for:
+  - Finder
+  - Terminal
+  - Calendar
+  - System Settings
+- `computer_use` stays available as a fallback when a direct browser or app action is not enough
+
 ### Conversation and Memory Tools
 
 - Optional conversation-aware rewrite history with timeout and turn-limit controls
@@ -110,6 +125,11 @@ Important behavior today:
 - **Microphone** permission
 - **Accessibility** permission for reliable insertion and global shortcuts
 - **Speech Recognition** permission when using the Apple Speech engine
+
+If you want Open Assist to control your Mac for browser or app tasks, you also need:
+
+- **Screen Recording** so the assistant can understand what is on screen
+- **Automation / Apple Events** so the assistant can talk to supported apps directly
 
 You may also need internet access for:
 
@@ -149,6 +169,11 @@ All shortcuts can be changed in Settings.
 9. If you want AI rewrite, open **AI Studio** and either:
    - connect a cloud provider, or
    - install local AI with the built-in Ollama setup flow
+10. If you want Open Assist to use your Mac directly, open **Settings -> Computer Control** and:
+   - grant **Screen Recording**
+   - allow **Automation / Apple Events**
+   - choose a browser profile for **Chrome**, **Brave**, or **Microsoft Edge**
+   - review the supported direct app actions for **Finder**, **Terminal**, **Calendar**, and **System Settings**
 
 For a step-by-step walkthrough, see the [User Guide](Docs/User-Guide.md).
 

@@ -115,4 +115,33 @@ final class SettingsStoreCrossIDEBootstrapTests: XCTestCase {
             0
         )
     }
+
+    func testAssistantCompactPresentationStyleDefaultsToOrbWhenMissing() {
+        let defaults = makeIsolatedDefaults()
+
+        XCTAssertEqual(
+            SettingsStore.restoredAssistantCompactPresentationStyle(defaults: defaults),
+            .orb
+        )
+    }
+
+    func testAssistantCompactPresentationStyleRestoresStoredNotchValue() {
+        let defaults = makeIsolatedDefaults()
+        defaults.set("notch", forKey: "OpenAssist.assistantCompactPresentationStyle")
+
+        XCTAssertEqual(
+            SettingsStore.restoredAssistantCompactPresentationStyle(defaults: defaults),
+            .notch
+        )
+    }
+
+    func testAssistantCompactPresentationStyleFallsBackToOrbForInvalidValue() {
+        let defaults = makeIsolatedDefaults()
+        defaults.set("floating-pill", forKey: "OpenAssist.assistantCompactPresentationStyle")
+
+        XCTAssertEqual(
+            SettingsStore.restoredAssistantCompactPresentationStyle(defaults: defaults),
+            .orb
+        )
+    }
 }

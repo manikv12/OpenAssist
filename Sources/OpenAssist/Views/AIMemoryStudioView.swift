@@ -437,6 +437,9 @@ struct AIMemoryStudioView: View {
         .onChange(of: promptRewriteConversationStore.contextSummaries) { _ in
             refreshConversationContextDetails()
         }
+        .onChange(of: assistantSetupStage) { _ in
+            sanitizeSelectedStudioPage()
+        }
         .onChange(of: selectedStudioPage) { newValue in
             if newValue == .conversationMemory {
                 refreshConversationContextDetails()
@@ -2369,8 +2372,26 @@ struct AIMemoryStudioView: View {
         return base.filter { !$0.isAssistantPage }
     }
 
+    private var assistantSetupStage: AIStudioAssistantSetupStage {
+        AIStudioAssistantDisclosure.setupStage(
+            environmentState: assistant.environment.state,
+            assistantEnabled: settings.assistantBetaEnabled
+        )
+    }
+
+    private var shouldShowAssistantAdvancedPages: Bool {
+        AIStudioAssistantDisclosure.showsAdvancedPages(
+            environmentState: assistant.environment.state,
+            assistantEnabled: settings.assistantBetaEnabled
+        )
+    }
+
     private var assistantStudioPages: [StudioPage] {
-        [.assistantSetup, .assistantMemory, .assistantInstructions, .assistantLimits, .assistantSessions]
+        var pages: [StudioPage] = [.assistantSetup]
+        if shouldShowAssistantAdvancedPages {
+            pages.append(contentsOf: [.assistantMemory, .assistantInstructions, .assistantLimits, .assistantSessions])
+        }
+        return pages
     }
 
     private var enabledSourceProviderCount: Int {
@@ -5371,62 +5392,62 @@ struct AIMemoryStudioView: View {
                 tint: Color(red: 0.46, green: 0.79, blue: 0.66)
             ) {
                 Toggle("Enable assistant memory", isOn: $settings.assistantMemoryEnabled)
-                    .disabled(!settings.assistantBetaEnabled)
 
-                Toggle("Review before saving long-term memory", isOn: $settings.assistantMemoryReviewEnabled)
-                    .disabled(!settings.assistantBetaEnabled || !settings.assistantMemoryEnabled)
+                if settings.assistantMemoryEnabled {
+                    Toggle("Review before saving long-term memory", isOn: $settings.assistantMemoryReviewEnabled)
 
-                Stepper(value: $settings.assistantMemorySummaryMaxChars, in: 400...4000, step: 200) {
-                    HStack {
-                        Text("Memory summary size")
-                        Spacer()
-                        Text("\(settings.assistantMemorySummaryMaxChars) chars")
+                    Stepper(value: $settings.assistantMemorySummaryMaxChars, in: 400...4000, step: 200) {
+                        HStack {
+                            Text("Memory summary size")
+                            Spacer()
+                            Text("\(settings.assistantMemorySummaryMaxChars) chars")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+
+                    if let memoryStatusMessage = assistant.memoryStatusMessage?.trimmingCharacters(in: .whitespacesAndNewlines),
+                       !memoryStatusMessage.isEmpty {
+                        Text(memoryStatusMessage)
                             .font(.caption)
                             .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    } else {
+                        Text("Assistant memory stays separate from voice-to-text memory.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
-                }
-                .disabled(!settings.assistantBetaEnabled || !settings.assistantMemoryEnabled)
 
-                if let memoryStatusMessage = assistant.memoryStatusMessage?.trimmingCharacters(in: .whitespacesAndNewlines),
-                   !memoryStatusMessage.isEmpty {
-                    Text(memoryStatusMessage)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
+                    HStack(spacing: 8) {
+                        Button("Open Current Memory File") {
+                            assistant.openCurrentMemoryFile()
+                        }
+                        .buttonStyle(.bordered)
+
+                        Button("Reset Current Task Memory") {
+                            assistant.resetCurrentTaskMemory()
+                        }
+                        .buttonStyle(.bordered)
+                    }
+
+                    HStack(spacing: 8) {
+                        Button("Review Memory Suggestions") {
+                            assistant.openMemorySuggestionReview()
+                            NotificationCenter.default.post(name: .openAssistOpenAssistant, object: nil)
+                        }
+                        .buttonStyle(.bordered)
+
+                        Button("Clear This Thread Memory", role: .destructive) {
+                            assistant.clearCurrentThreadMemory()
+                        }
+                        .buttonStyle(.bordered)
+                    }
                 } else {
-                    Text("Assistant memory stays separate from voice-to-text memory.")
+                    Text("Turn this on when you want the assistant to keep a small working memory for the current Codex thread.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
-                }
-
-                HStack(spacing: 8) {
-                    Button("Open Current Memory File") {
-                        assistant.openCurrentMemoryFile()
-                    }
-                    .buttonStyle(.bordered)
-                    .disabled(!settings.assistantBetaEnabled || !settings.assistantMemoryEnabled)
-
-                    Button("Reset Current Task Memory") {
-                        assistant.resetCurrentTaskMemory()
-                    }
-                    .buttonStyle(.bordered)
-                    .disabled(!settings.assistantBetaEnabled || !settings.assistantMemoryEnabled)
-                }
-
-                HStack(spacing: 8) {
-                    Button("Review Memory Suggestions") {
-                        assistant.openMemorySuggestionReview()
-                        NotificationCenter.default.post(name: .openAssistOpenAssistant, object: nil)
-                    }
-                    .buttonStyle(.bordered)
-                    .disabled(!settings.assistantBetaEnabled || !settings.assistantMemoryEnabled)
-
-                    Button("Clear This Thread Memory", role: .destructive) {
-                        assistant.clearCurrentThreadMemory()
-                    }
-                    .buttonStyle(.bordered)
-                    .disabled(!settings.assistantBetaEnabled || !settings.assistantMemoryEnabled)
                 }
             }
         }
@@ -5480,24 +5501,7 @@ struct AIMemoryStudioView: View {
                 symbol: "sparkles.rectangle.stack.fill",
                 tint: Color(red: 0.22, green: 0.70, blue: 1.00)
             ) {
-                Toggle("Enable assistant", isOn: $settings.assistantBetaEnabled)
-
-                if !settings.assistantBetaWarningAcknowledged {
-                    Text("This assistant can read files, continue Codex threads, and guide bigger tasks. Review the assistant window before using it for important work.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-
-                    Button("I understand") {
-                        settings.assistantBetaWarningAcknowledged = true
-                    }
-                    .buttonStyle(.bordered)
-                }
-
-                Toggle("Enable voice task entry", isOn: $settings.assistantVoiceTaskEntryEnabled)
-                    .disabled(!settings.assistantBetaEnabled)
-
-                Toggle("Show floating activity bubble", isOn: $settings.assistantFloatingHUDEnabled)
-                    .disabled(!settings.assistantBetaEnabled)
+                let environment = assistant.environment
 
                 if assistant.accountSnapshot.isLoggedIn {
                     HStack(spacing: 6) {
@@ -5510,68 +5514,143 @@ struct AIMemoryStudioView: View {
                     }
                 }
 
-                if assistant.accountSnapshot.isLoggedIn && assistant.visibleModels.isEmpty {
-                    Text(
-                        assistant.isLoadingModels
-                            ? "Loading assistant models..."
-                            : "No assistant models are available yet."
-                    )
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                }
+                switch assistantSetupStage {
+                case .installCodex:
+                    Text(environment.installHelpText)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
 
-                if !assistant.visibleModels.isEmpty {
-                    Picker(
-                        "Model",
-                        selection: Binding(
-                            get: { assistant.selectedModelID ?? "" },
-                            set: { assistant.chooseModel($0) }
-                        )
-                    ) {
-                        Text("Select a model").tag("")
-                        ForEach(assistant.visibleModels) { model in
-                            Text(model.displayName).tag(model.id)
-                        }
-                    }
-                }
-
-                HStack(spacing: 8) {
-                    Button("Open Assistant") {
-                        NotificationCenter.default.post(name: .openAssistOpenAssistant, object: nil)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(!settings.assistantBetaEnabled)
-
-                    switch assistant.environment.state {
-                    case .missingCodex:
+                    HStack(spacing: 8) {
                         Button("Install Codex") {
                             assistant.runPreferredInstallCommand()
                         }
+                        .buttonStyle(.borderedProminent)
+
+                        Button("Codex Docs") {
+                            assistant.openInstallDocs()
+                        }
                         .buttonStyle(.bordered)
-                    case .needsLogin:
+                    }
+
+                case .signIn:
+                    Text(environment.installHelpText)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    HStack(spacing: 8) {
                         Button("Sign In with ChatGPT") {
                             assistant.runLoginCommand()
                         }
+                        .buttonStyle(.borderedProminent)
+
+                        Button("Codex Docs") {
+                            assistant.openInstallDocs()
+                        }
                         .buttonStyle(.bordered)
-                    case .ready:
-                        EmptyView()
-                    case .failed:
+                    }
+
+                case .enableAssistant:
+                    Toggle("Enable assistant", isOn: $settings.assistantBetaEnabled)
+
+                    Text("Turn this on to reveal voice task entry, compact mode, browser automation, memory controls, and session tools.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                case .configureAssistant:
+                    Toggle("Enable assistant", isOn: $settings.assistantBetaEnabled)
+
+                    if !settings.assistantBetaWarningAcknowledged {
+                        Text("This assistant can read files, continue Codex threads, and guide bigger tasks. Review the assistant window before using it for important work.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+
+                        Button("I understand") {
+                            settings.assistantBetaWarningAcknowledged = true
+                        }
+                        .buttonStyle(.bordered)
+                    }
+
+                    Toggle("Enable voice task entry", isOn: $settings.assistantVoiceTaskEntryEnabled)
+
+                    Toggle("Show compact assistant", isOn: $settings.assistantFloatingHUDEnabled)
+
+                    if settings.assistantFloatingHUDEnabled {
+                        Picker(
+                            "Compact assistant style",
+                            selection: Binding(
+                                get: { settings.assistantCompactPresentationStyle },
+                                set: { settings.assistantCompactPresentationStyle = $0 }
+                            )
+                        ) {
+                            ForEach(AssistantCompactPresentationStyle.allCases) { style in
+                                Text(style.displayName).tag(style)
+                            }
+                        }
+                    }
+
+                    if assistant.visibleModels.isEmpty {
+                        Text(
+                            assistant.isLoadingModels
+                                ? "Loading assistant models..."
+                                : "No assistant models are available yet."
+                        )
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    } else {
+                        Picker(
+                            "Model",
+                            selection: Binding(
+                                get: { assistant.selectedModelID ?? "" },
+                                set: { assistant.chooseModel($0) }
+                            )
+                        ) {
+                            Text("Select a model").tag("")
+                            ForEach(assistant.visibleModels) { model in
+                                Text(model.displayName).tag(model.id)
+                            }
+                        }
+                    }
+
+                    HStack(spacing: 8) {
+                        Button("Open Assistant") {
+                            NotificationCenter.default.post(name: .openAssistOpenAssistant, object: nil)
+                        }
+                        .buttonStyle(.borderedProminent)
+                    }
+
+                case .needsAttention:
+                    Text(environment.installHelpText)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    HStack(spacing: 8) {
+                        if assistant.installGuidance.codexDetected {
+                            Button("Sign In with ChatGPT") {
+                                assistant.runLoginCommand()
+                            }
+                            .buttonStyle(.bordered)
+                        } else {
+                            Button("Install Codex") {
+                                assistant.runPreferredInstallCommand()
+                            }
+                            .buttonStyle(.bordered)
+                        }
+
                         Button("Codex Docs") {
                             assistant.openInstallDocs()
                         }
                         .buttonStyle(.bordered)
                     }
                 }
-
-                if assistant.environment.state != .ready {
-                    Text(assistant.environment.installHelpText)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
             }
 
-            BrowserAutomationSettingsView(settings: settings)
+            if shouldShowAssistantAdvancedPages {
+                BrowserAutomationSettingsView(settings: settings)
+            }
         }
         .onAppear {
             assistant.refreshAll()

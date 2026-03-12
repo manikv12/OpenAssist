@@ -5,7 +5,9 @@ import Foundation
 final class AssistantComposerBridge {
     enum CaptureTarget: Equatable {
         case assistantWindow
-        case assistantOrb
+        case assistantCompact
+
+        static let assistantOrb: CaptureTarget = .assistantCompact
     }
 
     static let shared = AssistantComposerBridge()

@@ -29,6 +29,10 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
     private var historyTargetApplication: NSRunningApplication?
     private var onboardingCompletion: (() -> Void)?
 
+    var assistantWindowScreen: NSScreen? {
+        assistantWindowController?.window?.screen
+    }
+
     init(
         settings: SettingsStore,
         transcriptHistory: TranscriptHistoryStore,
@@ -224,7 +228,7 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
             toolbar.showsBaselineSeparator = false
             window.toolbar = toolbar
             window.toolbarStyle = .unifiedCompact
-            window.isMovableByWindowBackground = true
+            window.isMovableByWindowBackground = false
             window.contentViewController = hostingController
             window.hidesOnDeactivate = false
             window.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary]
@@ -244,18 +248,13 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
             return
         }
 
+        let wasVisible = window.isVisible
         NSApp.activate(ignoringOtherApps: true)
         assistantWindowController?.showWindow(nil)
         if window.isMiniaturized {
             window.deminiaturize(nil)
         }
-        // Only center when the window hasn't been shown yet.
-        if !window.isVisible {
-            if window.frame.width < assistantMinimumSize.width || window.frame.height < assistantMinimumSize.height {
-                window.setContentSize(assistantDefaultSize)
-            }
-            centerWindowOnActiveScreen(window)
-        }
+        ensureReadableAssistantWindowFrame(window, wasVisible: wasVisible)
         window.orderFrontRegardless()
         window.makeKeyAndOrderFront(nil)
         onStatusUpdate(.ready)
@@ -382,6 +381,34 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
         } else {
             onInsertText(text)
         }
+    }
+
+    private func ensureReadableAssistantWindowFrame(_ window: NSWindow, wasVisible: Bool) {
+        let activeVisibleFrame = (NSScreen.main ?? window.screen ?? NSScreen.screens.first)?.visibleFrame
+        let targetSize = targetAssistantWindowSize(for: activeVisibleFrame)
+        let needsReadableSize = window.frame.width < targetSize.width || window.frame.height < targetSize.height
+
+        if needsReadableSize {
+            window.setContentSize(targetSize)
+        }
+
+        if !wasVisible || needsReadableSize {
+            centerWindowOnActiveScreen(window)
+        }
+    }
+
+    private func targetAssistantWindowSize(for visibleFrame: NSRect?) -> NSSize {
+        guard let visibleFrame else { return assistantDefaultSize }
+
+        let horizontalPadding: CGFloat = 48
+        let verticalPadding: CGFloat = 56
+        let maxWidth = max(assistantMinimumSize.width, visibleFrame.width - horizontalPadding)
+        let maxHeight = max(assistantMinimumSize.height, visibleFrame.height - verticalPadding)
+
+        return NSSize(
+            width: min(assistantDefaultSize.width, maxWidth),
+            height: min(assistantDefaultSize.height, maxHeight)
+        )
     }
 
     private func centerWindowOnActiveScreen(_ window: NSWindow) {

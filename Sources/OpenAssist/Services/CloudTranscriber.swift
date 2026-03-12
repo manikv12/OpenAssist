@@ -7,6 +7,7 @@ final class CloudTranscriber: NSObject {
     var onStatusUpdate: ((String) -> Void)?
     var onHUDAlert: ((SpeechTranscriberHUDAlert) -> Void)?
     var onAudioLevel: ((Float) -> Void)?
+    var onAudioWaveformBins: (([Float]) -> Void)?
     var onRecordingStateChange: ((Bool) -> Void)?
 
     private var audioEngine = AVAudioEngine()
@@ -277,8 +278,10 @@ final class CloudTranscriber: NSObject {
             guard let self else { return }
 
             let level = self.normalizedAudioLevel(from: buffer)
+            let waveformBins = AudioWaveformShape.bins(from: buffer)
             DispatchQueue.main.async {
                 self.onAudioLevel?(level)
+                self.onAudioWaveformBins?(waveformBins)
             }
 
             let inputSignature = "\(buffer.format.sampleRate)-\(buffer.format.channelCount)-\(buffer.format.commonFormat.rawValue)-\(buffer.format.isInterleaved)"
@@ -337,6 +340,7 @@ final class CloudTranscriber: NSObject {
             audioEngine.stop()
             audioEngine.reset()
             onAudioLevel?(0)
+            onAudioWaveformBins?(Array(repeating: 0, count: AudioWaveformShape.defaultBinCount))
             restoreMicSelection()
             isRecording = false
             onRecordingStateChange?(false)
@@ -358,6 +362,7 @@ final class CloudTranscriber: NSObject {
 
         guard isRecording || isTranscribing else {
             onAudioLevel?(0)
+            onAudioWaveformBins?(Array(repeating: 0, count: AudioWaveformShape.defaultBinCount))
             onRecordingStateChange?(false)
             return
         }
@@ -404,6 +409,7 @@ final class CloudTranscriber: NSObject {
             audioEngine.stop()
             audioEngine.reset()
             onAudioLevel?(0)
+            onAudioWaveformBins?(Array(repeating: 0, count: AudioWaveformShape.defaultBinCount))
         }
 
         restoreMicSelection()
@@ -535,6 +541,7 @@ final class CloudTranscriber: NSObject {
             audioEngine.stop()
             audioEngine.reset()
             onAudioLevel?(0)
+            onAudioWaveformBins?(Array(repeating: 0, count: AudioWaveformShape.defaultBinCount))
         }
     }
 

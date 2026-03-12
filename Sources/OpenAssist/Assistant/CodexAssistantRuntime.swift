@@ -172,7 +172,9 @@ final class CodexAssistantRuntime {
     // Subagent tracking
     private var activeSubagents: [String: SubagentState] = [:]
     private let computerUseService: AssistantComputerUseService
-    private var computerUseApprovedSessionIDs: Set<String> = []
+    private let browserUseService: AssistantBrowserUseService
+    private let appActionService: AssistantAppActionService
+    private var approvedDynamicToolKindsBySessionID: [String: Set<String>] = [:]
 
     var currentSessionID: String? {
         activeSessionID
@@ -184,10 +186,19 @@ final class CodexAssistantRuntime {
 
     init(
         preferredModelID: String? = nil,
-        computerUseService: AssistantComputerUseService = AssistantComputerUseService()
+        computerUseService: AssistantComputerUseService = AssistantComputerUseService(),
+        browserUseService: AssistantBrowserUseService? = nil,
+        appActionService: AssistantAppActionService? = nil
     ) {
         self.preferredModelID = preferredModelID?.nonEmpty
         self.computerUseService = computerUseService
+        self.browserUseService = browserUseService ?? AssistantBrowserUseService(
+            settings: .shared,
+            computerUseService: computerUseService
+        )
+        self.appActionService = appActionService ?? AssistantAppActionService(
+            computerUseService: computerUseService
+        )
     }
 
     func setPreferredModelID(_ modelID: String?) {
@@ -419,6 +430,14 @@ final class CodexAssistantRuntime {
     func respondToPermissionRequest(optionID: String) async {
         guard let pendingPermissionContext else { return }
         await pendingPermissionContext.select(optionID: optionID)
+        self.pendingPermissionContext = nil
+        onPermissionRequest?(nil)
+        updateHUD(phase: .acting, title: "Continuing", detail: pendingPermissionContext.request.toolTitle)
+    }
+
+    func respondToPermissionRequest(answers: [String: [String]]) async {
+        guard let pendingPermissionContext else { return }
+        await pendingPermissionContext.submit(answers: answers)
         self.pendingPermissionContext = nil
         onPermissionRequest?(nil)
         updateHUD(phase: .acting, title: "Continuing", detail: pendingPermissionContext.request.toolTitle)
@@ -824,7 +843,6 @@ final class CodexAssistantRuntime {
             handleCommandOutputDelta(params)
         case "turn/completed":
             CrashReporter.logInfo("Assistant runtime notification turn/completed")
-            activeTurnID = nil
             handleTurnCompleted(params)
         case "error":
             let message = firstNonEmptyString(
@@ -1313,22 +1331,29 @@ final class CodexAssistantRuntime {
 
     private func presentToolUserInputRequest(id: JSONRPCRequestID, params: [String: Any]) async {
         let questions = params["questions"] as? [[String: Any]] ?? []
-        let options = questions.flatMap { question -> [AssistantPermissionOption] in
+        let parsedQuestions = questions.compactMap { question -> AssistantUserInputQuestion? in
             let questionID = question["id"] as? String ?? UUID().uuidString
             let header = firstNonEmptyString(question["header"] as? String, question["question"] as? String, "Answer") ?? "Answer"
+            let prompt = firstNonEmptyString(question["question"] as? String, header) ?? header
             let questionOptions = question["options"] as? [[String: Any]] ?? []
-            return questionOptions.enumerated().map { index, option in
+            let parsedOptions = questionOptions.enumerated().map { index, option in
                 let label = option["label"] as? String ?? "Continue"
-                return AssistantPermissionOption(
-                    id: "\(questionID)||\(label)",
-                    title: "\(header): \(label)",
-                    kind: "userInput",
-                    isDefault: index == 0
+                return AssistantUserInputQuestionOption(
+                    id: "\(questionID)-option-\(index)",
+                    label: label,
+                    detail: firstNonEmptyString(option["description"] as? String)
                 )
             }
+            return AssistantUserInputQuestion(
+                id: questionID,
+                header: header,
+                prompt: prompt,
+                options: parsedOptions,
+                allowsCustomAnswer: true
+            )
         }
 
-        guard !options.isEmpty else {
+        guard !parsedQuestions.isEmpty else {
             onStatusMessage?("Codex asked for input that needs a richer form than Open Assist shows today.")
             return
         }
@@ -1342,7 +1367,8 @@ final class CodexAssistantRuntime {
             ) ?? "Codex needs input",
             toolKind: "userInput",
             rationale: questions.compactMap { $0["question"] as? String }.joined(separator: "\n"),
-            options: options,
+            options: [],
+            userInputQuestions: parsedQuestions,
             rawPayloadSummary: nil
         )
 
@@ -1356,6 +1382,23 @@ final class CodexAssistantRuntime {
                         "answers": [parts[1]]
                     ]
                 ]
+            ]
+            do {
+                try await self.transport?.sendResponse(id: id, result: response)
+            } catch {
+                await MainActor.run {
+                    self.onStatusMessage?(error.localizedDescription)
+                }
+            }
+        } submitAnswersHandler: { [weak self] answers in
+            guard let self else { return }
+            let response: [String: Any] = [
+                "answers": Dictionary(uniqueKeysWithValues: answers.map { questionID, values in
+                    (
+                        questionID,
+                        ["answers": values]
+                    )
+                })
             ]
             do {
                 try await self.transport?.sendResponse(id: id, result: response)
@@ -1395,7 +1438,7 @@ final class CodexAssistantRuntime {
     private func handleDynamicToolCall(id: JSONRPCRequestID, params: [String: Any]) async {
         let tool = dynamicToolName(from: params) ?? "Tool"
 
-        guard tool == AssistantComputerUseToolDefinition.name else {
+        guard let toolKind = dynamicToolKind(for: tool) else {
             do {
                 try await transport?.sendResponse(
                     id: id,
@@ -1417,39 +1460,59 @@ final class CodexAssistantRuntime {
 
         let sessionID = params["threadId"] as? String ?? activeSessionID ?? ""
         let arguments = dynamicToolArguments(from: params)
+        let taskSummary = dynamicToolTaskSummary(for: tool, arguments: arguments)
+        let displayName = dynamicToolDisplayName(tool)
+        let requiresExplicitConfirmation = dynamicToolRequiresExplicitConfirmation(
+            toolName: tool,
+            arguments: arguments
+        )
 
-        if computerUseApprovedSessionIDs.contains(sessionID) {
-            await executeComputerUseCall(
+        if !requiresExplicitConfirmation,
+           isDynamicToolApproved(toolKind: toolKind, for: sessionID) {
+            await executeDynamicToolCall(
+                toolName: tool,
                 requestID: id,
                 arguments: arguments
             )
             return
         }
 
-        let taskSummary: String
-        if let parsed = try? AssistantComputerUseService.parseTask(from: arguments) {
-            taskSummary = parsed.task
-        } else {
-            taskSummary = "Use the local computer"
+        var options: [AssistantPermissionOption] = []
+        if !requiresExplicitConfirmation {
+            options.append(
+                AssistantPermissionOption(
+                    id: "acceptForSession",
+                    title: "Allow for Session",
+                    kind: toolKind,
+                    isDefault: true
+                )
+            )
         }
-
-        let options = [
-            AssistantPermissionOption(id: "acceptForSession", title: "Allow for Session", kind: AssistantComputerUseToolDefinition.toolKind, isDefault: true),
-            AssistantPermissionOption(id: "accept", title: "Allow Once", kind: AssistantComputerUseToolDefinition.toolKind, isDefault: false),
-            AssistantPermissionOption(id: "decline", title: "Decline", kind: AssistantComputerUseToolDefinition.toolKind, isDefault: false),
-            AssistantPermissionOption(id: "cancel", title: "Cancel Turn", kind: AssistantComputerUseToolDefinition.toolKind, isDefault: false)
-        ]
+        options.append(
+            AssistantPermissionOption(
+                id: "accept",
+                title: requiresExplicitConfirmation ? "Approve Once" : "Allow Once",
+                kind: toolKind,
+                isDefault: requiresExplicitConfirmation
+            )
+        )
+        options.append(
+            AssistantPermissionOption(id: "decline", title: "Decline", kind: toolKind, isDefault: false)
+        )
+        options.append(
+            AssistantPermissionOption(id: "cancel", title: "Cancel Turn", kind: toolKind, isDefault: false)
+        )
 
         let request = AssistantPermissionRequest(
             id: approvalRequestID(from: id),
             sessionID: sessionID,
-            toolTitle: "Computer Use",
-            toolKind: AssistantComputerUseToolDefinition.toolKind,
-            rationale: """
-            Computer Use can click, scroll, type, and capture screenshots on your Mac.
-
-            Requested task: \(taskSummary)
-            """,
+            toolTitle: displayName,
+            toolKind: toolKind,
+            rationale: dynamicToolPermissionRationale(
+                toolName: tool,
+                taskSummary: taskSummary,
+                requiresExplicitConfirmation: requiresExplicitConfirmation
+            ),
             options: options,
             rawPayloadSummary: taskSummary
         )
@@ -1459,18 +1522,12 @@ final class CodexAssistantRuntime {
 
             switch optionID {
             case "acceptForSession":
-                await self.rememberComputerUseApproval(for: sessionID)
-                await self.executeComputerUseCall(
-                    requestID: id,
-                    arguments: arguments
-                )
+                await self.rememberDynamicToolApproval(toolKind: toolKind, for: sessionID)
+                await self.executeDynamicToolCall(toolName: tool, requestID: id, arguments: arguments)
             case "accept":
-                await self.executeComputerUseCall(
-                    requestID: id,
-                    arguments: arguments
-                )
+                await self.executeDynamicToolCall(toolName: tool, requestID: id, arguments: arguments)
             case "cancel":
-                let message = "Computer Use was canceled for this turn."
+                let message = "\(displayName) was canceled for this turn."
                 do {
                     try await self.transport?.sendResponse(
                         id: id,
@@ -1486,7 +1543,7 @@ final class CodexAssistantRuntime {
                 }
                 await self.cancelActiveTurn()
             default:
-                let message = "Computer Use was declined for this request."
+                let message = "\(displayName) was declined for this request."
                 do {
                     try await self.transport?.sendResponse(
                         id: id,
@@ -1520,7 +1577,7 @@ final class CodexAssistantRuntime {
         }
 
         onPermissionRequest?(request)
-        onTranscript?(AssistantTranscriptEntry(role: .permission, text: "Codex wants to use Computer Use.", emphasis: true))
+        onTranscript?(AssistantTranscriptEntry(role: .permission, text: "Codex wants to use \(displayName).", emphasis: true))
         onTimelineMutation?(
             .upsert(
                 .permission(
@@ -1536,16 +1593,46 @@ final class CodexAssistantRuntime {
         updateHUD(phase: .waitingForPermission, title: "Approve Action", detail: taskSummary)
     }
 
-    private func executeComputerUseCall(
+    private func executeDynamicToolCall(
+        toolName: String,
         requestID: JSONRPCRequestID,
         arguments: Any
     ) async {
-        updateHUD(phase: .acting, title: "Computer Use", detail: "Working on the current screen")
+        let displayName = dynamicToolDisplayName(toolName)
+        let workingDetail: String
+        let result: AssistantComputerUseService.ToolExecutionResult
 
-        let result = await computerUseService.run(
-            arguments: arguments,
-            preferredModelID: preferredModelID
-        )
+        switch toolName {
+        case AssistantComputerUseToolDefinition.name:
+            workingDetail = "Working on the current screen"
+            updateHUD(phase: .acting, title: displayName, detail: workingDetail)
+            result = await computerUseService.run(
+                arguments: arguments,
+                preferredModelID: preferredModelID
+            )
+        case AssistantBrowserUseToolDefinition.name:
+            workingDetail = "Using the selected browser profile"
+            updateHUD(phase: .acting, title: displayName, detail: workingDetail)
+            result = await browserUseService.run(
+                arguments: arguments,
+                preferredModelID: preferredModelID
+            )
+        case AssistantAppActionToolDefinition.name:
+            workingDetail = "Using a supported Mac app"
+            updateHUD(phase: .acting, title: displayName, detail: workingDetail)
+            result = await appActionService.run(
+                arguments: arguments,
+                preferredModelID: preferredModelID
+            )
+        default:
+            workingDetail = "Unsupported dynamic tool"
+            updateHUD(phase: .failed, title: displayName, detail: workingDetail)
+            result = AssistantComputerUseService.ToolExecutionResult(
+                contentItems: [.init(type: "inputText", text: "Open Assist does not support the dynamic tool `\(toolName)` yet.", imageURL: nil)],
+                success: false,
+                summary: "Unsupported dynamic tool."
+            )
+        }
 
         do {
             try await transport?.sendResponse(
@@ -1566,14 +1653,20 @@ final class CodexAssistantRuntime {
         }
         updateHUD(
             phase: result.success ? .acting : .failed,
-            title: result.success ? "Computer Use finished" : "Computer Use failed",
+            title: result.success ? "\(displayName) finished" : "\(displayName) failed",
             detail: result.summary
         )
     }
 
-    private func rememberComputerUseApproval(for sessionID: String) {
+    private func rememberDynamicToolApproval(toolKind: String, for sessionID: String) {
         guard !sessionID.isEmpty else { return }
-        computerUseApprovedSessionIDs.insert(sessionID)
+        var approvals = approvedDynamicToolKindsBySessionID[sessionID] ?? []
+        approvals.insert(toolKind)
+        approvedDynamicToolKindsBySessionID[sessionID] = approvals
+    }
+
+    private func isDynamicToolApproved(toolKind: String, for sessionID: String) -> Bool {
+        approvedDynamicToolKindsBySessionID[sessionID]?.contains(toolKind) == true
     }
 
     private func handleThreadStatusChanged(_ params: [String: Any]) {
@@ -1628,6 +1721,13 @@ final class CodexAssistantRuntime {
                     )
                 )
             )
+        }
+        if allowsProposedPlanForActiveTurn,
+           planTimelineID == nil,
+           streamingBuffer.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty != nil {
+            proposedPlanBuffer = streamingBuffer
+            onProposedPlan?(streamingBuffer)
+            emitPlanTimeline(text: streamingBuffer, isStreaming: false)
         }
         streamingEntryID = nil
         streamingBuffer = ""
@@ -1775,9 +1875,13 @@ final class CodexAssistantRuntime {
 
     private func handleTurnCompleted(_ params: [String: Any]) {
         let responsePreview = streamingBuffer.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+        let completedTurnResponse = streamingBuffer
         flushStreamingBuffer()
         flushCommentaryBuffer()
-        defer { allowsProposedPlanForActiveTurn = false }
+        defer {
+            allowsProposedPlanForActiveTurn = false
+            activeTurnID = nil
+        }
 
         guard let turn = params["turn"] as? [String: Any] else {
             updateHUD(phase: .success, title: "Finished", detail: responsePreview)
@@ -1796,8 +1900,8 @@ final class CodexAssistantRuntime {
             if sessionTurnCount == 0,
                let sessionID = activeSessionID,
                let userPrompt = firstTurnUserPrompt,
-               !streamingBuffer.isEmpty {
-                let response = streamingBuffer
+               completedTurnResponse.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty != nil {
+                let response = completedTurnResponse
                 onTitleRequest?(sessionID, userPrompt, response)
             }
             sessionTurnCount += 1
@@ -2143,7 +2247,16 @@ final class CodexAssistantRuntime {
         case .mcpToolCall:
             return "Used an MCP tool."
         case .dynamicToolCall:
-            return title == "Computer Use" ? "Used the computer." : "Used \(title)."
+            switch title {
+            case "Computer Use":
+                return "Used the computer."
+            case "Browser Use":
+                return "Used the browser."
+            case "App Action":
+                return "Used a Mac app."
+            default:
+                return "Used \(title)."
+            }
         case .subagent:
             return "Worked with a subagent."
         case .reasoning:
@@ -2187,11 +2300,11 @@ final class CodexAssistantRuntime {
     }
 
     func rememberComputerUseApprovalForTesting(_ sessionID: String) {
-        rememberComputerUseApproval(for: sessionID)
+        rememberDynamicToolApproval(toolKind: AssistantComputerUseToolDefinition.toolKind, for: sessionID)
     }
 
     func isComputerUseApprovedForTesting(_ sessionID: String) -> Bool {
-        computerUseApprovedSessionIDs.contains(sessionID)
+        isDynamicToolApproved(toolKind: AssistantComputerUseToolDefinition.toolKind, for: sessionID)
     }
 
     func configureImageAttachmentContextForTesting(
@@ -2216,6 +2329,13 @@ final class CodexAssistantRuntime {
         dynamicToolSpecs(for: mode).compactMap { tool in
             tool["name"] as? String
         }
+    }
+
+    func dynamicToolRequiresExplicitConfirmationForTesting(
+        toolName: String,
+        arguments: Any
+    ) -> Bool {
+        dynamicToolRequiresExplicitConfirmation(toolName: toolName, arguments: arguments)
     }
 
     func turnStartParamsForTesting(
@@ -2249,6 +2369,33 @@ final class CodexAssistantRuntime {
         await handleNotification(method: "error", params: ["message": message])
     }
 
+    func configureStreamingTurnForTesting(
+        sessionID: String = "thread-1",
+        turnID: String = "turn-1",
+        text: String,
+        mode: AssistantInteractionMode = .plan
+    ) {
+        activeSessionID = sessionID
+        activeTurnID = turnID
+        interactionMode = mode
+        allowsProposedPlanForActiveTurn = mode == .plan
+        streamingEntryID = UUID()
+        streamingTimelineID = "assistant-final-test"
+        streamingStartedAt = Date()
+        streamingBuffer = text
+    }
+
+    func processTurnCompletedForTesting(status: String = "completed") async {
+        await handleNotification(
+            method: "turn/completed",
+            params: [
+                "turn": [
+                    "status": status
+                ]
+            ]
+        )
+    }
+
     func blockedToolUseMessage(
         for mode: AssistantInteractionMode,
         activityTitle: String? = nil,
@@ -2257,7 +2404,11 @@ final class CodexAssistantRuntime {
         if mode == .conversational,
            currentTurnIncludesImageAttachments,
            let normalizedTitle = activityTitle?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
-           normalizedTitle == "tool" || normalizedTitle == "computer use" || normalizedTitle == "browser" {
+           normalizedTitle == "tool"
+            || normalizedTitle == "computer use"
+            || normalizedTitle == "browser"
+            || normalizedTitle == "browser use"
+            || normalizedTitle == "app action" {
             return "I stopped before using a tool because your image was already attached. Chat mode should answer directly from attached images when the selected model supports image input. Live screen or browser inspection still needs Agentic mode."
         }
 
@@ -2426,8 +2577,87 @@ final class CodexAssistantRuntime {
     }
 
     private func dynamicToolDisplayName(_ rawTool: String?) -> String {
-        let tool = rawTool ?? "Tool"
-        return tool == AssistantComputerUseToolDefinition.name ? "Computer Use" : tool
+        switch rawTool {
+        case AssistantComputerUseToolDefinition.name:
+            return "Computer Use"
+        case AssistantBrowserUseToolDefinition.name:
+            return "Browser Use"
+        case AssistantAppActionToolDefinition.name:
+            return "App Action"
+        default:
+            return rawTool ?? "Tool"
+        }
+    }
+
+    private func dynamicToolKind(for rawTool: String?) -> String? {
+        switch rawTool {
+        case AssistantComputerUseToolDefinition.name:
+            return AssistantComputerUseToolDefinition.toolKind
+        case AssistantBrowserUseToolDefinition.name:
+            return AssistantBrowserUseToolDefinition.toolKind
+        case AssistantAppActionToolDefinition.name:
+            return AssistantAppActionToolDefinition.toolKind
+        default:
+            return nil
+        }
+    }
+
+    private func dynamicToolTaskSummary(for toolName: String, arguments: Any) -> String {
+        switch toolName {
+        case AssistantComputerUseToolDefinition.name:
+            return (try? AssistantComputerUseService.parseTask(from: arguments).task) ?? "Use the local computer"
+        case AssistantBrowserUseToolDefinition.name:
+            return (try? AssistantBrowserUseService.parseTask(from: arguments).summaryLine) ?? "Use the selected browser profile"
+        case AssistantAppActionToolDefinition.name:
+            return (try? AssistantAppActionService.parseRequest(from: arguments).task) ?? "Use a supported Mac app"
+        default:
+            return "Use a dynamic tool"
+        }
+    }
+
+    private func dynamicToolPermissionRationale(
+        toolName: String,
+        taskSummary: String,
+        requiresExplicitConfirmation: Bool
+    ) -> String {
+        let lead: String
+        switch toolName {
+        case AssistantComputerUseToolDefinition.name:
+            lead = "Computer Use can click, scroll, type, and capture screenshots on your Mac."
+        case AssistantBrowserUseToolDefinition.name:
+            lead = "Browser Use can open sites and reuse the selected signed-in browser profile on this Mac."
+        case AssistantAppActionToolDefinition.name:
+            lead = "App Action can talk to supported Mac apps like Finder, Terminal, Calendar, and System Settings."
+        default:
+            lead = "This tool can control parts of your Mac."
+        }
+
+        let riskLine = requiresExplicitConfirmation
+            ? "\n\nThis request looks higher risk, so Open Assist needs a fresh confirmation for this one."
+            : ""
+
+        return lead + riskLine + "\n\nRequested task: \(taskSummary)"
+    }
+
+    private func dynamicToolRequiresExplicitConfirmation(
+        toolName: String,
+        arguments: Any
+    ) -> Bool {
+        guard dynamicToolKind(for: toolName) != nil else { return false }
+
+        if toolName == AssistantAppActionToolDefinition.name,
+           let request = try? AssistantAppActionService.parseRequest(from: arguments),
+           (
+               request.command?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty != nil
+                || request.app == .terminal
+                || request.commit
+           ) {
+            return true
+        }
+
+        let summary = dynamicToolTaskSummary(for: toolName, arguments: arguments).lowercased()
+        let riskyKeywords = ["send", "post", "purchase", "delete", "submit"]
+        return riskyKeywords.contains(where: summary.contains)
     }
 
     private func threadApprovalPolicy(for mode: AssistantInteractionMode) -> String {
@@ -2558,7 +2788,7 @@ final class CodexAssistantRuntime {
             )
         case "dynamicToolCall":
             let rawTool = dynamicToolName(from: item) ?? "Tool"
-            let tool = rawTool == AssistantComputerUseToolDefinition.name ? "Computer Use" : rawTool
+            let tool = dynamicToolDisplayName(rawTool)
             return AssistantToolCallState(
                 id: id,
                 title: tool,
@@ -2691,7 +2921,11 @@ final class CodexAssistantRuntime {
         case .conversational, .plan:
             return []
         case .agentic:
-            return [AssistantComputerUseToolDefinition.dynamicToolSpec()]
+            return [
+                AssistantAppActionToolDefinition.dynamicToolSpec(),
+                AssistantBrowserUseToolDefinition.dynamicToolSpec(),
+                AssistantComputerUseToolDefinition.dynamicToolSpec()
+            ]
         }
     }
 
@@ -3578,20 +3812,28 @@ private actor CodexAppServerTransport {
 private final class PendingPermissionContext {
     let request: AssistantPermissionRequest
     private let selectHandler: @Sendable (String) async -> Void
+    private let submitAnswersHandler: (@Sendable ([String: [String]]) async -> Void)?
     private let cancelHandler: @Sendable () async -> Void
 
     init(
         request: AssistantPermissionRequest,
         selectHandler: @escaping @Sendable (String) async -> Void,
+        submitAnswersHandler: (@Sendable ([String: [String]]) async -> Void)? = nil,
         cancelHandler: @escaping @Sendable () async -> Void
     ) {
         self.request = request
         self.selectHandler = selectHandler
+        self.submitAnswersHandler = submitAnswersHandler
         self.cancelHandler = cancelHandler
     }
 
     func select(optionID: String) async {
         await selectHandler(optionID)
+    }
+
+    func submit(answers: [String: [String]]) async {
+        guard let submitAnswersHandler else { return }
+        await submitAnswersHandler(answers)
     }
 
     func cancel() async {

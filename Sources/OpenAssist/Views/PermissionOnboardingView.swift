@@ -6,9 +6,14 @@ struct PermissionOnboardingView: View {
     let onComplete: () -> Void
 
     @State private var accessibilityGranted = false
+    @State private var screenRecordingGranted = false
     @State private var microphoneGranted = false
     @State private var speechRecognitionGranted = false
     @State private var speechRecognitionRequired = true
+    @State private var appleEventsGranted = false
+    @State private var appleEventsKnown = false
+    @State private var fullDiskAccessGranted = false
+    @State private var fullDiskAccessKnown = false
 
     private var allRequiredGranted: Bool {
         accessibilityGranted && microphoneGranted && (!speechRecognitionRequired || speechRecognitionGranted)
@@ -76,6 +81,45 @@ struct PermissionOnboardingView: View {
                             refreshPermissionSnapshot()
                         }
                     )
+
+                    Divider()
+
+                    permissionRow(
+                        title: "Screen Recording",
+                        hint: "Optional for computer control. Needed when Open Assist must understand what is visible on your screen.",
+                        granted: screenRecordingGranted,
+                        required: false,
+                        action: {
+                            PermissionCenter.requestScreenRecordingPermission(openSettingsIfDenied: true)
+                            refreshPermissionSnapshot()
+                        }
+                    )
+
+                    permissionRow(
+                        title: "Automation / Apple Events",
+                        hint: appleEventsKnown
+                            ? "Optional for computer control. Needed for direct browser and app scripting."
+                            : "Optional for computer control. This appears after you first approve a direct browser or app action.",
+                        granted: appleEventsGranted,
+                        required: false,
+                        action: {
+                            PermissionCenter.requestAppleEventsPermission(openSettingsIfDenied: true)
+                            refreshPermissionSnapshot()
+                        }
+                    )
+
+                    permissionRow(
+                        title: "Full Disk Access",
+                        hint: fullDiskAccessKnown
+                            ? "Optional. Only needed for protected app data and folders."
+                            : "Optional. Only open this if a protected location needs it later.",
+                        granted: fullDiskAccessGranted,
+                        required: false,
+                        action: {
+                            PermissionCenter.openPrivacySettingsPane(query: "Full Disk Access")
+                            refreshPermissionSnapshot()
+                        }
+                    )
                 }
                 .padding(12)
                 .appThemedSurface(cornerRadius: 12, strokeOpacity: 0.17)
@@ -111,7 +155,7 @@ struct PermissionOnboardingView: View {
             .padding(22)
             .appThemedSurface(cornerRadius: 16, strokeOpacity: 0.18)
             .shadow(color: .black.opacity(0.16), radius: 18, x: 0, y: 10)
-            .frame(width: 620, height: 460, alignment: .topLeading)
+            .frame(width: 620, height: 560, alignment: .topLeading)
             .padding(18)
         }
         .onAppear {
@@ -178,8 +222,13 @@ struct PermissionOnboardingView: View {
     private func refreshPermissionSnapshot() {
         let snapshot = PermissionCenter.snapshot(using: settings)
         accessibilityGranted = snapshot.accessibilityGranted
+        screenRecordingGranted = snapshot.screenRecordingGranted
         microphoneGranted = snapshot.microphoneGranted
         speechRecognitionGranted = snapshot.speechRecognitionGranted
         speechRecognitionRequired = snapshot.speechRecognitionRequired
+        appleEventsGranted = snapshot.appleEventsGranted
+        appleEventsKnown = snapshot.appleEventsKnown
+        fullDiskAccessGranted = snapshot.fullDiskAccessGranted
+        fullDiskAccessKnown = snapshot.fullDiskAccessKnown
     }
 }

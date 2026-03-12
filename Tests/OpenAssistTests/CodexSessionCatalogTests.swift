@@ -161,6 +161,84 @@ final class CodexSessionCatalogTests: XCTestCase {
         XCTAssertEqual(sessionsByID["source-object"]?.source, .other)
     }
 
+    func testLoadSessionsRestoresLatestAgenticConfigurationFromTurnContext() async throws {
+        let homeDirectory = try makeTemporaryHomeDirectory()
+        defer { try? FileManager.default.removeItem(at: homeDirectory) }
+
+        try writeSession(
+            id: "restore-agentic",
+            dayPath: "2026/03/07",
+            in: homeDirectory,
+            lines: [
+                try sessionMetaLine(
+                    id: "restore-agentic",
+                    timestamp: "2026-03-07T13:00:00Z",
+                    cwd: "/Users/test/OpenAssist",
+                    source: "exec",
+                    originator: "Open Assist"
+                ),
+                try turnContextLine(
+                    timestamp: "2026-03-07T13:00:01Z",
+                    model: "gpt-5.4",
+                    approvalPolicy: "untrusted",
+                    collaborationMode: "default"
+                ),
+                try turnContextLine(
+                    timestamp: "2026-03-07T13:05:00Z",
+                    model: "gpt-5.4-codex",
+                    approvalPolicy: "on-request",
+                    collaborationMode: "default",
+                    reasoningEffort: "xhigh",
+                    serviceTier: "fast"
+                )
+            ]
+        )
+
+        let catalog = CodexSessionCatalog(homeDirectory: homeDirectory)
+        let sessions = try await catalog.loadSessions(limit: 5)
+        let summary = try XCTUnwrap(sessions.first(where: { $0.id == "restore-agentic" }))
+
+        XCTAssertEqual(summary.latestModel, "gpt-5.4-codex")
+        XCTAssertEqual(summary.latestInteractionMode, .agentic)
+        XCTAssertEqual(summary.latestReasoningEffort, .xhigh)
+        XCTAssertEqual(summary.latestServiceTier, "fast")
+        XCTAssertTrue(summary.fastModeEnabled)
+    }
+
+    func testLoadSessionsRestoresPlanConfigurationFromTurnContext() async throws {
+        let homeDirectory = try makeTemporaryHomeDirectory()
+        defer { try? FileManager.default.removeItem(at: homeDirectory) }
+
+        try writeSession(
+            id: "restore-plan",
+            dayPath: "2026/03/07",
+            in: homeDirectory,
+            lines: [
+                try sessionMetaLine(
+                    id: "restore-plan",
+                    timestamp: "2026-03-07T14:00:00Z",
+                    cwd: "/Users/test/OpenAssist",
+                    source: "exec",
+                    originator: "Open Assist"
+                ),
+                try turnContextLine(
+                    timestamp: "2026-03-07T14:00:01Z",
+                    model: "gpt-5.4",
+                    approvalPolicy: "on-request",
+                    collaborationMode: "plan",
+                    reasoningEffort: "high"
+                )
+            ]
+        )
+
+        let catalog = CodexSessionCatalog(homeDirectory: homeDirectory)
+        let sessions = try await catalog.loadSessions(limit: 5)
+        let summary = try XCTUnwrap(sessions.first(where: { $0.id == "restore-plan" }))
+
+        XCTAssertEqual(summary.latestInteractionMode, .plan)
+        XCTAssertEqual(summary.latestReasoningEffort, .high)
+    }
+
     func testLoadSessionsCanFilterToOpenAssistOriginatorOnly() async throws {
         let homeDirectory = try makeTemporaryHomeDirectory()
         defer { try? FileManager.default.removeItem(at: homeDirectory) }
@@ -955,14 +1033,35 @@ final class CodexSessionCatalogTests: XCTestCase {
 
     private func turnContextLine(
         timestamp: String,
-        model: String
+        model: String,
+        approvalPolicy: String? = nil,
+        collaborationMode: String? = nil,
+        reasoningEffort: String? = nil,
+        serviceTier: String? = nil
     ) throws -> String {
-        try jsonLine([
+        var payload: [String: Any] = [
+            "model": model
+        ]
+        if let approvalPolicy {
+            payload["approval_policy"] = approvalPolicy
+        }
+        if let collaborationMode {
+            var settings: [String: Any] = ["model": model]
+            if let reasoningEffort {
+                settings["reasoning_effort"] = reasoningEffort
+            }
+            if let serviceTier {
+                settings["service_tier"] = serviceTier
+            }
+            payload["collaboration_mode"] = [
+                "mode": collaborationMode,
+                "settings": settings
+            ]
+        }
+        return try jsonLine([
             "timestamp": timestamp,
             "type": "turn_context",
-            "payload": [
-                "model": model
-            ]
+            "payload": payload
         ])
     }
 

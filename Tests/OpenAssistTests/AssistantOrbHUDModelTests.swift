@@ -144,6 +144,75 @@ final class AssistantOrbHUDModelTests: XCTestCase {
     }
 
     @MainActor
+    func testCollapseExpandedTrayKeepsCompactReplyAvailable() {
+        let model = AssistantOrbHUDModel()
+
+        model.update(
+            state: AssistantHUDState(
+                phase: .success,
+                title: "Done",
+                detail: "The answer is ready."
+            )
+        )
+        model.expand()
+
+        model.collapseExpandedTray()
+
+        XCTAssertFalse(model.isExpanded)
+        XCTAssertTrue(model.showDoneDetail)
+        XCTAssertEqual(model.doneDetailText, "The answer is ready.")
+    }
+
+    @MainActor
+    func testCompactComposerCanReopenAfterDoneCardIsClosed() {
+        let model = AssistantOrbHUDModel()
+        model.sessions = [
+            AssistantSessionSummary(
+                id: "session-follow-up",
+                title: "Follow up target",
+                source: .appServer,
+                status: .completed,
+                latestAssistantMessage: "Ready."
+            )
+        ]
+        model.selectedSessionID = "session-follow-up"
+
+        model.update(
+            state: AssistantHUDState(
+                phase: .success,
+                title: "Done",
+                detail: "The answer is ready."
+            )
+        )
+
+        model.dismissDoneDetail()
+
+        XCTAssertTrue(model.presentCompactComposerIfAvailable())
+        XCTAssertTrue(model.showCompactComposer)
+        XCTAssertEqual(model.selectedSessionID, "session-follow-up")
+    }
+
+    @MainActor
+    func testHideDoneDetailKeepsReplyAvailableForReopen() {
+        let model = AssistantOrbHUDModel()
+
+        model.update(
+            state: AssistantHUDState(
+                phase: .success,
+                title: "Done",
+                detail: "The answer is ready."
+            )
+        )
+
+        model.hideDoneDetail()
+
+        XCTAssertFalse(model.showDoneDetail)
+        XCTAssertEqual(model.doneDetailText, "The answer is ready.")
+        XCTAssertTrue(model.presentDoneDetailIfAvailable())
+        XCTAssertTrue(model.showDoneDetail)
+    }
+
+    @MainActor
     func testOpenSelectedSessionInMainWindowUsesActiveSessionSummary() {
         let model = AssistantOrbHUDModel()
         let session = AssistantSessionSummary(

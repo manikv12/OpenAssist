@@ -1,132 +1,78 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" width="512" height="512">
     <defs>
-        <radialGradient id="bg" cx="38%" cy="34%" r="82%">
+        <radialGradient id="bgGrad" cx="38%" cy="34%" r="82%">
             <stop offset="0%" stop-color="#20283A" />
             <stop offset="56%" stop-color="#0A1120" />
             <stop offset="100%" stop-color="#020305" />
         </radialGradient>
 
-        <linearGradient id="gold" x1="0" y1="0" x2="1" y2="1">
-            <stop offset="0%" stop-color="#F4DE99" />
-            <stop offset="40%" stop-color="#D8B45A" />
-            <stop offset="64%" stop-color="#FFF0BF" />
-            <stop offset="100%" stop-color="#A47A21" />
+        <linearGradient id="surfaceHL" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.04" />
+            <stop offset="40%" stop-color="#FFFFFF" stop-opacity="0" />
         </linearGradient>
-
-        <linearGradient id="headFill" x1="37" y1="32" x2="89" y2="84" gradientUnits="userSpaceOnUse">
-            <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.20" />
-            <stop offset="45%" stop-color="#C0D6F0" stop-opacity="0.12" />
-            <stop offset="100%" stop-color="#506888" stop-opacity="0.06" />
-        </linearGradient>
-
-        <linearGradient id="headStroke" x1="37" y1="30" x2="89" y2="84" gradientUnits="userSpaceOnUse">
-            <stop offset="0%" stop-color="#E8F2FF" />
-            <stop offset="50%" stop-color="#C0D8F0" />
-            <stop offset="100%" stop-color="#6A9FCF" />
-        </linearGradient>
-
-        <radialGradient id="faceGlow" cx="50%" cy="46%" r="40%">
-            <stop offset="0%" stop-color="#80C0FF" stop-opacity="0.55" />
-            <stop offset="40%" stop-color="#4A90D0" stop-opacity="0.25" />
-            <stop offset="75%" stop-color="#1A4A80" stop-opacity="0.08" />
-            <stop offset="100%" stop-color="#1A4A80" stop-opacity="0" />
-        </radialGradient>
 
         <linearGradient id="lensFill" x1="0" y1="0" x2="0.3" y2="1">
-            <stop offset="0%" stop-color="#2A2A3E" />
-            <stop offset="50%" stop-color="#18182A" />
-            <stop offset="100%" stop-color="#101020" />
+            <stop offset="0%" stop-color="#1A1A2E" />
+            <stop offset="50%" stop-color="#10102A" />
+            <stop offset="100%" stop-color="#0A0A1E" />
         </linearGradient>
 
         <linearGradient id="lensShine" x1="0" y1="0" x2="1" y2="1">
-            <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.25" />
-            <stop offset="40%" stop-color="#FFFFFF" stop-opacity="0.05" />
+            <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.22" />
+            <stop offset="40%" stop-color="#FFFFFF" stop-opacity="0.04" />
             <stop offset="100%" stop-color="#FFFFFF" stop-opacity="0" />
         </linearGradient>
 
-        <radialGradient id="vignette" cx="50%" cy="50%" r="52%">
-            <stop offset="0%" stop-color="#000000" stop-opacity="0" />
-            <stop offset="68%" stop-color="#000000" stop-opacity="0" />
-            <stop offset="85%" stop-color="#000000" stop-opacity="0.12" />
-            <stop offset="93%" stop-color="#000000" stop-opacity="0.24" />
-            <stop offset="100%" stop-color="#000000" stop-opacity="0.40" />
-        </radialGradient>
-
-        <filter id="softGlow">
-            <feGaussianBlur stdDeviation="3" />
+        <filter id="ambientGlow" x="-80%" y="-80%" width="260%" height="260%">
+            <feGaussianBlur stdDeviation="6" />
         </filter>
-
-        <clipPath id="clip">
-            <circle cx="60" cy="60" r="58.5" />
-        </clipPath>
+        <filter id="outerGlow" x="-40%" y="-40%" width="180%" height="180%">
+            <feGaussianBlur stdDeviation="2.5" />
+        </filter>
+        <filter id="glow" x="-20%" y="-20%" width="140%" height="140%">
+            <feGaussianBlur stdDeviation="1.2" result="blur" />
+            <feMerge>
+                <feMergeNode in="blur" />
+                <feMergeNode in="SourceGraphic" />
+            </feMerge>
+        </filter>
     </defs>
 
-    <!-- Blue background filling the full icon square -->
+    <!-- Background -->
     <rect width="120" height="120" fill="#0A1120" />
+    <rect width="120" height="120" fill="url(#surfaceHL)" />
 
-    <!-- Scale circle down so it fits inside the macOS squircle -->
-    <g transform="translate(60,60) scale(0.82) translate(-60,-60)">
-    <circle cx="60" cy="60" r="58.5" fill="url(#bg)" stroke="url(#gold)" stroke-width="2.8" />
+    <g transform="translate(60,60) scale(1.18) translate(-60,-60)">
 
-    <g clip-path="url(#clip)">
-        <g transform="translate(60,58) scale(1.15) translate(-60,-58)">
-        <!-- Ambient glow behind bot -->
-        <ellipse cx="63" cy="57" rx="26" ry="23" fill="url(#faceGlow)" filter="url(#softGlow)" />
-
-        <!-- Bot head - centered chat bubble, no antenna -->
-        <path
-            d="M45 36
-               H76
-               C82 36 87 41 87 47
-               V68
-               C87 74 82 79 76 79
-               H67
-               L62 84.5
-               C60.8 86 58.3 85 58.3 83
-               V79
-               H45
-               C39 79 34 74 34 68
-               V47
-               C34 41 39 36 45 36 Z"
-            fill="url(#headFill)" />
-
-        <path
-            d="M45 36
-               H76
-               C82 36 87 41 87 47
-               V68
-               C87 74 82 79 76 79
-               H67
-               L62 84.5
-               C60.8 86 58.3 85 58.3 83
-               V79
-               H45
-               C39 79 34 74 34 68
-               V47
-               C34 41 39 36 45 36 Z"
-            fill="none" stroke="url(#gold)" stroke-width="1.8" stroke-linejoin="round" />
-
-        <!-- Sunglasses frame (gold accent) -->
-        <path d="M39 53 C39 51 40 50 42 50 H57 C58.5 50 59 50.5 60.5 51.5 C62 50.5 62.5 50 64 50 H79 C81 50 82 51 82 53 V58 C82 61.5 79 63.5 76 63.5 H67 C64 63.5 62 61.5 62 58 V55 C61 55.5 60 55.5 59 55 V58 C59 61.5 57 63.5 54 63.5 H45 C42 63.5 39 61.5 39 58 Z"
-            fill="#1A1A2A" stroke="url(#gold)" stroke-width="1.3" stroke-linejoin="round" />
-
-        <!-- Left lens -->
-        <rect x="40.5" y="51" width="17" height="11.5" rx="3" fill="url(#lensFill)" />
-        <rect x="40.5" y="51" width="17" height="11.5" rx="3" fill="url(#lensShine)" />
-
-        <!-- Right lens -->
-        <rect x="63" y="51" width="17" height="11.5" rx="3" fill="url(#lensFill)" />
-        <rect x="63" y="51" width="17" height="11.5" rx="3" fill="url(#lensShine)" />
-
-        <!-- Bridge (gold) -->
-        <path d="M57.5 54 C59 52.5 62 52.5 63.5 54" fill="none" stroke="url(#gold)" stroke-width="1.3" stroke-linecap="round" />
-
-        <!-- Subtle mouth -->
-        <path d="M53 67 C56 69.2 63 69.2 66 67" fill="none" stroke="#D0E4F5" stroke-opacity="0.40" stroke-width="1.5" stroke-linecap="round" />
-        </g>
-
-        <!-- Vignette -->
-        <circle cx="60" cy="60" r="56" fill="url(#vignette)" />
+    <!-- Ambient surface illumination -->
+    <g filter="url(#ambientGlow)" opacity="0.10">
+        <rect x="32" y="26" width="56" height="46" rx="12" fill="#D8B45A" />
+        <rect x="38" y="82" width="44" height="5" rx="2.5" fill="#D8B45A" />
     </g>
+
+    <!-- Dark interior of head -->
+    <rect x="35" y="29" width="50" height="40" rx="9" fill="#080E14" opacity="0.8" />
+
+    <!-- ══ HEAD (clean neon) ══ -->
+    <rect x="32" y="26" width="56" height="46" rx="12" fill="none" stroke="#D8B45A" stroke-width="2.5" />
+    <rect x="32" y="26" width="56" height="46" rx="12" fill="none" stroke="#FFF0BF" stroke-width="0.8" opacity="0.8" />
+
+    <!-- ══ BOTTOM BAR (clean neon) ══ -->
+    <rect x="35" y="81" width="50" height="6" rx="3" fill="#D8B45A" />
+    <rect x="36.5" y="81.75" width="47" height="4.5" rx="2.25" fill="#FFF0BF" opacity="0.7" />
+
+    <!-- ══ SUNGLASSES (clean neon, no outer glow) ══ -->
+    <path d="M40 46 C40 44 41 43 43 43 H56 C57.5 43 58 43.5 59.5 44.5 C61 43.5 61.5 43 63 43 H78 C80 43 81 44 81 46 V51 C81 54.5 78 56.5 75 56.5 H66 C63 56.5 61 54.5 61 51 V48 C60 48.5 59 48.5 58 48 V51 C58 54.5 56 56.5 53 56.5 H44 C41 56.5 40 54.5 40 51 Z"
+        fill="none" stroke="#D8B45A" stroke-width="1.3" stroke-linejoin="round" />
+    <path d="M40 46 C40 44 41 43 43 43 H56 C57.5 43 58 43.5 59.5 44.5 C61 43.5 61.5 43 63 43 H78 C80 43 81 44 81 46 V51 C81 54.5 78 56.5 75 56.5 H66 C63 56.5 61 54.5 61 51 V48 C60 48.5 59 48.5 58 48 V51 C58 54.5 56 56.5 53 56.5 H44 C41 56.5 40 54.5 40 51 Z"
+        fill="none" stroke="#FFF0BF" stroke-width="0.5" stroke-linejoin="round" opacity="0.7" />
+
+    <!-- Bridge — glow -->
+    <path d="M57 47 C58.5 45.5 61 45.5 62.5 47" fill="none" stroke="#D8B45A" stroke-width="1.3" stroke-linecap="round" filter="url(#glow)" />
+    <path d="M57 47 C58.5 45.5 61 45.5 62.5 47" fill="none" stroke="#FFF0BF" stroke-width="0.5" stroke-linecap="round" opacity="0.6" />
+
+    <!-- Mouth -->
+    <path d="M52 61 C55 63.2 64 63.2 67 61" fill="none" stroke="#D0C8A0" stroke-opacity="0.40" stroke-width="1.5" stroke-linecap="round" />
+
     </g>
 </svg>

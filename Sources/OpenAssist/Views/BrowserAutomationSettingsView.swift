@@ -13,15 +13,34 @@ struct BrowserAutomationSettingsView: View {
                 Text("Browser Automation")
                     .font(.system(size: 13, weight: .semibold))
                 Spacer()
-                Toggle("", isOn: $settings.browserAutomationEnabled)
-                    .toggleStyle(.switch)
-                    .labelsHidden()
-                    .controlSize(.small)
+                if shouldShowAutomationToggle {
+                    Toggle("", isOn: $settings.browserAutomationEnabled)
+                        .toggleStyle(.switch)
+                        .labelsHidden()
+                        .controlSize(.small)
+                }
             }
 
-            if settings.browserAutomationEnabled {
+            if !profiles.isEmpty {
+                if settings.browserAutomationEnabled {
+                    Divider()
+                    browserProfilePicker
+                } else {
+                    Text("Turn this on when you want the assistant to open sites, click buttons, and reuse one of your existing browser profiles.")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            } else {
                 Divider()
-                browserProfilePicker
+                Text(
+                    settings.browserAutomationEnabled
+                        ? "No supported Chrome, Brave, or Edge profiles were found on this Mac."
+                        : "Browser automation will appear after Open Assist finds a Chrome, Brave, or Edge profile on this Mac."
+                )
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
             }
         }
         .padding(12)
@@ -32,6 +51,10 @@ struct BrowserAutomationSettingsView: View {
         .onChange(of: settings.browserAutomationEnabled) { _ in
             refreshProfiles()
         }
+    }
+
+    private var shouldShowAutomationToggle: Bool {
+        !profiles.isEmpty || settings.browserAutomationEnabled
     }
 
     @ViewBuilder

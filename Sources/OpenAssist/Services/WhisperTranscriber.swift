@@ -10,6 +10,7 @@ final class WhisperTranscriber: NSObject {
     var onStatusUpdate: ((String) -> Void)?
     var onHUDAlert: ((SpeechTranscriberHUDAlert) -> Void)?
     var onAudioLevel: ((Float) -> Void)?
+    var onAudioWaveformBins: (([Float]) -> Void)?
     var onRecordingStateChange: ((Bool) -> Void)?
 
     private var audioEngine = AVAudioEngine()
@@ -269,8 +270,10 @@ final class WhisperTranscriber: NSObject {
             guard let self else { return }
 
             let level = self.normalizedAudioLevel(from: buffer)
+            let waveformBins = AudioWaveformShape.bins(from: buffer)
             DispatchQueue.main.async {
                 self.onAudioLevel?(level)
+                self.onAudioWaveformBins?(waveformBins)
             }
 
             let inputSignature = "\(buffer.format.sampleRate)-\(buffer.format.channelCount)-\(buffer.format.commonFormat.rawValue)-\(buffer.format.isInterleaved)"
@@ -328,6 +331,7 @@ final class WhisperTranscriber: NSObject {
             inputNode.removeTap(onBus: 0)
             audioEngine.stop()
             onAudioLevel?(0)
+            onAudioWaveformBins?(Array(repeating: 0, count: AudioWaveformShape.defaultBinCount))
             restoreMicSelection()
             isRecording = false
             onRecordingStateChange?(false)
@@ -345,6 +349,7 @@ final class WhisperTranscriber: NSObject {
 
         guard isRecording || isTranscribing else {
             onAudioLevel?(0)
+            onAudioWaveformBins?(Array(repeating: 0, count: AudioWaveformShape.defaultBinCount))
             onRecordingStateChange?(false)
             return
         }
@@ -389,6 +394,7 @@ final class WhisperTranscriber: NSObject {
             isTranscribing = false
             onRecordingStateChange?(false)
             onAudioLevel?(0)
+            onAudioWaveformBins?(Array(repeating: 0, count: AudioWaveformShape.defaultBinCount))
             restoreMicSelection()
             updateStatus("Whisper model not installed. Open Settings > Recognition to download one")
             CrashReporter.logWarning("Whisper finalize blocked: selected model disappeared (\(selectedModelID))")
@@ -406,6 +412,7 @@ final class WhisperTranscriber: NSObject {
             audioEngine.stop()
             audioEngine.reset()
             onAudioLevel?(0)
+            onAudioWaveformBins?(Array(repeating: 0, count: AudioWaveformShape.defaultBinCount))
         }
 
         var samplesToTranscribe: [Float] = []
@@ -721,6 +728,7 @@ final class WhisperTranscriber: NSObject {
             audioEngine.stop()
             audioEngine.reset()
             onAudioLevel?(0)
+            onAudioWaveformBins?(Array(repeating: 0, count: AudioWaveformShape.defaultBinCount))
         }
     }
 
@@ -995,6 +1003,7 @@ final class WhisperTranscriber: NSObject {
     var onStatusUpdate: ((String) -> Void)?
     var onHUDAlert: ((SpeechTranscriberHUDAlert) -> Void)?
     var onAudioLevel: ((Float) -> Void)?
+    var onAudioWaveformBins: (([Float]) -> Void)?
     var onRecordingStateChange: ((Bool) -> Void)?
 
     func requestPermissions(promptIfNeeded: Bool = true) {
@@ -1024,6 +1033,7 @@ final class WhisperTranscriber: NSObject {
     func stopRecording(emitFinalText: Bool = true) {
         onRecordingStateChange?(false)
         onAudioLevel?(0)
+        onAudioWaveformBins?(Array(repeating: 0, count: AudioWaveformShape.defaultBinCount))
     }
 }
 

@@ -8,6 +8,8 @@ private final class AssistantRuntimeEventRecorder: @unchecked Sendable {
     var transcriptEntries: [AssistantTranscriptEntry] = []
     var statusMessages: [String?] = []
     var hudStates: [AssistantHUDState] = []
+    var timelineItems: [AssistantTimelineItem] = []
+    var proposedPlans: [String?] = []
 }
 
 final class AssistantSessionInteractionTests: XCTestCase {
@@ -111,23 +113,37 @@ final class AssistantSessionInteractionTests: XCTestCase {
                 command: "swift test"
             )
         )
-        XCTAssertFalse(
+        XCTAssertTrue(
             runtime.isToolActivityAllowedForTesting(
                 mode: .plan,
                 rawType: "fileChange"
             )
         )
-        XCTAssertFalse(
+        XCTAssertTrue(
             runtime.isToolActivityAllowedForTesting(
                 mode: .plan,
                 rawType: "browserAutomation"
             )
         )
-        XCTAssertFalse(
+        XCTAssertTrue(
             runtime.isToolActivityAllowedForTesting(
                 mode: .plan,
                 rawType: "dynamicToolCall",
                 toolName: "computer_use"
+            )
+        )
+        XCTAssertTrue(
+            runtime.isToolActivityAllowedForTesting(
+                mode: .plan,
+                rawType: "dynamicToolCall",
+                toolName: "browser_use"
+            )
+        )
+        XCTAssertTrue(
+            runtime.isToolActivityAllowedForTesting(
+                mode: .plan,
+                rawType: "dynamicToolCall",
+                toolName: "app_action"
             )
         )
         XCTAssertTrue(
@@ -153,6 +169,20 @@ final class AssistantSessionInteractionTests: XCTestCase {
                 mode: .conversational,
                 rawType: "dynamicToolCall",
                 toolName: "computer_use"
+            )
+        )
+        XCTAssertFalse(
+            runtime.isToolActivityAllowedForTesting(
+                mode: .conversational,
+                rawType: "dynamicToolCall",
+                toolName: "browser_use"
+            )
+        )
+        XCTAssertFalse(
+            runtime.isToolActivityAllowedForTesting(
+                mode: .conversational,
+                rawType: "dynamicToolCall",
+                toolName: "app_action"
             )
         )
         XCTAssertTrue(
@@ -202,6 +232,39 @@ final class AssistantSessionInteractionTests: XCTestCase {
     }
 
     @MainActor
+    func testBrowserAndAppDynamicToolCallsUseFriendlyTitlesAndSummaries() {
+        let runtime = CodexAssistantRuntime()
+
+        let browserState = runtime.toolCallStateForTesting(from: [
+            "id": "tool-browser",
+            "type": "dynamicToolCall",
+            "tool": "browser_use",
+            "status": "running",
+            "arguments": ["task": "Open the team board in Edge."]
+        ])
+
+        XCTAssertEqual(browserState?.title, "Browser Use")
+        XCTAssertEqual(
+            runtime.activitySummaryForTesting(kind: .dynamicToolCall, title: browserState?.title ?? ""),
+            "Used the browser."
+        )
+
+        let appState = runtime.toolCallStateForTesting(from: [
+            "id": "tool-app",
+            "type": "dynamicToolCall",
+            "tool": "app_action",
+            "status": "running",
+            "arguments": ["task": "Reveal ~/Downloads in Finder."]
+        ])
+
+        XCTAssertEqual(appState?.title, "App Action")
+        XCTAssertEqual(
+            runtime.activitySummaryForTesting(kind: .dynamicToolCall, title: appState?.title ?? ""),
+            "Used a Mac app."
+        )
+    }
+
+    @MainActor
     func testSnakeCaseWebSearchUsesFriendlyTitleAndSummary() {
         let runtime = CodexAssistantRuntime()
 
@@ -231,6 +294,42 @@ final class AssistantSessionInteractionTests: XCTestCase {
     }
 
     @MainActor
+    func testTerminalAppActionsAlwaysRequireFreshConfirmation() {
+        let runtime = CodexAssistantRuntime()
+
+        XCTAssertTrue(
+            runtime.dynamicToolRequiresExplicitConfirmationForTesting(
+                toolName: "app_action",
+                arguments: [
+                    "task": "Run git push in Terminal.",
+                    "app": "Terminal",
+                    "command": "git push"
+                ]
+            )
+        )
+        XCTAssertTrue(
+            runtime.dynamicToolRequiresExplicitConfirmationForTesting(
+                toolName: "app_action",
+                arguments: [
+                    "task": "Create the calendar event now.",
+                    "app": "Calendar",
+                    "commit": true
+                ]
+            )
+        )
+        XCTAssertFalse(
+            runtime.dynamicToolRequiresExplicitConfirmationForTesting(
+                toolName: "app_action",
+                arguments: [
+                    "task": "Reveal ~/Downloads in Finder.",
+                    "app": "Finder",
+                    "path": "~/Downloads"
+                ]
+            )
+        )
+    }
+
+    @MainActor
     func testBlockedToolUseMessagesTellUserToSwitchModes() {
         let runtime = CodexAssistantRuntime()
 
@@ -255,6 +354,28 @@ final class AssistantSessionInteractionTests: XCTestCase {
         )
         XCTAssertTrue(computerUse.contains("live screen or browser"))
         XCTAssertTrue(computerUse.contains("attached image"))
+
+        let browserUse = runtime.blockedToolUseMessage(
+            for: .conversational,
+            activityTitle: "Browser Use"
+        )
+        XCTAssertTrue(browserUse.contains("Agentic mode"))
+
+        let appAction = runtime.blockedToolUseMessage(
+            for: .conversational,
+            activityTitle: "App Action"
+        )
+        XCTAssertTrue(appAction.contains("Agentic mode"))
+    }
+
+    @MainActor
+    func testAgenticModeExposesAllComputerControlDynamicTools() {
+        let runtime = CodexAssistantRuntime()
+
+        XCTAssertEqual(
+            runtime.dynamicToolNamesForTesting(mode: .agentic),
+            ["app_action", "browser_use", "computer_use"]
+        )
     }
 
     @MainActor
@@ -419,12 +540,15 @@ final class AssistantSessionInteractionTests: XCTestCase {
     }
 
     @MainActor
-    func testChatModeDoesNotExposeComputerUseDynamicTool() {
+    func testChatAndPlanModesDoNotExposeComputerControlDynamicTools() {
         let runtime = CodexAssistantRuntime()
 
         XCTAssertEqual(runtime.dynamicToolNamesForTesting(mode: .conversational), [])
         XCTAssertEqual(runtime.dynamicToolNamesForTesting(mode: .plan), [])
-        XCTAssertEqual(runtime.dynamicToolNamesForTesting(mode: .agentic), ["computer_use"])
+        XCTAssertEqual(
+            runtime.dynamicToolNamesForTesting(mode: .agentic),
+            ["app_action", "browser_use", "computer_use"]
+        )
     }
 
     @MainActor
@@ -662,6 +786,85 @@ final class AssistantSessionInteractionTests: XCTestCase {
         XCTAssertNil(
             AssistantStore.planExecutionSessionID(planSessionID: " \n ")
         )
+    }
+
+    @MainActor
+    func testResolvedSessionConfigurationFallsBackToDefaultsForLegacySessions() {
+        let legacySession = AssistantSessionSummary(
+            id: "legacy-thread",
+            title: "Legacy",
+            source: .appServer,
+            status: .completed,
+            cwd: nil,
+            updatedAt: Date(),
+            summary: nil,
+            latestModel: nil,
+            latestInteractionMode: nil,
+            latestReasoningEffort: nil,
+            latestServiceTier: nil,
+            latestUserMessage: nil,
+            latestAssistantMessage: nil
+        )
+
+        let configuration = AssistantStore.resolvedSessionConfiguration(
+            from: legacySession,
+            availableModels: [
+                AssistantModelOption(
+                    id: "gpt-5.4",
+                    displayName: "GPT-5.4",
+                    description: "Default",
+                    isDefault: true,
+                    hidden: false,
+                    supportedReasoningEfforts: ["high"],
+                    defaultReasoningEffort: "high"
+                )
+            ],
+            preferredModelID: "gpt-5.4"
+        )
+
+        XCTAssertEqual(configuration.modelID, "gpt-5.4")
+        XCTAssertEqual(configuration.interactionMode, AssistantInteractionMode.conversational)
+        XCTAssertEqual(configuration.reasoningEffort, AssistantReasoningEffort.high)
+        XCTAssertFalse(configuration.fastModeEnabled)
+    }
+
+    @MainActor
+    func testPlanModePromotesPlainFinalAssistantTextIntoPlanTimelineBeforeTurnIDClears() async {
+        let runtime = CodexAssistantRuntime()
+        let text = """
+        1. Inspect the existing speech flow.
+        2. Add the local TADA service.
+        3. Add a safe fallback.
+        """
+        let recorder = AssistantRuntimeEventRecorder()
+
+        runtime.onTimelineMutation = { mutation in
+            if case let .upsert(item) = mutation {
+                recorder.timelineItems.append(item)
+            }
+        }
+        runtime.onProposedPlan = { recorder.proposedPlans.append($0) }
+
+        runtime.configureStreamingTurnForTesting(
+            sessionID: "thread-plan",
+            turnID: "turn-plan",
+            text: text,
+            mode: .plan
+        )
+
+        await runtime.processTurnCompletedForTesting()
+
+        let finalAssistant = recorder.timelineItems.last {
+            $0.kind == .assistantFinal && $0.isStreaming == false
+        }
+        let promotedPlan = recorder.timelineItems.last {
+            $0.kind == .plan && $0.isStreaming == false
+        }
+
+        XCTAssertEqual(finalAssistant?.turnID, "turn-plan")
+        XCTAssertEqual(promotedPlan?.turnID, "turn-plan")
+        XCTAssertEqual(promotedPlan?.planText, text)
+        XCTAssertEqual(recorder.proposedPlans.last ?? nil, text)
     }
 
     @MainActor

@@ -138,20 +138,20 @@ actor AssistantComputerUseService {
         let pendingSafetyChecks: [[String: Any]]
     }
 
-    private struct DisplaySnapshot {
-        let image: CGImage
-        let imageSize: CGSize
-        let screenFrame: CGRect
-        let imageDataURL: String
-    }
+    private typealias DisplaySnapshot = LocalAutomationDisplaySnapshot
 
     private static let maxSteps = 24
     private static let defaultModelID = "gpt-5.4"
 
     private let session: URLSession
+    private let helper: LocalAutomationHelper
 
-    init(session: URLSession = .shared) {
+    init(
+        session: URLSession = .shared,
+        helper: LocalAutomationHelper = .shared
+    ) {
         self.session = session
+        self.helper = helper
     }
 
     func run(arguments: Any, preferredModelID: String?) async -> ToolExecutionResult {
@@ -441,66 +441,23 @@ actor AssistantComputerUseService {
         actions: [[String: Any]],
         previousSnapshot: DisplaySnapshot?
     ) async throws -> DisplaySnapshot {
-        guard AXIsProcessTrusted() else {
-            throw ServiceError.accessibilityRequired
-        }
-        guard CGPreflightScreenCaptureAccess() else {
-            _ = CGRequestScreenCaptureAccess()
-            throw ServiceError.screenRecordingRequired
-        }
-
-        let initialSnapshot: DisplaySnapshot
-        if let previousSnapshot {
-            initialSnapshot = previousSnapshot
-        } else {
-            initialSnapshot = try captureSnapshot()
-        }
-
-        var coordinateSnapshot = initialSnapshot
-        for action in actions {
-            let type = (action["type"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
-
-            switch type {
-            case "screenshot":
-                coordinateSnapshot = try captureSnapshot()
-            case "click":
-                let point = try screenPoint(from: action, snapshot: coordinateSnapshot)
-                try await click(at: point, button: button(from: action["button"] as? String), clickCount: 1)
-            case "double_click":
-                let point = try screenPoint(from: action, snapshot: coordinateSnapshot)
-                try await click(at: point, button: .left, clickCount: 2)
-            case "move":
-                let point = try screenPoint(from: action, snapshot: coordinateSnapshot)
-                try moveMouse(to: point)
-            case "drag":
-                let path = try dragPath(from: action, snapshot: coordinateSnapshot)
-                try await drag(along: path)
-            case "scroll":
-                let point = try screenPoint(from: action, snapshot: coordinateSnapshot)
-                let scrollX = number(from: action["scroll_x"]) ?? 0
-                let scrollY = number(from: action["scroll_y"]) ?? 0
-                try await scroll(at: point, deltaX: scrollX, deltaY: scrollY)
-            case "keypress":
-                let keys = (action["keys"] as? [Any])?.compactMap { value -> String? in
-                    if let text = value as? String {
-                        return text.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
-                    }
-                    return nil
-                } ?? []
-                try await keypress(keys)
-            case "type":
-                let text = (action["text"] as? String) ?? ""
-                try await typeText(text)
-            case "wait":
-                try await pause(for: 1.0)
+        do {
+            return try await helper.executeComputerActions(
+                actions,
+                previousSnapshot: previousSnapshot
+            )
+        } catch let error as LocalAutomationError {
+            switch error {
+            case .accessibilityRequired:
+                throw ServiceError.accessibilityRequired
+            case .screenRecordingRequired:
+                throw ServiceError.screenRecordingRequired
+            case .screenshotFailed:
+                throw ServiceError.screenshotFailed
             default:
-                continue
+                throw ServiceError.requestFailed(error.localizedDescription)
             }
-
-            try await pause(for: 0.18)
         }
-
-        return try captureSnapshot()
     }
 
     private func captureSnapshot() throws -> DisplaySnapshot {

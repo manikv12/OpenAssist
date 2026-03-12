@@ -14,6 +14,8 @@
         <true />
         <key>NSMicrophoneUsageDescription</key>
         <string>Open Assist needs microphone access to transcribe your voice.</string>
+        <key>NSAppleEventsUsageDescription</key>
+        <string>Open Assist uses Automation permission so it can control supported apps like browsers, Finder, Terminal, Calendar, and System Settings when you approve a task.</string>
         <key>NSSpeechRecognitionUsageDescription</key>
         <string>Open Assist uses speech recognition so you can transcribe while holding the shortcut.</string>
         <key>LSMinimumSystemVersion</key>

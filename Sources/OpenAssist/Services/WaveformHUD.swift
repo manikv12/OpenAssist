@@ -57,6 +57,10 @@ final class WaveformHUDManager {
         waveformModel.updateLevel(level)
     }
 
+    func updateBars(_ bars: [Float]) {
+        waveformModel.updateBars(bars)
+    }
+
     func flashEvent(message: String, symbolName: String = "checkmark.circle.fill", duration: TimeInterval = 1.4) {
         let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
@@ -283,32 +287,36 @@ final class WaveformHUDManager {
 @MainActor
 final class WaveformModel: ObservableObject {
     @Published var level: Double = 0
-    @Published var phase: Double = 0
-    @Published var impulse: Double = 0
+    @Published var barLevels: [Double] = Array(
+        repeating: 0,
+        count: WaveformMeterEngine.barCount
+    )
 
-    private var targetLevel: Double = 0
+    private var meter = WaveformMeterEngine()
     private var animationTimer: Timer?
 
     func reset() {
-        level = 0
-        phase = 0
-        impulse = 0
-        targetLevel = 0
+        meter.reset()
+        syncFromMeter()
     }
 
     func updateLevel(_ value: Float) {
-        targetLevel = max(0, min(1, Double(value)))
+        meter.updateTargetLevel(value)
+    }
+
+    func updateBars(_ values: [Float]) {
+        meter.updateTargetBarLevels(values)
     }
 
     func startAnimating() {
         guard animationTimer == nil else { return }
 
-        let timer = Timer(timeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
+        let timer = Timer(timeInterval: 1.0 / 45.0, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 self?.tick()
             }
         }
-        timer.tolerance = 1.0 / 120.0
+        timer.tolerance = 1.0 / 180.0
         RunLoop.main.add(timer, forMode: .common)
         animationTimer = timer
     }
@@ -319,17 +327,13 @@ final class WaveformModel: ObservableObject {
     }
 
     private func tick() {
-        let delta = targetLevel - level
-        let attack: Double = 0.14
-        let release: Double = 0.08
-        level += delta * (delta > 0 ? attack : release)
+        meter.tick()
+        syncFromMeter()
+    }
 
-        let spike = max(0, delta)
-        impulse = max(spike, impulse * 0.85)
-        targetLevel *= 0.93
-
-        // Gentle, smooth phase progression
-        phase += 0.12 + (level * 0.30) + (impulse * 0.15)
+    private func syncFromMeter() {
+        level = meter.level
+        barLevels = meter.barLevels
     }
 }
 
@@ -343,7 +347,11 @@ struct WaveformPanelView: View {
                 .fill(Color.red)
                 .frame(width: 8, height: 8)
 
-            SoundWaveLine(level: model.level, phase: model.phase, impulse: model.impulse, theme: settings.waveformTheme)
+            SoundWaveLine(
+                level: model.level,
+                barLevels: model.barLevels,
+                theme: settings.waveformTheme
+            )
                 .frame(height: 22)
         }
         .padding(.horizontal, 10)
@@ -366,8 +374,7 @@ struct WaveformThemePreview: View {
 
             SoundWaveLine(
                 level: 0.48,
-                phase: 1.2,
-                impulse: 0.12,
+                barLevels: [0.14, 0.26, 0.46, 0.72, 0.46, 0.26, 0.14],
                 theme: theme
             )
             .frame(height: 22)
@@ -584,20 +591,30 @@ private struct HUDPillActionButtonStyle: ButtonStyle {
 
 struct SoundWaveLine: View {
     let level: Double
-    let phase: Double
-    let impulse: Double
+    let barLevels: [Double]
     let theme: WaveformTheme
 
-    private let barCount = 7
     private let barSpacing: CGFloat = 3.0
 
     var body: some View {
         HStack(spacing: barSpacing) {
-            ForEach(0..<barCount, id: \.self) { index in
-                BarView(index: index, barCount: barCount, level: level, phase: phase, impulse: impulse, theme: theme)
+            ForEach(Array(resolvedBarLevels.enumerated()), id: \.offset) { entry in
+                BarView(
+                    index: entry.offset,
+                    barCount: resolvedBarLevels.count,
+                    level: level,
+                    barLevel: entry.element,
+                    theme: theme
+                )
             }
         }
         .frame(height: 24, alignment: .center)
+    }
+
+    private var resolvedBarLevels: [Double] {
+        let fallback = Array(repeating: level, count: WaveformMeterEngine.barCount)
+        guard barLevels.count == WaveformMeterEngine.barCount else { return fallback }
+        return barLevels
     }
 }
 
@@ -605,8 +622,7 @@ struct BarView: View {
     let index: Int
     let barCount: Int
     let level: Double
-    let phase: Double
-    let impulse: Double
+    let barLevel: Double
     let theme: WaveformTheme
 
     var body: some View {
@@ -616,7 +632,7 @@ struct BarView: View {
     }
 
     private var barGradient: LinearGradient {
-        let mix = min(1, level + impulse * 0.3)
+        let mix = min(1, (level * 0.45) + (barLevel * 0.85))
         // Increase opacity for a more vibrant, colourful look while keeping it professional
         let opacity = 0.75 + mix * 0.25
         let t = Double(index) / Double(max(1, barCount - 1))
@@ -703,20 +719,75 @@ struct BarView: View {
     }
 
     private func calculateHeight() -> CGFloat {
-        let t = Double(index) / Double(max(1, barCount - 1))
-
-        let speed = phase * 0.15
-        let centerOffset = abs(t - 0.5) * 2.0
-        let bellCurve = exp(-pow(centerOffset / 0.7, 2))
-
-        let wave = sin((t * 2.5 + speed + Double(index) * 0.6) * .pi * 2.0)
-        let intensity = 0.18 + (level * 0.85) + (impulse * 0.3)
-
         let minHeight: CGFloat = 5.0
         let maxHeight: CGFloat = 22.0
         let diff = maxHeight - minHeight
+        let normalized = CGFloat(pow(max(0, min(barLevel, 1)), 0.78))
+        return min(maxHeight, minHeight + normalized * diff)
+    }
+}
 
-        let heightVariation = CGFloat(abs(wave)) * CGFloat(intensity) * CGFloat(bellCurve) * diff
-        return min(maxHeight, minHeight + heightVariation)
+struct WaveformMeterEngine {
+    static let barCount = 7
+
+    private static let noiseFloor = 0.04
+    private static let visualHeadroom = 0.90
+
+    private(set) var level: Double = 0
+    private(set) var barLevels: [Double] = Array(repeating: 0, count: barCount)
+
+    private var targetLevel: Double = 0
+    private var targetBarLevels: [Double] = Array(repeating: 0, count: barCount)
+
+    mutating func reset() {
+        level = 0
+        targetLevel = 0
+        barLevels = Array(repeating: 0, count: Self.barCount)
+        targetBarLevels = Array(repeating: 0, count: Self.barCount)
+    }
+
+    mutating func updateTargetLevel(_ value: Float) {
+        targetLevel = Self.processedLevel(from: Double(value))
+    }
+
+    mutating func updateTargetBarLevels(_ values: [Float]) {
+        let padded = (0..<Self.barCount).map { index -> Double in
+            let raw = index < values.count ? Double(max(0, min(1, values[index]))) : 0
+            return min(Self.visualHeadroom, raw)
+        }
+        targetBarLevels = Self.blendedBarTargets(from: padded)
+    }
+
+    mutating func tick() {
+        let delta = targetLevel - level
+        let attack: Double = 0.44
+        let release: Double = 0.22
+        level += delta * (delta > 0 ? attack : release)
+
+        for index in 0..<barLevels.count {
+            let floor = level * 0.14
+            let source = max(targetBarLevels[index], floor)
+            let current = barLevels[index]
+            let response: Double = source > current ? 0.72 : 0.32
+            barLevels[index] = current + ((source - current) * response)
+        }
+    }
+
+    static func processedLevel(from rawLevel: Double) -> Double {
+        let clamped = max(0, min(1, rawLevel))
+        guard clamped > noiseFloor else { return 0 }
+
+        let normalized = (clamped - noiseFloor) / (1 - noiseFloor)
+        let shaped = pow(normalized, 1.08)
+        return max(0, min(1, shaped))
+    }
+
+    private static func blendedBarTargets(from values: [Double]) -> [Double] {
+        values.enumerated().map { index, value in
+            let left = index > 0 ? values[index - 1] : value
+            let right = index + 1 < values.count ? values[index + 1] : value
+            let blended = (left * 0.12) + (value * 0.76) + (right * 0.12)
+            return min(Self.visualHeadroom, blended)
+        }
     }
 }
