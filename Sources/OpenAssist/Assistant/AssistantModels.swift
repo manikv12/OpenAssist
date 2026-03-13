@@ -218,6 +218,23 @@ struct TokenUsageSnapshot: Equatable, Sendable {
         return usedK
     }
 
+    var exactContextSummary: String {
+        let used = formatExactTokenCount(currentContextTokens)
+        if let window = modelContextWindow, window > 0 {
+            return "\(used) of \(formatExactTokenCount(window)) tokens"
+        }
+        return "\(used) tokens"
+    }
+
+    var contextTooltipDetail: String {
+        if let window = modelContextWindow, window > 0 {
+            let usedPercent = Int(round((contextUsageFraction ?? 0) * 100))
+            let remaining = max(window - currentContextTokens, 0)
+            return "\(usedPercent)% of context used - \(formatExactTokenCount(remaining)) left"
+        }
+        return "Current context in this chat"
+    }
+
     private func formatTokenCount(_ count: Int) -> String {
         if count >= 1_000_000 {
             return String(format: "%.1fM", Double(count) / 1_000_000)
@@ -225,6 +242,10 @@ struct TokenUsageSnapshot: Equatable, Sendable {
             return String(format: "%.1fK", Double(count) / 1_000)
         }
         return "\(count)"
+    }
+
+    private func formatExactTokenCount(_ count: Int) -> String {
+        count.formatted(.number.grouping(.automatic))
     }
 }
 
@@ -498,9 +519,9 @@ enum AssistantInteractionMode: String, CaseIterable, Codable, Sendable {
 
     var icon: String {
         switch self {
-        case .conversational: return "bubble.left.and.text.bubble.right"
-        case .plan: return "list.bullet.rectangle"
-        case .agentic: return "hammer"
+        case .conversational: return "bubble.left.and.bubble.right.fill"
+        case .plan: return "checklist"
+        case .agentic: return AssistantChromeSymbol.action
         }
     }
 
@@ -803,6 +824,7 @@ typealias AssistantFeatureController = AssistantStore
 @MainActor
 final class AssistantStore: ObservableObject {
     static let shared = AssistantStore()
+    private static let timelineCacheSaveDebounceInterval: TimeInterval = 0.35
 
     @Published private(set) var runtimeHealth: AssistantRuntimeHealth = .idle
     @Published private(set) var installGuidance: AssistantInstallGuidance = .placeholder
@@ -873,6 +895,15 @@ final class AssistantStore: ObservableObject {
     @Published private(set) var currentMemoryFileURL: URL?
     @Published private(set) var memoryStatusMessage: String?
     @Published private(set) var pendingMemorySuggestions: [AssistantMemorySuggestion] = []
+    @Published private(set) var assistantVoiceHealth: AssistantSpeechHealth = .unknown
+    @Published private(set) var assistantVoiceStatusMessage: String?
+    @Published private(set) var isRefreshingAssistantVoiceHealth = false
+    @Published private(set) var isRefreshingAssistantHumeVoices = false
+    @Published private(set) var isTestingAssistantVoice = false
+    @Published private(set) var isRemovingAssistantVoiceInstallation = false
+    @Published private(set) var assistantVoicePlaybackActive = false
+    @Published private(set) var assistantHumeVoiceOptions: [AssistantHumeVoiceOption] = []
+    @Published private(set) var assistantHumeConversationSnapshot = AssistantHumeConversationSnapshot()
     @Published var showMemorySuggestionReview = false
 
     let installSupport: CodexInstallSupport
@@ -882,6 +913,10 @@ final class AssistantStore: ObservableObject {
     private let threadMemoryService: AssistantThreadMemoryService
     private let memoryRetrievalService: AssistantMemoryRetrievalService
     private let memorySuggestionService: AssistantMemorySuggestionService
+    private let assistantSpeechPlaybackService: AssistantSpeechPlaybackService
+    private let assistantLegacyTADACleanupSupport: AssistantLegacyTADACleanupSupport
+    private let humeVoiceCatalogService: HumeVoiceCatalogService
+    private let humeConversationService: HumeConversationService
     private var lastSubmittedPrompt: String?
     private var transcriptSessionID: String?
     private var timelineSessionID: String?
@@ -898,6 +933,9 @@ final class AssistantStore: ObservableObject {
     private var memoryScopeBySessionID: [String: MemoryScopeContext] = [:]
     private var pendingResumeContextSessionIDs: Set<String> = []
     private var lastSubmittedAttachments: [AssistantAttachment] = []
+    private var lastSpokenAssistantTimelineItemID: String?
+    private var lastSpokenAssistantTurnID: String?
+    private var pendingTimelineCacheSaveWorkItems: [String: DispatchWorkItem] = [:]
 
     private init(
         installSupport: CodexInstallSupport = CodexInstallSupport(),
@@ -907,7 +945,9 @@ final class AssistantStore: ObservableObject {
         memoryStore: MemorySQLiteStore? = nil,
         threadMemoryService: AssistantThreadMemoryService? = nil,
         memoryRetrievalService: AssistantMemoryRetrievalService? = nil,
-        memorySuggestionService: AssistantMemorySuggestionService? = nil
+        memorySuggestionService: AssistantMemorySuggestionService? = nil,
+        assistantSpeechPlaybackService: AssistantSpeechPlaybackService? = nil,
+        assistantLegacyTADACleanupSupport: AssistantLegacyTADACleanupSupport = AssistantLegacyTADACleanupSupport()
     ) {
         self.installSupport = installSupport
         self.sessionCatalog = sessionCatalog
@@ -924,6 +964,17 @@ final class AssistantStore: ObservableObject {
         self.memorySuggestionService = memorySuggestionService ?? AssistantMemorySuggestionService(
             threadMemoryService: resolvedThreadMemoryService,
             store: resolvedMemoryStore
+        )
+        let humeTokenService = HumeAccessTokenService(settings: self.settings)
+        let humeConversationConfigService = HumeConversationConfigService(settings: self.settings)
+        self.assistantSpeechPlaybackService = assistantSpeechPlaybackService
+            ?? AssistantSpeechPlaybackService(settings: self.settings)
+        self.assistantLegacyTADACleanupSupport = assistantLegacyTADACleanupSupport
+        self.humeVoiceCatalogService = HumeVoiceCatalogService(settings: self.settings)
+        self.humeConversationService = HumeConversationService(
+            settings: self.settings,
+            tokenService: humeTokenService,
+            configService: humeConversationConfigService
         )
 
         self.runtime.onHealthUpdate = { [weak self] health in
@@ -1044,6 +1095,21 @@ final class AssistantStore: ObservableObject {
                     userPrompt: userPrompt,
                     assistantResponse: assistantResponse
                 )
+            }
+        }
+        self.assistantSpeechPlaybackService.onPlaybackStateChange = { [weak self] isPlaying in
+            Task { @MainActor in
+                self?.assistantVoicePlaybackActive = isPlaying
+            }
+        }
+        self.humeConversationService.onSnapshotChange = { [weak self] snapshot in
+            Task { @MainActor in
+                self?.assistantHumeConversationSnapshot = snapshot
+            }
+        }
+        self.humeConversationService.onStatusMessage = { [weak self] message in
+            Task { @MainActor in
+                self?.assistantVoiceStatusMessage = message
             }
         }
 
@@ -2233,6 +2299,34 @@ final class AssistantStore: ObservableObject {
         settings.browserAutomationEnabled && selectedBrowserProfile != nil
     }
 
+    var assistantFallbackVoiceOptions: [AssistantSpeechVoiceOption] {
+        assistantSpeechPlaybackService.availableMacOSVoices()
+    }
+
+    var assistantVoiceLegacyCleanupAvailable: Bool {
+        assistantLegacyTADACleanupSupport.hasLegacyArtifacts()
+    }
+
+    var assistantSelectedHumeVoiceSummary: String {
+        if let selectedVoice = assistantHumeVoiceOptions.first(where: { $0.id == settings.assistantHumeVoiceID }) {
+            return selectedVoice.displayLabel
+        }
+        if let selectedVoiceName = settings.assistantHumeVoiceName.nonEmpty {
+            return "\(selectedVoiceName) (\(settings.assistantHumeVoiceSource.displayName))"
+        }
+        return "No Hume voice selected"
+    }
+
+    var canStartHumeConversationMode: Bool {
+        settings.assistantHumeAPIKey.nonEmpty != nil
+            && settings.assistantHumeSecretKey.nonEmpty != nil
+            && settings.assistantHumeVoiceID.nonEmpty != nil
+    }
+
+    var isHumeConversationConnected: Bool {
+        assistantHumeConversationSnapshot.phase != .disconnected
+    }
+
     func selectBrowserProfile(_ profile: BrowserProfile) {
         settings.browserSelectedProfileID = profile.id
         showBrowserProfilePicker = false
@@ -2372,6 +2466,129 @@ final class AssistantStore: ObservableObject {
             try process.run()
         } catch {
             lastStatusMessage = "Could not open Terminal automatically. Run this command yourself: \(command)"
+        }
+    }
+
+    func refreshAssistantVoiceHealth() async {
+        isRefreshingAssistantVoiceHealth = true
+        assistantVoiceHealth = await assistantSpeechPlaybackService.healthStatus()
+        isRefreshingAssistantVoiceHealth = false
+    }
+
+    func refreshAssistantHumeVoices() async {
+        guard settings.assistantHumeAPIKey.nonEmpty != nil else {
+            assistantHumeVoiceOptions = []
+            assistantVoiceStatusMessage = "Add your Hume API key first, then refresh voices."
+            return
+        }
+
+        isRefreshingAssistantHumeVoices = true
+        defer { isRefreshingAssistantHumeVoices = false }
+
+        do {
+            let voices = try await humeVoiceCatalogService.listVoices(source: settings.assistantHumeVoiceSource)
+            assistantHumeVoiceOptions = voices
+            if let selectedVoice = voices.first(where: { $0.id == settings.assistantHumeVoiceID }) {
+                settings.assistantHumeVoiceName = selectedVoice.name
+            } else if let firstVoice = voices.first, settings.assistantHumeVoiceID.isEmpty {
+                settings.assistantHumeVoiceID = firstVoice.id
+                settings.assistantHumeVoiceName = firstVoice.name
+            }
+            assistantVoiceStatusMessage = voices.isEmpty
+                ? "No Hume voices were available for the selected source."
+                : "Loaded \(voices.count) Hume voice\(voices.count == 1 ? "" : "s")."
+        } catch {
+            assistantHumeVoiceOptions = []
+            assistantVoiceStatusMessage = error.localizedDescription
+        }
+    }
+
+    func testAssistantVoiceOutput() async {
+        isTestingAssistantVoice = true
+        defer { isTestingAssistantVoice = false }
+
+        do {
+            try await assistantSpeechPlaybackService.speak(
+                text: "This is an Open Assist voice test.",
+                    request: assistantSpeechRequest(
+                        text: "This is an Open Assist voice test.",
+                        sessionID: selectedSessionID,
+                        turnID: nil,
+                        timelineItemID: "assistant-voice-test"
+                    )
+                )
+            assistantVoiceStatusMessage = "Played the assistant voice test."
+        } catch {
+            assistantVoiceStatusMessage = error.localizedDescription
+        }
+
+        await refreshAssistantVoiceHealth()
+    }
+
+    func stopAssistantVoicePlayback() {
+        assistantSpeechPlaybackService.stopCurrentPlayback()
+        assistantVoiceStatusMessage = "Assistant speech stopped."
+    }
+
+    func removeLegacyAssistantVoiceData() async {
+        isRemovingAssistantVoiceInstallation = true
+        defer { isRemovingAssistantVoiceInstallation = false }
+
+        do {
+            assistantSpeechPlaybackService.stopCurrentPlayback()
+            await humeConversationService.endConversation()
+            assistantVoiceStatusMessage = try assistantLegacyTADACleanupSupport.removeLegacyArtifacts()
+        } catch {
+            assistantVoiceStatusMessage = error.localizedDescription
+        }
+
+        await refreshAssistantVoiceHealth()
+    }
+
+    func startHumeConversation() async {
+        guard canStartHumeConversationMode else {
+            assistantVoiceStatusMessage = "Add your Hume keys and choose a Hume voice first."
+            return
+        }
+        await humeConversationService.startConversation()
+    }
+
+    func toggleHumeConversationMicrophoneMute() {
+        humeConversationService.toggleMicrophoneMute()
+    }
+
+    func stopHumeConversationSpeaking() async {
+        await humeConversationService.stopSpeaking()
+    }
+
+    func endHumeConversation() async {
+        await humeConversationService.endConversation()
+    }
+
+    func selectAssistantHumeVoice(_ voice: AssistantHumeVoiceOption) {
+        settings.assistantHumeVoiceID = voice.id
+        settings.assistantHumeVoiceName = voice.name
+        settings.assistantHumeVoiceSource = voice.source
+        assistantVoiceStatusMessage = "Selected \(voice.displayLabel) for Hume voice."
+    }
+
+    func replayAssistantVoice(text: String, sessionID: String?, turnID: String?, timelineItemID: String?) {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                try await self.assistantSpeechPlaybackService.speak(
+                    text: text,
+                    request: self.assistantSpeechRequest(
+                        text: text,
+                        sessionID: sessionID,
+                        turnID: turnID,
+                        timelineItemID: timelineItemID
+                    )
+                )
+                self.assistantVoiceStatusMessage = "Played the assistant reply again."
+            } catch {
+                self.assistantVoiceStatusMessage = error.localizedDescription
+            }
         }
     }
 
@@ -2602,7 +2819,7 @@ final class AssistantStore: ObservableObject {
             if sessionsMatch(timelineSessionID, normalizedSessionID) || sessionsMatch(selectedSessionID, normalizedSessionID) {
                 setVisibleTimeline([], for: normalizedSessionID)
             }
-            persistTimelineCacheIfNeeded(sessionID: normalizedSessionID, items: [])
+            persistTimelineCacheIfNeeded(sessionID: normalizedSessionID, items: [], force: true)
 
         case .remove(let id):
             guard let targetSessionID = (timelineSessionID ?? selectedSessionID)?.nonEmpty else {
@@ -2618,15 +2835,17 @@ final class AssistantStore: ObservableObject {
             if sessionsMatch(timelineSessionID, targetSessionID) || sessionsMatch(selectedSessionID, targetSessionID) {
                 setVisibleTimeline(items, for: targetSessionID)
             }
-            persistTimelineCacheIfNeeded(sessionID: targetSessionID, items: items)
+            persistTimelineCacheIfNeeded(sessionID: targetSessionID, items: items, force: true)
 
         case .upsert(let item):
             let targetSessionID = item.sessionID?.nonEmpty
                 ?? runtime.currentSessionID?.nonEmpty
                 ?? selectedSessionID?.nonEmpty
 
+            let previousVisibleItems = timelineItems
             var items = targetSessionID.flatMap { timelineItemsBySessionID[$0] }
                 ?? (sessionsMatch(timelineSessionID, targetSessionID) ? timelineItems : [])
+            let existingItem = items.first(where: { $0.id == item.id })
 
             if let existingIndex = items.firstIndex(where: { $0.id == item.id }) {
                 items[existingIndex] = item
@@ -2639,14 +2858,80 @@ final class AssistantStore: ObservableObject {
             if let targetSessionID {
                 timelineItemsBySessionID[targetSessionID] = items
                 if sessionsMatch(selectedSessionID, targetSessionID) || sessionsMatch(timelineSessionID, targetSessionID) {
-                    setVisibleTimeline(items, for: targetSessionID)
+                    if !applyVisibleTimelineTailUpdateIfPossible(
+                        previousItems: previousVisibleItems,
+                        updatedItems: items,
+                        updatedItem: item,
+                        sessionID: targetSessionID
+                    ) {
+                        setVisibleTimeline(items, for: targetSessionID)
+                    }
                 }
-                persistTimelineCacheIfNeeded(sessionID: targetSessionID, items: items)
+                if item.cacheable || existingItem?.cacheable == true {
+                    persistTimelineCacheIfNeeded(
+                        sessionID: targetSessionID,
+                        items: items,
+                        force: shouldForceTimelineCachePersistence(for: item)
+                    )
+                }
             } else {
                 timelineItems = items
                 rebuildRenderItemsCache()
             }
+
+            maybeSpeakAssistantFinal(item, existingItem: existingItem)
         }
+    }
+
+    private func maybeSpeakAssistantFinal(_ item: AssistantTimelineItem, existingItem: AssistantTimelineItem?) {
+        guard AssistantSpeechTrigger.shouldAutoSpeak(
+            incoming: item,
+            existingItem: existingItem,
+            featureEnabled: settings.assistantVoiceOutputEnabled,
+            lastSpokenTimelineItemID: lastSpokenAssistantTimelineItemID
+        ) else {
+            return
+        }
+
+        let speechText = AssistantVisibleTextSanitizer.clean(item.text) ?? item.text ?? ""
+        lastSpokenAssistantTimelineItemID = item.id
+        lastSpokenAssistantTurnID = item.turnID
+
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                try await self.assistantSpeechPlaybackService.speak(
+                    text: speechText,
+                    request: self.assistantSpeechRequest(
+                        text: speechText,
+                        sessionID: item.sessionID,
+                        turnID: item.turnID,
+                        timelineItemID: item.id
+                    )
+                )
+            } catch {
+                self.assistantVoiceStatusMessage = error.localizedDescription
+            }
+        }
+    }
+
+    private func assistantSpeechRequest(
+        text: String,
+        sessionID: String?,
+        turnID: String?,
+        timelineItemID: String?
+    ) -> AssistantSpeechRequest {
+        AssistantSpeechRequest(
+            text: text,
+            sessionID: sessionID,
+            turnID: turnID,
+            timelineItemID: timelineItemID,
+            preferredEngine: settings.assistantVoiceEngine,
+            fallbackPolicy: settings.assistantTTSFallbackToMacOS ? .macOS : .disabled,
+            timeout: AssistantHumeDefaults.ttsTimeout,
+            voicePromptReference: nil,
+            promptText: nil
+        )
     }
 
     private func updateToolCallActivity(_ calls: [AssistantToolCallState]) {
@@ -3221,6 +3506,33 @@ final class AssistantStore: ObservableObject {
         )
     }
 
+    private func applyVisibleTimelineTailUpdateIfPossible(
+        previousItems: [AssistantTimelineItem],
+        updatedItems: [AssistantTimelineItem],
+        updatedItem: AssistantTimelineItem,
+        sessionID: String
+    ) -> Bool {
+        guard !updatedItems.isEmpty,
+              previousItems.count == updatedItems.count,
+              previousItems.last?.id == updatedItem.id,
+              updatedItems.last?.id == updatedItem.id,
+              updatedItem.kind != .activity,
+              !cachedRenderItems.isEmpty,
+              case .timeline(let previousRenderItem) = cachedRenderItems[cachedRenderItems.count - 1],
+              previousRenderItem.id == updatedItem.id,
+              shouldRenderTimelineItem(
+                updatedItem,
+                planTurnIDs: planTurnIDsForVisibleTimeline(in: updatedItems)
+              ) else {
+            return false
+        }
+
+        timelineItems = updatedItems
+        timelineSessionID = sessionID
+        cachedRenderItems[cachedRenderItems.count - 1] = .timeline(updatedItem)
+        return true
+    }
+
     private func setVisibleTimeline(_ items: [AssistantTimelineItem], for sessionID: String?) {
         timelineItems = items
         timelineSessionID = sessionID
@@ -3277,37 +3589,53 @@ final class AssistantStore: ObservableObject {
         }
     }
 
-    /// Rebuilds the cached render items from the current timeline items.
-    /// Called only when timeline data actually changes, avoiding the expensive
-    /// recomputation that previously happened on every @Published update.
-    private func rebuildRenderItemsCache() {
-        let planIDs = Set(
-            timelineItems.compactMap { item -> String? in
+    private func planTurnIDsForVisibleTimeline(in items: [AssistantTimelineItem]) -> Set<String> {
+        Set(
+            items.compactMap { item -> String? in
                 guard item.kind == .plan else { return nil }
                 return item.turnID?.assistantNonEmpty
             }
         )
+    }
 
-        let visible = timelineItems.filter { item in
-            switch item.kind {
-            case .userMessage, .system:
-                return item.text?.assistantNonEmpty != nil
-            case .assistantProgress, .assistantFinal:
-                if let turnID = item.turnID?.assistantNonEmpty,
-                   planIDs.contains(turnID) {
-                    return false
-                }
-                return AssistantVisibleTextSanitizer.clean(item.text)?.assistantNonEmpty != nil
-            case .activity:
-                return item.activity != nil
-            case .permission:
-                return item.permissionRequest != nil
-            case .plan:
-                return item.planText?.assistantNonEmpty != nil
+    private func shouldRenderTimelineItem(
+        _ item: AssistantTimelineItem,
+        planTurnIDs: Set<String>
+    ) -> Bool {
+        switch item.kind {
+        case .userMessage, .system:
+            return item.text?.assistantNonEmpty != nil
+        case .assistantProgress, .assistantFinal:
+            if let turnID = item.turnID?.assistantNonEmpty,
+               planTurnIDs.contains(turnID) {
+                return false
             }
+            return AssistantVisibleTextSanitizer.clean(item.text)?.assistantNonEmpty != nil
+        case .activity:
+            return item.activity != nil
+        case .permission:
+            return item.permissionRequest != nil
+        case .plan:
+            return item.planText?.assistantNonEmpty != nil
         }
+    }
 
-        cachedRenderItems = buildAssistantTimelineRenderItems(from: visible)
+    private func visibleTimelineItemsForRendering(
+        from items: [AssistantTimelineItem]
+    ) -> [AssistantTimelineItem] {
+        let planTurnIDs = planTurnIDsForVisibleTimeline(in: items)
+        return items.filter { item in
+            shouldRenderTimelineItem(item, planTurnIDs: planTurnIDs)
+        }
+    }
+
+    /// Rebuilds the cached render items from the current timeline items.
+    /// Called only when timeline data actually changes, avoiding the expensive
+    /// recomputation that previously happened on every @Published update.
+    private func rebuildRenderItemsCache() {
+        cachedRenderItems = buildAssistantTimelineRenderItems(
+            from: visibleTimelineItemsForRendering(from: timelineItems)
+        )
     }
 
     private func mergeTimelineHistory(
@@ -3524,14 +3852,53 @@ final class AssistantStore: ObservableObject {
         return lhs.caseInsensitiveCompare(rhs) == .orderedSame
     }
 
-    private func persistTimelineCacheIfNeeded(sessionID: String?, items: [AssistantTimelineItem]? = nil) {
+    private func shouldForceTimelineCachePersistence(for item: AssistantTimelineItem) -> Bool {
+        guard item.cacheable else { return false }
+
+        switch item.kind {
+        case .assistantProgress, .plan:
+            return !item.isStreaming
+        case .activity:
+            return item.activity?.isActive != true
+        case .permission, .system:
+            return true
+        case .userMessage, .assistantFinal:
+            return false
+        }
+    }
+
+    private func persistTimelineCacheIfNeeded(
+        sessionID: String?,
+        items: [AssistantTimelineItem]? = nil,
+        force: Bool = false
+    ) {
         guard let sessionID = sessionID?.nonEmpty else { return }
         let ownedSessionIDs = Set(settings.assistantOwnedThreadIDs.map { $0.lowercased() })
         guard ownedSessionIDs.contains(sessionID.lowercased()) else { return }
         let itemsToSave = items
             ?? timelineItemsBySessionID[sessionID]
             ?? (sessionsMatch(timelineSessionID, sessionID) ? timelineItems : [])
-        sessionCatalog.saveNormalizedTimeline(itemsToSave, for: sessionID)
+
+        if force {
+            pendingTimelineCacheSaveWorkItems[sessionID]?.cancel()
+            pendingTimelineCacheSaveWorkItems[sessionID] = nil
+            sessionCatalog.saveNormalizedTimeline(itemsToSave, for: sessionID)
+            return
+        }
+
+        pendingTimelineCacheSaveWorkItems[sessionID]?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.sessionCatalog.saveNormalizedTimeline(itemsToSave, for: sessionID)
+                self.pendingTimelineCacheSaveWorkItems[sessionID] = nil
+            }
+        }
+        pendingTimelineCacheSaveWorkItems[sessionID] = workItem
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + Self.timelineCacheSaveDebounceInterval,
+            execute: workItem
+        )
     }
 
     private static func resumeContextRoleLabel(for role: AssistantTranscriptRole) -> String {

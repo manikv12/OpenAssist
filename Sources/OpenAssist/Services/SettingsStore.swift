@@ -574,6 +574,16 @@ final class SettingsStore: ObservableObject {
         static let assistantFloatingHUDEnabled = "OpenAssist.assistantFloatingHUDEnabled"
         static let assistantCompactPresentationStyle = "OpenAssist.assistantCompactPresentationStyle"
         static let assistantBetaWarningAcknowledged = "OpenAssist.assistantBetaWarningAcknowledged"
+        static let assistantVoiceOutputEnabled = "OpenAssist.assistantVoiceOutputEnabled"
+        static let assistantVoiceEngine = "OpenAssist.assistantVoiceEngine"
+        static let assistantHumeVoiceID = "OpenAssist.assistantHumeVoiceID"
+        static let assistantHumeVoiceName = "OpenAssist.assistantHumeVoiceName"
+        static let assistantHumeVoiceSource = "OpenAssist.assistantHumeVoiceSource"
+        static let assistantHumeConversationConfigID = "OpenAssist.assistantHumeConversationConfigID"
+        static let assistantHumeConversationConfigVersion = "OpenAssist.assistantHumeConversationConfigVersion"
+        static let assistantTTSFallbackToMacOS = "OpenAssist.assistantTTSFallbackToMacOS"
+        static let assistantTTSFallbackVoiceIdentifier = "OpenAssist.assistantTTSFallbackVoiceIdentifier"
+        static let assistantInterruptCurrentSpeechOnNewReply = "OpenAssist.assistantInterruptCurrentSpeechOnNewReply"
         static let assistantPreferredModelID = "OpenAssist.assistantPreferredModelID"
         static let assistantOwnedThreadIDs = "OpenAssist.assistantOwnedThreadIDs"
         static let browserAutomationEnabled = "OpenAssist.browserAutomationEnabled"
@@ -1222,6 +1232,123 @@ final class SettingsStore: ObservableObject {
         }
     }
 
+    @Published var assistantVoiceOutputEnabled: Bool {
+        didSet {
+            save()
+        }
+    }
+
+    @Published var assistantVoiceEngineRawValue: String {
+        didSet {
+            save()
+        }
+    }
+
+    @Published var assistantHumeAPIKey: String {
+        didSet {
+            let trimmed = assistantHumeAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard trimmed == assistantHumeAPIKey else {
+                assistantHumeAPIKey = trimmed
+                return
+            }
+            Self.storeAssistantHumeCredential(trimmed, account: Self.assistantHumeAPIKeychainAccount)
+            save()
+        }
+    }
+
+    @Published var assistantHumeSecretKey: String {
+        didSet {
+            let trimmed = assistantHumeSecretKey.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard trimmed == assistantHumeSecretKey else {
+                assistantHumeSecretKey = trimmed
+                return
+            }
+            Self.storeAssistantHumeCredential(trimmed, account: Self.assistantHumeSecretKeychainAccount)
+            save()
+        }
+    }
+
+    @Published var assistantHumeVoiceID: String {
+        didSet {
+            let trimmed = assistantHumeVoiceID.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard trimmed == assistantHumeVoiceID else {
+                assistantHumeVoiceID = trimmed
+                return
+            }
+            if oldValue != assistantHumeVoiceID {
+                assistantHumeConversationConfigID = ""
+                assistantHumeConversationConfigVersion = 0
+            }
+            save()
+        }
+    }
+
+    @Published var assistantHumeVoiceName: String {
+        didSet {
+            let trimmed = assistantHumeVoiceName.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard trimmed == assistantHumeVoiceName else {
+                assistantHumeVoiceName = trimmed
+                return
+            }
+            save()
+        }
+    }
+
+    @Published var assistantHumeVoiceSourceRawValue: String {
+        didSet {
+            let trimmed = assistantHumeVoiceSourceRawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard trimmed == assistantHumeVoiceSourceRawValue else {
+                assistantHumeVoiceSourceRawValue = trimmed
+                return
+            }
+            if oldValue != assistantHumeVoiceSourceRawValue {
+                assistantHumeConversationConfigID = ""
+                assistantHumeConversationConfigVersion = 0
+            }
+            save()
+        }
+    }
+
+    @Published var assistantHumeConversationConfigID: String {
+        didSet {
+            let trimmed = assistantHumeConversationConfigID.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard trimmed == assistantHumeConversationConfigID else {
+                assistantHumeConversationConfigID = trimmed
+                return
+            }
+            save()
+        }
+    }
+
+    @Published var assistantHumeConversationConfigVersion: Int {
+        didSet {
+            let normalized = max(0, assistantHumeConversationConfigVersion)
+            guard normalized == assistantHumeConversationConfigVersion else {
+                assistantHumeConversationConfigVersion = normalized
+                return
+            }
+            save()
+        }
+    }
+
+    @Published var assistantTTSFallbackToMacOS: Bool {
+        didSet {
+            save()
+        }
+    }
+
+    @Published var assistantTTSFallbackVoiceIdentifier: String {
+        didSet {
+            save()
+        }
+    }
+
+    @Published var assistantInterruptCurrentSpeechOnNewReply: Bool {
+        didSet {
+            save()
+        }
+    }
+
     @Published var assistantPreferredModelID: String {
         didSet {
             save()
@@ -1854,6 +1981,60 @@ final class SettingsStore: ObservableObject {
             assistantBetaWarningAcknowledged = defaults.bool(forKey: Keys.assistantBetaWarningAcknowledged)
         }
 
+        if defaults.object(forKey: Keys.assistantVoiceOutputEnabled) == nil {
+            assistantVoiceOutputEnabled = false
+        } else {
+            assistantVoiceOutputEnabled = defaults.bool(forKey: Keys.assistantVoiceOutputEnabled)
+        }
+
+        let storedAssistantVoiceEngineRawValue = defaults.string(forKey: Keys.assistantVoiceEngine)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        switch storedAssistantVoiceEngineRawValue {
+        case AssistantSpeechEngine.macos.rawValue:
+            assistantVoiceEngineRawValue = AssistantSpeechEngine.macos.rawValue
+        case "tada":
+            assistantVoiceEngineRawValue = AssistantSpeechEngine.humeOctave.rawValue
+        default:
+            assistantVoiceEngineRawValue = (
+                AssistantSpeechEngine(rawValue: storedAssistantVoiceEngineRawValue ?? "")?.rawValue
+                    ?? AssistantSpeechEngine.humeOctave.rawValue
+            )
+        }
+
+        assistantHumeAPIKey = Self.loadAssistantHumeCredential(account: Self.assistantHumeAPIKeychainAccount)
+        assistantHumeSecretKey = Self.loadAssistantHumeCredential(account: Self.assistantHumeSecretKeychainAccount)
+        assistantHumeVoiceID = defaults.string(forKey: Keys.assistantHumeVoiceID)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        assistantHumeVoiceName = defaults.string(forKey: Keys.assistantHumeVoiceName)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let storedAssistantHumeVoiceSource = defaults.string(forKey: Keys.assistantHumeVoiceSource)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        assistantHumeVoiceSourceRawValue =
+            AssistantHumeVoiceSource(rawValue: storedAssistantHumeVoiceSource ?? "")?.rawValue
+            ?? AssistantHumeVoiceSource.humeAI.rawValue
+        assistantHumeConversationConfigID = defaults.string(forKey: Keys.assistantHumeConversationConfigID)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if defaults.object(forKey: Keys.assistantHumeConversationConfigVersion) == nil {
+            assistantHumeConversationConfigVersion = 0
+        } else {
+            assistantHumeConversationConfigVersion = defaults.integer(forKey: Keys.assistantHumeConversationConfigVersion)
+        }
+
+        if defaults.object(forKey: Keys.assistantTTSFallbackToMacOS) == nil {
+            assistantTTSFallbackToMacOS = true
+        } else {
+            assistantTTSFallbackToMacOS = defaults.bool(forKey: Keys.assistantTTSFallbackToMacOS)
+        }
+
+        assistantTTSFallbackVoiceIdentifier = defaults.string(forKey: Keys.assistantTTSFallbackVoiceIdentifier)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+        if defaults.object(forKey: Keys.assistantInterruptCurrentSpeechOnNewReply) == nil {
+            assistantInterruptCurrentSpeechOnNewReply = true
+        } else {
+            assistantInterruptCurrentSpeechOnNewReply = defaults.bool(forKey: Keys.assistantInterruptCurrentSpeechOnNewReply)
+        }
+
         assistantPreferredModelID = defaults
             .string(forKey: Keys.assistantPreferredModelID)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -2040,6 +2221,19 @@ final class SettingsStore: ObservableObject {
         defaults.set(assistantFloatingHUDEnabled, forKey: Keys.assistantFloatingHUDEnabled)
         defaults.set(assistantCompactPresentationStyleRawValue, forKey: Keys.assistantCompactPresentationStyle)
         defaults.set(assistantBetaWarningAcknowledged, forKey: Keys.assistantBetaWarningAcknowledged)
+        defaults.set(assistantVoiceOutputEnabled, forKey: Keys.assistantVoiceOutputEnabled)
+        defaults.set(assistantVoiceEngineRawValue, forKey: Keys.assistantVoiceEngine)
+        defaults.set(assistantHumeVoiceID.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Keys.assistantHumeVoiceID)
+        defaults.set(assistantHumeVoiceName.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Keys.assistantHumeVoiceName)
+        defaults.set(assistantHumeVoiceSourceRawValue, forKey: Keys.assistantHumeVoiceSource)
+        defaults.set(assistantHumeConversationConfigID.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Keys.assistantHumeConversationConfigID)
+        defaults.set(assistantHumeConversationConfigVersion, forKey: Keys.assistantHumeConversationConfigVersion)
+        defaults.set(assistantTTSFallbackToMacOS, forKey: Keys.assistantTTSFallbackToMacOS)
+        defaults.set(assistantTTSFallbackVoiceIdentifier.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Keys.assistantTTSFallbackVoiceIdentifier)
+        defaults.set(
+            assistantInterruptCurrentSpeechOnNewReply,
+            forKey: Keys.assistantInterruptCurrentSpeechOnNewReply
+        )
         defaults.set(assistantPreferredModelID.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Keys.assistantPreferredModelID)
         defaults.set(Self.normalizedStringList(assistantOwnedThreadIDs), forKey: Keys.assistantOwnedThreadIDs)
         defaults.set(Array(assistantAlwaysApprovedToolKinds), forKey: Keys.assistantAlwaysApprovedToolKinds)
@@ -2139,6 +2333,16 @@ final class SettingsStore: ObservableObject {
     var assistantCompactPresentationStyle: AssistantCompactPresentationStyle {
         get { AssistantCompactPresentationStyle(rawValue: assistantCompactPresentationStyleRawValue) ?? .orb }
         set { assistantCompactPresentationStyleRawValue = newValue.rawValue }
+    }
+
+    var assistantVoiceEngine: AssistantSpeechEngine {
+        get { AssistantSpeechEngine(rawValue: assistantVoiceEngineRawValue) ?? .humeOctave }
+        set { assistantVoiceEngineRawValue = newValue.rawValue }
+    }
+
+    var assistantHumeVoiceSource: AssistantHumeVoiceSource {
+        get { AssistantHumeVoiceSource(rawValue: assistantHumeVoiceSourceRawValue) ?? .humeAI }
+        set { assistantHumeVoiceSourceRawValue = newValue.rawValue }
     }
 
     var colorTheme: ColorTheme {
@@ -2547,6 +2751,9 @@ final class SettingsStore: ObservableObject {
     private static let cloudTranscriptionProviderAPIKeychainAccountPrefix = "cloud-transcription-provider-api-key"
     private static let automationAPIKeychainService = "com.developingadventures.OpenAssist"
     private static let automationAPIKeychainAccount = "automation-api-bearer-token"
+    private static let assistantHumeCredentialKeychainService = "com.developingadventures.OpenAssist"
+    private static let assistantHumeAPIKeychainAccount = "assistant-hume-api-key"
+    private static let assistantHumeSecretKeychainAccount = "assistant-hume-secret-key"
 
     private static func generateAutomationAPIToken() -> String {
         var bytes = [UInt8](repeating: 0, count: 32)
@@ -2818,6 +3025,63 @@ final class SettingsStore: ObservableObject {
             kSecAttrAccount as String: legacyPromptRewriteOpenAIAPIKeychainAccount
         ]
         _ = SecItemDelete(legacyQuery as CFDictionary)
+    }
+
+    private static func loadAssistantHumeCredential(account: String) -> String {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: assistantHumeCredentialKeychainService,
+            kSecAttrAccount as String: account,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+
+        var item: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &item)
+        guard status == errSecSuccess,
+              let data = item as? Data,
+              let value = String(data: data, encoding: .utf8) else {
+            return ""
+        }
+        return value
+    }
+
+    private static func storeAssistantHumeCredential(_ rawValue: String, account: String) {
+        let value = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        if value.isEmpty {
+            deleteAssistantHumeCredential(account: account)
+            return
+        }
+
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: assistantHumeCredentialKeychainService,
+            kSecAttrAccount as String: account
+        ]
+        let data = Data(value.utf8)
+
+        let updateStatus = SecItemUpdate(
+            query as CFDictionary,
+            [kSecValueData as String: data] as CFDictionary
+        )
+        if updateStatus == errSecSuccess {
+            return
+        }
+
+        if updateStatus == errSecItemNotFound {
+            var create = query
+            create[kSecValueData as String] = data
+            _ = SecItemAdd(create as CFDictionary, nil)
+        }
+    }
+
+    private static func deleteAssistantHumeCredential(account: String) {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: assistantHumeCredentialKeychainService,
+            kSecAttrAccount as String: account
+        ]
+        _ = SecItemDelete(query as CFDictionary)
     }
 
     /// Resets all permissions, deletes local app data, and removes the app bundle when possible.

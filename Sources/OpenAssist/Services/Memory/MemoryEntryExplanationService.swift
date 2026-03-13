@@ -29,7 +29,10 @@ actor MemoryEntryExplanationService {
         self.session = session
     }
 
-    func explain(entry: MemoryIndexedEntry) async -> MemoryEntryExplanationResult {
+    func explain(
+        entry: MemoryIndexedEntry,
+        onPartialText: (@Sendable (String) -> Void)? = nil
+    ) async -> MemoryEntryExplanationResult {
         guard let configuration = liveConfiguration() else {
             return .failure("Connect a provider first to explain memories with AI.")
         }
@@ -64,10 +67,14 @@ actor MemoryEntryExplanationService {
 
         let isStreamingCodex = configuration.providerMode == .openAI && isOAuth(credential)
 
-        let data: Data
-        let response: URLResponse
+        let streamingResponse: StreamingTextHTTPResponse
         do {
-            (data, response) = try await session.data(for: request)
+            streamingResponse = try await StreamingTextResponseReader.collect(
+                using: session,
+                request: request,
+                expectsEventStream: isStreamingCodex,
+                onPartialText: onPartialText
+            )
         } catch {
             let detail = error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
             if detail.isEmpty {
@@ -75,6 +82,9 @@ actor MemoryEntryExplanationService {
             }
             return .failure("Provider request failed: \(detail)")
         }
+
+        let data = streamingResponse.data
+        let response = streamingResponse.response
 
         guard let http = response as? HTTPURLResponse else {
             return .failure("Provider returned an invalid response.")

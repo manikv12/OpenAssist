@@ -405,7 +405,8 @@ struct AssistantOrbHUDView: View {
                 title: model.workingPopupTitle.lowercased().capitalized,
                 subtitle: "Live progress and quick steering",
                 symbol: "waveform.path.ecg",
-                tint: tint
+                tint: tint,
+                onOpenMainWindow: { model.openSelectedSessionInMainWindow() }
             ) {
                 model.dismissWorkingDetail()
             }
@@ -548,36 +549,51 @@ struct AssistantOrbHUDView: View {
                                 .orbInsetSurface(tint: orangeTint, cornerRadius: 14, fillOpacity: 0.08)
                         }
 
-                        VStack(spacing: 8) {
-                            ForEach(request.options) { option in
-                                OrbPermissionChoiceButton(
-                                    title: option.title,
-                                    tint: orangeTint,
-                                    isProminent: option.isDefault
-                                ) {
-                                    model.onResolvePermission?(option.id)
-                                }
+                        if request.hasStructuredUserInput {
+                            AssistantStructuredUserInputView(
+                                request: request,
+                                accent: orangeTint,
+                                secondaryText: .white.opacity(0.70),
+                                fieldBackground: Color.white.opacity(0.06),
+                                submitTitle: "Submit Answers",
+                                cancelTitle: "Cancel Request"
+                            ) { answers in
+                                model.onSubmitPermissionAnswers?(answers)
+                            } onCancel: {
+                                model.onCancelPermission?()
                             }
+                        } else {
+                            VStack(spacing: 8) {
+                                ForEach(request.options) { option in
+                                    OrbPermissionChoiceButton(
+                                        title: option.title,
+                                        tint: orangeTint,
+                                        isProminent: option.isDefault
+                                    ) {
+                                        model.onResolvePermission?(option.id)
+                                    }
+                                }
 
-                            if let toolKind = request.toolKind, !toolKind.isEmpty {
-                                OrbPermissionChoiceButton(
-                                    title: "Always Allow",
-                                    tint: orangeTint,
-                                    isProminent: false,
-                                    icon: "checkmark.shield.fill"
-                                ) {
-                                    model.onAlwaysAllowPermission?(toolKind)
-                                    if let optionID = assistantAlwaysAllowOptionID(for: request) {
-                                        model.onResolvePermission?(optionID)
+                                if let toolKind = request.toolKind, !toolKind.isEmpty, toolKind != "userInput" {
+                                    OrbPermissionChoiceButton(
+                                        title: "Always Allow",
+                                        tint: orangeTint,
+                                        isProminent: false,
+                                        icon: "checkmark.shield.fill"
+                                    ) {
+                                        model.onAlwaysAllowPermission?(toolKind)
+                                        if let optionID = assistantAlwaysAllowOptionID(for: request) {
+                                            model.onResolvePermission?(optionID)
+                                        }
                                     }
                                 }
                             }
-                        }
 
-                        OrbSecondaryActionButton(title: "Cancel Request", symbol: "xmark", tint: Color.white.opacity(0.55)) {
-                            model.onCancelPermission?()
+                            OrbSecondaryActionButton(title: "Cancel Request", symbol: "xmark", tint: Color.white.opacity(0.55)) {
+                                model.onCancelPermission?()
+                            }
+                            .frame(maxWidth: .infinity, alignment: .center)
                         }
-                        .frame(maxWidth: .infinity, alignment: .center)
                     }
                     .padding(.horizontal, 16)
                     .padding(.vertical, 14)
@@ -691,7 +707,7 @@ struct AssistantOrbHUDView: View {
                                 Button {
                                     model.showFollowUpPreview(for: session)
                                 } label: {
-                                    Label("Show Follow-Up", systemImage: "bubble.left.and.text.bubble.right")
+                                    Label("Show Follow-Up", systemImage: "bubble.left.and.bubble.right.fill")
                                 }
                             }
                         }
@@ -822,10 +838,15 @@ struct AssistantOrbHUDView: View {
                 }
             }
         } label: {
-            HStack(spacing: 3) {
-                Image(systemName: "bolt.fill")
-                    .font(.system(size: 7, weight: .semibold))
-                    .foregroundStyle(effectiveTint.opacity(0.9))
+            HStack(spacing: 5) {
+                AssistantGlyphBadge(
+                    symbol: AssistantChromeSymbol.model,
+                    tint: effectiveTint,
+                    side: showsLabel ? 16 : 14,
+                    fillOpacity: 0.12,
+                    strokeOpacity: 0.20,
+                    symbolScale: 0.48
+                )
                 if showsLabel {
                     Text("Model")
                         .font(.system(size: 8.8, weight: .semibold, design: .rounded))
@@ -1069,7 +1090,7 @@ struct AssistantOrbHUDView: View {
     }
 
     private func orbAttachmentButton(tint: Color, size: CGFloat = 34) -> some View {
-        OrbIconControlButton(symbol: "paperclip", tint: tint, size: size) {
+        OrbIconControlButton(symbol: AssistantChromeSymbol.attachment, tint: tint, size: size) {
             model.onOpenAttachmentPicker?()
         }
     }
@@ -1195,10 +1216,7 @@ struct AssistantNotchHUDView: View {
     }
 
     private var collapsedPillWidth: CGFloat {
-        if isTrayExpanded {
-            return Layout.expandedTraySize.width
-        }
-        return Layout.collapsedSize.width
+        Layout.collapsedSize.width
     }
 
     private var canHideCollapsedDock: Bool {
@@ -1327,43 +1345,40 @@ struct AssistantNotchHUDView: View {
     }
 
     var body: some View {
-        Group {
-            if !isTrayExpanded && !showingCompactCard {
-                ZStack(alignment: .top) {
+        VStack(spacing: Layout.traySpacing) {
+            ZStack(alignment: .top) {
+                if !isTrayExpanded && !showingCompactCard {
                     hiddenDockHandle
                         .opacity(model.notchDockRevealed ? 0 : 1)
-                        .scaleEffect(model.notchDockRevealed ? 0.94 : 1, anchor: .top)
+                }
 
-                    collapsedPill
-                        .frame(width: Layout.collapsedSize.width, height: Layout.collapsedSize.height, alignment: .top)
-                        .opacity(model.notchDockRevealed ? 1 : 0)
-                        .scaleEffect(model.notchDockRevealed ? 1 : 0.90, anchor: .top)
-                        .offset(y: model.notchDockRevealed ? 0 : -8)
-                }
-                .frame(width: bodyWidth, height: collapsedContainerHeight, alignment: .top)
-                .clipped()
-            } else {
-                VStack(spacing: Layout.traySpacing) {
-                    collapsedPill
-                    if isTrayExpanded {
-                        expandedTray
-                            .transition(
-                                .move(edge: .top)
-                                    .combined(with: .opacity)
-                            )
-                    } else if showingCompactCard {
-                        compactPeekCard
-                            .transition(
-                                .move(edge: .top)
-                                    .combined(with: .opacity)
-                            )
-                    }
-                }
-                .frame(width: bodyWidth, height: bodyHeight, alignment: .top)
+                collapsedPill
+                    .frame(width: Layout.collapsedSize.width, height: Layout.collapsedSize.height, alignment: .top)
+                    .opacity((!isTrayExpanded && !showingCompactCard) ? (model.notchDockRevealed ? 1 : 0) : 1)
+            }
+            .frame(height: collapsedContainerHeight)
+            .clipped()
+
+            if isTrayExpanded {
+                expandedTray
+                    .transition(
+                        .move(edge: .top)
+                            .combined(with: .opacity)
+                    )
+            } else if showingCompactCard {
+                compactPeekCard
+                    .transition(
+                        .move(edge: .top)
+                            .combined(with: .opacity)
+                    )
             }
         }
+        .frame(maxWidth: .infinity, alignment: .top)
+        .clipped()
         .animation(.spring(response: 0.30, dampingFraction: 0.88), value: model.notchDockRevealed)
         .animation(.easeInOut(duration: 0.35), value: model.state.phase)
+        .animation(.spring(response: 0.32, dampingFraction: 0.88), value: isTrayExpanded)
+        .animation(.spring(response: 0.32, dampingFraction: 0.88), value: showingCompactCard)
         .popover(item: $previewAttachment, attachmentAnchor: .point(.center)) { attachment in
             if let nsImage = NSImage(data: attachment.data) {
                 VStack {
@@ -1429,12 +1444,12 @@ struct AssistantNotchHUDView: View {
                 return
             }
 
-            if showingPermissionPeek {
-                return
-            }
-
-            if showingCompletionPeek {
-                model.hideDoneDetail()
+            // If a compact notch card is already open, tapping the pill dismisses it
+            if showingCompactCard {
+                if model.showDoneDetail { model.hideDoneDetail() }
+                if model.showWorkingDetail { model.dismissWorkingDetail() }
+                if model.showCompactComposer { model.dismissCompactComposer() }
+                if model.modeSwitchSuggestion != nil { model.onDismissModeSwitchSuggestion?() }
                 return
             }
 
@@ -1442,22 +1457,7 @@ struct AssistantNotchHUDView: View {
                 return
             }
 
-            if showingWorkingPeek {
-                model.dismissWorkingDetail()
-                return
-            }
-
             if model.presentWorkingDetailIfAvailable() {
-                return
-            }
-
-            if showingComposerPeek {
-                model.dismissCompactComposer()
-                return
-            }
-
-            if showingModeSwitchPeek {
-                model.onDismissModeSwitchSuggestion?()
                 return
             }
 
@@ -1538,8 +1538,8 @@ struct AssistantNotchHUDView: View {
                     .fill(
                         LinearGradient(
                             colors: [
-                                Color.black.opacity(0.68),
-                                Color(red: 0.030, green: 0.034, blue: 0.052).opacity(0.60)
+                                Color.black.opacity(0.84),
+                                Color(red: 0.030, green: 0.034, blue: 0.052).opacity(0.78)
                             ],
                             startPoint: .top,
                             endPoint: .bottom
@@ -1548,11 +1548,11 @@ struct AssistantNotchHUDView: View {
                     .overlay(
                         Capsule(style: .continuous)
                             .fill(AppVisualTheme.adaptiveMaterialFill())
-                            .opacity(0.58)
+                            .opacity(0.22)
                     )
                     .overlay(
                         Capsule(style: .continuous)
-                            .stroke(Color.white.opacity(0.13), lineWidth: 0.7)
+                            .stroke(Color.white.opacity(0.15), lineWidth: 0.7)
                     )
             )
             .overlay(alignment: .bottomLeading) {
@@ -1604,20 +1604,21 @@ struct AssistantNotchHUDView: View {
                 Text(model.state.phase == .failed ? "Needs attention" : "Response ready")
                     .font(.system(size: 11.5, weight: .semibold, design: .rounded))
                     .foregroundStyle(.white.opacity(0.92))
+                    .fixedSize(horizontal: true, vertical: false)
 
                 Spacer(minLength: 0)
 
-                OrbSecondaryActionButton(title: "Tray", symbol: "rectangle.split.3x1.fill", tint: AppVisualTheme.accentTint) {
+                OrbIconOnlySecondaryButton(symbol: "rectangle.split.3x1.fill", tint: AppVisualTheme.accentTint) {
                     withAnimation(.spring(response: 0.26, dampingFraction: 0.90)) {
                         model.expand()
                     }
                 }
 
-                OrbSecondaryActionButton(title: "Chat", symbol: "arrow.up.right.square", tint: AppVisualTheme.accentTint) {
+                OrbIconOnlySecondaryButton(symbol: "arrow.up.right.square", tint: AppVisualTheme.accentTint) {
                     model.openSelectedSessionInMainWindow()
                 }
 
-                OrbSecondaryActionButton(title: "New", symbol: "plus", tint: AppVisualTheme.accentTint) {
+                OrbIconOnlySecondaryButton(symbol: "plus", tint: AppVisualTheme.accentTint) {
                     Task { await model.startNewSessionFromCompactView() }
                 }
 
@@ -1650,7 +1651,8 @@ struct AssistantNotchHUDView: View {
             )
         }
         .padding(14)
-        .frame(width: Layout.compactCardSize.width, height: compactCardHeight, alignment: .topLeading)
+        .frame(maxWidth: .infinity, alignment: .topLeading)
+        .frame(height: compactCardHeight)
         .notchInsetSurface(tint: model.state.phase == .failed ? .orange : glowColor, cornerRadius: 22, fillOpacity: 0.10)
     }
 
@@ -1673,13 +1675,17 @@ struct AssistantNotchHUDView: View {
                     }
                 }
 
-                OrbSecondaryActionButton(title: "Tray", symbol: "rectangle.split.3x1.fill", tint: AppVisualTheme.accentTint) {
+                OrbIconOnlySecondaryButton(symbol: "rectangle.split.3x1.fill", tint: AppVisualTheme.accentTint) {
                     withAnimation(.spring(response: 0.26, dampingFraction: 0.90)) {
                         model.expand()
                     }
                 }
 
-                OrbSecondaryActionButton(title: "New", symbol: "plus", tint: AppVisualTheme.accentTint) {
+                OrbIconOnlySecondaryButton(symbol: "arrow.up.right.square", tint: AppVisualTheme.accentTint) {
+                    model.openSelectedSessionInMainWindow()
+                }
+
+                OrbIconOnlySecondaryButton(symbol: "plus", tint: AppVisualTheme.accentTint) {
                     Task { await model.startNewSessionFromCompactView() }
                 }
 
@@ -1761,7 +1767,8 @@ struct AssistantNotchHUDView: View {
             )
         }
         .padding(14)
-        .frame(width: Layout.compactCardSize.width, height: compactCardHeight, alignment: .topLeading)
+        .frame(maxWidth: .infinity, alignment: .topLeading)
+        .frame(height: compactCardHeight)
         .notchInsetSurface(tint: glowColor, cornerRadius: 22, fillOpacity: 0.10)
     }
 
@@ -1775,16 +1782,21 @@ struct AssistantNotchHUDView: View {
                 Text("Follow up")
                     .font(.system(size: 11.5, weight: .semibold, design: .rounded))
                     .foregroundStyle(.white.opacity(0.92))
+                    .fixedSize(horizontal: true, vertical: false)
 
                 Spacer(minLength: 0)
 
-                OrbSecondaryActionButton(title: "Tray", symbol: "rectangle.split.3x1.fill", tint: AppVisualTheme.accentTint) {
+                OrbIconOnlySecondaryButton(symbol: "rectangle.split.3x1.fill", tint: AppVisualTheme.accentTint) {
                     withAnimation(.spring(response: 0.26, dampingFraction: 0.90)) {
                         model.expand()
                     }
                 }
 
-                OrbSecondaryActionButton(title: "New", symbol: "plus", tint: AppVisualTheme.accentTint) {
+                OrbIconOnlySecondaryButton(symbol: "arrow.up.right.square", tint: AppVisualTheme.accentTint) {
+                    model.openSelectedSessionInMainWindow()
+                }
+
+                OrbIconOnlySecondaryButton(symbol: "plus", tint: AppVisualTheme.accentTint) {
                     Task { await model.startNewSessionFromCompactView() }
                 }
 
@@ -1812,7 +1824,8 @@ struct AssistantNotchHUDView: View {
             )
         }
         .padding(14)
-        .frame(width: Layout.compactCardSize.width, height: compactCardHeight, alignment: .topLeading)
+        .frame(maxWidth: .infinity, alignment: .topLeading)
+        .frame(height: compactCardHeight)
         .notchInsetSurface(tint: AppVisualTheme.baseTint, cornerRadius: 22, fillOpacity: 0.10)
     }
 
@@ -1826,16 +1839,17 @@ struct AssistantNotchHUDView: View {
                 Text("Mode switch")
                     .font(.system(size: 11.5, weight: .semibold, design: .rounded))
                     .foregroundStyle(.white.opacity(0.92))
+                    .fixedSize(horizontal: true, vertical: false)
 
                 Spacer(minLength: 0)
 
-                OrbSecondaryActionButton(title: "Tray", symbol: "rectangle.split.3x1.fill", tint: AppVisualTheme.accentTint) {
+                OrbIconOnlySecondaryButton(symbol: "rectangle.split.3x1.fill", tint: AppVisualTheme.accentTint) {
                     withAnimation(.spring(response: 0.26, dampingFraction: 0.90)) {
                         model.expand()
                     }
                 }
 
-                OrbSecondaryActionButton(title: "New", symbol: "plus", tint: AppVisualTheme.accentTint) {
+                OrbIconOnlySecondaryButton(symbol: "plus", tint: AppVisualTheme.accentTint) {
                     Task { await model.startNewSessionFromCompactView() }
                 }
 
@@ -1859,7 +1873,8 @@ struct AssistantNotchHUDView: View {
             compactModeSwitchInlineCard(suggestion)
         }
         .padding(14)
-        .frame(width: Layout.compactCardSize.width, height: compactCardHeight, alignment: .topLeading)
+        .frame(maxWidth: .infinity, alignment: .topLeading)
+        .frame(height: compactCardHeight)
         .notchInsetSurface(tint: .orange, cornerRadius: 22, fillOpacity: 0.11)
     }
 
@@ -1873,16 +1888,17 @@ struct AssistantNotchHUDView: View {
                 Text("Approval needed")
                     .font(.system(size: 11.5, weight: .semibold, design: .rounded))
                     .foregroundStyle(.white.opacity(0.92))
+                    .fixedSize(horizontal: true, vertical: false)
 
                 Spacer(minLength: 0)
 
-                OrbSecondaryActionButton(title: "Tray", symbol: "rectangle.split.3x1.fill", tint: AppVisualTheme.accentTint) {
+                OrbIconOnlySecondaryButton(symbol: "rectangle.split.3x1.fill", tint: AppVisualTheme.accentTint) {
                     withAnimation(.spring(response: 0.26, dampingFraction: 0.90)) {
                         model.expand()
                     }
                 }
 
-                OrbSecondaryActionButton(title: "New", symbol: "plus", tint: AppVisualTheme.accentTint) {
+                OrbIconOnlySecondaryButton(symbol: "plus", tint: AppVisualTheme.accentTint) {
                     Task { await model.startNewSessionFromCompactView() }
                 }
 
@@ -1924,27 +1940,42 @@ struct AssistantNotchHUDView: View {
                             .notchInsetSurface(tint: .orange, cornerRadius: 18, fillOpacity: 0.08)
                     }
 
-                    VStack(spacing: 8) {
-                        ForEach(request.options) { option in
-                            OrbPermissionChoiceButton(
-                                title: option.title,
-                                tint: .orange,
-                                isProminent: option.isDefault
-                            ) {
-                                model.onResolvePermission?(option.id)
-                            }
+                    if request.hasStructuredUserInput {
+                        AssistantStructuredUserInputView(
+                            request: request,
+                            accent: .orange,
+                            secondaryText: .white.opacity(0.70),
+                            fieldBackground: Color.white.opacity(0.06),
+                            submitTitle: "Submit Answers",
+                            cancelTitle: "Cancel Request"
+                        ) { answers in
+                            model.onSubmitPermissionAnswers?(answers)
+                        } onCancel: {
+                            model.onCancelPermission?()
                         }
+                    } else {
+                        VStack(spacing: 8) {
+                            ForEach(request.options) { option in
+                                OrbPermissionChoiceButton(
+                                    title: option.title,
+                                    tint: .orange,
+                                    isProminent: option.isDefault
+                                ) {
+                                    model.onResolvePermission?(option.id)
+                                }
+                            }
 
-                        if let toolKind = request.toolKind?.nonEmpty {
-                            OrbPermissionChoiceButton(
-                                title: "Always Allow",
-                                tint: .orange,
-                                isProminent: false,
-                                icon: "checkmark.shield.fill"
-                            ) {
-                                model.onAlwaysAllowPermission?(toolKind)
-                                if let optionID = assistantAlwaysAllowOptionID(for: request) {
-                                    model.onResolvePermission?(optionID)
+                            if let toolKind = request.toolKind?.nonEmpty, toolKind != "userInput" {
+                                OrbPermissionChoiceButton(
+                                    title: "Always Allow",
+                                    tint: .orange,
+                                    isProminent: false,
+                                    icon: "checkmark.shield.fill"
+                                ) {
+                                    model.onAlwaysAllowPermission?(toolKind)
+                                    if let optionID = assistantAlwaysAllowOptionID(for: request) {
+                                        model.onResolvePermission?(optionID)
+                                    }
                                 }
                             }
                         }
@@ -2108,7 +2139,7 @@ struct AssistantNotchHUDView: View {
                                 Button {
                                     model.showFollowUpPreview(for: session)
                                 } label: {
-                                    Label("Show Follow-Up", systemImage: "bubble.left.and.text.bubble.right")
+                                    Label("Show Follow-Up", systemImage: "bubble.left.and.bubble.right.fill")
                                 }
 
                                 Button {
@@ -2384,10 +2415,15 @@ struct AssistantNotchHUDView: View {
                 }
             }
         } label: {
-            HStack(spacing: 4) {
-                Image(systemName: "bolt.fill")
-                    .font(.system(size: 8, weight: .semibold))
-                    .foregroundStyle(tint.opacity(0.92))
+            HStack(spacing: 6) {
+                AssistantGlyphBadge(
+                    symbol: AssistantChromeSymbol.model,
+                    tint: tint,
+                    side: 16,
+                    fillOpacity: 0.14,
+                    strokeOpacity: 0.22,
+                    symbolScale: 0.48
+                )
                 Text(model.selectedModelSummary)
                     .font(.system(size: 9.5, weight: .medium, design: .rounded))
                     .foregroundStyle(.white.opacity(0.60))
@@ -2535,7 +2571,7 @@ struct AssistantNotchHUDView: View {
     }
 
     private func notchAttachmentButton(tint: Color) -> some View {
-        OrbIconControlButton(symbol: "paperclip", tint: tint, size: 30) {
+        OrbIconControlButton(symbol: AssistantChromeSymbol.attachment, tint: tint, size: 30) {
             model.onOpenAttachmentPicker?()
         }
     }

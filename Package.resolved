@@ -1,6 +1,15 @@
 {
   "pins" : [
     {
+      "identity" : "hume-swift-sdk",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/HumeAI/hume-swift-sdk.git",
+      "state" : {
+        "revision" : "ff03034eb41c62cb13962a26564a2d73eb3a053d",
+        "version" : "0.0.1-beta9"
+      }
+    },
+    {
       "identity" : "networkimage",
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/gonzalezreal/NetworkImage",

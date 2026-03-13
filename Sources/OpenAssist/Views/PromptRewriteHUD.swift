@@ -28,13 +28,17 @@ struct PromptRewriteLoadingDisplayState: Equatable {
     let aiSuggestionsEnabled: Bool
     let aiGenerationSummary: String
     let aiRuntimeSummary: String?
+    let partialPreviewText: String?
+    let isStreamingPreviewActive: Bool
 
     static let placeholder = PromptRewriteLoadingDisplayState(
         transcription: "",
         currentStep: "Preparing request",
         aiSuggestionsEnabled: false,
         aiGenerationSummary: "AI suggestions are currently disabled.",
-        aiRuntimeSummary: nil
+        aiRuntimeSummary: nil,
+        partialPreviewText: nil,
+        isStreamingPreviewActive: false
     )
 }
 

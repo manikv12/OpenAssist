@@ -76,6 +76,36 @@ struct AssistantWindowView: View {
         settings.assistantBetaEnabled && assistant.canStartConversation
     }
 
+    private var shouldShowHumeConversationPanel: Bool {
+        settings.assistantBetaEnabled
+            && (settings.assistantVoiceEngine == .humeOctave || assistant.isHumeConversationConnected)
+    }
+
+    private var humeConversationStatusText: String {
+        let snapshot = assistant.assistantHumeConversationSnapshot
+        if let error = snapshot.lastError?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !error.isEmpty {
+            return error
+        }
+
+        switch snapshot.phase {
+        case .disconnected:
+            return assistant.canStartHumeConversationMode
+                ? "Ready to start a live Hume conversation."
+                : "Add Hume keys and choose a Hume voice in AI Studio > Voice first."
+        case .connecting:
+            return "Connecting live voice conversation..."
+        case .connected:
+            return snapshot.isMicrophoneMuted
+                ? "Connected. Mic is muted."
+                : "Connected. Speak any time."
+        case .speaking:
+            return snapshot.isMicrophoneMuted
+                ? "Assistant is speaking. Mic is muted."
+                : "Assistant is speaking. You can interrupt by talking."
+        }
+    }
+
     private var composerPlaceholder: String {
         if !settings.assistantBetaEnabled {
             return "Enable assistant in Settings to chat."
@@ -585,11 +615,17 @@ struct AssistantWindowView: View {
         .shadow(color: Color.black.opacity(0.18), radius: 6, x: 0, y: 3)
     }
     private func topBarIconButton(symbol: String, emphasized: Bool = false) -> some View {
-        Image(systemName: symbol)
-            .font(.system(size: 11, weight: .medium))
-            .foregroundStyle(.white.opacity(emphasized ? 0.82 : 0.44))
-            .frame(width: 26, height: 26)
-            .contentShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+        AssistantGlyphBadge(
+            symbol: symbol,
+            tint: emphasized ? AppVisualTheme.accentTint : .white,
+            side: 26,
+            cornerRadius: 8,
+            fillOpacity: emphasized ? 0.16 : 0.08,
+            strokeOpacity: emphasized ? 0.24 : 0.12,
+            symbolScale: 0.44,
+            symbolWeight: .medium
+        )
+        .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 
     private var chatStatusBar: some View {
@@ -958,6 +994,8 @@ struct AssistantWindowView: View {
         case .assistantProgress:
             timelineAssistantRow(
                 messageID: item.id,
+                sessionID: item.sessionID,
+                turnID: item.turnID,
                 text: AssistantVisibleTextSanitizer.clean(item.text) ?? "",
                 timestamp: item.sortDate,
                 title: "Assistant",
@@ -970,6 +1008,8 @@ struct AssistantWindowView: View {
         case .assistantFinal:
             timelineAssistantRow(
                 messageID: item.id,
+                sessionID: item.sessionID,
+                turnID: item.turnID,
                 text: AssistantVisibleTextSanitizer.clean(item.text) ?? "",
                 timestamp: item.sortDate,
                 title: "Assistant",
@@ -982,6 +1022,8 @@ struct AssistantWindowView: View {
         case .system:
             timelineAssistantRow(
                 messageID: item.id,
+                sessionID: item.sessionID,
+                turnID: item.turnID,
                 text: item.text ?? "",
                 timestamp: item.sortDate,
                 title: item.emphasis ? "Needs Attention" : "System",
@@ -1093,6 +1135,8 @@ struct AssistantWindowView: View {
 
     private func timelineAssistantRow(
         messageID: String,
+        sessionID: String?,
+        turnID: String?,
         text: String,
         timestamp: Date,
         title: String,
@@ -1207,6 +1251,16 @@ struct AssistantWindowView: View {
             .contextMenu {
                 Button("Copy Message") {
                     copyAssistantTextToPasteboard(text)
+                }
+                if title == "Assistant", !isStreaming {
+                    Button("Play Again") {
+                        assistant.replayAssistantVoice(
+                            text: text,
+                            sessionID: sessionID,
+                            turnID: turnID,
+                            timelineItemID: messageID
+                        )
+                    }
                 }
                 if showsMemoryActions {
                     Button("Save as Memory") {
@@ -2155,6 +2209,11 @@ struct AssistantWindowView: View {
                 .padding(.bottom, 6)
             }
 
+            if shouldShowHumeConversationPanel {
+                humeConversationPanel
+                    .padding(.bottom, 6)
+            }
+
             // Attachment chips above composer
             if !assistant.attachments.isEmpty {
                 ScrollView(.horizontal, showsIndicators: false) {
@@ -2212,22 +2271,26 @@ struct AssistantWindowView: View {
                 HStack(alignment: .center, spacing: 10) {
                     composerToolbarGroup {
                         Button { openFilePicker() } label: {
-                            Image(systemName: "paperclip")
-                                .font(.system(size: 11, weight: .semibold))
-                                .foregroundStyle(.white.opacity(0.70))
-                                .frame(width: 24, height: 24)
-                                .background(
-                                    Circle()
-                                        .fill(Color.white.opacity(0.16))
-                                )
+                            AssistantToolbarCircleButtonLabel(
+                                symbol: AssistantChromeSymbol.attachment,
+                                tint: AppVisualTheme.accentTint,
+                                size: 24,
+                                emphasized: !assistant.attachments.isEmpty
+                            )
                         }
                         .buttonStyle(.plain)
                         .help("Attach files or images")
 
                         if !assistant.attachments.isEmpty {
-                            HStack(spacing: 4) {
-                                Image(systemName: "photo.on.rectangle.angled")
-                                    .font(.system(size: 8.5, weight: .semibold))
+                            HStack(spacing: 6) {
+                                AssistantGlyphBadge(
+                                    symbol: AssistantChromeSymbol.attachmentCount,
+                                    tint: AppVisualTheme.accentTint,
+                                    side: 16,
+                                    fillOpacity: 0.14,
+                                    strokeOpacity: 0.22,
+                                    symbolScale: 0.48
+                                )
                                 Text("\(assistant.attachments.count)")
                                     .font(.system(size: 9.5, weight: .semibold))
                             }
@@ -2283,10 +2346,15 @@ struct AssistantWindowView: View {
                                 }
                             }
                         } label: {
-                            HStack(spacing: 4) {
-                                Image(systemName: "bolt.fill")
-                                    .font(.system(size: 8, weight: .semibold))
-                                    .foregroundStyle(.white.opacity(0.68))
+                            HStack(spacing: 6) {
+                                AssistantGlyphBadge(
+                                    symbol: AssistantChromeSymbol.model,
+                                    tint: AppVisualTheme.accentTint,
+                                    side: 18,
+                                    fillOpacity: 0.14,
+                                    strokeOpacity: 0.22,
+                                    symbolScale: 0.48
+                                )
                                 Text(assistant.selectedModelSummary)
                                     .font(.system(size: 10.5, weight: .medium, design: .monospaced))
                                     .foregroundStyle(.white.opacity(0.64))
@@ -2321,15 +2389,25 @@ struct AssistantWindowView: View {
                                 }
                             }
                         } label: {
-                            Text(assistant.reasoningEffort.label)
-                                .font(.system(size: 10.5, weight: .medium))
-                                .foregroundStyle(.white.opacity(0.58))
-                                .padding(.horizontal, 8)
-                                .padding(.vertical, 5)
-                                .background(
-                                    Capsule(style: .continuous)
-                                        .fill(Color.white.opacity(0.05))
+                            HStack(spacing: 6) {
+                                AssistantGlyphBadge(
+                                    symbol: AssistantChromeSymbol.reasoning,
+                                    tint: AssistantWindowChrome.neutralAccent,
+                                    side: 18,
+                                    fillOpacity: 0.10,
+                                    strokeOpacity: 0.18,
+                                    symbolScale: 0.50
                                 )
+                                Text(assistant.reasoningEffort.label)
+                                    .font(.system(size: 10.5, weight: .medium))
+                                    .foregroundStyle(.white.opacity(0.58))
+                            }
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 5)
+                            .background(
+                                Capsule(style: .continuous)
+                                    .fill(Color.white.opacity(0.05))
+                            )
                         }
                         .menuStyle(.borderlessButton)
                         .fixedSize()
@@ -2357,10 +2435,19 @@ struct AssistantWindowView: View {
                                 }
                             }
                         } label: {
-                            HStack(spacing: 4) {
-                                Image(systemName: assistant.fastModeEnabled ? "bolt.fill" : "speedometer")
-                                    .font(.system(size: 8, weight: .semibold))
-                                    .foregroundStyle(.white.opacity(0.68))
+                            HStack(spacing: 6) {
+                                AssistantGlyphBadge(
+                                    symbol: assistant.fastModeEnabled
+                                        ? AssistantChromeSymbol.speedFast
+                                        : AssistantChromeSymbol.speedStandard,
+                                    tint: assistant.fastModeEnabled
+                                        ? AppVisualTheme.accentTint
+                                        : AssistantWindowChrome.neutralAccent,
+                                    side: 18,
+                                    fillOpacity: assistant.fastModeEnabled ? 0.14 : 0.10,
+                                    strokeOpacity: assistant.fastModeEnabled ? 0.22 : 0.18,
+                                    symbolScale: 0.48
+                                )
                                 Text(assistant.fastModeEnabled ? "Fast" : "Standard")
                                     .font(.system(size: 10.5, weight: .medium))
                                     .foregroundStyle(.white.opacity(0.58))
@@ -2388,18 +2475,31 @@ struct AssistantWindowView: View {
                             Button {
                                 Task { await assistant.cancelActiveTurn() }
                             } label: {
-                                Image(systemName: "stop.fill")
-                                    .font(.system(size: 10, weight: .bold))
-                                    .foregroundStyle(.white)
-                                    .frame(width: 24, height: 24)
-                                    .background(
-                                        Circle()
-                                            .fill(Color.red.opacity(0.62))
-                                    )
+                                AssistantToolbarCircleButtonLabel(
+                                    symbol: "stop.fill",
+                                    tint: .red,
+                                    size: 24,
+                                    emphasized: true
+                                )
                             }
                             .buttonStyle(.plain)
                             .help("Stop the current turn")
                         } else {
+                            if assistant.assistantVoicePlaybackActive {
+                                Button {
+                                    assistant.stopAssistantVoicePlayback()
+                                } label: {
+                                    AssistantToolbarCircleButtonLabel(
+                                        symbol: "speaker.slash.fill",
+                                        tint: .orange,
+                                        size: 24,
+                                        emphasized: true
+                                    )
+                                }
+                                .buttonStyle(.plain)
+                                .help("Stop assistant speech")
+                            }
+
                             AssistantPushToTalkButton(
                                 isListening: isVoiceCapturing,
                                 level: CGFloat(assistant.voiceCaptureLevel),
@@ -2413,18 +2513,13 @@ struct AssistantWindowView: View {
                             }
 
                             Button { sendCurrentPrompt() } label: {
-                                Image(systemName: "arrow.up")
-                                    .font(.system(size: 10, weight: .bold))
-                                    .foregroundStyle(.white)
-                                    .frame(width: 24, height: 24)
-                                    .background(
-                                        Circle()
-                                            .fill(
-                                                canSendMessage
-                                                    ? AppVisualTheme.accentTint
-                                                    : Color.white.opacity(0.12)
-                                            )
-                                    )
+                                AssistantToolbarCircleButtonLabel(
+                                    symbol: "arrow.up",
+                                    tint: AppVisualTheme.accentTint,
+                                    size: 24,
+                                    isEnabled: canSendMessage && !isVoiceCapturing,
+                                    emphasized: canSendMessage && !isVoiceCapturing
+                                )
                             }
                             .buttonStyle(.plain)
                             .disabled(!canSendMessage || isVoiceCapturing)
@@ -2468,6 +2563,61 @@ struct AssistantWindowView: View {
 
     private var sessionMemoryStatusLabel: String {
         sessionMemoryIsActive ? "Session memory on" : "Session memory off"
+    }
+
+    private var humeConversationPanel: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .center, spacing: 10) {
+                AssistantStatusBadge(
+                    title: "Hume Conversation",
+                    tint: assistant.isHumeConversationConnected ? .green : .cyan,
+                    symbol: assistant.assistantHumeConversationSnapshot.phase == .speaking
+                        ? "waveform"
+                        : "person.wave.2.fill"
+                )
+
+                Text(humeConversationStatusText)
+                    .font(.system(size: 11.5, weight: .medium))
+                    .foregroundStyle(.white.opacity(0.70))
+                    .fixedSize(horizontal: false, vertical: true)
+
+                Spacer(minLength: 0)
+            }
+
+            HStack(spacing: 8) {
+                if assistant.isHumeConversationConnected {
+                    Button(assistant.assistantHumeConversationSnapshot.isMicrophoneMuted ? "Unmute Mic" : "Mute Mic") {
+                        assistant.toggleHumeConversationMicrophoneMute()
+                    }
+                    .buttonStyle(.bordered)
+
+                    Button("Stop Speaking") {
+                        Task { await assistant.stopHumeConversationSpeaking() }
+                    }
+                    .buttonStyle(.bordered)
+
+                    Button("End Conversation", role: .destructive) {
+                        Task { await assistant.endHumeConversation() }
+                    }
+                    .buttonStyle(.bordered)
+                } else {
+                    Button("Start Conversation") {
+                        Task { await assistant.startHumeConversation() }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(!assistant.canStartHumeConversationMode)
+                }
+            }
+        }
+        .padding(12)
+        .background(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(Color.white.opacity(0.045))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .stroke(Color.white.opacity(0.08), lineWidth: 0.6)
+                )
+        )
     }
 
     @ViewBuilder
@@ -2654,6 +2804,20 @@ struct AssistantWindowView: View {
             }
 
             switch state {
+            case .waitingForInput where request.hasStructuredUserInput:
+                AssistantStructuredUserInputView(
+                    request: request,
+                    accent: .orange,
+                    secondaryText: AppVisualTheme.mutedText,
+                    fieldBackground: Color.white.opacity(0.04),
+                    submitTitle: "Submit Answers",
+                    cancelTitle: "Cancel Request"
+                ) { answers in
+                    Task { await assistant.resolvePermission(answers: answers) }
+                } onCancel: {
+                    Task { await assistant.cancelPermissionRequest() }
+                }
+
             case .waitingForApproval, .waitingForInput:
                 ForEach(request.options) { option in
                     if option.isDefault {
@@ -2669,7 +2833,7 @@ struct AssistantWindowView: View {
                     }
                 }
 
-                if let toolKind = request.toolKind, !toolKind.isEmpty, toolKind != "modeSwitch" {
+                if let toolKind = request.toolKind, !toolKind.isEmpty, toolKind != "modeSwitch", toolKind != "userInput" {
                     Button("Always Allow") {
                         assistant.alwaysAllowToolKind(toolKind)
                         let sessionOption = request.options.first(where: { $0.id == "acceptForSession" })

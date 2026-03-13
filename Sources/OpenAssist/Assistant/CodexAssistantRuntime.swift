@@ -167,7 +167,14 @@ final class CodexAssistantRuntime {
     private var pendingHUDState: AssistantHUDState?
     private var hudThrottleItem: DispatchWorkItem?
     private var lastTimelineMutationTime: CFAbsoluteTime = 0
+    private var pendingAssistantTimelineEmit: DispatchWorkItem?
     private var pendingToolCallEmit: DispatchWorkItem?
+    private var lastStreamingTranscriptEmitTime: CFAbsoluteTime = 0
+    private var pendingStreamingTranscriptEmit: DispatchWorkItem?
+    private var lastCommentaryTimelineEmitTime: CFAbsoluteTime = 0
+    private var pendingCommentaryTimelineEmit: DispatchWorkItem?
+    private var lastActivityTimelineEmitTimeByID: [String: CFAbsoluteTime] = [:]
+    private var pendingActivityTimelineEmitByID: [String: DispatchWorkItem] = [:]
 
     // Subagent tracking
     private var activeSubagents: [String: SubagentState] = [:]
@@ -699,6 +706,9 @@ final class CodexAssistantRuntime {
             CrashReporter.logInfo("Assistant runtime status: \(message)")
             onStatusMessage?(message)
         case .processExited(let message):
+            flushStreamingBuffer()
+            flushCommentaryBuffer()
+            finalizeActiveActivities(with: .interrupted)
             activeTurnID = nil
             transport = nil
             transportStartupTask = nil
@@ -810,13 +820,8 @@ final class CodexAssistantRuntime {
                         streamingEntryID = UUID()
                     }
                     streamingBuffer += delta
-                    onTranscript?(AssistantTranscriptEntry(
-                        id: streamingEntryID!,
-                        role: .assistant,
-                        text: streamingBuffer,
-                        isStreaming: true
-                    ))
-                    appendAssistantDelta(delta)
+                    emitStreamingTranscriptUpdate()
+                    appendAssistantDelta()
                     updateHUD(phase: .streaming, title: "Responding", detail: nil)
                 }
             }
@@ -1361,12 +1366,9 @@ final class CodexAssistantRuntime {
         let request = AssistantPermissionRequest(
             id: approvalRequestID(from: id),
             sessionID: params["threadId"] as? String ?? activeSessionID ?? "",
-            toolTitle: firstNonEmptyString(
-                (questions.first?["header"] as? String),
-                "Codex needs input"
-            ) ?? "Codex needs input",
+            toolTitle: "Codex needs input",
             toolKind: "userInput",
-            rationale: questions.compactMap { $0["question"] as? String }.joined(separator: "\n"),
+            rationale: nil,
             options: [],
             userInputQuestions: parsedQuestions,
             rawPayloadSummary: nil
@@ -1693,6 +1695,11 @@ final class CodexAssistantRuntime {
 
     /// Finalize the streaming buffer: emit the final non-streaming entry and reset.
     private func flushStreamingBuffer() {
+        pendingStreamingTranscriptEmit?.cancel()
+        pendingStreamingTranscriptEmit = nil
+        pendingAssistantTimelineEmit?.cancel()
+        pendingAssistantTimelineEmit = nil
+
         guard let entryID = streamingEntryID, !streamingBuffer.isEmpty else {
             streamingEntryID = nil
             streamingBuffer = ""
@@ -1777,6 +1784,10 @@ final class CodexAssistantRuntime {
         onToolCallUpdate?(toolCalls.values.sorted { $0.title < $1.title })
 
         if var activity = parseActivityItem(from: item) {
+            pendingActivityTimelineEmitByID[activity.id]?.cancel()
+            pendingActivityTimelineEmitByID[activity.id] = nil
+            lastActivityTimelineEmitTimeByID[activity.id] = nil
+
             if let existing = liveActivities[activity.id] {
                 if activity.rawDetails?.nonEmpty == nil {
                     activity.rawDetails = existing.rawDetails
@@ -1795,7 +1806,7 @@ final class CodexAssistantRuntime {
                 liveActivities[activity.id] = activity
             }
 
-            onTimelineMutation?(.upsert(.activity(activity)))
+            emitActivityTimelineUpdate(activity, force: true)
         }
 
         if !isCompleted {
@@ -1869,7 +1880,7 @@ final class CodexAssistantRuntime {
             activity.rawDetails = current.isEmpty ? delta : "\(current)\n\(delta)"
             activity.updatedAt = Date()
             liveActivities[itemID] = activity
-            onTimelineMutation?(.upsert(.activity(activity)))
+            emitActivityTimelineUpdate(activity)
         }
     }
 
@@ -1959,33 +1970,95 @@ final class CodexAssistantRuntime {
         }
     }
 
-    private func appendAssistantDelta(_ delta: String) {
+    private func appendAssistantDelta() {
         if streamingTimelineID == nil {
             streamingTimelineID = "assistant-final-\(UUID().uuidString)"
             streamingStartedAt = Date()
         }
 
-        guard let timelineID = streamingTimelineID else { return }
-
-        // Throttle timeline mutations to ~20Hz during streaming so text feels
-        // more live without overwhelming the full assistant window.
-        let now = CFAbsoluteTimeGetCurrent()
-        guard now - lastTimelineMutationTime >= 0.05 else { return }
-        lastTimelineMutationTime = now
-
-        onTimelineMutation?(
-            .upsert(
-                .assistantFinal(
-                    id: timelineID,
-                    sessionID: activeSessionID,
-                    turnID: activeTurnID,
-                    text: streamingBuffer,
-                    createdAt: streamingStartedAt ?? Date(),
-                    updatedAt: Date(),
-                    isStreaming: true,
-                    source: .runtime
+        let minimumInterval: CFAbsoluteTime = 0.05
+        let emit = { [weak self] in
+            guard let self,
+                  let timelineID = self.streamingTimelineID else { return }
+            self.onTimelineMutation?(
+                .upsert(
+                    .assistantFinal(
+                        id: timelineID,
+                        sessionID: self.activeSessionID,
+                        turnID: self.activeTurnID,
+                        text: self.streamingBuffer,
+                        createdAt: self.streamingStartedAt ?? Date(),
+                        updatedAt: Date(),
+                        isStreaming: true,
+                        source: .runtime
+                    )
                 )
             )
+            self.lastTimelineMutationTime = CFAbsoluteTimeGetCurrent()
+            self.pendingAssistantTimelineEmit = nil
+        }
+
+        let now = CFAbsoluteTimeGetCurrent()
+        let elapsed = now - lastTimelineMutationTime
+        if elapsed >= minimumInterval {
+            pendingAssistantTimelineEmit?.cancel()
+            emit()
+            return
+        }
+
+        guard pendingAssistantTimelineEmit == nil else { return }
+        let item = DispatchWorkItem(block: emit)
+        pendingAssistantTimelineEmit = item
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + max(0.01, minimumInterval - elapsed),
+            execute: item
+        )
+    }
+
+    private func emitStreamingTranscriptUpdate(force: Bool = false) {
+        guard streamingEntryID != nil,
+              streamingBuffer.nonEmpty != nil else {
+            if force {
+                pendingStreamingTranscriptEmit?.cancel()
+                pendingStreamingTranscriptEmit = nil
+            }
+            return
+        }
+
+        let minimumInterval: CFAbsoluteTime = 0.05
+        let emit = { [weak self] in
+            guard let self,
+                  let entryID = self.streamingEntryID else { return }
+            self.onTranscript?(AssistantTranscriptEntry(
+                id: entryID,
+                role: .assistant,
+                text: self.streamingBuffer,
+                isStreaming: true
+            ))
+            self.lastStreamingTranscriptEmitTime = CFAbsoluteTimeGetCurrent()
+            self.pendingStreamingTranscriptEmit = nil
+        }
+
+        if force {
+            pendingStreamingTranscriptEmit?.cancel()
+            emit()
+            return
+        }
+
+        let now = CFAbsoluteTimeGetCurrent()
+        let elapsed = now - lastStreamingTranscriptEmitTime
+        if elapsed >= minimumInterval {
+            pendingStreamingTranscriptEmit?.cancel()
+            emit()
+            return
+        }
+
+        guard pendingStreamingTranscriptEmit == nil else { return }
+        let item = DispatchWorkItem(block: emit)
+        pendingStreamingTranscriptEmit = item
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + max(0.01, minimumInterval - elapsed),
+            execute: item
         )
     }
 
@@ -1996,31 +2069,69 @@ final class CodexAssistantRuntime {
         }
 
         commentaryBuffer += delta
-        guard let commentaryTimelineID else { return }
-        onTimelineMutation?(
-            .upsert(
-                .assistantProgress(
-                    id: commentaryTimelineID,
-                    sessionID: activeSessionID,
-                    turnID: activeTurnID,
-                    text: commentaryBuffer,
-                    createdAt: commentaryStartedAt ?? Date(),
-                    updatedAt: Date(),
-                    isStreaming: true,
-                    source: .runtime
+        emitCommentaryTimelineUpdate()
+    }
+
+    private func emitCommentaryTimelineUpdate(force: Bool = false) {
+        guard commentaryTimelineID != nil else { return }
+
+        let minimumInterval: CFAbsoluteTime = 0.08
+        let emit = { [weak self] in
+            guard let self,
+                  let commentaryTimelineID = self.commentaryTimelineID else { return }
+            self.onTimelineMutation?(
+                .upsert(
+                    .assistantProgress(
+                        id: commentaryTimelineID,
+                        sessionID: self.activeSessionID,
+                        turnID: self.activeTurnID,
+                        text: self.commentaryBuffer,
+                        createdAt: self.commentaryStartedAt ?? Date(),
+                        updatedAt: Date(),
+                        isStreaming: true,
+                        source: .runtime
+                    )
                 )
             )
+            self.lastCommentaryTimelineEmitTime = CFAbsoluteTimeGetCurrent()
+            self.pendingCommentaryTimelineEmit = nil
+        }
+
+        if force {
+            pendingCommentaryTimelineEmit?.cancel()
+            emit()
+            return
+        }
+
+        let now = CFAbsoluteTimeGetCurrent()
+        let elapsed = now - lastCommentaryTimelineEmitTime
+        if elapsed >= minimumInterval {
+            pendingCommentaryTimelineEmit?.cancel()
+            emit()
+            return
+        }
+
+        guard pendingCommentaryTimelineEmit == nil else { return }
+        let item = DispatchWorkItem(block: emit)
+        pendingCommentaryTimelineEmit = item
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + max(0.01, minimumInterval - elapsed),
+            execute: item
         )
     }
 
     private func flushCommentaryBuffer() {
         guard let commentaryTimelineID, !commentaryBuffer.isEmpty else {
+            pendingCommentaryTimelineEmit?.cancel()
+            pendingCommentaryTimelineEmit = nil
             commentaryTimelineID = nil
             commentaryStartedAt = nil
             commentaryBuffer = ""
             return
         }
 
+        pendingCommentaryTimelineEmit?.cancel()
+        pendingCommentaryTimelineEmit = nil
         onTimelineMutation?(
             .upsert(
                 .assistantProgress(
@@ -2039,6 +2150,46 @@ final class CodexAssistantRuntime {
         self.commentaryTimelineID = nil
         self.commentaryStartedAt = nil
         self.commentaryBuffer = ""
+    }
+
+    private func emitActivityTimelineUpdate(
+        _ activity: AssistantActivityItem,
+        force: Bool = false
+    ) {
+        let activityID = activity.id
+        let minimumInterval: CFAbsoluteTime = 0.10
+
+        let emit = { [weak self] in
+            guard let self else { return }
+            let latestActivity = force ? activity : (self.liveActivities[activityID] ?? activity)
+            self.onTimelineMutation?(.upsert(.activity(latestActivity)))
+            self.lastActivityTimelineEmitTimeByID[activityID] = CFAbsoluteTimeGetCurrent()
+            self.pendingActivityTimelineEmitByID[activityID] = nil
+        }
+
+        if force {
+            pendingActivityTimelineEmitByID[activityID]?.cancel()
+            pendingActivityTimelineEmitByID[activityID] = nil
+            emit()
+            return
+        }
+
+        let now = CFAbsoluteTimeGetCurrent()
+        let elapsed = now - (lastActivityTimelineEmitTimeByID[activityID] ?? 0)
+        if elapsed >= minimumInterval {
+            pendingActivityTimelineEmitByID[activityID]?.cancel()
+            pendingActivityTimelineEmitByID[activityID] = nil
+            emit()
+            return
+        }
+
+        guard pendingActivityTimelineEmitByID[activityID] == nil else { return }
+        let item = DispatchWorkItem(block: emit)
+        pendingActivityTimelineEmitByID[activityID] = item
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + max(0.01, minimumInterval - elapsed),
+            execute: item
+        )
     }
 
     private func emitPlanTimeline(text: String, isStreaming: Bool) {
@@ -2087,14 +2238,27 @@ final class CodexAssistantRuntime {
             var finalized = activity
             finalized.status = status
             finalized.updatedAt = now
-            onTimelineMutation?(.upsert(.activity(finalized)))
+            emitActivityTimelineUpdate(finalized, force: true)
         }
         liveActivities.removeAll()
         toolCalls.removeAll()
+        pendingToolCallEmit?.cancel()
+        pendingToolCallEmit = nil
         onToolCallUpdate?([])
     }
 
     private func resetStreamingTimelineState() {
+        pendingAssistantTimelineEmit?.cancel()
+        pendingAssistantTimelineEmit = nil
+        pendingStreamingTranscriptEmit?.cancel()
+        pendingStreamingTranscriptEmit = nil
+        pendingCommentaryTimelineEmit?.cancel()
+        pendingCommentaryTimelineEmit = nil
+        pendingToolCallEmit?.cancel()
+        pendingToolCallEmit = nil
+        pendingActivityTimelineEmitByID.values.forEach { $0.cancel() }
+        pendingActivityTimelineEmitByID.removeAll()
+        lastActivityTimelineEmitTimeByID.removeAll()
         streamingEntryID = nil
         streamingBuffer = ""
         streamingTimelineID = nil
@@ -2107,6 +2271,8 @@ final class CodexAssistantRuntime {
         proposedPlanBuffer = ""
         allowsProposedPlanForActiveTurn = false
         lastTimelineMutationTime = 0
+        lastStreamingTranscriptEmitTime = 0
+        lastCommentaryTimelineEmitTime = 0
     }
 
     private func parseActivityItem(from item: [String: Any]) -> AssistantActivityItem? {
@@ -2394,6 +2560,17 @@ final class CodexAssistantRuntime {
                 ]
             ]
         )
+    }
+
+    func processProcessExitedForTesting(message: String? = nil) async {
+        await handleIncomingEvent(.processExited(message))
+    }
+
+    func processServerRequestForTesting(
+        method: String,
+        params: [String: Any]
+    ) async {
+        await handleServerRequest(id: .string("test-request"), method: method, params: params)
     }
 
     func blockedToolUseMessage(

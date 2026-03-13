@@ -33,10 +33,9 @@ enum AssistantNotchLayout {
         spacingBelowNotch: CGFloat
     ) -> CGFloat {
         guard hasHardwareNotch else { return 0 }
-
-        let shouldSitBelowNotch = requestedHeight > (hiddenHeight + 0.5)
-            && requestedHeight <= (collapsedHeight + 0.5)
-        guard shouldSitBelowNotch else { return 0 }
+        // Only content intentionally docked inside the notch (≤ hiddenHeight) stays behind it.
+        // All taller content — collapsed pill, compact card, expanded tray — must sit below.
+        guard requestedHeight > (hiddenHeight + 0.5) else { return 0 }
 
         return contentTopInset(
             hasHardwareNotch: hasHardwareNotch,
@@ -44,6 +43,11 @@ enum AssistantNotchLayout {
             safeAreaTop: safeAreaTop,
             spacingBelowNotch: spacingBelowNotch
         )
+    }
+
+    static func centeredOriginX(screenFrame: NSRect, width: CGFloat) -> CGFloat {
+        let centeredX = screenFrame.midX - (width / 2)
+        return round(max(screenFrame.minX, min(centeredX, screenFrame.maxX - width)))
     }
 
     static func contentTopInset(
@@ -335,6 +339,11 @@ final class AssistantCompactHUDManager: AssistantCompactPresenter {
         model.onResolvePermission = { [weak self] optionID in
             guard let self else { return }
             Task { await self.controller.resolvePermission(optionID: optionID) }
+        }
+
+        model.onSubmitPermissionAnswers = { [weak self] answers in
+            guard let self else { return }
+            Task { await self.controller.resolvePermission(answers: answers) }
         }
 
         model.onCancelPermission = { [weak self] in
@@ -1267,10 +1276,10 @@ final class AssistantCompactHUDManager: AssistantCompactPresenter {
         )
         let clampedHeight = min(requestedSize.height, max(44, screen.frame.height - verticalOffset - 48))
         let size = NSSize(width: clampedWidth, height: clampedHeight)
-
-        let centerX = preferredNotchCenterX(for: screen, requestedWidth: size.width)
-
-        let originX = round(max(screen.frame.minX, min(centerX - (size.width / 2), screen.frame.maxX - size.width)))
+        // Keep every notch state centered on the display horizontally.
+        // The hardware gap APIs are good for sizing and vertical placement,
+        // but they can drift enough to make the pop-up look like it jumps sideways.
+        let originX = AssistantNotchLayout.centeredOriginX(screenFrame: screen.frame, width: size.width)
         let originY = round(screen.frame.maxY - verticalOffset - size.height)
         return NSRect(origin: NSPoint(x: originX, y: originY), size: size)
     }
@@ -1283,15 +1292,6 @@ final class AssistantCompactHUDManager: AssistantCompactPresenter {
             && !model.showWorkingDetail
             && model.modeSwitchSuggestion == nil
             && !model.showCompactComposer
-    }
-
-    private func preferredNotchCenterX(for screen: NSScreen, requestedWidth: CGFloat) -> CGFloat {
-        switch notchAnchorMode(for: screen) {
-        case let .hardwareNotch(gapRect):
-            return normalizedHorizontalCoordinate(gapRect.midX, on: screen)
-        case .syntheticNotch:
-            return screen.frame.midX
-        }
     }
 
     private func notchDockVisibleHeight(for screen: NSScreen) -> CGFloat {

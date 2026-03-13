@@ -99,6 +99,7 @@ struct AIMemoryStudioView: View {
         case browser
         case actions
         case assistantSetup
+        case assistantVoice
         case assistantMemory
         case assistantInstructions
         case assistantLimits
@@ -124,6 +125,8 @@ struct AIMemoryStudioView: View {
                 return "Maintenance"
             case .assistantSetup:
                 return "Setup"
+            case .assistantVoice:
+                return "Voice"
             case .assistantMemory:
                 return "Memory"
             case .assistantInstructions:
@@ -153,6 +156,8 @@ struct AIMemoryStudioView: View {
                 return "Rescan, rebuild, and cleanup controls."
             case .assistantSetup:
                 return "Enable, model, account, and browser automation."
+            case .assistantVoice:
+                return "Assistant reply speech, Hume voice setup, fallback, and health."
             case .assistantMemory:
                 return "Thread memory, long-term lessons, and review controls."
             case .assistantInstructions:
@@ -179,9 +184,11 @@ struct AIMemoryStudioView: View {
             case .browser:
                 return "magnifyingglass.circle"
             case .actions:
-                return "hammer"
+                return AssistantChromeSymbol.action
             case .assistantSetup:
                 return "sparkles.rectangle.stack.fill"
+            case .assistantVoice:
+                return "speaker.wave.3.fill"
             case .assistantMemory:
                 return "brain.head.profile"
             case .assistantInstructions:
@@ -211,6 +218,8 @@ struct AIMemoryStudioView: View {
                 return Color(red: 0.90, green: 0.70, blue: 0.26)
             case .assistantSetup:
                 return Color(red: 0.22, green: 0.70, blue: 1.00)
+            case .assistantVoice:
+                return Color(red: 0.23, green: 0.72, blue: 0.58)
             case .assistantMemory:
                 return Color(red: 0.46, green: 0.79, blue: 0.66)
             case .assistantInstructions:
@@ -224,7 +233,7 @@ struct AIMemoryStudioView: View {
 
         var isAssistantPage: Bool {
             switch self {
-            case .assistantSetup, .assistantMemory, .assistantInstructions, .assistantLimits, .assistantSessions:
+            case .assistantSetup, .assistantVoice, .assistantMemory, .assistantInstructions, .assistantLimits, .assistantSessions:
                 return true
             default:
                 return false
@@ -701,6 +710,8 @@ struct AIMemoryStudioView: View {
             if isMemoryFeatureEnabled { studioActionsPage } else { studioOverviewPage }
         case .assistantSetup:
             studioAssistantSetupPage
+        case .assistantVoice:
+            studioAssistantVoicePage
         case .assistantMemory:
             studioAssistantMemoryPage
         case .assistantInstructions:
@@ -2389,7 +2400,7 @@ struct AIMemoryStudioView: View {
     private var assistantStudioPages: [StudioPage] {
         var pages: [StudioPage] = [.assistantSetup]
         if shouldShowAssistantAdvancedPages {
-            pages.append(contentsOf: [.assistantMemory, .assistantInstructions, .assistantLimits, .assistantSessions])
+            pages.append(contentsOf: [.assistantVoice, .assistantMemory, .assistantInstructions, .assistantLimits, .assistantSessions])
         }
         return pages
     }
@@ -5019,7 +5030,17 @@ struct AIMemoryStudioView: View {
         memoryInspectionExplanation = nil
 
         Task {
-            let result = await MemoryEntryExplanationService.shared.explain(entry: entry)
+            let result = await MemoryEntryExplanationService.shared.explain(
+                entry: entry,
+                onPartialText: { partialText in
+                    Task { @MainActor in
+                        let normalized = partialText.trimmingCharacters(in: .whitespacesAndNewlines)
+                        guard !normalized.isEmpty else { return }
+                        memoryInspectionStatusMessage = "Streaming AI explanation..."
+                        memoryInspectionExplanation = normalized
+                    }
+                }
+            )
             await MainActor.run {
                 isMemoryInspectionBusy = false
                 switch result {
@@ -5657,6 +5678,185 @@ struct AIMemoryStudioView: View {
         }
     }
 
+    // MARK: - Assistant Voice Page
+
+    private var studioAssistantVoicePage: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            settingsCard(
+                title: "Assistant Voice",
+                subtitle: "Speak only final assistant replies. Hume Octave is the cloud voice option, with macOS as the reliability fallback.",
+                symbol: "speaker.wave.3.fill",
+                tint: StudioPage.assistantVoice.tint
+            ) {
+                Toggle("Enable assistant reply voice output", isOn: $settings.assistantVoiceOutputEnabled)
+
+                Picker(
+                    "Voice engine",
+                    selection: Binding(
+                        get: { settings.assistantVoiceEngine },
+                        set: { settings.assistantVoiceEngine = $0 }
+                    )
+                ) {
+                    ForEach(AssistantSpeechEngine.allCases) { engine in
+                        Text(engine.displayName).tag(engine)
+                    }
+                }
+
+                if settings.assistantVoiceEngine == .humeOctave {
+                    SecureField("Hume API key", text: $settings.assistantHumeAPIKey)
+                        .textFieldStyle(.roundedBorder)
+                    SecureField("Hume Secret key", text: $settings.assistantHumeSecretKey)
+                        .textFieldStyle(.roundedBorder)
+
+                    Text("Your Hume keys stay in your macOS Keychain.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+
+                    Picker(
+                        "Voice source",
+                        selection: Binding(
+                            get: { settings.assistantHumeVoiceSource },
+                            set: { settings.assistantHumeVoiceSource = $0 }
+                        )
+                    ) {
+                        ForEach(AssistantHumeVoiceSource.allCases) { source in
+                            Text(source.displayName).tag(source)
+                        }
+                    }
+
+                    Picker(
+                        "Hume voice",
+                        selection: Binding(
+                            get: { settings.assistantHumeVoiceID },
+                            set: { selectedID in
+                                if let voice = assistant.assistantHumeVoiceOptions.first(where: { $0.id == selectedID }) {
+                                    assistant.selectAssistantHumeVoice(voice)
+                                } else {
+                                    settings.assistantHumeVoiceID = selectedID
+                                }
+                            }
+                        )
+                    ) {
+                        if settings.assistantHumeVoiceID.isEmpty {
+                            Text("Select a Hume voice").tag("")
+                        }
+                        ForEach(assistant.assistantHumeVoiceOptions) { voice in
+                            Text(voice.displayLabel).tag(voice.id)
+                        }
+                    }
+                    .disabled(assistant.assistantHumeVoiceOptions.isEmpty)
+
+                    Text("Selected voice: \(assistant.assistantSelectedHumeVoiceSummary)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    Toggle("Fallback to macOS voice if Hume fails", isOn: $settings.assistantTTSFallbackToMacOS)
+                }
+
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack {
+                        Text("Voice health")
+                            .font(.callout.weight(.medium))
+                        Spacer()
+                        Text(assistant.assistantVoiceHealth.statusLabel)
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(assistantVoiceHealthColor(assistant.assistantVoiceHealth))
+                    }
+
+                    Text(assistant.assistantVoiceHealth.detail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                HStack {
+                    Text("macOS voice")
+                        .font(.callout.weight(.medium))
+                    Spacer()
+                    Picker("macOS voice", selection: $settings.assistantTTSFallbackVoiceIdentifier) {
+                        ForEach(assistant.assistantFallbackVoiceOptions) { voice in
+                            Text(voice.displayLabel).tag(voice.id)
+                        }
+                    }
+                    .frame(width: 280)
+                    .pickerStyle(.menu)
+                }
+
+                Toggle(
+                    "Stop current speech when a newer final reply arrives",
+                    isOn: $settings.assistantInterruptCurrentSpeechOnNewReply
+                )
+
+                HStack(spacing: 8) {
+                    Button("Refresh Health") {
+                        Task {
+                            await assistant.refreshAssistantVoiceHealth()
+                        }
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(assistant.isRefreshingAssistantVoiceHealth)
+
+                    if settings.assistantVoiceEngine == .humeOctave {
+                        Button("Refresh Voices") {
+                            Task {
+                                await assistant.refreshAssistantHumeVoices()
+                            }
+                        }
+                        .buttonStyle(.bordered)
+                        .disabled(assistant.isRefreshingAssistantHumeVoices)
+
+                        if assistant.assistantVoicePlaybackActive {
+                            Button("Stop Speaking") {
+                                assistant.stopAssistantVoicePlayback()
+                            }
+                            .buttonStyle(.bordered)
+                        }
+                    }
+
+                    if assistant.assistantVoiceLegacyCleanupAvailable {
+                        Button("Remove Old Local TADA Data", role: .destructive) {
+                            Task {
+                                await assistant.removeLegacyAssistantVoiceData()
+                            }
+                        }
+                        .buttonStyle(.bordered)
+                        .disabled(assistant.isRemovingAssistantVoiceInstallation)
+                    }
+
+                    Button("Test Voice Output") {
+                        Task {
+                            await assistant.testAssistantVoiceOutput()
+                        }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(assistant.isTestingAssistantVoice)
+                }
+
+                if let statusMessage = assistant.assistantVoiceStatusMessage?.trimmingCharacters(in: .whitespacesAndNewlines),
+                   !statusMessage.isEmpty {
+                    Text(statusMessage)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+        .task(
+            id: settings.assistantVoiceEngineRawValue
+                + settings.assistantHumeVoiceID
+                + settings.assistantHumeVoiceSourceRawValue
+                + settings.assistantHumeAPIKey
+        ) {
+            await assistant.refreshAssistantVoiceHealth()
+            if settings.assistantVoiceEngine == .humeOctave,
+               assistant.assistantHumeVoiceOptions.isEmpty,
+               settings.assistantHumeAPIKey.nonEmpty != nil {
+                await assistant.refreshAssistantHumeVoices()
+            }
+        }
+    }
+
     // MARK: - Assistant Limits Page
 
     private var studioAssistantLimitsPage: some View {
@@ -5792,6 +5992,19 @@ struct AIMemoryStudioView: View {
             return "sparkles"
         case .other:
             return "tray.full.fill"
+        }
+    }
+
+    private func assistantVoiceHealthColor(_ health: AssistantSpeechHealth) -> Color {
+        switch health.state {
+        case .healthy:
+            return Color.green.opacity(0.92)
+        case .degraded:
+            return Color.orange.opacity(0.92)
+        case .unavailable:
+            return Color.red.opacity(0.92)
+        case .unknown:
+            return .secondary
         }
     }
 

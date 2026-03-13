@@ -25,9 +25,9 @@
         <key>NSHighResolutionCapable</key>
         <true />
         <key>CFBundleShortVersionString</key>
-        <string>1.0.7</string>
+        <string>1.0.0</string>
         <key>CFBundleVersion</key>
-        <string>73</string>
+        <string>1</string>
         <key>SUFeedURL</key>
         <string>https://manikv12.github.io/OpenAssist/appcast.xml</string>
         <key>SUEnableAutomaticChecks</key>

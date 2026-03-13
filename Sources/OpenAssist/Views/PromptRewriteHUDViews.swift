@@ -30,6 +30,26 @@ struct PromptRewriteLoadingView: View {
         return words.prefix(24).joined(separator: " ") + "…"
     }
 
+    private var livePreviewText: String? {
+        state.partialPreviewText?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nonEmpty
+    }
+
+    private var previewBlockTitle: String {
+        if state.isStreamingPreviewActive, livePreviewText != nil {
+            return "Live Preview"
+        }
+        return "Transcript"
+    }
+
+    private var previewBlockText: String {
+        if state.isStreamingPreviewActive, let livePreviewText {
+            return livePreviewText
+        }
+        return transcriptPreview
+    }
+
     private var stepText: String {
         let normalized = state.currentStep.trimmingCharacters(in: .whitespacesAndNewlines)
         return normalized.isEmpty ? "Preparing rewrite request" : normalized
@@ -94,12 +114,16 @@ struct PromptRewriteLoadingView: View {
             .padding(.top, -1)
 
             VStack(alignment: .leading, spacing: 4) {
+                Text(previewBlockTitle)
+                    .font(.system(size: 10, weight: .semibold, design: .rounded))
+                    .foregroundStyle(Color.white.opacity(0.56))
+
                 HStack(alignment: .top, spacing: 8) {
                     PromptRewriteAccentDot()
                         .padding(.top, 3)
 
                     PromptRewriteWordFlowText(
-                        text: transcriptPreview,
+                        text: previewBlockText,
                         font: .system(size: 11.5, weight: .medium, design: .rounded),
                         foregroundColor: Color.white.opacity(0.90),
                         wordsPerSecond: 4,

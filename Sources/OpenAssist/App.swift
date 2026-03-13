@@ -863,13 +863,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         let aiGenerationSummary: String
         let aiRuntimeSummary: String?
 
-        func displayState(step: String) -> PromptRewriteLoadingDisplayState {
+        func displayState(
+            step: String,
+            partialPreviewText: String? = nil,
+            isStreamingPreviewActive: Bool = false
+        ) -> PromptRewriteLoadingDisplayState {
             PromptRewriteLoadingDisplayState(
                 transcription: transcript,
                 currentStep: step,
                 aiSuggestionsEnabled: aiSuggestionsEnabled,
                 aiGenerationSummary: aiGenerationSummary,
-                aiRuntimeSummary: aiRuntimeSummary
+                aiRuntimeSummary: aiRuntimeSummary,
+                partialPreviewText: partialPreviewText,
+                isStreamingPreviewActive: isStreamingPreviewActive
             )
         }
     }
@@ -1925,6 +1931,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         }
 
         openAssistantWindow()
+        assistantController.stopAssistantVoicePlayback()
         assistantVoiceCaptureActive = true
         assistantVoiceStopMode = stopMode
         assistantVoiceSilenceStart = nil
@@ -1950,6 +1957,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             setUIStatus(.ready)
             updateMenuState()
         }
+
+        assistantController.stopAssistantVoicePlayback()
 
         Task { @MainActor in
             await assistantController.sendPrompt(trimmed)
@@ -1990,6 +1999,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             return
         }
 
+        assistantController.stopAssistantVoicePlayback()
         compactVoiceCaptureActive = true
         compactVoiceStopMode = stopMode
         assistantVoiceSilenceStart = nil
@@ -3018,7 +3028,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
                 let suggestion = try await PromptRewriteService.shared.retrieveSuggestion(
                     for: cleanedTranscript,
                     conversationContext: conversationContext,
-                    conversationHistory: conversationHistory
+                    conversationHistory: conversationHistory,
+                    onPartialSuggestion: { partialPreview in
+                        progressDripTask.cancel()
+                        Task { @MainActor in
+                            PromptRewriteHUDManager.shared.updateLoadingIndicator(
+                                insertionContext: insertionContext,
+                                displayState: loadingNarrative.displayState(
+                                    step: "Receiving live AI draft",
+                                    partialPreviewText: partialPreview,
+                                    isStreamingPreviewActive: true
+                                )
+                            )
+                        }
+                    }
                 )
                 return .suggestion(suggestion)
             }
@@ -3999,7 +4022,7 @@ struct SettingsView: View {
             case .shortcuts: return "keyboard"
             case .speech: return "waveform.and.mic"
             case .aiModels: return "shippingbox.fill"
-            case .computerControl: return "desktopcomputer.and.sparkles"
+            case .computerControl: return "computermouse.fill"
             case .integrations: return "point.3.connected.trianglepath.dotted"
             case .corrections: return "text.badge.checkmark"
             case .about: return "info.circle"

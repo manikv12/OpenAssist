@@ -172,7 +172,7 @@ struct OrbSecondaryActionButton: View {
             HStack(spacing: 6) {
                 if let symbol {
                     Image(systemName: symbol)
-                        .font(.system(size: 9, weight: .semibold))
+                        .font(.system(size: 10, weight: .bold))
                 }
 
                 Text(title)
@@ -194,6 +194,30 @@ struct OrbSecondaryActionButton: View {
     }
 }
 
+struct OrbIconOnlySecondaryButton: View {
+    let symbol: String
+    let tint: Color
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: 11, weight: .bold))
+                .foregroundStyle(tint)
+                .padding(8)
+                .background(
+                    Circle()
+                        .fill(tint.opacity(0.12))
+                        .overlay(
+                            Circle()
+                                .stroke(tint.opacity(0.18), lineWidth: 0.6)
+                        )
+                )
+        }
+        .buttonStyle(.plain)
+    }
+}
+
 struct OrbIconControlButton: View {
     let symbol: String
     let tint: Color
@@ -203,26 +227,12 @@ struct OrbIconControlButton: View {
 
     var body: some View {
         Button(action: action) {
-            ZStack {
-                Circle()
-                    .fill(
-                        LinearGradient(
-                            colors: isActive
-                                ? [tint.opacity(0.26), tint.opacity(0.12)]
-                                : [Color.white.opacity(0.08), Color.white.opacity(0.04)],
-                            startPoint: .topLeading,
-                            endPoint: .bottomTrailing
-                        )
-                    )
-
-                Circle()
-                    .stroke(isActive ? tint.opacity(0.30) : Color.white.opacity(0.08), lineWidth: 0.6)
-
-                Image(systemName: symbol)
-                    .font(.system(size: max(10, size * 0.4), weight: .semibold))
-                    .foregroundStyle(isActive ? tint : Color.white.opacity(0.52))
-            }
-            .frame(width: size, height: size)
+            AssistantToolbarCircleButtonLabel(
+                symbol: symbol,
+                tint: isActive ? tint : .white,
+                size: size,
+                emphasized: isActive
+            )
             .scaleEffect(isActive ? 1.06 : 1.0)
             .animation(
                 isActive
@@ -468,24 +478,33 @@ struct NotchPopupSurfaceModifier: ViewModifier {
             .background {
                 ZStack {
                     shape
-                        .fill(Color.black.opacity(reduceTransparency ? 0.98 : 0.62))
+                        .fill(Color.black.opacity(reduceTransparency ? 0.99 : 0.84))
 
                     if tokens.useMaterial {
                         shape
                             .fill(AppVisualTheme.adaptiveMaterialFill(reduceTransparency: reduceTransparency))
-                            .opacity(reduceTransparency ? 0.30 : 0.72)
+                            .opacity(reduceTransparency ? 0.18 : 0.24)
                     }
-
-                    shape
-                        .fill(tokens.surfaceBottom.opacity(reduceTransparency ? 0.90 : 0.38))
 
                     shape
                         .fill(
                             LinearGradient(
                                 colors: [
-                                    Color.white.opacity(0.05),
-                                    tint.opacity(0.08),
-                                    Color.black.opacity(0.30)
+                                    tokens.surfaceTop.opacity(reduceTransparency ? 0.82 : 0.68),
+                                    tokens.surfaceBottom.opacity(reduceTransparency ? 0.96 : 0.82)
+                                ],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            )
+                        )
+
+                    shape
+                        .fill(
+                            LinearGradient(
+                                colors: [
+                                    Color.white.opacity(0.08),
+                                    tint.opacity(0.10),
+                                    Color.black.opacity(0.22)
                                 ],
                                 startPoint: .topLeading,
                                 endPoint: .bottomTrailing
@@ -525,30 +544,46 @@ struct NotchInsetSurfaceModifier: ViewModifier {
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
     func body(content: Content) -> some View {
+        let tokens = AppVisualTheme.glassTokens(
+            style: SettingsStore.shared.appChromeStyle,
+            reduceTransparency: reduceTransparency
+        )
         let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
 
         return content
             .background {
                 ZStack {
                     shape
-                        .fill(Color.black.opacity(reduceTransparency ? 0.82 : 0.44))
+                        .fill(Color.black.opacity(reduceTransparency ? 0.92 : 0.76))
 
-                    if !reduceTransparency {
+                    if tokens.useMaterial {
                         shape
                             .fill(AppVisualTheme.adaptiveMaterialFill(reduceTransparency: reduceTransparency))
-                            .opacity(0.40)
+                            .opacity(0.22)
                     }
-
-                    shape
-                        .fill(Color.white.opacity(fillOpacity * 0.22))
 
                     shape
                         .fill(
                             LinearGradient(
                                 colors: [
-                                    tint.opacity(fillOpacity * 0.55),
+                                    tokens.surfaceTop.opacity(reduceTransparency ? 0.78 : 0.56),
+                                    tokens.surfaceBottom.opacity(reduceTransparency ? 0.94 : 0.70)
+                                ],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            )
+                        )
+
+                    shape
+                        .fill(Color.white.opacity(fillOpacity * 0.14))
+
+                    shape
+                        .fill(
+                            LinearGradient(
+                                colors: [
+                                    tint.opacity(fillOpacity * 0.42),
                                     Color.clear,
-                                    Color.black.opacity(fillOpacity * 0.80)
+                                    Color.black.opacity(0.18 + (fillOpacity * 0.90))
                                 ],
                                 startPoint: .topLeading,
                                 endPoint: .bottomTrailing
@@ -776,4 +811,3 @@ struct OrbWorkingActivityRow: View {
         return .orange
     }
 }
-

@@ -155,6 +155,7 @@ final class AssistantOrbHUDModel: ObservableObject {
     func presentWorkingDetailIfAvailable() -> Bool {
         guard canPresentWorkingDetail else { return false }
         showWorkingDetail = true
+        Task { await onRefreshSessions?() }
         return true
     }
 
@@ -164,6 +165,7 @@ final class AssistantOrbHUDModel: ObservableObject {
             return false
         }
         showDoneDetail = true
+        Task { await onRefreshSessions?() }
         return true
     }
 
@@ -177,6 +179,7 @@ final class AssistantOrbHUDModel: ObservableObject {
         showDoneDetail = false
         showWorkingDetail = false
         showCompactComposer = false
+        Task { await onRefreshSessions?() }
     }
 
     func dismissPlanDetail() {
@@ -191,7 +194,7 @@ final class AssistantOrbHUDModel: ObservableObject {
         if activeSessionSummary != nil {
             return true
         }
-        return !sessions.isEmpty
+        return true
     }
 
     @discardableResult
@@ -206,6 +209,7 @@ final class AssistantOrbHUDModel: ObservableObject {
         }
         showCompactComposer = true
         shouldFocusTextField = true
+        Task { await onRefreshSessions?() }
         return true
     }
 
@@ -296,6 +300,7 @@ final class AssistantOrbHUDModel: ObservableObject {
         storedProposedPlanText = nil
         showPlanDetail = false
         showCompactComposer = false
+        Task { await onRefreshSessions?() }
     }
 
     func selectSessionForReply(_ session: AssistantSessionSummary) {

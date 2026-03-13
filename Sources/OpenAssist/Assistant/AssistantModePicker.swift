@@ -37,6 +37,14 @@ struct AssistantModePicker: View {
             }
         }
 
+        var badgeSide: CGFloat {
+            switch self {
+            case .standard: return 18
+            case .compact: return 16
+            case .micro: return 14
+            }
+        }
+
         var textSize: CGFloat {
             switch self {
             case .standard: return 11
@@ -131,10 +139,15 @@ struct AssistantModePicker: View {
                 }
             }
         } label: {
-            HStack(spacing: 4) {
-                Image(systemName: selection.icon)
-                    .font(.system(size: style.iconSize, weight: .semibold))
-                    .foregroundStyle(selection.displayTint)
+            HStack(spacing: 5) {
+                AssistantGlyphBadge(
+                    symbol: selection.icon,
+                    tint: selection.displayTint,
+                    side: style.badgeSide,
+                    fillOpacity: style == .micro ? 0.10 : 0.14,
+                    strokeOpacity: style == .micro ? 0.16 : 0.22,
+                    symbolScale: style == .micro ? 0.46 : 0.50
+                )
                 Text(selection.label)
                     .font(.system(size: style.textSize, weight: .medium))
                     .foregroundStyle(.white.opacity(style.textOpacity))

@@ -265,6 +265,66 @@ final class AssistantSessionInteractionTests: XCTestCase {
     }
 
     @MainActor
+    func testToolUserInputRequestKeepsQuestionsStructured() async {
+        let runtime = CodexAssistantRuntime()
+        var capturedRequest: AssistantPermissionRequest?
+        runtime.onPermissionRequest = { request in
+            capturedRequest = request
+        }
+
+        await runtime.processServerRequestForTesting(
+            method: "item/tool/requestUserInput",
+            params: [
+                "threadId": "session-1",
+                "questions": [
+                    [
+                        "id": "runtime",
+                        "header": "Runtime",
+                        "question": "How should the Codex backend run for version 1 of the Electron app?",
+                        "options": [
+                            [
+                                "label": "Sidecar (Recommended)",
+                                "description": "Keep the app shell simple and talk to Codex through the existing sidecar process."
+                            ],
+                            [
+                                "label": "Local CLI",
+                                "description": "Run the CLI directly inside the app."
+                            ]
+                        ]
+                    ],
+                    [
+                        "id": "streaming",
+                        "header": "Streaming",
+                        "question": "What kind of frontend streaming do you want to preserve in the current UI?",
+                        "options": [
+                            [
+                                "label": "Token streaming (Recommended)",
+                                "description": "Keep the current gradual answer rendering."
+                            ],
+                            [
+                                "label": "Chunk updates",
+                                "description": "Only update the answer in bigger blocks."
+                            ]
+                        ]
+                    ]
+                ]
+            ]
+        )
+
+        XCTAssertEqual(capturedRequest?.toolKind, "userInput")
+        XCTAssertEqual(capturedRequest?.toolTitle, "Codex needs input")
+        XCTAssertNil(capturedRequest?.rationale)
+        XCTAssertTrue(capturedRequest?.options.isEmpty ?? false)
+        XCTAssertEqual(capturedRequest?.userInputQuestions.count, 2)
+        XCTAssertEqual(capturedRequest?.userInputQuestions.first?.header, "Runtime")
+        XCTAssertEqual(capturedRequest?.userInputQuestions.last?.header, "Streaming")
+        XCTAssertEqual(
+            capturedRequest?.userInputQuestions.first?.options.map(\.label),
+            ["Sidecar (Recommended)", "Local CLI"]
+        )
+    }
+
+    @MainActor
     func testSnakeCaseWebSearchUsesFriendlyTitleAndSummary() {
         let runtime = CodexAssistantRuntime()
 
@@ -833,7 +893,7 @@ final class AssistantSessionInteractionTests: XCTestCase {
         let runtime = CodexAssistantRuntime()
         let text = """
         1. Inspect the existing speech flow.
-        2. Add the local TADA service.
+        2. Add the Hume cloud voice path.
         3. Add a safe fallback.
         """
         let recorder = AssistantRuntimeEventRecorder()
@@ -865,6 +925,60 @@ final class AssistantSessionInteractionTests: XCTestCase {
         XCTAssertEqual(promotedPlan?.turnID, "turn-plan")
         XCTAssertEqual(promotedPlan?.planText, text)
         XCTAssertEqual(recorder.proposedPlans.last ?? nil, text)
+    }
+
+    @MainActor
+    func testProcessExitFlushesStreamingReplyAndInterruptsLiveActivity() async {
+        let runtime = CodexAssistantRuntime()
+        let recorder = AssistantRuntimeEventRecorder()
+        let text = """
+        - first
+        ```swift
+        print("hello")
+        """
+
+        runtime.onTranscript = { recorder.transcriptEntries.append($0) }
+        runtime.onTimelineMutation = { mutation in
+            if case let .upsert(item) = mutation {
+                recorder.timelineItems.append(item)
+            }
+        }
+
+        runtime.configureStreamingTurnForTesting(
+            sessionID: "thread-live",
+            turnID: "turn-live",
+            text: "",
+            mode: .agentic
+        )
+        runtime.processActivityEventForTesting([
+            "id": "cmd-live",
+            "type": "commandExecution",
+            "status": "running",
+            "command": "pwd"
+        ])
+        runtime.configureStreamingTurnForTesting(
+            sessionID: "thread-live",
+            turnID: "turn-live",
+            text: text,
+            mode: .agentic
+        )
+
+        await runtime.processProcessExitedForTesting(message: "Codex App Server stopped")
+
+        let finalTranscript = recorder.transcriptEntries.last {
+            $0.role == .assistant && $0.text == text
+        }
+        let finalAssistant = recorder.timelineItems.last {
+            $0.kind == .assistantFinal && $0.text == text
+        }
+        let interruptedActivity = recorder.timelineItems.last {
+            $0.kind == .activity && $0.activity?.id == "cmd-live"
+        }
+
+        XCTAssertEqual(finalTranscript?.isStreaming, false)
+        XCTAssertEqual(finalAssistant?.isStreaming, false)
+        XCTAssertEqual(interruptedActivity?.activity?.status, .interrupted)
+        XCTAssertEqual(interruptedActivity?.turnID, "turn-live")
     }
 
     @MainActor

@@ -68,7 +68,7 @@ final class AssistantNotchLayoutTests: XCTestCase {
                 collapsedHeight: 50,
                 spacingBelowNotch: 8
             ),
-            0,
+            44,
             accuracy: 0.001
         )
 
@@ -113,5 +113,17 @@ final class AssistantNotchLayoutTests: XCTestCase {
         XCTAssertEqual(zone.width, collapsedWidth, accuracy: 0.001)
         XCTAssertEqual(zone.height, collapsedHeight, accuracy: 0.001)
         XCTAssertTrue(zone.contains(NSPoint(x: hiddenFrame.midX, y: hiddenFrame.midY)))
+    }
+
+    func testCenteredOriginKeepsHiddenAndPopupNotchStatesAligned() {
+        let screenFrame = NSRect(x: 120, y: 40, width: 1512, height: 982)
+        let hiddenWidth: CGFloat = 184
+        let popupWidth: CGFloat = 520
+
+        let hiddenOriginX = AssistantNotchLayout.centeredOriginX(screenFrame: screenFrame, width: hiddenWidth)
+        let popupOriginX = AssistantNotchLayout.centeredOriginX(screenFrame: screenFrame, width: popupWidth)
+
+        XCTAssertEqual(hiddenOriginX + (hiddenWidth / 2), screenFrame.midX, accuracy: 0.001)
+        XCTAssertEqual(popupOriginX + (popupWidth / 2), screenFrame.midX, accuracy: 0.001)
     }
 }

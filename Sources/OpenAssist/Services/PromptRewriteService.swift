@@ -72,7 +72,8 @@ protocol PromptRewriteBackendServing {
     func retrieveSuggestion(
         for cleanedTranscript: String,
         conversationContext: PromptRewriteConversationContext?,
-        conversationHistory: [PromptRewriteConversationTurn]
+        conversationHistory: [PromptRewriteConversationTurn],
+        onPartialSuggestion: (@Sendable (String) -> Void)?
     ) async throws -> PromptRewriteSuggestion?
     func recordFeedback(_ event: PromptRewriteFeedbackEvent) async
 }
@@ -110,7 +111,8 @@ final class PromptRewriteService {
     func retrieveSuggestion(
         for cleanedTranscript: String,
         conversationContext: PromptRewriteConversationContext? = nil,
-        conversationHistory: [PromptRewriteConversationTurn] = []
+        conversationHistory: [PromptRewriteConversationTurn] = [],
+        onPartialSuggestion: (@Sendable (String) -> Void)? = nil
     ) async throws -> PromptRewriteSuggestion? {
         let normalizedTranscript = cleanedTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !normalizedTranscript.isEmpty else { return nil }
@@ -126,7 +128,8 @@ final class PromptRewriteService {
                     try await self.backend.retrieveSuggestion(
                         for: normalizedTranscript,
                         conversationContext: conversationContext,
-                        conversationHistory: conversationHistory
+                        conversationHistory: conversationHistory,
+                        onPartialSuggestion: onPartialSuggestion
                     )
                 }
                 group.addTask {
@@ -156,6 +159,23 @@ final class PromptRewriteService {
 
     func recordFeedback(_ event: PromptRewriteFeedbackEvent) async {
         await backend.recordFeedback(event)
+    }
+
+    func retrieveSuggestion(
+        for cleanedTranscript: String,
+        conversationContext: PromptRewriteConversationContext?,
+        conversationHistory: [PromptRewriteConversationTurn]
+    ) async throws -> PromptRewriteSuggestion? {
+        try await retrieveSuggestion(
+            for: cleanedTranscript,
+            conversationContext: conversationContext,
+            conversationHistory: conversationHistory,
+            onPartialSuggestion: nil
+        )
+    }
+
+    static func streamingSuggestionPreview(from rawStreamText: String) -> String? {
+        OpenAIPromptRewriteProvider.partialSuggestionPreview(from: rawStreamText)
     }
 
     private static func timeoutNanoseconds(for timeoutSeconds: TimeInterval) -> UInt64 {
@@ -339,7 +359,8 @@ final class BackendPromptRewriteService: PromptRewriteBackendServing {
     func retrieveSuggestion(
         for cleanedTranscript: String,
         conversationContext: PromptRewriteConversationContext?,
-        conversationHistory: [PromptRewriteConversationTurn]
+        conversationHistory: [PromptRewriteConversationTurn],
+        onPartialSuggestion: (@Sendable (String) -> Void)?
     ) async throws -> PromptRewriteSuggestion? {
         let mode = Self.stubMode
         switch mode {
@@ -391,7 +412,8 @@ final class BackendPromptRewriteService: PromptRewriteBackendServing {
                         includeMemoryContext: true,
                         configuration: config,
                         conversationContext: conversationContext,
-                        conversationHistory: conversationHistory
+                        conversationHistory: conversationHistory,
+                        onPartialSuggestion: onPartialSuggestion
                     )
                     return enrichedSuggestion(
                         suggestion,
@@ -407,7 +429,8 @@ final class BackendPromptRewriteService: PromptRewriteBackendServing {
                     includeMemoryContext: false,
                     configuration: config,
                     conversationContext: conversationContext,
-                    conversationHistory: conversationHistory
+                    conversationHistory: conversationHistory,
+                    onPartialSuggestion: onPartialSuggestion
                 )
                 return enrichedSuggestion(
                     suggestion,
@@ -892,7 +915,8 @@ private actor OpenAIPromptRewriteProvider {
         includeMemoryContext: Bool,
         configuration: PromptRewriteLiveConfiguration,
         conversationContext: PromptRewriteConversationContext?,
-        conversationHistory: [PromptRewriteConversationTurn]
+        conversationHistory: [PromptRewriteConversationTurn],
+        onPartialSuggestion: (@Sendable (String) -> Void)? = nil
     ) async throws -> PromptRewriteSuggestion? {
         guard includeMemoryContext == false || !rewriteContext.isEmpty else {
             logNilSuggestion(
@@ -1048,9 +1072,20 @@ private actor OpenAIPromptRewriteProvider {
         )
         let isStreamingCodex = configuration.providerMode == .openAI && isOAuth(credential)
 
-        let (data, response): (Data, URLResponse)
+        let streamingResponse: StreamingTextHTTPResponse
         do {
-            (data, response) = try await session.data(for: request)
+            streamingResponse = try await StreamingTextResponseReader.collect(
+                using: session,
+                request: request,
+                expectsEventStream: isStreamingCodex,
+                onPartialText: { partialText in
+                    guard let onPartialSuggestion,
+                          let preview = Self.partialSuggestionPreview(from: partialText) else {
+                        return
+                    }
+                    onPartialSuggestion(preview)
+                }
+            )
         } catch {
             CrashReporter.logError(
                 """
@@ -1065,6 +1100,9 @@ private actor OpenAIPromptRewriteProvider {
                 reason: "Provider request failed: \(error.localizedDescription)"
             )
         }
+
+        let data = streamingResponse.data
+        let response = streamingResponse.response
 
         guard let http = response as? HTTPURLResponse else {
             throw PromptRewriteBackendError.providerFailure(reason: "Provider returned an invalid response.")
@@ -1929,6 +1967,78 @@ private actor OpenAIPromptRewriteProvider {
             memoryContext: "\(providerMode.rawValue) rewrite suggestion",
             shouldRewrite: shouldRewrite
         )
+    }
+
+    static func partialSuggestionPreview(from rawStreamText: String) -> String? {
+        if let preview = partialJSONStringValue(
+            in: rawStreamText,
+            keys: ["suggested_text", "suggestedText"]
+        )?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
+            return preview
+        }
+
+        let normalized = rawStreamText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard normalized.nonEmpty != nil else { return nil }
+
+        if normalized.hasPrefix("{")
+            || normalized.hasPrefix("[")
+            || normalized.contains("\"should_rewrite\"")
+            || normalized.contains("\"suggested_text\"") {
+            return nil
+        }
+
+        return normalized
+    }
+
+    private static func partialJSONStringValue(
+        in text: String,
+        keys: [String]
+    ) -> String? {
+        for key in keys {
+            guard let keyRange = text.range(of: "\"\(key)\"") else { continue }
+            let suffix = text[keyRange.upperBound...]
+            guard let colonIndex = suffix.firstIndex(of: ":") else { continue }
+
+            let afterColon = suffix[suffix.index(after: colonIndex)...]
+            guard let openingQuote = afterColon.firstIndex(of: "\"") else { continue }
+
+            var cursor = afterColon.index(after: openingQuote)
+            var value = ""
+            var isEscaping = false
+
+            while cursor < afterColon.endIndex {
+                let character = afterColon[cursor]
+                if isEscaping {
+                    switch character {
+                    case "\"":
+                        value.append("\"")
+                    case "\\":
+                        value.append("\\")
+                    case "n":
+                        value.append("\n")
+                    case "r":
+                        value.append("\r")
+                    case "t":
+                        value.append("\t")
+                    default:
+                        value.append(character)
+                    }
+                    isEscaping = false
+                } else if character == "\\" {
+                    isEscaping = true
+                } else if character == "\"" {
+                    return value.nonEmpty
+                } else {
+                    value.append(character)
+                }
+
+                cursor = afterColon.index(after: cursor)
+            }
+
+            return value.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+        }
+
+        return nil
     }
 
     private func decodeOpenAICompatibleContent(data: Data) -> String {

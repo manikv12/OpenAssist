@@ -84,6 +84,102 @@ enum AppVisualTheme {
     }
 }
 
+enum AssistantChromeSymbol {
+    static let attachment = "paperclip"
+    static let attachmentCount = "photo.stack.fill"
+    static let model = "cpu.fill"
+    static let reasoning = "brain.head.profile"
+    static let speedStandard = "gauge.with.needle"
+    static let speedFast = "bolt.fill"
+    static let action = "terminal"
+}
+
+struct AssistantGlyphBadge: View {
+    let symbol: String
+    let tint: Color
+    var side: CGFloat = 18
+    var cornerRadius: CGFloat? = nil
+    var fillOpacity: Double = 0.16
+    var strokeOpacity: Double = 0.24
+    var symbolScale: CGFloat = 0.50
+    var symbolWeight: Font.Weight = .semibold
+
+    var body: some View {
+        let radius = cornerRadius ?? max(6, side * 0.34)
+        let shape = RoundedRectangle(cornerRadius: radius, style: .continuous)
+
+        shape
+            .fill(
+                LinearGradient(
+                    colors: [
+                        Color.white.opacity(fillOpacity * 0.95),
+                        tint.opacity(fillOpacity * 0.78),
+                        Color.black.opacity(0.08)
+                    ],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
+            )
+            .overlay {
+                shape
+                    .stroke(Color.white.opacity(0.10), lineWidth: 0.55)
+                    .overlay(
+                        shape
+                            .stroke(tint.opacity(strokeOpacity), lineWidth: 0.65)
+                    )
+            }
+            .overlay {
+                Image(systemName: symbol)
+                    .font(.system(size: max(8.5, side * symbolScale), weight: symbolWeight))
+                    .symbolRenderingMode(.hierarchical)
+                    .foregroundStyle(tint.opacity(0.96))
+            }
+            .frame(width: side, height: side)
+    }
+}
+
+struct AssistantToolbarCircleButtonLabel: View {
+    let symbol: String
+    let tint: Color
+    var size: CGFloat = 24
+    var isEnabled = true
+    var emphasized = false
+
+    var body: some View {
+        ZStack {
+            Circle()
+                .fill(
+                    LinearGradient(
+                        colors: emphasized
+                            ? [tint.opacity(0.34), tint.opacity(0.18)]
+                            : [Color.white.opacity(0.15), Color.white.opacity(0.08)],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                )
+                .overlay(
+                    Circle()
+                        .stroke(
+                            emphasized
+                                ? tint.opacity(0.26)
+                                : Color.white.opacity(0.12),
+                            lineWidth: 0.6
+                        )
+                )
+
+            Image(systemName: symbol)
+                .font(.system(size: max(10, size * 0.40), weight: .semibold))
+                .symbolRenderingMode(.hierarchical)
+                .foregroundStyle(
+                    isEnabled
+                        ? (emphasized ? Color.white.opacity(0.98) : tint.opacity(0.92))
+                        : Color.white.opacity(0.34)
+                )
+        }
+        .frame(width: size, height: size)
+    }
+}
+
 struct AppGlassTokens {
     let canvasBase: Color
     let canvasDeep: Color

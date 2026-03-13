@@ -121,8 +121,10 @@ fi
 
 echo "Copying Info.plist and resources..."
 cp "$SOURCE_INFO_PLIST" "$APP_DIR/Contents/"
-cp Resources/AppIcon.icns "$APP_DIR/Contents/Resources/"
-cp Resources/AppIcon.png "$APP_DIR/Contents/Resources/"
+rsync -a \
+    --exclude 'Info.plist' \
+    --exclude 'OpenAssist.entitlements' \
+    "Resources/" "$APP_DIR/Contents/Resources/"
 "$PLIST_BUDDY" -c "Set :CFBundleShortVersionString ${APP_MARKETING_VERSION}" "$APP_DIR/Contents/Info.plist"
 "$PLIST_BUDDY" -c "Set :CFBundleVersion ${APP_BUILD_VERSION}" "$APP_DIR/Contents/Info.plist"
 

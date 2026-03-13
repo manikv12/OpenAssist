@@ -11,15 +11,23 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/sparkle-project/Sparkle", from: "2.6.0"),
-        .package(url: "https://github.com/gonzalezreal/swift-markdown-ui", from: "2.4.1")
+        .package(url: "https://github.com/gonzalezreal/swift-markdown-ui", from: "2.4.1"),
+        .package(url: "https://github.com/HumeAI/hume-swift-sdk.git", exact: "0.0.1-beta9")
     ],
     targets: [
+        .target(
+            name: "OpenAssistObjCInterop",
+            path: "Sources/OpenAssistObjCInterop",
+            publicHeadersPath: "include"
+        ),
         .executableTarget(
             name: "OpenAssist",
             dependencies: [
                 "whisper",
+                "OpenAssistObjCInterop",
                 .product(name: "Sparkle", package: "Sparkle"),
-                .product(name: "MarkdownUI", package: "swift-markdown-ui")
+                .product(name: "MarkdownUI", package: "swift-markdown-ui"),
+                .product(name: "Hume", package: "hume-swift-sdk")
             ],
             path: "Sources/OpenAssist",
             resources: [.process("../../Resources")]
@@ -30,7 +38,10 @@ let package = Package(
         ),
         .testTarget(
             name: "OpenAssistTests",
-            dependencies: ["OpenAssist"],
+            dependencies: [
+                "OpenAssist",
+                "OpenAssistObjCInterop"
+            ],
             path: "Tests/OpenAssistTests"
         )
     ]

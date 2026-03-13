@@ -747,6 +747,10 @@ enum AssistantTextRenderingStyle {
 
 enum AssistantTextRenderingPolicy {
     static func style(for text: String, isStreaming: Bool) -> AssistantTextRenderingStyle {
+        if isStreaming {
+            return .plain
+        }
+
         let normalized = text.replacingOccurrences(of: "\r\n", with: "\n")
         let lines = normalized.components(separatedBy: "\n")
 
@@ -1152,6 +1156,7 @@ struct ContextUsageBar: View {
 
 struct ContextUsageCircle: View {
     let usage: TokenUsageSnapshot
+    @State private var isHovering = false
 
     private var fraction: Double {
         usage.contextUsageFraction ?? 0
@@ -1167,24 +1172,6 @@ struct ContextUsageCircle: View {
         "\(Int(round(fraction * 100)))%"
     }
 
-    private var tooltipText: String {
-        let used = usage.currentContextTokens
-        if let window = usage.modelContextWindow, window > 0 {
-            let remaining = max(window - used, 0)
-            return "\(formatTokenCount(remaining)) remaining of \(formatTokenCount(window)) context"
-        }
-        return "\(usage.contextSummary) tokens used"
-    }
-
-    private func formatTokenCount(_ count: Int) -> String {
-        if count >= 1_000_000 {
-            return String(format: "%.1fM", Double(count) / 1_000_000)
-        } else if count >= 1_000 {
-            return String(format: "%.1fK", Double(count) / 1_000)
-        }
-        return "\(count)"
-    }
-
     var body: some View {
         ZStack {
             Circle()
@@ -1198,7 +1185,52 @@ struct ContextUsageCircle: View {
                 .foregroundStyle(ringColor.opacity(0.9))
         }
         .frame(width: 22, height: 22)
-        .help(tooltipText)
+        .contentShape(Circle())
+        .overlay(alignment: .topTrailing) {
+            if isHovering {
+                ContextUsageHoverCard(
+                    title: usage.exactContextSummary,
+                    detail: usage.contextTooltipDetail
+                )
+                .offset(x: -4, y: -52)
+                .transition(.opacity.combined(with: .scale(scale: 0.96, anchor: .bottomTrailing)))
+                .allowsHitTesting(false)
+            }
+        }
+        .onHover { hovering in
+            withAnimation(.easeOut(duration: 0.14)) {
+                isHovering = hovering
+            }
+        }
+        .zIndex(isHovering ? 10 : 0)
+    }
+}
+
+private struct ContextUsageHoverCard: View {
+    let title: String
+    let detail: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(title)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(Color.white)
+            Text(detail)
+                .font(.system(size: 10, weight: .medium))
+                .foregroundStyle(Color.white.opacity(0.74))
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(
+            RoundedRectangle(cornerRadius: 11, style: .continuous)
+                .fill(Color.black.opacity(0.94))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 11, style: .continuous)
+                        .stroke(Color.white.opacity(0.10), lineWidth: 0.7)
+                )
+        )
+        .shadow(color: Color.black.opacity(0.28), radius: 16, x: 0, y: 8)
+        .fixedSize()
     }
 }
 
