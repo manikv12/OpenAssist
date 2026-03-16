@@ -1061,6 +1061,49 @@ final class AssistantSessionInteractionTests: XCTestCase {
     }
 
     @MainActor
+    func testPendingFreshSessionResumeCheckIsCaseInsensitive() {
+        XCTAssertTrue(
+            AssistantStore.shouldSkipPendingFreshSessionResume(
+                "THREAD-123",
+                pendingSessionIDs: ["thread-123"]
+            )
+        )
+
+        XCTAssertFalse(
+            AssistantStore.shouldSkipPendingFreshSessionResume(
+                "thread-456",
+                pendingSessionIDs: ["thread-123"]
+            )
+        )
+    }
+
+    @MainActor
+    func testPendingFreshSessionInsertionOrderKeepsPreferredUnsavedSessionVisible() {
+        XCTAssertEqual(
+            AssistantStore.pendingFreshSessionInsertionOrder(
+                loadedSessionIDs: ["older-thread"],
+                existingSessionIDs: ["new-thread", "older-thread"],
+                preferredSessionIDs: ["new-thread"],
+                pendingSessionIDs: ["new-thread"]
+            ),
+            ["new-thread"]
+        )
+    }
+
+    @MainActor
+    func testPendingFreshSessionInsertionOrderSkipsAlreadyPersistedSessions() {
+        XCTAssertEqual(
+            AssistantStore.pendingFreshSessionInsertionOrder(
+                loadedSessionIDs: ["new-thread", "older-thread"],
+                existingSessionIDs: ["new-thread"],
+                preferredSessionIDs: ["new-thread"],
+                pendingSessionIDs: ["new-thread"]
+            ),
+            []
+        )
+    }
+
+    @MainActor
     func testRepeatedCommandTrackerStopsWhenNormalizedCommandHitsLimit() {
         var tracker = AssistantRepeatedCommandTracker()
 

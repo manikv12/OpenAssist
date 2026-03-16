@@ -2865,7 +2865,7 @@ struct AssistantWindowView: View {
                 .foregroundStyle(.secondary)
 
             case .completed:
-                Text("This request is part of the session history. The task finished after it.")
+                Text("This approval prompt is part of the session history. It only means the request flow finished, not that the tool succeeded.")
                     .font(.caption)
                     .foregroundStyle(AppVisualTheme.mutedText)
 
@@ -2889,7 +2889,7 @@ struct AssistantWindowView: View {
         case .waitingForApproval, .waitingForInput:
             return .orange
         case .completed:
-            return .green.opacity(0.78)
+            return .white.opacity(0.45)
         case .notActive:
             return .white.opacity(0.45)
         }

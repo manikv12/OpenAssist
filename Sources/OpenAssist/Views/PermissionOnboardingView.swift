@@ -98,8 +98,8 @@ struct PermissionOnboardingView: View {
                     permissionRow(
                         title: "Automation / Apple Events",
                         hint: appleEventsKnown
-                            ? "Optional for computer control. Needed for direct browser and app scripting."
-                            : "Optional for computer control. This appears after you first approve a direct browser or app action.",
+                            ? "Optional for computer control. Click Grant to ask for each installed target app one by one."
+                            : "Optional for computer control. Click Grant to ask for each installed target app one by one.",
                         granted: appleEventsGranted,
                         required: false,
                         action: {

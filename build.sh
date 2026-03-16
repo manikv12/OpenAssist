@@ -135,14 +135,14 @@ if [ -n "${DEVELOPER_ID:-}" ]; then
 
     # Sign Sparkle's nested XPC services individually first
     for xpc in "$APP_DIR/Contents/Frameworks/Sparkle.framework/Versions/B/XPCServices/"*.xpc; do
-        [ -d "$xpc" ] && codesign --force --options runtime --sign "$SIGN_ID" "$xpc"
+        [ -d "$xpc" ] && codesign --force --options runtime --timestamp --sign "$SIGN_ID" "$xpc"
     done
 
-    codesign --force --deep --options runtime --entitlements Resources/OpenAssist.entitlements --sign "$SIGN_ID" "$APP_DIR"
+    codesign --force --deep --options runtime --timestamp --entitlements Resources/OpenAssist.entitlements --sign "$SIGN_ID" "$APP_DIR"
 else
-    echo "  No DEVELOPER_ID set — using ad-hoc signature."
-    echo "  (Set DEVELOPER_ID env var for distribution-ready signing)"
-    codesign --force --deep --sign - "$APP_DIR"
+    echo "  No DEVELOPER_ID set — using ad-hoc signature with hardened runtime entitlements."
+    echo "  (This keeps local testing closer to the shipped app.)"
+    codesign --force --deep --options runtime --entitlements Resources/OpenAssist.entitlements --sign - "$APP_DIR"
 fi
 
 if [ "$MAKE_DMG" = true ]; then
@@ -165,6 +165,8 @@ if [ "$INSTALL_APP" = true ]; then
 
     echo "Resetting Accessibility permission..."
     sudo tccutil reset Accessibility "$APP_BUNDLE_ID" || echo "  (sudo failed — run manually: sudo tccutil reset Accessibility ${APP_BUNDLE_ID})"
+    echo "Resetting Automation permission..."
+    tccutil reset AppleEvents "$APP_BUNDLE_ID" || echo "  (reset failed — run manually: tccutil reset AppleEvents ${APP_BUNDLE_ID})"
 
     echo ""
     echo "Build complete! Installed to ${INSTALL_DIR}"
@@ -172,7 +174,8 @@ if [ "$INSTALL_APP" = true ]; then
     if [ "$MAKE_DMG" = true ]; then
         echo "Drag-and-drop installer created at: ${DMG_FINAL}"
     fi
-    echo "Then re-grant Accessibility access in System Settings -> Privacy & Security -> Accessibility"
+    echo "Then re-grant Accessibility in System Settings -> Privacy & Security -> Accessibility"
+    echo "and retry browser/app automation so macOS can ask for fresh Automation access."
 else
     echo ""
     echo "Build complete! App bundle at: ${APP_DIR}"

@@ -581,7 +581,7 @@ enum AssistantPermissionCardState: Equatable, Sendable {
         case .waitingForApproval, .waitingForInput:
             return "Waiting"
         case .completed:
-            return "Completed"
+            return "Handled"
         case .notActive:
             return "Not Active"
         }
@@ -613,7 +613,9 @@ private func assistantPermissionRequestsMatch(
 
     let lhsSessionID = lhs.sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
     let rhsSessionID = rhs.sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !lhsSessionID.isEmpty, !rhsSessionID.isEmpty else { return false }
+    if lhsSessionID.isEmpty || rhsSessionID.isEmpty {
+        return true
+    }
 
     return lhsSessionID.caseInsensitiveCompare(rhsSessionID) == .orderedSame
 }

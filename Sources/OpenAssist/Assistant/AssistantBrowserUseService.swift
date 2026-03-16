@@ -62,11 +62,49 @@ actor AssistantBrowserUseService {
 
         var shouldReadCurrentTab: Bool {
             let task = normalizedTask
-            return task.contains("current tab")
-                || task.contains("front tab")
-                || task.contains("active tab")
-                || task.contains("what page")
-                || task.contains("which page")
+            let directSignals = [
+                "current tab",
+                "front tab",
+                "active tab",
+                "what page",
+                "which page",
+                "tab title",
+                "url if available"
+            ]
+            if directSignals.contains(where: task.contains) {
+                return true
+            }
+
+            let readSignals = [
+                "read",
+                "inspect",
+                "identify",
+                "report",
+                "tell me",
+                "check",
+                "summarize",
+                "summarise",
+                "find"
+            ]
+            let contextSignals = [
+                "current",
+                "currently",
+                "active",
+                "front",
+                "visible",
+                "open"
+            ]
+            let pageTargets = [
+                "tab",
+                "page",
+                "window",
+                "url",
+                "site"
+            ]
+
+            return readSignals.contains(where: task.contains)
+                && contextSignals.contains(where: task.contains)
+                && pageTargets.contains(where: task.contains)
         }
 
         var needsComputerFallback: Bool {

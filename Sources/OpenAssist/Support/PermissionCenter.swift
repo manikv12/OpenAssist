@@ -6,6 +6,52 @@ import Speech
 
 @MainActor
 enum PermissionCenter {
+    struct AutomationTarget: Identifiable, Hashable {
+        let id: String
+        let displayName: String
+        let bundleIdentifiers: [String]
+
+        fileprivate func resolvedBundleIdentifier() -> String? {
+            bundleIdentifiers.first(where: { NSWorkspace.shared.urlForApplication(withBundleIdentifier: $0) != nil })
+        }
+    }
+
+    enum AutomationPermissionState: String, Sendable {
+        case granted
+        case notDetermined
+        case denied
+        case notInstalled
+        case unavailable
+
+        var displayLabel: String {
+            switch self {
+            case .granted:
+                return "Allowed"
+            case .notDetermined:
+                return "Not Asked"
+            case .denied:
+                return "Denied"
+            case .notInstalled:
+                return "Not Installed"
+            case .unavailable:
+                return "Unavailable"
+            }
+        }
+    }
+
+    struct AutomationTargetStatus: Identifiable, Sendable {
+        let target: AutomationTarget
+        let resolvedBundleIdentifier: String?
+        let state: AutomationPermissionState
+
+        var id: String { target.id }
+        var displayName: String { target.displayName }
+        var isInstalled: Bool { resolvedBundleIdentifier != nil }
+        var isGranted: Bool { state == .granted }
+        var needsPrompt: Bool { state == .notDetermined }
+        var needsManualEnableInSettings: Bool { state == .denied }
+    }
+
     struct Snapshot {
         let accessibilityGranted: Bool
         let microphoneGranted: Bool
@@ -21,6 +67,74 @@ enum PermissionCenter {
             accessibilityGranted && microphoneGranted && (!speechRecognitionRequired || speechRecognitionGranted)
         }
     }
+
+    static let commonAutomationTargets: [AutomationTarget] = [
+        AutomationTarget(
+            id: "finder",
+            displayName: "Finder",
+            bundleIdentifiers: ["com.apple.finder"]
+        ),
+        AutomationTarget(
+            id: "terminal",
+            displayName: "Terminal",
+            bundleIdentifiers: ["com.apple.Terminal"]
+        ),
+        AutomationTarget(
+            id: "system-events",
+            displayName: "System Events",
+            bundleIdentifiers: ["com.apple.systemevents"]
+        ),
+        AutomationTarget(
+            id: "calendar",
+            displayName: "Calendar",
+            bundleIdentifiers: ["com.apple.iCal"]
+        ),
+        AutomationTarget(
+            id: "reminders",
+            displayName: "Reminders",
+            bundleIdentifiers: ["com.apple.reminders"]
+        ),
+        AutomationTarget(
+            id: "messages",
+            displayName: "Messages",
+            bundleIdentifiers: ["com.apple.MobileSMS"]
+        ),
+        AutomationTarget(
+            id: "mail",
+            displayName: "Mail",
+            bundleIdentifiers: ["com.apple.mail"]
+        ),
+        AutomationTarget(
+            id: "brave",
+            displayName: "Brave Browser",
+            bundleIdentifiers: ["com.brave.Browser"]
+        ),
+        AutomationTarget(
+            id: "chrome",
+            displayName: "Google Chrome",
+            bundleIdentifiers: ["com.google.Chrome"]
+        ),
+        AutomationTarget(
+            id: "edge",
+            displayName: "Microsoft Edge",
+            bundleIdentifiers: ["com.microsoft.edgemac"]
+        ),
+        AutomationTarget(
+            id: "outlook",
+            displayName: "Microsoft Outlook",
+            bundleIdentifiers: ["com.microsoft.Outlook"]
+        ),
+        AutomationTarget(
+            id: "teams",
+            displayName: "Microsoft Teams",
+            bundleIdentifiers: ["com.microsoft.teams2", "com.microsoft.teams"]
+        ),
+        AutomationTarget(
+            id: "spotify",
+            displayName: "Spotify",
+            bundleIdentifiers: ["com.spotify.client"]
+        )
+    ]
 
     static func snapshot(
         using settings: SettingsStore,
@@ -98,9 +212,65 @@ enum PermissionCenter {
     }
 
     static func requestAppleEventsPermission(openSettingsIfDenied: Bool = false) {
-        let probe = appleEventsPermissionProbe(promptIfNeeded: true)
-        guard !probe.granted, openSettingsIfDenied else { return }
+        let statuses = requestMissingAutomationPermissions()
+        guard openSettingsIfDenied,
+              statuses.contains(where: \.needsManualEnableInSettings) else { return }
         openPrivacySettingsPane(query: "Privacy_Automation")
+    }
+
+    static func automationPermissionStatuses() -> [AutomationTargetStatus] {
+        commonAutomationTargets.map { automationPermissionStatus(for: $0) }
+    }
+
+    static func automationPermissionStatus(
+        for target: AutomationTarget,
+        promptIfNeeded: Bool = false
+    ) -> AutomationTargetStatus {
+        guard let resolvedBundleIdentifier = target.resolvedBundleIdentifier() else {
+            return AutomationTargetStatus(
+                target: target,
+                resolvedBundleIdentifier: nil,
+                state: .notInstalled
+            )
+        }
+
+        let state = automationPermissionState(
+            forBundleIdentifier: resolvedBundleIdentifier,
+            promptIfNeeded: promptIfNeeded
+        )
+        return AutomationTargetStatus(
+            target: target,
+            resolvedBundleIdentifier: resolvedBundleIdentifier,
+            state: state
+        )
+    }
+
+    static func requestMissingAutomationPermissions() -> [AutomationTargetStatus] {
+        commonAutomationTargets.map { target in
+            let current = automationPermissionStatus(for: target)
+            guard current.needsPrompt else {
+                return current
+            }
+            return automationPermissionStatus(for: target, promptIfNeeded: true)
+        }
+    }
+
+    static func requestAutomationPermission(
+        forBundleIdentifier bundleIdentifier: String,
+        displayName: String,
+        openSettingsIfDenied: Bool = false
+    ) -> AutomationTargetStatus {
+        let target = AutomationTarget(
+            id: bundleIdentifier,
+            displayName: displayName,
+            bundleIdentifiers: [bundleIdentifier]
+        )
+        let status = automationPermissionStatus(for: target, promptIfNeeded: true)
+        guard openSettingsIfDenied, status.needsManualEnableInSettings else {
+            return status
+        }
+        openPrivacySettingsPane(query: "Privacy_Automation")
+        return status
     }
 
     static func openPrivacySettingsPane(query: String) {
@@ -138,8 +308,22 @@ enum PermissionCenter {
         // Use bundle identifier directly — Finder is always available, but we
         // don't need a running-application reference to build the AE target.
         let bundleIdentifier = "com.apple.finder"
-        guard let identifierData = bundleIdentifier.data(using: .utf8), !identifierData.isEmpty else {
+        switch automationPermissionState(forBundleIdentifier: bundleIdentifier, promptIfNeeded: promptIfNeeded) {
+        case .granted:
+            return (true, true)
+        case .notDetermined, .denied:
+            return (false, true)
+        case .notInstalled, .unavailable:
             return (false, false)
+        }
+    }
+
+    private static func automationPermissionState(
+        forBundleIdentifier bundleIdentifier: String,
+        promptIfNeeded: Bool
+    ) -> AutomationPermissionState {
+        guard let identifierData = bundleIdentifier.data(using: .utf8), !identifierData.isEmpty else {
+            return .unavailable
         }
 
         var target = AEAddressDesc()
@@ -147,7 +331,7 @@ enum PermissionCenter {
             AECreateDesc(DescType(typeApplicationBundleID), bytes.baseAddress, identifierData.count, &target)
         }
         guard createStatus == noErr else {
-            return (false, false)
+            return .unavailable
         }
         defer { AEDisposeDesc(&target) }
 
@@ -160,11 +344,13 @@ enum PermissionCenter {
 
         switch status {
         case noErr:
-            return (true, true)
-        case OSStatus(errAEEventNotPermitted), OSStatus(errAEEventWouldRequireUserConsent):
-            return (false, true)
+            return .granted
+        case OSStatus(errAEEventWouldRequireUserConsent):
+            return .notDetermined
+        case OSStatus(errAEEventNotPermitted):
+            return .denied
         default:
-            return (false, false)
+            return .unavailable
         }
     }
 

@@ -124,9 +124,12 @@ enum ToolPermissionRegistry {
             return ToolPermissionVerdict(satisfied: true, missing: [], message: "")
         }
 
-        let names = missing.map(\.displayName).joined(separator: ", ")
         let toolDisplay = toolName.replacingOccurrences(of: "_", with: " ").capitalized
-        let message = "\(toolDisplay) cannot run because these permissions are missing: \(names)."
+        let message = permissionGuidanceMessage(
+            toolName: toolName,
+            toolDisplay: toolDisplay,
+            missing: missing
+        )
         return ToolPermissionVerdict(satisfied: false, missing: missing, message: message)
     }
 
@@ -248,5 +251,49 @@ enum ToolPermissionRegistry {
     private static func appleEventsStatus(_ snapshot: PermissionSnapshot) -> String {
         if !snapshot.appleEventsKnown { return "UNKNOWN" }
         return snapshot.appleEventsGranted ? "YES" : "NO"
+    }
+
+    private static func permissionGuidanceMessage(
+        toolName: String,
+        toolDisplay: String,
+        missing: [AgentPermission]
+    ) -> String {
+        let names = missing.map(\.displayName).joined(separator: ", ")
+        var nextSteps: [String] = []
+
+        switch toolName {
+        case "computer_use":
+            if missing.contains(.accessibility) {
+                nextSteps.append("Grant Accessibility in Settings > Computer Control.")
+            }
+            if missing.contains(.screenRecording) {
+                nextSteps.append("Grant Screen Recording in Settings > Computer Control.")
+            }
+            if missing.contains(.openAIConnection) {
+                nextSteps.append("Connect OpenAI in AI Studio or add an API key.")
+            }
+        case "browser_use":
+            if missing.contains(.browserAutomation) {
+                nextSteps.append("Turn on Browser Automation in Settings > Computer Control.")
+            }
+            if missing.contains(.browserProfile) {
+                nextSteps.append("Choose a Browser Profile in Settings > Computer Control.")
+            }
+        case "app_action":
+            if missing.contains(.appleEvents) {
+                nextSteps.append("Grant Automation if macOS asks for it.")
+            }
+            if missing.contains(.fullDiskAccess) {
+                nextSteps.append("Grant Full Disk Access only if the requested app data needs it.")
+            }
+        default:
+            break
+        }
+
+        if nextSteps.isEmpty {
+            return "\(toolDisplay) cannot run because these permissions are missing: \(names)."
+        }
+
+        return "\(toolDisplay) cannot run because these permissions are missing: \(names). Next step: \(nextSteps.joined(separator: " "))"
     }
 }

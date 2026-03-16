@@ -7610,8 +7610,8 @@ struct SettingsView: View {
                         name: "Automation / Apple Events",
                         granted: computerPermissionSnapshot.appleEventsGranted,
                         hint: computerPermissionSnapshot.appleEventsKnown
-                            ? "Needed for direct browser and app scripting."
-                            : "Check this after you approve a browser or app action for the first time.",
+                            ? "Needed for direct browser and app scripting. Click Grant to ask for each installed target app one by one."
+                            : "Click Grant to ask for each installed target app one by one.",
                         action: {
                             PermissionCenter.requestAppleEventsPermission(openSettingsIfDenied: true)
                             refreshComputerControlState()
@@ -7641,6 +7641,17 @@ struct SettingsView: View {
                         PermissionCenter.openPrivacySettingsPane(query: "Privacy")
                     }
                     .buttonStyle(.bordered)
+                }
+            }
+
+            settingsCard(
+                title: "Automation App Access",
+                subtitle: "Ask macOS for the same per-app Automation entries that older builds may already have.",
+                symbol: "switch.2",
+                tint: SettingsSection.computerControl.tint
+            ) {
+                AutomationAccessSettingsView {
+                    refreshComputerControlState()
                 }
             }
 

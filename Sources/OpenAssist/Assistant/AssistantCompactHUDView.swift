@@ -1724,7 +1724,7 @@ struct AssistantNotchHUDView: View {
         }
         .padding(14)
         .frame(maxWidth: .infinity, alignment: .topLeading)
-        .frame(height: compactCardHeight)
+        .frame(maxHeight: compactCardHeight)
         .notchInsetSurface(tint: model.state.phase == .failed ? .orange : glowColor, cornerRadius: 22, fillOpacity: 0.10)
     }
 
@@ -1840,7 +1840,7 @@ struct AssistantNotchHUDView: View {
         }
         .padding(14)
         .frame(maxWidth: .infinity, alignment: .topLeading)
-        .frame(height: compactCardHeight)
+        .frame(maxHeight: compactCardHeight)
         .notchInsetSurface(tint: glowColor, cornerRadius: 22, fillOpacity: 0.10)
     }
 
@@ -1897,7 +1897,7 @@ struct AssistantNotchHUDView: View {
         }
         .padding(14)
         .frame(maxWidth: .infinity, alignment: .topLeading)
-        .frame(height: compactCardHeight)
+        .frame(maxHeight: compactCardHeight)
         .notchInsetSurface(tint: AppVisualTheme.baseTint, cornerRadius: 22, fillOpacity: 0.10)
     }
 
@@ -1946,7 +1946,7 @@ struct AssistantNotchHUDView: View {
         }
         .padding(14)
         .frame(maxWidth: .infinity, alignment: .topLeading)
-        .frame(height: compactCardHeight)
+        .frame(maxHeight: compactCardHeight)
         .notchInsetSurface(tint: .orange, cornerRadius: 22, fillOpacity: 0.11)
     }
 
@@ -2059,7 +2059,7 @@ struct AssistantNotchHUDView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         }
         .padding(14)
-        .frame(width: Layout.compactCardSize.width, height: compactCardHeight, alignment: .topLeading)
+        .frame(maxWidth: Layout.compactCardSize.width, maxHeight: compactCardHeight, alignment: .topLeading)
         .notchInsetSurface(tint: .orange, cornerRadius: 22, fillOpacity: 0.12)
     }
 

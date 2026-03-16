@@ -15,6 +15,7 @@ enum LocalAutomationError: LocalizedError {
     case accessibilityRequired
     case screenRecordingRequired
     case appleEventsPermissionRequired
+    case automationTargetPermissionRequired(String)
     case browserProfileUnavailable
     case browserAutomationDisabled
     case unsupportedAction(String)
@@ -33,6 +34,8 @@ enum LocalAutomationError: LocalizedError {
             return "Screen Recording permission is required so Open Assist can see the current screen."
         case .appleEventsPermissionRequired:
             return "Automation permission is required so Open Assist can control Mac apps directly."
+        case .automationTargetPermissionRequired(let appName):
+            return "Automation permission is required so Open Assist can control \(appName). If the permission prompt does not appear, open System Settings > Privacy & Security > Automation and allow \(appName)."
         case .browserProfileUnavailable:
             return "The selected browser profile is unavailable. Choose a browser profile in Computer Control settings."
         case .browserAutomationDisabled:
@@ -162,6 +165,10 @@ actor LocalAutomationHelper {
     }
 
     func activateBrowser(_ browser: SupportedBrowser) async throws {
+        try await ensureAutomationPermission(
+            bundleIdentifier: browser.bundleIdentifier,
+            displayName: browser.displayName
+        )
         let script = """
         tell application "\(browser.displayName)"
             activate
@@ -195,6 +202,10 @@ actor LocalAutomationHelper {
     }
 
     func readFrontBrowserTab(browser: SupportedBrowser) async throws -> (title: String?, url: String?) {
+        try await ensureAutomationPermission(
+            bundleIdentifier: browser.bundleIdentifier,
+            displayName: browser.displayName
+        )
         let script = """
         tell application "\(browser.displayName)"
             if not running then error "Browser is not running."
@@ -228,6 +239,10 @@ actor LocalAutomationHelper {
     }
 
     func runTerminalCommand(_ command: String) async throws {
+        try await ensureAutomationPermission(
+            bundleIdentifier: "com.apple.Terminal",
+            displayName: "Terminal"
+        )
         let escaped = Self.appleScriptEscaped(command)
         let script = """
         tell application "Terminal"
@@ -302,6 +317,10 @@ actor LocalAutomationHelper {
         endISO8601: String,
         notes: String?
     ) async throws {
+        try await ensureAutomationPermission(
+            bundleIdentifier: "com.apple.iCal",
+            displayName: "Calendar"
+        )
         let start = try calendarDate(from: startISO8601)
         let end = try calendarDate(from: endISO8601)
         let escapedTitle = Self.appleScriptEscaped(title)
@@ -323,7 +342,7 @@ actor LocalAutomationHelper {
         // permission to Open Assist itself (persisted in TCC) instead of to a
         // transient osascript child process that re-prompts every time.
         try await withCheckedThrowingContinuation { continuation in
-            DispatchQueue.global(qos: .userInitiated).async {
+            DispatchQueue.main.async {
                 var errorDict: NSDictionary?
                 let appleScript = NSAppleScript(source: script)
                 let result = appleScript?.executeAndReturnError(&errorDict)
@@ -373,6 +392,24 @@ actor LocalAutomationHelper {
         return NSScreen.screens.first(where: { $0.frame.contains(mouseLocation) })
             ?? NSScreen.main
             ?? NSScreen.screens.first
+    }
+
+    private func ensureAutomationPermission(
+        bundleIdentifier: String,
+        displayName: String
+    ) async throws {
+        let status = await MainActor.run {
+            NSApp.activate(ignoringOtherApps: true)
+            return PermissionCenter.requestAutomationPermission(
+                forBundleIdentifier: bundleIdentifier,
+                displayName: displayName,
+                openSettingsIfDenied: false
+            )
+        }
+
+        guard status.isGranted else {
+            throw LocalAutomationError.automationTargetPermissionRequired(displayName)
+        }
     }
 
     private func screenPoint(

@@ -65,6 +65,27 @@ final class AssistantPermissionCardStateTests: XCTestCase {
         )
     }
 
+    func testMatchingPendingRequestWithEmptySessionIDStillStaysWaiting() {
+        let request = AssistantPermissionRequest(
+            id: 42,
+            sessionID: "",
+            toolTitle: "Browser Use",
+            toolKind: "browserUse",
+            rationale: "Allow browser access?",
+            options: [],
+            rawPayloadSummary: nil
+        )
+
+        XCTAssertEqual(
+            assistantPermissionCardState(
+                for: request,
+                pendingRequest: request,
+                sessionStatus: .active
+            ),
+            .waitingForApproval
+        )
+    }
+
     func testCompletedSessionMarksOldRequestCompleted() {
         let request = AssistantPermissionRequest(
             id: 42,

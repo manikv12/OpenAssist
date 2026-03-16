@@ -942,6 +942,7 @@ final class AssistantStore: ObservableObject {
     private var proposedPlanSessionID: String?
     private var memoryScopeBySessionID: [String: MemoryScopeContext] = [:]
     private var pendingResumeContextSessionIDs: Set<String> = []
+    private var pendingFreshSessionIDs: Set<String> = []
     private var lastSubmittedAttachments: [AssistantAttachment] = []
     private var lastSpokenAssistantTimelineItemID: String?
     private var lastSpokenAssistantTurnID: String?
@@ -1554,6 +1555,10 @@ final class AssistantStore: ObservableObject {
                 recordOwnedSessionID(session.id)
             }
 
+            let persistedSessionIDs = Set(merged.compactMap { normalizedSessionID($0.id) })
+            pendingFreshSessionIDs.subtract(persistedSessionIDs)
+            merged = mergePendingFreshSessions(into: merged)
+
             if let currentSelectedSessionID = selectedSessionID?.nonEmpty,
                !merged.contains(where: { sessionsMatch($0.id, currentSelectedSessionID) }) {
                 let selectedSessionOnly = try await sessionCatalog.loadSessions(
@@ -1664,6 +1669,7 @@ final class AssistantStore: ObservableObject {
         syncRuntimeContext()
         do {
             let sessionID = try await runtime.startNewSession(cwd: cwd, preferredModelID: selectedModelID)
+            markPendingFreshSession(sessionID)
             recordOwnedSessionID(sessionID)
             selectedSessionID = sessionID
             ensureSessionVisible(sessionID)
@@ -2368,6 +2374,10 @@ final class AssistantStore: ObservableObject {
             return
         }
 
+        guard !isPendingFreshSession(sessionID) else {
+            return
+        }
+
         try? await runtime.refreshCurrentSessionConfiguration(
             cwd: resolvedSessionCWD(for: sessionID),
             preferredModelID: selectedModelID
@@ -2711,6 +2721,55 @@ final class AssistantStore: ObservableObject {
         return normalizedExisting.caseInsensitiveCompare(fallbackTitle) == .orderedSame
     }
 
+    static func shouldSkipPendingFreshSessionResume(
+        _ sessionID: String?,
+        pendingSessionIDs: Set<String>
+    ) -> Bool {
+        guard let sessionID = sessionID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+            return false
+        }
+        let normalizedPendingSessionIDs = Set(
+            pendingSessionIDs.compactMap {
+                $0.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty?.lowercased()
+            }
+        )
+        return normalizedPendingSessionIDs.contains(sessionID.lowercased())
+    }
+
+    static func pendingFreshSessionInsertionOrder(
+        loadedSessionIDs: [String],
+        existingSessionIDs: [String],
+        preferredSessionIDs: [String],
+        pendingSessionIDs: Set<String>
+    ) -> [String] {
+        let normalizedPendingSessionIDs = Set(
+            pendingSessionIDs.compactMap {
+                $0.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty?.lowercased()
+            }
+        )
+        let loaded = Set(
+            loadedSessionIDs.compactMap {
+                $0.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty?.lowercased()
+            }
+        )
+
+        var ordered: [String] = []
+        var seen = loaded
+
+        for sessionID in preferredSessionIDs + existingSessionIDs {
+            let trimmedSessionID = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmedSessionID.isEmpty else { continue }
+            let normalizedSessionID = trimmedSessionID.lowercased()
+            guard normalizedPendingSessionIDs.contains(normalizedSessionID),
+                  seen.insert(normalizedSessionID).inserted else {
+                continue
+            }
+            ordered.append(trimmedSessionID)
+        }
+
+        return ordered
+    }
+
     private func recordOwnedSessionID(_ sessionID: String?) {
         guard let sessionID = sessionID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
             return
@@ -2728,6 +2787,7 @@ final class AssistantStore: ObservableObject {
         guard let sessionID = sessionID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
             return
         }
+        clearPendingFreshSession(sessionID)
         settings.assistantOwnedThreadIDs.removeAll {
             $0.caseInsensitiveCompare(sessionID) == .orderedSame
         }
@@ -3408,10 +3468,12 @@ final class AssistantStore: ObservableObject {
         if let selectedSessionID = selectedSessionID?.nonEmpty {
             if let currentSessionID = runtime.currentSessionID?.nonEmpty {
                 if sessionsMatch(currentSessionID, selectedSessionID) {
-                    try await runtime.refreshCurrentSessionConfiguration(
-                        cwd: resolvedSessionCWD(for: currentSessionID),
-                        preferredModelID: selectedModelID
-                    )
+                    if !isPendingFreshSession(currentSessionID) {
+                        try await runtime.refreshCurrentSessionConfiguration(
+                            cwd: resolvedSessionCWD(for: currentSessionID),
+                            preferredModelID: selectedModelID
+                        )
+                    }
                     return currentSessionID
                 }
 
@@ -3424,6 +3486,16 @@ final class AssistantStore: ObservableObject {
                 }
             }
 
+            if isPendingFreshSession(selectedSessionID) {
+                let replacementSessionID = try await runtime.startNewSession(
+                    cwd: resolvedSessionCWD(for: selectedSessionID),
+                    preferredModelID: selectedModelID
+                )
+                discardPendingFreshSession(selectedSessionID)
+                markPendingFreshSession(replacementSessionID)
+                return replacementSessionID
+            }
+
             if let selectedSession = sessions.first(where: { sessionsMatch($0.id, selectedSessionID) }) {
                 try await runtime.resumeSession(selectedSession.id, cwd: selectedSession.cwd, preferredModelID: selectedModelID)
                 pendingResumeContextSessionIDs.insert(selectedSession.id)
@@ -3432,14 +3504,17 @@ final class AssistantStore: ObservableObject {
         }
 
         if let currentSessionID = runtime.currentSessionID?.nonEmpty {
-            try await runtime.refreshCurrentSessionConfiguration(
-                cwd: resolvedSessionCWD(for: currentSessionID),
-                preferredModelID: selectedModelID
-            )
+            if !isPendingFreshSession(currentSessionID) {
+                try await runtime.refreshCurrentSessionConfiguration(
+                    cwd: resolvedSessionCWD(for: currentSessionID),
+                    preferredModelID: selectedModelID
+                )
+            }
             return currentSessionID
         }
 
         let sessionID = try await runtime.startNewSession(preferredModelID: selectedModelID)
+        markPendingFreshSession(sessionID)
         return sessionID
     }
 
@@ -3855,6 +3930,91 @@ final class AssistantStore: ObservableObject {
         }
 
         return lhs.caseInsensitiveCompare(rhs) == .orderedSame
+    }
+
+    private func normalizedSessionID(_ sessionID: String?) -> String? {
+        sessionID?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nonEmpty?
+            .lowercased()
+    }
+
+    private func isPendingFreshSession(_ sessionID: String?) -> Bool {
+        Self.shouldSkipPendingFreshSessionResume(
+            sessionID,
+            pendingSessionIDs: pendingFreshSessionIDs
+        )
+    }
+
+    private func markPendingFreshSession(_ sessionID: String?) {
+        guard let normalizedSessionID = normalizedSessionID(sessionID) else {
+            return
+        }
+        pendingFreshSessionIDs.insert(normalizedSessionID)
+    }
+
+    private func clearPendingFreshSession(_ sessionID: String?) {
+        guard let normalizedSessionID = normalizedSessionID(sessionID) else {
+            return
+        }
+        pendingFreshSessionIDs.remove(normalizedSessionID)
+    }
+
+    private func discardPendingFreshSession(_ sessionID: String?) {
+        guard let sessionID = sessionID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+            return
+        }
+        clearPendingFreshSession(sessionID)
+        settings.assistantOwnedThreadIDs.removeAll {
+            $0.caseInsensitiveCompare(sessionID) == .orderedSame
+        }
+        sessions.removeAll {
+            sessionsMatch($0.id, sessionID) && !$0.hasConversationContent
+        }
+    }
+
+    private func mergePendingFreshSessions(into loadedSessions: [AssistantSessionSummary]) -> [AssistantSessionSummary] {
+        var merged = loadedSessions
+        var seen = Set(loadedSessions.compactMap { normalizedSessionID($0.id) })
+
+        let existingPendingSessions = sessions.filter { isPendingFreshSession($0.id) }
+        let orderedPendingIDs = Self.pendingFreshSessionInsertionOrder(
+            loadedSessionIDs: loadedSessions.map(\.id),
+            existingSessionIDs: existingPendingSessions.map(\.id),
+            preferredSessionIDs: [selectedSessionID, runtime.currentSessionID]
+                .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty },
+            pendingSessionIDs: pendingFreshSessionIDs
+        )
+
+        for sessionID in orderedPendingIDs.reversed() {
+            guard let normalizedSessionID = normalizedSessionID(sessionID),
+                  !seen.contains(normalizedSessionID) else {
+                continue
+            }
+
+            let placeholder = existingPendingSessions.first(where: { sessionsMatch($0.id, sessionID) })
+                ?? AssistantSessionSummary(
+                    id: sessionID,
+                    title: "New Assistant Session",
+                    source: .appServer,
+                    status: .active,
+                    cwd: resolvedSessionCWD(for: sessionID) ?? FileManager.default.homeDirectoryForCurrentUser.path,
+                    createdAt: Date(),
+                    updatedAt: Date(),
+                    summary: nil,
+                    latestModel: selectedModelID,
+                    latestInteractionMode: interactionMode,
+                    latestReasoningEffort: reasoningEffort,
+                    latestServiceTier: fastModeEnabled ? "fast" : nil,
+                    latestUserMessage: nil,
+                    latestAssistantMessage: nil
+                )
+
+            merged.insert(placeholder, at: 0)
+            seen.insert(normalizedSessionID)
+        }
+
+        return merged
     }
 
     private func shouldForceTimelineCachePersistence(for item: AssistantTimelineItem) -> Bool {
