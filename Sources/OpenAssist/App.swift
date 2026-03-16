@@ -735,6 +735,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
     private let transcriptHistory = TranscriptHistoryStore.shared
     private var windowCoordinator: AppWindowCoordinator?
     private var assistantCompactHUD: AssistantCompactPresenter?
+    private var liveVoiceCoordinator: AssistantLiveVoiceCoordinator?
     private var isAssistantWindowVisible = false
 
     private var statusItem: NSStatusItem?
@@ -771,6 +772,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
     private var lastAudioSetupHUDAlertAt: Date?
     private var assistantVoiceCaptureActive = false
     private var compactVoiceCaptureActive = false
+    private var liveVoiceCaptureActive = false
     private var assistantVoiceSilenceStart: Date?
     private var assistantVoiceHasSpoken = false
     private var assistantVoiceBaselineNoise: Float = 0
@@ -1024,8 +1026,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         setupStatusBar()
         assistantCompactHUD = AssistantCompactHUDManager(
             controller: assistantController,
+            settings: settings,
             style: settings.assistantCompactPresentationStyle
         )
+        liveVoiceCoordinator = AssistantLiveVoiceCoordinator(
+            store: assistantController,
+            startCapture: { [weak self] in
+                self?.beginLiveVoiceCapture() ?? false
+            },
+            stopCapture: { [weak self] in
+                self?.stopLiveVoiceCapture()
+            },
+            cancelCapture: { [weak self] in
+                self?.cancelLiveVoiceCapture()
+            }
+        )
+        assistantController.onStartLiveVoiceSession = { [weak self] surface in
+            self?.liveVoiceCoordinator?.startLiveVoiceSession(surface: surface)
+        }
+        assistantController.onEndLiveVoiceSession = { [weak self] in
+            self?.liveVoiceCoordinator?.endLiveVoiceSession()
+        }
+        assistantController.onStopLiveVoiceSpeaking = { [weak self] in
+            self?.liveVoiceCoordinator?.stopSpeakingAndResumeListening()
+        }
         syncAssistantCompactVisibility()
         assistantHUDObserver = assistantController.$hudState
             .receive(on: RunLoop.main)
@@ -1052,14 +1076,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             self?.isAssistantWindowVisible = isVisible
             self?.syncAssistantCompactVisibility()
         }
-        automationAPICoordinator.setNotificationInteractionHandler { [weak self] source in
-            guard let self else { return }
-            if let source, Self.activateTerminalForSource(source) {
-                return
-            }
-            self.windowCoordinator?.openSettingsWindow()
-        }
-
         settings.refreshMicrophones(notifyChange: false)
         syncWhisperModelSelectionIfNeeded()
         observeAdaptiveCorrectionChanges()
@@ -1161,7 +1177,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
                 guard let self else { return }
                 self.currentAudioLevel = max(0, min(1, level))
                 self.waveform.updateLevel(level)
-                if self.assistantVoiceCaptureActive {
+                if self.liveVoiceCaptureActive {
+                    self.assistantController.updateVoiceCaptureLevel(0)
+                    self.assistantCompactHUD?.updateLevel(level)
+                    self.evaluateLiveVoiceSilence(level: level)
+                } else if self.assistantVoiceCaptureActive {
                     self.assistantController.updateVoiceCaptureLevel(level)
                     self.assistantCompactHUD?.updateLevel(level)
                     self.evaluateAssistantVoiceSilence(level: level)
@@ -1912,6 +1932,63 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         assistantCompactHUD?.update(state: assistantController.hudState)
     }
 
+    private func beginLiveVoiceCapture() -> Bool {
+        guard FeatureFlags.personalAssistantEnabled else { return false }
+        guard settings.assistantBetaEnabled else {
+            liveVoiceCoordinator?.handleCaptureFailure("Turn on Assistant in Settings first.")
+            return false
+        }
+        guard !isDictating else {
+            liveVoiceCoordinator?.handleCaptureFailure("Finish the current recording first.")
+            return false
+        }
+
+        assistantController.stopAssistantVoicePlayback()
+        liveVoiceCaptureActive = true
+        assistantVoiceSilenceStart = nil
+        assistantVoiceHasSpoken = false
+        assistantVoiceBaselineSamples = []
+        assistantVoiceBaselineCalibrated = false
+        startRecording()
+
+        if !isDictating {
+            liveVoiceCaptureActive = false
+        }
+
+        return isDictating
+    }
+
+    private func stopLiveVoiceCapture() {
+        guard liveVoiceCaptureActive else { return }
+        liveVoiceCoordinator?.beginTranscribingTurn()
+        assistantVoiceSilenceStart = nil
+        assistantVoiceHasSpoken = false
+        assistantVoiceBaselineSamples = []
+        assistantVoiceBaselineCalibrated = false
+        assistantCompactHUD?.updateLevel(0)
+        transcriber.stopRecording()
+        isDictating = false
+        currentAudioLevel = 0
+        stopStatusIconAnimation()
+        updateMenuState()
+    }
+
+    private func cancelLiveVoiceCapture(message: String = "Live voice listening stopped.") {
+        guard liveVoiceCaptureActive else { return }
+        liveVoiceCaptureActive = false
+        assistantVoiceSilenceStart = nil
+        assistantVoiceHasSpoken = false
+        assistantVoiceBaselineSamples = []
+        assistantVoiceBaselineCalibrated = false
+        assistantCompactHUD?.updateLevel(0)
+        transcriber.stopRecording(emitFinalText: false)
+        isDictating = false
+        currentAudioLevel = 0
+        stopStatusIconAnimation()
+        updateMenuState()
+        liveVoiceCoordinator?.handleCaptureCancelled(message: message)
+    }
+
     private func beginAssistantVoiceTaskCapture(stopMode: AssistantVoiceStopMode = .silenceAutoStop) {
         guard FeatureFlags.personalAssistantEnabled else { return }
         guard settings.assistantBetaEnabled else {
@@ -2032,6 +2109,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         updateMenuState()
     }
 
+    private func evaluateLiveVoiceSilence(level: Float) {
+        let calibrationSampleCount = 15
+        let speechMultiplier: Float = 3.0
+        let minimumSpeechThreshold: Float = 0.08
+        let silenceDuration: TimeInterval = 2.0
+
+        if !assistantVoiceBaselineCalibrated {
+            assistantVoiceBaselineSamples.append(level)
+            if assistantVoiceBaselineSamples.count >= calibrationSampleCount {
+                let sum = assistantVoiceBaselineSamples.reduce(0, +)
+                assistantVoiceBaselineNoise = sum / Float(assistantVoiceBaselineSamples.count)
+                assistantVoiceBaselineCalibrated = true
+            }
+            return
+        }
+
+        let speechThreshold = max(assistantVoiceBaselineNoise * speechMultiplier, minimumSpeechThreshold)
+
+        if level > speechThreshold {
+            assistantVoiceHasSpoken = true
+            assistantVoiceSilenceStart = nil
+            return
+        }
+
+        guard assistantVoiceHasSpoken else { return }
+
+        if assistantVoiceSilenceStart == nil {
+            assistantVoiceSilenceStart = Date()
+        }
+
+        if let start = assistantVoiceSilenceStart,
+           Date().timeIntervalSince(start) >= silenceDuration {
+            stopLiveVoiceCapture()
+        }
+    }
+
     private func evaluateCompactVoiceSilence(level: Float) {
         guard compactVoiceStopMode == .silenceAutoStop else { return }
 
@@ -2112,6 +2225,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
     }
 
     private func stopAssistantFromMenuBar() {
+        if liveVoiceCaptureActive {
+            cancelLiveVoiceCapture()
+            return
+        }
+
+        if assistantController.isLiveVoiceSessionActive {
+            assistantController.endLiveVoiceSession()
+            updateMenuState()
+            return
+        }
+
         if compactVoiceCaptureActive {
             compactVoiceCaptureActive = false
             compactVoiceStopMode = .manualRelease
@@ -2155,6 +2279,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
     }
 
     private func stopAssistantExperience() {
+        if liveVoiceCaptureActive {
+            cancelLiveVoiceCapture(message: "Live voice stopped.")
+        }
+        if assistantController.isLiveVoiceSessionActive {
+            assistantController.endLiveVoiceSession()
+        }
         if assistantVoiceCaptureActive {
             assistantVoiceCaptureActive = false
             assistantVoiceStopMode = .silenceAutoStop
@@ -2505,6 +2635,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         guard !isDictating else { return }
         guard permissionsReady else {
             updatePermissionGate(openOnboardingIfNeeded: true)
+            if liveVoiceCaptureActive {
+                liveVoiceCaptureActive = false
+                liveVoiceCoordinator?.handleCaptureFailure(
+                    "Live voice needs microphone and accessibility permissions."
+                )
+            }
             if assistantVoiceCaptureActive {
                 assistantVoiceCaptureActive = false
                 assistantVoiceStopMode = .silenceAutoStop
@@ -2534,11 +2670,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         if started {
             playDictationFeedbackSound(.startListening)
             setUIStatus(.listening)
-            if !assistantVoiceCaptureActive && !compactVoiceCaptureActive {
+            if !liveVoiceCaptureActive && !assistantVoiceCaptureActive && !compactVoiceCaptureActive {
                 waveform.show()
             }
             startStatusIconAnimation()
         } else {
+            if liveVoiceCaptureActive {
+                liveVoiceCaptureActive = false
+                liveVoiceCoordinator?.handleCaptureFailure("Open Assist could not start live voice listening.")
+            }
             if assistantVoiceCaptureActive {
                 assistantVoiceCaptureActive = false
                 assistantVoiceStopMode = .silenceAutoStop
@@ -2586,6 +2726,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
 
     private func handleFinalTranscript(_ text: String) async {
         let cleaned = TextCleanup.process(text, mode: settings.textCleanupMode)
+
+        if liveVoiceCaptureActive {
+            liveVoiceCaptureActive = false
+            assistantVoiceSilenceStart = nil
+            assistantVoiceHasSpoken = false
+            assistantVoiceBaselineSamples = []
+            assistantVoiceBaselineCalibrated = false
+            liveVoiceCoordinator?.handleFinalTranscript(cleaned)
+            setUIStatus(.ready)
+            updateMenuState()
+            return
+        }
 
         if compactVoiceCaptureActive {
             compactVoiceCaptureActive = false
@@ -3817,7 +3969,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             value: FeatureFlags.personalAssistantEnabled && settings.assistantBetaEnabled
         )
 
-        let assistantBusy = assistantVoiceCaptureActive
+        let assistantBusy = liveVoiceCaptureActive
+            || assistantController.isLiveVoiceSessionActive
+            || assistantVoiceCaptureActive
             || assistantController.pendingPermissionRequest != nil
             || [.thinking, .acting, .waitingForPermission, .streaming].contains(assistantController.hudState.phase)
         updateStatusBarViewModel(
@@ -3826,9 +3980,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         )
         updateStatusBarViewModel(
             \.assistantStopActionLabel,
-            value: assistantVoiceCaptureActive
-                ? "Stop Assistant Listening"
-                : "Cancel Assistant Turn"
+            value: liveVoiceCaptureActive
+                ? "Stop Live Voice Listening"
+                : assistantController.isLiveVoiceSessionActive
+                    ? "End Live Voice"
+                    : assistantVoiceCaptureActive
+                        ? "Stop Assistant Listening"
+                        : "Cancel Assistant Turn"
         )
 
         let popoverVisible = statusBarViewModel.isPopoverVisible || popover?.isShown == true
@@ -3946,35 +4104,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         return flipped
     }
 
-    private static let terminalBundleIdentifiers = [
-        "com.apple.Terminal",
-        "com.googlecode.iterm2",
-        "dev.warp.Warp-Stable",
-        "co.zeit.hyper",
-        "com.github.wez.wezterm",
-        "net.kovidgoyal.kitty",
-        "com.mitchellh.ghostty",
-    ]
-
-    private static func activateTerminalForSource(_ source: String) -> Bool {
-        guard let resolvedSource = AutomationAPISourceResolver.source(for: source) else {
-            return false
-        }
-        switch resolvedSource {
-        case .claudeCode, .codexCLI:
-            break
-        case .codexCloud:
-            return false
-        }
-        let runningApps = NSWorkspace.shared.runningApplications
-        for bundleID in terminalBundleIdentifiers {
-            if let app = runningApps.first(where: { $0.bundleIdentifier == bundleID && !$0.isTerminated }) {
-                app.activate()
-                return true
-            }
-        }
-        return false
-    }
 }
 
 struct SettingsView: View {

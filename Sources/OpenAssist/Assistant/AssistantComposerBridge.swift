@@ -71,8 +71,6 @@ final class AssistantComposerBridge {
     private var activeRegistration: Registration? {
         pruneRegistrations()
 
-        guard NSApp.isActive else { return nil }
-
         if let keyWindow = NSApp.keyWindow {
             if let focused = registrations.values.first(where: { registration in
                 guard let textView = registration.textView,

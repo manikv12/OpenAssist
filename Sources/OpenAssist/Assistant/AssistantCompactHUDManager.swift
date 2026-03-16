@@ -24,23 +24,21 @@ enum AssistantNotchLayout {
     }
 
     static func verticalOffset(
-        hasHardwareNotch: Bool,
         topBandHeight: CGFloat,
         safeAreaTop: CGFloat,
+        visibleTopInset: CGFloat,
         hiddenHeight: CGFloat,
         requestedHeight: CGFloat,
-        collapsedHeight: CGFloat,
         spacingBelowNotch: CGFloat
     ) -> CGFloat {
-        guard hasHardwareNotch else { return 0 }
         // Only content intentionally docked inside the notch (≤ hiddenHeight) stays behind it.
         // All taller content — collapsed pill, compact card, expanded tray — must sit below.
         guard requestedHeight > (hiddenHeight + 0.5) else { return 0 }
 
         return contentTopInset(
-            hasHardwareNotch: hasHardwareNotch,
             topBandHeight: topBandHeight,
             safeAreaTop: safeAreaTop,
+            visibleTopInset: visibleTopInset,
             spacingBelowNotch: spacingBelowNotch
         )
     }
@@ -51,13 +49,56 @@ enum AssistantNotchLayout {
     }
 
     static func contentTopInset(
-        hasHardwareNotch: Bool,
         topBandHeight: CGFloat,
         safeAreaTop: CGFloat,
+        visibleTopInset: CGFloat,
         spacingBelowNotch: CGFloat
     ) -> CGFloat {
-        guard hasHardwareNotch else { return 0 }
-        return max(topBandHeight, safeAreaTop) + spacingBelowNotch
+        let unobscuredTopInset = max(topBandHeight, safeAreaTop, visibleTopInset)
+        guard unobscuredTopInset > 0 else { return 0 }
+        return unobscuredTopInset + spacingBelowNotch
+    }
+}
+
+enum AssistantNotchInteraction {
+    struct HoverState: Equatable {
+        var start: Date?
+        var displayID: CGDirectDisplayID?
+    }
+
+    static func updatedHoverState(
+        current: HoverState,
+        hoveredDisplayID: CGDirectDisplayID?,
+        isEligible: Bool,
+        now: Date
+    ) -> HoverState {
+        guard isEligible, let hoveredDisplayID else {
+            return HoverState(start: nil, displayID: nil)
+        }
+
+        if current.displayID == hoveredDisplayID, current.start != nil {
+            return current
+        }
+
+        return HoverState(start: now, displayID: hoveredDisplayID)
+    }
+
+    static func shouldReveal(
+        hoverStart: Date?,
+        now: Date,
+        revealDelay: TimeInterval
+    ) -> Bool {
+        guard let hoverStart else { return false }
+        return now.timeIntervalSince(hoverStart) >= revealDelay
+    }
+
+    static func shouldAllowMousePassthrough(
+        isDockRevealed: Bool,
+        shouldDockCollapsed: Bool,
+        isShowingCompactCard: Bool,
+        isExpanded: Bool
+    ) -> Bool {
+        !isDockRevealed && shouldDockCollapsed && !isShowingCompactCard && !isExpanded
     }
 }
 
@@ -72,7 +113,7 @@ final class AssistantCompactHUDManager: AssistantCompactPresenter {
         static let orbCollapsedSize = NSSize(width: 140, height: 156)
         static let orbExpandedSize = AssistantOrbHUDModel.Layout.expandedSize
         static let notchCollapsedSize = NSSize(width: 320, height: 50)
-        static let notchCompactCardSize = NSSize(width: 520, height: 360)
+        static let notchCompactCardSize = NSSize(width: 520, height: 480)
         static let notchExpandedSize = NSSize(width: 1100, height: 462)
         static let notchScreenFollowInterval: TimeInterval = 0.06
         static let notchDockHiddenVisibleHeight: CGFloat = 4
@@ -85,12 +126,15 @@ final class AssistantCompactHUDManager: AssistantCompactPresenter {
 
     private let model = AssistantOrbHUDModel()
     private let controller: AssistantStore
+    private let settings: SettingsStore
     private var panel: OrbHUDPanel?
     private var cancellables = Set<AnyCancellable>()
     private var clickOutsideMonitor: Any?
     private var notchScreenFollowTimer: Timer?
+    private var lastLiveVoiceSessionPhase: AssistantLiveVoiceSessionPhase = .idle
     private var isNotchDockRevealed = false
     private var notchDockHideDeadline: Date?
+    private var notchDockRevealHoverState = AssistantNotchInteraction.HoverState()
     private var lastAppliedNotchDockReveal = false
     private var suppressNotchDockRevealUntilPointerLeaves = false
 
@@ -130,9 +174,11 @@ final class AssistantCompactHUDManager: AssistantCompactPresenter {
 
     init(
         controller: AssistantStore,
+        settings: SettingsStore,
         style: AssistantCompactPresentationStyle = .orb
     ) {
         self.controller = controller
+        self.settings = settings
         self.presentationStyle = style
 
         // Restore saved position
@@ -260,6 +306,10 @@ final class AssistantCompactHUDManager: AssistantCompactPresenter {
             }
         }
 
+        model.onOpenMainWindow = {
+            NotificationCenter.default.post(name: .openAssistOpenAssistant, object: nil)
+        }
+
         model.onNewSession = { [weak self] in
             await self?.controller.startNewSession()
             await self?.refreshSessionsForOrb()
@@ -308,14 +358,19 @@ final class AssistantCompactHUDManager: AssistantCompactPresenter {
             self?.syncModelFromController()
         }
 
-        model.onStartVoiceRecording = { [weak self] in
-            self?.model.isVoiceRecording = true
-            NotificationCenter.default.post(name: .openAssistStartCompactVoiceCapture, object: nil)
+        model.onStartLiveVoiceSession = { [weak self] in
+            self?.controller.startLiveVoiceSession(surface: .compactHUD)
+            self?.syncModelFromController()
         }
 
-        model.onStopVoiceRecording = { [weak self] in
-            self?.model.isVoiceRecording = false
-            NotificationCenter.default.post(name: .openAssistStopCompactVoiceCapture, object: nil)
+        model.onEndLiveVoiceSession = { [weak self] in
+            self?.controller.endLiveVoiceSession()
+            self?.syncModelFromController()
+        }
+
+        model.onStopLiveVoiceSpeaking = { [weak self] in
+            self?.controller.stopSpeakingAndResumeListening()
+            self?.syncModelFromController()
         }
 
         model.onStopActiveTurn = { [weak self] in
@@ -372,6 +427,47 @@ final class AssistantCompactHUDManager: AssistantCompactPresenter {
             }
             .store(in: &cancellables)
 
+        controller.$liveVoiceSessionSnapshot
+            .receive(on: RunLoop.main)
+            .sink { [weak self] snapshot in
+                guard let self else { return }
+                let previousPhase = self.lastLiveVoiceSessionPhase
+                self.lastLiveVoiceSessionPhase = snapshot.phase
+                self.handleNotchLiveVoiceTurnHandoff(from: previousPhase, to: snapshot)
+                self.model.liveVoiceSnapshot = snapshot
+                self.model.isVoiceRecording = snapshot.isListening
+                self.syncModelFromController()
+            }
+            .store(in: &cancellables)
+
+        NotificationCenter.default.publisher(for: NSApplication.didChangeScreenParametersNotification)
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                self?.handleDisplayEnvironmentChange()
+            }
+            .store(in: &cancellables)
+
+        NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didWakeNotification)
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                self?.handleDisplayEnvironmentChange()
+            }
+            .store(in: &cancellables)
+
+        NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.screensDidWakeNotification)
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                self?.handleDisplayEnvironmentChange()
+            }
+            .store(in: &cancellables)
+
+        NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.activeSpaceDidChangeNotification)
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                self?.handleDisplayEnvironmentChange()
+            }
+            .store(in: &cancellables)
+
         syncModelFromController()
 
         // Show the compact assistant immediately only when the current style
@@ -399,6 +495,7 @@ final class AssistantCompactHUDManager: AssistantCompactPresenter {
     }
 
     func show(state: AssistantHUDState) {
+        guard isEnabled else { return }
         if panel == nil { createPanel() }
         guard let panel else { return }
         if presentationStyle == .notch {
@@ -408,7 +505,7 @@ final class AssistantCompactHUDManager: AssistantCompactPresenter {
                 captureMouseScreenAsPreferredDisplay()
             }
         }
-        model.update(state: displayState(for: state))
+        model.update(state: effectiveDisplayState(for: state))
         if presentationStyle == .notch || !panel.isVisible || panel.frame.size != targetSize {
             reposition()
         }
@@ -433,7 +530,7 @@ final class AssistantCompactHUDManager: AssistantCompactPresenter {
             }
         }
 
-        show(state: state)
+        show(state: effectiveDisplayState(for: state))
         scheduleAutoDismissIfNeeded(for: state)
     }
 
@@ -465,6 +562,7 @@ final class AssistantCompactHUDManager: AssistantCompactPresenter {
         model.updateLevel(0)
         isNotchDockRevealed = false
         notchDockHideDeadline = nil
+        notchDockRevealHoverState = AssistantNotchInteraction.HoverState()
         suppressNotchDockRevealUntilPointerLeaves = false
         stopClickOutsideMonitor()
         stopNotchScreenFollowTimer()
@@ -649,6 +747,7 @@ final class AssistantCompactHUDManager: AssistantCompactPresenter {
     }
 
     private func handleDoneDetailChange(_ showing: Bool) {
+        guard isEnabled else { return }
         if presentationStyle == .notch {
             if showing {
                 if panel == nil { createPanel() }
@@ -694,6 +793,7 @@ final class AssistantCompactHUDManager: AssistantCompactPresenter {
     }
 
     private func handleWorkingDetailChange(_ showing: Bool) {
+        guard isEnabled else { return }
         if presentationStyle == .notch {
             if panel == nil { createPanel() }
             if showing {
@@ -722,6 +822,7 @@ final class AssistantCompactHUDManager: AssistantCompactPresenter {
     }
 
     private func handleCompactComposerChange(_ showing: Bool) {
+        guard isEnabled else { return }
         if presentationStyle == .notch {
             if panel == nil { createPanel() }
             if showing {
@@ -740,7 +841,29 @@ final class AssistantCompactHUDManager: AssistantCompactPresenter {
         reposition()
     }
 
+    private func handleNotchLiveVoiceTurnHandoff(
+        from previousPhase: AssistantLiveVoiceSessionPhase,
+        to snapshot: AssistantLiveVoiceSessionSnapshot
+    ) {
+        guard isEnabled, presentationStyle == .notch else { return }
+        guard snapshot.surface == .compactHUD, snapshot.isActive else { return }
+
+        switch (previousPhase, snapshot.phase) {
+        case (.listening, .sending), (.transcribing, .sending):
+            model.collapse()
+            if panel == nil { createPanel() }
+            isNotchDockRevealed = true
+            syncNotchDockPresentation()
+            panel?.orderFrontRegardless()
+            reposition()
+            updateNotchScreenFollowTimer()
+        default:
+            break
+        }
+    }
+
     private func handlePermissionRequestChange(_ request: AssistantPermissionRequest?) {
+        guard isEnabled else { return }
         if presentationStyle == .notch {
             if request != nil {
                 if panel == nil { createPanel() }
@@ -768,6 +891,7 @@ final class AssistantCompactHUDManager: AssistantCompactPresenter {
     }
 
     private func handleModeSwitchSuggestionChange(_ suggestion: AssistantModeSwitchSuggestion?) {
+        guard isEnabled else { return }
         if presentationStyle == .notch {
             if suggestion != nil {
                 if panel == nil { createPanel() }
@@ -850,6 +974,34 @@ final class AssistantCompactHUDManager: AssistantCompactPresenter {
         _ = state
     }
 
+    private var notchDockRevealDelay: TimeInterval {
+        settings.assistantNotchHoverDelay.seconds
+    }
+
+    private func handleDisplayEnvironmentChange() {
+        guard isEnabled,
+              presentationStyle == .notch,
+              let panel,
+              panel.isVisible else {
+            return
+        }
+
+        notchDockHideDeadline = nil
+        notchDockRevealHoverState = AssistantNotchInteraction.HoverState()
+        suppressNotchDockRevealUntilPointerLeaves = false
+
+        if !model.isExpanded {
+            captureMouseScreenAsPreferredDisplay()
+        } else if screenForPreferredDisplay() == nil {
+            preserveCurrentNotchScreenAsPreferredDisplay()
+        }
+
+        panel.ignoresMouseEvents = false
+        reposition()
+        panel.orderFrontRegardless()
+        updateNotchScreenFollowTimer()
+    }
+
     private func updateNotchScreenFollowTimer() {
         stopNotchScreenFollowTimer()
 
@@ -875,7 +1027,8 @@ final class AssistantCompactHUDManager: AssistantCompactPresenter {
     }
 
     private func followMouseScreenIfNeeded() {
-        guard presentationStyle == .notch,
+        guard isEnabled,
+              presentationStyle == .notch,
               panel?.isVisible == true,
               !model.isExpanded,
               let targetScreen = Self.screenContainingMouse(),
@@ -892,6 +1045,8 @@ final class AssistantCompactHUDManager: AssistantCompactPresenter {
             || model.showCompactComposer
 
         if isShowingCompactCard {
+            notchDockRevealHoverState = AssistantNotchInteraction.HoverState()
+            syncPanelMouseBehavior()
             return
         }
 
@@ -940,14 +1095,16 @@ final class AssistantCompactHUDManager: AssistantCompactPresenter {
         guard shouldDockCollapsedNotch else {
             if isNotchDockRevealed {
                 isNotchDockRevealed = false
-                syncNotchDockPresentation()
+                syncNotchDockPresentation(for: screen)
             }
             notchDockHideDeadline = nil
+            notchDockRevealHoverState = AssistantNotchInteraction.HoverState()
             suppressNotchDockRevealUntilPointerLeaves = false
             return
         }
 
         let mouseLocation = NSEvent.mouseLocation
+        let isMouseButtonDown = NSEvent.pressedMouseButtons != 0
         let revealZone = notchRevealZone(for: screen)
         let revealedFrame = notchFrame(for: screen, dockRevealed: true)
         let interactionZone = revealedFrame.insetBy(dx: -12, dy: -10)
@@ -959,33 +1116,55 @@ final class AssistantCompactHUDManager: AssistantCompactPresenter {
         ) {
             if isNotchDockRevealed {
                 isNotchDockRevealed = false
-                syncNotchDockPresentation()
+                syncNotchDockPresentation(for: screen)
             }
             notchDockHideDeadline = nil
+            notchDockRevealHoverState = AssistantNotchInteraction.HoverState()
             return
         }
 
         let isHoveringDock = revealZone.contains(mouseLocation) || interactionZone.contains(mouseLocation)
         let canAutoHideIdleDock = model.state.phase == .idle
+        let hoveredDisplayID = Self.displayID(for: screen)
+        let now = Date()
+
+        notchDockRevealHoverState = AssistantNotchInteraction.updatedHoverState(
+            current: notchDockRevealHoverState,
+            hoveredDisplayID: hoveredDisplayID,
+            isEligible: isHoveringDock && !isMouseButtonDown,
+            now: now
+        )
 
         if isHoveringDock {
+            guard AssistantNotchInteraction.shouldReveal(
+                hoverStart: notchDockRevealHoverState.start,
+                now: now,
+                revealDelay: notchDockRevealDelay
+            ) else {
+                notchDockHideDeadline = nil
+                syncPanelMouseBehavior()
+                return
+            }
+
             isNotchDockRevealed = true
             notchDockHideDeadline = nil
-            syncNotchDockPresentation()
+            syncNotchDockPresentation(for: screen)
             return
         }
+
+        notchDockRevealHoverState = AssistantNotchInteraction.HoverState()
 
         guard canAutoHideIdleDock, isNotchDockRevealed else {
             notchDockHideDeadline = nil
+            syncPanelMouseBehavior()
             return
         }
 
-        let now = Date()
         if let deadline = notchDockHideDeadline {
             guard now >= deadline else { return }
             isNotchDockRevealed = false
             notchDockHideDeadline = nil
-            syncNotchDockPresentation()
+            syncNotchDockPresentation(for: screen)
         } else {
             notchDockHideDeadline = now.addingTimeInterval(Layout.notchDockHideDelay)
         }
@@ -1017,6 +1196,30 @@ final class AssistantCompactHUDManager: AssistantCompactPresenter {
             model.notchDockVisibleWidth = 160
             model.notchDockVisibleHeight = Layout.notchDockHiddenVisibleHeight
         }
+        syncPanelMouseBehavior()
+    }
+
+    private var isShowingNotchCompactCard: Bool {
+        model.pendingPermissionRequest != nil
+            || model.showDoneDetail
+            || model.showWorkingDetail
+            || model.modeSwitchSuggestion != nil
+            || model.showCompactComposer
+    }
+
+    private func syncPanelMouseBehavior() {
+        guard let panel else { return }
+        guard presentationStyle == .notch else {
+            panel.ignoresMouseEvents = false
+            return
+        }
+
+        panel.ignoresMouseEvents = AssistantNotchInteraction.shouldAllowMousePassthrough(
+            isDockRevealed: isNotchDockRevealed,
+            shouldDockCollapsed: shouldDockCollapsedNotch,
+            isShowingCompactCard: isShowingNotchCompactCard,
+            isExpanded: model.isExpanded
+        )
     }
 
     private func activatePopupTextEntry() {
@@ -1046,6 +1249,9 @@ final class AssistantCompactHUDManager: AssistantCompactPresenter {
 
         if panel == nil { createPanel() }
         panel?.allowsKeyStatus = true
+        if model.showCompactComposer {
+            NSApp.activate(ignoringOtherApps: true)
+        }
         panel?.makeKeyAndOrderFront(nil)
 
         let shouldAutoFocus = model.showDoneDetail || model.showCompactComposer
@@ -1114,7 +1320,9 @@ final class AssistantCompactHUDManager: AssistantCompactPresenter {
         model.workingToolActivity = Array(controller.visibleToolActivity.prefix(6))
         model.activeSessionSummary = activeSessionSummaryForOrb()
         model.canStopActiveTurn = controller.hasActiveTurn
-        model.update(state: displayState(for: model.state))
+        model.liveVoiceSnapshot = controller.liveVoiceSessionSnapshot
+        model.isVoiceRecording = controller.liveVoiceSessionSnapshot.isListening
+        model.update(state: effectiveDisplayState(for: controller.hudState))
     }
 
     private func activeSessionIDForOrb() -> String? {
@@ -1145,6 +1353,72 @@ final class AssistantCompactHUDManager: AssistantCompactPresenter {
             title: "Reply ready",
             detail: preview
         )
+    }
+
+    private func effectiveDisplayState(for state: AssistantHUDState) -> AssistantHUDState {
+        if let liveVoiceState = liveVoiceDisplayState(from: controller.liveVoiceSessionSnapshot) {
+            return liveVoiceState
+        }
+        return displayState(for: state)
+    }
+
+    private func liveVoiceDisplayState(
+        from snapshot: AssistantLiveVoiceSessionSnapshot
+    ) -> AssistantHUDState? {
+        switch snapshot.phase {
+        case .idle:
+            return nil
+        case .listening:
+            return AssistantHUDState(
+                phase: .listening,
+                title: "Listening",
+                detail: snapshot.displayText
+            )
+        case .transcribing:
+            return AssistantHUDState(
+                phase: .thinking,
+                title: "Transcribing",
+                detail: snapshot.displayText
+            )
+        case .sending:
+            return AssistantHUDState(
+                phase: .acting,
+                title: snapshot.interactionMode == .agentic ? "Agentic" : "Sending",
+                detail: snapshot.displayText
+            )
+        case .waitingForPermission:
+            return AssistantHUDState(
+                phase: .waitingForPermission,
+                title: "Waiting for approval",
+                detail: snapshot.displayText
+            )
+        case .speaking:
+            return AssistantHUDState(
+                phase: .streaming,
+                title: "Speaking",
+                detail: snapshot.displayText
+            )
+        case .paused:
+            if snapshot.isHandsFreeLoopEnabled,
+               snapshot.lastError?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty == nil {
+                return AssistantHUDState(
+                    phase: .thinking,
+                    title: "Re-arming",
+                    detail: snapshot.displayText
+                )
+            }
+            return AssistantHUDState(
+                phase: .idle,
+                title: "Paused",
+                detail: snapshot.displayText
+            )
+        case .ended:
+            return AssistantHUDState(
+                phase: .idle,
+                title: "Conversation ended",
+                detail: snapshot.displayText
+            )
+        }
     }
 
     private func latestAssistantPreview() -> String? {
@@ -1373,22 +1647,33 @@ final class AssistantCompactHUDManager: AssistantCompactPresenter {
         hiddenHeight: CGFloat,
         dockRevealed: Bool
     ) -> CGFloat {
+        let visibleTopInset = max(0, screen.frame.maxY - screen.visibleFrame.maxY)
+        let requestedHeight = dockRevealed
+            ? max(requestedSize.height, Layout.notchCollapsedSize.height)
+            : requestedSize.height
+
         switch notchAnchorMode(for: screen) {
         case let .hardwareNotch(gapRect):
-            let requestedHeight = dockRevealed
-                ? max(requestedSize.height, Layout.notchCollapsedSize.height)
-                : requestedSize.height
             return AssistantNotchLayout.verticalOffset(
-                hasHardwareNotch: true,
                 topBandHeight: gapRect.height,
                 safeAreaTop: screen.safeAreaInsets.top,
+                visibleTopInset: visibleTopInset,
                 hiddenHeight: hiddenHeight,
                 requestedHeight: requestedHeight,
-                collapsedHeight: Layout.notchCollapsedSize.height,
                 spacingBelowNotch: Layout.notchBelowCameraSpacing
             )
         case .syntheticNotch:
-            return 0
+            // Fall back to the screen's visible frame when the hardware-notch APIs
+            // are unavailable or do not look trustworthy. This keeps pop-up content
+            // below the menu bar/top safe area instead of letting it hide under it.
+            return AssistantNotchLayout.verticalOffset(
+                topBandHeight: 0,
+                safeAreaTop: screen.safeAreaInsets.top,
+                visibleTopInset: visibleTopInset,
+                hiddenHeight: hiddenHeight,
+                requestedHeight: requestedHeight,
+                spacingBelowNotch: Layout.notchBelowCameraSpacing
+            )
         }
     }
 
@@ -1495,6 +1780,7 @@ private class OrbHUDPanel: NSPanel {
     private var isWindowDragging = false
 
     override var canBecomeKey: Bool { allowsKeyStatus }
+    override var canBecomeMain: Bool { allowsKeyStatus }
 
     /// Check if click is in the orb drag zone.
     /// When the orb is bottom-anchored, drag from the lower orb area.

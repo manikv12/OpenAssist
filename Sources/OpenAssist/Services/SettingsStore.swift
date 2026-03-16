@@ -245,6 +245,41 @@ enum AssistantCompactPresentationStyle: String, CaseIterable, Identifiable, Coda
     }
 }
 
+enum AssistantNotchHoverDelay: String, CaseIterable, Identifiable, Codable {
+    case off = "off"
+    case oneSecond = "1s"
+    case twoSeconds = "2s"
+    case threeSeconds = "3s"
+
+    var id: Self { self }
+
+    var displayName: String {
+        switch self {
+        case .off:
+            return "Off"
+        case .oneSecond:
+            return "1 second"
+        case .twoSeconds:
+            return "2 seconds"
+        case .threeSeconds:
+            return "3 seconds"
+        }
+    }
+
+    var seconds: TimeInterval {
+        switch self {
+        case .off:
+            return 0
+        case .oneSecond:
+            return 1
+        case .twoSeconds:
+            return 2
+        case .threeSeconds:
+            return 3
+        }
+    }
+}
+
 struct ColorPalette {
     let baseTint: Color
     let accentTint: Color
@@ -573,6 +608,7 @@ final class SettingsStore: ObservableObject {
         static let assistantVoiceTaskEntryEnabled = "OpenAssist.assistantVoiceTaskEntryEnabled"
         static let assistantFloatingHUDEnabled = "OpenAssist.assistantFloatingHUDEnabled"
         static let assistantCompactPresentationStyle = "OpenAssist.assistantCompactPresentationStyle"
+        static let assistantNotchHoverDelay = "OpenAssist.assistantNotchHoverDelay"
         static let assistantBetaWarningAcknowledged = "OpenAssist.assistantBetaWarningAcknowledged"
         static let assistantVoiceOutputEnabled = "OpenAssist.assistantVoiceOutputEnabled"
         static let assistantVoiceEngine = "OpenAssist.assistantVoiceEngine"
@@ -1221,6 +1257,12 @@ final class SettingsStore: ObservableObject {
     }
 
     @Published var assistantCompactPresentationStyleRawValue: String {
+        didSet {
+            save()
+        }
+    }
+
+    @Published var assistantNotchHoverDelayRawValue: String {
         didSet {
             save()
         }
@@ -1975,6 +2017,12 @@ final class SettingsStore: ObservableObject {
             defaults: defaults
         ).rawValue
 
+        assistantNotchHoverDelayRawValue = (
+            AssistantNotchHoverDelay(
+                rawValue: defaults.string(forKey: Keys.assistantNotchHoverDelay) ?? ""
+            ) ?? .twoSeconds
+        ).rawValue
+
         if defaults.object(forKey: Keys.assistantBetaWarningAcknowledged) == nil {
             assistantBetaWarningAcknowledged = false
         } else {
@@ -2220,6 +2268,7 @@ final class SettingsStore: ObservableObject {
         defaults.set(assistantVoiceTaskEntryEnabled, forKey: Keys.assistantVoiceTaskEntryEnabled)
         defaults.set(assistantFloatingHUDEnabled, forKey: Keys.assistantFloatingHUDEnabled)
         defaults.set(assistantCompactPresentationStyleRawValue, forKey: Keys.assistantCompactPresentationStyle)
+        defaults.set(assistantNotchHoverDelayRawValue, forKey: Keys.assistantNotchHoverDelay)
         defaults.set(assistantBetaWarningAcknowledged, forKey: Keys.assistantBetaWarningAcknowledged)
         defaults.set(assistantVoiceOutputEnabled, forKey: Keys.assistantVoiceOutputEnabled)
         defaults.set(assistantVoiceEngineRawValue, forKey: Keys.assistantVoiceEngine)
@@ -2333,6 +2382,11 @@ final class SettingsStore: ObservableObject {
     var assistantCompactPresentationStyle: AssistantCompactPresentationStyle {
         get { AssistantCompactPresentationStyle(rawValue: assistantCompactPresentationStyleRawValue) ?? .orb }
         set { assistantCompactPresentationStyleRawValue = newValue.rawValue }
+    }
+
+    var assistantNotchHoverDelay: AssistantNotchHoverDelay {
+        get { AssistantNotchHoverDelay(rawValue: assistantNotchHoverDelayRawValue) ?? .twoSeconds }
+        set { assistantNotchHoverDelayRawValue = newValue.rawValue }
     }
 
     var assistantVoiceEngine: AssistantSpeechEngine {

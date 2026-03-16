@@ -1,6 +1,12 @@
 import AppKit
 import SwiftUI
 
+private func activateComposerWindowForEditing(_ window: NSWindow?) {
+    guard let window else { return }
+    NSApp.activate(ignoringOtherApps: true)
+    window.makeKeyAndOrderFront(nil)
+}
+
 struct OrbComposerTextView: NSViewRepresentable {
     @Binding var text: String
     var placeholder: String
@@ -105,6 +111,7 @@ final class OrbComposerScrollView: NSScrollView {
             return
         }
 
+        activateComposerWindowForEditing(window)
         window?.makeFirstResponder(textView)
         let insertionPoint = textView.string.utf16.count
         textView.setSelectedRange(NSRange(location: insertionPoint, length: 0))
@@ -143,6 +150,7 @@ final class OrbSubmittableTextView: NSTextView {
 
     override func mouseDown(with event: NSEvent) {
         if isEditable {
+            activateComposerWindowForEditing(window)
             window?.makeFirstResponder(self)
         }
         super.mouseDown(with: event)
@@ -177,4 +185,3 @@ final class OrbSubmittableTextView: NSTextView {
 }
 
 // MARK: - Orb Sphere (Siri-inspired)
-

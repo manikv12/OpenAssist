@@ -135,12 +135,13 @@ enum PermissionCenter {
     }
 
     private static func appleEventsPermissionProbe(promptIfNeeded: Bool = false) -> (granted: Bool, known: Bool) {
+        // Use bundle identifier directly — Finder is always available, but we
+        // don't need a running-application reference to build the AE target.
         let bundleIdentifier = "com.apple.finder"
-        guard let application = NSRunningApplication.runningApplications(withBundleIdentifier: bundleIdentifier).first else {
+        guard let identifierData = bundleIdentifier.data(using: .utf8), !identifierData.isEmpty else {
             return (false, false)
         }
 
-        let identifierData = (application.bundleIdentifier ?? bundleIdentifier).data(using: .utf8) ?? Data()
         var target = AEAddressDesc()
         let createStatus = identifierData.withUnsafeBytes { (bytes: UnsafeRawBufferPointer) -> OSErr in
             AECreateDesc(DescType(typeApplicationBundleID), bytes.baseAddress, identifierData.count, &target)
@@ -168,24 +169,37 @@ enum PermissionCenter {
     }
 
     private static func fullDiskAccessProbe() -> (granted: Bool, known: Bool) {
-        let protectedDirectories = [
-            "~/Library/Mail",
-            "~/Library/Messages",
-            "~/Library/Safari"
+        // Try directories in order — some may not exist if the user hasn't used
+        // the corresponding app. ~/Library/Safari/Bookmarks.plist is the most
+        // reliable single-file probe because Safari ships with every Mac.
+        // We also try the TCC database itself as a fallback — it always exists
+        // and is protected by Full Disk Access.
+        let protectedPaths = [
+            NSHomeDirectory() + "/Library/Safari",
+            NSHomeDirectory() + "/Library/Mail",
+            NSHomeDirectory() + "/Library/Messages",
+            "/Library/Application Support/com.apple.TCC/TCC.db"
         ]
 
-        for rawPath in protectedDirectories {
-            let path = NSString(string: rawPath).expandingTildeInPath
+        for path in protectedPaths {
             var isDirectory: ObjCBool = false
-            guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory), isDirectory.boolValue else {
-                continue
-            }
+            let exists = FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory)
+            guard exists else { continue }
 
-            do {
-                _ = try FileManager.default.contentsOfDirectory(atPath: path)
-                return (true, true)
-            } catch {
-                return (false, true)
+            if isDirectory.boolValue {
+                do {
+                    _ = try FileManager.default.contentsOfDirectory(atPath: path)
+                    return (true, true)
+                } catch {
+                    return (false, true)
+                }
+            } else {
+                // It's a file — try to read a single byte.
+                if FileManager.default.isReadableFile(atPath: path) {
+                    return (true, true)
+                } else {
+                    return (false, true)
+                }
             }
         }
 

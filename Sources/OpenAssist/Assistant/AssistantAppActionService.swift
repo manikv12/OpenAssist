@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 
 enum AssistantAppActionToolDefinition {
@@ -5,7 +6,7 @@ enum AssistantAppActionToolDefinition {
     static let toolKind = "appAction"
 
     static let description = """
-    Perform a direct action in supported Mac apps like Finder, Terminal, Calendar, or System Settings. Prefer this for app-specific work before falling back to general computer control.
+    Perform a direct action in supported Mac apps: Finder, Terminal, Calendar, System Settings, Reminders, Contacts, Notes, or Messages. Prefer this tool for app-specific work before falling back to general computer control. For Reminders, Contacts, Notes, and Messages, this tool reads data directly via native frameworks — no AppleScript needed.
     """
 
     static let inputSchema: [String: Any] = [
@@ -17,7 +18,19 @@ enum AssistantAppActionToolDefinition {
             ],
             "app": [
                 "type": "string",
-                "description": "Supported apps: Finder, Terminal, Calendar, System Settings."
+                "description": "Supported apps: Finder, Terminal, Calendar, System Settings, Reminders, Contacts, Notes, Messages."
+            ],
+            "query": [
+                "type": "string",
+                "description": "Search query for Contacts, Notes, or Messages."
+            ],
+            "list": [
+                "type": "string",
+                "description": "Reminder list name or calendar name to filter by."
+            ],
+            "chat": [
+                "type": "string",
+                "description": "Chat/conversation name for Messages."
             ],
             "action": [
                 "type": "string",
@@ -75,6 +88,10 @@ actor AssistantAppActionService {
         case terminal
         case calendar
         case systemSettings
+        case reminders
+        case contacts
+        case notes
+        case messages
 
         var displayName: String {
             switch self {
@@ -82,6 +99,18 @@ actor AssistantAppActionService {
             case .terminal: return "Terminal"
             case .calendar: return "Calendar"
             case .systemSettings: return "System Settings"
+            case .reminders: return "Reminders"
+            case .contacts: return "Contacts"
+            case .notes: return "Notes"
+            case .messages: return "Messages"
+            }
+        }
+
+        /// Apps that use native frameworks (EventKit, Contacts, SQLite) instead of AppleScript.
+        var usesNativeAccess: Bool {
+            switch self {
+            case .reminders, .contacts, .notes, .messages: return true
+            default: return false
             }
         }
     }
@@ -98,6 +127,9 @@ actor AssistantAppActionService {
         let notes: String?
         let pane: String?
         let commit: Bool
+        let query: String?
+        let list: String?
+        let chat: String?
 
         var normalizedTask: String {
             task.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -123,6 +155,19 @@ actor AssistantAppActionService {
     func run(arguments: Any, preferredModelID: String?) async -> AssistantComputerUseService.ToolExecutionResult {
         do {
             let request = try Self.parseRequest(from: arguments)
+
+            // Block privacy-protected apps immediately — no fallback to Computer Use
+            if let blockedApp = Self.detectPrivacyBlockedApp(in: request.task) {
+                return Self.result(
+                    summary: """
+                    Open Assist cannot access \(blockedApp) because macOS blocks automation and file access \
+                    to this app without explicit privacy permissions. This is a macOS restriction that cannot \
+                    be worked around. Please open \(blockedApp) manually to view its contents.
+                    """,
+                    detail: nil,
+                    success: false
+                )
+            }
 
             if request.needsComputerFallback {
                 return await computerUseService.run(
@@ -151,6 +196,14 @@ actor AssistantAppActionService {
                 return try await runCalendarAction(request)
             case .systemSettings:
                 return try await runSystemSettingsAction(request)
+            case .reminders:
+                return try await runRemindersAction(request)
+            case .contacts:
+                return try await runContactsAction(request)
+            case .notes:
+                return try await runNotesAction(request)
+            case .messages:
+                return try await runMessagesAction(request)
             }
         } catch {
             let summary = error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
@@ -173,7 +226,10 @@ actor AssistantAppActionService {
                 end: nil,
                 notes: nil,
                 pane: nil,
-                commit: false
+                commit: false,
+                query: nil,
+                list: nil,
+                chat: nil
             )
         }
 
@@ -212,12 +268,51 @@ actor AssistantAppActionService {
             end: (dictionary["end"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty,
             notes: (dictionary["notes"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty,
             pane: (dictionary["pane"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty,
-            commit: dictionary["commit"] as? Bool ?? false
+            commit: dictionary["commit"] as? Bool ?? false,
+            query: (dictionary["query"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty,
+            list: (dictionary["list"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty,
+            chat: (dictionary["chat"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
         )
+    }
+
+    /// Apps that macOS protects with privacy consent dialogs that hang when scripted.
+    /// Note: Reminders, Contacts, Notes, and Messages are no longer blocked — they now
+    /// use native framework access (EventKit, CNContactStore, direct SQLite).
+    private static let privacyBlockedApps: [(keyword: String, displayName: String)] = [
+        ("mail", "Mail"),
+        ("photos", "Photos"),
+        ("safari", "Safari"),
+        ("music", "Music"),
+        ("podcasts", "Podcasts"),
+        ("home", "Home"),
+        ("health", "Health"),
+    ]
+
+    /// Returns the display name of a privacy-blocked app if the task text targets one.
+    static func detectPrivacyBlockedApp(in taskText: String) -> String? {
+        let normalized = taskText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        for entry in privacyBlockedApps {
+            if normalized.contains(entry.keyword) {
+                return entry.displayName
+            }
+        }
+        return nil
     }
 
     private static func inferApp(from text: String) -> SupportedApp? {
         let normalized = text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if normalized.contains("reminder") || normalized.contains("overdue") || normalized.contains("to-do") || normalized.contains("todo") {
+            return .reminders
+        }
+        if normalized.contains("contact") || normalized.contains("phone number") || normalized.contains("email address") {
+            return .contacts
+        }
+        if normalized.contains("note") && !normalized.contains("notification") {
+            return .notes
+        }
+        if normalized.contains("imessage") || normalized.contains("message") || normalized.contains("text from") || normalized.contains("sms") {
+            return .messages
+        }
         if normalized.contains("finder") || normalized.contains("folder") || normalized.contains("file") {
             return .finder
         }
@@ -257,6 +352,34 @@ actor AssistantAppActionService {
     }
 
     private func runCalendarAction(_ request: ParsedRequest) async throws -> AssistantComputerUseService.ToolExecutionResult {
+        let action = request.action?.lowercased() ?? ""
+        let normalized = request.normalizedTask
+
+        // Read: fetch today's events, upcoming events, or events in a date range
+        if action.contains("list") || action.contains("read") || action.contains("fetch") || action.contains("show")
+            || normalized.contains("today") || normalized.contains("upcoming") || normalized.contains("schedule")
+            || normalized.contains("what") || normalized.contains("show") || normalized.contains("list")
+            || (request.title == nil && request.start == nil && !request.commit) {
+
+            if normalized.contains("today") || normalized.contains("today's") {
+                let events = try await nativeService.fetchTodayEvents()
+                let formatted = NativeDataAccessService.formatCalendarEvents(events)
+                return Self.result(
+                    summary: events.isEmpty ? "No events today." : "Found \(events.count) event(s) for today.",
+                    detail: formatted
+                )
+            }
+
+            let days = normalized.contains("week") ? 7 : (normalized.contains("month") ? 30 : 7)
+            let events = try await nativeService.fetchUpcomingEvents(days: days)
+            let formatted = NativeDataAccessService.formatCalendarEvents(events)
+            return Self.result(
+                summary: events.isEmpty ? "No upcoming events." : "Found \(events.count) upcoming event(s).",
+                detail: formatted
+            )
+        }
+
+        // Write: create a calendar event (native EventKit)
         guard let title = request.title ?? inferredCalendarTitle(from: request.task),
               let start = request.start,
               let end = request.end else {
@@ -264,13 +387,14 @@ actor AssistantAppActionService {
         }
 
         if request.commit {
-            try await helper.createCalendarEvent(
+            let result = try await nativeService.createCalendarEvent(
                 title: title,
                 startISO8601: start,
                 endISO8601: end,
+                calendarName: request.list,
                 notes: request.notes
             )
-            return Self.result(summary: "Created a Calendar event in your default calendar.", detail: title)
+            return Self.result(summary: result, detail: nil)
         }
 
         let preview = try await helper.previewCalendarEvent(
@@ -289,6 +413,156 @@ actor AssistantAppActionService {
         let pane = request.pane ?? request.action ?? request.task
         await helper.openSystemSettings(pane: pane)
         return Self.result(summary: "Opened System Settings.", detail: pane)
+    }
+
+    // MARK: - Native Framework Actions (Reminders, Contacts, Notes, Messages)
+
+    private let nativeService = NativeDataAccessService.shared
+
+    private func runRemindersAction(_ request: ParsedRequest) async throws -> AssistantComputerUseService.ToolExecutionResult {
+        let action = request.action?.lowercased() ?? ""
+        let normalized = request.normalizedTask
+
+        // Complete a reminder
+        if action.contains("complete") || action.contains("done") || action.contains("finish")
+            || normalized.contains("complete") || normalized.contains("mark as done") {
+            guard let title = request.title ?? extractQuotedString(from: request.task) else {
+                throw LocalAutomationError.invalidArguments("Completing a reminder needs a title.")
+            }
+            let result = try await nativeService.completeReminder(title: title)
+            return Self.result(summary: result, detail: nil)
+        }
+
+        // Add a reminder
+        if action.contains("add") || action.contains("create") || action.contains("new")
+            || normalized.contains("add") || normalized.contains("create") || request.commit {
+            guard let title = request.title ?? extractQuotedString(from: request.task) else {
+                throw LocalAutomationError.invalidArguments("Creating a reminder needs a title.")
+            }
+            let result = try await nativeService.addReminder(
+                title: title,
+                listName: request.list,
+                dueDate: request.start,
+                notes: request.notes,
+                priority: 0
+            )
+            return Self.result(summary: result, detail: nil)
+        }
+
+        // Fetch overdue reminders
+        if normalized.contains("overdue") || normalized.contains("past due") || normalized.contains("late") {
+            let reminders = try await nativeService.fetchOverdueReminders()
+            let formatted = NativeDataAccessService.formatReminders(reminders)
+            return Self.result(
+                summary: reminders.isEmpty ? "No overdue reminders." : "Found \(reminders.count) overdue reminder(s).",
+                detail: formatted
+            )
+        }
+
+        // Default: list reminders
+        let reminders = try await nativeService.fetchReminders(
+            includeCompleted: normalized.contains("completed") || normalized.contains("all"),
+            listName: request.list
+        )
+        let formatted = NativeDataAccessService.formatReminders(reminders)
+        return Self.result(
+            summary: reminders.isEmpty ? "No reminders found." : "Found \(reminders.count) reminder(s).",
+            detail: formatted
+        )
+    }
+
+    private func runContactsAction(_ request: ParsedRequest) async throws -> AssistantComputerUseService.ToolExecutionResult {
+        let searchQuery = request.query ?? request.title ?? extractQuotedString(from: request.task) ?? request.task
+        let contacts = try await nativeService.searchContacts(query: searchQuery)
+        let formatted = NativeDataAccessService.formatContacts(contacts)
+        return Self.result(
+            summary: contacts.isEmpty ? "No contacts found for '\(searchQuery)'." : "Found \(contacts.count) contact(s).",
+            detail: formatted
+        )
+    }
+
+    private func runNotesAction(_ request: ParsedRequest) async throws -> AssistantComputerUseService.ToolExecutionResult {
+        do {
+            let searchQuery = request.query ?? request.title ?? extractQuotedString(from: request.task)
+            let notes = try await nativeService.fetchNotes(query: searchQuery)
+            let formatted = NativeDataAccessService.formatNotes(notes)
+            return Self.result(
+                summary: notes.isEmpty ? "No notes found." : "Found \(notes.count) note(s).",
+                detail: formatted
+            )
+        } catch let error as NativeDataAccessError {
+            let userOpened = await Self.promptForFullDiskAccess(appName: "Notes")
+            return Self.fullDiskAccessErrorResult(error: error, userOpenedSettings: userOpened)
+        }
+    }
+
+    private func runMessagesAction(_ request: ParsedRequest) async throws -> AssistantComputerUseService.ToolExecutionResult {
+        do {
+            return try await runMessagesActionInner(request)
+        } catch let error as NativeDataAccessError {
+            let userOpened = await Self.promptForFullDiskAccess(appName: "Messages")
+            return Self.fullDiskAccessErrorResult(error: error, userOpenedSettings: userOpened)
+        }
+    }
+
+    private func runMessagesActionInner(_ request: ParsedRequest) async throws -> AssistantComputerUseService.ToolExecutionResult {
+        let action = request.action?.lowercased() ?? ""
+        let normalized = request.normalizedTask
+
+        // List chats
+        if action.contains("list") || action.contains("chats") || normalized.contains("list") || normalized.contains("conversations") || normalized.contains("chats") {
+            let chats = try await nativeService.listMessageChats()
+            let formatted = chats.enumerated().map { "\($0.offset + 1). \($0.element)" }.joined(separator: "\n")
+            return Self.result(
+                summary: chats.isEmpty ? "No message conversations found." : "Found \(chats.count) conversation(s).",
+                detail: formatted
+            )
+        }
+
+        // Search messages — try contact-aware search first (resolves names to phone numbers)
+        if let query = request.query, !query.isEmpty {
+            let messages = try await nativeService.searchMessagesByContactName(name: query)
+            let formatted = NativeDataAccessService.formatMessages(messages)
+            return Self.result(
+                summary: messages.isEmpty ? "No messages matching '\(query)'." : "Found \(messages.count) message(s) related to '\(query)'.",
+                detail: formatted
+            )
+        }
+
+        // Fetch recent messages from a specific person or chat
+        let chatFilter = request.chat ?? extractQuotedString(from: request.task)
+        if let chatFilter {
+            // Try contact-aware lookup first
+            let messages = try await nativeService.searchMessagesByContactName(name: chatFilter)
+            if !messages.isEmpty {
+                let formatted = NativeDataAccessService.formatMessages(messages)
+                return Self.result(
+                    summary: "Found \(messages.count) recent message(s) with \(chatFilter).",
+                    detail: formatted
+                )
+            }
+        }
+
+        // Fallback: fetch recent messages with optional chat filter on raw identifiers
+        let messages = try await nativeService.fetchRecentMessages(chatName: chatFilter)
+        let formatted = NativeDataAccessService.formatMessages(messages)
+        return Self.result(
+            summary: messages.isEmpty ? "No messages found." : "Found \(messages.count) recent message(s).",
+            detail: formatted
+        )
+    }
+
+    private func extractQuotedString(from text: String) -> String? {
+        // Extract text between quotes: "something" or 'something'
+        for (open, close) in [("\"", "\""), ("'", "'"), ("\u{201C}", "\u{201D}")] {
+            if let startRange = text.range(of: open),
+               let endRange = text.range(of: close, range: startRange.upperBound..<text.endIndex) {
+                let value = String(text[startRange.upperBound..<endRange.lowerBound])
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if !value.isEmpty { return value }
+            }
+        }
+        return nil
     }
 
     private func extractQuotedPath(from task: String) -> String? {
@@ -323,6 +597,38 @@ actor AssistantAppActionService {
         let trimmed = task.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
         return trimmed
+    }
+
+    /// Shows a user-friendly alert asking whether to open Full Disk Access settings.
+    /// Returns `true` if the user chose to open settings.
+    @MainActor
+    private static func promptForFullDiskAccess(appName: String) async -> Bool {
+        await MainActor.run {
+            let alert = NSAlert()
+            alert.alertStyle = .informational
+            alert.messageText = "Full Disk Access Required"
+            alert.informativeText = "Open Assist needs Full Disk Access to read your \(appName) data. macOS does not allow apps to request this permission automatically — you need to enable it manually in System Settings.\n\nWould you like to open Full Disk Access settings now?"
+            alert.addButton(withTitle: "Open Settings")
+            alert.addButton(withTitle: "Not Now")
+
+            let response = alert.runModal()
+            if response == .alertFirstButtonReturn {
+                PermissionCenter.openFullDiskAccessSettings()
+                return true
+            }
+            return false
+        }
+    }
+
+    private static func fullDiskAccessErrorResult(
+        error: NativeDataAccessError,
+        userOpenedSettings: Bool
+    ) -> AssistantComputerUseService.ToolExecutionResult {
+        let action = userOpenedSettings
+            ? "Opened Full Disk Access settings for the user. Tell them to add this app to the list, then try again."
+            : "The user chose not to open settings right now."
+        let message = "\(error.localizedDescription) \(action) There is no workaround -- do NOT try Computer Use, osascript, or reading files manually."
+        return result(summary: message, detail: nil, success: false)
     }
 
     private static func result(

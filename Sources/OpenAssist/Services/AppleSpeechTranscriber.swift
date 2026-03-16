@@ -328,6 +328,7 @@ final class AppleSpeechTranscriber: NSObject {
         previousEngine.inputNode.removeTap(onBus: 0)
 
         audioEngine = AVAudioEngine()
+        AudioEngineVoiceProcessing.enableIfAvailable(on: audioEngine, label: "Apple Speech")
         return audioEngine.inputNode
     }
 

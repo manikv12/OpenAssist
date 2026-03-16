@@ -319,38 +319,28 @@ actor LocalAutomationHelper {
     }
 
     func runAppleScript(_ script: String) async throws -> String {
+        // Run in-process via NSAppleScript so macOS attributes the Automation
+        // permission to Open Assist itself (persisted in TCC) instead of to a
+        // transient osascript child process that re-prompts every time.
         try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
-                let process = Process()
-                process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-                process.arguments = ["-e", script]
+                var errorDict: NSDictionary?
+                let appleScript = NSAppleScript(source: script)
+                let result = appleScript?.executeAndReturnError(&errorDict)
 
-                let outputPipe = Pipe()
-                let errorPipe = Pipe()
-                process.standardOutput = outputPipe
-                process.standardError = errorPipe
-
-                do {
-                    try process.run()
-                    process.waitUntilExit()
-                    let output = String(data: outputPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
-                        .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                    let error = String(data: errorPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
-                        .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-
-                    guard process.terminationStatus == 0 else {
-                        if error.contains("-1743") || error.localizedCaseInsensitiveContains("Not authorized to send Apple events") {
-                            continuation.resume(throwing: LocalAutomationError.appleEventsPermissionRequired)
-                            return
-                        }
-                        continuation.resume(throwing: LocalAutomationError.scriptFailed(error.nonEmpty ?? "AppleScript failed."))
-                        return
+                if let errorDict {
+                    let errorNumber = errorDict[NSAppleScript.errorNumber] as? Int ?? 0
+                    let errorMessage = errorDict[NSAppleScript.errorMessage] as? String ?? "AppleScript failed."
+                    if errorNumber == -1743 || errorMessage.localizedCaseInsensitiveContains("Not authorized to send Apple events") {
+                        continuation.resume(throwing: LocalAutomationError.appleEventsPermissionRequired)
+                    } else {
+                        continuation.resume(throwing: LocalAutomationError.scriptFailed(errorMessage))
                     }
-
-                    continuation.resume(returning: output)
-                } catch {
-                    continuation.resume(throwing: LocalAutomationError.scriptFailed(error.localizedDescription))
+                    return
                 }
+
+                let output = result?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                continuation.resume(returning: output)
             }
         }
     }

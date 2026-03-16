@@ -35,6 +35,16 @@ enum AssistantHUDPhase: String, Codable, Sendable {
     case streaming
     case success
     case failed
+
+    /// Whether the assistant is actively processing (as opposed to idle/done/failed).
+    var isActive: Bool {
+        switch self {
+        case .listening, .thinking, .acting, .waitingForPermission, .streaming:
+            return true
+        case .idle, .success, .failed:
+            return false
+        }
+    }
 }
 
 struct AssistantHUDState: Equatable, Sendable {
@@ -903,7 +913,7 @@ final class AssistantStore: ObservableObject {
     @Published private(set) var isRemovingAssistantVoiceInstallation = false
     @Published private(set) var assistantVoicePlaybackActive = false
     @Published private(set) var assistantHumeVoiceOptions: [AssistantHumeVoiceOption] = []
-    @Published private(set) var assistantHumeConversationSnapshot = AssistantHumeConversationSnapshot()
+    @Published private(set) var liveVoiceSessionSnapshot = AssistantLiveVoiceSessionSnapshot()
     @Published var showMemorySuggestionReview = false
 
     let installSupport: CodexInstallSupport
@@ -936,6 +946,9 @@ final class AssistantStore: ObservableObject {
     private var lastSpokenAssistantTimelineItemID: String?
     private var lastSpokenAssistantTurnID: String?
     private var pendingTimelineCacheSaveWorkItems: [String: DispatchWorkItem] = [:]
+    var onStartLiveVoiceSession: ((AssistantLiveVoiceSessionSurface) -> Void)?
+    var onEndLiveVoiceSession: (() -> Void)?
+    var onStopLiveVoiceSpeaking: (() -> Void)?
 
     private init(
         installSupport: CodexInstallSupport = CodexInstallSupport(),
@@ -1102,17 +1115,6 @@ final class AssistantStore: ObservableObject {
                 self?.assistantVoicePlaybackActive = isPlaying
             }
         }
-        self.humeConversationService.onSnapshotChange = { [weak self] snapshot in
-            Task { @MainActor in
-                self?.assistantHumeConversationSnapshot = snapshot
-            }
-        }
-        self.humeConversationService.onStatusMessage = { [weak self] message in
-            Task { @MainActor in
-                self?.assistantVoiceStatusMessage = message
-            }
-        }
-
         refreshModeSwitchSuggestion()
     }
 
@@ -2317,14 +2319,12 @@ final class AssistantStore: ObservableObject {
         return "No Hume voice selected"
     }
 
-    var canStartHumeConversationMode: Bool {
-        settings.assistantHumeAPIKey.nonEmpty != nil
-            && settings.assistantHumeSecretKey.nonEmpty != nil
-            && settings.assistantHumeVoiceID.nonEmpty != nil
+    var canStartLiveVoiceSession: Bool {
+        canStartConversation
     }
 
-    var isHumeConversationConnected: Bool {
-        assistantHumeConversationSnapshot.phase != .disconnected
+    var isLiveVoiceSessionActive: Bool {
+        liveVoiceSessionSnapshot.isActive
     }
 
     func selectBrowserProfile(_ profile: BrowserProfile) {
@@ -2459,12 +2459,10 @@ final class AssistantStore: ObservableObject {
         end tell
         """
 
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-        process.arguments = ["-e", script]
-        do {
-            try process.run()
-        } catch {
+        var errorDict: NSDictionary?
+        let appleScript = NSAppleScript(source: script)
+        appleScript?.executeAndReturnError(&errorDict)
+        if errorDict != nil {
             lastStatusMessage = "Could not open Terminal automatically. Run this command yourself: \(command)"
         }
     }
@@ -2536,6 +2534,9 @@ final class AssistantStore: ObservableObject {
 
         do {
             assistantSpeechPlaybackService.stopCurrentPlayback()
+            if liveVoiceSessionSnapshot.isActive {
+                onEndLiveVoiceSession?()
+            }
             await humeConversationService.endConversation()
             assistantVoiceStatusMessage = try assistantLegacyTADACleanupSupport.removeLegacyArtifacts()
         } catch {
@@ -2545,24 +2546,16 @@ final class AssistantStore: ObservableObject {
         await refreshAssistantVoiceHealth()
     }
 
-    func startHumeConversation() async {
-        guard canStartHumeConversationMode else {
-            assistantVoiceStatusMessage = "Add your Hume keys and choose a Hume voice first."
-            return
-        }
-        await humeConversationService.startConversation()
+    func startLiveVoiceSession(surface: AssistantLiveVoiceSessionSurface = .mainWindow) {
+        onStartLiveVoiceSession?(surface)
     }
 
-    func toggleHumeConversationMicrophoneMute() {
-        humeConversationService.toggleMicrophoneMute()
+    func endLiveVoiceSession() {
+        onEndLiveVoiceSession?()
     }
 
-    func stopHumeConversationSpeaking() async {
-        await humeConversationService.stopSpeaking()
-    }
-
-    func endHumeConversation() async {
-        await humeConversationService.endConversation()
+    func stopSpeakingAndResumeListening() {
+        onStopLiveVoiceSpeaking?()
     }
 
     func selectAssistantHumeVoice(_ voice: AssistantHumeVoiceOption) {
@@ -2887,7 +2880,7 @@ final class AssistantStore: ObservableObject {
         guard AssistantSpeechTrigger.shouldAutoSpeak(
             incoming: item,
             existingItem: existingItem,
-            featureEnabled: settings.assistantVoiceOutputEnabled,
+            featureEnabled: settings.assistantVoiceOutputEnabled || liveVoiceSessionSnapshot.isActive,
             lastSpokenTimelineItemID: lastSpokenAssistantTimelineItemID
         ) else {
             return
@@ -2932,6 +2925,10 @@ final class AssistantStore: ObservableObject {
             voicePromptReference: nil,
             promptText: nil
         )
+    }
+
+    func updateLiveVoiceSessionSnapshot(_ snapshot: AssistantLiveVoiceSessionSnapshot) {
+        liveVoiceSessionSnapshot = snapshot
     }
 
     private func updateToolCallActivity(_ calls: [AssistantToolCallState]) {
@@ -3411,6 +3408,10 @@ final class AssistantStore: ObservableObject {
         if let selectedSessionID = selectedSessionID?.nonEmpty {
             if let currentSessionID = runtime.currentSessionID?.nonEmpty {
                 if sessionsMatch(currentSessionID, selectedSessionID) {
+                    try await runtime.refreshCurrentSessionConfiguration(
+                        cwd: resolvedSessionCWD(for: currentSessionID),
+                        preferredModelID: selectedModelID
+                    )
                     return currentSessionID
                 }
 
@@ -3431,6 +3432,10 @@ final class AssistantStore: ObservableObject {
         }
 
         if let currentSessionID = runtime.currentSessionID?.nonEmpty {
+            try await runtime.refreshCurrentSessionConfiguration(
+                cwd: resolvedSessionCWD(for: currentSessionID),
+                preferredModelID: selectedModelID
+            )
             return currentSessionID
         }
 

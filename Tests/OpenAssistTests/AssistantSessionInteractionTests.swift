@@ -788,7 +788,7 @@ final class AssistantSessionInteractionTests: XCTestCase {
     }
 
     @MainActor
-    func testBuildInstructionsIncludesBrowserTurnReminderWhenProfileIsConfigured() {
+    func testBuildInstructionsIncludesBrowserTurnReminderWhenProfileIsConfigured() async {
         let runtime = CodexAssistantRuntime()
         runtime.browserProfileContext = [
             "browser": "Brave Browser",
@@ -798,7 +798,7 @@ final class AssistantSessionInteractionTests: XCTestCase {
             "profileName": "Personal"
         ]
 
-        let instructions = runtime.buildInstructionsForTesting()
+        let instructions = await runtime.buildInstructionsForTesting()
 
         XCTAssertTrue(instructions.contains("# Browser Task Override"))
         XCTAssertTrue(instructions.contains("Do NOT use MCP browser tools"))

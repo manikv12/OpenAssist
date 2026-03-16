@@ -43,6 +43,7 @@ final class AssistantOrbHUDModel: ObservableObject {
 
     // Voice recording
     @Published var isVoiceRecording = false
+    @Published var liveVoiceSnapshot = AssistantLiveVoiceSessionSnapshot()
     @Published var notchDockRevealed = false
     @Published var notchUsesHardwareOutline = false
     @Published var notchHardwareOutlineSize: NSSize = .zero
@@ -67,13 +68,15 @@ final class AssistantOrbHUDModel: ObservableObject {
     var onSendMessage: ((String, String?) -> Void)?
     var onSessionSelected: ((AssistantSessionSummary) -> Void)?
     var onOpenSession: ((AssistantSessionSummary) -> Void)?
+    var onOpenMainWindow: (() -> Void)?
     var onNewSession: (() async -> Void)?
     var onChooseModel: ((String) -> Void)?
     var onOpenAttachmentPicker: (() -> Void)?
     var onAddAttachment: ((AssistantAttachment) -> Void)?
     var onRemoveAttachment: ((UUID) -> Void)?
-    var onStartVoiceRecording: (() -> Void)?
-    var onStopVoiceRecording: (() -> Void)?
+    var onStartLiveVoiceSession: (() -> Void)?
+    var onEndLiveVoiceSession: (() -> Void)?
+    var onStopLiveVoiceSpeaking: (() -> Void)?
     var onStopActiveTurn: (() -> Void)?
     var onHideDock: (() -> Void)?
     var onResolvePermission: ((String) -> Void)?
@@ -328,6 +331,18 @@ final class AssistantOrbHUDModel: ObservableObject {
         )
     }
 
+    var isLiveVoiceActive: Bool {
+        liveVoiceSnapshot.isActive
+    }
+
+    var isLiveVoiceListening: Bool {
+        liveVoiceSnapshot.isListening
+    }
+
+    var isLiveVoiceSpeaking: Bool {
+        liveVoiceSnapshot.isSpeaking
+    }
+
     func cycleInteractionMode() {
         setInteractionMode(interactionMode.nextMode)
     }
@@ -360,10 +375,6 @@ final class AssistantOrbHUDModel: ObservableObject {
     }
 
     func collapseExpandedTray() {
-        if isVoiceRecording {
-            onStopVoiceRecording?()
-            isVoiceRecording = false
-        }
         isExpanded = false
         showCompactComposer = false
         shouldFocusTextField = false
@@ -380,6 +391,9 @@ final class AssistantOrbHUDModel: ObservableObject {
         dismissWorkingDetail()
         dismissCompactComposer()
         guard let session = activeSessionSummary ?? sessions.first(where: { $0.id == selectedSessionID }) else {
+            // No session available — still open the main assistant window
+            collapse()
+            onOpenMainWindow?()
             return
         }
         onOpenSession?(session)

@@ -102,3 +102,135 @@ struct AssistantPushToTalkButton: View {
             }
     }
 }
+
+struct AssistantLiveVoiceButton: View {
+    let snapshot: AssistantLiveVoiceSessionSnapshot
+    let level: CGFloat
+    var isEnabled: Bool = true
+    var accentColor: Color = Color(red: 0.0, green: 0.75, blue: 0.95)
+    var size: CGFloat = 28
+    var onTap: () -> Void
+
+    private var isActive: Bool {
+        snapshot.isActive
+    }
+
+    private var visualLevel: CGFloat {
+        if snapshot.isListening {
+            return min(1, max(level, 0.20))
+        }
+        if snapshot.isSpeaking {
+            return 0.42
+        }
+        if snapshot.phase == .sending || snapshot.phase == .transcribing {
+            return 0.28
+        }
+        if snapshot.phase == .waitingForPermission {
+            return 0.22
+        }
+        return isActive ? 0.16 : 0.0
+    }
+
+    private var symbolName: String {
+        switch snapshot.phase {
+        case .idle, .ended:
+            return "mic.fill"
+        case .speaking:
+            return "speaker.slash.fill"
+        case .waitingForPermission:
+            return "hand.raised.fill"
+        case .paused:
+            return "mic.badge.xmark.fill"
+        case .listening, .transcribing, .sending:
+            return "waveform"
+        }
+    }
+
+    private var helpText: String {
+        if !isEnabled {
+            return "Live voice is unavailable here right now."
+        }
+
+        switch snapshot.phase {
+        case .idle, .ended:
+            return "Start live voice."
+        case .speaking:
+            return "Stop the spoken reply and keep the live voice loop running."
+        case .listening:
+            return "Live voice is listening."
+        case .transcribing:
+            return "Live voice is transcribing your turn."
+        case .sending:
+            return "Live voice is sending your request."
+        case .waitingForPermission:
+            return "Live voice is waiting for approval."
+        case .paused:
+            return "Live voice is paused."
+        }
+    }
+
+    var body: some View {
+        TimelineView(.animation(minimumInterval: 1.0 / 24.0, paused: !isActive)) { timeline in
+            let time = timeline.date.timeIntervalSinceReferenceDate
+            let pulse = 1.0 + (visualLevel * 0.06) + (CGFloat(sin(time * 5.0)) * (isActive ? 0.02 : 0.0))
+            let ringScale = 1.0 + (visualLevel * 0.18)
+            let ringOpacity = 0.10 + (visualLevel * 0.18)
+            let baseFillTop = isActive ? accentColor.opacity(0.30) : Color.white.opacity(0.10)
+            let baseFillBottom = isActive ? accentColor.opacity(0.14) : Color.white.opacity(0.05)
+            let symbolColor = isEnabled
+                ? (isActive ? Color.white.opacity(0.96) : Color.white.opacity(0.72))
+                : Color.white.opacity(0.34)
+
+            Button(action: onTap) {
+                ZStack {
+                    if isActive {
+                        Circle()
+                            .stroke(accentColor.opacity(ringOpacity), lineWidth: 1.0)
+                            .frame(width: size + 5, height: size + 5)
+                            .scaleEffect(ringScale)
+
+                        Circle()
+                            .fill(accentColor.opacity(0.10 + (visualLevel * 0.12)))
+                            .frame(width: size + 2, height: size + 2)
+                            .blur(radius: 6)
+                            .scaleEffect(pulse)
+                    }
+
+                    Circle()
+                        .fill(
+                            LinearGradient(
+                                colors: [
+                                    baseFillTop,
+                                    baseFillBottom
+                                ],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            )
+                        )
+                        .overlay(
+                            Circle()
+                                .stroke(
+                                    isActive ? accentColor.opacity(0.34) : Color.white.opacity(0.10),
+                                    lineWidth: 0.9
+                                )
+                        )
+                        .frame(width: size, height: size)
+                        .shadow(color: isActive ? accentColor.opacity(0.18) : Color.black.opacity(0.08), radius: 8, x: 0, y: 4)
+
+                    Image(systemName: symbolName)
+                        .font(.system(size: size * 0.40, weight: .semibold))
+                        .foregroundStyle(symbolColor)
+                        .scaleEffect(isActive ? 1.02 : 1.0)
+                }
+                .frame(width: size, height: size)
+                .contentShape(Circle())
+                .opacity(isEnabled ? 1.0 : 0.62)
+            }
+            .buttonStyle(.plain)
+            .disabled(!isEnabled)
+            .help(helpText)
+            .accessibilityLabel("Live voice")
+            .accessibilityValue(snapshot.displayText)
+        }
+    }
+}

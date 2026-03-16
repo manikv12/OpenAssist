@@ -52,6 +52,11 @@ struct AssistantHumeConversationSnapshot: Equatable, Sendable {
     var isAssistantPaused = false
     var lastError: String?
     var chatGroupID: String?
+
+    var allowsMicrophoneStreaming: Bool {
+        guard !isMicrophoneMuted else { return false }
+        return phase == .connected
+    }
 }
 
 enum HumeAssistantVoiceError: LocalizedError {
@@ -89,7 +94,7 @@ enum AssistantHumeDefaults {
     Speak clearly, briefly, and naturally.
     Keep answers practical and easy to understand.
     Do not claim to run local coding tools or terminal commands.
-    If the user interrupts, stop and listen right away.
+    Keep replies short so the user can answer naturally between turns.
     """
     static let speechRate = 0.45
 }
@@ -562,9 +567,9 @@ final class HumeConversationService {
     }
 
     private func sendAudioChunk(_ audioData: Data) async {
-        guard !snapshot.isMicrophoneMuted,
+        guard snapshot.allowsMicrophoneStreaming,
               let socket,
-              snapshot.phase == .connected || snapshot.phase == .speaking else {
+              snapshot.phase == .connected else {
             return
         }
 

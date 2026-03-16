@@ -758,6 +758,7 @@ struct AssistantOrbHUDView: View {
 
                     HStack(spacing: 5) {
                         orbVoiceToggleButton(size: 20)
+                        liveVoiceEndButton(tint: glowColor)
 
                         OrbFloatingActionButton(
                             symbol: "arrow.up",
@@ -907,16 +908,47 @@ struct AssistantOrbHUDView: View {
     }
 
     private func orbVoiceToggleButton(size: CGFloat = 24) -> some View {
-        AssistantPushToTalkButton(
-            isListening: model.isVoiceRecording,
+        AssistantLiveVoiceButton(
+            snapshot: model.liveVoiceSnapshot,
             level: CGFloat(model.level),
-            size: size
-        ) { isPressed in
-            if isPressed {
-                model.onStartVoiceRecording?()
-            } else if model.isVoiceRecording {
-                model.onStopVoiceRecording?()
+            size: size,
+            onTap: handleLiveVoiceButtonTap
+        )
+    }
+
+    @ViewBuilder
+    private func liveVoiceEndButton(tint: Color) -> some View {
+        if model.isLiveVoiceActive {
+            OrbIconOnlySecondaryButton(symbol: "phone.down.fill", tint: tint) {
+                model.onEndLiveVoiceSession?()
             }
+        }
+    }
+
+    private var liveVoiceHintText: String {
+        switch model.liveVoiceSnapshot.phase {
+        case .idle, .ended:
+            return "Tap mic to start live voice"
+        case .listening:
+            return "Auto-stops after silence"
+        case .transcribing:
+            return "Transcribing your turn"
+        case .sending:
+            return "Waiting for the final answer"
+        case .waitingForPermission:
+            return "Approve to continue the live turn"
+        case .speaking:
+            return "Tap speaker to interrupt"
+        case .paused:
+            return model.liveVoiceSnapshot.displayText
+        }
+    }
+
+    private func handleLiveVoiceButtonTap() {
+        if model.isLiveVoiceSpeaking {
+            model.onStopLiveVoiceSpeaking?()
+        } else {
+            model.onStartLiveVoiceSession?()
         }
     }
 
@@ -1012,11 +1044,12 @@ struct AssistantOrbHUDView: View {
                 .padding(.horizontal, 10)
 
             HStack(spacing: 8) {
-                Text(model.isVoiceRecording ? "Release to stop" : "Enter sends")
+                Text(liveVoiceHintText)
                     .font(.system(size: 10, weight: .medium, design: .rounded))
                     .foregroundStyle(.white.opacity(0.52))
                 Spacer(minLength: 0)
                 orbVoiceToggleButton(size: 22)
+                liveVoiceEndButton(tint: tint)
                 OrbFloatingActionButton(
                     symbol: "arrow.up",
                     tint: tint,
@@ -1157,7 +1190,7 @@ struct AssistantNotchHUDView: View {
 
     private enum Layout {
         static let collapsedSize = NSSize(width: 320, height: 50)
-        static let compactCardSize = NSSize(width: 520, height: 360)
+        static let compactCardSize = NSSize(width: 520, height: 480)
         static let expandedTraySize = NSSize(width: 1100, height: 404)
         static let traySpacing: CGFloat = 4
         static let expandedSize = NSSize(
@@ -1225,6 +1258,42 @@ struct AssistantNotchHUDView: View {
 
     private var canSend: Bool {
         !model.messageText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !model.attachments.isEmpty
+    }
+
+    @ViewBuilder
+    private func liveVoiceEndButton(tint: Color) -> some View {
+        if model.isLiveVoiceActive {
+            OrbIconOnlySecondaryButton(symbol: "phone.down.fill", tint: tint) {
+                model.onEndLiveVoiceSession?()
+            }
+        }
+    }
+
+    private var liveVoiceHintText: String {
+        switch model.liveVoiceSnapshot.phase {
+        case .idle, .ended:
+            return "Tap mic to start live voice"
+        case .listening:
+            return "Auto-stops after silence"
+        case .transcribing:
+            return "Transcribing your turn"
+        case .sending:
+            return "Waiting for the final answer"
+        case .waitingForPermission:
+            return "Approve to continue the live turn"
+        case .speaking:
+            return "Tap speaker to interrupt"
+        case .paused:
+            return model.liveVoiceSnapshot.displayText
+        }
+    }
+
+    private func handleLiveVoiceButtonTap() {
+        if model.isLiveVoiceSpeaking {
+            model.onStopLiveVoiceSpeaking?()
+        } else {
+            model.onStartLiveVoiceSession?()
+        }
     }
 
     private var collapsedTitle: String {
@@ -1315,11 +1384,14 @@ struct AssistantNotchHUDView: View {
         if let detail = model.state.detail?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
             return detail
         }
-        if let hudDetail = model.workingToolActivity.first?.hudDetail?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
-            return hudDetail
-        }
-        if let activityDetail = model.workingToolActivity.first?.detail?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
-            return activityDetail
+        // Only show tool activity details while the assistant is actively working
+        if model.state.phase.isActive {
+            if let hudDetail = model.workingToolActivity.first?.hudDetail?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
+                return hudDetail
+            }
+            if let activityDetail = model.workingToolActivity.first?.detail?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
+                return activityDetail
+            }
         }
         if let sessionTitle = model.activeSessionSummary?.title.nonEmpty {
             return sessionTitle
@@ -1379,7 +1451,7 @@ struct AssistantNotchHUDView: View {
         .animation(.easeInOut(duration: 0.35), value: model.state.phase)
         .animation(.spring(response: 0.32, dampingFraction: 0.88), value: isTrayExpanded)
         .animation(.spring(response: 0.32, dampingFraction: 0.88), value: showingCompactCard)
-        .popover(item: $previewAttachment, attachmentAnchor: .point(.center)) { attachment in
+        .popover(item: $previewAttachment, attachmentAnchor: .point(.center), arrowEdge: .top) { attachment in
             if let nsImage = NSImage(data: attachment.data) {
                 VStack {
                     HStack {
@@ -2027,13 +2099,14 @@ struct AssistantNotchHUDView: View {
             )
 
             HStack(spacing: 8) {
-                Text(helperText)
+                Text(model.isLiveVoiceActive ? liveVoiceHintText : helperText)
                     .font(.system(size: 10, weight: .medium, design: .rounded))
                     .foregroundStyle(.white.opacity(0.54))
 
                 Spacer(minLength: 0)
 
                 notchVoiceToggleButton(size: 24)
+                liveVoiceEndButton(tint: tint)
                 OrbFloatingActionButton(
                     symbol: "arrow.up",
                     tint: tint,
@@ -2485,11 +2558,12 @@ struct AssistantNotchHUDView: View {
             )
 
             HStack(spacing: 8) {
-                Text(model.isVoiceRecording ? "Release to stop" : "Enter sends")
+                Text(liveVoiceHintText)
                     .font(.system(size: 10, weight: .medium, design: .rounded))
                     .foregroundStyle(.white.opacity(0.52))
                 Spacer(minLength: 0)
                 notchVoiceToggleButton(size: 26)
+                liveVoiceEndButton(tint: tint)
                 OrbFloatingActionButton(
                     symbol: "arrow.up",
                     tint: tint,
@@ -2505,17 +2579,12 @@ struct AssistantNotchHUDView: View {
     }
 
     private func notchVoiceToggleButton(size: CGFloat = 24) -> some View {
-        AssistantPushToTalkButton(
-            isListening: model.isVoiceRecording,
+        AssistantLiveVoiceButton(
+            snapshot: model.liveVoiceSnapshot,
             level: CGFloat(model.level),
-            size: size
-        ) { isPressed in
-            if isPressed {
-                model.onStartVoiceRecording?()
-            } else if model.isVoiceRecording {
-                model.onStopVoiceRecording?()
-            }
-        }
+            size: size,
+            onTap: handleLiveVoiceButtonTap
+        )
     }
 
     private func notchAttachmentStrip(tint: Color) -> some View {

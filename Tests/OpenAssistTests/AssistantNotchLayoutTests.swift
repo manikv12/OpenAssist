@@ -2,128 +2,55 @@ import XCTest
 @testable import OpenAssist
 
 final class AssistantNotchLayoutTests: XCTestCase {
-    func testRevealZoneWrapsAroundHiddenHandle() {
-        let hiddenFrame = NSRect(x: 100, y: 900, width: 180, height: 32)
-
-        let zone = AssistantNotchLayout.revealZone(
-            for: hiddenFrame,
-            horizontalPadding: 18,
-            minimumHoverHeight: 18,
-            verticalPadding: 10
+    func testVerticalOffsetPrefersVisibleTopInsetForTallContent() {
+        let offset = AssistantNotchLayout.verticalOffset(
+            topBandHeight: 16,
+            safeAreaTop: 0,
+            visibleTopInset: 37,
+            hiddenHeight: 24,
+            requestedHeight: 480,
+            spacingBelowNotch: 8
         )
 
-        XCTAssertLessThan(zone.minX, hiddenFrame.minX)
-        XCTAssertLessThan(zone.minY, hiddenFrame.minY)
-        XCTAssertGreaterThan(zone.maxX, hiddenFrame.maxX)
-        XCTAssertGreaterThan(zone.maxY, hiddenFrame.maxY)
+        XCTAssertEqual(offset, 45)
     }
 
-    func testVerticalOffsetOnlyAppliesToRealNotchContent() {
-        XCTAssertEqual(
-            AssistantNotchLayout.contentTopInset(
-                hasHardwareNotch: true,
-                topBandHeight: 36,
-                safeAreaTop: 34,
-                spacingBelowNotch: 8
-            ),
-            44,
-            accuracy: 0.001
+    func testVerticalOffsetKeepsHiddenDockInsideNotch() {
+        let offset = AssistantNotchLayout.verticalOffset(
+            topBandHeight: 16,
+            safeAreaTop: 0,
+            visibleTopInset: 37,
+            hiddenHeight: 24,
+            requestedHeight: 24,
+            spacingBelowNotch: 8
         )
 
-        XCTAssertEqual(
-            AssistantNotchLayout.verticalOffset(
-                hasHardwareNotch: true,
-                topBandHeight: 36,
-                safeAreaTop: 34,
-                hiddenHeight: 32,
-                requestedHeight: 32,
-                collapsedHeight: 50,
-                spacingBelowNotch: 8
-            ),
-            0,
-            accuracy: 0.001
-        )
-
-        XCTAssertEqual(
-            AssistantNotchLayout.verticalOffset(
-                hasHardwareNotch: true,
-                topBandHeight: 36,
-                safeAreaTop: 34,
-                hiddenHeight: 32,
-                requestedHeight: 50,
-                collapsedHeight: 50,
-                spacingBelowNotch: 8
-            ),
-            44,
-            accuracy: 0.001
-        )
-
-        XCTAssertEqual(
-            AssistantNotchLayout.verticalOffset(
-                hasHardwareNotch: true,
-                topBandHeight: 36,
-                safeAreaTop: 34,
-                hiddenHeight: 32,
-                requestedHeight: 162,
-                collapsedHeight: 50,
-                spacingBelowNotch: 8
-            ),
-            44,
-            accuracy: 0.001
-        )
-
-        XCTAssertEqual(
-            AssistantNotchLayout.verticalOffset(
-                hasHardwareNotch: false,
-                topBandHeight: 36,
-                safeAreaTop: 34,
-                hiddenHeight: 32,
-                requestedHeight: 50,
-                collapsedHeight: 50,
-                spacingBelowNotch: 8
-            ),
-            0,
-            accuracy: 0.001
-        )
-
-        XCTAssertEqual(
-            AssistantNotchLayout.contentTopInset(
-                hasHardwareNotch: false,
-                topBandHeight: 36,
-                safeAreaTop: 34,
-                spacingBelowNotch: 8
-            ),
-            0,
-            accuracy: 0.001
-        )
+        XCTAssertEqual(offset, 0)
     }
 
-    func testCollapsedDockPaddingCanRestoreFullHoverTarget() {
-        let hiddenFrame = NSRect(x: 100, y: 900, width: 160, height: 4)
-        let collapsedWidth: CGFloat = 320
-        let collapsedHeight: CGFloat = 50
-
-        let zone = AssistantNotchLayout.revealZone(
-            for: hiddenFrame,
-            horizontalPadding: (collapsedWidth - hiddenFrame.width) / 2,
-            minimumHoverHeight: collapsedHeight,
-            verticalPadding: (collapsedHeight - hiddenFrame.height) / 2
+    func testVerticalOffsetFallsBackToVisibleTopInsetWithoutHardwareGap() {
+        let offset = AssistantNotchLayout.verticalOffset(
+            topBandHeight: 0,
+            safeAreaTop: 0,
+            visibleTopInset: 37,
+            hiddenHeight: 4,
+            requestedHeight: 480,
+            spacingBelowNotch: 8
         )
 
-        XCTAssertEqual(zone.width, collapsedWidth, accuracy: 0.001)
-        XCTAssertEqual(zone.height, collapsedHeight, accuracy: 0.001)
-        XCTAssertTrue(zone.contains(NSPoint(x: hiddenFrame.midX, y: hiddenFrame.midY)))
+        XCTAssertEqual(offset, 45)
     }
 
-    func testCenteredOriginKeepsHiddenAndPopupNotchStatesAligned() {
-        let screenFrame = NSRect(x: 120, y: 40, width: 1512, height: 982)
-        let hiddenWidth: CGFloat = 184
-        let popupWidth: CGFloat = 520
+    func testVerticalOffsetKeepsSyntheticHiddenDockAtScreenTop() {
+        let offset = AssistantNotchLayout.verticalOffset(
+            topBandHeight: 0,
+            safeAreaTop: 0,
+            visibleTopInset: 37,
+            hiddenHeight: 4,
+            requestedHeight: 4,
+            spacingBelowNotch: 8
+        )
 
-        let hiddenOriginX = AssistantNotchLayout.centeredOriginX(screenFrame: screenFrame, width: hiddenWidth)
-        let popupOriginX = AssistantNotchLayout.centeredOriginX(screenFrame: screenFrame, width: popupWidth)
-
-        XCTAssertEqual(hiddenOriginX + (hiddenWidth / 2), screenFrame.midX, accuracy: 0.001)
-        XCTAssertEqual(popupOriginX + (popupWidth / 2), screenFrame.midX, accuracy: 0.001)
+        XCTAssertEqual(offset, 0)
     }
 }

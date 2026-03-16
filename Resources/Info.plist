@@ -18,6 +18,12 @@
         <string>Open Assist uses Automation permission so it can control supported apps like browsers, Finder, Terminal, Calendar, and System Settings when you approve a task.</string>
         <key>NSSpeechRecognitionUsageDescription</key>
         <string>Open Assist uses speech recognition so you can transcribe while holding the shortcut.</string>
+        <key>NSRemindersUsageDescription</key>
+        <string>Open Assist reads and creates reminders so your assistant can manage your to-do list.</string>
+        <key>NSCalendarsUsageDescription</key>
+        <string>Open Assist reads and creates calendar events so your assistant can manage your schedule.</string>
+        <key>NSContactsUsageDescription</key>
+        <string>Open Assist reads your contacts so your assistant can look up names, phone numbers, and email addresses.</string>
         <key>LSMinimumSystemVersion</key>
         <string>13.3</string>
         <key>CFBundleIconFile</key>

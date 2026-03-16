@@ -373,6 +373,7 @@ final class CloudTranscriber: NSObject {
         }
 
         if isRecording {
+            suspendActiveRecording()
             let delay = finalizeDelaySeconds
             if delay > 0 {
                 updateStatus("Finalizing…")
@@ -398,19 +399,21 @@ final class CloudTranscriber: NSObject {
         return audioEngine.inputNode
     }
 
+    private func suspendActiveRecording() {
+        guard isRecording else { return }
+
+        isRecording = false
+        onRecordingStateChange?(false)
+
+        audioEngine.inputNode.removeTap(onBus: 0)
+        audioEngine.stop()
+        audioEngine.reset()
+        onAudioLevel?(0)
+        onAudioWaveformBins?(Array(repeating: 0, count: AudioWaveformShape.defaultBinCount))
+    }
+
     private func completeStopRecording(emitFinalText: Bool) {
         pendingStopWorkItem = nil
-
-        if isRecording {
-            isRecording = false
-            onRecordingStateChange?(false)
-
-            audioEngine.inputNode.removeTap(onBus: 0)
-            audioEngine.stop()
-            audioEngine.reset()
-            onAudioLevel?(0)
-            onAudioWaveformBins?(Array(repeating: 0, count: AudioWaveformShape.defaultBinCount))
-        }
 
         restoreMicSelection()
 
@@ -509,6 +512,13 @@ final class CloudTranscriber: NSObject {
         switch result {
         case .success(let transcript):
             let trimmed = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+            if Self.looksLikeTranscriptionPromptEcho(trimmed) {
+                updateStatus("Cloud transcription failed: captured audio did not decode cleanly. Try again.")
+                CrashReporter.logWarning(
+                    "Cloud finalize rejected prompt echo run=\(runID) provider=\(provider.rawValue) model=\(model) transcript=\(trimmed)"
+                )
+                return
+            }
             updateStatus("Ready")
             CrashReporter.logInfo(
                 "Cloud finalize completed run=\(runID) provider=\(provider.rawValue) model=\(model) outputChars=\(trimmed.count)"
@@ -766,6 +776,24 @@ final class CloudTranscriber: NSObject {
         }
 
         return "Transcribe this audio verbatim. Preserve wording and punctuation when clear. Prefer these terms if acoustically plausible: \(limited.joined(separator: ", "))."
+    }
+
+    static func looksLikeTranscriptionPromptEcho(_ text: String) -> Bool {
+        let normalized = text
+            .lowercased()
+            .replacingOccurrences(of: #"[^a-z0-9]+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        switch normalized {
+        case "transcribe this audio",
+             "transcribe this audio verbatim",
+             "transcribe this audio verbatim preserve wording and punctuation when clear":
+            return true
+        default:
+            return normalized.hasPrefix(
+                "transcribe this audio verbatim preserve wording and punctuation when clear prefer these terms if acoustically plausible "
+            )
+        }
     }
 
     private func makeMultipartFormData(

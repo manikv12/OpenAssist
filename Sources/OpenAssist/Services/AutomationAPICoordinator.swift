@@ -707,9 +707,8 @@ final class AutomationAPICoordinator: NSObject, ObservableObject {
         return response.notification.request.content.userInfo[Self.automationNotificationUserInfoKey] as? Bool == true
     }
 
-    private func handleAutomationNotificationInteraction(source: String?) {
-        NSApp.activate(ignoringOtherApps: true)
-        notificationInteractionHandler?(source)
+    private func handleAutomationNotificationInteraction(source _: String?) {
+        // Ignore notification clicks for automation notifications.
     }
 }
 

@@ -360,6 +360,7 @@ final class WhisperTranscriber: NSObject {
         }
 
         if isRecording {
+            suspendActiveRecording()
             let delay = finalizeDelaySeconds
             if delay > 0 {
                 updateStatus("Finalizing…")
@@ -385,6 +386,19 @@ final class WhisperTranscriber: NSObject {
         return audioEngine.inputNode
     }
 
+    private func suspendActiveRecording() {
+        guard isRecording else { return }
+
+        isRecording = false
+        onRecordingStateChange?(false)
+
+        audioEngine.inputNode.removeTap(onBus: 0)
+        audioEngine.stop()
+        audioEngine.reset()
+        onAudioLevel?(0)
+        onAudioWaveformBins?(Array(repeating: 0, count: AudioWaveformShape.defaultBinCount))
+    }
+
     private func completeStopRecording(emitFinalText: Bool) {
         pendingStopWorkItem = nil
         cancelScheduledContextRelease()
@@ -403,17 +417,6 @@ final class WhisperTranscriber: NSObject {
 
         let coreMLDirectoryURL = useCoreML ? modelManager.installedCoreMLDirectoryURL(for: selectedModelID) : nil
         let shouldForceCPUForStability = selectedModelID.hasPrefix("small") || selectedModelID.hasPrefix("medium")
-
-        if isRecording {
-            isRecording = false
-            onRecordingStateChange?(false)
-
-            audioEngine.inputNode.removeTap(onBus: 0)
-            audioEngine.stop()
-            audioEngine.reset()
-            onAudioLevel?(0)
-            onAudioWaveformBins?(Array(repeating: 0, count: AudioWaveformShape.defaultBinCount))
-        }
 
         var samplesToTranscribe: [Float] = []
         sampleQueue.sync {

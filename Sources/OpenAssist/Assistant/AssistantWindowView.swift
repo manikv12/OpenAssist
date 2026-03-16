@@ -76,33 +76,46 @@ struct AssistantWindowView: View {
         settings.assistantBetaEnabled && assistant.canStartConversation
     }
 
-    private var shouldShowHumeConversationPanel: Bool {
+    private var shouldShowLiveVoicePanel: Bool {
         settings.assistantBetaEnabled
-            && (settings.assistantVoiceEngine == .humeOctave || assistant.isHumeConversationConnected)
+            && (assistant.interactionMode == .conversational || assistant.isLiveVoiceSessionActive)
     }
 
-    private var humeConversationStatusText: String {
-        let snapshot = assistant.assistantHumeConversationSnapshot
-        if let error = snapshot.lastError?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !error.isEmpty {
-            return error
-        }
+    private var liveVoiceStatusText: String {
+        assistant.liveVoiceSessionSnapshot.displayText
+    }
 
-        switch snapshot.phase {
-        case .disconnected:
-            return assistant.canStartHumeConversationMode
-                ? "Ready to start a live Hume conversation."
-                : "Add Hume keys and choose a Hume voice in AI Studio > Voice first."
-        case .connecting:
-            return "Connecting live voice conversation..."
-        case .connected:
-            return snapshot.isMicrophoneMuted
-                ? "Connected. Mic is muted."
-                : "Connected. Speak any time."
+    private var liveVoiceStatusSymbol: String {
+        switch assistant.liveVoiceSessionSnapshot.phase {
+        case .idle, .ended:
+            return "person.wave.2.fill"
+        case .listening:
+            return "mic.fill"
+        case .transcribing, .sending:
+            return "waveform"
+        case .waitingForPermission:
+            return "hand.raised.fill"
         case .speaking:
-            return snapshot.isMicrophoneMuted
-                ? "Assistant is speaking. Mic is muted."
-                : "Assistant is speaking. You can interrupt by talking."
+            return "speaker.wave.2.fill"
+        case .paused:
+            return "pause.circle.fill"
+        }
+    }
+
+    private var liveVoiceStatusTint: Color {
+        switch assistant.liveVoiceSessionSnapshot.phase {
+        case .waitingForPermission:
+            return .orange
+        case .speaking:
+            return .purple
+        case .listening:
+            return .green
+        case .transcribing, .sending:
+            return .cyan
+        case .paused:
+            return .yellow
+        case .idle, .ended:
+            return .cyan
         }
     }
 
@@ -2209,8 +2222,8 @@ struct AssistantWindowView: View {
                 .padding(.bottom, 6)
             }
 
-            if shouldShowHumeConversationPanel {
-                humeConversationPanel
+            if shouldShowLiveVoicePanel {
+                liveVoicePanel
                     .padding(.bottom, 6)
             }
 
@@ -2565,18 +2578,16 @@ struct AssistantWindowView: View {
         sessionMemoryIsActive ? "Session memory on" : "Session memory off"
     }
 
-    private var humeConversationPanel: some View {
+    private var liveVoicePanel: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .center, spacing: 10) {
                 AssistantStatusBadge(
-                    title: "Hume Conversation",
-                    tint: assistant.isHumeConversationConnected ? .green : .cyan,
-                    symbol: assistant.assistantHumeConversationSnapshot.phase == .speaking
-                        ? "waveform"
-                        : "person.wave.2.fill"
+                    title: "Live Voice Agent",
+                    tint: liveVoiceStatusTint,
+                    symbol: liveVoiceStatusSymbol
                 )
 
-                Text(humeConversationStatusText)
+                Text(liveVoiceStatusText)
                     .font(.system(size: 11.5, weight: .medium))
                     .foregroundStyle(.white.opacity(0.70))
                     .fixedSize(horizontal: false, vertical: true)
@@ -2585,27 +2596,28 @@ struct AssistantWindowView: View {
             }
 
             HStack(spacing: 8) {
-                if assistant.isHumeConversationConnected {
-                    Button(assistant.assistantHumeConversationSnapshot.isMicrophoneMuted ? "Unmute Mic" : "Mute Mic") {
-                        assistant.toggleHumeConversationMicrophoneMute()
+                if assistant.isLiveVoiceSessionActive {
+                    if assistant.liveVoiceSessionSnapshot.isSpeaking {
+                        Button("Stop Speaking") {
+                            assistant.stopSpeakingAndResumeListening()
+                        }
+                        .buttonStyle(.bordered)
                     }
-                    .buttonStyle(.bordered)
-
-                    Button("Stop Speaking") {
-                        Task { await assistant.stopHumeConversationSpeaking() }
-                    }
-                    .buttonStyle(.bordered)
 
                     Button("End Conversation", role: .destructive) {
-                        Task { await assistant.endHumeConversation() }
+                        assistant.endLiveVoiceSession()
                     }
                     .buttonStyle(.bordered)
                 } else {
-                    Button("Start Conversation") {
-                        Task { await assistant.startHumeConversation() }
+                    Button(
+                        assistant.liveVoiceSessionSnapshot.phase == .paused
+                            ? "Resume Conversation"
+                            : "Start Conversation"
+                    ) {
+                        assistant.startLiveVoiceSession()
                     }
                     .buttonStyle(.borderedProminent)
-                    .disabled(!assistant.canStartHumeConversationMode)
+                    .disabled(!assistant.canStartLiveVoiceSession)
                 }
             }
         }

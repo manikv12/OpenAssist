@@ -292,7 +292,7 @@ final class CodexAssistantRuntime {
 
         let response = try await sendRequest(
             method: "thread/start",
-            params: threadStartParams(cwd: cwd, modelID: requestedModelID)
+            params: await threadStartParams(cwd: cwd, modelID: requestedModelID)
         )
 
         guard let payload = response.raw as? [String: Any],
@@ -314,7 +314,7 @@ final class CodexAssistantRuntime {
         try await ensureTransport()
         _ = try await sendRequest(
             method: "thread/resume",
-            params: threadResumeParams(
+            params: await threadResumeParams(
                 threadID: sessionID,
                 cwd: cwd,
                 modelID: preferredModelID ?? self.preferredModelID
@@ -334,7 +334,7 @@ final class CodexAssistantRuntime {
         try await ensureTransport()
         _ = try await sendRequest(
             method: "thread/resume",
-            params: threadResumeParams(
+            params: await threadResumeParams(
                 threadID: activeSessionID,
                 cwd: cwd,
                 modelID: preferredModelID ?? self.preferredModelID
@@ -1216,6 +1216,22 @@ final class CodexAssistantRuntime {
 
     private func presentCommandApprovalRequest(id: JSONRPCRequestID, params: [String: Any]) async {
         let command = firstNonEmptyString(params["command"] as? String, "Approve command") ?? "Approve command"
+
+        // Auto-decline osascript/AppleScript commands targeting privacy-protected apps.
+        // These hang indefinitely waiting for a macOS TCC dialog that can't be dismissed.
+        if let blockedApp = Self.detectPrivacyBlockedOsascript(in: command) {
+            let declineMessage = "Automatically declined: osascript targeting \(blockedApp) would hang waiting for a macOS privacy dialog. Open \(blockedApp) manually instead."
+            do {
+                try await transport?.sendResponse(id: id, result: ["decision": "decline"])
+            } catch {
+                await MainActor.run { self.onStatusMessage?(error.localizedDescription) }
+            }
+            onStatusMessage?(declineMessage)
+            onTranscript?(AssistantTranscriptEntry(role: .status, text: declineMessage, emphasis: true))
+            updateHUD(phase: .acting, title: "Blocked osascript", detail: "Declined \(blockedApp) automation")
+            return
+        }
+
         let reason = firstNonEmptyString(params["reason"] as? String, params["cwd"] as? String)
         let options = [
             AssistantPermissionOption(id: "acceptForSession", title: "Allow for Session", kind: "command", isDefault: true),
@@ -1469,6 +1485,19 @@ final class CodexAssistantRuntime {
             arguments: arguments
         )
 
+        // Auto-approve native data access apps (Reminders, Contacts, Notes, Messages, Calendar reads).
+        // These use safe, read-only framework access and don't need per-session user approval.
+        if tool == AssistantAppActionToolDefinition.name,
+           let parsed = try? AssistantAppActionService.parseRequest(from: arguments),
+           let app = parsed.app, app.usesNativeAccess {
+            await executeDynamicToolCall(
+                toolName: tool,
+                requestID: id,
+                arguments: arguments
+            )
+            return
+        }
+
         if !requiresExplicitConfirmation,
            isDynamicToolApproved(toolKind: toolKind, for: sessionID) {
             await executeDynamicToolCall(
@@ -1601,6 +1630,31 @@ final class CodexAssistantRuntime {
         arguments: Any
     ) async {
         let displayName = dynamicToolDisplayName(toolName)
+
+        // Pre-flight permission check — catch missing permissions before hitting the service layer
+        let verdict = await preflightPermissionCheck(toolName: toolName, arguments: arguments)
+        if !verdict.satisfied {
+            let failedResult = AssistantComputerUseService.ToolExecutionResult(
+                contentItems: [.init(type: "inputText", text: verdict.message, imageURL: nil)],
+                success: false,
+                summary: verdict.message
+            )
+            do {
+                try await transport?.sendResponse(
+                    id: requestID,
+                    result: [
+                        "contentItems": failedResult.contentItems.map { $0.dictionaryRepresentation() },
+                        "success": false
+                    ]
+                )
+            } catch {
+                await MainActor.run { self.onStatusMessage?(error.localizedDescription) }
+            }
+            onStatusMessage?(verdict.message)
+            updateHUD(phase: .failed, title: "\(displayName) failed", detail: verdict.message)
+            return
+        }
+
         let workingDetail: String
         let result: AssistantComputerUseService.ToolExecutionResult
 
@@ -1946,19 +2000,12 @@ final class CodexAssistantRuntime {
         Self.cleanupAppleScriptProcesses()
     }
 
-    /// Kills lingering `osascript` processes and resets `System Events` memory
-    /// by sending it a quit signal (macOS relaunches it on demand).
+    /// Resets `System Events` memory by sending it a quit signal (macOS relaunches
+    /// it on demand). The old `killall -9 osascript` is no longer needed because
+    /// `runAppleScript()` now uses in-process `NSAppleScript` — no child osascript
+    /// processes are spawned by our tools.
     static func cleanupAppleScriptProcesses() {
         DispatchQueue.global(qos: .utility).async {
-            // Kill any orphaned osascript processes
-            let killOsa = Process()
-            killOsa.executableURL = URL(fileURLWithPath: "/usr/bin/killall")
-            killOsa.arguments = ["-9", "osascript"]
-            killOsa.standardOutput = FileHandle.nullDevice
-            killOsa.standardError = FileHandle.nullDevice
-            try? killOsa.run()
-            killOsa.waitUntilExit()
-
             // Reset System Events to reclaim memory (macOS auto-restarts it on next use)
             let resetSE = Process()
             resetSE.executableURL = URL(fileURLWithPath: "/usr/bin/killall")
@@ -2521,8 +2568,8 @@ final class CodexAssistantRuntime {
         )
     }
 
-    func buildInstructionsForTesting() -> String {
-        buildInstructions()
+    func buildInstructionsForTesting() async -> String {
+        await buildInstructions()
     }
 
     func processErrorNotificationForTesting(
@@ -2804,7 +2851,7 @@ final class CodexAssistantRuntime {
         case AssistantBrowserUseToolDefinition.name:
             lead = "Browser Use can open sites and reuse the selected signed-in browser profile on this Mac."
         case AssistantAppActionToolDefinition.name:
-            lead = "App Action can talk to supported Mac apps like Finder, Terminal, Calendar, and System Settings."
+            lead = "App Action can talk to supported Mac apps like Finder, Terminal, Calendar, System Settings, Reminders, Contacts, Notes, and Messages."
         default:
             lead = "This tool can control parts of your Mac."
         }
@@ -3147,7 +3194,7 @@ final class CodexAssistantRuntime {
         return [String: Any]()
     }
 
-    private func threadStartParams(cwd: String?, modelID: String?) -> [String: Any] {
+    private func threadStartParams(cwd: String?, modelID: String?) async -> [String: Any] {
         var params: [String: Any] = [
             "approvalPolicy": threadApprovalPolicy(for: interactionMode),
             "sandbox": threadSandboxMode(for: interactionMode),
@@ -3163,7 +3210,7 @@ final class CodexAssistantRuntime {
         if let tier = serviceTier?.nonEmpty {
             params["serviceTier"] = tier
         }
-        let instructions = buildInstructions()
+        let instructions = await buildInstructions()
         if !instructions.isEmpty {
             params["instructions"] = instructions
         }
@@ -3185,7 +3232,7 @@ final class CodexAssistantRuntime {
         return params
     }
 
-    private func buildInstructions() -> String {
+    private func buildInstructions() async -> String {
         var sections: [String] = []
 
         switch interactionMode {
@@ -3213,7 +3260,8 @@ final class CodexAssistantRuntime {
             Keep the output focused on the proposed plan so the user can review it before execution.
             """)
         case .agentic:
-            break
+            let snapshot = await livePermissionSnapshot()
+            sections.append(ToolPermissionRegistry.instructionBlock(snapshot: snapshot))
         }
 
         if let custom = customInstructions?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -3267,8 +3315,36 @@ final class CodexAssistantRuntime {
         """
     }
 
-    private func threadResumeParams(threadID: String, cwd: String?, modelID: String?) -> [String: Any] {
-        var params = threadStartParams(cwd: cwd, modelID: modelID)
+    /// Builds a live permission snapshot by querying `PermissionCenter` and `SettingsStore`.
+    private func livePermissionSnapshot() async -> ToolPermissionRegistry.PermissionSnapshot {
+        await MainActor.run {
+            let settings = SettingsStore.shared
+            let pc = PermissionCenter.snapshot(using: settings)
+            let hasAPIKey = !settings.promptRewriteOpenAIAPIKey
+                .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            let hasOAuth = PromptRewriteOAuthCredentialStore.loadSession(for: .openAI) != nil
+            return ToolPermissionRegistry.PermissionSnapshot(
+                accessibilityGranted: pc.accessibilityGranted,
+                screenRecordingGranted: pc.screenRecordingGranted,
+                appleEventsGranted: pc.appleEventsGranted,
+                appleEventsKnown: pc.appleEventsKnown,
+                fullDiskAccessGranted: pc.fullDiskAccessGranted,
+                browserAutomationEnabled: settings.browserAutomationEnabled,
+                browserProfileSelected: !settings.browserSelectedProfileID
+                    .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                openAIConnectionAvailable: hasAPIKey || hasOAuth
+            )
+        }
+    }
+
+    /// Pre-flight permission check for a dynamic tool call.
+    private func preflightPermissionCheck(toolName: String, arguments: Any) async -> ToolPermissionVerdict {
+        let snapshot = await livePermissionSnapshot()
+        return ToolPermissionRegistry.verify(toolName: toolName, arguments: arguments, snapshot: snapshot)
+    }
+
+    private func threadResumeParams(threadID: String, cwd: String?, modelID: String?) async -> [String: Any] {
+        var params = await threadStartParams(cwd: cwd, modelID: modelID)
         params["threadId"] = threadID
         return params
     }
@@ -3380,6 +3456,43 @@ final class CodexAssistantRuntime {
 
     private func compactDetail(_ text: String?) -> String? {
         text?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+    }
+
+    /// Detects osascript or AppleScript commands that target privacy-protected macOS apps.
+    /// Returns the display name of the blocked app, or nil if the command is safe.
+    static func detectPrivacyBlockedOsascript(in command: String) -> String? {
+        let normalized = command.lowercased()
+        // Only check commands that involve AppleScript/osascript
+        guard normalized.contains("osascript") || normalized.contains("applescript")
+                || normalized.contains("tell application") else {
+            return nil
+        }
+        // Reminders, Contacts, Notes, and Messages are no longer blocked —
+        // they use native framework access via app_action. But osascript against
+        // them should still be blocked since the native path is preferred.
+        let blockedApps: [(keyword: String, displayName: String)] = [
+            ("reminders", "Reminders"),
+            ("contacts", "Contacts"),
+            ("mail", "Mail"),
+            ("messages", "Messages"),
+            ("photos", "Photos"),
+            ("notes", "Notes"),
+            ("safari", "Safari"),
+            ("music", "Music"),
+            ("podcasts", "Podcasts"),
+            ("home", "Home"),
+            ("health", "Health"),
+        ]
+        for entry in blockedApps {
+            // Match "tell application \"Reminders\"" or just "Reminders" in an osascript context
+            if normalized.contains("\"" + entry.keyword + "\"")
+                || normalized.contains("'\(entry.keyword)'")
+                || normalized.contains("application \"\(entry.keyword)\"")
+                || normalized.contains("application \\\"\(entry.keyword)\\\"") {
+                return entry.displayName
+            }
+        }
+        return nil
     }
 
     /// Produces a short, human-readable summary of a raw shell command for the HUD.

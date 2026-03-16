@@ -192,6 +192,38 @@ final class AssistantSpeechPlaybackServiceTests: XCTestCase {
         )
     }
 
+    func testHumeConversationMicrophoneStreamingOnlyWhenConnectedAndUnmuted() {
+        XCTAssertTrue(
+            AssistantHumeConversationSnapshot(
+                phase: .connected,
+                isMicrophoneMuted: false,
+                isAssistantPaused: false,
+                lastError: nil,
+                chatGroupID: nil
+            ).allowsMicrophoneStreaming
+        )
+
+        XCTAssertFalse(
+            AssistantHumeConversationSnapshot(
+                phase: .speaking,
+                isMicrophoneMuted: false,
+                isAssistantPaused: false,
+                lastError: nil,
+                chatGroupID: nil
+            ).allowsMicrophoneStreaming
+        )
+
+        XCTAssertFalse(
+            AssistantHumeConversationSnapshot(
+                phase: .connected,
+                isMicrophoneMuted: true,
+                isAssistantPaused: false,
+                lastError: nil,
+                chatGroupID: nil
+            ).allowsMicrophoneStreaming
+        )
+    }
+
     func testHumeFailureFallsBackToMacOSWhenEnabled() async throws {
         let hume = MockAssistantSpeechProvider(engine: .humeOctave)
         hume.speakError = AssistantSpeechError.serviceUnavailable("Hume offline")

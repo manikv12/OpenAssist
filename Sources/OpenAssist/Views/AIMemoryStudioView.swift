@@ -5599,16 +5599,38 @@ struct AIMemoryStudioView: View {
                     Toggle("Show compact assistant", isOn: $settings.assistantFloatingHUDEnabled)
 
                     if settings.assistantFloatingHUDEnabled {
-                        Picker(
-                            "Compact assistant style",
-                            selection: Binding(
-                                get: { settings.assistantCompactPresentationStyle },
-                                set: { settings.assistantCompactPresentationStyle = $0 }
+                        Toggle(
+                            "Use notch style",
+                            isOn: Binding(
+                                get: { settings.assistantCompactPresentationStyle == .notch },
+                                set: { wantsNotch in
+                                    settings.assistantCompactPresentationStyle = wantsNotch ? .notch : .orb
+                                }
                             )
-                        ) {
-                            ForEach(AssistantCompactPresentationStyle.allCases) { style in
-                                Text(style.displayName).tag(style)
+                        )
+
+                        Text("Turn this on to show the compact assistant at the top notch area. Turn it off to use the floating orb instead.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+
+                        if settings.assistantCompactPresentationStyle == .notch {
+                            Picker(
+                                "Notch hover delay",
+                                selection: Binding(
+                                    get: { settings.assistantNotchHoverDelay },
+                                    set: { settings.assistantNotchHoverDelay = $0 }
+                                )
+                            ) {
+                                ForEach(AssistantNotchHoverDelay.allCases) { delay in
+                                    Text(delay.displayName).tag(delay)
+                                }
                             }
+
+                            Text("Choose how long the pointer should stay near the notch before the compact assistant appears.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
                         }
                     }
 
