@@ -131,10 +131,13 @@ jobs:
           generate_release_notes: true
           files: "dist/Open Assist.dmg"
 
+      - name: Prepare Pages content
+        run: mkdir -p pages && cp dist/appcast.xml pages/appcast.xml
+
       - name: Upload appcast as Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: dist/appcast.xml
+          path: pages
 
   deploy-pages:
     name: Deploy Appcast to GitHub Pages
