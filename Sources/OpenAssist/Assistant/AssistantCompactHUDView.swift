@@ -284,11 +284,19 @@ struct AssistantOrbHUDView: View {
                 .padding(.horizontal, 2)
 
             ScrollView(.vertical, showsIndicators: true) {
-                if let detail = model.doneDetailText, !detail.isEmpty {
-                    OrbDoneMarkdownText(text: detail)
-                        .padding(.horizontal, 16)
-                        .padding(.vertical, 14)
+                VStack(alignment: .leading, spacing: 12) {
+                    if let detail = model.doneDetailText, !detail.isEmpty {
+                        OrbDoneMarkdownText(text: detail)
+                    }
+
+                    orbPreviewImageGallery(
+                        model.previewImages,
+                        title: "Latest screenshot",
+                        maxHeight: 220
+                    )
                 }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 14)
             }
             .frame(maxHeight: .infinity)
 
@@ -427,6 +435,12 @@ struct AssistantOrbHUDView: View {
                             .fixedSize(horizontal: false, vertical: true)
                     }
 
+                    orbPreviewImageGallery(
+                        model.previewImages,
+                        title: "Latest screenshot",
+                        maxHeight: 220
+                    )
+
                     if let session = model.activeSessionSummary {
                         VStack(alignment: .leading, spacing: 6) {
                             Text("Active session")
@@ -505,6 +519,47 @@ struct AssistantOrbHUDView: View {
         .orbPopupSurface(tint: tint, cornerRadius: 20)
         .padding(.horizontal, 4)
         .padding(.bottom, 6)
+    }
+
+    @ViewBuilder
+    private func orbPreviewImageGallery(
+        _ images: [Data],
+        title: String,
+        maxHeight: CGFloat
+    ) -> some View {
+        if !images.isEmpty {
+            VStack(alignment: .leading, spacing: 8) {
+                Text(title)
+                    .font(.system(size: 9.5, weight: .semibold, design: .rounded))
+                    .tracking(0.5)
+                    .textCase(.uppercase)
+                    .foregroundStyle(.white.opacity(0.48))
+
+                ForEach(Array(images.prefix(3).enumerated()), id: \.offset) { index, imageData in
+                    if let nsImage = NSImage(data: imageData) {
+                        Button {
+                            previewAttachment = AssistantAttachment(
+                                filename: "screenshot-\(index + 1).png",
+                                data: imageData,
+                                mimeType: "image/png"
+                            )
+                        } label: {
+                            Image(nsImage: nsImage)
+                                .resizable()
+                                .aspectRatio(contentMode: .fit)
+                                .frame(maxWidth: .infinity, maxHeight: maxHeight, alignment: .leading)
+                                .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                                        .stroke(Color.white.opacity(0.08), lineWidth: 0.5)
+                                )
+                        }
+                        .buttonStyle(.plain)
+                        .help("Open screenshot preview")
+                    }
+                }
+            }
+        }
     }
 
     // MARK: Permission Popup
@@ -1710,9 +1765,17 @@ struct AssistantNotchHUDView: View {
             }
 
             ScrollView(.vertical, showsIndicators: true) {
-                OrbDoneMarkdownText(text: detail)
-                    .padding(.horizontal, 2)
-                    .padding(.vertical, 2)
+                VStack(alignment: .leading, spacing: 10) {
+                    OrbDoneMarkdownText(text: detail)
+
+                    orbPreviewImageGallery(
+                        model.previewImages,
+                        title: "Latest screenshot",
+                        maxHeight: 180
+                    )
+                }
+                .padding(.horizontal, 2)
+                .padding(.vertical, 2)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
 
@@ -1790,6 +1853,12 @@ struct AssistantNotchHUDView: View {
                                 .fixedSize(horizontal: false, vertical: true)
                         }
                     }
+
+                    orbPreviewImageGallery(
+                        model.previewImages,
+                        title: "Latest screenshot",
+                        maxHeight: 180
+                    )
 
                     if let session = model.activeSessionSummary {
                         VStack(alignment: .leading, spacing: 6) {
@@ -2284,9 +2353,17 @@ struct AssistantNotchHUDView: View {
                 permissionCard(request)
             } else if model.showDoneDetail, let detail = model.doneDetailText?.nonEmpty {
                 ScrollView(.vertical, showsIndicators: true) {
-                    VStack(alignment: .leading, spacing: 0) {
+                    VStack(alignment: .leading, spacing: 10) {
                         OrbDoneMarkdownText(text: detail)
                             .padding(12)
+
+                        orbPreviewImageGallery(
+                            model.previewImages,
+                            title: "Latest screenshot",
+                            maxHeight: 180
+                        )
+                        .padding(.horizontal, 12)
+                        .padding(.bottom, 12)
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
@@ -2686,5 +2763,46 @@ struct AssistantNotchHUDView: View {
             return false
         }
         return lhs.caseInsensitiveCompare(rhs) == .orderedSame
+    }
+
+    @ViewBuilder
+    private func orbPreviewImageGallery(
+        _ images: [Data],
+        title: String,
+        maxHeight: CGFloat
+    ) -> some View {
+        if !images.isEmpty {
+            VStack(alignment: .leading, spacing: 8) {
+                Text(title)
+                    .font(.system(size: 9.5, weight: .semibold, design: .rounded))
+                    .tracking(0.5)
+                    .textCase(.uppercase)
+                    .foregroundStyle(.white.opacity(0.48))
+
+                ForEach(Array(images.prefix(3).enumerated()), id: \.offset) { index, imageData in
+                    if let nsImage = NSImage(data: imageData) {
+                        Button {
+                            previewAttachment = AssistantAttachment(
+                                filename: "screenshot-\(index + 1).png",
+                                data: imageData,
+                                mimeType: "image/png"
+                            )
+                        } label: {
+                            Image(nsImage: nsImage)
+                                .resizable()
+                                .aspectRatio(contentMode: .fit)
+                                .frame(maxWidth: .infinity, maxHeight: maxHeight, alignment: .leading)
+                                .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                                        .stroke(Color.white.opacity(0.08), lineWidth: 0.5)
+                                )
+                        }
+                        .buttonStyle(.plain)
+                        .help("Open screenshot preview")
+                    }
+                }
+            }
+        }
     }
 }

@@ -2,30 +2,30 @@ import XCTest
 @testable import OpenAssist
 
 final class ToolPermissionRegistryTests: XCTestCase {
-    func testComputerUseMessageIncludesSettingsGuidance() {
+    func testComputerUseVerifyFailsWhenOpenAIConnectionIsMissing() {
         let snapshot = ToolPermissionRegistry.PermissionSnapshot(
-            accessibilityGranted: false,
-            screenRecordingGranted: false,
+            accessibilityGranted: true,
+            screenRecordingGranted: true,
             appleEventsGranted: false,
             appleEventsKnown: true,
             fullDiskAccessGranted: false,
-            browserAutomationEnabled: false,
-            browserProfileSelected: false,
-            openAIConnectionAvailable: true
+            browserAutomationEnabled: true,
+            browserProfileSelected: true,
+            openAIConnectionAvailable: false
         )
 
         let verdict = ToolPermissionRegistry.verify(
-            toolName: "computer_use",
-            arguments: ["task": "Read the screen"],
+            toolName: AssistantComputerUseToolDefinition.name,
+            arguments: ["task": "Type hello into Codex"],
             snapshot: snapshot
         )
 
         XCTAssertFalse(verdict.satisfied)
-        XCTAssertTrue(verdict.message.contains("Grant Accessibility in Settings > Computer Control."))
-        XCTAssertTrue(verdict.message.contains("Grant Screen Recording in Settings > Computer Control."))
+        XCTAssertEqual(verdict.missing, [.openAIConnection])
+        XCTAssertTrue(verdict.message.contains("OpenAI Connection"))
     }
 
-    func testBrowserUseMessageIncludesAutomationAndProfileGuidance() {
+    func testComputerUseVerifyPassesWhenRequiredInputsAreAvailable() {
         let snapshot = ToolPermissionRegistry.PermissionSnapshot(
             accessibilityGranted: true,
             screenRecordingGranted: true,
@@ -38,13 +38,12 @@ final class ToolPermissionRegistryTests: XCTestCase {
         )
 
         let verdict = ToolPermissionRegistry.verify(
-            toolName: "browser_use",
-            arguments: ["task": "Read the current tab"],
+            toolName: AssistantComputerUseToolDefinition.name,
+            arguments: ["task": "Type hello into Codex"],
             snapshot: snapshot
         )
 
-        XCTAssertFalse(verdict.satisfied)
-        XCTAssertTrue(verdict.message.contains("Turn on Browser Automation in Settings > Computer Control."))
-        XCTAssertTrue(verdict.message.contains("Choose a Browser Profile in Settings > Computer Control."))
+        XCTAssertTrue(verdict.satisfied)
+        XCTAssertTrue(verdict.missing.isEmpty)
     }
 }

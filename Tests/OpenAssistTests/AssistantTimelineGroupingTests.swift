@@ -115,6 +115,157 @@ final class AssistantTimelineGroupingTests: XCTestCase {
         XCTAssertTrue(targets.first?.url.absoluteString.contains("codex") == true)
     }
 
+    func testActivityImagePreviewsLoadScreenshotFiles() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let imageURL = root.appendingPathComponent("codex-current-screen.png")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let pngData = Data(base64Encoded: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9sX0X3cAAAAASUVORK5CYII=")!
+        try pngData.write(to: imageURL)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let activity = AssistantActivityItem(
+            id: "image-view-1",
+            sessionID: "session-1",
+            turnID: "turn-1",
+            kind: .commandExecution,
+            title: "Image View",
+            status: .completed,
+            friendlySummary: "Ran a tool.",
+            rawDetails: imageURL.path,
+            startedAt: Date(),
+            updatedAt: Date(),
+            source: .runtime
+        )
+
+        let previews = assistantActivityImagePreviews(for: activity)
+
+        XCTAssertEqual(previews.count, 1)
+        XCTAssertEqual(previews.first?.url.path, imageURL.path)
+        XCTAssertEqual(previews.first?.data, pngData)
+    }
+
+    func testActivityImagePreviewsIgnoreNonImageFiles() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let fileURL = root.appendingPathComponent("notes.txt")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try Data("hello".utf8).write(to: fileURL)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let activity = AssistantActivityItem(
+            id: "command-2",
+            sessionID: "session-1",
+            turnID: "turn-1",
+            kind: .commandExecution,
+            title: "Command",
+            status: .completed,
+            friendlySummary: "Ran a terminal command.",
+            rawDetails: fileURL.path,
+            startedAt: Date(),
+            updatedAt: Date(),
+            source: .runtime
+        )
+
+        XCTAssertTrue(assistantActivityImagePreviews(for: activity).isEmpty)
+    }
+
+    func testTimelineImageAttachmentsReturnImagesForMatchingReplyTurn() {
+        let imageData = Data([0x01, 0x02, 0x03])
+        let items: [AssistantTimelineItem] = [
+            .assistantFinal(
+                id: "reply-1",
+                sessionID: "session-1",
+                turnID: "turn-1",
+                text: "Here is what I can see on your screen right now.",
+                createdAt: Date(),
+                isStreaming: false,
+                source: .runtime
+            ),
+            .system(
+                sessionID: "session-1",
+                turnID: "turn-1",
+                text: "Latest screenshot",
+                imageAttachments: [imageData],
+                source: .runtime
+            )
+        ]
+
+        let attachments = assistantTimelineImageAttachments(
+            matchingReplyText: "Here is what I can see on your screen right now.",
+            in: items
+        )
+
+        XCTAssertEqual(attachments, [imageData])
+    }
+
+    func testTimelineImageAttachmentsIgnoreOlderScreenshotWhenCurrentReplyHasNone() {
+        let oldImage = Data([0x0A, 0x0B, 0x0C])
+        let items: [AssistantTimelineItem] = [
+            .assistantFinal(
+                id: "reply-old",
+                sessionID: "session-1",
+                turnID: "turn-old",
+                text: "I checked the old screen.",
+                createdAt: Date(),
+                isStreaming: false,
+                source: .runtime
+            ),
+            .system(
+                sessionID: "session-1",
+                turnID: "turn-old",
+                text: "Latest screenshot",
+                imageAttachments: [oldImage],
+                source: .runtime
+            ),
+            .assistantFinal(
+                id: "reply-new",
+                sessionID: "session-1",
+                turnID: "turn-new",
+                text: "That was an older screenshot. I can check again now.",
+                createdAt: Date(),
+                isStreaming: false,
+                source: .runtime
+            )
+        ]
+
+        let attachments = assistantTimelineImageAttachments(
+            matchingReplyText: "That was an older screenshot. I can check again now.",
+            in: items
+        )
+
+        XCTAssertTrue(attachments.isEmpty)
+    }
+
+    func testTimelineImageAttachmentsMatchTruncatedReplyPreview() {
+        let imageData = Data([0xAA, 0xBB, 0xCC])
+        let fullReply = "I checked your screen again and I can now see the current browser window with the project dashboard open."
+        let previewReply = "I checked your screen again and I can now see the current browser window..."
+        let items: [AssistantTimelineItem] = [
+            .assistantFinal(
+                id: "reply-1",
+                sessionID: "session-1",
+                turnID: "turn-1",
+                text: fullReply,
+                createdAt: Date(),
+                isStreaming: false,
+                source: .runtime
+            ),
+            .system(
+                sessionID: "session-1",
+                turnID: "turn-1",
+                text: "Latest screenshot",
+                imageAttachments: [imageData],
+                source: .runtime
+            )
+        ]
+
+        let attachments = assistantTimelineImageAttachments(
+            matchingReplyText: previewReply,
+            in: items
+        )
+
+        XCTAssertEqual(attachments, [imageData])
+    }
+
     func testConsecutiveActivitiesBecomeOneGroupedRenderItem() {
         let startedAt = Date(timeIntervalSince1970: 1_741_400_000)
         let items: [AssistantTimelineItem] = [

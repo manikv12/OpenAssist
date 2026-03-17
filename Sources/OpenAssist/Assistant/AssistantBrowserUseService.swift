@@ -218,6 +218,13 @@ actor AssistantBrowserUseService {
             let profile = try await resolveProfile(browserHint: parsedTask.browserHint)
 
             if parsedTask.needsComputerFallback {
+                if let blocked = await blockedComputerUseFallbackResult(
+                    task: parsedTask.task,
+                    app: profile.browser.displayName,
+                    reason: "Use the real \(profile.browser.displayName) session first when possible, then continue with live computer control if needed."
+                ) {
+                    return blocked
+                }
                 return await computerUseService.run(
                     arguments: [
                         "task": parsedTask.task,
@@ -255,6 +262,35 @@ actor AssistantBrowserUseService {
                 ?? "Browser Use failed."
             return Self.result(summary: summary, detail: nil, success: false)
         }
+    }
+
+    private func blockedComputerUseFallbackResult(
+        task: String,
+        app: String?,
+        reason: String?
+    ) async -> AssistantComputerUseService.ToolExecutionResult? {
+        let arguments: [String: Any] = {
+            var payload: [String: Any] = ["task": task]
+            if let app, !app.isEmpty {
+                payload["app"] = app
+            }
+            if let reason, !reason.isEmpty {
+                payload["reason"] = reason
+            }
+            return payload
+        }()
+
+        let verdict = await MainActor.run {
+            let snapshot = ToolPermissionRegistry.snapshot(using: settings)
+            return ToolPermissionRegistry.verify(
+                toolName: AssistantComputerUseToolDefinition.name,
+                arguments: arguments,
+                snapshot: snapshot
+            )
+        }
+
+        guard !verdict.satisfied else { return nil }
+        return Self.result(summary: verdict.message, detail: nil, success: false)
     }
 
     static func parseTask(from arguments: Any) throws -> ParsedTask {

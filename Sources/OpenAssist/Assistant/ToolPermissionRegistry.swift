@@ -40,6 +40,25 @@ struct ToolPermissionVerdict: Sendable {
 
 enum ToolPermissionRegistry {
 
+    @MainActor
+    static func snapshot(using settings: SettingsStore) -> PermissionSnapshot {
+        let pc = PermissionCenter.snapshot(using: settings)
+        let hasAPIKey = !settings.promptRewriteOpenAIAPIKey
+            .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        let hasOAuth = PromptRewriteOAuthCredentialStore.loadSession(for: .openAI) != nil
+        return PermissionSnapshot(
+            accessibilityGranted: pc.accessibilityGranted,
+            screenRecordingGranted: pc.screenRecordingGranted,
+            appleEventsGranted: pc.appleEventsGranted,
+            appleEventsKnown: pc.appleEventsKnown,
+            fullDiskAccessGranted: pc.fullDiskAccessGranted,
+            browserAutomationEnabled: settings.browserAutomationEnabled,
+            browserProfileSelected: !settings.browserSelectedProfileID
+                .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+            openAIConnectionAvailable: hasAPIKey || hasOAuth
+        )
+    }
+
     /// Base requirements for each dynamic tool. `requirements(forToolName:arguments:)`
     /// may promote optional permissions to required based on parsed arguments.
     static let requirements: [ToolPermissionRequirement] = [

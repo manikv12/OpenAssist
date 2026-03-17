@@ -127,6 +127,7 @@ final class CodexAssistantRuntime {
 
     private var transport: CodexAppServerTransport?
     private var activeSessionID: String?
+    private var activeSessionCWD: String?
     private var activeTurnID: String?
     private var preferredModelID: String?
     private var currentCodexPath: String?
@@ -204,6 +205,7 @@ final class CodexAssistantRuntime {
             computerUseService: computerUseService
         )
         self.appActionService = appActionService ?? AssistantAppActionService(
+            settings: .shared,
             computerUseService: computerUseService
         )
     }
@@ -302,6 +304,7 @@ final class CodexAssistantRuntime {
         }
 
         activeSessionID = threadID
+        activeSessionCWD = cwd?.nonEmpty
         onSessionChange?(threadID)
         onTranscript?(AssistantTranscriptEntry(role: .system, text: "Started a new Codex thread.", emphasis: true))
         onHealthUpdate?(makeHealth(availability: .active, summary: "Connected"))
@@ -322,6 +325,7 @@ final class CodexAssistantRuntime {
         )
 
         activeSessionID = sessionID
+        activeSessionCWD = cwd?.nonEmpty
         sessionTurnCount = 1 // Skip title generation for resumed sessions
         onSessionChange?(sessionID)
         onTranscript?(AssistantTranscriptEntry(role: .system, text: "Loaded Codex thread \(sessionID).", emphasis: true))
@@ -340,6 +344,7 @@ final class CodexAssistantRuntime {
                 modelID: preferredModelID ?? self.preferredModelID
             )
         )
+        activeSessionCWD = cwd?.nonEmpty
         onHealthUpdate?(makeHealth(
             availability: activeTurnID == nil ? .ready : .active,
             summary: "Connected"
@@ -1704,6 +1709,26 @@ final class CodexAssistantRuntime {
             }
         }
 
+        let screenshotDataItems = Self.imageDataItems(in: result.contentItems)
+        if !screenshotDataItems.isEmpty {
+            let imageTitle = result.success
+                ? "Screenshot from \(displayName)"
+                : "Last screenshot before \(displayName) failed"
+            onTimelineMutation?(
+                .upsert(
+                    .system(
+                        id: "tool-screenshot-\(UUID().uuidString)",
+                        sessionID: activeSessionID,
+                        turnID: activeTurnID,
+                        text: imageTitle,
+                        createdAt: Date(),
+                        imageAttachments: screenshotDataItems,
+                        source: .runtime
+                    )
+                )
+            )
+        }
+
         if !result.summary.isEmpty {
             onStatusMessage?(result.summary)
         }
@@ -1861,6 +1886,10 @@ final class CodexAssistantRuntime {
             }
 
             emitActivityTimelineUpdate(activity, force: true)
+
+            if isCompleted {
+                emitActivityImageTimelineUpdateIfNeeded(for: activity)
+            }
         }
 
         if !isCompleted {
@@ -1935,6 +1964,9 @@ final class CodexAssistantRuntime {
             activity.updatedAt = Date()
             liveActivities[itemID] = activity
             emitActivityTimelineUpdate(activity)
+            if mayContainImageReference(delta) {
+                emitActivityImageTimelineUpdateIfNeeded(for: activity)
+            }
         }
     }
 
@@ -2350,6 +2382,54 @@ final class CodexAssistantRuntime {
             updatedAt: Date(),
             source: .runtime
         )
+    }
+
+    private func emitActivityImageTimelineUpdateIfNeeded(for activity: AssistantActivityItem) {
+        let imageAttachments = assistantActivityImageAttachments(
+            for: activity,
+            sessionCWD: activeSessionCWD,
+            maxCount: 3
+        )
+        guard !imageAttachments.isEmpty else { return }
+
+        onTimelineMutation?(
+            .upsert(
+                .system(
+                    id: "activity-screenshot-\(activity.id)",
+                    sessionID: activity.sessionID ?? activeSessionID,
+                    turnID: activity.turnID ?? activeTurnID,
+                    text: timelineImageTitle(for: activity),
+                    createdAt: activity.updatedAt,
+                    imageAttachments: imageAttachments,
+                    source: .runtime
+                )
+            )
+        )
+    }
+
+    private func timelineImageTitle(for activity: AssistantActivityItem) -> String {
+        let normalizedTitle = activity.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        switch activity.kind {
+        case .commandExecution:
+            return "Screenshot captured from \(normalizedTitle.isEmpty ? "Command" : normalizedTitle)"
+        case .dynamicToolCall:
+            return "Screenshot captured from \(normalizedTitle.isEmpty ? "Tool" : normalizedTitle)"
+        case .browserAutomation:
+            return "Screenshot captured while using the browser"
+        default:
+            return "Latest screenshot"
+        }
+    }
+
+    private func mayContainImageReference(_ text: String) -> Bool {
+        let lowered = text.lowercased()
+        return lowered.contains(".png")
+            || lowered.contains(".jpg")
+            || lowered.contains(".jpeg")
+            || lowered.contains(".gif")
+            || lowered.contains(".webp")
+            || lowered.contains(".heic")
+            || lowered.contains(".tiff")
     }
 
     private func normalizedActivityType(_ rawValue: String?) -> String {
@@ -2839,6 +2919,36 @@ final class CodexAssistantRuntime {
         }
     }
 
+    private static func imageDataItems(
+        in contentItems: [AssistantComputerUseService.ToolExecutionResult.ContentItem]
+    ) -> [Data] {
+        var images: [Data] = []
+        for item in contentItems {
+            guard item.type == "inputImage",
+                  let imageURL = item.imageURL,
+                  let data = dataFromDataURL(imageURL) else {
+                continue
+            }
+            images.append(data)
+        }
+        return images
+    }
+
+    private static func dataFromDataURL(_ rawValue: String) -> Data? {
+        guard rawValue.hasPrefix("data:"),
+              let commaIndex = rawValue.firstIndex(of: ",") else {
+            return nil
+        }
+
+        let metadata = rawValue[..<commaIndex]
+        guard metadata.localizedCaseInsensitiveContains("base64") else {
+            return nil
+        }
+
+        let encoded = String(rawValue[rawValue.index(after: commaIndex)...])
+        return Data(base64Encoded: encoded)
+    }
+
     private func dynamicToolPermissionRationale(
         toolName: String,
         taskSummary: String,
@@ -3318,22 +3428,7 @@ final class CodexAssistantRuntime {
     /// Builds a live permission snapshot by querying `PermissionCenter` and `SettingsStore`.
     private func livePermissionSnapshot() async -> ToolPermissionRegistry.PermissionSnapshot {
         await MainActor.run {
-            let settings = SettingsStore.shared
-            let pc = PermissionCenter.snapshot(using: settings)
-            let hasAPIKey = !settings.promptRewriteOpenAIAPIKey
-                .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            let hasOAuth = PromptRewriteOAuthCredentialStore.loadSession(for: .openAI) != nil
-            return ToolPermissionRegistry.PermissionSnapshot(
-                accessibilityGranted: pc.accessibilityGranted,
-                screenRecordingGranted: pc.screenRecordingGranted,
-                appleEventsGranted: pc.appleEventsGranted,
-                appleEventsKnown: pc.appleEventsKnown,
-                fullDiskAccessGranted: pc.fullDiskAccessGranted,
-                browserAutomationEnabled: settings.browserAutomationEnabled,
-                browserProfileSelected: !settings.browserSelectedProfileID
-                    .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                openAIConnectionAvailable: hasAPIKey || hasOAuth
-            )
+            ToolPermissionRegistry.snapshot(using: .shared)
         }
     }
 

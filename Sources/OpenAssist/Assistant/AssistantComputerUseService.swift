@@ -155,6 +155,8 @@ actor AssistantComputerUseService {
     }
 
     func run(arguments: Any, preferredModelID: String?) async -> ToolExecutionResult {
+        var lastScreenshot: DisplaySnapshot?
+
         do {
             let parsedTask = try Self.parseTask(from: arguments)
             let auth = try await resolveAuth(preferredModelID: preferredModelID)
@@ -163,7 +165,6 @@ actor AssistantComputerUseService {
                 prompt: parsedTask.prompt,
                 auth: auth
             )
-            var lastScreenshot: DisplaySnapshot?
 
             for _ in 0..<Self.maxSteps {
                 if let computerCall = Self.extractComputerCall(from: response.raw) {
@@ -216,8 +217,14 @@ actor AssistantComputerUseService {
         } catch {
             let message = error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
             let summary = message.isEmpty ? "Computer Use failed." : message
+            var items: [ToolExecutionResult.ContentItem] = [
+                .init(type: "inputText", text: summary, imageURL: nil)
+            ]
+            if let lastScreenshot {
+                items.append(.init(type: "inputImage", text: nil, imageURL: lastScreenshot.imageDataURL))
+            }
             return ToolExecutionResult(
-                contentItems: [.init(type: "inputText", text: summary, imageURL: nil)],
+                contentItems: items,
                 success: false,
                 summary: summary
             )

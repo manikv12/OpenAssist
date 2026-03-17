@@ -219,6 +219,13 @@ final class AssistantCompactHUDManager: AssistantCompactPresenter {
             }
             .store(in: &cancellables)
 
+        controller.$timelineItems
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                self?.syncModelFromController()
+            }
+            .store(in: &cancellables)
+
         controller.$attachments
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in self?.syncModelFromController() }
@@ -1323,6 +1330,7 @@ final class AssistantCompactHUDManager: AssistantCompactPresenter {
         model.liveVoiceSnapshot = controller.liveVoiceSessionSnapshot
         model.isVoiceRecording = controller.liveVoiceSessionSnapshot.isListening
         model.update(state: effectiveDisplayState(for: controller.hudState))
+        model.updatePreviewImages(latestTimelineImageAttachments())
     }
 
     private func activeSessionIDForOrb() -> String? {
@@ -1431,6 +1439,17 @@ final class AssistantCompactHUDManager: AssistantCompactPresenter {
         }
 
         return controller.sessions.first?.latestAssistantMessage?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+    }
+
+    private func latestTimelineImageAttachments() -> [Data] {
+        let visibleItems = controller.timelineItems
+        let anchorText = model.doneDetailText?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+            ?? controller.hudState.detail?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+
+        return assistantTimelineImageAttachments(
+            matchingReplyText: anchorText,
+            in: visibleItems
+        )
     }
 
     private func activeSessionSummaryForOrb() -> AssistantSessionSummary? {

@@ -1,4 +1,5 @@
 import Foundation
+import UniformTypeIdentifiers
 
 enum AssistantTimelineSource: String, Codable, Sendable {
     case runtime
@@ -69,6 +70,17 @@ struct AssistantActivityOpenTarget: Identifiable, Equatable, Sendable {
     }
 }
 
+struct AssistantTimelineImagePreview: Identifiable, Equatable, Sendable {
+    let url: URL
+    let label: String
+    let detail: String?
+    let data: Data
+
+    var id: String {
+        url.standardizedFileURL.path
+    }
+}
+
 func assistantActivityOpenTargets(
     for activity: AssistantActivityItem,
     sessionCWD: String? = nil
@@ -118,6 +130,143 @@ func assistantActivityOpenTargets(
     }
 }
 
+func assistantActivityImagePreviews(
+    for activity: AssistantActivityItem,
+    sessionCWD: String? = nil,
+    maxCount: Int = 3
+) -> [AssistantTimelineImagePreview] {
+    assistantImagePreviews(
+        from: assistantActivityOpenTargets(for: activity, sessionCWD: sessionCWD),
+        maxCount: maxCount
+    )
+}
+
+func assistantImagePreviews(
+    from openTargets: [AssistantActivityOpenTarget],
+    maxCount: Int = 3
+) -> [AssistantTimelineImagePreview] {
+    let limitedTargets = assistantImageOpenTargets(from: openTargets, maxCount: maxCount)
+
+    return limitedTargets.compactMap { target in
+        guard let data = assistantLoadImageData(from: target.url) else { return nil }
+        return AssistantTimelineImagePreview(
+            url: target.url,
+            label: target.label,
+            detail: target.detail,
+            data: data
+        )
+    }
+}
+
+func assistantImageAttachments(
+    from openTargets: [AssistantActivityOpenTarget],
+    maxCount: Int = 3
+) -> [Data] {
+    assistantImagePreviews(from: openTargets, maxCount: maxCount).map(\.data)
+}
+
+func assistantActivityImageAttachments(
+    for activity: AssistantActivityItem,
+    sessionCWD: String? = nil,
+    maxCount: Int = 3
+) -> [Data] {
+    assistantActivityImagePreviews(
+        for: activity,
+        sessionCWD: sessionCWD,
+        maxCount: maxCount
+    ).map(\.data)
+}
+
+func assistantTimelineImageAttachments(
+    matchingReplyText replyText: String?,
+    in items: [AssistantTimelineItem]
+) -> [Data] {
+    guard !items.isEmpty,
+          let anchorText = replyText?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nonEmpty else {
+        return []
+    }
+
+    guard let anchorItem = items.reversed().first(where: { item in
+        assistantTimelineTextsLikelyMatch(
+            item.text?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty,
+            anchorText
+        )
+    }) else {
+        return []
+    }
+
+    if let anchorTurnID = anchorItem.turnID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
+        return items.reversed().compactMap { item -> [Data]? in
+            guard item.turnID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty == anchorTurnID,
+                  let images = item.imageAttachments,
+                  !images.isEmpty else {
+                return nil
+            }
+            return images
+        }.first ?? []
+    }
+
+    return anchorItem.imageAttachments ?? []
+}
+
+private func assistantTimelineTextsLikelyMatch(
+    _ lhs: String?,
+    _ rhs: String?
+) -> Bool {
+    guard let lhs = assistantNormalizedTimelineText(lhs),
+          let rhs = assistantNormalizedTimelineText(rhs) else {
+        return false
+    }
+
+    if lhs == rhs {
+        return true
+    }
+
+    let shorterLength = min(lhs.count, rhs.count)
+    guard shorterLength >= 24 else { return false }
+
+    if let lhsPrefix = assistantTimelineTruncatedPrefix(lhs),
+       rhs.hasPrefix(lhsPrefix) {
+        return true
+    }
+
+    if let rhsPrefix = assistantTimelineTruncatedPrefix(rhs),
+       lhs.hasPrefix(rhsPrefix) {
+        return true
+    }
+
+    return lhs.contains(rhs) || rhs.contains(lhs)
+}
+
+private func assistantNormalizedTimelineText(_ text: String?) -> String? {
+    guard let text = text?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+        return nil
+    }
+
+    let collapsed = text.replacingOccurrences(
+        of: #"\s+"#,
+        with: " ",
+        options: .regularExpression
+    )
+    return collapsed.lowercased()
+}
+
+private func assistantTimelineTruncatedPrefix(_ text: String) -> String? {
+    if let range = text.range(of: "...") {
+        let prefix = text[..<range.lowerBound].trimmingCharacters(in: .whitespacesAndNewlines)
+        return prefix.count >= 24 ? String(prefix) : nil
+    }
+
+    if let range = text.range(of: "…") {
+        let prefix = text[..<range.lowerBound].trimmingCharacters(in: .whitespacesAndNewlines)
+        return prefix.count >= 24 ? String(prefix) : nil
+    }
+
+    return nil
+}
+
 private func assistantResolvedFileTargets(
     from rawDetails: String,
     sessionCWD: String?
@@ -155,6 +304,24 @@ private func assistantResolvedFileTargets(
                 detail: detail
             )
         )
+    }
+
+    return results
+}
+
+private func assistantImageOpenTargets(
+    from targets: [AssistantActivityOpenTarget],
+    maxCount: Int
+) -> [AssistantActivityOpenTarget] {
+    let normalizedMaxCount = max(1, maxCount)
+    var results: [AssistantActivityOpenTarget] = []
+
+    for target in targets where target.kind == .file || target.url.isFileURL {
+        guard assistantFileURLLooksLikeImage(target.url) else { continue }
+        results.append(target)
+        if results.count >= normalizedMaxCount {
+            break
+        }
     }
 
     return results
@@ -255,6 +422,28 @@ private func assistantResolvedFileURL(
     }
 
     return nil
+}
+
+private func assistantFileURLLooksLikeImage(_ url: URL) -> Bool {
+    guard url.isFileURL else { return false }
+    let pathExtension = url.pathExtension.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !pathExtension.isEmpty,
+          let type = UTType(filenameExtension: pathExtension) else {
+        return false
+    }
+    return type.conforms(to: .image)
+}
+
+private func assistantLoadImageData(from fileURL: URL) -> Data? {
+    let standardizedURL = fileURL.standardizedFileURL
+    guard FileManager.default.fileExists(atPath: standardizedURL.path) else { return nil }
+    guard let attributes = try? FileManager.default.attributesOfItem(atPath: standardizedURL.path),
+          let byteCount = attributes[.size] as? NSNumber,
+          byteCount.intValue <= 16_000_000 else {
+        return nil
+    }
+
+    return try? Data(contentsOf: standardizedURL, options: [.mappedIfSafe])
 }
 
 private func assistantNormalizedPathCandidate(_ candidate: String) -> String? {
@@ -439,6 +628,7 @@ struct AssistantTimelineItem: Identifiable, Equatable, Codable, Sendable {
         createdAt: Date,
         updatedAt: Date = Date(),
         isStreaming: Bool,
+        imageAttachments: [Data]? = nil,
         source: AssistantTimelineSource
     ) -> AssistantTimelineItem {
         AssistantTimelineItem(
@@ -455,6 +645,7 @@ struct AssistantTimelineItem: Identifiable, Equatable, Codable, Sendable {
             permissionRequest: nil,
             planText: nil,
             planEntries: nil,
+            imageAttachments: imageAttachments,
             source: source
         )
     }
@@ -540,6 +731,7 @@ struct AssistantTimelineItem: Identifiable, Equatable, Codable, Sendable {
         text: String,
         createdAt: Date = Date(),
         emphasis: Bool = false,
+        imageAttachments: [Data]? = nil,
         source: AssistantTimelineSource
     ) -> AssistantTimelineItem {
         AssistantTimelineItem(
@@ -556,6 +748,7 @@ struct AssistantTimelineItem: Identifiable, Equatable, Codable, Sendable {
             permissionRequest: nil,
             planText: nil,
             planEntries: nil,
+            imageAttachments: imageAttachments,
             source: source
         )
     }

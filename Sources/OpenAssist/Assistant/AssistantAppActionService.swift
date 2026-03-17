@@ -141,13 +141,16 @@ actor AssistantAppActionService {
         }
     }
 
+    private let settings: SettingsStore
     private let helper: LocalAutomationHelper
     private let computerUseService: AssistantComputerUseService
 
     init(
+        settings: SettingsStore,
         helper: LocalAutomationHelper = .shared,
         computerUseService: AssistantComputerUseService
     ) {
+        self.settings = settings
         self.helper = helper
         self.computerUseService = computerUseService
     }
@@ -170,6 +173,13 @@ actor AssistantAppActionService {
             }
 
             if request.needsComputerFallback {
+                if let blocked = await blockedComputerUseFallbackResult(
+                    task: request.task,
+                    app: request.app?.displayName,
+                    reason: "Use the direct app action first when possible, then continue with computer control if needed."
+                ) {
+                    return blocked
+                }
                 return await computerUseService.run(
                     arguments: [
                         "task": request.task,
@@ -181,6 +191,13 @@ actor AssistantAppActionService {
             }
 
             guard let app = request.app else {
+                if let blocked = await blockedComputerUseFallbackResult(
+                    task: request.task,
+                    app: nil,
+                    reason: nil
+                ) {
+                    return blocked
+                }
                 return await computerUseService.run(
                     arguments: ["task": request.task],
                     preferredModelID: preferredModelID
@@ -210,6 +227,35 @@ actor AssistantAppActionService {
                 ?? "App Action failed."
             return Self.result(summary: summary, detail: nil, success: false)
         }
+    }
+
+    private func blockedComputerUseFallbackResult(
+        task: String,
+        app: String?,
+        reason: String?
+    ) async -> AssistantComputerUseService.ToolExecutionResult? {
+        let arguments: [String: Any] = {
+            var payload: [String: Any] = ["task": task]
+            if let app, !app.isEmpty {
+                payload["app"] = app
+            }
+            if let reason, !reason.isEmpty {
+                payload["reason"] = reason
+            }
+            return payload
+        }()
+
+        let verdict = await MainActor.run {
+            let snapshot = ToolPermissionRegistry.snapshot(using: settings)
+            return ToolPermissionRegistry.verify(
+                toolName: AssistantComputerUseToolDefinition.name,
+                arguments: arguments,
+                snapshot: snapshot
+            )
+        }
+
+        guard !verdict.satisfied else { return nil }
+        return Self.result(summary: verdict.message, detail: nil, success: false)
     }
 
     static func parseRequest(from arguments: Any) throws -> ParsedRequest {

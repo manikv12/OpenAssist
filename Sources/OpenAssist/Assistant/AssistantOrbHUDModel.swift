@@ -25,6 +25,8 @@ final class AssistantOrbHUDModel: ObservableObject {
     @Published var showDoneDetail = false
     @Published private(set) var storedDoneDetailText: String?
     var doneDetailText: String? { storedDoneDetailText }
+    @Published private(set) var storedPreviewImages: [Data] = []
+    var previewImages: [Data] { storedPreviewImages }
     @Published var showPlanDetail = false
     @Published private(set) var storedProposedPlanText: String?
     var proposedPlanText: String? { storedProposedPlanText }
@@ -114,6 +116,7 @@ final class AssistantOrbHUDModel: ObservableObject {
         switch state.phase {
         case .success, .failed:
             let trimmedDetail = state.detail?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+            storedPreviewImages = []
             storedDoneDetailText = trimmedDetail
             showDoneDetail = trimmedDetail != nil && storedProposedPlanText?.nonEmpty == nil
             showWorkingDetail = false
@@ -125,12 +128,14 @@ final class AssistantOrbHUDModel: ObservableObject {
             break
         case .waitingForPermission:
             storedDoneDetailText = nil
+            storedPreviewImages = []
             showDoneDetail = false
             showWorkingDetail = false
             showCompactComposer = false
             shouldFocusTextField = false
         case .listening, .thinking, .acting, .streaming:
             storedDoneDetailText = nil
+            storedPreviewImages = []
             showDoneDetail = false
             if showCompactComposer {
                 showCompactComposer = false
@@ -291,6 +296,7 @@ final class AssistantOrbHUDModel: ObservableObject {
     func dismissDoneDetail() {
         showDoneDetail = false
         storedDoneDetailText = nil
+        storedPreviewImages = []
     }
 
     func hideDoneDetail() {
@@ -304,6 +310,16 @@ final class AssistantOrbHUDModel: ObservableObject {
         showPlanDetail = false
         showCompactComposer = false
         Task { await onRefreshSessions?() }
+    }
+
+    func updatePreviewImages(_ images: [Data]) {
+        storedPreviewImages = images
+        if storedDoneDetailText == nil,
+           !images.isEmpty,
+           storedProposedPlanText?.nonEmpty == nil,
+           state.phase == .success || state.phase == .failed {
+            showDoneDetail = true
+        }
     }
 
     func selectSessionForReply(_ session: AssistantSessionSummary) {

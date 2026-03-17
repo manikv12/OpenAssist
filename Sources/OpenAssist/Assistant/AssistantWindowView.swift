@@ -1013,6 +1013,7 @@ struct AssistantWindowView: View {
                 timestamp: item.sortDate,
                 title: "Assistant",
                 isStreaming: item.isStreaming,
+                imageAttachments: item.imageAttachments,
                 compact: true,
                 showsInlineCopyButton: true,
                 showsMemoryActions: false
@@ -1027,6 +1028,7 @@ struct AssistantWindowView: View {
                 timestamp: item.sortDate,
                 title: "Assistant",
                 isStreaming: item.isStreaming,
+                imageAttachments: item.imageAttachments,
                 compact: false,
                 showsInlineCopyButton: true,
                 showsMemoryActions: settings.assistantMemoryEnabled && !item.isStreaming
@@ -1041,6 +1043,7 @@ struct AssistantWindowView: View {
                 timestamp: item.sortDate,
                 title: item.emphasis ? "Needs Attention" : "System",
                 isStreaming: false,
+                imageAttachments: item.imageAttachments,
                 compact: true,
                 showsInlineCopyButton: true,
                 showsMemoryActions: false
@@ -1154,6 +1157,7 @@ struct AssistantWindowView: View {
         timestamp: Date,
         title: String,
         isStreaming: Bool,
+        imageAttachments: [Data]?,
         compact: Bool,
         showsInlineCopyButton: Bool,
         showsMemoryActions: Bool
@@ -1208,6 +1212,22 @@ struct AssistantWindowView: View {
                 )
                 .opacity(isCompactStatusRow ? 0.78 : (compact ? 0.84 : 1.0))
                 .textSelection(.enabled)
+
+                if let imageAttachments, !imageAttachments.isEmpty {
+                    ForEach(Array(imageAttachments.enumerated()), id: \.offset) { _, imageData in
+                        if let nsImage = NSImage(data: imageData) {
+                            Image(nsImage: nsImage)
+                                .resizable()
+                                .aspectRatio(contentMode: .fit)
+                                .frame(maxWidth: compact ? 320 : 420, maxHeight: compact ? 220 : 320)
+                                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                        .stroke(Color.white.opacity(0.08), lineWidth: 0.5)
+                                )
+                        }
+                    }
+                }
             }
 
             Spacer(minLength: 40)
@@ -1346,6 +1366,7 @@ struct AssistantWindowView: View {
 
     private func timelineActivityRow(_ activity: AssistantActivityItem) -> some View {
         let openTargets = activityOpenTargets(for: activity)
+        let imagePreviews = assistantImagePreviews(from: openTargets)
         let detailSections = activityDetailSections(from: activity.rawDetails)
         let isExpanded = expandedActivityIDs.contains(activity.id)
         let canExpand = !detailSections.isEmpty || !openTargets.isEmpty
@@ -1367,7 +1388,8 @@ struct AssistantWindowView: View {
             if isExpanded {
                 timelineActivityExpandedDetails(
                     detailSections: detailSections,
-                    openTargets: openTargets
+                    openTargets: openTargets,
+                    imagePreviews: imagePreviews
                 )
                 .padding(.leading, 26)
             }
@@ -1380,6 +1402,7 @@ struct AssistantWindowView: View {
 
     private func timelineActivityGroupRow(_ group: AssistantTimelineActivityGroup) -> some View {
         let openTargets = activityOpenTargets(for: group)
+        let imagePreviews = assistantImagePreviews(from: openTargets)
         let isExpanded = expandedActivityIDs.contains(group.id)
         let canExpand = !group.activities.isEmpty || !openTargets.isEmpty
 
@@ -1398,7 +1421,11 @@ struct AssistantWindowView: View {
             }
 
             if isExpanded {
-                timelineActivityGroupExpandedDetails(group, openTargets: openTargets)
+                timelineActivityGroupExpandedDetails(
+                    group,
+                    openTargets: openTargets,
+                    imagePreviews: imagePreviews
+                )
                     .padding(.leading, 26)
             }
         }
@@ -1598,7 +1625,8 @@ struct AssistantWindowView: View {
     @ViewBuilder
     private func timelineActivityExpandedDetails(
         detailSections: [TimelineActivityDetailSectionData],
-        openTargets: [AssistantActivityOpenTarget]
+        openTargets: [AssistantActivityOpenTarget],
+        imagePreviews: [AssistantTimelineImagePreview]
     ) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             ForEach(Array(detailSections.enumerated()), id: \.offset) { _, section in
@@ -1615,12 +1643,17 @@ struct AssistantWindowView: View {
                     timelineActivityOpenTargetsList(openTargets)
                 }
             }
+
+            if !imagePreviews.isEmpty {
+                timelineActivityImagePreviewSection(imagePreviews)
+            }
         }
     }
 
     private func timelineActivityGroupExpandedDetails(
         _ group: AssistantTimelineActivityGroup,
-        openTargets: [AssistantActivityOpenTarget]
+        openTargets: [AssistantActivityOpenTarget],
+        imagePreviews: [AssistantTimelineImagePreview]
     ) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             if !openTargets.isEmpty {
@@ -1632,6 +1665,10 @@ struct AssistantWindowView: View {
 
                     timelineActivityOpenTargetsList(openTargets)
                 }
+            }
+
+            if !imagePreviews.isEmpty {
+                timelineActivityImagePreviewSection(imagePreviews)
             }
 
             VStack(alignment: .leading, spacing: 6) {
@@ -1678,6 +1715,62 @@ struct AssistantWindowView: View {
                         .foregroundStyle(.white.opacity(0.28))
                         .padding(.leading, 22)
                 }
+            }
+        }
+    }
+
+    private func timelineActivityImagePreviewSection(
+        _ previews: [AssistantTimelineImagePreview]
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Screenshots")
+                .font(.system(size: 9.5, weight: .bold, design: .rounded))
+                .foregroundStyle(.white.opacity(0.34))
+                .textCase(.uppercase)
+
+            ForEach(previews) { preview in
+                Button {
+                    openActivityTarget(
+                        AssistantActivityOpenTarget(
+                            kind: .file,
+                            label: preview.label,
+                            url: preview.url,
+                            detail: preview.detail
+                        )
+                    )
+                } label: {
+                    VStack(alignment: .leading, spacing: 6) {
+                        if let nsImage = NSImage(data: preview.data) {
+                            Image(nsImage: nsImage)
+                                .resizable()
+                                .aspectRatio(contentMode: .fit)
+                                .frame(maxWidth: 320, maxHeight: 220, alignment: .leading)
+                                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                        .stroke(Color.white.opacity(0.08), lineWidth: 0.5)
+                                )
+                        }
+
+                        HStack(alignment: .firstTextBaseline, spacing: 6) {
+                            Text(preview.label)
+                                .font(.system(size: 10.5, weight: .semibold))
+                                .foregroundStyle(.white.opacity(0.72))
+                                .lineLimit(1)
+
+                            if let detail = preview.detail {
+                                Text(detail)
+                                    .font(.system(size: 9.8, weight: .medium))
+                                    .foregroundStyle(.white.opacity(0.34))
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                            }
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .buttonStyle(.plain)
+                .help("Open \(preview.label)")
             }
         }
     }

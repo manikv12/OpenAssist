@@ -1053,6 +1053,16 @@ struct CodexSessionCatalog {
                         items: &items,
                         activityIndexByID: &activityIndexByID
                     )
+                    appendSavedActivityImagePreviewIfNeeded(
+                        callID: firstNonEmptyString(
+                            stringValue(payload["call_id"]),
+                            stringValue(payload["callId"])
+                        ) ?? "function-output-\(index)",
+                        sessionCWD: metadata?.cwd,
+                        timestamp: lineTimestamp,
+                        items: &items,
+                        activityIndexByID: activityIndexByID
+                    )
 
                 case "custom_tool_call":
                     guard let activity = savedCustomToolActivity(
@@ -1087,6 +1097,13 @@ struct CodexSessionCatalog {
                         timestamp: lineTimestamp,
                         items: &items,
                         activityIndexByID: &activityIndexByID
+                    )
+                    appendSavedActivityImagePreviewIfNeeded(
+                        callID: callID,
+                        sessionCWD: metadata?.cwd,
+                        timestamp: lineTimestamp,
+                        items: &items,
+                        activityIndexByID: activityIndexByID
                     )
 
                 case "web_search_call":
@@ -1429,6 +1446,37 @@ struct CodexSessionCatalog {
             source: .codexSession
         )
         upsertTimelineActivity(activity, items: &items, activityIndexByID: &activityIndexByID)
+    }
+
+    private func appendSavedActivityImagePreviewIfNeeded(
+        callID: String,
+        sessionCWD: String?,
+        timestamp: Date,
+        items: inout [AssistantTimelineItem],
+        activityIndexByID: [String: Int]
+    ) {
+        guard let existingIndex = activityIndexByID[callID],
+              let activity = items[existingIndex].activity else {
+            return
+        }
+
+        let imageAttachments = assistantActivityImageAttachments(
+            for: activity,
+            sessionCWD: sessionCWD,
+            maxCount: 3
+        )
+        guard !imageAttachments.isEmpty else { return }
+
+        let imageItem = AssistantTimelineItem.system(
+            id: "saved-activity-screenshot-\(callID)",
+            sessionID: activity.sessionID,
+            turnID: activity.turnID,
+            text: "Screenshot captured during \(activity.title)",
+            createdAt: timestamp,
+            imageAttachments: imageAttachments,
+            source: .codexSession
+        )
+        appendTimelineMessage(imageItem, to: &items)
     }
 
     private func timelineItemsShouldDeduplicate(

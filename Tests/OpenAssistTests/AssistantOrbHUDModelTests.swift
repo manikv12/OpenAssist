@@ -53,6 +53,24 @@ final class AssistantOrbHUDModelTests: XCTestCase {
     }
 
     @MainActor
+    func testNewCompletionClearsOldPreviewImages() {
+        let model = AssistantOrbHUDModel()
+        let oldImage = Data([0x01, 0x02, 0x03])
+
+        model.updatePreviewImages([oldImage])
+        model.update(
+            state: AssistantHUDState(
+                phase: .success,
+                title: "Finished",
+                detail: "Fresh reply without screenshot."
+            )
+        )
+
+        XCTAssertTrue(model.previewImages.isEmpty)
+        XCTAssertEqual(model.doneDetailText, "Fresh reply without screenshot.")
+    }
+
+    @MainActor
     func testWorkingPopupCanOpenDuringActiveTurnAndClosesWhenIdle() {
         let model = AssistantOrbHUDModel()
         model.activeSessionSummary = AssistantSessionSummary(
