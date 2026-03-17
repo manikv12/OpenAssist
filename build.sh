@@ -152,6 +152,11 @@ if [ "$MAKE_DMG" = true ]; then
     # Use create-dmg to build a professional-looking installer with an arrow background
     # and correct icon positions
     npx -y create-dmg "$APP_DIR_ABS" "$DIST_DIR_ABS/" --overwrite --no-version-in-filename --icon-size 128
+    # create-dmg replaces spaces with dots; rename back to expected filename
+    CREATED_DMG="$(find "$DIST_DIR_ABS" -maxdepth 1 -name "*.dmg" | head -n 1)"
+    if [ -n "$CREATED_DMG" ] && [ "$CREATED_DMG" != "$DMG_FINAL" ]; then
+        mv "$CREATED_DMG" "$DMG_FINAL"
+    fi
 fi
 
 if [ "$INSTALL_APP" = true ]; then
