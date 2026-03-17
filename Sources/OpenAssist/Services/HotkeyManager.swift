@@ -418,7 +418,14 @@ final class OneShotHotkeyManager {
     private var keyDownMonitor: Any?
     private var keyUpMonitor: Any?
     private var flagsMonitor: Any?
+    private var localKeyDownMonitor: Any?
+    private var localKeyUpMonitor: Any?
+    private var localFlagsMonitor: Any?
     private var active = false
+
+    private var isModifierOnlyShortcut: Bool {
+        keyCode == UInt16.max
+    }
 
     init(keyCode: UInt16, modifiers: NSEvent.ModifierFlags, onTrigger: @escaping Action) {
         self.keyCode = keyCode
@@ -453,10 +460,26 @@ final class OneShotHotkeyManager {
     private func startOnMain() {
         stopOnMain()
 
+        flagsMonitor = NSEvent.addGlobalMonitorForEvents(matching: .flagsChanged) { [weak self] event in
+            DispatchQueue.main.async {
+                self?.handleFlagsChanged(event)
+            }
+        }
+        localFlagsMonitor = NSEvent.addLocalMonitorForEvents(matching: .flagsChanged) { [weak self] event in
+            self?.handleFlagsChanged(event)
+            return event
+        }
+
+        guard !isModifierOnlyShortcut else { return }
+
         keyDownMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
             DispatchQueue.main.async {
                 self?.handleKeyDown(event)
             }
+        }
+        localKeyDownMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            self?.handleKeyDown(event)
+            return event
         }
 
         keyUpMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyUp) { [weak self] event in
@@ -464,11 +487,9 @@ final class OneShotHotkeyManager {
                 self?.handleKeyUp(event)
             }
         }
-
-        flagsMonitor = NSEvent.addGlobalMonitorForEvents(matching: .flagsChanged) { [weak self] event in
-            DispatchQueue.main.async {
-                self?.handleFlagsChanged(event)
-            }
+        localKeyUpMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyUp) { [weak self] event in
+            self?.handleKeyUp(event)
+            return event
         }
     }
 
@@ -484,6 +505,18 @@ final class OneShotHotkeyManager {
         if let flagsMonitor {
             NSEvent.removeMonitor(flagsMonitor)
             self.flagsMonitor = nil
+        }
+        if let localKeyDownMonitor {
+            NSEvent.removeMonitor(localKeyDownMonitor)
+            self.localKeyDownMonitor = nil
+        }
+        if let localKeyUpMonitor {
+            NSEvent.removeMonitor(localKeyUpMonitor)
+            self.localKeyUpMonitor = nil
+        }
+        if let localFlagsMonitor {
+            NSEvent.removeMonitor(localFlagsMonitor)
+            self.localFlagsMonitor = nil
         }
         active = false
     }
@@ -516,6 +549,17 @@ final class OneShotHotkeyManager {
 
     private func handleFlagsChanged(_ event: NSEvent) {
         let currentModifiers = normalizedModifiers(from: event)
+        if isModifierOnlyShortcut {
+            if currentModifiers.isSuperset(of: modifiers) {
+                guard !active else { return }
+                active = true
+                onTrigger()
+            } else {
+                active = false
+            }
+            return
+        }
+
         if !currentModifiers.isSuperset(of: modifiers) {
             active = false
         }

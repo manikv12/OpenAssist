@@ -61,7 +61,7 @@ struct StatusBarPopoverView: View {
                         PopoverMenuRow(
                             icon: "waveform",
                             label: "Speak Assistant Task",
-                            iconTint: AppVisualTheme.baseTint
+                            iconTint: AppVisualTheme.accentTint
                         ) {
                             viewModel.onSpeakAssistantTask?()
                         }
@@ -169,15 +169,15 @@ struct StatusBarPopoverView: View {
 
             VStack(alignment: .leading, spacing: 2) {
                 Text("Open Assist")
-                    .font(.system(size: 15, weight: .semibold, design: .rounded))
+                    .font(.system(size: 15, weight: .semibold))
                     .foregroundStyle(.white.opacity(0.95))
 
                 HStack(spacing: 6) {
                     Text(viewModel.uiStatus.menuText)
-                        .font(.system(size: 11, weight: .medium, design: .rounded))
+                        .font(.system(size: 11, weight: .medium))
                         .foregroundColor(statusPillColor)
                     Text("Quick Controls")
-                        .font(.system(size: 10, weight: .semibold, design: .rounded))
+                        .font(.system(size: 10, weight: .semibold))
                         .foregroundStyle(AppVisualTheme.mutedText)
                 }
             }
@@ -190,7 +190,7 @@ struct StatusBarPopoverView: View {
 
     private func sectionTitle(_ text: String) -> some View {
         Text(text)
-            .font(.system(size: 10, weight: .semibold, design: .rounded))
+            .font(.system(size: 10, weight: .semibold))
             .foregroundStyle(AppVisualTheme.mutedText.opacity(0.92))
             .padding(.horizontal, 6)
     }
@@ -286,7 +286,7 @@ private struct PopoverMenuRow: View {
                 )
 
                 Text(label)
-                    .font(.system(size: 13, weight: .medium, design: .rounded))
+                    .font(.system(size: 13, weight: .medium))
                     .foregroundColor(isHovered ? .white : Color.white.opacity(0.92))
 
                 Spacer()
@@ -302,21 +302,7 @@ private struct PopoverMenuRow: View {
             .background {
                 if isHovered {
                     RoundedRectangle(cornerRadius: 7, style: .continuous)
-                        .fill(
-                            LinearGradient(
-                                colors: [
-                                    iconTint.opacity(0.20),
-                                    Color.white.opacity(0.07),
-                                    Color.black.opacity(0.16)
-                                ],
-                                startPoint: .topLeading,
-                                endPoint: .bottomTrailing
-                            )
-                        )
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 7, style: .continuous)
-                                .stroke(Color.white.opacity(0.09), lineWidth: 0.45)
-                        )
+                        .fill(Color.white.opacity(0.08))
                         .transition(.opacity)
                 }
             }

@@ -22,13 +22,13 @@ struct AssistantWindowView: View {
     @State private var showSessionInstructions = false
     @State private var userHasScrolledUp = false
     @State private var autoScrollPinnedToBottom = true
-    @State private var lastManualChatScrollAt: Date = .distantPast
     @State private var visibleHistoryLimit = Self.initialVisibleHistoryLimit
     @State private var chatViewportHeight: CGFloat = 0
     @State private var isLoadingOlderHistory = false
     @State private var hoveredInlineCopyMessageID: String?
     @State private var inlineCopyHideWorkItem: DispatchWorkItem?
     @State private var previewAttachment: AssistantAttachment?
+    @State private var chatScrollTracking = AssistantChatScrollTracking()
     @AppStorage("assistantSidebarCollapsed") private var isSidebarCollapsed = false
     @AppStorage("assistantRuntimeExpanded") private var isRuntimeExpanded = true
     @AppStorage("assistantChatTextScale") private var chatTextScale: Double = 1.0
@@ -54,9 +54,27 @@ struct AssistantWindowView: View {
         allRenderItems.last?.lastUpdatedAt ?? .distantPast
     }
 
+    /// Pre-built lookup from lowercased-trimmed session ID → session status,
+    /// avoiding O(n) linear scan with string trimming per permission card.
+    private var sessionStatusByNormalizedID: [String: AssistantSessionStatus] {
+        var dict = [String: AssistantSessionStatus]()
+        dict.reserveCapacity(assistant.sessions.count)
+        for session in assistant.sessions {
+            let key = session.id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if !key.isEmpty { dict[key] = session.status }
+        }
+        return dict
+    }
+
+    private func sessionStatus(forSessionID sessionID: String?) -> AssistantSessionStatus? {
+        guard let sid = sessionID?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+              !sid.isEmpty else { return nil }
+        return sessionStatusByNormalizedID[sid]
+    }
+
     private var shouldAutoFollowLatestMessage: Bool {
         autoScrollPinnedToBottom
-            && Date().timeIntervalSince(lastManualChatScrollAt) >= Self.manualScrollFollowPause
+            && Date().timeIntervalSince(chatScrollTracking.lastManualScrollAt) >= Self.manualScrollFollowPause
     }
 
     private var isAgentBusy: Bool {
@@ -78,7 +96,6 @@ struct AssistantWindowView: View {
 
     private var shouldShowLiveVoicePanel: Bool {
         settings.assistantBetaEnabled
-            && (assistant.interactionMode == .conversational || assistant.isLiveVoiceSessionActive)
     }
 
     private var liveVoiceStatusText: String {
@@ -134,7 +151,7 @@ struct AssistantWindowView: View {
                 ? "Models will appear here when Codex is ready."
                 : "Select a model to start chatting..."
         }
-        return "Message assistant..."
+        return "Ask for follow-up changes"
     }
 
     private var emptyStateMessage: String {
@@ -175,8 +192,8 @@ struct AssistantWindowView: View {
                     sidebar
 
                     Rectangle()
-                        .fill(Color.white.opacity(0.10))
-                        .frame(width: 1)
+                        .fill(Color.white.opacity(0.06))
+                        .frame(width: 0.5)
                         .frame(maxHeight: .infinity)
                 }
 
@@ -266,83 +283,91 @@ struct AssistantWindowView: View {
     }
 
     private var sidebar: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack(alignment: .top, spacing: 12) {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Sessions")
-                        .font(.system(size: 20, weight: .semibold))
-                        .foregroundStyle(.white.opacity(0.96))
-                        .lineLimit(1)
-
-                    Text("Recent conversations and saved work")
-                        .font(.system(size: 11.5, weight: .medium))
-                        .foregroundStyle(.white.opacity(0.50))
-                }
-
-                Spacer(minLength: 0)
-
+        VStack(alignment: .leading, spacing: 0) {
+            // New thread button
+            Button {
+                Task { await assistant.startNewSession() }
+            } label: {
                 HStack(spacing: 8) {
-                    Button {
-                        withAnimation(.easeInOut(duration: 0.18)) {
-                            isSidebarCollapsed = true
-                        }
-                    } label: {
-                        topBarIconButton(symbol: "sidebar.left")
-                    }
-                    .buttonStyle(.plain)
-                    .help("Hide sessions sidebar")
+                    Image(systemName: "square.and.pencil")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.70))
+                    Text("New thread")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.82))
+                    Spacer()
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .disabled(!canStartConversation)
+            .padding(.bottom, 8)
 
+            // Sidebar actions
+            VStack(alignment: .leading, spacing: 2) {
+                sidebarNavItem(symbol: "clock", label: "Automations")
+                sidebarNavItem(symbol: "gearshape.2", label: "Skills")
+            }
+            .padding(.bottom, 12)
+
+            Rectangle()
+                .fill(AssistantWindowChrome.sidebarDivider)
+                .frame(height: 0.5)
+                .padding(.horizontal, 4)
+                .padding(.bottom, 12)
+
+            if !assistant.sessions.isEmpty {
+            }
+
+            // Threads section header
+            HStack(alignment: .center, spacing: 0) {
+                Text("Threads")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(AssistantWindowChrome.sectionHeader)
+
+                Spacer()
+
+                HStack(spacing: 4) {
                     Button {
                         guard !isRefreshing else { return }
                         Task { await refreshEverything() }
                     } label: {
-                        topBarIconButton(symbol: "arrow.clockwise")
+                        Image(systemName: "arrow.clockwise")
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundStyle(.white.opacity(0.34))
+                            .frame(width: 22, height: 22)
+                            .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
                     .disabled(isRefreshing)
 
                     Button {
-                        Task { await assistant.startNewSession() }
+                        withAnimation(.easeInOut(duration: 0.18)) {
+                            isSidebarCollapsed = true
+                        }
                     } label: {
-                        topBarIconButton(symbol: "plus", emphasized: true)
+                        Image(systemName: "sidebar.left")
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundStyle(.white.opacity(0.34))
+                            .frame(width: 22, height: 22)
+                            .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
-                    .disabled(!canStartConversation)
                 }
             }
-            .padding(.bottom, 4)
-
-            if !assistant.sessions.isEmpty {
-                Text("\(assistant.sessions.count) saved session\(assistant.sessions.count == 1 ? "" : "s")")
-                    .font(.system(size: 10.5, weight: .semibold))
-                    .foregroundStyle(.white.opacity(0.34))
-                    .textCase(.uppercase)
-                    .tracking(0.7)
-                    .padding(.horizontal, 2)
-            }
+            .padding(.horizontal, 6)
+            .padding(.bottom, 8)
 
             ScrollView {
-                VStack(alignment: .leading, spacing: 8) {
+                VStack(alignment: .leading, spacing: 2) {
                     if assistant.sessions.isEmpty {
-                        VStack(alignment: .leading, spacing: 8) {
-                            Text("No sessions yet")
-                                .font(.system(size: 13, weight: .semibold))
-                                .foregroundStyle(.white.opacity(0.82))
-
-                            Text("Your recent assistant threads will appear here once you start chatting.")
-                                .font(.system(size: 11.5, weight: .medium))
-                                .foregroundStyle(.white.opacity(0.48))
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(14)
-                        .appThemedSurface(
-                            cornerRadius: 10,
-                            tint: AppVisualTheme.baseTint,
-                            strokeOpacity: 0.12,
-                            tintOpacity: 0.015
-                        )
-                        .padding(.top, 6)
+                        Text("No threads yet")
+                            .font(.system(size: 12, weight: .regular))
+                            .foregroundStyle(.white.opacity(0.34))
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 16)
                     } else {
                         ForEach(assistant.sessions.prefix(assistant.visibleSessionsLimit)) { session in
                             Button {
@@ -368,33 +393,72 @@ struct AssistantWindowView: View {
                                 }
                             }
                         }
-                        
+
                         if assistant.sessions.count > assistant.visibleSessionsLimit {
                             Button {
                                 assistant.loadMoreSessions()
                             } label: {
-                                Text("Load More Sessions")
-                                    .font(.system(size: 12, weight: .medium))
-                                    .foregroundStyle(.white.opacity(0.7))
-                                    .padding(.vertical, 8)
+                                Text("Load more")
+                                    .font(.system(size: 11, weight: .medium))
+                                    .foregroundStyle(.white.opacity(0.44))
+                                    .padding(.vertical, 6)
                                     .frame(maxWidth: .infinity)
-                                    .background(Color.white.opacity(0.05))
-                                    .cornerRadius(8)
                             }
                             .buttonStyle(.plain)
-                            .padding(.top, 4)
+                            .padding(.top, 2)
                         }
                     }
                 }
-                .padding(.horizontal, 6)
+                .padding(.horizontal, 4)
             }
             .appScrollbars()
 
             Spacer(minLength: 0)
+
+            Rectangle()
+                .fill(AssistantWindowChrome.sidebarDivider)
+                .frame(height: 0.5)
+                .padding(.horizontal, 4)
+                .padding(.bottom, 8)
+
+            // Settings button at bottom
+            Button {
+                NotificationCenter.default.post(name: .openAssistOpenAssistantSetup, object: nil)
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: "gearshape")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.50))
+                    Text("Settings")
+                        .font(.system(size: 13, weight: .regular))
+                        .foregroundStyle(.white.opacity(0.60))
+                    Spacer()
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
         }
-        .padding(14)
-        .frame(width: 260)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 12)
+        .frame(width: 250)
         .frame(maxHeight: .infinity, alignment: .top)
+    }
+
+    private func sidebarNavItem(symbol: String, label: String) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: symbol)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(.white.opacity(0.44))
+                .frame(width: 16)
+            Text(label)
+                .font(.system(size: 13, weight: .regular))
+                .foregroundStyle(.white.opacity(0.60))
+            Spacer()
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
     }
 
     private var collapsedSidebarRevealButton: some View {
@@ -404,16 +468,12 @@ struct AssistantWindowView: View {
             }
         } label: {
             Image(systemName: "sidebar.right")
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundStyle(.white.opacity(0.74))
-                .frame(width: 30, height: 30)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(.white.opacity(0.50))
+                .frame(width: 28, height: 28)
                 .background(
-                    RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .fill(AssistantWindowChrome.toolbarFill.opacity(0.92))
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                .stroke(Color.white.opacity(0.08), lineWidth: 0.55)
-                        )
+                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        .fill(Color.white.opacity(0.04))
                 )
         }
         .buttonStyle(.plain)
@@ -482,7 +542,7 @@ struct AssistantWindowView: View {
                     }
                     .background(
                         ChatScrollInteractionMonitor {
-                            lastManualChatScrollAt = Date()
+                            chatScrollTracking.lastManualScrollAt = Date()
                         }
                     )
                     .appScrollbars()
@@ -540,40 +600,36 @@ struct AssistantWindowView: View {
             chatBottomDock
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color(red: 0.05, green: 0.05, blue: 0.05))
-        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .background(Color(red: 0.042, green: 0.044, blue: 0.054))
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
         .overlay(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .stroke(Color.white.opacity(0.06), lineWidth: 0.5)
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .stroke(Color.white.opacity(0.05), lineWidth: 0.5)
         )
-        .padding(.leading, 6)
+        .padding(.leading, 4)
     }
 
     private var chatBottomDock: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Rectangle()
-                .fill(Color.white.opacity(0.06))
-                .frame(height: 0.6)
-
+        VStack(alignment: .leading, spacing: 8) {
             chatComposer
 
             chatStatusBar
         }
-        .padding(.horizontal, 12)
-        .padding(.top, 8)
-        .padding(.bottom, 10)
+        .padding(.horizontal, 14)
+        .padding(.top, 6)
+        .padding(.bottom, 8)
     }
 
     private var chatTopBar: some View {
-        HStack(alignment: .center, spacing: 14) {
+        HStack(alignment: .center, spacing: 12) {
             Text(activeSessionTitle)
-                .font(.system(size: 16, weight: .semibold))
-                .foregroundStyle(.white.opacity(0.92))
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.88))
                 .lineLimit(1)
-            
+
             Spacer()
-            
-            HStack(spacing: 4) {
+
+            HStack(spacing: 6) {
                 Button {
                     showSessionInstructions.toggle()
                 } label: {
@@ -594,63 +650,38 @@ struct AssistantWindowView: View {
                     .buttonStyle(.plain)
                     .help("Continue in Compact View")
                 }
-
-                Button {
-                    NotificationCenter.default.post(name: .openAssistOpenAssistantSetup, object: nil)
-                } label: {
-                    topBarIconButton(symbol: "gearshape")
-                }
-                .buttonStyle(.plain)
-                .help("Open setup")
             }
         }
-        .padding(.horizontal, 18)
-        .padding(.vertical, 12)
-        .background(
-            AssistantWindowChrome.toolbarFill
-                .opacity(0.92)
-        )
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
         .overlay(
             Rectangle()
-                .fill(
-                    LinearGradient(
-                        colors: [
-                            Color.white.opacity(0.10),
-                            Color.white.opacity(0.04)
-                        ],
-                        startPoint: .leading,
-                        endPoint: .trailing
-                    )
-                )
+                .fill(Color.white.opacity(0.06))
                 .frame(height: 0.5),
             alignment: .bottom
         )
-        .shadow(color: Color.black.opacity(0.18), radius: 6, x: 0, y: 3)
     }
     private func topBarIconButton(symbol: String, emphasized: Bool = false) -> some View {
-        AssistantGlyphBadge(
-            symbol: symbol,
-            tint: emphasized ? AppVisualTheme.accentTint : .white,
-            side: 26,
-            cornerRadius: 8,
-            fillOpacity: emphasized ? 0.16 : 0.08,
-            strokeOpacity: emphasized ? 0.24 : 0.12,
-            symbolScale: 0.44,
-            symbolWeight: .medium
-        )
-        .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        Image(systemName: symbol)
+            .font(.system(size: 12, weight: .medium))
+            .foregroundStyle(emphasized ? AppVisualTheme.accentTint : .white.opacity(0.50))
+            .frame(width: 28, height: 28)
+            .background(
+                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    .fill(Color.white.opacity(emphasized ? 0.08 : 0.04))
+            )
+            .contentShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
     }
 
     private var chatStatusBar: some View {
-        HStack(spacing: 10) {
+        HStack(spacing: 8) {
             Circle()
                 .fill(runtimeDotColor)
-                .frame(width: 7, height: 7)
-                .shadow(color: runtimeDotColor.opacity(0.50), radius: 4, x: 0, y: 0)
+                .frame(width: 6, height: 6)
 
             Text(runtimeStatusLabel)
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundStyle(.white.opacity(0.70))
+                .font(.system(size: 10.5, weight: .medium))
+                .foregroundStyle(.white.opacity(0.50))
 
             if !assistant.rateLimits.isEmpty {
                 statusBarRateLimits
@@ -660,12 +691,12 @@ struct AssistantWindowView: View {
 
             if assistant.accountSnapshot.isLoggedIn {
                 Text(assistant.accountSnapshot.summary)
-                    .font(.system(size: 10.5, weight: .medium, design: .monospaced))
-                    .foregroundStyle(.white.opacity(0.46))
+                    .font(.system(size: 10, weight: .regular, design: .monospaced))
+                    .foregroundStyle(.white.opacity(0.34))
                     .lineLimit(1)
             }
         }
-        .padding(.horizontal, 8)
+        .padding(.horizontal, 6)
         .padding(.vertical, 2)
     }
 
@@ -854,12 +885,19 @@ struct AssistantWindowView: View {
         guard !assistant.isTransitioningSession, chatViewportHeight > 0 else { return }
 
         let distanceFromBottom = max(0, bottomOffset - chatViewportHeight)
-        autoScrollPinnedToBottom = distanceFromBottom <= Self.autoScrollThreshold
-        userHasScrolledUp = distanceFromBottom > Self.nearBottomThreshold
+        let isPinnedToBottom = distanceFromBottom <= Self.autoScrollThreshold
+        let hasScrolledUp = distanceFromBottom > Self.nearBottomThreshold
+
+        if autoScrollPinnedToBottom != isPinnedToBottom {
+            autoScrollPinnedToBottom = isPinnedToBottom
+        }
+        if userHasScrolledUp != hasScrolledUp {
+            userHasScrolledUp = hasScrolledUp
+        }
     }
 
     private func loadOlderHistoryIfNeeded(topOffset: CGFloat, with proxy: ScrollViewProxy) {
-        let hasRecentManualScrollIntent = Date().timeIntervalSince(lastManualChatScrollAt) <= Self.manualLoadOlderPause
+        let hasRecentManualScrollIntent = Date().timeIntervalSince(chatScrollTracking.lastManualScrollAt) <= Self.manualLoadOlderPause
         guard !assistant.isTransitioningSession,
               hasRecentManualScrollIntent,
               hiddenRenderItemCount > 0,
@@ -953,7 +991,7 @@ struct AssistantWindowView: View {
                 .controlSize(.small)
                 .tint(.white.opacity(0.5))
             Text("Loading session")
-                .font(.system(size: 13, weight: .medium, design: .rounded))
+                .font(.system(size: 13, weight: .medium))
                 .foregroundStyle(.white.opacity(0.4))
             Spacer()
         }
@@ -1056,13 +1094,10 @@ struct AssistantWindowView: View {
 
         case .permission:
             if let request = item.permissionRequest {
-                let sessionStatus = assistant.sessions.first {
-                    assistantTimelineSessionIDsMatch($0.id, request.sessionID)
-                }?.status
                 let cardState = assistantPermissionCardState(
                     for: request,
                     pendingRequest: assistant.pendingPermissionRequest,
-                    sessionStatus: sessionStatus
+                    sessionStatus: sessionStatus(forSessionID: request.sessionID)
                 )
                 HStack(alignment: .top, spacing: 0) {
                     permissionCard(request, state: cardState)
@@ -1094,7 +1129,7 @@ struct AssistantWindowView: View {
         HStack {
             Spacer(minLength: 80)
 
-            VStack(alignment: .trailing, spacing: 4) {
+            VStack(alignment: .trailing, spacing: 6) {
                 HStack(spacing: 6) {
                     copyMessageButton(
                         text: text,
@@ -1110,10 +1145,10 @@ struct AssistantWindowView: View {
                                 .resizable()
                                 .aspectRatio(contentMode: .fit)
                                 .frame(maxWidth: 280, maxHeight: 200)
-                                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
                                 .overlay(
-                                    RoundedRectangle(cornerRadius: 14, style: .continuous)
-                                        .stroke(Color.white.opacity(0.08), lineWidth: 0.5)
+                                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                        .stroke(Color.white.opacity(0.06), lineWidth: 0.5)
                                 )
                         }
                     }
@@ -1121,24 +1156,23 @@ struct AssistantWindowView: View {
 
                 Text(verbatim: text)
                     .font(.system(size: 14 * CGFloat(chatTextScale), weight: .regular))
-                    .foregroundStyle(.white.opacity(0.94))
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 12)
+                    .foregroundStyle(.white.opacity(0.92))
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 10)
                     .background(
-                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        RoundedRectangle(cornerRadius: 16, style: .continuous)
                             .fill(AssistantWindowChrome.userBubble)
                             .overlay(
-                                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                RoundedRectangle(cornerRadius: 16, style: .continuous)
                                     .stroke(AssistantWindowChrome.userBubbleBorder, lineWidth: 0.5)
                             )
                     )
-                    .shadow(color: Color.black.opacity(0.12), radius: 4, y: 2)
                     .textSelection(.enabled)
             }
         }
         .frame(maxWidth: .infinity)
         .contentShape(Rectangle())
-        .padding(.vertical, 6)
+        .padding(.vertical, 4)
         .onHover { hovering in
             updateInlineCopyHoverState(for: messageID, hovering: hovering)
         }
@@ -1167,7 +1201,7 @@ struct AssistantWindowView: View {
         let roleTint = assistantRowTint(for: title)
         let roleIcon = assistantRowIcon(for: title)
 
-        let rowContent = HStack(alignment: .top, spacing: isStandardAssistant ? 0 : 12) {
+        let rowContent = HStack(alignment: .top, spacing: isStandardAssistant ? 0 : 10) {
             if !isStandardAssistant {
                 if isCompactStatusRow {
                     compactAssistantStatusIcon(symbol: roleIcon, tint: roleTint)
@@ -1175,23 +1209,23 @@ struct AssistantWindowView: View {
                     AppIconBadge(
                         symbol: roleIcon,
                         tint: roleTint,
-                        size: compact ? 26 : 32,
-                        symbolSize: compact ? 10 : 12,
+                        size: compact ? 24 : 28,
+                        symbolSize: compact ? 10 : 11,
                         isEmphasized: isStreaming
                     )
                 }
             }
 
-            VStack(alignment: .leading, spacing: compact ? 5 : 8) {
+            VStack(alignment: .leading, spacing: compact ? 4 : 6) {
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
                     if !isStandardAssistant {
                         Text(title)
-                            .font(.system(size: compact ? 11.5 : 12.5, weight: isCompactStatusRow ? .medium : .semibold))
-                            .foregroundStyle(.white.opacity(isCompactStatusRow ? 0.68 : (compact ? 0.78 : 0.88)))
-                        
+                            .font(.system(size: compact ? 11.5 : 12, weight: isCompactStatusRow ? .medium : .semibold))
+                            .foregroundStyle(.white.opacity(isCompactStatusRow ? 0.58 : (compact ? 0.70 : 0.82)))
+
                         Text(timestamp.formatted(date: .omitted, time: .shortened))
-                            .font(.system(size: 10, weight: .medium))
-                            .foregroundStyle(.white.opacity(isCompactStatusRow ? 0.26 : (compact ? 0.38 : 0.48)))
+                            .font(.system(size: 10, weight: .regular))
+                            .foregroundStyle(.white.opacity(isCompactStatusRow ? 0.22 : (compact ? 0.30 : 0.36)))
                     }
 
                     Spacer(minLength: 8)
@@ -1210,7 +1244,7 @@ struct AssistantWindowView: View {
                     role: .assistant,
                     isStreaming: isStreaming
                 )
-                .opacity(isCompactStatusRow ? 0.78 : (compact ? 0.84 : 1.0))
+                .opacity(isCompactStatusRow ? 0.76 : (compact ? 0.84 : 1.0))
                 .textSelection(.enabled)
 
                 if let imageAttachments, !imageAttachments.isEmpty {
@@ -1220,10 +1254,10 @@ struct AssistantWindowView: View {
                                 .resizable()
                                 .aspectRatio(contentMode: .fit)
                                 .frame(maxWidth: compact ? 320 : 420, maxHeight: compact ? 220 : 320)
-                                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
                                 .overlay(
-                                    RoundedRectangle(cornerRadius: 14, style: .continuous)
-                                        .stroke(Color.white.opacity(0.08), lineWidth: 0.5)
+                                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                        .stroke(Color.white.opacity(0.06), lineWidth: 0.5)
                                 )
                         }
                     }
@@ -1234,49 +1268,40 @@ struct AssistantWindowView: View {
         }
 
         return rowContent
-            .padding(.horizontal, isStandardAssistant ? 0 : (compact ? 12 : 16))
-            .padding(.vertical, isStandardAssistant ? (compact ? 4 : 8) : (compact ? 8 : 16))
+            .padding(.horizontal, isStandardAssistant ? 0 : (compact ? 10 : 14))
+            .padding(.vertical, isStandardAssistant ? (compact ? 4 : 6) : (compact ? 6 : 12))
             .background {
                 if isStandardAssistant {
                     EmptyView()
                 } else if isCompactStatusRow {
-                    RoundedRectangle(cornerRadius: 12, style: .continuous)
-                        .fill(Color.white.opacity(0.015))
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                                .stroke(roleTint.opacity(title == "Needs Attention" ? 0.22 : 0.12), lineWidth: 0.55)
-                        )
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .fill(Color.white.opacity(0.012))
                         .overlay(alignment: .leading) {
                             Capsule(style: .continuous)
-                                .fill(roleTint.opacity(title == "Needs Attention" ? 0.52 : 0.28))
+                                .fill(roleTint.opacity(title == "Needs Attention" ? 0.50 : 0.24))
                                 .frame(width: 2)
-                                .padding(.vertical, 8)
+                                .padding(.vertical, 6)
                                 .padding(.leading, 1)
                         }
                 } else if compact {
                     RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .fill(roleTint.opacity(0.035))
+                        .fill(roleTint.opacity(0.025))
                         .overlay(alignment: .leading) {
                             Capsule(style: .continuous)
-                                .fill(roleTint.opacity(0.55))
+                                .fill(roleTint.opacity(0.45))
                                 .frame(width: 2)
-                                .padding(.vertical, 8)
+                                .padding(.vertical, 6)
                                 .padding(.leading, 1)
                         }
                 } else {
-                    RoundedRectangle(cornerRadius: 12, style: .continuous)
-                        .fill(AssistantWindowChrome.messagePanel)
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                                .stroke(AssistantWindowChrome.border, lineWidth: 0.5)
-                        )
+                    EmptyView()
                 }
             }
-            .padding(.leading, isStandardAssistant ? 20 : 0)
-            .padding(.trailing, isStandardAssistant ? (compact ? 120 : 180) : (compact ? 60 : 40))
+            .padding(.leading, isStandardAssistant ? 4 : 0)
+            .padding(.trailing, isStandardAssistant ? (compact ? 60 : 80) : (compact ? 40 : 24))
             .frame(maxWidth: .infinity, alignment: .leading)
             .contentShape(Rectangle())
-            .padding(.vertical, compact ? 2 : 6)
+            .padding(.vertical, compact ? 1 : 4)
             .onHover { hovering in
                 guard showsInlineCopyButton else { return }
                 updateInlineCopyHoverState(for: messageID, hovering: hovering)
@@ -1480,7 +1505,7 @@ struct AssistantWindowView: View {
                 .frame(width: 5, height: 5)
 
             Text(statusLabel)
-                .font(.system(size: 10, weight: .medium, design: .rounded))
+                .font(.system(size: 10, weight: .medium))
                 .foregroundStyle(statusTint.opacity(0.92))
 
             Text(timestamp.formatted(date: .omitted, time: .shortened))
@@ -1636,7 +1661,7 @@ struct AssistantWindowView: View {
             if !openTargets.isEmpty {
                 VStack(alignment: .leading, spacing: 6) {
                     Text("Open")
-                        .font(.system(size: 9.5, weight: .bold, design: .rounded))
+                        .font(.system(size: 9.5, weight: .bold))
                         .foregroundStyle(.white.opacity(0.34))
                         .textCase(.uppercase)
 
@@ -1659,7 +1684,7 @@ struct AssistantWindowView: View {
             if !openTargets.isEmpty {
                 VStack(alignment: .leading, spacing: 6) {
                     Text("Open")
-                        .font(.system(size: 9.5, weight: .bold, design: .rounded))
+                        .font(.system(size: 9.5, weight: .bold))
                         .foregroundStyle(.white.opacity(0.34))
                         .textCase(.uppercase)
 
@@ -1673,7 +1698,7 @@ struct AssistantWindowView: View {
 
             VStack(alignment: .leading, spacing: 6) {
                 Text("Steps")
-                    .font(.system(size: 9.5, weight: .bold, design: .rounded))
+                    .font(.system(size: 9.5, weight: .bold))
                     .foregroundStyle(.white.opacity(0.34))
                     .textCase(.uppercase)
 
@@ -1724,7 +1749,7 @@ struct AssistantWindowView: View {
     ) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             Text("Screenshots")
-                .font(.system(size: 9.5, weight: .bold, design: .rounded))
+                .font(.system(size: 9.5, weight: .bold))
                 .foregroundStyle(.white.opacity(0.34))
                 .textCase(.uppercase)
 
@@ -1781,7 +1806,7 @@ struct AssistantWindowView: View {
 
         return VStack(alignment: .leading, spacing: 4) {
             Text(section.title)
-                .font(.system(size: 9.5, weight: .bold, design: .rounded))
+                .font(.system(size: 9.5, weight: .bold))
                 .foregroundStyle(.white.opacity(0.34))
                 .textCase(.uppercase)
 
@@ -1999,7 +2024,7 @@ struct AssistantWindowView: View {
     private func toolActivitySection(title: String, calls: [AssistantToolCallState]) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             Text(title)
-                .font(.system(size: 10, weight: .bold, design: .rounded))
+                .font(.system(size: 10, weight: .bold))
                 .foregroundStyle(.white.opacity(0.35))
                 .textCase(.uppercase)
 
@@ -2028,7 +2053,7 @@ struct AssistantWindowView: View {
                     }
 
                     Text(statusLabel(for: call))
-                        .font(.system(size: 10, weight: .bold, design: .rounded))
+                        .font(.system(size: 10, weight: .bold))
                         .foregroundStyle(statusTint(for: call))
                         .padding(.horizontal, 6)
                         .padding(.vertical, 2)
@@ -2452,30 +2477,16 @@ struct AssistantWindowView: View {
                                 }
                             }
                         } label: {
-                            HStack(spacing: 6) {
-                                AssistantGlyphBadge(
-                                    symbol: AssistantChromeSymbol.model,
-                                    tint: AppVisualTheme.accentTint,
-                                    side: 18,
-                                    fillOpacity: 0.14,
-                                    strokeOpacity: 0.22,
-                                    symbolScale: 0.48
-                                )
+                            HStack(spacing: 4) {
                                 Text(assistant.selectedModelSummary)
-                                    .font(.system(size: 10.5, weight: .medium, design: .monospaced))
-                                    .foregroundStyle(.white.opacity(0.64))
+                                    .font(.system(size: 11, weight: .medium))
+                                    .foregroundStyle(.white.opacity(0.62))
                                 if !assistant.visibleModels.isEmpty {
                                     Image(systemName: "chevron.down")
-                                        .font(.system(size: 6, weight: .bold))
-                                        .foregroundStyle(.white.opacity(0.28))
+                                        .font(.system(size: 6, weight: .semibold))
+                                        .foregroundStyle(.white.opacity(0.30))
                                 }
                             }
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 5)
-                            .background(
-                                Capsule(style: .continuous)
-                                    .fill(Color.white.opacity(0.05))
-                            )
                         }
                         .menuStyle(.borderlessButton)
                         .fixedSize()
@@ -2495,83 +2506,18 @@ struct AssistantWindowView: View {
                                 }
                             }
                         } label: {
-                            HStack(spacing: 6) {
-                                AssistantGlyphBadge(
-                                    symbol: AssistantChromeSymbol.reasoning,
-                                    tint: AssistantWindowChrome.neutralAccent,
-                                    side: 18,
-                                    fillOpacity: 0.10,
-                                    strokeOpacity: 0.18,
-                                    symbolScale: 0.50
-                                )
+                            HStack(spacing: 4) {
                                 Text(assistant.reasoningEffort.label)
-                                    .font(.system(size: 10.5, weight: .medium))
-                                    .foregroundStyle(.white.opacity(0.58))
-                            }
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 5)
-                            .background(
-                                Capsule(style: .continuous)
-                                    .fill(Color.white.opacity(0.05))
-                            )
-                        }
-                        .menuStyle(.borderlessButton)
-                        .fixedSize()
-                        .disabled(assistant.selectedModel == nil)
-
-                        Menu {
-                            Button {
-                                assistant.fastModeEnabled = false
-                            } label: {
-                                HStack {
-                                    Text("Standard")
-                                    if !assistant.fastModeEnabled {
-                                        Image(systemName: "checkmark")
-                                    }
-                                }
-                            }
-                            Button {
-                                assistant.fastModeEnabled = true
-                            } label: {
-                                HStack {
-                                    Text("Fast")
-                                    if assistant.fastModeEnabled {
-                                        Image(systemName: "checkmark")
-                                    }
-                                }
-                            }
-                        } label: {
-                            HStack(spacing: 6) {
-                                AssistantGlyphBadge(
-                                    symbol: assistant.fastModeEnabled
-                                        ? AssistantChromeSymbol.speedFast
-                                        : AssistantChromeSymbol.speedStandard,
-                                    tint: assistant.fastModeEnabled
-                                        ? AppVisualTheme.accentTint
-                                        : AssistantWindowChrome.neutralAccent,
-                                    side: 18,
-                                    fillOpacity: assistant.fastModeEnabled ? 0.14 : 0.10,
-                                    strokeOpacity: assistant.fastModeEnabled ? 0.22 : 0.18,
-                                    symbolScale: 0.48
-                                )
-                                Text(assistant.fastModeEnabled ? "Fast" : "Standard")
-                                    .font(.system(size: 10.5, weight: .medium))
-                                    .foregroundStyle(.white.opacity(0.58))
+                                    .font(.system(size: 11, weight: .medium))
+                                    .foregroundStyle(.white.opacity(0.54))
                                 Image(systemName: "chevron.down")
-                                    .font(.system(size: 6, weight: .bold))
-                                    .foregroundStyle(.white.opacity(0.28))
+                                    .font(.system(size: 6, weight: .semibold))
+                                    .foregroundStyle(.white.opacity(0.26))
                             }
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 5)
-                            .background(
-                                Capsule(style: .continuous)
-                                    .fill(Color.white.opacity(0.06))
-                            )
                         }
                         .menuStyle(.borderlessButton)
                         .fixedSize()
                         .disabled(assistant.selectedModel == nil)
-                        .help("Choose service tier for the chat session.")
 
                         ContextUsageCircle(usage: assistant.tokenUsage)
                     }
@@ -2641,11 +2587,11 @@ struct AssistantWindowView: View {
             }
         }
         .background(
-            RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .fill(AssistantWindowChrome.elevatedPanel.opacity(0.94))
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(AssistantWindowChrome.elevatedPanel.opacity(0.90))
                 .overlay(
-                    RoundedRectangle(cornerRadius: 18, style: .continuous)
-                        .stroke(AssistantWindowChrome.strongBorder, lineWidth: 0.65)
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .stroke(AssistantWindowChrome.border, lineWidth: 0.5)
                 )
         )
     }

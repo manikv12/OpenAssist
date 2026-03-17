@@ -10,26 +10,28 @@ let assistantComposerMinTextHeight: CGFloat = 44
 let assistantComposerMaxTextHeight: CGFloat = 88
 
 enum AssistantWindowChrome {
-    static let canvasTop = Color(red: 0.055, green: 0.060, blue: 0.072)
-    static let canvasBottom = Color(red: 0.032, green: 0.035, blue: 0.043)
-    static let shellTop = Color(red: 0.090, green: 0.096, blue: 0.112)
-    static let shellBottom = Color(red: 0.072, green: 0.077, blue: 0.092)
-    static let sidebarTop = Color(red: 0.082, green: 0.087, blue: 0.101)
-    static let sidebarBottom = Color(red: 0.064, green: 0.068, blue: 0.080)
-    static let contentTop = Color(red: 0.098, green: 0.104, blue: 0.120)
-    static let contentBottom = Color(red: 0.078, green: 0.083, blue: 0.098)
-    static let elevatedPanel = Color(red: 0.108, green: 0.114, blue: 0.131)
-    static let messagePanel = Color(red: 0.112, green: 0.118, blue: 0.136)
-    static let userBubble = Color(red: 0.122, green: 0.128, blue: 0.146)
-    static let userBubbleBorder = Color(red: 0.285, green: 0.365, blue: 0.485).opacity(0.60)
-    static let editorFill = Color(red: 0.080, green: 0.085, blue: 0.099)
-    static let toolbarFill = Color(red: 0.102, green: 0.108, blue: 0.124)
-    static let buttonFill = Color.white.opacity(0.055)
-    static let buttonEmphasis = Color(red: 0.145, green: 0.165, blue: 0.208)
-    static let border = Color.white.opacity(0.08)
-    static let strongBorder = Color.white.opacity(0.13)
+    static let canvasTop = Color(red: 0.050, green: 0.052, blue: 0.062)
+    static let canvasBottom = Color(red: 0.028, green: 0.030, blue: 0.038)
+    static let shellTop = Color(red: 0.078, green: 0.082, blue: 0.098)
+    static let shellBottom = Color(red: 0.060, green: 0.064, blue: 0.078)
+    static let sidebarTop = Color(red: 0.068, green: 0.072, blue: 0.086)
+    static let sidebarBottom = Color(red: 0.050, green: 0.054, blue: 0.066)
+    static let contentTop = Color(red: 0.082, green: 0.086, blue: 0.102)
+    static let contentBottom = Color(red: 0.065, green: 0.068, blue: 0.082)
+    static let elevatedPanel = Color(red: 0.092, green: 0.096, blue: 0.114)
+    static let messagePanel = Color(red: 0.088, green: 0.092, blue: 0.108)
+    static let userBubble = Color(red: 0.110, green: 0.116, blue: 0.138)
+    static let userBubbleBorder = Color(red: 0.260, green: 0.340, blue: 0.480).opacity(0.50)
+    static let editorFill = Color(red: 0.065, green: 0.068, blue: 0.082)
+    static let toolbarFill = Color(red: 0.072, green: 0.076, blue: 0.092)
+    static let buttonFill = Color.white.opacity(0.050)
+    static let buttonEmphasis = Color(red: 0.130, green: 0.148, blue: 0.195)
+    static let border = Color.white.opacity(0.07)
+    static let strongBorder = Color.white.opacity(0.11)
     static let neutralAccent = Color(red: 0.46, green: 0.58, blue: 0.74)
     static let systemTint = Color(red: 0.52, green: 0.64, blue: 0.78)
+    static let sidebarDivider = Color.white.opacity(0.06)
+    static let sectionHeader = Color.white.opacity(0.38)
 }
 
 enum TimelineDisclosureState {
@@ -40,6 +42,11 @@ enum TimelineDisclosureState {
 struct TimelineActivityDetailSectionData {
     let title: String
     let text: String
+}
+
+@MainActor
+final class AssistantChatScrollTracking {
+    var lastManualScrollAt: Date = .distantPast
 }
 
 func assistantFormattedActivityDetailText(_ text: String) -> String {
@@ -185,4 +192,3 @@ func assistantTimelineSessionIDsMatch(_ lhs: String?, _ rhs: String?) -> Bool {
 
     return lhs.caseInsensitiveCompare(rhs) == .orderedSame
 }
-

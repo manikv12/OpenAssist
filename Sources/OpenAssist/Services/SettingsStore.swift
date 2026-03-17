@@ -533,6 +533,8 @@ final class SettingsStore: ObservableObject {
         static let continuousMode = "OpenAssist.continuousMode" // legacy key kept for migration safety
         static let continuousToggleShortcutKeyCode = "OpenAssist.continuousToggleShortcutKeyCode"
         static let continuousToggleShortcutModifiers = "OpenAssist.continuousToggleShortcutModifiers"
+        static let assistantLiveVoiceShortcutKeyCode = "OpenAssist.assistantLiveVoiceShortcutKeyCode"
+        static let assistantLiveVoiceShortcutModifiers = "OpenAssist.assistantLiveVoiceShortcutModifiers"
         static let autoDetectMicrophone = "OpenAssist.autoDetectMicrophone"
         static let selectedMicrophoneUID = "OpenAssist.selectedMicrophoneUID"
         static let copyToClipboard = "OpenAssist.copyToClipboard"
@@ -639,6 +641,11 @@ final class SettingsStore: ObservableObject {
         static let modifiers: UInt = NSEvent.ModifierFlags([.command, .option, .control]).rawValue
     }
 
+    private enum AssistantLiveVoiceShortcutDefaults {
+        static let keyCode: UInt16 = 37 // L
+        static let modifiers: UInt = NSEvent.ModifierFlags([.command, .option, .control]).rawValue
+    }
+
     private enum PasteLastShortcut {
         static let keyCode: UInt16 = 9 // V
         static let modifiers: UInt = NSEvent.ModifierFlags([.command, .option]).rawValue
@@ -684,6 +691,18 @@ final class SettingsStore: ObservableObject {
     }
 
     @Published var continuousToggleShortcutModifiers: UInt {
+        didSet {
+            save()
+        }
+    }
+
+    @Published var assistantLiveVoiceShortcutKeyCode: UInt16 {
+        didSet {
+            save()
+        }
+    }
+
+    @Published var assistantLiveVoiceShortcutModifiers: UInt {
         didSet {
             save()
         }
@@ -1569,6 +1588,31 @@ final class SettingsStore: ObservableObject {
         continuousToggleShortcutKeyCode = resolvedContinuousToggle.keyCode
         continuousToggleShortcutModifiers = resolvedContinuousToggle.modifiersRaw
 
+        let storedAssistantLiveVoiceShortcutKeyCode: UInt16
+        if defaults.object(forKey: Keys.assistantLiveVoiceShortcutKeyCode) == nil {
+            storedAssistantLiveVoiceShortcutKeyCode = AssistantLiveVoiceShortcutDefaults.keyCode
+        } else {
+            storedAssistantLiveVoiceShortcutKeyCode = UInt16(defaults.integer(forKey: Keys.assistantLiveVoiceShortcutKeyCode))
+        }
+
+        let storedAssistantLiveVoiceShortcutModifiersRaw: UInt
+        if defaults.object(forKey: Keys.assistantLiveVoiceShortcutModifiers) == nil {
+            storedAssistantLiveVoiceShortcutModifiersRaw = AssistantLiveVoiceShortcutDefaults.modifiers
+        } else {
+            storedAssistantLiveVoiceShortcutModifiersRaw = UInt(defaults.integer(forKey: Keys.assistantLiveVoiceShortcutModifiers))
+        }
+
+        let resolvedAssistantLiveVoiceShortcut = Self.resolveAssistantLiveVoiceShortcut(
+            keyCode: storedAssistantLiveVoiceShortcutKeyCode,
+            modifiersRaw: storedAssistantLiveVoiceShortcutModifiersRaw,
+            holdToTalkKeyCode: initialShortcutKeyCode,
+            holdToTalkModifiersRaw: ShortcutValidation.filteredModifierRawValue(from: initialShortcutModifiers),
+            continuousToggleKeyCode: resolvedContinuousToggle.keyCode,
+            continuousToggleModifiersRaw: resolvedContinuousToggle.modifiersRaw
+        )
+        assistantLiveVoiceShortcutKeyCode = resolvedAssistantLiveVoiceShortcut.keyCode
+        assistantLiveVoiceShortcutModifiers = resolvedAssistantLiveVoiceShortcut.modifiersRaw
+
         if defaults.object(forKey: Keys.muteSystemSoundsWhileHoldingShortcut) == nil {
             muteSystemSoundsWhileHoldingShortcut = false
         } else {
@@ -2182,6 +2226,8 @@ final class SettingsStore: ObservableObject {
         defaults.set(Int(ShortcutValidation.filteredModifierRawValue(from: shortcutModifiers)), forKey: Keys.shortcutModifiers)
         defaults.set(Int(continuousToggleShortcutKeyCode), forKey: Keys.continuousToggleShortcutKeyCode)
         defaults.set(Int(ShortcutValidation.filteredModifierRawValue(from: continuousToggleShortcutModifiers)), forKey: Keys.continuousToggleShortcutModifiers)
+        defaults.set(Int(assistantLiveVoiceShortcutKeyCode), forKey: Keys.assistantLiveVoiceShortcutKeyCode)
+        defaults.set(Int(ShortcutValidation.filteredModifierRawValue(from: assistantLiveVoiceShortcutModifiers)), forKey: Keys.assistantLiveVoiceShortcutModifiers)
         defaults.set(muteSystemSoundsWhileHoldingShortcut, forKey: Keys.muteSystemSoundsWhileHoldingShortcut)
         defaults.set(autoDetectMicrophone, forKey: Keys.autoDetectMicrophone)
         defaults.set(selectedMicrophoneUID, forKey: Keys.selectedMicrophoneUID)
@@ -2357,6 +2403,10 @@ final class SettingsStore: ObservableObject {
 
     var continuousToggleShortcutModifierFlags: NSEvent.ModifierFlags {
         ShortcutValidation.filteredModifierFlags(from: continuousToggleShortcutModifiers)
+    }
+
+    var assistantLiveVoiceShortcutModifierFlags: NSEvent.ModifierFlags {
+        ShortcutValidation.filteredModifierFlags(from: assistantLiveVoiceShortcutModifiers)
     }
 
     var recognitionMode: RecognitionMode {
@@ -3390,6 +3440,79 @@ final class SettingsStore: ObservableObject {
                 rhsModifiersRaw: PasteLastShortcut.modifiers
             )
             if !conflictsHold && !conflictsPasteLast {
+                return normalizedCandidate
+            }
+        }
+
+        return normalized
+    }
+
+    private static func resolveAssistantLiveVoiceShortcut(
+        keyCode: UInt16,
+        modifiersRaw: UInt,
+        holdToTalkKeyCode: UInt16,
+        holdToTalkModifiersRaw: UInt,
+        continuousToggleKeyCode: UInt16,
+        continuousToggleModifiersRaw: UInt
+    ) -> (keyCode: UInt16, modifiersRaw: UInt) {
+        let normalized = normalizedShortcut(
+            keyCode: keyCode,
+            modifiersRaw: modifiersRaw,
+            defaultKeyCode: AssistantLiveVoiceShortcutDefaults.keyCode,
+            defaultModifiersRaw: AssistantLiveVoiceShortcutDefaults.modifiers
+        )
+
+        if !shortcutsConflict(
+            lhsKeyCode: normalized.keyCode,
+            lhsModifiersRaw: normalized.modifiersRaw,
+            rhsKeyCode: holdToTalkKeyCode,
+            rhsModifiersRaw: holdToTalkModifiersRaw
+        ) && !shortcutsConflict(
+            lhsKeyCode: normalized.keyCode,
+            lhsModifiersRaw: normalized.modifiersRaw,
+            rhsKeyCode: continuousToggleKeyCode,
+            rhsModifiersRaw: continuousToggleModifiersRaw
+        ) && !shortcutsConflict(
+            lhsKeyCode: normalized.keyCode,
+            lhsModifiersRaw: normalized.modifiersRaw,
+            rhsKeyCode: PasteLastShortcut.keyCode,
+            rhsModifiersRaw: PasteLastShortcut.modifiers
+        ) {
+            return normalized
+        }
+
+        let fallbacks: [(UInt16, UInt)] = [
+            (AssistantLiveVoiceShortcutDefaults.keyCode, AssistantLiveVoiceShortcutDefaults.modifiers),
+            (15, NSEvent.ModifierFlags([.command, .option, .control]).rawValue), // R
+            (40, NSEvent.ModifierFlags([.command, .option, .control]).rawValue)  // K
+        ]
+
+        for candidate in fallbacks {
+            let normalizedCandidate = normalizedShortcut(
+                keyCode: candidate.0,
+                modifiersRaw: candidate.1,
+                defaultKeyCode: AssistantLiveVoiceShortcutDefaults.keyCode,
+                defaultModifiersRaw: AssistantLiveVoiceShortcutDefaults.modifiers
+            )
+            let conflictsHold = shortcutsConflict(
+                lhsKeyCode: normalizedCandidate.keyCode,
+                lhsModifiersRaw: normalizedCandidate.modifiersRaw,
+                rhsKeyCode: holdToTalkKeyCode,
+                rhsModifiersRaw: holdToTalkModifiersRaw
+            )
+            let conflictsContinuous = shortcutsConflict(
+                lhsKeyCode: normalizedCandidate.keyCode,
+                lhsModifiersRaw: normalizedCandidate.modifiersRaw,
+                rhsKeyCode: continuousToggleKeyCode,
+                rhsModifiersRaw: continuousToggleModifiersRaw
+            )
+            let conflictsPasteLast = shortcutsConflict(
+                lhsKeyCode: normalizedCandidate.keyCode,
+                lhsModifiersRaw: normalizedCandidate.modifiersRaw,
+                rhsKeyCode: PasteLastShortcut.keyCode,
+                rhsModifiersRaw: PasteLastShortcut.modifiers
+            )
+            if !conflictsHold && !conflictsContinuous && !conflictsPasteLast {
                 return normalizedCandidate
             }
         }

@@ -533,24 +533,14 @@ struct AIMemoryStudioView: View {
             .buttonStyle(.plain)
             .padding(.bottom, 4)
 
-            HStack(spacing: 10) {
-                AppIconBadge(
-                    symbol: selectedStudioPage.iconName,
-                    tint: selectedStudioPage.tint,
-                    size: 28,
-                    symbolSize: 12,
-                    isEmphasized: true
-                )
-
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("AI Studio")
-                        .font(.system(size: 16, weight: .semibold, design: .rounded))
-                        .foregroundStyle(.white.opacity(0.96))
-                    Text(selectedStudioPage.subtitle)
-                        .font(.caption)
-                        .foregroundStyle(AppVisualTheme.mutedText)
-                        .lineLimit(2)
-                }
+            VStack(alignment: .leading, spacing: 2) {
+                Text("AI Studio")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.92))
+                Text(selectedStudioPage.subtitle)
+                    .font(.system(size: 11, weight: .regular))
+                    .foregroundStyle(.white.opacity(0.44))
+                    .lineLimit(2)
             }
 
             VStack(spacing: 6) {
@@ -636,24 +626,20 @@ struct AIMemoryStudioView: View {
     private func sidebarMetricRow(label: String, value: String, tint: Color) -> some View {
         HStack(spacing: 8) {
             Text(label)
-                .font(.caption2.weight(.semibold))
-                .foregroundStyle(.secondary)
+                .font(.system(size: 10, weight: .medium))
+                .foregroundStyle(.white.opacity(0.40))
             Spacer(minLength: 0)
             Text(value)
-                .font(.caption.weight(.semibold))
+                .font(.system(size: 11, weight: .medium))
                 .lineLimit(1)
                 .truncationMode(.tail)
-                .foregroundStyle(.primary)
+                .foregroundStyle(.white.opacity(0.70))
         }
         .padding(.horizontal, 8)
-        .padding(.vertical, 6)
+        .padding(.vertical, 5)
         .background(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .fill(AppVisualTheme.adaptiveMaterialFill())
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .stroke(tint.opacity(0.14), lineWidth: 0.7)
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .fill(Color.white.opacity(0.03))
         )
     }
 
@@ -662,32 +648,25 @@ struct AIMemoryStudioView: View {
         let isSelected = selectedStudioPage == page
 
         HStack(spacing: 10) {
-            AppIconBadge(
-                symbol: page.iconName,
-                tint: page.tint,
-                size: 24,
-                symbolSize: 11,
-                isEmphasized: isSelected
-            )
+            Image(systemName: page.iconName)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(isSelected ? page.tint.opacity(0.85) : .white.opacity(0.40))
+                .frame(width: 20, height: 20)
 
             Text(page.title)
-                .font(.callout.weight(isSelected ? .semibold : .medium))
-                .foregroundStyle(.primary)
+                .font(.system(size: 13, weight: isSelected ? .semibold : .regular))
+                .foregroundStyle(isSelected ? .white.opacity(0.92) : .white.opacity(0.68))
                 .lineLimit(1)
 
             Spacer(minLength: 0)
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 7)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
         .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(Rectangle())
         .background(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(isSelected ? page.tint.opacity(0.06) : Color.clear)
-                .overlay(
-                    RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .stroke(isSelected ? page.tint.opacity(0.22) : Color.clear, lineWidth: 0.8)
-                )
+            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                .fill(isSelected ? Color.white.opacity(0.07) : Color.clear)
         )
     }
 

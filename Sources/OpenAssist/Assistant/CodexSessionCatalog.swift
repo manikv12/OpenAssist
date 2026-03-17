@@ -2241,7 +2241,7 @@ struct CodexSessionCatalog {
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
         if normalizedApprovalPolicy == "untrusted" {
-            return .conversational
+            return .agentic
         }
         if normalizedApprovalPolicy == "on-request" || normalizedApprovalPolicy == "never" {
             return .agentic
@@ -2251,7 +2251,7 @@ struct CodexSessionCatalog {
             stringValue(sandboxPolicy?["type"])
         )?.lowercased()
         if sandboxType == "read-only" || sandboxType == "readonly" {
-            return collaborationModeKind == "default" ? .conversational : nil
+            return collaborationModeKind == "default" ? .agentic : nil
         }
         if sandboxType == "danger-full-access" || sandboxType == "dangerfullaccess" {
             return .agentic

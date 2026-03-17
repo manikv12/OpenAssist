@@ -71,11 +71,11 @@ struct PromptRewriteLoadingView: View {
 
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Refining Transcript")
-                        .font(.system(size: 13.5, weight: .bold, design: .rounded))
+                        .font(.system(size: 13.5, weight: .bold))
                         .foregroundStyle(Color.white.opacity(0.95))
                     PromptRewriteWordFlowText(
                         text: stepText,
-                        font: .system(size: 11, weight: .medium, design: .rounded),
+                        font: .system(size: 11, weight: .medium),
                         foregroundColor: Color.white.opacity(0.70),
                         wordsPerSecond: 4,
                         lineLimit: 1
@@ -115,7 +115,7 @@ struct PromptRewriteLoadingView: View {
 
             VStack(alignment: .leading, spacing: 4) {
                 Text(previewBlockTitle)
-                    .font(.system(size: 10, weight: .semibold, design: .rounded))
+                    .font(.system(size: 10, weight: .semibold))
                     .foregroundStyle(Color.white.opacity(0.56))
 
                 HStack(alignment: .top, spacing: 8) {
@@ -124,7 +124,7 @@ struct PromptRewriteLoadingView: View {
 
                     PromptRewriteWordFlowText(
                         text: previewBlockText,
-                        font: .system(size: 11.5, weight: .medium, design: .rounded),
+                        font: .system(size: 11.5, weight: .medium),
                         foregroundColor: Color.white.opacity(0.90),
                         wordsPerSecond: 4,
                         lineLimit: 2
@@ -336,7 +336,7 @@ struct PromptRewriteStageChip: View {
             Image(systemName: isCompleted ? "checkmark.circle.fill" : (isActive ? "record.circle.fill" : "circle"))
                 .font(.system(size: 9, weight: .semibold))
             Text(title)
-                .font(.system(size: 10.5, weight: .bold, design: .rounded))
+                .font(.system(size: 10.5, weight: .bold))
         }
         .foregroundStyle(baseColor.opacity(isActive || isCompleted ? 0.96 : 0.74))
         .padding(.horizontal, 8)
@@ -369,7 +369,7 @@ struct PromptRewriteNowNextCard: View {
 
             PromptRewriteWordFlowText(
                 text: text,
-                font: .system(size: 12.5, weight: .semibold, design: .rounded),
+                font: .system(size: 12.5, weight: .semibold),
                 foregroundColor: Color.white.opacity(0.96),
                 wordsPerSecond: wordsPerSecond,
                 lineLimit: 2
@@ -416,7 +416,7 @@ struct PromptRewriteLoadingBlock: View {
 
             PromptRewriteWordFlowText(
                 text: text,
-                font: .system(size: 12.5, weight: .semibold, design: .rounded),
+                font: .system(size: 12.5, weight: .semibold),
                 foregroundColor: Color.white.opacity(0.96),
                 wordsPerSecond: wordsPerSecond,
                 lineLimit: lineLimit
@@ -446,7 +446,7 @@ struct PromptRewriteLoadingStatePill: View {
                 .fill(isActive ? AppVisualTheme.accentTint : Color.white.opacity(0.52))
                 .frame(width: 6, height: 6)
             Text(title)
-                .font(.system(size: 10.5, weight: .bold, design: .rounded))
+                .font(.system(size: 10.5, weight: .bold))
         }
         .foregroundStyle(Color.white.opacity(isActive ? 0.94 : 0.72))
         .padding(.horizontal, 9)
@@ -590,7 +590,7 @@ struct PromptRewriteHUDView: View {
                 )
                 VStack(alignment: .leading, spacing: 2) {
                     Text("AI suggestion")
-                        .font(.system(size: 12, weight: .semibold, design: .rounded))
+                        .font(.system(size: 12, weight: .semibold))
                         .foregroundStyle(Color.white.opacity(0.95))
                     if pages.count > 1 {
                         Text("\(safeSelectedIndex + 1)/\(pages.count) queued")
@@ -617,7 +617,7 @@ struct PromptRewriteHUDView: View {
             VStack(alignment: .leading, spacing: 8) {
                 ScrollView(.vertical, showsIndicators: false) {
                     Text(page.suggestion.suggestedText)
-                        .font(.system(size: 13, weight: .medium, design: .rounded))
+                        .font(.system(size: 13, weight: .medium))
                         .foregroundStyle(Color.white.opacity(0.90))
                         .multilineTextAlignment(.leading)
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -636,7 +636,7 @@ struct PromptRewriteHUDView: View {
                         onChoice(.useSuggested)
                     }
                     .buttonStyle(.plain)
-                    .font(.system(size: 12, weight: .semibold, design: .rounded))
+                    .font(.system(size: 12, weight: .semibold))
                     .padding(.horizontal, 16)
                     .padding(.vertical, 7)
                     .background(

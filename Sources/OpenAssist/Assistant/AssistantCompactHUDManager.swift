@@ -501,6 +501,14 @@ final class AssistantCompactHUDManager: AssistantCompactPresenter {
         }
     }
 
+    func prepareVoiceCaptureComposer() {
+        guard isEnabled else { return }
+        if panel == nil { createPanel() }
+        NSApp.activate(ignoringOtherApps: true)
+        _ = model.presentCompactComposerIfAvailable()
+        panel?.orderFrontRegardless()
+    }
+
     func show(state: AssistantHUDState) {
         guard isEnabled else { return }
         if panel == nil { createPanel() }

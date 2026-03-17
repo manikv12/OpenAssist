@@ -376,6 +376,7 @@ final class AssistantOrbHUDModelTests: XCTestCase {
         let model = AssistantOrbHUDModel()
 
         model.messageText = "Please plan this before coding."
+        model.flushModeSwitchSuggestion()
 
         XCTAssertEqual(model.modeSwitchSuggestion?.source, .draft)
         XCTAssertEqual(model.modeSwitchSuggestion?.choices.map(\.mode), [.plan])

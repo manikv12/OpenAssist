@@ -7,6 +7,7 @@ protocol AssistantCompactPresenter: AnyObject {
 
     func setPresentationStyle(_ style: AssistantCompactPresentationStyle)
     func setPreferredScreen(_ screen: NSScreen?)
+    func prepareVoiceCaptureComposer()
     func showFollowUp(for session: AssistantSessionSummary)
     func update(state: AssistantHUDState)
     func updateLevel(_ level: Float)

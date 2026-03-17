@@ -29,7 +29,7 @@ enum AssistantLiveVoiceSessionSurface: String, Codable, Sendable {
 struct AssistantLiveVoiceSessionSnapshot: Equatable, Sendable {
     var phase: AssistantLiveVoiceSessionPhase = .idle
     var surface: AssistantLiveVoiceSessionSurface = .mainWindow
-    var interactionMode: AssistantInteractionMode = .conversational
+    var interactionMode: AssistantInteractionMode = .agentic
     var isHandsFreeLoopEnabled = false
     var sessionID: String?
     var lastTranscript: String?
@@ -172,7 +172,7 @@ final class AssistantLiveVoiceCoordinator: AssistantLiveVoiceSessionControlling 
             snapshot = AssistantLiveVoiceSessionSnapshot(
                 phase: .idle,
                 surface: surface,
-                interactionMode: .conversational,
+                interactionMode: .agentic,
                 isHandsFreeLoopEnabled: false,
                 sessionID: store.selectedSessionID,
                 lastTranscript: nil,
@@ -185,11 +185,11 @@ final class AssistantLiveVoiceCoordinator: AssistantLiveVoiceSessionControlling 
         }
 
         store.stopAssistantVoicePlayback()
-        store.interactionMode = .conversational
+        store.interactionMode = .agentic
         snapshot = AssistantLiveVoiceSessionSnapshot(
             phase: .paused,
             surface: surface,
-            interactionMode: .conversational,
+            interactionMode: .agentic,
             isHandsFreeLoopEnabled: true,
             sessionID: store.selectedSessionID,
             lastTranscript: nil,

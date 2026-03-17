@@ -206,7 +206,7 @@ struct AssistantOrbHUDView: View {
                         .frame(width: 5, height: 5)
 
                     Text(phaseLabel)
-                        .font(.system(size: 9, weight: .semibold, design: .rounded))
+                        .font(.system(size: 9, weight: .semibold))
                         .tracking(0.9)
                         .textCase(.uppercase)
                         .foregroundStyle(.white.opacity(0.94))
@@ -215,7 +215,7 @@ struct AssistantOrbHUDView: View {
 
                 if let detail = model.state.detail, !detail.isEmpty, !model.showDoneDetail, !model.showWorkingDetail {
                     Text(detail)
-                        .font(.system(size: 9.5, weight: .medium, design: .rounded))
+                        .font(.system(size: 9.5, weight: .medium))
                         .foregroundStyle(.white.opacity(0.72))
                         .lineLimit(2)
                         .truncationMode(model.state.phase == .success ? .tail : .middle)
@@ -318,7 +318,7 @@ struct AssistantOrbHUDView: View {
 
                 HStack(spacing: 8) {
                     Text("Close this card to return the orb to its ready state.")
-                        .font(.system(size: 10.5, weight: .medium, design: .rounded))
+                        .font(.system(size: 10.5, weight: .medium))
                         .foregroundStyle(.white.opacity(0.60))
                         .fixedSize(horizontal: false, vertical: true)
 
@@ -381,7 +381,7 @@ struct AssistantOrbHUDView: View {
     private func modeSwitchInlineCard(_ suggestion: AssistantModeSwitchSuggestion, tint: Color) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             Text(suggestion.message)
-                .font(.system(size: 11.5, weight: .medium, design: .rounded))
+                .font(.system(size: 11.5, weight: .medium))
                 .foregroundStyle(.white.opacity(0.72))
                 .fixedSize(horizontal: false, vertical: true)
 
@@ -425,12 +425,12 @@ struct AssistantOrbHUDView: View {
             ScrollView(.vertical, showsIndicators: true) {
                 VStack(alignment: .leading, spacing: 12) {
                     Text(model.state.title)
-                        .font(.system(size: 14, weight: .semibold, design: .rounded))
+                        .font(.system(size: 14, weight: .semibold))
                         .foregroundStyle(.white.opacity(0.94))
 
                     if let summary = model.workingSummaryText, !summary.isEmpty {
                         Text(summary)
-                            .font(.system(size: 11.5, weight: .medium, design: .rounded))
+                            .font(.system(size: 11.5, weight: .medium))
                             .foregroundStyle(.white.opacity(0.72))
                             .fixedSize(horizontal: false, vertical: true)
                     }
@@ -444,13 +444,13 @@ struct AssistantOrbHUDView: View {
                     if let session = model.activeSessionSummary {
                         VStack(alignment: .leading, spacing: 6) {
                             Text("Active session")
-                                .font(.system(size: 9.5, weight: .semibold, design: .rounded))
+                                .font(.system(size: 9.5, weight: .semibold))
                                 .tracking(0.6)
                                 .textCase(.uppercase)
                                 .foregroundStyle(tint.opacity(0.92))
 
                             Text(session.title.isEmpty ? "Untitled Session" : session.title)
-                                .font(.system(size: 11.5, weight: .semibold, design: .rounded))
+                                .font(.system(size: 11.5, weight: .semibold))
                                 .foregroundStyle(.white.opacity(0.90))
                             if let cwd = session.cwd?.nonEmpty {
                                 Text(cwd)
@@ -467,7 +467,7 @@ struct AssistantOrbHUDView: View {
                     if !model.workingToolActivity.isEmpty {
                         VStack(alignment: .leading, spacing: 8) {
                             Text("Live steps")
-                                .font(.system(size: 10.5, weight: .semibold, design: .rounded))
+                                .font(.system(size: 10.5, weight: .semibold))
                                 .foregroundStyle(.white.opacity(0.52))
 
                             ForEach(Array(model.workingToolActivity.prefix(4))) { item in
@@ -476,7 +476,7 @@ struct AssistantOrbHUDView: View {
                         }
                     } else {
                         Text("Detailed step output has not arrived yet, but the agent is still working.")
-                            .font(.system(size: 10.5, weight: .medium, design: .rounded))
+                            .font(.system(size: 10.5, weight: .medium))
                             .foregroundStyle(.white.opacity(0.48))
                     }
                 }
@@ -503,7 +503,7 @@ struct AssistantOrbHUDView: View {
                         .font(.system(size: 10, weight: .semibold))
                         .foregroundStyle(tint.opacity(0.85))
                     Text("Typing here interrupts the current turn and applies your new instruction.")
-                        .font(.system(size: 10.5, weight: .medium, design: .rounded))
+                        .font(.system(size: 10.5, weight: .medium))
                         .foregroundStyle(.white.opacity(0.58))
                         .fixedSize(horizontal: false, vertical: true)
                     Spacer(minLength: 0)
@@ -530,7 +530,7 @@ struct AssistantOrbHUDView: View {
         if !images.isEmpty {
             VStack(alignment: .leading, spacing: 8) {
                 Text(title)
-                    .font(.system(size: 9.5, weight: .semibold, design: .rounded))
+                    .font(.system(size: 9.5, weight: .semibold))
                     .tracking(0.5)
                     .textCase(.uppercase)
                     .foregroundStyle(.white.opacity(0.48))
@@ -584,12 +584,12 @@ struct AssistantOrbHUDView: View {
                 ScrollView(.vertical, showsIndicators: true) {
                     VStack(alignment: .leading, spacing: 12) {
                         Text(request.toolTitle)
-                            .font(.system(size: 14, weight: .semibold, design: .rounded))
+                            .font(.system(size: 14, weight: .semibold))
                             .foregroundStyle(.white.opacity(0.94))
 
                         if let rationale = request.rationale, !rationale.isEmpty {
                             Text(rationale)
-                                .font(.system(size: 11.5, weight: .medium, design: .rounded))
+                                .font(.system(size: 11.5, weight: .medium))
                                 .foregroundStyle(.white.opacity(0.70))
                                 .fixedSize(horizontal: false, vertical: true)
                         }
@@ -689,7 +689,7 @@ struct AssistantOrbHUDView: View {
                             .foregroundStyle(AppVisualTheme.accentTint)
                     }
                     Text("New Session")
-                        .font(.system(size: 12, weight: .semibold, design: .rounded))
+                        .font(.system(size: 12, weight: .semibold))
                     Spacer()
                     Image(systemName: "arrow.right")
                         .font(.system(size: 10, weight: .semibold))
@@ -728,7 +728,7 @@ struct AssistantOrbHUDView: View {
                     .padding(.vertical, 20)
             } else if model.sessions.isEmpty {
                 Text("No sessions yet")
-                    .font(.system(size: 11, weight: .medium, design: .rounded))
+                    .font(.system(size: 11, weight: .medium))
                     .foregroundStyle(.white.opacity(0.35))
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 20)
@@ -905,11 +905,11 @@ struct AssistantOrbHUDView: View {
                 )
                 if showsLabel {
                     Text("Model")
-                        .font(.system(size: 8.8, weight: .semibold, design: .rounded))
+                        .font(.system(size: 8.8, weight: .semibold))
                         .foregroundStyle(.white.opacity(0.62))
                 }
                 Text(model.selectedModelSummary)
-                    .font(.system(size: showsLabel ? 9.2 : 8.6, weight: .medium, design: .rounded))
+                    .font(.system(size: showsLabel ? 9.2 : 8.6, weight: .medium))
                     .foregroundStyle(.white.opacity(showsLabel ? 0.68 : 0.50))
                     .lineLimit(1)
                     .truncationMode(.tail)
@@ -948,7 +948,7 @@ struct AssistantOrbHUDView: View {
             Text("To: \(name)")
                 .lineLimit(1)
         }
-        .font(.system(size: 8.8, weight: .medium, design: .rounded))
+        .font(.system(size: 8.8, weight: .medium))
         .foregroundStyle(.white.opacity(0.54))
         .padding(.horizontal, 8)
         .padding(.vertical, 4)
@@ -959,15 +959,6 @@ struct AssistantOrbHUDView: View {
                     Capsule(style: .continuous)
                         .stroke(Color.white.opacity(0.05), lineWidth: 0.5)
                 )
-        )
-    }
-
-    private func orbVoiceToggleButton(size: CGFloat = 24) -> some View {
-        AssistantLiveVoiceButton(
-            snapshot: model.liveVoiceSnapshot,
-            level: CGFloat(model.level),
-            size: size,
-            onTap: handleLiveVoiceButtonTap
         )
     }
 
@@ -1005,6 +996,15 @@ struct AssistantOrbHUDView: View {
         } else {
             model.onStartLiveVoiceSession?()
         }
+    }
+
+    private func orbVoiceToggleButton(size: CGFloat = 24) -> some View {
+        AssistantLiveVoiceButton(
+            snapshot: model.liveVoiceSnapshot,
+            level: CGFloat(model.level),
+            size: size,
+            onTap: handleLiveVoiceButtonTap
+        )
     }
 
     private func handleOrbTap() {
@@ -1100,7 +1100,7 @@ struct AssistantOrbHUDView: View {
 
             HStack(spacing: 8) {
                 Text(liveVoiceHintText)
-                    .font(.system(size: 10, weight: .medium, design: .rounded))
+                    .font(.system(size: 10, weight: .medium))
                     .foregroundStyle(.white.opacity(0.52))
                 Spacer(minLength: 0)
                 orbVoiceToggleButton(size: 22)
@@ -1152,7 +1152,7 @@ struct AssistantOrbHUDView: View {
             }
 
             Text(attachment.filename)
-                .font(.system(size: 10, weight: .medium, design: .rounded))
+                .font(.system(size: 10, weight: .medium))
                 .foregroundStyle(.white.opacity(0.70))
                 .lineLimit(1)
 
@@ -1605,12 +1605,12 @@ struct AssistantNotchHUDView: View {
 
                 VStack(alignment: .leading, spacing: 1) {
                     Text(collapsedTitle)
-                        .font(.system(size: 11.5, weight: .semibold, design: .rounded))
+                        .font(.system(size: 11.5, weight: .semibold))
                         .foregroundStyle(.white.opacity(0.92))
                         .lineLimit(1)
 
                     Text(liveSummary)
-                        .font(.system(size: 10, weight: .medium, design: .rounded))
+                        .font(.system(size: 10, weight: .medium))
                         .foregroundStyle(.white.opacity(0.56))
                         .lineLimit(1)
                 }
@@ -1622,16 +1622,16 @@ struct AssistantNotchHUDView: View {
                 } else {
                     HStack(spacing: 8) {
                         Text(livePhaseLabel)
-                            .font(.system(size: 9, weight: .semibold, design: .rounded))
-                            .foregroundStyle(collapsedBadgeTint.opacity(0.95))
-                            .padding(.horizontal, 9)
-                            .padding(.vertical, 5)
+                            .font(.system(size: 9, weight: .semibold))
+                            .foregroundStyle(collapsedBadgeTint.opacity(0.90))
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
                             .background(
                                 Capsule(style: .continuous)
                                     .fill(collapsedBadgeTint.opacity(0.10))
                                     .overlay(
                                         Capsule(style: .continuous)
-                                            .stroke(collapsedBadgeTint.opacity(0.22), lineWidth: 0.7)
+                                            .stroke(collapsedBadgeTint.opacity(0.14), lineWidth: 0.5)
                                     )
                             )
 
@@ -1662,34 +1662,12 @@ struct AssistantNotchHUDView: View {
             .frame(width: collapsedPillWidth, height: Layout.collapsedSize.height)
             .background(
                 Capsule(style: .continuous)
-                    .fill(
-                        LinearGradient(
-                            colors: [
-                                Color.black.opacity(0.84),
-                                Color(red: 0.030, green: 0.034, blue: 0.052).opacity(0.78)
-                            ],
-                            startPoint: .top,
-                            endPoint: .bottom
-                        )
-                    )
+                    .fill(Color(red: 0.045, green: 0.048, blue: 0.062).opacity(0.98))
                     .overlay(
                         Capsule(style: .continuous)
-                            .fill(AppVisualTheme.adaptiveMaterialFill())
-                            .opacity(0.22)
-                    )
-                    .overlay(
-                        Capsule(style: .continuous)
-                            .stroke(Color.white.opacity(0.15), lineWidth: 0.7)
+                            .stroke(Color.white.opacity(0.08), lineWidth: 0.5)
                     )
             )
-            .overlay(alignment: .bottomLeading) {
-                Capsule(style: .continuous)
-                    .fill(collapsedBadgeTint.opacity(reduceMotion ? 0.45 : 0.70))
-                    .frame(width: 64, height: 3)
-                    .blur(radius: reduceMotion ? 0 : 4)
-                    .padding(.leading, 18)
-                    .padding(.bottom, 6)
-            }
         }
         .buttonStyle(.plain)
         .help(isTrayExpanded ? "Collapse assistant tray" : "Show compact assistant details")
@@ -1729,7 +1707,7 @@ struct AssistantNotchHUDView: View {
                     .foregroundStyle(model.state.phase == .failed ? Color.orange : glowColor)
 
                 Text(model.state.phase == .failed ? "Needs attention" : "Response ready")
-                    .font(.system(size: 11.5, weight: .semibold, design: .rounded))
+                    .font(.system(size: 11.5, weight: .semibold))
                     .foregroundStyle(.white.opacity(0.92))
                     .fixedSize(horizontal: true, vertical: false)
 
@@ -1799,7 +1777,7 @@ struct AssistantNotchHUDView: View {
                     .foregroundStyle(glowColor)
 
                 Text("Live work")
-                    .font(.system(size: 11.5, weight: .semibold, design: .rounded))
+                    .font(.system(size: 11.5, weight: .semibold))
                     .foregroundStyle(.white.opacity(0.92))
 
                 Spacer(minLength: 0)
@@ -1843,12 +1821,12 @@ struct AssistantNotchHUDView: View {
                 VStack(alignment: .leading, spacing: 12) {
                     VStack(alignment: .leading, spacing: 6) {
                         Text(model.state.title.isEmpty ? "Assistant" : model.state.title)
-                            .font(.system(size: 13.5, weight: .semibold, design: .rounded))
+                            .font(.system(size: 13.5, weight: .semibold))
                             .foregroundStyle(.white.opacity(0.94))
 
                         if let summary = model.workingSummaryText?.nonEmpty {
                             Text(summary)
-                                .font(.system(size: 11, weight: .medium, design: .rounded))
+                                .font(.system(size: 11, weight: .medium))
                                 .foregroundStyle(.white.opacity(0.70))
                                 .fixedSize(horizontal: false, vertical: true)
                         }
@@ -1863,13 +1841,13 @@ struct AssistantNotchHUDView: View {
                     if let session = model.activeSessionSummary {
                         VStack(alignment: .leading, spacing: 6) {
                             Text("Active session")
-                                .font(.system(size: 9.5, weight: .semibold, design: .rounded))
+                                .font(.system(size: 9.5, weight: .semibold))
                                 .tracking(0.5)
                                 .textCase(.uppercase)
                                 .foregroundStyle(glowColor.opacity(0.92))
 
                             Text(session.title.isEmpty ? "Untitled Session" : session.title)
-                                .font(.system(size: 11.5, weight: .semibold, design: .rounded))
+                                .font(.system(size: 11.5, weight: .semibold))
                                 .foregroundStyle(.white.opacity(0.90))
 
                             if let cwd = session.cwd?.nonEmpty {
@@ -1892,7 +1870,7 @@ struct AssistantNotchHUDView: View {
                         }
                     } else {
                         Text("Detailed step output has not arrived yet, but the assistant is still working.")
-                            .font(.system(size: 10.5, weight: .medium, design: .rounded))
+                            .font(.system(size: 10.5, weight: .medium))
                             .foregroundStyle(.white.opacity(0.52))
                     }
                 }
@@ -1921,7 +1899,7 @@ struct AssistantNotchHUDView: View {
                     .foregroundStyle(AppVisualTheme.accentTint)
 
                 Text("Follow up")
-                    .font(.system(size: 11.5, weight: .semibold, design: .rounded))
+                    .font(.system(size: 11.5, weight: .semibold))
                     .foregroundStyle(.white.opacity(0.92))
                     .fixedSize(horizontal: true, vertical: false)
 
@@ -1978,7 +1956,7 @@ struct AssistantNotchHUDView: View {
                     .foregroundStyle(Color.orange)
 
                 Text("Mode switch")
-                    .font(.system(size: 11.5, weight: .semibold, design: .rounded))
+                    .font(.system(size: 11.5, weight: .semibold))
                     .foregroundStyle(.white.opacity(0.92))
                     .fixedSize(horizontal: true, vertical: false)
 
@@ -2027,7 +2005,7 @@ struct AssistantNotchHUDView: View {
                     .foregroundStyle(Color.orange)
 
                 Text("Approval needed")
-                    .font(.system(size: 11.5, weight: .semibold, design: .rounded))
+                    .font(.system(size: 11.5, weight: .semibold))
                     .foregroundStyle(.white.opacity(0.92))
                     .fixedSize(horizontal: true, vertical: false)
 
@@ -2061,12 +2039,12 @@ struct AssistantNotchHUDView: View {
             ScrollView(.vertical, showsIndicators: true) {
                 VStack(alignment: .leading, spacing: 12) {
                     Text(request.toolTitle)
-                        .font(.system(size: 13.5, weight: .semibold, design: .rounded))
+                        .font(.system(size: 13.5, weight: .semibold))
                         .foregroundStyle(.white.opacity(0.94))
 
                     if let rationale = request.rationale?.nonEmpty {
                         Text(rationale)
-                            .font(.system(size: 11, weight: .medium, design: .rounded))
+                            .font(.system(size: 11, weight: .medium))
                             .foregroundStyle(.white.opacity(0.70))
                             .fixedSize(horizontal: false, vertical: true)
                     }
@@ -2169,7 +2147,7 @@ struct AssistantNotchHUDView: View {
 
             HStack(spacing: 8) {
                 Text(model.isLiveVoiceActive ? liveVoiceHintText : helperText)
-                    .font(.system(size: 10, weight: .medium, design: .rounded))
+                    .font(.system(size: 10, weight: .medium))
                     .foregroundStyle(.white.opacity(0.54))
 
                 Spacer(minLength: 0)
@@ -2191,7 +2169,7 @@ struct AssistantNotchHUDView: View {
     private func compactModeSwitchInlineCard(_ suggestion: AssistantModeSwitchSuggestion) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             Text(suggestion.message)
-                .font(.system(size: 10.5, weight: .medium, design: .rounded))
+                .font(.system(size: 10.5, weight: .medium))
                 .foregroundStyle(.white.opacity(0.70))
                 .fixedSize(horizontal: false, vertical: true)
 
@@ -2215,29 +2193,28 @@ struct AssistantNotchHUDView: View {
 
     private var notchStatusBadge: some View {
         ZStack {
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .fill(Color.white.opacity(0.05))
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(collapsedBadgeTint.opacity(0.12))
                 .overlay(
-                    RoundedRectangle(cornerRadius: 12, style: .continuous)
-                        .stroke(collapsedBadgeTint.opacity(0.20), lineWidth: 0.8)
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .stroke(collapsedBadgeTint.opacity(0.16), lineWidth: 0.5)
                 )
 
             if model.state.phase == .listening && !reduceMotion {
                 HStack(spacing: 3) {
                     ForEach(0..<3, id: \.self) { index in
                         Capsule(style: .continuous)
-                            .fill(collapsedBadgeTint.opacity(0.88))
-                            .frame(width: 3, height: 8 + (CGFloat(index) * 4) + CGFloat(model.level * 10))
+                            .fill(collapsedBadgeTint.opacity(0.82))
+                            .frame(width: 2.5, height: 8 + (CGFloat(index) * 3) + CGFloat(model.level * 8))
                     }
                 }
             } else {
                 Image(systemName: collapsedStatusSymbol)
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(collapsedBadgeTint.opacity(0.94))
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(collapsedBadgeTint.opacity(0.90))
             }
         }
-        .frame(width: 34, height: 34)
-        .shadow(color: collapsedBadgeTint.opacity(0.18), radius: reduceMotion ? 0 : 10, y: 0)
+        .frame(width: 30, height: 30)
     }
 
     private var sessionsColumn: some View {
@@ -2259,7 +2236,7 @@ struct AssistantNotchHUDView: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
             } else if model.sessions.isEmpty {
                 Text("No sessions yet")
-                    .font(.system(size: 11, weight: .medium, design: .rounded))
+                    .font(.system(size: 11, weight: .medium))
                     .foregroundStyle(.white.opacity(0.42))
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
             } else {
@@ -2302,7 +2279,7 @@ struct AssistantNotchHUDView: View {
                         .font(.system(size: 10, weight: .semibold))
                         .foregroundStyle(AppVisualTheme.accentTint)
                     Text(session.title.isEmpty ? "Untitled Session" : session.title)
-                        .font(.system(size: 10.5, weight: .medium, design: .rounded))
+                        .font(.system(size: 10.5, weight: .medium))
                         .foregroundStyle(.white.opacity(0.62))
                         .lineLimit(1)
                 }
@@ -2333,16 +2310,16 @@ struct AssistantNotchHUDView: View {
                         .fill(glowColor.opacity(0.95))
                         .frame(width: 8, height: 8)
                     Text(model.state.title.isEmpty ? "Assistant" : model.state.title)
-                        .font(.system(size: 13, weight: .semibold, design: .rounded))
+                        .font(.system(size: 13, weight: .semibold))
                         .foregroundStyle(.white.opacity(0.92))
                     Spacer(minLength: 0)
                     Text(livePhaseLabel)
-                        .font(.system(size: 10, weight: .semibold, design: .rounded))
+                        .font(.system(size: 10, weight: .semibold))
                         .foregroundStyle(.white.opacity(0.54))
                 }
 
                 Text(liveSummary)
-                    .font(.system(size: 11.5, weight: .medium, design: .rounded))
+                    .font(.system(size: 11.5, weight: .medium))
                     .foregroundStyle(.white.opacity(0.68))
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -2381,7 +2358,7 @@ struct AssistantNotchHUDView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
             } else {
                 Text(idleActivityMessage)
-                    .font(.system(size: 11, weight: .medium, design: .rounded))
+                    .font(.system(size: 11, weight: .medium))
                     .foregroundStyle(.white.opacity(0.46))
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
             }
@@ -2406,7 +2383,7 @@ struct AssistantNotchHUDView: View {
             if let suggestion = model.modeSwitchSuggestion {
                 VStack(alignment: .leading, spacing: 8) {
                     Text(suggestion.message)
-                        .font(.system(size: 10.5, weight: .medium, design: .rounded))
+                        .font(.system(size: 10.5, weight: .medium))
                         .foregroundStyle(.white.opacity(0.66))
                         .fixedSize(horizontal: false, vertical: true)
 
@@ -2492,10 +2469,10 @@ struct AssistantNotchHUDView: View {
 
             VStack(alignment: .leading, spacing: 1) {
                 Text(title)
-                    .font(.system(size: 10.5, weight: .semibold, design: .rounded))
+                    .font(.system(size: 10.5, weight: .semibold))
                     .foregroundStyle(.white.opacity(0.90))
                 Text(subtitle)
-                    .font(.system(size: 9.5, weight: .medium, design: .rounded))
+                    .font(.system(size: 9.5, weight: .medium))
                     .foregroundStyle(.white.opacity(0.46))
             }
 
@@ -2508,12 +2485,12 @@ struct AssistantNotchHUDView: View {
     private func permissionCard(_ request: AssistantPermissionRequest) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             Text(request.toolTitle)
-                .font(.system(size: 12.5, weight: .semibold, design: .rounded))
+                .font(.system(size: 12.5, weight: .semibold))
                 .foregroundStyle(.white.opacity(0.92))
 
             if let rationale = request.rationale?.nonEmpty {
                 Text(rationale)
-                    .font(.system(size: 10.5, weight: .medium, design: .rounded))
+                    .font(.system(size: 10.5, weight: .medium))
                     .foregroundStyle(.white.opacity(0.66))
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -2539,7 +2516,7 @@ struct AssistantNotchHUDView: View {
             Image(systemName: "arrow.turn.right.down")
                 .font(.system(size: 8, weight: .bold))
             Text("To: \(name)")
-                .font(.system(size: 9.5, weight: .medium, design: .rounded))
+                .font(.system(size: 9.5, weight: .medium))
                 .lineLimit(1)
         }
         .foregroundStyle(.white.opacity(0.58))
@@ -2575,7 +2552,7 @@ struct AssistantNotchHUDView: View {
                     symbolScale: 0.48
                 )
                 Text(model.selectedModelSummary)
-                    .font(.system(size: 9.5, weight: .medium, design: .rounded))
+                    .font(.system(size: 9.5, weight: .medium))
                     .foregroundStyle(.white.opacity(0.60))
                     .lineLimit(1)
                 Image(systemName: "chevron.down")
@@ -2636,7 +2613,7 @@ struct AssistantNotchHUDView: View {
 
             HStack(spacing: 8) {
                 Text(liveVoiceHintText)
-                    .font(.system(size: 10, weight: .medium, design: .rounded))
+                    .font(.system(size: 10, weight: .medium))
                     .foregroundStyle(.white.opacity(0.52))
                 Spacer(minLength: 0)
                 notchVoiceToggleButton(size: 26)
@@ -2687,7 +2664,7 @@ struct AssistantNotchHUDView: View {
                         }
 
                         Text(attachment.filename)
-                            .font(.system(size: 10, weight: .medium, design: .rounded))
+                            .font(.system(size: 10, weight: .medium))
                             .foregroundStyle(.white.opacity(0.70))
                             .lineLimit(1)
 
@@ -2774,7 +2751,7 @@ struct AssistantNotchHUDView: View {
         if !images.isEmpty {
             VStack(alignment: .leading, spacing: 8) {
                 Text(title)
-                    .font(.system(size: 9.5, weight: .semibold, design: .rounded))
+                    .font(.system(size: 9.5, weight: .semibold))
                     .tracking(0.5)
                     .textCase(.uppercase)
                     .foregroundStyle(.white.opacity(0.48))

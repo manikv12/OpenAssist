@@ -3,20 +3,20 @@ import SwiftUI
 extension AssistantInteractionMode {
     @MainActor
     var displayTint: Color {
-        switch self {
-        case .conversational:
-            return .blue
+        switch normalizedForActiveUse {
         case .plan:
             return .orange
         case .agentic:
+            return AppVisualTheme.accentTint
+        case .conversational:
             return AppVisualTheme.accentTint
         }
     }
 
     var nextMode: AssistantInteractionMode {
         let allModes = Self.allCases
-        guard let currentIndex = allModes.firstIndex(of: self) else {
-            return .conversational
+        guard let currentIndex = allModes.firstIndex(of: normalizedForActiveUse) else {
+            return .agentic
         }
         let nextIndex = allModes.index(after: currentIndex)
         return nextIndex == allModes.endIndex ? allModes[allModes.startIndex] : allModes[nextIndex]

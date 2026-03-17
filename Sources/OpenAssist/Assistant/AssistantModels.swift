@@ -511,7 +511,7 @@ struct AssistantSessionSummary: Identifiable, Equatable, Codable, Sendable {
 }
 
 /// The interaction mode for the assistant session.
-/// - `conversational`: Chat-only mode with no execution and no structured planning flow.
+/// - `conversational`: Legacy chat-only mode kept only for backward compatibility with saved sessions.
 /// - `plan`: Planning mode that proposes a plan without executing work.
 /// - `agentic`: The agent has full tool access to execute work (Codex Default mode).
 enum AssistantInteractionMode: String, CaseIterable, Codable, Sendable {
@@ -519,27 +519,38 @@ enum AssistantInteractionMode: String, CaseIterable, Codable, Sendable {
     case plan
     case agentic
 
-    var label: String {
+    static let allCases: [AssistantInteractionMode] = [.plan, .agentic]
+
+    var normalizedForActiveUse: AssistantInteractionMode {
         switch self {
-        case .conversational: return "Chat"
+        case .conversational:
+            return .agentic
+        case .plan, .agentic:
+            return self
+        }
+    }
+
+    var label: String {
+        switch normalizedForActiveUse {
         case .plan: return "Plan"
         case .agentic: return "Agentic"
+        case .conversational: return "Agentic"
         }
     }
 
     var icon: String {
-        switch self {
-        case .conversational: return "bubble.left.and.bubble.right.fill"
+        switch normalizedForActiveUse {
         case .plan: return "checklist"
         case .agentic: return AssistantChromeSymbol.action
+        case .conversational: return AssistantChromeSymbol.action
         }
     }
 
     var hint: String {
-        switch self {
-        case .conversational: return "Inspect files and search, but do not make changes"
+        switch normalizedForActiveUse {
         case .plan: return "Use Codex plan mode and ask for approval when execution is needed"
         case .agentic: return "Full tool access to inspect and make changes"
+        case .conversational: return "Full tool access to inspect and make changes"
         }
     }
 
@@ -888,8 +899,13 @@ final class AssistantStore: ObservableObject {
             }
         }
     }
-    @Published var interactionMode: AssistantInteractionMode = .conversational {
+    @Published var interactionMode: AssistantInteractionMode = .agentic {
         didSet {
+            let normalizedMode = interactionMode.normalizedForActiveUse
+            if interactionMode != normalizedMode {
+                interactionMode = normalizedMode
+                return
+            }
             refreshModeSwitchSuggestion()
             guard oldValue != interactionMode else { return }
             guard !isRestoringSessionConfiguration else { return }
@@ -1187,7 +1203,7 @@ final class AssistantStore: ObservableObject {
         guard selectedModel.hasKnownInputModalities else { return nil }
         guard !selectedModel.supportsImageInput else { return nil }
 
-        return "The selected model \(selectedModel.displayName) cannot read image attachments. Choose a model that supports image input and try again. Chat mode can still analyze attached images when the model supports them, but live screen or browser inspection needs Agentic mode."
+        return "The selected model \(selectedModel.displayName) cannot read image attachments. Choose a model that supports image input and try again. Attached images can still be analyzed directly when the model supports them, but live screen or browser inspection needs Agentic mode."
     }
 
     var isRuntimeReadyForConversation: Bool {
@@ -3313,7 +3329,7 @@ final class AssistantStore: ObservableObject {
 
         return ResolvedSessionConfiguration(
             modelID: resolvedModelID,
-            interactionMode: session?.latestInteractionMode ?? .conversational,
+            interactionMode: (session?.latestInteractionMode ?? .agentic).normalizedForActiveUse,
             reasoningEffort: session?.latestReasoningEffort ?? .high,
             fastModeEnabled: session?.fastModeEnabled ?? false
         )

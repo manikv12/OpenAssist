@@ -14,7 +14,7 @@ enum AppVisualTheme {
     static var historyTint: Color { palette.historyTint }
     static var aiStudioTint: Color { palette.aiStudioTint }
     static var settingsTint: Color { palette.settingsTint }
-    static let mutedText = Color.white.opacity(0.68)
+    static let mutedText = Color.white.opacity(0.58)
 
     static func glassTokens(style: AppChromeStyle, reduceTransparency: Bool) -> AppGlassTokens {
         let materialEnabled = !reduceTransparency
@@ -105,34 +105,20 @@ struct AssistantGlyphBadge: View {
     var symbolWeight: Font.Weight = .semibold
 
     var body: some View {
-        let radius = cornerRadius ?? max(6, side * 0.34)
+        let radius = cornerRadius ?? max(5, side * 0.30)
         let shape = RoundedRectangle(cornerRadius: radius, style: .continuous)
 
         shape
-            .fill(
-                LinearGradient(
-                    colors: [
-                        Color.white.opacity(fillOpacity * 0.95),
-                        tint.opacity(fillOpacity * 0.78),
-                        Color.black.opacity(0.08)
-                    ],
-                    startPoint: .topLeading,
-                    endPoint: .bottomTrailing
-                )
-            )
+            .fill(tint.opacity(fillOpacity * 0.75))
             .overlay {
                 shape
-                    .stroke(Color.white.opacity(0.10), lineWidth: 0.55)
-                    .overlay(
-                        shape
-                            .stroke(tint.opacity(strokeOpacity), lineWidth: 0.65)
-                    )
+                    .stroke(tint.opacity(strokeOpacity * 0.6), lineWidth: 0.5)
             }
             .overlay {
                 Image(systemName: symbol)
                     .font(.system(size: max(8.5, side * symbolScale), weight: symbolWeight))
                     .symbolRenderingMode(.hierarchical)
-                    .foregroundStyle(tint.opacity(0.96))
+                    .foregroundStyle(tint.opacity(0.94))
             }
             .frame(width: side, height: side)
     }
@@ -148,22 +134,12 @@ struct AssistantToolbarCircleButtonLabel: View {
     var body: some View {
         ZStack {
             Circle()
-                .fill(
-                    LinearGradient(
-                        colors: emphasized
-                            ? [tint.opacity(0.34), tint.opacity(0.18)]
-                            : [Color.white.opacity(0.15), Color.white.opacity(0.08)],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    )
-                )
+                .fill(emphasized ? tint.opacity(0.18) : Color.white.opacity(0.06))
                 .overlay(
                     Circle()
                         .stroke(
-                            emphasized
-                                ? tint.opacity(0.26)
-                                : Color.white.opacity(0.12),
-                            lineWidth: 0.6
+                            emphasized ? tint.opacity(0.16) : Color.white.opacity(0.08),
+                            lineWidth: 0.5
                         )
                 )
 
@@ -172,8 +148,8 @@ struct AssistantToolbarCircleButtonLabel: View {
                 .symbolRenderingMode(.hierarchical)
                 .foregroundStyle(
                     isEnabled
-                        ? (emphasized ? Color.white.opacity(0.98) : tint.opacity(0.92))
-                        : Color.white.opacity(0.34)
+                        ? (emphasized ? Color.white.opacity(0.95) : tint.opacity(0.85))
+                        : Color.white.opacity(0.30)
                 )
         }
         .frame(width: size, height: size)
@@ -345,7 +321,7 @@ struct AppSplitChromeBackground: View {
             let leadingWidth = min(maxAllowedWidth, max(180, preferredWidth))
 
             ZStack {
-                tokens.canvasDeep.opacity(0.92)
+                tokens.canvasDeep.opacity(0.88)
 
                 HStack(spacing: 0) {
                     Group {
@@ -355,58 +331,27 @@ struct AppSplitChromeBackground: View {
                                     material: .sidebar,
                                     blendingMode: tokens.backgroundBlendingMode
                                 )
-                                .opacity(leadingPaneTransparent ? 0.66 : 0.82)
+                                .opacity(leadingPaneTransparent ? 0.74 : 0.82)
                             } else {
-                                tokens.surfaceBottom.opacity(0.90)
+                                tokens.surfaceBottom.opacity(leadingPaneTransparent ? 0.88 : 0.94)
                             }
 
                             LinearGradient(
                                 colors: [
-                                    tokens.surfaceTop.opacity(leadingPaneTransparent ? 0.42 : 0.66),
-                                    leadingTint.opacity(leadingPaneTransparent ? 0.14 : 0.22),
-                                    tokens.surfaceBottom.opacity(0.93)
+                                    tokens.surfaceTop.opacity(leadingPaneTransparent ? 0.56 : 0.66),
+                                    leadingTint.opacity(leadingPaneTransparent ? 0.18 : 0.22),
+                                    tokens.surfaceBottom.opacity(leadingPaneTransparent ? 0.84 : 0.94)
                                 ],
                                 startPoint: .topLeading,
                                 endPoint: .bottomTrailing
                             )
-
-                            LinearGradient(
-                                colors: [
-                                    leadingTint.opacity(leadingPaneTransparent ? 0.05 : 0.10),
-                                    Color.clear
-                                ],
-                                startPoint: .topLeading,
-                                endPoint: .bottomTrailing
-                            )
-
-                            if !leadingPaneTransparent {
-                                RadialGradient(
-                                    colors: [
-                                        tokens.glowBlue.opacity(0.48),
-                                        tokens.glowRed.opacity(0.22),
-                                        Color.clear
-                                    ],
-                                    center: .topTrailing,
-                                    startRadius: 20,
-                                    endRadius: 520
-                                )
-                            }
                         }
                     }
                     .frame(width: leadingWidth)
                     .overlay(alignment: .trailing) {
-                        if !leadingPaneTransparent {
-                            LinearGradient(
-                                colors: [
-                                    tokens.strokeTop.opacity(0.32),
-                                    tokens.strokeMid.opacity(0.26),
-                                    tokens.strokeBottom.opacity(0.30)
-                                ],
-                                startPoint: .top,
-                                endPoint: .bottom
-                            )
-                            .frame(width: 1)
-                        }
+                        Rectangle()
+                            .fill(Color.white.opacity(leadingPaneTransparent ? 0.04 : 0.06))
+                            .frame(width: 0.5)
                     }
 
                     ZStack {
@@ -504,65 +449,21 @@ struct AppIconBadge: View {
     var isEmphasized = false
 
     var body: some View {
-        let cornerRadius = max(8, size * 0.30)
-        let baseTop = Color(red: 0.12, green: 0.15, blue: 0.21)
-        let baseBottom = Color(red: 0.08, green: 0.10, blue: 0.15)
-        let tintTop = tint.opacity(isEmphasized ? 0.94 : 0.82)
-        let tintBottom = tint.opacity(isEmphasized ? 0.76 : 0.62)
-        let symbolColor = Color.white.opacity(0.98)
+        let cornerRadius = max(6, size * 0.28)
 
         ZStack {
             RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                .fill(
-                    LinearGradient(
-                        colors: [baseTop, baseBottom],
-                        startPoint: .top,
-                        endPoint: .bottom
-                    )
-                )
+                .fill(tint.opacity(isEmphasized ? 0.22 : 0.14))
                 .overlay(
                     RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                        .fill(
-                            LinearGradient(
-                                colors: [tintTop, tintBottom],
-                                startPoint: .top,
-                                endPoint: .bottom
-                            )
-                        )
-                        .saturation(isEmphasized ? 1.18 : 1.10)
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                        .strokeBorder(
-                            LinearGradient(
-                                colors: [
-                                    Color.white.opacity(0.34),
-                                    Color.white.opacity(0.05),
-                                    Color.black.opacity(0.35)
-                                ],
-                                startPoint: .top,
-                                endPoint: .bottom
-                            ),
-                            lineWidth: 0.9
-                        )
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                        .stroke(Color.black.opacity(0.45), lineWidth: 0.6)
+                        .stroke(tint.opacity(isEmphasized ? 0.28 : 0.18), lineWidth: 0.5)
                 )
 
             Image(systemName: symbol)
-                .font(.system(size: symbolSize, weight: .bold))
-                .foregroundStyle(symbolColor)
-                .shadow(color: Color.black.opacity(0.28), radius: 1.2, x: 0, y: 1)
+                .font(.system(size: symbolSize, weight: .semibold))
+                .foregroundStyle(tint.opacity(isEmphasized ? 0.96 : 0.88))
         }
         .frame(width: size, height: size)
-        .shadow(
-            color: Color.black.opacity(isEmphasized ? 0.24 : 0.18),
-            radius: isEmphasized ? 3.5 : 2.5,
-            x: 0,
-            y: 1.5
-        )
     }
 }
 
@@ -573,32 +474,22 @@ struct AppSidebarSearchField: View {
     var body: some View {
         HStack(spacing: 8) {
             Image(systemName: "magnifyingglass")
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(AppVisualTheme.mutedText)
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(.white.opacity(0.40))
             TextField(placeholder, text: $text)
                 .textFieldStyle(.plain)
-                .font(.system(size: 14, weight: .medium, design: .rounded))
-                .foregroundStyle(.white.opacity(0.94))
+                .font(.system(size: 13, weight: .regular))
+                .foregroundStyle(.white.opacity(0.90))
         }
-        .padding(.horizontal, 11)
-        .padding(.vertical, 8)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
         .background(
-            RoundedRectangle(cornerRadius: 11, style: .continuous)
-                .fill(
-                    LinearGradient(
-                        colors: [
-                            Color.white.opacity(0.07),
-                            AppVisualTheme.baseTint.opacity(0.16),
-                            Color.black.opacity(0.26)
-                        ],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    )
-                )
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(Color.white.opacity(0.04))
         )
         .overlay(
-            RoundedRectangle(cornerRadius: 11, style: .continuous)
-                .stroke(Color.white.opacity(0.10), lineWidth: 0.45)
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .stroke(Color.white.opacity(0.07), lineWidth: 0.5)
         )
     }
 }
@@ -651,70 +542,8 @@ private struct AppThemedSurfaceModifier: ViewModifier {
                     .overlay(
                         LinearGradient(
                             colors: [
-                                Color.white.opacity(isGlass ? 0.18 : 0.10),
-                                Color.white.opacity(isGlass ? 0.05 : 0.03),
+                                Color.white.opacity(isGlass ? 0.08 : 0.04),
                                 Color.clear
-                            ],
-                            startPoint: .top,
-                            endPoint: .bottom
-                        )
-                        .clipShape(RoundedRectangle(cornerRadius: resolvedCornerRadius, style: .continuous))
-                    )
-                    .overlay(
-                        LinearGradient(
-                            colors: [
-                                tint.opacity(isGlass ? (0.08 + (tintOpacity * 0.45)) : (0.11 + tintOpacity)),
-                                Color.clear
-                            ],
-                            startPoint: .leading,
-                            endPoint: .trailing
-                        )
-                        .clipShape(RoundedRectangle(cornerRadius: resolvedCornerRadius, style: .continuous))
-                    )
-                    .overlay(alignment: .top) {
-                        LinearGradient(
-                            colors: [
-                                tokens.glowRed.opacity(isGlass ? 0.22 : 0.12),
-                                tokens.glowBlue.opacity(isGlass ? 0.18 : 0.10),
-                                Color.clear
-                            ],
-                            startPoint: .leading,
-                            endPoint: .trailing
-                        )
-                        .frame(height: max(54, resolvedCornerRadius * 2.6))
-                        .clipShape(
-                            RoundedRectangle(cornerRadius: resolvedCornerRadius, style: .continuous)
-                        )
-                    }
-                    .overlay(
-                        RadialGradient(
-                            colors: [
-                                tokens.glowRed.opacity(isGlass ? 0.34 : 0.18),
-                                Color.clear
-                            ],
-                            center: .bottomLeading,
-                            startRadius: 16,
-                            endRadius: 420
-                        )
-                        .clipShape(RoundedRectangle(cornerRadius: resolvedCornerRadius, style: .continuous))
-                    )
-                    .overlay(
-                        RadialGradient(
-                            colors: [
-                                tokens.glowBlue.opacity(isGlass ? 0.32 : 0.18),
-                                Color.clear
-                            ],
-                            center: .topTrailing,
-                            startRadius: 18,
-                            endRadius: 420
-                        )
-                        .clipShape(RoundedRectangle(cornerRadius: resolvedCornerRadius, style: .continuous))
-                    )
-                    .overlay(
-                        LinearGradient(
-                            colors: [
-                                Color.black.opacity(isGlass ? 0.02 : 0.01),
-                                Color.black.opacity(isGlass ? 0.14 : 0.08)
                             ],
                             startPoint: .top,
                             endPoint: .bottom
@@ -725,23 +554,9 @@ private struct AppThemedSurfaceModifier: ViewModifier {
             .overlay(
                 RoundedRectangle(cornerRadius: resolvedCornerRadius, style: .continuous)
                     .stroke(
-                        LinearGradient(
-                            colors: [
-                                tokens.strokeTop.opacity(isGlass ? max(strokeOpacity * 0.55, 0.08) : strokeOpacity * 0.46),
-                                tokens.strokeMid.opacity(strokeOpacity * 0.28),
-                                tokens.strokeBottom.opacity(strokeOpacity * 0.40)
-                            ],
-                            startPoint: .top,
-                            endPoint: .bottom
-                        ),
-                        lineWidth: 0.45
+                        Color.white.opacity(isGlass ? max(strokeOpacity * 0.40, 0.06) : strokeOpacity * 0.30),
+                        lineWidth: 0.5
                     )
-            )
-            .shadow(
-                color: tokens.cardShadowColor,
-                radius: tokens.cardShadowRadius,
-                x: 0,
-                y: tokens.cardShadowYOffset
             )
     }
 }

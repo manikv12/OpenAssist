@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import SwiftUI
 
 private let kOrbPopupSizeKey = "assistantOrbPopupSize"
@@ -9,7 +10,16 @@ private let kOrbPopupSizeKey = "assistantOrbPopupSize"
 final class AssistantOrbHUDModel: ObservableObject {
     @Published var state: AssistantHUDState = .idle
     @Published var level: Float = 0
-    @Published var interactionMode: AssistantInteractionMode = .conversational
+    @Published var interactionMode: AssistantInteractionMode = .agentic {
+        didSet {
+            let normalizedMode = interactionMode.normalizedForActiveUse
+            if interactionMode != normalizedMode {
+                interactionMode = normalizedMode
+                return
+            }
+            if oldValue != interactionMode { refreshCachedModeSwitchSuggestion() }
+        }
+    }
     @Published var busySessionID: String?
 
     // Expansion state
@@ -17,7 +27,11 @@ final class AssistantOrbHUDModel: ObservableObject {
     @Published var isLoadingSessions = false
     @Published var sessions: [AssistantSessionSummary] = []
     @Published var selectedSessionID: String?
-    @Published var messageText = ""
+    @Published var messageText = "" {
+        didSet {
+            if oldValue != messageText { scheduleModeSwitchRefresh() }
+        }
+    }
     @Published var attachments: [AssistantAttachment] = []
     @Published var shouldFocusTextField = false
 
@@ -34,13 +48,19 @@ final class AssistantOrbHUDModel: ObservableObject {
     // Live working detail popup
     @Published var showWorkingDetail = false
     @Published var showCompactComposer = false
-    @Published var workingToolActivity: [AssistantToolCallState] = []
-    @Published var activeSessionSummary: AssistantSessionSummary?
+    @Published var workingToolActivity: [AssistantToolCallState] = [] {
+        didSet { refreshCachedWorkingSummary() }
+    }
+    @Published var activeSessionSummary: AssistantSessionSummary? {
+        didSet { refreshCachedWorkingSummary() }
+    }
 
     // Model selection
     @Published var availableModels: [AssistantModelOption] = []
     @Published var selectedModelSummary: String = ""
-    @Published var controllerModeSwitchSuggestion: AssistantModeSwitchSuggestion?
+    @Published var controllerModeSwitchSuggestion: AssistantModeSwitchSuggestion? {
+        didSet { refreshCachedModeSwitchSuggestion() }
+    }
     @Published var canStopActiveTurn = false
 
     // Voice recording
@@ -54,6 +74,11 @@ final class AssistantOrbHUDModel: ObservableObject {
 
     // Popup size (user-resizable, persisted)
     @Published var popupSize: NSSize = Layout.defaultPopupSize
+
+    // Cached computed values — avoids recomputation on every view body evaluation.
+    @Published private(set) var modeSwitchSuggestion: AssistantModeSwitchSuggestion?
+    @Published private(set) var cachedWorkingSummaryText: String?
+    private var modeSwitchDebounceWorkItem: DispatchWorkItem?
 
     enum Layout {
         static let defaultPopupSize = NSSize(width: 340, height: 456)
@@ -112,6 +137,7 @@ final class AssistantOrbHUDModel: ObservableObject {
 
     func update(state: AssistantHUDState) {
         self.state = state
+        refreshCachedWorkingSummary()
 
         switch state.phase {
         case .success, .failed:
@@ -236,7 +262,14 @@ final class AssistantOrbHUDModel: ObservableObject {
         shouldFocusTextField = true
     }
 
-    var workingSummaryText: String? {
+    var workingSummaryText: String? { cachedWorkingSummaryText }
+
+    private func refreshCachedWorkingSummary() {
+        let next = computeWorkingSummaryText()
+        if next != cachedWorkingSummaryText { cachedWorkingSummaryText = next }
+    }
+
+    private func computeWorkingSummaryText() -> String? {
         if let detail = state.detail?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
             return detail
         }
@@ -330,21 +363,46 @@ final class AssistantOrbHUDModel: ObservableObject {
     }
 
     func setInteractionMode(_ mode: AssistantInteractionMode) {
-        guard interactionMode != mode else { return }
-        interactionMode = mode
-        onModeChanged?(mode)
+        let normalizedMode = mode.normalizedForActiveUse
+        guard interactionMode != normalizedMode else { return }
+        interactionMode = normalizedMode
+        onModeChanged?(normalizedMode)
     }
 
-    var modeSwitchSuggestion: AssistantModeSwitchSuggestion? {
+    private func refreshCachedModeSwitchSuggestion() {
+        modeSwitchDebounceWorkItem?.cancel()
+        let next: AssistantModeSwitchSuggestion?
         if let controllerModeSwitchSuggestion,
            controllerModeSwitchSuggestion.originMode == interactionMode {
-            return controllerModeSwitchSuggestion
+            next = controllerModeSwitchSuggestion
+        } else {
+            next = AssistantStore.modeSwitchSuggestion(
+                forDraft: messageText,
+                currentMode: interactionMode
+            )
         }
+        if next != modeSwitchSuggestion { modeSwitchSuggestion = next }
+    }
 
-        return AssistantStore.modeSwitchSuggestion(
-            forDraft: messageText,
-            currentMode: interactionMode
-        )
+    /// Debounce mode-switch re-evaluation while the user is typing.
+    /// Clears the stale suggestion immediately (so UI stops showing an outdated card)
+    /// but delays the potentially-expensive recomputation by 0.3 s.
+    private func scheduleModeSwitchRefresh() {
+        modeSwitchDebounceWorkItem?.cancel()
+        // If the current suggestion is draft-based and the text changed, clear it now.
+        if modeSwitchSuggestion?.source == .draft { modeSwitchSuggestion = nil }
+        let work = DispatchWorkItem { [weak self] in
+            Task { @MainActor in self?.refreshCachedModeSwitchSuggestion() }
+        }
+        modeSwitchDebounceWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: work)
+    }
+
+    /// Force an immediate (non-debounced) mode-switch evaluation.
+    /// Useful after programmatic text changes or in tests.
+    func flushModeSwitchSuggestion() {
+        modeSwitchDebounceWorkItem?.cancel()
+        refreshCachedModeSwitchSuggestion()
     }
 
     var isLiveVoiceActive: Bool {

@@ -731,6 +731,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
     private let assistantController = AssistantFeatureController.shared
     private var hotkeyManager: HoldToTalkManager?
     private var continuousToggleHotkeyManager: OneShotHotkeyManager?
+    private var assistantLiveVoiceHotkeyManager: HoldToTalkManager?
     private var pasteLastTranscriptHotkeyManager: OneShotHotkeyManager?
     private let transcriptHistory = TranscriptHistoryStore.shared
     private var windowCoordinator: AppWindowCoordinator?
@@ -889,6 +890,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         let shortcutModifiers: UInt
         let continuousToggleShortcutKeyCode: UInt16
         let continuousToggleShortcutModifiers: UInt
+        let assistantLiveVoiceShortcutKeyCode: UInt16
+        let assistantLiveVoiceShortcutModifiers: UInt
         let muteSystemSoundsWhileHoldingShortcut: Bool
         let transcriptionEngineRawValue: String
         let cloudTranscriptionProviderRawValue: String
@@ -1448,6 +1451,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         assistantPermissionObserver = nil
         pasteLastTranscriptHotkeyManager?.stop()
         pasteLastTranscriptHotkeyManager = nil
+        assistantLiveVoiceHotkeyManager?.stop()
+        assistantLiveVoiceHotkeyManager = nil
         hotkeyManager?.stop()
         hotkeyManager = nil
         continuousToggleHotkeyManager?.stop()
@@ -1751,6 +1756,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         hotkeyManager = nil
         continuousToggleHotkeyManager?.stop()
         continuousToggleHotkeyManager = nil
+        assistantLiveVoiceHotkeyManager?.stop()
+        assistantLiveVoiceHotkeyManager = nil
         pasteLastTranscriptHotkeyManager?.stop()
         pasteLastTranscriptHotkeyManager = nil
         isDictating = false
@@ -2083,6 +2090,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         assistantVoiceHasSpoken = false
         assistantVoiceBaselineSamples = []
         assistantVoiceBaselineCalibrated = false
+        assistantCompactHUD?.setVoiceRecording(true)
         startRecording()
 
         if !isDictating {
@@ -2318,6 +2326,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             shortcutModifiers: settings.shortcutModifiers,
             continuousToggleShortcutKeyCode: settings.continuousToggleShortcutKeyCode,
             continuousToggleShortcutModifiers: settings.continuousToggleShortcutModifiers,
+            assistantLiveVoiceShortcutKeyCode: settings.assistantLiveVoiceShortcutKeyCode,
+            assistantLiveVoiceShortcutModifiers: settings.assistantLiveVoiceShortcutModifiers,
             muteSystemSoundsWhileHoldingShortcut: settings.muteSystemSoundsWhileHoldingShortcut,
             transcriptionEngineRawValue: settings.transcriptionEngineRawValue,
             cloudTranscriptionProviderRawValue: settings.cloudTranscriptionProviderRawValue,
@@ -2411,6 +2421,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             || previousSnapshot?.shortcutModifiers != snapshot.shortcutModifiers
             || previousSnapshot?.continuousToggleShortcutKeyCode != snapshot.continuousToggleShortcutKeyCode
             || previousSnapshot?.continuousToggleShortcutModifiers != snapshot.continuousToggleShortcutModifiers
+            || previousSnapshot?.assistantLiveVoiceShortcutKeyCode != snapshot.assistantLiveVoiceShortcutKeyCode
+            || previousSnapshot?.assistantLiveVoiceShortcutModifiers != snapshot.assistantLiveVoiceShortcutModifiers
             || previousSnapshot?.muteSystemSoundsWhileHoldingShortcut != snapshot.muteSystemSoundsWhileHoldingShortcut
         if hotkeysChanged {
             applyHotkeyMode()
@@ -2480,6 +2492,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         hotkeyManager = nil
         continuousToggleHotkeyManager?.stop()
         continuousToggleHotkeyManager = nil
+        assistantLiveVoiceHotkeyManager?.stop()
+        assistantLiveVoiceHotkeyManager = nil
         guard permissionsReady else { return }
 
         hotkeyManager = HoldToTalkManager(
@@ -2491,6 +2505,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         )
         hotkeyManager?.start()
         configureContinuousToggleHotkey()
+        configureAssistantLiveVoiceHotkey()
         updateMenuState()
     }
 
@@ -2505,6 +2520,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             lhsModifiers: settings.continuousToggleShortcutModifierFlags,
             rhsKeyCode: PasteLastTranscriptShortcut.keyCode,
             rhsModifiers: PasteLastTranscriptShortcut.modifiers
+        ) || shortcutsConflict(
+            lhsKeyCode: settings.continuousToggleShortcutKeyCode,
+            lhsModifiers: settings.continuousToggleShortcutModifierFlags,
+            rhsKeyCode: settings.assistantLiveVoiceShortcutKeyCode,
+            rhsModifiers: settings.assistantLiveVoiceShortcutModifierFlags
         ) {
             setUIStatus(.message("Fix shortcut conflicts in Settings to enable continuous toggle hotkey"))
             return
@@ -2517,6 +2537,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             self?.toggleContinuousDictation()
         }
         continuousToggleHotkeyManager?.start()
+    }
+
+    private func configureAssistantLiveVoiceHotkey() {
+        if shortcutsConflict(
+            lhsKeyCode: settings.assistantLiveVoiceShortcutKeyCode,
+            lhsModifiers: settings.assistantLiveVoiceShortcutModifierFlags,
+            rhsKeyCode: settings.shortcutKeyCode,
+            rhsModifiers: settings.shortcutModifierFlags
+        ) || shortcutsConflict(
+            lhsKeyCode: settings.assistantLiveVoiceShortcutKeyCode,
+            lhsModifiers: settings.assistantLiveVoiceShortcutModifierFlags,
+            rhsKeyCode: settings.continuousToggleShortcutKeyCode,
+            rhsModifiers: settings.continuousToggleShortcutModifierFlags
+        ) || shortcutsConflict(
+            lhsKeyCode: settings.assistantLiveVoiceShortcutKeyCode,
+            lhsModifiers: settings.assistantLiveVoiceShortcutModifierFlags,
+            rhsKeyCode: PasteLastTranscriptShortcut.keyCode,
+            rhsModifiers: PasteLastTranscriptShortcut.modifiers
+        ) {
+            setUIStatus(.message("Fix shortcut conflicts in Settings to enable the agent shortcut"))
+            return
+        }
+
+        assistantLiveVoiceHotkeyManager = HoldToTalkManager(
+            keyCode: settings.assistantLiveVoiceShortcutKeyCode,
+            modifiers: settings.assistantLiveVoiceShortcutModifierFlags,
+            suppressSystemShortcutSounds: settings.muteSystemSoundsWhileHoldingShortcut,
+            onStart: { [weak self] in self?.startAssistantShortcutCapture() },
+            onStop: { [weak self] in self?.stopAssistantShortcutCapture() }
+        )
+        assistantLiveVoiceHotkeyManager?.start()
     }
 
     private func shortcutsConflict(
@@ -2543,6 +2594,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         pasteLastTranscriptHotkeyManager?.start()
     }
 
+    private func startAssistantShortcutCapture() {
+        guard FeatureFlags.personalAssistantEnabled else { return }
+        guard settings.assistantBetaEnabled else {
+            setUIStatus(.message("Turn on Assistant in Settings first."))
+            windowCoordinator?.openSettingsWindow()
+            return
+        }
+
+        if liveVoiceCaptureActive {
+            cancelLiveVoiceCapture(message: "Live voice ended.")
+        }
+        if assistantController.isLiveVoiceSessionActive {
+            assistantController.endLiveVoiceSession()
+        }
+
+        guard !isDictating else {
+            setUIStatus(.message("Finish the current recording first."))
+            updateMenuState()
+            return
+        }
+
+        let shouldUseCompactSurface = settings.assistantFloatingHUDEnabled && !isAssistantWindowVisible
+        if shouldUseCompactSurface {
+            syncAssistantCompactVisibility()
+            assistantCompactHUD?.prepareVoiceCaptureComposer()
+            beginCompactVoiceCapture(stopMode: .manualRelease)
+        } else {
+            beginAssistantVoiceTaskCapture(stopMode: .manualRelease)
+        }
+
+        updateMenuState()
+    }
+
+    private func stopAssistantShortcutCapture() {
+        if compactVoiceCaptureActive {
+            stopCompactVoiceCapture()
+            return
+        }
+        if assistantVoiceCaptureActive {
+            stopAssistantVoiceCapture()
+        }
+    }
+
 
     private func startHoldToTalkDictation() {
         guard DictationInputModeStateMachine.onHoldStart(dictationInputMode) == .holdToTalk else {
@@ -2552,9 +2646,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             return
         }
 
-        if beginVoiceCaptureForActiveAssistantComposerIfPossible() {
-            dictationInputMode = .holdToTalk
-            updateMenuState()
+        if shouldBlockDictationShortcutInsideAssistant() {
             return
         }
 
@@ -2569,44 +2661,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             return
         }
 
-        if stopVoiceCaptureForActiveAssistantComposerIfNeeded() {
-            dictationInputMode = .idle
-            updateMenuState()
-            return
-        }
-
         stopRecording()
         dictationInputMode = .idle
-    }
-
-    private func beginVoiceCaptureForActiveAssistantComposerIfPossible() -> Bool {
-        guard settings.assistantVoiceTaskEntryEnabled else { return false }
-
-        switch AssistantComposerBridge.shared.activeCaptureTarget {
-        case .assistantWindow:
-            beginAssistantVoiceTaskCapture(stopMode: .manualRelease)
-            return assistantVoiceCaptureActive
-        case .assistantCompact:
-            assistantCompactHUD?.setVoiceRecording(true)
-            beginCompactVoiceCapture(stopMode: .manualRelease)
-            return compactVoiceCaptureActive
-        case nil:
-            return false
-        }
-    }
-
-    private func stopVoiceCaptureForActiveAssistantComposerIfNeeded() -> Bool {
-        if compactVoiceCaptureActive {
-            stopCompactVoiceCapture()
-            return true
-        }
-
-        if assistantVoiceCaptureActive {
-            stopAssistantVoiceCapture()
-            return true
-        }
-
-        return false
     }
 
     private func toggleContinuousDictation() {
@@ -2618,6 +2674,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
 
         switch nextMode {
         case .continuous:
+            if shouldBlockDictationShortcutInsideAssistant() {
+                return
+            }
             startRecording()
             if isDictating {
                 dictationInputMode = nextMode
@@ -2629,6 +2688,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         case .holdToTalk:
             break
         }
+    }
+
+    private func shouldBlockDictationShortcutInsideAssistant() -> Bool {
+        guard AssistantComposerBridge.shared.activeCaptureTarget != nil else { return false }
+        setUIStatus(.message("Use the agent shortcut inside Open Assist."))
+        return true
     }
 
     private func startRecording() {
@@ -3972,6 +4037,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         let assistantBusy = liveVoiceCaptureActive
             || assistantController.isLiveVoiceSessionActive
             || assistantVoiceCaptureActive
+            || compactVoiceCaptureActive
             || assistantController.pendingPermissionRequest != nil
             || [.thinking, .acting, .waitingForPermission, .streaming].contains(assistantController.hudState.phase)
         updateStatusBarViewModel(
@@ -3984,7 +4050,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
                 ? "Stop Live Voice Listening"
                 : assistantController.isLiveVoiceSessionActive
                     ? "End Live Voice"
-                    : assistantVoiceCaptureActive
+                    : (assistantVoiceCaptureActive || compactVoiceCaptureActive)
                         ? "Stop Assistant Listening"
                         : "Cancel Assistant Turn"
         )
@@ -4135,7 +4201,7 @@ struct SettingsView: View {
         var subtitle: String {
             switch self {
             case .essentials: return "Daily assistant, voice capture, and feedback controls"
-            case .shortcuts: return "Hold-to-talk and continuous toggle keys"
+            case .shortcuts: return "Dictation and agent shortcut keys"
             case .speech: return "Microphone, engine, whisper models, timing, and text quality"
             case .aiModels: return "Prompt rewrite, memory assistant, and provider connections"
             case .computerControl: return "Local Mac permissions, helper status, browser profiles, and app actions"
@@ -4204,6 +4270,7 @@ struct SettingsView: View {
     private enum ShortcutCaptureTarget {
         case holdToTalk
         case continuousToggle
+        case assistantLiveVoice
     }
 
     private enum IntegrationsPage {
@@ -4287,6 +4354,7 @@ struct SettingsView: View {
     @State private var shortcutCaptureMessage: String?
     @State private var showHoldManualMap = false
     @State private var showContinuousManualMap = false
+    @State private var showAssistantLiveVoiceManualMap = false
     @State private var showDictationOutputSettings = false
     @State private var showDictationSoundSettings = false
     @State private var showWaveformAppearanceSettings = false
@@ -4494,58 +4562,42 @@ struct SettingsView: View {
 
     @ViewBuilder
     private func settingsHeroCard(for section: SettingsSection) -> some View {
-        HStack(alignment: .top, spacing: 12) {
-            AppIconBadge(
-                symbol: section.iconName,
-                tint: section.tint,
-                size: 40,
-                symbolSize: 18,
-                isEmphasized: true
-            )
-
-            VStack(alignment: .leading, spacing: 4) {
-                Text(section.title)
-                    .font(.system(size: 29, weight: .bold, design: .rounded))
-                    .foregroundStyle(.white.opacity(0.97))
-                Text(section.subtitle)
-                    .font(.system(size: 14, weight: .medium, design: .rounded))
-                    .foregroundStyle(AppVisualTheme.mutedText)
-            }
-
-            Spacer(minLength: 0)
+        VStack(alignment: .leading, spacing: 4) {
+            Text(section.title)
+                .font(.system(size: 22, weight: .bold))
+                .foregroundStyle(.white.opacity(0.94))
+            Text(section.subtitle)
+                .font(.system(size: 13, weight: .regular))
+                .foregroundStyle(.white.opacity(0.58))
         }
-        .padding(18)
-        .appThemedSurface(
-            cornerRadius: 16,
-            tint: AppVisualTheme.accentTint,
-            strokeOpacity: 0.18,
-            tintOpacity: 0.035
-        )
+        .padding(.horizontal, 4)
+        .padding(.vertical, 6)
     }
 
     @ViewBuilder
     private var sidebarBrandHeader: some View {
         HStack(spacing: 10) {
-            AppIconBadge(
-                symbol: "waveform",
-                tint: AppVisualTheme.accentTint,
-                size: 34,
-                symbolSize: 15,
-                isEmphasized: true
-            )
+            Image(systemName: "waveform")
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(AppVisualTheme.accentTint.opacity(0.80))
+                .frame(width: 26, height: 26)
+                .background(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .fill(AppVisualTheme.accentTint.opacity(0.10))
+                )
 
             VStack(alignment: .leading, spacing: 1) {
                 Text("Open Assist")
-                    .font(.system(size: 18, weight: .semibold, design: .rounded))
-                    .foregroundStyle(.white.opacity(0.96))
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.92))
                 Text("Settings")
-                    .font(.system(size: 12, weight: .medium, design: .rounded))
-                    .foregroundStyle(AppVisualTheme.mutedText)
+                    .font(.system(size: 11, weight: .regular))
+                    .foregroundStyle(.white.opacity(0.44))
             }
 
             Spacer(minLength: 0)
         }
-        .padding(.horizontal, 8)
+        .padding(.horizontal, 6)
     }
 
     @ViewBuilder
@@ -4600,61 +4652,30 @@ struct SettingsView: View {
         let matchCount = matchCount(for: section)
 
         HStack(spacing: 10) {
-            AppIconBadge(
-                symbol: section.iconName,
-                tint: section.tint,
-                size: 25,
-                symbolSize: 11,
-                isEmphasized: isSelected
-            )
+            Image(systemName: section.iconName)
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(isSelected ? section.tint.opacity(0.95) : .white.opacity(0.54))
+                .frame(width: 22, height: 22)
 
-            VStack(alignment: .leading, spacing: 1) {
-                Text(section.title)
-                    .font(.system(size: 14, weight: isSelected ? .semibold : .medium, design: .rounded))
-                    .foregroundStyle(isSelected ? .white : .white.opacity(0.94))
-                Text(section.subtitle)
-                    .font(.caption2)
-                    .foregroundStyle(isSelected ? .white.opacity(0.76) : AppVisualTheme.mutedText)
-                    .lineLimit(1)
-            }
+            Text(section.title)
+                .font(.system(size: 13, weight: isSelected ? .semibold : .regular))
+                .foregroundStyle(isSelected ? .white.opacity(0.96) : .white.opacity(0.82))
 
             Spacer(minLength: 0)
 
             if !trimmedSearchQuery.isEmpty && matchCount > 0 {
                 Text("\(matchCount)")
-                    .font(.caption2.weight(.medium))
-                    .foregroundStyle(isSelected ? .white.opacity(0.84) : AppVisualTheme.mutedText)
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(.white.opacity(0.40))
             }
         }
-        .padding(.horizontal, 9)
-        .padding(.vertical, 7)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
         .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(Rectangle())
         .background(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(
-                    isSelected
-                        ? AnyShapeStyle(
-                            LinearGradient(
-                                colors: [
-                                    AppVisualTheme.rowSelection.opacity(0.46),
-                                    AppVisualTheme.rowSelection.opacity(0.30)
-                                ],
-                                startPoint: .topLeading,
-                                endPoint: .bottomTrailing
-                            )
-                        )
-                        : AnyShapeStyle(Color.white.opacity(isHovered ? 0.06 : 0.015))
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .stroke(
-                            isSelected
-                                ? Color.white.opacity(0.22)
-                                : Color.white.opacity(isHovered ? 0.16 : 0.07),
-                            lineWidth: 0.7
-                        )
-                )
+            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                .fill(isSelected ? Color.white.opacity(0.08) : (isHovered ? Color.white.opacity(0.04) : Color.clear))
         )
     }
 
@@ -4689,10 +4710,10 @@ struct SettingsView: View {
 
                 VStack(alignment: .leading, spacing: 1) {
                     Text("\(section.title) Controls")
-                        .font(.system(size: 11, weight: .semibold, design: .rounded))
+                        .font(.system(size: 11, weight: .semibold))
                         .foregroundStyle(section.tint.opacity(0.88))
                     Text("Section details")
-                        .font(.system(size: 12, weight: .semibold, design: .rounded))
+                        .font(.system(size: 12, weight: .semibold))
                         .foregroundStyle(AppVisualTheme.mutedText)
                 }
 
@@ -4923,8 +4944,9 @@ struct SettingsView: View {
             ) {
                 VStack(alignment: .leading, spacing: 6) {
                     Text("Paste last transcript shortcut: ⌥⌘V")
-                    Text("Hold-to-talk: hold your shortcut while speaking.")
-                    Text("Continuous mode: press your toggle shortcut to start/stop.")
+                    Text("Hold-to-talk: hold your shortcut while speaking in normal dictation.")
+                    Text("Continuous mode: press your toggle shortcut to start/stop normal dictation.")
+                    Text("Agent shortcut: hold it while speaking, then release it to paste text into Open Assist.")
                 }
                 .font(.callout)
                 .foregroundStyle(.secondary)
@@ -5069,6 +5091,65 @@ struct SettingsView: View {
 
                 if !isContinuousToggleShortcutValid {
                     Text("Continuous toggle shortcut must include 2 to 4 keys.")
+                        .font(.callout)
+                        .foregroundStyle(AppVisualTheme.accentTint)
+                }
+            }
+
+            settingsCard(
+                title: "Agent Shortcut",
+                subtitle: "Hold while speaking. Release to paste into the assistant box.",
+                symbol: "waveform.badge.mic",
+                tint: AppVisualTheme.accentTint
+            ) {
+                shortcutSegmentRow(assistantLiveVoiceShortcutSegments)
+
+                HStack(alignment: .center, spacing: 10) {
+                    Button(action: {
+                        beginShortcutCapture(for: .assistantLiveVoice)
+                    }) {
+                        Text(isCapturingShortcut && shortcutCaptureTarget == .assistantLiveVoice ? "Listening..." : "Choose Shortcut")
+                    }
+                    .buttonStyle(.borderedProminent)
+
+                    Text("This shortcut records into Open Assist. It cannot match dictation shortcuts.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Text("Inside Open Assist, this shortcut fills the agent text box instead of starting live voice.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                VStack(alignment: .leading, spacing: 0) {
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.2)) { showAssistantLiveVoiceManualMap.toggle() }
+                    } label: {
+                        HStack {
+                            Text("Manual map (advanced)")
+                            Spacer()
+                            Image(systemName: "chevron.right")
+                                .rotationEffect(.degrees(showAssistantLiveVoiceManualMap ? 90 : 0))
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.secondary)
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    if showAssistantLiveVoiceManualMap {
+                        manualShortcutBuilder(for: .assistantLiveVoice)
+                            .padding(.top, 6)
+                    }
+                }
+
+                if isCapturingShortcut && shortcutCaptureTarget == .assistantLiveVoice {
+                    Text("Press the agent shortcut now. Press Esc to cancel.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+
+                if !isAssistantLiveVoiceShortcutValid {
+                    Text("Agent shortcut must include 2 to 4 keys.")
                         .font(.callout)
                         .foregroundStyle(AppVisualTheme.accentTint)
                 }
@@ -7135,23 +7216,25 @@ struct SettingsView: View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(alignment: .top, spacing: 10) {
                 if let symbol {
-                    AppIconBadge(
-                        symbol: symbol,
-                        tint: tint,
-                        size: 28,
-                        symbolSize: 12
-                    )
+                    Image(systemName: symbol)
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(tint.opacity(0.85))
+                        .frame(width: 22, height: 22)
+                        .background(
+                            RoundedRectangle(cornerRadius: 5, style: .continuous)
+                                .fill(tint.opacity(0.12))
+                        )
                 }
 
                 VStack(alignment: .leading, spacing: 2) {
                     Text(title)
-                        .font(.system(size: 14, weight: .semibold, design: .rounded))
-                        .foregroundStyle(.white.opacity(0.96))
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.90))
 
                     if let subtitle {
                         Text(subtitle)
-                            .font(.caption)
-                            .foregroundStyle(AppVisualTheme.mutedText)
+                            .font(.system(size: 11, weight: .regular))
+                            .foregroundStyle(.white.opacity(0.54))
                     }
                 }
 
@@ -7160,12 +7243,14 @@ struct SettingsView: View {
 
             content()
         }
-        .padding(15)
-        .appThemedSurface(
-            cornerRadius: 14,
-            tint: tint,
-            strokeOpacity: 0.17,
-            tintOpacity: 0.035
+        .padding(14)
+        .background(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(Color.white.opacity(0.03))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .stroke(Color.white.opacity(0.06), lineWidth: 0.5)
+                )
         )
     }
 
@@ -7186,23 +7271,25 @@ struct SettingsView: View {
             } label: {
                 HStack(alignment: .top, spacing: 10) {
                     if let symbol {
-                        AppIconBadge(
-                            symbol: symbol,
-                            tint: tint,
-                            size: 26,
-                            symbolSize: 11
-                        )
+                        Image(systemName: symbol)
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundStyle(tint.opacity(0.85))
+                            .frame(width: 22, height: 22)
+                            .background(
+                                RoundedRectangle(cornerRadius: 5, style: .continuous)
+                                    .fill(tint.opacity(0.12))
+                            )
                     }
 
                     VStack(alignment: .leading, spacing: 2) {
                         Text(title)
-                            .font(.system(size: 14, weight: .semibold, design: .rounded))
-                            .foregroundStyle(.white.opacity(0.96))
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(.white.opacity(0.90))
 
                         if let subtitle {
                             Text(subtitle)
-                                .font(.caption)
-                                .foregroundStyle(AppVisualTheme.mutedText)
+                                .font(.system(size: 11, weight: .regular))
+                                .foregroundStyle(.white.opacity(0.54))
                         }
                     }
 
@@ -7210,9 +7297,9 @@ struct SettingsView: View {
 
                     Image(systemName: "chevron.right")
                         .rotationEffect(.degrees(isExpanded.wrappedValue ? 90 : 0))
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.secondary)
-                        .padding(.top, 4)
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.34))
+                        .padding(.top, 2)
                 }
                 .contentShape(Rectangle())
             }
@@ -7222,33 +7309,35 @@ struct SettingsView: View {
                 VStack(alignment: .leading, spacing: 10) {
                     content()
                 }
-                .padding(.top, 6)
+                .padding(.top, 4)
             }
         }
-        .padding(15)
-        .appThemedSurface(
-            cornerRadius: 14,
-            tint: tint,
-            strokeOpacity: 0.17,
-            tintOpacity: 0.035
+        .padding(14)
+        .background(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(Color.white.opacity(0.03))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .stroke(Color.white.opacity(0.07), lineWidth: 0.5)
+                )
         )
     }
 
     @ViewBuilder
     private func shortcutSegmentRow(_ segments: [String]) -> some View {
-        HStack(spacing: 8) {
+        HStack(spacing: 6) {
             ForEach(segments, id: \.self) { segment in
                 Text(segment)
-                    .font(.system(size: 13, weight: .semibold, design: .rounded))
-                    .foregroundStyle(.white.opacity(0.95))
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 5)
+                    .font(.system(size: 12, weight: .medium, design: .monospaced))
+                    .foregroundStyle(.white.opacity(0.86))
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
                     .background(
-                        Capsule()
-                            .fill(AppVisualTheme.accentTint.opacity(0.18))
+                        RoundedRectangle(cornerRadius: 5, style: .continuous)
+                            .fill(Color.white.opacity(0.06))
                             .overlay(
-                                Capsule()
-                                    .stroke(AppVisualTheme.accentTint.opacity(0.38), lineWidth: 0.7)
+                                RoundedRectangle(cornerRadius: 5, style: .continuous)
+                                    .stroke(Color.white.opacity(0.08), lineWidth: 0.5)
                             )
                     )
             }
@@ -7357,6 +7446,7 @@ struct SettingsView: View {
             .init(section: .shortcuts, title: "Mute shortcut system sounds", detail: "Optionally suppress beeps while hold-to-talk is pressed", keywords: ["mute", "beep", "sound", "hold", "shortcut"]),
             .init(section: .shortcuts, title: "Manual shortcut map", detail: "Click modifiers and choose a key manually", keywords: ["manual", "map", "shortcut", "click", "keys"]),
             .init(section: .shortcuts, title: "Continuous toggle shortcut", detail: "Set keys for start/stop continuous voice capture", keywords: ["continuous", "toggle", "shortcut"]),
+            .init(section: .shortcuts, title: "Agent shortcut", detail: "Hold to speak, then release to paste into the assistant box", keywords: ["assistant", "agent", "voice", "shortcut", "keyboard", "hold", "paste"]),
             .init(section: .shortcuts, title: "Paste last transcript", detail: "Reserved shortcut: ⌥⌘V", keywords: ["paste", "last transcript", "reserved"]),
             .init(section: .speech, title: "Auto-detect microphone", detail: "Automatically use best available input", keywords: ["microphone", "input", "auto"]),
             .init(section: .speech, title: "Microphone device picker", detail: "Choose a specific microphone manually", keywords: ["microphone", "device", "picker"]),
@@ -7806,6 +7896,13 @@ struct SettingsView: View {
         )
     }
 
+    private var assistantLiveVoiceShortcutSegments: [String] {
+        ShortcutValidation.displaySegments(
+            keyCode: settings.assistantLiveVoiceShortcutKeyCode,
+            modifiersRaw: settings.assistantLiveVoiceShortcutModifiers
+        )
+    }
+
     private var isHoldToTalkShortcutValid: Bool {
         ShortcutValidation.isValid(keyCode: settings.shortcutKeyCode, modifiersRaw: settings.shortcutModifiers)
     }
@@ -7817,12 +7914,21 @@ struct SettingsView: View {
         )
     }
 
+    private var isAssistantLiveVoiceShortcutValid: Bool {
+        ShortcutValidation.isValid(
+            keyCode: settings.assistantLiveVoiceShortcutKeyCode,
+            modifiersRaw: settings.assistantLiveVoiceShortcutModifiers
+        )
+    }
+
     private func shortcutKeyCode(for target: ShortcutCaptureTarget) -> UInt16 {
         switch target {
         case .holdToTalk:
             settings.shortcutKeyCode
         case .continuousToggle:
             settings.continuousToggleShortcutKeyCode
+        case .assistantLiveVoice:
+            settings.assistantLiveVoiceShortcutKeyCode
         }
     }
 
@@ -7832,6 +7938,8 @@ struct SettingsView: View {
             settings.shortcutModifiers
         case .continuousToggle:
             settings.continuousToggleShortcutModifiers
+        case .assistantLiveVoice:
+            settings.assistantLiveVoiceShortcutModifiers
         }
     }
 
@@ -7864,6 +7972,9 @@ struct SettingsView: View {
         case .continuousToggle:
             settings.continuousToggleShortcutKeyCode = keyCode
             settings.continuousToggleShortcutModifiers = filteredModifiers
+        case .assistantLiveVoice:
+            settings.assistantLiveVoiceShortcutKeyCode = keyCode
+            settings.assistantLiveVoiceShortcutModifiers = filteredModifiers
         }
 
         shortcutCaptureMessage = nil
@@ -7899,6 +8010,10 @@ struct SettingsView: View {
             keyCode: settings.continuousToggleShortcutKeyCode,
             modifiersRaw: ShortcutValidation.filteredModifierRawValue(from: settings.continuousToggleShortcutModifiers)
         )
+        let assistantLiveVoice = ShortcutBinding(
+            keyCode: settings.assistantLiveVoiceShortcutKeyCode,
+            modifiersRaw: ShortcutValidation.filteredModifierRawValue(from: settings.assistantLiveVoiceShortcutModifiers)
+        )
         let pasteLast = ShortcutBinding(
             keyCode: ReservedShortcut.pasteLastKeyCode,
             modifiersRaw: ReservedShortcut.pasteLastModifiersRaw
@@ -7909,9 +8024,22 @@ struct SettingsView: View {
             if candidate == continuousToggle {
                 return "Hold-to-talk shortcut cannot match continuous toggle shortcut."
             }
+            if candidate == assistantLiveVoice {
+                return "Hold-to-talk shortcut cannot match the agent shortcut."
+            }
         case .continuousToggle:
             if candidate == holdToTalk {
                 return "Continuous toggle shortcut cannot match hold-to-talk shortcut."
+            }
+            if candidate == assistantLiveVoice {
+                return "Continuous toggle shortcut cannot match the agent shortcut."
+            }
+        case .assistantLiveVoice:
+            if candidate == holdToTalk {
+                return "Agent shortcut cannot match hold-to-talk shortcut."
+            }
+            if candidate == continuousToggle {
+                return "Agent shortcut cannot match continuous toggle shortcut."
             }
         }
 
@@ -8269,7 +8397,7 @@ struct SettingsView: View {
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(title)
-                    .font(.system(size: 13, weight: .semibold, design: .rounded))
+                    .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(.white.opacity(0.94))
                 Text(detail)
                     .font(.caption2)
@@ -8302,7 +8430,7 @@ struct SettingsView: View {
 
             VStack(alignment: .leading, spacing: 1) {
                 Text(name)
-                    .font(.system(size: 13, weight: .semibold, design: .rounded))
+                    .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(.white.opacity(0.94))
                 Text(hint)
                     .font(.caption2)
@@ -8536,7 +8664,7 @@ private struct TranscriptHistoryEntryCard: View {
             }
 
             Text(entry.text)
-                .font(.system(size: 13, weight: .regular, design: .rounded))
+                .font(.system(size: 13, weight: .regular))
                 .lineSpacing(2)
                 .textSelection(.enabled)
                 .lineLimit(isExpanded ? nil : 3)

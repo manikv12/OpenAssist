@@ -37,14 +37,14 @@ private struct AssistantBetaOrbDock: View {
                 VStack(alignment: .leading, spacing: 10) {
                     HStack(alignment: .center, spacing: 10) {
                         Text(state.title)
-                            .font(.system(size: 17, weight: .semibold, design: .rounded))
+                            .font(.system(size: 17, weight: .semibold))
                             .foregroundStyle(.white.opacity(0.96))
 
                         AssistantBetaOrbPhaseChip(phase: state.phase)
                     }
 
                     Text(state.detail)
-                        .font(.system(size: 13.5, weight: .medium, design: .rounded))
+                        .font(.system(size: 13.5, weight: .medium))
                         .foregroundStyle(.white.opacity(0.74))
                         .lineLimit(2)
 

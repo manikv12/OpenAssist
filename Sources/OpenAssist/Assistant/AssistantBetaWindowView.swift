@@ -142,7 +142,7 @@ struct AssistantBetaWindowView: View {
 
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Assistant")
-                        .font(.system(size: 28, weight: .bold, design: .rounded))
+                        .font(.system(size: 28, weight: .bold))
                         .foregroundStyle(.white.opacity(0.97))
 
                     Text("A calm control room for typed tasks, voice drafts, live progress, and session history.")
@@ -281,7 +281,7 @@ struct AssistantBetaWindowView: View {
 
                 if model.draftText.isEmpty {
                     Text(model.composerPlaceholder)
-                        .font(.system(size: 15, weight: .medium, design: .rounded))
+                        .font(.system(size: 15, weight: .medium))
                         .foregroundStyle(Color.white.opacity(0.44))
                         .padding(.horizontal, 16)
                         .padding(.vertical, 14)
@@ -289,7 +289,7 @@ struct AssistantBetaWindowView: View {
                 }
 
                 TextEditor(text: $model.draftText)
-                    .font(.system(size: 15, weight: .medium, design: .rounded))
+                    .font(.system(size: 15, weight: .medium))
                     .foregroundStyle(.white.opacity(0.95))
                     .focused($composerFocused)
                     .scrollContentBackground(.hidden)
@@ -652,7 +652,7 @@ private struct AssistantBetaTranscriptRow: View {
                 }
 
                 Text(item.body)
-                    .font(.system(size: 14.5, weight: .medium, design: .rounded))
+                    .font(.system(size: 14.5, weight: .medium))
                     .foregroundStyle(.white.opacity(0.80))
                     .frame(maxWidth: .infinity, alignment: .leading)
 
@@ -896,7 +896,7 @@ private struct AssistantBetaPrimaryButtonStyle: ButtonStyle {
 
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
-            .font(.system(size: 14, weight: .semibold, design: .rounded))
+            .font(.system(size: 14, weight: .semibold))
             .foregroundStyle(.white.opacity(configuration.isPressed ? 0.82 : 0.95))
             .padding(.horizontal, 16)
             .padding(.vertical, 10)
@@ -926,7 +926,7 @@ private struct AssistantBetaPrimaryButtonStyle: ButtonStyle {
 private struct AssistantBetaSecondaryButtonStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
-            .font(.system(size: 13.5, weight: .semibold, design: .rounded))
+            .font(.system(size: 13.5, weight: .semibold))
             .foregroundStyle(.white.opacity(configuration.isPressed ? 0.76 : 0.92))
             .padding(.horizontal, 14)
             .padding(.vertical, 10)

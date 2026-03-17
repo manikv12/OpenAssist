@@ -47,7 +47,7 @@ struct AssistantMemorySuggestionReviewSheet: View {
                                     }
                                     Spacer()
                                     Text(suggestion.memoryType.label)
-                                        .font(.system(size: 10, weight: .bold, design: .rounded))
+                                        .font(.system(size: 10, weight: .bold))
                                         .foregroundStyle(AppVisualTheme.accentTint)
                                         .padding(.horizontal, 8)
                                         .padding(.vertical, 4)
@@ -145,87 +145,39 @@ struct AssistantSessionRow: View {
         case (60 * 60 * 24 * 7)..<(60 * 60 * 24 * 30):
             return "\(max(1, seconds / (60 * 60 * 24 * 7)))w"
         default:
-            let formatter = DateFormatter()
-            formatter.dateFormat = "MMM d"
-            return formatter.string(from: updatedAt)
+            let months = seconds / (60 * 60 * 24 * 30)
+            return months >= 1 ? "\(months)mo" : {
+                let formatter = DateFormatter()
+                formatter.dateFormat = "MMM d"
+                return formatter.string(from: updatedAt)
+            }()
         }
-    }
-
-    private var rowBackground: some View {
-        RoundedRectangle(cornerRadius: 13, style: .continuous)
-            .fill(
-                isSelected
-                    ? LinearGradient(
-                        colors: [
-                            Color.white.opacity(0.13),
-                            Color.white.opacity(0.08)
-                        ],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    )
-                    : LinearGradient(
-                        colors: [
-                            Color.white.opacity(0.02),
-                            Color.white.opacity(0.01)
-                        ],
-                        startPoint: .top,
-                        endPoint: .bottom
-                    )
-            )
-    }
-
-    private var rowStroke: some View {
-        RoundedRectangle(cornerRadius: 13, style: .continuous)
-            .stroke(
-                isSelected
-                    ? Color.white.opacity(0.12)
-                    : Color.white.opacity(0.035),
-                lineWidth: isSelected ? 0.8 : 0.45
-            )
-    }
-
-    private var titleColor: Color {
-        isSelected ? .white.opacity(0.98) : .white.opacity(0.88)
-    }
-
-    private var subtitleColor: Color {
-        isSelected ? .white.opacity(0.60) : .white.opacity(0.44)
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 5) {
-            HStack(alignment: .firstTextBaseline, spacing: 8) {
-                Text(session.title)
-                    .font(.system(size: 13.5, weight: isSelected ? .semibold : .medium))
-                    .foregroundStyle(titleColor)
-                    .lineLimit(1)
-
-                Spacer(minLength: 4)
-
-                if let relativeTimestamp {
-                    Text(relativeTimestamp)
-                        .font(.system(size: 10.5, weight: isSelected ? .semibold : .medium, design: .rounded))
-                        .foregroundStyle(isSelected ? .white.opacity(0.54) : .white.opacity(0.34))
-                        .lineLimit(1)
-                }
-            }
-
-            Text(session.subtitle)
-                .font(.system(size: 11.4, weight: .medium))
-                .foregroundStyle(subtitleColor)
+        HStack(alignment: .center, spacing: 10) {
+            Text(session.title)
+                .font(.system(size: 13, weight: isSelected ? .semibold : .regular))
+                .foregroundStyle(isSelected ? .white.opacity(0.96) : .white.opacity(0.78))
                 .lineLimit(1)
+
+            Spacer(minLength: 4)
+
+            if let relativeTimestamp {
+                Text(relativeTimestamp)
+                    .font(.system(size: 11, weight: .regular))
+                    .foregroundStyle(.white.opacity(isSelected ? 0.44 : 0.30))
+                    .lineLimit(1)
+            }
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 10)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(rowBackground)
-        .overlay(rowStroke)
-        .shadow(
-            color: Color.black.opacity(isSelected ? 0.22 : 0.06),
-            radius: isSelected ? 10 : 4,
-            x: 0,
-            y: isSelected ? 6 : 2
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(isSelected ? Color.white.opacity(0.08) : Color.clear)
         )
+        .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 }
 
@@ -244,7 +196,7 @@ struct AssistantStatusBadge: View {
             }
 
             Text(title)
-                .font(.system(size: 11, weight: .semibold, design: .rounded))
+                .font(.system(size: 11, weight: .semibold))
                 .foregroundStyle(.white.opacity(0.86))
                 .lineLimit(1)
         }
@@ -271,7 +223,7 @@ struct AssistantTopBarActionButton: View {
             Image(systemName: symbol)
                 .font(.system(size: 10, weight: .semibold))
             Text(title)
-                .font(.system(size: 11, weight: .semibold, design: .rounded))
+                .font(.system(size: 11, weight: .semibold))
         }
         .foregroundStyle(tint.opacity(0.94))
         .padding(.horizontal, 10)
