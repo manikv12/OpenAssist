@@ -1593,22 +1593,36 @@ final class MemorySQLiteStore {
         guard !normalizedIDs.isEmpty else { return }
 
         // SQLite has a limit on bound parameters per statement, so delete in batches.
+        // Wrap the batched deletes in a single transaction for performance and atomicity.
         let batchSize = 900
         var startIndex = 0
 
-        while startIndex < normalizedIDs.count {
-            let endIndex = min(startIndex + batchSize, normalizedIDs.count)
-            let batch = Array(normalizedIDs[startIndex..<endIndex])
-            let placeholders = Array(repeating: "?", count: batch.count).joined(separator: ", ")
-            let sql = "DELETE FROM assistant_memory_entries WHERE id IN (\(placeholders));"
+        try execute(sql: "BEGIN IMMEDIATE;")
+        do {
+            while startIndex < normalizedIDs.count {
+                let endIndex = min(startIndex + batchSize, normalizedIDs.count)
+                let batch = Array(normalizedIDs[startIndex..<endIndex])
+                let placeholders = Array(repeating: "?", count: batch.count).joined(separator: ", ")
+                let sql = "DELETE FROM assistant_memory_entries WHERE id IN (\(placeholders));"
 
-            try execute(sql: sql, bind: { statement in
-                for (index, id) in batch.enumerated() {
-                    self.bind(id, at: Int32(index + 1), in: statement)
-                }
-            })
+                try execute(sql: sql, bind: { statement in
+                    for (index, id) in batch.enumerated() {
+                        self.bind(id, at: Int32(index + 1), in: statement)
+                    }
+                })
 
-            startIndex = endIndex
+                startIndex = endIndex
+            }
+
+            try execute(sql: "COMMIT;")
+        } catch {
+            // Attempt to roll back if any delete in the batch fails.
+            do {
+                try execute(sql: "ROLLBACK;")
+            } catch {
+                // Ignore rollback errors to avoid masking the original error.
+            }
+            throw error
         }
     }
 
