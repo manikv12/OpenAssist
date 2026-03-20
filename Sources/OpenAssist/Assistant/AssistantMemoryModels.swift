@@ -87,6 +87,7 @@ enum AssistantMemorySuggestionKind: String, Codable, CaseIterable, Sendable {
     case reviewedLesson
     case reviewedFailure
     case manualSave
+    case staleLesson
 
     var label: String {
         switch self {
@@ -96,6 +97,8 @@ enum AssistantMemorySuggestionKind: String, Codable, CaseIterable, Sendable {
             return "Failure lesson"
         case .manualSave:
             return "Saved from chat"
+        case .staleLesson:
+            return "Stale memory"
         }
     }
 }

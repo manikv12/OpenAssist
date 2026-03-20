@@ -37,9 +37,9 @@ enum LocalAutomationError: LocalizedError {
         case .automationTargetPermissionRequired(let appName):
             return "Automation permission is required so Open Assist can control \(appName). If the permission prompt does not appear, open System Settings > Privacy & Security > Automation and allow \(appName)."
         case .browserProfileUnavailable:
-            return "The selected browser profile is unavailable. Choose a browser profile in Computer Control settings."
+            return "The selected browser profile is unavailable. Choose a browser profile in Automation settings."
         case .browserAutomationDisabled:
-            return "Browser automation is off. Turn it on in Computer Control settings first."
+            return "Browser automation is off. Turn it on in Automation settings first."
         case .unsupportedAction(let message):
             return message
         case .invalidArguments(let message):
@@ -69,12 +69,6 @@ actor LocalAutomationHelper {
     ) async -> HelperCapabilityStatus {
         let snapshot = await MainActor.run { PermissionCenter.snapshot(using: settings) }
         var issues: [String] = []
-        if !snapshot.accessibilityGranted {
-            issues.append("Accessibility is still needed for computer control.")
-        }
-        if !snapshot.screenRecordingGranted {
-            issues.append("Screen Recording is still needed for live screen understanding.")
-        }
         if snapshot.appleEventsKnown && !snapshot.appleEventsGranted {
             issues.append("Automation permission is still needed for browser and app scripting.")
         }
@@ -688,13 +682,6 @@ actor LocalAutomationHelper {
     }()
 
     private static let defaultConnectors: [ConnectorDescriptor] = [
-        ConnectorDescriptor(
-            id: "computer",
-            displayName: "Computer Use",
-            summary: "Fallback live screen control for clicking, typing, and reading visible UI.",
-            kind: .computer,
-            supportedActions: ["click", "type", "scroll", "read screen"]
-        ),
         ConnectorDescriptor(
             id: "browser",
             displayName: "Browser Use",

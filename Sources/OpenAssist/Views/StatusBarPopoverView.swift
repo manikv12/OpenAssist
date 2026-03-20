@@ -44,7 +44,7 @@ struct StatusBarPopoverView: View {
                         .padding(.bottom, 10)
                 }
 
-                Divider().overlay(Color.white.opacity(0.08))
+                Divider().overlay(AppVisualTheme.surfaceStroke(0.08))
                     .padding(.bottom, 8)
 
                 VStack(alignment: .leading, spacing: 5) {
@@ -76,7 +76,7 @@ struct StatusBarPopoverView: View {
                             }
                         }
 
-                        Divider().overlay(Color.white.opacity(0.08))
+                        Divider().overlay(AppVisualTheme.surfaceStroke(0.08))
                             .padding(.vertical, 8)
                     }
 
@@ -100,7 +100,7 @@ struct StatusBarPopoverView: View {
                         viewModel.onPasteLastTranscript?()
                     }
 
-                    Divider().overlay(Color.white.opacity(0.08))
+                    Divider().overlay(AppVisualTheme.surfaceStroke(0.08))
                         .padding(.vertical, 8)
 
                     sectionTitle("Open")
@@ -132,7 +132,7 @@ struct StatusBarPopoverView: View {
                 .padding(.horizontal, 8)
                 .padding(.bottom, 8)
 
-                Divider().overlay(Color.white.opacity(0.08))
+                Divider().overlay(AppVisualTheme.surfaceStroke(0.08))
                     .padding(.bottom, 8)
 
                 VStack(alignment: .leading, spacing: 5) {
@@ -170,7 +170,7 @@ struct StatusBarPopoverView: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text("Open Assist")
                     .font(.system(size: 15, weight: .semibold))
-                    .foregroundStyle(.white.opacity(0.95))
+                    .foregroundStyle(AppVisualTheme.foreground(0.95))
 
                 HStack(spacing: 6) {
                     Text(viewModel.uiStatus.menuText)
@@ -232,7 +232,7 @@ private struct StatusBarPopoverBackground: View {
                     tokens.surfaceTop.opacity(0.50),
                     AppVisualTheme.baseTint.opacity(0.16),
                     tokens.surfaceBottom.opacity(0.88),
-                    Color.black.opacity(0.34)
+                    AppVisualTheme.surfaceFill(0.34)
                 ],
                 startPoint: .topLeading,
                 endPoint: .bottom
@@ -287,14 +287,14 @@ private struct PopoverMenuRow: View {
 
                 Text(label)
                     .font(.system(size: 13, weight: .medium))
-                    .foregroundColor(isHovered ? .white : Color.white.opacity(0.92))
+                    .foregroundColor(isHovered ? AppVisualTheme.primaryText : AppVisualTheme.foreground(0.92))
 
                 Spacer()
 
                 if let shortcut {
                     Text(shortcut)
                         .font(.system(size: 11, weight: .regular, design: .monospaced))
-                        .foregroundStyle(isHovered ? Color.white.opacity(0.8) : AppVisualTheme.mutedText)
+                        .foregroundStyle(isHovered ? AppVisualTheme.foreground(0.80) : AppVisualTheme.mutedText)
                 }
             }
             .padding(.horizontal, 10)
@@ -302,7 +302,7 @@ private struct PopoverMenuRow: View {
             .background {
                 if isHovered {
                     RoundedRectangle(cornerRadius: 7, style: .continuous)
-                        .fill(Color.white.opacity(0.08))
+                        .fill(AppVisualTheme.surfaceFill(0.08))
                         .transition(.opacity)
                 }
             }

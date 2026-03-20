@@ -1,7 +1,6 @@
 import Foundation
 
 enum LocalAutomationConnectorKind: String, CaseIterable, Codable, Sendable {
-    case computer
     case browser
     case app
 }
@@ -49,7 +48,6 @@ struct ConnectorActionRequest: Codable, Equatable, Sendable {
     let endISO8601: String?
     let browserProfileID: String?
     let commit: Bool
-    let fallbackToComputerUse: Bool
 }
 
 struct ConnectorActionResult: Codable, Equatable, Sendable {
@@ -57,7 +55,6 @@ struct ConnectorActionResult: Codable, Equatable, Sendable {
     let summary: String
     let details: String?
     let connectorID: String
-    let usedComputerFallback: Bool
     let requiresConfirmation: Bool
     let confirmationMessage: String?
 }

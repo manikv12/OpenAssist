@@ -32,11 +32,11 @@ struct AssistantPushToTalkButton: View {
             let pulse = 1.0 + (visualLevel * 0.06) + (CGFloat(sin(time * 5.0)) * (isActive ? 0.02 : 0.0))
             let ringScale = 1.0 + (visualLevel * 0.18)
             let ringOpacity = 0.10 + (visualLevel * 0.18)
-            let baseFillTop = isActive ? accentColor.opacity(0.30) : Color.white.opacity(0.10)
-            let baseFillBottom = isActive ? accentColor.opacity(0.14) : Color.white.opacity(0.05)
+            let baseFillTop = isActive ? accentColor.opacity(0.30) : AppVisualTheme.foreground(0.10)
+            let baseFillBottom = isActive ? accentColor.opacity(0.14) : AppVisualTheme.foreground(0.05)
             let symbolColor = isEnabled
-                ? (isActive ? Color.white.opacity(0.96) : Color.white.opacity(0.72))
-                : Color.white.opacity(0.34)
+                ? (isActive ? AppVisualTheme.foreground(0.96) : AppVisualTheme.foreground(0.72))
+                : AppVisualTheme.foreground(0.34)
 
             ZStack {
                 if isActive {
@@ -66,7 +66,7 @@ struct AssistantPushToTalkButton: View {
                     .overlay(
                         Circle()
                             .stroke(
-                                isActive ? accentColor.opacity(0.34) : Color.white.opacity(0.10),
+                                isActive ? accentColor.opacity(0.34) : AppVisualTheme.foreground(0.10),
                                 lineWidth: 0.9
                             )
                     )
@@ -175,11 +175,11 @@ struct AssistantLiveVoiceButton: View {
             let pulse = 1.0 + (visualLevel * 0.06) + (CGFloat(sin(time * 5.0)) * (isActive ? 0.02 : 0.0))
             let ringScale = 1.0 + (visualLevel * 0.18)
             let ringOpacity = 0.10 + (visualLevel * 0.18)
-            let baseFillTop = isActive ? accentColor.opacity(0.30) : Color.white.opacity(0.10)
-            let baseFillBottom = isActive ? accentColor.opacity(0.14) : Color.white.opacity(0.05)
+            let baseFillTop = isActive ? accentColor.opacity(0.30) : AppVisualTheme.foreground(0.10)
+            let baseFillBottom = isActive ? accentColor.opacity(0.14) : AppVisualTheme.foreground(0.05)
             let symbolColor = isEnabled
-                ? (isActive ? Color.white.opacity(0.96) : Color.white.opacity(0.72))
-                : Color.white.opacity(0.34)
+                ? (isActive ? AppVisualTheme.foreground(0.96) : AppVisualTheme.foreground(0.72))
+                : AppVisualTheme.foreground(0.34)
 
             Button(action: onTap) {
                 ZStack {
@@ -210,7 +210,7 @@ struct AssistantLiveVoiceButton: View {
                         .overlay(
                             Circle()
                                 .stroke(
-                                    isActive ? accentColor.opacity(0.34) : Color.white.opacity(0.10),
+                                    isActive ? accentColor.opacity(0.34) : AppVisualTheme.foreground(0.10),
                                     lineWidth: 0.9
                                 )
                         )

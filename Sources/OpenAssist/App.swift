@@ -21,6 +21,8 @@ extension Notification.Name {
     static let openAssistAssistantZoomOut = Notification.Name("OpenAssist.assistantZoomOut")
     static let openAssistAssistantZoomReset = Notification.Name("OpenAssist.assistantZoomReset")
     static let openAssistMinimizeAssistantToOrb = Notification.Name("OpenAssist.minimizeAssistantToOrb")
+    static let openAssistRunScheduledJob = Notification.Name("OpenAssist.runScheduledJob")
+    static let openAssistSwitchToSession = Notification.Name("OpenAssist.switchToSession")
 }
 
 @MainActor
@@ -721,6 +723,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
     private let whisperModelManager = WhisperModelManager.shared
     private let settings = SettingsStore.shared
     private let automationAPICoordinator = AutomationAPICoordinator.shared
+    private let telegramRemoteCoordinator = TelegramRemoteCoordinator.shared
     private let adaptiveCorrectionStore = AdaptiveCorrectionStore.shared
     private let promptRewriteService = PromptRewriteService.shared
     private let assistantVoiceDraftRefinementService = AssistantVoiceDraftRefinementService()
@@ -751,6 +754,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
     private var assistantStartVoiceCaptureObserver: NSObjectProtocol?
     private var assistantStopVoiceCaptureObserver: NSObjectProtocol?
     private var assistantMinimizeToCompactObserver: NSObjectProtocol?
+    private var scheduledJobRequestObserver: NSObjectProtocol?
+    private var scheduledJobInFlightID: String?
     private var memoryPressureSource: DispatchSourceMemoryPressure?
     private var adaptiveCorrectionObserver: AnyCancellable?
     private var assistantHUDObserver: AnyCancellable?
@@ -1238,6 +1243,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         }
 
         automationAPICoordinator.applySettings(settings)
+        telegramRemoteCoordinator.applySettings(settings)
+        assistantController.onTurnCompletion = { [weak self] status in
+            Task { @MainActor in
+                await self?.finishScheduledJobIfNeeded(status)
+            }
+        }
 
         workspaceActivationObserver = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didActivateApplicationNotification,
@@ -1309,6 +1320,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             Task { @MainActor in
                 self?.openAssistantWindow()
                 self?.windowCoordinator?.openSettingsWindow()
+            }
+        }
+
+        scheduledJobRequestObserver = NotificationCenter.default.addObserver(
+            forName: .openAssistRunScheduledJob,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            guard let jobID = notification.userInfo?["jobID"] as? String,
+                  let prompt = notification.userInfo?["prompt"] as? String else { return }
+            let modelID = notification.userInfo?["preferredModelID"] as? String
+            let effortRaw = notification.userInfo?["reasoningEffort"] as? String
+            Task { @MainActor in
+                await self?.runScheduledJob(
+                    jobID: jobID,
+                    prompt: prompt,
+                    preferredModelID: modelID,
+                    reasoningEffortRawValue: effortRaw
+                )
+            }
+        }
+
+        JobQueueCoordinator.shared.start()
+
+        NotificationCenter.default.addObserver(
+            forName: .openAssistSwitchToSession,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            guard let sessionID = notification.userInfo?["sessionID"] as? String else { return }
+            Task { @MainActor in
+                self?.openAssistantWindow()
+                guard let self else { return }
+
+                if let matchingSession = self.assistantController.sessions.first(where: {
+                    $0.id.trimmingCharacters(in: .whitespacesAndNewlines)
+                        .caseInsensitiveCompare(sessionID.trimmingCharacters(in: .whitespacesAndNewlines)) == .orderedSame
+                }) {
+                    await self.assistantController.openSession(matchingSession)
+                } else {
+                    self.assistantController.selectedSessionID = sessionID
+                }
             }
         }
 
@@ -1443,6 +1496,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         settingsApplyWorkItem = nil
         settings.onChange = nil
         automationAPICoordinator.stop()
+        telegramRemoteCoordinator.stop()
         adaptiveCorrectionObserver?.cancel()
         adaptiveCorrectionObserver = nil
         assistantHUDObserver?.cancel()
@@ -2050,6 +2104,139 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         }
     }
 
+    private func runScheduledJob(
+        jobID: String,
+        prompt: String,
+        preferredModelID: String?,
+        reasoningEffortRawValue: String?
+    ) async {
+        let coordinator = JobQueueCoordinator.shared
+        guard let job = coordinator.jobs.first(where: { $0.id == jobID }) else {
+            coordinator.markJobExecutionFinished(id: jobID)
+            return
+        }
+        scheduledJobInFlightID = jobID
+        _ = coordinator.beginRun(jobID: jobID, startedAt: Date())
+        let existingSessionID = coordinator.jobs.first(where: { $0.id == jobID })?.dedicatedSessionID
+
+        if let preferredModelID {
+            assistantController.chooseModel(preferredModelID)
+        }
+        if let reasoningEffortRawValue,
+           let reasoningEffort = AssistantReasoningEffort(rawValue: reasoningEffortRawValue) {
+            assistantController.reasoningEffort = reasoningEffort
+        }
+
+        // Set up the dedicated session for this job (resume existing or start fresh).
+        guard let sessionID = await assistantController.resumeOrStartScheduledJobSession(existingID: existingSessionID) else {
+            let note = "Failed — could not set up a session for this job."
+            CrashReporter.logWarning("Scheduled job \(jobID): \(note)")
+            coordinator.recordJobResult(id: jobID, note: note)
+            await finishScheduledJobIfNeeded(nil, forcedOutcome: .failed, fallbackNote: note)
+            return
+        }
+        coordinator.updateActiveRunSession(jobID: jobID, sessionID: sessionID)
+
+        openAssistantWindow()
+        try? await Task.sleep(nanoseconds: 500_000_000)
+
+        guard !assistantController.hasActiveTurn else {
+            let note = "Skipped — assistant was busy with another task."
+            CrashReporter.logWarning("Scheduled job \(jobID): \(note)")
+            coordinator.recordJobResult(id: jobID, note: note, sessionID: sessionID)
+            await finishScheduledJobIfNeeded(nil, forcedOutcome: .interrupted, fallbackNote: note)
+            return
+        }
+
+        coordinator.recordJobResult(id: jobID, note: "Prompt sent · session \(sessionID.prefix(8))…", sessionID: sessionID)
+        await assistantController.sendPrompt(prompt, automationJob: job)
+
+        if !assistantController.hasActiveTurn {
+            CrashReporter.logWarning("Scheduled job \(jobID) did not start an assistant turn.")
+            let note = "Submitted but no turn started — check model/provider config."
+            coordinator.recordJobResult(id: jobID, note: note, sessionID: sessionID)
+            await finishScheduledJobIfNeeded(nil, forcedOutcome: .failed, fallbackNote: note)
+        }
+    }
+
+    private func finishScheduledJobIfNeeded(
+        _ completionStatus: AssistantTurnCompletionStatus? = nil,
+        forcedOutcome: ScheduledJobRunOutcome? = nil,
+        fallbackNote: String? = nil
+    ) async {
+        guard let jobID = scheduledJobInFlightID else { return }
+        scheduledJobInFlightID = nil
+        let coordinator = JobQueueCoordinator.shared
+        defer {
+            coordinator.markJobExecutionFinished(id: jobID)
+        }
+
+        guard let job = coordinator.jobs.first(where: { $0.id == jobID }) else {
+            return
+        }
+
+        let outcome: ScheduledJobRunOutcome = forcedOutcome ?? {
+            switch completionStatus {
+            case .completed:
+                return .completed
+            case .interrupted:
+                return .interrupted
+            case .failed:
+                return .failed
+            case .none:
+                return .failed
+            }
+        }()
+
+        let finishedAt = Date()
+        var run = coordinator.activeRun(jobID: jobID) ?? ScheduledJobRun.make(jobID: jobID, startedAt: finishedAt)
+        run.finishedAt = finishedAt
+        run.outcome = outcome
+
+        let sessionID = run.sessionID ?? job.dedicatedSessionID
+        let history: ([AssistantTimelineItem], [AssistantTranscriptEntry])
+        if let sessionID {
+            history = await assistantController.loadSessionHistoryForAutomationSummary(sessionID: sessionID)
+        } else {
+            history = ([], [])
+        }
+
+        let sessionCWD = sessionID.flatMap { activeSessionID in
+            assistantController.sessions.first(where: {
+                $0.id.trimmingCharacters(in: .whitespacesAndNewlines)
+                    .caseInsensitiveCompare(activeSessionID.trimmingCharacters(in: .whitespacesAndNewlines)) == .orderedSame
+            })?.cwd
+        }
+
+        let processed = await AutomationMemoryService.shared.processCompletedRun(
+            job: job,
+            run: run,
+            transcript: history.1,
+            timeline: history.0,
+            cwd: sessionCWD
+        )
+
+        let resolvedNote: String
+        if let fallbackNote = fallbackNote?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
+            resolvedNote = fallbackNote
+        } else if case let .failed(message)? = completionStatus,
+                  let normalized = message.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
+            resolvedNote = normalized
+        } else {
+            resolvedNote = processed.statusNote
+        }
+
+        coordinator.completeRun(
+            jobID: jobID,
+            outcome: outcome,
+            statusNote: resolvedNote,
+            summaryText: processed.summaryText,
+            firstIssueAt: processed.firstIssueAt,
+            learnedLessonCount: processed.learnedLessonCount,
+            finishedAt: finishedAt
+        )
+    }
+
     private func disableAssistantBeta() {
         settings.assistantBetaEnabled = false
         stopAssistantExperience()
@@ -2441,6 +2628,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         syncAssistantCompactVisibility()
 
         automationAPICoordinator.applySettings(settings)
+        telegramRemoteCoordinator.applySettings(settings)
         lastAppliedSettingsSnapshot = currentSettingsApplySnapshot()
         updateMenuState()
     }
@@ -2809,6 +2997,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             compactVoiceStopMode = .manualRelease
             assistantVoiceBaselineSamples = []
             assistantVoiceBaselineCalibrated = false
+            if settings.promptRewriteEnabled {
+                assistantController.showTransientHUDState(AssistantHUDState(
+                    phase: .thinking,
+                    title: "Refining",
+                    detail: "Applying AI corrections to your message"
+                ))
+            }
             let refinedAssistantDraft = await refinedAssistantVoiceDraft(from: cleaned)
             assistantCompactHUD?.receiveVoiceTranscript(refinedAssistantDraft)
             setUIStatus(.ready)
@@ -2822,6 +3017,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             assistantVoiceBaselineSamples = []
             assistantVoiceBaselineCalibrated = false
             openAssistantWindow()
+            if settings.promptRewriteEnabled {
+                assistantController.showTransientHUDState(AssistantHUDState(
+                    phase: .thinking,
+                    title: "Refining",
+                    detail: "Applying AI corrections to your message"
+                ))
+            }
             let refinedAssistantDraft = await refinedAssistantVoiceDraft(from: cleaned)
             assistantController.receiveVoiceDraft(refinedAssistantDraft)
             setUIStatus(.ready)
@@ -4191,7 +4393,7 @@ struct SettingsView: View {
             case .shortcuts: return "Shortcuts"
             case .speech: return "Speech & Input"
             case .aiModels: return "AI & Models"
-            case .computerControl: return "Computer Control"
+            case .computerControl: return "Automation"
             case .integrations: return "Integrations"
             case .corrections: return "Corrections"
             case .about: return "About & Permissions"
@@ -4204,7 +4406,7 @@ struct SettingsView: View {
             case .shortcuts: return "Dictation and agent shortcut keys"
             case .speech: return "Microphone, engine, whisper models, timing, and text quality"
             case .aiModels: return "Prompt rewrite, memory assistant, and provider connections"
-            case .computerControl: return "Local Mac permissions, helper status, browser profiles, and app actions"
+            case .computerControl: return "Browser reuse, automation permissions, helper status, and direct app actions"
             case .integrations: return "Local automation and agent notifications"
             case .corrections: return "Learn from and manage text fixes"
             case .about: return "Permission health, diagnostics, and uninstall"
@@ -4217,7 +4419,7 @@ struct SettingsView: View {
             case .shortcuts: return "keyboard"
             case .speech: return "waveform.and.mic"
             case .aiModels: return "shippingbox.fill"
-            case .computerControl: return "computermouse.fill"
+            case .computerControl: return "point.3.connected.trianglepath.dotted"
             case .integrations: return "point.3.connected.trianglepath.dotted"
             case .corrections: return "text.badge.checkmark"
             case .about: return "info.circle"
@@ -4256,7 +4458,7 @@ struct SettingsView: View {
             case .aiModels:
                 return ["ai", "prompt", "rewrite", "memory", "provider", "oauth", "api key", "openai", "anthropic", "google", "gemini", "studio", "style", "conversation", "history"]
             case .computerControl:
-                return ["computer", "control", "browser", "browser profile", "screen recording", "automation", "apple events", "finder", "terminal", "calendar", "system settings", "helper"]
+                return ["automation", "browser", "browser profile", "apple events", "finder", "terminal", "calendar", "system settings", "helper", "messages", "notes", "contacts", "reminders"]
             case .integrations:
                 return ["integrations", "automation", "api", "localhost", "claude", "codex", "cloud", "hooks", "notification", "speech", "sound", "token", "port"]
             case .corrections:
@@ -4276,6 +4478,7 @@ struct SettingsView: View {
     private enum IntegrationsPage {
         case overview
         case automationNotifications
+        case telegramRemote
     }
 
     private struct ShortcutBinding: Equatable {
@@ -4345,6 +4548,7 @@ struct SettingsView: View {
     @StateObject private var localAISetupService = LocalAISetupService.shared
     @StateObject private var updateCheckStatusStore = UpdateCheckStatusStore.shared
     @StateObject private var automationAPICoordinator = AutomationAPICoordinator.shared
+    @StateObject private var telegramRemoteCoordinator = TelegramRemoteCoordinator.shared
     @State private var selectedSection: SettingsSection = .essentials
     @State private var selectedIntegrationsPage: IntegrationsPage = .overview
     @State private var searchQuery = ""
@@ -4402,6 +4606,8 @@ struct SettingsView: View {
     @State private var showingCorrectionsListSheet = false
     @State private var correctionsSearchQuery = ""
     @State private var automationActionMessage: String?
+    @State private var telegramActionMessage: String?
+    @State private var telegramBotTokenDraft = ""
     @State private var computerPermissionSnapshot = PermissionCenter.snapshot(using: .shared)
     @State private var computerControlStatus: HelperCapabilityStatus?
     @State private var installClaudeNotificationHook = false
@@ -4478,7 +4684,7 @@ struct SettingsView: View {
                     .padding(.leading, 10)
                     .padding(.vertical, 10)
                 Rectangle()
-                    .fill(Color.white.opacity(0.12))
+                    .fill(AppVisualTheme.foreground(0.12))
                     .frame(width: 1)
                     .frame(maxHeight: .infinity)
                 settingsDetailPane
@@ -4565,10 +4771,10 @@ struct SettingsView: View {
         VStack(alignment: .leading, spacing: 4) {
             Text(section.title)
                 .font(.system(size: 22, weight: .bold))
-                .foregroundStyle(.white.opacity(0.94))
+                .foregroundStyle(AppVisualTheme.foreground(0.94))
             Text(section.subtitle)
                 .font(.system(size: 13, weight: .regular))
-                .foregroundStyle(.white.opacity(0.58))
+                .foregroundStyle(AppVisualTheme.foreground(0.58))
         }
         .padding(.horizontal, 4)
         .padding(.vertical, 6)
@@ -4589,10 +4795,10 @@ struct SettingsView: View {
             VStack(alignment: .leading, spacing: 1) {
                 Text("Open Assist")
                     .font(.system(size: 16, weight: .semibold))
-                    .foregroundStyle(.white.opacity(0.92))
+                    .foregroundStyle(AppVisualTheme.foreground(0.92))
                 Text("Settings")
                     .font(.system(size: 11, weight: .regular))
-                    .foregroundStyle(.white.opacity(0.44))
+                    .foregroundStyle(AppVisualTheme.foreground(0.44))
             }
 
             Spacer(minLength: 0)
@@ -4654,19 +4860,19 @@ struct SettingsView: View {
         HStack(spacing: 10) {
             Image(systemName: section.iconName)
                 .font(.system(size: 12, weight: .medium))
-                .foregroundStyle(isSelected ? section.tint.opacity(0.95) : .white.opacity(0.54))
+                .foregroundStyle(isSelected ? section.tint.opacity(0.95) : AppVisualTheme.foreground(0.54))
                 .frame(width: 22, height: 22)
 
             Text(section.title)
                 .font(.system(size: 13, weight: isSelected ? .semibold : .regular))
-                .foregroundStyle(isSelected ? .white.opacity(0.96) : .white.opacity(0.82))
+                .foregroundStyle(isSelected ? AppVisualTheme.foreground(0.96) : AppVisualTheme.foreground(0.82))
 
             Spacer(minLength: 0)
 
             if !trimmedSearchQuery.isEmpty && matchCount > 0 {
                 Text("\(matchCount)")
                     .font(.system(size: 10, weight: .medium))
-                    .foregroundStyle(.white.opacity(0.40))
+                    .foregroundStyle(AppVisualTheme.foreground(0.40))
             }
         }
         .padding(.horizontal, 8)
@@ -4675,7 +4881,7 @@ struct SettingsView: View {
         .contentShape(Rectangle())
         .background(
             RoundedRectangle(cornerRadius: 7, style: .continuous)
-                .fill(isSelected ? Color.white.opacity(0.08) : (isHovered ? Color.white.opacity(0.04) : Color.clear))
+                .fill(isSelected ? AppVisualTheme.foreground(0.08) : (isHovered ? AppVisualTheme.foreground(0.04) : Color.clear))
         )
     }
 
@@ -4723,7 +4929,7 @@ struct SettingsView: View {
             LinearGradient(
                 colors: [
                     section.tint.opacity(0.35),
-                    Color.white.opacity(0.09),
+                    AppVisualTheme.foreground(0.09),
                     Color.clear
                 ],
                 startPoint: .leading,
@@ -4762,7 +4968,7 @@ struct SettingsView: View {
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(entry.title)
                                     .font(.callout.weight(.semibold))
-                                    .foregroundStyle(.white.opacity(0.94))
+                                    .foregroundStyle(AppVisualTheme.foreground(0.94))
                                 Text(entry.detail)
                                     .font(.caption)
                                     .foregroundStyle(AppVisualTheme.mutedText)
@@ -4776,7 +4982,7 @@ struct SettingsView: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .background(
                             RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                .fill(Color.white.opacity(0.06))
+                                .fill(AppVisualTheme.foreground(0.06))
                                 .overlay(
                                     RoundedRectangle(cornerRadius: 8, style: .continuous)
                                         .fill(entry.section.tint.opacity(0.08))
@@ -5117,7 +5323,7 @@ struct SettingsView: View {
                         .foregroundStyle(.secondary)
                 }
 
-                Text("Inside Open Assist, this shortcut fills the agent text box instead of starting live voice.")
+                Text("Inside Open Assist, this shortcut records one voice draft into the agent box. Use Live Voice Start for the full listen, reply, and speak loop.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
@@ -5813,6 +6019,10 @@ struct SettingsView: View {
         automationAPICoordinator.maskedToken(for: settings)
     }
 
+    private var maskedTelegramBotToken: String {
+        telegramRemoteCoordinator.maskedBotToken(for: settings)
+    }
+
     private var automationAPIPortTextBinding: Binding<String> {
         Binding(
             get: { String(settings.automationAPIPort) },
@@ -5920,6 +6130,31 @@ struct SettingsView: View {
         return "Enabled sources: \(enabledSources.joined(separator: ", ")). Delivery settings are shared so users only configure sound, speech, and desktop alerts once."
     }
 
+    private var telegramOverviewSummary: String {
+        if settings.hasTelegramRemoteOwner {
+            return "Telegram remote is paired and ready. The bot shows one active session view at a time, so chats do not get mixed together."
+        }
+        if settings.hasTelegramPendingPairing {
+            let displayName = settings.telegramPendingDisplayName.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !displayName.isEmpty {
+                return "A Telegram pairing request from \(displayName) is waiting for approval."
+            }
+            return "A Telegram pairing request is waiting for approval."
+        }
+        if settings.telegramRemoteEnabled {
+            return "Telegram remote is on, but it still needs pairing. Open the focused page to paste your bot token, send /start from Telegram, and approve the pairing."
+        }
+        return "Telegram remote is off. Open the focused page to add a bot token, pair your Telegram DM, and control Open Assist while you are away from the Mac."
+    }
+
+    private var telegramBotChatURL: URL? {
+        let label = telegramRemoteCoordinator.botIdentityLabel.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard label.hasPrefix("@") else { return nil }
+        let username = label.dropFirst().trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !username.isEmpty else { return nil }
+        return URL(string: "https://t.me/\(username)")
+    }
+
     @ViewBuilder
     private var integrationsDetailHeader: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -5935,8 +6170,31 @@ struct SettingsView: View {
             VStack(alignment: .leading, spacing: 4) {
                 Text("Automation & Notifications")
                     .font(.title3.bold())
-                    .foregroundStyle(.white.opacity(0.97))
+                    .foregroundStyle(AppVisualTheme.foreground(0.97))
                 Text("Manage sources, shared delivery settings, local API access, and Codex status in one place.")
+                    .font(.callout)
+                    .foregroundStyle(AppVisualTheme.mutedText)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var telegramDetailHeader: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Button {
+                selectedIntegrationsPage = .overview
+            } label: {
+                Label("Back to Integrations", systemImage: "chevron.left")
+                    .font(.callout.weight(.medium))
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(AppVisualTheme.accentTint)
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Telegram Remote")
+                    .font(.title3.bold())
+                    .foregroundStyle(AppVisualTheme.foreground(0.97))
+                Text("Set up a Telegram bot, approve your private DM, and control one Open Assist session at a time without mixing chats.")
                     .font(.callout)
                     .foregroundStyle(AppVisualTheme.mutedText)
             }
@@ -5968,6 +6226,28 @@ struct SettingsView: View {
                             Spacer()
                             Button("Open Automation & Notifications") {
                                 selectedIntegrationsPage = .automationNotifications
+                            }
+                            .buttonStyle(.borderedProminent)
+                        }
+                    }
+
+                    settingsCard(
+                        title: "Telegram Remote",
+                        subtitle: "Control one Open Assist session at a time from your private Telegram chat.",
+                        symbol: "paperplane.fill",
+                        tint: AppVisualTheme.accentTint
+                    ) {
+                        Text(telegramOverviewSummary)
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+
+                        HStack {
+                            Text(settings.telegramRemoteEnabled ? "Telegram remote is on." : "Telegram remote is off.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                            Button("Open Telegram Remote") {
+                                selectedIntegrationsPage = .telegramRemote
                             }
                             .buttonStyle(.borderedProminent)
                         }
@@ -6237,6 +6517,207 @@ struct SettingsView: View {
                             await automationAPICoordinator.requestNotificationPermissionIfNeeded()
                         }
                     }
+                }
+
+            case .telegramRemote:
+                VStack(alignment: .leading, spacing: 14) {
+                    telegramDetailHeader
+
+                    if let telegramActionMessage {
+                        Text(telegramActionMessage)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    settingsCard(
+                        title: "Setup",
+                        subtitle: "Paste your bot token, then approve your private Telegram DM.",
+                        symbol: "paperplane.fill",
+                        tint: AppVisualTheme.accentTint
+                    ) {
+                        Toggle("Enable Telegram Remote", isOn: $settings.telegramRemoteEnabled)
+
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Bot token")
+                                .font(.callout.weight(.medium))
+
+                            SecureField("Paste your Telegram bot token", text: $telegramBotTokenDraft)
+                                .textFieldStyle(.roundedBorder)
+
+                            HStack(spacing: 10) {
+                                Button("Save Token") {
+                                    settings.telegramBotToken = telegramBotTokenDraft
+                                    telegramActionMessage = "Telegram bot token saved."
+                                }
+                                .buttonStyle(.borderedProminent)
+
+                                Button("Copy Saved Token") {
+                                    copyTextToPasteboard(settings.telegramBotToken)
+                                    telegramActionMessage = "Saved Telegram bot token copied."
+                                }
+                                .buttonStyle(.bordered)
+                                .disabled(settings.telegramBotToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+
+                                Button("Clear Token") {
+                                    settings.telegramBotToken = ""
+                                    telegramBotTokenDraft = ""
+                                    telegramActionMessage = "Telegram bot token cleared."
+                                }
+                                .buttonStyle(.bordered)
+                            }
+
+                            Text(maskedTelegramBotToken)
+                                .font(.system(size: 12, weight: .medium, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                        }
+
+                        HStack(spacing: 10) {
+                            Button("Open BotFather") {
+                                if let url = URL(string: "https://t.me/BotFather") {
+                                    NSWorkspace.shared.open(url)
+                                }
+                            }
+                            .buttonStyle(.bordered)
+
+                            if let telegramBotChatURL {
+                                Button("Open Bot Chat") {
+                                    NSWorkspace.shared.open(telegramBotChatURL)
+                                }
+                                .buttonStyle(.bordered)
+                            }
+
+                            Button("Test Bot Connection") {
+                                Task {
+                                    telegramActionMessage = await telegramRemoteCoordinator.testConnection()
+                                }
+                            }
+                            .buttonStyle(.bordered)
+                        }
+
+                        Text("""
+                        1. If you already made the bot, skip BotFather and just use your existing token.
+                        2. Paste the bot token here and save it.
+                        3. Turn on Telegram Remote.
+                        4. Open your bot in Telegram and send /start.
+                        5. If /start was sent before, send it one more time now.
+                        6. Come back here and approve the pairing request.
+                        7. After pairing, use /sessions, /new, or normal messages in Telegram.
+                        """)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    }
+
+                    settingsCard(
+                        title: "Pairing",
+                        subtitle: "Only one approved private Telegram DM can control Open Assist in this first version.",
+                        symbol: "person.crop.circle.badge.checkmark",
+                        tint: AppVisualTheme.accentTint
+                    ) {
+                        if settings.hasTelegramRemoteOwner {
+                            Text("Paired Telegram user ID: \(settings.telegramOwnerUserID)")
+                                .font(.callout)
+                                .foregroundStyle(.secondary)
+
+                            Button("Forget Paired Chat") {
+                                settings.clearTelegramRemoteOwner()
+                                telegramActionMessage = "Removed the paired Telegram chat."
+                            }
+                            .buttonStyle(.bordered)
+                        } else {
+                            Text("No Telegram chat is paired yet.")
+                                .font(.callout)
+                                .foregroundStyle(.secondary)
+
+                            Text("The bot connection already works. The next step is to open the bot in Telegram and send /start. If you changed the token, send /start again.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+
+                        if settings.hasTelegramPendingPairing {
+                            Divider()
+
+                            let pendingDisplayName = settings.telegramPendingDisplayName.trimmingCharacters(in: .whitespacesAndNewlines)
+                            Text(pendingDisplayName.isEmpty ? "Pending pairing request." : "Pending pairing request from \(pendingDisplayName).")
+                                .font(.callout.weight(.medium))
+
+                            Text("Approve this request to let that private Telegram chat control one Open Assist session view at a time.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+
+                            HStack(spacing: 10) {
+                                Button("Approve Pairing") {
+                                    Task {
+                                        telegramActionMessage = await telegramRemoteCoordinator.approvePendingPairing()
+                                    }
+                                }
+                                .buttonStyle(.borderedProminent)
+
+                                Button("Decline") {
+                                    Task {
+                                        telegramActionMessage = await telegramRemoteCoordinator.rejectPendingPairing()
+                                    }
+                                }
+                                .buttonStyle(.bordered)
+                            }
+                        }
+                    }
+
+                    settingsCard(
+                        title: "Behavior",
+                        subtitle: "Telegram shows one active session view so different Open Assist sessions do not get mixed together.",
+                        symbol: "rectangle.3.group.bubble.left.fill",
+                        tint: AppVisualTheme.accentTint
+                    ) {
+                        Text("""
+                        When you switch sessions in Telegram, Open Assist removes the temporary view for the old session and loads the new session instead. The real history stays safe inside Open Assist on your Mac.
+                        """)
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    }
+
+                    settingsCard(
+                        title: "Status",
+                        subtitle: "See bot identity, pairing state, and polling health.",
+                        symbol: "info.circle.fill",
+                        tint: AppVisualTheme.accentTint
+                    ) {
+                        automationStatusRow(
+                            title: "Telegram Bot",
+                            badgeText: settings.telegramBotToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Missing token" : "Configured",
+                            badgeColor: settings.telegramBotToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? Color.orange.opacity(0.92) : AppVisualTheme.accentTint,
+                            detail: telegramRemoteCoordinator.botIdentityLabel
+                        )
+
+                        automationStatusRow(
+                            title: "Remote status",
+                            badgeText: settings.telegramRemoteEnabled ? "Enabled" : "Off",
+                            badgeColor: settings.telegramRemoteEnabled ? AppVisualTheme.accentTint : Color.orange.opacity(0.92),
+                            detail: telegramRemoteCoordinator.connectionStatusMessage
+                        )
+
+                        automationStatusRow(
+                            title: "Pairing",
+                            badgeText: settings.hasTelegramRemoteOwner ? "Paired" : (settings.hasTelegramPendingPairing ? "Pending" : "Waiting"),
+                            badgeColor: settings.hasTelegramRemoteOwner ? Color.green.opacity(0.92) : Color.orange.opacity(0.92),
+                            detail: telegramRemoteCoordinator.pairingStatusMessage
+                        )
+
+                        if let lastErrorMessage = telegramRemoteCoordinator.lastErrorMessage,
+                           !lastErrorMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                            Text(lastErrorMessage)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                }
+                .onAppear {
+                    telegramActionMessage = nil
+                    telegramBotTokenDraft = settings.telegramBotToken
                 }
             }
         }
@@ -7037,15 +7518,15 @@ struct SettingsView: View {
     private func whisperModelBadge(_ text: String) -> some View {
         Text(text)
             .font(.caption2.weight(.semibold))
-            .foregroundStyle(.white.opacity(0.82))
+            .foregroundStyle(AppVisualTheme.foreground(0.82))
             .padding(.horizontal, 6)
             .padding(.vertical, 2)
             .background(
                 Capsule()
-                    .fill(Color.white.opacity(0.10))
+                    .fill(AppVisualTheme.foreground(0.10))
                     .overlay(
                         Capsule()
-                            .stroke(Color.white.opacity(0.18), lineWidth: 0.6)
+                            .stroke(AppVisualTheme.foreground(0.18), lineWidth: 0.6)
                     )
             )
     }
@@ -7229,12 +7710,12 @@ struct SettingsView: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(title)
                         .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(.white.opacity(0.90))
+                        .foregroundStyle(AppVisualTheme.foreground(0.90))
 
                     if let subtitle {
                         Text(subtitle)
                             .font(.system(size: 11, weight: .regular))
-                            .foregroundStyle(.white.opacity(0.54))
+                            .foregroundStyle(AppVisualTheme.foreground(0.54))
                     }
                 }
 
@@ -7246,10 +7727,10 @@ struct SettingsView: View {
         .padding(14)
         .background(
             RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(Color.white.opacity(0.03))
+                .fill(AppVisualTheme.foreground(0.03))
                 .overlay(
                     RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .stroke(Color.white.opacity(0.06), lineWidth: 0.5)
+                        .stroke(AppVisualTheme.foreground(0.06), lineWidth: 0.5)
                 )
         )
     }
@@ -7284,12 +7765,12 @@ struct SettingsView: View {
                     VStack(alignment: .leading, spacing: 2) {
                         Text(title)
                             .font(.system(size: 13, weight: .semibold))
-                            .foregroundStyle(.white.opacity(0.90))
+                            .foregroundStyle(AppVisualTheme.foreground(0.90))
 
                         if let subtitle {
                             Text(subtitle)
                                 .font(.system(size: 11, weight: .regular))
-                                .foregroundStyle(.white.opacity(0.54))
+                                .foregroundStyle(AppVisualTheme.foreground(0.54))
                         }
                     }
 
@@ -7298,7 +7779,7 @@ struct SettingsView: View {
                     Image(systemName: "chevron.right")
                         .rotationEffect(.degrees(isExpanded.wrappedValue ? 90 : 0))
                         .font(.system(size: 10, weight: .medium))
-                        .foregroundStyle(.white.opacity(0.34))
+                        .foregroundStyle(AppVisualTheme.foreground(0.34))
                         .padding(.top, 2)
                 }
                 .contentShape(Rectangle())
@@ -7315,10 +7796,10 @@ struct SettingsView: View {
         .padding(14)
         .background(
             RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(Color.white.opacity(0.03))
+                .fill(AppVisualTheme.foreground(0.03))
                 .overlay(
                     RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .stroke(Color.white.opacity(0.07), lineWidth: 0.5)
+                        .stroke(AppVisualTheme.foreground(0.07), lineWidth: 0.5)
                 )
         )
     }
@@ -7329,15 +7810,15 @@ struct SettingsView: View {
             ForEach(segments, id: \.self) { segment in
                 Text(segment)
                     .font(.system(size: 12, weight: .medium, design: .monospaced))
-                    .foregroundStyle(.white.opacity(0.86))
+                    .foregroundStyle(AppVisualTheme.foreground(0.86))
                     .padding(.horizontal, 8)
                     .padding(.vertical, 4)
                     .background(
                         RoundedRectangle(cornerRadius: 5, style: .continuous)
-                            .fill(Color.white.opacity(0.06))
+                            .fill(AppVisualTheme.foreground(0.06))
                             .overlay(
                                 RoundedRectangle(cornerRadius: 5, style: .continuous)
-                                    .stroke(Color.white.opacity(0.08), lineWidth: 0.5)
+                                    .stroke(AppVisualTheme.foreground(0.08), lineWidth: 0.5)
                             )
                     )
             }
@@ -7474,10 +7955,10 @@ struct SettingsView: View {
             .init(section: .aiModels, title: "Rewrite history source switch", detail: "Pin to a saved context or use automatic app/screen context", keywords: ["switch", "pin", "context", "history", "conversation"]),
             .init(section: .aiModels, title: "Provider connection status", detail: "See OAuth and API key status for OpenAI, Anthropic, and Google Gemini", keywords: ["provider", "oauth", "api key", "openai", "anthropic", "google", "gemini", "connection"]),
             .init(section: .aiModels, title: "AI Studio", detail: "Launch dedicated AI page for provider and prompt model controls", keywords: ["ai", "studio", "providers", "models", "rewrite"]),
-            .init(section: .computerControl, title: "Computer Control permissions", detail: "Review Accessibility, Screen Recording, Automation, and Full Disk Access", keywords: ["computer", "control", "screen recording", "automation", "apple events", "full disk"]),
+            .init(section: .computerControl, title: "Automation permissions", detail: "Review Automation and Full Disk Access for browser and app actions", keywords: ["automation", "apple events", "full disk", "browser"]),
             .init(section: .computerControl, title: "Browser profile", detail: "Choose the Chrome, Brave, or Edge profile Open Assist should reuse", keywords: ["browser", "profile", "chrome", "brave", "edge", "session"]),
             .init(section: .computerControl, title: "Helper status", detail: "See local automation helper readiness and current setup issues", keywords: ["helper", "status", "issues", "readiness"]),
-            .init(section: .computerControl, title: "Supported app actions", detail: "See Finder, Terminal, Calendar, and System Settings direct actions", keywords: ["finder", "terminal", "calendar", "system settings", "app action"]),
+            .init(section: .computerControl, title: "Supported app actions", detail: "See Finder, Terminal, Calendar, System Settings, Reminders, Contacts, Notes, and Messages actions", keywords: ["finder", "terminal", "calendar", "system settings", "app action", "messages", "notes", "contacts", "reminders"]),
             .init(section: .computerControl, title: "Approval behavior", detail: "Understand session approvals and high-risk confirmation rules", keywords: ["approval", "allow", "session", "confirmation", "risky"]),
             .init(section: .integrations, title: "Automation & notifications", detail: "Open the focused page for Claude Code, Codex CLI, and Codex Cloud alerts", keywords: ["automation", "notifications", "sources", "codex", "claude"], integrationsPage: .automationNotifications),
             .init(section: .integrations, title: "Enable automation API", detail: "Run a localhost API for Claude Code and Codex CLI", keywords: ["automation", "api", "localhost", "server", "claude", "codex"], integrationsPage: .automationNotifications),
@@ -7486,6 +7967,11 @@ struct SettingsView: View {
             .init(section: .integrations, title: "Codex CLI notify config", detail: "Copy the Codex CLI notify snippet for ~/.codex/config.toml", keywords: ["codex", "notify", "config", "toml", "cloud"], integrationsPage: .automationNotifications),
             .init(section: .integrations, title: "Codex Cloud beta", detail: "Watch local codex cloud tasks and alert when they are ready or fail", keywords: ["codex", "cloud", "beta", "polling", "ready", "failed"], integrationsPage: .automationNotifications),
             .init(section: .integrations, title: "Automation notification permission", detail: "Allow desktop notifications for local API alerts", keywords: ["notification", "permission", "desktop", "grant"], integrationsPage: .automationNotifications),
+            .init(section: .integrations, title: "Telegram remote", detail: "Control the selected Open Assist session from a private Telegram bot chat", keywords: ["telegram", "remote", "bot", "chat", "session"], integrationsPage: .telegramRemote),
+            .init(section: .integrations, title: "Telegram bot token", detail: "Paste, copy, test, or clear your Telegram bot token", keywords: ["telegram", "botfather", "token", "paste", "copy"], integrationsPage: .telegramRemote),
+            .init(section: .integrations, title: "Telegram pairing", detail: "Approve or forget the private Telegram chat that can control Open Assist", keywords: ["telegram", "pairing", "approve", "private", "chat"], integrationsPage: .telegramRemote),
+            .init(section: .integrations, title: "Telegram setup steps", detail: "Follow the built-in BotFather and /start setup guide", keywords: ["telegram", "setup", "steps", "botfather", "start"], integrationsPage: .telegramRemote),
+            .init(section: .integrations, title: "Telegram session switching", detail: "Switch sessions without mixing messages from different chats", keywords: ["telegram", "switch", "session", "messages", "mixed"], integrationsPage: .telegramRemote),
             .init(section: .about, title: "Permission overview", detail: "See accessibility, mic, and speech status", keywords: ["permissions", "accessibility", "microphone", "speech"]),
             .init(section: .about, title: "Crash logs", detail: "Open existing crash logs in Finder", keywords: ["crash", "logs", "diagnostics"]),
             .init(section: .about, title: "Uninstall Open Assist", detail: "Remove app and clear saved settings", keywords: ["uninstall", "remove", "reset"])
@@ -7666,36 +8152,12 @@ struct SettingsView: View {
             settingsSectionHeader(for: .computerControl)
 
             settingsCard(
-                title: "Computer Control Permissions",
-                subtitle: "Grant each Mac permission only for the capability that needs it.",
+                title: "Automation Permissions",
+                subtitle: "Grant only the Mac permissions needed for browser reuse and direct app actions.",
                 symbol: "hand.raised.fill",
                 tint: SettingsSection.computerControl.tint
             ) {
                 VStack(alignment: .leading, spacing: 10) {
-                    permissionRow(
-                        name: "Accessibility",
-                        granted: computerPermissionSnapshot.accessibilityGranted,
-                        hint: "Needed for clicking, typing, keyboard shortcuts, and pointer control.",
-                        action: {
-                            PermissionCenter.requestAccessibilityPermission(
-                                using: settings,
-                                promptIfNeeded: true,
-                                openSettingsIfDenied: false
-                            )
-                            refreshComputerControlState()
-                        }
-                    )
-
-                    permissionRow(
-                        name: "Screen Recording",
-                        granted: computerPermissionSnapshot.screenRecordingGranted,
-                        hint: "Needed when Open Assist has to understand what is visible on screen.",
-                        action: {
-                            PermissionCenter.requestScreenRecordingPermission(openSettingsIfDenied: true)
-                            refreshComputerControlState()
-                        }
-                    )
-
                     permissionRow(
                         name: "Automation / Apple Events",
                         granted: computerPermissionSnapshot.appleEventsGranted,
@@ -7807,7 +8269,7 @@ struct SettingsView: View {
 
             settingsCard(
                 title: "Supported Direct App Actions",
-                subtitle: "These app actions use direct Mac automation before falling back to live computer control.",
+                subtitle: "These app actions run directly without any extra live-control layer.",
                 symbol: "app.connected.to.app.below.fill",
                 tint: SettingsSection.computerControl.tint
             ) {
@@ -7832,17 +8294,22 @@ struct SettingsView: View {
                         detail: "Jump directly to a settings page or search target.",
                         color: SettingsSection.computerControl.tint
                     )
+                    statusBadgeRow(
+                        title: "Reminders, Contacts, Notes, Messages",
+                        detail: "Read supported data directly through native frameworks.",
+                        color: SettingsSection.computerControl.tint
+                    )
                 }
             }
 
             settingsCard(
                 title: "Approval Behavior",
-                subtitle: "Open Assist keeps computer control in Agentic mode and explains what each approval means.",
+                subtitle: "Open Assist explains what each browser or app automation approval means.",
                 symbol: "checkmark.shield.fill",
                 tint: SettingsSection.computerControl.tint
             ) {
                 VStack(alignment: .leading, spacing: 8) {
-                    Text("`app_action`, `browser_use`, and `computer_use` only run in Agentic mode.")
+                    Text("`app_action` and `browser_use` only run in Agentic mode.")
                         .font(.callout)
                         .foregroundStyle(.secondary)
                     Text("“Allow for Session” remembers approval only for the current conversation and tool type.")
@@ -8136,16 +8603,6 @@ struct SettingsView: View {
                     )
 
                     permissionRow(
-                        name: "Screen Recording",
-                        granted: computerPermissionSnapshot.screenRecordingGranted,
-                        hint: "Needed for live computer-control screen understanding",
-                        action: {
-                            PermissionCenter.requestScreenRecordingPermission(openSettingsIfDenied: true)
-                            refreshComputerControlState()
-                        }
-                    )
-
-                    permissionRow(
                         name: "Automation / Apple Events",
                         granted: computerPermissionSnapshot.appleEventsGranted,
                         hint: "Needed for direct browser and app scripting",
@@ -8285,16 +8742,16 @@ struct SettingsView: View {
                 Text(snippet)
                     .font(.system(size: 12, weight: .medium, design: .monospaced))
                     .textSelection(.enabled)
-                    .foregroundStyle(.white.opacity(0.92))
+                    .foregroundStyle(AppVisualTheme.foreground(0.92))
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
             .padding(10)
             .background(
                 RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .fill(Color.black.opacity(0.22))
+                    .fill(AppVisualTheme.surfaceFill(0.22))
                     .overlay(
                         RoundedRectangle(cornerRadius: 10, style: .continuous)
-                            .stroke(Color.white.opacity(0.10), lineWidth: 0.7)
+                            .stroke(AppVisualTheme.foreground(0.10), lineWidth: 0.7)
                     )
             )
         }
@@ -8398,7 +8855,7 @@ struct SettingsView: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text(title)
                     .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(.white.opacity(0.94))
+                    .foregroundStyle(AppVisualTheme.foreground(0.94))
                 Text(detail)
                     .font(.caption2)
                     .foregroundStyle(AppVisualTheme.mutedText)
@@ -8409,10 +8866,10 @@ struct SettingsView: View {
         .padding(.vertical, 8)
         .background(
             RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(Color.white.opacity(0.05))
+                .fill(AppVisualTheme.foreground(0.05))
                 .overlay(
                     RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .stroke(Color.white.opacity(0.10), lineWidth: 0.7)
+                        .stroke(AppVisualTheme.foreground(0.10), lineWidth: 0.7)
                 )
         )
     }
@@ -8431,7 +8888,7 @@ struct SettingsView: View {
             VStack(alignment: .leading, spacing: 1) {
                 Text(name)
                     .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(.white.opacity(0.94))
+                    .foregroundStyle(AppVisualTheme.foreground(0.94))
                 Text(hint)
                     .font(.caption2)
                     .foregroundStyle(AppVisualTheme.mutedText)
@@ -8449,10 +8906,10 @@ struct SettingsView: View {
         .padding(.vertical, 8)
         .background(
             RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(Color.white.opacity(0.05))
+                .fill(AppVisualTheme.foreground(0.05))
                 .overlay(
                     RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .stroke(Color.white.opacity(0.10), lineWidth: 0.7)
+                        .stroke(AppVisualTheme.foreground(0.10), lineWidth: 0.7)
                 )
         )
     }
@@ -8686,7 +9143,7 @@ private struct TranscriptHistoryEntryCard: View {
         .overlay(alignment: .bottom) {
             if showsDivider {
                 Divider()
-                    .overlay(Color.white.opacity(0.08))
+                    .overlay(AppVisualTheme.foreground(0.08))
             }
         }
     }

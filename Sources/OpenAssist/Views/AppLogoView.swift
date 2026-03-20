@@ -53,7 +53,7 @@ struct AppLogoView: View {
 #if DEBUG
 #Preview("App Logo") {
     ZStack {
-        Color.white
+        AppVisualTheme.windowBackground
         AppLogoView(size: 512)
     }
     .frame(width: 600, height: 600)

@@ -16,9 +16,13 @@ final class AssistantMemoryRetrievalService {
         threadID: String,
         prompt: String,
         cwd: String?,
-        summaryMaxChars: Int
+        summaryMaxChars: Int,
+        longTermScope: MemoryScopeContext? = nil,
+        projectContextBlock: String? = nil,
+        statusBase: String? = nil,
+        additionalLongTermEntries: [AssistantMemoryEntry] = []
     ) throws -> AssistantBuiltMemoryContext {
-        let scope = makeScopeContext(threadID: threadID, cwd: cwd)
+        let scope = longTermScope ?? makeScopeContext(threadID: threadID, cwd: cwd)
         let initialChange = try threadMemoryService.loadTrackedDocument(for: threadID, seedTask: prompt)
 
         let resolvedChange: AssistantThreadMemoryChange
@@ -50,11 +54,16 @@ final class AssistantMemoryRetrievalService {
             threadID: threadID,
             scope: scope
         )
+        let mergedLongTermEntries = mergeLongTermEntries(
+            primary: longTermEntries,
+            additional: additionalLongTermEntries
+        )
 
         let summary = buildSummary(
             document: resolvedChange.document,
-            longTermEntries: longTermEntries,
+            longTermEntries: mergedLongTermEntries,
             agentStateLines: agentStateLines,
+            projectContextBlock: projectContextBlock,
             maxChars: summaryMaxChars
         )
 
@@ -64,7 +73,8 @@ final class AssistantMemoryRetrievalService {
         } else if resolvedChange.didChangeExternally {
             statusMessage = "Using updated session memory"
         } else if summary?.isEmpty == false {
-            statusMessage = "Using session memory"
+            statusMessage = statusBase?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+                ?? (longTermScope == nil ? "Using session memory" : "Using automation memory")
         } else {
             statusMessage = nil
         }
@@ -119,16 +129,31 @@ final class AssistantMemoryRetrievalService {
         scope: MemoryScopeContext
     ) throws -> [AssistantMemoryEntry] {
         let promptKeywords = Set(MemoryTextNormalizer.keywords(from: prompt, limit: 18))
+        let exactThreadIDFilter = scope.identityType == "assistant-project" ? nil : threadID
         var candidates = try store.fetchAssistantMemoryEntries(
             query: prompt,
             provider: .codex,
             scopeKey: scope.scopeKey,
             projectKey: scope.projectKey,
             identityKey: scope.identityKey,
-            threadID: threadID,
+            threadID: exactThreadIDFilter,
             state: .active,
             limit: 40
         )
+
+        if let projectKey = scope.projectKey,
+           candidates.count < 10 {
+            let projectMatches = try store.fetchAssistantMemoryEntries(
+                query: prompt,
+                provider: .codex,
+                projectKey: projectKey,
+                state: .active,
+                limit: 40
+            )
+            for candidate in projectMatches where !candidates.contains(where: { $0.id == candidate.id }) {
+                candidates.append(candidate)
+            }
+        }
 
         if candidates.count < 10 {
             let broadMatches = try store.fetchAssistantMemoryEntries(
@@ -169,6 +194,7 @@ final class AssistantMemoryRetrievalService {
         document: AssistantThreadMemoryDocument,
         longTermEntries: [AssistantMemoryEntry],
         agentStateLines: [String],
+        projectContextBlock: String?,
         maxChars: Int
     ) -> String? {
         var sections: [String] = []
@@ -194,6 +220,9 @@ final class AssistantMemoryRetrievalService {
             }
             sections.append("Long-term lessons:\n" + lessons.joined(separator: "\n"))
         }
+        if let projectContextBlock = projectContextBlock?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
+            sections.append(projectContextBlock)
+        }
 
         guard !sections.isEmpty else { return nil }
         let raw = """
@@ -214,6 +243,21 @@ final class AssistantMemoryRetrievalService {
         # Session Memory
         \(shortened)
         """
+    }
+
+    private func mergeLongTermEntries(
+        primary: [AssistantMemoryEntry],
+        additional: [AssistantMemoryEntry]
+    ) -> [AssistantMemoryEntry] {
+        guard !additional.isEmpty else { return primary }
+
+        var merged = primary
+        var existingIDs = Set(primary.map(\.id))
+        for entry in additional where !existingIDs.contains(entry.id) {
+            merged.append(entry)
+            existingIDs.insert(entry.id)
+        }
+        return merged
     }
 
     private func relevanceScore(
@@ -237,29 +281,42 @@ final class AssistantMemoryRetrievalService {
         return score
     }
 
-    func makeScopeContext(threadID: String, cwd: String?) -> MemoryScopeContext {
+    func makeScopeContext(
+        threadID: String,
+        cwd: String?,
+        projectIdentityKey: String? = nil,
+        projectNameOverride: String? = nil,
+        repositoryNameOverride: String? = nil
+    ) -> MemoryScopeContext {
         let bundleID = Bundle.main.bundleIdentifier ?? "com.developingadventures.OpenAssist"
         let normalizedCWD = cwd?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let projectName = normalizedCWD.flatMap { path -> String? in
+        let inferredProjectName = normalizedCWD.flatMap { path -> String? in
             let url = URL(fileURLWithPath: path, isDirectory: true)
             let last = url.lastPathComponent.trimmingCharacters(in: .whitespacesAndNewlines)
             return last.isEmpty || last == "/" ? nil : last
         }
-        let projectKey = projectName.map {
-            "project:" + MemoryTextNormalizer.collapsedWhitespace($0).lowercased()
-        }
-        let identityKey = "assistant-session:\(threadID.lowercased())"
+        let projectName = projectNameOverride?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+            ?? inferredProjectName
+        let projectKey = projectIdentityKey?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+            ?? projectName.map {
+                "project:" + MemoryTextNormalizer.collapsedWhitespace($0).lowercased()
+            }
+        let repositoryName = repositoryNameOverride?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+            ?? inferredProjectName
+        let identityKey = projectIdentityKey?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+            ?? "assistant-session:\(threadID.lowercased())"
+        let identityType = projectIdentityKey == nil ? "assistant-session" : "assistant-project"
         return MemoryScopeContext(
             appName: "Open Assist",
             bundleID: bundleID,
             surfaceLabel: "Assistant",
             projectKey: projectKey,
             projectName: projectName,
-            repositoryName: projectName,
+            repositoryName: repositoryName,
             identityKey: identityKey,
-            identityType: "assistant-session",
-            identityLabel: projectName ?? "Assistant Session",
-            isCodingContext: projectName != nil
+            identityType: identityType,
+            identityLabel: projectName ?? (projectIdentityKey == nil ? "Assistant Session" : "Assistant Project"),
+            isCodingContext: projectKey != nil || repositoryName != nil
         )
     }
 }

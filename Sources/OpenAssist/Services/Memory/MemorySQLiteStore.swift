@@ -1475,7 +1475,7 @@ final class MemorySQLiteStore {
         projectKey: String? = nil,
         identityKey: String? = nil,
         threadID: String? = nil,
-        state: AssistantMemoryEntryState = .active,
+        state: AssistantMemoryEntryState? = .active,
         limit: Int = 24
     ) throws -> [AssistantMemoryEntry] {
         let normalizedQuery = MemoryTextNormalizer.collapsedWhitespace(searchQuery)
@@ -1489,7 +1489,7 @@ final class MemorySQLiteStore {
             title, summary, detail, keywords_json, confidence, state, metadata_json, created_at, updated_at
         FROM assistant_memory_entries
         WHERE provider = ?
-            AND state = ?
+            AND (? IS NULL OR state = ?)
             AND (? IS NULL OR scope_key = ?)
             AND (? IS NULL OR project_key = ?)
             AND (? IS NULL OR identity_key = ?)
@@ -1506,20 +1506,21 @@ final class MemorySQLiteStore {
 
         return try query(sql: sql, bind: { statement in
             self.bind(provider.rawValue, at: 1, in: statement)
-            self.bind(state.rawValue, at: 2, in: statement)
-            self.bind(scopeKey, at: 3, in: statement)
+            self.bind(state?.rawValue, at: 2, in: statement)
+            self.bind(state?.rawValue, at: 3, in: statement)
             self.bind(scopeKey, at: 4, in: statement)
-            self.bind(projectKey, at: 5, in: statement)
+            self.bind(scopeKey, at: 5, in: statement)
             self.bind(projectKey, at: 6, in: statement)
-            self.bind(identityKey, at: 7, in: statement)
+            self.bind(projectKey, at: 7, in: statement)
             self.bind(identityKey, at: 8, in: statement)
-            self.bind(threadID, at: 9, in: statement)
+            self.bind(identityKey, at: 9, in: statement)
             self.bind(threadID, at: 10, in: statement)
-            self.bind(hasSearchTerm ? 1 : 0, at: 11, in: statement)
-            self.bind(likeValue, at: 12, in: statement)
+            self.bind(threadID, at: 11, in: statement)
+            self.bind(hasSearchTerm ? 1 : 0, at: 12, in: statement)
             self.bind(likeValue, at: 13, in: statement)
             self.bind(likeValue, at: 14, in: statement)
-            self.bind(Int64(normalizedLimit), at: 15, in: statement)
+            self.bind(likeValue, at: 15, in: statement)
+            self.bind(Int64(normalizedLimit), at: 16, in: statement)
         }, mapRow: { statement in
             AssistantMemoryEntry(
                 id: UUID(uuidString: self.readString(at: 0, in: statement) ?? "") ?? UUID(),
@@ -1584,6 +1585,19 @@ final class MemorySQLiteStore {
         guard !normalizedThreadID.isEmpty else { return }
         try execute(sql: "DELETE FROM assistant_memory_entries WHERE thread_id = ?;", bind: { statement in
             self.bind(normalizedThreadID, at: 1, in: statement)
+        })
+    }
+
+    func deleteAssistantMemoryEntries(ids: [UUID]) throws {
+        let normalizedIDs = ids.map(\.uuidString)
+        guard !normalizedIDs.isEmpty else { return }
+
+        let placeholders = Array(repeating: "?", count: normalizedIDs.count).joined(separator: ", ")
+        let sql = "DELETE FROM assistant_memory_entries WHERE id IN (\(placeholders));"
+        try execute(sql: sql, bind: { statement in
+            for (index, id) in normalizedIDs.enumerated() {
+                self.bind(id, at: Int32(index + 1), in: statement)
+            }
         })
     }
 

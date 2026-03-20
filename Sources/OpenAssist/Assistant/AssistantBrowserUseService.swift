@@ -5,7 +5,7 @@ enum AssistantBrowserUseToolDefinition {
     static let toolKind = "browserUse"
 
     static let description = """
-    Use a real local browser profile on this Mac for browser work. Prefer this for opening sites, checking the current tab, or reusing an existing signed-in browser session. Falls back to computer control when the task needs more live clicking or typing.
+    Use a real local browser profile on this Mac for browser work. Prefer this for opening sites, checking the current tab, or reusing an existing signed-in browser session.
     """
 
     static let inputSchema: [String: Any] = [
@@ -200,38 +200,27 @@ actor AssistantBrowserUseService {
 
     private let settings: SettingsStore
     private let helper: LocalAutomationHelper
-    private let computerUseService: AssistantComputerUseService
 
     init(
         settings: SettingsStore,
-        helper: LocalAutomationHelper = .shared,
-        computerUseService: AssistantComputerUseService
+        helper: LocalAutomationHelper = .shared
     ) {
         self.settings = settings
         self.helper = helper
-        self.computerUseService = computerUseService
     }
 
-    func run(arguments: Any, preferredModelID: String?) async -> AssistantComputerUseService.ToolExecutionResult {
+    func run(arguments: Any, preferredModelID: String?) async -> AssistantToolExecutionResult {
         do {
             let parsedTask = try Self.parseTask(from: arguments)
             let profile = try await resolveProfile(browserHint: parsedTask.browserHint)
 
             if parsedTask.needsComputerFallback {
-                if let blocked = await blockedComputerUseFallbackResult(
-                    task: parsedTask.task,
-                    app: profile.browser.displayName,
-                    reason: "Use the real \(profile.browser.displayName) session first when possible, then continue with live computer control if needed."
-                ) {
-                    return blocked
-                }
-                return await computerUseService.run(
-                    arguments: [
-                        "task": parsedTask.task,
-                        "app": profile.browser.displayName,
-                        "reason": "Use the real \(profile.browser.displayName) session first when possible, then continue with live computer control if needed."
-                    ],
-                    preferredModelID: preferredModelID
+                return Self.result(
+                    summary: """
+                    Browser Use can open sites, activate the browser, and read the current tab. This request needs live clicking or typing, which Open Assist no longer supports.
+                    """,
+                    detail: "Try asking to open a URL, switch to the browser, or read the current tab instead.",
+                    success: false
                 )
             }
 
@@ -262,35 +251,6 @@ actor AssistantBrowserUseService {
                 ?? "Browser Use failed."
             return Self.result(summary: summary, detail: nil, success: false)
         }
-    }
-
-    private func blockedComputerUseFallbackResult(
-        task: String,
-        app: String?,
-        reason: String?
-    ) async -> AssistantComputerUseService.ToolExecutionResult? {
-        let arguments: [String: Any] = {
-            var payload: [String: Any] = ["task": task]
-            if let app, !app.isEmpty {
-                payload["app"] = app
-            }
-            if let reason, !reason.isEmpty {
-                payload["reason"] = reason
-            }
-            return payload
-        }()
-
-        let verdict = await MainActor.run {
-            let snapshot = ToolPermissionRegistry.snapshot(using: settings)
-            return ToolPermissionRegistry.verify(
-                toolName: AssistantComputerUseToolDefinition.name,
-                arguments: arguments,
-                snapshot: snapshot
-            )
-        }
-
-        guard !verdict.satisfied else { return nil }
-        return Self.result(summary: verdict.message, detail: nil, success: false)
     }
 
     static func parseTask(from arguments: Any) throws -> ParsedTask {
@@ -399,14 +359,14 @@ actor AssistantBrowserUseService {
         summary: String,
         detail: String?,
         success: Bool = true
-    ) -> AssistantComputerUseService.ToolExecutionResult {
-        var items: [AssistantComputerUseService.ToolExecutionResult.ContentItem] = [
+    ) -> AssistantToolExecutionResult {
+        var items: [AssistantToolExecutionResult.ContentItem] = [
             .init(type: "inputText", text: summary, imageURL: nil)
         ]
         if let detail {
             items.append(.init(type: "inputText", text: detail, imageURL: nil))
         }
-        return AssistantComputerUseService.ToolExecutionResult(
+        return AssistantToolExecutionResult(
             contentItems: items,
             success: success,
             summary: summary

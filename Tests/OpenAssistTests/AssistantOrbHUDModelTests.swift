@@ -283,9 +283,9 @@ final class AssistantOrbHUDModelTests: XCTestCase {
         let model = AssistantOrbHUDModel()
         var dismissedSuggestion = false
         model.controllerModeSwitchSuggestion = AssistantModeSwitchSuggestion(
-            source: .draft,
-            originMode: .conversational,
-            message: "Switch to Plan mode first.",
+            source: .blocked,
+            originMode: .agentic,
+            message: "Switch to Plan mode first if you want planning.",
             choices: [
                 AssistantModeSwitchChoice(
                     mode: .plan,
@@ -367,18 +367,17 @@ final class AssistantOrbHUDModelTests: XCTestCase {
         XCTAssertEqual(model.interactionMode, .agentic)
 
         model.cycleInteractionMode()
-        XCTAssertEqual(model.interactionMode, .conversational)
-        XCTAssertEqual(changes, [.plan, .agentic, .conversational])
+        XCTAssertEqual(model.interactionMode, .plan)
+        XCTAssertEqual(changes, [.plan, .agentic, .plan])
     }
 
     @MainActor
-    func testOrbDraftPlanRequestSuggestsSwitchToPlanMode() {
+    func testOrbDoesNotShowLegacyDraftSuggestionInAgenticMode() {
         let model = AssistantOrbHUDModel()
 
         model.messageText = "Please plan this before coding."
         model.flushModeSwitchSuggestion()
 
-        XCTAssertEqual(model.modeSwitchSuggestion?.source, .draft)
-        XCTAssertEqual(model.modeSwitchSuggestion?.choices.map(\.mode), [.plan])
+        XCTAssertNil(model.modeSwitchSuggestion)
     }
 }

@@ -6,7 +6,6 @@ struct PermissionOnboardingView: View {
     let onComplete: () -> Void
 
     @State private var accessibilityGranted = false
-    @State private var screenRecordingGranted = false
     @State private var microphoneGranted = false
     @State private var speechRecognitionGranted = false
     @State private var speechRecognitionRequired = true
@@ -85,21 +84,10 @@ struct PermissionOnboardingView: View {
                     Divider()
 
                     permissionRow(
-                        title: "Screen Recording",
-                        hint: "Optional for computer control. Needed when Open Assist must understand what is visible on your screen.",
-                        granted: screenRecordingGranted,
-                        required: false,
-                        action: {
-                            PermissionCenter.requestScreenRecordingPermission(openSettingsIfDenied: true)
-                            refreshPermissionSnapshot()
-                        }
-                    )
-
-                    permissionRow(
                         title: "Automation / Apple Events",
                         hint: appleEventsKnown
-                            ? "Optional for computer control. Click Grant to ask for each installed target app one by one."
-                            : "Optional for computer control. Click Grant to ask for each installed target app one by one.",
+                            ? "Optional for browser reuse and direct app automation. Click Grant to ask for each installed target app one by one."
+                            : "Optional for browser reuse and direct app automation. Click Grant to ask for each installed target app one by one.",
                         granted: appleEventsGranted,
                         required: false,
                         action: {
@@ -222,7 +210,6 @@ struct PermissionOnboardingView: View {
     private func refreshPermissionSnapshot() {
         let snapshot = PermissionCenter.snapshot(using: settings)
         accessibilityGranted = snapshot.accessibilityGranted
-        screenRecordingGranted = snapshot.screenRecordingGranted
         microphoneGranted = snapshot.microphoneGranted
         speechRecognitionGranted = snapshot.speechRecognitionGranted
         speechRecognitionRequired = snapshot.speechRecognitionRequired

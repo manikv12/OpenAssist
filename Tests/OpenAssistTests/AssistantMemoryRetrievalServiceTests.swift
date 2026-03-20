@@ -172,6 +172,58 @@ final class AssistantMemoryRetrievalServiceTests: XCTestCase {
         XCTAssertFalse(summary.contains("A normal rewrite correction"))
     }
 
+    func testPrepareTurnContextIncludesProjectScopeLessonsAndProjectBlock() throws {
+        let memoryRoot = try makeTemporaryDirectory(named: "assistant-memory")
+        let databaseURL = try makeDatabaseURL()
+        let store = try MemorySQLiteStore(databaseURL: databaseURL)
+        let threadMemoryService = AssistantThreadMemoryService(baseDirectoryURL: memoryRoot)
+        let retrievalService = AssistantMemoryRetrievalService(
+            store: store,
+            threadMemoryService: threadMemoryService
+        )
+
+        let projectScope = retrievalService.makeScopeContext(
+            threadID: "thread-project",
+            cwd: "/tmp/website-app",
+            projectIdentityKey: "assistant-project:proj-1",
+            projectNameOverride: "Website App",
+            repositoryNameOverride: "website-app"
+        )
+
+        try store.upsertAssistantMemoryEntry(
+            AssistantMemoryEntry(
+                provider: .codex,
+                scopeKey: projectScope.scopeKey,
+                bundleID: projectScope.bundleID,
+                projectKey: projectScope.projectKey,
+                identityKey: projectScope.identityKey,
+                threadID: nil,
+                memoryType: .lesson,
+                title: "Package manager",
+                summary: "Update project dependencies with pnpm, not npm.",
+                detail: "When you update project dependencies here, use pnpm instead of npm.",
+                keywords: ["pnpm", "project", "dependencies", "npm"],
+                confidence: 0.9,
+                metadata: ["memory_domain": "assistant"]
+            )
+        )
+
+        let built = try retrievalService.prepareTurnContext(
+            threadID: "thread-project",
+            prompt: "Update the project dependencies with pnpm",
+            cwd: "/tmp/website-app",
+            summaryMaxChars: 1400,
+            longTermScope: projectScope,
+            projectContextBlock: "Project context:\n- Project name: Website App\n- Project memory summary: Shared notes"
+        )
+
+        let summary = try XCTUnwrap(built.summary)
+        XCTAssertTrue(summary.contains("Project context:"))
+        XCTAssertTrue(summary.contains("Website App"))
+        XCTAssertTrue(summary.contains("dependencies with pnpm"))
+        XCTAssertEqual(built.statusMessage, "Using automation memory")
+    }
+
     private func makeTemporaryDirectory(named name: String) throws -> URL {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("\(name)-\(UUID().uuidString)", isDirectory: true)

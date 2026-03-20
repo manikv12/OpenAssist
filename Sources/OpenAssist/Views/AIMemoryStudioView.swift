@@ -387,7 +387,7 @@ struct AIMemoryStudioView: View {
                 studioSidebar
 
                 Rectangle()
-                    .fill(Color.white.opacity(0.12))
+                    .fill(AppVisualTheme.surfaceFill(0.12))
                     .frame(width: 1)
                     .frame(maxHeight: .infinity)
 
@@ -536,10 +536,10 @@ struct AIMemoryStudioView: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text("AI Studio")
                     .font(.system(size: 15, weight: .semibold))
-                    .foregroundStyle(.white.opacity(0.92))
+                    .foregroundStyle(AppVisualTheme.foreground(0.92))
                 Text(selectedStudioPage.subtitle)
                     .font(.system(size: 11, weight: .regular))
-                    .foregroundStyle(.white.opacity(0.44))
+                    .foregroundStyle(AppVisualTheme.foreground(0.44))
                     .lineLimit(2)
             }
 
@@ -578,7 +578,7 @@ struct AIMemoryStudioView: View {
             }
 
             Divider()
-                .overlay(Color.white.opacity(0.08))
+                .overlay(AppVisualTheme.surfaceStroke(0.08))
 
             Text("Workspace")
                 .font(.subheadline.weight(.semibold))
@@ -597,7 +597,7 @@ struct AIMemoryStudioView: View {
             }
 
             Divider()
-                .overlay(Color.white.opacity(0.08))
+                .overlay(AppVisualTheme.surfaceStroke(0.08))
 
             Text("Assistant")
                 .font(.subheadline.weight(.semibold))
@@ -627,19 +627,19 @@ struct AIMemoryStudioView: View {
         HStack(spacing: 8) {
             Text(label)
                 .font(.system(size: 10, weight: .medium))
-                .foregroundStyle(.white.opacity(0.40))
+                .foregroundStyle(AppVisualTheme.foreground(0.40))
             Spacer(minLength: 0)
             Text(value)
                 .font(.system(size: 11, weight: .medium))
                 .lineLimit(1)
                 .truncationMode(.tail)
-                .foregroundStyle(.white.opacity(0.70))
+                .foregroundStyle(AppVisualTheme.foreground(0.70))
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 5)
         .background(
             RoundedRectangle(cornerRadius: 6, style: .continuous)
-                .fill(Color.white.opacity(0.03))
+                .fill(AppVisualTheme.surfaceFill(0.03))
         )
     }
 
@@ -650,12 +650,12 @@ struct AIMemoryStudioView: View {
         HStack(spacing: 10) {
             Image(systemName: page.iconName)
                 .font(.system(size: 11, weight: .medium))
-                .foregroundStyle(isSelected ? page.tint.opacity(0.85) : .white.opacity(0.40))
+                .foregroundStyle(isSelected ? page.tint.opacity(0.85) : AppVisualTheme.foreground(0.40))
                 .frame(width: 20, height: 20)
 
             Text(page.title)
                 .font(.system(size: 13, weight: isSelected ? .semibold : .regular))
-                .foregroundStyle(isSelected ? .white.opacity(0.92) : .white.opacity(0.68))
+                .foregroundStyle(isSelected ? AppVisualTheme.foreground(0.92) : AppVisualTheme.foreground(0.68))
                 .lineLimit(1)
 
             Spacer(minLength: 0)
@@ -666,7 +666,7 @@ struct AIMemoryStudioView: View {
         .contentShape(Rectangle())
         .background(
             RoundedRectangle(cornerRadius: 7, style: .continuous)
-                .fill(isSelected ? Color.white.opacity(0.07) : Color.clear)
+                .fill(isSelected ? AppVisualTheme.foreground(0.07) : Color.clear)
         )
     }
 
@@ -2413,7 +2413,7 @@ struct AIMemoryStudioView: View {
     }
 
     private var promptAssistantStateTint: Color {
-        settings.promptRewriteEnabled ? AppVisualTheme.accentTint : Color.white.opacity(0.58)
+        settings.promptRewriteEnabled ? AppVisualTheme.accentTint : AppVisualTheme.foreground(0.58)
     }
 
     private var crossIDEConversationSharingResolution: FeatureFlags.CrossIDEConversationSharingResolution {
@@ -2937,12 +2937,12 @@ struct AIMemoryStudioView: View {
     private func memoryEntryBadge(_ label: String, tint: Color) -> some View {
         Text(label)
             .font(.caption2.weight(.semibold))
-            .foregroundStyle(Color.white.opacity(0.88))
+            .foregroundStyle(AppVisualTheme.foreground(0.88))
             .padding(.horizontal, 7)
             .padding(.vertical, 3)
             .background(
                 Capsule(style: .continuous)
-                    .fill(Color.white.opacity(0.08))
+                    .fill(AppVisualTheme.surfaceFill(0.08))
                     .overlay(
                         Capsule(style: .continuous)
                             .stroke(tint.opacity(0.22), lineWidth: 0.7)
@@ -3436,7 +3436,7 @@ struct AIMemoryStudioView: View {
         case "API key missing", "OAuth not connected", "Runtime needs repair", "Runtime not installed":
             return AppVisualTheme.baseTint
         default:
-            return Color.white.opacity(0.58)
+            return AppVisualTheme.foreground(0.58)
         }
     }
 
@@ -3450,7 +3450,7 @@ struct AIMemoryStudioView: View {
                 .foregroundStyle(
                     completed
                         ? AppVisualTheme.accentTint
-                        : (active ? AppVisualTheme.baseTint : Color.white.opacity(0.45))
+                        : (active ? AppVisualTheme.baseTint : AppVisualTheme.foreground(0.45))
                 )
                 .font(.caption)
             Text(step.title)
@@ -5470,10 +5470,10 @@ struct AIMemoryStudioView: View {
                     .frame(minHeight: 120, maxHeight: 240)
                     .background(
                         RoundedRectangle(cornerRadius: 8)
-                            .fill(Color.white.opacity(0.05))
+                            .fill(AppVisualTheme.surfaceFill(0.05))
                             .overlay(
                                 RoundedRectangle(cornerRadius: 8)
-                                    .stroke(Color.white.opacity(0.10), lineWidth: 0.8)
+                                    .stroke(AppVisualTheme.surfaceStroke(0.10), lineWidth: 0.8)
                             )
                     )
 
@@ -5960,7 +5960,7 @@ struct AIMemoryStudioView: View {
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(session.title)
                                     .font(.callout.weight(.semibold))
-                                    .foregroundStyle(.white.opacity(0.94))
+                                    .foregroundStyle(AppVisualTheme.foreground(0.94))
                                     .lineLimit(1)
                                 Text(session.detail.isEmpty ? (session.cwd ?? "") : session.detail)
                                     .font(.caption)
@@ -6042,7 +6042,7 @@ struct AIMemoryStudioView: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(title)
                         .font(.subheadline.weight(.semibold))
-                        .foregroundStyle(.white.opacity(0.96))
+                        .foregroundStyle(AppVisualTheme.foreground(0.96))
 
                     if let subtitle {
                         Text(subtitle)

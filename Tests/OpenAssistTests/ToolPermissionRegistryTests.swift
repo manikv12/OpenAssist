@@ -2,48 +2,43 @@ import XCTest
 @testable import OpenAssist
 
 final class ToolPermissionRegistryTests: XCTestCase {
-    func testComputerUseVerifyFailsWhenOpenAIConnectionIsMissing() {
+    func testBrowserUseVerifyFailsWhenBrowserProfileIsMissing() {
         let snapshot = ToolPermissionRegistry.PermissionSnapshot(
-            accessibilityGranted: true,
-            screenRecordingGranted: true,
             appleEventsGranted: false,
             appleEventsKnown: true,
             fullDiskAccessGranted: false,
             browserAutomationEnabled: true,
-            browserProfileSelected: true,
-            openAIConnectionAvailable: false
+            browserProfileSelected: false
         )
 
         let verdict = ToolPermissionRegistry.verify(
-            toolName: AssistantComputerUseToolDefinition.name,
-            arguments: ["task": "Type hello into Codex"],
+            toolName: AssistantBrowserUseToolDefinition.name,
+            arguments: ["task": "Open the current tab"],
             snapshot: snapshot
         )
 
         XCTAssertFalse(verdict.satisfied)
-        XCTAssertEqual(verdict.missing, [.openAIConnection])
-        XCTAssertTrue(verdict.message.contains("OpenAI Connection"))
+        XCTAssertEqual(verdict.missing, [.browserProfile])
+        XCTAssertTrue(verdict.message.contains("Browser Profile"))
     }
 
-    func testComputerUseVerifyPassesWhenRequiredInputsAreAvailable() {
+    func testAppActionVerifyPromotesAppleEventsForTerminal() {
         let snapshot = ToolPermissionRegistry.PermissionSnapshot(
-            accessibilityGranted: true,
-            screenRecordingGranted: true,
             appleEventsGranted: false,
             appleEventsKnown: true,
             fullDiskAccessGranted: false,
             browserAutomationEnabled: false,
-            browserProfileSelected: false,
-            openAIConnectionAvailable: true
+            browserProfileSelected: false
         )
 
         let verdict = ToolPermissionRegistry.verify(
-            toolName: AssistantComputerUseToolDefinition.name,
-            arguments: ["task": "Type hello into Codex"],
+            toolName: AssistantAppActionToolDefinition.name,
+            arguments: ["task": "Run git status in Terminal", "app": "Terminal"],
             snapshot: snapshot
         )
 
-        XCTAssertTrue(verdict.satisfied)
-        XCTAssertTrue(verdict.missing.isEmpty)
+        XCTAssertFalse(verdict.satisfied)
+        XCTAssertEqual(verdict.missing, [.appleEvents])
+        XCTAssertTrue(verdict.message.contains("Automation"))
     }
 }

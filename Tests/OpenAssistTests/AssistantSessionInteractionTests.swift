@@ -129,13 +129,6 @@ final class AssistantSessionInteractionTests: XCTestCase {
             runtime.isToolActivityAllowedForTesting(
                 mode: .plan,
                 rawType: "dynamicToolCall",
-                toolName: "computer_use"
-            )
-        )
-        XCTAssertTrue(
-            runtime.isToolActivityAllowedForTesting(
-                mode: .plan,
-                rawType: "dynamicToolCall",
                 toolName: "browser_use"
             )
         )
@@ -162,13 +155,6 @@ final class AssistantSessionInteractionTests: XCTestCase {
             runtime.isToolActivityAllowedForTesting(
                 mode: .conversational,
                 rawType: "mcpToolCall"
-            )
-        )
-        XCTAssertFalse(
-            runtime.isToolActivityAllowedForTesting(
-                mode: .conversational,
-                rawType: "dynamicToolCall",
-                toolName: "computer_use"
             )
         )
         XCTAssertFalse(
@@ -209,25 +195,6 @@ final class AssistantSessionInteractionTests: XCTestCase {
                 mode: .agentic,
                 rawType: "fileChange"
             )
-        )
-    }
-
-    @MainActor
-    func testComputerUseDynamicToolCallUsesFriendlyTitleAndSummary() {
-        let runtime = CodexAssistantRuntime()
-
-        let state = runtime.toolCallStateForTesting(from: [
-            "id": "tool-1",
-            "type": "dynamicToolCall",
-            "tool": "computer_use",
-            "status": "running",
-            "arguments": ["task": "Open Mail and read the latest message."]
-        ])
-
-        XCTAssertEqual(state?.title, "Computer Use")
-        XCTAssertEqual(
-            runtime.activitySummaryForTesting(kind: .dynamicToolCall, title: state?.title ?? ""),
-            "Used the computer."
         )
     }
 
@@ -344,16 +311,6 @@ final class AssistantSessionInteractionTests: XCTestCase {
     }
 
     @MainActor
-    func testComputerUseApprovalStaysScopedToTheSameSession() {
-        let runtime = CodexAssistantRuntime()
-
-        runtime.rememberComputerUseApprovalForTesting("thread-1")
-
-        XCTAssertTrue(runtime.isComputerUseApprovedForTesting("thread-1"))
-        XCTAssertFalse(runtime.isComputerUseApprovedForTesting("thread-2"))
-    }
-
-    @MainActor
     func testTerminalAppActionsAlwaysRequireFreshConfirmation() {
         let runtime = CodexAssistantRuntime()
 
@@ -408,13 +365,6 @@ final class AssistantSessionInteractionTests: XCTestCase {
         )
         XCTAssertTrue(plan.contains("Plan mode focuses on exploration and planning"))
 
-        let computerUse = runtime.blockedToolUseMessage(
-            for: .conversational,
-            activityTitle: "Computer Use"
-        )
-        XCTAssertTrue(computerUse.contains("live screen or browser"))
-        XCTAssertTrue(computerUse.contains("attached image"))
-
         let browserUse = runtime.blockedToolUseMessage(
             for: .conversational,
             activityTitle: "Browser Use"
@@ -429,12 +379,12 @@ final class AssistantSessionInteractionTests: XCTestCase {
     }
 
     @MainActor
-    func testAgenticModeExposesAllComputerControlDynamicTools() {
+    func testAgenticModeExposesBrowserAndAppDynamicTools() {
         let runtime = CodexAssistantRuntime()
 
         XCTAssertEqual(
             runtime.dynamicToolNamesForTesting(mode: .agentic),
-            ["app_action", "browser_use", "computer_use"]
+            ["app_action", "browser_use"]
         )
     }
 
@@ -517,7 +467,7 @@ final class AssistantSessionInteractionTests: XCTestCase {
 
         XCTAssertEqual(
             message,
-            "The selected model Text Only cannot read image attachments. Choose a model that supports image input and try again. Chat mode can still analyze attached images when the model supports them, but live screen or browser inspection needs Agentic mode."
+            "The selected model Text Only cannot read image attachments. Choose a model that supports image input and try again. Attached images can still be analyzed directly when the model supports them, but live browser or app automation needs Agentic mode."
         )
     }
 
@@ -591,7 +541,7 @@ final class AssistantSessionInteractionTests: XCTestCase {
     func testInteractionModesUseExpectedOrderAndCodexModeKinds() {
         XCTAssertEqual(
             AssistantInteractionMode.allCases,
-            [.conversational, .plan, .agentic]
+            [.plan, .agentic]
         )
 
         XCTAssertEqual(AssistantInteractionMode.conversational.codexModeKind, "default")
@@ -600,14 +550,14 @@ final class AssistantSessionInteractionTests: XCTestCase {
     }
 
     @MainActor
-    func testChatAndPlanModesDoNotExposeComputerControlDynamicTools() {
+    func testChatAndPlanModesDoNotExposeLiveAutomationDynamicTools() {
         let runtime = CodexAssistantRuntime()
 
         XCTAssertEqual(runtime.dynamicToolNamesForTesting(mode: .conversational), [])
         XCTAssertEqual(runtime.dynamicToolNamesForTesting(mode: .plan), [])
         XCTAssertEqual(
             runtime.dynamicToolNamesForTesting(mode: .agentic),
-            ["app_action", "browser_use", "computer_use"]
+            ["app_action", "browser_use"]
         )
     }
 
@@ -629,21 +579,6 @@ final class AssistantSessionInteractionTests: XCTestCase {
         let planParams = runtime.turnStartParamsForTesting(mode: .plan)
         XCTAssertEqual(planParams["approvalPolicy"] as? String, "on-request")
         XCTAssertNil(planParams["sandboxPolicy"])
-    }
-
-    @MainActor
-    func testDynamicToolStateReadsToolNameAliases() {
-        let runtime = CodexAssistantRuntime()
-
-        let state = runtime.toolCallStateForTesting(from: [
-            "id": "tool-2",
-            "type": "dynamicToolCall",
-            "toolName": "computer_use",
-            "status": "running",
-            "arguments": ["task": "Open Safari."]
-        ])
-
-        XCTAssertEqual(state?.title, "Computer Use")
     }
 
     @MainActor
@@ -883,7 +818,7 @@ final class AssistantSessionInteractionTests: XCTestCase {
         )
 
         XCTAssertEqual(configuration.modelID, "gpt-5.4")
-        XCTAssertEqual(configuration.interactionMode, AssistantInteractionMode.conversational)
+        XCTAssertEqual(configuration.interactionMode, AssistantInteractionMode.agentic)
         XCTAssertEqual(configuration.reasoningEffort, AssistantReasoningEffort.high)
         XCTAssertFalse(configuration.fastModeEnabled)
     }
@@ -938,6 +873,11 @@ final class AssistantSessionInteractionTests: XCTestCase {
         """
 
         runtime.onTranscript = { recorder.transcriptEntries.append($0) }
+        runtime.onTranscriptMutation = { mutation in
+            if case let .upsert(entry, _) = mutation {
+                recorder.transcriptEntries.append(entry)
+            }
+        }
         runtime.onTimelineMutation = { mutation in
             if case let .upsert(item) = mutation {
                 recorder.timelineItems.append(item)
@@ -979,6 +919,7 @@ final class AssistantSessionInteractionTests: XCTestCase {
         XCTAssertEqual(finalAssistant?.isStreaming, false)
         XCTAssertEqual(interruptedActivity?.activity?.status, .interrupted)
         XCTAssertEqual(interruptedActivity?.turnID, "turn-live")
+        XCTAssertNil(runtime.currentSessionID)
     }
 
     @MainActor
@@ -1100,6 +1041,78 @@ final class AssistantSessionInteractionTests: XCTestCase {
                 pendingSessionIDs: ["new-thread"]
             ),
             []
+        )
+    }
+
+    @MainActor
+    func testFreshEmptySessionStatusFallsBackToIdleWhenNoTurnIsRunning() {
+        XCTAssertEqual(
+            AssistantStore.normalizedFreshSessionStatus(
+                currentStatus: .active,
+                hasConversationContent: false,
+                hasActiveTurn: false
+            ),
+            .idle
+        )
+    }
+
+    @MainActor
+    func testFreshSessionStatusStaysActiveWhenConversationOrTurnExists() {
+        XCTAssertEqual(
+            AssistantStore.normalizedFreshSessionStatus(
+                currentStatus: .active,
+                hasConversationContent: true,
+                hasActiveTurn: false
+            ),
+            .active
+        )
+
+        XCTAssertEqual(
+            AssistantStore.normalizedFreshSessionStatus(
+                currentStatus: .active,
+                hasConversationContent: false,
+                hasActiveTurn: true
+            ),
+            .active
+        )
+    }
+
+    @MainActor
+    func testScheduledJobVisibleHistoryStateNeverKeepsUnrelatedThreadVisible() {
+        XCTAssertEqual(
+            AssistantStore.scheduledJobVisibleHistoryState(
+                isFreshSession: true,
+                hasCachedTimeline: false,
+                hasCachedTranscript: false
+            ),
+            .empty
+        )
+
+        XCTAssertEqual(
+            AssistantStore.scheduledJobVisibleHistoryState(
+                isFreshSession: false,
+                hasCachedTimeline: false,
+                hasCachedTranscript: false
+            ),
+            .loading
+        )
+
+        XCTAssertEqual(
+            AssistantStore.scheduledJobVisibleHistoryState(
+                isFreshSession: false,
+                hasCachedTimeline: true,
+                hasCachedTranscript: false
+            ),
+            .cached
+        )
+
+        XCTAssertEqual(
+            AssistantStore.scheduledJobVisibleHistoryState(
+                isFreshSession: false,
+                hasCachedTimeline: false,
+                hasCachedTranscript: true
+            ),
+            .loading
         )
     }
 

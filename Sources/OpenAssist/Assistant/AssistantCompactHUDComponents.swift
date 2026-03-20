@@ -25,11 +25,11 @@ struct OrbPopupHeader: View {
                         .font(.system(size: 10.5, weight: .bold))
                         .tracking(0.8)
                         .textCase(.uppercase)
-                        .foregroundStyle(.white.opacity(0.82))
+                        .foregroundStyle(AppVisualTheme.foreground(0.82))
 
                     Text(subtitle)
                         .font(.system(size: 10, weight: .medium))
-                        .foregroundStyle(.white.opacity(0.50))
+                        .foregroundStyle(AppVisualTheme.foreground(0.50))
                         .lineLimit(1)
                 }
             }
@@ -40,11 +40,11 @@ struct OrbPopupHeader: View {
                 Button(action: onOpenMainWindow) {
                     Image(systemName: "arrow.up.right.square")
                         .font(.system(size: 10.5, weight: .medium))
-                        .foregroundStyle(.white.opacity(0.54))
+                        .foregroundStyle(AppVisualTheme.foreground(0.54))
                         .frame(width: 26, height: 26)
                         .background(
                             Circle()
-                                .fill(Color.white.opacity(0.06))
+                                .fill(AppVisualTheme.foreground(0.06))
                         )
                 }
                 .buttonStyle(.plain)
@@ -53,11 +53,11 @@ struct OrbPopupHeader: View {
             Button(action: onClose) {
                 Image(systemName: "xmark")
                     .font(.system(size: 10.5, weight: .medium))
-                    .foregroundStyle(.white.opacity(0.54))
+                    .foregroundStyle(AppVisualTheme.foreground(0.54))
                     .frame(width: 26, height: 26)
                     .background(
                         Circle()
-                            .fill(Color.white.opacity(0.06))
+                            .fill(AppVisualTheme.foreground(0.06))
                     )
             }
             .buttonStyle(.plain)
@@ -73,7 +73,7 @@ struct OrbPopupDivider: View {
 
     var body: some View {
         Rectangle()
-            .fill(Color.white.opacity(0.06))
+            .fill(AppVisualTheme.foreground(0.06))
             .frame(height: 0.5)
     }
 }
@@ -94,7 +94,7 @@ struct OrbInlinePill: View {
                 .font(.system(size: 9.5, weight: .medium))
                 .lineLimit(1)
         }
-        .foregroundStyle(.white.opacity(0.62))
+        .foregroundStyle(AppVisualTheme.foreground(0.62))
         .padding(.horizontal, 9)
         .padding(.vertical, 5)
         .background(
@@ -102,7 +102,7 @@ struct OrbInlinePill: View {
                 .fill(tint.opacity(0.10))
                 .overlay(
                     Capsule(style: .continuous)
-                        .stroke(Color.white.opacity(0.06), lineWidth: 0.5)
+                        .stroke(AppVisualTheme.foreground(0.06), lineWidth: 0.5)
                 )
         )
     }
@@ -119,14 +119,14 @@ struct OrbFloatingActionButton: View {
         Button(action: action) {
             ZStack {
                 Circle()
-                    .fill(isEnabled ? tint.opacity(0.82) : Color.white.opacity(0.06))
+                    .fill(isEnabled ? tint.opacity(0.82) : AppVisualTheme.foreground(0.06))
 
                 Circle()
-                    .stroke(isEnabled ? tint.opacity(0.30) : Color.white.opacity(0.06), lineWidth: 0.5)
+                    .stroke(isEnabled ? tint.opacity(0.30) : AppVisualTheme.foreground(0.06), lineWidth: 0.5)
 
                 Image(systemName: symbol)
                     .font(.system(size: max(10, size * 0.33), weight: .bold))
-                    .foregroundStyle(isEnabled ? Color.white.opacity(0.96) : Color.white.opacity(0.30))
+                    .foregroundStyle(isEnabled ? AppVisualTheme.foreground(0.96) : AppVisualTheme.foreground(0.30))
             }
             .frame(width: size, height: size)
         }
@@ -203,7 +203,7 @@ struct OrbIconControlButton: View {
         Button(action: action) {
             AssistantToolbarCircleButtonLabel(
                 symbol: symbol,
-                tint: isActive ? tint : .white,
+                tint: isActive ? tint : AppVisualTheme.primaryText,
                 size: size,
                 emphasized: isActive
             )
@@ -232,7 +232,7 @@ struct OrbPermissionChoiceButton: View {
 
                 Spacer(minLength: 0)
             }
-            .foregroundStyle(isProminent ? Color.white.opacity(0.96) : tint.opacity(0.90))
+            .foregroundStyle(isProminent ? AppVisualTheme.foreground(0.96) : tint.opacity(0.90))
             .padding(.horizontal, 12)
             .padding(.vertical, 10)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -241,7 +241,7 @@ struct OrbPermissionChoiceButton: View {
                     .fill(isProminent ? tint.opacity(0.24) : tint.opacity(0.08))
                     .overlay(
                         RoundedRectangle(cornerRadius: 10, style: .continuous)
-                            .stroke(isProminent ? tint.opacity(0.28) : Color.white.opacity(0.06), lineWidth: 0.5)
+                            .stroke(isProminent ? tint.opacity(0.28) : AppVisualTheme.foreground(0.06), lineWidth: 0.5)
                     )
             )
         }
@@ -255,10 +255,10 @@ struct OrbStatusCapsuleBackground: View {
 
     var body: some View {
         Capsule(style: .continuous)
-            .fill(Color(red: 0.06, green: 0.06, blue: 0.08).opacity(0.92))
+            .fill(AppVisualTheme.surfaceFill(0.92))
             .overlay(
                 Capsule(style: .continuous)
-                    .stroke(Color.white.opacity(0.08), lineWidth: 0.5)
+                    .stroke(AppVisualTheme.foreground(0.08), lineWidth: 0.5)
             )
     }
 }
@@ -273,25 +273,29 @@ struct OrbPopupSurfaceModifier: ViewModifier {
             style: SettingsStore.shared.appChromeStyle,
             reduceTransparency: reduceTransparency
         )
+        let isDark = AppVisualTheme.isDarkAppearance
         let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+        let solidFill = isDark
+            ? Color(red: 0.055, green: 0.058, blue: 0.072).opacity(0.98)
+            : AppVisualTheme.windowBackground.opacity(0.99)
 
         return content
             .background {
                 ZStack {
                     shape
-                        .fill(Color(red: 0.055, green: 0.058, blue: 0.072).opacity(0.98))
+                        .fill(solidFill)
 
-                    if tokens.useMaterial {
+                    if tokens.useMaterial, isDark {
                         shape
                             .fill(AppVisualTheme.adaptiveMaterialFill(reduceTransparency: reduceTransparency))
-                            .opacity(0.60)
+                            .opacity(0.36)
                     }
                 }
             }
             .clipShape(shape)
             .overlay {
                 shape
-                    .stroke(Color.white.opacity(0.08), lineWidth: 0.5)
+                    .stroke(AppVisualTheme.foreground(0.08), lineWidth: 0.5)
             }
     }
 }
@@ -303,17 +307,21 @@ struct OrbInsetSurfaceModifier: ViewModifier {
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
     func body(content: Content) -> some View {
+        let isDark = AppVisualTheme.isDarkAppearance
         let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+        let fillColor = isDark
+            ? AppVisualTheme.foreground(fillOpacity * 0.50)
+            : AppVisualTheme.controlBackground.opacity(0.98)
 
         return content
             .background {
                 shape
-                    .fill(Color.white.opacity(fillOpacity * 0.50))
+                    .fill(fillColor)
             }
             .clipShape(shape)
             .overlay {
                 shape
-                    .stroke(Color.white.opacity(0.06), lineWidth: 0.5)
+                    .stroke(AppVisualTheme.foreground(0.06), lineWidth: 0.5)
             }
     }
 }
@@ -328,18 +336,22 @@ struct NotchPopupSurfaceModifier: ViewModifier {
             style: SettingsStore.shared.appChromeStyle,
             reduceTransparency: reduceTransparency
         )
+        let isDark = AppVisualTheme.isDarkAppearance
         let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+        let solidFill = isDark
+            ? Color(red: 0.045, green: 0.048, blue: 0.062).opacity(0.98)
+            : AppVisualTheme.windowBackground.opacity(0.99)
 
         return content
             .background {
                 ZStack {
                     shape
-                        .fill(Color(red: 0.045, green: 0.048, blue: 0.062).opacity(0.98))
+                        .fill(solidFill)
 
-                    if tokens.useMaterial {
+                    if tokens.useMaterial, isDark {
                         shape
                             .fill(AppVisualTheme.adaptiveMaterialFill(reduceTransparency: reduceTransparency))
-                            .opacity(0.40)
+                            .opacity(0.24)
                     }
 
                     shape
@@ -358,7 +370,7 @@ struct NotchPopupSurfaceModifier: ViewModifier {
             .clipShape(shape)
             .overlay {
                 shape
-                    .stroke(Color.white.opacity(0.07), lineWidth: 0.5)
+                    .stroke(AppVisualTheme.foreground(0.07), lineWidth: 0.5)
             }
     }
 }
@@ -370,17 +382,21 @@ struct NotchInsetSurfaceModifier: ViewModifier {
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
     func body(content: Content) -> some View {
+        let isDark = AppVisualTheme.isDarkAppearance
         let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+        let fillColor = isDark
+            ? AppVisualTheme.surfaceFill(0.96)
+            : AppVisualTheme.controlBackground.opacity(0.98)
 
         return content
             .background {
                 shape
-                    .fill(Color(red: 0.06, green: 0.064, blue: 0.08).opacity(0.96))
+                    .fill(fillColor)
             }
             .clipShape(shape)
             .overlay {
                 shape
-                    .stroke(Color.white.opacity(0.06), lineWidth: 0.5)
+                    .stroke(AppVisualTheme.foreground(0.06), lineWidth: 0.5)
             }
     }
 }
@@ -395,10 +411,10 @@ struct HardwareNotchDockHandle: View {
         let shape = RoundedRectangle(cornerRadius: min(12, height * 0.45), style: .continuous)
 
         shape
-            .fill(Color.black.opacity(0.92))
+            .fill(AppVisualTheme.surfaceFill(0.92))
             .overlay {
                 shape
-                    .stroke(Color.white.opacity(0.08), lineWidth: 0.5)
+                    .stroke(AppVisualTheme.foreground(0.08), lineWidth: 0.5)
             }
             .overlay(alignment: .bottom) {
                 Capsule(style: .continuous)
@@ -463,13 +479,13 @@ struct OrbSessionRow: View {
             VStack(alignment: .leading, spacing: 3) {
                 Text(session.title.isEmpty ? "Untitled Session" : session.title)
                     .font(.system(size: 11.5, weight: .semibold))
-                    .foregroundStyle(.white.opacity(0.90))
+                    .foregroundStyle(AppVisualTheme.foreground(0.90))
                     .lineLimit(1)
 
                 if !session.subtitle.isEmpty {
                     Text(session.subtitle)
                         .font(.system(size: 9.5, weight: .medium))
-                        .foregroundStyle(.white.opacity(0.50))
+                        .foregroundStyle(AppVisualTheme.foreground(0.50))
                         .lineLimit(1)
                 }
             }
@@ -479,14 +495,14 @@ struct OrbSessionRow: View {
             if isSelected && !isBusy {
                 Image(systemName: "checkmark")
                     .font(.system(size: 9, weight: .bold))
-                    .foregroundStyle(.white.opacity(0.56))
+                    .foregroundStyle(AppVisualTheme.foreground(0.56))
             }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
         .background {
             RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .fill(isSelected ? Color.white.opacity(0.08) : Color.white.opacity(0.03))
+                .fill(isSelected ? AppVisualTheme.foreground(0.08) : AppVisualTheme.foreground(0.03))
         }
     }
 
@@ -543,12 +559,12 @@ struct OrbWorkingActivityRow: View {
             VStack(alignment: .leading, spacing: 4) {
                 Text(item.title)
                     .font(.system(size: 11.5, weight: .semibold))
-                    .foregroundStyle(.white.opacity(0.88))
+                    .foregroundStyle(AppVisualTheme.foreground(0.88))
 
                 if let detail = (item.hudDetail ?? item.detail)?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
                     Text(detail)
                         .font(.system(size: 10.5, weight: .medium))
-                        .foregroundStyle(.white.opacity(0.56))
+                        .foregroundStyle(AppVisualTheme.foreground(0.56))
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }

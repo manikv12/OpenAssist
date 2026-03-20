@@ -4,6 +4,9 @@ import SwiftUI
 @MainActor
 enum AppVisualTheme {
     private static var palette: ColorPalette { SettingsStore.shared.colorTheme.palette }
+    static var isDarkAppearance: Bool {
+        return NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+    }
     static var baseTint: Color { palette.baseTint }
     static var accentTint: Color { palette.accentTint }
     static var canvasBase: Color { palette.canvasBase }
@@ -14,11 +17,91 @@ enum AppVisualTheme {
     static var historyTint: Color { palette.historyTint }
     static var aiStudioTint: Color { palette.aiStudioTint }
     static var settingsTint: Color { palette.settingsTint }
-    static let mutedText = Color.white.opacity(0.58)
+    static var primaryText: Color { Color(nsColor: .labelColor) }
+    static var secondaryText: Color { Color(nsColor: .secondaryLabelColor) }
+    static var tertiaryText: Color { Color(nsColor: .tertiaryLabelColor) }
+    static var quaternaryText: Color { Color(nsColor: .quaternaryLabelColor) }
+    static var separatorColor: Color { Color(nsColor: .separatorColor) }
+    static var windowBackground: Color { Color(nsColor: .windowBackgroundColor) }
+    static var textBackground: Color { Color(nsColor: .textBackgroundColor) }
+    static var controlBackground: Color { Color(nsColor: .controlBackgroundColor) }
+    static var selectedContentBackground: Color { Color(nsColor: .selectedContentBackgroundColor) }
+    static let mutedText = Color(nsColor: .secondaryLabelColor)
+
+    private static func clampedOpacity(_ opacity: Double) -> Double {
+        min(1, max(0, opacity))
+    }
+
+    static func foreground(_ opacity: Double) -> Color {
+        primaryText.opacity(clampedOpacity(opacity))
+    }
+
+    static func secondaryForeground(_ opacity: Double) -> Color {
+        secondaryText.opacity(clampedOpacity(opacity))
+    }
+
+    static func tertiaryForeground(_ opacity: Double) -> Color {
+        tertiaryText.opacity(clampedOpacity(opacity))
+    }
+
+    static func quaternaryForeground(_ opacity: Double) -> Color {
+        quaternaryText.opacity(clampedOpacity(opacity))
+    }
+
+    static func surfaceFill(_ opacity: Double) -> Color {
+        controlBackground.opacity(clampedOpacity(opacity))
+    }
+
+    static func windowFill(_ opacity: Double) -> Color {
+        windowBackground.opacity(clampedOpacity(opacity))
+    }
+
+    static func surfaceStroke(_ opacity: Double) -> Color {
+        separatorColor.opacity(clampedOpacity(opacity))
+    }
 
     static func glassTokens(style: AppChromeStyle, reduceTransparency: Bool) -> AppGlassTokens {
         let materialEnabled = !reduceTransparency
         let p = palette
+        let darkMode = isDarkAppearance
+
+        func lightModeTokens(
+            highContrast: Bool
+        ) -> AppGlassTokens {
+            let glowRedOpacity = materialEnabled ? (highContrast ? 0.16 : 0.10) : 0.08
+            let glowBlueOpacity = materialEnabled ? (highContrast ? 0.18 : 0.12) : 0.08
+            return AppGlassTokens(
+                canvasBase: windowBackground,
+                canvasDeep: textBackground,
+                surfaceTop: Color(nsColor: .textBackgroundColor),
+                surfaceBottom: Color(nsColor: .controlBackgroundColor),
+                glowRed: p.glowWarm.opacity(glowRedOpacity),
+                glowBlue: p.glowCool.opacity(glowBlueOpacity),
+                strokeTop: Color.white.opacity(materialEnabled ? (highContrast ? 0.18 : 0.14) : 0.10),
+                strokeMid: Color.white.opacity(materialEnabled ? (highContrast ? 0.08 : 0.05) : 0.04),
+                strokeBottom: Color.black.opacity(materialEnabled ? (highContrast ? 0.12 : 0.10) : 0.08),
+                backgroundMaterial: .underPageBackground,
+                surfaceMaterial: .hudWindow,
+                backgroundBlendingMode: .behindWindow,
+                surfaceBlendingMode: .withinWindow,
+                useMaterial: materialEnabled,
+                materialOpacity: materialEnabled ? (highContrast ? 0.72 : 0.64) : 0.0,
+                cardShadowColor: Color.black.opacity(materialEnabled ? (highContrast ? 0.14 : 0.10) : 0.08),
+                cardShadowRadius: materialEnabled ? (highContrast ? 12 : 10) : 8,
+                cardShadowYOffset: materialEnabled ? (highContrast ? 7 : 5) : 4,
+                cardCornerRadius: highContrast ? 16 : 14,
+                modalCornerRadius: highContrast ? 20 : 16
+            )
+        }
+
+        if !darkMode {
+            switch style {
+            case .glassHighContrast:
+                return lightModeTokens(highContrast: true)
+            case .classic:
+                return lightModeTokens(highContrast: false)
+            }
+        }
 
         switch style {
         case .glassHighContrast:
@@ -134,13 +217,10 @@ struct AssistantToolbarCircleButtonLabel: View {
     var body: some View {
         ZStack {
             Circle()
-                .fill(emphasized ? tint.opacity(0.18) : Color.white.opacity(0.06))
+                .fill(emphasized ? tint.opacity(0.18) : AppVisualTheme.surfaceFill(0.62))
                 .overlay(
                     Circle()
-                        .stroke(
-                            emphasized ? tint.opacity(0.16) : Color.white.opacity(0.08),
-                            lineWidth: 0.5
-                        )
+                        .stroke(emphasized ? tint.opacity(0.16) : AppVisualTheme.surfaceStroke(0.38), lineWidth: 0.5)
                 )
 
             Image(systemName: symbol)
@@ -148,8 +228,8 @@ struct AssistantToolbarCircleButtonLabel: View {
                 .symbolRenderingMode(.hierarchical)
                 .foregroundStyle(
                     isEnabled
-                        ? (emphasized ? Color.white.opacity(0.95) : tint.opacity(0.85))
-                        : Color.white.opacity(0.30)
+                        ? (emphasized ? AppVisualTheme.foreground(0.95) : tint.opacity(0.85))
+                        : AppVisualTheme.quaternaryForeground(0.72)
                 )
         }
         .frame(width: size, height: size)
@@ -207,6 +287,7 @@ struct AppChromeBackground: View {
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
     var body: some View {
+        let isDark = AppVisualTheme.isDarkAppearance
         let tokens = AppVisualTheme.glassTokens(
             style: SettingsStore.shared.appChromeStyle,
             reduceTransparency: reduceTransparency
@@ -286,8 +367,8 @@ struct AppChromeBackground: View {
         .overlay(
             LinearGradient(
                 colors: [
-                    Color.black.opacity(0.03),
-                    Color.black.opacity(0.18)
+                    isDark ? Color.black.opacity(0.03) : Color.white.opacity(0.18),
+                    isDark ? Color.black.opacity(0.18) : Color.black.opacity(0.08)
                 ],
                 startPoint: .top,
                 endPoint: .bottom
@@ -302,12 +383,13 @@ struct AppSplitChromeBackground: View {
     var leadingPaneMaxWidth: CGFloat = 340
     var leadingPaneWidth: CGFloat? = nil
     var leadingTint: Color = AppVisualTheme.sidebarTint
-    var trailingTint: Color = Color.black
+    var trailingTint: Color = AppVisualTheme.windowBackground
     var accent: Color = AppVisualTheme.accentTint
     var leadingPaneTransparent = false
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
     var body: some View {
+        let isDark = AppVisualTheme.isDarkAppearance
         let tokens = AppVisualTheme.glassTokens(
             style: SettingsStore.shared.appChromeStyle,
             reduceTransparency: reduceTransparency
@@ -350,7 +432,7 @@ struct AppSplitChromeBackground: View {
                     .frame(width: leadingWidth)
                     .overlay(alignment: .trailing) {
                         Rectangle()
-                            .fill(Color.white.opacity(leadingPaneTransparent ? 0.04 : 0.06))
+                            .fill(AppVisualTheme.surfaceStroke(leadingPaneTransparent ? 0.24 : 0.32))
                             .frame(width: 0.5)
                     }
 
@@ -416,8 +498,8 @@ struct AppSplitChromeBackground: View {
 
                         LinearGradient(
                             colors: [
-                                Color.white.opacity(0.03),
-                                Color.black.opacity(0.14)
+                                isDark ? Color.white.opacity(0.03) : Color.black.opacity(0.05),
+                                isDark ? Color.black.opacity(0.14) : Color.black.opacity(0.06)
                             ],
                             startPoint: .topLeading,
                             endPoint: .bottom
@@ -429,8 +511,8 @@ struct AppSplitChromeBackground: View {
             .overlay(
                 LinearGradient(
                     colors: [
-                        Color.black.opacity(0.03),
-                        Color.black.opacity(0.13)
+                        isDark ? Color.black.opacity(0.03) : Color.white.opacity(0.14),
+                        isDark ? Color.black.opacity(0.13) : Color.black.opacity(0.06)
                     ],
                     startPoint: .top,
                     endPoint: .bottom
@@ -475,21 +557,21 @@ struct AppSidebarSearchField: View {
         HStack(spacing: 8) {
             Image(systemName: "magnifyingglass")
                 .font(.system(size: 12, weight: .medium))
-                .foregroundStyle(.white.opacity(0.40))
+                .foregroundStyle(AppVisualTheme.secondaryForeground(0.72))
             TextField(placeholder, text: $text)
                 .textFieldStyle(.plain)
                 .font(.system(size: 13, weight: .regular))
-                .foregroundStyle(.white.opacity(0.90))
+                .foregroundStyle(AppVisualTheme.primaryText)
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 7)
         .background(
             RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .fill(Color.white.opacity(0.04))
+                .fill(AppVisualTheme.surfaceFill(0.40))
         )
         .overlay(
             RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .stroke(Color.white.opacity(0.07), lineWidth: 0.5)
+                .stroke(AppVisualTheme.surfaceStroke(0.36), lineWidth: 0.5)
         )
     }
 }
@@ -503,6 +585,7 @@ private struct AppThemedSurfaceModifier: ViewModifier {
     let tintOpacity: Double
 
     func body(content: Content) -> some View {
+        let isDark = AppVisualTheme.isDarkAppearance
         let style = SettingsStore.shared.appChromeStyle
         let tokens = AppVisualTheme.glassTokens(
             style: style,
@@ -542,7 +625,7 @@ private struct AppThemedSurfaceModifier: ViewModifier {
                     .overlay(
                         LinearGradient(
                             colors: [
-                                Color.white.opacity(isGlass ? 0.08 : 0.04),
+                                isDark ? Color.white.opacity(isGlass ? 0.08 : 0.04) : Color.black.opacity(isGlass ? 0.06 : 0.03),
                                 Color.clear
                             ],
                             startPoint: .top,
@@ -553,10 +636,7 @@ private struct AppThemedSurfaceModifier: ViewModifier {
             )
             .overlay(
                 RoundedRectangle(cornerRadius: resolvedCornerRadius, style: .continuous)
-                    .stroke(
-                        Color.white.opacity(isGlass ? max(strokeOpacity * 0.40, 0.06) : strokeOpacity * 0.30),
-                        lineWidth: 0.5
-                    )
+                    .stroke(AppVisualTheme.surfaceStroke(isGlass ? max(strokeOpacity * 0.40, 0.06) : strokeOpacity * 0.30), lineWidth: 0.5)
             )
     }
 }
@@ -568,6 +648,7 @@ private struct AppSidebarSurfaceModifier: ViewModifier {
     let tint: Color
 
     func body(content: Content) -> some View {
+        let isDark = AppVisualTheme.isDarkAppearance
         let style = SettingsStore.shared.appChromeStyle
         let tokens = AppVisualTheme.glassTokens(
             style: style,
@@ -605,7 +686,7 @@ private struct AppSidebarSurfaceModifier: ViewModifier {
                     .overlay(
                         LinearGradient(
                             colors: [
-                                tint.opacity(isGlass ? 0.10 : 0.14),
+                                isDark ? tint.opacity(isGlass ? 0.10 : 0.14) : Color.black.opacity(isGlass ? 0.05 : 0.03),
                                 Color.clear
                             ],
                             startPoint: .leading,

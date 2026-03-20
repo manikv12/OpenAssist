@@ -1,0 +1,69 @@
+import XCTest
+@testable import OpenAssist
+
+final class AccountRateLimitsTests: XCTestCase {
+    func testSparkModelPrefersNonDefaultBucketWhenAvailable() throws {
+        let limits = try XCTUnwrap(AccountRateLimits.fromPayload(fullRateLimitsPayload()))
+
+        XCTAssertEqual(limits.additionalBuckets.map(\.limitID), ["codex_other"])
+        XCTAssertEqual(limits.bucket(for: "gpt-5.4")?.limitID, "codex")
+        XCTAssertEqual(limits.bucket(for: "gpt-5.3-codex-spark")?.limitID, "codex_other")
+    }
+
+    func testIncrementalDefaultUpdateKeepsExistingAdditionalBuckets() throws {
+        let existing = try XCTUnwrap(AccountRateLimits.fromPayload(fullRateLimitsPayload()))
+        let updated = try XCTUnwrap(
+            AccountRateLimits.fromPayload(
+                [
+                    "rateLimits": [
+                        "limitId": "codex",
+                        "primary": [
+                            "usedPercent": 19,
+                            "windowDurationMins": 300
+                        ],
+                        "secondary": [
+                            "usedPercent": 31,
+                            "windowDurationMins": 10_080
+                        ]
+                    ]
+                ],
+                preserving: existing
+            )
+        )
+
+        XCTAssertEqual(updated.additionalBuckets.map(\.limitID), ["codex_other"])
+        XCTAssertEqual(updated.primary?.usedPercent, 19)
+        XCTAssertEqual(updated.bucket(for: "gpt-5.3-codex-spark")?.limitID, "codex_other")
+    }
+
+    private func fullRateLimitsPayload() -> [String: Any] {
+        let codexSnapshot: [String: Any] = [
+            "limitId": "codex",
+            "primary": [
+                "usedPercent": 12,
+                "windowDurationMins": 300
+            ],
+            "secondary": [
+                "usedPercent": 24,
+                "windowDurationMins": 10_080
+            ]
+        ]
+
+        let sparkSnapshot: [String: Any] = [
+            "limitId": "codex_other",
+            "limitName": "spark",
+            "primary": [
+                "usedPercent": 77,
+                "windowDurationMins": 300
+            ]
+        ]
+
+        return [
+            "rateLimits": codexSnapshot,
+            "rateLimitsByLimitId": [
+                "codex": codexSnapshot,
+                "codex_other": sparkSnapshot
+            ]
+        ]
+    }
+}

@@ -32,8 +32,8 @@ struct OrbComposerTextView: NSViewRepresentable {
         textView.isRichText = false
         textView.allowsUndo = true
         textView.font = .systemFont(ofSize: 12.5, weight: .regular)
-        textView.textColor = NSColor.white.withAlphaComponent(0.92)
-        textView.insertionPointColor = NSColor.white.withAlphaComponent(0.90)
+        textView.textColor = NSColor.labelColor.withAlphaComponent(0.92)
+        textView.insertionPointColor = NSColor.labelColor
         textView.backgroundColor = .clear
         textView.drawsBackground = false
         textView.isVerticallyResizable = true
@@ -50,6 +50,7 @@ struct OrbComposerTextView: NSViewRepresentable {
         textView.onToggleMode = onToggleMode
         textView.onPasteAttachment = onPasteAttachment
         textView.placeholder = placeholder
+        applyAssistantComposerAppearance(to: textView)
         AssistantComposerBridge.shared.register(textView: textView, target: .assistantCompact)
 
         scrollView.documentView = textView
@@ -70,6 +71,7 @@ struct OrbComposerTextView: NSViewRepresentable {
         textView.onToggleMode = onToggleMode
         textView.onPasteAttachment = onPasteAttachment
         textView.placeholder = placeholder
+        applyAssistantComposerAppearance(to: textView)
         textView.needsDisplay = true
 
         if shouldFocus {
@@ -137,7 +139,7 @@ final class OrbSubmittableTextView: NSTextView {
 
         let attributes: [NSAttributedString.Key: Any] = [
             .font: font ?? NSFont.systemFont(ofSize: 12.5, weight: .regular),
-            .foregroundColor: NSColor.white.withAlphaComponent(0.38)
+            .foregroundColor: assistantComposerResolvedPlaceholderColor(for: effectiveAppearance)
         ]
         let placeholderRect = NSRect(
             x: textContainerInset.width + 1,
@@ -146,6 +148,16 @@ final class OrbSubmittableTextView: NSTextView {
             height: bounds.height - (textContainerInset.height * 2)
         )
         NSString(string: placeholder).draw(in: placeholderRect, withAttributes: attributes)
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        applyAssistantComposerAppearance(to: self)
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        applyAssistantComposerAppearance(to: self)
     }
 
     override func mouseDown(with event: NSEvent) {

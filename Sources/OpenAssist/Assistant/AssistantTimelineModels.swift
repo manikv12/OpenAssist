@@ -816,6 +816,18 @@ private func assistantPermissionRequestsMatch(
 enum AssistantTimelineMutation: Equatable, Sendable {
     case reset(sessionID: String?)
     case upsert(AssistantTimelineItem)
+    case appendTextDelta(
+        id: String,
+        sessionID: String?,
+        turnID: String?,
+        kind: AssistantTimelineItemKind,
+        delta: String,
+        createdAt: Date,
+        updatedAt: Date,
+        isStreaming: Bool,
+        emphasis: Bool,
+        source: AssistantTimelineSource
+    )
     case remove(id: String)
 }
 

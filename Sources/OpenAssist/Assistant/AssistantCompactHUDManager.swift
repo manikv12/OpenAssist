@@ -1372,10 +1372,26 @@ final class AssistantCompactHUDManager: AssistantCompactPresenter {
     }
 
     private func effectiveDisplayState(for state: AssistantHUDState) -> AssistantHUDState {
-        if let liveVoiceState = liveVoiceDisplayState(from: controller.liveVoiceSessionSnapshot) {
+        let displayState = displayState(for: state)
+        if Self.shouldUseLiveVoiceDisplayState(
+            controller.liveVoiceSessionSnapshot,
+            over: displayState
+        ), let liveVoiceState = liveVoiceDisplayState(from: controller.liveVoiceSessionSnapshot) {
             return liveVoiceState
         }
-        return displayState(for: state)
+        return displayState
+    }
+
+    static func shouldUseLiveVoiceDisplayState(
+        _ snapshot: AssistantLiveVoiceSessionSnapshot,
+        over hudState: AssistantHUDState
+    ) -> Bool {
+        switch snapshot.phase {
+        case .idle, .ended:
+            return false
+        case .listening, .transcribing, .sending, .waitingForPermission, .speaking, .paused:
+            return true
+        }
     }
 
     private func liveVoiceDisplayState(

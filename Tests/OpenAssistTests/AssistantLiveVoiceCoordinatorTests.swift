@@ -138,13 +138,13 @@ final class AssistantLiveVoiceCoordinatorTests: XCTestCase {
         await pumpMainRunLoop()
 
         XCTAssertEqual(startCaptureCalls, 1)
-        XCTAssertEqual(store.interactionMode, .conversational)
+        XCTAssertEqual(store.interactionMode, .agentic)
         XCTAssertEqual(store.liveVoiceSessionSnapshot.phase, .listening)
         XCTAssertEqual(store.liveVoiceSessionSnapshot.surface, .compactHUD)
         XCTAssertTrue(store.liveVoiceSessionSnapshot.isHandsFreeLoopEnabled)
     }
 
-    func testBlockedModeSuggestionAutoPromotesToAgenticAndRetries() async {
+    func testBlockedModeSuggestionLeavesAgenticSessionAlone() async {
         let store = MockLiveVoiceStore()
         let coordinator = AssistantLiveVoiceCoordinator(
             store: store,
@@ -161,12 +161,12 @@ final class AssistantLiveVoiceCoordinatorTests: XCTestCase {
         coordinator.handleFinalTranscript("Run the test suite.")
         await pumpMainRunLoop()
         XCTAssertEqual(store.sentPrompts, ["Run the test suite."])
+        XCTAssertEqual(store.liveVoiceSessionSnapshot.lastTranscript, "Run the test suite.")
 
         store.modeSwitchSuggestion = blockedAgenticSuggestion()
         await pumpMainRunLoop()
 
-        XCTAssertEqual(store.appliedModeSwitchChoices.count, 1)
-        XCTAssertEqual(store.appliedModeSwitchChoices.first?.mode, .agentic)
+        XCTAssertEqual(store.appliedModeSwitchChoices.count, 0)
         XCTAssertEqual(store.liveVoiceSessionSnapshot.interactionMode, .agentic)
     }
 
