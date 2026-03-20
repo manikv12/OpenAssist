@@ -86,7 +86,8 @@ jobs:
           VERSION="${{ steps.version.outputs.version }}"
           BUILD_NUMBER="$(git rev-list --count HEAD)"
           DMG_FILE="dist/Open Assist.dmg"
-          DOWNLOAD_URL="https://github.com/manikv12/OpenAssist/releases/download/${{ github.ref_name }}/Open%20Assist.dmg"
+          # GitHub normalizes release asset URLs by replacing spaces with dots.
+          DOWNLOAD_URL="https://github.com/manikv12/OpenAssist/releases/download/${{ github.ref_name }}/Open.Assist.dmg"
           SPARKLE_KEY_FILE="$(mktemp -t sparkle_ed25519)"
           trap 'rm -f "$SPARKLE_KEY_FILE"' EXIT
           printf "%s" "$SPARKLE_PRIVATE_KEY" > "$SPARKLE_KEY_FILE"
