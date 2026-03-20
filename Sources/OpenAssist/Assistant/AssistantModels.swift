@@ -2094,37 +2094,7 @@ final class AssistantStore: ObservableObject {
             timelineItems = loadedTimeline
         }
 
-        let currentTurnItems: ArraySlice<AssistantTimelineItem>
-        if let lastUserIndex = timelineItems.lastIndex(where: { $0.kind == .userMessage }) {
-            let nextIndex = timelineItems.index(after: lastUserIndex)
-            currentTurnItems = timelineItems[nextIndex...]
-        } else {
-            currentTurnItems = timelineItems[...]
-        }
-
-        let imageItem = currentTurnItems.first(where: { item in
-            guard let images = item.imageAttachments, !images.isEmpty else {
-                return false
-            }
-            switch item.kind {
-            case .userMessage:
-                return false
-            case .assistantProgress, .assistantFinal, .activity, .permission, .plan, .system:
-                return true
-            }
-        }) ?? timelineItems.reversed().first(where: { item in
-            guard let images = item.imageAttachments, !images.isEmpty else {
-                return false
-            }
-            switch item.kind {
-            case .userMessage:
-                return false
-            case .assistantProgress, .assistantFinal, .activity, .permission, .plan, .system:
-                return true
-            }
-        })
-
-        guard let imageItem else {
+        guard let imageItem = latestRemoteImageItem(in: timelineItems) else {
             return nil
         }
 
@@ -2153,6 +2123,31 @@ final class AssistantStore: ObservableObject {
             caption: caption,
             attachments: attachments
         )
+    }
+
+    func latestRemoteImageItem(in timelineItems: [AssistantTimelineItem]) -> AssistantTimelineItem? {
+        let currentTurnItems: ArraySlice<AssistantTimelineItem>
+        if let lastUserIndex = timelineItems.lastIndex(where: { $0.kind == .userMessage }) {
+            let nextIndex = timelineItems.index(after: lastUserIndex)
+            currentTurnItems = timelineItems[nextIndex...]
+        } else {
+            currentTurnItems = timelineItems[...]
+        }
+
+        return currentTurnItems.reversed().first(where: Self.isRemoteImageTimelineItem)
+            ?? timelineItems.reversed().first(where: Self.isRemoteImageTimelineItem)
+    }
+
+    private static func isRemoteImageTimelineItem(_ item: AssistantTimelineItem) -> Bool {
+        guard let images = item.imageAttachments, !images.isEmpty else {
+            return false
+        }
+        switch item.kind {
+        case .userMessage:
+            return false
+        case .assistantProgress, .assistantFinal, .activity, .permission, .plan, .system:
+            return true
+        }
     }
 
     private static func remoteImageMimeType(for data: Data) -> String {

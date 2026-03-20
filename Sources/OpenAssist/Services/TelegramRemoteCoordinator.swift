@@ -585,6 +585,18 @@ final class TelegramRemoteCoordinator: ObservableObject {
     private func handlePendingPairing(text _: String, message: TelegramMessage) async {
         guard let settings else { return }
 
+        guard !settings.hasTelegramPendingPairing else {
+            _ = try? await sendTelegramMessage(
+                chatID: message.chat.id,
+                text: """
+                An approval request is already pending on the Mac.
+
+                Please wait for the owner to approve or reject it.
+                """
+            )
+            return
+        }
+
         settings.updateTelegramPendingPairing(
             userID: String(message.from?.id ?? message.chat.id),
             chatID: String(message.chat.id),

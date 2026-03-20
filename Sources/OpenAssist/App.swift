@@ -2123,6 +2123,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         _ = coordinator.beginRun(jobID: jobID, startedAt: Date())
         let existingSessionID = coordinator.jobs.first(where: { $0.id == jobID })?.dedicatedSessionID
 
+        // Set up the dedicated session for this job (resume existing or start fresh).
+        guard !assistantController.hasActiveTurn else {
+            let note = "Skipped — assistant was busy with another task."
+            CrashReporter.logWarning("Scheduled job \(jobID): \(note)")
+            coordinator.recordJobResult(id: jobID, note: note)
+            await finishScheduledJobIfNeeded(nil, forcedOutcome: .interrupted, fallbackNote: note)
+            return
+        }
+
         if let preferredModelID {
             assistantController.applyRuntimeModelSelection(preferredModelID)
         }
@@ -2131,7 +2140,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             assistantController.reasoningEffort = reasoningEffort
         }
 
-        // Set up the dedicated session for this job (resume existing or start fresh).
         guard let sessionID = await assistantController.resumeOrStartScheduledJobSession(existingID: existingSessionID) else {
             let note = "Failed — could not set up a session for this job."
             CrashReporter.logWarning("Scheduled job \(jobID): \(note)")
@@ -2143,14 +2151,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
 
         openAssistantWindow()
         try? await Task.sleep(nanoseconds: 500_000_000)
-
-        guard !assistantController.hasActiveTurn else {
-            let note = "Skipped — assistant was busy with another task."
-            CrashReporter.logWarning("Scheduled job \(jobID): \(note)")
-            coordinator.recordJobResult(id: jobID, note: note, sessionID: sessionID)
-            await finishScheduledJobIfNeeded(nil, forcedOutcome: .interrupted, fallbackNote: note)
-            return
-        }
 
         coordinator.recordJobResult(id: jobID, note: "Prompt sent · session \(sessionID.prefix(8))…", sessionID: sessionID)
         await assistantController.sendPrompt(prompt, automationJob: job)

@@ -148,7 +148,7 @@ final class AssistantRemoteBridge {
         guard assistant.visibleModels.contains(where: { $0.id == modelID }) else {
             return false
         }
-        assistant.chooseModel(modelID)
+        assistant.applyRuntimeModelSelection(modelID, force: true)
         return true
     }
 
