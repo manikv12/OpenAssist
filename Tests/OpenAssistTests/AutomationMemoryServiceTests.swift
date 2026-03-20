@@ -189,6 +189,112 @@ final class AutomationMemoryServiceTests: XCTestCase {
         XCTAssertTrue((invalidatedLesson.metadata["invalidation_reason"] ?? "").contains("Superseded"))
     }
 
+    func testSuccessfulRunWithoutIssuesDoesNotInventFirstIssue() async throws {
+        let memoryRoot = try makeTemporaryDirectory(named: "automation-memory")
+        let databaseURL = try makeDatabaseURL()
+        let store = try MemorySQLiteStore(databaseURL: databaseURL)
+        let retrievalService = AssistantMemoryRetrievalService(
+            store: store,
+            threadMemoryService: AssistantThreadMemoryService(baseDirectoryURL: memoryRoot)
+        )
+        let service = AutomationMemoryService(
+            store: store,
+            memoryRetrievalService: retrievalService,
+            rewriteProvider: SequencedAutomationRewriteProvider(summaries: [], lessons: [])
+        )
+
+        let job = ScheduledJob.make(
+            name: "Teams checker",
+            prompt: "Check the latest Teams chat",
+            jobType: .general,
+            recurrence: .daily
+        )
+
+        var run = ScheduledJobRun.make(
+            jobID: job.id,
+            sessionID: "thread-a",
+            startedAt: Date(timeIntervalSince1970: 4_000)
+        )
+        run.finishedAt = Date(timeIntervalSince1970: 4_120)
+        run.outcome = .completed
+
+        let result = await service.processCompletedRun(
+            job: job,
+            run: run,
+            transcript: [
+                AssistantTranscriptEntry(role: .user, text: job.prompt, createdAt: run.startedAt),
+                AssistantTranscriptEntry(
+                    role: .assistant,
+                    text: "Levi's latest message is visible.",
+                    createdAt: Date(timeIntervalSince1970: 4_110)
+                )
+            ],
+            timeline: [],
+            cwd: "/tmp/OpenAssist"
+        )
+
+        XCTAssertNil(result.firstIssueAt)
+        XCTAssertEqual(result.statusNote, "Succeeded")
+        XCTAssertFalse(result.summaryText?.contains("First issue:") == true)
+    }
+
+    func testSuccessfulRunKeepsRealIssueTimestampWhenOneWasDetected() async throws {
+        let memoryRoot = try makeTemporaryDirectory(named: "automation-memory")
+        let databaseURL = try makeDatabaseURL()
+        let store = try MemorySQLiteStore(databaseURL: databaseURL)
+        let retrievalService = AssistantMemoryRetrievalService(
+            store: store,
+            threadMemoryService: AssistantThreadMemoryService(baseDirectoryURL: memoryRoot)
+        )
+        let service = AutomationMemoryService(
+            store: store,
+            memoryRetrievalService: retrievalService,
+            rewriteProvider: SequencedAutomationRewriteProvider(summaries: [], lessons: [])
+        )
+
+        let job = ScheduledJob.make(
+            name: "Teams checker",
+            prompt: "Check the latest Teams chat",
+            jobType: .general,
+            recurrence: .daily
+        )
+
+        var run = ScheduledJobRun.make(
+            jobID: job.id,
+            sessionID: "thread-a",
+            startedAt: Date(timeIntervalSince1970: 5_000)
+        )
+        run.finishedAt = Date(timeIntervalSince1970: 5_120)
+        run.outcome = .completed
+
+        let issueAt = Date(timeIntervalSince1970: 5_030)
+        let result = await service.processCompletedRun(
+            job: job,
+            run: run,
+            transcript: [
+                AssistantTranscriptEntry(role: .user, text: job.prompt, createdAt: run.startedAt),
+                AssistantTranscriptEntry(
+                    role: .system,
+                    text: "Teams search preview was incomplete.",
+                    createdAt: issueAt,
+                    emphasis: true
+                ),
+                AssistantTranscriptEntry(
+                    role: .assistant,
+                    text: "I opened the real chat thread and finished successfully.",
+                    createdAt: Date(timeIntervalSince1970: 5_110)
+                )
+            ],
+            timeline: [],
+            cwd: "/tmp/OpenAssist"
+        )
+
+        XCTAssertEqual(result.firstIssueAt, issueAt)
+        XCTAssertTrue(result.statusNote.hasPrefix("Succeeded"))
+        XCTAssertFalse(result.statusNote.contains("issue captured"))
+        XCTAssertTrue(result.summaryText?.contains("First issue:") == true)
+    }
+
     private func makeTemporaryDirectory(named name: String) throws -> URL {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("\(name)-\(UUID().uuidString)", isDirectory: true)

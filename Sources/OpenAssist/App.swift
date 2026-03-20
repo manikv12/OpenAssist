@@ -705,6 +705,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         static let latestReleaseURLString = "https://github.com/manikv12/OpenAssist/releases/latest"
     }
 
+    private enum ScheduledJobWatchdog {
+        static let timeoutSeconds: TimeInterval = 10 * 60
+
+        static var timeoutNote: String {
+            "Stopped after \(Int(timeoutSeconds / 60)) min because the run never finished."
+        }
+    }
+
     private enum PasteLastTranscriptShortcut {
         static let keyCode: UInt16 = 9 // V
         static let modifiers: NSEvent.ModifierFlags = [.command, .option]
@@ -756,6 +764,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
     private var assistantMinimizeToCompactObserver: NSObjectProtocol?
     private var scheduledJobRequestObserver: NSObjectProtocol?
     private var scheduledJobInFlightID: String?
+    private var scheduledJobWatchdogTask: Task<Void, Never>?
+    private var scheduledJobWatchdogToken: String?
     private var scheduledJobPreviousModelID: String?
     private var scheduledJobPreviousReasoningEffort: AssistantReasoningEffort?
     private var memoryPressureSource: DispatchSourceMemoryPressure?
@@ -2117,6 +2127,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             coordinator.markJobExecutionFinished(id: jobID)
             return
         }
+        cancelScheduledJobWatchdog()
         scheduledJobPreviousModelID = assistantController.selectedModelID
         scheduledJobPreviousReasoningEffort = assistantController.reasoningEffort
         scheduledJobInFlightID = jobID
@@ -2155,7 +2166,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         coordinator.recordJobResult(id: jobID, note: "Prompt sent · session \(sessionID.prefix(8))…", sessionID: sessionID)
         await assistantController.sendPrompt(prompt, automationJob: job)
 
-        if !assistantController.hasActiveTurn {
+        if assistantController.hasActiveTurn {
+            startScheduledJobWatchdog(jobID: jobID, sessionID: sessionID)
+        } else {
             CrashReporter.logWarning("Scheduled job \(jobID) did not start an assistant turn.")
             let note = "Submitted but no turn started — check model/provider config."
             coordinator.recordJobResult(id: jobID, note: note, sessionID: sessionID)
@@ -2168,6 +2181,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         forcedOutcome: ScheduledJobRunOutcome? = nil,
         fallbackNote: String? = nil
     ) async {
+        cancelScheduledJobWatchdog()
         guard let jobID = scheduledJobInFlightID else { return }
         scheduledJobInFlightID = nil
         let coordinator = JobQueueCoordinator.shared
@@ -2239,6 +2253,63 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             firstIssueAt: processed.firstIssueAt,
             learnedLessonCount: processed.learnedLessonCount,
             finishedAt: finishedAt
+        )
+    }
+
+    private func startScheduledJobWatchdog(jobID: String, sessionID: String?) {
+        cancelScheduledJobWatchdog()
+        let token = UUID().uuidString
+        scheduledJobWatchdogToken = token
+        let timeoutNanoseconds = UInt64(ScheduledJobWatchdog.timeoutSeconds * 1_000_000_000)
+
+        scheduledJobWatchdogTask = Task { [weak self] in
+            do {
+                try await Task.sleep(nanoseconds: timeoutNanoseconds)
+            } catch {
+                return
+            }
+
+            await self?.handleScheduledJobWatchdogTimeout(
+                jobID: jobID,
+                sessionID: sessionID,
+                token: token
+            )
+        }
+    }
+
+    private func cancelScheduledJobWatchdog() {
+        scheduledJobWatchdogTask?.cancel()
+        scheduledJobWatchdogTask = nil
+        scheduledJobWatchdogToken = nil
+    }
+
+    private func handleScheduledJobWatchdogTimeout(
+        jobID: String,
+        sessionID: String?,
+        token: String
+    ) async {
+        guard scheduledJobInFlightID == jobID,
+              scheduledJobWatchdogToken == token else {
+            return
+        }
+
+        let note = ScheduledJobWatchdog.timeoutNote
+        let sessionLabel = sessionID.map { String($0.prefix(8)) } ?? "none"
+        CrashReporter.logWarning(
+            "Scheduled job \(jobID) timed out after \(Int(ScheduledJobWatchdog.timeoutSeconds))s session=\(sessionLabel)"
+        )
+
+        let coordinator = JobQueueCoordinator.shared
+        coordinator.recordJobResult(id: jobID, note: note, sessionID: sessionID)
+
+        if assistantController.hasActiveTurn {
+            await assistantController.cancelActiveTurn()
+        }
+
+        await finishScheduledJobIfNeeded(
+            nil,
+            forcedOutcome: .interrupted,
+            fallbackNote: note
         )
     }
 

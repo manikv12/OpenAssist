@@ -79,6 +79,7 @@ final class AutomationMemoryService {
             explicitValue: run.firstIssueAt,
             transcript: relevantTranscript,
             timeline: relevantTimeline,
+            outcome: run.outcome,
             fallback: run.finishedAt
         )
         let finishedAt = run.finishedAt ?? Date()
@@ -145,6 +146,7 @@ final class AutomationMemoryService {
         explicitValue: Date?,
         transcript: [AssistantTranscriptEntry],
         timeline: [AssistantTimelineItem],
+        outcome: ScheduledJobRunOutcome?,
         fallback: Date?
     ) -> Date? {
         if let explicitValue {
@@ -168,7 +170,9 @@ final class AutomationMemoryService {
         }
         .min()
 
-        return [explicitValue, transcriptIssue, timelineIssue, fallback]
+        let fallbackIssue = outcome == .completed ? nil : fallback
+
+        return [transcriptIssue, timelineIssue, fallbackIssue]
             .compactMap { $0 }
             .min()
     }

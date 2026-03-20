@@ -655,7 +655,7 @@ struct JobEditPanel: View {
                     .padding(.vertical, 8)
             }
 
-            if let firstIssueAt = job.lastRunFirstIssueAt {
+            if let firstIssueAt = visibleFirstIssueTimestamp(for: job) {
                 Divider().overlay(AppVisualTheme.foreground(0.05))
                 runDetailRow(
                     label: "First Issue",
@@ -799,6 +799,19 @@ struct JobEditPanel: View {
         case .none:
             return AppVisualTheme.mutedText
         }
+    }
+
+    private func visibleFirstIssueTimestamp(for job: ScheduledJob) -> Date? {
+        guard let firstIssueAt = job.lastRunFirstIssueAt else {
+            return nil
+        }
+        guard job.lastRunOutcome == .completed,
+              let finishedAt = job.lastRunFinishedAt ?? job.lastRunAt else {
+            return firstIssueAt
+        }
+
+        // Older builds saved the finish time as a fake issue timestamp on successful runs.
+        return abs(firstIssueAt.timeIntervalSince(finishedAt)) < 1 ? nil : firstIssueAt
     }
 
     private func latestOutcomeLabel(for job: ScheduledJob) -> String {
