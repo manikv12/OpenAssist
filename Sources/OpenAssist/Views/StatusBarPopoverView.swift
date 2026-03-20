@@ -159,13 +159,7 @@ struct StatusBarPopoverView: View {
 
     private var headerSection: some View {
         HStack(spacing: 12) {
-            AppIconBadge(
-                symbol: "waveform",
-                tint: AppVisualTheme.accentTint,
-                size: 34,
-                symbolSize: 15,
-                isEmphasized: true
-            )
+            AppLogoView(variant: .agentMark, size: 34)
 
             VStack(alignment: .leading, spacing: 2) {
                 Text("Open Assist")

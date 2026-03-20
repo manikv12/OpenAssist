@@ -18,7 +18,7 @@ Resources/old/
 .goutputstream-*
 
 # Web build artifacts
-web/chat/node_modules/
+node_modules/
 web/chat/dist/
 
 # Code signing

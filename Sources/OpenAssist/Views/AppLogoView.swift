@@ -1,7 +1,31 @@
 import SwiftUI
 
-/// Displays the Open Assist app icon from the bundled PNG asset.
+enum AppLogoVariant {
+    case appIcon
+    case agentMark
+
+    fileprivate var candidateFileNames: [String] {
+        switch self {
+        case .appIcon:
+            return ["AppIcon", "AppLogo"]
+        case .agentMark:
+            return ["AppLogo", "OpenAssistLogo", "AppIcon"]
+        }
+    }
+
+    fileprivate var fallbackSystemSymbolName: String {
+        switch self {
+        case .appIcon:
+            return "app.fill"
+        case .agentMark:
+            return "brain.head.profile"
+        }
+    }
+}
+
+/// Displays bundled Open Assist branding art from PNG assets.
 struct AppLogoView: View {
+    var variant: AppLogoVariant = .appIcon
     var size: CGFloat = 256
 
     var body: some View {
@@ -17,7 +41,7 @@ struct AppLogoView: View {
 
     /// Resolve the bundled app icon image.
     private var logoImage: Image {
-        for fileName in ["AppIcon", "AppLogo"] {
+        for fileName in variant.candidateFileNames {
             // Look for the processed resource inside the executable's bundle.
             if let url = Bundle.main.url(forResource: fileName, withExtension: "png"),
                let nsImage = NSImage(contentsOf: url) {
@@ -34,19 +58,20 @@ struct AppLogoView: View {
 
         // Last resort: load directly from the executable's directory.
         let execDir = Bundle.main.bundleURL.deletingLastPathComponent()
-        for subpath in [
-            "OpenAssist_OpenAssist.bundle/AppIcon.png",
-            "OpenAssist_OpenAssist.bundle/AppLogo.png",
-            "AppIcon.png",
-            "AppLogo.png",
-        ] {
+        let bundlePaths = variant.candidateFileNames.flatMap { fileName in
+            [
+                "OpenAssist_OpenAssist.bundle/\(fileName).png",
+                "\(fileName).png",
+            ]
+        }
+        for subpath in bundlePaths {
             let url = execDir.appendingPathComponent(subpath)
             if let nsImage = NSImage(contentsOf: url) {
                 return Image(nsImage: nsImage)
             }
         }
         // Fallback to SF Symbol if the asset is missing at runtime.
-        return Image(systemName: "mic.circle")
+        return Image(systemName: variant.fallbackSystemSymbolName)
     }
 }
 
