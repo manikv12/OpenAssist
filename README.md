@@ -5,8 +5,8 @@
 <h1 align="center">Open Assist</h1>
 
 <p align="center">
-  A macOS personal assistant that can speak, type, and help inside your current app.<br/>
-  Built as a personal assistant first, with local-first voice capture and dictation when you need it.
+  An AI assistant for macOS with voice, local-first options, and approved automation.<br/>
+  Use typed or spoken prompts, connect local or cloud models in AI Studio, and optionally insert text into your current app.
 </p>
 
 <p align="center">
@@ -18,126 +18,170 @@
 
 ---
 
-## What Open Assist Is
+## Open Assist At A Glance
 
-Open Assist is a personal assistant for macOS that lives in your menu bar.
+Open Assist is a personal AI assistant for macOS.
 
-You can open the assistant for typed or spoken tasks, or use quick voice capture to insert text into the app you are using right now. It is built for low-friction help, local-first voice features, and fast text insertion.
+It is built to help you do real work on your Mac:
 
-Important behavior today:
+- ask questions or give tasks with text or voice
+- draft, rewrite, and polish text
+- keep using local models if you want more privacy
+- use cloud models if you want faster setup or different capabilities
+- let the assistant take approved actions in your browser or supported apps
+- use voice capture and dictation when speaking is faster than typing
 
-- It runs as a menu-bar utility with no Dock icon.
-- The menu-bar popover gives quick actions for the assistant, voice capture, history, AI Studio, and Settings.
-- It can insert text directly, paste through a temporary clipboard, or fall back to typed keystrokes.
-- It keeps recent transcript history on your Mac.
-- It can learn from quick fixes you make after insertion.
-- It supports both local and cloud-based speech/AI flows.
-
----
-
-## Current Features
-
-### Assistant and AI Workflows
-
-- Open the assistant from the menu bar for typed or spoken tasks
-- Speak an assistant task directly from the quick-actions popover
-- Optional AI prompt correction before insertion
-- Suggestion preview when auto-insert is not used
-- Optional auto-insert for high-confidence suggestions
-- Optional Markdown-preserving output for structured suggestions
-- Rewrite provider options:
-  - Ollama (local)
-  - OpenAI
-  - Anthropic
-  - Google AI Studio (Gemini)
-  - Groq
-  - OpenRouter
-- Built-in **AI Studio** for provider setup, model selection, timeouts, and conversation controls
-- Rewrite style presets such as `Balanced`, `Formal`, `Casual`, `Architect`, and more
-- OpenAI and Anthropic OAuth support, plus API-key support where needed
-
-### Voice Capture and Dictation
-
-- **Apple Speech** with selectable recognition mode (`Local Only`, `Cloud Only`, `Automatic`)
-- **Local `whisper.cpp`** with curated model downloads, Core ML support, and idle unload controls
-- **Cloud transcription providers**:
-  - OpenAI
-  - Groq
-  - Deepgram
-  - Google Gemini (AI Studio)
-
-### Text Insertion
-
-- Direct Accessibility-based insertion when possible
-- Privacy-friendly transient clipboard fallback when clipboard copy is off
-- Optional "also copy transcript to system clipboard" mode
-- Hold-to-talk and continuous dictation modes
-- Paste last transcript shortcut
-- Transcript history window with search, copy, delete, and reinsert actions
-
-### Computer Control
-
-- A top-level **Computer Control** settings area for setup, browser profile choice, and computer-control status
-- Local computer control in Agentic mode for tasks on your real Mac
-- Browser control with your signed-in local profile for:
-  - Google Chrome
-  - Brave
-  - Microsoft Edge
-- Direct app actions for:
-  - Finder
-  - Terminal
-  - Calendar
-  - System Settings
-- `computer_use` stays available as a fallback when a direct browser or app action is not enough
-
-### Conversation and Memory Tools
-
-- Optional conversation-aware rewrite history with timeout and turn-limit controls
-- Pinned or automatic rewrite context selection in AI Studio
-- Cross-IDE conversation sharing for matching coding contexts
-- Context mappings and conversation inspection are available in AI Studio
-- External memory indexing exists, but it is still behind the `OPENASSIST_FEATURE_AI_MEMORY=1` feature flag
-
-### Quality-of-Life Features
-
-- Adaptive corrections that learn from your edits
-- Custom correction management
-- Configurable sounds, waveform themes, and app chrome themes
-- Sparkle-based update checks from the app
+The menu bar is how you open it quickly. The assistant is the product.
 
 ---
 
-## Privacy Notes
+## Three Ways To Use Open Assist
 
-- No account is required for local voice capture or local assistant flows
-- No telemetry is enabled by default
-- Settings, transcript history, and learned corrections stay on your Mac
-- API keys and OAuth sessions are stored in macOS Keychain
-- If you choose cloud transcription or cloud rewrite providers, your audio/text is sent to that provider
-- Clipboard copying is off by default, so Open Assist tries to avoid leaving dictation in clipboard history
-- Local crash logs stay on disk in `~/Library/Logs/OpenAssist/`
+### 1. Ask
+
+Use Open Assist like your everyday assistant.
+
+You open the assistant, type or speak a request, and continue the conversation until the result is useful.
+
+Common examples:
+
+- "Summarize these notes."
+- "Rewrite this message to sound more professional."
+- "Help me plan my day."
+- "Draft a reply to this email."
+
+### 2. Speak
+
+Use voice when talking is faster than typing.
+
+Open Assist can:
+
+- take a spoken assistant task
+- transcribe speech into your current app
+- keep recent transcript history
+- let you paste your last transcript again
+
+This is useful when you want fast text input without switching apps.
+
+### 3. Act
+
+Use Open Assist in agentic mode when you want it to do work on your Mac with your approval.
+
+It can help with:
+
+- browser tasks using your signed-in local browser profile
+- direct app actions in Finder, Terminal, Calendar, System Settings, Reminders, Contacts, Notes, and Messages
+
+Examples:
+
+- "Open my project board in Chrome."
+- "Reveal the Downloads folder in Finder."
+- "Create a calendar event draft for tomorrow at 3 PM."
 
 ---
 
-## Requirements
+## Setup In 5 Minutes
 
-- macOS 13.3 or newer
-- **Microphone** permission
-- **Accessibility** permission for reliable insertion and global shortcuts
-- **Speech Recognition** permission when using the Apple Speech engine
+If you want the main product experience, start here.
 
-If you want Open Assist to control your Mac for browser or app tasks, you also need:
+1. Download the latest release from [GitHub Releases](https://github.com/manikv12/OpenAssist/releases).
+2. Open `Open Assist.app`.
+3. Open **Settings -> AI & Models -> AI Studio**.
+4. Connect a cloud provider or set up local AI.
+5. Open the assistant and try a simple request.
 
-- **Screen Recording** so the assistant can understand what is on screen
-- **Automation / Apple Events** so the assistant can talk to supported apps directly
+Example first prompt:
 
-You may also need internet access for:
+- "Help me write a short update for my team."
 
-- cloud transcription
-- cloud rewrite providers
-- downloading `whisper.cpp` models
-- local AI runtime/model setup
-- app update checks
+### Choose the setup you need
+
+| Goal | Open this | What to do |
+|---|---|---|
+| Use the assistant | `Settings -> AI & Models` and `AI Studio` | Connect a provider, choose a model, and start chatting. |
+| Speak to the assistant or dictate text | `Settings -> Speech & Input` | Pick a speech engine and grant the needed permissions. |
+| Let the assistant control browser or apps | `Settings -> Automation` | Allow `Automation / Apple Events` and choose a browser profile if needed. |
+
+---
+
+## How To Set Up Open Assist
+
+### 1. Assistant setup
+
+This is the most important setup.
+
+1. Open **Settings -> AI & Models**.
+2. Open **AI Studio**.
+3. Choose how you want to run AI:
+   - local AI through Ollama or the built-in local AI setup flow
+   - or a cloud provider such as OpenAI, Anthropic, Gemini, Groq, or OpenRouter
+4. Choose a model.
+5. Save your API key or finish OAuth sign-in if your provider needs it.
+6. Open the assistant and test a real request.
+
+Simple examples:
+
+- If you want local AI and no API key, start with the local AI setup in **AI Studio**.
+- If you already use OpenAI or Anthropic, connect that provider and pick your preferred model.
+
+### 2. Voice and dictation setup
+
+Set this up if you want spoken prompts or speech-to-text.
+
+1. Grant **Microphone** when macOS asks.
+2. If you want to use **Apple Speech**, also grant **Speech Recognition**.
+3. If you want direct insertion and reliable global shortcuts, grant **Accessibility**.
+4. Open **Settings -> Speech & Input**.
+5. Choose your speech engine:
+   - `Apple Speech` for the fastest setup
+   - `Whisper.cpp` for local transcription after model install
+   - `Cloud Providers` for services like OpenAI, Groq, Deepgram, or Gemini
+6. If you choose **Whisper.cpp**, open **Whisper Model Install** and:
+   - download a model such as `tiny`, `base`, or `small`
+   - pick the active model
+   - optionally enable Core ML if your Mac supports it
+7. Test a voice shortcut or speak a task to the assistant.
+
+### 3. Automation setup
+
+Set this up if you want the assistant to take actions on your Mac.
+
+1. Open **Settings -> Automation**.
+2. Allow **Automation / Apple Events** when macOS prompts you.
+3. If you want browser control, choose a profile for Google Chrome, Brave, or Microsoft Edge.
+4. Open the assistant in **Agentic** mode and try a simple task.
+
+Simple examples:
+
+- "Open Bluetooth settings."
+- "Show my Downloads folder."
+- "Create a reminder for tomorrow."
+
+---
+
+## How To Use Open Assist Day To Day
+
+### For normal assistant tasks
+
+1. Open Open Assist from the menu bar.
+2. Choose **Open Assistant** or a voice-first entry point.
+3. Type or speak your request.
+4. Review the result.
+5. Ask a follow-up if you want to refine it.
+
+### For quick dictation
+
+1. Click into any text field.
+2. Hold `Option + Command + Space`.
+3. Speak naturally.
+4. Release to insert text.
+
+### For automation tasks
+
+1. Open the assistant in **Agentic** mode.
+2. Ask for the task in simple words.
+3. Approve the action if Open Assist asks.
+4. Review the result.
 
 ---
 
@@ -145,48 +189,60 @@ You may also need internet access for:
 
 | Action | Default shortcut |
 |---|---|
-| Hold-to-talk | `⌥⌘Space` |
-| Toggle continuous dictation | `⌃⌥⌘Space` |
-| Paste last transcript | `⌥⌘V` |
+| Hold-to-talk | `Option + Command + Space` (`⌥⌘Space`) |
+| Toggle continuous dictation | `Control + Option + Command + Space` (`⌃⌥⌘Space`) |
+| Paste last transcript | `Option + Command + V` (`⌥⌘V`) |
 
-All shortcuts can be changed in Settings.
+You can change all shortcuts in Settings.
 
 ---
 
-## Quick Start
+## Requirements And Permissions
 
-1. Download the latest release from [GitHub Releases](https://github.com/manikv12/OpenAssist/releases).
-2. Open `Open Assist.app`.
-3. Grant **Accessibility** and **Microphone** access when prompted.
-4. If you use **Apple Speech**, also grant **Speech Recognition**.
-5. Open **Settings** from the menu bar.
-6. Choose your transcription engine:
-   - `Apple Speech` for built-in system speech
-   - `whisper.cpp` for fully local speech after model install
-   - `Cloud Providers` for OpenAI/Groq/Deepgram/Gemini transcription
-7. If you want assistant help, open **AI Studio** and connect a cloud provider or install local AI.
-8. If you only want plain dictation, you can turn off **AI prompt correction** in **Settings -> AI & Models**.
-9. If you want AI rewrite, open **AI Studio** and either:
-   - connect a cloud provider, or
-   - install local AI with the built-in Ollama setup flow
-10. If you want Open Assist to use your Mac directly, open **Settings -> Computer Control** and:
-   - grant **Screen Recording**
-   - allow **Automation / Apple Events**
-   - choose a browser profile for **Chrome**, **Brave**, or **Microsoft Edge**
-   - review the supported direct app actions for **Finder**, **Terminal**, **Calendar**, and **System Settings**
+### System requirements
 
-For a step-by-step walkthrough, see the [User Guide](Docs/User-Guide.md).
+- macOS 13.3 or newer
+
+### Permissions by feature
+
+- **Microphone**: needed for spoken assistant tasks and dictation
+- **Accessibility**: needed for direct insertion and reliable global shortcuts
+- **Speech Recognition**: only needed for the Apple Speech engine
+- **Automation / Apple Events**: needed for browser or direct app actions
+
+Typed assistant use can work without microphone or dictation setup.
+
+### Internet is only needed for some features
+
+- cloud AI providers
+- cloud transcription
+- downloading `whisper.cpp` models
+- local AI runtime/model setup
+- app update checks
+
+---
+
+## Privacy Notes
+
+- No account is required for local use
+- No telemetry is enabled by default
+- Settings, transcript history, and learned corrections stay on your Mac
+- API keys and OAuth sessions are stored in macOS Keychain
+- If you choose cloud providers, your audio or text is sent to that provider
+- Clipboard copying is off by default to reduce clipboard history leakage
 
 ---
 
 ## Build From Source
 
+Use this if you want to run or modify the project yourself.
+
 ### Prerequisites
 
-- This repo is a **Swift Package Manager** macOS app
 - Xcode 15+ or Apple developer tools with Swift 5.9 support
-- Node/npm only if you want to create a DMG with `--make-dmg`
-- A Developer ID certificate plus Apple notarization credentials only if you want a public signed release
+- macOS 13.3 or newer
+- Node/npm only if you want to make a DMG with `--make-dmg`
+- A Developer ID certificate and Apple notarization credentials only if you want a public signed build
 
 ### Main build
 
@@ -198,12 +254,18 @@ This creates:
 
 - `dist/Open Assist.app`
 
-What `build.sh` does today:
+Run it with:
 
-- Downloads `Vendor/Whisper/whisper.xcframework` automatically if it is missing
-- Runs `swift build -c release`
-- Bundles the app into `dist/Open Assist.app`
-- Uses ad-hoc signing by default unless `DEVELOPER_ID` is set
+```bash
+open "dist/Open Assist.app"
+```
+
+What `build.sh` does:
+
+- downloads `Vendor/Whisper/whisper.xcframework` automatically if it is missing
+- runs `swift build -c release`
+- bundles the app into `dist/Open Assist.app`
+- uses ad-hoc signing by default unless `DEVELOPER_ID` is set
 
 ### Useful build options
 
@@ -214,9 +276,11 @@ What `build.sh` does today:
 
 - `--install` copies the app to `/Applications/Open Assist.app`
 - `--make-dmg` also creates `dist/Open Assist.dmg`
-- `--install` also resets Accessibility permission, so you will need to grant it again after install
+- `--install` resets Accessibility and Automation permissions, so macOS will ask again later
 
-### Signed / distribution builds
+### Signed distribution build
+
+If you have a Developer ID certificate and want a signed DMG:
 
 ```bash
 export DEVELOPER_ID="Your Name (TEAMID)"
@@ -224,89 +288,97 @@ export DEVELOPER_ID="Your Name (TEAMID)"
 Scripts/notarize.sh
 ```
 
-There is also a project-specific helper:
-
-```bash
-./build-local.sh --make-dmg
-```
-
-`Scripts/notarize.sh` notarizes `dist/Open Assist.dmg` and expects these environment variables:
+`Scripts/notarize.sh` expects these environment variables:
 
 - `APPLE_ID`
 - `APPLE_TEAM_ID`
 - `APPLE_APP_PASSWORD`
 
+There is also a repo-specific convenience helper:
+
+```bash
+./build-local.sh --make-dmg
+```
+
+Use that helper only if the signing identity inside the script matches your machine.
+
 ---
 
 ## Tests
 
-Run package tests with:
+Run package tests:
 
 ```bash
 swift test
 ```
 
-Run the smoke/regression suite with:
+Run the smoke and regression scripts:
 
 ```bash
 Scripts/run-tests.sh
 ```
 
-Run insertion reliability checks directly with:
+Run insertion reliability checks directly:
 
 ```bash
 Scripts/run-insertion-reliability.sh --regression
 ```
 
-The repo also contains `XCTest` coverage for some conversation and settings behavior in `Tests/OpenAssistTests/`.
+The repository also includes `XCTest` coverage in `Tests/OpenAssistTests/`.
 
 ---
 
-## Diagnostics
+## Diagnostics And Troubleshooting
 
-If insertion is not behaving the way you expect, you can enable insertion diagnostics:
+If text insertion is not working the way you expect:
 
-- Turn it on in app settings, or set `OPENASSIST_INSERTION_DIAGNOSTICS=1`
-- Default log path: `/tmp/openassist-insertion-diagnostics.log`
-- You can override the log path with `OPENASSIST_INSERTION_DIAGNOSTICS_PATH`
+- turn on insertion diagnostics in app settings, or set `OPENASSIST_INSERTION_DIAGNOSTICS=1`
+- default log path: `/tmp/openassist-insertion-diagnostics.log`
+- optional custom log path: `OPENASSIST_INSERTION_DIAGNOSTICS_PATH`
 
-Crash logs, when present, are stored locally at `~/Library/Logs/OpenAssist/crash.log`.
+Crash logs, when present, are stored at:
+
+- `~/Library/Logs/OpenAssist/crash.log`
+
+If you need more help:
+
+- Start with the [User Guide](Docs/User-Guide.md)
+- See the [Quick Start wiki](Wiki/Quick-Start.md)
+- Check the [Troubleshooting wiki](Wiki/Troubleshooting.md)
 
 ---
 
 ## Repo Layout
 
 ```text
-Sources/OpenAssist/      App code
-Resources/              Info.plist, icons, entitlements
-Scripts/                Build, test, release, and utility scripts
+Sources/OpenAssist/       Main app code
+Sources/OpenAssistObjCInterop/ Objective-C interop helpers
+Resources/               Info.plist, icons, entitlements
+Scripts/                 Build, test, release, and utility scripts
 Tests/OpenAssistTests/   XCTest coverage
-Docs/                   User-facing docs
-Wiki/                   Extra product notes
-Vendor/Whisper/         Bundled whisper.cpp XCFramework
+Docs/                    User-facing docs
+Wiki/                    Extra product notes
+Vendor/Whisper/          Bundled whisper.cpp XCFramework
 ```
 
-Main app areas:
+Useful places to start:
 
-- `Sources/OpenAssist/App.swift` wires the app lifecycle, menu bar, settings, and windows.
-- `Sources/OpenAssist/Services/` contains transcription, insertion, AI, memory, and settings logic.
-- `Sources/OpenAssist/Views/` contains SwiftUI screens such as the status popover and AI Studio.
-- `Sources/OpenAssist/Support/` contains feature flags, permissions, and window helpers.
+- `Sources/OpenAssist/App.swift`: app lifecycle, windows, and app-level wiring
+- `Sources/OpenAssist/Services/`: transcription, insertion, AI, settings, and automation logic
+- `Sources/OpenAssist/Views/`: SwiftUI views such as Settings and AI Studio
+- `Sources/OpenAssist/Assistant/`: assistant workflows and automation behavior
+
+## Advanced Notes
+
+- AI memory indexing exists, but it is still behind the `OPENASSIST_FEATURE_AI_MEMORY=1` feature flag.
+- The main product story is assistant first, while voice, dictation, and automation are important supporting features.
 
 ---
 
-## Docs
+## More Docs
 
 - [User Guide](Docs/User-Guide.md)
 - [Wiki Home](Wiki/Home.md)
 - [Quick Start Wiki](Wiki/Quick-Start.md)
+- [Why Open Assist](Wiki/Why-OpenAssist.md)
 - [Privacy-First Design](Wiki/Privacy-First-Design.md)
-
----
-
-## Current State Notes
-
-- The app currently supports three speech paths: Apple Speech, local `whisper.cpp`, and cloud providers.
-- AI Studio is already integrated and is the main place for rewrite provider setup and local AI setup.
-- The advanced external memory-indexing workflow is present in the codebase, but it is still gated behind `OPENASSIST_FEATURE_AI_MEMORY=1`.
-- The old README said the default build created both `.app` and `.dmg`; today, the default build creates the `.app`, and DMG creation is opt-in with `--make-dmg`.

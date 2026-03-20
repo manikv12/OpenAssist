@@ -3,23 +3,17 @@ import Foundation
 // MARK: - Permission Model
 
 enum AgentPermission: String, CaseIterable, Sendable {
-    case accessibility
-    case screenRecording
     case appleEvents
     case fullDiskAccess
     case browserAutomation
     case browserProfile
-    case openAIConnection
 
     var displayName: String {
         switch self {
-        case .accessibility: return "Accessibility"
-        case .screenRecording: return "Screen Recording"
         case .appleEvents: return "Apple Events / Automation"
         case .fullDiskAccess: return "Full Disk Access"
         case .browserAutomation: return "Browser Automation (enabled in settings)"
         case .browserProfile: return "Browser Profile (selected in settings)"
-        case .openAIConnection: return "OpenAI Connection (API key or sign-in)"
         }
     }
 }
@@ -43,30 +37,19 @@ enum ToolPermissionRegistry {
     @MainActor
     static func snapshot(using settings: SettingsStore) -> PermissionSnapshot {
         let pc = PermissionCenter.snapshot(using: settings)
-        let hasAPIKey = !settings.promptRewriteOpenAIAPIKey
-            .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        let hasOAuth = PromptRewriteOAuthCredentialStore.loadSession(for: .openAI) != nil
         return PermissionSnapshot(
-            accessibilityGranted: pc.accessibilityGranted,
-            screenRecordingGranted: pc.screenRecordingGranted,
             appleEventsGranted: pc.appleEventsGranted,
             appleEventsKnown: pc.appleEventsKnown,
             fullDiskAccessGranted: pc.fullDiskAccessGranted,
             browserAutomationEnabled: settings.browserAutomationEnabled,
             browserProfileSelected: !settings.browserSelectedProfileID
-                .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-            openAIConnectionAvailable: hasAPIKey || hasOAuth
+                .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         )
     }
 
     /// Base requirements for each dynamic tool. `requirements(forToolName:arguments:)`
     /// may promote optional permissions to required based on parsed arguments.
     static let requirements: [ToolPermissionRequirement] = [
-        ToolPermissionRequirement(
-            toolName: "computer_use",
-            required: [.accessibility, .screenRecording, .openAIConnection],
-            optional: []
-        ),
         ToolPermissionRequirement(
             toolName: "browser_use",
             required: [.browserAutomation, .browserProfile],
@@ -113,14 +96,11 @@ enum ToolPermissionRegistry {
     /// Snapshot of live permission state used by the registry for verification.
     /// Decoupled from `PermissionCenter.Snapshot` so callers build it from whatever source they have.
     struct PermissionSnapshot: Sendable {
-        let accessibilityGranted: Bool
-        let screenRecordingGranted: Bool
         let appleEventsGranted: Bool
         let appleEventsKnown: Bool
         let fullDiskAccessGranted: Bool
         let browserAutomationEnabled: Bool
         let browserProfileSelected: Bool
-        let openAIConnectionAvailable: Bool
     }
 
     static func verify(
@@ -154,13 +134,10 @@ enum ToolPermissionRegistry {
 
     private static func isGranted(_ permission: AgentPermission, in snapshot: PermissionSnapshot) -> Bool {
         switch permission {
-        case .accessibility: return snapshot.accessibilityGranted
-        case .screenRecording: return snapshot.screenRecordingGranted
         case .appleEvents: return snapshot.appleEventsGranted
         case .fullDiskAccess: return snapshot.fullDiskAccessGranted
         case .browserAutomation: return snapshot.browserAutomationEnabled
         case .browserProfile: return snapshot.browserProfileSelected
-        case .openAIConnection: return snapshot.openAIConnectionAvailable
         }
     }
 
@@ -173,13 +150,10 @@ enum ToolPermissionRegistry {
         lines.append("")
         lines.append("| Permission | Status |")
         lines.append("|---|---|")
-        lines.append("| Accessibility | \(yesNo(snapshot.accessibilityGranted)) |")
-        lines.append("| Screen Recording | \(yesNo(snapshot.screenRecordingGranted)) |")
         lines.append("| Apple Events / Automation | \(appleEventsStatus(snapshot)) |")
         lines.append("| Full Disk Access | \(yesNo(snapshot.fullDiskAccessGranted)) |")
         lines.append("| Browser Automation | \(yesNo(snapshot.browserAutomationEnabled)) |")
         lines.append("| Browser Profile | \(yesNo(snapshot.browserProfileSelected)) |")
-        lines.append("| OpenAI Connection | \(yesNo(snapshot.openAIConnectionAvailable)) |")
         lines.append("")
 
         // Tool availability summary
@@ -215,7 +189,7 @@ enum ToolPermissionRegistry {
         - Hang indefinitely waiting for a macOS permission dialog that cannot be dismissed from the terminal, OR
         - Fail with "Operation not permitted"
 
-        There is NO workaround. Do NOT retry with different syntax, shell wrappers, or file-level access. When the user asks about these apps, immediately tell them that Open Assist cannot access that app's data due to macOS privacy restrictions, and suggest they open the app manually. Do NOT use Computer Use to try to read these apps visually either — just explain the limitation.
+        There is NO workaround. Do NOT retry with different syntax, shell wrappers, or file-level access. When the user asks about these apps, immediately tell them that Open Assist cannot access that app's data due to macOS privacy restrictions, and suggest they open the app manually.
         """)
         lines.append("")
 
@@ -281,22 +255,12 @@ enum ToolPermissionRegistry {
         var nextSteps: [String] = []
 
         switch toolName {
-        case "computer_use":
-            if missing.contains(.accessibility) {
-                nextSteps.append("Grant Accessibility in Settings > Computer Control.")
-            }
-            if missing.contains(.screenRecording) {
-                nextSteps.append("Grant Screen Recording in Settings > Computer Control.")
-            }
-            if missing.contains(.openAIConnection) {
-                nextSteps.append("Connect OpenAI in AI Studio or add an API key.")
-            }
         case "browser_use":
             if missing.contains(.browserAutomation) {
-                nextSteps.append("Turn on Browser Automation in Settings > Computer Control.")
+                nextSteps.append("Turn on Browser Automation in Settings > Automation.")
             }
             if missing.contains(.browserProfile) {
-                nextSteps.append("Choose a Browser Profile in Settings > Computer Control.")
+                nextSteps.append("Choose a Browser Profile in Settings > Automation.")
             }
         case "app_action":
             if missing.contains(.appleEvents) {

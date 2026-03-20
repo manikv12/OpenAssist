@@ -1,6 +1,39 @@
 import AppKit
 import SwiftUI
 
+private final class AppHostWindow: NSWindow {
+    override func sendEvent(_ event: NSEvent) {
+        if shouldZoomOnDoubleClick(for: event) {
+            zoom(nil)
+            return
+        }
+
+        super.sendEvent(event)
+    }
+
+    private func shouldZoomOnDoubleClick(for event: NSEvent) -> Bool {
+        guard event.type == .leftMouseUp,
+              event.clickCount == 2,
+              styleMask.contains(.resizable) else {
+            return false
+        }
+
+        let location = event.locationInWindow
+        guard location.y >= contentLayoutRect.maxY else {
+            return false
+        }
+
+        let standardButtons: [NSWindow.ButtonType] = [.closeButton, .miniaturizeButton, .zoomButton]
+        for buttonType in standardButtons {
+            if let button = standardWindowButton(buttonType), button.frame.contains(location) {
+                return false
+            }
+        }
+
+        return true
+    }
+}
+
 @MainActor
 final class AppWindowCoordinator: NSObject, NSWindowDelegate {
     private let settingsDefaultSize = NSSize(width: 900, height: 680)
@@ -29,6 +62,10 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
     private var historyTargetApplication: NSRunningApplication?
     private var onboardingCompletion: (() -> Void)?
 
+    private var standardWindowCollectionBehavior: NSWindow.CollectionBehavior {
+        [.moveToActiveSpace, .fullScreenPrimary]
+    }
+
     var assistantWindowScreen: NSScreen? {
         assistantWindowController?.window?.screen
     }
@@ -52,7 +89,7 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
 
         if settingsWindowController == nil {
             let hostingController = NSHostingController(rootView: SettingsView().environmentObject(settings))
-            let window = NSWindow(
+            let window = AppHostWindow(
                 contentRect: NSRect(origin: .zero, size: settingsDefaultSize),
                 styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
                 backing: .buffered,
@@ -68,7 +105,7 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
             window.isMovableByWindowBackground = false
             window.contentViewController = hostingController
             window.hidesOnDeactivate = false
-            window.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary]
+            window.collectionBehavior = standardWindowCollectionBehavior
             window.isReleasedWhenClosed = false
             window.minSize = settingsMinimumSize
             centerWindowOnActiveScreen(window)
@@ -109,7 +146,7 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
             .environmentObject(settings)
 
             let hostingController = NSHostingController(rootView: onboardingView)
-            let window = NSWindow(
+            let window = AppHostWindow(
                 contentRect: NSRect(origin: .zero, size: onboardingDefaultSize),
                 styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
                 backing: .buffered,
@@ -125,7 +162,7 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
             window.isMovableByWindowBackground = false
             window.contentViewController = hostingController
             window.hidesOnDeactivate = false
-            window.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary]
+            window.collectionBehavior = standardWindowCollectionBehavior
             window.isReleasedWhenClosed = false
             window.minSize = onboardingMinimumSize
             centerWindowOnActiveScreen(window)
@@ -158,7 +195,7 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
 
         if aiStudioWindowController == nil {
             let hostingController = NSHostingController(rootView: AIMemoryStudioView().environmentObject(settings))
-            let window = NSWindow(
+            let window = AppHostWindow(
                 contentRect: NSRect(origin: .zero, size: aiStudioDefaultSize),
                 styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
                 backing: .buffered,
@@ -173,7 +210,7 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
             window.isMovableByWindowBackground = false
             window.contentViewController = hostingController
             window.hidesOnDeactivate = false
-            window.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary]
+            window.collectionBehavior = standardWindowCollectionBehavior
             window.isReleasedWhenClosed = false
             window.minSize = aiStudioMinimumSize
             centerWindowOnActiveScreen(window)
@@ -213,7 +250,7 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
             hostingController.sizingOptions = []
             assistantHostingController = hostingController
 
-            let window = NSWindow(
+            let window = AppHostWindow(
                 contentRect: NSRect(origin: .zero, size: assistantDefaultSize),
                 styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
                 backing: .buffered,
@@ -231,7 +268,7 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
             window.isMovableByWindowBackground = false
             window.contentViewController = hostingController
             window.hidesOnDeactivate = false
-            window.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary]
+            window.collectionBehavior = standardWindowCollectionBehavior
             window.isReleasedWhenClosed = false
             window.minSize = assistantMinimumSize
             centerWindowOnActiveScreen(window)
@@ -392,7 +429,7 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
             window.setContentSize(targetSize)
         }
 
-        if !wasVisible || needsReadableSize {
+        if !wasVisible {
             centerWindowOnActiveScreen(window)
         }
     }

@@ -11,13 +11,13 @@ final class AssistantTextRenderingPolicyTests: XCTestCase {
         XCTAssertEqual(style, .plain)
     }
 
-    func testStreamingBulletListUsesPlainRendering() {
+    func testStreamingBulletListUsesMarkdownRendering() {
         let style = AssistantTextRenderingPolicy.style(
             for: "- first\n- second",
             isStreaming: true
         )
 
-        XCTAssertEqual(style, .plain)
+        XCTAssertEqual(style, .markdown)
     }
 
     func testBulletListUsesMarkdownRenderingWhenFinalized() {
@@ -38,13 +38,13 @@ final class AssistantTextRenderingPolicyTests: XCTestCase {
         XCTAssertEqual(style, .markdown)
     }
 
-    func testStreamingCodeFenceUsesPlainRendering() {
+    func testStreamingCodeFenceUsesMarkdownRendering() {
         let style = AssistantTextRenderingPolicy.style(
             for: "```swift\nprint(\"hello\")",
             isStreaming: true
         )
 
-        XCTAssertEqual(style, .plain)
+        XCTAssertEqual(style, .markdown)
     }
 
     func testVisibleTextSanitizerRemovesWrappedAnalysisBlock() {

@@ -14,7 +14,7 @@ Core capabilities:
 - Optional AI rewrite before insertion
 - Conversation-aware rewrite and assistant context
 - Local transcript history and adaptive corrections
-- Local computer control for supported browser and app tasks in Agentic mode
+- Browser and direct app automation for supported tasks in Agentic mode
 
 ## 2. Requirements
 
@@ -23,9 +23,8 @@ Core capabilities:
 - Accessibility permission (for direct text insertion and global shortcuts)
 - Speech Recognition permission (only when using Apple Speech engine)
 
-For computer control features, you also need:
+For browser and app automation features, you also need:
 
-- Screen Recording permission (so Open Assist can understand your screen)
 - Automation / Apple Events permission (so Open Assist can control supported apps directly)
 
 ## 3. Install and Launch
@@ -43,11 +42,10 @@ Open **Settings** from the menu bar and confirm:
 2. Accessibility = Granted
 3. Microphone = Granted
 4. Speech Recognition = Granted (if using Apple Speech)
-5. Open **Computer Control**
-6. Screen Recording = Granted (for computer control)
-7. Automation / Apple Events = Allowed (for browser and app actions)
-8. Choose your browser profile if you want browser control
-9. Verify your shortcut settings in **Shortcuts**
+5. Open **Automation**
+6. Automation / Apple Events = Allowed (for browser and app actions)
+7. Choose your browser profile if you want browser control
+8. Verify your shortcut settings in **Shortcuts**
 
 ## 5. Daily Assistant and Voice Workflows
 
@@ -57,7 +55,7 @@ Open **Settings** from the menu bar and confirm:
 2. Choose **Open Assistant** for typed work, or **Speak Assistant Task** for voice-first requests.
 3. Continue in the assistant window and review the result before using it elsewhere.
 
-### Computer control tasks
+### Browser and app automation tasks
 
 Use these when you want Open Assist to work on your Mac for you.
 
@@ -168,12 +166,12 @@ If local AI fails later, use **Repair Local AI** in AI Studio.
 - Provider keys/OAuth status
 - AI Studio entry point
 
-### Computer Control
+### Automation
 
-- Permission status for Screen Recording and Automation / Apple Events
+- Permission status for Automation / Apple Events
 - Browser profile picker for Google Chrome, Brave, and Microsoft Edge
-- Supported direct app actions for Finder, Terminal, Calendar, and System Settings
-- Computer-control status and approval behavior summary
+- Supported direct app actions for Finder, Terminal, Calendar, System Settings, Reminders, Contacts, Notes, and Messages
+- Automation status and approval behavior summary
 
 ### Corrections
 
@@ -188,9 +186,9 @@ If local AI fails later, use **Repair Local AI** in AI Studio.
 - Check for updates
 - Uninstall options
 
-## 10. Computer Control Details
+## 10. Automation Details
 
-Open **Settings → Computer Control** for all setup in one place.
+Open **Settings → Automation** for all setup in one place.
 
 Browser support:
 
@@ -206,8 +204,10 @@ Direct app actions:
 - Terminal: open Terminal and run a command
 - Calendar: create event drafts for review before final action
 - System Settings: open the right settings page
-
-If a task is too complex for a direct action, Open Assist can fall back to general computer control.
+- Reminders: read, add, and complete reminders
+- Contacts: search contacts by name
+- Notes: search and read notes
+- Messages: list chats and read recent messages
 
 ## 11. Updates and Version Info
 
@@ -260,13 +260,12 @@ Stored data may include:
 2. Confirm model/provider selection in AI settings.
 3. For local AI, run **Repair Local AI** in AI Studio.
 
-### Computer control is not working
+### Automation is not working
 
-1. Open **Settings → Computer Control**.
-2. Confirm **Screen Recording** is granted.
-3. Confirm **Automation / Apple Events** is allowed.
-4. If you are using browser control, make sure you selected the right profile for Chrome, Brave, or Microsoft Edge.
-5. Try the request again in **Agentic** mode.
+1. Open **Settings → Automation**.
+2. Confirm **Automation / Apple Events** is allowed.
+3. If you are using browser control, make sure you selected the right profile for Chrome, Brave, or Microsoft Edge.
+4. Try the request again in **Agentic** mode.
 
 ### Update check shows error
 

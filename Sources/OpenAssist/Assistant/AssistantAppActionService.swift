@@ -6,7 +6,7 @@ enum AssistantAppActionToolDefinition {
     static let toolKind = "appAction"
 
     static let description = """
-    Perform a direct action in supported Mac apps: Finder, Terminal, Calendar, System Settings, Reminders, Contacts, Notes, or Messages. Prefer this tool for app-specific work before falling back to general computer control. For Reminders, Contacts, Notes, and Messages, this tool reads data directly via native frameworks — no AppleScript needed.
+    Perform a direct action in supported Mac apps: Finder, Terminal, Calendar, System Settings, Reminders, Contacts, Notes, or Messages. Use this tool for supported app-specific work only. For Reminders, Contacts, Notes, and Messages, this tool reads data directly via native frameworks — no AppleScript needed.
     """
 
     static let inputSchema: [String: Any] = [
@@ -141,25 +141,17 @@ actor AssistantAppActionService {
         }
     }
 
-    private let settings: SettingsStore
     private let helper: LocalAutomationHelper
-    private let computerUseService: AssistantComputerUseService
 
-    init(
-        settings: SettingsStore,
-        helper: LocalAutomationHelper = .shared,
-        computerUseService: AssistantComputerUseService
-    ) {
-        self.settings = settings
+    init(helper: LocalAutomationHelper = .shared) {
         self.helper = helper
-        self.computerUseService = computerUseService
     }
 
-    func run(arguments: Any, preferredModelID: String?) async -> AssistantComputerUseService.ToolExecutionResult {
+    func run(arguments: Any, preferredModelID: String?) async -> AssistantToolExecutionResult {
         do {
             let request = try Self.parseRequest(from: arguments)
 
-            // Block privacy-protected apps immediately — no fallback to Computer Use
+            // Block privacy-protected apps immediately — no live-control fallback
             if let blockedApp = Self.detectPrivacyBlockedApp(in: request.task) {
                 return Self.result(
                     summary: """
@@ -173,34 +165,22 @@ actor AssistantAppActionService {
             }
 
             if request.needsComputerFallback {
-                if let blocked = await blockedComputerUseFallbackResult(
-                    task: request.task,
-                    app: request.app?.displayName,
-                    reason: "Use the direct app action first when possible, then continue with computer control if needed."
-                ) {
-                    return blocked
-                }
-                return await computerUseService.run(
-                    arguments: [
-                        "task": request.task,
-                        "app": request.app?.displayName,
-                        "reason": "Use the direct app action first when possible, then continue with computer control if needed."
-                    ],
-                    preferredModelID: preferredModelID
+                return Self.result(
+                    summary: """
+                    Open Assist can only use direct app actions here. This request needs live clicking or typing, which Open Assist no longer supports.
+                    """,
+                    detail: """
+                    Try a direct supported action instead, like Finder open/reveal, Terminal run command, Calendar read/create, System Settings open, Reminders, Contacts, Notes, or Messages.
+                    """,
+                    success: false
                 )
             }
 
             guard let app = request.app else {
-                if let blocked = await blockedComputerUseFallbackResult(
-                    task: request.task,
-                    app: nil,
-                    reason: nil
-                ) {
-                    return blocked
-                }
-                return await computerUseService.run(
-                    arguments: ["task": request.task],
-                    preferredModelID: preferredModelID
+                return Self.result(
+                    summary: "App Action only works with supported direct Mac apps.",
+                    detail: "Choose Finder, Terminal, Calendar, System Settings, Reminders, Contacts, Notes, or Messages.",
+                    success: false
                 )
             }
 
@@ -227,35 +207,6 @@ actor AssistantAppActionService {
                 ?? "App Action failed."
             return Self.result(summary: summary, detail: nil, success: false)
         }
-    }
-
-    private func blockedComputerUseFallbackResult(
-        task: String,
-        app: String?,
-        reason: String?
-    ) async -> AssistantComputerUseService.ToolExecutionResult? {
-        let arguments: [String: Any] = {
-            var payload: [String: Any] = ["task": task]
-            if let app, !app.isEmpty {
-                payload["app"] = app
-            }
-            if let reason, !reason.isEmpty {
-                payload["reason"] = reason
-            }
-            return payload
-        }()
-
-        let verdict = await MainActor.run {
-            let snapshot = ToolPermissionRegistry.snapshot(using: settings)
-            return ToolPermissionRegistry.verify(
-                toolName: AssistantComputerUseToolDefinition.name,
-                arguments: arguments,
-                snapshot: snapshot
-            )
-        }
-
-        guard !verdict.satisfied else { return nil }
-        return Self.result(summary: verdict.message, detail: nil, success: false)
     }
 
     static func parseRequest(from arguments: Any) throws -> ParsedRequest {
@@ -374,7 +325,7 @@ actor AssistantAppActionService {
         return nil
     }
 
-    private func runFinderAction(_ request: ParsedRequest) async throws -> AssistantComputerUseService.ToolExecutionResult {
+    private func runFinderAction(_ request: ParsedRequest) async throws -> AssistantToolExecutionResult {
         let action = request.action?.lowercased() ?? ""
         guard let path = request.path ?? extractQuotedPath(from: request.task) else {
             throw LocalAutomationError.invalidArguments("Finder actions need a file or folder path.")
@@ -389,7 +340,7 @@ actor AssistantAppActionService {
         return Self.result(summary: "Opened \(path) in Finder.", detail: nil)
     }
 
-    private func runTerminalAction(_ request: ParsedRequest) async throws -> AssistantComputerUseService.ToolExecutionResult {
+    private func runTerminalAction(_ request: ParsedRequest) async throws -> AssistantToolExecutionResult {
         guard let command = request.command ?? extractCommand(from: request.task) else {
             throw LocalAutomationError.invalidArguments("Terminal actions need a command.")
         }
@@ -397,7 +348,7 @@ actor AssistantAppActionService {
         return Self.result(summary: "Opened Terminal and ran the command.", detail: command)
     }
 
-    private func runCalendarAction(_ request: ParsedRequest) async throws -> AssistantComputerUseService.ToolExecutionResult {
+    private func runCalendarAction(_ request: ParsedRequest) async throws -> AssistantToolExecutionResult {
         let action = request.action?.lowercased() ?? ""
         let normalized = request.normalizedTask
 
@@ -455,7 +406,7 @@ actor AssistantAppActionService {
         )
     }
 
-    private func runSystemSettingsAction(_ request: ParsedRequest) async throws -> AssistantComputerUseService.ToolExecutionResult {
+    private func runSystemSettingsAction(_ request: ParsedRequest) async throws -> AssistantToolExecutionResult {
         let pane = request.pane ?? request.action ?? request.task
         await helper.openSystemSettings(pane: pane)
         return Self.result(summary: "Opened System Settings.", detail: pane)
@@ -465,7 +416,7 @@ actor AssistantAppActionService {
 
     private let nativeService = NativeDataAccessService.shared
 
-    private func runRemindersAction(_ request: ParsedRequest) async throws -> AssistantComputerUseService.ToolExecutionResult {
+    private func runRemindersAction(_ request: ParsedRequest) async throws -> AssistantToolExecutionResult {
         let action = request.action?.lowercased() ?? ""
         let normalized = request.normalizedTask
 
@@ -517,7 +468,7 @@ actor AssistantAppActionService {
         )
     }
 
-    private func runContactsAction(_ request: ParsedRequest) async throws -> AssistantComputerUseService.ToolExecutionResult {
+    private func runContactsAction(_ request: ParsedRequest) async throws -> AssistantToolExecutionResult {
         let searchQuery = request.query ?? request.title ?? extractQuotedString(from: request.task) ?? request.task
         let contacts = try await nativeService.searchContacts(query: searchQuery)
         let formatted = NativeDataAccessService.formatContacts(contacts)
@@ -527,7 +478,7 @@ actor AssistantAppActionService {
         )
     }
 
-    private func runNotesAction(_ request: ParsedRequest) async throws -> AssistantComputerUseService.ToolExecutionResult {
+    private func runNotesAction(_ request: ParsedRequest) async throws -> AssistantToolExecutionResult {
         do {
             let searchQuery = request.query ?? request.title ?? extractQuotedString(from: request.task)
             let notes = try await nativeService.fetchNotes(query: searchQuery)
@@ -542,7 +493,7 @@ actor AssistantAppActionService {
         }
     }
 
-    private func runMessagesAction(_ request: ParsedRequest) async throws -> AssistantComputerUseService.ToolExecutionResult {
+    private func runMessagesAction(_ request: ParsedRequest) async throws -> AssistantToolExecutionResult {
         do {
             return try await runMessagesActionInner(request)
         } catch let error as NativeDataAccessError {
@@ -551,7 +502,7 @@ actor AssistantAppActionService {
         }
     }
 
-    private func runMessagesActionInner(_ request: ParsedRequest) async throws -> AssistantComputerUseService.ToolExecutionResult {
+    private func runMessagesActionInner(_ request: ParsedRequest) async throws -> AssistantToolExecutionResult {
         let action = request.action?.lowercased() ?? ""
         let normalized = request.normalizedTask
 
@@ -669,11 +620,11 @@ actor AssistantAppActionService {
     private static func fullDiskAccessErrorResult(
         error: NativeDataAccessError,
         userOpenedSettings: Bool
-    ) -> AssistantComputerUseService.ToolExecutionResult {
+    ) -> AssistantToolExecutionResult {
         let action = userOpenedSettings
             ? "Opened Full Disk Access settings for the user. Tell them to add this app to the list, then try again."
             : "The user chose not to open settings right now."
-        let message = "\(error.localizedDescription) \(action) There is no workaround -- do NOT try Computer Use, osascript, or reading files manually."
+        let message = "\(error.localizedDescription) \(action) There is no workaround -- do NOT try osascript or reading files manually."
         return result(summary: message, detail: nil, success: false)
     }
 
@@ -681,14 +632,14 @@ actor AssistantAppActionService {
         summary: String,
         detail: String?,
         success: Bool = true
-    ) -> AssistantComputerUseService.ToolExecutionResult {
-        var items: [AssistantComputerUseService.ToolExecutionResult.ContentItem] = [
+    ) -> AssistantToolExecutionResult {
+        var items: [AssistantToolExecutionResult.ContentItem] = [
             .init(type: "inputText", text: summary, imageURL: nil)
         ]
         if let detail {
             items.append(.init(type: "inputText", text: detail, imageURL: nil))
         }
-        return AssistantComputerUseService.ToolExecutionResult(
+        return AssistantToolExecutionResult(
             contentItems: items,
             success: success,
             summary: summary

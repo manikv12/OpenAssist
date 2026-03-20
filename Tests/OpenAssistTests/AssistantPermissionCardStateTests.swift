@@ -44,13 +44,13 @@ final class AssistantPermissionCardStateTests: XCTestCase {
         )
     }
 
-    func testMatchingPendingComputerUseRequestStaysWaitingForApproval() {
+    func testMatchingPendingBrowserUseRequestStaysWaitingForApproval() {
         let request = AssistantPermissionRequest(
             id: 42,
             sessionID: "session-1",
-            toolTitle: "Computer Use",
-            toolKind: "computerUse",
-            rationale: "Allow computer control?",
+            toolTitle: "Browser Use",
+            toolKind: "browserUse",
+            rationale: "Allow browser access?",
             options: [],
             rawPayloadSummary: nil
         )

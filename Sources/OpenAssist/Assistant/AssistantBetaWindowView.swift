@@ -40,7 +40,7 @@ struct AssistantBetaWindowView: View {
                 VStack(alignment: .leading, spacing: 3) {
                     Text("Recent Sessions")
                         .font(.title3.weight(.semibold))
-                        .foregroundStyle(.white.opacity(0.96))
+                        .foregroundStyle(AppVisualTheme.foreground(0.96))
 
                     Text("Open an old task, resume it, or quickly start a new one.")
                         .font(.caption)
@@ -143,7 +143,7 @@ struct AssistantBetaWindowView: View {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Assistant")
                         .font(.system(size: 28, weight: .bold))
-                        .foregroundStyle(.white.opacity(0.97))
+                        .foregroundStyle(AppVisualTheme.foreground(0.97))
 
                     Text("A calm control room for typed tasks, voice drafts, live progress, and session history.")
                         .font(.subheadline)
@@ -198,7 +198,7 @@ struct AssistantBetaWindowView: View {
                 VStack(alignment: .leading, spacing: 3) {
                     Text("Live Activity")
                         .font(.title3.weight(.semibold))
-                        .foregroundStyle(.white.opacity(0.96))
+                        .foregroundStyle(AppVisualTheme.foreground(0.96))
 
                     Text("Keep responses short here. Full logic can stay in the runtime later.")
                         .font(.caption)
@@ -214,7 +214,7 @@ struct AssistantBetaWindowView: View {
             }
 
             Divider()
-                .overlay(Color.white.opacity(0.10))
+                .overlay(AppVisualTheme.surfaceStroke(0.10))
 
             ScrollView {
                 if model.transcriptItems.isEmpty {
@@ -245,7 +245,7 @@ struct AssistantBetaWindowView: View {
                 VStack(alignment: .leading, spacing: 3) {
                     Text("Task Composer")
                         .font(.title3.weight(.semibold))
-                        .foregroundStyle(.white.opacity(0.96))
+                        .foregroundStyle(AppVisualTheme.foreground(0.96))
 
                     Text("The app can drop a voice draft here, and the user can edit it before sending.")
                         .font(.caption)
@@ -266,9 +266,9 @@ struct AssistantBetaWindowView: View {
                     .fill(
                         LinearGradient(
                             colors: [
-                                Color.white.opacity(0.07),
+                                AppVisualTheme.foreground(0.07),
                                 AppVisualTheme.baseTint.opacity(0.18),
-                                Color.black.opacity(0.20)
+                                AppVisualTheme.surfaceFill(0.20)
                             ],
                             startPoint: .topLeading,
                             endPoint: .bottomTrailing
@@ -276,13 +276,13 @@ struct AssistantBetaWindowView: View {
                     )
                     .overlay(
                         RoundedRectangle(cornerRadius: 18, style: .continuous)
-                            .stroke(Color.white.opacity(0.08), lineWidth: 0.6)
+                            .stroke(AppVisualTheme.surfaceStroke(0.08), lineWidth: 0.6)
                     )
 
                 if model.draftText.isEmpty {
                     Text(model.composerPlaceholder)
                         .font(.system(size: 15, weight: .medium))
-                        .foregroundStyle(Color.white.opacity(0.44))
+                        .foregroundStyle(AppVisualTheme.foreground(0.44))
                         .padding(.horizontal, 16)
                         .padding(.vertical, 14)
                         .allowsHitTesting(false)
@@ -290,7 +290,7 @@ struct AssistantBetaWindowView: View {
 
                 TextEditor(text: $model.draftText)
                     .font(.system(size: 15, weight: .medium))
-                    .foregroundStyle(.white.opacity(0.95))
+                    .foregroundStyle(AppVisualTheme.foreground(0.95))
                     .focused($composerFocused)
                     .scrollContentBackground(.hidden)
                     .padding(10)
@@ -326,7 +326,7 @@ struct AssistantBetaWindowView: View {
                 VStack(alignment: .leading, spacing: 3) {
                     Text("Session Details")
                         .font(.title3.weight(.semibold))
-                        .foregroundStyle(.white.opacity(0.96))
+                        .foregroundStyle(AppVisualTheme.foreground(0.96))
 
                     Text("Open one session, see its summary, then resume it if needed.")
                         .font(.caption)
@@ -338,11 +338,11 @@ struct AssistantBetaWindowView: View {
                 VStack(alignment: .leading, spacing: 12) {
                     Text(detail.headline)
                         .font(.headline.weight(.semibold))
-                        .foregroundStyle(.white.opacity(0.95))
+                        .foregroundStyle(AppVisualTheme.foreground(0.95))
 
                     Text(detail.summary)
                         .font(.subheadline)
-                        .foregroundStyle(.white.opacity(0.74))
+                        .foregroundStyle(AppVisualTheme.foreground(0.74))
 
                     AssistantBetaMiniPill(
                         symbol: "bolt.horizontal.circle.fill",
@@ -361,7 +361,7 @@ struct AssistantBetaWindowView: View {
 
                                     Text(fact.value)
                                         .font(.caption)
-                                        .foregroundStyle(.white.opacity(0.86))
+                                        .foregroundStyle(AppVisualTheme.foreground(0.86))
                                         .frame(maxWidth: .infinity, alignment: .leading)
                                 }
                             }
@@ -385,7 +385,7 @@ struct AssistantBetaWindowView: View {
 
                                     Text(note)
                                         .font(.caption)
-                                        .foregroundStyle(.white.opacity(0.82))
+                                        .foregroundStyle(AppVisualTheme.foreground(0.82))
                                 }
                             }
                         }
@@ -423,11 +423,11 @@ struct AssistantBetaWindowView: View {
                 VStack(alignment: .leading, spacing: 3) {
                     Text(installHelp.title)
                         .font(.headline.weight(.semibold))
-                        .foregroundStyle(.white.opacity(0.95))
+                        .foregroundStyle(AppVisualTheme.foreground(0.95))
 
                     Text(installHelp.message)
                         .font(.caption)
-                        .foregroundStyle(.white.opacity(0.78))
+                        .foregroundStyle(AppVisualTheme.foreground(0.78))
                 }
             }
 
@@ -436,16 +436,16 @@ struct AssistantBetaWindowView: View {
                     HStack(alignment: .top, spacing: 10) {
                         Text("\(index + 1)")
                             .font(.caption.weight(.bold))
-                            .foregroundStyle(.black.opacity(0.82))
+                            .foregroundStyle(AppVisualTheme.foreground(0.82))
                             .frame(width: 18, height: 18)
                             .background(
                                 Circle()
-                                    .fill(Color.white.opacity(0.86))
+                                    .fill(AppVisualTheme.surfaceFill(0.86))
                             )
 
                         Text(step)
                             .font(.caption)
-                            .foregroundStyle(.white.opacity(0.82))
+                            .foregroundStyle(AppVisualTheme.foreground(0.82))
                             .frame(maxWidth: .infinity, alignment: .leading)
                     }
                 }
@@ -477,7 +477,7 @@ struct AssistantBetaWindowView: View {
                 VStack(alignment: .leading, spacing: 3) {
                     Text("Voice Draft")
                         .font(.headline.weight(.semibold))
-                        .foregroundStyle(.white.opacity(0.95))
+                        .foregroundStyle(AppVisualTheme.foreground(0.95))
 
                     Text("Simple status area for voice capture. The main app can wire transcription later.")
                         .font(.caption)
@@ -528,12 +528,12 @@ private struct AssistantBetaSessionRow: View {
                 VStack(alignment: .leading, spacing: 4) {
                     Text(session.title)
                         .font(.subheadline.weight(.semibold))
-                        .foregroundStyle(.white.opacity(0.95))
+                        .foregroundStyle(AppVisualTheme.foreground(0.95))
                         .lineLimit(2)
 
                     Text(session.subtitle)
                         .font(.caption)
-                        .foregroundStyle(.white.opacity(0.68))
+                        .foregroundStyle(AppVisualTheme.foreground(0.68))
                         .lineLimit(2)
                 }
 
@@ -561,8 +561,8 @@ private struct AssistantBetaSessionRow: View {
                 .fill(
                     LinearGradient(
                         colors: [
-                            (isSelected ? statusColor.opacity(0.22) : Color.white.opacity(0.06)),
-                            Color.black.opacity(isSelected ? 0.18 : 0.12)
+                            (isSelected ? statusColor.opacity(0.22) : AppVisualTheme.foreground(0.06)),
+                            AppVisualTheme.surfaceFill(isSelected ? 0.18 : 0.12)
                         ],
                         startPoint: .topLeading,
                         endPoint: .bottomTrailing
@@ -574,8 +574,8 @@ private struct AssistantBetaSessionRow: View {
                 .stroke(
                     LinearGradient(
                         colors: [
-                            Color.white.opacity(isSelected ? 0.22 : 0.09),
-                            Color.black.opacity(0.20)
+                            AppVisualTheme.foreground(isSelected ? 0.22 : 0.09),
+                            AppVisualTheme.surfaceStroke(0.20)
                         ],
                         startPoint: .top,
                         endPoint: .bottom
@@ -632,7 +632,7 @@ private struct AssistantBetaTranscriptRow: View {
                 HStack {
                     Text(item.title)
                         .font(.subheadline.weight(.semibold))
-                        .foregroundStyle(.white.opacity(0.95))
+                        .foregroundStyle(AppVisualTheme.foreground(0.95))
 
                     Spacer(minLength: 10)
 
@@ -645,7 +645,7 @@ private struct AssistantBetaTranscriptRow: View {
                     } label: {
                         Image(systemName: "doc.on.doc")
                             .font(.system(size: 11, weight: .semibold))
-                            .foregroundStyle(.white.opacity(0.55))
+                            .foregroundStyle(AppVisualTheme.foreground(0.55))
                     }
                     .buttonStyle(.plain)
                     .help(copyHelpText)
@@ -653,7 +653,7 @@ private struct AssistantBetaTranscriptRow: View {
 
                 Text(item.body)
                     .font(.system(size: 14.5, weight: .medium))
-                    .foregroundStyle(.white.opacity(0.80))
+                    .foregroundStyle(AppVisualTheme.foreground(0.80))
                     .frame(maxWidth: .infinity, alignment: .leading)
 
                 if let footnote, !footnote.isEmpty {
@@ -735,11 +735,11 @@ private struct AssistantBetaBannerCard: View {
             VStack(alignment: .leading, spacing: 4) {
                 Text(banner.title)
                     .font(.subheadline.weight(.semibold))
-                    .foregroundStyle(.white.opacity(0.96))
+                    .foregroundStyle(AppVisualTheme.foreground(0.96))
 
                 Text(banner.message)
                     .font(.caption)
-                    .foregroundStyle(.white.opacity(0.78))
+                    .foregroundStyle(AppVisualTheme.foreground(0.78))
             }
 
             Spacer(minLength: 0)
@@ -785,10 +785,10 @@ private struct AssistantBetaVoiceDraftStatus: View {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Listening")
                         .font(.subheadline.weight(.semibold))
-                        .foregroundStyle(.white.opacity(0.95))
+                        .foregroundStyle(AppVisualTheme.foreground(0.95))
                     Text(message)
                         .font(.caption)
-                        .foregroundStyle(.white.opacity(0.76))
+                        .foregroundStyle(AppVisualTheme.foreground(0.76))
                 }
                 Spacer(minLength: 0)
             }
@@ -799,7 +799,7 @@ private struct AssistantBetaVoiceDraftStatus: View {
                 AssistantBetaMiniPill(symbol: "checkmark.circle.fill", label: "Draft captured", tint: .green)
                 Text(text)
                     .font(.caption)
-                    .foregroundStyle(.white.opacity(0.84))
+                    .foregroundStyle(AppVisualTheme.foreground(0.84))
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
             .padding(14)
@@ -809,7 +809,7 @@ private struct AssistantBetaVoiceDraftStatus: View {
                 AssistantBetaMiniPill(symbol: "exclamationmark.triangle.fill", label: "Voice draft failed", tint: .red)
                 Text(message)
                     .font(.caption)
-                    .foregroundStyle(.white.opacity(0.84))
+                    .foregroundStyle(AppVisualTheme.foreground(0.84))
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
             .padding(14)
@@ -841,7 +841,7 @@ private struct AssistantBetaMiniPill: View {
                 .font(.caption.weight(.semibold))
                 .lineLimit(1)
         }
-        .foregroundStyle(.white.opacity(0.92))
+        .foregroundStyle(AppVisualTheme.foreground(0.92))
         .padding(.horizontal, 10)
         .padding(.vertical, 6)
         .background(
@@ -851,7 +851,7 @@ private struct AssistantBetaMiniPill: View {
                         colors: [
                             tint.opacity(0.38),
                             tint.opacity(0.20),
-                            Color.black.opacity(0.22)
+                                AppVisualTheme.surfaceFill(0.22)
                         ],
                         startPoint: .topLeading,
                         endPoint: .bottomTrailing
@@ -860,7 +860,7 @@ private struct AssistantBetaMiniPill: View {
         )
         .overlay(
             Capsule(style: .continuous)
-                .stroke(Color.white.opacity(0.08), lineWidth: 0.6)
+                .stroke(AppVisualTheme.surfaceStroke(0.08), lineWidth: 0.6)
         )
     }
 }
@@ -878,12 +878,12 @@ private struct AssistantBetaEmptyCard: View {
 
             Text(title)
                 .font(.subheadline.weight(.semibold))
-                .foregroundStyle(.white.opacity(0.94))
+                .foregroundStyle(AppVisualTheme.foreground(0.94))
 
             Text(message)
                 .font(.caption)
                 .multilineTextAlignment(.center)
-                .foregroundStyle(.white.opacity(0.70))
+                .foregroundStyle(AppVisualTheme.foreground(0.70))
         }
         .frame(maxWidth: .infinity)
         .padding(18)
@@ -897,7 +897,7 @@ private struct AssistantBetaPrimaryButtonStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .font(.system(size: 14, weight: .semibold))
-            .foregroundStyle(.white.opacity(configuration.isPressed ? 0.82 : 0.95))
+            .foregroundStyle(AppVisualTheme.foreground(configuration.isPressed ? 0.82 : 0.95))
             .padding(.horizontal, 16)
             .padding(.vertical, 10)
             .background(
@@ -915,7 +915,7 @@ private struct AssistantBetaPrimaryButtonStyle: ButtonStyle {
             )
             .overlay(
                 RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .stroke(Color.white.opacity(0.12), lineWidth: 0.65)
+                    .stroke(AppVisualTheme.surfaceStroke(0.12), lineWidth: 0.65)
             )
             .shadow(color: tint.opacity(configuration.isPressed ? 0.18 : 0.32), radius: configuration.isPressed ? 4 : 9, x: 0, y: 4)
             .scaleEffect(configuration.isPressed ? 0.985 : 1)
@@ -927,7 +927,7 @@ private struct AssistantBetaSecondaryButtonStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .font(.system(size: 13.5, weight: .semibold))
-            .foregroundStyle(.white.opacity(configuration.isPressed ? 0.76 : 0.92))
+            .foregroundStyle(AppVisualTheme.foreground(configuration.isPressed ? 0.76 : 0.92))
             .padding(.horizontal, 14)
             .padding(.vertical, 10)
             .background(
@@ -935,9 +935,9 @@ private struct AssistantBetaSecondaryButtonStyle: ButtonStyle {
                     .fill(
                         LinearGradient(
                             colors: [
-                                Color.white.opacity(configuration.isPressed ? 0.09 : 0.12),
+                                AppVisualTheme.foreground(configuration.isPressed ? 0.09 : 0.12),
                                 AppVisualTheme.baseTint.opacity(configuration.isPressed ? 0.18 : 0.24),
-                                Color.black.opacity(0.18)
+                                AppVisualTheme.surfaceFill(0.18)
                             ],
                             startPoint: .topLeading,
                             endPoint: .bottomTrailing
@@ -946,7 +946,7 @@ private struct AssistantBetaSecondaryButtonStyle: ButtonStyle {
             )
             .overlay(
                 RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .stroke(Color.white.opacity(0.09), lineWidth: 0.6)
+                    .stroke(AppVisualTheme.surfaceStroke(0.09), lineWidth: 0.6)
             )
             .scaleEffect(configuration.isPressed ? 0.987 : 1)
             .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
@@ -958,16 +958,16 @@ private struct AssistantBetaIconButtonStyle: ButtonStyle {
 
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
-            .foregroundStyle(.white.opacity(isBusy ? 0.72 : (configuration.isPressed ? 0.78 : 0.94)))
+            .foregroundStyle(AppVisualTheme.foreground(isBusy ? 0.72 : (configuration.isPressed ? 0.78 : 0.94)))
             .frame(width: 32, height: 32)
             .background(
                 Circle()
                     .fill(
                         LinearGradient(
                             colors: [
-                                Color.white.opacity(0.09),
+                                AppVisualTheme.foreground(0.09),
                                 AppVisualTheme.baseTint.opacity(0.18),
-                                Color.black.opacity(0.22)
+                                AppVisualTheme.surfaceFill(0.22)
                             ],
                             startPoint: .topLeading,
                             endPoint: .bottomTrailing
@@ -976,7 +976,7 @@ private struct AssistantBetaIconButtonStyle: ButtonStyle {
             )
             .overlay(
                 Circle()
-                    .stroke(Color.white.opacity(0.08), lineWidth: 0.6)
+                    .stroke(AppVisualTheme.surfaceStroke(0.08), lineWidth: 0.6)
             )
             .rotationEffect(.degrees(isBusy ? 360 : 0))
             .animation(isBusy ? .linear(duration: 0.9).repeatForever(autoreverses: false) : .default, value: isBusy)

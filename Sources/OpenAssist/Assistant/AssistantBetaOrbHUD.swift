@@ -38,14 +38,14 @@ private struct AssistantBetaOrbDock: View {
                     HStack(alignment: .center, spacing: 10) {
                         Text(state.title)
                             .font(.system(size: 17, weight: .semibold))
-                            .foregroundStyle(.white.opacity(0.96))
+                            .foregroundStyle(AppVisualTheme.foreground(0.96))
 
                         AssistantBetaOrbPhaseChip(phase: state.phase)
                     }
 
                     Text(state.detail)
                         .font(.system(size: 13.5, weight: .medium))
-                        .foregroundStyle(.white.opacity(0.74))
+                        .foregroundStyle(AppVisualTheme.foreground(0.74))
                         .lineLimit(2)
 
                     AssistantBetaSpectrumStrip(
@@ -121,7 +121,7 @@ private struct AssistantBetaOrbCore: View {
                         colors: [
                             orbColors.primary.opacity(0.95),
                             orbColors.secondary.opacity(0.80),
-                            Color.white.opacity(0.82),
+                            AppVisualTheme.foreground(0.82),
                             orbColors.primary.opacity(0.95)
                         ],
                         center: .center,
@@ -145,7 +145,7 @@ private struct AssistantBetaOrbCore: View {
                 )
                 .overlay(
                     Circle()
-                        .fill(Color.white.opacity(0.22 * shimmer))
+                        .fill(AppVisualTheme.foreground(0.22 * shimmer))
                         .frame(width: 24, height: 24)
                         .offset(x: -10, y: -11)
                         .blur(radius: 6)
@@ -154,7 +154,7 @@ private struct AssistantBetaOrbCore: View {
                 .scaleEffect(pulse)
 
             Circle()
-                .fill(Color.white.opacity(0.72))
+                .fill(AppVisualTheme.foreground(0.72))
                 .frame(width: 7, height: 7)
                 .blur(radius: 0.2)
                 .offset(x: 13, y: -13)
@@ -220,7 +220,7 @@ private struct AssistantBetaSpectrumStrip: View {
                                 colors: [
                                     spectrumColors.primary.opacity(0.95),
                                     spectrumColors.secondary.opacity(0.70),
-                                    Color.white.opacity(0.30)
+                                    AppVisualTheme.foreground(0.30)
                                 ],
                                 startPoint: .bottom,
                                 endPoint: .top
@@ -341,7 +341,7 @@ private struct AssistantBetaOrbPhaseChip: View {
             Text(label)
                 .font(.caption.weight(.semibold))
         }
-        .foregroundStyle(.white.opacity(0.92))
+        .foregroundStyle(AppVisualTheme.foreground(0.92))
         .padding(.horizontal, 10)
         .padding(.vertical, 5)
         .background(
@@ -351,7 +351,7 @@ private struct AssistantBetaOrbPhaseChip: View {
                         colors: [
                             tint.opacity(0.36),
                             tint.opacity(0.18),
-                            Color.black.opacity(0.22)
+                            AppVisualTheme.surfaceFill(0.22)
                         ],
                         startPoint: .topLeading,
                         endPoint: .bottomTrailing
@@ -360,7 +360,7 @@ private struct AssistantBetaOrbPhaseChip: View {
         )
         .overlay(
             Capsule(style: .continuous)
-                .stroke(Color.white.opacity(0.08), lineWidth: 0.6)
+                .stroke(AppVisualTheme.foreground(0.08), lineWidth: 0.6)
         )
     }
 

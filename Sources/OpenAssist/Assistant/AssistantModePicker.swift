@@ -47,7 +47,7 @@ struct AssistantModePicker: View {
 
         var textSize: CGFloat {
             switch self {
-            case .standard: return 11
+            case .standard: return 12
             case .compact: return 9.5
             case .micro: return 8.75
             }
@@ -63,7 +63,7 @@ struct AssistantModePicker: View {
 
         var horizontalPadding: CGFloat {
             switch self {
-            case .standard: return 8
+            case .standard: return 4
             case .compact: return 7
             case .micro: return 6
             }
@@ -71,7 +71,7 @@ struct AssistantModePicker: View {
 
         var verticalPadding: CGFloat {
             switch self {
-            case .standard: return 4
+            case .standard: return 2
             case .compact: return 3
             case .micro: return 2.5
             }
@@ -87,7 +87,7 @@ struct AssistantModePicker: View {
 
         var fillOpacity: Double {
             switch self {
-            case .standard: return 0.07
+            case .standard: return 0.0
             case .compact: return 0.07
             case .micro: return 0.045
             }
@@ -103,7 +103,7 @@ struct AssistantModePicker: View {
 
         var textOpacity: Double {
             switch self {
-            case .standard: return 0.55
+            case .standard: return 0.70
             case .compact: return 0.55
             case .micro: return 0.50
             }
@@ -112,7 +112,7 @@ struct AssistantModePicker: View {
 
         var chevronOpacity: Double {
             switch self {
-            case .standard: return 0.25
+            case .standard: return 0.38
             case .compact: return 0.25
             case .micro: return 0.20
             }
@@ -150,20 +150,20 @@ struct AssistantModePicker: View {
                 )
                 Text(selection.label)
                     .font(.system(size: style.textSize, weight: .medium))
-                    .foregroundStyle(.white.opacity(style.textOpacity))
+                    .foregroundStyle(AppVisualTheme.foreground(style.textOpacity))
                     .lineLimit(1)
                 Image(systemName: "chevron.down")
                     .font(.system(size: style.chevronSize, weight: .bold))
-                    .foregroundStyle(.white.opacity(style.chevronOpacity))
+                    .foregroundStyle(AppVisualTheme.foreground(style.chevronOpacity))
             }
             .padding(.horizontal, style.horizontalPadding)
             .padding(.vertical, style.verticalPadding)
             .background(
                 RoundedRectangle(cornerRadius: style.cornerRadius, style: .continuous)
-                    .fill(Color.white.opacity(style.fillOpacity))
+                    .fill(AppVisualTheme.foreground(style.fillOpacity))
                     .overlay(
                         RoundedRectangle(cornerRadius: style.cornerRadius, style: .continuous)
-                            .stroke(Color.white.opacity(style.strokeOpacity), lineWidth: 0.6)
+                            .stroke(AppVisualTheme.foreground(style.strokeOpacity), lineWidth: 0.6)
                     )
             )
         }

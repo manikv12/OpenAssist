@@ -156,6 +156,86 @@ final class AssistantThreadMemoryService {
         return sharedCount <= 1 && currentKeywords != promptKeywords
     }
 
+    @discardableResult
+    func captureCheckpoint(for threadID: String, anchorID: String) throws -> URL? {
+        let normalizedThreadID = normalizedThreadID(threadID)
+        let normalizedAnchorID = normalizedCheckpointAnchorID(anchorID)
+        guard !normalizedAnchorID.isEmpty else { return nil }
+
+        let fileURL = try memoryFileURL(for: normalizedThreadID)
+        guard fileManager.fileExists(atPath: fileURL.path) else {
+            return nil
+        }
+
+        let markdown = try String(contentsOf: fileURL, encoding: .utf8)
+        let checkpointsDirectory = try checkpointsDirectoryURL(for: normalizedThreadID)
+        try fileManager.createDirectory(at: checkpointsDirectory, withIntermediateDirectories: true)
+
+        let checkpointURL = checkpointsDirectory.appendingPathComponent("\(normalizedAnchorID).md", isDirectory: false)
+        try markdown.write(to: checkpointURL, atomically: true, encoding: .utf8)
+        return checkpointURL
+    }
+
+    func restoreCheckpoint(
+        for threadID: String,
+        anchorID: String
+    ) throws -> AssistantThreadMemoryChange {
+        let normalizedThreadID = normalizedThreadID(threadID)
+        let normalizedAnchorID = normalizedCheckpointAnchorID(anchorID)
+        let checkpointURL = try checkpointFileURL(for: normalizedThreadID, anchorID: normalizedAnchorID)
+        let markdown = try String(contentsOf: checkpointURL, encoding: .utf8)
+        let document = AssistantThreadMemoryDocument.parse(markdown: markdown)
+        let fileURL = try saveDocument(document, for: normalizedThreadID)
+        return AssistantThreadMemoryChange(
+            document: document,
+            fileURL: fileURL,
+            didChangeExternally: false
+        )
+    }
+
+    func hasCheckpoint(for threadID: String, anchorID: String) -> Bool {
+        let normalizedThreadID = normalizedThreadID(threadID)
+        let normalizedAnchorID = normalizedCheckpointAnchorID(anchorID)
+        guard !normalizedAnchorID.isEmpty,
+              let checkpointURL = try? checkpointFileURL(for: normalizedThreadID, anchorID: normalizedAnchorID) else {
+            return false
+        }
+        return fileManager.fileExists(atPath: checkpointURL.path)
+    }
+
+    func deleteCheckpoints(
+        for threadID: String,
+        retaining retainedAnchorIDs: Set<String>
+    ) throws {
+        let normalizedThreadID = normalizedThreadID(threadID)
+        let checkpointsDirectory = try checkpointsDirectoryURL(for: normalizedThreadID)
+        guard fileManager.fileExists(atPath: checkpointsDirectory.path) else { return }
+
+        let normalizedRetainedAnchorIDs = Set(
+            retainedAnchorIDs.map(normalizedCheckpointAnchorID).filter { !$0.isEmpty }
+        )
+
+        let files = try fileManager.contentsOfDirectory(
+            at: checkpointsDirectory,
+            includingPropertiesForKeys: nil
+        )
+        for fileURL in files {
+            let anchorID = fileURL.deletingPathExtension().lastPathComponent
+            guard !normalizedRetainedAnchorIDs.contains(anchorID) else { continue }
+            try? fileManager.removeItem(at: fileURL)
+        }
+    }
+
+    func clearThreadMemoryDocument(for threadID: String) throws -> AssistantThreadMemoryChange {
+        let normalizedThreadID = normalizedThreadID(threadID)
+        let fileURL = try saveDocument(.empty, for: normalizedThreadID)
+        return AssistantThreadMemoryChange(
+            document: .empty,
+            fileURL: fileURL,
+            didChangeExternally: false
+        )
+    }
+
     private func normalizedThreadID(_ threadID: String) -> String {
         threadID.trimmingCharacters(in: .whitespacesAndNewlines)
     }
@@ -179,6 +259,16 @@ final class AssistantThreadMemoryService {
             .appendingPathComponent("snapshots", isDirectory: true)
     }
 
+    private func checkpointsDirectoryURL(for threadID: String) throws -> URL {
+        try threadDirectoryURL(for: threadID)
+            .appendingPathComponent("checkpoints", isDirectory: true)
+    }
+
+    private func checkpointFileURL(for threadID: String, anchorID: String) throws -> URL {
+        try checkpointsDirectoryURL(for: threadID)
+            .appendingPathComponent("\(anchorID).md", isDirectory: false)
+    }
+
     private func archiveCurrentDocument(_ document: AssistantThreadMemoryDocument, for threadID: String) throws {
         guard document.hasMeaningfulContent else { return }
         let snapshotsDirectory = try snapshotsDirectoryURL(for: threadID)
@@ -194,5 +284,15 @@ final class AssistantThreadMemoryService {
     private func markObserved(threadID: String, fileURL: URL) throws {
         let resourceValues = try fileURL.resourceValues(forKeys: [.contentModificationDateKey])
         lastObservedModifiedAtByThreadID[threadID] = resourceValues.contentModificationDate ?? Date()
+    }
+
+    private func normalizedCheckpointAnchorID(_ anchorID: String) -> String {
+        anchorID
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(
+                of: #"[^A-Za-z0-9._-]+"#,
+                with: "-",
+                options: .regularExpression
+            )
     }
 }

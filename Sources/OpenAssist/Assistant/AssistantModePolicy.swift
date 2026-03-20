@@ -8,7 +8,6 @@ enum AssistantCommandSafetyClass: Equatable, Sendable {
 
 enum AssistantModePolicy {
     private static let restrictedDynamicToolNames: Set<String> = [
-        "computer_use",
         "browser_use",
         "app_action"
     ]
@@ -221,8 +220,8 @@ enum AssistantModePolicy {
 
         switch mode {
         case .conversational:
-            if ["computer use", "browser", "browser use", "app action"].contains(normalizedTitle?.lowercased() ?? "") {
-                return "I stopped\(activityPhrase) because Chat mode cannot inspect the live screen or browser with computer-control tools. Chat mode can still analyze an attached image when the selected model supports image input. Switch to Agentic mode for live screen or browser inspection."
+            if ["browser", "browser use", "app action"].contains(normalizedTitle?.lowercased() ?? "") {
+                return "I stopped\(activityPhrase) because Chat mode cannot use live browser or app automation tools. Chat mode can still analyze an attached image when the selected model supports image input. Switch to Agentic mode for live browser or app automation."
             }
             if commandClass == .validation {
                 return "I stopped\(activityPhrase) because Chat mode can inspect files and search the web, but it cannot run build or test checks. Switch to Plan or Agentic mode if you want me to run checks."

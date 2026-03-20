@@ -577,6 +577,13 @@ final class SettingsStore: ObservableObject {
         static let automationClaudeEnabled = "OpenAssist.automationClaudeEnabled"
         static let automationCodexCLIEnabled = "OpenAssist.automationCodexCLIEnabled"
         static let automationCodexCloudEnabled = "OpenAssist.automationCodexCloudEnabled"
+        static let telegramRemoteEnabled = "OpenAssist.telegramRemoteEnabled"
+        static let telegramOwnerUserID = "OpenAssist.telegramOwnerUserID"
+        static let telegramOwnerChatID = "OpenAssist.telegramOwnerChatID"
+        static let telegramPendingUserID = "OpenAssist.telegramPendingUserID"
+        static let telegramPendingChatID = "OpenAssist.telegramPendingChatID"
+        static let telegramPendingDisplayName = "OpenAssist.telegramPendingDisplayName"
+        static let telegramLastProcessedUpdateID = "OpenAssist.telegramLastProcessedUpdateID"
         static let promptRewriteEnabled = "OpenAssist.promptRewriteEnabled"
         static let promptRewriteAutoInsertEnabled = "OpenAssist.promptRewriteAutoInsertEnabled"
         static let memoryIndexingEnabled = "OpenAssist.memoryIndexingEnabled"
@@ -671,6 +678,7 @@ final class SettingsStore: ObservableObject {
 
     private var promptRewriteModelByProvider: [String: String] = [:]
     private var promptRewriteBaseURLByProvider: [String: String] = [:]
+    private var saveSuppressionDepth = 0
 
     @Published var shortcutKeyCode: UInt16 {
         didSet {
@@ -1018,6 +1026,62 @@ final class SettingsStore: ObservableObject {
     }
 
     @Published var automationCodexCloudEnabled: Bool {
+        didSet {
+            save()
+        }
+    }
+
+    @Published var telegramRemoteEnabled: Bool {
+        didSet {
+            save()
+        }
+    }
+
+    @Published var telegramOwnerUserID: String {
+        didSet {
+            let normalized = Self.normalizedIdentifier(telegramOwnerUserID)
+            guard normalized == telegramOwnerUserID else {
+                telegramOwnerUserID = normalized
+                return
+            }
+            save()
+        }
+    }
+
+    @Published var telegramOwnerChatID: String {
+        didSet {
+            let normalized = Self.normalizedIdentifier(telegramOwnerChatID)
+            guard normalized == telegramOwnerChatID else {
+                telegramOwnerChatID = normalized
+                return
+            }
+            save()
+        }
+    }
+
+    @Published var telegramPendingUserID: String {
+        didSet {
+            let normalized = Self.normalizedIdentifier(telegramPendingUserID)
+            guard normalized == telegramPendingUserID else {
+                telegramPendingUserID = normalized
+                return
+            }
+            save()
+        }
+    }
+
+    @Published var telegramPendingChatID: String {
+        didSet {
+            let normalized = Self.normalizedIdentifier(telegramPendingChatID)
+            guard normalized == telegramPendingChatID else {
+                telegramPendingChatID = normalized
+                return
+            }
+            save()
+        }
+    }
+
+    @Published var telegramPendingDisplayName: String {
         didSet {
             save()
         }
@@ -1851,6 +1915,21 @@ final class SettingsStore: ObservableObject {
             automationCodexCloudEnabled = defaults.bool(forKey: Keys.automationCodexCloudEnabled)
         }
 
+        if defaults.object(forKey: Keys.telegramRemoteEnabled) == nil {
+            telegramRemoteEnabled = false
+        } else {
+            telegramRemoteEnabled = defaults.bool(forKey: Keys.telegramRemoteEnabled)
+        }
+        telegramOwnerUserID = defaults.string(forKey: Keys.telegramOwnerUserID)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        telegramOwnerChatID = defaults.string(forKey: Keys.telegramOwnerChatID)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        telegramPendingUserID = defaults.string(forKey: Keys.telegramPendingUserID)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        telegramPendingChatID = defaults.string(forKey: Keys.telegramPendingChatID)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        telegramPendingDisplayName = defaults.string(forKey: Keys.telegramPendingDisplayName) ?? ""
+
         if defaults.object(forKey: Keys.promptRewriteEnabled) == nil {
             promptRewriteEnabled = true
         } else {
@@ -2222,6 +2301,7 @@ final class SettingsStore: ObservableObject {
     }
 
     func save() {
+        guard saveSuppressionDepth == 0 else { return }
         defaults.set(Int(shortcutKeyCode), forKey: Keys.shortcutKeyCode)
         defaults.set(Int(ShortcutValidation.filteredModifierRawValue(from: shortcutModifiers)), forKey: Keys.shortcutModifiers)
         defaults.set(Int(continuousToggleShortcutKeyCode), forKey: Keys.continuousToggleShortcutKeyCode)
@@ -2270,6 +2350,12 @@ final class SettingsStore: ObservableObject {
         defaults.set(automationClaudeEnabled, forKey: Keys.automationClaudeEnabled)
         defaults.set(automationCodexCLIEnabled, forKey: Keys.automationCodexCLIEnabled)
         defaults.set(automationCodexCloudEnabled, forKey: Keys.automationCodexCloudEnabled)
+        defaults.set(telegramRemoteEnabled, forKey: Keys.telegramRemoteEnabled)
+        defaults.set(telegramOwnerUserID.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Keys.telegramOwnerUserID)
+        defaults.set(telegramOwnerChatID.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Keys.telegramOwnerChatID)
+        defaults.set(telegramPendingUserID.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Keys.telegramPendingUserID)
+        defaults.set(telegramPendingChatID.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Keys.telegramPendingChatID)
+        defaults.set(telegramPendingDisplayName.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Keys.telegramPendingDisplayName)
         defaults.set(promptRewriteEnabled, forKey: Keys.promptRewriteEnabled)
         defaults.set(promptRewriteAutoInsertEnabled, forKey: Keys.promptRewriteAutoInsertEnabled)
         defaults.set(memoryIndexingEnabled, forKey: Keys.memoryIndexingEnabled)
@@ -2345,6 +2431,14 @@ final class SettingsStore: ObservableObject {
         defaults.set(assistantMemorySummaryMaxChars, forKey: Keys.assistantMemorySummaryMaxChars)
 
         scheduleOnChangeNotificationIfNeeded()
+    }
+
+    private func performBatchedSave(_ updates: () -> Void) {
+        saveSuppressionDepth += 1
+        updates()
+        saveSuppressionDepth = max(0, saveSuppressionDepth - 1)
+        guard saveSuppressionDepth == 0 else { return }
+        save()
     }
 
     static func restoredInteger(
@@ -2553,6 +2647,76 @@ final class SettingsStore: ObservableObject {
         set {
             Self.storeAutomationAPIToken(newValue)
             save()
+        }
+    }
+
+    var telegramBotToken: String {
+        get { Self.loadTelegramBotToken() }
+        set {
+            let previousValue = Self.loadTelegramBotToken().trimmingCharacters(in: .whitespacesAndNewlines)
+            let normalizedNewValue = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
+
+            if previousValue != normalizedNewValue {
+                clearTelegramPendingPairing()
+                clearTelegramRemoteOwner()
+                telegramLastProcessedUpdateID = 0
+            }
+
+            Self.storeTelegramBotToken(normalizedNewValue)
+            save()
+        }
+    }
+
+    var telegramLastProcessedUpdateID: Int {
+        get { defaults.integer(forKey: Keys.telegramLastProcessedUpdateID) }
+        set { defaults.set(newValue, forKey: Keys.telegramLastProcessedUpdateID) }
+    }
+
+    var hasTelegramRemoteOwner: Bool {
+        telegramOwnerUserID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+            && telegramOwnerChatID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+    }
+
+    var hasTelegramPendingPairing: Bool {
+        telegramPendingUserID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+            && telegramPendingChatID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+    }
+
+    func approveTelegramPendingPairing() {
+        guard hasTelegramPendingPairing else { return }
+        performBatchedSave {
+            telegramOwnerUserID = telegramPendingUserID
+            telegramOwnerChatID = telegramPendingChatID
+            telegramPendingUserID = ""
+            telegramPendingChatID = ""
+            telegramPendingDisplayName = ""
+        }
+    }
+
+    func clearTelegramPendingPairing() {
+        performBatchedSave {
+            telegramPendingUserID = ""
+            telegramPendingChatID = ""
+            telegramPendingDisplayName = ""
+        }
+    }
+
+    func clearTelegramRemoteOwner() {
+        performBatchedSave {
+            telegramOwnerUserID = ""
+            telegramOwnerChatID = ""
+        }
+    }
+
+    func updateTelegramPendingPairing(
+        userID: String,
+        chatID: String,
+        displayName: String
+    ) {
+        performBatchedSave {
+            telegramPendingUserID = userID
+            telegramPendingChatID = chatID
+            telegramPendingDisplayName = displayName
         }
     }
 
@@ -2855,6 +3019,8 @@ final class SettingsStore: ObservableObject {
     private static let cloudTranscriptionProviderAPIKeychainAccountPrefix = "cloud-transcription-provider-api-key"
     private static let automationAPIKeychainService = "com.developingadventures.OpenAssist"
     private static let automationAPIKeychainAccount = "automation-api-bearer-token"
+    private static let telegramBotTokenKeychainService = "com.developingadventures.OpenAssist"
+    private static let telegramBotTokenKeychainAccount = "telegram-bot-token"
     private static let assistantHumeCredentialKeychainService = "com.developingadventures.OpenAssist"
     private static let assistantHumeAPIKeychainAccount = "assistant-hume-api-key"
     private static let assistantHumeSecretKeychainAccount = "assistant-hume-secret-key"
@@ -2927,6 +3093,63 @@ final class SettingsStore: ObservableObject {
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: automationAPIKeychainService,
             kSecAttrAccount as String: automationAPIKeychainAccount
+        ]
+        _ = SecItemDelete(query as CFDictionary)
+    }
+
+    private static func loadTelegramBotToken() -> String {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: telegramBotTokenKeychainService,
+            kSecAttrAccount as String: telegramBotTokenKeychainAccount,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+
+        var item: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &item)
+        guard status == errSecSuccess,
+              let data = item as? Data,
+              let value = String(data: data, encoding: .utf8) else {
+            return ""
+        }
+        return value
+    }
+
+    private static func storeTelegramBotToken(_ rawValue: String) {
+        let value = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        if value.isEmpty {
+            deleteTelegramBotToken()
+            return
+        }
+
+        let data = Data(value.utf8)
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: telegramBotTokenKeychainService,
+            kSecAttrAccount as String: telegramBotTokenKeychainAccount
+        ]
+
+        let updateStatus = SecItemUpdate(
+            query as CFDictionary,
+            [kSecValueData as String: data] as CFDictionary
+        )
+        if updateStatus == errSecSuccess {
+            return
+        }
+
+        if updateStatus == errSecItemNotFound {
+            var create = query
+            create[kSecValueData as String] = data
+            _ = SecItemAdd(create as CFDictionary, nil)
+        }
+    }
+
+    private static func deleteTelegramBotToken() {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: telegramBotTokenKeychainService,
+            kSecAttrAccount as String: telegramBotTokenKeychainAccount
         ]
         _ = SecItemDelete(query as CFDictionary)
     }

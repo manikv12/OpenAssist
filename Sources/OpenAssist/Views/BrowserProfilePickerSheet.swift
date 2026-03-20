@@ -99,23 +99,23 @@ private struct ProfileRow: View {
         HStack(spacing: 10) {
             Image(systemName: profile.browser == .chrome ? "network" : "shield.lefthalf.filled")
                 .font(.system(size: 14))
-                .foregroundStyle(isSelected ? .white : .secondary)
+                .foregroundStyle(isSelected ? AppVisualTheme.primaryText : .secondary)
                 .frame(width: 20)
 
             VStack(alignment: .leading, spacing: 1) {
                 Text(profile.label)
                     .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(isSelected ? .white : .primary)
+                    .foregroundStyle(isSelected ? AppVisualTheme.primaryText : .primary)
                 Text(profile.browser.displayName)
                     .font(.system(size: 10))
-                    .foregroundStyle(isSelected ? .white.opacity(0.7) : .secondary)
+                    .foregroundStyle(isSelected ? AppVisualTheme.foreground(0.7) : .secondary)
             }
 
             Spacer()
 
             if isSelected {
                 Image(systemName: "checkmark.circle.fill")
-                    .foregroundStyle(.white)
+                    .foregroundStyle(AppVisualTheme.primaryText)
                     .font(.system(size: 14))
             }
         }

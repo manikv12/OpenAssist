@@ -38,7 +38,7 @@ struct OrbSphere: View {
                     .fill(
                         LinearGradient(
                             colors: [
-                                Color.black.opacity(0.36),
+                                AppVisualTheme.quaternaryForeground(0.36),
                                 c.secondary.opacity(0.58),
                                 c.primary.opacity(0.82)
                             ],
@@ -50,7 +50,7 @@ struct OrbSphere: View {
                 Circle()
                     .fill(
                         RadialGradient(
-                            colors: [Color.white.opacity(0.20), c.primary.opacity(0.72), Color.clear],
+                            colors: [AppVisualTheme.foreground(0.20), c.primary.opacity(0.72), Color.clear],
                             center: UnitPoint(
                                 x: 0.42 + (sin(time * speed * 0.26) * highlightTravel * 1.4),
                                 y: 0.34 + (cos(time * speed * 0.20) * highlightTravel * 1.1)
@@ -85,7 +85,7 @@ struct OrbSphere: View {
                 Circle()
                     .fill(
                         RadialGradient(
-                            colors: [Color.white.opacity(0.26), c.accent.opacity(0.22), Color.clear],
+                            colors: [AppVisualTheme.foreground(0.26), c.accent.opacity(0.22), Color.clear],
                             center: .center,
                             startRadius: 0,
                             endRadius: 16
@@ -102,7 +102,7 @@ struct OrbSphere: View {
                     .fill(
                         LinearGradient(
                             colors: [
-                                Color.black.opacity(0.26),
+                                AppVisualTheme.quaternaryForeground(0.26),
                                 Color.clear
                             ],
                             startPoint: .top,
@@ -117,8 +117,8 @@ struct OrbSphere: View {
                     .fill(
                         RadialGradient(
                             colors: [
-                                Color.white.opacity(0.26),
-                                Color.white.opacity(0.08),
+                                AppVisualTheme.foreground(0.26),
+                                AppVisualTheme.foreground(0.08),
                                 Color.clear
                             ],
                             center: UnitPoint(
@@ -138,8 +138,8 @@ struct OrbSphere: View {
                 .fill(
                     RadialGradient(
                         colors: [
-                            Color.white.opacity(0.32),
-                            Color.white.opacity(0.08),
+                            AppVisualTheme.foreground(0.32),
+                            AppVisualTheme.foreground(0.08),
                             Color.clear
                         ],
                         center: UnitPoint(x: 0.36, y: 0.28),
@@ -154,8 +154,8 @@ struct OrbSphere: View {
                 .fill(
                     RadialGradient(
                         colors: [
-                            Color.white.opacity(0.82),
-                            Color.white.opacity(0.18),
+                            AppVisualTheme.foreground(0.82),
+                            AppVisualTheme.foreground(0.18),
                             Color.clear
                         ],
                         center: UnitPoint(x: 0.30, y: 0.22),
@@ -171,9 +171,9 @@ struct OrbSphere: View {
                     AngularGradient(
                         colors: [
                             c.primary.opacity(0.42),
-                            Color.white.opacity(0.28),
+                            AppVisualTheme.foreground(0.28),
                             c.secondary.opacity(0.30),
-                            Color.white.opacity(0.14),
+                            AppVisualTheme.foreground(0.14),
                             c.primary.opacity(0.42)
                         ],
                         center: .center
@@ -187,9 +187,9 @@ struct OrbSphere: View {
                 .strokeBorder(
                     LinearGradient(
                         colors: [
-                            Color.white.opacity(0.18),
+                            AppVisualTheme.foreground(0.18),
                             Color.clear,
-                            Color.black.opacity(0.20)
+                            AppVisualTheme.quaternaryForeground(0.20)
                         ],
                         startPoint: .topLeading,
                         endPoint: .bottomTrailing
@@ -316,7 +316,7 @@ struct OrbSphere: View {
             return OrbColors(
                 primary: AppVisualTheme.accentTint,
                 secondary: AppVisualTheme.accentTint.opacity(0.65),
-                accent: Color.white.opacity(0.30)
+                accent: AppVisualTheme.foreground(0.30)
             )
         case .listening:
             return OrbColors(
@@ -378,4 +378,3 @@ struct OrbSphere: View {
 }
 
 // MARK: - Done Detail Markdown
-

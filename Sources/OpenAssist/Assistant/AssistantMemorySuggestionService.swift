@@ -33,7 +33,8 @@ final class AssistantMemorySuggestionService {
     func createManualSuggestions(
         from assistantText: String,
         threadID: String,
-        scope: MemoryScopeContext
+        scope: MemoryScopeContext,
+        metadata extraMetadata: [String: String] = [:]
     ) throws -> [AssistantMemorySuggestion] {
         let lessons = distilledLessons(from: assistantText, fallbackKind: .manualSave)
         return try persistSuggestions(
@@ -43,7 +44,8 @@ final class AssistantMemorySuggestionService {
                     scope: scope,
                     kind: .manualSave,
                     detail: $0,
-                    sourceExcerpt: assistantText
+                    sourceExcerpt: assistantText,
+                    metadata: extraMetadata
                 )
             }
         )
@@ -53,7 +55,8 @@ final class AssistantMemorySuggestionService {
     func createFailureSuggestions(
         from assistantText: String,
         threadID: String,
-        scope: MemoryScopeContext
+        scope: MemoryScopeContext,
+        metadata extraMetadata: [String: String] = [:]
     ) throws -> [AssistantMemorySuggestion] {
         let lessons = failureLessons(from: assistantText)
         return try persistSuggestions(
@@ -63,7 +66,8 @@ final class AssistantMemorySuggestionService {
                     scope: scope,
                     kind: .reviewedFailure,
                     detail: $0,
-                    sourceExcerpt: assistantText
+                    sourceExcerpt: assistantText,
+                    metadata: extraMetadata
                 )
             }
         )
@@ -74,7 +78,8 @@ final class AssistantMemorySuggestionService {
         from assistantText: String,
         toolCount: Int,
         threadID: String,
-        scope: MemoryScopeContext
+        scope: MemoryScopeContext,
+        metadata extraMetadata: [String: String] = [:]
     ) throws -> [AssistantMemorySuggestion] {
         let lessons = automaticFailureLessons(from: assistantText, toolCount: toolCount)
         return try persistSuggestions(
@@ -84,17 +89,66 @@ final class AssistantMemorySuggestionService {
                     scope: scope,
                     kind: .reviewedFailure,
                     detail: $0,
-                    sourceExcerpt: assistantText
+                    sourceExcerpt: assistantText,
+                    metadata: extraMetadata
                 )
             }
         )
+    }
+
+    @discardableResult
+    func createStaleLessonSuggestion(
+        target: AssistantMemoryEntry,
+        threadID: String,
+        scope: MemoryScopeContext,
+        reason: String,
+        sourceExcerpt: String?
+    ) throws -> [AssistantMemorySuggestion] {
+        guard target.state == .active else { return [] }
+        guard target.metadata["memory_domain"]?.lowercased() == "assistant" else { return [] }
+
+        let detail = """
+        Review whether this saved project lesson is still correct.
+
+        Current lesson:
+        \(target.detail)
+
+        Why it may be stale:
+        \(MemoryTextNormalizer.normalizedBody(reason))
+        """
+        let metadata: [String: String] = [
+            "memory_domain": "assistant",
+            "target_memory_id": target.id.uuidString,
+            "action": "invalidate",
+            "lesson_key": target.metadata["lesson_key"] ?? normalizedDuplicateKey(target.summary),
+            "invalidation_reason": MemoryTextNormalizer.normalizedSummary(reason, limit: 240)
+        ]
+
+        let suggestion = makeSuggestion(
+            threadID: threadID,
+            scope: scope,
+            kind: .staleLesson,
+            detail: detail,
+            sourceExcerpt: sourceExcerpt ?? target.summary,
+            metadata: metadata,
+            titleOverride: "Review stale project memory",
+            summaryOverride: "Review whether this project memory is stale: \(target.summary)"
+        )
+        return try persistSuggestions([suggestion])
     }
 
     func acceptSuggestion(id: UUID) throws {
         guard let suggestion = try loadSuggestions().first(where: { $0.id == id }) else {
             return
         }
-        if try !containsExistingLongTermDuplicate(for: suggestion) {
+        if suggestion.kind == .staleLesson,
+           let targetMemoryID = suggestion.metadata["target_memory_id"].flatMap(UUID.init(uuidString:)) {
+            try store.invalidateAssistantMemoryEntry(
+                id: targetMemoryID,
+                reason: suggestion.metadata["invalidation_reason"] ?? suggestion.detail
+            )
+        } else if try !containsExistingLongTermDuplicate(for: suggestion) {
+            try invalidateConflictingActiveEntries(for: suggestion)
             try store.upsertAssistantMemoryEntry(suggestion.asEntry(updatedAt: Date()))
         }
         try threadMemoryService.removeCandidateLesson(suggestion.summary, for: suggestion.threadID)
@@ -114,6 +168,72 @@ final class AssistantMemorySuggestionService {
             .filter { $0.threadID.caseInsensitiveCompare(threadID) == .orderedSame }
             .map(\.id)
         try removeSuggestions(ids: suggestionsToRemove)
+    }
+
+    func purgeHistoryArtifacts(
+        for threadID: String,
+        sourceTurnAnchorIDs: Set<String>
+    ) throws -> (removedSuggestions: [AssistantMemorySuggestion], removedEntries: [AssistantMemoryEntry]) {
+        let normalizedThreadID = threadID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedThreadID.isEmpty, !sourceTurnAnchorIDs.isEmpty else {
+            return ([], [])
+        }
+
+        let normalizedAnchorIDs = Set(sourceTurnAnchorIDs.map { $0.lowercased() })
+        let allSuggestions = try loadSuggestions()
+        let removedSuggestions = allSuggestions.filter {
+            $0.threadID.caseInsensitiveCompare(normalizedThreadID) == .orderedSame
+                && normalizedAnchorIDs.contains(($0.metadata["source_turn_anchor_id"] ?? "").lowercased())
+        }
+
+        if !removedSuggestions.isEmpty {
+            for suggestion in removedSuggestions {
+                try threadMemoryService.removeCandidateLesson(suggestion.summary, for: suggestion.threadID)
+            }
+            try saveSuggestions(
+                allSuggestions.filter { candidate in
+                    !removedSuggestions.contains(where: { $0.id == candidate.id })
+                }
+            )
+        }
+
+        let removedEntries = try store.fetchAssistantMemoryEntries(
+            query: "",
+            provider: .codex,
+            threadID: normalizedThreadID,
+            state: nil,
+            limit: 1000
+        ).filter {
+            normalizedAnchorIDs.contains(($0.metadata["source_turn_anchor_id"] ?? "").lowercased())
+        }
+
+        if !removedEntries.isEmpty {
+            try store.deleteAssistantMemoryEntries(ids: removedEntries.map(\.id))
+        }
+
+        return (removedSuggestions, removedEntries)
+    }
+
+    func restoreHistoryArtifacts(
+        suggestions: [AssistantMemorySuggestion],
+        acceptedEntries: [AssistantMemoryEntry]
+    ) throws {
+        guard !suggestions.isEmpty || !acceptedEntries.isEmpty else { return }
+
+        if !suggestions.isEmpty {
+            let existingSuggestions = try loadSuggestions()
+            var merged = existingSuggestions
+            let existingIDs = Set(existingSuggestions.map(\.id))
+            for suggestion in suggestions where !existingIDs.contains(suggestion.id) {
+                merged.insert(suggestion, at: 0)
+                try threadMemoryService.addCandidateLesson(suggestion.summary, for: suggestion.threadID)
+            }
+            try saveSuggestions(merged)
+        }
+
+        for entry in acceptedEntries {
+            try store.upsertAssistantMemoryEntry(entry)
+        }
     }
 
     private func persistSuggestions(_ suggestions: [AssistantMemorySuggestion]) throws -> [AssistantMemorySuggestion] {
@@ -176,12 +296,24 @@ final class AssistantMemorySuggestionService {
         scope: MemoryScopeContext,
         kind: AssistantMemorySuggestionKind,
         detail: String,
-        sourceExcerpt: String?
+        sourceExcerpt: String?,
+        metadata extraMetadata: [String: String] = [:],
+        titleOverride: String? = nil,
+        summaryOverride: String? = nil
     ) -> AssistantMemorySuggestion {
         let normalizedDetail = MemoryTextNormalizer.normalizedBody(detail)
-        let summary = MemoryTextNormalizer.normalizedSummary(normalizedDetail, limit: 180)
-        let title = MemoryTextNormalizer.normalizedTitle(summary, fallback: "Assistant Memory")
+        let summary = summaryOverride.flatMap {
+            MemoryTextNormalizer.normalizedSummary($0, limit: 180).nonEmpty
+        } ?? MemoryTextNormalizer.normalizedSummary(normalizedDetail, limit: 180)
+        let title = titleOverride.flatMap {
+            MemoryTextNormalizer.normalizedTitle($0, fallback: "Assistant Memory").nonEmpty
+        } ?? MemoryTextNormalizer.normalizedTitle(summary, fallback: "Assistant Memory")
         let keywords = MemoryTextNormalizer.keywords(from: normalizedDetail, limit: 12)
+        var metadata = extraMetadata
+        metadata["memory_domain"] = "assistant"
+        metadata["surface_label"] = scope.surfaceLabel
+        metadata["scope_key"] = scope.scopeKey
+        metadata["lesson_key"] = metadata["lesson_key"] ?? normalizedDuplicateKey(summary)
 
         return AssistantMemorySuggestion(
             threadID: threadID,
@@ -195,13 +327,9 @@ final class AssistantMemorySuggestionService {
             projectKey: scope.projectKey,
             identityKey: scope.identityKey,
             keywords: keywords,
-            confidence: kind == .reviewedFailure ? 0.76 : 0.66,
+            confidence: kind == .reviewedFailure ? 0.76 : (kind == .staleLesson ? 0.72 : 0.66),
             sourceExcerpt: sourceExcerpt.flatMap { MemoryTextNormalizer.normalizedSummary($0, limit: 280).nonEmpty },
-            metadata: [
-                "memory_domain": "assistant",
-                "surface_label": scope.surfaceLabel,
-                "scope_key": scope.scopeKey
-            ]
+            metadata: metadata
         )
     }
 
@@ -254,11 +382,7 @@ final class AssistantMemorySuggestionService {
         let hasBrowserAutomationBlock = lower.contains("brave")
             && lower.contains("apple events")
             && lower.contains("javascript")
-        let hasDetourSignal = lower.contains("switching")
-            || lower.contains("detour")
-            || lower.contains("another path")
-            || lower.contains("workaround")
-            || lower.contains("instead")
+        let hasDetourSignal = containsDetourSignal(in: lower)
         let hasPermissionSignal = lower.contains("permission")
             || lower.contains("approve")
             || lower.contains("user input")
@@ -275,7 +399,7 @@ final class AssistantMemorySuggestionService {
         if hasBrowserAutomationBlock && progressVerbCount >= 3 {
             lessons.append("For browser tasks in Brave, check whether 'Allow JavaScript from Apple Events' is enabled before relying on page scripting.")
         }
-        if hasDetourSignal && (progressVerbCount >= 5 || toolCount >= 14) {
+        if hasDetourSignal && ((progressVerbCount >= 4 && toolCount >= 8) || progressVerbCount >= 6) {
             lessons.append("When the current path looks blocked, ask earlier instead of trying many detours.")
         }
         if hasPermissionSignal && (progressVerbCount >= 4 || toolCount >= 14) {
@@ -313,13 +437,14 @@ final class AssistantMemorySuggestionService {
     }
 
     private func containsExistingLongTermDuplicate(for suggestion: AssistantMemorySuggestion) throws -> Bool {
+        let threadIDFilter = shouldUseThreadFilter(for: suggestion) ? suggestion.threadID : nil
         let matches = try store.fetchAssistantMemoryEntries(
             query: suggestion.summary,
             provider: .codex,
             scopeKey: suggestion.scopeKey,
             projectKey: suggestion.projectKey,
             identityKey: suggestion.identityKey,
-            threadID: suggestion.threadID,
+            threadID: threadIDFilter,
             state: .active,
             limit: 50
         )
@@ -328,6 +453,36 @@ final class AssistantMemorySuggestionService {
             $0.metadata["memory_domain"]?.lowercased() == "assistant"
                 && normalizedDuplicateKey($0.summary) == normalizedSummary
         }
+    }
+
+    private func invalidateConflictingActiveEntries(for suggestion: AssistantMemorySuggestion) throws {
+        guard suggestion.kind != .staleLesson else { return }
+        let lessonKey = suggestion.metadata["lesson_key"] ?? normalizedDuplicateKey(suggestion.summary)
+        let threadIDFilter = shouldUseThreadFilter(for: suggestion) ? suggestion.threadID : nil
+        let matches = try store.fetchAssistantMemoryEntries(
+            query: "",
+            provider: .codex,
+            scopeKey: suggestion.scopeKey,
+            projectKey: suggestion.projectKey,
+            identityKey: suggestion.identityKey,
+            threadID: threadIDFilter,
+            state: .active,
+            limit: 200
+        )
+
+        for match in matches where match.metadata["lesson_key"] == lessonKey {
+            try store.invalidateAssistantMemoryEntry(
+                id: match.id,
+                reason: "Replaced by a newer assistant memory suggestion."
+            )
+        }
+    }
+
+    private func shouldUseThreadFilter(for suggestion: AssistantMemorySuggestion) -> Bool {
+        guard let identityKey = suggestion.identityKey?.lowercased() else {
+            return true
+        }
+        return !identityKey.hasPrefix("assistant-project:")
     }
 
     private func countMatches(pattern: String, in text: String) -> Int {
@@ -349,5 +504,26 @@ final class AssistantMemorySuggestionService {
 
     private func normalizedDuplicateKey(_ value: String) -> String {
         MemoryTextNormalizer.collapsedWhitespace(value).lowercased()
+    }
+
+    private func containsDetourSignal(in lowercasedText: String) -> Bool {
+        let explicitSignals = [
+            "switching to another path",
+            "switching to a different path",
+            "switching approaches",
+            "switching to a fallback",
+            "trying another path",
+            "trying a different path",
+            "trying a workaround",
+            "using a workaround",
+            "detour",
+            "workaround",
+            "another path",
+            "different path",
+            "alternate path",
+            "fallback path",
+            "low-confidence path"
+        ]
+        return explicitSignals.contains(where: lowercasedText.contains)
     }
 }

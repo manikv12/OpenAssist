@@ -3,6 +3,7 @@ import Foundation
 struct CodexSessionCatalog {
     private static let metadataReadLimit = 32 * 1024
     private static let summaryTailReadLimit = 256 * 1024
+    private static let recentHistoryTailReadLimit = 384 * 1024
     private static let summaryOverscanLimit = 24
     private static let fractionalSecondsDateFormatter: ISO8601DateFormatter = {
         let formatter = ISO8601DateFormatter()
@@ -34,6 +35,17 @@ struct CodexSessionCatalog {
         )
     }
 
+    struct SessionHistoryChunk {
+        let timeline: [AssistantTimelineItem]
+        let transcript: [AssistantTranscriptEntry]
+        let hasMoreTimeline: Bool
+        let hasMoreTranscript: Bool
+
+        var hasMore: Bool {
+            hasMoreTimeline || hasMoreTranscript
+        }
+    }
+
     func loadSessions(
         limit: Int = 40,
         preferredThreadID: String? = nil,
@@ -55,24 +67,109 @@ struct CodexSessionCatalog {
     }
 
     func loadTranscript(sessionID: String, limit: Int = 200) async -> [AssistantTranscriptEntry] {
+        loadTranscript(
+            sessionID: sessionID,
+            limit: limit,
+            readLimit: nil
+        )
+    }
+
+    func loadMergedTimeline(sessionID: String, limit: Int = 400) async -> [AssistantTimelineItem] {
+        loadMergedTimeline(
+            sessionID: sessionID,
+            limit: limit,
+            readLimit: nil
+        )
+    }
+
+    func loadRecentHistoryChunk(
+        sessionID: String,
+        timelineLimit: Int,
+        transcriptLimit: Int
+    ) async -> SessionHistoryChunk {
+        let sourceMayHaveOlderHistory = (sessionFileRecord(for: sessionID)?.fileSize ?? 0) > Self.recentHistoryTailReadLimit
+        async let timelineTask = loadMergedTimeline(
+            sessionID: sessionID,
+            limit: timelineLimit,
+            readLimit: Self.recentHistoryTailReadLimit
+        )
+        async let transcriptTask = loadTranscript(
+            sessionID: sessionID,
+            limit: transcriptLimit,
+            readLimit: Self.recentHistoryTailReadLimit
+        )
+        let (timeline, transcript) = await (timelineTask, transcriptTask)
+        return SessionHistoryChunk(
+            timeline: timeline,
+            transcript: transcript,
+            hasMoreTimeline: sourceMayHaveOlderHistory || timeline.count >= timelineLimit,
+            hasMoreTranscript: sourceMayHaveOlderHistory || transcript.count >= transcriptLimit
+        )
+    }
+
+    private func loadTranscript(
+        sessionID: String,
+        limit: Int,
+        readLimit: Int?
+    ) -> [AssistantTranscriptEntry] {
         guard let sessionID = sessionID.nonEmpty,
-              let fileURL = sessionFile(for: sessionID) else {
+              let file = sessionFileRecord(for: sessionID) else {
             return []
         }
 
-        let entries = parseTranscript(from: fileURL)
+        let metadata = loadSessionMetadata(from: file)
+        let entries: [AssistantTranscriptEntry]
+        if let readLimit,
+           file.fileSize > readLimit,
+           let trailingContents = readTrailingText(from: file, maxBytes: readLimit)?.nonEmpty {
+            let recentContents = normalizedTrailingScanText(
+                trailingContents,
+                fileSize: file.fileSize,
+                readLimit: readLimit
+            )
+            let recentEntries = parseTranscriptContents(
+                from: recentContents,
+                fileURL: file.url,
+                metadata: metadata
+            )
+            entries = recentEntries.isEmpty ? parseTranscript(from: file.url) : recentEntries
+        } else {
+            entries = parseTranscript(from: file.url)
+        }
+
         if entries.count <= limit {
             return entries
         }
         return Array(entries.suffix(limit))
     }
 
-    func loadMergedTimeline(sessionID: String, limit: Int = 400) async -> [AssistantTimelineItem] {
+    private func loadMergedTimeline(
+        sessionID: String,
+        limit: Int,
+        readLimit: Int?
+    ) -> [AssistantTimelineItem] {
         guard let sessionID = sessionID.nonEmpty else { return [] }
 
         let codexItems: [AssistantTimelineItem]
-        if let fileURL = sessionFile(for: sessionID) {
-            codexItems = parseTimeline(from: fileURL)
+        if let file = sessionFileRecord(for: sessionID) {
+            let metadata = loadSessionMetadata(from: file)
+            if let readLimit,
+               file.fileSize > readLimit,
+               let trailingContents = readTrailingText(from: file, maxBytes: readLimit)?.nonEmpty {
+                let recentContents = normalizedTrailingScanText(
+                    trailingContents,
+                    fileSize: file.fileSize,
+                    readLimit: readLimit
+                )
+                let recentItems = parseTimelineContents(
+                    from: recentContents,
+                    fileURL: file.url,
+                    metadata: metadata
+                )
+                codexItems = recentItems.isEmpty ? parseTimeline(from: file.url) : recentItems
+            } else {
+                codexItems = parseTimeline(from: file.url)
+            }
         } else {
             codexItems = []
         }
@@ -251,17 +348,25 @@ struct CodexSessionCatalog {
     }
 
     private func sessionFile(for sessionID: String) -> URL? {
+        sessionFileRecord(for: sessionID)?.url
+    }
+
+    func sessionFileURL(for sessionID: String) -> URL? {
+        sessionFile(for: sessionID)
+    }
+
+    private func sessionFileRecord(for sessionID: String) -> SessionFileRecord? {
         let trimmedSessionID = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedSessionID.isEmpty else { return nil }
 
         let files = sessionFiles(matching: Set([trimmedSessionID]))
         if let filenameMatch = files.first(where: { $0.url.lastPathComponent.contains(sessionID) }) {
-            return filenameMatch.url
+            return filenameMatch
         }
 
         return files.first {
             loadSessionMetadata(from: $0)?.id == sessionID
-        }?.url
+        }
     }
 
     private func normalizedSessionIDSet(from rawValues: [String]?) -> Set<String>? {
@@ -746,7 +851,12 @@ struct CodexSessionCatalog {
     }
 
     private func readTrailingText(from file: SessionFileRecord) -> String? {
-        let readCount = min(max(file.fileSize, 0), Self.summaryTailReadLimit)
+        readTrailingText(from: file, maxBytes: Self.summaryTailReadLimit)
+    }
+
+    private func readTrailingText(from file: SessionFileRecord, maxBytes: Int) -> String? {
+        let normalizedMaxBytes = max(1, maxBytes)
+        let readCount = min(max(file.fileSize, 0), normalizedMaxBytes)
         guard readCount > 0 else { return nil }
 
         do {
@@ -769,7 +879,15 @@ struct CodexSessionCatalog {
     }
 
     private func normalizedTrailingScanText(_ rawValue: String, fileSize: Int) -> String {
-        guard fileSize > Self.summaryTailReadLimit else {
+        normalizedTrailingScanText(
+            rawValue,
+            fileSize: fileSize,
+            readLimit: Self.summaryTailReadLimit
+        )
+    }
+
+    private func normalizedTrailingScanText(_ rawValue: String, fileSize: Int, readLimit: Int) -> String {
+        guard fileSize > readLimit else {
             return rawValue
         }
 
@@ -807,7 +925,15 @@ struct CodexSessionCatalog {
             return []
         }
 
-        let metadata = parsePrimaryMetadata(from: contents, fileURL: fileURL)
+        return parseTranscriptContents(from: contents, fileURL: fileURL, metadata: nil)
+    }
+
+    private func parseTranscriptContents(
+        from contents: String,
+        fileURL: URL,
+        metadata prefetchedMetadata: SessionMetadata? = nil
+    ) -> [AssistantTranscriptEntry] {
+        let metadata = prefetchedMetadata ?? parsePrimaryMetadata(from: contents, fileURL: fileURL)
         var candidates: [TranscriptCandidate] = []
         var addedSystemEntry = false
 
@@ -974,7 +1100,15 @@ struct CodexSessionCatalog {
             return []
         }
 
-        let metadata = parsePrimaryMetadata(from: contents, fileURL: fileURL)
+        return parseTimelineContents(from: contents, fileURL: fileURL, metadata: nil)
+    }
+
+    private func parseTimelineContents(
+        from contents: String,
+        fileURL: URL,
+        metadata prefetchedMetadata: SessionMetadata? = nil
+    ) -> [AssistantTimelineItem] {
+        let metadata = prefetchedMetadata ?? parsePrimaryMetadata(from: contents, fileURL: fileURL)
         let sessionID = metadata?.id ?? sessionIDFromFilename(fileURL)
         var items: [AssistantTimelineItem] = []
         var activityIndexByID: [String: Int] = [:]
@@ -1000,13 +1134,16 @@ struct CodexSessionCatalog {
 
                     switch role {
                     case "user":
-                        guard let text = cleanedUserMessage(rawText) else { continue }
+                        let text = cleanedUserMessage(rawText)
+                        let imageAttachments = extractImageAttachments(from: payload["content"])
+                        guard text != nil || !imageAttachments.isEmpty else { continue }
                         appendTimelineMessage(
                             .userMessage(
                                 id: "codex-user-\(index)",
                                 sessionID: sessionID,
-                                text: text,
+                                text: text ?? "",
                                 createdAt: lineTimestamp,
+                                imageAttachments: imageAttachments.isEmpty ? nil : imageAttachments,
                                 source: .codexSession
                             ),
                             to: &items
@@ -1142,13 +1279,16 @@ struct CodexSessionCatalog {
 
                 switch eventType {
                 case "user_message":
-                    guard let text = cleanedUserMessage(stringValue(payload["message"])) else { continue }
+                    let text = cleanedUserMessage(stringValue(payload["message"]))
+                    let imageAttachments = extractImageAttachments(from: payload["images"])
+                    guard text != nil || !imageAttachments.isEmpty else { continue }
                     appendTimelineMessage(
                         .userMessage(
                             id: "event-user-\(index)",
                             sessionID: sessionID,
-                            text: text,
+                            text: text ?? "",
                             createdAt: lineTimestamp,
+                            imageAttachments: imageAttachments.isEmpty ? nil : imageAttachments,
                             source: .codexSession
                         ),
                         to: &items
@@ -1372,11 +1512,43 @@ struct CodexSessionCatalog {
             return
         }
 
-        if items.contains(where: { timelineItemsShouldDeduplicate($0, item) }) {
+        if let duplicateIndex = items.firstIndex(where: { timelineItemsShouldDeduplicate($0, item) }) {
+            items[duplicateIndex] = mergedTimelineMessage(existing: items[duplicateIndex], incoming: item)
             return
         }
 
         items.append(item)
+    }
+
+    private func mergedTimelineMessage(
+        existing: AssistantTimelineItem,
+        incoming: AssistantTimelineItem
+    ) -> AssistantTimelineItem {
+        var merged = existing
+
+        if (merged.text?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true),
+           let incomingText = incoming.text?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !incomingText.isEmpty {
+            merged.text = incomingText
+        }
+
+        let mergedImages = mergeImageData(existing.imageAttachments, incoming.imageAttachments)
+        merged.imageAttachments = mergedImages.isEmpty ? nil : mergedImages
+        return merged
+    }
+
+    private func mergeImageData(_ lhs: [Data]?, _ rhs: [Data]?) -> [Data] {
+        let combined = (lhs ?? []) + (rhs ?? [])
+        guard !combined.isEmpty else { return [] }
+
+        var merged: [Data] = []
+        var seen = Set<String>()
+        for imageData in combined {
+            let key = MemoryIdentifier.stableHexDigest(data: imageData)
+            guard seen.insert(key).inserted else { continue }
+            merged.append(imageData)
+        }
+        return merged
     }
 
     private func latestAssistantTimelineText(in items: [AssistantTimelineItem]) -> String? {
@@ -1483,6 +1655,26 @@ struct CodexSessionCatalog {
         _ lhs: AssistantTimelineItem,
         _ rhs: AssistantTimelineItem
     ) -> Bool {
+        // Turn-based dedup: items from the same turn with compatible kinds
+        // are always duplicates, regardless of timestamps or text variations.
+        if let lhsTurnID = lhs.turnID?.nonEmpty,
+           let rhsTurnID = rhs.turnID?.nonEmpty,
+           lhsTurnID.caseInsensitiveCompare(rhsTurnID) == .orderedSame {
+            switch (lhs.kind, rhs.kind) {
+            case (.assistantProgress, .assistantProgress),
+                 (.assistantFinal, .assistantFinal),
+                 (.assistantProgress, .assistantFinal),
+                 (.assistantFinal, .assistantProgress):
+                return true
+            case (.userMessage, .userMessage):
+                return true
+            case (.plan, .plan):
+                return true
+            default:
+                break
+            }
+        }
+
         switch (lhs.kind, rhs.kind) {
         case (.activity, .activity):
             return lhs.activity?.id == rhs.activity?.id
@@ -1497,7 +1689,7 @@ struct CodexSessionCatalog {
              (.assistantProgress, .assistantFinal),
              (.assistantFinal, .assistantProgress):
             return normalizedDeduplicationText(lhs.text ?? "") == normalizedDeduplicationText(rhs.text ?? "")
-                && abs(lhs.createdAt.timeIntervalSince(rhs.createdAt)) < 5
+                && abs(lhs.createdAt.timeIntervalSince(rhs.createdAt)) < 120
 
         case (.permission, .permission):
             return lhs.permissionRequest?.toolTitle == rhs.permissionRequest?.toolTitle
@@ -2076,6 +2268,13 @@ struct CodexSessionCatalog {
         return normalizeTranscriptMessage(uniqueFragments.joined(separator: "\n\n"))
     }
 
+    private func extractImageAttachments(from rawValue: Any?) -> [Data] {
+        var attachments: [Data] = []
+        var seen = Set<String>()
+        collectImageAttachments(from: rawValue, into: &attachments, seen: &seen)
+        return attachments
+    }
+
     private func collectTextFragments(from rawValue: Any?, into fragments: inout [String]) {
         switch rawValue {
         case let string as String:
@@ -2106,6 +2305,62 @@ struct CodexSessionCatalog {
         default:
             break
         }
+    }
+
+    private func collectImageAttachments(
+        from rawValue: Any?,
+        into attachments: inout [Data],
+        seen: inout Set<String>
+    ) {
+        switch rawValue {
+        case let string as String:
+            guard let imageData = decodeImageDataURL(string) else { return }
+            let key = MemoryIdentifier.stableHexDigest(data: imageData)
+            guard seen.insert(key).inserted else { return }
+            attachments.append(imageData)
+
+        case let array as [Any]:
+            for item in array {
+                collectImageAttachments(from: item, into: &attachments, seen: &seen)
+            }
+
+        case let dictionary as [String: Any]:
+            if let imageURL = stringValue(dictionary["image_url"]) {
+                collectImageAttachments(from: imageURL, into: &attachments, seen: &seen)
+            }
+            if let imageURL = dictionaryValue(dictionary["image_url"]),
+               let url = stringValue(imageURL["url"]) {
+                collectImageAttachments(from: url, into: &attachments, seen: &seen)
+            }
+            if let url = stringValue(dictionary["url"]) {
+                collectImageAttachments(from: url, into: &attachments, seen: &seen)
+            }
+            if let images = dictionary["images"] {
+                collectImageAttachments(from: images, into: &attachments, seen: &seen)
+            }
+            if let content = dictionary["content"] {
+                collectImageAttachments(from: content, into: &attachments, seen: &seen)
+            }
+
+        default:
+            break
+        }
+    }
+
+    private func decodeImageDataURL(_ rawValue: String) -> Data? {
+        let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.hasPrefix("data:"),
+              let commaIndex = trimmed.firstIndex(of: ",") else {
+            return nil
+        }
+
+        let metadata = String(trimmed[..<commaIndex])
+        let payload = String(trimmed[trimmed.index(after: commaIndex)...])
+        guard metadata.lowercased().hasPrefix("data:image/"),
+              metadata.contains(";base64") else {
+            return nil
+        }
+        return Data(base64Encoded: payload)
     }
 
     private func parseDate(_ raw: String?) -> Date? {

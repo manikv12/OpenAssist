@@ -48,6 +48,20 @@ struct AssistantLiveVoiceSessionSnapshot: Equatable, Sendable {
 
     var isListening: Bool { phase == .listening }
     var isSpeaking: Bool { phase == .speaking }
+    var transcriptPreview: String? {
+        guard let lastTranscript else { return nil }
+        let normalized = lastTranscript
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else { return nil }
+        let limit = 96
+        guard normalized.count > limit else { return normalized }
+        return String(normalized.prefix(limit - 1)).trimmingCharacters(in: .whitespacesAndNewlines) + "..."
+    }
+
+    var transcriptStatusText: String? {
+        transcriptPreview.map { "Heard: \($0)" }
+    }
 
     var displayText: String {
         if let lastError = lastError?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
@@ -249,7 +263,10 @@ final class AssistantLiveVoiceCoordinator: AssistantLiveVoiceSessionControlling 
 
         let trimmed = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
-            resumeListeningIfNeeded(message: "I didn't catch that. Try again.")
+            scheduleListeningResume(
+                afterNanoseconds: 600_000_000,
+                statusMessage: "I didn't catch that. Try again."
+            )
             return
         }
 
@@ -460,7 +477,10 @@ final class AssistantLiveVoiceCoordinator: AssistantLiveVoiceSessionControlling 
            !store.hasActiveTurn,
            store.pendingPermissionRequest == nil,
            !store.assistantVoicePlaybackActive {
-            resumeListeningIfNeeded(message: "Listening. Speak when you're ready.")
+            scheduleListeningResume(
+                afterNanoseconds: 600_000_000,
+                statusMessage: "Getting ready to listen again..."
+            )
         }
     }
 

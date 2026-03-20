@@ -112,7 +112,7 @@ struct AssistantOrbHUDView: View {
                         } label: {
                             Image(systemName: "xmark.circle.fill")
                                 .font(.title2)
-                                .foregroundStyle(.white.opacity(0.6))
+                                .foregroundStyle(AppVisualTheme.foreground(0.6))
                         }
                         .buttonStyle(.plain)
                         .padding(8)
@@ -209,14 +209,14 @@ struct AssistantOrbHUDView: View {
                         .font(.system(size: 9, weight: .semibold))
                         .tracking(0.9)
                         .textCase(.uppercase)
-                        .foregroundStyle(.white.opacity(0.94))
+                        .foregroundStyle(AppVisualTheme.foreground(0.94))
                         .contentTransition(.opacity)
                 }
 
                 if let detail = model.state.detail, !detail.isEmpty, !model.showDoneDetail, !model.showWorkingDetail {
                     Text(detail)
                         .font(.system(size: 9.5, weight: .medium))
-                        .foregroundStyle(.white.opacity(0.72))
+                        .foregroundStyle(AppVisualTheme.foreground(0.72))
                         .lineLimit(2)
                         .truncationMode(model.state.phase == .success ? .tail : .middle)
                         .multilineTextAlignment(.center)
@@ -231,7 +231,7 @@ struct AssistantOrbHUDView: View {
             .background(OrbStatusCapsuleBackground(tint: glowColor))
             .overlay(
                 Capsule(style: .continuous)
-                    .stroke(Color.white.opacity(0.07), lineWidth: 0.5)
+                    .stroke(AppVisualTheme.surfaceStroke(0.07), lineWidth: 0.5)
             )
             .animation(OrbHUDAnimations.content, value: model.state.detail)
             .animation(OrbHUDAnimations.state, value: model.state.phase)
@@ -319,7 +319,7 @@ struct AssistantOrbHUDView: View {
                 HStack(spacing: 8) {
                     Text("Close this card to return the orb to its ready state.")
                         .font(.system(size: 10.5, weight: .medium))
-                        .foregroundStyle(.white.opacity(0.60))
+                        .foregroundStyle(AppVisualTheme.foreground(0.60))
                         .fixedSize(horizontal: false, vertical: true)
 
                     Spacer(minLength: 8)
@@ -382,7 +382,7 @@ struct AssistantOrbHUDView: View {
         VStack(alignment: .leading, spacing: 10) {
             Text(suggestion.message)
                 .font(.system(size: 11.5, weight: .medium))
-                .foregroundStyle(.white.opacity(0.72))
+                .foregroundStyle(AppVisualTheme.foreground(0.72))
                 .fixedSize(horizontal: false, vertical: true)
 
             HStack(spacing: 8) {
@@ -426,12 +426,12 @@ struct AssistantOrbHUDView: View {
                 VStack(alignment: .leading, spacing: 12) {
                     Text(model.state.title)
                         .font(.system(size: 14, weight: .semibold))
-                        .foregroundStyle(.white.opacity(0.94))
+                        .foregroundStyle(AppVisualTheme.foreground(0.94))
 
                     if let summary = model.workingSummaryText, !summary.isEmpty {
                         Text(summary)
                             .font(.system(size: 11.5, weight: .medium))
-                            .foregroundStyle(.white.opacity(0.72))
+                            .foregroundStyle(AppVisualTheme.foreground(0.72))
                             .fixedSize(horizontal: false, vertical: true)
                     }
 
@@ -451,11 +451,11 @@ struct AssistantOrbHUDView: View {
 
                             Text(session.title.isEmpty ? "Untitled Session" : session.title)
                                 .font(.system(size: 11.5, weight: .semibold))
-                                .foregroundStyle(.white.opacity(0.90))
+                                .foregroundStyle(AppVisualTheme.foreground(0.90))
                             if let cwd = session.cwd?.nonEmpty {
                                 Text(cwd)
                                     .font(.system(size: 10, weight: .medium, design: .monospaced))
-                                    .foregroundStyle(.white.opacity(0.50))
+                                    .foregroundStyle(AppVisualTheme.foreground(0.50))
                                     .lineLimit(2)
                             }
                         }
@@ -468,7 +468,7 @@ struct AssistantOrbHUDView: View {
                         VStack(alignment: .leading, spacing: 8) {
                             Text("Live steps")
                                 .font(.system(size: 10.5, weight: .semibold))
-                                .foregroundStyle(.white.opacity(0.52))
+                                .foregroundStyle(AppVisualTheme.foreground(0.52))
 
                             ForEach(Array(model.workingToolActivity.prefix(4))) { item in
                                 OrbWorkingActivityRow(item: item, tint: tint)
@@ -477,7 +477,7 @@ struct AssistantOrbHUDView: View {
                     } else {
                         Text("Detailed step output has not arrived yet, but the agent is still working.")
                             .font(.system(size: 10.5, weight: .medium))
-                            .foregroundStyle(.white.opacity(0.48))
+                            .foregroundStyle(AppVisualTheme.foreground(0.48))
                     }
                 }
                 .padding(.horizontal, 16)
@@ -504,7 +504,7 @@ struct AssistantOrbHUDView: View {
                         .foregroundStyle(tint.opacity(0.85))
                     Text("Typing here interrupts the current turn and applies your new instruction.")
                         .font(.system(size: 10.5, weight: .medium))
-                        .foregroundStyle(.white.opacity(0.58))
+                        .foregroundStyle(AppVisualTheme.foreground(0.58))
                         .fixedSize(horizontal: false, vertical: true)
                     Spacer(minLength: 0)
                 }
@@ -533,7 +533,7 @@ struct AssistantOrbHUDView: View {
                     .font(.system(size: 9.5, weight: .semibold))
                     .tracking(0.5)
                     .textCase(.uppercase)
-                    .foregroundStyle(.white.opacity(0.48))
+                    .foregroundStyle(AppVisualTheme.foreground(0.48))
 
                 ForEach(Array(images.prefix(3).enumerated()), id: \.offset) { index, imageData in
                     if let nsImage = NSImage(data: imageData) {
@@ -551,7 +551,7 @@ struct AssistantOrbHUDView: View {
                                 .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
                                 .overlay(
                                     RoundedRectangle(cornerRadius: 16, style: .continuous)
-                                        .stroke(Color.white.opacity(0.08), lineWidth: 0.5)
+                                        .stroke(AppVisualTheme.surfaceStroke(0.08), lineWidth: 0.5)
                                 )
                         }
                         .buttonStyle(.plain)
@@ -585,19 +585,19 @@ struct AssistantOrbHUDView: View {
                     VStack(alignment: .leading, spacing: 12) {
                         Text(request.toolTitle)
                             .font(.system(size: 14, weight: .semibold))
-                            .foregroundStyle(.white.opacity(0.94))
+                            .foregroundStyle(AppVisualTheme.foreground(0.94))
 
                         if let rationale = request.rationale, !rationale.isEmpty {
                             Text(rationale)
                                 .font(.system(size: 11.5, weight: .medium))
-                                .foregroundStyle(.white.opacity(0.70))
+                                .foregroundStyle(AppVisualTheme.foreground(0.70))
                                 .fixedSize(horizontal: false, vertical: true)
                         }
 
                         if let summary = request.rawPayloadSummary, !summary.isEmpty {
                             Text(summary)
                                 .font(.system(size: 11, weight: .regular, design: .monospaced))
-                                .foregroundStyle(.white.opacity(0.58))
+                                .foregroundStyle(AppVisualTheme.foreground(0.58))
                                 .lineLimit(4)
                                 .padding(10)
                                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -608,8 +608,8 @@ struct AssistantOrbHUDView: View {
                             AssistantStructuredUserInputView(
                                 request: request,
                                 accent: orangeTint,
-                                secondaryText: .white.opacity(0.70),
-                                fieldBackground: Color.white.opacity(0.06),
+                                secondaryText: AppVisualTheme.foreground(0.70),
+                                fieldBackground: AppVisualTheme.foreground(0.06),
                                 submitTitle: "Submit Answers",
                                 cancelTitle: "Cancel Request"
                             ) { answers in
@@ -644,7 +644,7 @@ struct AssistantOrbHUDView: View {
                                 }
                             }
 
-                            OrbSecondaryActionButton(title: "Cancel Request", symbol: "xmark", tint: Color.white.opacity(0.55)) {
+                            OrbSecondaryActionButton(title: "Cancel Request", symbol: "xmark", tint: AppVisualTheme.foreground(0.55)) {
                                 model.onCancelPermission?()
                             }
                             .frame(maxWidth: .infinity, alignment: .center)
@@ -693,9 +693,9 @@ struct AssistantOrbHUDView: View {
                     Spacer()
                     Image(systemName: "arrow.right")
                         .font(.system(size: 10, weight: .semibold))
-                        .foregroundStyle(.white.opacity(0.35))
+                        .foregroundStyle(AppVisualTheme.foreground(0.35))
                 }
-                .foregroundStyle(.white.opacity(0.88))
+                .foregroundStyle(AppVisualTheme.foreground(0.88))
                 .padding(.horizontal, 12)
                 .padding(.vertical, 10)
                 .orbInsetSurface(tint: AppVisualTheme.accentTint, cornerRadius: 14, fillOpacity: 0.10)
@@ -723,13 +723,13 @@ struct AssistantOrbHUDView: View {
             if model.isLoadingSessions {
                 ProgressView()
                     .scaleEffect(0.7)
-                    .tint(.white.opacity(0.5))
+                    .tint(AppVisualTheme.foreground(0.5))
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 20)
             } else if model.sessions.isEmpty {
                 Text("No sessions yet")
                     .font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(.white.opacity(0.35))
+                    .foregroundStyle(AppVisualTheme.foreground(0.35))
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 20)
             } else {
@@ -828,10 +828,10 @@ struct AssistantOrbHUDView: View {
                     .padding(.vertical, 3)
                     .background(
                         RoundedRectangle(cornerRadius: 11, style: .continuous)
-                            .fill(Color.white.opacity(0.035))
+                            .fill(AppVisualTheme.surfaceFill(0.035))
                             .overlay(
                                 RoundedRectangle(cornerRadius: 11, style: .continuous)
-                                    .stroke(Color.white.opacity(0.05), lineWidth: 0.5)
+                                    .stroke(AppVisualTheme.surfaceStroke(0.05), lineWidth: 0.5)
                             )
                     )
                 }
@@ -906,25 +906,25 @@ struct AssistantOrbHUDView: View {
                 if showsLabel {
                     Text("Model")
                         .font(.system(size: 8.8, weight: .semibold))
-                        .foregroundStyle(.white.opacity(0.62))
+                        .foregroundStyle(AppVisualTheme.foreground(0.62))
                 }
                 Text(model.selectedModelSummary)
                     .font(.system(size: showsLabel ? 9.2 : 8.6, weight: .medium))
-                    .foregroundStyle(.white.opacity(showsLabel ? 0.68 : 0.50))
+                    .foregroundStyle(AppVisualTheme.foreground(showsLabel ? 0.68 : 0.50))
                     .lineLimit(1)
                     .truncationMode(.tail)
                 Image(systemName: "chevron.down")
                     .font(.system(size: 5, weight: .bold))
-                    .foregroundStyle(.white.opacity(0.18))
+                    .foregroundStyle(AppVisualTheme.foreground(0.18))
             }
             .padding(.horizontal, 6)
             .padding(.vertical, 2.5)
             .background(
                 Capsule(style: .continuous)
-                    .fill(Color.white.opacity(0.04))
+                    .fill(AppVisualTheme.surfaceFill(0.04))
                     .overlay(
                         Capsule(style: .continuous)
-                            .stroke(Color.white.opacity(0.05), lineWidth: 0.5)
+                            .stroke(AppVisualTheme.surfaceStroke(0.05), lineWidth: 0.5)
                     )
             )
         }
@@ -949,7 +949,7 @@ struct AssistantOrbHUDView: View {
                 .lineLimit(1)
         }
         .font(.system(size: 8.8, weight: .medium))
-        .foregroundStyle(.white.opacity(0.54))
+        .foregroundStyle(AppVisualTheme.foreground(0.54))
         .padding(.horizontal, 8)
         .padding(.vertical, 4)
         .background(
@@ -957,7 +957,7 @@ struct AssistantOrbHUDView: View {
                 .fill(AppVisualTheme.accentTint.opacity(0.06))
                 .overlay(
                     Capsule(style: .continuous)
-                        .stroke(Color.white.opacity(0.05), lineWidth: 0.5)
+                        .stroke(AppVisualTheme.surfaceStroke(0.05), lineWidth: 0.5)
                 )
         )
     }
@@ -980,13 +980,13 @@ struct AssistantOrbHUDView: View {
         case .transcribing:
             return "Transcribing your turn"
         case .sending:
-            return "Waiting for the final answer"
+            return model.liveVoiceSnapshot.transcriptStatusText ?? "Waiting for the final answer"
         case .waitingForPermission:
-            return "Approve to continue the live turn"
+            return model.liveVoiceSnapshot.transcriptStatusText ?? "Approve to continue the live turn"
         case .speaking:
-            return "Tap speaker to interrupt"
+            return model.liveVoiceSnapshot.transcriptStatusText ?? "Tap speaker to interrupt"
         case .paused:
-            return model.liveVoiceSnapshot.displayText
+            return model.liveVoiceSnapshot.transcriptStatusText ?? model.liveVoiceSnapshot.displayText
         }
     }
 
@@ -1101,7 +1101,7 @@ struct AssistantOrbHUDView: View {
             HStack(spacing: 8) {
                 Text(liveVoiceHintText)
                     .font(.system(size: 10, weight: .medium))
-                    .foregroundStyle(.white.opacity(0.52))
+                    .foregroundStyle(AppVisualTheme.foreground(0.52))
                 Spacer(minLength: 0)
                 orbVoiceToggleButton(size: 22)
                 liveVoiceEndButton(tint: tint)
@@ -1153,7 +1153,7 @@ struct AssistantOrbHUDView: View {
 
             Text(attachment.filename)
                 .font(.system(size: 10, weight: .medium))
-                .foregroundStyle(.white.opacity(0.70))
+                .foregroundStyle(AppVisualTheme.foreground(0.70))
                 .lineLimit(1)
 
             Button {
@@ -1161,7 +1161,7 @@ struct AssistantOrbHUDView: View {
             } label: {
                 Image(systemName: "xmark")
                     .font(.system(size: 8, weight: .bold))
-                    .foregroundStyle(.white.opacity(0.42))
+                    .foregroundStyle(AppVisualTheme.foreground(0.42))
             }
             .buttonStyle(.plain)
         }
@@ -1169,7 +1169,7 @@ struct AssistantOrbHUDView: View {
         .padding(.vertical, 6)
         .background(
             Capsule(style: .continuous)
-                .fill(Color.white.opacity(0.08))
+                .fill(AppVisualTheme.surfaceFill(0.08))
                 .overlay(
                     Capsule(style: .continuous)
                         .stroke(tint.opacity(0.16), lineWidth: 0.6)
@@ -1516,7 +1516,7 @@ struct AssistantNotchHUDView: View {
                         } label: {
                             Image(systemName: "xmark.circle.fill")
                                 .font(.title2)
-                                .foregroundStyle(.white.opacity(0.6))
+                                .foregroundStyle(AppVisualTheme.foreground(0.6))
                         }
                         .buttonStyle(.plain)
                         .padding(8)
@@ -1544,7 +1544,7 @@ struct AssistantNotchHUDView: View {
                 )
             } else {
                 Capsule(style: .continuous)
-                    .fill(Color.black.opacity(0.88))
+                    .fill(AppVisualTheme.surfaceFill(0.88))
                     .overlay(
                         Capsule(style: .continuous)
                             .stroke(glowColor.opacity(0.16), lineWidth: 0.7)
@@ -1606,12 +1606,12 @@ struct AssistantNotchHUDView: View {
                 VStack(alignment: .leading, spacing: 1) {
                     Text(collapsedTitle)
                         .font(.system(size: 11.5, weight: .semibold))
-                        .foregroundStyle(.white.opacity(0.92))
+                        .foregroundStyle(AppVisualTheme.foreground(0.92))
                         .lineLimit(1)
 
                     Text(liveSummary)
                         .font(.system(size: 10, weight: .medium))
-                        .foregroundStyle(.white.opacity(0.56))
+                        .foregroundStyle(AppVisualTheme.foreground(0.56))
                         .lineLimit(1)
                 }
 
@@ -1641,14 +1641,14 @@ struct AssistantNotchHUDView: View {
                             } label: {
                                 Image(systemName: "chevron.up")
                                     .font(.system(size: 8, weight: .bold))
-                                    .foregroundStyle(.white.opacity(0.62))
+                                    .foregroundStyle(AppVisualTheme.foreground(0.62))
                                     .frame(width: 24, height: 24)
                                     .background(
                                         Circle()
-                                            .fill(Color.white.opacity(0.05))
+                                            .fill(AppVisualTheme.surfaceFill(0.05))
                                             .overlay(
                                                 Circle()
-                                                    .stroke(Color.white.opacity(0.08), lineWidth: 0.5)
+                                                    .stroke(AppVisualTheme.surfaceStroke(0.08), lineWidth: 0.5)
                                             )
                                     )
                             }
@@ -1660,14 +1660,19 @@ struct AssistantNotchHUDView: View {
             }
             .padding(.horizontal, 12)
             .frame(width: collapsedPillWidth, height: Layout.collapsedSize.height)
-            .background(
+            .background {
+                let isDark = AppVisualTheme.isDarkAppearance
                 Capsule(style: .continuous)
-                    .fill(Color(red: 0.045, green: 0.048, blue: 0.062).opacity(0.98))
+                    .fill(
+                        isDark
+                            ? Color(red: 0.045, green: 0.048, blue: 0.062).opacity(0.98)
+                            : AppVisualTheme.windowBackground.opacity(0.99)
+                    )
                     .overlay(
                         Capsule(style: .continuous)
-                            .stroke(Color.white.opacity(0.08), lineWidth: 0.5)
+                            .stroke(AppVisualTheme.surfaceStroke(isDark ? 0.08 : 0.10), lineWidth: 0.5)
                     )
-            )
+            }
         }
         .buttonStyle(.plain)
         .help(isTrayExpanded ? "Collapse assistant tray" : "Show compact assistant details")
@@ -1708,7 +1713,7 @@ struct AssistantNotchHUDView: View {
 
                 Text(model.state.phase == .failed ? "Needs attention" : "Response ready")
                     .font(.system(size: 11.5, weight: .semibold))
-                    .foregroundStyle(.white.opacity(0.92))
+                    .foregroundStyle(AppVisualTheme.foreground(0.92))
                     .fixedSize(horizontal: true, vertical: false)
 
                 Spacer(minLength: 0)
@@ -1732,11 +1737,11 @@ struct AssistantNotchHUDView: View {
                 } label: {
                     Image(systemName: "xmark")
                         .font(.system(size: 8, weight: .bold))
-                        .foregroundStyle(.white.opacity(0.40))
+                        .foregroundStyle(AppVisualTheme.foreground(0.40))
                         .frame(width: 24, height: 24)
                         .background(
                             Circle()
-                                .fill(Color.white.opacity(0.05))
+                                .fill(AppVisualTheme.surfaceFill(0.05))
                         )
                 }
                 .buttonStyle(.plain)
@@ -1778,7 +1783,7 @@ struct AssistantNotchHUDView: View {
 
                 Text("Live work")
                     .font(.system(size: 11.5, weight: .semibold))
-                    .foregroundStyle(.white.opacity(0.92))
+                    .foregroundStyle(AppVisualTheme.foreground(0.92))
 
                 Spacer(minLength: 0)
 
@@ -1807,11 +1812,11 @@ struct AssistantNotchHUDView: View {
                 } label: {
                     Image(systemName: "xmark")
                         .font(.system(size: 8, weight: .bold))
-                        .foregroundStyle(.white.opacity(0.40))
+                        .foregroundStyle(AppVisualTheme.foreground(0.40))
                         .frame(width: 24, height: 24)
                         .background(
                             Circle()
-                                .fill(Color.white.opacity(0.05))
+                                .fill(AppVisualTheme.surfaceFill(0.05))
                         )
                 }
                 .buttonStyle(.plain)
@@ -1822,12 +1827,12 @@ struct AssistantNotchHUDView: View {
                     VStack(alignment: .leading, spacing: 6) {
                         Text(model.state.title.isEmpty ? "Assistant" : model.state.title)
                             .font(.system(size: 13.5, weight: .semibold))
-                            .foregroundStyle(.white.opacity(0.94))
+                            .foregroundStyle(AppVisualTheme.foreground(0.94))
 
                         if let summary = model.workingSummaryText?.nonEmpty {
                             Text(summary)
                                 .font(.system(size: 11, weight: .medium))
-                                .foregroundStyle(.white.opacity(0.70))
+                                .foregroundStyle(AppVisualTheme.foreground(0.70))
                                 .fixedSize(horizontal: false, vertical: true)
                         }
                     }
@@ -1848,12 +1853,12 @@ struct AssistantNotchHUDView: View {
 
                             Text(session.title.isEmpty ? "Untitled Session" : session.title)
                                 .font(.system(size: 11.5, weight: .semibold))
-                                .foregroundStyle(.white.opacity(0.90))
+                                .foregroundStyle(AppVisualTheme.foreground(0.90))
 
                             if let cwd = session.cwd?.nonEmpty {
                                 Text(cwd)
                                     .font(.system(size: 10, weight: .medium, design: .monospaced))
-                                    .foregroundStyle(.white.opacity(0.50))
+                                    .foregroundStyle(AppVisualTheme.foreground(0.50))
                                     .lineLimit(3)
                             }
                         }
@@ -1871,7 +1876,7 @@ struct AssistantNotchHUDView: View {
                     } else {
                         Text("Detailed step output has not arrived yet, but the assistant is still working.")
                             .font(.system(size: 10.5, weight: .medium))
-                            .foregroundStyle(.white.opacity(0.52))
+                            .foregroundStyle(AppVisualTheme.foreground(0.52))
                     }
                 }
                 .padding(.horizontal, 2)
@@ -1900,7 +1905,7 @@ struct AssistantNotchHUDView: View {
 
                 Text("Follow up")
                     .font(.system(size: 11.5, weight: .semibold))
-                    .foregroundStyle(.white.opacity(0.92))
+                    .foregroundStyle(AppVisualTheme.foreground(0.92))
                     .fixedSize(horizontal: true, vertical: false)
 
                 Spacer(minLength: 0)
@@ -1924,11 +1929,11 @@ struct AssistantNotchHUDView: View {
                 } label: {
                     Image(systemName: "xmark")
                         .font(.system(size: 8, weight: .bold))
-                        .foregroundStyle(.white.opacity(0.40))
+                        .foregroundStyle(AppVisualTheme.foreground(0.40))
                         .frame(width: 24, height: 24)
                         .background(
                             Circle()
-                                .fill(Color.white.opacity(0.05))
+                                .fill(AppVisualTheme.surfaceFill(0.05))
                         )
                 }
                 .buttonStyle(.plain)
@@ -1957,7 +1962,7 @@ struct AssistantNotchHUDView: View {
 
                 Text("Mode switch")
                     .font(.system(size: 11.5, weight: .semibold))
-                    .foregroundStyle(.white.opacity(0.92))
+                    .foregroundStyle(AppVisualTheme.foreground(0.92))
                     .fixedSize(horizontal: true, vertical: false)
 
                 Spacer(minLength: 0)
@@ -1977,11 +1982,11 @@ struct AssistantNotchHUDView: View {
                 } label: {
                     Image(systemName: "xmark")
                         .font(.system(size: 8, weight: .bold))
-                        .foregroundStyle(.white.opacity(0.40))
+                        .foregroundStyle(AppVisualTheme.foreground(0.40))
                         .frame(width: 24, height: 24)
                         .background(
                             Circle()
-                                .fill(Color.white.opacity(0.05))
+                                .fill(AppVisualTheme.surfaceFill(0.05))
                         )
                 }
                 .buttonStyle(.plain)
@@ -2006,7 +2011,7 @@ struct AssistantNotchHUDView: View {
 
                 Text("Approval needed")
                     .font(.system(size: 11.5, weight: .semibold))
-                    .foregroundStyle(.white.opacity(0.92))
+                    .foregroundStyle(AppVisualTheme.foreground(0.92))
                     .fixedSize(horizontal: true, vertical: false)
 
                 Spacer(minLength: 0)
@@ -2026,11 +2031,11 @@ struct AssistantNotchHUDView: View {
                 } label: {
                     Image(systemName: "xmark")
                         .font(.system(size: 8, weight: .bold))
-                        .foregroundStyle(.white.opacity(0.40))
+                        .foregroundStyle(AppVisualTheme.foreground(0.40))
                         .frame(width: 24, height: 24)
                         .background(
                             Circle()
-                                .fill(Color.white.opacity(0.05))
+                                .fill(AppVisualTheme.surfaceFill(0.05))
                         )
                 }
                 .buttonStyle(.plain)
@@ -2040,19 +2045,19 @@ struct AssistantNotchHUDView: View {
                 VStack(alignment: .leading, spacing: 12) {
                     Text(request.toolTitle)
                         .font(.system(size: 13.5, weight: .semibold))
-                        .foregroundStyle(.white.opacity(0.94))
+                        .foregroundStyle(AppVisualTheme.foreground(0.94))
 
                     if let rationale = request.rationale?.nonEmpty {
                         Text(rationale)
                             .font(.system(size: 11, weight: .medium))
-                            .foregroundStyle(.white.opacity(0.70))
+                            .foregroundStyle(AppVisualTheme.foreground(0.70))
                             .fixedSize(horizontal: false, vertical: true)
                     }
 
                     if let summary = request.rawPayloadSummary?.nonEmpty {
                         Text(summary)
                             .font(.system(size: 10.5, weight: .regular, design: .monospaced))
-                            .foregroundStyle(.white.opacity(0.58))
+                            .foregroundStyle(AppVisualTheme.foreground(0.58))
                             .lineLimit(nil)
                             .padding(12)
                             .frame(maxWidth: .infinity, alignment: .leading)
@@ -2063,8 +2068,8 @@ struct AssistantNotchHUDView: View {
                         AssistantStructuredUserInputView(
                             request: request,
                             accent: .orange,
-                            secondaryText: .white.opacity(0.70),
-                            fieldBackground: Color.white.opacity(0.06),
+                            secondaryText: AppVisualTheme.foreground(0.70),
+                            fieldBackground: AppVisualTheme.foreground(0.06),
                             submitTitle: "Submit Answers",
                             cancelTitle: "Cancel Request"
                         ) { answers in
@@ -2148,7 +2153,7 @@ struct AssistantNotchHUDView: View {
             HStack(spacing: 8) {
                 Text(model.isLiveVoiceActive ? liveVoiceHintText : helperText)
                     .font(.system(size: 10, weight: .medium))
-                    .foregroundStyle(.white.opacity(0.54))
+                    .foregroundStyle(AppVisualTheme.foreground(0.54))
 
                 Spacer(minLength: 0)
 
@@ -2170,7 +2175,7 @@ struct AssistantNotchHUDView: View {
         VStack(alignment: .leading, spacing: 8) {
             Text(suggestion.message)
                 .font(.system(size: 10.5, weight: .medium))
-                .foregroundStyle(.white.opacity(0.70))
+                .foregroundStyle(AppVisualTheme.foreground(0.70))
                 .fixedSize(horizontal: false, vertical: true)
 
             HStack(spacing: 6) {
@@ -2232,12 +2237,12 @@ struct AssistantNotchHUDView: View {
             if model.isLoadingSessions {
                 ProgressView()
                     .controlSize(.small)
-                    .tint(.white.opacity(0.52))
+                    .tint(AppVisualTheme.foreground(0.52))
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
             } else if model.sessions.isEmpty {
                 Text("No sessions yet")
                     .font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(.white.opacity(0.42))
+                    .foregroundStyle(AppVisualTheme.foreground(0.42))
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
             } else {
                 ScrollView(.vertical, showsIndicators: model.sessions.count > 4) {
@@ -2280,7 +2285,7 @@ struct AssistantNotchHUDView: View {
                         .foregroundStyle(AppVisualTheme.accentTint)
                     Text(session.title.isEmpty ? "Untitled Session" : session.title)
                         .font(.system(size: 10.5, weight: .medium))
-                        .foregroundStyle(.white.opacity(0.62))
+                        .foregroundStyle(AppVisualTheme.foreground(0.62))
                         .lineLimit(1)
                 }
             }
@@ -2311,16 +2316,16 @@ struct AssistantNotchHUDView: View {
                         .frame(width: 8, height: 8)
                     Text(model.state.title.isEmpty ? "Assistant" : model.state.title)
                         .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(.white.opacity(0.92))
+                        .foregroundStyle(AppVisualTheme.foreground(0.92))
                     Spacer(minLength: 0)
                     Text(livePhaseLabel)
                         .font(.system(size: 10, weight: .semibold))
-                        .foregroundStyle(.white.opacity(0.54))
+                        .foregroundStyle(AppVisualTheme.foreground(0.54))
                 }
 
                 Text(liveSummary)
                     .font(.system(size: 11.5, weight: .medium))
-                    .foregroundStyle(.white.opacity(0.68))
+                    .foregroundStyle(AppVisualTheme.foreground(0.68))
                     .fixedSize(horizontal: false, vertical: true)
             }
             .padding(12)
@@ -2359,7 +2364,7 @@ struct AssistantNotchHUDView: View {
             } else {
                 Text(idleActivityMessage)
                     .font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(.white.opacity(0.46))
+                    .foregroundStyle(AppVisualTheme.foreground(0.46))
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
             }
         }
@@ -2384,7 +2389,7 @@ struct AssistantNotchHUDView: View {
                 VStack(alignment: .leading, spacing: 8) {
                     Text(suggestion.message)
                         .font(.system(size: 10.5, weight: .medium))
-                        .foregroundStyle(.white.opacity(0.66))
+                        .foregroundStyle(AppVisualTheme.foreground(0.66))
                         .fixedSize(horizontal: false, vertical: true)
 
                     HStack(spacing: 6) {
@@ -2464,16 +2469,16 @@ struct AssistantNotchHUDView: View {
                     .frame(width: 28, height: 28)
                 Image(systemName: symbol)
                     .font(.system(size: 11, weight: .semibold))
-                    .foregroundStyle(.white.opacity(0.76))
+                    .foregroundStyle(AppVisualTheme.foreground(0.76))
             }
 
             VStack(alignment: .leading, spacing: 1) {
                 Text(title)
                     .font(.system(size: 10.5, weight: .semibold))
-                    .foregroundStyle(.white.opacity(0.90))
+                    .foregroundStyle(AppVisualTheme.foreground(0.90))
                 Text(subtitle)
                     .font(.system(size: 9.5, weight: .medium))
-                    .foregroundStyle(.white.opacity(0.46))
+                    .foregroundStyle(AppVisualTheme.foreground(0.46))
             }
 
             Spacer(minLength: 0)
@@ -2486,12 +2491,12 @@ struct AssistantNotchHUDView: View {
         VStack(alignment: .leading, spacing: 10) {
             Text(request.toolTitle)
                 .font(.system(size: 12.5, weight: .semibold))
-                .foregroundStyle(.white.opacity(0.92))
+                .foregroundStyle(AppVisualTheme.foreground(0.92))
 
             if let rationale = request.rationale?.nonEmpty {
                 Text(rationale)
                     .font(.system(size: 10.5, weight: .medium))
-                    .foregroundStyle(.white.opacity(0.66))
+                    .foregroundStyle(AppVisualTheme.foreground(0.66))
                     .fixedSize(horizontal: false, vertical: true)
             }
 
@@ -2519,7 +2524,7 @@ struct AssistantNotchHUDView: View {
                 .font(.system(size: 9.5, weight: .medium))
                 .lineLimit(1)
         }
-        .foregroundStyle(.white.opacity(0.58))
+        .foregroundStyle(AppVisualTheme.foreground(0.58))
         .padding(.horizontal, 10)
         .padding(.vertical, 6)
         .background(
@@ -2527,7 +2532,7 @@ struct AssistantNotchHUDView: View {
                 .fill(AppVisualTheme.accentTint.opacity(0.08))
                 .overlay(
                     Capsule(style: .continuous)
-                        .stroke(Color.white.opacity(0.06), lineWidth: 0.6)
+                        .stroke(AppVisualTheme.surfaceStroke(0.06), lineWidth: 0.6)
                 )
         )
     }
@@ -2553,20 +2558,20 @@ struct AssistantNotchHUDView: View {
                 )
                 Text(model.selectedModelSummary)
                     .font(.system(size: 9.5, weight: .medium))
-                    .foregroundStyle(.white.opacity(0.60))
+                    .foregroundStyle(AppVisualTheme.foreground(0.60))
                     .lineLimit(1)
                 Image(systemName: "chevron.down")
                     .font(.system(size: 5.5, weight: .bold))
-                    .foregroundStyle(.white.opacity(0.18))
+                    .foregroundStyle(AppVisualTheme.foreground(0.18))
             }
             .padding(.horizontal, 8)
             .padding(.vertical, 5)
             .background(
                 Capsule(style: .continuous)
-                    .fill(Color.white.opacity(0.06))
+                    .fill(AppVisualTheme.surfaceFill(0.06))
                     .overlay(
                         Capsule(style: .continuous)
-                            .stroke(Color.white.opacity(0.06), lineWidth: 0.5)
+                            .stroke(AppVisualTheme.surfaceStroke(0.06), lineWidth: 0.5)
                     )
             )
         }
@@ -2614,7 +2619,7 @@ struct AssistantNotchHUDView: View {
             HStack(spacing: 8) {
                 Text(liveVoiceHintText)
                     .font(.system(size: 10, weight: .medium))
-                    .foregroundStyle(.white.opacity(0.52))
+                    .foregroundStyle(AppVisualTheme.foreground(0.52))
                 Spacer(minLength: 0)
                 notchVoiceToggleButton(size: 26)
                 liveVoiceEndButton(tint: tint)
@@ -2665,7 +2670,7 @@ struct AssistantNotchHUDView: View {
 
                         Text(attachment.filename)
                             .font(.system(size: 10, weight: .medium))
-                            .foregroundStyle(.white.opacity(0.70))
+                            .foregroundStyle(AppVisualTheme.foreground(0.70))
                             .lineLimit(1)
 
                         Button {
@@ -2673,7 +2678,7 @@ struct AssistantNotchHUDView: View {
                         } label: {
                             Image(systemName: "xmark")
                                 .font(.system(size: 8, weight: .bold))
-                                .foregroundStyle(.white.opacity(0.42))
+                                .foregroundStyle(AppVisualTheme.foreground(0.42))
                         }
                         .buttonStyle(.plain)
                     }
@@ -2681,7 +2686,7 @@ struct AssistantNotchHUDView: View {
                     .padding(.vertical, 6)
                     .background(
                         Capsule(style: .continuous)
-                            .fill(Color.white.opacity(0.08))
+                            .fill(AppVisualTheme.surfaceFill(0.08))
                             .overlay(
                                 Capsule(style: .continuous)
                                     .stroke(tint.opacity(0.16), lineWidth: 0.6)
@@ -2754,7 +2759,7 @@ struct AssistantNotchHUDView: View {
                     .font(.system(size: 9.5, weight: .semibold))
                     .tracking(0.5)
                     .textCase(.uppercase)
-                    .foregroundStyle(.white.opacity(0.48))
+                    .foregroundStyle(AppVisualTheme.foreground(0.48))
 
                 ForEach(Array(images.prefix(3).enumerated()), id: \.offset) { index, imageData in
                     if let nsImage = NSImage(data: imageData) {
@@ -2772,7 +2777,7 @@ struct AssistantNotchHUDView: View {
                                 .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
                                 .overlay(
                                     RoundedRectangle(cornerRadius: 16, style: .continuous)
-                                        .stroke(Color.white.opacity(0.08), lineWidth: 0.5)
+                                        .stroke(AppVisualTheme.surfaceStroke(0.08), lineWidth: 0.5)
                                 )
                         }
                         .buttonStyle(.plain)

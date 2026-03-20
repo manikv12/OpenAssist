@@ -1,5 +1,4 @@
 import AppKit
-import MarkdownUI
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -9,29 +8,80 @@ let assistantComposerLineFragmentPadding: CGFloat = 4
 let assistantComposerMinTextHeight: CGFloat = 44
 let assistantComposerMaxTextHeight: CGFloat = 88
 
+@MainActor
 enum AssistantWindowChrome {
-    static let canvasTop = Color(red: 0.050, green: 0.052, blue: 0.062)
-    static let canvasBottom = Color(red: 0.028, green: 0.030, blue: 0.038)
-    static let shellTop = Color(red: 0.078, green: 0.082, blue: 0.098)
-    static let shellBottom = Color(red: 0.060, green: 0.064, blue: 0.078)
-    static let sidebarTop = Color(red: 0.068, green: 0.072, blue: 0.086)
-    static let sidebarBottom = Color(red: 0.050, green: 0.054, blue: 0.066)
-    static let contentTop = Color(red: 0.082, green: 0.086, blue: 0.102)
-    static let contentBottom = Color(red: 0.065, green: 0.068, blue: 0.082)
-    static let elevatedPanel = Color(red: 0.092, green: 0.096, blue: 0.114)
-    static let messagePanel = Color(red: 0.088, green: 0.092, blue: 0.108)
-    static let userBubble = Color(red: 0.110, green: 0.116, blue: 0.138)
-    static let userBubbleBorder = Color(red: 0.260, green: 0.340, blue: 0.480).opacity(0.50)
-    static let editorFill = Color(red: 0.065, green: 0.068, blue: 0.082)
-    static let toolbarFill = Color(red: 0.072, green: 0.076, blue: 0.092)
-    static let buttonFill = Color.white.opacity(0.050)
-    static let buttonEmphasis = Color(red: 0.130, green: 0.148, blue: 0.195)
-    static let border = Color.white.opacity(0.07)
-    static let strongBorder = Color.white.opacity(0.11)
-    static let neutralAccent = Color(red: 0.46, green: 0.58, blue: 0.74)
-    static let systemTint = Color(red: 0.52, green: 0.64, blue: 0.78)
-    static let sidebarDivider = Color.white.opacity(0.06)
-    static let sectionHeader = Color.white.opacity(0.38)
+    private static var isDarkAppearance: Bool { AppVisualTheme.isDarkAppearance }
+
+    static var canvasTop: Color {
+        isDarkAppearance ? Color(red: 0.050, green: 0.052, blue: 0.062) : AppVisualTheme.windowBackground
+    }
+
+    static var canvasBottom: Color {
+        isDarkAppearance ? Color(red: 0.028, green: 0.030, blue: 0.038) : Color(nsColor: .underPageBackgroundColor)
+    }
+
+    static var shellTop: Color {
+        isDarkAppearance ? Color(red: 0.078, green: 0.082, blue: 0.098) : AppVisualTheme.surfaceFill(0.86)
+    }
+
+    static var shellBottom: Color {
+        isDarkAppearance ? Color(red: 0.060, green: 0.064, blue: 0.078) : AppVisualTheme.surfaceFill(0.74)
+    }
+
+    static var sidebarTop: Color {
+        isDarkAppearance ? Color(red: 0.068, green: 0.072, blue: 0.086) : AppVisualTheme.surfaceFill(0.92)
+    }
+
+    static var sidebarBottom: Color {
+        isDarkAppearance ? Color(red: 0.050, green: 0.054, blue: 0.066) : AppVisualTheme.surfaceFill(0.80)
+    }
+
+    static var contentTop: Color {
+        isDarkAppearance ? Color(red: 0.082, green: 0.086, blue: 0.102) : AppVisualTheme.textBackground
+    }
+
+    static var contentBottom: Color {
+        isDarkAppearance ? Color(red: 0.065, green: 0.068, blue: 0.082) : AppVisualTheme.controlBackground
+    }
+
+    static var elevatedPanel: Color {
+        isDarkAppearance ? Color(red: 0.092, green: 0.096, blue: 0.114) : AppVisualTheme.surfaceFill(0.94)
+    }
+
+    static var messagePanel: Color {
+        isDarkAppearance ? Color(red: 0.088, green: 0.092, blue: 0.108) : AppVisualTheme.surfaceFill(0.88)
+    }
+
+    static var userBubble: Color {
+        isDarkAppearance ? Color(red: 0.110, green: 0.116, blue: 0.138) : AppVisualTheme.selectedContentBackground.opacity(0.88)
+    }
+
+    static var userBubbleBorder: Color {
+        isDarkAppearance ? Color(red: 0.260, green: 0.340, blue: 0.480).opacity(0.50) : AppVisualTheme.surfaceStroke(0.55)
+    }
+
+    static var editorFill: Color {
+        isDarkAppearance ? Color(red: 0.065, green: 0.068, blue: 0.082) : AppVisualTheme.textBackground
+    }
+
+    static var toolbarFill: Color {
+        isDarkAppearance ? Color(red: 0.072, green: 0.076, blue: 0.092) : AppVisualTheme.surfaceFill(0.86)
+    }
+
+    static var buttonFill: Color {
+        isDarkAppearance ? Color.white.opacity(0.050) : AppVisualTheme.surfaceFill(0.56)
+    }
+
+    static var buttonEmphasis: Color {
+        isDarkAppearance ? Color(red: 0.130, green: 0.148, blue: 0.195) : AppVisualTheme.accentTint.opacity(0.16)
+    }
+
+    static var border: Color { AppVisualTheme.surfaceStroke(0.58) }
+    static var strongBorder: Color { AppVisualTheme.surfaceStroke(0.82) }
+    static var neutralAccent: Color { Color(red: 0.46, green: 0.58, blue: 0.74) }
+    static var systemTint: Color { Color(red: 0.52, green: 0.64, blue: 0.78) }
+    static var sidebarDivider: Color { AppVisualTheme.surfaceStroke(0.40) }
+    static var sectionHeader: Color { AppVisualTheme.secondaryText }
 }
 
 enum TimelineDisclosureState {
@@ -191,4 +241,145 @@ func assistantTimelineSessionIDsMatch(_ lhs: String?, _ rhs: String?) -> Bool {
     }
 
     return lhs.caseInsensitiveCompare(rhs) == .orderedSame
+}
+
+struct AssistantSessionToolActivitySnapshot: Equatable {
+    let activeCalls: [AssistantToolCallState]
+    let recentCalls: [AssistantToolCallState]
+
+    var hasActivity: Bool {
+        !activeCalls.isEmpty || !recentCalls.isEmpty
+    }
+
+    static let empty = AssistantSessionToolActivitySnapshot(
+        activeCalls: [],
+        recentCalls: []
+    )
+}
+
+func assistantSessionOwnsLiveRuntimeState(
+    sessionID: String?,
+    activeRuntimeSessionID: String?
+) -> Bool {
+    assistantTimelineSessionIDsMatch(sessionID, activeRuntimeSessionID)
+}
+
+func assistantShouldShowPendingAssistantPlaceholder(
+    selectedSessionID: String?,
+    activeRuntimeSessionID: String?,
+    hasPendingPermissionRequest: Bool,
+    hasVisibleStreamingAssistantMessage: Bool,
+    hudPhase: AssistantHUDPhase
+) -> Bool {
+    guard selectedSessionID?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false else {
+        return false
+    }
+    guard assistantSessionOwnsLiveRuntimeState(
+        sessionID: selectedSessionID,
+        activeRuntimeSessionID: activeRuntimeSessionID
+    ) else {
+        return false
+    }
+    guard !hasPendingPermissionRequest else { return false }
+    guard !hasVisibleStreamingAssistantMessage else { return false }
+
+    switch hudPhase {
+    case .thinking, .acting, .streaming:
+        return true
+    default:
+        return false
+    }
+}
+
+func assistantSelectedSessionToolActivity(
+    selectedSessionID: String?,
+    activeRuntimeSessionID: String?,
+    hasActiveTurn: Bool,
+    toolCalls: [AssistantToolCallState],
+    recentToolCalls: [AssistantToolCallState]
+) -> AssistantSessionToolActivitySnapshot {
+    guard assistantSessionOwnsLiveRuntimeState(
+        sessionID: selectedSessionID,
+        activeRuntimeSessionID: activeRuntimeSessionID
+    ) else {
+        return .empty
+    }
+
+    guard hasActiveTurn else {
+        let archivedActiveCalls = toolCalls.map { call -> AssistantToolCallState in
+            var archived = call
+            let normalizedStatus = archived.status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if ["inprogress", "running", "working", "active", "started", "pending"].contains(normalizedStatus) {
+                archived.status = "completed"
+            }
+            return archived
+        }
+
+        return AssistantSessionToolActivitySnapshot(
+            activeCalls: [],
+            recentCalls: archivedActiveCalls + recentToolCalls
+        )
+    }
+
+    return AssistantSessionToolActivitySnapshot(
+        activeCalls: toolCalls,
+        recentCalls: recentToolCalls
+    )
+}
+
+func assistantSidebarActivityState(
+    forSessionID sessionID: String,
+    selectedSessionID: String?,
+    activeRuntimeSessionID: String?,
+    sessionStatus: AssistantSessionStatus,
+    hasPendingPermissionRequest: Bool,
+    hudPhase: AssistantHUDPhase,
+    isTransitioningSession: Bool,
+    isLiveVoiceSessionActive: Bool,
+    hasActiveTurn: Bool
+) -> AssistantSessionRow.ActivityState {
+    let isSelectedSession = assistantTimelineSessionIDsMatch(selectedSessionID, sessionID)
+    let ownsLiveRuntimeState = assistantSessionOwnsLiveRuntimeState(
+        sessionID: sessionID,
+        activeRuntimeSessionID: activeRuntimeSessionID
+    )
+
+    if ownsLiveRuntimeState {
+        if hasPendingPermissionRequest || hudPhase == .waitingForPermission {
+            return .waiting
+        }
+        if isTransitioningSession || hudPhase.isActive || isLiveVoiceSessionActive {
+            return .running
+        }
+        if hudPhase == .failed {
+            return .failed
+        }
+    }
+
+    if isSelectedSession {
+        switch sessionStatus {
+        case .active:
+            // Fresh sessions can stay marked active for a moment after the turn ends.
+            // Keep the selected thread calm unless it is the one that actually owns
+            // the current runtime work.
+            return ownsLiveRuntimeState && hasActiveTurn ? .running : .idle
+        case .waitingForApproval, .waitingForInput:
+            return .waiting
+        case .failed:
+            return .failed
+        case .unknown, .idle, .completed:
+            return .idle
+        }
+    }
+
+    switch sessionStatus {
+    case .active:
+        return .running
+    case .waitingForApproval, .waitingForInput:
+        return .waiting
+    case .failed:
+        return .failed
+    case .unknown, .idle, .completed:
+        return .idle
+    }
 }

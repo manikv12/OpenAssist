@@ -72,11 +72,11 @@ struct PromptRewriteLoadingView: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Refining Transcript")
                         .font(.system(size: 13.5, weight: .bold))
-                        .foregroundStyle(Color.white.opacity(0.95))
+                        .foregroundStyle(AppVisualTheme.foreground(0.95))
                     PromptRewriteWordFlowText(
                         text: stepText,
                         font: .system(size: 11, weight: .medium),
-                        foregroundColor: Color.white.opacity(0.70),
+                        foregroundColor: AppVisualTheme.foreground(0.70),
                         wordsPerSecond: 4,
                         lineLimit: 1
                     )
@@ -87,14 +87,14 @@ struct PromptRewriteLoadingView: View {
                 Button(action: onPause) {
                     Image(systemName: "pause.fill")
                         .font(.system(size: 9, weight: .bold))
-                        .foregroundStyle(Color.white.opacity(0.96))
+                        .foregroundStyle(AppVisualTheme.foreground(0.96))
                         .frame(width: 18, height: 18)
                         .background(
                             Circle()
-                                .fill(Color.white.opacity(0.16))
+                                .fill(AppVisualTheme.foreground(0.16))
                                 .overlay(
                                     Circle()
-                                        .stroke(Color.white.opacity(0.28), lineWidth: 0.8)
+                                        .stroke(AppVisualTheme.foreground(0.28), lineWidth: 0.8)
                                 )
                         )
                 }
@@ -108,7 +108,7 @@ struct PromptRewriteLoadingView: View {
 
                 Text("\(Int((animatedProgressValue * 100).rounded()))%")
                     .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                    .foregroundStyle(Color.white.opacity(0.70))
+                    .foregroundStyle(AppVisualTheme.foreground(0.70))
                     .frame(width: 38, alignment: .trailing)
             }
             .padding(.top, -1)
@@ -116,7 +116,7 @@ struct PromptRewriteLoadingView: View {
             VStack(alignment: .leading, spacing: 4) {
                 Text(previewBlockTitle)
                     .font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(Color.white.opacity(0.56))
+                    .foregroundStyle(AppVisualTheme.foreground(0.56))
 
                 HStack(alignment: .top, spacing: 8) {
                     PromptRewriteAccentDot()
@@ -125,7 +125,7 @@ struct PromptRewriteLoadingView: View {
                     PromptRewriteWordFlowText(
                         text: previewBlockText,
                         font: .system(size: 11.5, weight: .medium),
-                        foregroundColor: Color.white.opacity(0.90),
+                        foregroundColor: AppVisualTheme.foreground(0.90),
                         wordsPerSecond: 4,
                         lineLimit: 2
                     )
@@ -149,7 +149,7 @@ struct PromptRewriteLoadingView: View {
             ZStack {
                 PromptRewriteGlassSurface(cornerRadius: 20)
                 RoundedRectangle(cornerRadius: 20, style: .continuous)
-                    .fill(Color.black.opacity(reduceTransparency ? 0.30 : 0.18))
+                    .fill(AppVisualTheme.surfaceFill(reduceTransparency ? 0.30 : 0.18))
                 LinearGradient(
                     colors: [
                         AppVisualTheme.accentTint.opacity(0.14),
@@ -177,7 +177,7 @@ struct PromptRewriteLoadingView: View {
                 .stroke(tokens.strokeTop.opacity(0.42), lineWidth: 1)
                 .overlay(
                     RoundedRectangle(cornerRadius: 20, style: .continuous)
-                        .stroke(Color.black.opacity(0.30), lineWidth: 0.6)
+                        .stroke(AppVisualTheme.surfaceStroke(0.30), lineWidth: 0.6)
                         .blur(radius: 0.3)
                 )
         }
@@ -223,7 +223,7 @@ struct PromptRewriteActivityBar: View {
             let clampedProgress = min(1, max(0.08, CGFloat(progress)))
             let fillWidth = max(14, width * clampedProgress)
             Capsule(style: .continuous)
-                .fill(Color.white.opacity(0.14))
+                .fill(AppVisualTheme.foreground(0.14))
                 .overlay(alignment: .leading) {
                     Capsule(style: .continuous)
                         .fill(
@@ -231,7 +231,7 @@ struct PromptRewriteActivityBar: View {
                                 colors: [
                                     AppVisualTheme.accentTint.opacity(0.45),
                                     AppVisualTheme.accentTint.opacity(0.92),
-                                    Color.white.opacity(0.85)
+                                    AppVisualTheme.foreground(0.85)
                                 ],
                                 startPoint: .leading,
                                 endPoint: .trailing
@@ -243,9 +243,9 @@ struct PromptRewriteActivityBar: View {
                                 .fill(
                                     LinearGradient(
                                         colors: [
-                                            Color.white.opacity(0.04),
-                                            Color.white.opacity(0.33),
-                                            Color.white.opacity(0.04)
+                                            AppVisualTheme.foreground(0.04),
+                                            AppVisualTheme.foreground(0.33),
+                                            AppVisualTheme.foreground(0.04)
                                         ],
                                         startPoint: .leading,
                                         endPoint: .trailing
@@ -257,7 +257,7 @@ struct PromptRewriteActivityBar: View {
                         .clipShape(Capsule(style: .continuous))
                         .overlay(alignment: .trailing) {
                             Circle()
-                                .fill(Color.white.opacity(0.94))
+                                .fill(AppVisualTheme.foreground(0.94))
                                 .frame(width: 5, height: 5)
                                 .padding(.trailing, 2)
                         }
@@ -281,7 +281,7 @@ struct PromptRewriteAccentDot: View {
             .frame(width: 8, height: 8)
             .overlay(
                 Circle()
-                    .stroke(Color.white.opacity(0.36), lineWidth: 0.7)
+                    .stroke(AppVisualTheme.foreground(0.36), lineWidth: 0.7)
             )
     }
 }
@@ -330,7 +330,7 @@ struct PromptRewriteStageChip: View {
             if isActive {
                 return AppVisualTheme.accentTint
             }
-            return Color.white
+            return AppVisualTheme.primaryText
         }()
         HStack(spacing: 6) {
             Image(systemName: isCompleted ? "checkmark.circle.fill" : (isActive ? "record.circle.fill" : "circle"))
@@ -360,17 +360,17 @@ struct PromptRewriteNowNextCard: View {
             Label {
                 Text(title)
                     .font(.caption2.weight(.bold))
-                    .foregroundStyle(Color.white.opacity(0.76))
+                    .foregroundStyle(AppVisualTheme.foreground(0.76))
             } icon: {
                 Image(systemName: icon)
                     .font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(Color.white.opacity(0.78))
+                    .foregroundStyle(AppVisualTheme.foreground(0.78))
             }
 
             PromptRewriteWordFlowText(
                 text: text,
                 font: .system(size: 12.5, weight: .semibold),
-                foregroundColor: Color.white.opacity(0.96),
+                foregroundColor: AppVisualTheme.foreground(0.96),
                 wordsPerSecond: wordsPerSecond,
                 lineLimit: 2
             )
@@ -380,10 +380,10 @@ struct PromptRewriteNowNextCard: View {
         .padding(.vertical, 8)
         .background(
             RoundedRectangle(cornerRadius: 11, style: .continuous)
-                .fill(Color.white.opacity(0.08))
+                .fill(AppVisualTheme.foreground(0.08))
                 .overlay(
                     RoundedRectangle(cornerRadius: 11, style: .continuous)
-                        .stroke(Color.white.opacity(0.18), lineWidth: 0.7)
+                        .stroke(AppVisualTheme.foreground(0.18), lineWidth: 0.7)
                 )
         )
     }
@@ -407,7 +407,7 @@ struct PromptRewriteLoadingBlock: View {
             Label {
                 Text(title)
                     .font(.caption2.weight(.bold))
-                    .foregroundStyle(Color.white.opacity(0.78))
+                    .foregroundStyle(AppVisualTheme.foreground(0.78))
             } icon: {
                 Image(systemName: iconName)
                     .font(.system(size: 10.5, weight: .semibold))
@@ -417,7 +417,7 @@ struct PromptRewriteLoadingBlock: View {
             PromptRewriteWordFlowText(
                 text: text,
                 font: .system(size: 12.5, weight: .semibold),
-                foregroundColor: Color.white.opacity(0.96),
+                foregroundColor: AppVisualTheme.foreground(0.96),
                 wordsPerSecond: wordsPerSecond,
                 lineLimit: lineLimit
             )
@@ -443,17 +443,17 @@ struct PromptRewriteLoadingStatePill: View {
     var body: some View {
         HStack(spacing: 5) {
             Circle()
-                .fill(isActive ? AppVisualTheme.accentTint : Color.white.opacity(0.52))
+                .fill(isActive ? AppVisualTheme.accentTint : AppVisualTheme.foreground(0.52))
                 .frame(width: 6, height: 6)
             Text(title)
                 .font(.system(size: 10.5, weight: .bold))
         }
-        .foregroundStyle(Color.white.opacity(isActive ? 0.94 : 0.72))
+        .foregroundStyle(AppVisualTheme.foreground(isActive ? 0.94 : 0.72))
         .padding(.horizontal, 9)
         .padding(.vertical, 6)
         .background(
             Capsule(style: .continuous)
-                .fill((isActive ? AppVisualTheme.accentTint : Color.white).opacity(isActive ? 0.30 : 0.14))
+                .fill((isActive ? AppVisualTheme.accentTint : AppVisualTheme.primaryText).opacity(isActive ? 0.30 : 0.14))
         )
     }
 }
@@ -591,11 +591,11 @@ struct PromptRewriteHUDView: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("AI suggestion")
                         .font(.system(size: 12, weight: .semibold))
-                        .foregroundStyle(Color.white.opacity(0.95))
+                        .foregroundStyle(AppVisualTheme.foreground(0.95))
                     if pages.count > 1 {
                         Text("\(safeSelectedIndex + 1)/\(pages.count) queued")
                             .font(.caption2.weight(.medium))
-                            .foregroundStyle(Color.white.opacity(0.68))
+                            .foregroundStyle(AppVisualTheme.foreground(0.68))
                     }
                 }
             }
@@ -618,7 +618,7 @@ struct PromptRewriteHUDView: View {
                 ScrollView(.vertical, showsIndicators: false) {
                     Text(page.suggestion.suggestedText)
                         .font(.system(size: 13, weight: .medium))
-                        .foregroundStyle(Color.white.opacity(0.90))
+                        .foregroundStyle(AppVisualTheme.foreground(0.90))
                         .multilineTextAlignment(.leading)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .textSelection(.enabled)
@@ -628,7 +628,7 @@ struct PromptRewriteHUDView: View {
                 HStack {
                     Text("Enter inserts • Esc keeps original")
                         .font(.caption2.weight(.medium))
-                        .foregroundStyle(Color.white.opacity(0.66))
+                        .foregroundStyle(AppVisualTheme.foreground(0.66))
 
                     Spacer()
 
@@ -648,13 +648,13 @@ struct PromptRewriteHUDView: View {
                             .stroke(tokens.strokeTop.opacity(0.26), lineWidth: 0.6)
                     )
                     .controlSize(.small)
-                        .foregroundStyle(Color.white.opacity(0.95))
+                        .foregroundStyle(AppVisualTheme.foreground(0.95))
                 }
 
                 if let duration = page.suggestion.refinementDurationSeconds {
                     Text("Refined in \(formattedDuration(duration))")
                         .font(.caption2.weight(.medium))
-                        .foregroundStyle(Color.white.opacity(0.58))
+                        .foregroundStyle(AppVisualTheme.foreground(0.58))
                 }
             }
         }
@@ -802,8 +802,8 @@ struct PromptRewriteGlassSurface: View {
             )
             LinearGradient(
                 colors: [
-                    Color.black.opacity(tokens.useMaterial ? 0.12 : 0.16),
-                    Color.black.opacity(tokens.useMaterial ? 0.22 : 0.28)
+                    AppVisualTheme.surfaceFill(tokens.useMaterial ? 0.12 : 0.16),
+                    AppVisualTheme.surfaceFill(tokens.useMaterial ? 0.22 : 0.28)
                 ],
                 startPoint: .top,
                 endPoint: .bottom

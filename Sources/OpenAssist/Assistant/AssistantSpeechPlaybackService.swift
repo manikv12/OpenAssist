@@ -282,6 +282,8 @@ final class MacOSAssistantSpeechProvider: NSObject, AssistantSpeechProvider {
         if let voiceIdentifier = settings.assistantTTSFallbackVoiceIdentifier.nonEmpty,
            let voice = AVSpeechSynthesisVoice(identifier: voiceIdentifier) {
             utterance.voice = voice
+        } else if let bestVoice = MacOSAssistantSpeechProvider.bestAvailableVoice() {
+            utterance.voice = bestVoice
         }
 
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
@@ -303,13 +305,18 @@ final class MacOSAssistantSpeechProvider: NSObject, AssistantSpeechProvider {
     func prewarmIfNeeded() async {}
 
     func healthStatus() async -> AssistantSpeechHealth {
+        let bestVoice = MacOSAssistantSpeechProvider.bestAvailableVoice()
         let voiceName: String
         if let voiceIdentifier = settings.assistantTTSFallbackVoiceIdentifier.nonEmpty,
            let voice = AVSpeechSynthesisVoice(identifier: voiceIdentifier) {
             voiceName = voice.name
+        } else if let bestVoice {
+            voiceName = "\(bestVoice.name) (auto-selected)"
         } else {
             voiceName = "System Default"
         }
+
+        let installRecommended = bestVoice == nil
 
         return AssistantSpeechHealth(
             engine: .macos,
@@ -318,7 +325,7 @@ final class MacOSAssistantSpeechProvider: NSObject, AssistantSpeechProvider {
             checkedAt: Date(),
             model: nil,
             usesFallback: false,
-            installRecommended: false
+            installRecommended: installRecommended
         )
     }
 
@@ -336,6 +343,32 @@ final class MacOSAssistantSpeechProvider: NSObject, AssistantSpeechProvider {
             .sorted {
                 $0.displayLabel.localizedCaseInsensitiveCompare($1.displayLabel) == .orderedAscending
             }
+    }
+
+    /// Returns the highest-quality available voice, preferring the user's current locale.
+    /// Priority: premium locale match → premium any → enhanced locale match → enhanced any.
+    static func bestAvailableVoice() -> AVSpeechSynthesisVoice? {
+        let voices = AVSpeechSynthesisVoice.speechVoices()
+        let currentLanguage = Locale.current.language.languageCode?.identifier ?? "en"
+
+        let tiers: [(quality: AVSpeechSynthesisVoiceQuality, preferLocale: Bool)] = [
+            (.premium, true),
+            (.premium, false),
+            (.enhanced, true),
+            (.enhanced, false),
+        ]
+
+        for tier in tiers {
+            let candidates = voices.filter { voice in
+                voice.quality == tier.quality &&
+                (!tier.preferLocale || voice.language.hasPrefix(currentLanguage))
+            }
+            if let pick = candidates.first {
+                return pick
+            }
+        }
+
+        return nil
     }
 
     fileprivate func handleSpeechDidFinish() {

@@ -54,59 +54,120 @@ actor MemoryEntryExplanationService {
             }
         }
 
-        let request: URLRequest
         do {
-            request = try buildRequest(
+            let request = try buildRequest(
                 configuration: configuration,
                 credential: credential,
                 entry: entry
             )
-        } catch {
-            return .failure("Could not build explanation request. Check provider base URL.")
-        }
-
-        let isStreamingCodex = configuration.providerMode == .openAI && isOAuth(credential)
-
-        let streamingResponse: StreamingTextHTTPResponse
-        do {
-            streamingResponse = try await StreamingTextResponseReader.collect(
-                using: session,
-                request: request,
-                expectsEventStream: isStreamingCodex,
+            return try await executeRequest(
+                request,
+                configuration: configuration,
+                credential: credential,
+                emptyResultMessage: "Provider returned an empty explanation.",
                 onPartialText: onPartialText
             )
         } catch {
+            return .failure("Could not build explanation request. Check provider base URL.")
+        }
+    }
+
+    func explainSelectedText(
+        _ selectedText: String,
+        parentMessageText: String,
+        question: String? = nil,
+        onPartialText: (@Sendable (String) -> Void)? = nil
+    ) async -> MemoryEntryExplanationResult {
+        let normalizedSelection = selectedText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedSelection.isEmpty else {
+            return .failure("Select some text first.")
+        }
+        let normalizedParentMessage = parentMessageText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedParentMessage.isEmpty else {
+            return .failure("Could not find the full message for this selection.")
+        }
+
+        guard let configuration = liveConfiguration() else {
+            return .failure("Connect a provider first to explain selected text with AI.")
+        }
+
+        let credential: ProviderCredential
+        do {
+            credential = try await resolveCredential(for: configuration)
+        } catch {
             let detail = error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
             if detail.isEmpty {
-                return .failure("Provider request failed.")
+                return .failure("Could not refresh provider authentication.")
             }
-            return .failure("Provider request failed: \(detail)")
+            return .failure("Could not refresh provider authentication: \(detail)")
         }
 
-        let data = streamingResponse.data
-        let response = streamingResponse.response
-
-        guard let http = response as? HTTPURLResponse else {
-            return .failure("Provider returned an invalid response.")
-        }
-        guard (200...299).contains(http.statusCode) else {
-            let detail = providerErrorDetail(from: data) ?? "HTTP \(http.statusCode)"
-            return .failure("Provider request failed (\(http.statusCode)): \(detail)")
+        if configuration.providerMode.requiresAPIKey {
+            if case .none = credential {
+                return .failure("No provider credentials available. Connect OAuth or add an API key.")
+            }
         }
 
-        let content: String
-        if isStreamingCodex {
-            content = decodeSSEContent(data: data)
-        } else if configuration.providerMode == .anthropic {
-            content = decodeAnthropicContent(data: data)
+        let normalizedQuestion = question?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nonEmpty
+        let systemPrompt: String
+        let userPrompt: String
+
+        if let normalizedQuestion {
+            systemPrompt = """
+            You answer questions about selected text in simple terms for a non-technical user.
+            Output plain text only.
+            Use short paragraphs and easy words.
+            Stay faithful to the selected text.
+            If the answer is not clearly supported by the text, say that plainly.
+            """
+            userPrompt = """
+            Selected text:
+            \(snippet(normalizedSelection, limit: 12_000))
+
+            Full message context:
+            \(snippet(normalizedParentMessage, limit: 18_000))
+
+            Question:
+            \(normalizedQuestion)
+            """
         } else {
-            content = decodeOpenAICompatibleContent(data: data)
+            systemPrompt = """
+            You explain selected text in simple terms for a non-technical user.
+            Output plain text only.
+            Use short paragraphs and easy words.
+            Stay faithful to the selected text.
+            If the text uses jargon, explain it with simpler wording.
+            """
+            userPrompt = """
+            Explain this selected text in simple terms.
+
+            Selected text:
+            \(snippet(normalizedSelection, limit: 12_000))
+
+            Full message context:
+            \(snippet(normalizedParentMessage, limit: 18_000))
+            """
         }
-        let normalized = content.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !normalized.isEmpty else {
-            return .failure("Provider returned an empty explanation.")
+
+        do {
+            let request = try buildRequest(
+                configuration: configuration,
+                credential: credential,
+                systemPrompt: systemPrompt,
+                userPrompt: userPrompt
+            )
+            return try await executeRequest(
+                request,
+                configuration: configuration,
+                credential: credential,
+                emptyResultMessage: "Provider returned an empty answer.",
+                onPartialText: onPartialText
+            )
+        } catch {
+            return .failure("Could not build explanation request. Check provider base URL.")
         }
-        return .success(normalized)
     }
 
     private func buildRequest(
@@ -139,6 +200,27 @@ actor MemoryEntryExplanationService {
         - is_plan_content: \(entry.isPlanContent ? "true" : "false")
         """
 
+        return try buildRequest(
+            configuration: configuration,
+            credential: credential,
+            systemPrompt: """
+            \(systemPrompt)
+            Memory summary instruction:
+            \(memoryInstructionSummary)
+            """,
+            userPrompt: userPrompt
+        )
+    }
+
+    private func buildRequest(
+        configuration: LiveConfiguration,
+        credential: ProviderCredential,
+        systemPrompt: String,
+        userPrompt: String
+    ) throws -> URLRequest {
+        let trimmedSystemPrompt = systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedUserPrompt = userPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+
         let endpoint: URL?
         let payload: [String: Any]
         switch configuration.providerMode {
@@ -148,22 +230,18 @@ actor MemoryEntryExplanationService {
                 "model": configuration.model,
                 "store": false,
                 "stream": true,
-                "instructions": """
-                \(systemPrompt)
-                Memory summary instruction:
-                \(memoryInstructionSummary)
-                """,
+                "instructions": trimmedSystemPrompt,
                 "input": [
                     [
                         "role": "system",
                         "content": [
-                            ["type": "input_text", "text": systemPrompt]
+                            ["type": "input_text", "text": trimmedSystemPrompt]
                         ]
                     ],
                     [
                         "role": "user",
                         "content": [
-                            ["type": "input_text", "text": userPrompt]
+                            ["type": "input_text", "text": trimmedUserPrompt]
                         ]
                     ]
                 ]
@@ -172,12 +250,12 @@ actor MemoryEntryExplanationService {
             endpoint = anthropicMessagesEndpoint(from: configuration.baseURL)
             payload = [
                 "model": configuration.model,
-                "system": systemPrompt,
+                "system": trimmedSystemPrompt,
                 "messages": [
-                    ["role": "user", "content": userPrompt]
+                    ["role": "user", "content": trimmedUserPrompt]
                 ],
                 "temperature": 0.2,
-                "max_tokens": 420
+                "max_tokens": 520
             ]
         case .openAI, .google, .openRouter, .groq, .ollama:
             endpoint = openAICompatibleEndpoint(from: configuration.baseURL)
@@ -185,8 +263,8 @@ actor MemoryEntryExplanationService {
                 "model": configuration.model,
                 "temperature": 0.2,
                 "messages": [
-                    ["role": "system", "content": systemPrompt],
-                    ["role": "user", "content": userPrompt]
+                    ["role": "system", "content": trimmedSystemPrompt],
+                    ["role": "user", "content": trimmedUserPrompt]
                 ]
             ]
         }
@@ -242,6 +320,58 @@ actor MemoryEntryExplanationService {
         }
 
         return request
+    }
+
+    private func executeRequest(
+        _ request: URLRequest,
+        configuration: LiveConfiguration,
+        credential: ProviderCredential,
+        emptyResultMessage: String,
+        onPartialText: (@Sendable (String) -> Void)? = nil
+    ) async throws -> MemoryEntryExplanationResult {
+        let isStreamingCodex = configuration.providerMode == .openAI && isOAuth(credential)
+
+        let streamingResponse: StreamingTextHTTPResponse
+        do {
+            streamingResponse = try await StreamingTextResponseReader.collect(
+                using: session,
+                request: request,
+                expectsEventStream: isStreamingCodex,
+                onPartialText: onPartialText
+            )
+        } catch {
+            let detail = error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
+            if detail.isEmpty {
+                return .failure("Provider request failed.")
+            }
+            return .failure("Provider request failed: \(detail)")
+        }
+
+        let data = streamingResponse.data
+        let response = streamingResponse.response
+
+        guard let http = response as? HTTPURLResponse else {
+            return .failure("Provider returned an invalid response.")
+        }
+        guard (200...299).contains(http.statusCode) else {
+            let detail = providerErrorDetail(from: data) ?? "HTTP \(http.statusCode)"
+            return .failure("Provider request failed (\(http.statusCode)): \(detail)")
+        }
+
+        let content: String
+        if isStreamingCodex {
+            content = decodeSSEContent(data: data)
+        } else if configuration.providerMode == .anthropic {
+            content = decodeAnthropicContent(data: data)
+        } else {
+            content = decodeOpenAICompatibleContent(data: data)
+        }
+
+        let normalized = content.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else {
+            return .failure(emptyResultMessage)
+        }
+        return .success(normalized)
     }
 
     private func summarizeMemoryInstruction(for entry: MemoryIndexedEntry) -> String {

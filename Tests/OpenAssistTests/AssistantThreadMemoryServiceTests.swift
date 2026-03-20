@@ -95,6 +95,31 @@ final class AssistantThreadMemoryServiceTests: XCTestCase {
         XCTAssertEqual(change.document.activeFacts, ["File changed by hand"])
     }
 
+    func testCheckpointsCanRestoreAndPrunePerTurnMemory() throws {
+        let service = AssistantThreadMemoryService(baseDirectoryURL: try makeTemporaryDirectory())
+        let threadID = "thread-checkpoints"
+
+        var firstDocument = AssistantThreadMemoryDocument.empty
+        firstDocument.currentTask = "First task"
+        firstDocument.activeFacts = ["Keep the first fact"]
+        _ = try service.saveDocument(firstDocument, for: threadID)
+        _ = try service.captureCheckpoint(for: threadID, anchorID: "turn-a")
+
+        var secondDocument = AssistantThreadMemoryDocument.empty
+        secondDocument.currentTask = "Second task"
+        secondDocument.activeFacts = ["Keep the second fact"]
+        _ = try service.saveDocument(secondDocument, for: threadID)
+        _ = try service.captureCheckpoint(for: threadID, anchorID: "turn-b")
+
+        let restored = try service.restoreCheckpoint(for: threadID, anchorID: "turn-a")
+        XCTAssertEqual(restored.document.currentTask, "First task")
+        XCTAssertEqual(restored.document.activeFacts, ["Keep the first fact"])
+
+        try service.deleteCheckpoints(for: threadID, retaining: Set(["turn-b"]))
+        XCTAssertFalse(service.hasCheckpoint(for: threadID, anchorID: "turn-a"))
+        XCTAssertTrue(service.hasCheckpoint(for: threadID, anchorID: "turn-b"))
+    }
+
     private func makeTemporaryDirectory() throws -> URL {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("AssistantThreadMemoryTests-\(UUID().uuidString)", isDirectory: true)

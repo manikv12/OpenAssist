@@ -202,13 +202,6 @@ final class AssistantModePolicyTests: XCTestCase {
             AssistantModePolicy.isAllowed(
                 mode: .plan,
                 activityKind: .dynamicToolCall,
-                toolName: "computer_use"
-            )
-        )
-        XCTAssertTrue(
-            AssistantModePolicy.isAllowed(
-                mode: .plan,
-                activityKind: .dynamicToolCall,
                 toolName: "browser_use"
             )
         )
@@ -241,13 +234,6 @@ final class AssistantModePolicyTests: XCTestCase {
             AssistantModePolicy.isAllowed(
                 mode: .conversational,
                 activityKind: .mcpToolCall
-            )
-        )
-        XCTAssertFalse(
-            AssistantModePolicy.isAllowed(
-                mode: .conversational,
-                activityKind: .dynamicToolCall,
-                toolName: "computer_use"
             )
         )
         XCTAssertFalse(

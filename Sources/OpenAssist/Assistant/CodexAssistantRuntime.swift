@@ -104,10 +104,17 @@ struct AssistantRepeatedCommandTracker: Sendable {
     }
 }
 
+enum AssistantTurnCompletionStatus: Equatable {
+    case completed
+    case interrupted
+    case failed(message: String)
+}
+
 @MainActor
 final class CodexAssistantRuntime {
     var onHealthUpdate: (@Sendable (AssistantRuntimeHealth) -> Void)?
     var onTranscript: (@Sendable (AssistantTranscriptEntry) -> Void)?
+    var onTranscriptMutation: (@Sendable (AssistantTranscriptMutation) -> Void)?
     var onTimelineMutation: (@Sendable (AssistantTimelineMutation) -> Void)?
     var onHUDUpdate: (@Sendable (AssistantHUDState) -> Void)?
     var onPlanUpdate: (@Sendable ([AssistantPlanEntry]) -> Void)?
@@ -122,6 +129,7 @@ final class CodexAssistantRuntime {
     var onSubagentUpdate: (@Sendable ([SubagentState]) -> Void)?
     var onProposedPlan: (@Sendable (String?) -> Void)?
     var onModeRestriction: (@Sendable (AssistantModeRestrictionEvent) -> Void)?
+    var onTurnCompletion: (@Sendable (AssistantTurnCompletionStatus) -> Void)?
     /// Fired after the first successful turn of a new session with (sessionID, userPrompt, assistantResponse).
     var onTitleRequest: (@Sendable (_ sessionID: String, _ userPrompt: String, _ assistantResponse: String) -> Void)?
 
@@ -132,6 +140,7 @@ final class CodexAssistantRuntime {
     private var preferredModelID: String?
     private var currentCodexPath: String?
     private var currentAccountSnapshot: AssistantAccountSnapshot = .signedOut
+    private var currentRateLimits: AccountRateLimits = .empty
     private var currentModels: [AssistantModelOption] = []
     private var toolCalls: [String: AssistantToolCallState] = [:]
     private var liveActivities: [String: AssistantActivityItem] = [:]
@@ -154,11 +163,13 @@ final class CodexAssistantRuntime {
     // Streaming buffer: accumulates agentMessage deltas into a single growing entry
     private var streamingEntryID: UUID?
     private var streamingBuffer: String = ""
+    private var pendingStreamingDeltaBuffer: String = ""
     private var streamingTimelineID: String?
     private var streamingStartedAt: Date?
     private var commentaryTimelineID: String?
     private var commentaryStartedAt: Date?
     private var commentaryBuffer: String = ""
+    private var pendingCommentaryDeltaBuffer: String = ""
     private var planTimelineID: String?
     private var planStartedAt: Date?
 
@@ -179,7 +190,6 @@ final class CodexAssistantRuntime {
 
     // Subagent tracking
     private var activeSubagents: [String: SubagentState] = [:]
-    private let computerUseService: AssistantComputerUseService
     private let browserUseService: AssistantBrowserUseService
     private let appActionService: AssistantAppActionService
     private var approvedDynamicToolKindsBySessionID: [String: Set<String>] = [:]
@@ -194,29 +204,29 @@ final class CodexAssistantRuntime {
 
     init(
         preferredModelID: String? = nil,
-        computerUseService: AssistantComputerUseService = AssistantComputerUseService(),
         browserUseService: AssistantBrowserUseService? = nil,
         appActionService: AssistantAppActionService? = nil
     ) {
         self.preferredModelID = preferredModelID?.nonEmpty
-        self.computerUseService = computerUseService
         self.browserUseService = browserUseService ?? AssistantBrowserUseService(
-            settings: .shared,
-            computerUseService: computerUseService
+            settings: .shared
         )
-        self.appActionService = appActionService ?? AssistantAppActionService(
-            settings: .shared,
-            computerUseService: computerUseService
-        )
+        self.appActionService = appActionService ?? AssistantAppActionService()
     }
 
     func setPreferredModelID(_ modelID: String?) {
+        let changed = preferredModelID != modelID?.nonEmpty
         preferredModelID = modelID?.nonEmpty
         let health = makeHealth(
             availability: activeTurnID == nil ? .ready : .active,
             summary: currentAccountSnapshot.isLoggedIn ? "Codex is connected" : "Sign in with ChatGPT to use Codex"
         )
         onHealthUpdate?(health)
+
+        // Refresh rate limits for the new model (Spark has different limits)
+        if changed, currentAccountSnapshot.isLoggedIn {
+            Task { await refreshRateLimits() }
+        }
     }
 
     func refreshEnvironment(codexPath: String?) async throws -> AssistantEnvironmentDetails {
@@ -272,7 +282,9 @@ final class CodexAssistantRuntime {
         loginRefreshTask?.cancel()
         loginRefreshTask = nil
         currentAccountSnapshot = .signedOut
+        currentRateLimits = .empty
         onAccountUpdate?(currentAccountSnapshot)
+        onRateLimitsUpdate?(currentRateLimits)
         onHealthUpdate?(makeHealth(availability: .loginRequired, summary: "Signed out of Codex"))
     }
 
@@ -330,6 +342,32 @@ final class CodexAssistantRuntime {
         onSessionChange?(sessionID)
         onTranscript?(AssistantTranscriptEntry(role: .system, text: "Loaded Codex thread \(sessionID).", emphasis: true))
         onHealthUpdate?(makeHealth(availability: .active, summary: "Connected"))
+        updateHUD(phase: .idle, title: "Thread ready", detail: nil)
+    }
+
+    func resumeSessionSilently(
+        _ sessionID: String,
+        cwd: String?,
+        preferredModelID: String? = nil
+    ) async throws {
+        try await ensureTransport()
+        _ = try await sendRequest(
+            method: "thread/resume",
+            params: await threadResumeParams(
+                threadID: sessionID,
+                cwd: cwd,
+                modelID: preferredModelID ?? self.preferredModelID
+            )
+        )
+
+        activeSessionID = sessionID
+        activeSessionCWD = cwd?.nonEmpty
+        sessionTurnCount = 1
+        onSessionChange?(sessionID)
+        onHealthUpdate?(makeHealth(
+            availability: activeTurnID == nil ? .ready : .active,
+            summary: "Connected"
+        ))
         updateHUD(phase: .idle, title: "Thread ready", detail: nil)
     }
 
@@ -437,6 +475,7 @@ final class CodexAssistantRuntime {
         self.activeTurnID = nil
         allowsProposedPlanForActiveTurn = false
         updateHUD(phase: .idle, title: "Cancelled", detail: nil)
+        onTurnCompletion?(.interrupted)
     }
 
     func respondToPermissionRequest(optionID: String) async {
@@ -467,6 +506,9 @@ final class CodexAssistantRuntime {
     /// This is available for cases where the UI intentionally wants the next prompt
     /// to start a fresh thread instead of continuing the current one.
     func detachSession() {
+        if activeTurnID != nil {
+            onTurnCompletion?(.interrupted)
+        }
         if let oldSessionID = activeSessionID {
             detachedSessionIDs.insert(oldSessionID)
         }
@@ -490,6 +532,9 @@ final class CodexAssistantRuntime {
         transportStartupTask = nil
         await pendingPermissionContext?.cancel()
         pendingPermissionContext = nil
+        if activeTurnID != nil {
+            onTurnCompletion?(.interrupted)
+        }
         activeTurnID = nil
         activeSessionID = nil
         toolCalls.removeAll()
@@ -577,8 +622,7 @@ final class CodexAssistantRuntime {
         do {
             let response = try await requestWithTimeout(method: "account/rateLimits/read", params: [:])
             guard let payload = response.raw as? [String: Any] else { return }
-            let rateLimits = payload["rateLimits"] as? [String: Any] ?? payload
-            handleRateLimitsUpdated(["rateLimits": rateLimits])
+            handleRateLimitsUpdated(payload)
         } catch {
             CrashReporter.logInfo("account/rateLimits/read not available: \(error.localizedDescription)")
         }
@@ -714,7 +758,12 @@ final class CodexAssistantRuntime {
             flushStreamingBuffer()
             flushCommentaryBuffer()
             finalizeActiveActivities(with: .interrupted)
+            if activeTurnID != nil {
+                onTurnCompletion?(.interrupted)
+            }
             activeTurnID = nil
+            activeSessionID = nil
+            activeSessionCWD = nil
             transport = nil
             transportStartupTask = nil
             CrashReporter.logWarning("Assistant runtime process exited message=\(message ?? "none")")
@@ -820,13 +869,10 @@ final class CodexAssistantRuntime {
                 if channel == "commentary" {
                     appendCommentaryDelta(delta)
                 } else {
-                    // Accumulate deltas into a single growing entry
-                    if streamingEntryID == nil {
-                        streamingEntryID = UUID()
-                    }
+                    ensureStreamingIdentifiers()
                     streamingBuffer += delta
-                    emitStreamingTranscriptUpdate()
-                    appendAssistantDelta()
+                    pendingStreamingDeltaBuffer += delta
+                    emitStreamingAssistantDelta(force: shouldForceStreamingDeltaFlush(for: delta))
                     updateHUD(phase: .streaming, title: "Responding", detail: nil)
                 }
             }
@@ -1058,19 +1104,8 @@ final class CodexAssistantRuntime {
     }
 
     private func handleRateLimitsUpdated(_ params: [String: Any]) {
-        guard let rateLimits = params["rateLimits"] as? [String: Any] else { return }
-        let planType = rateLimits["planType"] as? String
-        let primaryDict = rateLimits["primary"] as? [String: Any]
-        let secondaryDict = rateLimits["secondary"] as? [String: Any]
-        let creditsDict = rateLimits["credits"] as? [String: Any]
-
-        let limits = AccountRateLimits(
-            planType: planType,
-            primary: RateLimitWindow(from: primaryDict),
-            secondary: RateLimitWindow(from: secondaryDict),
-            hasCredits: creditsDict?["hasCredits"] as? Bool ?? true,
-            unlimited: creditsDict?["unlimited"] as? Bool ?? false
-        )
+        guard let limits = AccountRateLimits.fromPayload(params, preserving: currentRateLimits) else { return }
+        currentRateLimits = limits
         onRateLimitsUpdate?(limits)
     }
 
@@ -1596,7 +1631,7 @@ final class CodexAssistantRuntime {
             }
         } cancelHandler: { [weak self] in
             guard let self else { return }
-            let message = "Computer Use was canceled for this turn."
+            let message = "\(displayName) was canceled for this turn."
             do {
                 try await self.transport?.sendResponse(
                     id: id,
@@ -1639,7 +1674,7 @@ final class CodexAssistantRuntime {
         // Pre-flight permission check — catch missing permissions before hitting the service layer
         let verdict = await preflightPermissionCheck(toolName: toolName, arguments: arguments)
         if !verdict.satisfied {
-            let failedResult = AssistantComputerUseService.ToolExecutionResult(
+            let failedResult = AssistantToolExecutionResult(
                 contentItems: [.init(type: "inputText", text: verdict.message, imageURL: nil)],
                 success: false,
                 summary: verdict.message
@@ -1661,16 +1696,9 @@ final class CodexAssistantRuntime {
         }
 
         let workingDetail: String
-        let result: AssistantComputerUseService.ToolExecutionResult
+        let result: AssistantToolExecutionResult
 
         switch toolName {
-        case AssistantComputerUseToolDefinition.name:
-            workingDetail = "Working on the current screen"
-            updateHUD(phase: .acting, title: displayName, detail: workingDetail)
-            result = await computerUseService.run(
-                arguments: arguments,
-                preferredModelID: preferredModelID
-            )
         case AssistantBrowserUseToolDefinition.name:
             workingDetail = "Using the selected browser profile"
             updateHUD(phase: .acting, title: displayName, detail: workingDetail)
@@ -1688,7 +1716,7 @@ final class CodexAssistantRuntime {
         default:
             workingDetail = "Unsupported dynamic tool"
             updateHUD(phase: .failed, title: displayName, detail: workingDetail)
-            result = AssistantComputerUseService.ToolExecutionResult(
+            result = AssistantToolExecutionResult(
                 contentItems: [.init(type: "inputText", text: "Open Assist does not support the dynamic tool `\(toolName)` yet.", imageURL: nil)],
                 success: false,
                 summary: "Unsupported dynamic tool."
@@ -1774,24 +1802,29 @@ final class CodexAssistantRuntime {
 
     /// Finalize the streaming buffer: emit the final non-streaming entry and reset.
     private func flushStreamingBuffer() {
-        pendingStreamingTranscriptEmit?.cancel()
-        pendingStreamingTranscriptEmit = nil
-        pendingAssistantTimelineEmit?.cancel()
-        pendingAssistantTimelineEmit = nil
+        emitStreamingAssistantDelta(force: true)
 
         guard let entryID = streamingEntryID, !streamingBuffer.isEmpty else {
             streamingEntryID = nil
             streamingBuffer = ""
+            pendingStreamingDeltaBuffer = ""
             streamingTimelineID = nil
             streamingStartedAt = nil
             return
         }
-        onTranscript?(AssistantTranscriptEntry(
-            id: entryID,
-            role: .assistant,
-            text: streamingBuffer,
-            isStreaming: false
-        ))
+        onTranscriptMutation?(
+            .upsert(
+                AssistantTranscriptEntry(
+                    id: entryID,
+                    role: .assistant,
+                    text: streamingBuffer,
+                    createdAt: streamingStartedAt ?? Date(),
+                    emphasis: false,
+                    isStreaming: false
+                ),
+                sessionID: activeSessionID
+            )
+        )
         if let timelineID = streamingTimelineID {
             onTimelineMutation?(
                 .upsert(
@@ -1817,6 +1850,7 @@ final class CodexAssistantRuntime {
         }
         streamingEntryID = nil
         streamingBuffer = ""
+        pendingStreamingDeltaBuffer = ""
         streamingTimelineID = nil
         streamingStartedAt = nil
     }
@@ -1989,6 +2023,7 @@ final class CodexAssistantRuntime {
         switch status {
         case "completed":
             finalizeActiveActivities(with: .completed)
+            onTurnCompletion?(.completed)
             onTranscript?(AssistantTranscriptEntry(role: .status, text: "Codex finished this turn."))
             updateHUD(phase: .success, title: "Finished", detail: responsePreview)
             onHealthUpdate?(makeHealth(availability: .ready, summary: "Codex is connected"))
@@ -2004,6 +2039,7 @@ final class CodexAssistantRuntime {
             sessionTurnCount += 1
         case "interrupted":
             finalizeActiveActivities(with: .interrupted)
+            onTurnCompletion?(.interrupted)
             if blockedToolUseInterruptionMessage == nil {
                 onTranscript?(AssistantTranscriptEntry(role: .status, text: "This turn was interrupted."))
                 emitTimelineSystemMessage("This turn was interrupted.")
@@ -2015,6 +2051,7 @@ final class CodexAssistantRuntime {
         case "failed":
             finalizeActiveActivities(with: .failed)
             let errorText = extractString((turn["error"] as? [String: Any])?["message"]) ?? "Codex could not finish this turn."
+            onTurnCompletion?(.failed(message: errorText))
             onTranscript?(AssistantTranscriptEntry(role: .error, text: errorText, emphasis: true))
             emitTimelineSystemMessage(errorText, emphasis: true)
             updateHUD(phase: .failed, title: "Needs attention", detail: errorText)
@@ -2050,91 +2087,101 @@ final class CodexAssistantRuntime {
     }
 
     private func appendAssistantDelta() {
+        emitStreamingAssistantDelta()
+    }
+
+    private func emitStreamingTranscriptUpdate(force: Bool = false) {
+        emitStreamingAssistantDelta(force: force)
+    }
+
+    private func shouldForceStreamingDeltaFlush(for delta: String) -> Bool {
+        delta.contains("\n\n") || delta.contains("\r\n\r\n") || delta.contains("\n")
+    }
+
+    private func ensureStreamingIdentifiers() {
+        if streamingEntryID == nil {
+            streamingEntryID = UUID()
+        }
         if streamingTimelineID == nil {
             streamingTimelineID = "assistant-final-\(UUID().uuidString)"
+        }
+        if streamingStartedAt == nil {
             streamingStartedAt = Date()
         }
+    }
 
-        let minimumInterval: CFAbsoluteTime = 0.05
+    private func emitStreamingAssistantDelta(force: Bool = false) {
+        guard streamingEntryID != nil,
+              streamingTimelineID != nil,
+              pendingStreamingDeltaBuffer.nonEmpty != nil else {
+            if force {
+                pendingStreamingTranscriptEmit?.cancel()
+                pendingStreamingTranscriptEmit = nil
+                pendingAssistantTimelineEmit?.cancel()
+                pendingAssistantTimelineEmit = nil
+            }
+            return
+        }
+
+        let minimumInterval: CFAbsoluteTime = 0.14
         let emit = { [weak self] in
             guard let self,
-                  let timelineID = self.streamingTimelineID else { return }
-            self.onTimelineMutation?(
-                .upsert(
-                    .assistantFinal(
-                        id: timelineID,
-                        sessionID: self.activeSessionID,
-                        turnID: self.activeTurnID,
-                        text: self.streamingBuffer,
-                        createdAt: self.streamingStartedAt ?? Date(),
-                        updatedAt: Date(),
-                        isStreaming: true,
-                        source: .runtime
-                    )
+                  let entryID = self.streamingEntryID,
+                  let timelineID = self.streamingTimelineID,
+                  let delta = self.pendingStreamingDeltaBuffer.nonEmpty else { return }
+            let createdAt = self.streamingStartedAt ?? Date()
+            self.onTranscriptMutation?(
+                .appendDelta(
+                    id: entryID,
+                    sessionID: self.activeSessionID,
+                    role: .assistant,
+                    delta: delta,
+                    createdAt: createdAt,
+                    emphasis: false,
+                    isStreaming: true
                 )
             )
-            self.lastTimelineMutationTime = CFAbsoluteTimeGetCurrent()
+            self.onTimelineMutation?(
+                .appendTextDelta(
+                    id: timelineID,
+                    sessionID: self.activeSessionID,
+                    turnID: self.activeTurnID,
+                    kind: .assistantFinal,
+                    delta: delta,
+                    createdAt: createdAt,
+                    updatedAt: Date(),
+                    isStreaming: true,
+                    emphasis: false,
+                    source: .runtime
+                )
+            )
+            self.pendingStreamingDeltaBuffer = ""
+            self.lastStreamingTranscriptEmitTime = CFAbsoluteTimeGetCurrent()
+            self.lastTimelineMutationTime = self.lastStreamingTranscriptEmitTime
+            self.pendingStreamingTranscriptEmit = nil
             self.pendingAssistantTimelineEmit = nil
         }
 
-        let now = CFAbsoluteTimeGetCurrent()
-        let elapsed = now - lastTimelineMutationTime
-        if elapsed >= minimumInterval {
+        if force {
+            pendingStreamingTranscriptEmit?.cancel()
             pendingAssistantTimelineEmit?.cancel()
             emit()
             return
         }
 
-        guard pendingAssistantTimelineEmit == nil else { return }
-        let item = DispatchWorkItem(block: emit)
-        pendingAssistantTimelineEmit = item
-        DispatchQueue.main.asyncAfter(
-            deadline: .now() + max(0.01, minimumInterval - elapsed),
-            execute: item
-        )
-    }
-
-    private func emitStreamingTranscriptUpdate(force: Bool = false) {
-        guard streamingEntryID != nil,
-              streamingBuffer.nonEmpty != nil else {
-            if force {
-                pendingStreamingTranscriptEmit?.cancel()
-                pendingStreamingTranscriptEmit = nil
-            }
-            return
-        }
-
-        let minimumInterval: CFAbsoluteTime = 0.05
-        let emit = { [weak self] in
-            guard let self,
-                  let entryID = self.streamingEntryID else { return }
-            self.onTranscript?(AssistantTranscriptEntry(
-                id: entryID,
-                role: .assistant,
-                text: self.streamingBuffer,
-                isStreaming: true
-            ))
-            self.lastStreamingTranscriptEmitTime = CFAbsoluteTimeGetCurrent()
-            self.pendingStreamingTranscriptEmit = nil
-        }
-
-        if force {
-            pendingStreamingTranscriptEmit?.cancel()
-            emit()
-            return
-        }
-
         let now = CFAbsoluteTimeGetCurrent()
-        let elapsed = now - lastStreamingTranscriptEmitTime
+        let elapsed = now - max(lastStreamingTranscriptEmitTime, lastTimelineMutationTime)
         if elapsed >= minimumInterval {
             pendingStreamingTranscriptEmit?.cancel()
+            pendingAssistantTimelineEmit?.cancel()
             emit()
             return
         }
 
-        guard pendingStreamingTranscriptEmit == nil else { return }
+        guard pendingStreamingTranscriptEmit == nil, pendingAssistantTimelineEmit == nil else { return }
         let item = DispatchWorkItem(block: emit)
         pendingStreamingTranscriptEmit = item
+        pendingAssistantTimelineEmit = item
         DispatchQueue.main.asyncAfter(
             deadline: .now() + max(0.01, minimumInterval - elapsed),
             execute: item
@@ -2148,30 +2195,40 @@ final class CodexAssistantRuntime {
         }
 
         commentaryBuffer += delta
-        emitCommentaryTimelineUpdate()
+        pendingCommentaryDeltaBuffer += delta
+        emitCommentaryTimelineUpdate(force: shouldForceStreamingDeltaFlush(for: delta))
     }
 
     private func emitCommentaryTimelineUpdate(force: Bool = false) {
-        guard commentaryTimelineID != nil else { return }
+        guard commentaryTimelineID != nil,
+              pendingCommentaryDeltaBuffer.nonEmpty != nil else {
+            if force {
+                pendingCommentaryTimelineEmit?.cancel()
+                pendingCommentaryTimelineEmit = nil
+            }
+            return
+        }
 
-        let minimumInterval: CFAbsoluteTime = 0.08
+        let minimumInterval: CFAbsoluteTime = 0.16
         let emit = { [weak self] in
             guard let self,
-                  let commentaryTimelineID = self.commentaryTimelineID else { return }
+                  let commentaryTimelineID = self.commentaryTimelineID,
+                  let delta = self.pendingCommentaryDeltaBuffer.nonEmpty else { return }
             self.onTimelineMutation?(
-                .upsert(
-                    .assistantProgress(
-                        id: commentaryTimelineID,
-                        sessionID: self.activeSessionID,
-                        turnID: self.activeTurnID,
-                        text: self.commentaryBuffer,
-                        createdAt: self.commentaryStartedAt ?? Date(),
-                        updatedAt: Date(),
-                        isStreaming: true,
-                        source: .runtime
-                    )
+                .appendTextDelta(
+                    id: commentaryTimelineID,
+                    sessionID: self.activeSessionID,
+                    turnID: self.activeTurnID,
+                    kind: .assistantProgress,
+                    delta: delta,
+                    createdAt: self.commentaryStartedAt ?? Date(),
+                    updatedAt: Date(),
+                    isStreaming: true,
+                    emphasis: false,
+                    source: .runtime
                 )
             )
+            self.pendingCommentaryDeltaBuffer = ""
             self.lastCommentaryTimelineEmitTime = CFAbsoluteTimeGetCurrent()
             self.pendingCommentaryTimelineEmit = nil
         }
@@ -2206,11 +2263,11 @@ final class CodexAssistantRuntime {
             commentaryTimelineID = nil
             commentaryStartedAt = nil
             commentaryBuffer = ""
+            pendingCommentaryDeltaBuffer = ""
             return
         }
 
-        pendingCommentaryTimelineEmit?.cancel()
-        pendingCommentaryTimelineEmit = nil
+        emitCommentaryTimelineUpdate(force: true)
         onTimelineMutation?(
             .upsert(
                 .assistantProgress(
@@ -2229,6 +2286,7 @@ final class CodexAssistantRuntime {
         self.commentaryTimelineID = nil
         self.commentaryStartedAt = nil
         self.commentaryBuffer = ""
+        self.pendingCommentaryDeltaBuffer = ""
     }
 
     private func emitActivityTimelineUpdate(
@@ -2340,11 +2398,13 @@ final class CodexAssistantRuntime {
         lastActivityTimelineEmitTimeByID.removeAll()
         streamingEntryID = nil
         streamingBuffer = ""
+        pendingStreamingDeltaBuffer = ""
         streamingTimelineID = nil
         streamingStartedAt = nil
         commentaryTimelineID = nil
         commentaryStartedAt = nil
         commentaryBuffer = ""
+        pendingCommentaryDeltaBuffer = ""
         planTimelineID = nil
         planStartedAt = nil
         proposedPlanBuffer = ""
@@ -2541,8 +2601,6 @@ final class CodexAssistantRuntime {
             return "Used an MCP tool."
         case .dynamicToolCall:
             switch title {
-            case "Computer Use":
-                return "Used the computer."
             case "Browser Use":
                 return "Used the browser."
             case "App Action":
@@ -2590,14 +2648,6 @@ final class CodexAssistantRuntime {
         isCompleted: Bool = false
     ) {
         handleItemStartedOrCompleted(["item": item], isCompleted: isCompleted)
-    }
-
-    func rememberComputerUseApprovalForTesting(_ sessionID: String) {
-        rememberDynamicToolApproval(toolKind: AssistantComputerUseToolDefinition.toolKind, for: sessionID)
-    }
-
-    func isComputerUseApprovedForTesting(_ sessionID: String) -> Bool {
-        isDynamicToolApproved(toolKind: AssistantComputerUseToolDefinition.toolKind, for: sessionID)
     }
 
     func configureImageAttachmentContextForTesting(
@@ -2709,11 +2759,10 @@ final class CodexAssistantRuntime {
            currentTurnIncludesImageAttachments,
            let normalizedTitle = activityTitle?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
            normalizedTitle == "tool"
-            || normalizedTitle == "computer use"
             || normalizedTitle == "browser"
             || normalizedTitle == "browser use"
             || normalizedTitle == "app action" {
-            return "I stopped before using a tool because your image was already attached. Chat mode should answer directly from attached images when the selected model supports image input. Live screen or browser inspection still needs Agentic mode."
+            return "I stopped before using a tool because your image was already attached. Chat mode should answer directly from attached images when the selected model supports image input. Live browser or app automation still needs Agentic mode."
         }
 
         return AssistantModePolicy.blockedMessage(
@@ -2766,7 +2815,7 @@ final class CodexAssistantRuntime {
         redirectedImageToolCallForActiveTurn = true
 
         let message = """
-        The user already attached the image for this turn. Do not use tools, browser automation, or computer control to inspect it. Read the attached image directly and answer from it.
+        The user already attached the image for this turn. Do not use tools or browser/app automation just to inspect it. Read the attached image directly and answer from it.
         """
 
         do {
@@ -2882,8 +2931,6 @@ final class CodexAssistantRuntime {
 
     private func dynamicToolDisplayName(_ rawTool: String?) -> String {
         switch rawTool {
-        case AssistantComputerUseToolDefinition.name:
-            return "Computer Use"
         case AssistantBrowserUseToolDefinition.name:
             return "Browser Use"
         case AssistantAppActionToolDefinition.name:
@@ -2895,8 +2942,6 @@ final class CodexAssistantRuntime {
 
     private func dynamicToolKind(for rawTool: String?) -> String? {
         switch rawTool {
-        case AssistantComputerUseToolDefinition.name:
-            return AssistantComputerUseToolDefinition.toolKind
         case AssistantBrowserUseToolDefinition.name:
             return AssistantBrowserUseToolDefinition.toolKind
         case AssistantAppActionToolDefinition.name:
@@ -2908,8 +2953,6 @@ final class CodexAssistantRuntime {
 
     private func dynamicToolTaskSummary(for toolName: String, arguments: Any) -> String {
         switch toolName {
-        case AssistantComputerUseToolDefinition.name:
-            return (try? AssistantComputerUseService.parseTask(from: arguments).task) ?? "Use the local computer"
         case AssistantBrowserUseToolDefinition.name:
             return (try? AssistantBrowserUseService.parseTask(from: arguments).summaryLine) ?? "Use the selected browser profile"
         case AssistantAppActionToolDefinition.name:
@@ -2920,7 +2963,7 @@ final class CodexAssistantRuntime {
     }
 
     private static func imageDataItems(
-        in contentItems: [AssistantComputerUseService.ToolExecutionResult.ContentItem]
+        in contentItems: [AssistantToolExecutionResult.ContentItem]
     ) -> [Data] {
         var images: [Data] = []
         for item in contentItems {
@@ -2956,8 +2999,6 @@ final class CodexAssistantRuntime {
     ) -> String {
         let lead: String
         switch toolName {
-        case AssistantComputerUseToolDefinition.name:
-            lead = "Computer Use can click, scroll, type, and capture screenshots on your Mac."
         case AssistantBrowserUseToolDefinition.name:
             lead = "Browser Use can open sites and reuse the selected signed-in browser profile on this Mac."
         case AssistantAppActionToolDefinition.name:
@@ -3257,8 +3298,7 @@ final class CodexAssistantRuntime {
         case .agentic:
             return [
                 AssistantAppActionToolDefinition.dynamicToolSpec(),
-                AssistantBrowserUseToolDefinition.dynamicToolSpec(),
-                AssistantComputerUseToolDefinition.dynamicToolSpec()
+                AssistantBrowserUseToolDefinition.dynamicToolSpec()
             ]
         }
     }
@@ -3354,7 +3394,7 @@ final class CodexAssistantRuntime {
             Do NOT propose or output a structured plan, checklist, outline, or step-by-step implementation plan in this mode.
             You may inspect the workspace, search the web, and run safe read-only commands when needed to answer accurately.
             If the user attaches images and the selected model supports image input, read those attached images directly and answer from them.
-            Do NOT edit files, run validation checks like builds or tests, use browser automation, use computer-control tools, or use unsafe commands.
+            Do NOT edit files, run validation checks like builds or tests, use browser or app automation, or use unsafe commands.
             If the task requires changes or higher-risk execution, explain that Chat mode can inspect and search but cannot make changes, and tell the user to switch to Agentic mode.
             """)
         case .plan:
@@ -3469,7 +3509,7 @@ final class CodexAssistantRuntime {
         if attachments.contains(where: \.isImage) {
             inputItems.append([
                 "type": "text",
-                "text": "If image attachments are present, analyze those attached images directly. Do not use tools, browser automation, or computer control just to inspect attached images."
+                "text": "If image attachments are present, analyze those attached images directly. Do not use tools or browser/app automation just to inspect attached images."
             ])
         }
         var params: [String: Any] = [

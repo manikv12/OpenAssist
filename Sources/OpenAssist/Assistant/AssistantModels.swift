@@ -1,6 +1,7 @@
 import AppKit
 import Combine
 import Foundation
+import SwiftUI
 
 enum AssistantPermissionGrantState: String, Codable, Sendable {
     case granted
@@ -142,23 +143,45 @@ struct RateLimitWindow: Equatable, Sendable {
     }
 }
 
-struct AccountRateLimits: Equatable, Sendable {
-    var planType: String?
+private func normalizedRateLimitSearchText(_ value: String?) -> String? {
+    guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else {
+        return nil
+    }
+
+    let lowered = value.lowercased()
+    let normalizedScalars = lowered.unicodeScalars.map { scalar -> Character in
+        if CharacterSet.alphanumerics.contains(scalar) {
+            return Character(scalar)
+        }
+        return " "
+    }
+    let normalized = String(normalizedScalars)
+        .split(whereSeparator: \.isWhitespace)
+        .joined(separator: " ")
+    return normalized.isEmpty ? nil : normalized
+}
+
+struct AccountRateLimitBucket: Identifiable, Equatable, Sendable {
+    var limitID: String
+    var limitName: String?
     var primary: RateLimitWindow?
     var secondary: RateLimitWindow?
     var hasCredits: Bool
     var unlimited: Bool
 
-    static let empty = AccountRateLimits(
-        planType: nil, primary: nil, secondary: nil,
-        hasCredits: true, unlimited: false
-    )
+    var id: String { limitID }
 
-    var isEmpty: Bool {
-        primary == nil && secondary == nil
+    var isDefaultCodex: Bool {
+        limitID.caseInsensitiveCompare("codex") == .orderedSame
     }
 
-    /// Returns the window with the highest usage percent, for compact display.
+    var displayName: String {
+        if let trimmed = limitName?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty {
+            return trimmed
+        }
+        return limitID.replacingOccurrences(of: "_", with: "-")
+    }
+
     var mostUsedWindow: RateLimitWindow? {
         switch (primary, secondary) {
         case let (p?, s?): return p.usedPercent >= s.usedPercent ? p : s
@@ -166,6 +189,182 @@ struct AccountRateLimits: Equatable, Sendable {
         case let (nil, s?): return s
         case (nil, nil): return nil
         }
+    }
+
+    fileprivate var searchText: String {
+        normalizedRateLimitSearchText([limitID, limitName].compactMap { $0 }.joined(separator: " ")) ?? ""
+    }
+
+    init(
+        limitID: String,
+        limitName: String? = nil,
+        primary: RateLimitWindow? = nil,
+        secondary: RateLimitWindow? = nil,
+        hasCredits: Bool = true,
+        unlimited: Bool = false
+    ) {
+        self.limitID = limitID
+        self.limitName = limitName?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+        self.primary = primary
+        self.secondary = secondary
+        self.hasCredits = hasCredits
+        self.unlimited = unlimited
+    }
+
+    init?(from dict: [String: Any], fallbackLimitID: String? = nil) {
+        let resolvedLimitID = (dict["limitId"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+            ?? fallbackLimitID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+        let primary = RateLimitWindow(from: dict["primary"] as? [String: Any])
+        let secondary = RateLimitWindow(from: dict["secondary"] as? [String: Any])
+        let creditsDict = dict["credits"] as? [String: Any]
+
+        guard let limitID = resolvedLimitID ?? ((primary != nil || secondary != nil || creditsDict != nil) ? "codex" : nil) else {
+            return nil
+        }
+
+        self.init(
+            limitID: limitID,
+            limitName: dict["limitName"] as? String,
+            primary: primary,
+            secondary: secondary,
+            hasCredits: creditsDict?["hasCredits"] as? Bool ?? true,
+            unlimited: creditsDict?["unlimited"] as? Bool ?? false
+        )
+    }
+}
+
+struct AccountRateLimits: Equatable, Sendable {
+    var planType: String?
+    var primary: RateLimitWindow?
+    var secondary: RateLimitWindow?
+    var hasCredits: Bool
+    var unlimited: Bool
+    var limitID: String? = nil
+    var limitName: String? = nil
+    var additionalBuckets: [AccountRateLimitBucket] = []
+
+    static let empty = AccountRateLimits(
+        planType: nil, primary: nil, secondary: nil,
+        hasCredits: true, unlimited: false,
+        limitID: nil, limitName: nil, additionalBuckets: []
+    )
+
+    var isEmpty: Bool {
+        allBuckets.allSatisfy { $0.primary == nil && $0.secondary == nil }
+    }
+
+    /// Returns the window with the highest usage percent, for compact display.
+    var mostUsedWindow: RateLimitWindow? {
+        bucket(for: nil)?.mostUsedWindow
+    }
+
+    var defaultBucket: AccountRateLimitBucket? {
+        guard let limitID = limitID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+            ?? ((primary != nil || secondary != nil) ? "codex" : nil) else {
+            return nil
+        }
+
+        return AccountRateLimitBucket(
+            limitID: limitID,
+            limitName: limitName,
+            primary: primary,
+            secondary: secondary,
+            hasCredits: hasCredits,
+            unlimited: unlimited
+        )
+    }
+
+    var allBuckets: [AccountRateLimitBucket] {
+        var ordered: [AccountRateLimitBucket] = []
+        var seen: Set<String> = []
+
+        func appendBucket(_ bucket: AccountRateLimitBucket?) {
+            guard let bucket else { return }
+            let normalizedID = normalizedRateLimitSearchText(bucket.limitID) ?? bucket.limitID.lowercased()
+            guard seen.insert(normalizedID).inserted else { return }
+            ordered.append(bucket)
+        }
+
+        appendBucket(defaultBucket)
+        additionalBuckets.forEach(appendBucket)
+
+        let defaultBuckets = ordered.filter(\.isDefaultCodex)
+        let nonDefaultBuckets = ordered
+            .filter { !$0.isDefaultCodex }
+            .sorted { lhs, rhs in
+                lhs.displayName.localizedCaseInsensitiveCompare(rhs.displayName) == .orderedAscending
+            }
+        return defaultBuckets + nonDefaultBuckets
+    }
+
+    func bucket(for modelID: String?) -> AccountRateLimitBucket? {
+        let buckets = allBuckets.filter { $0.primary != nil || $0.secondary != nil }
+        guard !buckets.isEmpty else { return nil }
+
+        let defaultBucket = buckets.first(where: \.isDefaultCodex) ?? buckets.first
+        let nonDefaultBuckets = buckets.filter { !$0.isDefaultCodex }
+        guard let normalizedModelID = normalizedRateLimitSearchText(modelID) else {
+            return defaultBucket
+        }
+
+        if normalizedModelID.contains("spark") {
+            if let sparkBucket = nonDefaultBuckets.first(where: { $0.searchText.contains("spark") }) {
+                return sparkBucket
+            }
+
+            if nonDefaultBuckets.count == 1 {
+                return nonDefaultBuckets[0]
+            }
+        }
+
+        if let matchingBucket = nonDefaultBuckets.first(where: { bucket in
+            let searchText = bucket.searchText
+            return !searchText.isEmpty
+                && (searchText.contains(normalizedModelID) || normalizedModelID.contains(searchText))
+        }) {
+            return matchingBucket
+        }
+
+        return defaultBucket
+    }
+
+    static func fromPayload(
+        _ payload: [String: Any],
+        preserving existing: AccountRateLimits = .empty
+    ) -> AccountRateLimits? {
+        let defaultDict = (payload["rateLimits"] as? [String: Any]) ?? payload
+        let defaultBucket = AccountRateLimitBucket(from: defaultDict, fallbackLimitID: "codex")
+            ?? existing.defaultBucket
+
+        guard let resolvedDefaultBucket = defaultBucket else {
+            return nil
+        }
+
+        let parsedAdditionalBuckets: [AccountRateLimitBucket]
+        if let bucketsByLimitID = payload["rateLimitsByLimitId"] as? [String: Any] {
+            parsedAdditionalBuckets = bucketsByLimitID.compactMap { key, value in
+                guard let dict = value as? [String: Any] else { return nil }
+                let bucket = AccountRateLimitBucket(from: dict, fallbackLimitID: key)
+                if bucket?.limitID.caseInsensitiveCompare(resolvedDefaultBucket.limitID) == .orderedSame {
+                    return nil
+                }
+                return bucket
+            }
+        } else {
+            parsedAdditionalBuckets = existing.additionalBuckets
+        }
+
+        return AccountRateLimits(
+            planType: (defaultDict["planType"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+                ?? existing.planType,
+            primary: resolvedDefaultBucket.primary,
+            secondary: resolvedDefaultBucket.secondary,
+            hasCredits: resolvedDefaultBucket.hasCredits,
+            unlimited: resolvedDefaultBucket.unlimited,
+            limitID: resolvedDefaultBucket.limitID,
+            limitName: resolvedDefaultBucket.limitName,
+            additionalBuckets: parsedAdditionalBuckets
+        )
     }
 }
 
@@ -396,6 +595,20 @@ struct AssistantTranscriptEntry: Identifiable, Equatable, Sendable {
     }
 }
 
+enum AssistantTranscriptMutation: Equatable, Sendable {
+    case reset(sessionID: String?)
+    case upsert(AssistantTranscriptEntry, sessionID: String?)
+    case appendDelta(
+        id: UUID,
+        sessionID: String?,
+        role: AssistantTranscriptRole,
+        delta: String,
+        createdAt: Date,
+        emphasis: Bool,
+        isStreaming: Bool
+    )
+}
+
 enum AssistantSessionSource: String, Codable, Sendable, CaseIterable {
     case cli
     case vscode
@@ -428,6 +641,7 @@ struct AssistantSessionSummary: Identifiable, Equatable, Codable, Sendable {
     var source: AssistantSessionSource
     var status: AssistantSessionStatus
     var cwd: String?
+    var effectiveCWD: String?
     var createdAt: Date?
     var updatedAt: Date?
     var summary: String?
@@ -437,6 +651,10 @@ struct AssistantSessionSummary: Identifiable, Equatable, Codable, Sendable {
     var latestServiceTier: String?
     var latestUserMessage: String?
     var latestAssistantMessage: String?
+    var projectID: String?
+    var projectName: String?
+    var linkedProjectFolderPath: String?
+    var projectFolderMissing: Bool
 
     init(
         id: String,
@@ -444,6 +662,7 @@ struct AssistantSessionSummary: Identifiable, Equatable, Codable, Sendable {
         source: AssistantSessionSource,
         status: AssistantSessionStatus,
         cwd: String? = nil,
+        effectiveCWD: String? = nil,
         createdAt: Date? = nil,
         updatedAt: Date? = nil,
         summary: String? = nil,
@@ -452,13 +671,18 @@ struct AssistantSessionSummary: Identifiable, Equatable, Codable, Sendable {
         latestReasoningEffort: AssistantReasoningEffort? = nil,
         latestServiceTier: String? = nil,
         latestUserMessage: String? = nil,
-        latestAssistantMessage: String? = nil
+        latestAssistantMessage: String? = nil,
+        projectID: String? = nil,
+        projectName: String? = nil,
+        linkedProjectFolderPath: String? = nil,
+        projectFolderMissing: Bool = false
     ) {
         self.id = id
         self.title = title
         self.source = source
         self.status = status
         self.cwd = cwd
+        self.effectiveCWD = effectiveCWD
         self.createdAt = createdAt
         self.updatedAt = updatedAt
         self.summary = summary
@@ -468,12 +692,17 @@ struct AssistantSessionSummary: Identifiable, Equatable, Codable, Sendable {
         self.latestServiceTier = latestServiceTier
         self.latestUserMessage = latestUserMessage
         self.latestAssistantMessage = latestAssistantMessage
+        self.projectID = projectID
+        self.projectName = projectName
+        self.linkedProjectFolderPath = linkedProjectFolderPath
+        self.projectFolderMissing = projectFolderMissing
     }
 
     var subtitle: String {
         if let latestAssistantMessage, !latestAssistantMessage.isEmpty { return latestAssistantMessage }
         if let summary, !summary.isEmpty { return summary }
         if let latestUserMessage, !latestUserMessage.isEmpty { return latestUserMessage }
+        if let effectiveCWD, !effectiveCWD.isEmpty { return effectiveCWD }
         if let cwd, !cwd.isEmpty { return cwd }
         return "No recent summary"
     }
@@ -840,21 +1069,112 @@ struct AssistantEnvironmentDetails: Sendable {
     let models: [AssistantModelOption]
 }
 
+struct AssistantRemoteSessionSnapshot: Sendable {
+    let session: AssistantSessionSummary
+    let transcriptEntries: [AssistantTranscriptEntry]
+    let pendingPermissionRequest: AssistantPermissionRequest?
+    let hudState: AssistantHUDState?
+    let hasActiveTurn: Bool
+    let imageDelivery: AssistantRemoteImageDelivery?
+}
+
+struct AssistantRemoteImageAttachment: Equatable, Sendable {
+    let id: String
+    let filename: String
+    let mimeType: String
+    let data: Data
+}
+
+struct AssistantRemoteImageDelivery: Equatable, Sendable {
+    let signature: String
+    let caption: String
+    let attachments: [AssistantRemoteImageAttachment]
+}
+
+enum AssistantHistoryMutationKind: String, Equatable {
+    case undo
+    case edit
+}
+
+struct AssistantHistoryRollbackSnapshot: Equatable {
+    let memoryDocument: AssistantThreadMemoryDocument?
+    let removedSuggestions: [AssistantMemorySuggestion]
+    let removedAcceptedEntries: [AssistantMemoryEntry]
+    let agentProfile: ConversationAgentProfileRecord?
+    let agentEntities: ConversationAgentEntitiesRecord?
+    let agentPreferences: ConversationAgentPreferencesRecord?
+}
+
+struct AssistantHistoryMutationState: Equatable {
+    let kind: AssistantHistoryMutationKind
+    let sessionID: String
+    let anchorID: String
+    let isPendingComposerEdit: Bool
+    let rewriteBackup: CodexRewriteBackup?
+    let previousDraft: String
+    let previousAttachments: [AssistantAttachment]
+    let restoredPrompt: String
+    let restoredAttachments: [AssistantAttachment]
+    let removedAnchorIDs: [String]
+    let retainedAnchorIDs: [String]
+    let rollbackSnapshot: AssistantHistoryRollbackSnapshot?
+
+    var bannerText: String? {
+        guard isPendingComposerEdit else { return nil }
+        return "Editing your last message. Update it, then press Send."
+    }
+}
+
+struct AssistantHistoryActionAvailability: Equatable {
+    let anchorID: String
+    let canUndo: Bool
+    let canEdit: Bool
+}
+
 typealias AssistantFeatureController = AssistantStore
 
 @MainActor
 final class AssistantStore: ObservableObject {
     static let shared = AssistantStore()
     private static let timelineCacheSaveDebounceInterval: TimeInterval = 0.35
+    private enum HistoryLoading {
+        static let initialTimelineLimit = 32
+        static let initialTranscriptLimit = 24
+        static let timelineBatchSize = 48
+        static let transcriptBatchSize = 36
+        static let recentTimelineChunkLimit = 14
+        static let recentTranscriptChunkLimit = 12
+    }
 
     @Published private(set) var runtimeHealth: AssistantRuntimeHealth = .idle
     @Published private(set) var installGuidance: AssistantInstallGuidance = .placeholder
     @Published private(set) var permissions: AssistantPermissionSnapshot = .unknown
     @Published private(set) var sessions: [AssistantSessionSummary] = []
+    @Published private(set) var projects: [AssistantProject] = []
     @Published var visibleSessionsLimit: Int = 10
     
     func loadMoreSessions() {
         visibleSessionsLimit += 10
+    }
+
+    var selectedProjectFilter: AssistantProject? {
+        guard let selectedProjectFilterID = selectedProjectFilterID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+            return nil
+        }
+        return projects.first(where: {
+            $0.id.trimmingCharacters(in: .whitespacesAndNewlines)
+                .caseInsensitiveCompare(selectedProjectFilterID) == .orderedSame
+        })
+    }
+
+    var visibleSidebarSessions: [AssistantSessionSummary] {
+        guard let selectedProjectFilterID = selectedProjectFilterID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+            return sessions
+        }
+        return sessions.filter {
+            $0.projectID?.trimmingCharacters(in: .whitespacesAndNewlines)
+                .caseInsensitiveCompare(selectedProjectFilterID) == .orderedSame
+        }
     }
     @Published private(set) var timelineItems: [AssistantTimelineItem] = []
     /// Pre-computed render items, rebuilt only when `timelineItems` changes (not on every @Published update).
@@ -878,6 +1198,7 @@ final class AssistantStore: ObservableObject {
         }
     }
     @Published var selectedSessionID: String?
+    @Published private(set) var selectedProjectFilterID: String?
     @Published var assistantEnabled = false
     @Published var lastStatusMessage: String?
     @Published var showBrowserProfilePicker = false
@@ -921,6 +1242,9 @@ final class AssistantStore: ObservableObject {
     @Published private(set) var currentMemoryFileURL: URL?
     @Published private(set) var memoryStatusMessage: String?
     @Published private(set) var pendingMemorySuggestions: [AssistantMemorySuggestion] = []
+    @Published private(set) var historyMutationState: AssistantHistoryMutationState?
+    @Published private(set) var historyActionsRevision: Int = 0
+    @Published private(set) var memoryInspectorSnapshot: AssistantMemoryInspectorSnapshot?
     @Published private(set) var assistantVoiceHealth: AssistantSpeechHealth = .unknown
     @Published private(set) var assistantVoiceStatusMessage: String?
     @Published private(set) var isRefreshingAssistantVoiceHealth = false
@@ -931,14 +1255,20 @@ final class AssistantStore: ObservableObject {
     @Published private(set) var assistantHumeVoiceOptions: [AssistantHumeVoiceOption] = []
     @Published private(set) var liveVoiceSessionSnapshot = AssistantLiveVoiceSessionSnapshot()
     @Published var showMemorySuggestionReview = false
+    @Published var showMemoryInspector = false
 
     let installSupport: CodexInstallSupport
     let sessionCatalog: CodexSessionCatalog
     let runtime: CodexAssistantRuntime
     private let settings: SettingsStore
+    private let projectStore: AssistantProjectStore
+    private let projectMemoryService: AssistantProjectMemoryService
     private let threadMemoryService: AssistantThreadMemoryService
     private let memoryRetrievalService: AssistantMemoryRetrievalService
     private let memorySuggestionService: AssistantMemorySuggestionService
+    private let memoryInspectorService: AssistantMemoryInspectorService
+    private let automationMemoryService: AutomationMemoryService
+    private let threadRewriteService: CodexThreadRewriteService
     private let assistantSpeechPlaybackService: AssistantSpeechPlaybackService
     private let assistantLegacyTADACleanupSupport: AssistantLegacyTADACleanupSupport
     private let humeVoiceCatalogService: HumeVoiceCatalogService
@@ -948,7 +1278,12 @@ final class AssistantStore: ObservableObject {
     private var timelineSessionID: String?
     private var transcriptEntriesBySessionID: [String: [AssistantTranscriptEntry]] = [:]
     private var timelineItemsBySessionID: [String: [AssistantTimelineItem]] = [:]
+    private var requestedTimelineHistoryLimitBySessionID: [String: Int] = [:]
+    private var requestedTranscriptHistoryLimitBySessionID: [String: Int] = [:]
+    private var canLoadMoreHistoryBySessionID: [String: Bool] = [:]
+    private var editableTurnsBySessionID: [String: [CodexEditableTurn]] = [:]
     private var sessionLoadRequestID = UUID()
+    private var deferredSessionHistoryReloadTask: Task<Void, Never>?
     private var isSendingPrompt = false
     private var isRefreshingEnvironment = false
     private var isRefreshingSessions = false
@@ -958,14 +1293,19 @@ final class AssistantStore: ObservableObject {
     private var proposedPlanSessionID: String?
     private var memoryScopeBySessionID: [String: MemoryScopeContext] = [:]
     private var pendingResumeContextSessionIDs: Set<String> = []
+    private var pendingResumeContextSnapshotsBySessionID: [String: String] = [:]
     private var pendingFreshSessionIDs: Set<String> = []
     private var lastSubmittedAttachments: [AssistantAttachment] = []
     private var lastSpokenAssistantTimelineItemID: String?
     private var lastSpokenAssistantTurnID: String?
     private var pendingTimelineCacheSaveWorkItems: [String: DispatchWorkItem] = [:]
+    private var isRefreshingProjectMemory = false
+    private var projectMemoryCatchUpTask: Task<Void, Never>?
+    private var activeMemoryInspectorTarget: AssistantMemoryInspectorTarget?
     var onStartLiveVoiceSession: ((AssistantLiveVoiceSessionSurface) -> Void)?
     var onEndLiveVoiceSession: (() -> Void)?
     var onStopLiveVoiceSpeaking: (() -> Void)?
+    var onTurnCompletion: ((AssistantTurnCompletionStatus) -> Void)?
 
     private init(
         installSupport: CodexInstallSupport = CodexInstallSupport(),
@@ -973,9 +1313,12 @@ final class AssistantStore: ObservableObject {
         runtime: CodexAssistantRuntime? = nil,
         settings: SettingsStore? = nil,
         memoryStore: MemorySQLiteStore? = nil,
+        projectStore: AssistantProjectStore? = nil,
         threadMemoryService: AssistantThreadMemoryService? = nil,
         memoryRetrievalService: AssistantMemoryRetrievalService? = nil,
         memorySuggestionService: AssistantMemorySuggestionService? = nil,
+        threadRewriteService: CodexThreadRewriteService? = nil,
+        automationMemoryService: AutomationMemoryService = .shared,
         assistantSpeechPlaybackService: AssistantSpeechPlaybackService? = nil,
         assistantLegacyTADACleanupSupport: AssistantLegacyTADACleanupSupport = AssistantLegacyTADACleanupSupport()
     ) {
@@ -985,6 +1328,8 @@ final class AssistantStore: ObservableObject {
         self.selectedModelID = self.settings.assistantPreferredModelID.nonEmpty
         self.runtime = runtime ?? CodexAssistantRuntime(preferredModelID: self.settings.assistantPreferredModelID.nonEmpty)
         let resolvedMemoryStore = memoryStore ?? (try? MemorySQLiteStore()) ?? MemorySQLiteStore.fallback()
+        let resolvedProjectStore = projectStore ?? AssistantProjectStore()
+        self.projectStore = resolvedProjectStore
         let resolvedThreadMemoryService = threadMemoryService ?? AssistantThreadMemoryService()
         self.threadMemoryService = resolvedThreadMemoryService
         self.memoryRetrievalService = memoryRetrievalService ?? AssistantMemoryRetrievalService(
@@ -995,6 +1340,21 @@ final class AssistantStore: ObservableObject {
             threadMemoryService: resolvedThreadMemoryService,
             store: resolvedMemoryStore
         )
+        self.projectMemoryService = AssistantProjectMemoryService(
+            projectStore: resolvedProjectStore,
+            memoryStore: resolvedMemoryStore,
+            memorySuggestionService: self.memorySuggestionService
+        )
+        self.memoryInspectorService = AssistantMemoryInspectorService(
+            projectStore: resolvedProjectStore,
+            projectMemoryService: self.projectMemoryService,
+            threadMemoryService: resolvedThreadMemoryService,
+            memoryRetrievalService: self.memoryRetrievalService,
+            memorySuggestionService: self.memorySuggestionService,
+            memoryStore: resolvedMemoryStore
+        )
+        self.automationMemoryService = automationMemoryService
+        self.threadRewriteService = threadRewriteService ?? CodexThreadRewriteService(sessionCatalog: self.sessionCatalog)
         let humeTokenService = HumeAccessTokenService(settings: self.settings)
         let humeConversationConfigService = HumeConversationConfigService(settings: self.settings)
         self.assistantSpeechPlaybackService = assistantSpeechPlaybackService
@@ -1030,6 +1390,11 @@ final class AssistantStore: ObservableObject {
                 self?.appendTranscriptEntry(entry, sessionID: runtimeSessionID)
             }
         }
+        self.runtime.onTranscriptMutation = { [weak self] mutation in
+            Task { @MainActor in
+                self?.applyTranscriptMutation(mutation)
+            }
+        }
         self.runtime.onTimelineMutation = { [weak self] mutation in
             Task { @MainActor in
                 self?.applyTimelineMutation(mutation)
@@ -1037,6 +1402,16 @@ final class AssistantStore: ObservableObject {
         }
         self.runtime.onHUDUpdate = { [weak self] state in
             Task { @MainActor in self?.hudState = state }
+        }
+        self.runtime.onTurnCompletion = { [weak self] status in
+            Task { @MainActor in
+                await self?.handleProjectMemoryCheckpoint(for: self?.runtime.currentSessionID ?? self?.selectedSessionID)
+                await self?.handleThreadMemoryCheckpoint(
+                    for: self?.runtime.currentSessionID ?? self?.selectedSessionID,
+                    status: status
+                )
+                self?.onTurnCompletion?(status)
+            }
         }
         self.runtime.onModeRestriction = { [weak self] event in
             Task { @MainActor in
@@ -1132,6 +1507,7 @@ final class AssistantStore: ObservableObject {
                 self?.assistantVoicePlaybackActive = isPlaying
             }
         }
+        reloadProjectsFromStore()
         refreshModeSwitchSuggestion()
     }
 
@@ -1188,6 +1564,21 @@ final class AssistantStore: ObservableObject {
         return visibleModels.first(where: { $0.id == selectedModelID })
     }
 
+    var selectedRateLimitBucket: AccountRateLimitBucket? {
+        rateLimits.bucket(for: selectedModelID)
+    }
+
+    var selectedRateLimitBucketLabel: String? {
+        guard let bucket = selectedRateLimitBucket, !bucket.isDefaultCodex else { return nil }
+
+        if selectedModelID?.localizedCaseInsensitiveContains("spark") == true {
+            return "Spark"
+        }
+
+        let displayName = bucket.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        return displayName.isEmpty ? nil : displayName
+    }
+
     var selectedModelSupportsImageInput: Bool {
         guard let selectedModel else { return true }
         guard selectedModel.hasKnownInputModalities else { return true }
@@ -1203,7 +1594,7 @@ final class AssistantStore: ObservableObject {
         guard selectedModel.hasKnownInputModalities else { return nil }
         guard !selectedModel.supportsImageInput else { return nil }
 
-        return "The selected model \(selectedModel.displayName) cannot read image attachments. Choose a model that supports image input and try again. Attached images can still be analyzed directly when the model supports them, but live screen or browser inspection needs Agentic mode."
+        return "The selected model \(selectedModel.displayName) cannot read image attachments. Choose a model that supports image input and try again. Attached images can still be analyzed directly when the model supports them, but live browser or app automation needs Agentic mode."
     }
 
     var isRuntimeReadyForConversation: Bool {
@@ -1260,6 +1651,13 @@ final class AssistantStore: ObservableObject {
 
     var hasActiveTurn: Bool {
         runtime.hasActiveTurn
+    }
+
+    var selectedSessionCanLoadMoreHistory: Bool {
+        guard let sessionID = selectedSessionID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+            return false
+        }
+        return canLoadMoreHistoryBySessionID[sessionID] ?? false
     }
 
     private var currentBrowserAutomationSignature: String? {
@@ -1543,6 +1941,7 @@ final class AssistantStore: ObservableObject {
 
         isRefreshingSessions = true
         defer { isRefreshingSessions = false }
+        reloadProjectsFromStore()
 
         let ownedSessionIDs = resolvedOwnedSessionIDs()
 
@@ -1574,6 +1973,7 @@ final class AssistantStore: ObservableObject {
             let persistedSessionIDs = Set(merged.compactMap { normalizedSessionID($0.id) })
             pendingFreshSessionIDs.subtract(persistedSessionIDs)
             merged = mergePendingFreshSessions(into: merged)
+            merged = applyProjectMetadata(to: merged)
 
             if let currentSelectedSessionID = selectedSessionID?.nonEmpty,
                !merged.contains(where: { sessionsMatch($0.id, currentSelectedSessionID) }) {
@@ -1589,7 +1989,9 @@ final class AssistantStore: ObservableObject {
                 }
             }
 
-            sessions = Array(merged.prefix(limit))
+            withAnimation(.spring(response: 0.26, dampingFraction: 0.86)) {
+                sessions = Array(merged.prefix(limit))
+            }
             ensureSessionVisible(selectedSessionID)
 
             if let selectedSessionID,
@@ -1606,8 +2008,10 @@ final class AssistantStore: ObservableObject {
             }
 
             restoreSessionConfiguration(from: selectedSession)
-            await reloadSelectedSessionHistoryIfNeeded(force: transcript.isEmpty || timelineItems.isEmpty)
             refreshMemoryState(for: selectedSessionID)
+            reloadMemoryInspectorSnapshot(closeIfMissing: true)
+            scheduleSelectedSessionHistoryReload(force: transcript.isEmpty || timelineItems.isEmpty)
+            scheduleProjectMemoryCatchUp()
         } catch {
             lastStatusMessage = error.localizedDescription
         }
@@ -1621,11 +2025,184 @@ final class AssistantStore: ObservableObject {
         }
     }
 
+    func remoteSessionSnapshot(
+        sessionID: String,
+        transcriptLimit: Int = 12
+    ) async -> AssistantRemoteSessionSnapshot? {
+        let normalizedSessionID = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedSessionID.isEmpty else { return nil }
+
+        let sessionSummary: AssistantSessionSummary?
+        if let cachedSession = sessions.first(where: { sessionsMatch($0.id, normalizedSessionID) }) {
+            sessionSummary = cachedSession
+        } else {
+            let loaded = try? await sessionCatalog.loadSessions(
+                limit: 1,
+                preferredThreadID: normalizedSessionID,
+                preferredCWD: nil,
+                sessionIDs: [normalizedSessionID]
+            )
+            sessionSummary = loaded?.first
+        }
+
+        guard let session = sessionSummary else { return nil }
+
+        let transcriptEntries: [AssistantTranscriptEntry]
+        if sessionsMatch(transcriptSessionID, normalizedSessionID) {
+            transcriptEntries = Array(transcript.suffix(transcriptLimit))
+        } else if let cachedEntries = transcriptEntriesBySessionID[normalizedSessionID],
+                  !cachedEntries.isEmpty {
+            transcriptEntries = Array(cachedEntries.suffix(transcriptLimit))
+        } else {
+            transcriptEntries = await sessionCatalog.loadTranscript(
+                sessionID: normalizedSessionID,
+                limit: transcriptLimit
+            )
+        }
+
+        let pendingPermission = pendingPermissionRequest.flatMap { request in
+            sessionsMatch(request.sessionID, normalizedSessionID) ? request : nil
+        }
+        let isActiveSession = sessionsMatch(runtime.currentSessionID, normalizedSessionID)
+        let imageDelivery = await latestRemoteImageDelivery(
+            for: normalizedSessionID,
+            sessionTitle: session.title
+        )
+        return AssistantRemoteSessionSnapshot(
+            session: session,
+            transcriptEntries: transcriptEntries,
+            pendingPermissionRequest: pendingPermission,
+            hudState: isActiveSession ? hudState : nil,
+            hasActiveTurn: runtime.hasActiveTurn && isActiveSession,
+            imageDelivery: imageDelivery
+        )
+    }
+
+    private func latestRemoteImageDelivery(
+        for sessionID: String,
+        sessionTitle: String,
+        limit: Int = 3
+    ) async -> AssistantRemoteImageDelivery? {
+        let timelineItems: [AssistantTimelineItem]
+        if sessionsMatch(timelineSessionID, sessionID) {
+            timelineItems = self.timelineItems
+        } else if let cachedItems = timelineItemsBySessionID[sessionID], !cachedItems.isEmpty {
+            timelineItems = cachedItems
+        } else {
+            let (loadedTimeline, _) = await loadSessionHistoryForAutomationSummary(sessionID: sessionID)
+            timelineItems = loadedTimeline
+        }
+
+        guard let imageItem = latestRemoteImageItem(in: timelineItems) else {
+            return nil
+        }
+
+        let imageData = Array((imageItem.imageAttachments ?? []).prefix(max(1, limit)))
+        guard !imageData.isEmpty else { return nil }
+
+        let caption = imageItem.text?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nonEmpty ?? "Image from \(sessionTitle)"
+
+        let attachments = imageData.enumerated().map { index, data in
+            let mimeType = Self.remoteImageMimeType(for: data)
+            let fileExtension = Self.remoteImageFileExtension(for: mimeType)
+            let digest = String(MemoryIdentifier.stableHexDigest(data: data).prefix(16))
+            return AssistantRemoteImageAttachment(
+                id: digest,
+                filename: "openassist-image-\(index + 1).\(fileExtension)",
+                mimeType: mimeType,
+                data: data
+            )
+        }
+
+        let signatureSeed = attachments.map(\.id).joined(separator: "|")
+        return AssistantRemoteImageDelivery(
+            signature: MemoryIdentifier.stableHexDigest(for: signatureSeed),
+            caption: caption,
+            attachments: attachments
+        )
+    }
+
+    func latestRemoteImageItem(in timelineItems: [AssistantTimelineItem]) -> AssistantTimelineItem? {
+        let currentTurnItems: ArraySlice<AssistantTimelineItem>
+        if let lastUserIndex = timelineItems.lastIndex(where: { $0.kind == .userMessage }) {
+            let nextIndex = timelineItems.index(after: lastUserIndex)
+            currentTurnItems = timelineItems[nextIndex...]
+        } else {
+            currentTurnItems = timelineItems[...]
+        }
+
+        return currentTurnItems.reversed().first(where: Self.isRemoteImageTimelineItem)
+            ?? timelineItems.reversed().first(where: Self.isRemoteImageTimelineItem)
+    }
+
+    private static func isRemoteImageTimelineItem(_ item: AssistantTimelineItem) -> Bool {
+        guard let images = item.imageAttachments, !images.isEmpty else {
+            return false
+        }
+        switch item.kind {
+        case .userMessage:
+            return false
+        case .assistantProgress, .assistantFinal, .activity, .permission, .plan, .system:
+            return true
+        }
+    }
+
+    private static func remoteImageMimeType(for data: Data) -> String {
+        if data.starts(with: [0x89, 0x50, 0x4E, 0x47]) {
+            return "image/png"
+        }
+        if data.starts(with: [0xFF, 0xD8, 0xFF]) {
+            return "image/jpeg"
+        }
+        if data.starts(with: Array("GIF8".utf8)) {
+            return "image/gif"
+        }
+        if data.starts(with: Array("RIFF".utf8)), data.count >= 12 {
+            let header = data.subdata(in: 8..<12)
+            if header == Data("WEBP".utf8) {
+                return "image/webp"
+            }
+        }
+        return "image/png"
+    }
+
+    private static func remoteImageFileExtension(for mimeType: String) -> String {
+        switch mimeType.lowercased() {
+        case "image/jpeg":
+            return "jpg"
+        case "image/gif":
+            return "gif"
+        case "image/webp":
+            return "webp"
+        default:
+            return "png"
+        }
+    }
+
     func chooseModel(_ modelID: String) {
         let trimmed = modelID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty,
               visibleModels.contains(where: { $0.id == trimmed }) else { return }
         settings.assistantPreferredModelID = trimmed
+        applyRuntimeModelSelection(trimmed, force: true)
+    }
+
+    func applyRuntimeModelSelection(_ modelID: String?, force: Bool = false) {
+        let trimmed = modelID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+        guard let trimmed else {
+            selectedModelID = nil
+            runtime.setPreferredModelID(nil)
+            runtimeHealth.selectedModelID = nil
+            syncRuntimeContext()
+            return
+        }
+
+        if !force, !visibleModels.contains(where: { $0.id == trimmed }) {
+            return
+        }
+
         selectedModelID = trimmed
         syncReasoningEffortWithSelectedModel(preferModelDefault: true)
         runtime.setPreferredModelID(trimmed)
@@ -1662,8 +2239,14 @@ final class AssistantStore: ObservableObject {
     }
 
     func startNewSession(cwd: String? = nil) async {
+        if let mutation = historyMutationState, mutation.isPendingComposerEdit {
+            lastStatusMessage = "Finish or cancel the current edit before starting a new thread."
+            return
+        }
         guard await ensureConversationCanStart() else { return }
         let interruptedActiveTurn = runtime.hasActiveTurn
+        let targetProjectID = selectedProjectFilterID
+        let requestedCWD = cwd ?? selectedProjectLinkedFolderPathIfUsable()
         if interruptedActiveTurn {
             lastStatusMessage = "Stopping the current task and starting a new session..."
             await runtime.cancelActiveTurn()
@@ -1684,9 +2267,12 @@ final class AssistantStore: ObservableObject {
         subagents = []
         syncRuntimeContext()
         do {
-            let sessionID = try await runtime.startNewSession(cwd: cwd, preferredModelID: selectedModelID)
+            let sessionID = try await runtime.startNewSession(cwd: requestedCWD, preferredModelID: selectedModelID)
             markPendingFreshSession(sessionID)
             recordOwnedSessionID(sessionID)
+            if let targetProjectID {
+                try? updateSessionProjectAssignment(sessionID: sessionID, projectID: targetProjectID)
+            }
             selectedSessionID = sessionID
             ensureSessionVisible(sessionID)
             if settings.assistantMemoryEnabled {
@@ -1703,18 +2289,112 @@ final class AssistantStore: ObservableObject {
         }
     }
 
+    /// Resumes an existing Codex thread for a scheduled job, or starts a fresh one if none exists.
+    /// Returns the session ID that was activated, or nil on failure.
+    func resumeOrStartScheduledJobSession(existingID: String?) async -> String? {
+        syncRuntimeContext()
+        do {
+            if let existingID = existingID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
+                do {
+                    try await runtime.resumeSession(existingID, cwd: nil, preferredModelID: selectedModelID)
+                    return await activateScheduledJobSession(existingID, isFreshSession: false)
+                } catch {
+                    guard isMissingRolloutError(error) else {
+                        throw error
+                    }
+                    CrashReporter.logWarning(
+                        "Scheduled job session \(existingID) could not be resumed; starting a fresh session instead. error=\(error)"
+                    )
+                    let recoveredSessionID = try await recoverMissingRollout(for: existingID)
+                    return await activateScheduledJobSession(recoveredSessionID, isFreshSession: true)
+                }
+            } else {
+                let sessionID = try await runtime.startNewSession(cwd: nil, preferredModelID: selectedModelID)
+                return await activateScheduledJobSession(sessionID, isFreshSession: true)
+            }
+        } catch {
+            CrashReporter.logError("Scheduled job session setup failed: \(error)")
+            return nil
+        }
+    }
+
+    private func activateScheduledJobSession(
+        _ sessionID: String,
+        isFreshSession: Bool
+    ) async -> String {
+        let cachedTimeline = timelineItemsBySessionID[sessionID] ?? []
+        let cachedTranscript = transcriptEntriesBySessionID[sessionID] ?? []
+        let hasRenderableCachedTimeline = hasRenderableTimelineHistory(cachedTimeline)
+
+        deferredSessionHistoryReloadTask?.cancel()
+        deferredSessionHistoryReloadTask = nil
+
+        switch Self.scheduledJobVisibleHistoryState(
+            isFreshSession: isFreshSession,
+            hasCachedTimeline: hasRenderableCachedTimeline,
+            hasCachedTranscript: !cachedTranscript.isEmpty
+        ) {
+        case .cached:
+            setVisibleTimeline(cachedTimeline, for: sessionID)
+            setVisibleTranscript(cachedTranscript, for: sessionID)
+            refreshEditableTurns(for: sessionID)
+            isTransitioningSession = false
+        case .loading:
+            setVisibleHistoryLoadingState(for: sessionID)
+            isTransitioningSession = true
+        case .empty:
+            setVisibleHistoryLoadingState(for: sessionID)
+            isTransitioningSession = false
+        }
+
+        if isFreshSession {
+            markPendingFreshSession(sessionID)
+            recordOwnedSessionID(sessionID)
+        }
+
+        selectedSessionID = sessionID
+        transcriptSessionID = sessionID
+        timelineSessionID = sessionID
+        clearActiveProposedPlanIfNeeded(for: sessionID)
+        ensureSessionVisible(sessionID)
+        if isFreshSession, settings.assistantMemoryEnabled {
+            _ = try? threadMemoryService.ensureMemoryFile(for: sessionID)
+        }
+        refreshMemoryState(for: sessionID)
+        await refreshSessions()
+        ensureSessionVisible(sessionID)
+        return sessionID
+    }
+
     func openSession(_ session: AssistantSessionSummary) async {
         let normalizedSessionID = session.id.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !normalizedSessionID.isEmpty else { return }
+        if let mutation = historyMutationState,
+           mutation.isPendingComposerEdit,
+           !sessionsMatch(mutation.sessionID, normalizedSessionID) {
+            lastStatusMessage = "Finish or cancel the current edit before switching threads."
+            return
+        }
 
+        deferredSessionHistoryReloadTask?.cancel()
+        deferredSessionHistoryReloadTask = nil
         clearActiveProposedPlanIfNeeded(for: normalizedSessionID)
+
+        let cachedTimeline = timelineItemsBySessionID[normalizedSessionID] ?? []
+        let cachedTranscript = transcriptEntriesBySessionID[normalizedSessionID] ?? []
+        let hasUsableCachedHistory = hasRenderableTimelineHistory(cachedTimeline)
+        let hasVisibleSelectedSessionHistory = sessionsMatch(timelineSessionID, normalizedSessionID)
+            && sessionsMatch(transcriptSessionID, normalizedSessionID)
+            && !cachedRenderItems.isEmpty
 
         if sessionsMatch(selectedSessionID, normalizedSessionID),
            sessionsMatch(transcriptSessionID, normalizedSessionID),
            sessionsMatch(timelineSessionID, normalizedSessionID),
-           !isTransitioningSession {
+           !isTransitioningSession,
+           (hasVisibleSelectedSessionHistory || hasUsableCachedHistory) {
             restoreSessionConfiguration(from: session)
             refreshMemoryState(for: normalizedSessionID)
+            refreshEditableTurns(for: normalizedSessionID)
             return
         }
 
@@ -1723,22 +2403,63 @@ final class AssistantStore: ObservableObject {
         selectedSessionID = normalizedSessionID
         restoreSessionConfiguration(from: session)
 
-        let cachedTimeline = timelineItemsBySessionID[normalizedSessionID] ?? []
-        let cachedTranscript = transcriptEntriesBySessionID[normalizedSessionID] ?? []
-        let hasCachedHistory = timelineItemsBySessionID.keys.contains(normalizedSessionID)
-            || transcriptEntriesBySessionID.keys.contains(normalizedSessionID)
-
-        if hasCachedHistory {
+        if hasUsableCachedHistory {
             setVisibleTimeline(cachedTimeline, for: normalizedSessionID)
             setVisibleTranscript(cachedTranscript, for: normalizedSessionID)
+            refreshEditableTurns(for: normalizedSessionID)
             isTransitioningSession = false
         } else {
+            setVisibleHistoryLoadingState(for: normalizedSessionID)
             isTransitioningSession = true
+
+            let recentChunk = await sessionCatalog.loadRecentHistoryChunk(
+                sessionID: normalizedSessionID,
+                timelineLimit: min(
+                    currentTimelineHistoryLimit(
+                        for: normalizedSessionID,
+                        minimum: Self.HistoryLoading.initialTimelineLimit
+                    ),
+                    Self.HistoryLoading.recentTimelineChunkLimit
+                ),
+                transcriptLimit: min(
+                    currentTranscriptHistoryLimit(
+                        for: normalizedSessionID,
+                        minimum: Self.HistoryLoading.initialTranscriptLimit
+                    ),
+                    Self.HistoryLoading.recentTranscriptChunkLimit
+                )
+            )
+
+            guard sessionLoadRequestID == requestID,
+                  sessionsMatch(selectedSessionID, normalizedSessionID) else {
+                return
+            }
+
+            if hasRenderableTimelineHistory(recentChunk.timeline) {
+                setVisibleTimeline(recentChunk.timeline, for: normalizedSessionID)
+                setVisibleTranscript(recentChunk.transcript, for: normalizedSessionID)
+                timelineItemsBySessionID[normalizedSessionID] = recentChunk.timeline
+                transcriptEntriesBySessionID[normalizedSessionID] = recentChunk.transcript
+                canLoadMoreHistoryBySessionID[normalizedSessionID] = recentChunk.hasMore
+                refreshEditableTurns(for: normalizedSessionID)
+                isTransitioningSession = false
+                scheduleSelectedSessionHistoryReload(force: true)
+                refreshMemoryState(for: normalizedSessionID)
+                return
+            }
         }
 
-        async let timelineTask = sessionCatalog.loadMergedTimeline(sessionID: normalizedSessionID)
-        async let transcriptTask = sessionCatalog.loadTranscript(sessionID: normalizedSessionID)
-        let (loadedTimeline, loadedTranscript) = await (timelineTask, transcriptTask)
+        let loadedHistory = await loadSessionHistorySlice(
+            sessionID: normalizedSessionID,
+            timelineLimit: currentTimelineHistoryLimit(
+                for: normalizedSessionID,
+                minimum: Self.HistoryLoading.initialTimelineLimit
+            ),
+            transcriptLimit: currentTranscriptHistoryLimit(
+                for: normalizedSessionID,
+                minimum: Self.HistoryLoading.initialTranscriptLimit
+            )
+        )
 
         guard sessionLoadRequestID == requestID,
               sessionsMatch(selectedSessionID, normalizedSessionID) else {
@@ -1746,21 +2467,26 @@ final class AssistantStore: ObservableObject {
         }
 
         let mergedTimeline = mergeTimelineHistory(
-            loadedTimeline,
+            loadedHistory.timeline,
             with: timelineItemsBySessionID[normalizedSessionID] ?? []
         )
         let mergedTranscript = mergeTranscriptHistory(
-            loadedTranscript,
+            loadedHistory.transcript,
             with: transcriptEntriesBySessionID[normalizedSessionID] ?? []
         )
 
         setVisibleTimeline(mergedTimeline, for: normalizedSessionID)
         setVisibleTranscript(mergedTranscript, for: normalizedSessionID)
+        refreshEditableTurns(for: normalizedSessionID)
         refreshMemoryState(for: normalizedSessionID)
         isTransitioningSession = false
     }
 
     func sendPrompt(_ prompt: String) async {
+        await sendPrompt(prompt, automationJob: nil)
+    }
+
+    func sendPrompt(_ prompt: String, automationJob: ScheduledJob? = nil) async {
         let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty || !attachments.isEmpty else { return }
         guard await ensureConversationCanStart() else {
@@ -1804,6 +2530,11 @@ final class AssistantStore: ObservableObject {
         attachments = []
         promptDraft = ""
         isSendingPrompt = true
+        hudState = AssistantHUDState(
+            phase: .thinking,
+            title: "Thinking",
+            detail: "Sending your message"
+        )
         defer {
             isSendingPrompt = false
             if oneShotSessionInstructions != nil {
@@ -1817,12 +2548,31 @@ final class AssistantStore: ObservableObject {
             let resumeContext = resumeContextIfNeeded(for: sessionID)
             let memoryContext: String?
             if settings.assistantMemoryEnabled {
-                let builtMemory = try memoryRetrievalService.prepareTurnContext(
-                    threadID: sessionID,
-                    prompt: trimmed,
-                    cwd: resolvedSessionCWD(for: sessionID),
-                    summaryMaxChars: settings.assistantMemorySummaryMaxChars
-                )
+                let builtMemory: AssistantBuiltMemoryContext
+                if let automationJob {
+                    builtMemory = try automationMemoryService.prepareAutomationTurnContext(
+                        job: automationJob,
+                        threadID: sessionID,
+                        prompt: trimmed,
+                        cwd: resolvedSessionCWD(for: sessionID),
+                        summaryMaxChars: settings.assistantMemorySummaryMaxChars
+                    )
+                } else {
+                    let projectTurnContext = try projectMemoryService.turnContext(
+                        forThreadID: sessionID,
+                        fallbackCWD: resolvedSessionCWD(for: sessionID)
+                    )
+                    builtMemory = try memoryRetrievalService.prepareTurnContext(
+                        threadID: sessionID,
+                        prompt: trimmed,
+                        cwd: resolvedSessionCWD(for: sessionID),
+                        summaryMaxChars: settings.assistantMemorySummaryMaxChars
+                        ,
+                        longTermScope: projectTurnContext?.scope,
+                        projectContextBlock: projectTurnContext?.projectContextBlock,
+                        statusBase: projectTurnContext == nil ? "Using session memory" : "Using thread + project memory"
+                    )
+                }
                 currentMemoryFileURL = builtMemory.fileURL
                 updateMemoryStatus(base: builtMemory.statusMessage)
                 memoryContext = builtMemory.summary
@@ -1858,9 +2608,16 @@ final class AssistantStore: ObservableObject {
                 resumeContext: resumeContext,
                 memoryContext: memoryContext
             )
+            commitPendingHistoryEditIfNeeded(for: sessionID)
             pendingResumeContextSessionIDs.remove(sessionID)
+            pendingResumeContextSnapshotsBySessionID.removeValue(forKey: sessionID)
             ensureSessionVisible(sessionID)
         } catch {
+            hudState = AssistantHUDState(
+                phase: .failed,
+                title: "Send failed",
+                detail: error.localizedDescription
+            )
             lastStatusMessage = error.localizedDescription
             promptDraft = trimmed
             appendTranscriptEntry(AssistantTranscriptEntry(role: .error, text: error.localizedDescription, emphasis: true))
@@ -1874,6 +2631,14 @@ final class AssistantStore: ObservableObject {
                 )
             )
         }
+    }
+
+    func loadSessionHistoryForAutomationSummary(sessionID: String) async -> ([AssistantTimelineItem], [AssistantTranscriptEntry]) {
+        let normalizedSessionID = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedSessionID.isEmpty else { return ([], []) }
+        let timeline = await sessionCatalog.loadMergedTimeline(sessionID: normalizedSessionID, limit: 400)
+        let transcript = await sessionCatalog.loadTranscript(sessionID: normalizedSessionID, limit: 200)
+        return (timeline, transcript)
     }
 
     /// Switch to Agentic mode and continue execution in the exact session that created the plan.
@@ -1952,18 +2717,225 @@ final class AssistantStore: ObservableObject {
         await runtime.cancelActiveTurn()
     }
 
+    func undoUserMessage(anchorID: String) async {
+        let normalizedAnchorID = anchorID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedAnchorID.isEmpty else { return }
+        guard let sessionID = selectedSessionID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+            lastStatusMessage = "Open the thread first, then try Undo."
+            return
+        }
+        guard historyMutationState == nil else {
+            lastStatusMessage = "Finish or cancel the current history change before starting another one."
+            return
+        }
+        guard !runtime.hasActiveTurn else {
+            lastStatusMessage = "Wait for the current Codex task to finish before undoing a message."
+            return
+        }
+
+        historyMutationState = AssistantHistoryMutationState(
+            kind: .undo,
+            sessionID: sessionID,
+            anchorID: normalizedAnchorID,
+            isPendingComposerEdit: false,
+            rewriteBackup: nil,
+            previousDraft: "",
+            previousAttachments: [],
+            restoredPrompt: "",
+            restoredAttachments: [],
+            removedAnchorIDs: [],
+            retainedAnchorIDs: [],
+            rollbackSnapshot: nil
+        )
+
+        var rewriteBackup: CodexRewriteBackup?
+        var rollbackSnapshot: AssistantHistoryRollbackSnapshot?
+        do {
+            let outcome = try threadRewriteService.truncateBeforeTurn(
+                sessionID: sessionID,
+                turnAnchorID: normalizedAnchorID
+            )
+            rewriteBackup = outcome.backup
+            try await runtime.resumeSessionSilently(
+                sessionID,
+                cwd: resolvedSessionCWD(for: sessionID),
+                preferredModelID: selectedModelID
+            )
+
+            rollbackSnapshot = try await applyHistoryRewriteRollback(
+                for: sessionID,
+                retainedAnchorIDs: outcome.retainedTurns.map(\.anchorID),
+                removedAnchorIDs: outcome.removedTurns.map(\.anchorID),
+                captureSnapshot: true,
+                keepRemovedCheckpoints: false
+            )
+
+            await reloadAfterHistoryRewrite(for: sessionID)
+            await reconcileProjectDigest(for: sessionID)
+            threadRewriteService.deleteBackup(outcome.backup)
+            historyMutationState = nil
+            refreshEditableTurns(for: sessionID)
+            lastStatusMessage = "Undid that message and everything after it."
+        } catch {
+            if let rewriteBackup {
+                try? threadRewriteService.restoreBackup(rewriteBackup)
+                try? await restoreHistoryRollback(for: sessionID, snapshot: rollbackSnapshot)
+                await reloadAfterHistoryRewrite(for: sessionID)
+                await reconcileProjectDigest(for: sessionID)
+                threadRewriteService.deleteBackup(rewriteBackup)
+            }
+            historyMutationState = nil
+            refreshEditableTurns(for: sessionID)
+            lastStatusMessage = error.localizedDescription
+        }
+    }
+
+    func beginEditLastUserMessage(anchorID: String) async {
+        let normalizedAnchorID = anchorID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedAnchorID.isEmpty else { return }
+        guard let sessionID = selectedSessionID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+            lastStatusMessage = "Open the thread first, then try Edit."
+            return
+        }
+        guard historyMutationState == nil else {
+            lastStatusMessage = "Finish or cancel the current history change before starting another one."
+            return
+        }
+        guard !runtime.hasActiveTurn else {
+            lastStatusMessage = "Wait for the current Codex task to finish before editing a message."
+            return
+        }
+
+        let previousDraft = promptDraft
+        let previousAttachments = attachments
+
+        historyMutationState = AssistantHistoryMutationState(
+            kind: .edit,
+            sessionID: sessionID,
+            anchorID: normalizedAnchorID,
+            isPendingComposerEdit: false,
+            rewriteBackup: nil,
+            previousDraft: previousDraft,
+            previousAttachments: previousAttachments,
+            restoredPrompt: "",
+            restoredAttachments: [],
+            removedAnchorIDs: [],
+            retainedAnchorIDs: [],
+            rollbackSnapshot: nil
+        )
+
+        var rewriteBackup: CodexRewriteBackup?
+        var rollbackSnapshot: AssistantHistoryRollbackSnapshot?
+        do {
+            let outcome = try threadRewriteService.beginEditLastTurn(
+                sessionID: sessionID,
+                turnAnchorID: normalizedAnchorID
+            )
+            rewriteBackup = outcome.backup
+            try await runtime.resumeSessionSilently(
+                sessionID,
+                cwd: resolvedSessionCWD(for: sessionID),
+                preferredModelID: selectedModelID
+            )
+
+            rollbackSnapshot = try await applyHistoryRewriteRollback(
+                for: sessionID,
+                retainedAnchorIDs: outcome.retainedTurns.map(\.anchorID),
+                removedAnchorIDs: outcome.removedTurns.map(\.anchorID),
+                captureSnapshot: true,
+                keepRemovedCheckpoints: true
+            )
+
+            let restoredPrompt = outcome.editedTurn?.text ?? ""
+            let restoredAttachments = (outcome.editedTurn?.imageAttachments ?? []).map(assistantAttachment(from:))
+
+            promptDraft = restoredPrompt
+            attachments = restoredAttachments
+
+            historyMutationState = AssistantHistoryMutationState(
+                kind: .edit,
+                sessionID: sessionID,
+                anchorID: normalizedAnchorID,
+                isPendingComposerEdit: true,
+                rewriteBackup: outcome.backup,
+                previousDraft: previousDraft,
+                previousAttachments: previousAttachments,
+                restoredPrompt: restoredPrompt,
+                restoredAttachments: restoredAttachments,
+                removedAnchorIDs: outcome.removedTurns.map(\.anchorID),
+                retainedAnchorIDs: outcome.retainedTurns.map(\.anchorID),
+                rollbackSnapshot: rollbackSnapshot
+            )
+
+            await reloadAfterHistoryRewrite(for: sessionID)
+            await reconcileProjectDigest(for: sessionID)
+            lastStatusMessage = "Editing your last message. Update it, then press Send."
+        } catch {
+            if let rewriteBackup {
+                try? threadRewriteService.restoreBackup(rewriteBackup)
+                try? await restoreHistoryRollback(for: sessionID, snapshot: rollbackSnapshot)
+                await reloadAfterHistoryRewrite(for: sessionID)
+                await reconcileProjectDigest(for: sessionID)
+                threadRewriteService.deleteBackup(rewriteBackup)
+            }
+            promptDraft = previousDraft
+            attachments = previousAttachments
+            historyMutationState = nil
+            lastStatusMessage = error.localizedDescription
+        }
+    }
+
+    func cancelPendingHistoryEdit() async {
+        guard let mutation = historyMutationState,
+              mutation.kind == .edit,
+              mutation.isPendingComposerEdit,
+              let backup = mutation.rewriteBackup else {
+            return
+        }
+
+        do {
+            _ = try threadRewriteService.cancelPendingEdit(sessionID: mutation.sessionID)
+            try await restoreHistoryRollback(
+                for: mutation.sessionID,
+                snapshot: mutation.rollbackSnapshot
+            )
+            promptDraft = mutation.previousDraft
+            attachments = mutation.previousAttachments
+            historyMutationState = nil
+            await reloadAfterHistoryRewrite(for: mutation.sessionID)
+            await reconcileProjectDigest(for: mutation.sessionID)
+            threadRewriteService.deleteBackup(backup)
+            lastStatusMessage = "Canceled the edit and restored the original message."
+        } catch {
+            lastStatusMessage = error.localizedDescription
+        }
+    }
+
     func deleteSession(_ sessionID: String) async {
         let normalizedSessionID = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !normalizedSessionID.isEmpty else { return }
+        if let mutation = historyMutationState,
+           sessionsMatch(mutation.sessionID, normalizedSessionID) {
+            if mutation.kind == .edit {
+                threadRewriteService.discardPendingEditBackup(sessionID: normalizedSessionID)
+            }
+            historyMutationState = nil
+        }
 
         do {
             if runtime.currentSessionID == normalizedSessionID {
                 await runtime.stop()
             }
 
+            let previousProjectID = projectStore.context(forThreadID: normalizedSessionID)?.project.id
             let deleted = try await sessionCatalog.deleteSession(sessionID: normalizedSessionID)
             try? threadMemoryService.clearMemory(for: normalizedSessionID)
             try? memorySuggestionService.clearSuggestions(for: normalizedSessionID)
+            _ = try? projectStore.removeThreadAssignment(normalizedSessionID)
+            if let previousProjectID {
+                try? projectStore.removeThreadState(normalizedSessionID, from: previousProjectID)
+                _ = try? projectMemoryService.rebuildProjectSummary(for: previousProjectID, sessionSummaries: sessions)
+            }
 
             removeOwnedSessionID(normalizedSessionID)
             if deleted {
@@ -1985,9 +2957,17 @@ final class AssistantStore: ObservableObject {
                 pendingPermissionRequest = nil
             }
 
+            pendingTimelineCacheSaveWorkItems[normalizedSessionID]?.cancel()
+            pendingTimelineCacheSaveWorkItems.removeValue(forKey: normalizedSessionID)
+            pendingResumeContextSnapshotsBySessionID.removeValue(forKey: normalizedSessionID)
             transcriptEntriesBySessionID.removeValue(forKey: normalizedSessionID)
             timelineItemsBySessionID.removeValue(forKey: normalizedSessionID)
+            requestedTimelineHistoryLimitBySessionID.removeValue(forKey: normalizedSessionID)
+            requestedTranscriptHistoryLimitBySessionID.removeValue(forKey: normalizedSessionID)
+            canLoadMoreHistoryBySessionID.removeValue(forKey: normalizedSessionID)
+            editableTurnsBySessionID.removeValue(forKey: normalizedSessionID)
             sessions.removeAll { $0.id == normalizedSessionID }
+            reloadProjectsFromStore()
             refreshMemoryState(for: selectedSessionID)
             await refreshSessions()
         } catch {
@@ -2028,6 +3008,11 @@ final class AssistantStore: ObservableObject {
             lastStatusMessage = "There are no Open Assist sessions to delete."
             return
         }
+        if let mutation = historyMutationState,
+           mutation.kind == .edit {
+            threadRewriteService.discardPendingEditBackup(sessionID: mutation.sessionID)
+        }
+        historyMutationState = nil
 
         do {
             if let currentSessionID = runtime.currentSessionID,
@@ -2035,11 +3020,21 @@ final class AssistantStore: ObservableObject {
                 await runtime.stop()
             }
 
+            let sessionProjectPairs = ownedSessionIDs.map { sessionID in
+                (sessionID, projectStore.context(forThreadID: sessionID)?.project.id)
+            }
+            let affectedProjectIDs = Set(sessionProjectPairs.compactMap(\.1))
             let deletedCount = try await sessionCatalog.deleteSessions(sessionIDs: ownedSessionIDs)
-            for sessionID in ownedSessionIDs {
+            for (sessionID, projectID) in sessionProjectPairs {
                 try? threadMemoryService.clearMemory(for: sessionID)
                 try? memorySuggestionService.clearSuggestions(for: sessionID)
-
+                _ = try? projectStore.removeThreadAssignment(sessionID)
+                if let projectID {
+                    try? projectStore.removeThreadState(sessionID, from: projectID)
+                }
+            }
+            for projectID in affectedProjectIDs {
+                _ = try? projectMemoryService.rebuildProjectSummary(for: projectID, sessionSummaries: sessions)
             }
             settings.assistantOwnedThreadIDs = []
             sessionLoadRequestID = UUID()
@@ -2055,6 +3050,8 @@ final class AssistantStore: ObservableObject {
             sessions = []
             transcriptEntriesBySessionID = [:]
             timelineItemsBySessionID = [:]
+            editableTurnsBySessionID = [:]
+            reloadProjectsFromStore()
             refreshMemoryState(for: nil)
             lastStatusMessage = deletedCount == 1
                 ? "Deleted 1 Open Assist session."
@@ -2153,6 +3150,32 @@ final class AssistantStore: ObservableObject {
         showMemorySuggestionReview = true
     }
 
+    func inspectMemory(for session: AssistantSessionSummary) {
+        do {
+            memoryInspectorSnapshot = try memoryInspectorService.snapshot(for: session)
+            activeMemoryInspectorTarget = .thread(session.id)
+            showMemoryInspector = true
+        } catch {
+            lastStatusMessage = error.localizedDescription
+        }
+    }
+
+    func inspectMemory(for project: AssistantProject) {
+        do {
+            memoryInspectorSnapshot = try memoryInspectorService.snapshot(for: project, sessions: sessions)
+            activeMemoryInspectorTarget = .project(project.id)
+            showMemoryInspector = true
+        } catch {
+            lastStatusMessage = error.localizedDescription
+        }
+    }
+
+    func dismissMemoryInspector() {
+        showMemoryInspector = false
+        activeMemoryInspectorTarget = nil
+        memoryInspectorSnapshot = nil
+    }
+
     func saveAssistantMessageAsMemory(_ assistantText: String) {
         guard settings.assistantMemoryEnabled else {
             lastStatusMessage = "Assistant memory is turned off."
@@ -2164,14 +3187,12 @@ final class AssistantStore: ObservableObject {
         }
 
         do {
-            let scope = memoryRetrievalService.makeScopeContext(
-                threadID: sessionID,
-                cwd: resolvedSessionCWD(for: sessionID)
-            )
+            let scope = resolvedAssistantMemoryScope(for: sessionID)
             let created = try memorySuggestionService.createManualSuggestions(
                 from: assistantText,
                 threadID: sessionID,
-                scope: scope
+                scope: scope,
+                metadata: projectMemorySuggestionMetadata(for: sessionID)
             )
             try handleCreatedSuggestions(created, sessionID: sessionID, directSaveWhenReviewDisabled: true)
         } catch {
@@ -2190,18 +3211,121 @@ final class AssistantStore: ObservableObject {
         }
 
         do {
-            let scope = memoryRetrievalService.makeScopeContext(
-                threadID: sessionID,
-                cwd: resolvedSessionCWD(for: sessionID)
-            )
+            let scope = resolvedAssistantMemoryScope(for: sessionID)
             let created = try memorySuggestionService.createFailureSuggestions(
                 from: assistantText,
                 threadID: sessionID,
-                scope: scope
+                scope: scope,
+                metadata: projectMemorySuggestionMetadata(for: sessionID)
             )
             try handleCreatedSuggestions(created, sessionID: sessionID, directSaveWhenReviewDisabled: false)
         } catch {
             lastStatusMessage = error.localizedDescription
+        }
+    }
+
+    func explainSelectedText(
+        _ selectedText: String,
+        in parentMessageText: String,
+        question: String? = nil
+    ) async {
+        let normalizedSelection = selectedText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedSelection.isEmpty else {
+            lastStatusMessage = "Select some text first."
+            return
+        }
+        let normalizedParentMessage = parentMessageText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedParentMessage.isEmpty else {
+            lastStatusMessage = "Could not find the full message for this selection."
+            return
+        }
+
+        guard let sessionID = selectedSessionID ?? runtime.currentSessionID else {
+            lastStatusMessage = "Open an Open Assist session first."
+            return
+        }
+
+        let explanationID = "selection-insight-\(UUID().uuidString)"
+        let createdAt = Date()
+        let normalizedQuestion = question?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+
+        appendTimelineItem(
+            selectionInsightTimelineItem(
+                id: explanationID,
+                sessionID: sessionID,
+                selectedText: normalizedSelection,
+                question: normalizedQuestion,
+                body: normalizedQuestion == nil
+                    ? "Explaining the selected text..."
+                    : "Thinking about your question...",
+                createdAt: createdAt,
+                updatedAt: createdAt,
+                isStreaming: true,
+                emphasis: false
+            )
+        )
+
+        let result = await MemoryEntryExplanationService.shared.explainSelectedText(
+            normalizedSelection,
+            parentMessageText: normalizedParentMessage,
+            question: normalizedQuestion,
+            onPartialText: { [weak self] partialText in
+                Task { @MainActor in
+                    guard let self else { return }
+                    let normalizedPartial = partialText.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !normalizedPartial.isEmpty else { return }
+
+                    self.appendTimelineItem(
+                        self.selectionInsightTimelineItem(
+                            id: explanationID,
+                            sessionID: sessionID,
+                            selectedText: normalizedSelection,
+                            question: normalizedQuestion,
+                            body: normalizedPartial,
+                            createdAt: createdAt,
+                            updatedAt: Date(),
+                            isStreaming: true,
+                            emphasis: false
+                        )
+                    )
+                }
+            }
+        )
+
+        switch result {
+        case .success(let explanation):
+            appendTimelineItem(
+                selectionInsightTimelineItem(
+                    id: explanationID,
+                    sessionID: sessionID,
+                    selectedText: normalizedSelection,
+                    question: normalizedQuestion,
+                    body: explanation,
+                    createdAt: createdAt,
+                    updatedAt: Date(),
+                    isStreaming: false,
+                    emphasis: false
+                )
+            )
+            lastStatusMessage = normalizedQuestion == nil
+                ? "Added an explanation for the selected text."
+                : "Answered your question about the selected text."
+
+        case .failure(let detail):
+            appendTimelineItem(
+                selectionInsightTimelineItem(
+                    id: explanationID,
+                    sessionID: sessionID,
+                    selectedText: normalizedSelection,
+                    question: normalizedQuestion,
+                    body: "Could not explain the selected text.\n\n\(detail)",
+                    createdAt: createdAt,
+                    updatedAt: Date(),
+                    isStreaming: false,
+                    emphasis: true
+                )
+            )
+            lastStatusMessage = detail
         }
     }
 
@@ -2210,6 +3334,10 @@ final class AssistantStore: ObservableObject {
             try memorySuggestionService.acceptSuggestion(id: suggestion.id)
             refreshMemoryState(for: suggestion.threadID)
             updateMemoryStatus(base: "Saved lesson to long-term assistant memory")
+            refreshMemoryInspectorIfNeeded(
+                affectedThreadIDs: [suggestion.threadID],
+                affectedProjectIDs: [suggestion.metadata["project_id"]].compactMap { $0 }
+            )
         } catch {
             lastStatusMessage = error.localizedDescription
         }
@@ -2220,6 +3348,10 @@ final class AssistantStore: ObservableObject {
             try memorySuggestionService.ignoreSuggestion(id: suggestion.id)
             refreshMemoryState(for: suggestion.threadID)
             updateMemoryStatus(base: "Ignored that memory suggestion")
+            refreshMemoryInspectorIfNeeded(
+                affectedThreadIDs: [suggestion.threadID],
+                affectedProjectIDs: [suggestion.metadata["project_id"]].compactMap { $0 }
+            )
         } catch {
             lastStatusMessage = error.localizedDescription
         }
@@ -2233,6 +3365,10 @@ final class AssistantStore: ObservableObject {
             detail: "Speak your assistant task"
         )
         lastStatusMessage = "Listening for your assistant request."
+    }
+
+    func showTransientHUDState(_ state: AssistantHUDState) {
+        hudState = state
     }
 
     func receiveVoiceDraft(_ text: String) {
@@ -2614,6 +3750,11 @@ final class AssistantStore: ObservableObject {
     private func ensureSessionVisible(_ sessionID: String?) {
         guard let sessionID, !sessionID.isEmpty else { return }
         if let existingIndex = sessions.firstIndex(where: { $0.id == sessionID }) {
+            sessions[existingIndex].status = Self.normalizedFreshSessionStatus(
+                currentStatus: sessions[existingIndex].status,
+                hasConversationContent: sessions[existingIndex].hasConversationContent,
+                hasActiveTurn: runtime.hasActiveTurn
+            )
             sessions[existingIndex].updatedAt = Date()
             sessions[existingIndex].latestModel = selectedModelID
             sessions[existingIndex].latestInteractionMode = interactionMode
@@ -2634,7 +3775,11 @@ final class AssistantStore: ObservableObject {
             id: sessionID,
             title: title,
             source: .appServer,
-            status: .active,
+            status: Self.normalizedFreshSessionStatus(
+                currentStatus: .active,
+                hasConversationContent: lastSubmittedPrompt?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty != nil,
+                hasActiveTurn: runtime.hasActiveTurn
+            ),
             cwd: FileManager.default.homeDirectoryForCurrentUser.path,
             createdAt: Date(),
             updatedAt: Date(),
@@ -2786,6 +3931,42 @@ final class AssistantStore: ObservableObject {
         return ordered
     }
 
+    static func normalizedFreshSessionStatus(
+        currentStatus: AssistantSessionStatus,
+        hasConversationContent: Bool,
+        hasActiveTurn: Bool
+    ) -> AssistantSessionStatus {
+        guard currentStatus == .active,
+              !hasConversationContent,
+              !hasActiveTurn else {
+            return currentStatus
+        }
+
+        return .idle
+    }
+
+    enum ScheduledJobVisibleHistoryState: Equatable {
+        case cached
+        case loading
+        case empty
+    }
+
+    static func scheduledJobVisibleHistoryState(
+        isFreshSession: Bool,
+        hasCachedTimeline: Bool,
+        hasCachedTranscript: Bool
+    ) -> ScheduledJobVisibleHistoryState {
+        if hasCachedTimeline {
+            return .cached
+        }
+
+        if hasCachedTranscript {
+            return .loading
+        }
+
+        return isFreshSession ? .empty : .loading
+    }
+
     private func recordOwnedSessionID(_ sessionID: String?) {
         guard let sessionID = sessionID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
             return
@@ -2870,8 +4051,122 @@ final class AssistantStore: ObservableObject {
         }
     }
 
+    private func applyTranscriptMutation(_ mutation: AssistantTranscriptMutation) {
+        switch mutation {
+        case .reset(let sessionID):
+            guard let normalizedSessionID = sessionID?.nonEmpty else {
+                if selectedSessionID == nil {
+                    setVisibleTranscript([], for: nil)
+                }
+                return
+            }
+
+            transcriptEntriesBySessionID[normalizedSessionID] = []
+            if sessionsMatch(transcriptSessionID, normalizedSessionID) || sessionsMatch(selectedSessionID, normalizedSessionID) {
+                setVisibleTranscript([], for: normalizedSessionID)
+            }
+
+        case .upsert(let entry, let sessionID):
+            appendTranscriptEntry(entry, sessionID: sessionID)
+
+        case .appendDelta(let id, let sessionID, let role, let delta, let createdAt, let emphasis, let isStreaming):
+            guard let normalizedDelta = delta.nonEmpty else { return }
+            let targetSessionID = sessionID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty ?? selectedSessionID
+
+            guard sessionsMatch(targetSessionID, selectedSessionID) || transcriptSessionID == nil else {
+                appendTranscriptDeltaToCache(
+                    id: id,
+                    sessionID: targetSessionID,
+                    role: role,
+                    delta: normalizedDelta,
+                    createdAt: createdAt,
+                    emphasis: emphasis,
+                    isStreaming: isStreaming
+                )
+                return
+            }
+
+            if transcriptSessionID == nil {
+                transcriptSessionID = targetSessionID
+            }
+
+            if let existingIndex = transcript.lastIndex(where: { $0.id == id }) {
+                let existingEntry = transcript[existingIndex]
+                transcript[existingIndex] = AssistantTranscriptEntry(
+                    id: existingEntry.id,
+                    role: existingEntry.role,
+                    text: existingEntry.text + normalizedDelta,
+                    createdAt: existingEntry.createdAt,
+                    emphasis: existingEntry.emphasis || emphasis,
+                    isStreaming: isStreaming
+                )
+            } else {
+                transcript.append(
+                    AssistantTranscriptEntry(
+                        id: id,
+                        role: role,
+                        text: normalizedDelta,
+                        createdAt: createdAt,
+                        emphasis: emphasis,
+                        isStreaming: isStreaming
+                    )
+                )
+            }
+
+            if let targetSessionID {
+                transcriptEntriesBySessionID[targetSessionID] = transcript
+            }
+
+            if let latestEntry = transcript.last {
+                updateVisibleSessionPreview(with: latestEntry, sessionID: targetSessionID)
+            }
+        }
+    }
+
     private func appendTimelineItem(_ item: AssistantTimelineItem) {
         applyTimelineMutation(.upsert(item))
+    }
+
+    private func selectionInsightTimelineItem(
+        id: String,
+        sessionID: String,
+        selectedText: String,
+        question: String?,
+        body: String,
+        createdAt: Date,
+        updatedAt: Date,
+        isStreaming: Bool,
+        emphasis: Bool
+    ) -> AssistantTimelineItem {
+        let selectionPreview = Self.normalizedResumeContextSnippet(selectedText, limit: 180)
+        let title = question == nil ? "### Selection Insight" : "### Selection Q&A"
+
+        var sections = [title]
+        if !selectionPreview.isEmpty {
+            sections.append("> \(selectionPreview)")
+        }
+        if let question {
+            sections.append("Question: \(question)")
+        }
+        sections.append(body.trimmingCharacters(in: .whitespacesAndNewlines))
+
+        return AssistantTimelineItem(
+            id: id,
+            sessionID: sessionID,
+            turnID: nil,
+            kind: .system,
+            createdAt: createdAt,
+            updatedAt: updatedAt,
+            text: sections.joined(separator: "\n\n"),
+            isStreaming: isStreaming,
+            emphasis: emphasis,
+            activity: nil,
+            permissionRequest: nil,
+            planText: nil,
+            planEntries: nil,
+            imageAttachments: nil,
+            source: .runtime
+        )
     }
 
     private func applyTimelineMutation(_ mutation: AssistantTimelineMutation) {
@@ -2949,6 +4244,123 @@ final class AssistantStore: ObservableObject {
             }
 
             maybeSpeakAssistantFinal(item, existingItem: existingItem)
+
+        case .appendTextDelta(
+            let id,
+            let sessionID,
+            let turnID,
+            let kind,
+            let delta,
+            let createdAt,
+            let updatedAt,
+            let isStreaming,
+            let emphasis,
+            let source
+        ):
+            guard let normalizedDelta = delta.nonEmpty else { return }
+            let targetSessionID = sessionID?.nonEmpty
+                ?? runtime.currentSessionID?.nonEmpty
+                ?? selectedSessionID?.nonEmpty
+
+            let previousVisibleItems = timelineItems
+            var items = targetSessionID.flatMap { timelineItemsBySessionID[$0] }
+                ?? (sessionsMatch(timelineSessionID, targetSessionID) ? timelineItems : [])
+
+            if let existingIndex = items.firstIndex(where: { $0.id == id }) {
+                items[existingIndex].updatedAt = updatedAt
+                items[existingIndex].isStreaming = isStreaming
+                items[existingIndex].emphasis = items[existingIndex].emphasis || emphasis
+
+                switch kind {
+                case .plan:
+                    let previousText = items[existingIndex].planText ?? ""
+                    items[existingIndex].planText = previousText + normalizedDelta
+                default:
+                    items[existingIndex].text = (items[existingIndex].text ?? "") + normalizedDelta
+                }
+            } else {
+                let newItem: AssistantTimelineItem
+                switch kind {
+                case .assistantProgress:
+                    newItem = .assistantProgress(
+                        id: id,
+                        sessionID: targetSessionID,
+                        turnID: turnID,
+                        text: normalizedDelta,
+                        createdAt: createdAt,
+                        updatedAt: updatedAt,
+                        isStreaming: isStreaming,
+                        source: source
+                    )
+                case .assistantFinal:
+                    newItem = .assistantFinal(
+                        id: id,
+                        sessionID: targetSessionID,
+                        turnID: turnID,
+                        text: normalizedDelta,
+                        createdAt: createdAt,
+                        updatedAt: updatedAt,
+                        isStreaming: isStreaming,
+                        source: source
+                    )
+                case .plan:
+                    newItem = .plan(
+                        id: id,
+                        sessionID: targetSessionID,
+                        turnID: turnID,
+                        text: normalizedDelta,
+                        entries: nil,
+                        createdAt: createdAt,
+                        updatedAt: updatedAt,
+                        isStreaming: isStreaming,
+                        source: source
+                    )
+                case .system:
+                    newItem = .system(
+                        id: id,
+                        sessionID: targetSessionID,
+                        turnID: turnID,
+                        text: normalizedDelta,
+                        createdAt: createdAt,
+                        emphasis: emphasis,
+                        source: source
+                    )
+                case .userMessage:
+                    newItem = .userMessage(
+                        id: id,
+                        sessionID: targetSessionID,
+                        turnID: turnID,
+                        text: normalizedDelta,
+                        createdAt: createdAt,
+                        source: source
+                    )
+                case .activity, .permission:
+                    return
+                }
+
+                items.append(newItem)
+            }
+
+            sortTimelineItems(&items)
+
+            if let targetSessionID {
+                timelineItemsBySessionID[targetSessionID] = items
+                let updatedItem = items.first(where: { $0.id == id })
+                if let updatedItem,
+                   sessionsMatch(selectedSessionID, targetSessionID) || sessionsMatch(timelineSessionID, targetSessionID) {
+                    if !applyVisibleTimelineTailUpdateIfPossible(
+                        previousItems: previousVisibleItems,
+                        updatedItems: items,
+                        updatedItem: updatedItem,
+                        sessionID: targetSessionID
+                    ) {
+                        setVisibleTimeline(items, for: targetSessionID)
+                    }
+                }
+            } else {
+                timelineItems = items
+                rebuildRenderItemsCache()
+            }
         }
     }
 
@@ -3069,7 +4481,7 @@ final class AssistantStore: ObservableObject {
         do {
             currentMemoryFileURL = memoryRetrievalService.currentMemoryFileURL(for: sessionID)
             pendingMemorySuggestions = try memorySuggestionService.suggestions(for: sessionID)
-            updateMemoryStatus(base: currentMemoryFileURL != nil ? "Using session memory" : nil)
+            updateMemoryStatus(base: currentMemoryFileURL != nil ? memoryStatusBase(for: sessionID) : nil)
         } catch {
             lastStatusMessage = error.localizedDescription
         }
@@ -3127,11 +4539,698 @@ final class AssistantStore: ObservableObject {
             : "Added \(created.count) memory suggestions for review."
     }
 
-    private func resolvedSessionCWD(for sessionID: String) -> String? {
-        if let matchingSession = sessions.first(where: { sessionsMatch($0.id, sessionID) }) {
-            return matchingSession.cwd
+    private func reloadProjectsFromStore() {
+        projects = projectStore.projects()
+        if let selectedProjectFilterID,
+           !projects.contains(where: {
+               $0.id.trimmingCharacters(in: .whitespacesAndNewlines)
+                   .caseInsensitiveCompare(selectedProjectFilterID) == .orderedSame
+           }) {
+            self.selectedProjectFilterID = nil
         }
-        return selectedSession?.cwd
+    }
+
+    func selectProjectFilter(_ projectID: String?) async {
+        let normalizedProjectID = projectID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+        if let normalizedProjectID,
+           selectedProjectFilterID?.caseInsensitiveCompare(normalizedProjectID) == .orderedSame {
+            selectedProjectFilterID = nil
+            return
+        }
+
+        selectedProjectFilterID = normalizedProjectID
+
+        guard let normalizedProjectID else { return }
+        let selectedSessionStillVisible = selectedSessionID.flatMap { currentSelectedSessionID in
+            visibleSidebarSessions.first(where: { sessionsMatch($0.id, currentSelectedSessionID) })
+        } != nil
+        if !selectedSessionStillVisible,
+           let firstVisibleSession = visibleSidebarSessions.first(where: {
+               $0.projectID?.trimmingCharacters(in: .whitespacesAndNewlines)
+                   .caseInsensitiveCompare(normalizedProjectID) == .orderedSame
+           }) {
+            await openSession(firstVisibleSession)
+        }
+    }
+
+    func createProject(name: String, linkedFolderPath: String? = nil) {
+        do {
+            let project = try projectStore.createProject(name: name, linkedFolderPath: linkedFolderPath)
+            reloadProjectsFromStore()
+            sessions = applyProjectMetadata(to: sessions)
+            refreshMemoryInspectorIfNeeded(affectedProjectIDs: [project.id])
+        } catch {
+            lastStatusMessage = error.localizedDescription
+        }
+    }
+
+    func renameProject(_ projectID: String, to newName: String) {
+        do {
+            let updatedProject = try projectStore.renameProject(id: projectID, to: newName)
+            reloadProjectsFromStore()
+            sessions = applyProjectMetadata(to: sessions)
+            refreshMemoryState(for: selectedSessionID)
+            refreshMemoryInspectorIfNeeded(affectedProjectIDs: [updatedProject.id])
+        } catch {
+            lastStatusMessage = error.localizedDescription
+        }
+    }
+
+    func updateProjectLinkedFolder(_ projectID: String, path: String?) {
+        do {
+            let previousProject = projectStore.project(forProjectID: projectID)
+            let previousFolderPath = previousProject?.linkedFolderPath
+            let updatedProject = try projectStore.updateLinkedFolderPath(for: projectID, path: path)
+            reloadProjectsFromStore()
+            sessions = applyProjectMetadata(to: sessions)
+
+            if previousFolderPath != updatedProject.linkedFolderPath,
+               let representativeThreadID = representativeThreadID(forProjectID: projectID) {
+                _ = try? projectMemoryService.createFolderChangeStaleSuggestions(
+                    project: updatedProject,
+                    fallbackCWD: updatedProject.linkedFolderPath,
+                    threadID: representativeThreadID,
+                    previousFolderPath: previousFolderPath
+                )
+            }
+
+            refreshMemoryState(for: selectedSessionID)
+            refreshMemoryInspectorIfNeeded(
+                affectedThreadIDs: representativeThreadID(forProjectID: projectID).map { [$0] } ?? [],
+                affectedProjectIDs: [projectID]
+            )
+        } catch {
+            lastStatusMessage = error.localizedDescription
+        }
+    }
+
+    func updateProjectIcon(_ projectID: String, symbol: String?) {
+        do {
+            _ = try projectStore.setIconSymbol(symbol, forProjectID: projectID)
+            reloadProjectsFromStore()
+        } catch {
+            lastStatusMessage = error.localizedDescription
+        }
+    }
+
+    func deleteProject(_ projectID: String) {
+        do {
+            guard let project = projectStore.project(forProjectID: projectID) else { return }
+            let deletion = try projectStore.deleteProjectResult(id: projectID)
+            try projectMemoryService.invalidateAllProjectLessons(
+                project: project,
+                fallbackCWD: project.linkedFolderPath,
+                reason: "The project was deleted from Open Assist."
+            )
+
+            reloadProjectsFromStore()
+            sessions = applyProjectMetadata(to: sessions)
+
+            if selectedProjectFilterID?.caseInsensitiveCompare(projectID) == .orderedSame {
+                selectedProjectFilterID = nil
+            }
+
+            for threadID in deletion.removedThreadIDs where sessionsMatch(threadID, selectedSessionID) {
+                refreshMemoryState(for: threadID)
+            }
+            refreshMemoryInspectorIfNeeded(
+                affectedThreadIDs: deletion.removedThreadIDs,
+                affectedProjectIDs: [projectID],
+                closeIfMissing: true
+            )
+        } catch {
+            lastStatusMessage = error.localizedDescription
+        }
+    }
+
+    func assignSessionToProject(_ sessionID: String, projectID: String?) {
+        do {
+            try updateSessionProjectAssignment(sessionID: sessionID, projectID: projectID)
+        } catch {
+            lastStatusMessage = error.localizedDescription
+        }
+    }
+
+    private func updateSessionProjectAssignment(sessionID: String, projectID: String?) throws {
+        let normalizedSessionID = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedProjectID = projectID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+        guard !normalizedSessionID.isEmpty else { return }
+
+        let previousContext = projectStore.context(forThreadID: normalizedSessionID)
+        if let previousProjectID = previousContext?.project.id,
+           let normalizedProjectID,
+           previousProjectID.caseInsensitiveCompare(normalizedProjectID) == .orderedSame {
+            return
+        }
+
+        if let previousProjectID = previousContext?.project.id {
+            try projectStore.removeThreadState(normalizedSessionID, from: previousProjectID)
+            _ = try projectStore.removeThreadAssignment(normalizedSessionID)
+            _ = try? projectMemoryService.rebuildProjectSummary(for: previousProjectID, sessionSummaries: sessions)
+        }
+
+        if let normalizedProjectID {
+            try projectStore.assignThread(normalizedSessionID, toProjectID: normalizedProjectID)
+            _ = try? projectMemoryService.rebuildProjectSummary(for: normalizedProjectID, sessionSummaries: sessions)
+        }
+
+        let sessionTitle = sessions.first(where: { sessionsMatch($0.id, normalizedSessionID) })?.title ?? "Thread"
+        let assignedProjectName = normalizedProjectID.flatMap { projectStore.project(forProjectID: $0)?.name }
+
+        reloadProjectsFromStore()
+        sessions = applyProjectMetadata(to: sessions)
+        refreshMemoryState(for: normalizedSessionID)
+        refreshMemoryInspectorIfNeeded(
+            affectedThreadIDs: [normalizedSessionID],
+            affectedProjectIDs: [previousContext?.project.id, normalizedProjectID].compactMap { $0 }
+        )
+
+        if let assignedProjectName {
+            let action = previousContext == nil ? "Assigned" : "Moved"
+            lastStatusMessage = "\(action) “\(sessionTitle)” to project “\(assignedProjectName)”."
+        } else if previousContext != nil {
+            lastStatusMessage = "Removed “\(sessionTitle)” from its project."
+        }
+
+        Task { @MainActor [weak self] in
+            await self?.handleProjectMemoryCheckpoint(for: normalizedSessionID)
+        }
+    }
+
+    private func applyProjectMetadata(to sessions: [AssistantSessionSummary]) -> [AssistantSessionSummary] {
+        let snapshot = projectStore.snapshot()
+
+        let projectsByID = Dictionary(
+            uniqueKeysWithValues: snapshot.projects.map {
+                ($0.id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(), $0)
+            }
+        )
+
+        return sessions.map { session in
+            var updated = session
+            let normalizedSessionID = session.id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if let projectID = snapshot.threadAssignments[normalizedSessionID],
+               let project = projectsByID[projectID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()] {
+                let effectiveFolder = resolvedProjectLinkedFolderPath(project.linkedFolderPath)
+                updated.projectID = project.id
+                updated.projectName = project.name
+                updated.linkedProjectFolderPath = project.linkedFolderPath
+                updated.projectFolderMissing = project.linkedFolderPath != nil && effectiveFolder == nil
+                updated.effectiveCWD = effectiveFolder ?? session.cwd
+            } else {
+                updated.projectID = nil
+                updated.projectName = nil
+                updated.linkedProjectFolderPath = nil
+                updated.projectFolderMissing = false
+                updated.effectiveCWD = session.cwd
+            }
+            return updated
+        }
+    }
+
+    private func resolvedProjectLinkedFolderPath(_ path: String?) -> String? {
+        guard let normalizedPath = AssistantProject.normalizedLinkedFolderPath(path),
+              fileManagerDirectoryExists(atPath: normalizedPath) else {
+            return nil
+        }
+        return normalizedPath
+    }
+
+    private func selectedProjectLinkedFolderPathIfUsable() -> String? {
+        guard let linkedFolderPath = selectedProjectFilter?.linkedFolderPath else {
+            return nil
+        }
+        return resolvedProjectLinkedFolderPath(linkedFolderPath)
+    }
+
+    private func representativeThreadID(forProjectID projectID: String) -> String? {
+        let normalizedProjectID = projectID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return sessions.first(where: {
+            $0.projectID?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == normalizedProjectID
+        })?.id
+    }
+
+    private func resolvedAssistantMemoryScope(for sessionID: String) -> MemoryScopeContext {
+        if let projectTurnContext = try? projectMemoryService.turnContext(
+            forThreadID: sessionID,
+            fallbackCWD: resolvedSessionCWD(for: sessionID)
+        ) {
+            return projectTurnContext.scope
+        }
+        return memoryRetrievalService.makeScopeContext(
+            threadID: sessionID,
+            cwd: resolvedSessionCWD(for: sessionID)
+        )
+    }
+
+    private func projectMemorySuggestionMetadata(for sessionID: String) -> [String: String] {
+        var metadata: [String: String] = [
+            "source_session_id": sessionID
+        ]
+
+        if let anchorID = latestEditableTurnAnchorID(for: sessionID) {
+            metadata["source_turn_anchor_id"] = anchorID
+        }
+
+        if let project = projectStore.context(forThreadID: sessionID)?.project {
+            metadata["project_memory"] = "true"
+            metadata["project_id"] = project.id
+            if let linkedFolderPath = project.linkedFolderPath {
+                metadata["folder_path"] = linkedFolderPath
+            }
+        }
+        return metadata
+    }
+
+    private func memoryStatusBase(for sessionID: String?) -> String? {
+        guard let sessionID = sessionID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+            return "Using session memory"
+        }
+        if projectStore.context(forThreadID: sessionID) != nil {
+            return "Using thread + project memory"
+        }
+        return "Using session memory"
+    }
+
+    private func fileManagerDirectoryExists(atPath path: String) -> Bool {
+        var isDirectory: ObjCBool = false
+        return FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory) && isDirectory.boolValue
+    }
+
+    private func refreshMemoryInspectorIfNeeded(
+        affectedThreadIDs: [String] = [],
+        affectedProjectIDs: [String] = [],
+        closeIfMissing: Bool = false
+    ) {
+        guard showMemoryInspector,
+              let target = activeMemoryInspectorTarget else {
+            return
+        }
+
+        let normalizedThreadIDs = Set(
+            affectedThreadIDs.compactMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty?.lowercased() }
+        )
+        let normalizedProjectIDs = Set(
+            affectedProjectIDs.compactMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty?.lowercased() }
+        )
+
+        let shouldRefresh: Bool
+        switch target {
+        case .thread(let threadID):
+            let normalizedThreadID = threadID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            shouldRefresh = normalizedThreadIDs.isEmpty || normalizedThreadIDs.contains(normalizedThreadID)
+        case .project(let projectID):
+            let normalizedProjectID = projectID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            shouldRefresh = normalizedProjectIDs.isEmpty || normalizedProjectIDs.contains(normalizedProjectID)
+        }
+
+        guard shouldRefresh else { return }
+        reloadMemoryInspectorSnapshot(closeIfMissing: closeIfMissing)
+    }
+
+    private func reloadMemoryInspectorSnapshot(closeIfMissing: Bool = false) {
+        guard showMemoryInspector,
+              let target = activeMemoryInspectorTarget else {
+            return
+        }
+
+        do {
+            switch target {
+            case .thread(let threadID):
+                guard let session = sessions.first(where: { sessionsMatch($0.id, threadID) }) else {
+                    if closeIfMissing {
+                        dismissMemoryInspector()
+                    }
+                    return
+                }
+                memoryInspectorSnapshot = try memoryInspectorService.snapshot(for: session)
+            case .project(let projectID):
+                guard let project = projects.first(where: {
+                    $0.id.trimmingCharacters(in: .whitespacesAndNewlines)
+                        .caseInsensitiveCompare(projectID) == .orderedSame
+                }) else {
+                    if closeIfMissing {
+                        dismissMemoryInspector()
+                    }
+                    return
+                }
+                memoryInspectorSnapshot = try memoryInspectorService.snapshot(for: project, sessions: sessions)
+            }
+        } catch {
+            lastStatusMessage = error.localizedDescription
+        }
+    }
+
+    private func scheduleProjectMemoryCatchUp() {
+        projectMemoryCatchUpTask?.cancel()
+        let projectLinkedSessions = sessions.filter { $0.projectID != nil }
+        guard !projectLinkedSessions.isEmpty else { return }
+
+        projectMemoryCatchUpTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.runProjectMemoryCatchUp(for: projectLinkedSessions)
+        }
+    }
+
+    private func runProjectMemoryCatchUp(for sessions: [AssistantSessionSummary]) async {
+        guard !isRefreshingProjectMemory else { return }
+        isRefreshingProjectMemory = true
+        defer { isRefreshingProjectMemory = false }
+
+        for session in sessions {
+            if Task.isCancelled { return }
+            guard shouldProcessProjectMemoryCatchUp(session) else { continue }
+            await handleProjectMemoryCheckpoint(for: session.id)
+        }
+
+        self.sessions = applyProjectMetadata(to: self.sessions)
+        refreshMemoryState(for: selectedSessionID)
+    }
+
+    private func shouldProcessProjectMemoryCatchUp(_ session: AssistantSessionSummary) -> Bool {
+        guard let context = projectStore.context(forThreadID: session.id) else {
+            return false
+        }
+        let threadID = session.id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !threadID.isEmpty else { return false }
+        guard let updatedAt = session.updatedAt ?? session.createdAt else { return true }
+        guard let lastProcessedAt = context.brainState.lastProcessedAt else { return true }
+        if lastProcessedAt < updatedAt {
+            return true
+        }
+        return context.brainState.lastProcessedTranscriptFingerprintByThreadID[threadID] == nil
+    }
+
+    private func handleProjectMemoryCheckpoint(for sessionID: String?) async {
+        guard let sessionID = sessionID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty,
+              let session = sessions.first(where: { sessionsMatch($0.id, sessionID) }),
+              session.projectID != nil else {
+            return
+        }
+
+        let history = await loadSessionHistoryForAutomationSummary(sessionID: sessionID)
+        do {
+            let result = try projectMemoryService.processCheckpoint(
+                session: session,
+                transcript: history.1
+            )
+            if result.didChange {
+                let affectedProjectID = session.projectID
+                reloadProjectsFromStore()
+                sessions = applyProjectMetadata(to: sessions)
+                refreshMemoryState(for: sessionID)
+                refreshMemoryInspectorIfNeeded(
+                    affectedThreadIDs: [sessionID],
+                    affectedProjectIDs: affectedProjectID.map { [$0] } ?? []
+                )
+            }
+        } catch {
+            CrashReporter.logError("Project memory checkpoint failed: \(error.localizedDescription)")
+        }
+    }
+
+    private func handleThreadMemoryCheckpoint(
+        for sessionID: String?,
+        status: AssistantTurnCompletionStatus
+    ) async {
+        guard status == .completed,
+              settings.assistantMemoryEnabled,
+              let sessionID = sessionID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+            return
+        }
+
+        do {
+            let turns = try threadRewriteService.editableTurns(sessionID: sessionID)
+            setEditableTurns(turns, for: sessionID)
+
+            guard let latestAnchorID = turns.last?.anchorID else { return }
+            _ = try threadMemoryService.captureCheckpoint(for: sessionID, anchorID: latestAnchorID)
+        } catch {
+            CrashReporter.logError("Thread memory checkpoint failed: \(error.localizedDescription)")
+        }
+    }
+
+    private func refreshEditableTurns(for sessionID: String?) {
+        guard let sessionID = sessionID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+            return
+        }
+
+        do {
+            setEditableTurns(try threadRewriteService.editableTurns(sessionID: sessionID), for: sessionID)
+        } catch {
+            editableTurnsBySessionID[sessionID] = []
+            historyActionsRevision &+= 1
+        }
+    }
+
+    private func setEditableTurns(_ turns: [CodexEditableTurn], for sessionID: String) {
+        editableTurnsBySessionID[sessionID] = turns
+        historyActionsRevision &+= 1
+    }
+
+    private func clearEditableTurns(for sessionID: String?) {
+        guard let sessionID = sessionID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else { return }
+        editableTurnsBySessionID.removeValue(forKey: sessionID)
+        historyActionsRevision &+= 1
+    }
+
+    private func latestEditableTurnAnchorID(for sessionID: String) -> String? {
+        let normalizedSessionID = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedSessionID.isEmpty else { return nil }
+
+        if let cached = editableTurnsBySessionID[normalizedSessionID]?.last?.anchorID {
+            return cached
+        }
+
+        if let turns = try? threadRewriteService.editableTurns(sessionID: normalizedSessionID) {
+            setEditableTurns(turns, for: normalizedSessionID)
+            return turns.last?.anchorID
+        }
+
+        return nil
+    }
+
+    func historyActionMetadata(
+        for renderItems: [AssistantTimelineRenderItem]
+    ) -> [String: AssistantHistoryActionAvailability] {
+        guard let sessionID = selectedSessionID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+            return [:]
+        }
+
+        let editableTurns = editableTurnsBySessionID[sessionID] ?? []
+        guard !editableTurns.isEmpty else { return [:] }
+
+        let visibleUserItems = renderItems.compactMap { renderItem -> AssistantTimelineItem? in
+            guard case .timeline(let item) = renderItem,
+                  item.kind == .userMessage else {
+                return nil
+            }
+
+            if item.source == .runtime && item.turnID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty == nil {
+                return nil
+            }
+            return item
+        }
+        guard !visibleUserItems.isEmpty else { return [:] }
+
+        let mappedCount = min(visibleUserItems.count, editableTurns.count)
+        guard mappedCount > 0 else { return [:] }
+
+        let itemTail = Array(visibleUserItems.suffix(mappedCount))
+        let turnTail = Array(editableTurns.suffix(mappedCount))
+        let latestEditableAnchorID = editableTurns.last?.anchorID
+        let canMutate = !runtime.hasActiveTurn && historyMutationState == nil
+
+        var metadata: [String: AssistantHistoryActionAvailability] = [:]
+        for (item, turn) in zip(itemTail, turnTail) {
+            metadata[item.id] = AssistantHistoryActionAvailability(
+                anchorID: turn.anchorID,
+                canUndo: canMutate,
+                canEdit: canMutate && turn.supportsEdit && turn.anchorID == latestEditableAnchorID
+            )
+        }
+
+        return metadata
+    }
+
+    private func applyHistoryRewriteRollback(
+        for sessionID: String,
+        retainedAnchorIDs: [String],
+        removedAnchorIDs: [String],
+        captureSnapshot: Bool,
+        keepRemovedCheckpoints: Bool
+    ) async throws -> AssistantHistoryRollbackSnapshot? {
+        let normalizedSessionID = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let removedAnchorSet = Set(removedAnchorIDs)
+        guard !normalizedSessionID.isEmpty else { return nil }
+
+        let memoryDocument = captureSnapshot
+            ? (try? threadMemoryService.loadTrackedDocument(for: normalizedSessionID).document)
+            : nil
+        let removedArtifacts = try memorySuggestionService.purgeHistoryArtifacts(
+            for: normalizedSessionID,
+            sourceTurnAnchorIDs: removedAnchorSet
+        )
+
+        let agentService = ConversationAgentStateService.shared
+        let profile = captureSnapshot ? (try? await agentService.fetchProfile(threadID: normalizedSessionID)) : nil
+        let entities = captureSnapshot ? (try? await agentService.fetchEntities(threadID: normalizedSessionID)) : nil
+        let preferences = captureSnapshot ? (try? await agentService.fetchPreferences(threadID: normalizedSessionID)) : nil
+
+        try? await agentService.clearProfile(threadID: normalizedSessionID)
+        try? await agentService.clearEntities(threadID: normalizedSessionID)
+        try? await agentService.clearPreferences(threadID: normalizedSessionID)
+
+        if let latestRetainedAnchorID = retainedAnchorIDs.last,
+           threadMemoryService.hasCheckpoint(for: normalizedSessionID, anchorID: latestRetainedAnchorID) {
+            _ = try threadMemoryService.restoreCheckpoint(for: normalizedSessionID, anchorID: latestRetainedAnchorID)
+        } else if threadMemoryService.memoryFileIfExists(for: normalizedSessionID) != nil || captureSnapshot {
+            _ = try threadMemoryService.clearThreadMemoryDocument(for: normalizedSessionID)
+        }
+
+        if !keepRemovedCheckpoints {
+            try? threadMemoryService.deleteCheckpoints(
+                for: normalizedSessionID,
+                retaining: Set(retainedAnchorIDs)
+            )
+        }
+
+        guard captureSnapshot else { return nil }
+        return AssistantHistoryRollbackSnapshot(
+            memoryDocument: memoryDocument,
+            removedSuggestions: removedArtifacts.removedSuggestions,
+            removedAcceptedEntries: removedArtifacts.removedEntries,
+            agentProfile: profile,
+            agentEntities: entities,
+            agentPreferences: preferences
+        )
+    }
+
+    private func restoreHistoryRollback(
+        for sessionID: String,
+        snapshot: AssistantHistoryRollbackSnapshot?
+    ) async throws {
+        guard let snapshot else { return }
+
+        if let memoryDocument = snapshot.memoryDocument {
+            _ = try threadMemoryService.saveDocument(memoryDocument, for: sessionID)
+        }
+
+        try memorySuggestionService.restoreHistoryArtifacts(
+            suggestions: snapshot.removedSuggestions,
+            acceptedEntries: snapshot.removedAcceptedEntries
+        )
+
+        let agentService = ConversationAgentStateService.shared
+        if let profile = snapshot.agentProfile {
+            try? await agentService.upsertProfile(profile)
+        }
+        if let entities = snapshot.agentEntities {
+            try? await agentService.upsertEntities(entities)
+        }
+        if let preferences = snapshot.agentPreferences {
+            try? await agentService.upsertPreferences(preferences)
+        }
+    }
+
+    private func assistantAttachment(from editableAttachment: CodexEditableAttachment) -> AssistantAttachment {
+        AssistantAttachment(
+            filename: editableAttachment.filename,
+            data: editableAttachment.data,
+            mimeType: editableAttachment.mimeType
+        )
+    }
+
+    private func invalidateSessionHistoryCaches(for sessionID: String) {
+        let normalizedSessionID = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedSessionID.isEmpty else { return }
+
+        pendingTimelineCacheSaveWorkItems[normalizedSessionID]?.cancel()
+        pendingTimelineCacheSaveWorkItems.removeValue(forKey: normalizedSessionID)
+        sessionCatalog.saveNormalizedTimeline([], for: normalizedSessionID)
+        pendingResumeContextSnapshotsBySessionID.removeValue(forKey: normalizedSessionID)
+        pendingResumeContextSessionIDs.remove(normalizedSessionID)
+        transcriptEntriesBySessionID.removeValue(forKey: normalizedSessionID)
+        timelineItemsBySessionID.removeValue(forKey: normalizedSessionID)
+        requestedTimelineHistoryLimitBySessionID.removeValue(forKey: normalizedSessionID)
+        requestedTranscriptHistoryLimitBySessionID.removeValue(forKey: normalizedSessionID)
+        canLoadMoreHistoryBySessionID.removeValue(forKey: normalizedSessionID)
+        clearEditableTurns(for: normalizedSessionID)
+    }
+
+    private func reloadAfterHistoryRewrite(for sessionID: String) async {
+        let normalizedSessionID = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedSessionID.isEmpty else { return }
+
+        invalidateSessionHistoryCaches(for: normalizedSessionID)
+        await refreshSessions(limit: max(40, sessions.count))
+        if sessionsMatch(selectedSessionID, normalizedSessionID) {
+            await reloadSelectedSessionHistoryIfNeeded(force: true)
+        }
+        refreshEditableTurns(for: normalizedSessionID)
+        refreshMemoryState(for: normalizedSessionID)
+        reloadMemoryInspectorSnapshot(closeIfMissing: true)
+    }
+
+    private func reconcileProjectDigest(for sessionID: String) async {
+        guard let session = sessions.first(where: { sessionsMatch($0.id, sessionID) }),
+              let projectID = session.projectID,
+              let project = projectStore.project(forProjectID: projectID) else {
+            return
+        }
+
+        let history = await loadSessionHistoryForAutomationSummary(sessionID: sessionID)
+        do {
+            if history.1.isEmpty {
+                try projectMemoryService.removeThread(sessionID, fromProjectID: project.id)
+            } else {
+                _ = try projectMemoryService.processCheckpoint(
+                    project: project,
+                    sessionSummary: session,
+                    transcript: history.1,
+                    cwd: resolvedSessionCWD(for: sessionID)
+                )
+            }
+            reloadProjectsFromStore()
+            withAnimation(.spring(response: 0.26, dampingFraction: 0.86)) {
+                sessions = applyProjectMetadata(to: sessions)
+            }
+            refreshMemoryInspectorIfNeeded(
+                affectedThreadIDs: [sessionID],
+                affectedProjectIDs: [project.id]
+            )
+        } catch {
+            CrashReporter.logError("Project digest reconciliation failed: \(error.localizedDescription)")
+        }
+    }
+
+    private func commitPendingHistoryEditIfNeeded(for sessionID: String) {
+        guard let mutation = historyMutationState,
+              mutation.kind == .edit,
+              mutation.isPendingComposerEdit,
+              sessionsMatch(mutation.sessionID, sessionID) else {
+            return
+        }
+
+        try? threadMemoryService.deleteCheckpoints(
+            for: mutation.sessionID,
+            retaining: Set(mutation.retainedAnchorIDs)
+        )
+        threadRewriteService.discardPendingEditBackup(sessionID: mutation.sessionID)
+        historyMutationState = nil
+        refreshEditableTurns(for: mutation.sessionID)
+    }
+
+    private func resolvedSessionCWD(for sessionID: String) -> String? {
+        if let projectContext = projectStore.context(forThreadID: sessionID),
+           let linkedFolderPath = projectContext.project.linkedFolderPath,
+           fileManagerDirectoryExists(atPath: linkedFolderPath) {
+            return linkedFolderPath
+        }
+        if let matchingSession = sessions.first(where: { sessionsMatch($0.id, sessionID) }) {
+            return matchingSession.effectiveCWD ?? matchingSession.cwd
+        }
+        return selectedSession?.effectiveCWD ?? selectedSession?.cwd
     }
 
     private func latestUserMessage(for sessionID: String) -> String? {
@@ -3205,11 +5304,11 @@ final class AssistantStore: ObservableObject {
             )
         }
 
-        if ["browser", "browser use", "computer use", "app action"].contains(normalizedTitle ?? "") {
+        if ["browser", "browser use", "app action"].contains(normalizedTitle ?? "") {
             return AssistantModeSwitchSuggestion(
                 source: .blocked,
                 originMode: event.mode,
-                message: "Chat mode stopped because this needs live browser or computer control. You can retry it in Agentic mode.",
+                message: "Chat mode stopped because this needs live browser or app automation. You can retry it in Agentic mode.",
                 choices: [
                     AssistantModeSwitchChoice(
                         mode: .agentic,
@@ -3280,15 +5379,13 @@ final class AssistantStore: ObservableObject {
         let toolCount = toolCalls.count + recentToolCalls.count
 
         do {
-            let scope = memoryRetrievalService.makeScopeContext(
-                threadID: sessionID,
-                cwd: resolvedSessionCWD(for: sessionID)
-            )
+            let scope = resolvedAssistantMemoryScope(for: sessionID)
             let created = try memorySuggestionService.createAutomaticFailureSuggestions(
                 from: text,
                 toolCount: toolCount,
                 threadID: sessionID,
-                scope: scope
+                scope: scope,
+                metadata: projectMemorySuggestionMetadata(for: sessionID)
             )
             guard !created.isEmpty else { return }
             pendingMemorySuggestions = try memorySuggestionService.suggestions(for: sessionID)
@@ -3473,11 +5570,12 @@ final class AssistantStore: ObservableObject {
     }
 
     private func preferredSessionID(preferConversationContent: Bool = true) -> String? {
+        let sourceSessions = visibleSidebarSessions
         if preferConversationContent,
-           let session = sessions.first(where: { $0.hasConversationContent }) {
+           let session = sourceSessions.first(where: { $0.hasConversationContent }) {
             return session.id
         }
-        return sessions.first?.id
+        return sourceSessions.first?.id ?? sessions.first?.id
     }
 
     private func prepareSessionForPrompt() async throws -> String {
@@ -3485,10 +5583,17 @@ final class AssistantStore: ObservableObject {
             if let currentSessionID = runtime.currentSessionID?.nonEmpty {
                 if sessionsMatch(currentSessionID, selectedSessionID) {
                     if !isPendingFreshSession(currentSessionID) {
-                        try await runtime.refreshCurrentSessionConfiguration(
-                            cwd: resolvedSessionCWD(for: currentSessionID),
-                            preferredModelID: selectedModelID
-                        )
+                        do {
+                            try await runtime.refreshCurrentSessionConfiguration(
+                                cwd: resolvedSessionCWD(for: currentSessionID),
+                                preferredModelID: selectedModelID
+                            )
+                        } catch {
+                            if isMissingRolloutError(error) {
+                                return try await recoverMissingRollout(for: selectedSessionID)
+                            }
+                            throw error
+                        }
                     }
                     return currentSessionID
                 }
@@ -3513,18 +5618,36 @@ final class AssistantStore: ObservableObject {
             }
 
             if let selectedSession = sessions.first(where: { sessionsMatch($0.id, selectedSessionID) }) {
-                try await runtime.resumeSession(selectedSession.id, cwd: selectedSession.cwd, preferredModelID: selectedModelID)
-                pendingResumeContextSessionIDs.insert(selectedSession.id)
-                return selectedSession.id
+                do {
+                    try await runtime.resumeSession(
+                        selectedSession.id,
+                        cwd: resolvedSessionCWD(for: selectedSession.id),
+                        preferredModelID: selectedModelID
+                    )
+                    pendingResumeContextSessionIDs.insert(selectedSession.id)
+                    return selectedSession.id
+                } catch {
+                    if isMissingRolloutError(error) {
+                        return try await recoverMissingRollout(for: selectedSession.id)
+                    }
+                    throw error
+                }
             }
         }
 
         if let currentSessionID = runtime.currentSessionID?.nonEmpty {
             if !isPendingFreshSession(currentSessionID) {
-                try await runtime.refreshCurrentSessionConfiguration(
-                    cwd: resolvedSessionCWD(for: currentSessionID),
-                    preferredModelID: selectedModelID
-                )
+                do {
+                    try await runtime.refreshCurrentSessionConfiguration(
+                        cwd: resolvedSessionCWD(for: currentSessionID),
+                        preferredModelID: selectedModelID
+                    )
+                } catch {
+                    if isMissingRolloutError(error) {
+                        return try await recoverMissingRollout(for: currentSessionID)
+                    }
+                    throw error
+                }
             }
             return currentSessionID
         }
@@ -3543,13 +5666,56 @@ final class AssistantStore: ObservableObject {
 
         let cachedTimeline = timelineItemsBySessionID[selectedSessionID] ?? []
         let cachedTranscript = transcriptEntriesBySessionID[selectedSessionID] ?? []
-        if !cachedTimeline.isEmpty,
+        let hasRenderableCachedTimeline = hasRenderableTimelineHistory(cachedTimeline)
+        let hasVisibleSelectedSessionHistory = sessionsMatch(timelineSessionID, selectedSessionID)
+            && !cachedRenderItems.isEmpty
+
+        if hasRenderableCachedTimeline,
            (!sessionsMatch(timelineSessionID, selectedSessionID) || timelineItems.isEmpty) {
             setVisibleTimeline(cachedTimeline, for: selectedSessionID)
         }
         if !cachedTranscript.isEmpty,
            (!sessionsMatch(transcriptSessionID, selectedSessionID) || transcript.isEmpty) {
             setVisibleTranscript(cachedTranscript, for: selectedSessionID)
+        }
+
+        let needsFreshVisibleHistory = !hasRenderableCachedTimeline
+            && (force || !hasVisibleSelectedSessionHistory || transcriptSessionID != selectedSessionID)
+        if needsFreshVisibleHistory {
+            isTransitioningSession = true
+
+            let requestID = UUID()
+            sessionLoadRequestID = requestID
+            let recentChunk = await sessionCatalog.loadRecentHistoryChunk(
+                sessionID: selectedSessionID,
+                timelineLimit: min(
+                    currentTimelineHistoryLimit(
+                        for: selectedSessionID,
+                        minimum: Self.HistoryLoading.initialTimelineLimit
+                    ),
+                    Self.HistoryLoading.recentTimelineChunkLimit
+                ),
+                transcriptLimit: min(
+                    currentTranscriptHistoryLimit(
+                        for: selectedSessionID,
+                        minimum: Self.HistoryLoading.initialTranscriptLimit
+                    ),
+                    Self.HistoryLoading.recentTranscriptChunkLimit
+                )
+            )
+
+            guard sessionLoadRequestID == requestID,
+                  sessionsMatch(self.selectedSessionID, selectedSessionID) else {
+                return
+            }
+
+            if hasRenderableTimelineHistory(recentChunk.timeline) {
+                setVisibleTimeline(recentChunk.timeline, for: selectedSessionID)
+                setVisibleTranscript(recentChunk.transcript, for: selectedSessionID)
+                canLoadMoreHistoryBySessionID[selectedSessionID] = recentChunk.hasMore
+                refreshEditableTurns(for: selectedSessionID)
+                isTransitioningSession = false
+            }
         }
 
         guard force
@@ -3560,8 +5726,17 @@ final class AssistantStore: ObservableObject {
 
         let requestID = UUID()
         sessionLoadRequestID = requestID
-        let loadedTimeline = await sessionCatalog.loadMergedTimeline(sessionID: selectedSessionID)
-        let loadedTranscript = await sessionCatalog.loadTranscript(sessionID: selectedSessionID)
+        let loadedHistory = await loadSessionHistorySlice(
+            sessionID: selectedSessionID,
+            timelineLimit: currentTimelineHistoryLimit(
+                for: selectedSessionID,
+                minimum: Self.HistoryLoading.initialTimelineLimit
+            ),
+            transcriptLimit: currentTranscriptHistoryLimit(
+                for: selectedSessionID,
+                minimum: Self.HistoryLoading.initialTranscriptLimit
+            )
+        )
 
         guard sessionLoadRequestID == requestID,
               sessionsMatch(self.selectedSessionID, selectedSessionID) else {
@@ -3569,11 +5744,11 @@ final class AssistantStore: ObservableObject {
         }
 
         let mergedTimeline = mergeTimelineHistory(
-            loadedTimeline,
+            loadedHistory.timeline,
             with: timelineItemsBySessionID[selectedSessionID] ?? []
         )
         let mergedTranscript = mergeTranscriptHistory(
-            loadedTranscript,
+            loadedHistory.transcript,
             with: transcriptEntriesBySessionID[selectedSessionID] ?? []
         )
         if !mergedTimeline.isEmpty || timelineItems.isEmpty || timelineSessionID != selectedSessionID {
@@ -3582,23 +5757,194 @@ final class AssistantStore: ObservableObject {
         if !mergedTranscript.isEmpty || transcript.isEmpty || transcriptSessionID != selectedSessionID {
             setVisibleTranscript(mergedTranscript, for: selectedSessionID)
         }
+        refreshEditableTurns(for: selectedSessionID)
         isTransitioningSession = false
     }
 
+    private func scheduleSelectedSessionHistoryReload(force: Bool) {
+        deferredSessionHistoryReloadTask?.cancel()
+        deferredSessionHistoryReloadTask = Task { @MainActor [weak self] in
+            await Task.yield()
+            guard !Task.isCancelled else { return }
+            await self?.reloadSelectedSessionHistoryIfNeeded(force: force)
+            guard !Task.isCancelled else { return }
+            self?.deferredSessionHistoryReloadTask = nil
+        }
+    }
+
+    func loadMoreHistoryForSelectedSession() async -> Bool {
+        guard let selectedSessionID = selectedSessionID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty,
+              let selectedSession,
+              selectedSession.isLocalSession else {
+            return false
+        }
+
+        let previousTimelineCount = timelineItemsBySessionID[selectedSessionID]?.count ?? 0
+        let previousTranscriptCount = transcriptEntriesBySessionID[selectedSessionID]?.count ?? 0
+        let requestID = UUID()
+        sessionLoadRequestID = requestID
+
+        let loadedHistory = await loadSessionHistorySlice(
+            sessionID: selectedSessionID,
+            timelineLimit: currentTimelineHistoryLimit(
+                for: selectedSessionID,
+                minimum: Self.HistoryLoading.initialTimelineLimit
+            ) + Self.HistoryLoading.timelineBatchSize,
+            transcriptLimit: currentTranscriptHistoryLimit(
+                for: selectedSessionID,
+                minimum: Self.HistoryLoading.initialTranscriptLimit
+            ) + Self.HistoryLoading.transcriptBatchSize,
+            previousTimelineCount: previousTimelineCount,
+            previousTranscriptCount: previousTranscriptCount
+        )
+
+        guard sessionLoadRequestID == requestID,
+              sessionsMatch(self.selectedSessionID, selectedSessionID) else {
+            return false
+        }
+
+        let mergedTimeline = mergeTimelineHistory(
+            loadedHistory.timeline,
+            with: timelineItemsBySessionID[selectedSessionID] ?? []
+        )
+        let mergedTranscript = mergeTranscriptHistory(
+            loadedHistory.transcript,
+            with: transcriptEntriesBySessionID[selectedSessionID] ?? []
+        )
+        let didGrow = mergedTimeline.count > previousTimelineCount || mergedTranscript.count > previousTranscriptCount
+        if didGrow {
+            setVisibleTimeline(mergedTimeline, for: selectedSessionID)
+            setVisibleTranscript(mergedTranscript, for: selectedSessionID)
+            refreshEditableTurns(for: selectedSessionID)
+        } else {
+            canLoadMoreHistoryBySessionID[selectedSessionID] = false
+        }
+        isTransitioningSession = false
+        return didGrow
+    }
+
     private func resumeContextIfNeeded(for sessionID: String) -> String? {
+        if let snapshot = pendingResumeContextSnapshotsBySessionID[sessionID]?.nonEmpty {
+            return snapshot
+        }
+
         guard pendingResumeContextSessionIDs.contains(sessionID) else { return nil }
 
         let sessionTranscript: [AssistantTranscriptEntry]
         if sessionsMatch(transcriptSessionID, sessionID) {
             sessionTranscript = transcript
         } else {
-            sessionTranscript = []
+            sessionTranscript = transcriptEntriesBySessionID[sessionID] ?? []
         }
 
         let summary = sessions.first(where: { sessionsMatch($0.id, sessionID) })
         return Self.buildResumeContext(
             transcriptEntries: sessionTranscript,
             sessionSummary: summary
+        )
+    }
+
+    private func buildResumeContextSnapshot(for sessionID: String?) -> String? {
+        guard let sessionID = sessionID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+            return nil
+        }
+
+        let sessionTranscript: [AssistantTranscriptEntry]
+        if sessionsMatch(transcriptSessionID, sessionID) {
+            sessionTranscript = transcript
+        } else {
+            sessionTranscript = transcriptEntriesBySessionID[sessionID] ?? []
+        }
+
+        let summary = sessions.first(where: { sessionsMatch($0.id, sessionID) })
+        return Self.buildResumeContext(
+            transcriptEntries: sessionTranscript,
+            sessionSummary: summary
+        )
+    }
+
+    private func recoverMissingRollout(for sessionID: String?) async throws -> String {
+        let sourceSessionID = sessionID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+        let recoveredContext = buildResumeContextSnapshot(for: sessionID)
+        let replacementSessionID = try await runtime.startNewSession(
+            cwd: sourceSessionID.flatMap { resolvedSessionCWD(for: $0) },
+            preferredModelID: selectedModelID
+        )
+        markPendingFreshSession(replacementSessionID)
+        recordOwnedSessionID(replacementSessionID)
+        if let recoveredContext {
+            pendingResumeContextSnapshotsBySessionID[replacementSessionID] = recoveredContext
+        }
+        lastStatusMessage = "That saved thread could not be reopened, so Open Assist started a new thread with a short recovered summary."
+        return replacementSessionID
+    }
+
+    private func isMissingRolloutError(_ error: Error) -> Bool {
+        let message = error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !message.isEmpty else { return false }
+        return message.contains("no rollout found for thread id")
+            || message.contains("failed to load rollout")
+    }
+
+    private struct SessionHistorySlice {
+        let timeline: [AssistantTimelineItem]
+        let transcript: [AssistantTranscriptEntry]
+    }
+
+    private func currentTimelineHistoryLimit(for sessionID: String, minimum: Int) -> Int {
+        max(
+            minimum,
+            max(
+                requestedTimelineHistoryLimitBySessionID[sessionID] ?? 0,
+                timelineItemsBySessionID[sessionID]?.count ?? 0
+            )
+        )
+    }
+
+    private func currentTranscriptHistoryLimit(for sessionID: String, minimum: Int) -> Int {
+        max(
+            minimum,
+            max(
+                requestedTranscriptHistoryLimitBySessionID[sessionID] ?? 0,
+                transcriptEntriesBySessionID[sessionID]?.count ?? 0
+            )
+        )
+    }
+
+    private func loadSessionHistorySlice(
+        sessionID: String,
+        timelineLimit: Int,
+        transcriptLimit: Int,
+        previousTimelineCount: Int? = nil,
+        previousTranscriptCount: Int? = nil
+    ) async -> SessionHistorySlice {
+        async let timelineTask = sessionCatalog.loadMergedTimeline(
+            sessionID: sessionID,
+            limit: timelineLimit
+        )
+        async let transcriptTask = sessionCatalog.loadTranscript(
+            sessionID: sessionID,
+            limit: transcriptLimit
+        )
+        let (timeline, transcript) = await (timelineTask, transcriptTask)
+
+        requestedTimelineHistoryLimitBySessionID[sessionID] = max(
+            timelineLimit,
+            requestedTimelineHistoryLimitBySessionID[sessionID] ?? 0
+        )
+        requestedTranscriptHistoryLimitBySessionID[sessionID] = max(
+            transcriptLimit,
+            requestedTranscriptHistoryLimitBySessionID[sessionID] ?? 0
+        )
+
+        let maybeHasMore = timeline.count >= timelineLimit || transcript.count >= transcriptLimit
+        let didGrowTimeline = previousTimelineCount.map { timeline.count > $0 } ?? true
+        let didGrowTranscript = previousTranscriptCount.map { transcript.count > $0 } ?? true
+        canLoadMoreHistoryBySessionID[sessionID] = maybeHasMore && (didGrowTimeline || didGrowTranscript)
+
+        return SessionHistorySlice(
+            timeline: timeline,
+            transcript: transcript
         )
     }
 
@@ -3646,6 +5992,11 @@ final class AssistantStore: ObservableObject {
         }
     }
 
+    private func setVisibleHistoryLoadingState(for sessionID: String?) {
+        setVisibleTimeline([], for: sessionID)
+        setVisibleTranscript([], for: sessionID)
+    }
+
     private func storeTranscriptEntryInCache(_ entry: AssistantTranscriptEntry, sessionID: String?) {
         guard let sessionID = sessionID?.nonEmpty else { return }
         var entries = transcriptEntriesBySessionID[sessionID] ?? []
@@ -3653,6 +6004,48 @@ final class AssistantStore: ObservableObject {
             entries[existingIndex] = entry
         } else {
             entries.append(entry)
+        }
+        entries.sort {
+            if $0.createdAt == $1.createdAt {
+                return $0.id.uuidString < $1.id.uuidString
+            }
+            return $0.createdAt < $1.createdAt
+        }
+        transcriptEntriesBySessionID[sessionID] = entries
+    }
+
+    private func appendTranscriptDeltaToCache(
+        id: UUID,
+        sessionID: String?,
+        role: AssistantTranscriptRole,
+        delta: String,
+        createdAt: Date,
+        emphasis: Bool,
+        isStreaming: Bool
+    ) {
+        guard let sessionID = sessionID?.nonEmpty else { return }
+        var entries = transcriptEntriesBySessionID[sessionID] ?? []
+        if let existingIndex = entries.lastIndex(where: { $0.id == id }) {
+            let existingEntry = entries[existingIndex]
+            entries[existingIndex] = AssistantTranscriptEntry(
+                id: existingEntry.id,
+                role: existingEntry.role,
+                text: existingEntry.text + delta,
+                createdAt: existingEntry.createdAt,
+                emphasis: existingEntry.emphasis || emphasis,
+                isStreaming: isStreaming
+            )
+        } else {
+            entries.append(
+                AssistantTranscriptEntry(
+                    id: id,
+                    role: role,
+                    text: delta,
+                    createdAt: createdAt,
+                    emphasis: emphasis,
+                    isStreaming: isStreaming
+                )
+            )
         }
         entries.sort {
             if $0.createdAt == $1.createdAt {
@@ -3699,8 +6092,12 @@ final class AssistantStore: ObservableObject {
         planTurnIDs: Set<String>
     ) -> Bool {
         switch item.kind {
-        case .userMessage, .system:
+        case .userMessage:
             return item.text?.assistantNonEmpty != nil
+                || (item.imageAttachments?.isEmpty == false)
+        case .system:
+            return item.text?.assistantNonEmpty != nil
+                || (item.imageAttachments?.isEmpty == false)
         case .assistantProgress, .assistantFinal:
             if let turnID = item.turnID?.assistantNonEmpty,
                planTurnIDs.contains(turnID) {
@@ -3723,6 +6120,10 @@ final class AssistantStore: ObservableObject {
         return items.filter { item in
             shouldRenderTimelineItem(item, planTurnIDs: planTurnIDs)
         }
+    }
+
+    private func hasRenderableTimelineHistory(_ items: [AssistantTimelineItem]) -> Bool {
+        !visibleTimelineItemsForRendering(from: items).isEmpty
     }
 
     /// Rebuilds the cached render items from the current timeline items.
@@ -3838,6 +6239,29 @@ final class AssistantStore: ObservableObject {
             return false
         }
 
+        // Turn-based dedup: items from the same turn with the same kind are
+        // always duplicates regardless of timestamps. This handles cases where
+        // loaded history (JSONL) and runtime items have different IDs and
+        // createdAt timestamps that diverge beyond the text-based window
+        // (e.g., long-running agent tasks).
+        if let lhsTurnID = lhs.turnID?.nonEmpty,
+           let rhsTurnID = rhs.turnID?.nonEmpty,
+           lhsTurnID.caseInsensitiveCompare(rhsTurnID) == .orderedSame {
+            switch (lhs.kind, rhs.kind) {
+            case (.assistantProgress, .assistantProgress),
+                 (.assistantFinal, .assistantFinal),
+                 (.assistantProgress, .assistantFinal),
+                 (.assistantFinal, .assistantProgress):
+                return true
+            case (.userMessage, .userMessage):
+                return true
+            case (.plan, .plan):
+                return true
+            default:
+                break
+            }
+        }
+
         switch (lhs.kind, rhs.kind) {
         case (.activity, .activity):
             return lhs.activity?.id == rhs.activity?.id
@@ -3854,7 +6278,7 @@ final class AssistantStore: ObservableObject {
              (.assistantFinal, .assistantProgress):
             return normalizedTimelineDeduplicationText(lhs.text) == normalizedTimelineDeduplicationText(rhs.text)
                 && timelineTurnsLikelyMatch(lhs.turnID, rhs.turnID)
-                && abs(lhs.createdAt.timeIntervalSince(rhs.createdAt)) < 5
+                && abs(lhs.createdAt.timeIntervalSince(rhs.createdAt)) < 120
 
         case (.permission, .permission):
             return lhs.permissionRequest?.toolTitle == rhs.permissionRequest?.toolTitle
@@ -4009,11 +6433,24 @@ final class AssistantStore: ObservableObject {
             }
 
             let placeholder = existingPendingSessions.first(where: { sessionsMatch($0.id, sessionID) })
+                .map { existing in
+                    var normalized = existing
+                    normalized.status = Self.normalizedFreshSessionStatus(
+                        currentStatus: existing.status,
+                        hasConversationContent: existing.hasConversationContent,
+                        hasActiveTurn: runtime.hasActiveTurn
+                    )
+                    return normalized
+                }
                 ?? AssistantSessionSummary(
                     id: sessionID,
                     title: "New Assistant Session",
                     source: .appServer,
-                    status: .active,
+                    status: Self.normalizedFreshSessionStatus(
+                        currentStatus: .active,
+                        hasConversationContent: false,
+                        hasActiveTurn: runtime.hasActiveTurn
+                    ),
                     cwd: resolvedSessionCWD(for: sessionID) ?? FileManager.default.homeDirectoryForCurrentUser.path,
                     createdAt: Date(),
                     updatedAt: Date(),

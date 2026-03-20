@@ -102,7 +102,7 @@ struct AssistantStructuredUserInputView: View {
                     )
                     .overlay(
                         RoundedRectangle(cornerRadius: 12, style: .continuous)
-                            .stroke(isSelected ? accent.opacity(0.85) : Color.white.opacity(0.08), lineWidth: 1)
+                            .stroke(isSelected ? accent.opacity(0.85) : AppVisualTheme.foreground(0.08), lineWidth: 1)
                     )
                 }
                 .buttonStyle(.plain)
@@ -136,7 +136,7 @@ struct AssistantStructuredUserInputView: View {
                     )
                     .overlay(
                         RoundedRectangle(cornerRadius: 12, style: .continuous)
-                            .stroke(normalizedCustomAnswer(for: question) == nil ? Color.white.opacity(0.08) : accent.opacity(0.85), lineWidth: 1)
+                            .stroke(normalizedCustomAnswer(for: question) == nil ? AppVisualTheme.foreground(0.08) : accent.opacity(0.85), lineWidth: 1)
                     )
                 }
             }
@@ -144,7 +144,7 @@ struct AssistantStructuredUserInputView: View {
         .padding(12)
         .background(
             RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .fill(Color.white.opacity(0.03))
+                .fill(AppVisualTheme.foreground(0.03))
         )
     }
 

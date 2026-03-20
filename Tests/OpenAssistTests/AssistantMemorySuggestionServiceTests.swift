@@ -178,6 +178,47 @@ final class AssistantMemorySuggestionServiceTests: XCTestCase {
         XCTAssertTrue(try suggestionService.suggestions(for: "thread-4").isEmpty)
     }
 
+    func testAutomaticFailureSuggestionsDoNotTreatPlainInsteadPhraseAsDetour() throws {
+        let memoryRoot = try makeTemporaryDirectory(named: "assistant-memory")
+        let databaseURL = try makeDatabaseURL()
+        let store = try MemorySQLiteStore(databaseURL: databaseURL)
+        let suggestionService = AssistantMemorySuggestionService(
+            threadMemoryService: AssistantThreadMemoryService(baseDirectoryURL: memoryRoot),
+            store: store
+        )
+
+        let scope = MemoryScopeContext(
+            appName: "Open Assist",
+            bundleID: "com.developingadventures.OpenAssist",
+            surfaceLabel: "Assistant",
+            projectName: "OpenAssist",
+            repositoryName: "OpenAssist",
+            identityKey: "assistant-session:thread-4b",
+            identityType: "assistant-session",
+            identityLabel: "thread-4b",
+            scopeKey: "scope|assistant|thread-4b",
+            isCodingContext: true
+        )
+
+        let created = try suggestionService.createAutomaticFailureSuggestions(
+            from: """
+            I have enough context now to make a real implementation plan. Before I summarize it, I'm checking one last thing: whether the existing tests already cover these approval endpoints, so I can include testing work in the plan instead of guessing.
+            """,
+            toolCount: 22,
+            threadID: "thread-4b",
+            scope: scope
+        )
+
+        XCTAssertTrue(
+            created.allSatisfy { !$0.summary.contains("ask earlier instead of trying many detours") }
+        )
+        XCTAssertTrue(
+            try suggestionService.suggestions(for: "thread-4b").allSatisfy {
+                !$0.summary.contains("ask earlier instead of trying many detours")
+            }
+        )
+    }
+
     func testAutomaticFailureSuggestionsCaptureNoisyBrowserDetour() throws {
         let memoryRoot = try makeTemporaryDirectory(named: "assistant-memory")
         let databaseURL = try makeDatabaseURL()
@@ -340,6 +381,160 @@ final class AssistantMemorySuggestionServiceTests: XCTestCase {
         XCTAssertEqual(entries.first?.summary, summary)
         XCTAssertTrue(try suggestionService.suggestions(for: "thread-7").isEmpty)
         XCTAssertTrue(try threadMemoryService.loadTrackedDocument(for: "thread-7").document.candidateLessons.isEmpty)
+    }
+
+    func testAcceptingStaleSuggestionInvalidatesTargetProjectLesson() throws {
+        let memoryRoot = try makeTemporaryDirectory(named: "assistant-memory")
+        let databaseURL = try makeDatabaseURL()
+        let store = try MemorySQLiteStore(databaseURL: databaseURL)
+        let threadMemoryService = AssistantThreadMemoryService(baseDirectoryURL: memoryRoot)
+        let suggestionService = AssistantMemorySuggestionService(
+            threadMemoryService: threadMemoryService,
+            store: store
+        )
+
+        let scope = MemoryScopeContext(
+            appName: "Open Assist",
+            bundleID: "com.developingadventures.OpenAssist",
+            surfaceLabel: "Assistant Project",
+            projectKey: "assistant-project:proj-1",
+            projectName: "Website App",
+            repositoryName: "website-app",
+            identityKey: "assistant-project:proj-1",
+            identityType: "assistant-project",
+            identityLabel: "Website App",
+            scopeKey: "scope|project|proj-1",
+            isCodingContext: true
+        )
+
+        let entry = AssistantMemoryEntry(
+            provider: .codex,
+            scopeKey: scope.scopeKey,
+            bundleID: scope.bundleID,
+            projectKey: scope.projectKey,
+            identityKey: scope.identityKey,
+            threadID: nil,
+            memoryType: .lesson,
+            title: "Auth provider",
+            summary: "This project uses Supabase auth.",
+            detail: "This project uses Supabase auth for sign-in.",
+            keywords: ["supabase", "auth", "signin"],
+            confidence: 0.9,
+            metadata: [
+                "memory_domain": "assistant",
+                "lesson_key": "auth-provider",
+                "project_id": "proj-1"
+            ]
+        )
+        try store.upsertAssistantMemoryEntry(entry)
+
+        let suggestions = try suggestionService.createStaleLessonSuggestion(
+            target: entry,
+            threadID: "thread-8",
+            scope: scope,
+            reason: "A newer thread says the project migrated from Supabase to Clerk.",
+            sourceExcerpt: "The project migrated from Supabase to Clerk."
+        )
+        XCTAssertEqual(suggestions.count, 1)
+
+        try suggestionService.acceptSuggestion(id: try XCTUnwrap(suggestions.first?.id))
+
+        let invalidated = try store.fetchAssistantMemoryEntries(
+            query: "",
+            provider: .codex,
+            scopeKey: scope.scopeKey,
+            projectKey: scope.projectKey,
+            identityKey: scope.identityKey,
+            state: .invalidated,
+            limit: 10
+        )
+        XCTAssertEqual(invalidated.count, 1)
+        XCTAssertEqual(invalidated.first?.id, entry.id)
+        XCTAssertTrue((invalidated.first?.metadata["invalidation_reason"] ?? "").contains("Supabase"))
+    }
+
+    func testPurgeAndRestoreHistoryArtifactsByTurnAnchor() throws {
+        let memoryRoot = try makeTemporaryDirectory(named: "assistant-memory")
+        let databaseURL = try makeDatabaseURL()
+        let store = try MemorySQLiteStore(databaseURL: databaseURL)
+        let threadMemoryService = AssistantThreadMemoryService(baseDirectoryURL: memoryRoot)
+        let suggestionService = AssistantMemorySuggestionService(
+            threadMemoryService: threadMemoryService,
+            store: store
+        )
+
+        let scope = MemoryScopeContext(
+            appName: "Open Assist",
+            bundleID: "com.developingadventures.OpenAssist",
+            surfaceLabel: "Assistant",
+            projectName: "OpenAssist",
+            repositoryName: "OpenAssist",
+            identityKey: "assistant-session:thread-history",
+            identityType: "assistant-session",
+            identityLabel: "thread-history",
+            scopeKey: "scope|assistant|thread-history",
+            isCodingContext: true
+        )
+
+        let pending = try suggestionService.createManualSuggestions(
+            from: "Keep progress updates brief when the user only needs the result.",
+            threadID: "thread-history",
+            scope: scope,
+            metadata: [
+                "source_turn_anchor_id": "turn-a",
+                "source_session_id": "thread-history"
+            ]
+        )
+        XCTAssertEqual(pending.count, 1)
+        let accepted = try suggestionService.createManualSuggestions(
+            from: "Ask before switching to a different thread.",
+            threadID: "thread-history",
+            scope: scope,
+            metadata: [
+                "source_turn_anchor_id": "turn-a",
+                "source_session_id": "thread-history"
+            ]
+        )
+        try suggestionService.acceptSuggestion(id: try XCTUnwrap(accepted.first?.id))
+
+        let removed = try suggestionService.purgeHistoryArtifacts(
+            for: "thread-history",
+            sourceTurnAnchorIDs: Set(["turn-a"])
+        )
+
+        XCTAssertEqual(removed.removedSuggestions.count, 1)
+        XCTAssertEqual(removed.removedEntries.count, 1)
+        XCTAssertTrue(try suggestionService.suggestions(for: "thread-history").isEmpty)
+        XCTAssertTrue(
+            try store.fetchAssistantMemoryEntries(
+                query: "",
+                provider: .codex,
+                threadID: "thread-history",
+                state: nil,
+                limit: 10
+            ).isEmpty
+        )
+
+        try suggestionService.restoreHistoryArtifacts(
+            suggestions: removed.removedSuggestions,
+            acceptedEntries: removed.removedEntries
+        )
+
+        XCTAssertEqual(try suggestionService.suggestions(for: "thread-history").count, 1)
+        XCTAssertEqual(
+            try store.fetchAssistantMemoryEntries(
+                query: "",
+                provider: .codex,
+                threadID: "thread-history",
+                state: nil,
+                limit: 10
+            ).count,
+            1
+        )
+
+        let document = try threadMemoryService.loadTrackedDocument(for: "thread-history").document
+        XCTAssertEqual(document.candidateLessons.count, 1)
+        XCTAssertTrue(document.candidateLessons.contains(where: { $0.contains("Keep progress updates brief") }))
     }
 
     private func makeTemporaryDirectory(named name: String) throws -> URL {
