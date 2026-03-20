@@ -113,6 +113,24 @@ final class AssistantProjectStoreTests: XCTestCase {
         }
     }
 
+    func testAssignThreadRejectsMissingThreadID() throws {
+        let directory = try makeTemporaryDirectory(named: "assistant-project-thread-id")
+        let store = AssistantProjectStore(baseDirectoryURL: directory)
+        let project = try store.createProject(name: "Notes")
+
+        XCTAssertThrowsError(try store.assignThread("   ", toProjectID: project.id)) { error in
+            guard let storeError = error as? AssistantProjectStoreError else {
+                return XCTFail("Unexpected error type: \(error)")
+            }
+            if case .invalidThreadID = storeError {
+                // expected
+            } else {
+                XCTFail("Expected invalidThreadID, got \(storeError)")
+            }
+            XCTAssertEqual(storeError.localizedDescription, "Enter a thread ID first.")
+        }
+    }
+
     private func makeTemporaryDirectory(named name: String) throws -> URL {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("\(name)-\(UUID().uuidString)", isDirectory: true)

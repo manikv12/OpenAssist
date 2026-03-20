@@ -81,13 +81,21 @@ final class AssistantMarkdownWebCoordinator: NSObject, WKScriptMessageHandler {
         }
         let path = url.path
         if (scheme == "file" || scheme.isEmpty), !path.isEmpty {
-            if let vscodeURL = URL(string: "vscode://file\(path)"),
+            if let vscodeURL = vscodeFileURL(for: path),
                NSWorkspace.shared.urlForApplication(toOpen: vscodeURL) != nil {
                 NSWorkspace.shared.open(vscodeURL)
                 return
             }
             NSWorkspace.shared.open(URL(fileURLWithPath: path))
         }
+    }
+
+    private func vscodeFileURL(for path: String) -> URL? {
+        var components = URLComponents()
+        components.scheme = "vscode"
+        components.host = "file"
+        components.path = path
+        return components.url
     }
 }
 

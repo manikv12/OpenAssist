@@ -756,6 +756,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
     private var assistantMinimizeToCompactObserver: NSObjectProtocol?
     private var scheduledJobRequestObserver: NSObjectProtocol?
     private var scheduledJobInFlightID: String?
+    private var scheduledJobPreviousModelID: String?
+    private var scheduledJobPreviousReasoningEffort: AssistantReasoningEffort?
     private var memoryPressureSource: DispatchSourceMemoryPressure?
     private var adaptiveCorrectionObserver: AnyCancellable?
     private var assistantHUDObserver: AnyCancellable?
@@ -2115,12 +2117,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             coordinator.markJobExecutionFinished(id: jobID)
             return
         }
+        scheduledJobPreviousModelID = assistantController.selectedModelID
+        scheduledJobPreviousReasoningEffort = assistantController.reasoningEffort
         scheduledJobInFlightID = jobID
         _ = coordinator.beginRun(jobID: jobID, startedAt: Date())
         let existingSessionID = coordinator.jobs.first(where: { $0.id == jobID })?.dedicatedSessionID
 
         if let preferredModelID {
-            assistantController.chooseModel(preferredModelID)
+            assistantController.applyRuntimeModelSelection(preferredModelID)
         }
         if let reasoningEffortRawValue,
            let reasoningEffort = AssistantReasoningEffort(rawValue: reasoningEffortRawValue) {
@@ -2168,6 +2172,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         scheduledJobInFlightID = nil
         let coordinator = JobQueueCoordinator.shared
         defer {
+            restoreScheduledJobOverrides()
             coordinator.markJobExecutionFinished(id: jobID)
         }
 
@@ -2235,6 +2240,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             learnedLessonCount: processed.learnedLessonCount,
             finishedAt: finishedAt
         )
+    }
+
+    private func restoreScheduledJobOverrides() {
+        let previousModelID = scheduledJobPreviousModelID
+        let previousReasoningEffort = scheduledJobPreviousReasoningEffort
+        scheduledJobPreviousModelID = nil
+        scheduledJobPreviousReasoningEffort = nil
+
+        assistantController.applyRuntimeModelSelection(previousModelID, force: true)
+        if let previousReasoningEffort {
+            assistantController.reasoningEffort = previousReasoningEffort
+        }
     }
 
     private func disableAssistantBeta() {

@@ -20,6 +20,7 @@ final class JobQueueCoordinator: ObservableObject {
     private var wakeObserver: NSObjectProtocol?
     private var hasStarted = false
     private var pendingExecutions: [PendingExecution] = []
+    private var pendingExecutionJobIDs: Set<String> = []
     private var activeExecution: PendingExecution?
     private var activeRunsByJobID: [String: ScheduledJobRun] = [:]
 
@@ -85,6 +86,7 @@ final class JobQueueCoordinator: ObservableObject {
     func removeJob(id: String) {
         jobs.removeAll { $0.id == id }
         pendingExecutions.removeAll { $0.jobID == id }
+        pendingExecutionJobIDs.remove(id)
         try? store?.delete(id: id)
         runsByJobID[id] = nil
         automationLessonsByJobID[id] = nil
@@ -252,9 +254,13 @@ final class JobQueueCoordinator: ObservableObject {
     // MARK: - Global Queue
 
     private func enqueue(jobID: String, allowsDisabledExecution: Bool) {
+        guard activeExecution?.jobID != jobID,
+              !pendingExecutionJobIDs.contains(jobID),
+              !runningJobIDs.contains(jobID) else { return }
         pendingExecutions.append(
             PendingExecution(jobID: jobID, allowsDisabledExecution: allowsDisabledExecution)
         )
+        pendingExecutionJobIDs.insert(jobID)
         startNextQueuedExecutionIfPossible()
     }
 
@@ -263,6 +269,7 @@ final class JobQueueCoordinator: ObservableObject {
 
         while !pendingExecutions.isEmpty {
             let next = pendingExecutions.removeFirst()
+            pendingExecutionJobIDs.remove(next.jobID)
             guard let job = jobs.first(where: { $0.id == next.jobID }) else { continue }
             guard next.allowsDisabledExecution || job.isEnabled else { continue }
 

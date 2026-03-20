@@ -2192,6 +2192,23 @@ final class AssistantStore: ObservableObject {
         guard !trimmed.isEmpty,
               visibleModels.contains(where: { $0.id == trimmed }) else { return }
         settings.assistantPreferredModelID = trimmed
+        applyRuntimeModelSelection(trimmed, force: true)
+    }
+
+    func applyRuntimeModelSelection(_ modelID: String?, force: Bool = false) {
+        let trimmed = modelID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+        guard let trimmed else {
+            selectedModelID = nil
+            runtime.setPreferredModelID(nil)
+            runtimeHealth.selectedModelID = nil
+            syncRuntimeContext()
+            return
+        }
+
+        if !force, !visibleModels.contains(where: { $0.id == trimmed }) {
+            return
+        }
+
         selectedModelID = trimmed
         syncReasoningEffortWithSelectedModel(preferModelDefault: true)
         runtime.setPreferredModelID(trimmed)

@@ -427,13 +427,19 @@ final class TelegramBotClient {
     private func replyMarkupDictionary(_ markup: TelegramInlineKeyboardMarkup) throws -> [String: Any] {
         let data = try JSONEncoder().encode(markup)
         let object = try JSONSerialization.jsonObject(with: data, options: [])
-        return object as? [String: Any] ?? [:]
+        guard let dictionary = object as? [String: Any] else {
+            throw TelegramBotClientError.malformedResponse
+        }
+        return dictionary
     }
 
     private func commandDictionaries(_ commands: [TelegramBotCommand]) throws -> [[String: Any]] {
         let data = try JSONEncoder().encode(commands)
         let object = try JSONSerialization.jsonObject(with: data, options: [])
-        return object as? [[String: Any]] ?? []
+        guard let dictionaries = object as? [[String: Any]] else {
+            throw TelegramBotClientError.malformedResponse
+        }
+        return dictionaries
     }
 }
 

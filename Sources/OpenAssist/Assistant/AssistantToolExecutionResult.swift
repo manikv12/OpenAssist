@@ -12,7 +12,7 @@ struct AssistantToolExecutionResult: Sendable {
                 dictionary["text"] = text
             }
             if let imageURL {
-                dictionary["imageUrl"] = imageURL
+                dictionary["image_url"] = ["url": imageURL]
             }
             return dictionary
         }

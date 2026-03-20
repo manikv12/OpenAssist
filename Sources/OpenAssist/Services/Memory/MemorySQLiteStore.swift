@@ -1592,13 +1592,24 @@ final class MemorySQLiteStore {
         let normalizedIDs = ids.map(\.uuidString)
         guard !normalizedIDs.isEmpty else { return }
 
-        let placeholders = Array(repeating: "?", count: normalizedIDs.count).joined(separator: ", ")
-        let sql = "DELETE FROM assistant_memory_entries WHERE id IN (\(placeholders));"
-        try execute(sql: sql, bind: { statement in
-            for (index, id) in normalizedIDs.enumerated() {
-                self.bind(id, at: Int32(index + 1), in: statement)
-            }
-        })
+        // SQLite has a limit on bound parameters per statement, so delete in batches.
+        let batchSize = 900
+        var startIndex = 0
+
+        while startIndex < normalizedIDs.count {
+            let endIndex = min(startIndex + batchSize, normalizedIDs.count)
+            let batch = Array(normalizedIDs[startIndex..<endIndex])
+            let placeholders = Array(repeating: "?", count: batch.count).joined(separator: ", ")
+            let sql = "DELETE FROM assistant_memory_entries WHERE id IN (\(placeholders));"
+
+            try execute(sql: sql, bind: { statement in
+                for (index, id) in batch.enumerated() {
+                    self.bind(id, at: Int32(index + 1), in: statement)
+                }
+            })
+
+            startIndex = endIndex
+        }
     }
 
     func clearAllConversationAgentState() throws {

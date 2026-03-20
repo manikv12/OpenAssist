@@ -6,6 +6,7 @@ enum AssistantProjectStoreError: LocalizedError {
     case invalidProjectIconName
     case duplicateProjectName(String)
     case projectNotFound
+    case invalidThreadID
 
     var errorDescription: String? {
         switch self {
@@ -17,6 +18,8 @@ enum AssistantProjectStoreError: LocalizedError {
             return "A project named “\(name)” already exists."
         case .projectNotFound:
             return "That project could not be found."
+        case .invalidThreadID:
+            return "Enter a thread ID first."
         }
     }
 }
@@ -494,7 +497,7 @@ final class AssistantProjectStore {
 
     private func requiredThreadID(_ threadID: String?) throws -> String {
         guard let normalizedThreadID = normalizedThreadID(threadID) else {
-            throw AssistantProjectStoreError.projectNotFound
+            throw AssistantProjectStoreError.invalidThreadID
         }
         return normalizedThreadID
     }

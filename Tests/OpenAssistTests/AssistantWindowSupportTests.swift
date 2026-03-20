@@ -49,6 +49,7 @@ final class AssistantWindowSupportTests: XCTestCase {
         let hiddenActivity = assistantSelectedSessionToolActivity(
             selectedSessionID: "thread-b",
             activeRuntimeSessionID: "thread-a",
+            hasActiveTurn: true,
             toolCalls: activeCalls,
             recentToolCalls: recentCalls
         )
@@ -57,6 +58,7 @@ final class AssistantWindowSupportTests: XCTestCase {
         let visibleActivity = assistantSelectedSessionToolActivity(
             selectedSessionID: "THREAD-A",
             activeRuntimeSessionID: "thread-a",
+            hasActiveTurn: true,
             toolCalls: activeCalls,
             recentToolCalls: recentCalls
         )

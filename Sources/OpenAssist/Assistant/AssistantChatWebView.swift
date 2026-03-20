@@ -513,6 +513,7 @@ final class AssistantChatWebContainerView: NSView, WKNavigationDelegate {
     private var pendingMessages: [AssistantChatWebMessage]?
     private var pendingTyping: (Bool, String, String)?
     private var pendingTextScale: CGFloat?
+    private var pendingCanLoadOlderHistory: Bool?
 
     // Throttling for streaming updates
     private var throttleTimer: Timer?
@@ -565,6 +566,10 @@ final class AssistantChatWebContainerView: NSView, WKNavigationDelegate {
             if let js = self.pendingAccentCSS {
                 self.webView.evaluateJavaScript(js, completionHandler: nil)
                 self.pendingAccentCSS = nil
+            }
+            if let canLoadOlderHistory = self.pendingCanLoadOlderHistory {
+                self.webView.evaluateJavaScript("chatBridge.setCanLoadOlder(\(canLoadOlderHistory))", completionHandler: nil)
+                self.pendingCanLoadOlderHistory = nil
             }
         }
         uc.add(readyHandler, name: "ready")
@@ -699,7 +704,10 @@ final class AssistantChatWebContainerView: NSView, WKNavigationDelegate {
     private var pendingAccentCSS: String?
 
     func applyCanLoadOlder(_ canLoad: Bool) {
-        guard isReady else { return }
+        guard isReady else {
+            pendingCanLoadOlderHistory = canLoad
+            return
+        }
         webView.evaluateJavaScript("chatBridge.setCanLoadOlder(\(canLoad))", completionHandler: nil)
     }
 
