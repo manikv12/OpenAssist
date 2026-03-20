@@ -54,7 +54,15 @@ final class AssistantRemoteBridge {
     }
 
     func listSessions(limit: Int = 8, projectID: String? = nil) async -> [AssistantSessionSummary] {
-        await assistant.refreshSessions(limit: max(limit, 20))
+        let refreshLimit: Int
+        if let normalizedProjectID = projectID?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !normalizedProjectID.isEmpty {
+            refreshLimit = max(limit * 8, 200)
+        } else {
+            refreshLimit = max(limit, 20)
+        }
+
+        await assistant.refreshSessions(limit: refreshLimit)
         guard let normalizedProjectID = projectID?.trimmingCharacters(in: .whitespacesAndNewlines),
               !normalizedProjectID.isEmpty else {
             return Array(assistant.sessions.prefix(limit))

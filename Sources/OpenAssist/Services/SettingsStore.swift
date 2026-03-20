@@ -678,6 +678,7 @@ final class SettingsStore: ObservableObject {
 
     private var promptRewriteModelByProvider: [String: String] = [:]
     private var promptRewriteBaseURLByProvider: [String: String] = [:]
+    private var saveSuppressionDepth = 0
 
     @Published var shortcutKeyCode: UInt16 {
         didSet {
@@ -2300,6 +2301,7 @@ final class SettingsStore: ObservableObject {
     }
 
     func save() {
+        guard saveSuppressionDepth == 0 else { return }
         defaults.set(Int(shortcutKeyCode), forKey: Keys.shortcutKeyCode)
         defaults.set(Int(ShortcutValidation.filteredModifierRawValue(from: shortcutModifiers)), forKey: Keys.shortcutModifiers)
         defaults.set(Int(continuousToggleShortcutKeyCode), forKey: Keys.continuousToggleShortcutKeyCode)
@@ -2429,6 +2431,14 @@ final class SettingsStore: ObservableObject {
         defaults.set(assistantMemorySummaryMaxChars, forKey: Keys.assistantMemorySummaryMaxChars)
 
         scheduleOnChangeNotificationIfNeeded()
+    }
+
+    private func performBatchedSave(_ updates: () -> Void) {
+        saveSuppressionDepth += 1
+        updates()
+        saveSuppressionDepth = max(0, saveSuppressionDepth - 1)
+        guard saveSuppressionDepth == 0 else { return }
+        save()
     }
 
     static func restoredInteger(
@@ -2674,20 +2684,28 @@ final class SettingsStore: ObservableObject {
 
     func approveTelegramPendingPairing() {
         guard hasTelegramPendingPairing else { return }
-        telegramOwnerUserID = telegramPendingUserID
-        telegramOwnerChatID = telegramPendingChatID
-        clearTelegramPendingPairing()
+        performBatchedSave {
+            telegramOwnerUserID = telegramPendingUserID
+            telegramOwnerChatID = telegramPendingChatID
+            telegramPendingUserID = ""
+            telegramPendingChatID = ""
+            telegramPendingDisplayName = ""
+        }
     }
 
     func clearTelegramPendingPairing() {
-        telegramPendingUserID = ""
-        telegramPendingChatID = ""
-        telegramPendingDisplayName = ""
+        performBatchedSave {
+            telegramPendingUserID = ""
+            telegramPendingChatID = ""
+            telegramPendingDisplayName = ""
+        }
     }
 
     func clearTelegramRemoteOwner() {
-        telegramOwnerUserID = ""
-        telegramOwnerChatID = ""
+        performBatchedSave {
+            telegramOwnerUserID = ""
+            telegramOwnerChatID = ""
+        }
     }
 
     func updateTelegramPendingPairing(
@@ -2695,9 +2713,11 @@ final class SettingsStore: ObservableObject {
         chatID: String,
         displayName: String
     ) {
-        telegramPendingUserID = userID
-        telegramPendingChatID = chatID
-        telegramPendingDisplayName = displayName
+        performBatchedSave {
+            telegramPendingUserID = userID
+            telegramPendingChatID = chatID
+            telegramPendingDisplayName = displayName
+        }
     }
 
     func ensureAutomationAPIToken() {

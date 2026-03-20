@@ -302,6 +302,10 @@ struct JobEditPanel: View {
     }
 
     private var isNew: Bool { existingJob == nil }
+    private var isRunning: Bool {
+        guard let jobID = liveJob?.id ?? existingJob?.id else { return false }
+        return coordinator.runningJobIDs.contains(jobID)
+    }
     private var canSave: Bool {
         !name.trimmingCharacters(in: .whitespaces).isEmpty &&
         !prompt.trimmingCharacters(in: .whitespaces).isEmpty
@@ -969,6 +973,8 @@ struct JobEditPanel: View {
                         .background(Color(red: 0.95, green: 0.40, blue: 0.35).opacity(0.10), in: RoundedRectangle(cornerRadius: 7))
                 }
                 .buttonStyle(.plain)
+                .disabled(isRunning)
+                .opacity(isRunning ? 0.45 : 1.0)
             }
             Spacer()
             if let onCancel, isNew {

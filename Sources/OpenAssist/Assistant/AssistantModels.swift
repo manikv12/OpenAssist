@@ -2064,7 +2064,6 @@ final class AssistantStore: ObservableObject {
             sessionsMatch(request.sessionID, normalizedSessionID) ? request : nil
         }
         let isActiveSession = sessionsMatch(runtime.currentSessionID, normalizedSessionID)
-            || sessionsMatch(selectedSessionID, normalizedSessionID)
         let imageDelivery = await latestRemoteImageDelivery(
             for: normalizedSessionID,
             sessionTitle: session.title
@@ -4933,8 +4932,7 @@ final class AssistantStore: ObservableObject {
         do {
             let result = try projectMemoryService.processCheckpoint(
                 session: session,
-                transcript: history.1,
-                timeline: history.0
+                transcript: history.1
             )
             if result.didChange {
                 let affectedProjectID = session.projectID

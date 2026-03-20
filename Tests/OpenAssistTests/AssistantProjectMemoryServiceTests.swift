@@ -67,8 +67,7 @@ final class AssistantProjectMemoryServiceTests: XCTestCase {
 
         let first = try service.processCheckpoint(
             session: session,
-            transcript: transcript,
-            timeline: []
+            transcript: transcript
         )
         XCTAssertTrue(first.didChange)
 
@@ -79,8 +78,7 @@ final class AssistantProjectMemoryServiceTests: XCTestCase {
 
         let second = try service.processCheckpoint(
             session: session,
-            transcript: transcript,
-            timeline: []
+            transcript: transcript
         )
         XCTAssertFalse(second.didChange)
     }

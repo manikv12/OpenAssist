@@ -3,6 +3,7 @@ import {
   useCallback,
   useEffect,
   useImperativeHandle,
+  useLayoutEffect,
   useRef,
   useState,
 } from "react";
@@ -49,6 +50,7 @@ export const ChatView = forwardRef<
   const bottomRef = useRef<HTMLDivElement>(null);
   const wasAtBottom = useRef(true);
   const scrollTimeout = useRef<number>(0);
+  const loadOlderAnchor = useRef<null | { scrollHeight: number; scrollTop: number }>(null);
   const [isLoadingOlder, setIsLoadingOlder] = useState(false);
 
   const scrollToBottom = useCallback((animated: boolean) => {
@@ -85,8 +87,22 @@ export const ChatView = forwardRef<
     }, 50);
   }, [onScrollState]);
 
+  useLayoutEffect(() => {
+    const container = containerRef.current;
+    const anchor = loadOlderAnchor.current;
+    if (!container || !anchor) return;
+
+    const scrollDelta = container.scrollHeight - anchor.scrollHeight;
+    container.scrollTop = anchor.scrollTop + scrollDelta;
+    loadOlderAnchor.current = null;
+    setIsLoadingOlder(false);
+  }, [messages]);
+
   // Auto-scroll when new messages arrive (if pinned to bottom)
   useEffect(() => {
+    if (loadOlderAnchor.current) {
+      return;
+    }
     if (wasAtBottom.current || isPinnedToBottom) {
       requestAnimationFrame(() => {
         scrollToBottom(false);
@@ -94,12 +110,14 @@ export const ChatView = forwardRef<
     }
   }, [messages, typing, isPinnedToBottom, scrollToBottom]);
 
-  // Reset loading state when messages change (older messages arrived)
-  useEffect(() => {
-    setIsLoadingOlder(false);
-  }, [messages.length]);
-
   const handleLoadOlder = useCallback(() => {
+    const container = containerRef.current;
+    if (container) {
+      loadOlderAnchor.current = {
+        scrollHeight: container.scrollHeight,
+        scrollTop: container.scrollTop,
+      };
+    }
     setIsLoadingOlder(true);
     onLoadOlder();
   }, [onLoadOlder]);

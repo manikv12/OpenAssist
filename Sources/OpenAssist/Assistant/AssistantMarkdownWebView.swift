@@ -43,7 +43,7 @@ private struct AssistantMarkdownWebNSView: NSViewRepresentable {
     }
 
     func updateNSView(_ container: AssistantMarkdownWebContainerView, context: Context) {
-        container.coordinator = context.coordinator
+        _ = context.coordinator
         container.apply(contentID: contentID, text: text, isStreaming: isStreaming, textScale: textScale)
     }
 }
@@ -102,7 +102,7 @@ final class AssistantMarkdownWebCoordinator: NSObject, WKScriptMessageHandler {
 // MARK: - Container View
 
 final class AssistantMarkdownWebContainerView: NSView, WKNavigationDelegate {
-    var coordinator: AssistantMarkdownWebCoordinator
+    let coordinator: AssistantMarkdownWebCoordinator
 
     private static var cachedHTMLString: String?
 
@@ -128,7 +128,7 @@ final class AssistantMarkdownWebContainerView: NSView, WKNavigationDelegate {
         uc.add(coordinator, name: "linkClicked")
 
         let webView = WKWebView(frame: .zero, configuration: config)
-        webView.setValue(false, forKey: "drawsBackground")
+        webView.underPageBackgroundColor = .clear
         webView.allowsMagnification = false
         self.webView = webView
 

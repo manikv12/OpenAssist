@@ -341,8 +341,13 @@ final class TelegramBotClient {
             request.httpBody = try JSONSerialization.data(withJSONObject: payload, options: [])
         }
 
-        let (data, _) = try await session.data(for: request)
-        let envelope = try decoder.decode(TelegramAPIEnvelope<Result>.self, from: data)
+        let (data, response) = try await session.data(for: request)
+        let validatedData = try validatedResponseData(
+            data: data,
+            response: response,
+            method: method
+        )
+        let envelope = try decoder.decode(TelegramAPIEnvelope<Result>.self, from: validatedData)
 
         if envelope.ok, let result = envelope.result {
             return result
@@ -386,8 +391,13 @@ final class TelegramBotClient {
             fileData: fileData
         )
 
-        let (data, _) = try await session.data(for: request)
-        let envelope = try decoder.decode(TelegramAPIEnvelope<Result>.self, from: data)
+        let (data, response) = try await session.data(for: request)
+        let validatedData = try validatedResponseData(
+            data: data,
+            response: response,
+            method: method
+        )
+        let envelope = try decoder.decode(TelegramAPIEnvelope<Result>.self, from: validatedData)
 
         if envelope.ok, let result = envelope.result {
             return result
@@ -440,6 +450,39 @@ final class TelegramBotClient {
             throw TelegramBotClientError.malformedResponse
         }
         return dictionaries
+    }
+
+    private func validatedResponseData(
+        data: Data,
+        response: URLResponse,
+        method: String
+    ) throws -> Data {
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw TelegramBotClientError.malformedResponse
+        }
+        guard (200...299).contains(httpResponse.statusCode) else {
+            let excerpt = sanitizedResponseExcerpt(from: data)
+            let message = excerpt.isEmpty
+                ? "Telegram \(method) failed with HTTP \(httpResponse.statusCode)."
+                : "Telegram \(method) failed with HTTP \(httpResponse.statusCode): \(excerpt)"
+            throw TelegramBotClientError.server(message: message)
+        }
+        return data
+    }
+
+    private func sanitizedResponseExcerpt(from data: Data) -> String {
+        guard let rawText = String(data: data, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+              !rawText.isEmpty else {
+            return ""
+        }
+
+        let collapsed = rawText.replacingOccurrences(
+            of: "\\s+",
+            with: " ",
+            options: .regularExpression
+        )
+        return String(collapsed.prefix(240))
     }
 }
 

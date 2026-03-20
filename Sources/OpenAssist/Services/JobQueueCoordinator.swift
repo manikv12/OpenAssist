@@ -84,6 +84,7 @@ final class JobQueueCoordinator: ObservableObject {
     }
 
     func removeJob(id: String) {
+        guard !runningJobIDs.contains(id) else { return }
         jobs.removeAll { $0.id == id }
         pendingExecutions.removeAll { $0.jobID == id }
         pendingExecutionJobIDs.remove(id)

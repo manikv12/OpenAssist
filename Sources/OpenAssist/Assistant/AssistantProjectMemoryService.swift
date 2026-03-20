@@ -99,10 +99,8 @@ final class AssistantProjectMemoryService {
 
     func processCheckpoint(
         session: AssistantSessionSummary,
-        transcript: [AssistantTranscriptEntry],
-        timeline: [AssistantTimelineItem]
+        transcript: [AssistantTranscriptEntry]
     ) throws -> AssistantProjectCheckpointUpdate {
-        _ = timeline
         guard let context = projectStore.context(forThreadID: session.id) else {
             return AssistantProjectCheckpointUpdate(didChange: false, staleSuggestionCount: 0)
         }

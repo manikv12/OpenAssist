@@ -52,6 +52,7 @@ final class ScheduledJobStore {
     }
 
     private func ensureSchema() throws {
+        try execute(sql: "PRAGMA foreign_keys=ON;")
         try execute(sql: "PRAGMA journal_mode=WAL;")
         try execute(sql: """
         CREATE TABLE IF NOT EXISTS scheduled_jobs (
@@ -345,7 +346,7 @@ final class ScheduledJobStore {
     // MARK: - Bind Helpers
 
     private func bind(_ value: String, at index: Int32, in stmt: OpaquePointer) {
-        value.withCString { cString in
+        _ = value.withCString { cString in
             sqlite3_bind_text(stmt, index, cString, -1, transient)
         }
     }
@@ -365,7 +366,7 @@ final class ScheduledJobStore {
 
     private func bindOptionalString(_ value: String?, at index: Int32, in stmt: OpaquePointer) {
         if let value {
-            value.withCString { cString in
+            _ = value.withCString { cString in
                 sqlite3_bind_text(stmt, index, cString, -1, transient)
             }
         } else { sqlite3_bind_null(stmt, index) }

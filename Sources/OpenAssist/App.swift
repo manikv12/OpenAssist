@@ -766,6 +766,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
     private var scheduledJobInFlightID: String?
     private var scheduledJobWatchdogTask: Task<Void, Never>?
     private var scheduledJobWatchdogToken: String?
+    private var scheduledJobPreviousSessionID: String?
     private var scheduledJobPreviousModelID: String?
     private var scheduledJobPreviousReasoningEffort: AssistantReasoningEffort?
     private var memoryPressureSource: DispatchSourceMemoryPressure?
@@ -2128,6 +2129,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             return
         }
         cancelScheduledJobWatchdog()
+        scheduledJobPreviousSessionID = assistantController.selectedSessionID
         scheduledJobPreviousModelID = assistantController.selectedModelID
         scheduledJobPreviousReasoningEffort = assistantController.reasoningEffort
         scheduledJobInFlightID = jobID
@@ -2185,12 +2187,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         guard let jobID = scheduledJobInFlightID else { return }
         scheduledJobInFlightID = nil
         let coordinator = JobQueueCoordinator.shared
-        defer {
-            restoreScheduledJobOverrides()
-            coordinator.markJobExecutionFinished(id: jobID)
-        }
 
         guard let job = coordinator.jobs.first(where: { $0.id == jobID }) else {
+            await restoreScheduledJobOverrides()
+            coordinator.markJobExecutionFinished(id: jobID)
             return
         }
 
@@ -2254,6 +2254,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             learnedLessonCount: processed.learnedLessonCount,
             finishedAt: finishedAt
         )
+
+        await restoreScheduledJobOverrides()
+        coordinator.markJobExecutionFinished(id: jobID)
     }
 
     private func startScheduledJobWatchdog(jobID: String, sessionID: String?) {
@@ -2313,9 +2316,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         )
     }
 
-    private func restoreScheduledJobOverrides() {
+    private func restoreScheduledJobOverrides() async {
+        let previousSessionID = scheduledJobPreviousSessionID?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nonEmpty
         let previousModelID = scheduledJobPreviousModelID
         let previousReasoningEffort = scheduledJobPreviousReasoningEffort
+        scheduledJobPreviousSessionID = nil
         scheduledJobPreviousModelID = nil
         scheduledJobPreviousReasoningEffort = nil
 
@@ -2323,6 +2330,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         if let previousReasoningEffort {
             assistantController.reasoningEffort = previousReasoningEffort
         }
+
+        guard let previousSessionID,
+              !assistantController.hasActiveTurn else {
+            return
+        }
+
+        let currentlySelectedSessionID = assistantController.selectedSessionID?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nonEmpty
+        guard currentlySelectedSessionID?.caseInsensitiveCompare(previousSessionID) != .orderedSame else {
+            return
+        }
+
+        guard let previousSession = assistantController.sessions.first(where: {
+            $0.id.trimmingCharacters(in: .whitespacesAndNewlines)
+                .caseInsensitiveCompare(previousSessionID) == .orderedSame
+        }) else {
+            return
+        }
+
+        await assistantController.openSession(previousSession)
     }
 
     private func disableAssistantBeta() {
