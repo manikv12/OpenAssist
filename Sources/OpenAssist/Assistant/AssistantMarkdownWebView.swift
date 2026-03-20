@@ -291,6 +291,10 @@ final class AssistantMarkdownWebContainerView: NSView, WKNavigationDelegate {
 
     deinit {
         cancelStreamingThrottle()
+        let uc = webView.configuration.userContentController
+        uc.removeScriptMessageHandler(forName: "heightChanged")
+        uc.removeScriptMessageHandler(forName: "linkClicked")
+        uc.removeScriptMessageHandler(forName: "ready")
     }
 }
 

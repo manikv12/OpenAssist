@@ -345,7 +345,9 @@ final class ScheduledJobStore {
     // MARK: - Bind Helpers
 
     private func bind(_ value: String, at index: Int32, in stmt: OpaquePointer) {
-        sqlite3_bind_text(stmt, index, value, -1, transient)
+        value.withCString { cString in
+            sqlite3_bind_text(stmt, index, cString, -1, transient)
+        }
     }
 
     private func bind(_ value: Int64, at index: Int32, in stmt: OpaquePointer) {
@@ -362,12 +364,15 @@ final class ScheduledJobStore {
     }
 
     private func bindOptionalString(_ value: String?, at index: Int32, in stmt: OpaquePointer) {
-        if let value { sqlite3_bind_text(stmt, index, value, -1, transient) }
-        else { sqlite3_bind_null(stmt, index) }
+        if let value {
+            value.withCString { cString in
+                sqlite3_bind_text(stmt, index, cString, -1, transient)
+            }
+        } else { sqlite3_bind_null(stmt, index) }
     }
 
     private func readString(at index: Int32, in stmt: OpaquePointer) -> String? {
         guard let ptr = sqlite3_column_text(stmt, index) else { return nil }
-        return String(cString: ptr)
+        return String(cString: UnsafeRawPointer(ptr).assumingMemoryBound(to: CChar.self))
     }
 }

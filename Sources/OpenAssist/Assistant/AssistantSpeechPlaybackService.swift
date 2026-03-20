@@ -305,17 +305,18 @@ final class MacOSAssistantSpeechProvider: NSObject, AssistantSpeechProvider {
     func prewarmIfNeeded() async {}
 
     func healthStatus() async -> AssistantSpeechHealth {
+        let bestVoice = MacOSAssistantSpeechProvider.bestAvailableVoice()
         let voiceName: String
         if let voiceIdentifier = settings.assistantTTSFallbackVoiceIdentifier.nonEmpty,
            let voice = AVSpeechSynthesisVoice(identifier: voiceIdentifier) {
             voiceName = voice.name
-        } else if let bestVoice = MacOSAssistantSpeechProvider.bestAvailableVoice() {
+        } else if let bestVoice {
             voiceName = "\(bestVoice.name) (auto-selected)"
         } else {
             voiceName = "System Default"
         }
 
-        let installRecommended = MacOSAssistantSpeechProvider.bestAvailableVoice() == nil
+        let installRecommended = bestVoice == nil
 
         return AssistantSpeechHealth(
             engine: .macos,
