@@ -46,15 +46,16 @@ final class AssistantSessionRegistry {
         sessionIDs: Set<String>? = nil
     ) -> [AssistantSessionSummary] {
         let snapshot = loadSnapshot()
+        let normalizedFilterIDs = sessionIDs.map { Set($0.compactMap { normalizedSessionID($0) }) }
         return snapshot.sessions.filter { session in
             if let sources, !sources.contains(session.source) {
                 return false
             }
-            if let sessionIDs {
-                guard let normalizedSessionID = normalizedSessionID(session.id) else {
+            if let normalizedFilterIDs {
+                guard let normalizedID = normalizedSessionID(session.id) else {
                     return false
                 }
-                return sessionIDs.contains(normalizedSessionID)
+                return normalizedFilterIDs.contains(normalizedID)
             }
             return true
         }

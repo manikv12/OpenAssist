@@ -19,7 +19,7 @@ enum AssistantAttachmentSupport {
     ]
 
     static func openFilePicker(
-        allowedContentTypes: [UTType] = allowedContentTypes,
+        allowedContentTypes: [UTType] = Self.allowedContentTypes,
         onComplete: @escaping @MainActor ([AssistantAttachment]) -> Void
     ) {
         let panel = NSOpenPanel()

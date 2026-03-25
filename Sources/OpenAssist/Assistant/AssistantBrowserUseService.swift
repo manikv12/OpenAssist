@@ -271,16 +271,16 @@ actor AssistantBrowserUseService {
         self.helper = helper
     }
 
-    func run(arguments: Any, preferredModelID: String?) async throws -> AssistantToolExecutionResult {
-        try await execute(
+    func run(arguments: Any, preferredModelID: String?) async -> AssistantToolExecutionResult {
+        await execute(
             arguments: arguments,
             preferredModelID: preferredModelID,
             resumeAfterLogin: false
         )
     }
 
-    func resumeAfterLogin(arguments: Any, preferredModelID: String?) async throws -> AssistantToolExecutionResult {
-        try await execute(
+    func resumeAfterLogin(arguments: Any, preferredModelID: String?) async -> AssistantToolExecutionResult {
+        await execute(
             arguments: arguments,
             preferredModelID: preferredModelID,
             resumeAfterLogin: true
@@ -291,7 +291,7 @@ actor AssistantBrowserUseService {
         arguments: Any,
         preferredModelID: String?,
         resumeAfterLogin: Bool
-    ) async throws -> AssistantToolExecutionResult {
+    ) async -> AssistantToolExecutionResult {
         do {
             let parsedTask = try Self.parseTask(from: arguments)
             let profile = try await resolveProfile(browserHint: parsedTask.browserHint)
@@ -325,7 +325,7 @@ actor AssistantBrowserUseService {
                     profileLabel: profile.label,
                     tab: tab
                 ) {
-                    throw AssistantBrowserUseServiceError.loginRequired(prompt)
+                    return Self.loginRequiredResult(prompt: prompt)
                 }
 
                 let summary = Self.summaryLine(
@@ -343,8 +343,6 @@ actor AssistantBrowserUseService {
                 summary: "Activated \(profile.browser.displayName) with profile \(profile.label).",
                 detail: nil
             )
-        } catch let error as AssistantBrowserUseServiceError {
-            throw error
         } catch {
             let summary = error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
                 ?? "Browser Use failed."
@@ -582,6 +580,15 @@ actor AssistantBrowserUseService {
             contentItems: items,
             success: success,
             summary: summary
+        )
+    }
+
+    private static func loginRequiredResult(prompt: AssistantBrowserLoginPrompt) -> AssistantToolExecutionResult {
+        AssistantToolExecutionResult(
+            contentItems: [.init(type: "inputText", text: prompt.requestRationale, imageURL: nil)],
+            success: false,
+            summary: prompt.requestRationale,
+            loginPrompt: prompt
         )
     }
 }
