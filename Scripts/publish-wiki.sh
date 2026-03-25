@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_URL="https://github.com/manikv12/OpenAssist.wiki.git"
+REPO_URL="${WIKI_REPO_URL:-https://github.com/manikv12/OpenAssist.wiki.git}"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 ROOT_DIR="$(cd -- "${SCRIPT_DIR}/.." >/dev/null 2>&1 && pwd)"
 SOURCE_DIR="${ROOT_DIR}/Wiki"
@@ -31,11 +31,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-if command -v gh >/dev/null 2>&1; then
-  gh repo clone manikv12/OpenAssist.wiki "${workdir}" -- --depth 1 >/dev/null
-else
-  git clone --depth 1 "${REPO_URL}" "${workdir}" >/dev/null
-fi
+git clone --depth 1 "${REPO_URL}" "${workdir}" >/dev/null
 
 cp -f "${SOURCE_DIR}"/*.md "${workdir}/"
 

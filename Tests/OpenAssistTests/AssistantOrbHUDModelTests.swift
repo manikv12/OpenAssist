@@ -211,7 +211,110 @@ final class AssistantOrbHUDModelTests: XCTestCase {
     }
 
     @MainActor
-    func testHideDoneDetailKeepsReplyAvailableForReopen() {
+    func testDismissedCompletionDoesNotReopenForSameReply() {
+        let model = AssistantOrbHUDModel()
+        model.selectedSessionID = "session-repeat"
+
+        let completedReply = AssistantHUDState(
+            phase: .success,
+            title: "Done",
+            detail: "Hi! How can I help you today?"
+        )
+
+        model.update(state: completedReply)
+        XCTAssertTrue(model.showDoneDetail)
+
+        model.dismissDoneDetail()
+        XCTAssertFalse(model.showDoneDetail)
+        XCTAssertNil(model.doneDetailText)
+
+        model.update(state: completedReply)
+
+        XCTAssertFalse(model.showDoneDetail)
+        XCTAssertEqual(model.state.phase, .idle)
+    }
+
+    @MainActor
+    func testNewTurnClearsDismissedCompletionSuppression() {
+        let model = AssistantOrbHUDModel()
+        model.selectedSessionID = "session-repeat"
+
+        let completedReply = AssistantHUDState(
+            phase: .success,
+            title: "Done",
+            detail: "Hi! How can I help you today?"
+        )
+
+        model.update(state: completedReply)
+        model.dismissDoneDetail()
+
+        model.update(
+            state: AssistantHUDState(
+                phase: .thinking,
+                title: "Working",
+                detail: "Checking your project"
+            )
+        )
+
+        model.update(state: completedReply)
+
+        XCTAssertTrue(model.showDoneDetail)
+        XCTAssertEqual(model.doneDetailText, "Hi! How can I help you today?")
+        XCTAssertEqual(model.state.phase, .success)
+    }
+
+    @MainActor
+    func testStartNewTemporarySessionFromCompactViewUsesTemporaryCallback() async {
+        let model = AssistantOrbHUDModel()
+        var startedRegular = false
+        var startedTemporary = false
+
+        model.showPreview("Old detail")
+        model.attachments = [
+            AssistantAttachment(filename: "notes.txt", data: Data("hello".utf8), mimeType: "text/plain")
+        ]
+        model.onNewSession = {
+            startedRegular = true
+        }
+        model.onNewTemporarySession = {
+            startedTemporary = true
+        }
+
+        await model.startNewTemporarySessionFromCompactView()
+
+        XCTAssertFalse(startedRegular)
+        XCTAssertTrue(startedTemporary)
+        XCTAssertTrue(model.showCompactComposer)
+        XCTAssertTrue(model.attachments.isEmpty)
+        XCTAssertNil(model.doneDetailText)
+    }
+
+    @MainActor
+    func testPromoteSelectedTemporarySessionUsesPromotionCallback() {
+        let model = AssistantOrbHUDModel()
+        model.sessions = [
+            AssistantSessionSummary(
+                id: "temp-session",
+                title: "Scratchpad",
+                source: .appServer,
+                status: .active,
+                isTemporary: true
+            )
+        ]
+        model.selectedSessionID = "temp-session"
+
+        var promotedSessionID: String?
+        model.onPromoteTemporarySession = { sessionID in
+            promotedSessionID = sessionID
+        }
+
+        model.promoteSelectedTemporarySession()
+
+        XCTAssertEqual(promotedSessionID, "temp-session")
+    }
+
+    @MainActor
+    func testHideDoneDetailDismissesReplyUntilNewWorkStarts() {
         let model = AssistantOrbHUDModel()
 
         model.update(
@@ -225,9 +328,8 @@ final class AssistantOrbHUDModelTests: XCTestCase {
         model.hideDoneDetail()
 
         XCTAssertFalse(model.showDoneDetail)
-        XCTAssertEqual(model.doneDetailText, "The answer is ready.")
-        XCTAssertTrue(model.presentDoneDetailIfAvailable())
-        XCTAssertTrue(model.showDoneDetail)
+        XCTAssertNil(model.doneDetailText)
+        XCTAssertFalse(model.presentDoneDetailIfAvailable())
     }
 
     @MainActor

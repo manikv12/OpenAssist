@@ -549,6 +549,36 @@ struct AppIconBadge: View {
     }
 }
 
+struct PermissionStateBadge: View {
+    let granted: Bool
+    var grantedLabel: String = "Allowed"
+    var missingLabel: String = "Needs Access"
+
+    var body: some View {
+        let tint = granted ? Color.green : AppVisualTheme.baseTint
+        let label = granted ? grantedLabel : missingLabel
+        let symbol = granted ? "checkmark.circle.fill" : "hand.raised.fill"
+
+        HStack(spacing: 6) {
+            Image(systemName: symbol)
+                .font(.system(size: 11, weight: .semibold))
+            Text(label)
+                .font(.system(size: 11, weight: .semibold))
+        }
+        .foregroundStyle(tint.opacity(0.96))
+        .padding(.horizontal, 9)
+        .padding(.vertical, 5)
+        .background(
+            Capsule(style: .continuous)
+                .fill(tint.opacity(0.14))
+                .overlay(
+                    Capsule(style: .continuous)
+                        .stroke(tint.opacity(0.22), lineWidth: 0.7)
+                )
+        )
+    }
+}
+
 struct AppSidebarSearchField: View {
     let placeholder: String
     @Binding var text: String

@@ -7,7 +7,13 @@ import {
   useRef,
   useState,
 } from "react";
-import type { ChatMessage, TypingState } from "../types";
+import type {
+  ChatMessage,
+  MessageCheckpointInfo,
+  ProviderTone,
+  RewindState,
+  TypingState,
+} from "../types";
 import { UserMessage } from "./UserMessage";
 import { AssistantMessage } from "./AssistantMessage";
 import { ActivityRow } from "./ActivityRow";
@@ -18,6 +24,9 @@ import { TypingIndicator } from "./TypingIndicator";
 interface Props {
   messages: ChatMessage[];
   typing: TypingState;
+  activeProviderTone?: ProviderTone;
+  checkpointsByMessageID: Map<string, MessageCheckpointInfo>;
+  rewindState: RewindState | null;
   textScale: number;
   isPinnedToBottom: boolean;
   canLoadOlder: boolean;
@@ -31,12 +40,18 @@ interface Props {
 }
 
 export const ChatView = forwardRef<
-  { scrollToBottom: (animated: boolean) => void },
+  {
+    scrollToBottom: (animated: boolean) => void;
+    revealMessage: (messageID: string, animated: boolean, expand: boolean) => void;
+  },
   Props
 >(function ChatView(
   {
     messages,
     typing,
+    activeProviderTone = "default",
+    checkpointsByMessageID,
+    rewindState,
     textScale,
     isPinnedToBottom,
     canLoadOlder,
@@ -46,6 +61,25 @@ export const ChatView = forwardRef<
   },
   ref
 ) {
+  const latestRunningMessageID = (() => {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const message = messages[index];
+
+      if (message.type === "activity" && message.activityStatus === "running") {
+        return message.id;
+      }
+
+      if (
+        message.type === "activityGroup" &&
+        (message.groupItems || []).some((item) => item.status === "running")
+      ) {
+        return message.id;
+      }
+    }
+
+    return undefined;
+  })();
+
   const containerRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const wasAtBottom = useRef(true);
@@ -67,7 +101,42 @@ export const ChatView = forwardRef<
     wasAtBottom.current = true;
   }, []);
 
-  useImperativeHandle(ref, () => ({ scrollToBottom }), [scrollToBottom]);
+  const revealMessage = useCallback(
+    (messageID: string, animated: boolean, expand: boolean) => {
+      const container = containerRef.current;
+      if (!container) return;
+
+      const escapedMessageID =
+        typeof CSS !== "undefined" && typeof CSS.escape === "function"
+          ? CSS.escape(messageID)
+          : messageID.replace(/"/g, '\\"');
+      const messageNode = container.querySelector<HTMLElement>(
+        `[data-message-id="${escapedMessageID}"]`
+      );
+      if (!messageNode) return;
+
+      if (expand) {
+        const toggle = messageNode.querySelector<HTMLElement>(
+          "[data-activity-toggle='true']"
+        );
+        if (toggle?.getAttribute("aria-expanded") === "false") {
+          toggle.click();
+        }
+      }
+
+      messageNode.scrollIntoView({
+        behavior: animated ? "smooth" : "auto",
+        block: "center",
+      });
+    },
+    []
+  );
+
+  useImperativeHandle(
+    ref,
+    () => ({ scrollToBottom, revealMessage }),
+    [revealMessage, scrollToBottom]
+  );
 
   // Handle scroll events — only report scroll state, no auto-loading
   const handleScroll = useCallback(() => {
@@ -108,7 +177,7 @@ export const ChatView = forwardRef<
         scrollToBottom(false);
       });
     }
-  }, [messages, typing, isPinnedToBottom, scrollToBottom]);
+  }, [messages, typing, checkpointsByMessageID, isPinnedToBottom, scrollToBottom]);
 
   const handleLoadOlder = useCallback(() => {
     const container = containerRef.current;
@@ -125,36 +194,50 @@ export const ChatView = forwardRef<
   const showJumpToLatest = !isPinnedToBottom && messages.length > 0;
 
   return (
-    <div className="chat-container" ref={containerRef} onScroll={handleScroll}>
-      <div className="chat-messages" style={{ fontSize: `${13.8 * textScale}px` }}>
+    <>
+      <div className="chat-shell" data-active-provider={activeProviderTone}>
+        <div className="chat-container" ref={containerRef} onScroll={handleScroll}>
+        <div className="chat-messages" style={{ fontSize: `${13.8 * textScale}px` }}>
 
-        {canLoadOlder && (
-          <div className="load-older-row">
-            <button
-              className="load-older-btn"
-              onClick={handleLoadOlder}
-              disabled={isLoadingOlder}
-            >
-              {isLoadingOlder ? "Loading…" : "Load older messages"}
-            </button>
-          </div>
-        )}
+          {canLoadOlder && (
+            <div className="load-older-row">
+              <button
+                className="load-older-btn"
+                onClick={handleLoadOlder}
+                disabled={isLoadingOlder}
+              >
+                {isLoadingOlder ? "Loading…" : "Load older messages"}
+              </button>
+            </div>
+          )}
 
-        {messages.map((msg) => (
-          <MessageRow key={msg.id} message={msg} />
-        ))}
+          {messages.map((msg) => (
+            <MessageRow
+              key={msg.id}
+              message={msg}
+              checkpointsByMessageID={checkpointsByMessageID}
+              latestRunningMessageID={latestRunningMessageID}
+              rewindState={rewindState}
+            />
+          ))}
 
-        {typing.visible && (
-          <TypingIndicator title={typing.title} detail={typing.detail} />
-        )}
+          {typing.visible && (
+            <TypingIndicator
+              title={typing.title}
+              detail={typing.detail}
+              providerTone={activeProviderTone}
+            />
+          )}
 
-        <div ref={bottomRef} className="scroll-anchor" />
+          <div ref={bottomRef} className="scroll-anchor" />
+        </div>
+
+        {/* Top fade */}
+        <div className="fade-top" />
+        {/* Bottom fade */}
+        <div className="fade-bottom" />
+        </div>
       </div>
-
-      {/* Top fade */}
-      <div className="fade-top" />
-      {/* Bottom fade */}
-      <div className="fade-bottom" />
 
       {showJumpToLatest && (
         <button className="jump-to-latest" onClick={onJumpToLatest}>
@@ -165,20 +248,41 @@ export const ChatView = forwardRef<
           </svg>
         </button>
       )}
-    </div>
+
+    </>
   );
 });
 
-function MessageRow({ message }: { message: ChatMessage }) {
+function MessageRow({
+  message,
+  checkpointsByMessageID,
+  latestRunningMessageID,
+  rewindState: _rewindState,
+}: {
+  message: ChatMessage;
+  checkpointsByMessageID: Map<string, MessageCheckpointInfo>;
+  latestRunningMessageID?: string;
+  rewindState: RewindState | null;
+}) {
   switch (message.type) {
     case "user":
       return <UserMessage message={message} />;
     case "assistant":
-      return <AssistantMessage message={message} />;
+      return <AssistantMessage message={message} checkpointInfo={checkpointsByMessageID.get(message.id)} />;
     case "activity":
-      return <ActivityRow message={message} />;
+      return (
+        <ActivityRow
+          message={message}
+          isLatestRunningActivity={message.id === latestRunningMessageID}
+        />
+      );
     case "activityGroup":
-      return <ActivityGroupRow message={message} />;
+      return (
+        <ActivityGroupRow
+          message={message}
+          isLatestRunningActivity={message.id === latestRunningMessageID}
+        />
+      );
     case "system":
       return <SystemMessage message={message} />;
     default:

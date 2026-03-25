@@ -6,6 +6,7 @@ struct AutomationAccessSettingsView: View {
     @State private var statuses: [PermissionCenter.AutomationTargetStatus] = []
     @State private var isRefreshing = false
     @State private var statusMessage: String?
+    @State private var refreshTask: Task<Void, Never>?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -54,6 +55,9 @@ struct AutomationAccessSettingsView: View {
         }
         .onAppear {
             refreshStatuses()
+        }
+        .onDisappear {
+            refreshTask?.cancel()
         }
     }
 
@@ -105,38 +109,59 @@ struct AutomationAccessSettingsView: View {
     }
 
     private func refreshStatuses() {
+        refreshTask?.cancel()
         isRefreshing = true
-        statuses = PermissionCenter.automationPermissionStatuses()
-        isRefreshing = false
-        onPermissionsChanged()
+        refreshTask = Task {
+            defer { isRefreshing = false }
+            let result = await Task.detached(priority: .utility) {
+                PermissionCenter.automationPermissionStatuses()
+            }.value
+            guard !Task.isCancelled else { return }
+            statuses = result
+            onPermissionsChanged()
+        }
     }
 
     private func requestMissingAccess() {
+        refreshTask?.cancel()
         isRefreshing = true
-        statuses = PermissionCenter.requestMissingAutomationPermissions()
-        isRefreshing = false
-        onPermissionsChanged()
+        refreshTask = Task {
+            defer { isRefreshing = false }
+            let result = await Task.detached(priority: .utility) {
+                PermissionCenter.requestMissingAutomationPermissions()
+            }.value
+            guard !Task.isCancelled else { return }
+            statuses = result
+            onPermissionsChanged()
 
-        if statuses.contains(where: \.needsManualEnableInSettings) {
-            statusMessage = "Some apps still show Denied. If you clicked Don't Allow before, macOS will not ask again. Open Automation settings and turn them on there."
-        } else if statuses.contains(where: \.needsPrompt) {
-            statusMessage = "Some apps still need approval. macOS may still be waiting for your answer."
-        } else {
-            statusMessage = "Open Assist has asked for the installed app permissions it can request automatically."
+            if statuses.contains(where: \.needsManualEnableInSettings) {
+                statusMessage = "Some apps still show Denied. If you clicked Don't Allow before, macOS will not ask again. Open Automation settings and turn them on there."
+            } else if statuses.contains(where: \.needsPrompt) {
+                statusMessage = "Some apps still need approval. macOS may still be waiting for your answer."
+            } else {
+                statusMessage = "Open Assist has asked for the installed app permissions it can request automatically."
+            }
         }
     }
 
     private func requestPermission(for target: PermissionCenter.AutomationTarget) {
+        refreshTask?.cancel()
         isRefreshing = true
-        _ = PermissionCenter.automationPermissionStatus(for: target, promptIfNeeded: true)
-        statuses = PermissionCenter.automationPermissionStatuses()
-        isRefreshing = false
-        onPermissionsChanged()
+        refreshTask = Task {
+            defer { isRefreshing = false }
+            let result = await Task.detached(priority: .utility) {
+                _ = PermissionCenter.automationPermissionStatus(for: target, promptIfNeeded: true)
+                return PermissionCenter.automationPermissionStatuses()
+            }.value
+            guard !Task.isCancelled else { return }
+            statuses = result
+            onPermissionsChanged()
 
-        if let refreshed = statuses.first(where: { $0.target.id == target.id }), refreshed.needsManualEnableInSettings {
-            statusMessage = "\(refreshed.displayName) is still denied. Open Automation settings to turn it on manually."
-        } else {
-            statusMessage = nil
+            if let refreshed = statuses.first(where: { $0.target.id == target.id }), refreshed.needsManualEnableInSettings {
+                statusMessage = "\(refreshed.displayName) is still denied. Open Automation settings to turn it on manually."
+            } else {
+                statusMessage = nil
+            }
         }
     }
 

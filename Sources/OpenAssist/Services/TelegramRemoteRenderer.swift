@@ -53,6 +53,24 @@ enum TelegramRemoteRenderer {
         case ordered(start: Int)
     }
 
+    private static func providerUsageLine(for window: RateLimitWindow) -> String {
+        var line = "\(providerWindowLabel(for: window)): \(window.usedPercent)% used (\(window.remainingPercent)% left)"
+        if let resets = window.resetsInLabel {
+            line += ", resets \(resets)"
+        }
+        return line
+    }
+
+    private static func providerWindowLabel(for window: RateLimitWindow) -> String {
+        if window.windowDurationMins == 300 {
+            return "5-hour"
+        }
+        if let mins = window.windowDurationMins, mins >= 10_080 {
+            return "Weekly"
+        }
+        return window.windowLabel.isEmpty ? "Usage" : window.windowLabel
+    }
+
     static func chunkText(_ text: String, limit: Int = messageCharacterLimit) -> [String] {
         let normalized = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !normalized.isEmpty else { return [] }
@@ -168,13 +186,80 @@ enum TelegramRemoteRenderer {
     }
 
     static func sessionHeaderText(snapshot: AssistantRemoteSessionSnapshot) -> String {
-        let sessionTitle = telegramPlainText(snapshot.session.title) ?? snapshot.session.title
-        var lines = ["Session: \(sessionTitle)"]
+        var lines = ["Session: \(displaySessionTitle(title: snapshot.session.title, isTemporary: snapshot.session.isTemporary))"]
+        if snapshot.session.isTemporary {
+            lines.append("Type: Temporary chat")
+        }
         if let projectName = telegramPlainText(snapshot.session.projectName)?.trimmingCharacters(in: .whitespacesAndNewlines),
            !projectName.isEmpty {
             lines.append("Project: \(projectName)")
         }
         return lines.joined(separator: "\n")
+    }
+
+    static func providerUsageText(
+        status: AssistantRemoteStatusSnapshot,
+        rateLimits: AccountRateLimits
+    ) -> String {
+        let sessionLine: String
+        if status.selectedSessionID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty != nil {
+            sessionLine = displaySessionTitle(
+                title: status.selectedSessionTitle,
+                isTemporary: status.selectedSessionIsTemporary
+            )
+        } else {
+            sessionLine = "No session selected"
+        }
+
+        let modelLine = status.selectedModelSummary
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nonEmpty ?? "No model selected"
+
+        var lines = [
+            "Provider Usage",
+            "Session: \(sessionLine)",
+            "Backend: \(status.assistantBackendName)",
+            "Model: \(modelLine)"
+        ]
+
+        if status.selectedSessionIsTemporary {
+            lines.append("Type: Temporary chat")
+        }
+
+        guard let bucket = rateLimits.bucket(for: status.selectedModelID),
+              bucket.primary != nil || bucket.secondary != nil else {
+            lines.append("Provider: No provider usage reported yet for the selected model.")
+            return lines.joined(separator: "\n")
+        }
+
+        lines.append("Provider: \(bucket.isDefaultCodex ? "Codex" : bucket.displayName)")
+
+        if let primary = bucket.primary {
+            lines.append(providerUsageLine(for: primary))
+        }
+        if let secondary = bucket.secondary {
+            lines.append(providerUsageLine(for: secondary))
+        }
+
+        return lines.joined(separator: "\n")
+    }
+
+    static func displaySessionTitle(title: String?, isTemporary: Bool) -> String {
+        let sanitizedTitle = (telegramPlainText(title) ?? title ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if !sanitizedTitle.isEmpty {
+            return sanitizedTitle
+        }
+        return isTemporary ? "Temporary Chat" : "New Session"
+    }
+
+    static func sessionMenuLabel(_ session: AssistantSessionSummary, isSelected: Bool) -> String {
+        let prefix = isSelected ? "• " : ""
+        let title = displaySessionTitle(title: session.title, isTemporary: session.isTemporary)
+        if session.isTemporary {
+            return "\(prefix)[Temp] \(title)"
+        }
+        return "\(prefix)\(title)"
     }
 
     static func streamMessageText(snapshot: AssistantRemoteSessionSnapshot) -> String? {

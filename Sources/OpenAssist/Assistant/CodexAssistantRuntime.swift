@@ -16,7 +16,7 @@ enum CodexAssistantRuntimeError: Error, LocalizedError {
         case .requestFailed(let message):
             return message
         case .sessionUnavailable:
-            return "There is no active Codex thread yet."
+            return "There is no active assistant session yet."
         case .invalidResponse(let message):
             return message
         }
@@ -104,6 +104,15 @@ struct AssistantRepeatedCommandTracker: Sendable {
     }
 }
 
+struct CodexTranscriptionAuthContext: Sendable {
+    let authMode: AssistantAccountAuthMode
+    let token: String
+
+    var usesOpenAIAPI: Bool {
+        authMode == .apiKey
+    }
+}
+
 enum AssistantTurnCompletionStatus: Equatable {
     case completed
     case interrupted
@@ -112,6 +121,7 @@ enum AssistantTurnCompletionStatus: Equatable {
 
 @MainActor
 final class CodexAssistantRuntime {
+    var backend: AssistantRuntimeBackend = .codex
     var onHealthUpdate: (@Sendable (AssistantRuntimeHealth) -> Void)?
     var onTranscript: (@Sendable (AssistantTranscriptEntry) -> Void)?
     var onTranscriptMutation: (@Sendable (AssistantTranscriptMutation) -> Void)?
@@ -138,7 +148,11 @@ final class CodexAssistantRuntime {
     private var activeSessionCWD: String?
     private var activeTurnID: String?
     private var preferredModelID: String?
+    private var preferredSubagentModelID: String?
     private var currentCodexPath: String?
+    private var currentTransportWorkingDirectory: String?
+    private var transportSessionID: String?
+    private var bootstrapSessionID: String?
     private var currentAccountSnapshot: AssistantAccountSnapshot = .signedOut
     private var currentRateLimits: AccountRateLimits = .empty
     private var currentModels: [AssistantModelOption] = []
@@ -170,8 +184,10 @@ final class CodexAssistantRuntime {
     private var commentaryStartedAt: Date?
     private var commentaryBuffer: String = ""
     private var pendingCommentaryDeltaBuffer: String = ""
+    private var pendingCopilotFallbackReply: String?
     private var planTimelineID: String?
     private var planStartedAt: Date?
+    private let installSupport: CodexInstallSupport
 
     // Throttle state for high-frequency updates
     private var lastHUDEmitTime: CFAbsoluteTime = 0
@@ -192,10 +208,20 @@ final class CodexAssistantRuntime {
     private var activeSubagents: [String: SubagentState] = [:]
     private let browserUseService: AssistantBrowserUseService
     private let appActionService: AssistantAppActionService
+    private let computerUseService: AssistantComputerUseService
+    private let imageGenerationService: AssistantImageGenerationService
     private var approvedDynamicToolKindsBySessionID: [String: Set<String>] = [:]
 
     var currentSessionID: String? {
         activeSessionID
+    }
+
+    var currentTurnID: String? {
+        activeTurnID
+    }
+
+    var currentSessionCWD: String? {
+        activeSessionCWD
     }
 
     var hasActiveTurn: Bool {
@@ -204,14 +230,22 @@ final class CodexAssistantRuntime {
 
     init(
         preferredModelID: String? = nil,
+        preferredSubagentModelID: String? = nil,
         browserUseService: AssistantBrowserUseService? = nil,
-        appActionService: AssistantAppActionService? = nil
+        appActionService: AssistantAppActionService? = nil,
+        computerUseService: AssistantComputerUseService? = nil,
+        imageGenerationService: AssistantImageGenerationService? = nil,
+        installSupport: CodexInstallSupport = CodexInstallSupport()
     ) {
         self.preferredModelID = preferredModelID?.nonEmpty
+        self.preferredSubagentModelID = preferredSubagentModelID?.nonEmpty
         self.browserUseService = browserUseService ?? AssistantBrowserUseService(
             settings: .shared
         )
         self.appActionService = appActionService ?? AssistantAppActionService()
+        self.computerUseService = computerUseService ?? AssistantComputerUseService()
+        self.imageGenerationService = imageGenerationService ?? AssistantImageGenerationService()
+        self.installSupport = installSupport
     }
 
     func setPreferredModelID(_ modelID: String?) {
@@ -219,64 +253,100 @@ final class CodexAssistantRuntime {
         preferredModelID = modelID?.nonEmpty
         let health = makeHealth(
             availability: activeTurnID == nil ? .ready : .active,
-            summary: currentAccountSnapshot.isLoggedIn ? "Codex is connected" : "Sign in with ChatGPT to use Codex"
+            summary: currentAccountSnapshot.isLoggedIn ? backend.connectedSummary : backend.signInPromptSummary
         )
         onHealthUpdate?(health)
 
         // Refresh rate limits for the new model (Spark has different limits)
-        if changed, currentAccountSnapshot.isLoggedIn {
+        if backend == .codex, changed, currentAccountSnapshot.isLoggedIn {
             Task { await refreshRateLimits() }
         }
     }
 
-    func refreshEnvironment(codexPath: String?) async throws -> AssistantEnvironmentDetails {
-        currentCodexPath = codexPath?.nonEmpty
-        CrashReporter.logInfo("Assistant runtime refresh started codexPath=\(currentCodexPath ?? "missing")")
-        try await ensureTransport()
-        let health = connectedHealthForCurrentState()
-        onHealthUpdate?(health)
-        scheduleMetadataRefresh()
-        CrashReporter.logInfo("Assistant runtime refresh finished availability=\(health.availability.rawValue) loggedIn=\(currentAccountSnapshot.isLoggedIn) models=\(currentModels.count) deferredMetadata=true")
-        return AssistantEnvironmentDetails(health: health, account: currentAccountSnapshot, models: currentModels)
+    func setPreferredSubagentModelID(_ modelID: String?) {
+        preferredSubagentModelID = modelID?.nonEmpty
     }
 
-    func startChatGPTLogin() async throws -> URL? {
-        try await ensureTransport()
+    func clearCachedEnvironmentState() {
+        currentAccountSnapshot = .signedOut
+        currentRateLimits = .empty
+        currentModels = []
+        currentCodexPath = nil
+    }
 
-        if currentAccountSnapshot.isLoggedIn {
-            _ = try? await refreshModels()
-            loginRefreshTask?.cancel()
-            onStatusMessage?("Codex is already signed in.")
-            onHealthUpdate?(makeHealth(availability: .ready, summary: "Codex is connected"))
-            CrashReporter.logInfo("Assistant login skipped because Codex account is already signed in")
-            return nil
+    func refreshEnvironment(codexPath: String?) async throws -> AssistantEnvironmentDetails {
+        currentCodexPath = codexPath?.nonEmpty
+        CrashReporter.logInfo("Assistant runtime refresh started backend=\(backend.rawValue) path=\(currentCodexPath ?? "missing")")
+        switch backend {
+        case .codex:
+            try await ensureTransport()
+            let health = connectedHealthForCurrentState()
+            onHealthUpdate?(health)
+            scheduleMetadataRefresh()
+            CrashReporter.logInfo("Assistant runtime refresh finished availability=\(health.availability.rawValue) loggedIn=\(currentAccountSnapshot.isLoggedIn) models=\(currentModels.count) deferredMetadata=true")
+            return AssistantEnvironmentDetails(health: health, account: currentAccountSnapshot, models: currentModels)
+        case .copilot:
+            return try await refreshCopilotEnvironment(cwd: activeSessionCWD)
         }
+    }
 
-        let response = try await sendRequest(
-            method: "account/login/start",
-            params: ["type": "chatgpt"]
-        )
+    func startLogin() async throws -> AssistantRuntimeLoginAction {
+        switch backend {
+        case .codex:
+            try await ensureTransport()
 
-        guard let payload = response.raw as? [String: Any] else {
-            throw CodexAssistantRuntimeError.invalidResponse("Codex did not return a login response.")
+            if currentAccountSnapshot.isLoggedIn {
+                _ = try? await refreshModels()
+                loginRefreshTask?.cancel()
+                onStatusMessage?(backend.alreadySignedInMessage)
+                onHealthUpdate?(makeHealth(availability: .ready, summary: backend.connectedSummary))
+                CrashReporter.logInfo("Assistant login skipped because Codex account is already signed in")
+                return .none
+            }
+
+            let response = try await sendRequest(
+                method: "account/login/start",
+                params: ["type": "chatgpt"]
+            )
+
+            guard let payload = response.raw as? [String: Any] else {
+                throw CodexAssistantRuntimeError.invalidResponse("Codex did not return a login response.")
+            }
+
+            let loginType = payload["type"] as? String
+            let loginID = payload["loginId"] as? String
+            let authURL = (payload["authUrl"] as? String).flatMap(URL.init(string:))
+
+            currentAccountSnapshot.loginInProgress = loginType == "chatgpt"
+            currentAccountSnapshot.pendingLoginID = loginID
+            currentAccountSnapshot.pendingLoginURL = authURL
+            onAccountUpdate?(currentAccountSnapshot)
+            onStatusMessage?("Finish the ChatGPT sign-in in your browser, then come back to Open Assist.")
+            onHealthUpdate?(makeHealth(availability: .loginRequired, summary: "Waiting for ChatGPT sign-in"))
+            CrashReporter.logInfo("Assistant login started loginID=\(loginID ?? "missing") authURLPresent=\(authURL != nil)")
+            scheduleLoginRefreshFallback()
+            return authURL.map(AssistantRuntimeLoginAction.openURL) ?? .none
+        case .copilot:
+            guard await resolvedExecutablePath() != nil else {
+                throw CodexAssistantRuntimeError.runtimeUnavailable("GitHub Copilot CLI is not installed on this Mac.")
+            }
+            onStatusMessage?("Run `copilot login` in Terminal, then return to Open Assist.")
+            onHealthUpdate?(makeHealth(availability: .loginRequired, summary: backend.loginRequiredSummary))
+            return .runCommand(backend.loginCommands.first ?? "copilot login")
         }
-
-        let loginType = payload["type"] as? String
-        let loginID = payload["loginId"] as? String
-        let authURL = (payload["authUrl"] as? String).flatMap(URL.init(string:))
-
-        currentAccountSnapshot.loginInProgress = loginType == "chatgpt"
-        currentAccountSnapshot.pendingLoginID = loginID
-        currentAccountSnapshot.pendingLoginURL = authURL
-        onAccountUpdate?(currentAccountSnapshot)
-        onStatusMessage?("Finish the ChatGPT sign-in in your browser, then come back to Open Assist.")
-        onHealthUpdate?(makeHealth(availability: .loginRequired, summary: "Waiting for ChatGPT sign-in"))
-        CrashReporter.logInfo("Assistant login started loginID=\(loginID ?? "missing") authURLPresent=\(authURL != nil)")
-        scheduleLoginRefreshFallback()
-        return authURL
     }
 
     func logout() async throws {
+        guard backend == .codex else {
+            currentAccountSnapshot = .signedOut
+            currentRateLimits = .empty
+            currentModels = []
+            onAccountUpdate?(currentAccountSnapshot)
+            onRateLimitsUpdate?(currentRateLimits)
+            onModelsUpdate?(currentModels)
+            onHealthUpdate?(makeHealth(availability: .loginRequired, summary: backend.signedOutSummary))
+            return
+        }
         try await ensureTransport()
         _ = try await sendRequest(method: "account/logout", params: [:])
         loginRefreshTask?.cancel()
@@ -289,13 +359,22 @@ final class CodexAssistantRuntime {
     }
 
     func startNewSession(cwd: String? = nil, preferredModelID: String? = nil) async throws -> String {
+        if backend == .copilot {
+            return try await startCopilotSession(
+                cwd: cwd,
+                preferredModelID: preferredModelID ?? self.preferredModelID,
+                announce: true
+            )
+        }
         try await ensureTransport()
         toolCalls.removeAll()
         liveActivities.removeAll()
+        clearSubagents(publish: false)
         repeatedCommandTracker.reset()
         resetStreamingTimelineState()
         onToolCallUpdate?([])
         onPlanUpdate?([])
+        onSubagentUpdate?([])
         onTimelineMutation?(.reset(sessionID: nil))
         onPermissionRequest?(nil)
         sessionTurnCount = 0
@@ -318,7 +397,7 @@ final class CodexAssistantRuntime {
         activeSessionID = threadID
         activeSessionCWD = cwd?.nonEmpty
         onSessionChange?(threadID)
-        onTranscript?(AssistantTranscriptEntry(role: .system, text: "Started a new Codex thread.", emphasis: true))
+        onTranscript?(AssistantTranscriptEntry(role: .system, text: backend.startedSessionMessage, emphasis: true))
         onHealthUpdate?(makeHealth(availability: .active, summary: "Connected"))
         updateHUD(phase: .idle, title: "Assistant is ready", detail: nil)
         CrashReporter.logInfo("Assistant runtime thread/start finished threadID=\(threadID)")
@@ -326,6 +405,15 @@ final class CodexAssistantRuntime {
     }
 
     func resumeSession(_ sessionID: String, cwd: String?, preferredModelID: String? = nil) async throws {
+        if backend == .copilot {
+            try await resumeCopilotSession(
+                sessionID,
+                cwd: cwd,
+                preferredModelID: preferredModelID ?? self.preferredModelID,
+                announce: true
+            )
+            return
+        }
         try await ensureTransport()
         _ = try await sendRequest(
             method: "thread/resume",
@@ -340,7 +428,7 @@ final class CodexAssistantRuntime {
         activeSessionCWD = cwd?.nonEmpty
         sessionTurnCount = 1 // Skip title generation for resumed sessions
         onSessionChange?(sessionID)
-        onTranscript?(AssistantTranscriptEntry(role: .system, text: "Loaded Codex thread \(sessionID).", emphasis: true))
+        onTranscript?(AssistantTranscriptEntry(role: .system, text: backend.loadedSessionMessage(sessionID), emphasis: true))
         onHealthUpdate?(makeHealth(availability: .active, summary: "Connected"))
         updateHUD(phase: .idle, title: "Thread ready", detail: nil)
     }
@@ -350,6 +438,15 @@ final class CodexAssistantRuntime {
         cwd: String?,
         preferredModelID: String? = nil
     ) async throws {
+        if backend == .copilot {
+            try await resumeCopilotSession(
+                sessionID,
+                cwd: cwd,
+                preferredModelID: preferredModelID ?? self.preferredModelID,
+                announce: false
+            )
+            return
+        }
         try await ensureTransport()
         _ = try await sendRequest(
             method: "thread/resume",
@@ -373,6 +470,14 @@ final class CodexAssistantRuntime {
 
     func refreshCurrentSessionConfiguration(cwd: String?, preferredModelID: String? = nil) async throws {
         guard let activeSessionID else { return }
+        if backend == .copilot {
+            try await refreshCopilotCurrentSessionConfiguration(
+                sessionID: activeSessionID,
+                cwd: cwd,
+                preferredModelID: preferredModelID ?? self.preferredModelID
+            )
+            return
+        }
         try await ensureTransport()
         _ = try await sendRequest(
             method: "thread/resume",
@@ -422,6 +527,18 @@ final class CodexAssistantRuntime {
             throw CodexAssistantRuntimeError.sessionUnavailable
         }
 
+        if backend == .copilot {
+            try await sendCopilotPrompt(
+                sessionID: activeSessionID,
+                prompt: trimmed,
+                attachments: attachments,
+                preferredModelID: preferredModelID ?? self.preferredModelID,
+                resumeContext: resumeContext,
+                memoryContext: memoryContext
+            )
+            return
+        }
+
         turnToolCallCount = 0
         repeatedCommandTracker.reset()
         updateHUD(phase: .streaming, title: "Starting", detail: nil)
@@ -455,7 +572,32 @@ final class CodexAssistantRuntime {
         pendingPermissionContext = nil
         onPermissionRequest?(nil)
 
-        guard let activeSessionID, let activeTurnID else {
+        guard let activeSessionID else {
+            updateHUD(phase: .idle, title: "Cancelled", detail: nil)
+            return
+        }
+
+        if backend == .copilot {
+            let hadActiveTurn = activeTurnID != nil
+            do {
+                _ = try await sendRequest(
+                    method: "session/cancel",
+                    params: ["sessionId": activeSessionID]
+                )
+            } catch {
+                onStatusMessage?(error.localizedDescription)
+            }
+            self.activeTurnID = nil
+            allowsProposedPlanForActiveTurn = false
+            updateHUD(phase: .idle, title: "Cancelled", detail: nil)
+            if hadActiveTurn {
+                onTurnCompletion?(.interrupted)
+            }
+            onHealthUpdate?(makeHealth(availability: .ready, summary: backend.connectedSummary))
+            return
+        }
+
+        guard let activeTurnID else {
             updateHUD(phase: .idle, title: "Cancelled", detail: nil)
             return
         }
@@ -514,13 +656,26 @@ final class CodexAssistantRuntime {
         }
         activeTurnID = nil
         activeSessionID = nil
+        activeSessionCWD = nil
+        transportSessionID = nil
         toolCalls.removeAll()
         liveActivities.removeAll()
+        clearSubagents(publish: false)
         repeatedCommandTracker.reset()
         resetStreamingTimelineState()
         onToolCallUpdate?([])
         onPlanUpdate?([])
+        onSubagentUpdate?([])
         onTimelineMutation?(.reset(sessionID: nil))
+    }
+
+    func listSessions(limit: Int = 40) async throws -> [AssistantSessionSummary] {
+        switch backend {
+        case .codex:
+            return []
+        case .copilot:
+            return try await listCopilotSessions(limit: limit)
+        }
     }
 
     func stop() async {
@@ -537,12 +692,18 @@ final class CodexAssistantRuntime {
         }
         activeTurnID = nil
         activeSessionID = nil
+        activeSessionCWD = nil
+        transportSessionID = nil
+        currentTransportWorkingDirectory = nil
+        bootstrapSessionID = nil
         toolCalls.removeAll()
         liveActivities.removeAll()
+        clearSubagents(publish: false)
         repeatedCommandTracker.reset()
         resetStreamingTimelineState()
         onToolCallUpdate?([])
         onPlanUpdate?([])
+        onSubagentUpdate?([])
         onTimelineMutation?(.reset(sessionID: nil))
         onSessionChange?(nil)
         await transport?.stop()
@@ -554,24 +715,67 @@ final class CodexAssistantRuntime {
         Self.cleanupAppleScriptProcesses()
     }
 
-    private func ensureTransport() async throws {
+    static func inspectCopilotSessions(
+        executablePath: String,
+        limit: Int,
+        workingDirectory: String? = nil
+    ) async throws -> [AssistantSessionSummary] {
+        let transport = CodexAppServerTransport { _ in }
+        try await transport.startCopilot(
+            copilotExecutablePath: executablePath,
+            workingDirectory: workingDirectory
+        )
+
+        do {
+            let response = try await transport.sendRequest(method: "session/list", params: [:])
+            let sessions = parseCopilotSessions(
+                from: response.raw,
+                limit: limit,
+                excluding: nil
+            )
+            await transport.stop()
+            return sessions
+        } catch {
+            await transport.stop()
+            throw error
+        }
+    }
+
+    private func ensureTransport(cwd: String? = nil) async throws {
+        let desiredWorkingDirectory = backend == .copilot
+            ? resolvedCopilotWorkingDirectory(cwd ?? activeSessionCWD)
+            : nil
+
         if let transport {
-            if await transport.isRunning() {
+            if backend == .copilot,
+               currentTransportWorkingDirectory != desiredWorkingDirectory {
+                await transport.stop()
+                self.transport = nil
+                self.transportSessionID = nil
+                self.currentTransportWorkingDirectory = nil
+            } else if await transport.isRunning() {
                 return
             }
             self.transport = nil
+            self.transportSessionID = nil
+            self.currentTransportWorkingDirectory = nil
         }
 
         if let transportStartupTask {
             return try await transportStartupTask.value
         }
 
-        guard let codexPath = currentCodexPath?.nonEmpty else {
-            throw CodexAssistantRuntimeError.codexMissing
+        guard let codexPath = await resolvedExecutablePath() else {
+            switch backend {
+            case .codex:
+                throw CodexAssistantRuntimeError.codexMissing
+            case .copilot:
+                throw CodexAssistantRuntimeError.runtimeUnavailable("GitHub Copilot CLI is not installed on this Mac.")
+            }
         }
 
-        onHealthUpdate?(makeHealth(availability: .connecting, summary: "Connecting to Codex App Server"))
-        CrashReporter.logInfo("Assistant runtime connecting to Codex App Server path=\(codexPath)")
+        onHealthUpdate?(makeHealth(availability: .connecting, summary: backend.startupSummary))
+        CrashReporter.logInfo("Assistant runtime connecting backend=\(backend.rawValue) path=\(codexPath)")
         let startupTask = Task<Void, Error> { @MainActor [weak self] in
             guard let self else { return }
 
@@ -582,17 +786,27 @@ final class CodexAssistantRuntime {
             }
 
             do {
-                try await transport.start(codexExecutablePath: codexPath)
+                switch self.backend {
+                case .codex:
+                    try await transport.startCodex(codexExecutablePath: codexPath)
+                case .copilot:
+                    try await transport.startCopilot(
+                        copilotExecutablePath: codexPath,
+                        workingDirectory: desiredWorkingDirectory
+                    )
+                }
                 self.transport = transport
-                self.onStatusMessage?("Connected to Codex App Server")
-                CrashReporter.logInfo("Assistant runtime connected to Codex App Server")
+                self.transportSessionID = nil
+                self.currentTransportWorkingDirectory = desiredWorkingDirectory
+                self.onStatusMessage?("Connected to \(self.backend.displayName)")
+                CrashReporter.logInfo("Assistant runtime connected backend=\(self.backend.rawValue)")
             } catch {
                 self.onHealthUpdate?(self.makeHealth(
                     availability: .failed,
-                    summary: "Could not start Codex App Server",
+                    summary: self.backend.startupFailureSummary,
                     detail: error.localizedDescription
                 ))
-                CrashReporter.logError("Assistant runtime failed to start Codex App Server: \(error.localizedDescription)")
+                CrashReporter.logError("Assistant runtime failed to start backend=\(self.backend.rawValue): \(error.localizedDescription)")
                 throw error
             }
         }
@@ -618,17 +832,101 @@ final class CodexAssistantRuntime {
         return account
     }
 
+    func resolveTranscriptionAuthContext(refreshToken: Bool = true) async throws -> CodexTranscriptionAuthContext {
+        guard backend == .codex else {
+            throw CodexAssistantRuntimeError.runtimeUnavailable(
+                "Transcription auth context is only available when Codex is the selected assistant backend."
+            )
+        }
+        try await ensureTransport()
+
+        let params: [String: Any] = [
+            "includeToken": true,
+            "refreshToken": refreshToken
+        ]
+
+        var lastError: Error?
+        for method in ["getAuthStatus", "account/getAuthStatus"] {
+            do {
+                CrashReporter.logInfo("Assistant runtime requesting \(method) for transcription")
+                let response = try await requestWithTimeout(
+                    method: method,
+                    params: params,
+                    timeoutNanoseconds: 12_000_000_000
+                )
+                let context = try parseTranscriptionAuthContext(from: response.raw)
+                CrashReporter.logInfo(
+                    "Assistant runtime resolved transcription auth method=\(context.authMode.rawValue)"
+                )
+                return context
+            } catch {
+                lastError = error
+                CrashReporter.logInfo("\(method) unavailable for transcription auth: \(error.localizedDescription)")
+            }
+        }
+
+        throw lastError ?? CodexAssistantRuntimeError.invalidResponse(
+            "Codex did not provide a transcription auth status response."
+        )
+    }
+
     func refreshRateLimits() async {
-        do {
-            let response = try await requestWithTimeout(method: "account/rateLimits/read", params: [:])
-            guard let payload = response.raw as? [String: Any] else { return }
-            handleRateLimitsUpdated(payload)
-        } catch {
-            CrashReporter.logInfo("account/rateLimits/read not available: \(error.localizedDescription)")
+        switch backend {
+        case .codex:
+            do {
+                let response = try await requestWithTimeout(method: "account/rateLimits/read", params: [:])
+                guard let payload = response.raw as? [String: Any] else { return }
+                handleRateLimitsUpdated(payload)
+            } catch {
+                CrashReporter.logInfo("account/rateLimits/read not available: \(error.localizedDescription)")
+            }
+        case .copilot:
+            let tokenResolver = CopilotTokenResolver(
+                runner: installSupport.runner,
+                fileManager: installSupport.fileManager,
+                homeDirectory: installSupport.homeDirectory
+            )
+
+            guard let token = await tokenResolver.resolveGitHubToken() else {
+                CrashReporter.logInfo("Copilot usage refresh skipped because no GitHub auth token could be resolved.")
+                return
+            }
+
+            do {
+                let snapshot = try await CopilotUsageFetcher().fetchUsage(token: token)
+                currentRateLimits = snapshot.rateLimits
+                onRateLimitsUpdate?(currentRateLimits)
+
+                if currentAccountSnapshot.planType != snapshot.planType {
+                    currentAccountSnapshot.planType = snapshot.planType
+                    onAccountUpdate?(currentAccountSnapshot)
+                }
+            } catch {
+                CrashReporter.logInfo("Copilot usage refresh failed: \(error.localizedDescription)")
+            }
         }
     }
 
     private func refreshModels() async throws -> [AssistantModelOption] {
+        if backend == .copilot {
+            let resolvedCWD = resolvedCopilotWorkingDirectory(activeSessionCWD)
+            if let activeSessionID {
+                try await refreshCopilotCurrentSessionConfiguration(
+                    sessionID: activeSessionID,
+                    cwd: activeSessionCWD ?? resolvedCWD,
+                    preferredModelID: preferredModelID
+                )
+                return currentModels
+            }
+
+            _ = try await startCopilotSession(
+                cwd: resolvedCWD,
+                preferredModelID: preferredModelID,
+                announce: false
+            )
+            return currentModels
+        }
+
         CrashReporter.logInfo("Assistant runtime requesting model/list")
         let response = try await requestWithTimeout(method: "model/list", params: [:])
         let models = parseModels(from: response.raw)
@@ -644,6 +942,7 @@ final class CodexAssistantRuntime {
         timeoutNanoseconds: UInt64 = 8_000_000_000
     ) async throws -> CodexResponsePayload {
         let requestTask = Task { try await sendRequest(method: method, params: params) }
+        let backendDisplayName = backend.displayName
 
         do {
             return try await withThrowingTaskGroup(of: CodexResponsePayload.self) { group in
@@ -652,7 +951,7 @@ final class CodexAssistantRuntime {
                 }
                 group.addTask {
                     try await Task.sleep(nanoseconds: timeoutNanoseconds)
-                    throw CodexAssistantRuntimeError.runtimeUnavailable("Codex App Server did not answer \(method) in time.")
+                    throw CodexAssistantRuntimeError.runtimeUnavailable("\(backendDisplayName) did not answer \(method) in time.")
                 }
 
                 let result = try await group.next()
@@ -665,6 +964,8 @@ final class CodexAssistantRuntime {
                 await transport?.stop()
                 transport = nil
                 transportStartupTask = nil
+                transportSessionID = nil
+                currentTransportWorkingDirectory = nil
             }
             throw error
         }
@@ -672,16 +973,27 @@ final class CodexAssistantRuntime {
 
     private func connectedHealthForCurrentState(detail: String? = nil) -> AssistantRuntimeHealth {
         if activeTurnID != nil {
-            return makeHealth(availability: .active, summary: "Codex is working", detail: detail)
+            return makeHealth(availability: .active, summary: backend.activeSummary, detail: detail)
         }
 
         if currentAccountSnapshot.isLoggedIn {
             let resolvedDetail = detail ?? (currentModels.isEmpty ? "Loading model details…" : nil)
-            return makeHealth(availability: .ready, summary: "Codex is connected", detail: resolvedDetail)
+            return makeHealth(availability: .ready, summary: backend.connectedSummary, detail: resolvedDetail)
         }
 
         let resolvedDetail = detail ?? "Account details are still loading. You can already start chatting."
-        return makeHealth(availability: .ready, summary: "Codex App Server is connected", detail: resolvedDetail)
+        return makeHealth(availability: .ready, summary: backend.connectedSummary, detail: resolvedDetail)
+    }
+
+    private func resolvedExecutablePath() async -> String? {
+        if let existingPath = currentCodexPath?.nonEmpty {
+            return existingPath
+        }
+
+        let guidance = await installSupport.inspect(backend: backend)
+        let resolvedPath = guidance.codexPath?.nonEmpty
+        currentCodexPath = resolvedPath
+        return resolvedPath
     }
 
     private func scheduleMetadataRefresh() {
@@ -744,7 +1056,7 @@ final class CodexAssistantRuntime {
 
     private func sendRequest(method: String, params: [String: Any]) async throws -> CodexResponsePayload {
         guard let transport else {
-            throw CodexAssistantRuntimeError.runtimeUnavailable("Codex App Server is not running yet.")
+            throw CodexAssistantRuntimeError.runtimeUnavailable("\(backend.displayName) is not running yet.")
         }
         return try await transport.sendRequest(method: method, params: params)
     }
@@ -764,10 +1076,14 @@ final class CodexAssistantRuntime {
             activeTurnID = nil
             activeSessionID = nil
             activeSessionCWD = nil
+            transportSessionID = nil
+            currentTransportWorkingDirectory = nil
+            bootstrapSessionID = nil
+            clearSubagents()
             transport = nil
             transportStartupTask = nil
             CrashReporter.logWarning("Assistant runtime process exited message=\(message ?? "none")")
-            onHealthUpdate?(makeHealth(availability: .idle, summary: "Codex App Server stopped", detail: message))
+            onHealthUpdate?(makeHealth(availability: .idle, summary: "\(backend.displayName) stopped", detail: message))
             if let message {
                 onTranscript?(AssistantTranscriptEntry(role: .status, text: message))
             }
@@ -779,6 +1095,11 @@ final class CodexAssistantRuntime {
     }
 
     private func handleNotification(method: String, params: [String: Any]) async {
+        if backend == .copilot {
+            await handleCopilotNotification(method: method, params: params)
+            return
+        }
+
         // Intercept notifications from the title-generation thread
         if let titleThread = titleGenThreadID,
            let notifThread = params["threadId"] as? String,
@@ -858,6 +1179,8 @@ final class CodexAssistantRuntime {
                let turnID = turn["id"] as? String {
                 activeTurnID = turnID
             }
+            clearSubagents()
+            onPlanUpdate?([])
             resetStreamingTimelineState()
             updateHUD(phase: .thinking, title: "Thinking", detail: nil)
             onHealthUpdate?(makeHealth(availability: .active, summary: "Codex is working"))
@@ -865,6 +1188,15 @@ final class CodexAssistantRuntime {
             onPlanUpdate?(parsePlanEntries(from: params["plan"]))
         case "item/agentMessage/delta":
             if let delta = params["delta"] as? String, delta.nonEmpty != nil {
+                let threadID = params["threadId"] as? String
+                let turnID = assistantMessageTurnID(from: params)
+                guard acceptAssistantMessageDelta(
+                    threadID: threadID,
+                    turnID: turnID,
+                    source: method
+                ) else {
+                    break
+                }
                 let channel = (params["channel"] as? String)?.lowercased()
                 if channel == "commentary" {
                     appendCommentaryDelta(delta)
@@ -978,24 +1310,93 @@ final class CodexAssistantRuntime {
 
     // MARK: - Subagent / Collaboration Handlers
 
+    private func collabAgentMetadata(from item: [String: Any]) -> (threadID: String?, nickname: String?, role: String?) {
+        let collabAgent = item["collabAgent"] as? [String: Any]
+        let arguments = item["arguments"] as? [String: Any]
+        let result = item["result"] as? [String: Any]
+
+        let threadID = firstNonEmptyString(
+            collabAgent?["thread_id"] as? String,
+            collabAgent?["threadId"] as? String,
+            item["thread_id"] as? String,
+            item["threadId"] as? String,
+            item["new_thread_id"] as? String,
+            item["newThreadId"] as? String,
+            arguments?["thread_id"] as? String,
+            arguments?["threadId"] as? String,
+            result?["thread_id"] as? String,
+            result?["threadId"] as? String,
+            result?["new_thread_id"] as? String,
+            result?["newThreadId"] as? String
+        )
+        let nickname = firstNonEmptyString(
+            collabAgent?["agent_nickname"] as? String,
+            collabAgent?["agentNickname"] as? String,
+            item["agent_nickname"] as? String,
+            item["agentNickname"] as? String,
+            item["new_agent_nickname"] as? String,
+            item["newAgentNickname"] as? String,
+            arguments?["agent_nickname"] as? String,
+            arguments?["agentNickname"] as? String,
+            result?["agent_nickname"] as? String,
+            result?["agentNickname"] as? String,
+            result?["new_agent_nickname"] as? String,
+            result?["newAgentNickname"] as? String
+        )
+        let role = firstNonEmptyString(
+            collabAgent?["agent_role"] as? String,
+            collabAgent?["agentRole"] as? String,
+            item["agent_role"] as? String,
+            item["agentRole"] as? String,
+            item["new_agent_role"] as? String,
+            item["newAgentRole"] as? String,
+            arguments?["agent_role"] as? String,
+            arguments?["agentRole"] as? String,
+            result?["agent_role"] as? String,
+            result?["agentRole"] as? String,
+            result?["new_agent_role"] as? String,
+            result?["newAgentRole"] as? String
+        )
+
+        return (threadID, nickname, role)
+    }
+
     private func handleCollabToolCall(item: [String: Any], status: String) {
         guard let callID = item["id"] as? String else { return }
         let tool = item["tool"] as? String ?? ""
-        let agent = item["collabAgent"] as? [String: Any]
-        let threadID = agent?["thread_id"] as? String
-        let nickname = agent?["agent_nickname"] as? String
-        let role = agent?["agent_role"] as? String
+        let metadata = collabAgentMetadata(from: item)
+        let threadID = metadata.threadID
+        let nickname = metadata.nickname
+        let role = metadata.role
+        let now = Date()
 
         switch tool {
         case "SpawnAgent":
-            activeSubagents[callID] = SubagentState(
-                id: callID, threadID: threadID, nickname: nickname, role: role,
-                status: .spawning, prompt: extractString(item["arguments"])
+            var subagent = activeSubagents[callID] ?? SubagentState(
+                id: callID,
+                parentThreadID: activeSessionID,
+                threadID: threadID,
+                nickname: nickname,
+                role: role,
+                status: .spawning,
+                prompt: extractString(item["arguments"]),
+                startedAt: now,
+                updatedAt: now,
+                endedAt: nil
             )
+            if subagent.parentThreadID?.nonEmpty == nil {
+                subagent.parentThreadID = activeSessionID
+            }
+            subagent.threadID = threadID ?? subagent.threadID
+            subagent.nickname = nickname ?? subagent.nickname
+            subagent.role = role ?? subagent.role
+            subagent.prompt = extractString(item["arguments"]) ?? subagent.prompt
+            subagent.updatedAt = now
+            activeSubagents[callID] = subagent
         case "CloseAgent":
             if let threadID {
                 for (key, var agent) in activeSubagents where agent.threadID == threadID {
-                    agent.status = .closed
+                    applySubagentStatus(.closed, to: &agent, at: now)
                     activeSubagents[key] = agent
                 }
             }
@@ -1005,7 +1406,13 @@ final class CodexAssistantRuntime {
 
         if status == "completed" || status == "failed" {
             if var existing = activeSubagents[callID] {
-                existing.status = status == "failed" ? .errored : (tool == "CloseAgent" ? .closed : existing.status)
+                if status == "failed" {
+                    applySubagentStatus(.errored, to: &existing, at: now)
+                } else if tool == "CloseAgent" {
+                    applySubagentStatus(.closed, to: &existing, at: now)
+                } else {
+                    existing.updatedAt = now
+                }
                 activeSubagents[callID] = existing
             }
         }
@@ -1016,9 +1423,18 @@ final class CodexAssistantRuntime {
     private func handleCollabSpawnBegin(_ params: [String: Any]) {
         let callID = params["call_id"] as? String ?? params["callId"] as? String ?? UUID().uuidString
         let prompt = params["prompt"] as? String
+        let now = Date()
         activeSubagents[callID] = SubagentState(
-            id: callID, threadID: nil, nickname: nil, role: nil,
-            status: .spawning, prompt: prompt
+            id: callID,
+            parentThreadID: activeSessionID,
+            threadID: nil,
+            nickname: nil,
+            role: nil,
+            status: .spawning,
+            prompt: prompt,
+            startedAt: now,
+            updatedAt: now,
+            endedAt: nil
         )
         publishSubagents()
         updateHUD(phase: .acting, title: "Spawning agent", detail: prompt)
@@ -1029,17 +1445,26 @@ final class CodexAssistantRuntime {
         let threadID = params["new_thread_id"] as? String ?? params["newThreadId"] as? String
         let nickname = params["new_agent_nickname"] as? String ?? params["newAgentNickname"] as? String
         let role = params["new_agent_role"] as? String ?? params["newAgentRole"] as? String
+        let now = Date()
 
         if var existing = activeSubagents[callID] {
             existing.threadID = threadID
             existing.nickname = nickname
             existing.role = role
-            existing.status = .running
+            applySubagentStatus(.running, to: &existing, at: now)
             activeSubagents[callID] = existing
         } else {
             activeSubagents[callID] = SubagentState(
-                id: callID, threadID: threadID, nickname: nickname, role: role,
-                status: .running, prompt: params["prompt"] as? String
+                id: callID,
+                parentThreadID: activeSessionID,
+                threadID: threadID,
+                nickname: nickname,
+                role: role,
+                status: .running,
+                prompt: params["prompt"] as? String,
+                startedAt: now,
+                updatedAt: now,
+                endedAt: nil
             )
         }
         publishSubagents()
@@ -1048,7 +1473,7 @@ final class CodexAssistantRuntime {
     private func handleCollabInteractionBegin(_ params: [String: Any]) {
         let receiverThreadID = params["receiver_thread_id"] as? String ?? params["receiverThreadId"] as? String
         if let receiverThreadID {
-            updateSubagentByThread(receiverThreadID, status: .running)
+            updateSubagentByThread(receiverThreadID, status: .running, timestamp: Date())
         }
     }
 
@@ -1057,47 +1482,75 @@ final class CodexAssistantRuntime {
         let statusStr = params["status"] as? String
         if let receiverThreadID {
             let status: SubagentStatus = statusStr == "errored" ? .errored : (statusStr == "completed" ? .completed : .running)
-            updateSubagentByThread(receiverThreadID, status: status)
+            updateSubagentByThread(receiverThreadID, status: status, timestamp: Date())
         }
     }
 
     private func handleCollabClose(_ params: [String: Any]) {
         let receiverThreadID = params["receiver_thread_id"] as? String ?? params["receiverThreadId"] as? String
         if let receiverThreadID {
-            updateSubagentByThread(receiverThreadID, status: .closed)
+            updateSubagentByThread(receiverThreadID, status: .closed, timestamp: Date())
         }
     }
 
     private func handleCollabWaitingBegin(_ params: [String: Any]) {
         let threadIDs = params["receiver_thread_ids"] as? [String] ?? params["receiverThreadIds"] as? [String] ?? []
         for threadID in threadIDs {
-            updateSubagentByThread(threadID, status: .waiting)
+            updateSubagentByThread(threadID, status: .waiting, timestamp: Date())
         }
         updateHUD(phase: .acting, title: "Waiting for agents", detail: "\(threadIDs.count) agent\(threadIDs.count == 1 ? "" : "s")")
     }
 
     private func handleCollabWaitingEnd(_ params: [String: Any]) {
         let threadIDs = params["receiver_thread_ids"] as? [String] ?? params["receiverThreadIds"] as? [String] ?? []
+        let now = Date()
         for threadID in threadIDs {
             for (key, var agent) in activeSubagents where agent.threadID == threadID && agent.status == .waiting {
-                agent.status = .completed
+                applySubagentStatus(.completed, to: &agent, at: now)
                 activeSubagents[key] = agent
             }
         }
         publishSubagents()
     }
 
-    private func updateSubagentByThread(_ threadID: String, status: SubagentStatus) {
+    private func updateSubagentByThread(_ threadID: String, status: SubagentStatus, timestamp: Date) {
         for (key, var agent) in activeSubagents where agent.threadID == threadID {
-            agent.status = status
+            applySubagentStatus(status, to: &agent, at: timestamp)
             activeSubagents[key] = agent
         }
         publishSubagents()
     }
 
+    private func applySubagentStatus(_ status: SubagentStatus, to agent: inout SubagentState, at timestamp: Date) {
+        agent.status = status
+        agent.updatedAt = timestamp
+        if status.isActive {
+            agent.endedAt = nil
+        } else {
+            agent.endedAt = timestamp
+        }
+    }
+
+    private func clearSubagents(publish: Bool = true) {
+        guard !activeSubagents.isEmpty else {
+            if publish {
+                onSubagentUpdate?([])
+            }
+            return
+        }
+
+        activeSubagents.removeAll()
+        if publish {
+            onSubagentUpdate?([])
+        }
+    }
+
     private func publishSubagents() {
         let sorted = activeSubagents.values.sorted { a, b in
             if a.status.isActive != b.status.isActive { return a.status.isActive }
+            let lhsDate = a.lastEventAt ?? .distantPast
+            let rhsDate = b.lastEventAt ?? .distantPast
+            if lhsDate != rhsDate { return lhsDate > rhsDate }
             return a.id < b.id
         }
         onSubagentUpdate?(Array(sorted))
@@ -1155,6 +1608,11 @@ final class CodexAssistantRuntime {
     }
 
     private func handleServerRequest(id: JSONRPCRequestID, method: String, params: [String: Any]) async {
+        if backend == .copilot {
+            await handleCopilotServerRequest(id: id, method: method, params: params)
+            return
+        }
+
         // Auto-decline any tool requests from the title-generation thread
         if let titleThread = titleGenThreadID,
            let notifThread = params["threadId"] as? String,
@@ -1524,6 +1982,18 @@ final class CodexAssistantRuntime {
             toolName: tool,
             arguments: arguments
         )
+        let approvalContextDisplayName: String?
+        let approvalKind: String
+        if tool == AssistantComputerUseToolDefinition.name {
+            let appContext = await computerUseService.frontmostAppContext()
+            approvalContextDisplayName = appContext.displayName
+            approvalKind = requiresExplicitConfirmation
+                ? toolKind
+                : AssistantComputerUseService.sessionApprovalKey(for: appContext)
+        } else {
+            approvalContextDisplayName = nil
+            approvalKind = toolKind
+        }
 
         // Auto-approve native data access apps (Reminders, Contacts, Notes, Messages, Calendar reads).
         // These use safe, read-only framework access and don't need per-session user approval.
@@ -1538,12 +2008,23 @@ final class CodexAssistantRuntime {
             return
         }
 
-        if !requiresExplicitConfirmation,
-           isDynamicToolApproved(toolKind: toolKind, for: sessionID) {
+        if tool == AssistantImageGenerationToolDefinition.name {
             await executeDynamicToolCall(
                 toolName: tool,
                 requestID: id,
-                arguments: arguments
+                arguments: arguments,
+                sessionID: sessionID
+            )
+            return
+        }
+
+        if !requiresExplicitConfirmation,
+           isDynamicToolApproved(toolKind: approvalKind, for: sessionID) {
+            await executeDynamicToolCall(
+                toolName: tool,
+                requestID: id,
+                arguments: arguments,
+                sessionID: sessionID
             )
             return
         }
@@ -1554,7 +2035,7 @@ final class CodexAssistantRuntime {
                 AssistantPermissionOption(
                     id: "acceptForSession",
                     title: "Allow for Session",
-                    kind: toolKind,
+                    kind: approvalKind,
                     isDefault: true
                 )
             )
@@ -1563,26 +2044,27 @@ final class CodexAssistantRuntime {
             AssistantPermissionOption(
                 id: "accept",
                 title: requiresExplicitConfirmation ? "Approve Once" : "Allow Once",
-                kind: toolKind,
+                kind: approvalKind,
                 isDefault: requiresExplicitConfirmation
             )
         )
         options.append(
-            AssistantPermissionOption(id: "decline", title: "Decline", kind: toolKind, isDefault: false)
+            AssistantPermissionOption(id: "decline", title: "Decline", kind: approvalKind, isDefault: false)
         )
         options.append(
-            AssistantPermissionOption(id: "cancel", title: "Cancel Turn", kind: toolKind, isDefault: false)
+            AssistantPermissionOption(id: "cancel", title: "Cancel Turn", kind: approvalKind, isDefault: false)
         )
 
         let request = AssistantPermissionRequest(
             id: approvalRequestID(from: id),
             sessionID: sessionID,
             toolTitle: displayName,
-            toolKind: toolKind,
+            toolKind: approvalKind,
             rationale: dynamicToolPermissionRationale(
                 toolName: tool,
                 taskSummary: taskSummary,
-                requiresExplicitConfirmation: requiresExplicitConfirmation
+                requiresExplicitConfirmation: requiresExplicitConfirmation,
+                targetDisplayName: approvalContextDisplayName
             ),
             options: options,
             rawPayloadSummary: taskSummary
@@ -1593,10 +2075,20 @@ final class CodexAssistantRuntime {
 
             switch optionID {
             case "acceptForSession":
-                await self.rememberDynamicToolApproval(toolKind: toolKind, for: sessionID)
-                await self.executeDynamicToolCall(toolName: tool, requestID: id, arguments: arguments)
+                await self.rememberDynamicToolApproval(toolKind: approvalKind, for: sessionID)
+                await self.executeDynamicToolCall(
+                    toolName: tool,
+                    requestID: id,
+                    arguments: arguments,
+                    sessionID: sessionID
+                )
             case "accept":
-                await self.executeDynamicToolCall(toolName: tool, requestID: id, arguments: arguments)
+                await self.executeDynamicToolCall(
+                    toolName: tool,
+                    requestID: id,
+                    arguments: arguments,
+                    sessionID: sessionID
+                )
             case "cancel":
                 let message = "\(displayName) was canceled for this turn."
                 do {
@@ -1667,7 +2159,9 @@ final class CodexAssistantRuntime {
     private func executeDynamicToolCall(
         toolName: String,
         requestID: JSONRPCRequestID,
-        arguments: Any
+        arguments: Any,
+        sessionID: String? = nil,
+        browserLoginResume: Bool = false
     ) async {
         let displayName = dynamicToolDisplayName(toolName)
 
@@ -1696,20 +2190,53 @@ final class CodexAssistantRuntime {
         }
 
         let workingDetail: String
-        let result: AssistantToolExecutionResult
+        var result: AssistantToolExecutionResult
 
         switch toolName {
         case AssistantBrowserUseToolDefinition.name:
-            workingDetail = "Using the selected browser profile"
+            workingDetail = browserLoginResume
+                ? "Checking the browser after sign-in"
+                : "Using the selected browser profile"
             updateHUD(phase: .acting, title: displayName, detail: workingDetail)
-            result = await browserUseService.run(
-                arguments: arguments,
-                preferredModelID: preferredModelID
+            result = await (
+                browserLoginResume
+                    ? browserUseService.resumeAfterLogin(
+                        arguments: arguments,
+                        preferredModelID: preferredModelID
+                    )
+                    : browserUseService.run(
+                        arguments: arguments,
+                        preferredModelID: preferredModelID
+                    )
             )
+            if let prompt = result?.loginPrompt {
+                await presentBrowserLoginRequest(
+                    id: requestID,
+                    arguments: arguments,
+                    prompt: prompt,
+                    taskSummary: dynamicToolTaskSummary(for: toolName, arguments: arguments)
+                )
+                return
+            }
         case AssistantAppActionToolDefinition.name:
             workingDetail = "Using a supported Mac app"
             updateHUD(phase: .acting, title: displayName, detail: workingDetail)
             result = await appActionService.run(
+                arguments: arguments,
+                preferredModelID: preferredModelID
+            )
+        case AssistantComputerUseToolDefinition.name:
+            workingDetail = "Using screenshot-based desktop control"
+            updateHUD(phase: .acting, title: displayName, detail: workingDetail)
+            result = await computerUseService.run(
+                sessionID: sessionID ?? activeSessionID ?? "",
+                arguments: arguments,
+                preferredModelID: preferredModelID
+            )
+        case AssistantImageGenerationToolDefinition.name:
+            workingDetail = "Generating an image with Google Gemini"
+            updateHUD(phase: .acting, title: displayName, detail: workingDetail)
+            result = await imageGenerationService.run(
                 arguments: arguments,
                 preferredModelID: preferredModelID
             )
@@ -1739,9 +2266,16 @@ final class CodexAssistantRuntime {
 
         let screenshotDataItems = Self.imageDataItems(in: result.contentItems)
         if !screenshotDataItems.isEmpty {
-            let imageTitle = result.success
-                ? "Screenshot from \(displayName)"
-                : "Last screenshot before \(displayName) failed"
+            let imageTitle: String
+            if toolName == AssistantImageGenerationToolDefinition.name {
+                imageTitle = result.success
+                    ? "Generated image"
+                    : "Image generation failed"
+            } else {
+                imageTitle = result.success
+                    ? "Screenshot from \(displayName)"
+                    : "Last screenshot before \(displayName) failed"
+            }
             onTimelineMutation?(
                 .upsert(
                     .system(
@@ -1798,6 +2332,106 @@ final class CodexAssistantRuntime {
         default:
             break
         }
+    }
+
+    private func presentBrowserLoginRequest(
+        id: JSONRPCRequestID,
+        arguments: Any,
+        prompt: AssistantBrowserLoginPrompt,
+        taskSummary: String
+    ) async {
+        let proceedOption = AssistantPermissionOption(
+            id: "proceed",
+            title: "Proceed",
+            kind: "browserLogin",
+            isDefault: true
+        )
+        let cancelOption = AssistantPermissionOption(
+            id: "cancel",
+            title: "Cancel Request",
+            kind: "browserLogin",
+            isDefault: false
+        )
+        let request = AssistantPermissionRequest(
+            id: approvalRequestID(from: id),
+            sessionID: activeSessionID ?? "",
+            toolTitle: prompt.requestTitle,
+            toolKind: "browserLogin",
+            rationale: prompt.requestRationale,
+            options: [proceedOption, cancelOption],
+            rawPayloadSummary: prompt.requestSummary
+        )
+
+        pendingPermissionContext = PendingPermissionContext(request: request) { [weak self] optionID in
+            guard let self else { return }
+            switch optionID {
+            case "proceed":
+                await self.executeDynamicToolCall(
+                    toolName: AssistantBrowserUseToolDefinition.name,
+                    requestID: id,
+                    arguments: arguments,
+                    browserLoginResume: true
+                )
+            default:
+                await self.declineBrowserLoginRequest(
+                    id: id,
+                    message: "Browser sign-in was canceled for this turn."
+                )
+            }
+        } cancelHandler: { [weak self] in
+            guard let self else { return }
+            await self.declineBrowserLoginRequest(
+                id: id,
+                message: "Browser sign-in was canceled for this turn."
+            )
+        }
+
+        onPermissionRequest?(request)
+        onTranscript?(
+            AssistantTranscriptEntry(
+                role: .permission,
+                text: prompt.requestRationale,
+                emphasis: true
+            )
+        )
+        onTimelineMutation?(
+            .upsert(
+                .permission(
+                    id: "permission-\(request.id)",
+                    sessionID: request.sessionID,
+                    turnID: activeTurnID,
+                    request: request,
+                    createdAt: Date(),
+                    source: .runtime
+                )
+            )
+        )
+        onStatusMessage?(prompt.requestRationale)
+        updateHUD(
+            phase: .waitingForPermission,
+            title: "Login Required",
+            detail: prompt.pageTitle?.nonEmpty ?? taskSummary
+        )
+    }
+
+    private func declineBrowserLoginRequest(id: JSONRPCRequestID, message: String) async {
+        do {
+            try await transport?.sendResponse(
+                id: id,
+                result: [
+                    "contentItems": [["type": "inputText", "text": message]],
+                    "success": false
+                ]
+            )
+        } catch {
+            await MainActor.run {
+                onStatusMessage?(error.localizedDescription)
+            }
+        }
+
+        onTranscript?(AssistantTranscriptEntry(role: .status, text: message, emphasis: true))
+        onStatusMessage?(message)
+        updateHUD(phase: .failed, title: "Browser login canceled", detail: message)
     }
 
     /// Finalize the streaming buffer: emit the final non-streaming entry and reset.
@@ -1874,6 +2508,11 @@ final class CodexAssistantRuntime {
         }
 
         guard let item = params["item"] as? [String: Any] else {
+            return
+        }
+
+        if let browserMCPTool = browserMCPToolContext(from: item) {
+            interruptForBlockedBrowserMCPToolUse(activityTitle: browserMCPTool)
             return
         }
 
@@ -2005,6 +2644,7 @@ final class CodexAssistantRuntime {
     }
 
     private func handleTurnCompleted(_ params: [String: Any]) {
+        materializeCopilotFallbackReplyIfNeeded()
         let responsePreview = streamingBuffer.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
         let completedTurnResponse = streamingBuffer
         flushStreamingBuffer()
@@ -2012,6 +2652,7 @@ final class CodexAssistantRuntime {
         defer {
             allowsProposedPlanForActiveTurn = false
             activeTurnID = nil
+            pendingCopilotFallbackReply = nil
         }
 
         guard let turn = params["turn"] as? [String: Any] else {
@@ -2024,9 +2665,9 @@ final class CodexAssistantRuntime {
         case "completed":
             finalizeActiveActivities(with: .completed)
             onTurnCompletion?(.completed)
-            onTranscript?(AssistantTranscriptEntry(role: .status, text: "Codex finished this turn."))
+            onTranscript?(AssistantTranscriptEntry(role: .status, text: "\(backend.shortDisplayName) finished this turn."))
             updateHUD(phase: .success, title: "Finished", detail: responsePreview)
-            onHealthUpdate?(makeHealth(availability: .ready, summary: "Codex is connected"))
+            onHealthUpdate?(makeHealth(availability: .ready, summary: backend.connectedSummary))
 
             // After the first successful turn, request an AI-generated session title
             if sessionTurnCount == 0,
@@ -2047,17 +2688,17 @@ final class CodexAssistantRuntime {
             } else {
                 updateHUD(phase: .idle, title: "Mode restriction", detail: nil)
             }
-            onHealthUpdate?(makeHealth(availability: .ready, summary: "Codex is connected"))
+            onHealthUpdate?(makeHealth(availability: .ready, summary: backend.connectedSummary))
         case "failed":
             finalizeActiveActivities(with: .failed)
-            let errorText = extractString((turn["error"] as? [String: Any])?["message"]) ?? "Codex could not finish this turn."
+            let errorText = extractString((turn["error"] as? [String: Any])?["message"]) ?? "\(backend.displayName) could not finish this turn."
             onTurnCompletion?(.failed(message: errorText))
             onTranscript?(AssistantTranscriptEntry(role: .error, text: errorText, emphasis: true))
             emitTimelineSystemMessage(errorText, emphasis: true)
             updateHUD(phase: .failed, title: "Needs attention", detail: errorText)
             // The turn failed but the transport is still connected — keep availability
             // as .ready so the user can send follow-up messages.
-            onHealthUpdate?(makeHealth(availability: .ready, summary: "Codex is connected", detail: errorText))
+            onHealthUpdate?(makeHealth(availability: .ready, summary: backend.connectedSummary, detail: errorText))
         default:
             updateHUD(phase: .idle, title: "Assistant is ready", detail: nil)
         }
@@ -2096,6 +2737,49 @@ final class CodexAssistantRuntime {
 
     private func shouldForceStreamingDeltaFlush(for delta: String) -> Bool {
         delta.contains("\n\n") || delta.contains("\r\n\r\n") || delta.contains("\n")
+    }
+
+    private func assistantMessageTurnID(from params: [String: Any]) -> String? {
+        let item = params["item"] as? [String: Any]
+        let update = params["update"] as? [String: Any]
+        return firstNonEmptyString(
+            params["turnId"] as? String,
+            params["turnID"] as? String,
+            (params["turn"] as? [String: Any])?["id"] as? String,
+            item?["turnId"] as? String,
+            item?["turnID"] as? String,
+            item?["turn_id"] as? String,
+            update?["turnId"] as? String,
+            update?["turnID"] as? String,
+            update?["turn_id"] as? String
+        )
+    }
+
+    private func acceptAssistantMessageDelta(
+        threadID: String?,
+        turnID: String?,
+        source: String
+    ) -> Bool {
+        if let activeTurnID = activeTurnID?.nonEmpty {
+            if let turnID = turnID?.nonEmpty,
+               turnID.caseInsensitiveCompare(activeTurnID) != .orderedSame {
+                CrashReporter.logWarning(
+                    "Ignoring stray assistant delta source=\(source) thread=\(threadID ?? activeSessionID ?? "unknown") turn=\(turnID) activeTurn=\(activeTurnID)"
+                )
+                return false
+            }
+            return true
+        }
+
+        if let resolvedTurnID = turnID?.nonEmpty {
+            activeTurnID = resolvedTurnID
+            return true
+        }
+
+        CrashReporter.logInfo(
+            "Ignoring stray assistant delta without active turn source=\(source) thread=\(threadID ?? activeSessionID ?? "unknown")"
+        )
+        return false
     }
 
     private func ensureStreamingIdentifiers() {
@@ -2370,6 +3054,7 @@ final class CodexAssistantRuntime {
     }
 
     private func finalizeActiveActivities(with status: AssistantActivityStatus) {
+        let hadVisibleActivity = !liveActivities.isEmpty || !toolCalls.isEmpty
         let now = Date()
         for activity in liveActivities.values.sorted(by: { $0.startedAt < $1.startedAt }) {
             var finalized = activity
@@ -2381,7 +3066,9 @@ final class CodexAssistantRuntime {
         toolCalls.removeAll()
         pendingToolCallEmit?.cancel()
         pendingToolCallEmit = nil
-        onToolCallUpdate?([])
+        if hadVisibleActivity {
+            onToolCallUpdate?([])
+        }
     }
 
     private func resetStreamingTimelineState() {
@@ -2405,6 +3092,7 @@ final class CodexAssistantRuntime {
         commentaryStartedAt = nil
         commentaryBuffer = ""
         pendingCommentaryDeltaBuffer = ""
+        pendingCopilotFallbackReply = nil
         planTimelineID = nil
         planStartedAt = nil
         proposedPlanBuffer = ""
@@ -2605,6 +3293,10 @@ final class CodexAssistantRuntime {
                 return "Used the browser."
             case "App Action":
                 return "Used a Mac app."
+            case "Computer Use":
+                return "Controlled the visible desktop."
+            case "Image Generation":
+                return "Generated an image."
             default:
                 return "Used \(title)."
             }
@@ -2623,6 +3315,55 @@ final class CodexAssistantRuntime {
 
     func activitySummaryForTesting(kind: AssistantActivityKind, title: String) -> String {
         activitySummary(kind: kind, title: title)
+    }
+
+    func setCurrentSessionIDForTesting(_ sessionID: String?) {
+        activeSessionID = sessionID
+    }
+
+    func setExecutablePathForTesting(_ path: String?) {
+        currentCodexPath = path?.nonEmpty
+    }
+
+    func currentExecutablePathForTesting() -> String? {
+        currentCodexPath
+    }
+
+    func pendingCopilotFallbackReplyForTesting() -> String? {
+        pendingCopilotFallbackReply
+    }
+
+    func subagentsForTesting() -> [SubagentState] {
+        activeSubagents.values.sorted { lhs, rhs in
+            if lhs.status.isActive != rhs.status.isActive {
+                return lhs.status.isActive
+            }
+            return lhs.id < rhs.id
+        }
+    }
+
+    func processCollaborationNotificationForTesting(
+        method: String,
+        params: [String: Any]
+    ) {
+        switch method {
+        case "item/collabAgentSpawn/begin":
+            handleCollabSpawnBegin(params)
+        case "item/collabAgentSpawn/end":
+            handleCollabSpawnEnd(params)
+        case "item/collabAgentInteraction/begin":
+            handleCollabInteractionBegin(params)
+        case "item/collabAgentInteraction/end":
+            handleCollabInteractionEnd(params)
+        case "item/collabClose/begin", "item/collabClose/end":
+            handleCollabClose(params)
+        case "item/collabWaiting/begin":
+            handleCollabWaitingBegin(params)
+        case "item/collabWaiting/end":
+            handleCollabWaitingEnd(params)
+        default:
+            break
+        }
     }
 
     func commandSafetyClassForTesting(_ command: String) -> AssistantCommandSafetyClass {
@@ -2728,6 +3469,35 @@ final class CodexAssistantRuntime {
         streamingBuffer = text
     }
 
+    func configureSessionForTesting(
+        sessionID: String = "thread-1",
+        turnID: String? = nil
+    ) {
+        activeSessionID = sessionID
+        activeTurnID = turnID
+    }
+
+    func processAgentMessageDeltaNotificationForTesting(
+        delta: String,
+        threadID: String = "thread-1",
+        turnID: String? = nil,
+        channel: String? = nil
+    ) async {
+        backend = .codex
+        activeSessionID = threadID
+        var params: [String: Any] = [
+            "threadId": threadID,
+            "delta": delta
+        ]
+        if let turnID {
+            params["turnId"] = turnID
+        }
+        if let channel {
+            params["channel"] = channel
+        }
+        await handleNotification(method: "item/agentMessage/delta", params: params)
+    }
+
     func processTurnCompletedForTesting(status: String = "completed") async {
         await handleNotification(
             method: "turn/completed",
@@ -2748,6 +3518,27 @@ final class CodexAssistantRuntime {
         params: [String: Any]
     ) async {
         await handleServerRequest(id: .string("test-request"), method: method, params: params)
+    }
+
+    func processCopilotSessionUpdateForTesting(_ update: [String: Any]) async {
+        backend = .copilot
+        let sessionID = firstNonEmptyString(
+            update["sessionId"] as? String,
+            activeSessionID
+        ) ?? "copilot-test-session"
+        await handleCopilotNotification(
+            method: "session/update",
+            params: [
+                "sessionId": sessionID,
+                "update": update
+            ]
+        )
+    }
+
+    func processCopilotPromptCompletionForTesting(stopReason: String? = nil) {
+        backend = .copilot
+        let payload = stopReason.map { ["stopReason": $0] } ?? [:]
+        handleCopilotPromptCompletion(from: payload)
     }
 
     func blockedToolUseMessage(
@@ -2795,6 +3586,24 @@ final class CodexAssistantRuntime {
         emitTimelineSystemMessage(message, emphasis: true)
         onStatusMessage?(message)
         updateHUD(phase: .idle, title: "Mode restriction", detail: activityTitle)
+
+        Task { [weak self] in
+            await self?.cancelActiveTurn()
+        }
+    }
+
+    private func interruptForBlockedBrowserMCPToolUse(activityTitle: String) {
+        guard !blockedToolUseHandledForActiveTurn else { return }
+
+        blockedToolUseHandledForActiveTurn = true
+        let message = """
+        Open Assist keeps browser work in the selected signed-in browser profile. Do not switch to a separate Playwright or MCP browser session for \(activityTitle).
+        """
+        blockedToolUseInterruptionMessage = message
+        onTranscript?(AssistantTranscriptEntry(role: .system, text: message, emphasis: true))
+        emitTimelineSystemMessage(message, emphasis: true)
+        onStatusMessage?(message)
+        updateHUD(phase: .idle, title: "Browser switch blocked", detail: activityTitle)
 
         Task { [weak self] in
             await self?.cancelActiveTurn()
@@ -2901,6 +3710,22 @@ final class CodexAssistantRuntime {
         return (title, commandClass)
     }
 
+    private func browserMCPToolContext(from item: [String: Any]) -> String? {
+        guard normalizedActivityType(item["type"] as? String) == "mcpToolCall" else {
+            return nil
+        }
+
+        let server = ((item["server"] as? String) ?? "MCP").trimmingCharacters(in: .whitespacesAndNewlines)
+        let tool = ((item["tool"] as? String) ?? (item["name"] as? String) ?? "tool")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let lowered = "\(server) \(tool)".lowercased()
+        guard lowered.contains("playwright") || lowered.contains("browser_") else {
+            return nil
+        }
+
+        return "\(server): \(tool)"
+    }
+
     private func activityTitleForPolicy(
         kind: AssistantActivityKind,
         item: [String: Any]
@@ -2935,6 +3760,10 @@ final class CodexAssistantRuntime {
             return "Browser Use"
         case AssistantAppActionToolDefinition.name:
             return "App Action"
+        case AssistantComputerUseToolDefinition.name:
+            return "Computer Use"
+        case AssistantImageGenerationToolDefinition.name:
+            return "Image Generation"
         default:
             return rawTool ?? "Tool"
         }
@@ -2946,6 +3775,10 @@ final class CodexAssistantRuntime {
             return AssistantBrowserUseToolDefinition.toolKind
         case AssistantAppActionToolDefinition.name:
             return AssistantAppActionToolDefinition.toolKind
+        case AssistantComputerUseToolDefinition.name:
+            return AssistantComputerUseToolDefinition.toolKind
+        case AssistantImageGenerationToolDefinition.name:
+            return AssistantImageGenerationToolDefinition.toolKind
         default:
             return nil
         }
@@ -2957,6 +3790,10 @@ final class CodexAssistantRuntime {
             return (try? AssistantBrowserUseService.parseTask(from: arguments).summaryLine) ?? "Use the selected browser profile"
         case AssistantAppActionToolDefinition.name:
             return (try? AssistantAppActionService.parseRequest(from: arguments).task) ?? "Use a supported Mac app"
+        case AssistantComputerUseToolDefinition.name:
+            return (try? AssistantComputerUseService.parseRequest(from: arguments).summaryLine) ?? "Use screenshot-based desktop control"
+        case AssistantImageGenerationToolDefinition.name:
+            return (try? AssistantImageGenerationService.parseRequest(from: arguments).summaryLine) ?? "Generate an image"
         default:
             return "Use a dynamic tool"
         }
@@ -2995,14 +3832,19 @@ final class CodexAssistantRuntime {
     private func dynamicToolPermissionRationale(
         toolName: String,
         taskSummary: String,
-        requiresExplicitConfirmation: Bool
+        requiresExplicitConfirmation: Bool,
+        targetDisplayName: String? = nil
     ) -> String {
         let lead: String
         switch toolName {
         case AssistantBrowserUseToolDefinition.name:
-            lead = "Browser Use can open sites and reuse the selected signed-in browser profile on this Mac."
+            lead = "Browser Use works in the selected signed-in browser profile on this Mac and keeps you in that same browser session."
         case AssistantAppActionToolDefinition.name:
             lead = "App Action can talk to supported Mac apps like Finder, Terminal, Calendar, System Settings, Reminders, Contacts, Notes, and Messages."
+        case AssistantComputerUseToolDefinition.name:
+            lead = "Computer Use captures the visible screen on this Mac, then uses mouse or keyboard actions on the live desktop when browser_use and app_action are not enough."
+        case AssistantImageGenerationToolDefinition.name:
+            lead = "Image Generation sends the request to Google Gemini using the shared Google AI Studio API key configured in Open Assist and returns the generated image back into the conversation."
         default:
             lead = "This tool can control parts of your Mac."
         }
@@ -3010,8 +3852,11 @@ final class CodexAssistantRuntime {
         let riskLine = requiresExplicitConfirmation
             ? "\n\nThis request looks higher risk, so Open Assist needs a fresh confirmation for this one."
             : ""
+        let targetLine = targetDisplayName?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty.map {
+            "\n\nCurrent app: \($0)"
+        } ?? ""
 
-        return lead + riskLine + "\n\nRequested task: \(taskSummary)"
+        return lead + targetLine + riskLine + "\n\nRequested task: \(taskSummary)"
     }
 
     private func dynamicToolRequiresExplicitConfirmation(
@@ -3028,6 +3873,10 @@ final class CodexAssistantRuntime {
                 || request.commit
            ) {
             return true
+        }
+        if toolName == AssistantComputerUseToolDefinition.name,
+           let request = try? AssistantComputerUseService.parseRequest(from: arguments) {
+            return request.isHighRisk
         }
 
         let summary = dynamicToolTaskSummary(for: toolName, arguments: arguments).lowercased()
@@ -3275,6 +4124,7 @@ final class CodexAssistantRuntime {
 
     var browserProfileContext: [String: String]?
     var customInstructions: String?
+    var activeSkills: [AssistantSkillDescriptor] = []
     var reasoningEffort: String?
     var serviceTier: String?
     var interactionMode: AssistantInteractionMode = .agentic
@@ -3294,12 +4144,19 @@ final class CodexAssistantRuntime {
     private func dynamicToolSpecs(for mode: AssistantInteractionMode) -> [[String: Any]] {
         switch mode {
         case .conversational, .plan:
-            return []
-        case .agentic:
             return [
+                AssistantImageGenerationToolDefinition.dynamicToolSpec()
+            ]
+        case .agentic:
+            var tools: [[String: Any]] = [
+                AssistantImageGenerationToolDefinition.dynamicToolSpec(),
                 AssistantAppActionToolDefinition.dynamicToolSpec(),
                 AssistantBrowserUseToolDefinition.dynamicToolSpec()
             ]
+            if SettingsStore.shared.assistantComputerUseEnabled {
+                tools.append(AssistantComputerUseToolDefinition.dynamicToolSpec())
+            }
+            return tools
         }
     }
 
@@ -3368,11 +4225,7 @@ final class CodexAssistantRuntime {
         // Include collaborationMode at thread start so the server knows the
         // base behavior for this thread. Turn-level overrides can still switch
         // a specific prompt into plan mode when needed.
-        if let effectiveModel = (modelID?.nonEmpty ?? preferredModelID)?.nonEmpty {
-            var modeSettings: [String: Any] = ["model": effectiveModel]
-            if let effort = reasoningEffort?.nonEmpty {
-                modeSettings["reasoningEffort"] = effort
-            }
+        if let modeSettings = collaborationModeSettings(parentModelID: modelID) {
             params["collaborationMode"] = [
                 "mode": interactionMode.codexModeKind,
                 "settings": modeSettings
@@ -3418,17 +4271,57 @@ final class CodexAssistantRuntime {
            !custom.isEmpty {
             sections.append("# Custom Instructions\n\n\(custom)")
         }
+        if let skillInstructions = activeSkillInstructionsBlock() {
+            sections.append(skillInstructions)
+        }
         if let browserInstructions = browserTurnReminder() {
             sections.append(browserInstructions)
         }
         return sections.joined(separator: "\n\n")
     }
 
-    func browserTurnReminder() -> String? {
-        Self.browserTurnReminder(from: browserProfileContext)
+    private func activeSkillInstructionsBlock() -> String? {
+        let resolvedSkills = activeSkills
+            .sorted {
+                $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending
+            }
+
+        guard !resolvedSkills.isEmpty else { return nil }
+
+        let lines = resolvedSkills.map { skill in
+            let summary = skill.summaryText
+                .replacingOccurrences(
+                    of: #"\s+"#,
+                    with: " ",
+                    options: .regularExpression
+                )
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            return """
+            - `\(skill.name)`: \(summary)
+              Skill file: `\(skill.skillFilePath)`
+            """
+        }
+
+        return """
+        # Active Skills
+
+        These skills are attached to the current thread. Use them when they fit the user's request, and read the local `SKILL.md` file before using a skill in depth.
+
+        \(lines.joined(separator: "\n"))
+        """
     }
 
-    static func browserTurnReminder(from context: [String: String]?) -> String? {
+    func browserTurnReminder() -> String? {
+        Self.browserTurnReminder(
+            from: browserProfileContext,
+            computerUseEnabled: SettingsStore.shared.assistantComputerUseEnabled
+        )
+    }
+
+    static func browserTurnReminder(
+        from context: [String: String]?,
+        computerUseEnabled: Bool
+    ) -> String? {
         guard let ctx = context,
               let browser = ctx["browser"],
               let channel = ctx["channel"],
@@ -3438,14 +4331,7 @@ final class CodexAssistantRuntime {
         }
 
         let profilePath = "\(userDataDir)/\(profileDir)"
-        let escapedProfilePath = profilePath.replacingOccurrences(of: "'", with: "\\'")
         let appName = channel == "brave" ? "Brave Browser" : "Google Chrome"
-        let launchOptions: String
-        if channel == "brave" {
-            launchOptions = "executablePath: '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser'"
-        } else {
-            launchOptions = "channel: '\(channel)'"
-        }
 
         return """
         # Browser Task Override
@@ -3455,13 +4341,17 @@ final class CodexAssistantRuntime {
         - Profile: \(ctx["profileName"] ?? "Default")
         - Profile path: \(profilePath)
 
-        Do NOT use MCP browser tools like `browser_navigate`, `browser_click`, `browser_snapshot`, `browser_run_code`, or any `playwright:*` tool. Those tools open a separate browser without the user's signed-in session.
+        Do NOT use MCP browser tools like `browser_navigate`, `browser_click`, `browser_snapshot`, or `browser_run_code`. Those tools open a separate browser without the user's signed-in session.
 
-        Use one of these instead:
-        - Simple reads/navigation: `osascript` against "\(appName)"
-        - Complex flows: Playwright `chromium.launchPersistentContext('\(escapedProfilePath)', { headless: false, \(launchOptions), args: ['--disable-blink-features=AutomationControlled', '--no-first-run', '--no-default-browser-check'], ignoreDefaultArgs: ['--enable-automation'], viewport: null })`
+        Keep the work in the same signed-in browser session. Use `browser_use` first for opening sites, activating the browser, reading the current tab, and detecting when a manual login is needed. Use `osascript` against "\(appName)" only for simple reads or navigation that stay in the same browser window.
 
-        If the browser is already open and you need Playwright, ask the user to close it first.
+        \(computerUseEnabled
+            ? "Use `computer_use` only as a last resort when the task truly depends on visible pixels in the already-open browser window and cannot be completed with `browser_use` or simple browser scripting in that same session."
+            : "If the task truly needs pixel-based clicking, dragging, scrolling, or typing in the visible browser window, explain that Computer Use is currently turned off in settings instead of trying to open a separate browser context.")
+
+        If a site asks the user to sign in, pause and ask the user to log in manually in the browser. Continue only after they press Proceed.
+        Do not use `computer_use` to type passwords, OTPs, API keys, or other secrets.
+        If the browser is already open, keep using that same browser window and do not open a second browser context.
         """
     }
 
@@ -3530,11 +4420,7 @@ final class CodexAssistantRuntime {
         // Build collaborationMode for the turn (only when a model is known).
         // The Codex protocol requires `model` as a non-optional field in settings,
         // so we skip collaborationMode entirely when no model has been selected.
-        if let effectiveModel = (modelID?.nonEmpty ?? preferredModelID)?.nonEmpty {
-            var modeSettings: [String: Any] = ["model": effectiveModel]
-            if let effort = reasoningEffort?.nonEmpty {
-                modeSettings["reasoningEffort"] = effort
-            }
+        if let modeSettings = collaborationModeSettings(parentModelID: modelID) {
             params["collaborationMode"] = [
                 "mode": interactionMode.codexModeKind,
                 "settings": modeSettings
@@ -3542,6 +4428,24 @@ final class CodexAssistantRuntime {
         }
 
         return params
+    }
+
+    private func collaborationModeSettings(parentModelID: String?) -> [String: Any]? {
+        let effectiveParentModel = (parentModelID?.nonEmpty ?? preferredModelID)?.nonEmpty
+        let collaborationModel = preferredSubagentModelID?.nonEmpty ?? effectiveParentModel
+        guard let collaborationModel else { return nil }
+
+        var settings: [String: Any] = ["model": collaborationModel]
+
+        // When subagents use the same model as the parent, we can safely keep
+        // the parent's reasoning effort. If the user picks a different
+        // subagent model, let Codex choose that model's default effort.
+        if preferredSubagentModelID?.nonEmpty == nil || collaborationModel == effectiveParentModel,
+           let effort = reasoningEffort?.nonEmpty {
+            settings["reasoningEffort"] = effort
+        }
+
+        return settings
     }
 
     private func makeHealth(
@@ -3820,6 +4724,106 @@ final class CodexAssistantRuntime {
         return nil
     }
 
+    private func parseTranscriptionAuthContext(from raw: Any) throws -> CodexTranscriptionAuthContext {
+        let dictionaries = transcriptionAuthCandidateDictionaries(from: raw)
+        guard !dictionaries.isEmpty else {
+            throw CodexAssistantRuntimeError.invalidResponse("Codex returned an empty transcription auth response.")
+        }
+
+        if let message = dictionaries.compactMap({ dictionary in
+            firstNonEmptyString(
+                dictionary["error"] as? String,
+                dictionary["message"] as? String,
+                (dictionary["detail"] as? [String: Any]).flatMap { $0["message"] as? String },
+                (dictionary["details"] as? [String: Any]).flatMap { $0["message"] as? String }
+            )
+        }).first {
+            throw CodexAssistantRuntimeError.requestFailed(message)
+        }
+
+        let token = dictionaries.compactMap { dictionary in
+            firstNonEmptyString(
+                dictionary["token"] as? String,
+                dictionary["accessToken"] as? String,
+                dictionary["access_token"] as? String,
+                dictionary["apiKey"] as? String,
+                dictionary["api_key"] as? String,
+                dictionary["authToken"] as? String
+            )
+        }.first
+
+        guard let token else {
+            throw CodexAssistantRuntimeError.invalidResponse(
+                "Codex did not return a reusable transcription token."
+            )
+        }
+
+        let authMode = resolvedTranscriptionAuthMode(from: dictionaries)
+        guard authMode != .none else {
+            throw CodexAssistantRuntimeError.invalidResponse(
+                "Codex did not indicate whether transcription auth is ChatGPT or API key based."
+            )
+        }
+
+        return CodexTranscriptionAuthContext(authMode: authMode, token: token)
+    }
+
+    private func transcriptionAuthCandidateDictionaries(from raw: Any) -> [[String: Any]] {
+        guard let root = raw as? [String: Any] else {
+            return []
+        }
+
+        var dictionaries: [[String: Any]] = [root]
+        let nestedKeys = ["result", "status", "auth", "data", "credentials", "tokens", "account"]
+        var index = 0
+        while index < dictionaries.count {
+            let dictionary = dictionaries[index]
+            for key in nestedKeys {
+                if let nested = dictionary[key] as? [String: Any],
+                   dictionaries.contains(where: { NSDictionary(dictionary: $0).isEqual(to: nested) }) == false {
+                    dictionaries.append(nested)
+                }
+            }
+            index += 1
+        }
+        return dictionaries
+    }
+
+    private func resolvedTranscriptionAuthMode(from dictionaries: [[String: Any]]) -> AssistantAccountAuthMode {
+        let explicitMode = dictionaries.compactMap { dictionary in
+            firstNonEmptyString(
+                dictionary["authMode"] as? String,
+                dictionary["authMethod"] as? String,
+                dictionary["method"] as? String,
+                dictionary["type"] as? String,
+                dictionary["provider"] as? String
+            )
+        }
+        .compactMap(assistantAccountAuthMode(from:))
+        .first
+
+        if let explicitMode {
+            return explicitMode
+        }
+
+        return currentAccountSnapshot.authMode
+    }
+
+    private func assistantAccountAuthMode(from rawValue: String) -> AssistantAccountAuthMode? {
+        let normalized = rawValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !normalized.isEmpty else { return nil }
+        if normalized.contains("chatgpt") || normalized.contains("chat_gpt") || normalized.contains("session") {
+            return .chatGPT
+        }
+        if normalized.contains("api") || normalized.contains("key") {
+            return .apiKey
+        }
+        if normalized == "none" || normalized == "signedout" || normalized == "signed_out" {
+            return AssistantAccountAuthMode.none
+        }
+        return nil
+    }
+
     private func transientReconnectStatusMessage(from message: String) -> String? {
         let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
@@ -3840,7 +4844,7 @@ final class CodexAssistantRuntime {
             return text.nonEmpty
         }
         if let dictionary = raw as? [String: Any] {
-            for key in ["message", "text", "content", "output", "description"] {
+            for key in ["message", "text", "content", "output", "description", "prompt", "task", "instructions", "query"] {
                 if let text = extractString(dictionary[key]) {
                     return text
                 }
@@ -3851,6 +4855,913 @@ final class CodexAssistantRuntime {
             return merged.nonEmpty
         }
         return nil
+    }
+
+    private func resolvedCopilotWorkingDirectory(_ cwd: String?) -> String {
+        if let trimmed = cwd?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
+            var isDirectory: ObjCBool = false
+            if FileManager.default.fileExists(atPath: trimmed, isDirectory: &isDirectory), isDirectory.boolValue {
+                return trimmed
+            }
+        }
+        return FileManager.default.homeDirectoryForCurrentUser.path
+    }
+
+    private func signedInCopilotAccountSnapshot() -> AssistantAccountSnapshot {
+        AssistantAccountSnapshot(
+            authMode: .chatGPT,
+            email: "GitHub Copilot",
+            planType: nil,
+            requiresOpenAIAuth: false,
+            loginInProgress: false,
+            pendingLoginURL: nil,
+            pendingLoginID: nil
+        )
+    }
+
+    private func refreshCopilotEnvironment(cwd: String?) async throws -> AssistantEnvironmentDetails {
+        let resolvedCWD = resolvedCopilotWorkingDirectory(cwd)
+        try await ensureTransport(cwd: resolvedCWD)
+        currentAccountSnapshot = signedInCopilotAccountSnapshot()
+        onAccountUpdate?(currentAccountSnapshot)
+
+        if currentModels.isEmpty {
+            _ = try await startCopilotSession(
+                cwd: resolvedCWD,
+                preferredModelID: preferredModelID,
+                announce: false
+            )
+        } else if let activeSessionID {
+            try await refreshCopilotCurrentSessionConfiguration(
+                sessionID: activeSessionID,
+                cwd: activeSessionCWD ?? resolvedCWD,
+                preferredModelID: preferredModelID
+            )
+        }
+
+        await refreshRateLimits()
+
+        let health = connectedHealthForCurrentState()
+        onHealthUpdate?(health)
+        return AssistantEnvironmentDetails(
+            health: health,
+            account: currentAccountSnapshot,
+            models: currentModels
+        )
+    }
+
+    private func startCopilotSession(
+        cwd: String?,
+        preferredModelID: String?,
+        announce: Bool
+    ) async throws -> String {
+        let resolvedCWD = resolvedCopilotWorkingDirectory(cwd)
+
+        if announce,
+           let bootstrapSessionID,
+           bootstrapSessionID == activeSessionID,
+           activeSessionCWD == resolvedCWD {
+            self.bootstrapSessionID = nil
+            try await refreshCopilotCurrentSessionConfiguration(
+                sessionID: bootstrapSessionID,
+                cwd: resolvedCWD,
+                preferredModelID: preferredModelID
+            )
+            onSessionChange?(bootstrapSessionID)
+            onTranscript?(AssistantTranscriptEntry(role: .system, text: backend.startedSessionMessage, emphasis: true))
+            updateHUD(phase: .idle, title: "Assistant is ready", detail: nil)
+            return bootstrapSessionID
+        }
+
+        if announce {
+            toolCalls.removeAll()
+            liveActivities.removeAll()
+            clearSubagents(publish: false)
+            repeatedCommandTracker.reset()
+            resetStreamingTimelineState()
+            onToolCallUpdate?([])
+            onPlanUpdate?([])
+            onSubagentUpdate?([])
+            onTimelineMutation?(.reset(sessionID: nil))
+            onPermissionRequest?(nil)
+            sessionTurnCount = 0
+            firstTurnUserPrompt = nil
+        }
+
+        try await ensureTransport(cwd: resolvedCWD)
+        let response = try await sendRequest(
+            method: "session/new",
+            params: [
+                "cwd": resolvedCWD,
+                "mcpServers": []
+            ]
+        )
+
+        guard let payload = response.raw as? [String: Any],
+              let sessionID = payload["sessionId"] as? String else {
+            throw CodexAssistantRuntimeError.invalidResponse("GitHub Copilot did not return a session id.")
+        }
+
+        activeSessionID = sessionID
+        activeSessionCWD = resolvedCWD
+        transportSessionID = sessionID
+        currentAccountSnapshot = signedInCopilotAccountSnapshot()
+        onAccountUpdate?(currentAccountSnapshot)
+        applyCopilotConfiguration(from: payload)
+        try await applyCopilotSessionConfiguration(
+            sessionID: sessionID,
+            preferredModelID: preferredModelID
+        )
+
+        if announce {
+            bootstrapSessionID = nil
+            onSessionChange?(sessionID)
+            onTranscript?(AssistantTranscriptEntry(role: .system, text: backend.startedSessionMessage, emphasis: true))
+        } else {
+            bootstrapSessionID = sessionID
+        }
+
+        onHealthUpdate?(makeHealth(availability: .ready, summary: backend.connectedSummary))
+        updateHUD(phase: .idle, title: "Assistant is ready", detail: nil)
+        return sessionID
+    }
+
+    private func resumeCopilotSession(
+        _ sessionID: String,
+        cwd: String?,
+        preferredModelID: String?,
+        announce: Bool
+    ) async throws {
+        let resolvedCWD = resolvedCopilotWorkingDirectory(cwd)
+        try await ensureTransport(cwd: resolvedCWD)
+
+        if transportSessionID != sessionID {
+            do {
+                let response = try await sendRequest(
+                    method: "session/load",
+                    params: [
+                        "sessionId": sessionID,
+                        "cwd": resolvedCWD,
+                        "mcpServers": []
+                    ]
+                )
+                applyCopilotConfiguration(from: response.raw)
+            } catch {
+                let message = error.localizedDescription.lowercased()
+                guard !message.contains("already loaded") else {
+                    // The session is already active in the ACP process.
+                    activeSessionID = sessionID
+                    activeSessionCWD = resolvedCWD
+                    transportSessionID = sessionID
+                    bootstrapSessionID = bootstrapSessionID == sessionID ? nil : bootstrapSessionID
+                    try await applyCopilotSessionConfiguration(
+                        sessionID: sessionID,
+                        preferredModelID: preferredModelID
+                    )
+                    onSessionChange?(sessionID)
+                    if announce {
+                        onTranscript?(AssistantTranscriptEntry(role: .system, text: backend.loadedSessionMessage(sessionID), emphasis: true))
+                    }
+                    onHealthUpdate?(makeHealth(availability: .ready, summary: backend.connectedSummary))
+                    updateHUD(phase: .idle, title: "Session ready", detail: nil)
+                    return
+                }
+                throw error
+            }
+        }
+
+        activeSessionID = sessionID
+        activeSessionCWD = resolvedCWD
+        transportSessionID = sessionID
+        bootstrapSessionID = bootstrapSessionID == sessionID ? nil : bootstrapSessionID
+        currentAccountSnapshot = signedInCopilotAccountSnapshot()
+        onAccountUpdate?(currentAccountSnapshot)
+        try await applyCopilotSessionConfiguration(
+            sessionID: sessionID,
+            preferredModelID: preferredModelID
+        )
+        sessionTurnCount = 1
+        onSessionChange?(sessionID)
+        if announce {
+            onTranscript?(AssistantTranscriptEntry(role: .system, text: backend.loadedSessionMessage(sessionID), emphasis: true))
+        }
+        onHealthUpdate?(makeHealth(availability: .ready, summary: backend.connectedSummary))
+        updateHUD(phase: .idle, title: "Session ready", detail: nil)
+    }
+
+    private func refreshCopilotCurrentSessionConfiguration(
+        sessionID: String,
+        cwd: String?,
+        preferredModelID: String?
+    ) async throws {
+        let resolvedCWD = resolvedCopilotWorkingDirectory(cwd)
+        try await ensureTransport(cwd: resolvedCWD)
+        if transportSessionID != sessionID {
+            do {
+                let response = try await sendRequest(
+                    method: "session/load",
+                    params: [
+                        "sessionId": sessionID,
+                        "cwd": resolvedCWD,
+                        "mcpServers": []
+                    ]
+                )
+                applyCopilotConfiguration(from: response.raw)
+            } catch {
+                if !error.localizedDescription.lowercased().contains("already loaded") {
+                    throw error
+                }
+            }
+            transportSessionID = sessionID
+        }
+
+        activeSessionID = sessionID
+        activeSessionCWD = resolvedCWD
+        currentAccountSnapshot = signedInCopilotAccountSnapshot()
+        onAccountUpdate?(currentAccountSnapshot)
+        try await applyCopilotSessionConfiguration(
+            sessionID: sessionID,
+            preferredModelID: preferredModelID
+        )
+        onHealthUpdate?(makeHealth(
+            availability: activeTurnID == nil ? .ready : .active,
+            summary: activeTurnID == nil ? backend.connectedSummary : backend.activeSummary
+        ))
+    }
+
+    private func applyCopilotSessionConfiguration(
+        sessionID: String,
+        preferredModelID: String?
+    ) async throws {
+        _ = try await sendRequest(
+            method: "session/set_mode",
+            params: [
+                "sessionId": sessionID,
+                "modeId": copilotModeID(for: interactionMode)
+            ]
+        )
+
+        if let requestedModelID = preferredModelID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty,
+           currentCopilotModelID() != requestedModelID {
+            let response = try await sendRequest(
+                method: "session/set_config_option",
+                params: [
+                    "sessionId": sessionID,
+                    "configId": "model",
+                    "value": requestedModelID
+                ]
+            )
+            applyCopilotConfiguration(from: response.raw)
+        }
+
+        if let reasoningEffort = reasoningEffort?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
+            do {
+                let response = try await sendRequest(
+                    method: "session/set_config_option",
+                    params: [
+                        "sessionId": sessionID,
+                        "configId": "reasoning_effort",
+                        "value": reasoningEffort
+                    ]
+                )
+                applyCopilotConfiguration(from: response.raw)
+            } catch {
+                guard isCopilotUnsupportedReasoningError(error) else { throw error }
+            }
+        }
+    }
+
+    private func sendCopilotPrompt(
+        sessionID: String,
+        prompt: String,
+        attachments: [AssistantAttachment],
+        preferredModelID: String?,
+        resumeContext: String?,
+        memoryContext: String?
+    ) async throws {
+        guard attachments.isEmpty else {
+            throw CodexAssistantRuntimeError.runtimeUnavailable(
+                "Attachments are not wired through GitHub Copilot ACP in Open Assist yet."
+            )
+        }
+
+        let resolvedCWD = resolvedCopilotWorkingDirectory(activeSessionCWD)
+        try await refreshCopilotCurrentSessionConfiguration(
+            sessionID: sessionID,
+            cwd: resolvedCWD,
+            preferredModelID: preferredModelID
+        )
+
+        if bootstrapSessionID == sessionID {
+            bootstrapSessionID = nil
+        }
+
+        turnToolCallCount = 0
+        repeatedCommandTracker.reset()
+        activeTurnID = activeTurnID ?? "copilot-turn-\(UUID().uuidString)"
+        updateHUD(phase: .streaming, title: "Starting", detail: nil)
+        onHealthUpdate?(makeHealth(availability: .active, summary: backend.activeSummary))
+
+        do {
+            let response = try await sendRequest(
+                method: "session/prompt",
+                params: [
+                    "sessionId": sessionID,
+                    "prompt": buildCopilotPromptContent(
+                        prompt: prompt,
+                        resumeContext: resumeContext,
+                        memoryContext: memoryContext
+                    )
+                ]
+            )
+            guard activeTurnID != nil else { return }
+            handleCopilotPromptCompletion(from: response.raw)
+        } catch {
+            guard activeTurnID != nil else { throw error }
+            handleTurnCompleted([
+                "turn": [
+                    "status": "failed",
+                    "error": ["message": error.localizedDescription]
+                ]
+            ])
+            throw error
+        }
+    }
+
+    private func buildCopilotPromptContent(
+        prompt: String,
+        resumeContext: String?,
+        memoryContext: String?
+    ) -> [[String: Any]] {
+        let combined = [resumeContext, memoryContext, prompt]
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty }
+            .joined(separator: "\n\n")
+        return [["type": "text", "text": combined]]
+    }
+
+    private func handleCopilotPromptCompletion(from raw: Any) {
+        let stopReason = ((raw as? [String: Any])?["stopReason"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+
+        switch stopReason {
+        case "cancelled", "canceled", "interrupted":
+            handleTurnCompleted(["turn": ["status": "interrupted"]])
+        default:
+            handleTurnCompleted(["turn": ["status": "completed"]])
+        }
+
+        Task { await refreshRateLimits() }
+    }
+
+    private func listCopilotSessions(limit: Int) async throws -> [AssistantSessionSummary] {
+        try await ensureTransport(cwd: currentTransportWorkingDirectory ?? activeSessionCWD)
+        let response = try await sendRequest(method: "session/list", params: [:])
+        return Self.parseCopilotSessions(
+            from: response.raw,
+            limit: limit,
+            excluding: bootstrapSessionID
+        )
+    }
+
+    private static func parseCopilotSessions(
+        from raw: Any,
+        limit: Int,
+        excluding excludedSessionID: String?
+    ) -> [AssistantSessionSummary] {
+        guard let payload = raw as? [String: Any] else { return [] }
+        let rows = payload["sessions"] as? [[String: Any]] ?? []
+        func firstResolvedString(_ candidates: String?...) -> String? {
+            for candidate in candidates {
+                if let value = candidate?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
+                    return value
+                }
+            }
+            return nil
+        }
+        let sessions = rows.compactMap { row -> AssistantSessionSummary? in
+            guard let sessionID = row["sessionId"] as? String,
+                  sessionID != excludedSessionID else {
+                return nil
+            }
+            let cwd = firstResolvedString(row["cwd"] as? String)
+            let title = firstResolvedString(row["title"] as? String, cwd, "Copilot Session") ?? "Copilot Session"
+            return AssistantSessionSummary(
+                id: sessionID,
+                title: title,
+                source: .cli,
+                status: .idle,
+                cwd: cwd,
+                effectiveCWD: cwd,
+                updatedAt: parseCopilotDate(row["updatedAt"] as? String)
+            )
+        }
+        return Array(sessions.prefix(limit))
+    }
+
+    private static func parseCopilotDate(_ rawValue: String?) -> Date? {
+        guard let rawValue = rawValue?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+            return nil
+        }
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = formatter.date(from: rawValue) {
+            return date
+        }
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter.date(from: rawValue)
+    }
+
+    private func applyCopilotConfiguration(from raw: Any) {
+        currentAccountSnapshot = signedInCopilotAccountSnapshot()
+        onAccountUpdate?(currentAccountSnapshot)
+        let models = parseCopilotModels(from: raw)
+        guard !models.isEmpty else { return }
+        currentModels = models
+        onModelsUpdate?(models)
+    }
+
+    private func parseCopilotModels(from raw: Any) -> [AssistantModelOption] {
+        guard let payload = raw as? [String: Any] else { return currentModels }
+
+        let configOptions = (payload["configOptions"] as? [[String: Any]]) ?? []
+        let modelConfig = configOptions.first(where: { ($0["id"] as? String) == "model" })
+        let reasoningConfig = configOptions.first(where: { ($0["id"] as? String) == "reasoning_effort" })
+
+        let currentModelID = firstNonEmptyString(
+            ((payload["models"] as? [String: Any])?["currentModelId"] as? String),
+            modelConfig?["currentValue"] as? String
+        )
+
+        let rows: [[String: Any]]
+        if let availableRows = (payload["models"] as? [String: Any])?["availableModels"] as? [[String: Any]] {
+            rows = availableRows
+        } else {
+            rows = modelConfig?["options"] as? [[String: Any]] ?? []
+        }
+
+        guard !rows.isEmpty else { return currentModels }
+
+        let supportedEfforts = (reasoningConfig?["options"] as? [[String: Any]] ?? [])
+            .compactMap { $0["value"] as? String }
+        let currentReasoningEffort = reasoningConfig?["currentValue"] as? String
+
+        return rows.compactMap { row in
+            guard let id = firstNonEmptyString(
+                row["modelId"] as? String,
+                row["value"] as? String
+            ) else {
+                return nil
+            }
+
+            let displayName = firstNonEmptyString(
+                row["name"] as? String,
+                row["displayName"] as? String,
+                id
+            ) ?? id
+            let description = firstNonEmptyString(
+                row["description"] as? String,
+                displayName,
+                id
+            ) ?? id
+
+            let reasoningEfforts = id.lowercased().hasPrefix("gpt-") ? supportedEfforts : []
+            let defaultReasoningEffort = reasoningEfforts.isEmpty ? nil : currentReasoningEffort
+
+            return AssistantModelOption(
+                id: id,
+                displayName: displayName,
+                description: description,
+                isDefault: id == currentModelID,
+                hidden: false,
+                supportedReasoningEfforts: reasoningEfforts,
+                defaultReasoningEffort: defaultReasoningEffort,
+                inputModalities: []
+            )
+        }
+    }
+
+    private func currentCopilotModelID() -> String? {
+        currentModels.first(where: \.isDefault)?.id
+    }
+
+    private func copilotModeID(for interactionMode: AssistantInteractionMode) -> String {
+        switch interactionMode {
+        case .conversational:
+            return "https://agentclientprotocol.com/protocol/session-modes#agent"
+        case .plan:
+            return "https://agentclientprotocol.com/protocol/session-modes#plan"
+        case .agentic:
+            return "https://agentclientprotocol.com/protocol/session-modes#autopilot"
+        }
+    }
+
+    private func isCopilotUnsupportedReasoningError(_ error: Error) -> Bool {
+        error.localizedDescription
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .localizedCaseInsensitiveContains("does not support reasoning_effort configuration")
+    }
+
+    private func handleCopilotNotification(method: String, params: [String: Any]) async {
+        guard method == "session/update" else { return }
+        guard let sessionID = params["sessionId"] as? String else { return }
+        if detachedSessionIDs.contains(sessionID) {
+            return
+        }
+        if let currentActive = activeSessionID, sessionID != currentActive {
+            return
+        }
+        handleCopilotSessionUpdate(params)
+    }
+
+    private func handleCopilotServerRequest(
+        id: JSONRPCRequestID,
+        method: String,
+        params: [String: Any]
+    ) async {
+        switch method {
+        case "session/request_permission":
+            await presentCopilotPermissionRequest(id: id, params: params)
+        default:
+            onStatusMessage?("GitHub Copilot requested an unsupported action: \(method)")
+        }
+    }
+
+    private func handleCopilotSessionUpdate(_ params: [String: Any]) {
+        guard let update = params["update"] as? [String: Any] else { return }
+        switch update["sessionUpdate"] as? String {
+        case "agent_message_chunk":
+            guard let content = update["content"] as? [String: Any],
+                  let delta = content["text"] as? String,
+                  delta.nonEmpty != nil else {
+                return
+            }
+            guard acceptAssistantMessageDelta(
+                threadID: params["sessionId"] as? String,
+                turnID: assistantMessageTurnID(from: update),
+                source: "session/update.agent_message_chunk"
+            ) else {
+                return
+            }
+            pendingCopilotFallbackReply = nil
+            ensureStreamingIdentifiers()
+            streamingBuffer += delta
+            pendingStreamingDeltaBuffer += delta
+            emitStreamingAssistantDelta(force: shouldForceStreamingDeltaFlush(for: delta))
+            updateHUD(phase: .streaming, title: "Responding", detail: nil)
+        case "agent_thought_chunk":
+            guard let content = update["content"] as? [String: Any],
+                  let delta = content["text"] as? String,
+                  delta.nonEmpty != nil else {
+                return
+            }
+            if shouldSurfaceCopilotThought(delta) {
+                appendCommentaryDelta(delta)
+            }
+            updateHUD(phase: .thinking, title: "Reasoning", detail: nil)
+        case "tool_call":
+            handleCopilotToolCallUpdate(update, isInitial: true)
+        case "tool_call_update":
+            handleCopilotToolCallUpdate(update, isInitial: false)
+        case "config_option_update":
+            applyCopilotConfiguration(from: update)
+            onHealthUpdate?(connectedHealthForCurrentState())
+        default:
+            break
+        }
+    }
+
+    private func handleCopilotToolCallUpdate(_ update: [String: Any], isInitial: Bool) {
+        guard let item = copilotSyntheticItem(from: update) else { return }
+        let status = (item["status"] as? String)?.lowercased() ?? "running"
+        let isCompleted = !["pending", "running", "waiting", "inprogress", "in_progress"].contains(status)
+        let toolOutput = copilotOutputText(from: update)
+
+        if shouldHideCopilotToolActivity(item: item) {
+            if isCompleted,
+               let reply = toolOutput.flatMap(copilotFallbackReplyCandidate(from:)) {
+                storeCopilotFallbackReply(reply)
+            }
+            return
+        }
+
+        if !isCompleted,
+           let itemID = item["id"] as? String,
+           let output = toolOutput,
+           output.nonEmpty != nil {
+            handleCommandOutputDelta([
+                "itemId": itemID,
+                "delta": output
+            ])
+        }
+
+        handleItemStartedOrCompleted(["item": item], isCompleted: isInitial ? false : isCompleted)
+    }
+
+    private func copilotSyntheticItem(from update: [String: Any]) -> [String: Any]? {
+        guard let itemID = update["toolCallId"] as? String else { return nil }
+        let rawInput = update["rawInput"] as? [String: Any] ?? [:]
+        let title = firstNonEmptyString(update["title"] as? String, "Tool") ?? "Tool"
+        let kind = update["kind"] as? String
+        let type = copilotActivityType(kind: kind, rawInput: rawInput, title: title)
+
+        var item: [String: Any] = [
+            "id": itemID,
+            "type": type,
+            "status": copilotToolStatus(update["status"] as? String)
+        ]
+
+        switch type {
+        case "commandExecution":
+            item["command"] = firstNonEmptyString(
+                rawInput["command"] as? String,
+                (rawInput["commands"] as? [String])?.joined(separator: " && "),
+                title
+            )
+        case "fileChange":
+            item["changes"] = rawInput["files"] as? [[String: Any]] ?? []
+        case "mcpToolCall":
+            item["server"] = "MCP"
+            item["tool"] = title
+            item["arguments"] = rawInput
+        default:
+            item["tool"] = title
+            item["arguments"] = rawInput
+        }
+
+        if let output = copilotOutputText(from: update) {
+            item["result"] = output
+        }
+        return item
+    }
+
+    private func copilotOutputText(from update: [String: Any]) -> String? {
+        if let rawOutput = update["rawOutput"] as? [String: Any] {
+            if let text = firstNonEmptyString(
+                rawOutput["detailedContent"] as? String,
+                rawOutput["content"] as? String,
+                rawOutput["code"] as? String
+            ) {
+                return text
+            }
+        }
+
+        let content = update["content"] as? [[String: Any]] ?? []
+        let joined = content.compactMap { row -> String? in
+            if let contentRow = row["content"] as? [String: Any] {
+                return firstNonEmptyString(contentRow["text"] as? String)
+            }
+            return firstNonEmptyString(row["text"] as? String)
+        }
+        .joined(separator: "\n")
+
+        return joined.nonEmpty
+    }
+
+    private func copilotActivityType(
+        kind: String?,
+        rawInput: [String: Any],
+        title: String?
+    ) -> String {
+        if rawInput["command"] != nil || rawInput["commands"] != nil || kind == "execute" {
+            return "commandExecution"
+        }
+        if rawInput["files"] != nil || kind == "edit" || title?.localizedCaseInsensitiveContains("edit") == true {
+            return "fileChange"
+        }
+        if kind?.localizedCaseInsensitiveContains("mcp") == true {
+            return "mcpToolCall"
+        }
+        return "other"
+    }
+
+    private func copilotToolStatus(_ rawValue: String?) -> String {
+        switch rawValue?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "pending":
+            return "pending"
+        case "failed":
+            return "failed"
+        case "completed":
+            return "completed"
+        default:
+            return "running"
+        }
+    }
+
+    private func shouldHideCopilotToolActivity(item: [String: Any]) -> Bool {
+        normalizedActivityType(item["type"] as? String ?? "other") == "other"
+    }
+
+    private func shouldSurfaceCopilotThought(_ delta: String) -> Bool {
+        delta.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty != nil && backend != .copilot
+    }
+
+    private func copilotFallbackReplyCandidate(from rawOutput: String) -> String? {
+        let trimmedOutput = rawOutput.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedOutput.isEmpty else { return nil }
+
+        let prefixes = [
+            "task completed:",
+            "completed:",
+            "final answer:",
+            "answer:"
+        ]
+
+        var candidate = trimmedOutput
+        let lowered = trimmedOutput.lowercased()
+        for prefix in prefixes {
+            if lowered.hasPrefix(prefix) {
+                candidate = String(trimmedOutput.dropFirst(prefix.count))
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                break
+            }
+        }
+
+        guard !candidate.isEmpty else { return nil }
+
+        let normalizedCandidateForDiffCheck = candidate
+            .replacingOccurrences(of: "```diff", with: "")
+            .replacingOccurrences(of: "```", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !assistantLooksLikeUnifiedDiff(normalizedCandidateForDiffCheck) else {
+            return nil
+        }
+
+        let normalizedCandidate = candidate.lowercased()
+        let internalNotes = [
+            "greeting user",
+            "acknowledging the intent",
+            "processing the greeting"
+        ]
+        if internalNotes.contains(normalizedCandidate) {
+            return nil
+        }
+
+        let hasSentencePunctuation = candidate.contains(".")
+            || candidate.contains("!")
+            || candidate.contains("?")
+        let wordCount = candidate.split(whereSeparator: \.isWhitespace).count
+        guard hasSentencePunctuation || wordCount >= 8 else {
+            return nil
+        }
+
+        return candidate
+    }
+
+    private func storeCopilotFallbackReply(_ reply: String) {
+        let trimmedReply = reply.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedReply.isEmpty else { return }
+        if let existing = pendingCopilotFallbackReply?.trimmingCharacters(in: .whitespacesAndNewlines),
+           existing.count > trimmedReply.count {
+            return
+        }
+        pendingCopilotFallbackReply = trimmedReply
+    }
+
+    private func materializeCopilotFallbackReplyIfNeeded() {
+        guard backend == .copilot,
+              streamingBuffer.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty == nil,
+              let fallbackReply = pendingCopilotFallbackReply?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+            return
+        }
+
+        ensureStreamingIdentifiers()
+        streamingBuffer = fallbackReply
+        pendingStreamingDeltaBuffer = ""
+    }
+
+    private func presentCopilotPermissionRequest(
+        id: JSONRPCRequestID,
+        params: [String: Any]
+    ) async {
+        guard let toolCall = params["toolCall"] as? [String: Any] else {
+            onStatusMessage?("GitHub Copilot requested permission without a tool description.")
+            return
+        }
+
+        let sessionID = firstNonEmptyString(
+            params["sessionId"] as? String,
+            activeSessionID
+        ) ?? ""
+        let toolKind = copilotPermissionToolKind(from: toolCall)
+        let options = copilotPermissionOptions(
+            from: params["options"] as? [[String: Any]] ?? [],
+            toolKind: toolKind
+        )
+        let request = AssistantPermissionRequest(
+            id: approvalRequestID(from: id),
+            sessionID: sessionID,
+            toolTitle: firstNonEmptyString(toolCall["title"] as? String, "Approval Needed") ?? "Approval Needed",
+            toolKind: toolKind,
+            rationale: copilotPermissionRationale(from: toolCall),
+            options: options,
+            rawPayloadSummary: copilotPermissionSummary(from: toolCall)
+        )
+
+        pendingPermissionContext = PendingPermissionContext(request: request) { [weak self] optionID in
+            guard let self else { return }
+            do {
+                try await self.transport?.sendResponse(
+                    id: id,
+                    result: [
+                        "outcome": [
+                            "outcome": "selected",
+                            "optionId": optionID
+                        ]
+                    ]
+                )
+            } catch {
+                await MainActor.run {
+                    self.onStatusMessage?(error.localizedDescription)
+                }
+            }
+        } cancelHandler: { [weak self] in
+            guard let self else { return }
+            do {
+                try await self.transport?.sendResponse(
+                    id: id,
+                    result: [
+                        "outcome": [
+                            "outcome": "cancelled"
+                        ]
+                    ]
+                )
+            } catch {
+                await MainActor.run {
+                    self.onStatusMessage?(error.localizedDescription)
+                }
+            }
+        }
+
+        onPermissionRequest?(request)
+        let transcriptText = request.rawPayloadSummary ?? request.toolTitle
+        onTranscript?(AssistantTranscriptEntry(
+            role: .permission,
+            text: "\(backend.shortDisplayName) wants approval for: \(transcriptText)",
+            emphasis: true
+        ))
+        onTimelineMutation?(
+            .upsert(
+                .permission(
+                    id: "permission-\(request.id)",
+                    sessionID: request.sessionID,
+                    turnID: activeTurnID,
+                    request: request,
+                    createdAt: Date(),
+                    source: .runtime
+                )
+            )
+        )
+        updateHUD(
+            phase: .waitingForPermission,
+            title: "Approve \(request.toolTitle)",
+            detail: request.rawPayloadSummary ?? request.rationale
+        )
+    }
+
+    private func copilotPermissionToolKind(from toolCall: [String: Any]) -> String? {
+        let rawInput = toolCall["rawInput"] as? [String: Any] ?? [:]
+        if rawInput["command"] != nil || rawInput["commands"] != nil {
+            return "commandExecution"
+        }
+        if rawInput["files"] != nil {
+            return "fileChange"
+        }
+        return toolCall["kind"] as? String
+    }
+
+    private func copilotPermissionOptions(
+        from rawOptions: [[String: Any]],
+        toolKind: String?
+    ) -> [AssistantPermissionOption] {
+        rawOptions.map { option in
+            let optionID = option["optionId"] as? String ?? UUID().uuidString
+            return AssistantPermissionOption(
+                id: optionID,
+                title: option["name"] as? String ?? optionID,
+                kind: toolKind ?? option["kind"] as? String ?? "permission",
+                isDefault: optionID == "allow_always"
+                    || (optionID == "allow_once" && !rawOptions.contains(where: { ($0["optionId"] as? String) == "allow_always" }))
+            )
+        }
+    }
+
+    private func copilotPermissionRationale(from toolCall: [String: Any]) -> String? {
+        let rawInput = toolCall["rawInput"] as? [String: Any] ?? [:]
+        return firstNonEmptyString(
+            rawInput["description"] as? String,
+            rawInput["command"] as? String,
+            (rawInput["commands"] as? [String])?.joined(separator: "\n")
+        )
+    }
+
+    private func copilotPermissionSummary(from toolCall: [String: Any]) -> String? {
+        let rawInput = toolCall["rawInput"] as? [String: Any] ?? [:]
+        return firstNonEmptyString(
+            rawInput["command"] as? String,
+            (rawInput["commands"] as? [String])?.joined(separator: "\n"),
+            toolCall["title"] as? String
+        )
     }
 
     // MARK: - AI Title Generation
@@ -3968,7 +5879,52 @@ private actor CodexAppServerTransport {
         process?.isRunning ?? false
     }
 
-    func start(codexExecutablePath: String) async throws {
+    func startCodex(codexExecutablePath: String) async throws {
+        try await startProcess(
+            executablePath: codexExecutablePath,
+            arguments: ["app-server"],
+            workingDirectory: nil,
+            initializeParams: [
+                "protocolVersion": 2,
+                "clientInfo": [
+                    "name": "Open Assist",
+                    "version": Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0"
+                ],
+                "capabilities": [
+                    "experimentalApi": true
+                ]
+            ],
+            sendsInitializedNotification: true,
+            launchLabel: "Codex App Server"
+        )
+    }
+
+    func startCopilot(copilotExecutablePath: String, workingDirectory: String?) async throws {
+        try await startProcess(
+            executablePath: copilotExecutablePath,
+            arguments: ["--acp", "--stdio"],
+            workingDirectory: workingDirectory,
+            initializeParams: [
+                "protocolVersion": 1,
+                "clientInfo": [
+                    "name": "Open Assist",
+                    "version": Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0"
+                ],
+                "capabilities": [:]
+            ],
+            sendsInitializedNotification: false,
+            launchLabel: "GitHub Copilot"
+        )
+    }
+
+    private func startProcess(
+        executablePath: String,
+        arguments: [String],
+        workingDirectory: String?,
+        initializeParams: [String: Any],
+        sendsInitializedNotification: Bool,
+        launchLabel: String
+    ) async throws {
         if process != nil {
             return
         }
@@ -3978,18 +5934,21 @@ private actor CodexAppServerTransport {
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()
 
-        process.executableURL = URL(fileURLWithPath: codexExecutablePath)
-        process.arguments = ["app-server"]
+        process.executableURL = URL(fileURLWithPath: executablePath)
+        process.arguments = arguments
         process.environment = AssistantCommandEnvironment.mergedEnvironment()
+        if let workingDirectory {
+            process.currentDirectoryURL = URL(fileURLWithPath: workingDirectory, isDirectory: true)
+        }
         process.standardInput = stdinPipe
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe
         process.terminationHandler = { [incoming] process in
             let message: String?
             if process.terminationReason == .uncaughtSignal {
-                message = "Codex App Server exited because of a signal."
+                message = "\(launchLabel) exited because of a signal."
             } else if process.terminationStatus != 0 {
-                message = "Codex App Server exited with code \(process.terminationStatus)."
+                message = "\(launchLabel) exited with code \(process.terminationStatus)."
             } else {
                 message = nil
             }
@@ -3999,7 +5958,7 @@ private actor CodexAppServerTransport {
         do {
             try process.run()
         } catch {
-            throw CodexAssistantRuntimeError.runtimeUnavailable("Could not launch Codex App Server: \(error.localizedDescription)")
+            throw CodexAssistantRuntimeError.runtimeUnavailable("Could not launch \(launchLabel): \(error.localizedDescription)")
         }
 
         self.process = process
@@ -4011,18 +5970,11 @@ private actor CodexAppServerTransport {
         _ = try await sendRequest(
             id: 0,
             method: "initialize",
-            params: [
-                "protocolVersion": 2,
-                "clientInfo": [
-                    "name": "Open Assist",
-                    "version": Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0"
-                ],
-                "capabilities": [
-                    "experimentalApi": true
-                ]
-            ]
+            params: initializeParams
         )
-        try await sendNotification(method: "initialized", params: nil)
+        if sendsInitializedNotification {
+            try await sendNotification(method: "initialized", params: nil)
+        }
         nextClientRequestID = 1
     }
 

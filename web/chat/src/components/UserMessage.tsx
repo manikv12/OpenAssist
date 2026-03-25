@@ -1,5 +1,6 @@
 import { memo, useCallback } from "react";
 import type { ChatMessage } from "../types";
+import { copyPlainText } from "../clipboard";
 import { CollapsibleImageGallery } from "./CollapsibleImageGallery";
 
 function UserMessageInner({ message }: { message: ChatMessage }) {
@@ -10,11 +11,7 @@ function UserMessageInner({ message }: { message: ChatMessage }) {
     : "";
 
   const handleCopy = useCallback(() => {
-    navigator.clipboard.writeText(text).catch(() => {
-      try {
-        window.webkit?.messageHandlers?.copyText?.postMessage(text);
-      } catch {}
-    });
+    void copyPlainText(text).catch(() => {});
   }, [text]);
 
   const handleUndo = useCallback(() => {
@@ -37,6 +34,7 @@ function UserMessageInner({ message }: { message: ChatMessage }) {
         <div className="user-actions">
           {message.canUndo && (
             <button
+              type="button"
               className="user-action-pill"
               onClick={handleUndo}
               title="Undo this message and everything after it"
@@ -46,6 +44,7 @@ function UserMessageInner({ message }: { message: ChatMessage }) {
           )}
           {message.canEdit && (
             <button
+              type="button"
               className="user-action-pill"
               onClick={handleEdit}
               title="Edit the last message"
@@ -54,6 +53,7 @@ function UserMessageInner({ message }: { message: ChatMessage }) {
             </button>
           )}
           <button
+            type="button"
             className="copy-btn copy-btn-float-user"
             onClick={handleCopy}
             title="Copy message"
@@ -70,6 +70,7 @@ function UserMessageInner({ message }: { message: ChatMessage }) {
           itemName="image"
           className="user-images"
           imageClassName="user-image"
+          defaultExpanded
         />
 
         {showText && <div className="user-bubble">{text}</div>}

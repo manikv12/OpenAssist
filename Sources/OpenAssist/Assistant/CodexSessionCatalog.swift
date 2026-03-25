@@ -21,6 +21,47 @@ struct CodexSessionCatalog {
     private let quickLookCache: SessionQuickLookCache
     private let activityStore: AssistantSessionActivityStore
 
+    private struct SessionIndexRecord {
+        let id: String
+        var threadName: String?
+        var updatedAtRawValue: String?
+        var isArchived: Bool
+        var archivedAt: Date?
+        var archiveExpiresAt: Date?
+        var archiveUsesDefaultRetention: Bool?
+
+        var hasArchiveMetadata: Bool {
+            isArchived || archivedAt != nil || archiveExpiresAt != nil || archiveUsesDefaultRetention != nil
+        }
+
+        var hasMeaningfulMetadata: Bool {
+            threadName != nil || hasArchiveMetadata
+        }
+
+        func serializedJSON(dateFormatter: (Date) -> String) -> [String: Any] {
+            var json: [String: Any] = ["id": id]
+            if let threadName {
+                json["thread_name"] = threadName
+            }
+            if let updatedAtRawValue {
+                json["updated_at"] = updatedAtRawValue
+            }
+            if isArchived {
+                json["archived"] = true
+            }
+            if let archivedAt {
+                json["archived_at"] = dateFormatter(archivedAt)
+            }
+            if let archiveExpiresAt {
+                json["archive_expires_at"] = dateFormatter(archiveExpiresAt)
+            }
+            if let archiveUsesDefaultRetention {
+                json["archive_uses_default_retention"] = archiveUsesDefaultRetention
+            }
+            return json
+        }
+    }
+
     init(
         fileManager: FileManager = .default,
         homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser,
@@ -55,14 +96,14 @@ struct CodexSessionCatalog {
     ) async throws -> [AssistantSessionSummary] {
         let normalizedSessionIDs = normalizedSessionIDSet(from: sessionIDs)
         let files = sessionFiles(matching: normalizedSessionIDs)
-        let threadNameOverrides = loadThreadNameOverrides()
+        let sessionIndexRecords = loadSessionIndexRecords()
         return loadIndexedSessions(
             from: files,
             limit: limit,
             preferredThreadID: preferredThreadID,
             preferredCWD: preferredCWD,
             originatorFilter: originatorFilter,
-            threadNameOverrides: threadNameOverrides
+            sessionIndexRecords: sessionIndexRecords
         )
     }
 
@@ -188,14 +229,20 @@ struct CodexSessionCatalog {
     }
 
     func deleteSession(sessionID: String) async throws -> Bool {
+        return try deleteSessionSynchronously(sessionID: sessionID)
+    }
+
+    func deleteSessionSynchronously(sessionID: String) throws -> Bool {
         guard let sessionID = sessionID.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty,
               let fileURL = sessionFile(for: sessionID) else {
             activityStore.deleteTimeline(sessionID: sessionID)
+            try removeSessionIndexRecord(sessionID: sessionID)
             return false
         }
 
         try fileManager.removeItem(at: fileURL)
         activityStore.deleteTimeline(sessionID: sessionID)
+        try removeSessionIndexRecord(sessionID: sessionID)
         removeEmptyParentDirectories(startingAt: fileURL.deletingLastPathComponent())
         return true
     }
@@ -209,7 +256,9 @@ struct CodexSessionCatalog {
         for file in files {
             do {
                 try fileManager.removeItem(at: file.url)
-                activityStore.deleteTimeline(sessionID: sessionIDFromFilename(file.url))
+                let deletedSessionID = sessionIDFromFilename(file.url)
+                activityStore.deleteTimeline(sessionID: deletedSessionID)
+                try removeSessionIndexRecord(sessionID: deletedSessionID)
                 deletedCount += 1
                 removeEmptyParentDirectories(startingAt: file.url.deletingLastPathComponent())
             } catch {
@@ -219,6 +268,7 @@ struct CodexSessionCatalog {
 
         for sessionID in normalizedSessionIDs where !files.contains(where: { matchesSessionID(in: $0.url, against: Set([sessionID])) }) {
             activityStore.deleteTimeline(sessionID: sessionID)
+            try removeSessionIndexRecord(sessionID: sessionID)
         }
 
         return deletedCount
@@ -231,74 +281,49 @@ struct CodexSessionCatalog {
         guard let normalizedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
             return
         }
-
-        let indexURL = sessionIndexURL
-        if let directoryURL = indexURL.deletingLastPathComponent() as URL? {
-            try fileManager.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+        try upsertSessionIndexRecord(for: normalizedSessionID) { record in
+            record.threadName = normalizedTitle
         }
+    }
 
-        let updatedAt = Self.fractionalSecondsDateFormatter.string(from: Date())
-        let existingContents = (try? String(contentsOf: indexURL, encoding: .utf8)) ?? ""
-        let existingEntries = sessionIndexEntries(from: existingContents)
+    func archiveSession(
+        sessionID: String,
+        archivedAt: Date,
+        expiresAt: Date,
+        usesDefaultRetention: Bool
+    ) throws {
+        let normalizedSessionID = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedSessionID.isEmpty else { return }
 
-        var rewrittenLines: [String] = []
-        var replacedExistingEntry = false
-        let normalizedLookupID = normalizedSessionID.lowercased()
-
-        for entry in existingEntries {
-            guard let existingID = stringValue(entry["id"])?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
-                rewrittenLines.append(try jsonStringLine(entry))
-                continue
-            }
-
-            if existingID.lowercased() == normalizedLookupID {
-                if !replacedExistingEntry {
-                    let rewrittenLine = try jsonStringLine([
-                        "id": existingID,
-                        "thread_name": normalizedTitle,
-                        "updated_at": updatedAt
-                    ])
-                    rewrittenLines.append(rewrittenLine)
-                    replacedExistingEntry = true
-                }
-                continue
-            }
-
-            guard let existingTitle = firstNonEmptyString(
-                stringValue(entry["thread_name"]),
-                stringValue(entry["threadName"]),
-                stringValue(entry["title"])
-            ) else {
-                rewrittenLines.append(try jsonStringLine(entry))
-                continue
-            }
-
-            let existingUpdatedAt = firstNonEmptyString(
-                stringValue(entry["updated_at"]),
-                stringValue(entry["updatedAt"])
-            ) ?? updatedAt
-
-            rewrittenLines.append(
-                try jsonStringLine([
-                    "id": existingID,
-                    "thread_name": existingTitle,
-                    "updated_at": existingUpdatedAt
-                ])
-            )
+        try upsertSessionIndexRecord(for: normalizedSessionID) { record in
+            record.isArchived = true
+            record.archivedAt = archivedAt
+            record.archiveExpiresAt = expiresAt
+            record.archiveUsesDefaultRetention = usesDefaultRetention
         }
+    }
 
-        if !replacedExistingEntry {
-            rewrittenLines.append(
-                try jsonStringLine([
-                    "id": normalizedSessionID,
-                    "thread_name": normalizedTitle,
-                    "updated_at": updatedAt
-                ])
-            )
+    func unarchiveSession(sessionID: String) throws {
+        let normalizedSessionID = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedSessionID.isEmpty else { return }
+
+        try upsertSessionIndexRecord(for: normalizedSessionID) { record in
+            record.isArchived = false
+            record.archivedAt = nil
+            record.archiveExpiresAt = nil
+            record.archiveUsesDefaultRetention = nil
         }
+    }
 
-        let serialized = rewrittenLines.joined(separator: "\n") + "\n"
-        try serialized.write(to: indexURL, atomically: true, encoding: .utf8)
+    func expiredArchivedSessionIDs(asOf referenceDate: Date = Date()) -> [String] {
+        loadSessionIndexRecords().values.compactMap { record in
+            guard record.isArchived,
+                  let archiveExpiresAt = record.archiveExpiresAt,
+                  archiveExpiresAt <= referenceDate else {
+                return nil
+            }
+            return record.id
+        }
     }
 
     private var sessionsRoot: URL {
@@ -416,7 +441,7 @@ struct CodexSessionCatalog {
         preferredThreadID: String?,
         preferredCWD: String?,
         originatorFilter: String?,
-        threadNameOverrides: [String: String]
+        sessionIndexRecords: [String: SessionIndexRecord]
     ) -> [AssistantSessionSummary] {
         var metadataCache: [URL: SessionMetadata] = [:]
         var missingMetadataURLs = Set<URL>()
@@ -492,9 +517,9 @@ struct CodexSessionCatalog {
                 originatorFilter: originatorFilter,
                 metadata: metadata(for: file)
             ).map { summary in
-                applyingThreadNameOverride(
+                applyingSessionIndexRecord(
                     summary,
-                    threadName: threadNameOverrides[summary.id.lowercased()]
+                    record: sessionIndexRecords[summary.id.lowercased()]
                 )
             }
         }
@@ -633,6 +658,7 @@ struct CodexSessionCatalog {
             metadata = SessionMetadata(
                 id: fallbackID,
                 source: .other,
+                parentThreadID: nil,
                 cwd: nil,
                 createdAt: nil,
                 originator: nil
@@ -681,6 +707,7 @@ struct CodexSessionCatalog {
                 latestUserMessage: latestUserText,
                 latestAssistantMessage: latestAssistantText
             ),
+            parentThreadID: metadata?.parentThreadID,
             cwd: metadata?.cwd,
             createdAt: metadata?.createdAt,
             updatedAt: accumulator.updatedAt ?? metadata?.createdAt,
@@ -1215,13 +1242,23 @@ struct CodexSessionCatalog {
                         stringValue(payload["callId"])
                     ) ?? "custom-tool-output-\(index)"
                     let rawOutput = decodeSavedOutput(payload["output"])
-                    let title = formattedToolTitle(from: stringValue(payload["name"])) ?? "Tool"
-                    let kind: AssistantActivityKind = (stringValue(payload["name"])?.lowercased() == "apply_patch")
-                        ? .fileChange
-                        : .dynamicToolCall
-                    let summary = kind == .fileChange
-                        ? "Edited files in the workspace."
-                        : "Used a custom tool."
+                    let existingActivity = activityIndexByID[callID].flatMap { index in
+                        items[index].activity
+                    }
+                    let payloadToolName = stringValue(payload["name"])
+                    let kind: AssistantActivityKind
+                    if let existingActivity {
+                        kind = existingActivity.kind
+                    } else if payloadToolName?.lowercased() == "apply_patch" {
+                        kind = .fileChange
+                    } else {
+                        kind = .dynamicToolCall
+                    }
+                    let title = existingActivity?.title
+                        ?? formattedToolTitle(from: payloadToolName)
+                        ?? "Tool"
+                    let summary = existingActivity?.friendlySummary
+                        ?? savedActivitySummary(kind: kind, title: title)
 
                     updateTimelineActivityOutput(
                         callID: callID,
@@ -1235,6 +1272,24 @@ struct CodexSessionCatalog {
                         items: &items,
                         activityIndexByID: &activityIndexByID
                     )
+                    let imageAttachments = extractImageAttachments(from: payload["output"])
+                    if !imageAttachments.isEmpty {
+                        let imageTitle = title == "Image Generation"
+                            ? "Generated image"
+                            : "Images from \(title)"
+                        appendTimelineMessage(
+                            .system(
+                                id: "saved-tool-image-\(callID)",
+                                sessionID: sessionID,
+                                turnID: existingActivity?.turnID,
+                                text: imageTitle,
+                                createdAt: lineTimestamp,
+                                imageAttachments: imageAttachments,
+                                source: .codexSession
+                            ),
+                            to: &items
+                        )
+                    }
                     appendSavedActivityImagePreviewIfNeeded(
                         callID: callID,
                         sessionCWD: metadata?.cwd,
@@ -1325,14 +1380,15 @@ struct CodexSessionCatalog {
                     guard let text = cleanedAssistantMessage(stringValue(payload["last_agent_message"])) else {
                         continue
                     }
-                    if let latestAssistantText = latestAssistantTimelineText(in: items),
-                       normalizedDeduplicationText(latestAssistantText) == normalizedDeduplicationText(text) {
-                        continue
-                    }
+                    let completedTurnID = firstNonEmptyString(
+                        stringValue(payload["turn_id"]),
+                        stringValue(payload["turnID"])
+                    )
                     appendTimelineMessage(
                         .assistantFinal(
                             id: "task-complete-\(index)",
                             sessionID: sessionID,
+                            turnID: completedTurnID,
                             text: text,
                             createdAt: lineTimestamp,
                             updatedAt: lineTimestamp,
@@ -1525,6 +1581,10 @@ struct CodexSessionCatalog {
         incoming: AssistantTimelineItem
     ) -> AssistantTimelineItem {
         var merged = existing
+
+        if merged.turnID?.nonEmpty == nil {
+            merged.turnID = incoming.turnID?.nonEmpty
+        }
 
         if (merged.text?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true),
            let incomingText = incoming.text?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -1827,7 +1887,16 @@ struct CodexSessionCatalog {
         case .mcpToolCall:
             return "Used an MCP tool."
         case .dynamicToolCall:
-            return "Used \(title)."
+            switch title {
+            case "Browser Use":
+                return "Used the browser."
+            case "App Action":
+                return "Used a Mac app."
+            case "Image Generation":
+                return "Generated an image."
+            default:
+                return "Used \(title)."
+            }
         case .subagent:
             return "Worked with a subagent."
         case .reasoning:
@@ -1888,6 +1957,9 @@ struct CodexSessionCatalog {
         if lowercased == "apply_patch" {
             return "File Changes"
         }
+        if lowercased == "generate_image" {
+            return "Image Generation"
+        }
         if rawName.hasPrefix("mcp__") {
             let components = rawName.split(separator: "_")
             if components.count >= 4 {
@@ -1943,6 +2015,13 @@ struct CodexSessionCatalog {
         return json
     }
 
+    private func decodedJSONValue(from rawJSONString: String) -> Any? {
+        guard let data = rawJSONString.data(using: .utf8) else {
+            return nil
+        }
+        return try? JSONSerialization.jsonObject(with: data)
+    }
+
     private func parsePrimaryMetadata(from contents: String, fileURL: URL) -> SessionMetadata? {
         for rawLine in contents.split(whereSeparator: \.isNewline) {
             guard let json = jsonObject(from: rawLine),
@@ -1961,6 +2040,7 @@ struct CodexSessionCatalog {
             return SessionMetadata(
                 id: sessionID,
                 source: sessionSource(from: payload["source"], originator: firstNonEmptyString(stringValue(payload["originator"]))),
+                parentThreadID: parentThreadID(from: payload["source"]),
                 cwd: firstNonEmptyString(stringValue(payload["cwd"])),
                 createdAt: createdAt,
                 originator: firstNonEmptyString(stringValue(payload["originator"]))
@@ -1988,6 +2068,19 @@ struct CodexSessionCatalog {
         default:
             return .other
         }
+    }
+
+    private func parentThreadID(from rawValue: Any?) -> String? {
+        guard let source = dictionaryValue(rawValue),
+              let subagent = dictionaryValue(source["subagent"]),
+              let threadSpawn = dictionaryValue(subagent["thread_spawn"]) else {
+            return nil
+        }
+
+        return firstNonEmptyString(
+            stringValue(threadSpawn["parent_thread_id"]),
+            stringValue(threadSpawn["parentThreadId"])
+        )
     }
 
     private func normalizedSourceValue(_ rawValue: Any?) -> String? {
@@ -2070,25 +2163,20 @@ struct CodexSessionCatalog {
         return lastComponent ?? standardized
     }
 
-    private func loadThreadNameOverrides() -> [String: String] {
+    private func loadSessionIndexRecords() -> [String: SessionIndexRecord] {
         guard let contents = try? String(contentsOf: sessionIndexURL, encoding: .utf8),
               !contents.isEmpty else {
             return [:]
         }
 
-        var overrides: [String: String] = [:]
+        var records: [String: SessionIndexRecord] = [:]
         for json in sessionIndexEntries(from: contents) {
-            guard let sessionID = stringValue(json["id"])?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty,
-                  let title = firstNonEmptyString(
-                    stringValue(json["thread_name"]),
-                    stringValue(json["threadName"]),
-                    stringValue(json["title"])
-                  ) else {
+            guard let record = sessionIndexRecord(from: json) else {
                 continue
             }
-            overrides[sessionID.lowercased()] = title
+            records[record.id.lowercased()] = record
         }
-        return overrides
+        return records
     }
 
     private func sessionIndexEntries(from contents: String) -> [[String: Any]] {
@@ -2119,21 +2207,198 @@ struct CodexSessionCatalog {
         return entries
     }
 
-    private func applyingThreadNameOverride(
+    private func sessionIndexRecord(from json: [String: Any]) -> SessionIndexRecord? {
+        guard let sessionID = stringValue(json["id"])?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+            return nil
+        }
+
+        return SessionIndexRecord(
+            id: sessionID,
+            threadName: firstNonEmptyString(
+                stringValue(json["thread_name"]),
+                stringValue(json["threadName"]),
+                stringValue(json["title"])
+            ),
+            updatedAtRawValue: firstNonEmptyString(
+                stringValue(json["updated_at"]),
+                stringValue(json["updatedAt"])
+            ),
+            isArchived: boolValue(json["archived"]) ?? boolValue(json["is_archived"]) ?? false,
+            archivedAt: parseDate(
+                firstNonEmptyString(
+                    stringValue(json["archived_at"]),
+                    stringValue(json["archivedAt"])
+                )
+            ),
+            archiveExpiresAt: parseDate(
+                firstNonEmptyString(
+                    stringValue(json["archive_expires_at"]),
+                    stringValue(json["archiveExpiresAt"])
+                )
+            ),
+            archiveUsesDefaultRetention: boolValue(json["archive_uses_default_retention"])
+                ?? boolValue(json["archiveUsesDefaultRetention"])
+        )
+    }
+
+    private func loadOrderedSessionIndexEntries() -> [[String: Any]] {
+        guard let contents = try? String(contentsOf: sessionIndexURL, encoding: .utf8),
+              !contents.isEmpty else {
+            return []
+        }
+        return sessionIndexEntries(from: contents)
+    }
+
+    private func writeSessionIndexEntries(_ entries: [[String: Any]]) throws {
+        if entries.isEmpty {
+            if fileManager.fileExists(atPath: sessionIndexURL.path) {
+                try fileManager.removeItem(at: sessionIndexURL)
+            }
+            return
+        }
+
+        let codexDirectory = sessionIndexURL.deletingLastPathComponent()
+        if !fileManager.fileExists(atPath: codexDirectory.path) {
+            try fileManager.createDirectory(at: codexDirectory, withIntermediateDirectories: true)
+        }
+
+        let lines = try entries.map { entry in
+            let data = try JSONSerialization.data(withJSONObject: entry, options: [])
+            guard let line = String(data: data, encoding: .utf8) else {
+                throw CocoaError(.fileWriteUnknown)
+            }
+            return line
+        }
+        let contents = lines.joined(separator: "\n") + "\n"
+        try contents.write(to: sessionIndexURL, atomically: true, encoding: .utf8)
+    }
+
+    private func upsertSessionIndexRecord(
+        for sessionID: String,
+        mutate: (inout SessionIndexRecord) -> Void
+    ) throws {
+        let normalizedSessionID = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedSessionID.isEmpty else { return }
+
+        let nowValue = Self.fractionalSecondsDateFormatter.string(from: Date())
+        let entries = loadOrderedSessionIndexEntries()
+        var updatedEntries: [[String: Any]] = []
+        var didUpdateExisting = false
+
+        for entry in entries {
+            guard let entrySessionID = stringValue(entry["id"])?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty,
+                  entrySessionID.caseInsensitiveCompare(normalizedSessionID) == .orderedSame else {
+                updatedEntries.append(entry)
+                continue
+            }
+
+            if didUpdateExisting {
+                continue
+            }
+
+            var record = sessionIndexRecord(from: entry) ?? SessionIndexRecord(
+                id: entrySessionID,
+                threadName: nil,
+                updatedAtRawValue: nil,
+                isArchived: false,
+                archivedAt: nil,
+                archiveExpiresAt: nil,
+                archiveUsesDefaultRetention: nil
+            )
+            mutate(&record)
+            record.updatedAtRawValue = nowValue
+            if record.hasMeaningfulMetadata {
+                updatedEntries.append(
+                    record.serializedJSON(dateFormatter: { Self.fractionalSecondsDateFormatter.string(from: $0) })
+                )
+            }
+            didUpdateExisting = true
+        }
+
+        if !didUpdateExisting {
+            var record = SessionIndexRecord(
+                id: normalizedSessionID,
+                threadName: nil,
+                updatedAtRawValue: nowValue,
+                isArchived: false,
+                archivedAt: nil,
+                archiveExpiresAt: nil,
+                archiveUsesDefaultRetention: nil
+            )
+            mutate(&record)
+            if record.hasMeaningfulMetadata {
+                updatedEntries.append(
+                    record.serializedJSON(dateFormatter: { Self.fractionalSecondsDateFormatter.string(from: $0) })
+                )
+            }
+        }
+
+        try writeSessionIndexEntries(updatedEntries)
+    }
+
+    private func removeSessionIndexRecord(sessionID: String) throws {
+        let normalizedSessionID = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedSessionID.isEmpty else { return }
+
+        let entries = loadOrderedSessionIndexEntries()
+        let filtered = entries.filter { entry in
+            guard let entrySessionID = stringValue(entry["id"])?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+                return true
+            }
+            return entrySessionID.caseInsensitiveCompare(normalizedSessionID) != .orderedSame
+        }
+
+        guard filtered.count != entries.count else { return }
+        try writeSessionIndexEntries(filtered)
+    }
+
+    private func boolValue(_ raw: Any?) -> Bool? {
+        switch raw {
+        case let value as Bool:
+            return value
+        case let value as NSNumber:
+            return value.boolValue
+        case let value as String:
+            let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            switch normalized {
+            case "true", "yes", "1":
+                return true
+            case "false", "no", "0":
+                return false
+            default:
+                return nil
+            }
+        default:
+            return nil
+        }
+    }
+
+    private func applyingSessionIndexRecord(
         _ summary: AssistantSessionSummary,
-        threadName: String?
+        record: SessionIndexRecord?
     ) -> AssistantSessionSummary {
-        guard let normalizedThreadName = threadName?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+        guard let record else {
             return summary
         }
 
         var updatedSummary = summary
-        updatedSummary.title = normalizedThreadName
+        if let normalizedThreadName = record.threadName?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
+            updatedSummary.title = normalizedThreadName
+        }
+        updatedSummary.isArchived = record.isArchived
+        updatedSummary.archivedAt = record.archivedAt
+        updatedSummary.archiveExpiresAt = record.archiveExpiresAt
+        updatedSummary.archiveUsesDefaultRetention = record.archiveUsesDefaultRetention
+        if let archivedAt = record.archivedAt {
+            updatedSummary.updatedAt = maxDate(updatedSummary.updatedAt, archivedAt)
+        }
         return updatedSummary
     }
 
     private func sessionStartedText(for source: AssistantSessionSource) -> String {
         switch source {
+        case .openAssist:
+            return "Started an OpenAssist thread."
         case .cli:
             return "Started a Codex CLI session."
         case .vscode:
@@ -2314,10 +2579,15 @@ struct CodexSessionCatalog {
     ) {
         switch rawValue {
         case let string as String:
-            guard let imageData = decodeImageDataURL(string) else { return }
-            let key = MemoryIdentifier.stableHexDigest(data: imageData)
-            guard seen.insert(key).inserted else { return }
-            attachments.append(imageData)
+            if let imageData = decodeImageDataURL(string) {
+                let key = MemoryIdentifier.stableHexDigest(data: imageData)
+                guard seen.insert(key).inserted else { return }
+                attachments.append(imageData)
+                return
+            }
+            if let jsonValue = decodedJSONValue(from: string) {
+                collectImageAttachments(from: jsonValue, into: &attachments, seen: &seen)
+            }
 
         case let array as [Any]:
             for item in array {
@@ -2577,6 +2847,7 @@ private struct SessionFileRecord {
 private struct SessionMetadata {
     let id: String
     let source: AssistantSessionSource
+    let parentThreadID: String?
     let cwd: String?
     let createdAt: Date?
     let originator: String?

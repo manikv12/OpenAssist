@@ -5,7 +5,7 @@ enum AssistantBrowserUseToolDefinition {
     static let toolKind = "browserUse"
 
     static let description = """
-    Use a real local browser profile on this Mac for browser work. Prefer this for opening sites, checking the current tab, or reusing an existing signed-in browser session.
+    Use a real local browser profile on this Mac for browser work. Prefer this for opening sites, checking the current tab, reusing an existing signed-in browser session, or pausing when a site needs a manual login. Stay in the same browser profile and do not switch to a separate Playwright or MCP browser session.
     """
 
     static let inputSchema: [String: Any] = [
@@ -38,6 +38,53 @@ enum AssistantBrowserUseToolDefinition {
             "description": description,
             "inputSchema": inputSchema
         ]
+    }
+}
+
+struct AssistantBrowserLoginPrompt: Equatable, Sendable {
+    let browser: SupportedBrowser
+    let profileLabel: String
+    let pageTitle: String?
+    let pageURL: String?
+    let taskSummary: String
+    let reason: String
+
+    var requestTitle: String {
+        "Browser login required"
+    }
+
+    var requestRationale: String {
+        [
+            reason,
+            pageTitle?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty.map { "Page: \($0)" },
+            pageURL?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty.map { "URL: \($0)" },
+            "Please sign in with \(browser.displayName) using profile \(profileLabel), then press Proceed."
+        ]
+        .compactMap { $0 }
+        .joined(separator: "\n")
+    }
+
+    var requestSummary: String {
+        [
+            "Browser: \(browser.displayName)",
+            "Profile: \(profileLabel)",
+            pageTitle?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty.map { "Title: \($0)" },
+            pageURL?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty.map { "URL: \($0)" },
+            "Task: \(taskSummary)"
+        ]
+        .compactMap { $0 }
+        .joined(separator: "\n")
+    }
+}
+
+enum AssistantBrowserUseServiceError: Error, LocalizedError, Sendable {
+    case loginRequired(AssistantBrowserLoginPrompt)
+
+    var errorDescription: String? {
+        switch self {
+        case .loginRequired(let prompt):
+            return prompt.requestRationale
+        }
     }
 }
 
@@ -107,6 +154,24 @@ actor AssistantBrowserUseService {
                 && pageTargets.contains(where: task.contains)
         }
 
+        var wantsLoginFlow: Bool {
+            let task = normalizedTask
+            let loginSignals = [
+                "log in",
+                "log into",
+                "login",
+                "sign in",
+                "sign into",
+                "signin",
+                "sign-in",
+                "authenticate",
+                "authentication",
+                "reauth",
+                "re-auth"
+            ]
+            return loginSignals.contains(where: task.contains)
+        }
+
         var needsComputerFallback: Bool {
             let fallbackSignals = [
                 "click",
@@ -115,9 +180,6 @@ actor AssistantBrowserUseService {
                 "scroll",
                 "drag",
                 "type",
-                "log in",
-                "login",
-                "sign in",
                 "reply",
                 "post",
                 "send",
@@ -210,6 +272,26 @@ actor AssistantBrowserUseService {
     }
 
     func run(arguments: Any, preferredModelID: String?) async -> AssistantToolExecutionResult {
+        await execute(
+            arguments: arguments,
+            preferredModelID: preferredModelID,
+            resumeAfterLogin: false
+        )
+    }
+
+    func resumeAfterLogin(arguments: Any, preferredModelID: String?) async -> AssistantToolExecutionResult {
+        await execute(
+            arguments: arguments,
+            preferredModelID: preferredModelID,
+            resumeAfterLogin: true
+        )
+    }
+
+    private func execute(
+        arguments: Any,
+        preferredModelID: String?,
+        resumeAfterLogin: Bool
+    ) async -> AssistantToolExecutionResult {
         do {
             let parsedTask = try Self.parseTask(from: arguments)
             let profile = try await resolveProfile(browserHint: parsedTask.browserHint)
@@ -217,27 +299,42 @@ actor AssistantBrowserUseService {
             if parsedTask.needsComputerFallback {
                 return Self.result(
                     summary: """
-                    Browser Use can open sites, activate the browser, and read the current tab. This request needs live clicking or typing, which Open Assist no longer supports.
+                    Browser Use can open sites, activate the browser, and read the current tab. This request needs live clicking or typing.
                     """,
-                    detail: "Try asking to open a URL, switch to the browser, or read the current tab instead.",
+                    detail: "Only fall back to `computer_use` if the task truly depends on the visible page or browser UI and cannot be completed with normal browser navigation in the same signed-in window. If the site needs a manual sign-in first, pause and let the user log in before continuing.",
                     success: false
                 )
             }
 
-            if let requestedURL = parsedTask.requestedURL {
+            if !resumeAfterLogin, let requestedURL = parsedTask.requestedURL {
                 try await helper.openBrowserURL(requestedURL, profile: profile)
-                let tab = try? await helper.readFrontBrowserTab(browser: profile.browser)
-                let summary = "Opened \(requestedURL.absoluteString) in \(profile.browser.displayName) using profile \(profile.label)."
-                return Self.result(
-                    summary: summary,
-                    detail: browserDetail(from: tab)
-                )
             }
 
-            if parsedTask.shouldReadCurrentTab {
+            let shouldInspectCurrentTab = resumeAfterLogin
+                || parsedTask.requestedURL != nil
+                || parsedTask.shouldReadCurrentTab
+                || parsedTask.wantsLoginFlow
+
+            if shouldInspectCurrentTab {
                 try await helper.activateBrowser(profile.browser)
-                let tab = try await helper.readFrontBrowserTab(browser: profile.browser)
-                let summary = browserDetail(from: tab) ?? "Read the current tab in \(profile.browser.displayName)."
+                let tab = try? await helper.readFrontBrowserTab(browser: profile.browser)
+
+                if let prompt = Self.loginPrompt(
+                    for: parsedTask,
+                    browser: profile.browser,
+                    profileLabel: profile.label,
+                    tab: tab
+                ) {
+                    return Self.loginRequiredResult(prompt: prompt)
+                }
+
+                let summary = Self.summaryLine(
+                    for: parsedTask,
+                    browser: profile.browser,
+                    profile: profile,
+                    tab: tab,
+                    resumeAfterLogin: resumeAfterLogin
+                )
                 return Self.result(summary: summary, detail: nil)
             }
 
@@ -251,6 +348,119 @@ actor AssistantBrowserUseService {
                 ?? "Browser Use failed."
             return Self.result(summary: summary, detail: nil, success: false)
         }
+    }
+
+    private static func summaryLine(
+        for parsedTask: ParsedTask,
+        browser: SupportedBrowser,
+        profile: BrowserProfile,
+        tab: (title: String?, url: String?)?,
+        resumeAfterLogin: Bool
+    ) -> String {
+        if resumeAfterLogin {
+            if let requestedURL = parsedTask.requestedURL {
+                return "Signed in and continued \(requestedURL.absoluteString) in \(browser.displayName) using profile \(profile.label)."
+            }
+            return "Signed in and read the current tab in \(browser.displayName) using profile \(profile.label)."
+        }
+
+        if let requestedURL = parsedTask.requestedURL {
+            return "Opened \(requestedURL.absoluteString) in \(browser.displayName) using profile \(profile.label)."
+        }
+
+        if parsedTask.shouldReadCurrentTab || parsedTask.wantsLoginFlow {
+            return browserDetail(from: tab) ?? "Read the current tab in \(browser.displayName)."
+        }
+
+        return "Activated \(browser.displayName) with profile \(profile.label)."
+    }
+
+    static func loginPrompt(
+        for parsedTask: ParsedTask,
+        browser: SupportedBrowser,
+        profileLabel: String,
+        tab: (title: String?, url: String?)?
+    ) -> AssistantBrowserLoginPrompt? {
+        guard let tab else { return nil }
+
+        guard let reason = loginDetectionReason(
+            for: parsedTask,
+            title: tab.title,
+            url: tab.url
+        ) else {
+            return nil
+        }
+
+        return AssistantBrowserLoginPrompt(
+            browser: browser,
+            profileLabel: profileLabel,
+            pageTitle: tab.title?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty,
+            pageURL: tab.url?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty,
+            taskSummary: parsedTask.summaryLine,
+            reason: reason
+        )
+    }
+
+    private static func loginDetectionReason(
+        for parsedTask: ParsedTask,
+        title: String?,
+        url: String?
+    ) -> String? {
+        let normalizedTitle = title?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        let normalizedURL = url?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+
+        let titleSignals = [
+            "sign in",
+            "sign-in",
+            "signin",
+            "login",
+            "log in",
+            "log-in",
+            "authenticate",
+            "authentication",
+            "verification",
+            "verify your identity",
+            "security check",
+            "two-factor",
+            "2fa",
+            "mfa"
+        ]
+        if titleSignals.contains(where: normalizedTitle.contains) {
+            return "The page title looks like a sign-in screen."
+        }
+
+        let urlSignals = [
+            "/login",
+            "/signin",
+            "/sign-in",
+            "/oauth",
+            "/sso",
+            "/auth",
+            "/session",
+            "/verify",
+            "/challenge",
+            "/checkpoint",
+            "accounts."
+        ]
+        if urlSignals.contains(where: normalizedURL.contains) {
+            return "The page URL looks like a login flow."
+        }
+
+        if parsedTask.wantsLoginFlow {
+            let loginContextSignals = [
+                "account",
+                "accounts.",
+                "authorize",
+                "authentication",
+                "auth"
+            ]
+            if loginContextSignals.contains(where: normalizedTitle.contains)
+                || loginContextSignals.contains(where: normalizedURL.contains) {
+                return "This looks like the login flow you asked for."
+            }
+        }
+
+        return nil
     }
 
     static func parseTask(from arguments: Any) throws -> ParsedTask {
@@ -343,7 +553,7 @@ actor AssistantBrowserUseService {
         }
     }
 
-    private func browserDetail(from tab: (title: String?, url: String?)?) -> String? {
+    private static func browserDetail(from tab: (title: String?, url: String?)?) -> String? {
         guard let tab else { return nil }
         var lines: [String] = []
         if let title = tab.title?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
@@ -370,6 +580,15 @@ actor AssistantBrowserUseService {
             contentItems: items,
             success: success,
             summary: summary
+        )
+    }
+
+    private static func loginRequiredResult(prompt: AssistantBrowserLoginPrompt) -> AssistantToolExecutionResult {
+        AssistantToolExecutionResult(
+            contentItems: [.init(type: "inputText", text: prompt.requestRationale, imageURL: nil)],
+            success: false,
+            summary: prompt.requestRationale,
+            loginPrompt: prompt
         )
     }
 }

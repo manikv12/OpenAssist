@@ -83,7 +83,7 @@ final class AssistantProjectMemoryServiceTests: XCTestCase {
         XCTAssertFalse(second.didChange)
     }
 
-    func testTurnContextUsesStableProjectIdentityAndSummary() throws {
+    func testTurnContextUsesStableProjectIdentityAndFiltersRelevantDigests() throws {
         let projectDirectory = try makeTemporaryDirectory(named: "assistant-project-context")
         let memoryRoot = try makeTemporaryDirectory(named: "assistant-thread-memory")
         let databaseURL = try makeDatabaseURL()
@@ -109,23 +109,38 @@ final class AssistantProjectMemoryServiceTests: XCTestCase {
             summary: "Assistant: Added a project sidebar.",
             fingerprint: "sidebar-1"
         )
-        try projectStore.setProjectSummary(
-            "Project: Mac Client\nRecent thread digests:\n- Refine sidebar: Added a project sidebar.",
-            forProjectID: project.id
+        try projectStore.updateThreadDigest(
+            projectID: project.id,
+            threadID: "thread-8",
+            threadTitle: "Regex search performance",
+            summary: "Assistant: Compared ripgrep pipeline and a code index to speed up regex search.",
+            fingerprint: "regex-1"
+        )
+        try projectStore.updateThreadDigest(
+            projectID: project.id,
+            threadID: "thread-9",
+            threadTitle: "Gemini key setup",
+            summary: "Assistant: Verified Google AI Studio Gemini configuration in settings.",
+            fingerprint: "gemini-1"
         )
 
         let context = try XCTUnwrap(
             service.turnContext(
                 forThreadID: "thread-7",
-                fallbackCWD: "/tmp/mac-client"
+                fallbackCWD: "/tmp/mac-client",
+                prompt: "How can we implement faster regex search in this project?"
             )
         )
 
         XCTAssertEqual(context.scope.identityKey, "assistant-project:\(project.id.lowercased())")
         XCTAssertEqual(context.scope.identityType, "assistant-project")
         XCTAssertEqual(context.scope.projectName, "Mac Client")
-        XCTAssertTrue(context.projectContextBlock?.contains("Project memory summary") == true)
-        XCTAssertTrue(context.projectContextBlock?.contains("Mac Client") == true)
+        let block = context.projectContextBlock ?? ""
+        XCTAssertTrue(block.contains("Project context:"), block)
+        XCTAssertTrue(block.contains("Mac Client"), block)
+        XCTAssertTrue(block.contains("Regex search performance"), block)
+        XCTAssertFalse(block.contains("Gemini key setup"), block)
+        XCTAssertFalse(block.contains("Refine sidebar"), block)
     }
 
     private func makeTemporaryDirectory(named name: String) throws -> URL {

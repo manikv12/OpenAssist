@@ -12,6 +12,7 @@
     "@panzoom/panzoom": "^4.6.1",
     "mermaid": "^11.13.0",
     "react": "^19.1.0",
+    "react-collapsed": "^4.2.0",
     "react-dom": "^19.1.0",
     "react-markdown": "^10.1.0",
     "react-syntax-highlighter": "^15.6.1",

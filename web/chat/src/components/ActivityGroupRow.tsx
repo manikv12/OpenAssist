@@ -1,28 +1,44 @@
-import { memo, useState } from "react";
+import { memo, useEffect, useMemo, useState, type CSSProperties } from "react";
 import type { ActivityGroupItem, ChatMessage } from "../types";
 import { ActivityIcon } from "./ActivityIcon";
 import { ActivityDetailSections } from "./ActivityDetailSections";
 import { ChevronIcon } from "./ChevronIcon";
 import { FileChangeSummary } from "./FileChangeSummary";
+import {
+  buildActivityActionDetail,
+  buildActivityActionLabel,
+  buildActivityTrailModel,
+} from "./activityPresentation";
 
-function ActivityGroupItemRow({ item }: { item: ActivityGroupItem }) {
+function ActivityGroupItemRow({
+  item,
+  highlightRunning = false,
+}: {
+  item: ActivityGroupItem;
+  highlightRunning?: boolean;
+}) {
   const [expanded, setExpanded] = useState(false);
   const detailSections = item.detailSections || [];
   const canExpand = detailSections.length > 0;
   const isRunning = item.status === "running";
+  const shouldAnimateRunning = isRunning && highlightRunning;
   const statusClass =
     item.status === "completed"
       ? "status-completed"
       : item.status === "failed"
         ? "status-failed"
         : "status-running";
+  const actionTitle =
+    buildActivityActionLabel(item.icon, item.activityTargets, item.title) ||
+    item.title;
+  const actionDetail = buildActivityActionDetail(item.activityTargets, item.detail);
 
   const summaryContent = (
     <>
       <ActivityIcon kind={item.icon} status={item.status} />
       <div className="activity-group-item-copy">
-        <span className="activity-title">{item.title}</span>
-        {item.detail && <span className="activity-detail">{item.detail}</span>}
+        <span className="activity-title">{actionTitle}</span>
+        {actionDetail && <span className="activity-detail">{actionDetail}</span>}
       </div>
       {item.statusLabel && (
         <span className={`activity-status-label ${statusClass}`}>
@@ -42,14 +58,14 @@ function ActivityGroupItemRow({ item }: { item: ActivityGroupItem }) {
       {canExpand ? (
         <button
           type="button"
-          className={`activity-group-item-summary activity-group-item-summary-button${isRunning ? " activity-card-running" : ""}`}
+          className={`activity-group-item-summary activity-group-item-summary-button${shouldAnimateRunning ? " activity-card-running" : ""}`}
           onClick={() => setExpanded((current) => !current)}
           aria-expanded={expanded}
         >
           {summaryContent}
         </button>
       ) : (
-        <div className={`activity-group-item-summary${isRunning ? " activity-card-running" : ""}`}>
+        <div className={`activity-group-item-summary${shouldAnimateRunning ? " activity-card-running" : ""}`}>
           {summaryContent}
         </div>
       )}
@@ -66,26 +82,102 @@ function ActivityGroupItemRow({ item }: { item: ActivityGroupItem }) {
   );
 }
 
-function ActivityGroupRowInner({ message }: { message: ChatMessage }) {
-  const [expanded, setExpanded] = useState(false);
-  const transitionClass = message.transitionState
-    ? ` is-${message.transitionState}`
-    : "";
+function ActivityTrail({
+  title,
+  items,
+  running,
+}: {
+  title: string;
+  items: ActivityGroupItem[];
+  running: boolean;
+}) {
+  const trail = buildActivityTrailModel(items, running);
+  if (!trail) {
+    return null;
+  }
+
+  const latestActiveIndex = (() => {
+    for (let index = trail.entries.length - 1; index >= 0; index -= 1) {
+      if (trail.entries[index].status === "running") {
+        return index;
+      }
+    }
+
+    return running ? trail.entries.length - 1 : -1;
+  })();
+
+  return (
+    <div className="activity-trail">
+      <span className="activity-trail-title">{title}</span>
+      <div className="activity-trail-list">
+        {trail.entries.map((entry, index) => {
+          const isActive = index === latestActiveIndex;
+          const style = {
+            "--activity-trail-delay": `${index * 70}ms`,
+          } as CSSProperties;
+
+          return (
+            <div
+              key={entry.id}
+              className={`activity-trail-item${isActive ? " is-running" : ""}`}
+              style={style}
+            >
+              <span className="activity-trail-item-label">{entry.label}</span>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function ActivityGroupRowInner({
+  message,
+  isLatestRunningActivity = false,
+}: {
+  message: ChatMessage;
+  isLatestRunningActivity?: boolean;
+}) {
   const items = message.groupItems || [];
   const completedCount = items.filter((i) => i.status === "completed").length;
   const runningCount = items.filter((i) => i.status === "running").length;
-  const title = buildActivityGroupTitle(items);
+  const isRunning = runningCount > 0;
+  const latestRunningItemID = useMemo(() => {
+    for (let index = items.length - 1; index >= 0; index -= 1) {
+      if (items[index].status === "running") {
+        return items[index].id;
+      }
+    }
+
+    return undefined;
+  }, [items]);
+  const trail = buildActivityTrailModel(items, isRunning);
+  const [expanded, setExpanded] = useState(() => Boolean(trail) && isRunning);
+  const transitionClass = message.transitionState
+    ? ` is-${message.transitionState}`
+    : "";
+  const title = trail?.title || buildActivityGroupTitle(items);
   const summary = buildActivityGroupSummary(items, runningCount, completedCount);
   const groupIcon = buildActivityGroupIcon(items);
-  const isRunning = runningCount > 0;
+  const shouldAnimateRunning = isRunning && isLatestRunningActivity;
+
+  useEffect(() => {
+    if (trail && isRunning) {
+      setExpanded(true);
+    }
+  }, [trail, isRunning]);
 
   return (
-    <div className={`message-row activity-group-row${transitionClass}`}>
+    <div
+      className={`message-row activity-group-row${transitionClass}`}
+      data-message-id={message.id}
+    >
       <button
         type="button"
-        className={`activity-card activity-card-button activity-group-toggle${isRunning ? " activity-card-running" : ""}`}
+        className={`activity-card activity-card-button activity-card-compact activity-group-toggle${shouldAnimateRunning ? " activity-card-running" : ""}`}
         onClick={() => setExpanded((current) => !current)}
         aria-expanded={expanded}
+        data-activity-toggle="true"
       >
         <div className="activity-icon-wrap">
           {groupIcon ? (
@@ -99,7 +191,7 @@ function ActivityGroupRowInner({ message }: { message: ChatMessage }) {
         </div>
         <div className="activity-body">
           <span className="activity-title">{title}</span>
-          <span className="activity-detail">{summary}</span>
+          {!trail && <span className="activity-detail">{summary}</span>}
         </div>
         <div className="activity-meta">
           <span className="activity-toggle-button" aria-hidden="true">
@@ -110,9 +202,17 @@ function ActivityGroupRowInner({ message }: { message: ChatMessage }) {
 
       {expanded && (
         <div className="activity-group-items">
-          {items.map((item) => (
-            <ActivityGroupItemRow key={item.id} item={item} />
-          ))}
+          {trail ? (
+            <ActivityTrail title={title} items={items} running={shouldAnimateRunning} />
+          ) : (
+            items.map((item) => (
+              <ActivityGroupItemRow
+                key={item.id}
+                item={item}
+                highlightRunning={shouldAnimateRunning && item.id === latestRunningItemID}
+              />
+            ))
+          )}
         </div>
       )}
     </div>

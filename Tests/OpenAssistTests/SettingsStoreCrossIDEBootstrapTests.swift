@@ -144,4 +144,22 @@ final class SettingsStoreCrossIDEBootstrapTests: XCTestCase {
             .orb
         )
     }
+
+    func testGooglePromptRewriteAndGeminiTranscriptionShareSameKeychainAccount() {
+        XCTAssertEqual(
+            SettingsStore.keychainAccount(for: .google),
+            SettingsStore.googleAIStudioAPIKeychainAccount
+        )
+        XCTAssertEqual(
+            SettingsStore.cloudTranscriptionKeychainAccount(for: .gemini),
+            SettingsStore.googleAIStudioAPIKeychainAccount
+        )
+    }
+
+    func testGoogleAIStudioUsesStableDefaultImageModel() {
+        XCTAssertEqual(
+            SettingsStore.googleAIStudioImageGenerationDefaultModel,
+            "gemini-2.5-flash-image"
+        )
+    }
 }

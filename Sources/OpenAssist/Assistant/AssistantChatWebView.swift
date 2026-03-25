@@ -7,6 +7,9 @@ import WebKit
 
 struct AssistantChatWebView: NSViewRepresentable {
     let messages: [AssistantChatWebMessage]
+    let runtimePanel: AssistantChatWebRuntimePanel?
+    let reviewPanel: AssistantChatWebCodeReviewPanel?
+    let rewindState: AssistantChatWebRewindState?
     let showTypingIndicator: Bool
     let typingTitle: String
     let typingDetail: String
@@ -15,16 +18,27 @@ struct AssistantChatWebView: NSViewRepresentable {
     var accentColor: Color? = nil
     let onScrollStateChanged: (Bool, Bool) -> Void // (isPinned, isScrolledUp)
     let onLoadOlderHistory: () -> Void
+    let onSelectRuntimeBackend: (String) -> Void
+    let onOpenRuntimeSettings: () -> Void
     let onUndoMessage: (String) -> Void
     let onEditMessage: (String) -> Void
+    let onUndoCodeCheckpoint: () -> Void
+    let onRedoHistoryMutation: () -> Void
+    let onCloseCodeReviewPanel: () -> Void
     var onTextSelected: ((String, String, String, CGRect) -> Void)? = nil
+    var onContainerReady: ((AssistantChatWebContainerView) -> Void)? = nil
 
     func makeCoordinator() -> AssistantChatWebCoordinator {
         AssistantChatWebCoordinator(
             onScrollStateChanged: onScrollStateChanged,
             onLoadOlderHistory: onLoadOlderHistory,
+            onSelectRuntimeBackend: onSelectRuntimeBackend,
+            onOpenRuntimeSettings: onOpenRuntimeSettings,
             onUndoMessage: onUndoMessage,
-            onEditMessage: onEditMessage
+            onEditMessage: onEditMessage,
+            onUndoCodeCheckpoint: onUndoCodeCheckpoint,
+            onRedoHistoryMutation: onRedoHistoryMutation,
+            onCloseCodeReviewPanel: onCloseCodeReviewPanel
         )
     }
 
@@ -33,12 +47,16 @@ struct AssistantChatWebView: NSViewRepresentable {
         context.coordinator.onTextSelected = onTextSelected
         context.coordinator.webViewContainer = container
         container.applyMessages(messages)
+        container.applyRuntimePanel(runtimePanel)
+        container.applyReviewPanel(reviewPanel)
+        container.applyRewindState(rewindState)
         container.applyTypingIndicator(showTypingIndicator, title: typingTitle, detail: typingDetail)
         container.applyTextScale(textScale)
         container.applyCanLoadOlder(canLoadOlderHistory)
         if let accent = accentColor {
             container.applyAccentColor(accent)
         }
+        onContainerReady?(container)
         return container
     }
 
@@ -46,6 +64,9 @@ struct AssistantChatWebView: NSViewRepresentable {
         container.coordinator = context.coordinator
         context.coordinator.onTextSelected = onTextSelected
         container.applyMessages(messages)
+        container.applyRuntimePanel(runtimePanel)
+        container.applyReviewPanel(reviewPanel)
+        container.applyRewindState(rewindState)
         container.applyTypingIndicator(showTypingIndicator, title: typingTitle, detail: typingDetail)
         container.applyTextScale(textScale)
         container.applyCanLoadOlder(canLoadOlderHistory)
@@ -63,11 +84,13 @@ struct AssistantChatWebMessage: Equatable {
     let text: String?
     let isStreaming: Bool
     let timestamp: Date
+    let turnID: String?
     let images: [Data]?
     let emphasis: Bool
     let canUndo: Bool
     let canEdit: Bool
     let rewriteAnchorID: String?
+    let providerLabel: String?
 
     // Activity
     let activityIcon: String?
@@ -76,6 +99,7 @@ struct AssistantChatWebMessage: Equatable {
     let activityStatus: String? // "running", "completed", "failed"
     let activityStatusLabel: String?
     let detailSections: [AssistantChatWebDetailSection]?
+    let activityTargets: [AssistantChatWebActivityTarget]?
 
     // Activity group
     let groupItems: [AssistantChatWebActivityGroupItem]?
@@ -88,10 +112,12 @@ struct AssistantChatWebMessage: Equatable {
             "timestamp": timestamp.timeIntervalSince1970 * 1000,
         ]
         if let text { json["text"] = text }
+        if let turnID { json["turnID"] = turnID }
         if emphasis { json["emphasis"] = true }
         if canUndo { json["canUndo"] = true }
         if canEdit { json["canEdit"] = true }
         if let rewriteAnchorID { json["rewriteAnchorID"] = rewriteAnchorID }
+        if let providerLabel { json["providerLabel"] = providerLabel }
 
         if let images, !images.isEmpty {
             json["images"] = images.compactMap { data -> String? in
@@ -115,6 +141,9 @@ struct AssistantChatWebMessage: Equatable {
         if let detailSections, !detailSections.isEmpty {
             json["detailSections"] = detailSections.map { $0.toJSON() }
         }
+        if let activityTargets, !activityTargets.isEmpty {
+            json["activityTargets"] = activityTargets.map { $0.toJSON() }
+        }
 
         if let groupItems, !groupItems.isEmpty {
             json["groupItems"] = groupItems.map { $0.toJSON() }
@@ -133,6 +162,7 @@ struct AssistantChatWebActivityGroupItem: Equatable {
     let statusLabel: String?
     let timestamp: Date
     let detailSections: [AssistantChatWebDetailSection]?
+    let activityTargets: [AssistantChatWebActivityTarget]?
 
     func toJSON() -> [String: Any] {
         var json: [String: Any] = [
@@ -146,6 +176,26 @@ struct AssistantChatWebActivityGroupItem: Equatable {
         if let statusLabel { json["statusLabel"] = statusLabel }
         if let detailSections, !detailSections.isEmpty {
             json["detailSections"] = detailSections.map { $0.toJSON() }
+        }
+        if let activityTargets, !activityTargets.isEmpty {
+            json["activityTargets"] = activityTargets.map { $0.toJSON() }
+        }
+        return json
+    }
+}
+
+struct AssistantChatWebActivityTarget: Equatable {
+    let kind: String
+    let label: String
+    let detail: String?
+
+    func toJSON() -> [String: Any] {
+        var json: [String: Any] = [
+            "kind": kind,
+            "label": label
+        ]
+        if let detail, !detail.isEmpty {
+            json["detail"] = detail
         }
         return json
     }
@@ -163,11 +213,242 @@ struct AssistantChatWebDetailSection: Equatable {
     }
 }
 
+struct AssistantChatWebCodeReviewFile: Equatable {
+    let path: String
+    let changeKind: String
+    let isBinary: Bool
+
+    func toJSON() -> [String: Any] {
+        [
+            "path": path,
+            "changeKind": changeKind,
+            "isBinary": isBinary
+        ]
+    }
+}
+
+struct AssistantChatWebCodeReviewCheckpoint: Equatable {
+    let id: String
+    let checkpointNumber: Int
+    let createdAt: Date
+    let summary: String
+    let patch: String
+    let turnStatus: String
+    let ignoredTouchedPaths: [String]
+    let changedFiles: [AssistantChatWebCodeReviewFile]
+    let associatedMessageID: String?
+    let associatedTurnID: String?
+    let associatedUserMessageID: String?
+    let associatedUserAnchorID: String?
+
+    func toJSON() -> [String: Any] {
+        var json: [String: Any] = [
+            "id": id,
+            "checkpointNumber": checkpointNumber,
+            "createdAt": createdAt.timeIntervalSince1970 * 1000,
+            "summary": summary,
+            "patch": patch,
+            "turnStatus": turnStatus,
+            "ignoredTouchedPaths": ignoredTouchedPaths,
+            "changedFiles": changedFiles.map { $0.toJSON() }
+        ]
+        if let associatedMessageID {
+            json["associatedMessageID"] = associatedMessageID
+        }
+        if let associatedTurnID {
+            json["associatedTurnID"] = associatedTurnID
+        }
+        if let associatedUserMessageID {
+            json["associatedUserMessageID"] = associatedUserMessageID
+        }
+        if let associatedUserAnchorID {
+            json["associatedUserAnchorID"] = associatedUserAnchorID
+        }
+        return json
+    }
+}
+
+struct AssistantChatWebRewindState: Equatable {
+    let kind: String
+    let canStepBackward: Bool
+    let redoHostMessageID: String?
+
+    func toJSON() -> [String: Any] {
+        var json: [String: Any] = [
+            "kind": kind,
+            "canStepBackward": canStepBackward
+        ]
+        if let redoHostMessageID {
+            json["redoHostMessageID"] = redoHostMessageID
+        }
+        return json
+    }
+}
+
+struct AssistantChatWebRuntimeBackendOption: Equatable {
+    let id: String
+    let label: String
+    let isSelected: Bool
+    let isDisabled: Bool
+
+    func toJSON() -> [String: Any] {
+        [
+            "id": id,
+            "label": label,
+            "isSelected": isSelected,
+            "isDisabled": isDisabled
+        ]
+    }
+}
+
+struct AssistantChatWebRuntimePanel: Equatable {
+    let tone: String
+    let statusSummary: String
+    let statusDetail: String?
+    let accountSummary: String?
+    let backendHelpText: String?
+    let backends: [AssistantChatWebRuntimeBackendOption]
+    let setupButtonTitle: String?
+
+    func toJSON() -> [String: Any] {
+        var json: [String: Any] = [
+            "tone": tone,
+            "statusSummary": statusSummary,
+            "backends": backends.map { $0.toJSON() }
+        ]
+        if let statusDetail {
+            json["statusDetail"] = statusDetail
+        }
+        if let accountSummary {
+            json["accountSummary"] = accountSummary
+        }
+        if let backendHelpText {
+            json["backendHelpText"] = backendHelpText
+        }
+        if let setupButtonTitle {
+            json["setupButtonTitle"] = setupButtonTitle
+        }
+        return json
+    }
+}
+
+struct AssistantChatWebCodeReviewPanel: Equatable {
+    let repoLabel: String
+    let repoRootPath: String
+    let currentCheckpointPosition: Int
+    let selectedCheckpointID: String
+    let hasActiveTurn: Bool
+    let actionsLocked: Bool
+    let embedded: Bool
+    let checkpoints: [AssistantChatWebCodeReviewCheckpoint]
+
+    func toJSON() -> [String: Any] {
+        [
+            "repoLabel": repoLabel,
+            "repoRootPath": repoRootPath,
+            "currentCheckpointPosition": currentCheckpointPosition,
+            "selectedCheckpointID": selectedCheckpointID,
+            "hasActiveTurn": hasActiveTurn,
+            "actionsLocked": actionsLocked,
+            "embedded": embedded,
+            "checkpoints": checkpoints.map { $0.toJSON() }
+        ]
+    }
+}
+
+extension AssistantChatWebCodeReviewPanel {
+    init?(state: AssistantCodeReviewPanelState, hasActiveTurn: Bool, actionsLocked: Bool = false, embedded: Bool = false) {
+        guard !state.checkpoints.isEmpty else { return nil }
+        self.init(
+            repoLabel: state.repoLabel,
+            repoRootPath: state.repoRootPath,
+            currentCheckpointPosition: state.currentCheckpointPosition,
+            selectedCheckpointID: state.selectedCheckpointID,
+            hasActiveTurn: hasActiveTurn,
+            actionsLocked: actionsLocked,
+            embedded: embedded,
+            checkpoints: state.checkpoints.map { checkpoint in
+                AssistantChatWebCodeReviewCheckpoint(
+                    id: checkpoint.id,
+                    checkpointNumber: checkpoint.checkpointNumber,
+                    createdAt: checkpoint.createdAt,
+                    summary: checkpoint.summary,
+                    patch: checkpoint.patch,
+                    turnStatus: checkpoint.turnStatus.rawValue,
+                    ignoredTouchedPaths: checkpoint.ignoredTouchedPaths,
+                    changedFiles: checkpoint.changedFiles.map { file in
+                        AssistantChatWebCodeReviewFile(
+                            path: file.path,
+                            changeKind: file.changeKind.rawValue,
+                            isBinary: file.isBinary
+                        )
+                    },
+                    associatedMessageID: checkpoint.associatedMessageID,
+                    associatedTurnID: checkpoint.associatedTurnID,
+                    associatedUserMessageID: checkpoint.associatedUserMessageID,
+                    associatedUserAnchorID: checkpoint.associatedUserAnchorID
+                )
+            }
+        )
+    }
+
+    init?(trackingState: AssistantCodeTrackingState, hasActiveTurn: Bool, actionsLocked: Bool = false, embedded: Bool = false) {
+        guard trackingState.availability == .available,
+              let repoRootPath = trackingState.repoRootPath,
+              let repoLabel = trackingState.repoLabel,
+              !trackingState.checkpoints.isEmpty else {
+            return nil
+        }
+
+        let nextCheckpointID = trackingState.checkpoints.indices.contains(trackingState.currentCheckpointPosition + 1)
+            ? trackingState.checkpoints[trackingState.currentCheckpointPosition + 1].id
+            : nil
+        let selectedCheckpointID = trackingState.currentCheckpoint?.id
+            ?? nextCheckpointID
+            ?? trackingState.latestCheckpoint?.id
+            ?? trackingState.checkpoints.last?.id
+        guard let selectedCheckpointID else { return nil }
+
+        self.init(
+            repoLabel: repoLabel,
+            repoRootPath: repoRootPath,
+            currentCheckpointPosition: trackingState.currentCheckpointPosition,
+            selectedCheckpointID: selectedCheckpointID,
+            hasActiveTurn: hasActiveTurn,
+            actionsLocked: actionsLocked,
+            embedded: embedded,
+            checkpoints: trackingState.checkpoints.map { checkpoint in
+                AssistantChatWebCodeReviewCheckpoint(
+                    id: checkpoint.id,
+                    checkpointNumber: checkpoint.checkpointNumber,
+                    createdAt: checkpoint.createdAt,
+                    summary: checkpoint.summary,
+                    patch: checkpoint.patch,
+                    turnStatus: checkpoint.turnStatus.rawValue,
+                    ignoredTouchedPaths: checkpoint.ignoredTouchedPaths,
+                    changedFiles: checkpoint.changedFiles.map { file in
+                        AssistantChatWebCodeReviewFile(
+                            path: file.path,
+                            changeKind: file.changeKind.rawValue,
+                            isBinary: file.isBinary
+                        )
+                    },
+                    associatedMessageID: checkpoint.associatedMessageID,
+                    associatedTurnID: checkpoint.associatedTurnID,
+                    associatedUserMessageID: checkpoint.associatedUserMessageID,
+                    associatedUserAnchorID: checkpoint.associatedUserAnchorID
+                )
+            }
+        )
+    }
+}
+
 struct AssistantChatWebRenderContext {
     let pendingPermissionRequest: AssistantPermissionRequest?
     let activeRuntimeSessionID: String?
     let hasActiveTurn: Bool
     let sessionStatusByNormalizedID: [String: AssistantSessionStatus]
+    let sessionWorkingDirectoryByNormalizedID: [String: String]
 
     func sessionStatus(for sessionID: String?) -> AssistantSessionStatus? {
         guard let normalizedSessionID = sessionID?
@@ -184,6 +465,16 @@ struct AssistantChatWebRenderContext {
             sessionID: sessionID,
             activeRuntimeSessionID: activeRuntimeSessionID
         ) && hasActiveTurn
+    }
+
+    func sessionWorkingDirectory(for sessionID: String?) -> String? {
+        guard let normalizedSessionID = sessionID?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased(),
+              !normalizedSessionID.isEmpty else {
+            return nil
+        }
+        return sessionWorkingDirectoryByNormalizedID[normalizedSessionID]
     }
 }
 
@@ -231,13 +522,74 @@ private func assistantChatWebDetailSections(
     return sections
 }
 
+private func assistantPermissionActivityPresentation(
+    text: String?,
+    request: AssistantPermissionRequest?
+) -> (title: String, detail: String?, detailSections: [AssistantChatWebDetailSection]?) {
+    let title = request?.toolTitle.trimmingCharacters(in: .whitespacesAndNewlines).assistantNonEmpty
+        ?? "Permission Request"
+    let rawText = text?.trimmingCharacters(in: .whitespacesAndNewlines).assistantNonEmpty
+    let summaryText = request?.rawPayloadSummary?.trimmingCharacters(in: .whitespacesAndNewlines).assistantNonEmpty
+    let rationaleText = request?.rationale?.trimmingCharacters(in: .whitespacesAndNewlines).assistantNonEmpty
+
+    let inlineCandidates: [String?] = [summaryText, rationaleText, rawText]
+    let preferredInlineDetail = inlineCandidates.compactMap { candidate -> String? in
+        guard let candidate else { return nil }
+        guard !assistantLooksLikeUnifiedDiff(candidate), !candidate.contains("\n") else {
+            return nil
+        }
+        return assistantFormattedActivityDetailText(candidate)
+    }.first
+
+    let shouldSummarizeAsFileChanges =
+        request?.toolKind == "fileChange"
+        || assistantLooksLikeUnifiedDiff(rawText)
+        || assistantLooksLikeUnifiedDiff(summaryText)
+
+    let detail = preferredInlineDetail
+        ?? (shouldSummarizeAsFileChanges ? "Review the proposed file changes." : nil)
+
+    let expandedCandidates: [String?] = [rawText, summaryText, rationaleText]
+    let expandedDetailsSource = expandedCandidates.compactMap { candidate -> String? in
+        guard let candidate else { return nil }
+        if assistantLooksLikeUnifiedDiff(candidate) || candidate.count > 160 || candidate.contains("\n") {
+            return candidate
+        }
+        return nil
+    }.first
+
+    let detailSections = assistantChatWebDetailSections(from: expandedDetailsSource)
+    return (
+        title,
+        detail,
+        detailSections.isEmpty ? nil : detailSections
+    )
+}
+
+private func assistantChatWebActivityTargets(
+    from openTargets: [AssistantActivityOpenTarget]
+) -> [AssistantChatWebActivityTarget] {
+    openTargets.map {
+        AssistantChatWebActivityTarget(
+            kind: $0.kind.rawValue,
+            label: $0.label,
+            detail: $0.detail
+        )
+    }
+}
+
 // MARK: - Coordinator
 
 final class AssistantChatWebCoordinator: NSObject, WKScriptMessageHandler {
     var onScrollStateChanged: (Bool, Bool) -> Void
     var onLoadOlderHistory: () -> Void
+    var onSelectRuntimeBackend: (String) -> Void
+    var onOpenRuntimeSettings: () -> Void
     var onUndoMessage: (String) -> Void
     var onEditMessage: (String) -> Void
+    var onUndoCodeCheckpoint: () -> Void
+    var onRedoHistoryMutation: () -> Void
+    var onCloseCodeReviewPanel: () -> Void
     var onTextSelected: ((String, String, String, CGRect) -> Void)? // selectedText, messageID, parentText, screenRect
     weak var webViewContainer: AssistantChatWebContainerView?
     private let imageQuickLookController = AssistantChatImageQuickLookController()
@@ -245,13 +597,23 @@ final class AssistantChatWebCoordinator: NSObject, WKScriptMessageHandler {
     init(
         onScrollStateChanged: @escaping (Bool, Bool) -> Void,
         onLoadOlderHistory: @escaping () -> Void,
+        onSelectRuntimeBackend: @escaping (String) -> Void,
+        onOpenRuntimeSettings: @escaping () -> Void,
         onUndoMessage: @escaping (String) -> Void,
-        onEditMessage: @escaping (String) -> Void
+        onEditMessage: @escaping (String) -> Void,
+        onUndoCodeCheckpoint: @escaping () -> Void,
+        onRedoHistoryMutation: @escaping () -> Void,
+        onCloseCodeReviewPanel: @escaping () -> Void
     ) {
         self.onScrollStateChanged = onScrollStateChanged
         self.onLoadOlderHistory = onLoadOlderHistory
+        self.onSelectRuntimeBackend = onSelectRuntimeBackend
+        self.onOpenRuntimeSettings = onOpenRuntimeSettings
         self.onUndoMessage = onUndoMessage
         self.onEditMessage = onEditMessage
+        self.onUndoCodeCheckpoint = onUndoCodeCheckpoint
+        self.onRedoHistoryMutation = onRedoHistoryMutation
+        self.onCloseCodeReviewPanel = onCloseCodeReviewPanel
     }
 
     func userContentController(
@@ -270,6 +632,16 @@ final class AssistantChatWebCoordinator: NSObject, WKScriptMessageHandler {
         case "loadOlderHistory":
             DispatchQueue.main.async { [self] in
                 onLoadOlderHistory()
+            }
+        case "selectRuntimeBackend":
+            if let backendID = message.body as? String {
+                DispatchQueue.main.async { [self] in
+                    onSelectRuntimeBackend(backendID)
+                }
+            }
+        case "openRuntimeSettings":
+            DispatchQueue.main.async { [self] in
+                onOpenRuntimeSettings()
             }
         case "linkClicked":
             if let urlString = message.body as? String {
@@ -321,27 +693,27 @@ final class AssistantChatWebCoordinator: NSObject, WKScriptMessageHandler {
                     onEditMessage(anchorID)
                 }
             }
+        case "undoCodeCheckpoint":
+            CrashReporter.logInfo("Assistant chat web received undoCodeCheckpoint")
+            DispatchQueue.main.async { [self] in
+                onUndoCodeCheckpoint()
+            }
+        case "redoHistoryMutation":
+            CrashReporter.logInfo("Assistant chat web received redoHistoryMutation")
+            DispatchQueue.main.async { [self] in
+                onRedoHistoryMutation()
+            }
+        case "closeCodeReviewPanel":
+            DispatchQueue.main.async { [self] in
+                onCloseCodeReviewPanel()
+            }
         default:
             break
         }
     }
 
     func handleLinkClick(_ urlString: String) {
-        guard let url = URL(string: urlString) else { return }
-        let scheme = url.scheme?.lowercased() ?? ""
-        if scheme == "http" || scheme == "https" {
-            NSWorkspace.shared.open(url)
-            return
-        }
-        let path = url.path
-        if (scheme == "file" || scheme.isEmpty), !path.isEmpty {
-            if let vscodeURL = URL(string: "vscode://file\(path)"),
-               NSWorkspace.shared.urlForApplication(toOpen: vscodeURL) != nil {
-                NSWorkspace.shared.open(vscodeURL)
-                return
-            }
-            NSWorkspace.shared.open(URL(fileURLWithPath: path))
-        }
+        AssistantWorkspaceFileOpener.openLink(urlString)
     }
 
     private func openImageInQuickLook(dataURLString: String, suggestedName: String?) {
@@ -514,6 +886,20 @@ final class AssistantChatWebContainerView: NSView, WKNavigationDelegate {
     private var pendingTyping: (Bool, String, String)?
     private var pendingTextScale: CGFloat?
     private var pendingCanLoadOlderHistory: Bool?
+    private var pendingRuntimePanel: AssistantChatWebRuntimePanel?
+    private var pendingReviewPanel: AssistantChatWebCodeReviewPanel?
+    private var pendingRewindState: AssistantChatWebRewindState?
+    private var pendingAccentCSS: String?
+    private var lastAppliedTyping: (Bool, String, String)?
+    private var lastAppliedTextScale: CGFloat?
+    private var lastAppliedCanLoadOlderHistory: Bool?
+    private var lastAppliedRuntimePanel: AssistantChatWebRuntimePanel?
+    private var hasAppliedRuntimePanel = false
+    private var lastAppliedReviewPanel: AssistantChatWebCodeReviewPanel?
+    private var hasAppliedReviewPanel = false
+    private var lastAppliedRewindState: AssistantChatWebRewindState?
+    private var hasAppliedRewindState = false
+    private var lastAppliedAccentCSS: String?
 
     // Throttling for streaming updates
     private var throttleTimer: Timer?
@@ -529,12 +915,17 @@ final class AssistantChatWebContainerView: NSView, WKNavigationDelegate {
         let uc = config.userContentController
         uc.add(coordinator, name: "scrollState")
         uc.add(coordinator, name: "loadOlderHistory")
+        uc.add(coordinator, name: "selectRuntimeBackend")
+        uc.add(coordinator, name: "openRuntimeSettings")
         uc.add(coordinator, name: "linkClicked")
         uc.add(coordinator, name: "copyText")
         uc.add(coordinator, name: "openImage")
         uc.add(coordinator, name: "textSelected")
         uc.add(coordinator, name: "undoMessage")
         uc.add(coordinator, name: "editMessage")
+        uc.add(coordinator, name: "undoCodeCheckpoint")
+        uc.add(coordinator, name: "redoHistoryMutation")
+        uc.add(coordinator, name: "closeCodeReviewPanel")
 
         let webView = WKWebView(frame: .zero, configuration: config)
         webView.setValue(false, forKey: "drawsBackground")
@@ -570,6 +961,18 @@ final class AssistantChatWebContainerView: NSView, WKNavigationDelegate {
             if let canLoadOlderHistory = self.pendingCanLoadOlderHistory {
                 self.webView.evaluateJavaScript("chatBridge.setCanLoadOlder(\(canLoadOlderHistory))", completionHandler: nil)
                 self.pendingCanLoadOlderHistory = nil
+            }
+            if let runtimePanel = self.pendingRuntimePanel {
+                self.sendRuntimePanel(runtimePanel)
+                self.pendingRuntimePanel = nil
+            }
+            if let reviewPanel = self.pendingReviewPanel {
+                self.sendReviewPanel(reviewPanel)
+                self.pendingReviewPanel = nil
+            }
+            if let rewindState = self.pendingRewindState {
+                self.sendRewindState(rewindState)
+                self.pendingRewindState = nil
             }
         }
         uc.add(readyHandler, name: "ready")
@@ -679,11 +1082,46 @@ final class AssistantChatWebContainerView: NSView, WKNavigationDelegate {
         }
     }
 
+    func applyReviewPanel(_ reviewPanel: AssistantChatWebCodeReviewPanel?) {
+        if hasAppliedReviewPanel, lastAppliedReviewPanel == reviewPanel {
+            return
+        }
+        hasAppliedReviewPanel = true
+        lastAppliedReviewPanel = reviewPanel
+        sendReviewPanel(reviewPanel)
+    }
+
+    func applyRuntimePanel(_ runtimePanel: AssistantChatWebRuntimePanel?) {
+        if hasAppliedRuntimePanel, lastAppliedRuntimePanel == runtimePanel {
+            return
+        }
+        hasAppliedRuntimePanel = true
+        lastAppliedRuntimePanel = runtimePanel
+        sendRuntimePanel(runtimePanel)
+    }
+
+    func applyRewindState(_ rewindState: AssistantChatWebRewindState?) {
+        if hasAppliedRewindState, lastAppliedRewindState == rewindState {
+            return
+        }
+        hasAppliedRewindState = true
+        lastAppliedRewindState = rewindState
+        sendRewindState(rewindState)
+    }
+
     func applyTypingIndicator(_ visible: Bool, title: String, detail: String) {
+        let nextTyping = (visible, title, detail)
+        if let lastAppliedTyping,
+           lastAppliedTyping == nextTyping {
+            return
+        }
+        lastAppliedTyping = nextTyping
         sendTypingIndicator(visible, title: title, detail: detail)
     }
 
     func applyTextScale(_ scale: CGFloat) {
+        guard lastAppliedTextScale != scale else { return }
+        lastAppliedTextScale = scale
         sendTextScale(scale)
     }
 
@@ -693,7 +1131,28 @@ final class AssistantChatWebContainerView: NSView, WKNavigationDelegate {
         nsColor.usingColorSpace(.sRGB)?.getRed(&r, green: &g, blue: &b, alpha: &a)
         let ri = Int(r * 255), gi = Int(g * 255), bi = Int(b * 255)
         let css = "rgb(\(ri),\(gi),\(bi))"
-        let js = "document.documentElement.style.setProperty('--chat-accent', '\(css)')"
+        let accentSoft = "rgba(\(ri),\(gi),\(bi),0.10)"
+        let accentStrong = "rgba(\(ri),\(gi),\(bi),0.92)"
+        let checkpointHeader = "rgba(\(ri),\(gi),\(bi),0.03)"
+        let checkpointCurrentHeader = "rgba(\(ri),\(gi),\(bi),0.09)"
+        let checkpointCurrentBorder = "rgba(\(ri),\(gi),\(bi),0.15)"
+        let checkpointCurrentText = "rgba(\(ri),\(gi),\(bi),0.95)"
+        let checkpointCurrentPill = "rgba(\(ri),\(gi),\(bi),0.12)"
+        let js = """
+        (() => {
+          const root = document.documentElement.style;
+          root.setProperty('--chat-accent', '\(css)');
+          root.setProperty('--chat-accent-soft', '\(accentSoft)');
+          root.setProperty('--chat-accent-strong', '\(accentStrong)');
+          root.setProperty('--chat-checkpoint-header', '\(checkpointHeader)');
+          root.setProperty('--chat-checkpoint-current-header', '\(checkpointCurrentHeader)');
+          root.setProperty('--chat-checkpoint-current-border', '\(checkpointCurrentBorder)');
+          root.setProperty('--chat-checkpoint-current-text', '\(checkpointCurrentText)');
+          root.setProperty('--chat-checkpoint-current-pill', '\(checkpointCurrentPill)');
+        })();
+        """
+        guard lastAppliedAccentCSS != js else { return }
+        lastAppliedAccentCSS = js
         guard isReady else {
             pendingAccentCSS = js
             return
@@ -701,9 +1160,9 @@ final class AssistantChatWebContainerView: NSView, WKNavigationDelegate {
         webView.evaluateJavaScript(js, completionHandler: nil)
     }
 
-    private var pendingAccentCSS: String?
-
     func applyCanLoadOlder(_ canLoad: Bool) {
+        guard lastAppliedCanLoadOlderHistory != canLoad else { return }
+        lastAppliedCanLoadOlderHistory = canLoad
         guard isReady else {
             pendingCanLoadOlderHistory = canLoad
             return
@@ -714,6 +1173,18 @@ final class AssistantChatWebContainerView: NSView, WKNavigationDelegate {
     func scrollToBottom(animated: Bool) {
         guard isReady else { return }
         webView.evaluateJavaScript("chatBridge.scrollToBottom(\(animated))", completionHandler: nil)
+    }
+
+    func revealMessage(id: String, animated: Bool, expand: Bool) {
+        guard isReady,
+              let encodedID = try? JSONEncoder().encode(id),
+              let idString = String(data: encodedID, encoding: .utf8) else {
+            return
+        }
+        webView.evaluateJavaScript(
+            "chatBridge.revealMessage?.(\(idString), \(animated), \(expand))",
+            completionHandler: nil
+        )
     }
 
     // MARK: - Throttled Streaming
@@ -820,6 +1291,71 @@ final class AssistantChatWebContainerView: NSView, WKNavigationDelegate {
         webView.evaluateJavaScript("chatBridge.setTextScale(\(scale))", completionHandler: nil)
     }
 
+    private func sendReviewPanel(_ reviewPanel: AssistantChatWebCodeReviewPanel?) {
+        guard isReady else {
+            pendingReviewPanel = reviewPanel
+            return
+        }
+
+        guard let reviewPanel else {
+            webView.evaluateJavaScript("chatBridge.setCodeReviewPanel(null)", completionHandler: nil)
+            return
+        }
+
+        guard let data = try? JSONSerialization.data(withJSONObject: reviewPanel.toJSON()),
+              let jsonString = String(data: data, encoding: .utf8) else {
+            return
+        }
+        webView.evaluateJavaScript(
+            "chatBridge.setCodeReviewPanel(\(jsonString))",
+            completionHandler: nil
+        )
+    }
+
+    private func sendRuntimePanel(_ runtimePanel: AssistantChatWebRuntimePanel?) {
+        guard isReady else {
+            pendingRuntimePanel = runtimePanel
+            return
+        }
+
+        guard let runtimePanel else {
+            webView.evaluateJavaScript("chatBridge.setRuntimePanel(null)", completionHandler: nil)
+            return
+        }
+
+        guard let data = try? JSONSerialization.data(withJSONObject: runtimePanel.toJSON()),
+              let jsonString = String(data: data, encoding: .utf8) else {
+            return
+        }
+
+        webView.evaluateJavaScript(
+            "chatBridge.setRuntimePanel(\(jsonString))",
+            completionHandler: nil
+        )
+    }
+
+    private func sendRewindState(_ rewindState: AssistantChatWebRewindState?) {
+        guard isReady else {
+            pendingRewindState = rewindState
+            return
+        }
+
+        guard let rewindState else {
+            webView.evaluateJavaScript("chatBridge.setRewindState(null)", completionHandler: nil)
+            return
+        }
+
+        guard let data = try? JSONSerialization.data(withJSONObject: rewindState.toJSON()),
+              let jsonString = String(data: data, encoding: .utf8) else {
+            return
+        }
+
+        webView.evaluateJavaScript(
+            "chatBridge.setRewindState(\(jsonString))",
+            completionHandler: nil
+        )
+    }
+
     // MARK: - Navigation Delegate
 
     func webView(
@@ -853,17 +1389,20 @@ private extension AssistantChatWebMessage {
             text: text,
             isStreaming: isStreaming,
             timestamp: timestamp,
+            turnID: turnID,
             images: images,
             emphasis: emphasis,
             canUndo: canUndo,
             canEdit: canEdit,
             rewriteAnchorID: rewriteAnchorID,
+            providerLabel: providerLabel,
             activityIcon: activityIcon,
             activityTitle: activityTitle,
             activityDetail: activityDetail,
             activityStatus: activityStatus,
             activityStatusLabel: activityStatusLabel,
             detailSections: detailSections,
+            activityTargets: activityTargets,
             groupItems: groupItems
         )
     }
@@ -916,6 +1455,7 @@ extension AssistantChatWebMessage {
         let activityTitle: String?
         let activityDetail: String?
         let detailSections: [AssistantChatWebDetailSection]?
+        let activityTargets: [AssistantChatWebActivityTarget]?
 
         switch item.kind {
         case .userMessage:
@@ -926,6 +1466,7 @@ extension AssistantChatWebMessage {
             activityTitle = nil
             activityDetail = nil
             detailSections = nil
+            activityTargets = nil
         case .assistantProgress, .assistantFinal:
             type = "assistant"
             activityIcon = nil
@@ -934,6 +1475,7 @@ extension AssistantChatWebMessage {
             activityTitle = nil
             activityDetail = nil
             detailSections = nil
+            activityTargets = nil
         case .activity:
             type = "activity"
             let activity = item.activity
@@ -950,11 +1492,27 @@ extension AssistantChatWebMessage {
             activityStatus = effectiveStatus.map { Self.activityStatusString(for: $0) }
             activityStatusLabel = effectiveStatus?.rawValue.capitalized
             detailSections = assistantChatWebDetailSections(from: activity?.rawDetails)
+            if let activity {
+                activityTargets = assistantChatWebActivityTargets(
+                    from: assistantActivityOpenTargets(
+                        for: activity,
+                        sessionCWD: renderContext?.sessionWorkingDirectory(
+                            for: item.sessionID ?? activity.sessionID
+                        )
+                    )
+                )
+            } else {
+                activityTargets = nil
+            }
         case .permission:
             type = "activity"
             activityIcon = "permission"
-            activityTitle = "Permission Request"
-            activityDetail = item.text
+            let permissionPresentation = assistantPermissionActivityPresentation(
+                text: item.text,
+                request: item.permissionRequest
+            )
+            activityTitle = permissionPresentation.title
+            activityDetail = permissionPresentation.detail
             if let request = item.permissionRequest {
                 let state = assistantPermissionCardState(
                     for: request,
@@ -976,7 +1534,8 @@ extension AssistantChatWebMessage {
                 activityStatus = "completed"
                 activityStatusLabel = "Handled"
             }
-            detailSections = nil
+            detailSections = permissionPresentation.detailSections
+            activityTargets = nil
         case .plan:
             type = "assistant"
             activityIcon = nil
@@ -985,6 +1544,7 @@ extension AssistantChatWebMessage {
             activityTitle = nil
             activityDetail = nil
             detailSections = nil
+            activityTargets = nil
         case .system:
             type = "system"
             activityIcon = nil
@@ -993,6 +1553,7 @@ extension AssistantChatWebMessage {
             activityTitle = nil
             activityDetail = nil
             detailSections = nil
+            activityTargets = nil
         }
 
         let text: String?
@@ -1001,6 +1562,13 @@ extension AssistantChatWebMessage {
         } else {
             text = item.text.flatMap { AssistantVisibleTextSanitizer.clean($0) }
         }
+        let providerLabel: String?
+        switch item.kind {
+        case .assistantProgress, .assistantFinal, .plan:
+            providerLabel = item.providerBackend?.shortDisplayName
+        case .userMessage, .activity, .permission, .system:
+            providerLabel = nil
+        }
 
         return AssistantChatWebMessage(
             id: item.id,
@@ -1008,17 +1576,20 @@ extension AssistantChatWebMessage {
             text: text,
             isStreaming: item.isStreaming,
             timestamp: item.sortDate,
+            turnID: item.turnID?.nonEmpty,
             images: item.imageAttachments,
             emphasis: item.emphasis,
             canUndo: historyAction?.canUndo ?? false,
             canEdit: historyAction?.canEdit ?? false,
             rewriteAnchorID: historyAction?.anchorID,
+            providerLabel: providerLabel,
             activityIcon: activityIcon,
             activityTitle: activityTitle,
             activityDetail: activityDetail,
             activityStatus: activityStatus,
             activityStatusLabel: activityStatusLabel,
             detailSections: detailSections?.isEmpty == false ? detailSections : nil,
+            activityTargets: activityTargets?.isEmpty == false ? activityTargets : nil,
             groupItems: nil
         )
     }
@@ -1036,6 +1607,16 @@ extension AssistantChatWebMessage {
                     renderContext: renderContext
                 )
             } ?? .completed
+            let activityTargets = activity.map {
+                assistantChatWebActivityTargets(
+                    from: assistantActivityOpenTargets(
+                        for: $0,
+                        sessionCWD: renderContext?.sessionWorkingDirectory(
+                            for: item.sessionID ?? $0.sessionID
+                        )
+                    )
+                )
+            }
             return AssistantChatWebActivityGroupItem(
                 id: item.id,
                 icon: activity.map { iconForActivityKind($0.kind) },
@@ -1044,7 +1625,8 @@ extension AssistantChatWebMessage {
                 status: activityStatusString(for: effectiveStatus),
                 statusLabel: effectiveStatus.rawValue.capitalized,
                 timestamp: item.sortDate,
-                detailSections: assistantChatWebDetailSections(from: activity?.rawDetails)
+                detailSections: assistantChatWebDetailSections(from: activity?.rawDetails),
+                activityTargets: activityTargets?.isEmpty == false ? activityTargets : nil
             )
         }
 
@@ -1054,17 +1636,20 @@ extension AssistantChatWebMessage {
             text: nil,
             isStreaming: false,
             timestamp: group.items.first?.sortDate ?? Date(),
+            turnID: nil,
             images: nil,
             emphasis: false,
             canUndo: false,
             canEdit: false,
             rewriteAnchorID: nil,
+            providerLabel: nil,
             activityIcon: nil,
             activityTitle: nil,
             activityDetail: nil,
             activityStatus: nil,
             activityStatusLabel: nil,
             detailSections: nil,
+            activityTargets: nil,
             groupItems: groupItems
         )
     }

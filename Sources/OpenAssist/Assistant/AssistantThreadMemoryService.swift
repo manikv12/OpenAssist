@@ -134,26 +134,58 @@ final class AssistantThreadMemoryService {
         guard !normalizedPrompt.isEmpty else { return false }
 
         let explicitResetPhrases = [
-            "restart", "start over", "redo", "ignore that", "do something else",
-            "before that", "instead", "new task", "switch to"
+            "restart",
+            "start over",
+            "redo from scratch",
+            "ignore that",
+            "forget that",
+            "do something else",
+            "different task",
+            "new task",
+            "switch to",
+            "move on to"
         ]
         if explicitResetPhrases.contains(where: { normalizedPrompt.contains($0) }) {
-            return true
-        }
-
-        if normalizedPrompt.contains("again") || normalizedPrompt.contains("retry") {
             return true
         }
 
         let currentTask = document.currentTask.lowercased()
         guard !currentTask.isEmpty else { return false }
 
+        let promptWordCount = normalizedPrompt.split(whereSeparator: \.isWhitespace).count
+        let continuationPhrases = [
+            "continue",
+            "keep going",
+            "go on",
+            "next step",
+            "what next",
+            "can you also",
+            "also",
+            "then",
+            "try again",
+            "retry",
+            "again",
+            "with more",
+            "instead"
+        ]
+        if promptWordCount <= 4 || continuationPhrases.contains(where: { normalizedPrompt.contains($0) }) {
+            return false
+        }
+
         let currentKeywords = Set(MemoryTextNormalizer.keywords(from: currentTask, limit: 12))
         let promptKeywords = Set(MemoryTextNormalizer.keywords(from: normalizedPrompt, limit: 12))
         guard !currentKeywords.isEmpty, !promptKeywords.isEmpty else { return false }
 
         let sharedCount = currentKeywords.intersection(promptKeywords).count
-        return sharedCount <= 1 && currentKeywords != promptKeywords
+        let promptHasEnoughSignal = promptKeywords.count >= 3
+        let currentHasEnoughSignal = currentKeywords.count >= 3
+        guard promptHasEnoughSignal, currentHasEnoughSignal else {
+            return false
+        }
+
+        // Only reset when the prompt looks like a clearly different task,
+        // not for normal follow-ups that happen to use different wording.
+        return sharedCount == 0
     }
 
     @discardableResult

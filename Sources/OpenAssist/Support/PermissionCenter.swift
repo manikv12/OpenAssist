@@ -2,11 +2,11 @@ import AppKit
 import AVFoundation
 import CoreGraphics
 import CoreServices
+import Foundation
 import Speech
 
-@MainActor
 enum PermissionCenter {
-    struct AutomationTarget: Identifiable, Hashable {
+    struct AutomationTarget: Identifiable, Hashable, Sendable {
         let id: String
         let displayName: String
         let bundleIdentifiers: [String]
@@ -52,7 +52,7 @@ enum PermissionCenter {
         var needsManualEnableInSettings: Bool { state == .denied }
     }
 
-    struct Snapshot {
+    struct Snapshot: Sendable {
         let accessibilityGranted: Bool
         let microphoneGranted: Bool
         let speechRecognitionGranted: Bool
@@ -136,8 +136,19 @@ enum PermissionCenter {
         )
     ]
 
+    @MainActor
     static func snapshot(
         using settings: SettingsStore,
+        includeExtendedPermissions: Bool = true
+    ) -> Snapshot {
+        snapshot(
+            speechRecognitionRequired: settings.transcriptionEngine == .appleSpeech,
+            includeExtendedPermissions: includeExtendedPermissions
+        )
+    }
+
+    static func snapshot(
+        speechRecognitionRequired: Bool,
         includeExtendedPermissions: Bool = true
     ) -> Snapshot {
         let accessibilityGranted = AXIsProcessTrusted()
@@ -151,7 +162,7 @@ enum PermissionCenter {
             accessibilityGranted: accessibilityGranted,
             microphoneGranted: AVCaptureDevice.authorizationStatus(for: .audio) == .authorized,
             speechRecognitionGranted: SFSpeechRecognizer.authorizationStatus() == .authorized,
-            speechRecognitionRequired: settings.transcriptionEngine == .appleSpeech,
+            speechRecognitionRequired: speechRecognitionRequired,
             screenRecordingGranted: CGPreflightScreenCaptureAccess(),
             appleEventsGranted: appleEvents.granted,
             appleEventsKnown: appleEvents.known,
@@ -160,6 +171,7 @@ enum PermissionCenter {
         )
     }
 
+    @MainActor
     static func requestAccessibilityPermission(
         using settings: SettingsStore,
         promptIfNeeded: Bool = true,
@@ -274,14 +286,22 @@ enum PermissionCenter {
     }
 
     static func openPrivacySettingsPane(query: String) {
-        for url in privacySettingsURLs(query: query) {
-            if NSWorkspace.shared.open(url) {
-                return
+        let openPane = {
+            for url in privacySettingsURLs(query: query) {
+                if NSWorkspace.shared.open(url) {
+                    return
+                }
             }
+
+            let legacySecurityPaneURL = URL(fileURLWithPath: "/System/Library/PreferencePanes/Security.prefPane")
+            _ = NSWorkspace.shared.open(legacySecurityPaneURL)
         }
 
-        let legacySecurityPaneURL = URL(fileURLWithPath: "/System/Library/PreferencePanes/Security.prefPane")
-        _ = NSWorkspace.shared.open(legacySecurityPaneURL)
+        if Thread.isMainThread {
+            openPane()
+        } else {
+            DispatchQueue.main.async(execute: openPane)
+        }
     }
 
     static func openFullDiskAccessSettings() {

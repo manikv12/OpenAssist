@@ -63,6 +63,24 @@ final class AssistantSessionSummaryTests: XCTestCase {
         XCTAssertTrue(appServer.isLocalSession)
     }
 
+    func testCatalogHistorySupportExcludesCLIBackedSessions() {
+        let cli = AssistantSessionSummary(
+            id: "cli-1",
+            title: "CLI",
+            source: .cli,
+            status: .active
+        )
+        let appServer = AssistantSessionSummary(
+            id: "server-1",
+            title: "Open Assist",
+            source: .appServer,
+            status: .completed
+        )
+
+        XCTAssertFalse(cli.supportsCatalogHistory)
+        XCTAssertTrue(appServer.supportsCatalogHistory)
+    }
+
     func testStatusSupportsCurrentCodexSessionStates() {
         let approval = AssistantSessionSummary(
             id: "approval-1",
@@ -93,5 +111,164 @@ final class AssistantSessionSummaryTests: XCTestCase {
     func testHUDShortLabelReflectsPhase() {
         let state = AssistantHUDState(phase: .waitingForPermission, title: "Permission needed", detail: "Write file")
         XCTAssertEqual(state.shortLabel, "Waiting")
+    }
+
+    func testProviderIndependentThreadPrefersActiveProviderBindingMetadata() {
+        let summary = AssistantSessionSummary(
+            id: "openassist-v2-thread",
+            title: "V2",
+            source: .openAssist,
+            threadArchitectureVersion: .providerIndependentV2,
+            activeProvider: .copilot,
+            providerBindingsByBackend: [
+                AssistantProviderBinding(
+                    backend: .codex,
+                    providerSessionID: "codex-1",
+                    latestModelID: "gpt-5.4"
+                ),
+                AssistantProviderBinding(
+                    backend: .copilot,
+                    providerSessionID: "copilot-1",
+                    latestModelID: "gemini-3-pro-preview"
+                )
+            ],
+            status: .idle,
+            latestModel: "legacy-model"
+        )
+
+        XCTAssertTrue(summary.isProviderIndependentThreadV2)
+        XCTAssertEqual(summary.activeProviderBackend, .copilot)
+        XCTAssertEqual(summary.activeProviderSessionID, "copilot-1")
+        XCTAssertEqual(summary.modelID, "gemini-3-pro-preview")
+    }
+
+    func testOnlyProviderIndependentThreadsAppearInModernSidebar() {
+        let legacyThread = AssistantSessionSummary(
+            id: "openassist-legacy",
+            title: "Legacy",
+            source: .openAssist,
+            threadArchitectureVersion: .legacy,
+            status: .idle
+        )
+        let v2Thread = AssistantSessionSummary(
+            id: "openassist-v2",
+            title: "V2",
+            source: .openAssist,
+            threadArchitectureVersion: .providerIndependentV2,
+            status: .idle,
+            latestUserMessage: "hello"
+        )
+        let cliSession = AssistantSessionSummary(
+            id: "copilot-legacy",
+            title: "CLI",
+            source: .cli,
+            status: .idle
+        )
+
+        XCTAssertFalse(assistantSessionSupportsCurrentThreadUI(legacyThread))
+        XCTAssertFalse(assistantShouldListSessionInSidebar(legacyThread, selectedSessionID: nil))
+        XCTAssertTrue(assistantSessionSupportsCurrentThreadUI(v2Thread))
+        XCTAssertTrue(assistantShouldListSessionInSidebar(v2Thread, selectedSessionID: nil))
+        XCTAssertFalse(assistantSessionSupportsCurrentThreadUI(cliSession))
+        XCTAssertFalse(assistantShouldListSessionInSidebar(cliSession, selectedSessionID: nil))
+    }
+
+    func testEmptyProviderIndependentDraftIsHiddenUnlessSelected() {
+        let emptyDraft = AssistantSessionSummary(
+            id: "openassist-empty",
+            title: "New Assistant Session",
+            source: .openAssist,
+            threadArchitectureVersion: .providerIndependentV2,
+            status: .idle,
+            summary: nil,
+            latestUserMessage: nil,
+            latestAssistantMessage: nil
+        )
+        let filledThread = AssistantSessionSummary(
+            id: "openassist-filled",
+            title: "Hi",
+            source: .openAssist,
+            threadArchitectureVersion: .providerIndependentV2,
+            status: .completed,
+            latestUserMessage: "Hello"
+        )
+
+        XCTAssertFalse(assistantShouldListSessionInSidebar(emptyDraft, selectedSessionID: nil))
+        XCTAssertTrue(assistantShouldListSessionInSidebar(emptyDraft, selectedSessionID: emptyDraft.id))
+        XCTAssertTrue(assistantShouldListSessionInSidebar(filledThread, selectedSessionID: nil))
+    }
+
+    func testCleanupSessionMergeKeepsRegistryBackedV2Threads() {
+        let liveSession = AssistantSessionSummary(
+            id: "openassist-live",
+            title: "Live",
+            source: .openAssist,
+            threadArchitectureVersion: .providerIndependentV2,
+            status: .idle
+        )
+        let catalogSession = AssistantSessionSummary(
+            id: "catalog-openassist",
+            title: "Catalog",
+            source: .openAssist,
+            threadArchitectureVersion: .legacy,
+            status: .completed
+        )
+        let registrySession = AssistantSessionSummary(
+            id: "openassist-v2-registry",
+            title: "Registry",
+            source: .openAssist,
+            threadArchitectureVersion: .providerIndependentV2,
+            status: .completed
+        )
+
+        let merged = assistantMergedSessionsForCleanup(
+            liveSessions: [liveSession],
+            catalogSessions: [catalogSession],
+            registrySessions: [registrySession]
+        )
+
+        XCTAssertEqual(
+            Set(merged.map(\.id)),
+            Set(["openassist-live", "catalog-openassist", "openassist-v2-registry"])
+        )
+    }
+
+    func testConversationPersistenceDefaultsToSnapshotOnlyForOlderSavedThreads() throws {
+        let data = try JSONSerialization.data(
+            withJSONObject: [
+                "id": "openassist-old",
+                "title": "Old",
+                "source": "openAssist",
+                "threadArchitectureVersion": 2,
+                "status": "idle"
+            ],
+            options: [.sortedKeys]
+        )
+
+        let decoded = try JSONDecoder().decode(AssistantSessionSummary.self, from: data)
+        XCTAssertEqual(decoded.conversationPersistence, .snapshotOnly)
+        XCTAssertFalse(decoded.usesHybridConversationPersistence)
+    }
+
+    func testProviderIndependentHybridPersistenceFlagRequiresHybridSetting() {
+        let hybrid = AssistantSessionSummary(
+            id: "openassist-hybrid",
+            title: "Hybrid",
+            source: .openAssist,
+            threadArchitectureVersion: .providerIndependentV2,
+            conversationPersistence: .hybridJSONL,
+            status: .idle
+        )
+        let snapshotOnly = AssistantSessionSummary(
+            id: "openassist-snapshot",
+            title: "Snapshot",
+            source: .openAssist,
+            threadArchitectureVersion: .providerIndependentV2,
+            conversationPersistence: .snapshotOnly,
+            status: .idle
+        )
+
+        XCTAssertTrue(hybrid.usesHybridConversationPersistence)
+        XCTAssertFalse(snapshotOnly.usesHybridConversationPersistence)
     }
 }

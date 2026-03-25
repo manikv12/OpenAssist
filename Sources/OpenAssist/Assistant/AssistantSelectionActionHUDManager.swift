@@ -51,6 +51,38 @@ final class AssistantSelectionActionHUDManager {
     private let viewModel = ViewModel()
     private var panel: HUDPanel?
     private var anchorRect = NSRect.zero
+    private var appObservers: [NSObjectProtocol] = []
+
+    private init() {
+        let center = NotificationCenter.default
+        appObservers = [
+            center.addObserver(
+                forName: NSApplication.didResignActiveNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    self?.hide()
+                }
+            },
+            center.addObserver(
+                forName: NSApplication.didHideNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    self?.hide()
+                }
+            }
+        ]
+    }
+
+    deinit {
+        let center = NotificationCenter.default
+        for observer in appObservers {
+            center.removeObserver(observer)
+        }
+    }
 
     var retainsPresentationWithoutSelection: Bool {
         guard panel?.isVisible == true else { return false }
@@ -158,7 +190,7 @@ final class AssistantSelectionActionHUDManager {
             NSApp.activate(ignoringOtherApps: true)
             panel.makeKeyAndOrderFront(nil)
         } else {
-            panel.orderFrontRegardless()
+            panel.orderFront(nil)
         }
     }
 
@@ -176,7 +208,7 @@ final class AssistantSelectionActionHUDManager {
         panel.backgroundColor = .clear
         panel.isOpaque = false
         panel.hasShadow = false
-        panel.hidesOnDeactivate = false
+        panel.hidesOnDeactivate = true
         panel.isFloatingPanel = true
         panel.level = .floating
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
@@ -426,7 +458,7 @@ private struct AssistantSelectionActionHUDRootView: View {
                     .controlSize(.small)
                     .tint(AppVisualTheme.foreground(0.85))
 
-                Text("Using your selected AI provider to explain this text.")
+                Text("Using an available AI provider to explain this text.")
                     .font(.system(size: 12.5, weight: .medium))
                     .foregroundStyle(AppVisualTheme.foreground(0.82))
             }

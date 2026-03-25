@@ -47,12 +47,78 @@ struct TelegramChat: Decodable, Sendable {
     }
 }
 
+struct TelegramVoice: Decodable, Sendable {
+    let fileID: String
+    let duration: Int
+    let mimeType: String?
+    let fileSize: Int?
+
+    private enum CodingKeys: String, CodingKey {
+        case fileID = "file_id"
+        case duration
+        case mimeType = "mime_type"
+        case fileSize = "file_size"
+    }
+}
+
+struct TelegramAudio: Decodable, Sendable {
+    let fileID: String
+    let duration: Int?
+    let fileName: String?
+    let mimeType: String?
+    let fileSize: Int?
+    let title: String?
+    let performer: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case fileID = "file_id"
+        case duration
+        case fileName = "file_name"
+        case mimeType = "mime_type"
+        case fileSize = "file_size"
+        case title
+        case performer
+    }
+}
+
+struct TelegramDocument: Decodable, Sendable {
+    let fileID: String
+    let fileName: String?
+    let mimeType: String?
+    let fileSize: Int?
+
+    private enum CodingKeys: String, CodingKey {
+        case fileID = "file_id"
+        case fileName = "file_name"
+        case mimeType = "mime_type"
+        case fileSize = "file_size"
+    }
+}
+
+struct TelegramFile: Decodable, Sendable {
+    let fileID: String?
+    let fileUniqueID: String?
+    let filePath: String?
+    let fileSize: Int?
+
+    private enum CodingKeys: String, CodingKey {
+        case fileID = "file_id"
+        case fileUniqueID = "file_unique_id"
+        case filePath = "file_path"
+        case fileSize = "file_size"
+    }
+}
+
 struct TelegramMessage: Decodable, Sendable {
     let messageID: Int
     let chat: TelegramChat
     let from: TelegramUser?
     let date: Int
     let text: String?
+    let voice: TelegramVoice?
+    let audio: TelegramAudio?
+    let document: TelegramDocument?
+    let caption: String?
 
     private enum CodingKeys: String, CodingKey {
         case messageID = "message_id"
@@ -60,6 +126,10 @@ struct TelegramMessage: Decodable, Sendable {
         case from
         case date
         case text
+        case voice
+        case audio
+        case document
+        case caption
     }
 }
 
@@ -167,6 +237,30 @@ final class TelegramBotClient {
             ],
             responseType: [TelegramUpdate].self
         )
+    }
+
+    func getFile(fileID: String) async throws -> TelegramFile {
+        try await perform(
+            method: "getFile",
+            payload: ["file_id": fileID],
+            responseType: TelegramFile.self
+        )
+    }
+
+    func downloadFile(filePath: String) async throws -> Data {
+        let url = try fileDownloadURL(filePath: filePath)
+        let (data, response) = try await session.data(from: url)
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw TelegramBotClientError.malformedResponse
+        }
+        guard (200...299).contains(httpResponse.statusCode) else {
+            let excerpt = sanitizedResponseExcerpt(from: data)
+            let message = excerpt.isEmpty
+                ? "Telegram file download failed with HTTP \(httpResponse.statusCode)."
+                : "Telegram file download failed with HTTP \(httpResponse.statusCode): \(excerpt)"
+            throw TelegramBotClientError.server(message: message)
+        }
+        return data
     }
 
     @discardableResult
@@ -468,6 +562,23 @@ final class TelegramBotClient {
             throw TelegramBotClientError.server(message: message)
         }
         return data
+    }
+
+    private func fileDownloadURL(filePath: String) throws -> URL {
+        guard !token.isEmpty else {
+            throw TelegramBotClientError.invalidToken
+        }
+
+        let trimmedPath = filePath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedPath.isEmpty else {
+            throw TelegramBotClientError.invalidRequest
+        }
+
+        let encodedPath = trimmedPath.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? trimmedPath
+        guard let url = URL(string: "https://api.telegram.org/file/bot\(token)/\(encodedPath)") else {
+            throw TelegramBotClientError.invalidRequest
+        }
+        return url
     }
 
     private func sanitizedResponseExcerpt(from data: Data) -> String {

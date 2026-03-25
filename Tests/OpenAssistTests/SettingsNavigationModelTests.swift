@@ -2,46 +2,54 @@ import XCTest
 @testable import OpenAssist
 
 final class SettingsNavigationModelTests: XCTestCase {
-    func testTelegramSearchRoutesToTelegramRemotePage() throws {
+    func testGettingStartedSearchRoutesToGettingStartedHome() throws {
+        let entry = try XCTUnwrap(searchEntry(matchingTitle: "Getting started", query: "getting started"))
+
+        XCTAssertEqual(entry.destination.section, .gettingStarted)
+        XCTAssertEqual(entry.destination.cardID, "gettingStarted.checklist")
+    }
+
+    func testTelegramSearchRoutesToAdvancedTelegramPage() throws {
         let entry = try XCTUnwrap(searchEntry(matchingTitle: "Telegram remote", query: "telegram"))
 
-        XCTAssertEqual(entry.destination.section, .automationRemote)
-        XCTAssertEqual(entry.destination.automationPage, .telegramRemote)
+        XCTAssertEqual(entry.destination.section, .advanced)
+        XCTAssertEqual(entry.destination.cardID, "integrations.telegram.setup")
+        XCTAssertEqual(entry.destination.advancedPage, .telegramRemote)
     }
 
     func testBrowserProfileSearchRoutesToBrowserAndAppControlPage() throws {
         let entry = try XCTUnwrap(searchEntry(matchingTitle: "Browser profile", query: "browser profile"))
 
-        XCTAssertEqual(entry.destination.section, .automationRemote)
-        XCTAssertEqual(entry.destination.automationPage, .browserAndApps)
+        XCTAssertEqual(entry.destination.section, .browserAppControl)
+        XCTAssertEqual(entry.destination.cardID, "automation.browserProfile")
     }
 
     func testWhisperSearchRoutesToVoiceAndDictation() throws {
         let entry = try XCTUnwrap(searchEntry(matchingTitle: "Whisper model library", query: "whisper"))
 
         XCTAssertEqual(entry.destination.section, .voiceDictation)
-        XCTAssertNil(entry.destination.automationPage)
+        XCTAssertEqual(entry.destination.cardID, "speech.modelLibrary")
     }
 
-    func testAIStudioSearchRoutesToAssistantSection() throws {
+    func testAIStudioSearchRoutesToAdvancedSection() throws {
         let entry = try XCTUnwrap(searchEntry(matchingTitle: "AI Studio", query: "AI Studio"))
 
-        XCTAssertEqual(entry.destination.section, .assistant)
-        XCTAssertNil(entry.destination.automationPage)
+        XCTAssertEqual(entry.destination.section, .advanced)
+        XCTAssertEqual(entry.destination.cardID, "advanced.aiStudio")
     }
 
-    func testPermissionsSearchRoutesToAppPermissionsSection() throws {
+    func testPermissionsSearchRoutesToPermissionsPrivacySection() throws {
         let entry = try XCTUnwrap(searchEntry(matchingTitle: "Permission overview", query: "permissions"))
 
-        XCTAssertEqual(entry.destination.section, .appPermissions)
-        XCTAssertNil(entry.destination.automationPage)
+        XCTAssertEqual(entry.destination.section, .permissionsPrivacy)
+        XCTAssertEqual(entry.destination.cardID, "permissions.overview")
     }
 
-    func testAgentShortcutSearchRoutesToAssistantSection() throws {
+    func testAgentShortcutSearchRoutesToVoiceAndDictation() throws {
         let entry = try XCTUnwrap(searchEntry(matchingTitle: "Agent shortcut", query: "agent shortcut"))
 
-        XCTAssertEqual(entry.destination.section, .assistant)
-        XCTAssertNil(entry.destination.automationPage)
+        XCTAssertEqual(entry.destination.section, .voiceDictation)
+        XCTAssertEqual(entry.destination.cardID, "shortcuts.agentShortcut")
     }
 
     func testWhisperSectionFilterIncludesVoiceAndDictation() {
@@ -50,10 +58,10 @@ final class SettingsNavigationModelTests: XCTestCase {
         XCTAssertTrue(sections.contains(.voiceDictation))
     }
 
-    func testBrowserSectionFilterIncludesAutomationAndRemote() {
+    func testBrowserSectionFilterIncludesBrowserAndAppControl() {
         let sections = SettingsNavigationModel.filteredSections(for: "browser profile")
 
-        XCTAssertTrue(sections.contains(.automationRemote))
+        XCTAssertTrue(sections.contains(.browserAppControl))
     }
 
     private func searchEntry(matchingTitle title: String, query: String) -> SettingSearchEntry? {

@@ -41,6 +41,7 @@ final class AssistantOrbHUDModel: ObservableObject {
     var doneDetailText: String? { storedDoneDetailText }
     @Published private(set) var storedPreviewImages: [Data] = []
     var previewImages: [Data] { storedPreviewImages }
+    @Published private(set) var dismissedDoneDetailSignature: String?
     @Published var showPlanDetail = false
     @Published private(set) var storedProposedPlanText: String?
     var proposedPlanText: String? { storedProposedPlanText }
@@ -97,6 +98,8 @@ final class AssistantOrbHUDModel: ObservableObject {
     var onOpenSession: ((AssistantSessionSummary) -> Void)?
     var onOpenMainWindow: (() -> Void)?
     var onNewSession: (() async -> Void)?
+    var onNewTemporarySession: (() async -> Void)?
+    var onPromoteTemporarySession: ((String?) -> Void)?
     var onChooseModel: ((String) -> Void)?
     var onOpenAttachmentPicker: (() -> Void)?
     var onAddAttachment: ((AssistantAttachment) -> Void)?
@@ -136,12 +139,18 @@ final class AssistantOrbHUDModel: ObservableObject {
     }
 
     func update(state: AssistantHUDState) {
-        self.state = state
+        let trimmedDetail = state.detail?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+        let completionSignature = doneDetailSignature(for: trimmedDetail)
+        let shouldSuppressRepeatedCompletion =
+            (state.phase == .success || state.phase == .failed)
+            && completionSignature != nil
+            && completionSignature == dismissedDoneDetailSignature
+
+        self.state = shouldSuppressRepeatedCompletion ? .idle : state
         refreshCachedWorkingSummary()
 
-        switch state.phase {
+        switch self.state.phase {
         case .success, .failed:
-            let trimmedDetail = state.detail?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
             storedPreviewImages = []
             storedDoneDetailText = trimmedDetail
             showDoneDetail = trimmedDetail != nil && storedProposedPlanText?.nonEmpty == nil
@@ -153,6 +162,7 @@ final class AssistantOrbHUDModel: ObservableObject {
             showWorkingDetail = false
             break
         case .waitingForPermission:
+            dismissedDoneDetailSignature = nil
             storedDoneDetailText = nil
             storedPreviewImages = []
             showDoneDetail = false
@@ -160,6 +170,7 @@ final class AssistantOrbHUDModel: ObservableObject {
             showCompactComposer = false
             shouldFocusTextField = false
         case .listening, .thinking, .acting, .streaming:
+            dismissedDoneDetailSignature = nil
             storedDoneDetailText = nil
             storedPreviewImages = []
             showDoneDetail = false
@@ -262,6 +273,45 @@ final class AssistantOrbHUDModel: ObservableObject {
         shouldFocusTextField = true
     }
 
+    func startNewTemporarySessionFromCompactView() async {
+        dismissDoneDetail()
+        dismissWorkingDetail()
+        showCompactComposer = true
+        messageText = ""
+        attachments.removeAll()
+        await onNewTemporarySession?()
+        shouldFocusTextField = true
+    }
+
+    var selectedSessionSummary: AssistantSessionSummary? {
+        if let selectedSessionID = selectedSessionID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
+            if let matchingSession = sessions.first(where: {
+                $0.id.caseInsensitiveCompare(selectedSessionID) == .orderedSame
+            }) {
+                return matchingSession
+            }
+            if let activeSessionSummary,
+               activeSessionSummary.id.caseInsensitiveCompare(selectedSessionID) == .orderedSame {
+                return activeSessionSummary
+            }
+        }
+
+        if let activeSessionSummary {
+            return activeSessionSummary
+        }
+
+        return sessions.first
+    }
+
+    var selectedSessionIsTemporary: Bool {
+        selectedSessionSummary?.isTemporary == true
+    }
+
+    func promoteSelectedTemporarySession() {
+        guard selectedSessionIsTemporary else { return }
+        onPromoteTemporarySession?(selectedSessionSummary?.id ?? selectedSessionID)
+    }
+
     var workingSummaryText: String? { cachedWorkingSummaryText }
 
     private func refreshCachedWorkingSummary() {
@@ -327,16 +377,18 @@ final class AssistantOrbHUDModel: ObservableObject {
     }
 
     func dismissDoneDetail() {
+        dismissedDoneDetailSignature = doneDetailSignature(for: storedDoneDetailText)
         showDoneDetail = false
         storedDoneDetailText = nil
         storedPreviewImages = []
     }
 
     func hideDoneDetail() {
-        showDoneDetail = false
+        dismissDoneDetail()
     }
 
     func showPreview(_ text: String) {
+        dismissedDoneDetailSignature = nil
         storedDoneDetailText = text
         showDoneDetail = true
         storedProposedPlanText = nil
@@ -349,6 +401,7 @@ final class AssistantOrbHUDModel: ObservableObject {
         storedPreviewImages = images
         if storedDoneDetailText == nil,
            !images.isEmpty,
+           dismissedDoneDetailSignature == nil,
            storedProposedPlanText?.nonEmpty == nil,
            state.phase == .success || state.phase == .failed {
             showDoneDetail = true
@@ -525,5 +578,17 @@ final class AssistantOrbHUDModel: ObservableObject {
         case dismissedModeSwitchSuggestion
         case presentedWorkingDetail
         case expandedInlinePanel
+    }
+
+    private func doneDetailSignature(for text: String?) -> String? {
+        guard let normalizedText = text?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+            return nil
+        }
+
+        let sessionID = selectedSessionID?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            ?? activeSessionSummary?.id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            ?? ""
+
+        return "\(sessionID)|\(normalizedText)"
     }
 }

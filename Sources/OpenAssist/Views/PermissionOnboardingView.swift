@@ -18,6 +18,10 @@ struct PermissionOnboardingView: View {
         accessibilityGranted && microphoneGranted && (!speechRecognitionRequired || speechRecognitionGranted)
     }
 
+    private var continueButtonTitle: String {
+        allRequiredGranted ? "Continue to Getting Started" : "Continue"
+    }
+
     var body: some View {
         ZStack {
             AppChromeBackground()
@@ -112,6 +116,33 @@ struct PermissionOnboardingView: View {
                 .padding(12)
                 .appThemedSurface(cornerRadius: 12, strokeOpacity: 0.17)
 
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("Next after permissions")
+                        .font(.callout.weight(.semibold))
+
+                    Text("Open Assist will send you to one simple setup home next. From there you can connect the assistant, test voice dictation, and optionally set up browser or app control.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    VStack(alignment: .leading, spacing: 8) {
+                        nextStepRow(
+                            title: "Connect assistant or provider",
+                            detail: "Pick the AI setup you want without hunting through several windows."
+                        )
+                        nextStepRow(
+                            title: "Try voice dictation",
+                            detail: "Check your microphone, shortcut, and speech settings in one place."
+                        )
+                        nextStepRow(
+                            title: "Optional browser and app control",
+                            detail: "Only set this up if you want automation features like browser reuse or Computer Use."
+                        )
+                    }
+                }
+                .padding(12)
+                .appThemedSurface(cornerRadius: 12, strokeOpacity: 0.17)
+
                 if !allRequiredGranted {
                     Text("Open Assist stays paused until required permissions are granted.")
                         .font(.callout.weight(.medium))
@@ -131,7 +162,7 @@ struct PermissionOnboardingView: View {
 
                     Spacer()
 
-                    Button("Continue") {
+                    Button(continueButtonTitle) {
                         refreshPermissionSnapshot()
                         guard allRequiredGranted else { return }
                         onComplete()
@@ -143,7 +174,7 @@ struct PermissionOnboardingView: View {
             .padding(22)
             .appThemedSurface(cornerRadius: 16, strokeOpacity: 0.18)
             .shadow(color: .black.opacity(0.16), radius: 18, x: 0, y: 10)
-            .frame(width: 620, height: 560, alignment: .topLeading)
+            .frame(width: 680, alignment: .topLeading)
             .padding(18)
         }
         .onAppear {
@@ -171,9 +202,13 @@ struct PermissionOnboardingView: View {
         action: @escaping () -> Void
     ) -> some View {
         HStack(alignment: .center, spacing: 10) {
-            Image(systemName: granted ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
-                .foregroundStyle(granted ? .green : .orange)
-                .font(.title3)
+            AppIconBadge(
+                symbol: granted ? "checkmark.shield.fill" : "hand.raised.slash.fill",
+                tint: granted ? .green : AppVisualTheme.baseTint,
+                size: 28,
+                symbolSize: 12,
+                isEmphasized: granted
+            )
 
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 6) {
@@ -192,11 +227,13 @@ struct PermissionOnboardingView: View {
 
             Spacer()
 
-            if granted {
-                Text("Granted")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.green)
-            } else {
+            PermissionStateBadge(
+                granted: granted,
+                grantedLabel: "Allowed",
+                missingLabel: required ? "Required" : "Optional"
+            )
+
+            if !granted {
                 Button("Grant") {
                     action()
                 }
@@ -205,6 +242,25 @@ struct PermissionOnboardingView: View {
             }
         }
         .padding(.vertical, 4)
+    }
+
+    @ViewBuilder
+    private func nextStepRow(title: String, detail: String) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "arrow.turn.down.right")
+                .foregroundStyle(AppVisualTheme.accentTint)
+                .font(.system(size: 11, weight: .semibold))
+                .padding(.top, 2)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.callout.weight(.medium))
+                Text(detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
     }
 
     private func refreshPermissionSnapshot() {

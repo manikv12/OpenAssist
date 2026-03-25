@@ -477,10 +477,16 @@ struct OrbSessionRow: View {
             leadingIndicator
 
             VStack(alignment: .leading, spacing: 3) {
-                Text(session.title.isEmpty ? "Untitled Session" : session.title)
-                    .font(.system(size: 11.5, weight: .semibold))
-                    .foregroundStyle(AppVisualTheme.foreground(0.90))
-                    .lineLimit(1)
+                HStack(spacing: 6) {
+                    Text(session.title.isEmpty ? "Untitled Session" : session.title)
+                        .font(.system(size: 11.5, weight: .semibold))
+                        .foregroundStyle(AppVisualTheme.foreground(0.90))
+                        .lineLimit(1)
+
+                    if session.isTemporary {
+                        CompactTemporaryBadge(compact: true)
+                    }
+                }
 
                 if !session.subtitle.isEmpty {
                     Text(session.subtitle)
@@ -526,6 +532,31 @@ struct OrbSessionRow: View {
         case .failed: return .red.opacity(0.80)
         case .idle, .unknown: return Color(white: 0.32)
         }
+    }
+}
+
+struct CompactTemporaryBadge: View {
+    var compact: Bool = false
+
+    var body: some View {
+        HStack(spacing: compact ? 4 : 5) {
+            Image(systemName: "clock.badge.exclamationmark")
+                .font(.system(size: compact ? 7.5 : 8.5, weight: .semibold))
+            Text("Temporary")
+                .font(.system(size: compact ? 8.5 : 9.5, weight: .semibold))
+                .lineLimit(1)
+        }
+        .foregroundStyle(Color.orange.opacity(0.94))
+        .padding(.horizontal, compact ? 6 : 8)
+        .padding(.vertical, compact ? 3 : 4)
+        .background(
+            Capsule(style: .continuous)
+                .fill(Color.orange.opacity(0.15))
+                .overlay(
+                    Capsule(style: .continuous)
+                        .stroke(Color.orange.opacity(0.22), lineWidth: 0.6)
+                )
+        )
     }
 }
 

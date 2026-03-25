@@ -1,8 +1,16 @@
-import { startTransition, useCallback, useEffect, useRef, useState } from "react";
+import { startTransition, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ChatView } from "./components/ChatView";
 import { FindBar } from "./components/FindBar";
 import { useTextSelection } from "./hooks/useTextSelection";
-import type { ChatMessage, TypingState } from "./types";
+import type {
+  ChatMessage,
+  CodeReviewPanelState,
+  MessageCheckpointInfo,
+  ProviderTone,
+  RewindState,
+  RuntimePanelState,
+  TypingState,
+} from "./types";
 
 const HISTORY_TRUNCATE_TRANSITION_MS = 180;
 
@@ -18,6 +26,13 @@ function stableMessages(messages: ChatMessage[]): ChatMessage[] {
   return messages
     .filter((message) => message.transitionState !== "removing")
     .map(clearMessageTransitionState);
+}
+
+function providerTone(value?: string | null): ProviderTone {
+  const normalized = (value || "").trim().toLowerCase();
+  if (normalized.includes("copilot")) return "copilot";
+  if (normalized.includes("codex")) return "codex";
+  return "default";
 }
 
 function dedupeMessages(messages: ChatMessage[]): ChatMessage[] {
@@ -59,17 +74,107 @@ function buildTruncationTransition(
   return [...next.map(clearMessageTransitionState), ...removedTail];
 }
 
+function resolveCheckpointMessageIndex(
+  messages: ChatMessage[],
+  checkpoint: CodeReviewPanelState["checkpoints"][number]
+): number {
+  if (checkpoint.associatedMessageID) {
+    const exactIndex = messages.findIndex((message) => message.id === checkpoint.associatedMessageID);
+    if (exactIndex >= 0) {
+      return exactIndex;
+    }
+  }
+
+  if (checkpoint.associatedTurnID) {
+    for (let index = messages.length - 1; index >= 0; index--) {
+      if (
+        messages[index].type === "assistant" &&
+        messages[index].turnID === checkpoint.associatedTurnID
+      ) {
+        return index;
+      }
+    }
+  }
+
+  for (let index = messages.length - 1; index >= 0; index--) {
+    if (
+      messages[index].type === "assistant" &&
+      messages[index].timestamp <= checkpoint.createdAt
+    ) {
+      return index;
+    }
+  }
+
+  return -1;
+}
+
+function resolveCheckpointConversationStartIndex(
+  messages: ChatMessage[],
+  checkpointMessageIndex: number
+): number | null {
+  if (checkpointMessageIndex < 0 || checkpointMessageIndex >= messages.length) {
+    return null;
+  }
+
+  for (let index = checkpointMessageIndex; index >= 0; index--) {
+    if (messages[index].type === "user") {
+      return index;
+    }
+  }
+
+  return checkpointMessageIndex;
+}
+
+function resolveVisibleCheckpointMessageIndex(
+  messages: ChatMessage[],
+  checkpoint: CodeReviewPanelState["checkpoints"][number]
+): number {
+  if (checkpoint.associatedMessageID) {
+    const exactIndex = messages.findIndex((message) => message.id === checkpoint.associatedMessageID);
+    if (exactIndex >= 0) {
+      return exactIndex;
+    }
+  }
+
+  if (checkpoint.associatedTurnID) {
+    for (let index = messages.length - 1; index >= 0; index--) {
+      if (
+        messages[index].type === "assistant" &&
+        messages[index].turnID === checkpoint.associatedTurnID
+      ) {
+        return index;
+      }
+    }
+  }
+
+  return -1;
+}
+
 export function App() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [typing, setTyping] = useState<TypingState>({ visible: false });
+  const [runtimePanel, setRuntimePanel] = useState<RuntimePanelState | null>(null);
+  const [codeReviewPanel, setCodeReviewPanel] = useState<CodeReviewPanelState | null>(
+    null
+  );
+  const [rewindState, setRewindState] = useState<RewindState | null>(null);
   const [textScale, setTextScaleState] = useState(1.0);
   const [isPinnedToBottom, setIsPinnedToBottom] = useState(true);
   const [canLoadOlder, setCanLoadOlder] = useState(false);
+  const activeProviderTone = useMemo<ProviderTone>(() => {
+    const selectedBackendID = runtimePanel?.backends.find((backend) => backend.isSelected)?.id;
+    return providerTone(selectedBackendID);
+  }, [runtimePanel]);
   const [findVisible, setFindVisible] = useState(false);
   const pendingTruncationTimeoutRef = useRef<number | null>(null);
-  const chatViewRef = useRef<{ scrollToBottom: (animated: boolean) => void }>(
-    null
-  );
+  const chatViewRef = useRef<{
+    scrollToBottom: (animated: boolean) => void;
+    revealMessage: (
+      messageID: string,
+      animated: boolean,
+      expand: boolean
+    ) => void;
+  }>(null);
 
   const handleScrollState = useCallback(
     (pinned: boolean, scrolledUp: boolean, distFromTop: number) => {
@@ -105,6 +210,149 @@ export function App() {
 
   // Text selection tracking for Ask/Explain feature
   useTextSelection();
+
+  const hiddenFutureState = useMemo(() => {
+    const hiddenTurnIDs = new Set<string>();
+    let truncationStartIndex: number | null = null;
+
+    if (!codeReviewPanel || codeReviewPanel.actionsLocked) {
+      return {
+        hiddenTurnIDs,
+        truncationStartIndex,
+        futureTurnsHidden: false,
+      };
+    }
+
+    const firstHiddenCheckpointIndex =
+      codeReviewPanel.currentCheckpointPosition < 0
+        ? 1
+        : codeReviewPanel.currentCheckpointPosition + 1;
+    if (
+      firstHiddenCheckpointIndex >= 0 &&
+      firstHiddenCheckpointIndex < codeReviewPanel.checkpoints.length
+    ) {
+      const firstHiddenCheckpoint = codeReviewPanel.checkpoints[firstHiddenCheckpointIndex];
+      const checkpointMessageIndex = resolveVisibleCheckpointMessageIndex(
+        messages,
+        firstHiddenCheckpoint
+      );
+      if (checkpointMessageIndex >= 0) {
+        truncationStartIndex = resolveCheckpointConversationStartIndex(
+          messages,
+          checkpointMessageIndex
+        );
+      }
+    }
+
+    for (
+      let i = Math.max(0, firstHiddenCheckpointIndex);
+      i < codeReviewPanel.checkpoints.length;
+      i++
+    ) {
+      const turnID = codeReviewPanel.checkpoints[i].associatedTurnID;
+      if (turnID) {
+        hiddenTurnIDs.add(turnID);
+      }
+    }
+
+    return {
+      hiddenTurnIDs,
+      truncationStartIndex,
+      futureTurnsHidden: truncationStartIndex !== null || hiddenTurnIDs.size > 0,
+    };
+  }, [codeReviewPanel, messages]);
+
+  const visibleMessages = useMemo(() => {
+    if (hiddenFutureState.truncationStartIndex !== null) {
+      return messages.slice(0, hiddenFutureState.truncationStartIndex);
+    }
+
+    if (hiddenFutureState.hiddenTurnIDs.size === 0) {
+      return messages;
+    }
+
+    return messages.filter(
+      (message) =>
+        !message.turnID || !hiddenFutureState.hiddenTurnIDs.has(message.turnID)
+    );
+  }, [hiddenFutureState, messages]);
+
+  // Build checkpoint-to-message mapping
+  const checkpointsByMessageID = useMemo(() => {
+    const map = new Map<string, MessageCheckpointInfo>();
+    if (!codeReviewPanel) return map;
+    const currentMessageIDs = new Set(visibleMessages.map((message) => message.id));
+    const currentTurnIDs = new Set(
+      visibleMessages
+        .map((message) => message.turnID)
+        .filter((turnID): turnID is string => typeof turnID === "string" && turnID.length > 0)
+    );
+    for (let i = 0; i < codeReviewPanel.checkpoints.length; i++) {
+      const cp = codeReviewPanel.checkpoints[i];
+      if (cp.associatedMessageID && currentMessageIDs.has(cp.associatedMessageID)) {
+        map.set(cp.associatedMessageID, {
+          checkpoint: cp,
+          checkpointIndex: i,
+          currentCheckpointPosition: codeReviewPanel.currentCheckpointPosition,
+          totalCheckpointCount: codeReviewPanel.checkpoints.length,
+          hasActiveTurn: codeReviewPanel.hasActiveTurn,
+          actionsLocked: codeReviewPanel.actionsLocked,
+          futureTurnsHidden: hiddenFutureState.futureTurnsHidden,
+        });
+      }
+    }
+    // Fallback for checkpoints whose saved message ID no longer exists after a restart:
+    // first try the stable turn ID, then fall back to time-based placement.
+    for (let i = 0; i < codeReviewPanel.checkpoints.length; i++) {
+      const cp = codeReviewPanel.checkpoints[i];
+      const hasMatchingAssociatedMessage =
+        !!cp.associatedMessageID && currentMessageIDs.has(cp.associatedMessageID);
+      if (hasMatchingAssociatedMessage) continue;
+      if (cp.associatedTurnID && currentTurnIDs.has(cp.associatedTurnID)) {
+        const turnMatchedMessage = visibleMessages.find(
+          (message) => message.type === "assistant" && message.turnID === cp.associatedTurnID
+        );
+        if (turnMatchedMessage && !map.has(turnMatchedMessage.id)) {
+          map.set(turnMatchedMessage.id, {
+            checkpoint: cp,
+            checkpointIndex: i,
+            currentCheckpointPosition: codeReviewPanel.currentCheckpointPosition,
+            totalCheckpointCount: codeReviewPanel.checkpoints.length,
+            hasActiveTurn: codeReviewPanel.hasActiveTurn,
+            actionsLocked: codeReviewPanel.actionsLocked,
+            futureTurnsHidden: hiddenFutureState.futureTurnsHidden,
+          });
+          continue;
+        }
+      }
+      if (cp.associatedMessageID || cp.associatedTurnID) {
+        continue;
+      }
+      // Find the last assistant message before this checkpoint's timestamp
+      let fallbackID: string | null = null;
+      for (let j = visibleMessages.length - 1; j >= 0; j--) {
+        if (
+          visibleMessages[j].type === "assistant" &&
+          visibleMessages[j].timestamp <= cp.createdAt
+        ) {
+          fallbackID = visibleMessages[j].id;
+          break;
+        }
+      }
+      if (fallbackID && !map.has(fallbackID)) {
+        map.set(fallbackID, {
+          checkpoint: cp,
+          checkpointIndex: i,
+          currentCheckpointPosition: codeReviewPanel.currentCheckpointPosition,
+          totalCheckpointCount: codeReviewPanel.checkpoints.length,
+          hasActiveTurn: codeReviewPanel.hasActiveTurn,
+          actionsLocked: codeReviewPanel.actionsLocked,
+          futureTurnsHidden: hiddenFutureState.futureTurnsHidden,
+        });
+      }
+    }
+    return map;
+  }, [codeReviewPanel, hiddenFutureState.futureTurnsHidden, visibleMessages, messages]);
 
   // Expose bridge API to Swift
   useEffect(() => {
@@ -184,19 +432,45 @@ export function App() {
         title?: string,
         detail?: string
       ) => {
-        setTyping({ visible, title, detail });
+        setTyping((prev) => {
+          if (
+            prev.visible === visible &&
+            prev.title === title &&
+            prev.detail === detail
+          ) {
+            return prev;
+          }
+          return { visible, title, detail };
+        });
+      },
+
+      setRuntimePanel: (panel: RuntimePanelState | null) => {
+        setRuntimePanel(panel);
+      },
+
+      setCodeReviewPanel: (panel: CodeReviewPanelState | null) => {
+        setCodeReviewPanel(panel);
+      },
+
+      setRewindState: (next: RewindState | null) => {
+        setRewindState(next);
       },
 
       scrollToBottom: (animated: boolean) => {
         chatViewRef.current?.scrollToBottom(animated);
       },
 
+      revealMessage: (messageID: string, animated: boolean, expand: boolean) => {
+        chatViewRef.current?.revealMessage(messageID, animated, expand);
+      },
+
       setTextScale: (scale: number) => {
-        setTextScaleState(Math.max(0.8, scale));
+        const nextScale = Math.max(0.8, scale);
+        setTextScaleState((prev) => (prev === nextScale ? prev : nextScale));
       },
 
       setCanLoadOlder: (can: boolean) => {
-        setCanLoadOlder(can);
+        setCanLoadOlder((prev) => (prev === can ? prev : can));
       },
 
       toggleFind: () => {
@@ -226,8 +500,11 @@ export function App() {
       <FindBar visible={findVisible} onClose={() => setFindVisible(false)} />
       <ChatView
         ref={chatViewRef}
-        messages={messages}
+        messages={visibleMessages}
         typing={typing}
+        activeProviderTone={activeProviderTone}
+        checkpointsByMessageID={checkpointsByMessageID}
+        rewindState={rewindState}
         textScale={textScale}
         isPinnedToBottom={isPinnedToBottom}
         canLoadOlder={canLoadOlder}
@@ -249,8 +526,12 @@ declare global {
         loadOlderHistory?: { postMessage: (v: boolean) => void };
         linkClicked?: { postMessage: (url: string) => void };
         copyText?: { postMessage: (text: string) => void };
+        selectRuntimeBackend?: { postMessage: (backendID: string) => void };
+        openRuntimeSettings?: { postMessage: (value: boolean) => void };
         undoMessage?: { postMessage: (anchorID: string) => void };
         editMessage?: { postMessage: (anchorID: string) => void };
+        undoCodeCheckpoint?: { postMessage: (value: boolean) => void };
+        redoHistoryMutation?: { postMessage: (value: boolean) => void };
         openImage?: {
           postMessage: (payload: { dataUrl: string; suggestedName?: string }) => void;
         };

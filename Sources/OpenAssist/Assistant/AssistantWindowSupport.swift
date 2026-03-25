@@ -136,6 +136,27 @@ func assistantPrettyPrintedActivityDetailJSON(
     return prettyText
 }
 
+func assistantLooksLikeUnifiedDiff(_ text: String?) -> Bool {
+    guard let trimmed = text?
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .assistantNonEmpty else {
+        return false
+    }
+
+    if trimmed.hasPrefix("```diff") {
+        return true
+    }
+
+    if trimmed.hasPrefix("diff --git ") {
+        return true
+    }
+
+    let normalized = trimmed.replacingOccurrences(of: "\r\n", with: "\n")
+    return (normalized.contains("\n--- ") && normalized.contains("\n+++ "))
+        || normalized.contains("\n@@ ")
+        || normalized.contains("\n@@ -")
+}
+
 
 struct AssistantTimelineActivityGroup: Identifiable, Equatable {
     let items: [AssistantTimelineItem]
@@ -257,6 +278,38 @@ struct AssistantSessionToolActivitySnapshot: Equatable {
     )
 }
 
+struct AssistantSessionActiveWorkSnapshot: Equatable {
+    let sessionID: String
+    let planEntries: [AssistantPlanEntry]
+    let subagents: [SubagentState]
+    let fileChangeCount: Int
+
+    var completedTaskCount: Int {
+        planEntries.filter { assistantPlanEntryIsCompleted($0.status) }.count
+    }
+
+    var totalTaskCount: Int {
+        planEntries.count
+    }
+
+    var hasChecklist: Bool {
+        !planEntries.isEmpty
+    }
+
+    var hasFileChanges: Bool {
+        fileChangeCount > 0
+    }
+
+    var hasBackgroundAgents: Bool {
+        !subagents.isEmpty
+    }
+}
+
+struct AssistantParentThreadLinkState: Equatable {
+    let parentThreadID: String
+    let childAgent: SubagentState
+}
+
 func assistantSessionOwnsLiveRuntimeState(
     sessionID: String?,
     activeRuntimeSessionID: String?
@@ -325,6 +378,96 @@ func assistantSelectedSessionToolActivity(
         activeCalls: toolCalls,
         recentCalls: recentToolCalls
     )
+}
+
+func assistantSelectedSessionActiveWorkSnapshot(
+    selectedSessionID: String?,
+    activeRuntimeSessionID _: String?,
+    planEntries: [AssistantPlanEntry],
+    subagents: [SubagentState],
+    toolCalls: [AssistantToolCallState],
+    recentToolCalls: [AssistantToolCallState]
+) -> AssistantSessionActiveWorkSnapshot? {
+    guard let selectedSessionID = selectedSessionID?
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .nonEmpty else {
+        return nil
+    }
+
+    let childAgents = subagents.filter { agent in
+        assistantTimelineSessionIDsMatch(agent.parentThreadID, selectedSessionID)
+    }
+    guard !childAgents.isEmpty else { return nil }
+
+    return AssistantSessionActiveWorkSnapshot(
+        sessionID: selectedSessionID,
+        planEntries: planEntries,
+        subagents: childAgents,
+        fileChangeCount: assistantFileChangeCount(in: toolCalls + recentToolCalls)
+    )
+}
+
+func assistantSidebarChildSubagents(
+    parentSessionID: String,
+    selectedSessionID _: String?,
+    activeRuntimeSessionID _: String?,
+    subagents: [SubagentState]
+) -> [SubagentState] {
+    return subagents.filter { agent in
+        assistantTimelineSessionIDsMatch(agent.parentThreadID, parentSessionID)
+    }
+}
+
+func assistantParentThreadLinkState(
+    selectedSessionID: String?,
+    activeRuntimeSessionID _: String?,
+    subagents: [SubagentState]
+) -> AssistantParentThreadLinkState? {
+    guard let selectedSessionID = selectedSessionID?
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .nonEmpty else {
+        return nil
+    }
+
+    guard let childAgent = subagents.first(where: {
+        assistantTimelineSessionIDsMatch($0.threadID, selectedSessionID)
+            && $0.parentThreadID?.nonEmpty != nil
+    }),
+    let parentThreadID = childAgent.parentThreadID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+        return nil
+    }
+
+    return AssistantParentThreadLinkState(
+        parentThreadID: parentThreadID,
+        childAgent: childAgent
+    )
+}
+
+private func assistantPlanEntryIsCompleted(_ status: String) -> Bool {
+    let normalizedStatus = status
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .replacingOccurrences(of: "-", with: "_")
+        .lowercased()
+    return normalizedStatus == "completed"
+}
+
+private func assistantFileChangeCount(in calls: [AssistantToolCallState]) -> Int {
+    calls.reduce(into: 0) { total, call in
+        guard call.kind == "fileChange" else { return }
+
+        if let detail = call.detail?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty,
+           let parsedCount = assistantLeadingInteger(in: detail) {
+            total += parsedCount
+        } else {
+            total += 1
+        }
+    }
+}
+
+private func assistantLeadingInteger(in text: String) -> Int? {
+    let digits = text.prefix { $0.isNumber }
+    guard !digits.isEmpty else { return nil }
+    return Int(digits)
 }
 
 func assistantSidebarActivityState(

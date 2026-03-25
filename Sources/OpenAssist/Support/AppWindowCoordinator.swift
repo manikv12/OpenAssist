@@ -44,8 +44,8 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
     private let assistantMinimumSize = NSSize(width: 980, height: 620)
     private let historyDefaultSize = NSSize(width: 620, height: 500)
     private let historyMinimumSize = NSSize(width: 520, height: 360)
-    private let onboardingDefaultSize = NSSize(width: 620, height: 460)
-    private let onboardingMinimumSize = NSSize(width: 560, height: 420)
+    private let onboardingDefaultSize = NSSize(width: 700, height: 620)
+    private let onboardingMinimumSize = NSSize(width: 620, height: 540)
 
     private let settings: SettingsStore
     private let transcriptHistory: TranscriptHistoryStore
@@ -61,6 +61,7 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
     private var onboardingWindowController: NSWindowController?
     private var historyTargetApplication: NSRunningApplication?
     private var onboardingCompletion: (() -> Void)?
+    private var activationPolicyObservers: [NSObjectProtocol] = []
 
     private var standardWindowCollectionBehavior: NSWindow.CollectionBehavior {
         [.moveToActiveSpace, .fullScreenPrimary]
@@ -81,14 +82,23 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
         self.onStatusUpdate = onStatusUpdate
         self.onInsertText = onInsertText
         super.init()
+        installActivationPolicyObservers()
+        syncActivationPolicyToCurrentWindows()
     }
 
-    func openSettingsWindow() {
+    deinit {
+        let center = NotificationCenter.default
+        for observer in activationPolicyObservers {
+            center.removeObserver(observer)
+        }
+    }
+
+    func openSettingsWindow(route: SettingsRoute? = nil) {
         onStatusUpdate(.openingSettings)
         requestDockActivation()
 
+        let hostingController = NSHostingController(rootView: SettingsView(initialRoute: route).environmentObject(settings))
         if settingsWindowController == nil {
-            let hostingController = NSHostingController(rootView: SettingsView().environmentObject(settings))
             let window = AppHostWindow(
                 contentRect: NSRect(origin: .zero, size: settingsDefaultSize),
                 styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
@@ -112,6 +122,8 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
             window.delegate = self
 
             settingsWindowController = NSWindowController(window: window)
+        } else {
+            settingsWindowController?.contentViewController = hostingController
         }
 
         guard let window = settingsWindowController?.window else {
@@ -421,6 +433,10 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
     }
 
     private func ensureReadableAssistantWindowFrame(_ window: NSWindow, wasVisible: Bool) {
+        // When the window is already visible the user may have intentionally
+        // resized it — respect that choice and skip size enforcement.
+        guard !wasVisible else { return }
+
         let activeVisibleFrame = (NSScreen.main ?? window.screen ?? NSScreen.screens.first)?.visibleFrame
         let targetSize = targetAssistantWindowSize(for: activeVisibleFrame)
         let needsReadableSize = window.frame.width < targetSize.width || window.frame.height < targetSize.height
@@ -429,9 +445,7 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
             window.setContentSize(targetSize)
         }
 
-        if !wasVisible {
-            centerWindowOnActiveScreen(window)
-        }
+        centerWindowOnActiveScreen(window)
     }
 
     private func targetAssistantWindowSize(for visibleFrame: NSRect?) -> NSSize {
@@ -467,12 +481,62 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
     }
 
     private func setActivationPolicyForOpenWindows() {
-        let hasOpenWindows =
-            settingsWindowController != nil ||
-            aiStudioWindowController != nil ||
-            assistantWindowController != nil ||
-            historyWindowController != nil ||
-            onboardingWindowController != nil
-        NSApp.setActivationPolicy(hasOpenWindows ? .regular : .accessory)
+        syncActivationPolicyToCurrentWindows()
+    }
+
+    func syncActivationPolicyToCurrentWindows() {
+        NSApp.setActivationPolicy(hasVisibleWorkWindow ? .regular : .accessory)
+    }
+
+    private var hasVisibleWorkWindow: Bool {
+        NSApp.windows.contains(where: shouldCountForRegularActivation(_:))
+    }
+
+    private func installActivationPolicyObservers() {
+        let center = NotificationCenter.default
+        let observedNames: [Notification.Name] = [
+            NSWindow.didBecomeMainNotification,
+            NSWindow.didResignMainNotification,
+            NSWindow.didMiniaturizeNotification,
+            NSWindow.didDeminiaturizeNotification,
+            NSWindow.didChangeOcclusionStateNotification,
+            NSWindow.willCloseNotification
+        ]
+
+        activationPolicyObservers = observedNames.map { name in
+            center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    self?.syncActivationPolicyToCurrentWindows()
+                }
+            }
+        }
+    }
+
+    private func shouldCountForRegularActivation(_ window: NSWindow) -> Bool {
+        guard !window.isMiniaturized else {
+            return false
+        }
+
+        let styleMask = window.styleMask
+        guard styleMask.contains(.titled) else {
+            return false
+        }
+        guard !styleMask.contains(.nonactivatingPanel) else {
+            return false
+        }
+
+        let isActuallyVisible = window.isVisible || window.occlusionState.contains(.visible)
+        guard isActuallyVisible else {
+            return false
+        }
+
+        if let panel = window as? NSPanel,
+           panel.isFloatingPanel,
+           !styleMask.contains(.miniaturizable),
+           !styleMask.contains(.resizable) {
+            return false
+        }
+
+        return true
     }
 }

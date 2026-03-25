@@ -2,6 +2,10 @@ import AppKit
 import UniformTypeIdentifiers
 
 enum AssistantAttachmentSupport {
+    static let imageContentTypes: [UTType] = [
+        .image
+    ]
+
     static let allowedContentTypes: [UTType] = [
         .image,
         .plainText,
@@ -14,7 +18,10 @@ enum AssistantAttachmentSupport {
         .data
     ]
 
-    static func openFilePicker(onComplete: @escaping @MainActor ([AssistantAttachment]) -> Void) {
+    static func openFilePicker(
+        allowedContentTypes: [UTType] = Self.allowedContentTypes,
+        onComplete: @escaping @MainActor ([AssistantAttachment]) -> Void
+    ) {
         let panel = NSOpenPanel()
         panel.allowsMultipleSelection = true
         panel.canChooseDirectories = false

@@ -1,41 +1,41 @@
 # Open Assist Wiki
 
-Open Assist turns speech into polished text directly inside your active app on macOS.
-
-No account. No copy-paste loops. No forced cloud dependency.
-
 ![Open Assist Logo](https://raw.githubusercontent.com/manikv12/OpenAssist/main/Assets/AppLogo.png)
 
-## Why people choose Open Assist
+Open Assist is now an assistant-first macOS app.
 
-- Fast dictation from a global shortcut in any app
-- Local-first architecture with private defaults
-- Optional AI rewrite when you want cleaner phrasing
-- Conversation-aware context for better continuity
-- Menu-bar utility that stays out of your way
+You can type, speak, dictate into another app, and let the assistant take approved actions on your Mac. The app also includes AI Studio, memory, skills, checkpoints, scheduled jobs, and Telegram remote control.
 
-## 60-second start
+## What is new in the app
 
-1. Download the latest release from [Releases](https://github.com/manikv12/OpenAssist/releases).
-2. Open `Open Assist.app` and grant permissions when prompted.
-3. Place your cursor in any text field.
-4. Hold `Option + Command + Space`, speak, and release.
+- Assistant window for typed or spoken tasks
+- Voice dictation and live voice conversations
+- Local or cloud models through AI Studio
+- Projects, threads, skills, attachments, and checkpoints
+- Browser and app control with approval
+- Memory tools for long-running work
+- Scheduled jobs for recurring tasks
+- Telegram remote control when you are away from your Mac
+- Compact HUD for quick access
 
-## Key shortcuts
+## Start here
 
-- Hold to talk: `Option + Command + Space`
-- Toggle continuous dictation: `Control + Option + Command + Space`
-- Paste last transcript: `Option + Command + V`
+1. New to the app? Read [Assistant Overview](Assistant-Overview).
+2. Want to get set up fast? Read [Quick Start](Quick-Start).
+3. Want the big-picture reason behind the app? Read [Why Open Assist](Why-OpenAssist).
+4. Want to tune rewrite and AI setup? Read [AI Rewrite and Context](AI-Rewrite-and-Context).
+5. Want privacy and permission details? Read [Privacy First Design](Privacy-First-Design).
+6. Need help with a problem? Read [Troubleshooting](Troubleshooting).
 
-## Explore this wiki
+## Feature pages
 
-- [Quick Start](Quick-Start)
-- [Why Open Assist](Why-OpenAssist)
-- [AI Rewrite and Context](AI-Rewrite-and-Context)
-- [Privacy First Design](Privacy-First-Design)
-- [Troubleshooting](Troubleshooting)
+- [Automation](Automation)
+- [Scheduled Jobs](Scheduled-Jobs)
+- [Telegram Remote Control](Telegram-Remote-Control)
 
-## Community
+## Good links
 
-- Report bugs or request features in [Issues](https://github.com/manikv12/OpenAssist/issues)
-- Follow updates in [Releases](https://github.com/manikv12/OpenAssist/releases)
+- [Repository](https://github.com/manikv12/OpenAssist)
+- [Releases](https://github.com/manikv12/OpenAssist/releases)
+- [User Guide](https://github.com/manikv12/OpenAssist/blob/main/Docs/User-Guide.md)
+- [Issues](https://github.com/manikv12/OpenAssist/issues)

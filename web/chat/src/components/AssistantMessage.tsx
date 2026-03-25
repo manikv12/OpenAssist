@@ -1,26 +1,35 @@
-import { memo, useCallback, useEffect, useRef, useState } from "react";
-import type { ChatMessage } from "../types";
+import { memo, useCallback } from "react";
+import type { ChatMessage, MessageCheckpointInfo } from "../types";
+import { copyPlainText } from "../clipboard";
 import { MarkdownContent } from "./MarkdownContent";
 import { CollapsibleImageGallery } from "./CollapsibleImageGallery";
+import { MessageCheckpointCard } from "./MessageCheckpointCard";
+import { useSmoothTextStream } from "../hooks/useSmoothTextStream";
 
-function AssistantMessageInner({ message }: { message: ChatMessage }) {
+function providerTheme(label?: string): "codex" | "copilot" | "default" {
+  const normalized = (label || "").trim().toLowerCase();
+  if (normalized.includes("copilot")) return "copilot";
+  if (normalized.includes("codex")) return "codex";
+  return "default";
+}
+
+function AssistantMessageInner({
+  message,
+  checkpointInfo,
+}: {
+  message: ChatMessage;
+  checkpointInfo?: MessageCheckpointInfo;
+}) {
   const text = message.text || "";
-  const renderedText = useStreamingText(text, message.isStreaming);
-  const showRevealPulse = useStreamingRevealPulse(
-    renderedText,
-    message.isStreaming
-  );
+  const smoothText = useSmoothTextStream(text, message.isStreaming || false);
   const transitionClass = message.transitionState
     ? ` is-${message.transitionState}`
     : "";
-  const copyText = message.isStreaming ? renderedText : text;
+  const copyText = text;
+  const providerTone = providerTheme(message.providerLabel);
 
   const handleCopy = useCallback(() => {
-    navigator.clipboard.writeText(copyText).catch(() => {
-      try {
-        window.webkit?.messageHandlers?.copyText?.postMessage(copyText);
-      } catch {}
-    });
+    void copyPlainText(copyText).catch(() => {});
   }, [copyText]);
 
   return (
@@ -32,6 +41,7 @@ function AssistantMessageInner({ message }: { message: ChatMessage }) {
       <div className="assistant-content">
         {copyText && (
           <button
+            type="button"
             className="copy-btn copy-btn-float"
             onClick={handleCopy}
             title="Copy message"
@@ -44,13 +54,21 @@ function AssistantMessageInner({ message }: { message: ChatMessage }) {
         )}
 
         {copyText && (
-          <div
-            className={`assistant-markdown-shell${showRevealPulse ? " reveal-pulse" : ""}`}
-          >
-            <MarkdownContent
-              markdown={renderedText}
-              isStreaming={message.isStreaming}
-            />
+          <div className="assistant-message-stage phase-settled">
+            <div className="assistant-markdown-shell">
+              <MarkdownContent markdown={smoothText} />
+            </div>
+            {message.providerLabel && (
+              <div
+                className="assistant-provider-footer"
+                data-provider={providerTone}
+                role="note"
+                aria-label={`Runtime ${message.providerLabel}`}
+              >
+                <span className="assistant-provider-footer__spark" aria-hidden="true" />
+                <span className="assistant-provider-footer__value">{message.providerLabel}</span>
+              </div>
+            )}
           </div>
         )}
 
@@ -59,117 +77,25 @@ function AssistantMessageInner({ message }: { message: ChatMessage }) {
           itemName="image"
           className="assistant-images"
           imageClassName="assistant-image"
+          defaultExpanded
         />
+
+        {checkpointInfo && (
+          <MessageCheckpointCard info={checkpointInfo} />
+        )}
 
       </div>
     </div>
   );
 }
 
-export const AssistantMessage = memo(AssistantMessageInner);
-
-function useStreamingRevealPulse(text: string, isStreaming: boolean): boolean {
-  const [isPulsing, setIsPulsing] = useState(false);
-  const previousTextRef = useRef(text);
-
-  useEffect(() => {
-    if (!isStreaming) {
-      previousTextRef.current = text;
-      setIsPulsing(false);
-      return;
-    }
-
-    if (text === previousTextRef.current) {
-      return;
-    }
-
-    previousTextRef.current = text;
-    setIsPulsing(true);
-    const timeoutID = window.setTimeout(() => {
-      setIsPulsing(false);
-    }, 150);
-
-    return () => window.clearTimeout(timeoutID);
-  }, [isStreaming, text]);
-
-  return isPulsing;
-}
-
-function useStreamingText(text: string, isStreaming: boolean): string {
-  const [displayedText, setDisplayedText] = useState(text);
-  const targetTextRef = useRef(text);
-  const frameRef = useRef<number | null>(null);
-
-  useEffect(() => {
-    targetTextRef.current = text;
-
-    if (!isStreaming) {
-      if (frameRef.current !== null) {
-        window.cancelAnimationFrame(frameRef.current);
-        frameRef.current = null;
-      }
-      setDisplayedText(text);
-      return;
-    }
-
-    setDisplayedText((current) => {
-      if (current === text) {
-        return current;
-      }
-      if (current.length > text.length || !text.startsWith(current)) {
-        return text;
-      }
-      return current;
-    });
-
-    if (frameRef.current !== null || displayedText === text) {
-      return;
-    }
-
-    const step = () => {
-      frameRef.current = null;
-      let shouldContinue = false;
-
-      setDisplayedText((current) => {
-        const target = targetTextRef.current;
-
-        if (current === target) {
-          return current;
-        }
-
-        if (current.length > target.length || !target.startsWith(current)) {
-          return target;
-        }
-
-        const remaining = target.length - current.length;
-        const chunkSize =
-          remaining > 220
-            ? 34
-            : remaining > 120
-              ? 24
-              : remaining > 48
-                ? 14
-                : 6;
-        const next = target.slice(0, current.length + chunkSize);
-        shouldContinue = next.length < target.length;
-        return next;
-      });
-
-      if (shouldContinue) {
-        frameRef.current = window.requestAnimationFrame(step);
-      }
-    };
-
-    frameRef.current = window.requestAnimationFrame(step);
-  }, [displayedText, isStreaming, text]);
-
-  useEffect(() => {
-    return () => {
-      if (frameRef.current !== null) {
-        window.cancelAnimationFrame(frameRef.current);
-      }
-    };
-  }, []);
-
-  return displayedText;
-}
+export const AssistantMessage = memo(AssistantMessageInner, (prev, next) => {
+  return (
+    prev.message === next.message &&
+    prev.checkpointInfo?.checkpoint.id === next.checkpointInfo?.checkpoint.id &&
+    prev.checkpointInfo?.currentCheckpointPosition === next.checkpointInfo?.currentCheckpointPosition &&
+    prev.checkpointInfo?.hasActiveTurn === next.checkpointInfo?.hasActiveTurn &&
+    prev.checkpointInfo?.actionsLocked === next.checkpointInfo?.actionsLocked &&
+    prev.checkpointInfo?.futureTurnsHidden === next.checkpointInfo?.futureTurnsHidden
+  );
+});

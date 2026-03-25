@@ -76,6 +76,35 @@ final class CodexInstallSupportTests: XCTestCase {
         XCTAssertEqual(guidance.codexPath, codexPath.path)
         XCTAssertEqual(guidance.primaryTitle, "Codex is installed")
     }
+
+    func testInspectShowsCopilotGuidanceWhenCopilotIsInstalled() async {
+        let support = CodexInstallSupport(
+            runner: WhichCommandRunner(
+                locations: [
+                    "copilot": "/opt/homebrew/bin/copilot"
+                ]
+            ),
+            searchPathsOverride: [],
+            allowShellLookup: false
+        )
+
+        let guidance = await support.inspect(backend: .copilot)
+
+        XCTAssertEqual(guidance.backend, .copilot)
+        XCTAssertTrue(guidance.codexDetected)
+        XCTAssertEqual(guidance.codexPath, "/opt/homebrew/bin/copilot")
+        XCTAssertEqual(guidance.primaryTitle, "GitHub Copilot is installed")
+        XCTAssertEqual(
+            guidance.primaryDetail,
+            "GitHub Copilot CLI is available on this Mac. Open Assist can connect over ACP, browse Copilot sessions, and stream live assistant progress."
+        )
+        XCTAssertEqual(guidance.installCommands, ["npm install -g @github/copilot"])
+        XCTAssertEqual(guidance.loginCommands, ["copilot login"])
+        XCTAssertEqual(
+            guidance.docsURL?.absoluteString,
+            "https://docs.github.com/copilot/concepts/agents/about-copilot-cli"
+        )
+    }
 }
 
 private struct WhichCommandRunner: CommandRunning {

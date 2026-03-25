@@ -7,6 +7,9 @@ enum AgentPermission: String, CaseIterable, Sendable {
     case fullDiskAccess
     case browserAutomation
     case browserProfile
+    case computerUseEnabled
+    case accessibility
+    case screenRecording
 
     var displayName: String {
         switch self {
@@ -14,6 +17,9 @@ enum AgentPermission: String, CaseIterable, Sendable {
         case .fullDiskAccess: return "Full Disk Access"
         case .browserAutomation: return "Browser Automation (enabled in settings)"
         case .browserProfile: return "Browser Profile (selected in settings)"
+        case .computerUseEnabled: return "Computer Use (enabled in settings)"
+        case .accessibility: return "Accessibility"
+        case .screenRecording: return "Screen Recording"
         }
     }
 }
@@ -38,12 +44,15 @@ enum ToolPermissionRegistry {
     static func snapshot(using settings: SettingsStore) -> PermissionSnapshot {
         let pc = PermissionCenter.snapshot(using: settings)
         return PermissionSnapshot(
+            accessibilityGranted: pc.accessibilityGranted,
+            screenRecordingGranted: pc.screenRecordingGranted,
             appleEventsGranted: pc.appleEventsGranted,
             appleEventsKnown: pc.appleEventsKnown,
             fullDiskAccessGranted: pc.fullDiskAccessGranted,
             browserAutomationEnabled: settings.browserAutomationEnabled,
             browserProfileSelected: !settings.browserSelectedProfileID
-                .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+            computerUseEnabled: settings.assistantComputerUseEnabled
         )
     }
 
@@ -59,6 +68,16 @@ enum ToolPermissionRegistry {
             toolName: "app_action",
             required: [],
             optional: [.appleEvents]
+        ),
+        ToolPermissionRequirement(
+            toolName: "computer_use",
+            required: [.computerUseEnabled, .accessibility, .screenRecording],
+            optional: []
+        ),
+        ToolPermissionRequirement(
+            toolName: "generate_image",
+            required: [],
+            optional: []
         )
     ]
 
@@ -96,11 +115,14 @@ enum ToolPermissionRegistry {
     /// Snapshot of live permission state used by the registry for verification.
     /// Decoupled from `PermissionCenter.Snapshot` so callers build it from whatever source they have.
     struct PermissionSnapshot: Sendable {
+        let accessibilityGranted: Bool
+        let screenRecordingGranted: Bool
         let appleEventsGranted: Bool
         let appleEventsKnown: Bool
         let fullDiskAccessGranted: Bool
         let browserAutomationEnabled: Bool
         let browserProfileSelected: Bool
+        let computerUseEnabled: Bool
     }
 
     static func verify(
@@ -134,10 +156,13 @@ enum ToolPermissionRegistry {
 
     private static func isGranted(_ permission: AgentPermission, in snapshot: PermissionSnapshot) -> Bool {
         switch permission {
+        case .accessibility: return snapshot.accessibilityGranted
+        case .screenRecording: return snapshot.screenRecordingGranted
         case .appleEvents: return snapshot.appleEventsGranted
         case .fullDiskAccess: return snapshot.fullDiskAccessGranted
         case .browserAutomation: return snapshot.browserAutomationEnabled
         case .browserProfile: return snapshot.browserProfileSelected
+        case .computerUseEnabled: return snapshot.computerUseEnabled
         }
     }
 
@@ -150,10 +175,13 @@ enum ToolPermissionRegistry {
         lines.append("")
         lines.append("| Permission | Status |")
         lines.append("|---|---|")
+        lines.append("| Accessibility | \(yesNo(snapshot.accessibilityGranted)) |")
+        lines.append("| Screen Recording | \(yesNo(snapshot.screenRecordingGranted)) |")
         lines.append("| Apple Events / Automation | \(appleEventsStatus(snapshot)) |")
         lines.append("| Full Disk Access | \(yesNo(snapshot.fullDiskAccessGranted)) |")
         lines.append("| Browser Automation | \(yesNo(snapshot.browserAutomationEnabled)) |")
         lines.append("| Browser Profile | \(yesNo(snapshot.browserProfileSelected)) |")
+        lines.append("| Computer Use | \(yesNo(snapshot.computerUseEnabled)) |")
         lines.append("")
 
         // Tool availability summary
@@ -233,6 +261,12 @@ enum ToolPermissionRegistry {
 
         For Mail, Photos, Safari, Music, and other blocked apps, tell the user Open Assist cannot access them.
         """)
+        lines.append("")
+        lines.append("""
+        ### Computer Use
+
+        The `computer_use` tool is for generic visual desktop interaction when `browser_use` and `app_action` are not enough. It needs Computer Use enabled in Settings plus Accessibility and Screen Recording permissions. Use `computer_use` only for screenshot-based observe, click, drag, scroll, keypress, type, or wait steps on the visible desktop.
+        """ )
 
         return lines.joined(separator: "\n")
     }
@@ -268,6 +302,16 @@ enum ToolPermissionRegistry {
             }
             if missing.contains(.fullDiskAccess) {
                 nextSteps.append("Grant Full Disk Access only if the requested app data needs it.")
+            }
+        case "computer_use":
+            if missing.contains(.computerUseEnabled) {
+                nextSteps.append("Turn on Computer Use in Settings > Automation.")
+            }
+            if missing.contains(.accessibility) {
+                nextSteps.append("Grant Accessibility so Open Assist can click and type.")
+            }
+            if missing.contains(.screenRecording) {
+                nextSteps.append("Grant Screen Recording so Open Assist can capture the current screen.")
             }
         default:
             break

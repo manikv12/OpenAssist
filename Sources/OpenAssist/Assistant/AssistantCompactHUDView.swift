@@ -629,7 +629,7 @@ struct AssistantOrbHUDView: View {
                                     }
                                 }
 
-                                if let toolKind = request.toolKind, !toolKind.isEmpty, toolKind != "userInput" {
+                                if let toolKind = request.toolKind, !toolKind.isEmpty, toolKind != "userInput", toolKind != "browserLogin" {
                                     OrbPermissionChoiceButton(
                                         title: "Always Allow",
                                         tint: orangeTint,
@@ -676,33 +676,9 @@ struct AssistantOrbHUDView: View {
     private var sessionListSection: some View {
         VStack(spacing: 0) {
             // New session button
-            Button(action: {
-                Task { await model.onNewSession?() }
-            }) {
-                HStack(spacing: 10) {
-                    ZStack {
-                        Circle()
-                            .fill(AppVisualTheme.accentTint.opacity(0.18))
-                            .frame(width: 24, height: 24)
-                        Image(systemName: "plus")
-                            .font(.system(size: 11, weight: .bold))
-                            .foregroundStyle(AppVisualTheme.accentTint)
-                    }
-                    Text("New Session")
-                        .font(.system(size: 12, weight: .semibold))
-                    Spacer()
-                    Image(systemName: "arrow.right")
-                        .font(.system(size: 10, weight: .semibold))
-                        .foregroundStyle(AppVisualTheme.foreground(0.35))
-                }
-                .foregroundStyle(AppVisualTheme.foreground(0.88))
+            compactNewSessionListButton()
                 .padding(.horizontal, 12)
-                .padding(.vertical, 10)
-                .orbInsetSurface(tint: AppVisualTheme.accentTint, cornerRadius: 14, fillOpacity: 0.10)
-            }
-            .buttonStyle(.plain)
-            .padding(.horizontal, 12)
-            .padding(.top, 12)
+                .padding(.top, 12)
 
             if model.showDoneDetail {
                 doneDetailPopup(maxHeight: 180, showsFollowUpComposer: false)
@@ -763,6 +739,14 @@ struct AssistantOrbHUDView: View {
                                     model.showFollowUpPreview(for: session)
                                 } label: {
                                     Label("Show Follow-Up", systemImage: "bubble.left.and.bubble.right.fill")
+                                }
+
+                                if session.isTemporary {
+                                    Button {
+                                        model.onPromoteTemporarySession?(session.id)
+                                    } label: {
+                                        Label("Keep Chat", systemImage: "pin")
+                                    }
                                 }
                             }
                         }
@@ -1199,9 +1183,15 @@ struct AssistantOrbHUDView: View {
 
     private var permissionHeaderTitle: String {
         guard let request = model.pendingPermissionRequest else { return "ACTION NEEDED" }
+        if request.toolKind == "browserLogin" {
+            return "LOGIN NEEDED"
+        }
         let normalizedTitle = request.toolTitle.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if normalizedTitle.contains("information") || normalizedTitle.contains("input") || normalizedTitle.contains("question") {
             return "INPUT NEEDED"
+        }
+        if normalizedTitle.contains("login") || normalizedTitle.contains("sign in") {
+            return "LOGIN NEEDED"
         }
         return "APPROVAL NEEDED"
     }
@@ -1227,6 +1217,42 @@ struct AssistantOrbHUDView: View {
 
     private var glowColor: Color {
         OrbSphere.phaseColor(for: model.state.phase)
+    }
+
+    private func compactNewSessionListButton() -> some View {
+        Button(action: {
+            Task { await model.onNewSession?() }
+        }) {
+            HStack(spacing: 10) {
+                ZStack {
+                    Circle()
+                        .fill(AppVisualTheme.accentTint.opacity(0.18))
+                        .frame(width: 24, height: 24)
+                    Image(systemName: "plus")
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundStyle(AppVisualTheme.accentTint)
+                }
+                Text("New Session")
+                    .font(.system(size: 12, weight: .semibold))
+                Spacer()
+                Image(systemName: "arrow.right")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(AppVisualTheme.foreground(0.35))
+            }
+            .foregroundStyle(AppVisualTheme.foreground(0.88))
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            .orbInsetSurface(tint: AppVisualTheme.accentTint, cornerRadius: 14, fillOpacity: 0.10)
+        }
+        .buttonStyle(.plain)
+        .contextMenu {
+            Button {
+                Task { await model.onNewTemporarySession?() }
+            } label: {
+                Label("New Temporary Chat", systemImage: "clock.badge.plus")
+            }
+        }
+        .help("Click for a regular chat. Right-click for a temporary chat.")
     }
 
     private func sessionMatches(_ lhs: String?, _ rhs: String?) -> Bool {
@@ -1716,6 +1742,10 @@ struct AssistantNotchHUDView: View {
                     .foregroundStyle(AppVisualTheme.foreground(0.92))
                     .fixedSize(horizontal: true, vertical: false)
 
+                if model.selectedSessionIsTemporary {
+                    CompactTemporaryBadge(compact: true)
+                }
+
                 Spacer(minLength: 0)
 
                 OrbIconOnlySecondaryButton(symbol: "rectangle.split.3x1.fill", tint: AppVisualTheme.accentTint) {
@@ -1728,9 +1758,9 @@ struct AssistantNotchHUDView: View {
                     model.openSelectedSessionInMainWindow()
                 }
 
-                OrbIconOnlySecondaryButton(symbol: "plus", tint: AppVisualTheme.accentTint) {
-                    Task { await model.startNewSessionFromCompactView() }
-                }
+                compactNewSessionIconButton()
+
+                compactKeepChatTopBarButton()
 
                 Button {
                     model.hideDoneDetail()
@@ -1785,6 +1815,10 @@ struct AssistantNotchHUDView: View {
                     .font(.system(size: 11.5, weight: .semibold))
                     .foregroundStyle(AppVisualTheme.foreground(0.92))
 
+                if model.selectedSessionIsTemporary {
+                    CompactTemporaryBadge(compact: true)
+                }
+
                 Spacer(minLength: 0)
 
                 if model.canStopActiveTurn {
@@ -1803,9 +1837,9 @@ struct AssistantNotchHUDView: View {
                     model.openSelectedSessionInMainWindow()
                 }
 
-                OrbIconOnlySecondaryButton(symbol: "plus", tint: AppVisualTheme.accentTint) {
-                    Task { await model.startNewSessionFromCompactView() }
-                }
+                compactNewSessionIconButton()
+
+                compactKeepChatTopBarButton()
 
                 Button {
                     model.dismissWorkingDetail()
@@ -1851,9 +1885,15 @@ struct AssistantNotchHUDView: View {
                                 .textCase(.uppercase)
                                 .foregroundStyle(glowColor.opacity(0.92))
 
-                            Text(session.title.isEmpty ? "Untitled Session" : session.title)
-                                .font(.system(size: 11.5, weight: .semibold))
-                                .foregroundStyle(AppVisualTheme.foreground(0.90))
+                            HStack(spacing: 6) {
+                                Text(session.title.isEmpty ? "Untitled Session" : session.title)
+                                    .font(.system(size: 11.5, weight: .semibold))
+                                    .foregroundStyle(AppVisualTheme.foreground(0.90))
+
+                                if session.isTemporary {
+                                    CompactTemporaryBadge(compact: true)
+                                }
+                            }
 
                             if let cwd = session.cwd?.nonEmpty {
                                 Text(cwd)
@@ -1908,6 +1948,10 @@ struct AssistantNotchHUDView: View {
                     .foregroundStyle(AppVisualTheme.foreground(0.92))
                     .fixedSize(horizontal: true, vertical: false)
 
+                if model.selectedSessionIsTemporary {
+                    CompactTemporaryBadge(compact: true)
+                }
+
                 Spacer(minLength: 0)
 
                 OrbIconOnlySecondaryButton(symbol: "rectangle.split.3x1.fill", tint: AppVisualTheme.accentTint) {
@@ -1920,9 +1964,9 @@ struct AssistantNotchHUDView: View {
                     model.openSelectedSessionInMainWindow()
                 }
 
-                OrbIconOnlySecondaryButton(symbol: "plus", tint: AppVisualTheme.accentTint) {
-                    Task { await model.startNewSessionFromCompactView() }
-                }
+                compactNewSessionIconButton()
+
+                compactKeepChatTopBarButton()
 
                 Button {
                     model.dismissCompactComposer()
@@ -1965,6 +2009,10 @@ struct AssistantNotchHUDView: View {
                     .foregroundStyle(AppVisualTheme.foreground(0.92))
                     .fixedSize(horizontal: true, vertical: false)
 
+                if model.selectedSessionIsTemporary {
+                    CompactTemporaryBadge(compact: true)
+                }
+
                 Spacer(minLength: 0)
 
                 OrbIconOnlySecondaryButton(symbol: "rectangle.split.3x1.fill", tint: AppVisualTheme.accentTint) {
@@ -1973,9 +2021,9 @@ struct AssistantNotchHUDView: View {
                     }
                 }
 
-                OrbIconOnlySecondaryButton(symbol: "plus", tint: AppVisualTheme.accentTint) {
-                    Task { await model.startNewSessionFromCompactView() }
-                }
+                compactNewSessionIconButton()
+
+                compactKeepChatTopBarButton()
 
                 Button {
                     model.onDismissModeSwitchSuggestion?()
@@ -2014,6 +2062,10 @@ struct AssistantNotchHUDView: View {
                     .foregroundStyle(AppVisualTheme.foreground(0.92))
                     .fixedSize(horizontal: true, vertical: false)
 
+                if model.selectedSessionIsTemporary {
+                    CompactTemporaryBadge(compact: true)
+                }
+
                 Spacer(minLength: 0)
 
                 OrbIconOnlySecondaryButton(symbol: "rectangle.split.3x1.fill", tint: AppVisualTheme.accentTint) {
@@ -2022,9 +2074,9 @@ struct AssistantNotchHUDView: View {
                     }
                 }
 
-                OrbIconOnlySecondaryButton(symbol: "plus", tint: AppVisualTheme.accentTint) {
-                    Task { await model.startNewSessionFromCompactView() }
-                }
+                compactNewSessionIconButton()
+
+                compactKeepChatTopBarButton()
 
                 Button {
                     model.onCancelPermission?()
@@ -2229,8 +2281,14 @@ struct AssistantNotchHUDView: View {
                 subtitle: "\(min(model.sessions.count, 5)) recent",
                 symbol: "rectangle.stack.fill"
             ) {
-                OrbSecondaryActionButton(title: "New", symbol: "plus", tint: AppVisualTheme.accentTint) {
-                    Task { await model.onNewSession?() }
+                HStack(spacing: 8) {
+                    compactNewSessionTextButton(title: "New")
+
+                    if model.selectedSessionIsTemporary {
+                        OrbSecondaryActionButton(title: "Keep", symbol: "pin", tint: AppVisualTheme.accentTint) {
+                            model.promoteSelectedTemporarySession()
+                        }
+                    }
                 }
             }
 
@@ -2271,6 +2329,14 @@ struct AssistantNotchHUDView: View {
                                 } label: {
                                     Label("Open Chat", systemImage: "arrow.up.right.square")
                                 }
+
+                                if session.isTemporary {
+                                    Button {
+                                        model.onPromoteTemporarySession?(session.id)
+                                    } label: {
+                                        Label("Keep Chat", systemImage: "pin")
+                                    }
+                                }
                             }
                         }
                     }
@@ -2287,6 +2353,10 @@ struct AssistantNotchHUDView: View {
                         .font(.system(size: 10.5, weight: .medium))
                         .foregroundStyle(AppVisualTheme.foreground(0.62))
                         .lineLimit(1)
+
+                    if session.isTemporary {
+                        CompactTemporaryBadge(compact: true)
+                    }
                 }
             }
         }
@@ -2454,6 +2524,76 @@ struct AssistantNotchHUDView: View {
             return "Start a session or send a follow-up from here."
         }
         return "Select a session or type the next instruction."
+    }
+
+    private func compactNewSessionContextMenu(startInComposer: Bool) -> some View {
+        Group {
+            Button {
+                if startInComposer {
+                    Task { await model.startNewTemporarySessionFromCompactView() }
+                } else {
+                    Task { await model.onNewTemporarySession?() }
+                }
+            } label: {
+                Label("New Temporary Chat", systemImage: "clock.badge.plus")
+            }
+        }
+    }
+
+    private func compactNewSessionIconButton() -> some View {
+        OrbIconOnlySecondaryButton(symbol: "plus", tint: AppVisualTheme.accentTint) {
+            Task { await model.startNewSessionFromCompactView() }
+        }
+        .contextMenu { compactNewSessionContextMenu(startInComposer: true) }
+        .help("Click for a regular chat. Right-click for a temporary chat.")
+    }
+
+    private func compactNewSessionTextButton(title: String) -> some View {
+        OrbSecondaryActionButton(title: title, symbol: "plus", tint: AppVisualTheme.accentTint) {
+            Task { await model.onNewSession?() }
+        }
+        .contextMenu { compactNewSessionContextMenu(startInComposer: false) }
+        .help("Click for a regular chat. Right-click for a temporary chat.")
+    }
+
+    private func compactNewSessionListButton() -> some View {
+        Button(action: {
+            Task { await model.onNewSession?() }
+        }) {
+            HStack(spacing: 10) {
+                ZStack {
+                    Circle()
+                        .fill(AppVisualTheme.accentTint.opacity(0.18))
+                        .frame(width: 24, height: 24)
+                    Image(systemName: "plus")
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundStyle(AppVisualTheme.accentTint)
+                }
+                Text("New Session")
+                    .font(.system(size: 12, weight: .semibold))
+                Spacer()
+                Image(systemName: "arrow.right")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(AppVisualTheme.foreground(0.35))
+            }
+            .foregroundStyle(AppVisualTheme.foreground(0.88))
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            .orbInsetSurface(tint: AppVisualTheme.accentTint, cornerRadius: 14, fillOpacity: 0.10)
+        }
+        .buttonStyle(.plain)
+        .contextMenu { compactNewSessionContextMenu(startInComposer: false) }
+        .help("Click for a regular chat. Right-click for a temporary chat.")
+    }
+
+    @ViewBuilder
+    private func compactKeepChatTopBarButton() -> some View {
+        if model.selectedSessionIsTemporary {
+            OrbSecondaryActionButton(title: "Keep", symbol: "pin", tint: AppVisualTheme.accentTint) {
+                model.promoteSelectedTemporarySession()
+            }
+            .help("Keep this temporary chat as a regular thread.")
+        }
     }
 
     private func sectionHeader<Trailing: View>(

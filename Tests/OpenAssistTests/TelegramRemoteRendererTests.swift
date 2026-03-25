@@ -109,6 +109,138 @@ final class TelegramRemoteRendererTests: XCTestCase {
         XCTAssertTrue(catchUp?.contains("Here is the latest screenshot.") == true)
     }
 
+    func testSessionHeaderTextMarksTemporaryChat() {
+        let snapshot = AssistantRemoteSessionSnapshot(
+            session: AssistantSessionSummary(
+                id: "session-temp",
+                title: "",
+                source: .appServer,
+                status: .active,
+                isTemporary: true,
+                projectName: "RAPID"
+            ),
+            transcriptEntries: [],
+            pendingPermissionRequest: nil,
+            hudState: .idle,
+            hasActiveTurn: false,
+            imageDelivery: nil
+        )
+
+        let header = TelegramRemoteRenderer.sessionHeaderText(snapshot: snapshot)
+
+        XCTAssertTrue(header.contains("Session: Temporary Chat"))
+        XCTAssertTrue(header.contains("Type: Temporary chat"))
+        XCTAssertTrue(header.contains("Project: RAPID"))
+    }
+
+    func testSessionMenuLabelPrefixesTemporarySessions() {
+        let session = AssistantSessionSummary(
+            id: "session-temp",
+            title: "Scratchpad",
+            source: .appServer,
+            status: .active,
+            isTemporary: true
+        )
+
+        let label = TelegramRemoteRenderer.sessionMenuLabel(session, isSelected: true)
+
+        XCTAssertEqual(label, "• [Temp] Scratchpad")
+    }
+
+    func testProviderUsageTextUsesSelectedModelBucketAndShowsWindows() throws {
+        let status = AssistantRemoteStatusSnapshot(
+            runtimeHealth: .idle,
+            assistantBackend: .copilot,
+            selectedSessionID: "session-5",
+            selectedSessionTitle: "Build Fix",
+            selectedSessionIsTemporary: false,
+            selectedModelID: "gpt-5.3-codex-spark",
+            selectedModelSummary: "gpt-5.3-codex-spark",
+            interactionMode: .agentic,
+            reasoningEffort: .high,
+            supportedReasoningEfforts: [.medium, .high],
+            canAdjustReasoningEffort: true,
+            fastModeEnabled: false,
+            tokenUsage: .empty,
+            lastStatusMessage: nil
+        )
+        let fiveHour = try XCTUnwrap(
+            RateLimitWindow(from: [
+                "usedPercent": 77,
+                "windowDurationMins": 300
+            ])
+        )
+        let weekly = try XCTUnwrap(
+            RateLimitWindow(from: [
+                "usedPercent": 8,
+                "windowDurationMins": 10_080
+            ])
+        )
+        let limits = AccountRateLimits(
+            planType: nil,
+            primary: try XCTUnwrap(
+                RateLimitWindow(from: [
+                    "usedPercent": 12,
+                    "windowDurationMins": 300
+                ])
+            ),
+            secondary: try XCTUnwrap(
+                RateLimitWindow(from: [
+                    "usedPercent": 24,
+                    "windowDurationMins": 10_080
+                ])
+            ),
+            hasCredits: true,
+            unlimited: false,
+            limitID: "codex",
+            limitName: nil,
+            additionalBuckets: [
+                AccountRateLimitBucket(
+                    limitID: "codex_other",
+                    limitName: "spark",
+                    primary: fiveHour,
+                    secondary: weekly
+                )
+            ]
+        )
+
+        let summary = TelegramRemoteRenderer.providerUsageText(status: status, rateLimits: limits)
+
+        XCTAssertTrue(summary.contains("Provider Usage"))
+        XCTAssertTrue(summary.contains("Session: Build Fix"))
+        XCTAssertTrue(summary.contains("Backend: GitHub Copilot"))
+        XCTAssertTrue(summary.contains("Model: gpt-5.3-codex-spark"))
+        XCTAssertTrue(summary.contains("Provider: spark"))
+        XCTAssertTrue(summary.contains("5-hour: 77% used (23% left)"))
+        XCTAssertTrue(summary.contains("Weekly: 8% used (92% left)"))
+    }
+
+    func testProviderUsageTextHandlesMissingProviderWindows() {
+        let status = AssistantRemoteStatusSnapshot(
+            runtimeHealth: .idle,
+            assistantBackend: .codex,
+            selectedSessionID: "session-6",
+            selectedSessionTitle: "Temporary Scratch",
+            selectedSessionIsTemporary: true,
+            selectedModelID: "gpt-5.4",
+            selectedModelSummary: "gpt-5.4",
+            interactionMode: .agentic,
+            reasoningEffort: .high,
+            supportedReasoningEfforts: [.low, .medium, .high],
+            canAdjustReasoningEffort: true,
+            fastModeEnabled: false,
+            tokenUsage: .empty,
+            lastStatusMessage: nil
+        )
+
+        let summary = TelegramRemoteRenderer.providerUsageText(status: status, rateLimits: .empty)
+
+        XCTAssertTrue(summary.contains("Provider Usage"))
+        XCTAssertTrue(summary.contains("Type: Temporary chat"))
+        XCTAssertTrue(summary.contains("Backend: Codex"))
+        XCTAssertTrue(summary.contains("Provider: No provider usage reported yet for the selected model."))
+    }
+
     func testStreamMessageDoesNotEmitThinkingBubbleWithoutAssistantText() {
         let snapshot = AssistantRemoteSessionSnapshot(
             session: AssistantSessionSummary(

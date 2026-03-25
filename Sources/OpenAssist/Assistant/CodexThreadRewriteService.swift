@@ -40,10 +40,16 @@ struct CodexEditableTurn: Equatable {
     let endLineIndex: Int
 }
 
-struct CodexRewriteBackup: Equatable {
+struct CodexRewriteBackupFile: Equatable, Codable, Sendable {
+    let originalFileURL: URL
+    let backupFileURL: URL
+}
+
+struct CodexRewriteBackup: Equatable, Codable, Sendable {
     let sessionID: String
     let sessionFileURL: URL
     let backupFileURL: URL
+    let auxiliaryFiles: [CodexRewriteBackupFile]
     let createdAt: Date
 }
 
@@ -71,13 +77,35 @@ final class CodexThreadRewriteService {
 
     private struct ParsedTurnRecord {
         let turn: CodexEditableTurn
-        let lines: [String]
+        let jsonlLines: [String]
+        let timelineItemIDs: [String]
+        let transcriptEntryIDs: [String]
+        let conversationTurnIDs: [String]
     }
 
     private struct ParsedSession {
         let sessionFileURL: URL
-        let preludeLines: [String]
+        let storage: ParsedSessionStorage
         let turns: [ParsedTurnRecord]
+    }
+
+    private enum ParsedSessionStorage {
+        case jsonl(preludeLines: [String])
+        case conversationSnapshot(
+            snapshot: AssistantConversationSnapshot,
+            preludeTimelineItemIDs: Set<String>,
+            preludeTranscriptEntryIDs: Set<String>
+        )
+    }
+
+    private struct TimelineTurnSlice {
+        let userItem: AssistantTimelineItem
+        let itemIDs: [String]
+        let conversationTurnIDs: [String]
+    }
+
+    private struct TranscriptTurnSlice {
+        let entryIDs: [String]
     }
 
     private struct TurnAccumulator {
@@ -178,13 +206,17 @@ final class CodexThreadRewriteService {
                     startLineIndex: startLineIndex,
                     endLineIndex: endLineIndex
                 ),
-                lines: rawLines
+                jsonlLines: rawLines,
+                timelineItemIDs: [],
+                transcriptEntryIDs: [],
+                conversationTurnIDs: []
             )
         }
     }
 
     private let fileManager: FileManager
     private let sessionCatalog: CodexSessionCatalog
+    private let conversationStore: AssistantConversationStore?
     private let backupRootDirectoryURL: URL
     private var pendingEditBackupsBySessionID: [String: CodexRewriteBackup] = [:]
     private let fractionalSecondsDateFormatter: ISO8601DateFormatter = {
@@ -201,10 +233,12 @@ final class CodexThreadRewriteService {
     init(
         fileManager: FileManager = .default,
         sessionCatalog: CodexSessionCatalog = CodexSessionCatalog(),
+        conversationStore: AssistantConversationStore? = nil,
         backupRootDirectoryURL: URL? = nil
     ) {
         self.fileManager = fileManager
         self.sessionCatalog = sessionCatalog
+        self.conversationStore = conversationStore
         if let backupRootDirectoryURL {
             self.backupRootDirectoryURL = backupRootDirectoryURL
         } else {
@@ -231,11 +265,11 @@ final class CodexThreadRewriteService {
             throw CodexThreadRewriteError.turnNotFound(turnAnchorID)
         }
 
-        let backup = try createBackup(sessionID: normalizedSessionID, sessionFileURL: parsed.sessionFileURL)
+        let backup = try createBackup(sessionID: normalizedSessionID, parsedSession: parsed)
         let retained = Array(parsed.turns.prefix(targetIndex))
         let removed = Array(parsed.turns.suffix(from: targetIndex))
         try writeSession(
-            preludeLines: parsed.preludeLines,
+            storage: parsed.storage,
             turnRecords: retained,
             to: parsed.sessionFileURL
         )
@@ -270,11 +304,11 @@ final class CodexThreadRewriteService {
             throw CodexThreadRewriteError.turnNotEditable(turnAnchorID)
         }
 
-        let backup = try createBackup(sessionID: normalizedSessionID, sessionFileURL: parsed.sessionFileURL)
+        let backup = try createBackup(sessionID: normalizedSessionID, parsedSession: parsed)
         let retained = Array(parsed.turns.prefix(targetIndex))
         let removed = Array(parsed.turns.suffix(from: targetIndex))
         try writeSession(
-            preludeLines: parsed.preludeLines,
+            storage: parsed.storage,
             turnRecords: retained,
             to: parsed.sessionFileURL
         )
@@ -301,6 +335,14 @@ final class CodexThreadRewriteService {
     func restoreBackup(_ backup: CodexRewriteBackup) throws {
         let data = try Data(contentsOf: backup.backupFileURL)
         try data.write(to: backup.sessionFileURL, options: .atomic)
+        for file in backup.auxiliaryFiles {
+            let data = try Data(contentsOf: file.backupFileURL)
+            try fileManager.createDirectory(
+                at: file.originalFileURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try data.write(to: file.originalFileURL, options: .atomic)
+        }
     }
 
     func discardPendingEditBackup(sessionID: String) {
@@ -312,15 +354,40 @@ final class CodexThreadRewriteService {
 
     func deleteBackup(_ backup: CodexRewriteBackup) {
         try? fileManager.removeItem(at: backup.backupFileURL)
+        for file in backup.auxiliaryFiles {
+            try? fileManager.removeItem(at: file.backupFileURL)
+        }
+        let backupDirectoryURL = backup.backupFileURL.deletingLastPathComponent()
+        try? fileManager.removeItem(at: backupDirectoryURL)
     }
 
     private func parsedSession(sessionID: String) throws -> ParsedSession {
         let normalizedSessionID = normalizedSessionID(sessionID)
-        guard let sessionFileURL = sessionCatalog.sessionFileURL(for: normalizedSessionID),
-              fileManager.fileExists(atPath: sessionFileURL.path) else {
-            throw CodexThreadRewriteError.sessionNotFound(sessionID)
+        if let sessionFileURL = sessionCatalog.sessionFileURL(for: normalizedSessionID),
+           fileManager.fileExists(atPath: sessionFileURL.path) {
+            return try parsedJSONLSession(
+                sessionID: normalizedSessionID,
+                sessionFileURL: sessionFileURL
+            )
         }
 
+        if let conversationStore,
+           let snapshotFileURL = conversationStore.snapshotFileURL(for: normalizedSessionID),
+           fileManager.fileExists(atPath: snapshotFileURL.path) {
+            return try parsedConversationSnapshotSession(
+                sessionID: normalizedSessionID,
+                snapshotFileURL: snapshotFileURL,
+                conversationStore: conversationStore
+            )
+        }
+
+        throw CodexThreadRewriteError.sessionNotFound(sessionID)
+    }
+
+    private func parsedJSONLSession(
+        sessionID: String,
+        sessionFileURL: URL
+    ) throws -> ParsedSession {
         let contents = try String(contentsOf: sessionFileURL, encoding: .utf8)
         var lines = contents
             .split(maxSplits: Int.max, omittingEmptySubsequences: false, whereSeparator: \.isNewline)
@@ -359,7 +426,7 @@ final class CodexThreadRewriteService {
 
                 let normalizedText = Self.normalizedVisibleText(userInput.text)
                 currentTurn = TurnAccumulator(
-                    sessionID: normalizedSessionID,
+                    sessionID: normalizedSessionID(sessionID),
                     startLineIndex: lineIndex,
                     endLineIndex: lineIndex,
                     createdAt: userInput.timestamp,
@@ -386,41 +453,284 @@ final class CodexThreadRewriteService {
 
         return ParsedSession(
             sessionFileURL: sessionFileURL,
-            preludeLines: preludeLines,
+            storage: .jsonl(preludeLines: preludeLines),
+            turns: turns
+        )
+    }
+
+    private func parsedConversationSnapshotSession(
+        sessionID: String,
+        snapshotFileURL: URL,
+        conversationStore: AssistantConversationStore
+    ) throws -> ParsedSession {
+        guard let snapshot = conversationStore.loadSnapshot(threadID: sessionID) else {
+            throw CodexThreadRewriteError.sessionNotFound(sessionID)
+        }
+
+        let visibleTimeline = conversationStore
+            .loadTimeline(threadID: sessionID, limit: Int.max)
+            .sorted(by: Self.timelineSort)
+        let transcript = snapshot.transcript.sorted(by: Self.transcriptSort)
+
+        let timelineSlices = Self.timelineTurnSlices(from: visibleTimeline)
+        let transcriptSlices = Self.transcriptTurnSlices(from: transcript)
+
+        let turns = timelineSlices.enumerated().map { index, slice in
+            let transcriptEntryIDs = transcriptSlices.indices.contains(index)
+                ? transcriptSlices[index].entryIDs
+                : []
+            let conversationTurnIDs = !slice.conversationTurnIDs.isEmpty
+                ? slice.conversationTurnIDs
+                : (snapshot.turns.indices.contains(index) ? [snapshot.turns[index].openAssistTurnID] : [])
+            let imageAttachments = (slice.userItem.imageAttachments ?? []).enumerated().map { imageIndex, data in
+                CodexEditableAttachment(
+                    filename: "edited-image-\(index)-\(imageIndex).png",
+                    data: data,
+                    mimeType: "image/png"
+                )
+            }
+            let anchorSeed = [
+                sessionID,
+                "conversation",
+                slice.userItem.id.lowercased()
+            ].joined(separator: "|")
+
+            return ParsedTurnRecord(
+                turn: CodexEditableTurn(
+                    sessionID: sessionID,
+                    anchorID: "turn-\(MemoryIdentifier.stableHexDigest(for: anchorSeed).prefix(24))",
+                    text: slice.userItem.text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "",
+                    createdAt: slice.userItem.createdAt,
+                    imageAttachments: imageAttachments,
+                    supportsEdit: true,
+                    startLineIndex: index,
+                    endLineIndex: index
+                ),
+                jsonlLines: [],
+                timelineItemIDs: slice.itemIDs,
+                transcriptEntryIDs: transcriptEntryIDs,
+                conversationTurnIDs: conversationTurnIDs
+            )
+        }
+
+        let turnTimelineItemIDs = Set(timelineSlices.flatMap(\.itemIDs))
+        let turnTranscriptEntryIDs = Set(transcriptSlices.flatMap(\.entryIDs))
+
+        return ParsedSession(
+            sessionFileURL: snapshotFileURL,
+            storage: .conversationSnapshot(
+                snapshot: snapshot,
+                preludeTimelineItemIDs: Set(
+                    visibleTimeline
+                        .map(\.id)
+                        .filter { !turnTimelineItemIDs.contains($0) }
+                ),
+                preludeTranscriptEntryIDs: Set(
+                    transcript
+                        .map { $0.id.uuidString }
+                        .filter { !turnTranscriptEntryIDs.contains($0) }
+                )
+            ),
             turns: turns
         )
     }
 
     private func createBackup(
         sessionID: String,
-        sessionFileURL: URL
+        parsedSession: ParsedSession
     ) throws -> CodexRewriteBackup {
         try fileManager.createDirectory(at: backupRootDirectoryURL, withIntermediateDirectories: true)
 
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         let stamp = formatter.string(from: Date()).replacingOccurrences(of: ":", with: "-")
-        let backupFileURL = backupRootDirectoryURL
-            .appendingPathComponent("\(sessionID)-\(stamp).jsonl", isDirectory: false)
+        let backupDirectoryURL = backupRootDirectoryURL
+            .appendingPathComponent("\(sessionID)-\(stamp)", isDirectory: true)
+        try fileManager.createDirectory(at: backupDirectoryURL, withIntermediateDirectories: true)
 
-        let data = try Data(contentsOf: sessionFileURL)
+        let backupFileURL = backupDirectoryURL
+            .appendingPathComponent(parsedSession.sessionFileURL.lastPathComponent, isDirectory: false)
+
+        let data = try Data(contentsOf: parsedSession.sessionFileURL)
         try data.write(to: backupFileURL, options: .atomic)
+        let auxiliaryFiles = try auxiliaryBackupFiles(
+            sessionID: sessionID,
+            storage: parsedSession.storage,
+            backupDirectoryURL: backupDirectoryURL
+        )
         return CodexRewriteBackup(
             sessionID: sessionID,
-            sessionFileURL: sessionFileURL,
+            sessionFileURL: parsedSession.sessionFileURL,
             backupFileURL: backupFileURL,
+            auxiliaryFiles: auxiliaryFiles,
             createdAt: Date()
         )
     }
 
+    private func auxiliaryBackupFiles(
+        sessionID: String,
+        storage: ParsedSessionStorage,
+        backupDirectoryURL: URL
+    ) throws -> [CodexRewriteBackupFile] {
+        guard case .conversationSnapshot(let snapshot, _, _) = storage,
+              snapshot.version == 2,
+              let conversationStore,
+              let eventLogURL = conversationStore.eventLogFileURL(for: sessionID),
+              fileManager.fileExists(atPath: eventLogURL.path) else {
+            return []
+        }
+
+        let backupFileURL = backupDirectoryURL.appendingPathComponent(
+            eventLogURL.lastPathComponent,
+            isDirectory: false
+        )
+        let data = try Data(contentsOf: eventLogURL)
+        try data.write(to: backupFileURL, options: .atomic)
+        return [
+            CodexRewriteBackupFile(
+                originalFileURL: eventLogURL,
+                backupFileURL: backupFileURL
+            )
+        ]
+    }
+
     private func writeSession(
-        preludeLines: [String],
+        storage: ParsedSessionStorage,
         turnRecords: [ParsedTurnRecord],
         to fileURL: URL
     ) throws {
-        let rewrittenLines = preludeLines + turnRecords.flatMap(\.lines)
-        let serialized = rewrittenLines.joined(separator: "\n") + "\n"
-        try serialized.write(to: fileURL, atomically: true, encoding: .utf8)
+        switch storage {
+        case .jsonl(let preludeLines):
+            let rewrittenLines = preludeLines + turnRecords.flatMap(\.jsonlLines)
+            let serialized = rewrittenLines.joined(separator: "\n") + "\n"
+            try serialized.write(to: fileURL, atomically: true, encoding: .utf8)
+
+        case .conversationSnapshot(
+            var snapshot,
+            let preludeTimelineItemIDs,
+            let preludeTranscriptEntryIDs
+        ):
+            let retainedTimelineItemIDs = preludeTimelineItemIDs.union(turnRecords.flatMap(\.timelineItemIDs))
+            let retainedTranscriptEntryIDs = preludeTranscriptEntryIDs.union(turnRecords.flatMap(\.transcriptEntryIDs))
+            let retainedConversationTurnIDs = Set(turnRecords.flatMap(\.conversationTurnIDs))
+
+            snapshot.timeline = snapshot.timeline.filter { retainedTimelineItemIDs.contains($0.id) }
+            snapshot.transcript = snapshot.transcript.filter {
+                retainedTranscriptEntryIDs.contains($0.id.uuidString)
+            }
+            snapshot.turns = snapshot.turns.filter {
+                retainedConversationTurnIDs.contains($0.openAssistTurnID)
+            }
+            snapshot.updatedAt = Date()
+            if snapshot.version == 2,
+               let conversationStore {
+                try conversationStore.rewriteHybridSnapshotAndEventLog(snapshot)
+            } else if let conversationStore {
+                try conversationStore.storeSnapshot(snapshot)
+            } else {
+                let encoder = JSONEncoder()
+                encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+                let data = try encoder.encode(snapshot)
+                try data.write(to: fileURL, options: .atomic)
+            }
+        }
+    }
+
+    private static func timelineTurnSlices(
+        from items: [AssistantTimelineItem]
+    ) -> [TimelineTurnSlice] {
+        var slices: [TimelineTurnSlice] = []
+        var currentUserItem: AssistantTimelineItem?
+        var currentItemIDs: [String] = []
+        var currentConversationTurnIDs: [String] = []
+
+        func finalizeCurrentSlice() {
+            guard let currentUserItem else { return }
+            slices.append(
+                TimelineTurnSlice(
+                    userItem: currentUserItem,
+                    itemIDs: currentItemIDs,
+                    conversationTurnIDs: currentConversationTurnIDs
+                )
+            )
+        }
+
+        for item in items {
+            let isVisibleUserMessage = item.kind == .userMessage
+                && item.text?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+
+            if isVisibleUserMessage {
+                finalizeCurrentSlice()
+                currentUserItem = item
+                currentItemIDs = [item.id]
+                currentConversationTurnIDs = []
+                continue
+            }
+
+            guard currentUserItem != nil else { continue }
+            currentItemIDs.append(item.id)
+            if let turnID = item.turnID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty,
+               !currentConversationTurnIDs.contains(turnID) {
+                currentConversationTurnIDs.append(turnID)
+            }
+        }
+
+        finalizeCurrentSlice()
+        return slices
+    }
+
+    private static func transcriptTurnSlices(
+        from entries: [AssistantTranscriptEntry]
+    ) -> [TranscriptTurnSlice] {
+        var slices: [TranscriptTurnSlice] = []
+        var currentEntryIDs: [String] = []
+        var hasCurrentTurn = false
+
+        func finalizeCurrentSlice() {
+            guard hasCurrentTurn else { return }
+            slices.append(TranscriptTurnSlice(entryIDs: currentEntryIDs))
+        }
+
+        for entry in entries {
+            let isVisibleUserMessage = entry.role == .user
+                && entry.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+
+            if isVisibleUserMessage {
+                finalizeCurrentSlice()
+                currentEntryIDs = [entry.id.uuidString]
+                hasCurrentTurn = true
+                continue
+            }
+
+            guard hasCurrentTurn else { continue }
+            currentEntryIDs.append(entry.id.uuidString)
+        }
+
+        finalizeCurrentSlice()
+        return slices
+    }
+
+    private static func timelineSort(
+        lhs: AssistantTimelineItem,
+        rhs: AssistantTimelineItem
+    ) -> Bool {
+        if lhs.sortDate != rhs.sortDate {
+            return lhs.sortDate < rhs.sortDate
+        }
+        if lhs.lastUpdatedAt != rhs.lastUpdatedAt {
+            return lhs.lastUpdatedAt < rhs.lastUpdatedAt
+        }
+        return lhs.id < rhs.id
+    }
+
+    private static func transcriptSort(
+        lhs: AssistantTranscriptEntry,
+        rhs: AssistantTranscriptEntry
+    ) -> Bool {
+        if lhs.createdAt != rhs.createdAt {
+            return lhs.createdAt < rhs.createdAt
+        }
+        return lhs.id.uuidString < rhs.id.uuidString
     }
 
     private func visibleUserInput(

@@ -5905,6 +5905,9 @@ enum PromptRewriteConversationContextResolver {
             || lowered == "toggle diff panel" {
             return false
         }
+        if lowered.hasPrefix("what would you like to do") {
+            return false
+        }
         if lowered.hasPrefix("ask for follow-up changes") {
             return false
         }
