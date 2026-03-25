@@ -1,0 +1,50 @@
+name: Publish Wiki
+
+on:
+  push:
+    branches:
+      - main
+      - 'mVashith/**'
+    paths:
+      - 'Wiki/**'
+      - 'Scripts/publish-wiki.sh'
+      - '.github/workflows/publish-wiki.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish-wiki:
+    name: Publish wiki content
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Check wiki token
+        env:
+          WIKI_PUBLISH_TOKEN: ${{ secrets.WIKI_PUBLISH_TOKEN }}
+        run: |
+          if [[ -z "${WIKI_PUBLISH_TOKEN:-}" ]]; then
+            echo "Set the WIKI_PUBLISH_TOKEN repository secret before running this workflow."
+            exit 1
+          fi
+
+      - name: Ensure wiki is enabled
+        env:
+          WIKI_PUBLISH_TOKEN: ${{ secrets.WIKI_PUBLISH_TOKEN }}
+        run: |
+          curl -fsS -X PATCH \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${WIKI_PUBLISH_TOKEN}" \
+            https://api.github.com/repos/manikv12/OpenAssist \
+            -d '{"has_wiki":true}' >/dev/null
+
+      - name: Publish wiki
+        env:
+          WIKI_REPO_URL: https://x-access-token:${{ secrets.WIKI_PUBLISH_TOKEN }}@github.com/manikv12/OpenAssist.wiki.git
+        run: bash Scripts/publish-wiki.sh

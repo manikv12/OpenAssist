@@ -1,50 +1,66 @@
 # AI Rewrite and Context
 
-AI rewrite in Open Assist is optional and configurable. You can keep dictation raw, lightly refine it, or strongly rewrite it based on your goals.
+AI rewrite in Open Assist is optional.
+
+You can keep text raw, lightly polish it, or rewrite it more strongly depending on the situation.
+
+## Where to set it up
+
+Open `Settings -> AI & Models` and then:
+
+1. Turn on AI rewrite.
+2. Choose a provider.
+3. Pick a rewrite strength.
+4. Open `AI Studio` if you want to manage models or local AI.
+
+You can use rewrite from the compact HUD or the full assistant window.
 
 ## Supported providers
 
-- Ollama (local)
+- Ollama for local use
 - OpenAI
 - Anthropic
 - Google Gemini
 - Groq
 - OpenRouter
 
-## Local AI setup (no API key)
-
-Use built-in setup from:
-
-`Settings -> AI Models -> AI Studio -> Prompt Models`
-
-Then:
-
-1. Choose a model under `Local AI Setup`.
-2. Click `Install Selected Model`.
-3. Complete the guided flow: `Select -> Install Runtime -> Download -> Verify -> Done`.
-
-If local AI later fails, run `Repair Local AI` from AI Studio.
-
 ## Rewrite strength
 
-- `Light`: minor polish, keeps original wording close
-- `Balanced`: improved clarity and grammar
-- `Strong`: heavier rewriting for cleaner output
+- `Light`: small cleanup that keeps your wording close
+- `Balanced`: clearer text with better grammar and flow
+- `Strong`: heavier rewrite for a cleaner final draft
 
-## Conversation context
+## Local AI setup
 
-Open Assist can track prior turns per app/thread so rewrites are aware of what you already said.
+If you want no API key, use the built-in setup:
 
-Benefits:
+1. Open `Settings -> AI & Models -> AI Studio`.
+2. Open `Prompt Models`.
+3. Choose `Local AI Setup`.
+4. Install the runtime and the model you want.
+5. Verify the setup when the app finishes.
 
-- Better continuity over long sessions
-- Less repetition
-- More consistent tone across consecutive dictations
+If local AI fails later, use `Repair Local AI` from AI Studio.
 
-## Recommendation
+## Context and memory
+
+Open Assist can keep context across turns so rewrites stay consistent.
+
+That helps when you:
+
+- keep working in the same thread
+- write longer messages or documents
+- want the same tone across several replies
+
+Helpful note:
+
+- assistant memory and voice dictation history are separate
+- you can still keep text raw if you do not want rewriting
+
+## Good starting point
 
 Start with:
 
 - `Balanced` rewrite strength
-- Local Ollama provider (if you want local-only AI)
-- Hold-to-talk workflow for most reliable finalization
+- Local Ollama if you want a local-only setup
+- Hold-to-talk for the most reliable final text

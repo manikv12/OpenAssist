@@ -1,46 +1,53 @@
 # Why Open Assist
 
-Open Assist is designed for people who type all day and want speech input that actually fits real workflows.
+Open Assist is for people who want one app for writing, voice, automation, and follow-up work.
 
 ## Built for flow, not friction
 
-- Dictate directly into your active app
-- No app switching while writing
-- No copy-paste handoff from a separate transcription window
+- Stay in one assistant window instead of bouncing between tools
+- Use text when you want precision
+- Use voice when speaking is faster
+- Dictate directly into your active app when you just need the text
 
 ## Private by default
 
 - Local-first operation
-- No account required
+- No account required for basic use
 - No telemetry by default
-- Data remains on your machine unless you explicitly configure a cloud AI provider
+- Your data stays on your Mac unless you choose a cloud provider or remote service
 
-## Flexible transcription engines
+## Flexible AI setup
 
-- Apple Speech for instant setup
-- Whisper.cpp for local model-based transcription
-- Model options (`tiny`, `base`, `small`) to balance speed and quality
+- Local models if you want a private setup
+- Cloud models if you want easier setup or different capabilities
+- AI rewrite only when you want it
+- AI Studio for provider and model management
 
-## AI when you want it, optional when you do not
+## More than dictation
 
-- Keep raw dictation as-is
-- Or enable AI rewrite for cleaner style and structure
-- Use local Ollama for no-key, no-account AI rewrite
+Open Assist is not only a speech tool.
 
-## Conversation-aware rewriting
+It also gives you:
 
-Open Assist can keep context per app and thread so rewrites stay coherent over longer sessions.
+- projects and threads for long work
+- skills for reusable help
+- checkpoints for recovery and retries
+- memory for continuity across sessions
+- browser and app control with approval
+- scheduled jobs and Telegram remote control
 
-This is especially helpful for:
+## Good defaults
 
-- Multi-turn writing tasks
-- Ongoing support conversations
-- IDE and assistant workflows where continuity matters
+- Hold-to-talk feels quick and simple
+- Plan mode helps you think before acting
+- Agentic mode helps you get work done with approval
+- Shortcuts and settings are easy to adjust later
 
-## Practical defaults
+## When it is a good fit
 
-- Clipboard-safe insertion behavior by default
-- Transcript history for quick re-use
-- Customizable shortcuts and settings
+- You type or dictate all day
+- You want a local-first assistant on macOS
+- You want voice, rewrite, and automation in one app
+- You want the assistant to remember enough to stay useful
 
-Open Assist aims to feel lightweight while still giving power users advanced control.
+Open Assist tries to feel simple at the surface and powerful underneath.
