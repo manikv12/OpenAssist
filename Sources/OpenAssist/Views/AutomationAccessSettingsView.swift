@@ -112,12 +112,12 @@ struct AutomationAccessSettingsView: View {
         refreshTask?.cancel()
         isRefreshing = true
         refreshTask = Task {
+            defer { isRefreshing = false }
             let result = await Task.detached(priority: .utility) {
                 PermissionCenter.automationPermissionStatuses()
             }.value
             guard !Task.isCancelled else { return }
             statuses = result
-            isRefreshing = false
             onPermissionsChanged()
         }
     }
@@ -126,12 +126,12 @@ struct AutomationAccessSettingsView: View {
         refreshTask?.cancel()
         isRefreshing = true
         refreshTask = Task {
+            defer { isRefreshing = false }
             let result = await Task.detached(priority: .utility) {
                 PermissionCenter.requestMissingAutomationPermissions()
             }.value
             guard !Task.isCancelled else { return }
             statuses = result
-            isRefreshing = false
             onPermissionsChanged()
 
             if statuses.contains(where: \.needsManualEnableInSettings) {
@@ -148,13 +148,13 @@ struct AutomationAccessSettingsView: View {
         refreshTask?.cancel()
         isRefreshing = true
         refreshTask = Task {
+            defer { isRefreshing = false }
             let result = await Task.detached(priority: .utility) {
                 _ = PermissionCenter.automationPermissionStatus(for: target, promptIfNeeded: true)
                 return PermissionCenter.automationPermissionStatuses()
             }.value
             guard !Task.isCancelled else { return }
             statuses = result
-            isRefreshing = false
             onPermissionsChanged()
 
             if let refreshed = statuses.first(where: { $0.target.id == target.id }), refreshed.needsManualEnableInSettings {
