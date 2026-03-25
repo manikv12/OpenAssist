@@ -835,7 +835,23 @@ final class AssistantSessionInteractionTests: XCTestCase {
 
         XCTAssertEqual(
             runtime.dynamicToolNamesForTesting(mode: .agentic),
-            ["generate_image", "app_action", "browser_use", "computer_use"]
+            [
+                "generate_image",
+                "app_action",
+                "browser_use",
+                "exec_command",
+                "write_stdin",
+                "read_terminal",
+                "view_image",
+                "screen_capture",
+                "window_list",
+                "window_capture",
+                "ui_inspect",
+                "ui_click",
+                "ui_type",
+                "ui_press_key",
+                "computer_use"
+            ]
         )
     }
 
@@ -1013,7 +1029,22 @@ final class AssistantSessionInteractionTests: XCTestCase {
         XCTAssertEqual(runtime.dynamicToolNamesForTesting(mode: .plan), ["generate_image"])
         XCTAssertEqual(
             runtime.dynamicToolNamesForTesting(mode: .agentic),
-            ["generate_image", "app_action", "browser_use"]
+            [
+                "generate_image",
+                "app_action",
+                "browser_use",
+                "exec_command",
+                "write_stdin",
+                "read_terminal",
+                "view_image",
+                "screen_capture",
+                "window_list",
+                "window_capture",
+                "ui_inspect",
+                "ui_click",
+                "ui_type",
+                "ui_press_key"
+            ]
         )
     }
 

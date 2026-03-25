@@ -102,4 +102,50 @@ final class ToolPermissionRegistryTests: XCTestCase {
         XCTAssertTrue(verdict.message.contains("Accessibility"))
         XCTAssertTrue(verdict.message.contains("Screen Recording"))
     }
+
+    func testUIInspectVerifyRequiresAccessibility() {
+        let snapshot = ToolPermissionRegistry.PermissionSnapshot(
+            accessibilityGranted: false,
+            screenRecordingGranted: true,
+            appleEventsGranted: false,
+            appleEventsKnown: true,
+            fullDiskAccessGranted: false,
+            browserAutomationEnabled: true,
+            browserProfileSelected: true,
+            computerUseEnabled: true
+        )
+
+        let verdict = ToolPermissionRegistry.verify(
+            toolName: AssistantUIInspectToolDefinition.name,
+            arguments: ["app": "Chrome"],
+            snapshot: snapshot
+        )
+
+        XCTAssertFalse(verdict.satisfied)
+        XCTAssertEqual(verdict.missing, [.accessibility])
+        XCTAssertTrue(verdict.message.contains("Accessibility"))
+    }
+
+    func testExecCommandVerifyRequiresNoMacPermissions() {
+        let snapshot = ToolPermissionRegistry.PermissionSnapshot(
+            accessibilityGranted: false,
+            screenRecordingGranted: false,
+            appleEventsGranted: false,
+            appleEventsKnown: true,
+            fullDiskAccessGranted: false,
+            browserAutomationEnabled: false,
+            browserProfileSelected: false,
+            computerUseEnabled: false
+        )
+
+        let verdict = ToolPermissionRegistry.verify(
+            toolName: AssistantExecCommandToolDefinition.name,
+            arguments: ["cmd": "pwd"],
+            snapshot: snapshot
+        )
+
+        XCTAssertTrue(verdict.satisfied)
+        XCTAssertTrue(verdict.missing.isEmpty)
+        XCTAssertEqual(verdict.message, "")
+    }
 }

@@ -210,6 +210,10 @@ final class CodexAssistantRuntime {
     private let appActionService: AssistantAppActionService
     private let computerUseService: AssistantComputerUseService
     private let imageGenerationService: AssistantImageGenerationService
+    private let shellExecutionService: AssistantShellExecutionService
+    private let windowAutomationService: AssistantWindowAutomationService
+    private let accessibilityAutomationService: AssistantAccessibilityAutomationService
+    private let toolExecutor: AssistantToolExecutor
     private var approvedDynamicToolKindsBySessionID: [String: Set<String>] = [:]
 
     var currentSessionID: String? {
@@ -235,6 +239,9 @@ final class CodexAssistantRuntime {
         appActionService: AssistantAppActionService? = nil,
         computerUseService: AssistantComputerUseService? = nil,
         imageGenerationService: AssistantImageGenerationService? = nil,
+        shellExecutionService: AssistantShellExecutionService? = nil,
+        windowAutomationService: AssistantWindowAutomationService? = nil,
+        accessibilityAutomationService: AssistantAccessibilityAutomationService? = nil,
         installSupport: CodexInstallSupport = CodexInstallSupport()
     ) {
         self.preferredModelID = preferredModelID?.nonEmpty
@@ -245,6 +252,19 @@ final class CodexAssistantRuntime {
         self.appActionService = appActionService ?? AssistantAppActionService()
         self.computerUseService = computerUseService ?? AssistantComputerUseService()
         self.imageGenerationService = imageGenerationService ?? AssistantImageGenerationService()
+        self.shellExecutionService = shellExecutionService ?? AssistantShellExecutionService()
+        self.windowAutomationService = windowAutomationService ?? AssistantWindowAutomationService()
+        self.accessibilityAutomationService = accessibilityAutomationService ?? AssistantAccessibilityAutomationService()
+        self.toolExecutor = AssistantToolExecutor(
+            browserUseService: self.browserUseService,
+            appActionService: self.appActionService,
+            computerUseService: self.computerUseService,
+            imageGenerationService: self.imageGenerationService,
+            shellExecutionService: self.shellExecutionService,
+            windowAutomationService: self.windowAutomationService,
+            accessibilityAutomationService: self.accessibilityAutomationService,
+            surfaceCompiler: AssistantToolSurfaceCompiler()
+        )
         self.installSupport = installSupport
     }
 
@@ -1954,7 +1974,8 @@ final class CodexAssistantRuntime {
     private func handleDynamicToolCall(id: JSONRPCRequestID, params: [String: Any]) async {
         let tool = dynamicToolName(from: params) ?? "Tool"
 
-        guard let toolKind = dynamicToolKind(for: tool) else {
+        guard let descriptor = toolExecutor.descriptor(for: tool),
+              let toolKind = dynamicToolKind(for: tool) else {
             do {
                 try await transport?.sendResponse(
                     id: id,
@@ -1976,12 +1997,9 @@ final class CodexAssistantRuntime {
 
         let sessionID = params["threadId"] as? String ?? activeSessionID ?? ""
         let arguments = dynamicToolArguments(from: params)
-        let taskSummary = dynamicToolTaskSummary(for: tool, arguments: arguments)
-        let displayName = dynamicToolDisplayName(tool)
-        let requiresExplicitConfirmation = dynamicToolRequiresExplicitConfirmation(
-            toolName: tool,
-            arguments: arguments
-        )
+        let taskSummary = descriptor.summaryProvider(arguments)
+        let displayName = descriptor.displayName
+        let requiresExplicitConfirmation = descriptor.requiresExplicitConfirmation(arguments)
         let approvalContextDisplayName: String?
         let approvalKind: String
         if tool == AssistantComputerUseToolDefinition.name {
@@ -2190,64 +2208,26 @@ final class CodexAssistantRuntime {
         }
 
         let workingDetail: String
-        var result: AssistantToolExecutionResult
-
-        switch toolName {
-        case AssistantBrowserUseToolDefinition.name:
-            workingDetail = browserLoginResume
-                ? "Checking the browser after sign-in"
-                : "Using the selected browser profile"
-            updateHUD(phase: .acting, title: displayName, detail: workingDetail)
-            result = await (
-                browserLoginResume
-                    ? browserUseService.resumeAfterLogin(
-                        arguments: arguments,
-                        preferredModelID: preferredModelID
-                    )
-                    : browserUseService.run(
-                        arguments: arguments,
-                        preferredModelID: preferredModelID
-                    )
-            )
-            if let prompt = result?.loginPrompt {
-                await presentBrowserLoginRequest(
-                    id: requestID,
-                    arguments: arguments,
-                    prompt: prompt,
-                    taskSummary: dynamicToolTaskSummary(for: toolName, arguments: arguments)
-                )
-                return
-            }
-        case AssistantAppActionToolDefinition.name:
-            workingDetail = "Using a supported Mac app"
-            updateHUD(phase: .acting, title: displayName, detail: workingDetail)
-            result = await appActionService.run(
+        let result: AssistantToolExecutionResult
+        workingDetail = toolExecutor.workingDetail(for: toolName, browserLoginResume: browserLoginResume)
+        updateHUD(phase: .acting, title: displayName, detail: workingDetail)
+        result = await toolExecutor.execute(
+            AssistantToolExecutionContext(
+                toolName: toolName,
                 arguments: arguments,
-                preferredModelID: preferredModelID
-            )
-        case AssistantComputerUseToolDefinition.name:
-            workingDetail = "Using screenshot-based desktop control"
-            updateHUD(phase: .acting, title: displayName, detail: workingDetail)
-            result = await computerUseService.run(
                 sessionID: sessionID ?? activeSessionID ?? "",
+                preferredModelID: preferredModelID,
+                browserLoginResume: browserLoginResume
+            )
+        )
+        if let prompt = result.loginPrompt {
+            await presentBrowserLoginRequest(
+                id: requestID,
                 arguments: arguments,
-                preferredModelID: preferredModelID
+                prompt: prompt,
+                taskSummary: dynamicToolTaskSummary(for: toolName, arguments: arguments)
             )
-        case AssistantImageGenerationToolDefinition.name:
-            workingDetail = "Generating an image with Google Gemini"
-            updateHUD(phase: .acting, title: displayName, detail: workingDetail)
-            result = await imageGenerationService.run(
-                arguments: arguments,
-                preferredModelID: preferredModelID
-            )
-        default:
-            workingDetail = "Unsupported dynamic tool"
-            updateHUD(phase: .failed, title: displayName, detail: workingDetail)
-            result = AssistantToolExecutionResult(
-                contentItems: [.init(type: "inputText", text: "Open Assist does not support the dynamic tool `\(toolName)` yet.", imageURL: nil)],
-                success: false,
-                summary: "Unsupported dynamic tool."
-            )
+            return
         }
 
         do {
@@ -3410,9 +3390,7 @@ final class CodexAssistantRuntime {
     }
 
     func dynamicToolNamesForTesting(mode: AssistantInteractionMode) -> [String] {
-        dynamicToolSpecs(for: mode).compactMap { tool in
-            tool["name"] as? String
-        }
+        toolExecutor.dynamicToolNames(for: mode, backend: backend)
     }
 
     func dynamicToolRequiresExplicitConfirmationForTesting(
@@ -3755,48 +3733,15 @@ final class CodexAssistantRuntime {
     }
 
     private func dynamicToolDisplayName(_ rawTool: String?) -> String {
-        switch rawTool {
-        case AssistantBrowserUseToolDefinition.name:
-            return "Browser Use"
-        case AssistantAppActionToolDefinition.name:
-            return "App Action"
-        case AssistantComputerUseToolDefinition.name:
-            return "Computer Use"
-        case AssistantImageGenerationToolDefinition.name:
-            return "Image Generation"
-        default:
-            return rawTool ?? "Tool"
-        }
+        toolExecutor.descriptor(for: rawTool)?.displayName ?? rawTool ?? "Tool"
     }
 
     private func dynamicToolKind(for rawTool: String?) -> String? {
-        switch rawTool {
-        case AssistantBrowserUseToolDefinition.name:
-            return AssistantBrowserUseToolDefinition.toolKind
-        case AssistantAppActionToolDefinition.name:
-            return AssistantAppActionToolDefinition.toolKind
-        case AssistantComputerUseToolDefinition.name:
-            return AssistantComputerUseToolDefinition.toolKind
-        case AssistantImageGenerationToolDefinition.name:
-            return AssistantImageGenerationToolDefinition.toolKind
-        default:
-            return nil
-        }
+        toolExecutor.descriptor(for: rawTool)?.toolKind
     }
 
     private func dynamicToolTaskSummary(for toolName: String, arguments: Any) -> String {
-        switch toolName {
-        case AssistantBrowserUseToolDefinition.name:
-            return (try? AssistantBrowserUseService.parseTask(from: arguments).summaryLine) ?? "Use the selected browser profile"
-        case AssistantAppActionToolDefinition.name:
-            return (try? AssistantAppActionService.parseRequest(from: arguments).task) ?? "Use a supported Mac app"
-        case AssistantComputerUseToolDefinition.name:
-            return (try? AssistantComputerUseService.parseRequest(from: arguments).summaryLine) ?? "Use screenshot-based desktop control"
-        case AssistantImageGenerationToolDefinition.name:
-            return (try? AssistantImageGenerationService.parseRequest(from: arguments).summaryLine) ?? "Generate an image"
-        default:
-            return "Use a dynamic tool"
-        }
+        toolExecutor.descriptor(for: toolName)?.summaryProvider(arguments) ?? "Use a dynamic tool"
     }
 
     private static func imageDataItems(
@@ -3835,19 +3780,8 @@ final class CodexAssistantRuntime {
         requiresExplicitConfirmation: Bool,
         targetDisplayName: String? = nil
     ) -> String {
-        let lead: String
-        switch toolName {
-        case AssistantBrowserUseToolDefinition.name:
-            lead = "Browser Use works in the selected signed-in browser profile on this Mac and keeps you in that same browser session."
-        case AssistantAppActionToolDefinition.name:
-            lead = "App Action can talk to supported Mac apps like Finder, Terminal, Calendar, System Settings, Reminders, Contacts, Notes, and Messages."
-        case AssistantComputerUseToolDefinition.name:
-            lead = "Computer Use captures the visible screen on this Mac, then uses mouse or keyboard actions on the live desktop when browser_use and app_action are not enough."
-        case AssistantImageGenerationToolDefinition.name:
-            lead = "Image Generation sends the request to Google Gemini using the shared Google AI Studio API key configured in Open Assist and returns the generated image back into the conversation."
-        default:
-            lead = "This tool can control parts of your Mac."
-        }
+        let lead = toolExecutor.descriptor(for: toolName)?.permissionLeadText
+            ?? "This tool can control parts of your Mac."
 
         let riskLine = requiresExplicitConfirmation
             ? "\n\nThis request looks higher risk, so Open Assist needs a fresh confirmation for this one."
@@ -3863,25 +3797,8 @@ final class CodexAssistantRuntime {
         toolName: String,
         arguments: Any
     ) -> Bool {
-        guard dynamicToolKind(for: toolName) != nil else { return false }
-
-        if toolName == AssistantAppActionToolDefinition.name,
-           let request = try? AssistantAppActionService.parseRequest(from: arguments),
-           (
-               request.command?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty != nil
-                || request.app == .terminal
-                || request.commit
-           ) {
-            return true
-        }
-        if toolName == AssistantComputerUseToolDefinition.name,
-           let request = try? AssistantComputerUseService.parseRequest(from: arguments) {
-            return request.isHighRisk
-        }
-
-        let summary = dynamicToolTaskSummary(for: toolName, arguments: arguments).lowercased()
-        let riskyKeywords = ["send", "post", "purchase", "delete", "submit"]
-        return riskyKeywords.contains(where: summary.contains)
+        guard let descriptor = toolExecutor.descriptor(for: toolName) else { return false }
+        return descriptor.requiresExplicitConfirmation(arguments)
     }
 
     private func threadApprovalPolicy(for mode: AssistantInteractionMode) -> String {
@@ -4142,22 +4059,7 @@ final class CodexAssistantRuntime {
     private var detachedSessionIDs: Set<String> = []
 
     private func dynamicToolSpecs(for mode: AssistantInteractionMode) -> [[String: Any]] {
-        switch mode {
-        case .conversational, .plan:
-            return [
-                AssistantImageGenerationToolDefinition.dynamicToolSpec()
-            ]
-        case .agentic:
-            var tools: [[String: Any]] = [
-                AssistantImageGenerationToolDefinition.dynamicToolSpec(),
-                AssistantAppActionToolDefinition.dynamicToolSpec(),
-                AssistantBrowserUseToolDefinition.dynamicToolSpec()
-            ]
-            if SettingsStore.shared.assistantComputerUseEnabled {
-                tools.append(AssistantComputerUseToolDefinition.dynamicToolSpec())
-            }
-            return tools
-        }
+        toolExecutor.dynamicToolSpecs(for: mode, backend: backend)
     }
 
     private func dynamicToolName(from payload: [String: Any]) -> String? {

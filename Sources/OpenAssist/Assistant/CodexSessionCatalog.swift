@@ -1833,7 +1833,9 @@ struct CodexSessionCatalog {
 
     private func savedActivityKind(forToolName name: String) -> AssistantActivityKind {
         let lowercased = name.lowercased()
-        if lowercased == "exec_command" {
+        if lowercased == "exec_command"
+            || lowercased == "write_stdin"
+            || lowercased == "read_terminal" {
             return .commandExecution
         }
         if lowercased == "apply_patch" {
@@ -1959,6 +1961,36 @@ struct CodexSessionCatalog {
         }
         if lowercased == "generate_image" {
             return "Image Generation"
+        }
+        if lowercased == "write_stdin" {
+            return "Write Stdin"
+        }
+        if lowercased == "read_terminal" {
+            return "Read Terminal"
+        }
+        if lowercased == "view_image" {
+            return "View Image"
+        }
+        if lowercased == "screen_capture" {
+            return "Screen Capture"
+        }
+        if lowercased == "window_list" {
+            return "Window List"
+        }
+        if lowercased == "window_capture" {
+            return "Window Capture"
+        }
+        if lowercased == "ui_inspect" {
+            return "UI Inspect"
+        }
+        if lowercased == "ui_click" {
+            return "UI Click"
+        }
+        if lowercased == "ui_type" {
+            return "UI Type"
+        }
+        if lowercased == "ui_press_key" {
+            return "UI Press Key"
         }
         if rawName.hasPrefix("mcp__") {
             let components = rawName.split(separator: "_")

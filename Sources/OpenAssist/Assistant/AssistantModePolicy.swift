@@ -10,7 +10,18 @@ enum AssistantModePolicy {
     private static let restrictedDynamicToolNames: Set<String> = [
         "browser_use",
         "app_action",
-        "computer_use"
+        "computer_use",
+        "exec_command",
+        "write_stdin",
+        "read_terminal",
+        "view_image",
+        "screen_capture",
+        "window_list",
+        "window_capture",
+        "ui_inspect",
+        "ui_click",
+        "ui_type",
+        "ui_press_key"
     ]
 
     private static let simpleReadOnlyExecutables: Set<String> = [

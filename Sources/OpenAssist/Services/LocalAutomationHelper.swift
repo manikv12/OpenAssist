@@ -226,6 +226,35 @@ actor LocalAutomationHelper {
         return (lines.first, lines.dropFirst().first)
     }
 
+    func clickScreenPoint(
+        _ point: CGPoint,
+        buttonName: String? = nil,
+        clickCount: Int = 1
+    ) async throws {
+        guard AXIsProcessTrusted() else {
+            throw LocalAutomationError.accessibilityRequired
+        }
+        try await click(
+            at: point,
+            button: button(from: buttonName),
+            clickCount: max(1, clickCount)
+        )
+    }
+
+    func sendKeypress(_ keys: [String]) async throws {
+        guard AXIsProcessTrusted() else {
+            throw LocalAutomationError.accessibilityRequired
+        }
+        try await keypress(keys)
+    }
+
+    func typeTextDirect(_ text: String) async throws {
+        guard AXIsProcessTrusted() else {
+            throw LocalAutomationError.accessibilityRequired
+        }
+        try await typeText(text)
+    }
+
     func revealInFinder(path: String) throws {
         let expandedPath = NSString(string: path).expandingTildeInPath
         let url = URL(fileURLWithPath: expandedPath)

@@ -78,6 +78,61 @@ enum ToolPermissionRegistry {
             toolName: "generate_image",
             required: [],
             optional: []
+        ),
+        ToolPermissionRequirement(
+            toolName: "exec_command",
+            required: [],
+            optional: []
+        ),
+        ToolPermissionRequirement(
+            toolName: "write_stdin",
+            required: [],
+            optional: []
+        ),
+        ToolPermissionRequirement(
+            toolName: "read_terminal",
+            required: [],
+            optional: []
+        ),
+        ToolPermissionRequirement(
+            toolName: "view_image",
+            required: [],
+            optional: []
+        ),
+        ToolPermissionRequirement(
+            toolName: "screen_capture",
+            required: [.screenRecording],
+            optional: []
+        ),
+        ToolPermissionRequirement(
+            toolName: "window_list",
+            required: [],
+            optional: []
+        ),
+        ToolPermissionRequirement(
+            toolName: "window_capture",
+            required: [.screenRecording],
+            optional: []
+        ),
+        ToolPermissionRequirement(
+            toolName: "ui_inspect",
+            required: [.accessibility],
+            optional: []
+        ),
+        ToolPermissionRequirement(
+            toolName: "ui_click",
+            required: [.accessibility],
+            optional: []
+        ),
+        ToolPermissionRequirement(
+            toolName: "ui_type",
+            required: [.accessibility],
+            optional: []
+        ),
+        ToolPermissionRequirement(
+            toolName: "ui_press_key",
+            required: [.accessibility],
+            optional: []
         )
     ]
 
@@ -267,6 +322,18 @@ enum ToolPermissionRegistry {
 
         The `computer_use` tool is for generic visual desktop interaction when `browser_use` and `app_action` are not enough. It needs Computer Use enabled in Settings plus Accessibility and Screen Recording permissions. Use `computer_use` only for screenshot-based observe, click, drag, scroll, keypress, type, or wait steps on the visible desktop.
         """ )
+        lines.append("")
+        lines.append("""
+        ### Shell And Window Tools
+
+        The `exec_command`, `write_stdin`, and `read_terminal` tools run local shell work and continue interactive sessions on this Mac. The `view_image` tool loads a local image file. The `screen_capture` and `window_capture` tools need Screen Recording because they capture pixels from the current desktop.
+        """)
+        lines.append("")
+        lines.append("""
+        ### Accessibility UI Tools
+
+        The `ui_inspect`, `ui_click`, `ui_type`, and `ui_press_key` tools use macOS Accessibility APIs to inspect app controls, focus fields, click elements, and send keys without relying only on screenshot coordinates.
+        """)
 
         return lines.joined(separator: "\n")
     }
@@ -312,6 +379,14 @@ enum ToolPermissionRegistry {
             }
             if missing.contains(.screenRecording) {
                 nextSteps.append("Grant Screen Recording so Open Assist can capture the current screen.")
+            }
+        case "screen_capture", "window_capture":
+            if missing.contains(.screenRecording) {
+                nextSteps.append("Grant Screen Recording so Open Assist can capture the current screen or window.")
+            }
+        case "ui_inspect", "ui_click", "ui_type", "ui_press_key":
+            if missing.contains(.accessibility) {
+                nextSteps.append("Grant Accessibility so Open Assist can inspect and control macOS UI elements.")
             }
         default:
             break
