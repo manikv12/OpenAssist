@@ -39,6 +39,7 @@ final class CloudTranscriber: NSObject {
     private let audioSetupRetryCooldownSeconds: TimeInterval = 1.5
     private let finalizeWatchdogGraceSeconds: TimeInterval = 5
     private let formatNotSupportedOSStatus = -10868
+    private let transcriptionService: AudioTranscriptionService
 
     private struct RequestConfiguration {
         let provider: CloudTranscriptionProvider
@@ -70,6 +71,11 @@ final class CloudTranscriber: NSObject {
                 return message
             }
         }
+    }
+
+    init(transcriptionService: AudioTranscriptionService = .shared) {
+        self.transcriptionService = transcriptionService
+        super.init()
     }
 
     func requestPermissions(promptIfNeeded: Bool = true) {
@@ -438,7 +444,7 @@ final class CloudTranscriber: NSObject {
             CrashReporter.logWarning("Cloud finalize blocked: provider setup incomplete provider=\(provider.rawValue)")
             return
         }
-        guard !providerAPIKey.isEmpty else {
+        guard !provider.requiresAPIKey || !providerAPIKey.isEmpty else {
             updateStatus("Cloud API key missing. Open Settings > Recognition.")
             CrashReporter.logWarning("Cloud finalize blocked: provider API key missing provider=\(provider.rawValue)")
             return
@@ -556,18 +562,23 @@ final class CloudTranscriber: NSObject {
     }
 
     private func performTranscription(audioWAVData: Data, config: RequestConfiguration) async throws -> String {
-        guard !audioWAVData.isEmpty else {
-            throw CloudTranscriberError.emptyAudio
-        }
-
-        switch config.provider {
-        case .openAI, .groq:
-            return try await transcribeWithOpenAICompatibleAPI(audioWAVData: audioWAVData, config: config)
-        case .deepgram:
-            return try await transcribeWithDeepgram(audioWAVData: audioWAVData, config: config)
-        case .gemini:
-            return try await transcribeWithGemini(audioWAVData: audioWAVData, config: config)
-        }
+        let serviceConfiguration = AudioTranscriptionRequestConfiguration(
+            provider: config.provider,
+            model: config.model,
+            baseURL: config.baseURL,
+            apiKey: config.apiKey,
+            requestTimeoutSeconds: config.requestTimeoutSeconds,
+            biasPhrases: config.biasPhrases
+        )
+        let upload = AudioTranscriptionUpload(
+            fileData: audioWAVData,
+            fileName: "audio.wav",
+            mimeType: "audio/wav"
+        )
+        return try await transcriptionService.transcribe(
+            upload: upload,
+            configuration: serviceConfiguration
+        )
     }
 
     private func transcribeWithOpenAICompatibleAPI(audioWAVData: Data, config: RequestConfiguration) async throws -> String {

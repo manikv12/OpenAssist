@@ -79,7 +79,8 @@ final class AssistantProjectMemoryService {
 
     func turnContext(
         forThreadID threadID: String,
-        fallbackCWD: String?
+        fallbackCWD: String?,
+        prompt: String? = nil
     ) throws -> AssistantProjectTurnContext? {
         guard let context = projectStore.context(forThreadID: threadID) else {
             return nil
@@ -92,7 +93,9 @@ final class AssistantProjectMemoryService {
             scope: scope,
             projectContextBlock: makeProjectContextBlock(
                 project: context.project,
-                brain: context.brainState
+                brain: context.brainState,
+                currentThreadID: threadID,
+                prompt: prompt
             )
         )
     }
@@ -263,7 +266,9 @@ final class AssistantProjectMemoryService {
 
     private func makeProjectContextBlock(
         project: AssistantProject,
-        brain: AssistantProjectBrainState
+        brain: AssistantProjectBrainState,
+        currentThreadID: String,
+        prompt: String?
     ) -> String? {
         var lines: [String] = ["Project name: \(project.name)"]
 
@@ -273,12 +278,66 @@ final class AssistantProjectMemoryService {
             lines.append("Linked project folder: none")
         }
 
-        if let projectSummary = brain.projectSummary?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
-            lines.append("Project memory summary: \(projectSummary)")
+        let relevantDigestLines = relevantProjectDigestLines(
+            from: brain,
+            excludingThreadID: currentThreadID,
+            prompt: prompt
+        )
+        if !relevantDigestLines.isEmpty {
+            lines.append("Relevant project notes:\n" + relevantDigestLines.joined(separator: "\n"))
         }
 
         guard !lines.isEmpty else { return nil }
         return "Project context:\n" + lines.map { "- \($0)" }.joined(separator: "\n")
+    }
+
+    private func relevantProjectDigestLines(
+        from brain: AssistantProjectBrainState,
+        excludingThreadID currentThreadID: String,
+        prompt: String?
+    ) -> [String] {
+        let promptKeywords = Set(
+            MemoryTextNormalizer.keywords(from: prompt ?? "", limit: 18)
+        )
+        guard !promptKeywords.isEmpty else {
+            return []
+        }
+        let minimumOverlap = promptKeywords.count <= 2 ? 1 : 2
+
+        let normalizedCurrentThreadID = currentThreadID
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+
+        let rankedDigests = brain.threadDigestsByThreadID.values
+            .filter { digest in
+                digest.threadID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() != normalizedCurrentThreadID
+            }
+            .compactMap { digest -> (digest: AssistantProjectThreadDigest, score: Int)? in
+                let digestKeywords = Set(
+                    MemoryTextNormalizer.keywords(
+                        from: "\(digest.threadTitle)\n\(digest.summary)",
+                        limit: 24
+                    )
+                )
+                let overlap = digestKeywords.intersection(promptKeywords).count
+                guard overlap >= minimumOverlap else {
+                    return nil
+                }
+                return (digest, overlap)
+            }
+            .sorted { lhs, rhs in
+                if lhs.score != rhs.score {
+                    return lhs.score > rhs.score
+                }
+                if lhs.digest.updatedAt != rhs.digest.updatedAt {
+                    return lhs.digest.updatedAt > rhs.digest.updatedAt
+                }
+                return lhs.digest.threadTitle.localizedCaseInsensitiveCompare(rhs.digest.threadTitle) == .orderedAscending
+            }
+
+        return rankedDigests.prefix(3).map { item in
+            "- \(item.digest.threadTitle): \(item.digest.summary)"
+        }
     }
 
     private func buildThreadDigest(

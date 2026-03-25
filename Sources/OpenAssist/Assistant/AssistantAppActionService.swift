@@ -167,10 +167,10 @@ actor AssistantAppActionService {
             if request.needsComputerFallback {
                 return Self.result(
                     summary: """
-                    Open Assist can only use direct app actions here. This request needs live clicking or typing, which Open Assist no longer supports.
+                    Open Assist can only use direct app actions here. This request needs generic visual interaction instead.
                     """,
                     detail: """
-                    Try a direct supported action instead, like Finder open/reveal, Terminal run command, Calendar read/create, System Settings open, Reminders, Contacts, Notes, or Messages.
+                    Use `computer_use` for screenshot-based clicking, dragging, scrolling, or typing on the visible desktop. Keep using `app_action` for structured tasks like Finder open/reveal, Terminal run command, Calendar read/create, System Settings open, Reminders, Contacts, Notes, or Messages.
                     """,
                     success: false
                 )

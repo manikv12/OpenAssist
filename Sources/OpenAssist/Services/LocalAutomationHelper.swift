@@ -65,10 +65,19 @@ actor LocalAutomationHelper {
 
     func capabilityStatus(
         selectedBrowserProfile: BrowserProfile?,
-        settings: SettingsStore
-    ) async -> HelperCapabilityStatus {
-        let snapshot = await MainActor.run { PermissionCenter.snapshot(using: settings) }
+        permissionSnapshot snapshot: PermissionCenter.Snapshot,
+        computerUseEnabled: Bool
+    ) -> HelperCapabilityStatus {
         var issues: [String] = []
+        if !computerUseEnabled {
+            issues.append("Computer Use is turned off in Automation settings.")
+        }
+        if !snapshot.accessibilityGranted {
+            issues.append("Accessibility permission is still needed for Computer Use to click and type.")
+        }
+        if !snapshot.screenRecordingGranted {
+            issues.append("Screen Recording permission is still needed for Computer Use to capture the current screen.")
+        }
         if snapshot.appleEventsKnown && !snapshot.appleEventsGranted {
             issues.append("Automation permission is still needed for browser and app scripting.")
         }
@@ -120,14 +129,14 @@ actor LocalAutomationHelper {
                 .lowercased() ?? ""
 
             switch type {
-            case "screenshot":
+            case "observe", "screenshot":
                 coordinateSnapshot = try captureSnapshot()
             case "click":
                 let point = try screenPoint(from: action, snapshot: coordinateSnapshot)
                 try await click(at: point, button: button(from: action["button"] as? String), clickCount: 1)
             case "double_click":
                 let point = try screenPoint(from: action, snapshot: coordinateSnapshot)
-                try await click(at: point, button: .left, clickCount: 2)
+                try await click(at: point, button: button(from: action["button"] as? String), clickCount: 2)
             case "move":
                 let point = try screenPoint(from: action, snapshot: coordinateSnapshot)
                 try moveMouse(to: point)
@@ -147,7 +156,10 @@ actor LocalAutomationHelper {
             case "type":
                 try await typeText((action["text"] as? String) ?? "")
             case "wait":
-                try await pause(for: 1.0)
+                let durationMilliseconds = number(from: action["duration_ms"])
+                    ?? number(from: action["durationMs"])
+                    ?? 1000
+                try await pause(for: max(0, durationMilliseconds) / 1000)
             default:
                 continue
             }
@@ -716,6 +728,13 @@ actor LocalAutomationHelper {
             summary: "Open the requested settings pane directly.",
             kind: .app,
             supportedActions: ["open pane"]
+        ),
+        ConnectorDescriptor(
+            id: "computer-use",
+            displayName: "Computer Use",
+            summary: "Capture the screen and use mouse or keyboard actions on the visible desktop.",
+            kind: .app,
+            supportedActions: ["observe", "click", "drag", "scroll", "keypress", "type"]
         )
     ]
 

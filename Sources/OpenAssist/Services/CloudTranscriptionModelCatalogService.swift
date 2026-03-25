@@ -60,6 +60,13 @@ actor CloudTranscriptionModelCatalogService {
         }
 
         switch provider {
+        case .codexSession:
+            let models = await fallbackModels(for: provider)
+            return CloudTranscriptionModelFetchResult(
+                models: models,
+                source: .fallback,
+                message: "Using built-in ChatGPT / Codex session transcription models."
+            )
         case .openAI, .groq:
             guard !trimmedAPIKey.isEmpty else {
                 return await fallbackResult(reason: "Add API key to load live transcription models.")
@@ -323,6 +330,8 @@ actor CloudTranscriptionModelCatalogService {
             ids = ["nova-3", "nova-2", "enhanced"]
         case .gemini:
             ids = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-pro"]
+        case .codexSession:
+            ids = ["gpt-4o-mini-transcribe", "gpt-4o-transcribe", "whisper-1"]
         }
         return normalizeModelOptions(
             ids.map {
@@ -342,7 +351,7 @@ actor CloudTranscriptionModelCatalogService {
             let normalizedID = normalizedModelID(option.id, for: provider)
             let lowercasedID = normalizedID.lowercased()
             switch provider {
-            case .openAI, .groq:
+            case .openAI, .groq, .codexSession:
                 let tokens = ["transcribe", "whisper", "stt", "speech-to-text"]
                 return tokens.contains { lowercasedID.contains($0) }
             case .deepgram:
@@ -435,6 +444,8 @@ actor CloudTranscriptionModelCatalogService {
             return "deepgram"
         case .gemini:
             return "google"
+        case .codexSession:
+            return "openai"
         }
     }
 
@@ -458,7 +469,7 @@ actor CloudTranscriptionModelCatalogService {
         switch provider {
         case .gemini:
             return min(180, max(12, clampedTimeout))
-        case .openAI, .groq, .deepgram:
+        case .openAI, .groq, .deepgram, .codexSession:
             return min(180, max(8, clampedTimeout))
         case .none:
             return min(180, max(8, clampedTimeout))

@@ -6,6 +6,7 @@ interface CollapsibleImageGalleryProps {
   itemName?: string;
   className?: string;
   imageClassName?: string;
+  defaultExpanded?: boolean;
   headerTitle?: string;
   collapsedDetail?: string;
   expandedDetail?: string;
@@ -16,11 +17,12 @@ function CollapsibleImageGalleryInner({
   itemName = "image",
   className,
   imageClassName,
+  defaultExpanded = false,
   headerTitle,
   collapsedDetail,
   expandedDetail,
 }: CollapsibleImageGalleryProps) {
-  const [expanded, setExpanded] = useState(false);
+  const [expanded, setExpanded] = useState(defaultExpanded);
   const [previewIndex, setPreviewIndex] = useState<number | null>(null);
   const [zoom, setZoom] = useState(1);
   const contentId = useId();
@@ -69,6 +71,14 @@ function CollapsibleImageGalleryInner({
     if (previewIndex === null) return;
     setZoom(1);
   }, [previewIndex]);
+
+  useEffect(() => {
+    if (!defaultExpanded || images.length === 0) {
+      return;
+    }
+
+    setExpanded(true);
+  }, [defaultExpanded, images.length]);
 
   if (images.length === 0) {
     return null;

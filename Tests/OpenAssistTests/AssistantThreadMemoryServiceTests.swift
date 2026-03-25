@@ -120,6 +120,27 @@ final class AssistantThreadMemoryServiceTests: XCTestCase {
         XCTAssertTrue(service.hasCheckpoint(for: threadID, anchorID: "turn-b"))
     }
 
+    func testShouldSoftResetKeepsMemoryForNormalFollowUps() throws {
+        let service = AssistantThreadMemoryService(baseDirectoryURL: try makeTemporaryDirectory())
+
+        var document = AssistantThreadMemoryDocument.empty
+        document.currentTask = "Export Square sales report from Brave safely"
+
+        XCTAssertFalse(service.shouldSoftReset(document: document, nextPrompt: "Try again with more logs."))
+        XCTAssertFalse(service.shouldSoftReset(document: document, nextPrompt: "Use pnpm instead."))
+        XCTAssertFalse(service.shouldSoftReset(document: document, nextPrompt: "What's the next step?"))
+    }
+
+    func testShouldSoftResetWhenPromptClearlyStartsDifferentTask() throws {
+        let service = AssistantThreadMemoryService(baseDirectoryURL: try makeTemporaryDirectory())
+
+        var document = AssistantThreadMemoryDocument.empty
+        document.currentTask = "Export Square sales report from Brave safely"
+
+        XCTAssertTrue(service.shouldSoftReset(document: document, nextPrompt: "Start over and check my unread Gmail messages."))
+        XCTAssertTrue(service.shouldSoftReset(document: document, nextPrompt: "Switch to writing release notes for the iOS app."))
+    }
+
     private func makeTemporaryDirectory() throws -> URL {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("AssistantThreadMemoryTests-\(UUID().uuidString)", isDirectory: true)

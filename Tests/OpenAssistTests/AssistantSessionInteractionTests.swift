@@ -41,6 +41,276 @@ final class AssistantSessionInteractionTests: XCTestCase {
     }
 
     @MainActor
+    func testResolvedManagedSessionIDPrefersOpenAssistThreadIdentity() {
+        XCTAssertEqual(
+            AssistantStore.resolvedManagedSessionID(
+                boundSessionID: "openassist-thread",
+                canonicalThreadID: "openassist-thread",
+                runtimeSessionID: "copilot-session"
+            ),
+            "openassist-thread"
+        )
+
+        XCTAssertEqual(
+            AssistantStore.resolvedManagedSessionID(
+                boundSessionID: nil,
+                canonicalThreadID: "openassist-thread",
+                runtimeSessionID: "copilot-session"
+            ),
+            "openassist-thread"
+        )
+
+        XCTAssertEqual(
+            AssistantStore.resolvedManagedSessionID(
+                boundSessionID: nil,
+                canonicalThreadID: nil,
+                runtimeSessionID: "copilot-session"
+            ),
+            "copilot-session"
+        )
+    }
+
+    @MainActor
+    func testProviderIndependentThreadOnlyPinsProviderSwitchWhileTurnIsActive() {
+        let session = AssistantSessionSummary(
+            id: "openassist-v2-thread",
+            title: "Merged",
+            source: .openAssist,
+            threadArchitectureVersion: .providerIndependentV2,
+            status: .idle
+        )
+
+        XCTAssertFalse(
+            AssistantStore.shouldPinBackendSelection(
+                for: session,
+                hasActiveTurn: false
+            )
+        )
+        XCTAssertTrue(
+            AssistantStore.shouldPinBackendSelection(
+                for: session,
+                hasActiveTurn: true
+            )
+        )
+    }
+
+    @MainActor
+    func testCanonicalV2ThreadIgnoresNilSessionChangeFromOldProvider() {
+        let session = AssistantSessionSummary(
+            id: "openassist-v2-thread",
+            title: "Merged",
+            source: .openAssist,
+            threadArchitectureVersion: .providerIndependentV2,
+            activeProvider: .codex,
+            providerBindingsByBackend: [
+                AssistantProviderBinding(
+                    backend: .copilot,
+                    providerSessionID: "copilot-session"
+                ),
+                AssistantProviderBinding(
+                    backend: .codex,
+                    providerSessionID: "codex-session"
+                )
+            ],
+            status: .idle
+        )
+
+        XCTAssertFalse(
+            AssistantStore.shouldApplyProviderSessionChange(
+                for: session,
+                runtimeBackend: .copilot,
+                providerSessionID: nil
+            )
+        )
+    }
+
+    @MainActor
+    func testCanonicalV2ThreadIgnoresStaleSessionChangeFromOldProvider() {
+        let session = AssistantSessionSummary(
+            id: "openassist-v2-thread",
+            title: "Merged",
+            source: .openAssist,
+            threadArchitectureVersion: .providerIndependentV2,
+            activeProvider: .codex,
+            providerBindingsByBackend: [
+                AssistantProviderBinding(
+                    backend: .copilot,
+                    providerSessionID: "copilot-session"
+                ),
+                AssistantProviderBinding(
+                    backend: .codex,
+                    providerSessionID: "codex-session"
+                )
+            ],
+            status: .idle
+        )
+
+        XCTAssertFalse(
+            AssistantStore.shouldApplyProviderSessionChange(
+                for: session,
+                runtimeBackend: .copilot,
+                providerSessionID: "copilot-session"
+            )
+        )
+    }
+
+    @MainActor
+    func testCanonicalV2ThreadAcceptsSessionChangeForActiveProvider() {
+        let session = AssistantSessionSummary(
+            id: "openassist-v2-thread",
+            title: "Merged",
+            source: .openAssist,
+            threadArchitectureVersion: .providerIndependentV2,
+            activeProvider: .codex,
+            providerBindingsByBackend: [
+                AssistantProviderBinding(
+                    backend: .copilot,
+                    providerSessionID: "copilot-session"
+                ),
+                AssistantProviderBinding(
+                    backend: .codex,
+                    providerSessionID: "codex-session"
+                )
+            ],
+            status: .idle
+        )
+
+        XCTAssertTrue(
+            AssistantStore.shouldApplyProviderSessionChange(
+                for: session,
+                runtimeBackend: .codex,
+                providerSessionID: "codex-session-next"
+            )
+        )
+    }
+
+    @MainActor
+    func testRemappedTranscriptMutationUsesCanonicalThreadID() {
+        let entryID = UUID()
+        let mutation = AssistantTranscriptMutation.appendDelta(
+            id: entryID,
+            sessionID: "copilot-session",
+            role: .assistant,
+            delta: "Hi",
+            createdAt: Date(timeIntervalSince1970: 123),
+            emphasis: false,
+            isStreaming: true
+        )
+
+        let remapped = AssistantStore.remappedTranscriptMutation(
+            mutation,
+            sessionID: "openassist-v2-thread"
+        )
+
+        guard case let .appendDelta(id, sessionID, role, delta, _, _, isStreaming) = remapped else {
+            return XCTFail("Expected appendDelta transcript mutation")
+        }
+
+        XCTAssertEqual(id, entryID)
+        XCTAssertEqual(sessionID, "openassist-v2-thread")
+        XCTAssertEqual(role, .assistant)
+        XCTAssertEqual(delta, "Hi")
+        XCTAssertTrue(isStreaming)
+    }
+
+    @MainActor
+    func testRemappedTimelineMutationUsesCanonicalThreadID() {
+        let createdAt = Date(timeIntervalSince1970: 456)
+        let mutation = AssistantTimelineMutation.appendTextDelta(
+            id: "assistant-final-1",
+            sessionID: "copilot-session",
+            turnID: "copilot-turn",
+            kind: .assistantFinal,
+            delta: "Hello",
+            createdAt: createdAt,
+            updatedAt: createdAt,
+            isStreaming: true,
+            emphasis: false,
+            source: .runtime
+        )
+
+        let remapped = AssistantStore.remappedTimelineMutation(
+            mutation,
+            sessionID: "openassist-v2-thread"
+        )
+
+        guard case let .appendTextDelta(id, sessionID, turnID, kind, delta, _, _, isStreaming, _, source) = remapped else {
+            return XCTFail("Expected appendTextDelta timeline mutation")
+        }
+
+        XCTAssertEqual(id, "assistant-final-1")
+        XCTAssertEqual(sessionID, "openassist-v2-thread")
+        XCTAssertEqual(turnID, "copilot-turn")
+        XCTAssertEqual(kind, .assistantFinal)
+        XCTAssertEqual(delta, "Hello")
+        XCTAssertTrue(isStreaming)
+        XCTAssertEqual(source, .runtime)
+    }
+
+    @MainActor
+    func testRemappedTimelineUpsertPreservesItemButRewritesSessionID() {
+        let item = AssistantTimelineItem.assistantFinal(
+            id: "assistant-final-2",
+            sessionID: "copilot-session",
+            turnID: "copilot-turn",
+            text: "Hi there",
+            createdAt: Date(timeIntervalSince1970: 789),
+            updatedAt: Date(timeIntervalSince1970: 790),
+            isStreaming: false,
+            source: .runtime
+        )
+
+        let remapped = AssistantStore.remappedTimelineMutation(
+            .upsert(item),
+            sessionID: "openassist-v2-thread"
+        )
+
+        guard case let .upsert(remappedItem) = remapped else {
+            return XCTFail("Expected upsert timeline mutation")
+        }
+
+        XCTAssertEqual(remappedItem.sessionID, "openassist-v2-thread")
+        XCTAssertEqual(remappedItem.turnID, "copilot-turn")
+        XCTAssertEqual(remappedItem.text, "Hi there")
+    }
+
+    @MainActor
+    func testCanonicalThreadIgnoresImplicitTimelineResetMutation() {
+        let session = AssistantSessionSummary(
+            id: "openassist-v2-thread",
+            title: "Merged",
+            source: .openAssist,
+            threadArchitectureVersion: .providerIndependentV2,
+            activeProvider: .copilot,
+            status: .idle
+        )
+
+        XCTAssertTrue(
+            AssistantStore.shouldIgnoreTimelineResetMutation(
+                .reset(sessionID: nil),
+                session: session
+            )
+        )
+        XCTAssertFalse(
+            AssistantStore.shouldIgnoreTimelineResetMutation(
+                .reset(sessionID: "copilot-session"),
+                session: session
+            )
+        )
+        XCTAssertFalse(
+            AssistantStore.shouldIgnoreTimelineResetMutation(
+                .reset(sessionID: nil),
+                session: AssistantSessionSummary(
+                    id: "copilot-session",
+                    title: "CLI",
+                    source: .cli,
+                    status: .idle
+                )
+            )
+        )
+    }
+
+    @MainActor
     func testRuntimeSuppressesNonToolActivityRows() {
         let runtime = CodexAssistantRuntime()
 
@@ -142,6 +412,20 @@ final class AssistantSessionInteractionTests: XCTestCase {
         XCTAssertTrue(
             runtime.isToolActivityAllowedForTesting(
                 mode: .plan,
+                rawType: "dynamicToolCall",
+                toolName: "generate_image"
+            )
+        )
+        XCTAssertTrue(
+            runtime.isToolActivityAllowedForTesting(
+                mode: .plan,
+                rawType: "dynamicToolCall",
+                toolName: "computer_use"
+            )
+        )
+        XCTAssertTrue(
+            runtime.isToolActivityAllowedForTesting(
+                mode: .plan,
                 rawType: "mcpToolCall"
             )
         )
@@ -171,11 +455,25 @@ final class AssistantSessionInteractionTests: XCTestCase {
                 toolName: "app_action"
             )
         )
+        XCTAssertFalse(
+            runtime.isToolActivityAllowedForTesting(
+                mode: .conversational,
+                rawType: "dynamicToolCall",
+                toolName: "computer_use"
+            )
+        )
         XCTAssertTrue(
             runtime.isToolActivityAllowedForTesting(
                 mode: .conversational,
                 rawType: "dynamicToolCall",
                 toolName: "web_lookup"
+            )
+        )
+        XCTAssertTrue(
+            runtime.isToolActivityAllowedForTesting(
+                mode: .conversational,
+                rawType: "dynamicToolCall",
+                toolName: "generate_image"
             )
         )
         XCTAssertTrue(
@@ -199,7 +497,7 @@ final class AssistantSessionInteractionTests: XCTestCase {
     }
 
     @MainActor
-    func testBrowserAndAppDynamicToolCallsUseFriendlyTitlesAndSummaries() {
+    func testBrowserAppAndImageDynamicToolCallsUseFriendlyTitlesAndSummaries() {
         let runtime = CodexAssistantRuntime()
 
         let browserState = runtime.toolCallStateForTesting(from: [
@@ -229,6 +527,124 @@ final class AssistantSessionInteractionTests: XCTestCase {
             runtime.activitySummaryForTesting(kind: .dynamicToolCall, title: appState?.title ?? ""),
             "Used a Mac app."
         )
+
+        let imageState = runtime.toolCallStateForTesting(from: [
+            "id": "tool-image",
+            "type": "dynamicToolCall",
+            "tool": "generate_image",
+            "status": "running",
+            "arguments": ["prompt": "Create a small synthwave poster."]
+        ])
+
+        XCTAssertEqual(imageState?.title, "Image Generation")
+        XCTAssertEqual(
+            runtime.activitySummaryForTesting(kind: .dynamicToolCall, title: imageState?.title ?? ""),
+            "Generated an image."
+        )
+
+        let computerState = runtime.toolCallStateForTesting(from: [
+            "id": "tool-computer",
+            "type": "dynamicToolCall",
+            "tool": "computer_use",
+            "status": "running",
+            "arguments": [
+                "task": "Click the Filters button.",
+                "reason": "Need generic UI interaction.",
+                "action": ["type": "click", "x": 120, "y": 40]
+            ]
+        ])
+
+        XCTAssertEqual(computerState?.title, "Computer Use")
+        XCTAssertEqual(
+            runtime.activitySummaryForTesting(kind: .dynamicToolCall, title: computerState?.title ?? ""),
+            "Controlled the visible desktop."
+        )
+    }
+
+    @MainActor
+    func testCollaborationEventsCaptureParentThreadAndLifecycleTimestamps() {
+        let runtime = CodexAssistantRuntime()
+        runtime.setCurrentSessionIDForTesting("parent-thread")
+
+        runtime.processCollaborationNotificationForTesting(
+            method: "item/collabAgentSpawn/begin",
+            params: [
+                "call_id": "agent-1",
+                "prompt": "Inspect the provider flow"
+            ]
+        )
+
+        var spawnedAgent = try! XCTUnwrap(runtime.subagentsForTesting().first)
+        XCTAssertEqual(spawnedAgent.parentThreadID, "parent-thread")
+        XCTAssertEqual(spawnedAgent.status, .spawning)
+        XCTAssertNotNil(spawnedAgent.startedAt)
+        XCTAssertNotNil(spawnedAgent.updatedAt)
+        XCTAssertNil(spawnedAgent.endedAt)
+
+        runtime.processCollaborationNotificationForTesting(
+            method: "item/collabAgentSpawn/end",
+            params: [
+                "call_id": "agent-1",
+                "new_thread_id": "child-thread",
+                "new_agent_nickname": "Kant",
+                "new_agent_role": "explorer"
+            ]
+        )
+
+        spawnedAgent = try! XCTUnwrap(runtime.subagentsForTesting().first)
+        XCTAssertEqual(spawnedAgent.threadID, "child-thread")
+        XCTAssertEqual(spawnedAgent.nickname, "Kant")
+        XCTAssertEqual(spawnedAgent.role, "explorer")
+        XCTAssertEqual(spawnedAgent.status, .running)
+        XCTAssertNil(spawnedAgent.endedAt)
+
+        runtime.processCollaborationNotificationForTesting(
+            method: "item/collabWaiting/begin",
+            params: [
+                "receiver_thread_ids": ["child-thread"]
+            ]
+        )
+        XCTAssertEqual(runtime.subagentsForTesting().first?.status, .waiting)
+
+        runtime.processCollaborationNotificationForTesting(
+            method: "item/collabWaiting/end",
+            params: [
+                "receiver_thread_ids": ["child-thread"]
+            ]
+        )
+
+        let completedAgent = try! XCTUnwrap(runtime.subagentsForTesting().first)
+        XCTAssertEqual(completedAgent.status, .completed)
+        XCTAssertNotNil(completedAgent.endedAt)
+        XCTAssertEqual(completedAgent.updatedAt, completedAgent.endedAt)
+    }
+
+    @MainActor
+    func testCollabToolCallReadsChildThreadMetadataFromResultPayload() {
+        let runtime = CodexAssistantRuntime()
+        runtime.setCurrentSessionIDForTesting("parent-thread")
+
+        _ = runtime.toolCallStateForTesting(from: [
+            "id": "agent-tool-1",
+            "type": "collabAgentToolCall",
+            "tool": "SpawnAgent",
+            "status": "completed",
+            "arguments": [
+                "prompt": "Inspect the cleanup flow"
+            ],
+            "result": [
+                "new_thread_id": "child-thread",
+                "new_agent_nickname": "Kant",
+                "new_agent_role": "explorer"
+            ]
+        ])
+
+        let agent = try! XCTUnwrap(runtime.subagentsForTesting().first)
+        XCTAssertEqual(agent.parentThreadID, "parent-thread")
+        XCTAssertEqual(agent.threadID, "child-thread")
+        XCTAssertEqual(agent.nickname, "Kant")
+        XCTAssertEqual(agent.role, "explorer")
+        XCTAssertEqual(agent.prompt, "Inspect the cleanup flow")
     }
 
     @MainActor
@@ -344,6 +760,36 @@ final class AssistantSessionInteractionTests: XCTestCase {
                 ]
             )
         )
+        XCTAssertTrue(
+            runtime.dynamicToolRequiresExplicitConfirmationForTesting(
+                toolName: "computer_use",
+                arguments: [
+                    "task": "Type the final message, then submit it.",
+                    "reason": "Need to post the reply in the live app UI.",
+                    "targetLabel": "Reply field",
+                    "action": [
+                        "type": "type",
+                        "text": "Shipping now."
+                    ]
+                ]
+            )
+        )
+        XCTAssertFalse(
+            runtime.dynamicToolRequiresExplicitConfirmationForTesting(
+                toolName: "computer_use",
+                arguments: [
+                    "task": "Scroll the current page to the metrics table.",
+                    "reason": "Need to reach data that is only visible in the live UI.",
+                    "targetLabel": "Metrics table",
+                    "action": [
+                        "type": "scroll",
+                        "x": 400,
+                        "y": 200,
+                        "scroll_y": 600
+                    ]
+                ]
+            )
+        )
     }
 
     @MainActor
@@ -379,12 +825,17 @@ final class AssistantSessionInteractionTests: XCTestCase {
     }
 
     @MainActor
-    func testAgenticModeExposesBrowserAndAppDynamicTools() {
+    func testAgenticModeExposesBrowserAppAndImageDynamicTools() {
         let runtime = CodexAssistantRuntime()
+        let originalValue = SettingsStore.shared.assistantComputerUseEnabled
+        SettingsStore.shared.assistantComputerUseEnabled = true
+        defer {
+            SettingsStore.shared.assistantComputerUseEnabled = originalValue
+        }
 
         XCTAssertEqual(
             runtime.dynamicToolNamesForTesting(mode: .agentic),
-            ["app_action", "browser_use"]
+            ["generate_image", "app_action", "browser_use", "computer_use"]
         )
     }
 
@@ -550,14 +1001,38 @@ final class AssistantSessionInteractionTests: XCTestCase {
     }
 
     @MainActor
-    func testChatAndPlanModesDoNotExposeLiveAutomationDynamicTools() {
+    func testChatAndPlanModesExposeOnlySafeImageToolOutsideAgenticAutomation() {
         let runtime = CodexAssistantRuntime()
+        let originalValue = SettingsStore.shared.assistantComputerUseEnabled
+        SettingsStore.shared.assistantComputerUseEnabled = false
+        defer {
+            SettingsStore.shared.assistantComputerUseEnabled = originalValue
+        }
 
-        XCTAssertEqual(runtime.dynamicToolNamesForTesting(mode: .conversational), [])
-        XCTAssertEqual(runtime.dynamicToolNamesForTesting(mode: .plan), [])
+        XCTAssertEqual(runtime.dynamicToolNamesForTesting(mode: .conversational), ["generate_image"])
+        XCTAssertEqual(runtime.dynamicToolNamesForTesting(mode: .plan), ["generate_image"])
         XCTAssertEqual(
             runtime.dynamicToolNamesForTesting(mode: .agentic),
-            ["app_action", "browser_use"]
+            ["generate_image", "app_action", "browser_use"]
+        )
+    }
+
+    @MainActor
+    func testAgenticModeExposesComputerUseOnlyWhenSettingIsEnabled() {
+        let runtime = CodexAssistantRuntime()
+        let originalValue = SettingsStore.shared.assistantComputerUseEnabled
+        defer {
+            SettingsStore.shared.assistantComputerUseEnabled = originalValue
+        }
+
+        SettingsStore.shared.assistantComputerUseEnabled = false
+        XCTAssertFalse(
+            runtime.dynamicToolNamesForTesting(mode: .agentic).contains("computer_use")
+        )
+
+        SettingsStore.shared.assistantComputerUseEnabled = true
+        XCTAssertTrue(
+            runtime.dynamicToolNamesForTesting(mode: .agentic).contains("computer_use")
         )
     }
 
@@ -579,6 +1054,21 @@ final class AssistantSessionInteractionTests: XCTestCase {
         let planParams = runtime.turnStartParamsForTesting(mode: .plan)
         XCTAssertEqual(planParams["approvalPolicy"] as? String, "on-request")
         XCTAssertNil(planParams["sandboxPolicy"])
+    }
+
+    @MainActor
+    func testTurnStartParamsCanUseSeparateSubagentModelOverride() {
+        let runtime = CodexAssistantRuntime(preferredModelID: "gpt-5.4")
+        runtime.setPreferredSubagentModelID("gpt-5.4-mini")
+        runtime.reasoningEffort = "high"
+
+        let params = runtime.turnStartParamsForTesting(mode: .agentic, modelID: "gpt-5.4")
+        let collaborationMode = params["collaborationMode"] as? [String: Any]
+        let settings = collaborationMode?["settings"] as? [String: Any]
+
+        XCTAssertEqual(params["model"] as? String, "gpt-5.4")
+        XCTAssertEqual(settings?["model"] as? String, "gpt-5.4-mini")
+        XCTAssertNil(settings?["reasoningEffort"])
     }
 
     @MainActor
@@ -707,24 +1197,53 @@ final class AssistantSessionInteractionTests: XCTestCase {
 
     @MainActor
     func testBrowserTurnReminderCarriesCurrentProfileDetails() {
-        let reminder = CodexAssistantRuntime.browserTurnReminder(from: [
-            "browser": "Brave Browser",
-            "channel": "brave",
-            "profileDir": "Profile 1",
-            "userDataDir": "/Users/test/Library/Application Support/BraveSoftware/Brave-Browser",
-            "profileName": "Personal"
-        ])
+        let reminder = CodexAssistantRuntime.browserTurnReminder(
+            from: [
+                "browser": "Brave Browser",
+                "channel": "brave",
+                "profileDir": "Profile 1",
+                "userDataDir": "/Users/test/Library/Application Support/BraveSoftware/Brave-Browser",
+                "profileName": "Personal"
+            ],
+            computerUseEnabled: true
+        )
 
         XCTAssertNotNil(reminder)
         XCTAssertTrue(reminder?.contains("Profile: Personal") == true)
         XCTAssertTrue(reminder?.contains("Brave Browser") == true)
-        XCTAssertTrue(reminder?.contains("launchPersistentContext") == true)
         XCTAssertTrue(reminder?.contains("Profile 1") == true)
+        XCTAssertTrue(reminder?.contains("Do NOT use MCP browser tools") == true)
+        XCTAssertTrue(reminder?.contains("Use `computer_use` only as a last resort") == true)
+        XCTAssertFalse(reminder?.contains("launchPersistentContext") == true)
+        XCTAssertFalse(reminder?.contains("Playwright") == true)
+    }
+
+    @MainActor
+    func testBrowserTurnReminderExplainsWhenComputerUseIsDisabled() {
+        let reminder = CodexAssistantRuntime.browserTurnReminder(
+            from: [
+                "browser": "Brave Browser",
+                "channel": "brave",
+                "profileDir": "Profile 1",
+                "userDataDir": "/Users/test/Library/Application Support/BraveSoftware/Brave-Browser",
+                "profileName": "Personal"
+            ],
+            computerUseEnabled: false
+        )
+
+        XCTAssertNotNil(reminder)
+        XCTAssertTrue(reminder?.contains("Computer Use is currently turned off in settings") == true)
+        XCTAssertFalse(reminder?.contains("switch to `computer_use` instead") == true)
     }
 
     @MainActor
     func testBuildInstructionsIncludesBrowserTurnReminderWhenProfileIsConfigured() async {
         let runtime = CodexAssistantRuntime()
+        let originalValue = SettingsStore.shared.assistantComputerUseEnabled
+        SettingsStore.shared.assistantComputerUseEnabled = true
+        defer {
+            SettingsStore.shared.assistantComputerUseEnabled = originalValue
+        }
         runtime.browserProfileContext = [
             "browser": "Brave Browser",
             "channel": "brave",
@@ -738,6 +1257,56 @@ final class AssistantSessionInteractionTests: XCTestCase {
         XCTAssertTrue(instructions.contains("# Browser Task Override"))
         XCTAssertTrue(instructions.contains("Do NOT use MCP browser tools"))
         XCTAssertTrue(instructions.contains("Profile: Personal"))
+    }
+
+    @MainActor
+    func testBrowserMcpToolCallsAreBlockedInAgenticMode() {
+        let runtime = CodexAssistantRuntime()
+        runtime.interactionMode = .agentic
+
+        let recorder = AssistantRuntimeEventRecorder()
+        runtime.onTranscript = { entry in
+            if entry.role == .system {
+                recorder.systemMessages.append(entry.text)
+            }
+        }
+
+        runtime.processActivityEventForTesting([
+            "id": "mcp-browser-1",
+            "type": "mcpToolCall",
+            "server": "Playwright",
+            "tool": "browser_run_code",
+            "status": "running"
+        ])
+
+        XCTAssertEqual(recorder.systemMessages.count, 1)
+        XCTAssertTrue(recorder.systemMessages[0].contains("selected signed-in browser profile"))
+        XCTAssertTrue(recorder.systemMessages[0].contains("browser_run_code"))
+    }
+
+    @MainActor
+    func testBuildInstructionsIncludesActiveSkillsBlock() async {
+        let runtime = CodexAssistantRuntime()
+        runtime.activeSkills = [
+            AssistantSkillDescriptor(
+                name: "obsidian-cli",
+                displayName: "Obsidian CLI",
+                description: "Use the vault tools for note tasks.",
+                shortDescription: "Manage notes in Obsidian",
+                defaultPrompt: "Use $obsidian-cli for vault work.",
+                source: .imported,
+                skillDirectoryPath: "/tmp/obsidian-cli",
+                skillFilePath: "/tmp/obsidian-cli/SKILL.md",
+                metadataFilePath: nil
+            )
+        ]
+
+        let instructions = await runtime.buildInstructionsForTesting()
+
+        XCTAssertTrue(instructions.contains("# Active Skills"))
+        XCTAssertTrue(instructions.contains("`obsidian-cli`"))
+        XCTAssertTrue(instructions.contains("Manage notes in Obsidian"))
+        XCTAssertTrue(instructions.contains("`/tmp/obsidian-cli/SKILL.md`"))
     }
 
     @MainActor
@@ -803,6 +1372,7 @@ final class AssistantSessionInteractionTests: XCTestCase {
 
         let configuration = AssistantStore.resolvedSessionConfiguration(
             from: legacySession,
+            backend: .codex,
             availableModels: [
                 AssistantModelOption(
                     id: "gpt-5.4",
@@ -821,6 +1391,96 @@ final class AssistantSessionInteractionTests: XCTestCase {
         XCTAssertEqual(configuration.interactionMode, AssistantInteractionMode.agentic)
         XCTAssertEqual(configuration.reasoningEffort, AssistantReasoningEffort.high)
         XCTAssertFalse(configuration.fastModeEnabled)
+    }
+
+    @MainActor
+    func testResolvedModelSelectionFallsBackToProviderDefaultForV2Threads() {
+        let v2Session = AssistantSessionSummary(
+            id: "openassist-thread",
+            title: "Merged",
+            source: .openAssist,
+            threadArchitectureVersion: .providerIndependentV2,
+            activeProvider: .copilot,
+            providerBindingsByBackend: [
+                AssistantProviderBinding(backend: .copilot)
+            ],
+            status: .idle,
+            latestModel: "gpt-5.4"
+        )
+
+        let resolved = AssistantStore.resolvedModelSelection(
+            from: v2Session,
+            backend: .copilot,
+            availableModels: [
+                AssistantModelOption(
+                    id: "gemini-2.5-pro",
+                    displayName: "Gemini 2.5 Pro",
+                    description: "Default",
+                    isDefault: true,
+                    hidden: false,
+                    supportedReasoningEfforts: ["high"],
+                    defaultReasoningEffort: "high"
+                ),
+                AssistantModelOption(
+                    id: "gpt-4.1",
+                    displayName: "GPT-4.1",
+                    description: "Other",
+                    isDefault: false,
+                    hidden: false,
+                    supportedReasoningEfforts: ["high"],
+                    defaultReasoningEffort: "high"
+                )
+            ],
+            preferredModelID: "gpt-5.4"
+        )
+
+        XCTAssertEqual(resolved, "gemini-2.5-pro")
+    }
+
+    @MainActor
+    func testResolvedModelSelectionUsesBoundProviderModelForV2Threads() {
+        let v2Session = AssistantSessionSummary(
+            id: "openassist-thread",
+            title: "Merged",
+            source: .openAssist,
+            threadArchitectureVersion: .providerIndependentV2,
+            activeProvider: .copilot,
+            providerBindingsByBackend: [
+                AssistantProviderBinding(
+                    backend: .copilot,
+                    latestModelID: "gpt-4.1"
+                )
+            ],
+            status: .idle
+        )
+
+        let resolved = AssistantStore.resolvedModelSelection(
+            from: v2Session,
+            backend: .copilot,
+            availableModels: [
+                AssistantModelOption(
+                    id: "gemini-2.5-pro",
+                    displayName: "Gemini 2.5 Pro",
+                    description: "Default",
+                    isDefault: true,
+                    hidden: false,
+                    supportedReasoningEfforts: ["high"],
+                    defaultReasoningEffort: "high"
+                ),
+                AssistantModelOption(
+                    id: "gpt-4.1",
+                    displayName: "GPT-4.1",
+                    description: "Other",
+                    isDefault: false,
+                    hidden: false,
+                    supportedReasoningEfforts: ["high"],
+                    defaultReasoningEffort: "high"
+                )
+            ],
+            preferredModelID: "gpt-5.4"
+        )
+
+        XCTAssertEqual(resolved, "gpt-4.1")
     }
 
     @MainActor
@@ -847,7 +1507,7 @@ final class AssistantSessionInteractionTests: XCTestCase {
             mode: .plan
         )
 
-        await runtime.processTurnCompletedForTesting()
+        runtime.processCopilotPromptCompletionForTesting()
 
         let finalAssistant = recorder.timelineItems.last {
             $0.kind == .assistantFinal && $0.isStreaming == false
@@ -860,6 +1520,192 @@ final class AssistantSessionInteractionTests: XCTestCase {
         XCTAssertEqual(promotedPlan?.turnID, "turn-plan")
         XCTAssertEqual(promotedPlan?.planText, text)
         XCTAssertEqual(recorder.proposedPlans.last ?? nil, text)
+    }
+
+    @MainActor
+    func testCopilotThoughtChunksDoNotCreateVisibleProgressMessages() async {
+        let runtime = CodexAssistantRuntime()
+        let recorder = AssistantRuntimeEventRecorder()
+
+        runtime.onTimelineMutation = { mutation in
+            if case let .upsert(item) = mutation {
+                recorder.timelineItems.append(item)
+            }
+        }
+
+        runtime.configureStreamingTurnForTesting(
+            sessionID: "copilot-thread",
+            turnID: "copilot-turn",
+            text: "",
+            mode: .agentic
+        )
+
+        await runtime.processCopilotSessionUpdateForTesting([
+            "sessionUpdate": "agent_thought_chunk",
+            "content": ["text": "Processing the Greeting"]
+        ])
+
+        XCTAssertFalse(recorder.timelineItems.contains(where: { $0.kind == .assistantProgress }))
+    }
+
+    @MainActor
+    func testCodexIgnoresStrayAssistantDeltaWithoutActiveTurn() async {
+        let runtime = CodexAssistantRuntime()
+        let recorder = AssistantRuntimeEventRecorder()
+
+        runtime.onTranscriptMutation = { mutation in
+            if case let .appendDelta(_, _, _, delta, _, _, _) = mutation {
+                recorder.systemMessages.append(delta)
+            }
+        }
+        runtime.onTimelineMutation = { mutation in
+            if case let .appendTextDelta(_, _, _, _, delta, _, _, _, _, _) = mutation {
+                recorder.activityTitles.append(delta)
+            }
+        }
+
+        runtime.configureSessionForTesting(sessionID: "thread-stray", turnID: nil)
+
+        await runtime.processAgentMessageDeltaNotificationForTesting(
+            delta: "Old reply that should be ignored",
+            threadID: "thread-stray"
+        )
+
+        XCTAssertTrue(recorder.systemMessages.isEmpty)
+        XCTAssertTrue(recorder.activityTitles.isEmpty)
+    }
+
+    @MainActor
+    func testCopilotIgnoresStrayAssistantChunkWithoutActiveTurn() async {
+        let runtime = CodexAssistantRuntime()
+        let recorder = AssistantRuntimeEventRecorder()
+
+        runtime.onTranscriptMutation = { mutation in
+            if case let .appendDelta(_, _, _, delta, _, _, _) = mutation {
+                recorder.systemMessages.append(delta)
+            }
+        }
+        runtime.onTimelineMutation = { mutation in
+            if case let .appendTextDelta(_, _, _, _, delta, _, _, _, _, _) = mutation {
+                recorder.activityTitles.append(delta)
+            }
+        }
+
+        runtime.configureSessionForTesting(sessionID: "copilot-thread", turnID: nil)
+
+        await runtime.processCopilotSessionUpdateForTesting([
+            "sessionId": "copilot-thread",
+            "sessionUpdate": "agent_message_chunk",
+            "content": ["text": "Old reply that should be ignored"]
+        ])
+
+        XCTAssertTrue(recorder.systemMessages.isEmpty)
+        XCTAssertTrue(recorder.activityTitles.isEmpty)
+    }
+
+    @MainActor
+    func testCopilotInternalCompletionToolPromotesCleanFinalReply() async {
+        let runtime = CodexAssistantRuntime()
+        let recorder = AssistantRuntimeEventRecorder()
+
+        runtime.onToolCallUpdate = { recorder.toolSnapshots.append($0) }
+        runtime.onTimelineMutation = { mutation in
+            if case let .upsert(item) = mutation {
+                recorder.timelineItems.append(item)
+            }
+        }
+
+        runtime.configureStreamingTurnForTesting(
+            sessionID: "copilot-thread",
+            turnID: "copilot-turn",
+            text: "",
+            mode: .agentic
+        )
+
+        await runtime.processCopilotSessionUpdateForTesting([
+            "sessionUpdate": "tool_call",
+            "toolCallId": "tool-hidden",
+            "status": "running",
+            "kind": "internal"
+        ])
+
+        await runtime.processCopilotSessionUpdateForTesting([
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "tool-hidden",
+            "status": "completed",
+            "kind": "internal",
+            "rawOutput": [
+                "content": "Task completed: Hi! I'm your GitHub Copilot CLI assistant."
+            ]
+        ])
+
+        XCTAssertEqual(
+            runtime.pendingCopilotFallbackReplyForTesting(),
+            "Hi! I'm your GitHub Copilot CLI assistant."
+        )
+
+        runtime.processCopilotPromptCompletionForTesting()
+
+        let finalAssistant = recorder.timelineItems.last {
+            $0.kind == .assistantFinal && $0.isStreaming == false
+        }
+
+        XCTAssertEqual(finalAssistant?.text, "Hi! I'm your GitHub Copilot CLI assistant.")
+        XCTAssertFalse(recorder.timelineItems.contains(where: { $0.kind == .activity }))
+        XCTAssertTrue(recorder.toolSnapshots.isEmpty)
+    }
+
+    @MainActor
+    func testCopilotInternalCompletionToolIgnoresUnifiedDiffOutput() async {
+        let runtime = CodexAssistantRuntime()
+        let recorder = AssistantRuntimeEventRecorder()
+
+        runtime.onTimelineMutation = { mutation in
+            if case let .upsert(item) = mutation {
+                recorder.timelineItems.append(item)
+            }
+        }
+
+        runtime.configureStreamingTurnForTesting(
+            sessionID: "copilot-thread",
+            turnID: "copilot-turn",
+            text: "",
+            mode: .agentic
+        )
+
+        await runtime.processCopilotSessionUpdateForTesting([
+            "sessionUpdate": "tool_call",
+            "toolCallId": "tool-hidden",
+            "status": "running",
+            "kind": "internal"
+        ])
+
+        await runtime.processCopilotSessionUpdateForTesting([
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "tool-hidden",
+            "status": "completed",
+            "kind": "internal",
+            "rawOutput": [
+                "content": """
+                diff --git a/CLAUDE.md b/CLAUDE.md
+                --- a/CLAUDE.md
+                +++ b/CLAUDE.md
+                @@ -1,1 +1,1 @@
+                -Old text
+                +New text
+                """
+            ]
+        ])
+
+        XCTAssertNil(runtime.pendingCopilotFallbackReplyForTesting())
+
+        runtime.processCopilotPromptCompletionForTesting()
+
+        let finalAssistant = recorder.timelineItems.last {
+            $0.kind == .assistantFinal && $0.isStreaming == false
+        }
+
+        XCTAssertNil(finalAssistant)
     }
 
     @MainActor
@@ -996,6 +1842,25 @@ final class AssistantSessionInteractionTests: XCTestCase {
             AssistantStore.shouldApplyGeneratedSessionTitle(
                 existingTitle: "My Custom Thread Name",
                 fallbackTitle: "Check browser profile usage",
+                cwd: "/Users/test/project"
+            )
+        )
+    }
+
+    @MainActor
+    func testPromptDerivedSessionTitleReplacesDefaultPlaceholder() {
+        XCTAssertTrue(
+            AssistantStore.shouldApplyPromptDerivedSessionTitle(
+                existingTitle: "New Assistant Session",
+                fallbackTitle: "Fix login redirect bug",
+                cwd: "/Users/test/project"
+            )
+        )
+
+        XCTAssertFalse(
+            AssistantStore.shouldApplyPromptDerivedSessionTitle(
+                existingTitle: "My Custom Thread Name",
+                fallbackTitle: "Fix login redirect bug",
                 cwd: "/Users/test/project"
             )
         )

@@ -26,6 +26,7 @@ struct AIMemoryStudioView: View {
     @State private var memoryBrowserUnfilteredEntryCount = 0
 
     @State private var promptRewriteOpenAIKeyVisible = false
+    @State private var googleAIStudioKeyVisible = false
     @State private var promptRewriteShowManualAPIKey = false
     @State private var oauthBusyProviderRawValue: String?
     @State private var oauthStatusMessage: String?
@@ -517,7 +518,10 @@ struct AIMemoryStudioView: View {
     private var studioSidebar: some View {
         VStack(alignment: .leading, spacing: 12) {
             Button {
-                NotificationCenter.default.post(name: .openAssistOpenSettings, object: nil)
+                NotificationCenter.default.post(
+                    name: .openAssistOpenSettings,
+                    object: SettingsRoute(section: .advanced, cardID: "advanced.aiStudio")
+                )
             } label: {
                 HStack(spacing: 4) {
                     Image(systemName: "chevron.left")
@@ -832,6 +836,7 @@ struct AIMemoryStudioView: View {
     private var studioModelPage: some View {
         VStack(alignment: .leading, spacing: 14) {
             providerConnectionCard
+            googleAIStudioCard
             if settings.promptRewriteProviderMode == .ollama {
                 localAISetupCard
             }
@@ -2979,6 +2984,53 @@ struct AIMemoryStudioView: View {
     }
 
     @ViewBuilder
+    private var googleAIStudioCard: some View {
+        settingsCard(
+            title: "Google AI Studio (Shared Gemini Key)",
+            subtitle: "One key for Gemini prompt rewrite, Gemini transcription, and assistant image generation.",
+            symbol: "sparkles.rectangle.stack",
+            tint: AppVisualTheme.accentTint
+        ) {
+            HStack(spacing: 8) {
+                if googleAIStudioKeyVisible {
+                    TextField("Google AI Studio API key", text: $settings.googleAIStudioAPIKey)
+                        .textFieldStyle(.roundedBorder)
+                        .autocorrectionDisabled()
+                } else {
+                    SecureField("Google AI Studio API key", text: $settings.googleAIStudioAPIKey)
+                        .textFieldStyle(.roundedBorder)
+                }
+
+                Toggle("Show", isOn: $googleAIStudioKeyVisible)
+                    .toggleStyle(.checkbox)
+                    .fixedSize()
+
+                Button {
+                    copyToPasteboard(settings.googleAIStudioAPIKey)
+                } label: {
+                    Image(systemName: "doc.on.doc")
+                }
+                .buttonStyle(.borderless)
+                .help("Copy API key to clipboard")
+                .disabled(settings.googleAIStudioAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+
+            TextField("Gemini image model", text: $settings.googleAIStudioImageGenerationModel)
+                .textFieldStyle(.roundedBorder)
+
+            Text("Default image model: \(SettingsStore.googleAIStudioImageGenerationDefaultModel)")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            Text("The assistant can use this shared key to generate images in the main app and Telegram remote without switching your prompt rewrite provider to Gemini.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            Text("Credentials are stored in macOS Keychain.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    @ViewBuilder
     private var localAISetupCard: some View {
         settingsCard(
             title: "Local AI Setup (No Account Needed)",
@@ -3404,7 +3456,7 @@ struct AIMemoryStudioView: View {
     private func promptRewriteAuthStateLabel(for mode: PromptRewriteProviderMode) -> String {
         if mode.supportsOAuthSignIn {
             let isConnected = oauthConnectedProviders[mode.rawValue] ?? false
-            let hasKey = !settings.promptRewriteOpenAIAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            let hasKey = !promptRewriteAPIKeyValue(for: mode).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             if isConnected && hasKey {
                 return "OAuth + API key"
             }
@@ -3412,7 +3464,7 @@ struct AIMemoryStudioView: View {
         }
 
         if mode.requiresAPIKey {
-            let hasKey = !settings.promptRewriteOpenAIAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            let hasKey = !promptRewriteAPIKeyValue(for: mode).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             return hasKey ? "API key configured" : "API key missing"
         }
 
@@ -3529,13 +3581,15 @@ struct AIMemoryStudioView: View {
 
     @ViewBuilder
     private func apiKeyField(for mode: PromptRewriteProviderMode) -> some View {
+        let binding = promptRewriteAPIKeyBinding(for: mode)
+        let value = binding.wrappedValue
         HStack(spacing: 8) {
             if promptRewriteOpenAIKeyVisible {
-                TextField("\(mode.displayName) API key", text: $settings.promptRewriteOpenAIAPIKey)
+                TextField("\(mode.displayName) API key", text: binding)
                     .textFieldStyle(.roundedBorder)
                     .autocorrectionDisabled()
             } else {
-                SecureField("\(mode.displayName) API key", text: $settings.promptRewriteOpenAIAPIKey)
+                SecureField("\(mode.displayName) API key", text: binding)
                     .textFieldStyle(.roundedBorder)
             }
 
@@ -3544,14 +3598,28 @@ struct AIMemoryStudioView: View {
                 .fixedSize()
 
             Button {
-                copyToPasteboard(settings.promptRewriteOpenAIAPIKey)
+                copyToPasteboard(value)
             } label: {
                 Image(systemName: "doc.on.doc")
             }
             .buttonStyle(.borderless)
             .help("Copy API key to clipboard")
-            .disabled(settings.promptRewriteOpenAIAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            .disabled(value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
         }
+    }
+
+    private func promptRewriteAPIKeyBinding(for mode: PromptRewriteProviderMode) -> Binding<String> {
+        if mode == .google {
+            return $settings.googleAIStudioAPIKey
+        }
+        return $settings.promptRewriteOpenAIAPIKey
+    }
+
+    private func promptRewriteAPIKeyValue(for mode: PromptRewriteProviderMode) -> String {
+        if mode == .google {
+            return settings.googleAIStudioAPIKey
+        }
+        return settings.promptRewriteOpenAIAPIKey
     }
 
     @ViewBuilder
@@ -5005,7 +5073,7 @@ struct AIMemoryStudioView: View {
     private func explainMemoryEntryWithAI(_ entry: MemoryIndexedEntry) {
         guard !isMemoryInspectionBusy else { return }
         isMemoryInspectionBusy = true
-        memoryInspectionStatusMessage = "Asking \(settings.promptRewriteProviderMode.displayName) to explain this memory..."
+        memoryInspectionStatusMessage = "Asking an available AI provider to explain this memory..."
         memoryInspectionExplanation = nil
 
         Task {
@@ -5497,7 +5565,7 @@ struct AIMemoryStudioView: View {
         VStack(alignment: .leading, spacing: 14) {
             settingsCard(
                 title: "Assistant",
-                subtitle: "Codex-powered personal assistant with voice task entry.",
+                subtitle: "\(assistant.assistantBackendName)-powered personal assistant with voice task entry.",
                 symbol: "sparkles.rectangle.stack.fill",
                 tint: Color(red: 0.22, green: 0.70, blue: 1.00)
             ) {
@@ -5522,12 +5590,12 @@ struct AIMemoryStudioView: View {
                         .fixedSize(horizontal: false, vertical: true)
 
                     HStack(spacing: 8) {
-                        Button("Install Codex") {
+                        Button(assistant.assistantInstallActionTitle) {
                             assistant.runPreferredInstallCommand()
                         }
                         .buttonStyle(.borderedProminent)
 
-                        Button("Codex Docs") {
+                        Button(assistant.assistantDocsActionTitle) {
                             assistant.openInstallDocs()
                         }
                         .buttonStyle(.bordered)
@@ -5540,12 +5608,12 @@ struct AIMemoryStudioView: View {
                         .fixedSize(horizontal: false, vertical: true)
 
                     HStack(spacing: 8) {
-                        Button("Sign In with ChatGPT") {
+                        Button(assistant.assistantLoginActionTitle) {
                             assistant.runLoginCommand()
                         }
                         .buttonStyle(.borderedProminent)
 
-                        Button("Codex Docs") {
+                        Button(assistant.assistantDocsActionTitle) {
                             assistant.openInstallDocs()
                         }
                         .buttonStyle(.bordered)
@@ -5563,7 +5631,7 @@ struct AIMemoryStudioView: View {
                     Toggle("Enable assistant", isOn: $settings.assistantBetaEnabled)
 
                     if !settings.assistantBetaWarningAcknowledged {
-                        Text("This assistant can read files, continue Codex threads, and guide bigger tasks. Review the assistant window before using it for important work.")
+                        Text("This assistant can read files, continue \(assistant.assistantBackendName) sessions, and guide bigger tasks. Review the assistant window before using it for important work.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
 
@@ -5634,7 +5702,35 @@ struct AIMemoryStudioView: View {
                                 Text(model.displayName).tag(model.id)
                             }
                         }
+
+                        Picker(
+                            "Sub-agent model",
+                            selection: Binding(
+                                get: { assistant.selectedSubagentModelID ?? "" },
+                                set: { assistant.chooseSubagentModel($0) }
+                            )
+                        ) {
+                            Text("Same as main model").tag("")
+                            ForEach(assistant.visibleModels) { model in
+                                Text(model.displayName).tag(model.id)
+                            }
+                        }
+
+                        Text("Use this only for helper agents. Example: keep the main assistant on GPT-5.4, but let sub-agents use GPT-5.4 Mini.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
+
+                    Toggle(
+                        "Track code changes in Git repositories",
+                        isOn: $settings.assistantTrackCodeChangesInGitRepos
+                    )
+
+                    Text("When this is on, Open Assist saves hidden checkpoints for Git-based coding sessions so you can review, undo, or redo code changes later.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
 
                     HStack(spacing: 8) {
                         Button("Open Assistant") {
@@ -5651,19 +5747,47 @@ struct AIMemoryStudioView: View {
 
                     HStack(spacing: 8) {
                         if assistant.installGuidance.codexDetected {
-                            Button("Sign In with ChatGPT") {
+                            Button(assistant.assistantLoginActionTitle) {
                                 assistant.runLoginCommand()
                             }
                             .buttonStyle(.bordered)
                         } else {
-                            Button("Install Codex") {
+                            Button(assistant.assistantInstallActionTitle) {
                                 assistant.runPreferredInstallCommand()
                             }
                             .buttonStyle(.bordered)
                         }
 
-                        Button("Codex Docs") {
+                        Button(assistant.assistantDocsActionTitle) {
                             assistant.openInstallDocs()
+                        }
+                        .buttonStyle(.bordered)
+                    }
+                }
+            }
+
+            if assistant.shouldOfferCopilotSetupCard {
+                let copilotGuidance = assistant.guidance(for: .copilot)
+
+                settingsCard(
+                    title: "Add GitHub Copilot",
+                    subtitle: "Optional alternate assistant runtime for Open Assist.",
+                    symbol: "plus.circle.fill",
+                    tint: Color(red: 0.29, green: 0.73, blue: 0.56)
+                ) {
+                    Text(copilotGuidance.primaryDetail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    HStack(spacing: 8) {
+                        Button(AssistantRuntimeBackend.copilot.installActionTitle) {
+                            assistant.runPreferredInstallCommand(for: .copilot)
+                        }
+                        .buttonStyle(.borderedProminent)
+
+                        Button(AssistantRuntimeBackend.copilot.docsActionTitle) {
+                            assistant.openInstallDocs(for: .copilot)
                         }
                         .buttonStyle(.bordered)
                     }
@@ -5985,6 +6109,8 @@ struct AIMemoryStudioView: View {
 
     private func assistantSessionBadgeSymbol(for source: AssistantSessionSource) -> String {
         switch source {
+        case .openAssist:
+            return "bubble.left.and.bubble.right.fill"
         case .cli:
             return "terminal.fill"
         case .vscode:
@@ -6011,6 +6137,8 @@ struct AIMemoryStudioView: View {
 
     private func assistantSessionBadgeTint(for source: AssistantSessionSource) -> Color {
         switch source {
+        case .openAssist:
+            return .purple
         case .cli:
             return AppVisualTheme.baseTint
         case .vscode:

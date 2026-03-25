@@ -5,8 +5,18 @@ import { ActivityDetailSections } from "./ActivityDetailSections";
 import { ChevronIcon } from "./ChevronIcon";
 import { CollapsibleImageGallery } from "./CollapsibleImageGallery";
 import { FileChangeSummary } from "./FileChangeSummary";
+import {
+  buildActivityActionDetail,
+  buildActivityActionLabel,
+} from "./activityPresentation";
 
-function ActivityRowInner({ message }: { message: ChatMessage }) {
+function ActivityRowInner({
+  message,
+  isLatestRunningActivity = false,
+}: {
+  message: ChatMessage;
+  isLatestRunningActivity?: boolean;
+}) {
   const [expanded, setExpanded] = useState(false);
   const transitionClass = message.transitionState
     ? ` is-${message.transitionState}`
@@ -21,6 +31,17 @@ function ActivityRowInner({ message }: { message: ChatMessage }) {
   const imageCount = message.images?.length || 0;
   const canExpand = detailSections.length > 0 || imageCount > 0;
   const isRunning = message.activityStatus === "running";
+  const shouldAnimateRunning = isRunning && isLatestRunningActivity;
+  const actionTitle =
+    buildActivityActionLabel(
+      message.activityIcon,
+      message.activityTargets,
+      message.activityTitle
+    ) || message.activityTitle || "Action";
+  const actionDetail = buildActivityActionDetail(
+    message.activityTargets,
+    message.activityDetail
+  );
 
   const cardContent = (
     <>
@@ -31,12 +52,8 @@ function ActivityRowInner({ message }: { message: ChatMessage }) {
         />
       </div>
       <div className="activity-body">
-        <span className="activity-title">
-          {message.activityTitle || "Action"}
-        </span>
-        {message.activityDetail && (
-          <span className="activity-detail">{message.activityDetail}</span>
-        )}
+        <span className="activity-title">{actionTitle}</span>
+        {actionDetail && <span className="activity-detail">{actionDetail}</span>}
       </div>
       <div className="activity-meta">
         {message.activityStatusLabel && (
@@ -55,18 +72,22 @@ function ActivityRowInner({ message }: { message: ChatMessage }) {
   );
 
   return (
-    <div className={`message-row activity-row${transitionClass}`}>
+    <div
+      className={`message-row activity-row${transitionClass}`}
+      data-message-id={message.id}
+    >
       {canExpand ? (
         <button
           type="button"
-          className={`activity-card activity-card-button${isRunning ? " activity-card-running" : ""}`}
+          className={`activity-card activity-card-button activity-card-compact${shouldAnimateRunning ? " activity-card-running" : ""}`}
           onClick={() => setExpanded((current) => !current)}
           aria-expanded={expanded}
+          data-activity-toggle="true"
         >
           {cardContent}
         </button>
       ) : (
-        <div className={`activity-card${isRunning ? " activity-card-running" : ""}`}>
+        <div className={`activity-card activity-card-compact${shouldAnimateRunning ? " activity-card-running" : ""}`}>
           {cardContent}
         </div>
       )}

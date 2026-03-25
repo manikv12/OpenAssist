@@ -159,6 +159,7 @@ final class CodexSessionCatalogTests: XCTestCase {
             "Synced the assistant window."
         )
         XCTAssertEqual(sessionsByID["source-object"]?.source, .other)
+        XCTAssertEqual(sessionsByID["source-object"]?.parentThreadID, "parent-1")
     }
 
     func testLoadSessionsRestoresLatestAgenticConfigurationFromTurnContext() async throws {
@@ -625,6 +626,181 @@ final class CodexSessionCatalogTests: XCTestCase {
         XCTAssertEqual(indexContents.split(whereSeparator: \.isNewline).count, 3)
     }
 
+    func testLoadSessionsRestoresArchiveMetadataFromSessionIndex() async throws {
+        let homeDirectory = try makeTemporaryHomeDirectory()
+        defer { try? FileManager.default.removeItem(at: homeDirectory) }
+
+        try writeSession(
+            id: "archived-session",
+            dayPath: "2026/03/08",
+            in: homeDirectory,
+            lines: [
+                try sessionMetaLine(
+                    id: "archived-session",
+                    timestamp: "2026-03-08T08:00:00Z",
+                    cwd: "/Users/test/Archived",
+                    source: "exec",
+                    originator: "Open Assist"
+                ),
+                try responseMessageLine(
+                    timestamp: "2026-03-08T08:00:01Z",
+                    role: "user",
+                    text: "Archive me"
+                )
+            ]
+        )
+        try writeSessionIndex(
+            entries: [
+                [
+                    "id": "archived-session",
+                    "thread_name": "Archived Friendly Name",
+                    "archived": true,
+                    "archived_at": "2026-03-08T09:00:00Z",
+                    "archive_expires_at": "2026-03-09T09:00:00Z",
+                    "archive_uses_default_retention": true
+                ]
+            ],
+            in: homeDirectory
+        )
+
+        let catalog = CodexSessionCatalog(homeDirectory: homeDirectory)
+        let sessions = try await catalog.loadSessions(limit: 10)
+        let session = try XCTUnwrap(sessions.first(where: { $0.id == "archived-session" }))
+
+        XCTAssertEqual(session.title, "Archived Friendly Name")
+        XCTAssertTrue(session.isArchived)
+        XCTAssertEqual(session.archivedAt, ISO8601DateFormatter().date(from: "2026-03-08T09:00:00Z"))
+        XCTAssertEqual(session.archiveExpiresAt, ISO8601DateFormatter().date(from: "2026-03-09T09:00:00Z"))
+        XCTAssertEqual(session.archiveUsesDefaultRetention, true)
+    }
+
+    func testUnarchiveSessionClearsArchiveMetadataButKeepsThreadName() async throws {
+        let homeDirectory = try makeTemporaryHomeDirectory()
+        defer { try? FileManager.default.removeItem(at: homeDirectory) }
+
+        try writeSession(
+            id: "archive-clear",
+            dayPath: "2026/03/08",
+            in: homeDirectory,
+            lines: [
+                try sessionMetaLine(
+                    id: "archive-clear",
+                    timestamp: "2026-03-08T08:00:00Z",
+                    cwd: "/Users/test/ArchiveClear",
+                    source: "exec",
+                    originator: "Open Assist"
+                )
+            ]
+        )
+        try writeSessionIndex(
+            entries: [
+                [
+                    "id": "archive-clear",
+                    "thread_name": "Keep My Name",
+                    "archived": true,
+                    "archived_at": "2026-03-08T09:00:00Z",
+                    "archive_expires_at": "2026-03-09T09:00:00Z"
+                ]
+            ],
+            in: homeDirectory
+        )
+
+        let catalog = CodexSessionCatalog(homeDirectory: homeDirectory)
+        try catalog.unarchiveSession(sessionID: "archive-clear")
+
+        let sessions = try await catalog.loadSessions(limit: 10)
+        let session = try XCTUnwrap(sessions.first(where: { $0.id == "archive-clear" }))
+        XCTAssertEqual(session.title, "Keep My Name")
+        XCTAssertFalse(session.isArchived)
+        XCTAssertNil(session.archivedAt)
+        XCTAssertNil(session.archiveExpiresAt)
+        XCTAssertNil(session.archiveUsesDefaultRetention)
+
+        let indexContents = try String(
+            contentsOf: homeDirectory.appendingPathComponent(".codex/session_index.jsonl"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(indexContents.contains("\"thread_name\":\"Keep My Name\""))
+        XCTAssertFalse(indexContents.contains("\"archived\":true"))
+        XCTAssertFalse(indexContents.contains("\"archive_expires_at\""))
+    }
+
+    func testExpiredArchivedSessionIDsReturnsOnlyExpiredEntries() throws {
+        let homeDirectory = try makeTemporaryHomeDirectory()
+        defer { try? FileManager.default.removeItem(at: homeDirectory) }
+
+        try writeSessionIndex(
+            entries: [
+                [
+                    "id": "expired-session",
+                    "archived": true,
+                    "archive_expires_at": "2026-03-08T09:00:00Z"
+                ],
+                [
+                    "id": "future-session",
+                    "archived": true,
+                    "archive_expires_at": "2026-03-12T09:00:00Z"
+                ],
+                [
+                    "id": "active-session",
+                    "thread_name": "Still active"
+                ]
+            ],
+            in: homeDirectory
+        )
+
+        let catalog = CodexSessionCatalog(homeDirectory: homeDirectory)
+        let expired = catalog.expiredArchivedSessionIDs(
+            asOf: ISO8601DateFormatter().date(from: "2026-03-10T09:00:00Z")!
+        )
+
+        XCTAssertEqual(Set(expired), Set(["expired-session"]))
+    }
+
+    func testDeleteSessionSynchronouslyRemovesMatchingSessionIndexEntry() throws {
+        let homeDirectory = try makeTemporaryHomeDirectory()
+        defer { try? FileManager.default.removeItem(at: homeDirectory) }
+
+        try writeSession(
+            id: "delete-me",
+            dayPath: "2026/03/08",
+            in: homeDirectory,
+            lines: [
+                try sessionMetaLine(
+                    id: "delete-me",
+                    timestamp: "2026-03-08T08:00:00Z",
+                    cwd: "/Users/test/DeleteMe",
+                    source: "exec",
+                    originator: "Open Assist"
+                )
+            ]
+        )
+        try writeSessionIndex(
+            entries: [
+                [
+                    "id": "delete-me",
+                    "thread_name": "Delete Me"
+                ],
+                [
+                    "id": "keep-me",
+                    "thread_name": "Keep Me"
+                ]
+            ],
+            in: homeDirectory
+        )
+
+        let catalog = CodexSessionCatalog(homeDirectory: homeDirectory)
+        let deleted = try catalog.deleteSessionSynchronously(sessionID: "delete-me")
+        XCTAssertTrue(deleted)
+
+        let indexContents = try String(
+            contentsOf: homeDirectory.appendingPathComponent(".codex/session_index.jsonl"),
+            encoding: .utf8
+        )
+        XCTAssertFalse(indexContents.contains("\"id\":\"delete-me\""))
+        XCTAssertTrue(indexContents.contains("\"id\":\"keep-me\""))
+    }
+
     func testLoadTranscriptFiltersSetupNoiseAndDeduplicatesAgentEchoes() async throws {
         let homeDirectory = try makeTemporaryHomeDirectory()
         defer { try? FileManager.default.removeItem(at: homeDirectory) }
@@ -811,6 +987,63 @@ final class CodexSessionCatalogTests: XCTestCase {
 
         XCTAssertEqual(activityByID["call-patch"]?.kind, .fileChange)
         XCTAssertTrue(activityByID["call-patch"]?.rawDetails?.contains("Updated the following files") == true)
+    }
+
+    func testLoadMergedTimelineReplaysGeneratedImagesFromCustomToolOutput() async throws {
+        let homeDirectory = try makeTemporaryHomeDirectory()
+        defer { try? FileManager.default.removeItem(at: homeDirectory) }
+
+        let sessionID = "timeline-generated-image"
+        let pngData = Data([0x89, 0x50, 0x4E, 0x47])
+        let base64 = pngData.base64EncodedString()
+        let output = """
+        {"content":[{"type":"inputText","text":"Generated an image with Google Gemini."},{"type":"inputImage","image_url":{"url":"data:image/png;base64,\(base64)"}}]}
+        """
+
+        try writeSession(
+            id: sessionID,
+            dayPath: "2026/03/09",
+            in: homeDirectory,
+            lines: [
+                try sessionMetaLine(
+                    id: sessionID,
+                    timestamp: "2026-03-09T10:00:00Z",
+                    cwd: "/Users/test/OpenAssist",
+                    source: "exec",
+                    originator: "Open Assist"
+                ),
+                try customToolCallLine(
+                    timestamp: "2026-03-09T10:00:01Z",
+                    name: "generate_image",
+                    input: "{\"prompt\":\"Create a playful banana robot mascot\"}",
+                    callID: "call-image"
+                ),
+                try customToolCallOutputLine(
+                    timestamp: "2026-03-09T10:00:02Z",
+                    callID: "call-image",
+                    output: output
+                )
+            ]
+        )
+
+        let catalog = CodexSessionCatalog(homeDirectory: homeDirectory)
+        let timeline = await catalog.loadMergedTimeline(sessionID: sessionID)
+
+        let activity = try XCTUnwrap(
+            timeline.first(where: { $0.activity?.id == "call-image" })?.activity
+        )
+        XCTAssertEqual(activity.kind, .dynamicToolCall)
+        XCTAssertEqual(activity.title, "Image Generation")
+        XCTAssertEqual(activity.friendlySummary, "Generated an image.")
+
+        let imageItem = try XCTUnwrap(
+            timeline.first(where: {
+                $0.kind == .system
+                    && $0.text == "Generated image"
+                    && $0.imageAttachments?.isEmpty == false
+            })
+        )
+        XCTAssertEqual(imageItem.imageAttachments, [pngData])
     }
 
     func testActivityStoreOnlyPersistsCacheableTimelineItems() throws {

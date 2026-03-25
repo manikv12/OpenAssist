@@ -170,6 +170,37 @@ final class AssistantMemorySuggestionService {
         try removeSuggestions(ids: suggestionsToRemove)
     }
 
+    func replaceSuggestions(
+        for threadID: String,
+        with suggestions: [AssistantMemorySuggestion]
+    ) throws {
+        let normalizedThreadID = threadID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedThreadID.isEmpty else { return }
+
+        let existingSuggestions = try loadSuggestions()
+        let existingThreadSuggestions = existingSuggestions.filter {
+            $0.threadID.caseInsensitiveCompare(normalizedThreadID) == .orderedSame
+        }
+        let replacementSuggestions = suggestions.filter {
+            $0.threadID.caseInsensitiveCompare(normalizedThreadID) == .orderedSame
+        }
+
+        let existingSummaries = Set(existingThreadSuggestions.map(\.summary))
+        let replacementSummaries = Set(replacementSuggestions.map(\.summary))
+
+        for suggestion in existingThreadSuggestions where !replacementSummaries.contains(suggestion.summary) {
+            try threadMemoryService.removeCandidateLesson(suggestion.summary, for: normalizedThreadID)
+        }
+        for suggestion in replacementSuggestions where !existingSummaries.contains(suggestion.summary) {
+            try threadMemoryService.addCandidateLesson(suggestion.summary, for: normalizedThreadID)
+        }
+
+        let retainedSuggestions = existingSuggestions.filter {
+            $0.threadID.caseInsensitiveCompare(normalizedThreadID) != .orderedSame
+        }
+        try saveSuggestions(retainedSuggestions + replacementSuggestions)
+    }
+
     func purgeHistoryArtifacts(
         for threadID: String,
         sourceTurnAnchorIDs: Set<String>

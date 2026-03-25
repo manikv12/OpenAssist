@@ -208,6 +208,526 @@ final class CodexThreadRewriteServiceTests: XCTestCase {
         )
     }
 
+    func testConversationSnapshotsSupportEditableTurnsAndTruncation() throws {
+        let homeDirectory = try makeTemporaryHomeDirectory()
+        let conversationDirectory = try makeTemporaryDirectory(named: "ConversationRewriteStore")
+        let backupDirectory = try makeTemporaryDirectory(named: "ConversationRewriteBackups")
+        let threadID = "openassist-thread-rewrite"
+
+        let conversationStore = AssistantConversationStore(baseDirectoryURL: conversationDirectory)
+        try conversationStore.saveSnapshot(
+            threadID: threadID,
+            timeline: [
+                .system(
+                    id: "system-prelude",
+                    sessionID: threadID,
+                    text: "Loaded thread.",
+                    createdAt: date(0),
+                    emphasis: true,
+                    source: .runtime
+                ),
+                .userMessage(
+                    id: "user-1",
+                    sessionID: threadID,
+                    text: "Turn one",
+                    createdAt: date(1),
+                    source: .runtime
+                ),
+                .assistantFinal(
+                    id: "assistant-1",
+                    sessionID: threadID,
+                    turnID: "oa-turn-1",
+                    text: "Answer one",
+                    createdAt: date(2),
+                    updatedAt: date(2),
+                    isStreaming: false,
+                    providerBackend: .codex,
+                    providerModelID: "gpt-5.4",
+                    source: .runtime
+                ),
+                .userMessage(
+                    id: "user-2",
+                    sessionID: threadID,
+                    text: "Turn two",
+                    createdAt: date(3),
+                    source: .runtime
+                ),
+                .assistantFinal(
+                    id: "assistant-2",
+                    sessionID: threadID,
+                    turnID: "oa-turn-2",
+                    text: "Answer two",
+                    createdAt: date(4),
+                    updatedAt: date(4),
+                    isStreaming: false,
+                    providerBackend: .codex,
+                    providerModelID: "gpt-5.4",
+                    source: .runtime
+                ),
+                .userMessage(
+                    id: "user-3",
+                    sessionID: threadID,
+                    text: "Turn three",
+                    createdAt: date(5),
+                    source: .runtime
+                ),
+                .assistantFinal(
+                    id: "assistant-3",
+                    sessionID: threadID,
+                    turnID: "oa-turn-3",
+                    text: "Answer three",
+                    createdAt: date(6),
+                    updatedAt: date(6),
+                    isStreaming: false,
+                    providerBackend: .codex,
+                    providerModelID: "gpt-5.4",
+                    source: .runtime
+                )
+            ],
+            transcript: [
+                AssistantTranscriptEntry(
+                    id: UUID(uuidString: "00000000-0000-0000-0000-000000000001")!,
+                    role: .system,
+                    text: "Loaded thread.",
+                    createdAt: date(0),
+                    emphasis: true
+                ),
+                AssistantTranscriptEntry(
+                    id: UUID(uuidString: "00000000-0000-0000-0000-000000000011")!,
+                    role: .user,
+                    text: "Turn one",
+                    createdAt: date(1)
+                ),
+                AssistantTranscriptEntry(
+                    id: UUID(uuidString: "00000000-0000-0000-0000-000000000012")!,
+                    role: .assistant,
+                    text: "Answer one",
+                    createdAt: date(2),
+                    providerBackend: .codex,
+                    providerModelID: "gpt-5.4"
+                ),
+                AssistantTranscriptEntry(
+                    id: UUID(uuidString: "00000000-0000-0000-0000-000000000021")!,
+                    role: .user,
+                    text: "Turn two",
+                    createdAt: date(3)
+                ),
+                AssistantTranscriptEntry(
+                    id: UUID(uuidString: "00000000-0000-0000-0000-000000000022")!,
+                    role: .assistant,
+                    text: "Answer two",
+                    createdAt: date(4),
+                    providerBackend: .codex,
+                    providerModelID: "gpt-5.4"
+                ),
+                AssistantTranscriptEntry(
+                    id: UUID(uuidString: "00000000-0000-0000-0000-000000000031")!,
+                    role: .user,
+                    text: "Turn three",
+                    createdAt: date(5)
+                ),
+                AssistantTranscriptEntry(
+                    id: UUID(uuidString: "00000000-0000-0000-0000-000000000032")!,
+                    role: .assistant,
+                    text: "Answer three",
+                    createdAt: date(6),
+                    providerBackend: .codex,
+                    providerModelID: "gpt-5.4"
+                )
+            ],
+            session: nil
+        )
+
+        let catalog = CodexSessionCatalog(homeDirectory: homeDirectory)
+        let service = CodexThreadRewriteService(
+            sessionCatalog: catalog,
+            conversationStore: conversationStore,
+            backupRootDirectoryURL: backupDirectory
+        )
+
+        let turns = try service.editableTurns(sessionID: threadID)
+        XCTAssertEqual(turns.map(\.text), ["Turn one", "Turn two", "Turn three"])
+
+        let outcome = try service.truncateBeforeTurn(
+            sessionID: threadID,
+            turnAnchorID: turns[1].anchorID
+        )
+
+        XCTAssertEqual(outcome.retainedTurns.map(\.text), ["Turn one"])
+        XCTAssertEqual(outcome.removedTurns.map(\.text), ["Turn two", "Turn three"])
+
+        let rewrittenSnapshot = try XCTUnwrap(conversationStore.loadSnapshot(threadID: threadID))
+        XCTAssertEqual(
+            rewrittenSnapshot.timeline.filter { $0.kind == .userMessage }.compactMap(\.text),
+            ["Turn one"]
+        )
+        XCTAssertEqual(
+            rewrittenSnapshot.transcript.filter { $0.role == .user }.map(\.text),
+            ["Turn one"]
+        )
+        XCTAssertEqual(rewrittenSnapshot.turns.map(\.openAssistTurnID), ["oa-turn-1"])
+        XCTAssertTrue(rewrittenSnapshot.timeline.contains(where: { $0.id == "system-prelude" }))
+    }
+
+    func testConversationSnapshotsRetainTurnIDsWhenVisibleTimelineIsRebuilt() throws {
+        let homeDirectory = try makeTemporaryHomeDirectory()
+        let conversationDirectory = try makeTemporaryDirectory(named: "ConversationRewriteStore")
+        let backupDirectory = try makeTemporaryDirectory(named: "ConversationRewriteBackups")
+        let threadID = "openassist-thread-rebuilt"
+
+        let conversationStore = AssistantConversationStore(baseDirectoryURL: conversationDirectory)
+        try conversationStore.storeSnapshot(
+            AssistantConversationSnapshot(
+                version: 1,
+                threadID: threadID,
+                timeline: [
+                    .assistantFinal(
+                        id: "assistant-a",
+                        sessionID: threadID,
+                        turnID: "oa-turn-a",
+                        text: "Answer A",
+                        createdAt: date(2),
+                        updatedAt: date(2),
+                        isStreaming: false,
+                        providerBackend: .codex,
+                        providerModelID: "gpt-5.4",
+                        source: .runtime
+                    ),
+                    .assistantFinal(
+                        id: "assistant-b",
+                        sessionID: threadID,
+                        turnID: "oa-turn-b",
+                        text: "Answer B",
+                        createdAt: date(4),
+                        updatedAt: date(4),
+                        isStreaming: false,
+                        providerBackend: .codex,
+                        providerModelID: "gpt-5.4",
+                        source: .runtime
+                    )
+                ],
+                transcript: [
+                    AssistantTranscriptEntry(
+                        id: UUID(uuidString: "00000000-0000-0000-0000-000000000101")!,
+                        role: .user,
+                        text: "Turn A",
+                        createdAt: date(1)
+                    ),
+                    AssistantTranscriptEntry(
+                        id: UUID(uuidString: "00000000-0000-0000-0000-000000000102")!,
+                        role: .assistant,
+                        text: "Answer A",
+                        createdAt: date(2),
+                        providerBackend: .codex,
+                        providerModelID: "gpt-5.4"
+                    ),
+                    AssistantTranscriptEntry(
+                        id: UUID(uuidString: "00000000-0000-0000-0000-000000000201")!,
+                        role: .user,
+                        text: "Turn B",
+                        createdAt: date(3)
+                    ),
+                    AssistantTranscriptEntry(
+                        id: UUID(uuidString: "00000000-0000-0000-0000-000000000202")!,
+                        role: .assistant,
+                        text: "Answer B",
+                        createdAt: date(4),
+                        providerBackend: .codex,
+                        providerModelID: "gpt-5.4"
+                    )
+                ],
+                turns: [
+                    AssistantConversationTurnRecord(
+                        threadID: threadID,
+                        openAssistTurnID: "oa-turn-a",
+                        provider: .codex,
+                        providerSessionID: "provider-a",
+                        providerTurnID: "oa-turn-a",
+                        messageIDs: ["assistant-a"],
+                        createdAt: date(2),
+                        updatedAt: date(2),
+                        checkpointReferences: []
+                    ),
+                    AssistantConversationTurnRecord(
+                        threadID: threadID,
+                        openAssistTurnID: "oa-turn-b",
+                        provider: .codex,
+                        providerSessionID: "provider-b",
+                        providerTurnID: "oa-turn-b",
+                        messageIDs: ["assistant-b"],
+                        createdAt: date(4),
+                        updatedAt: date(4),
+                        checkpointReferences: []
+                    )
+                ],
+                updatedAt: date(5)
+            )
+        )
+
+        let service = CodexThreadRewriteService(
+            sessionCatalog: CodexSessionCatalog(homeDirectory: homeDirectory),
+            conversationStore: conversationStore,
+            backupRootDirectoryURL: backupDirectory
+        )
+
+        let turns = try service.editableTurns(sessionID: threadID)
+        XCTAssertEqual(turns.map(\.text), ["Turn A", "Turn B"])
+
+        _ = try service.truncateBeforeTurn(
+            sessionID: threadID,
+            turnAnchorID: turns[1].anchorID
+        )
+
+        let rewrittenSnapshot = try XCTUnwrap(conversationStore.loadSnapshot(threadID: threadID))
+        XCTAssertEqual(rewrittenSnapshot.turns.map(\.openAssistTurnID), ["oa-turn-a"])
+    }
+
+    func testHybridConversationSnapshotsRegenerateEventLogAfterTruncation() throws {
+        let homeDirectory = try makeTemporaryHomeDirectory()
+        let conversationDirectory = try makeTemporaryDirectory(named: "ConversationRewriteStore")
+        let backupDirectory = try makeTemporaryDirectory(named: "ConversationRewriteBackups")
+        let threadID = "openassist-thread-hybrid-rewrite"
+
+        let conversationStore = AssistantConversationStore(baseDirectoryURL: conversationDirectory)
+        try conversationStore.rewriteHybridSnapshotAndEventLog(
+            AssistantConversationSnapshot(
+                version: 2,
+                threadID: threadID,
+                timeline: [
+                    .userMessage(
+                        id: "user-1",
+                        sessionID: threadID,
+                        text: "Turn one",
+                        createdAt: date(1),
+                        source: .runtime
+                    ),
+                    .assistantFinal(
+                        id: "assistant-1",
+                        sessionID: threadID,
+                        turnID: "oa-turn-1",
+                        text: "Answer one",
+                        createdAt: date(2),
+                        updatedAt: date(2),
+                        isStreaming: false,
+                        providerBackend: .codex,
+                        providerModelID: "gpt-5.4",
+                        source: .runtime
+                    ),
+                    .userMessage(
+                        id: "user-2",
+                        sessionID: threadID,
+                        text: "Turn two",
+                        createdAt: date(3),
+                        source: .runtime
+                    ),
+                    .assistantFinal(
+                        id: "assistant-2",
+                        sessionID: threadID,
+                        turnID: "oa-turn-2",
+                        text: "Answer two",
+                        createdAt: date(4),
+                        updatedAt: date(4),
+                        isStreaming: false,
+                        providerBackend: .codex,
+                        providerModelID: "gpt-5.4",
+                        source: .runtime
+                    )
+                ],
+                transcript: [
+                    AssistantTranscriptEntry(
+                        id: UUID(uuidString: "00000000-0000-0000-0000-000000000501")!,
+                        role: .user,
+                        text: "Turn one",
+                        createdAt: date(1)
+                    ),
+                    AssistantTranscriptEntry(
+                        id: UUID(uuidString: "00000000-0000-0000-0000-000000000502")!,
+                        role: .assistant,
+                        text: "Answer one",
+                        createdAt: date(2),
+                        providerBackend: .codex,
+                        providerModelID: "gpt-5.4"
+                    ),
+                    AssistantTranscriptEntry(
+                        id: UUID(uuidString: "00000000-0000-0000-0000-000000000503")!,
+                        role: .user,
+                        text: "Turn two",
+                        createdAt: date(3)
+                    ),
+                    AssistantTranscriptEntry(
+                        id: UUID(uuidString: "00000000-0000-0000-0000-000000000504")!,
+                        role: .assistant,
+                        text: "Answer two",
+                        createdAt: date(4),
+                        providerBackend: .codex,
+                        providerModelID: "gpt-5.4"
+                    )
+                ],
+                turns: [
+                    AssistantConversationTurnRecord(
+                        threadID: threadID,
+                        openAssistTurnID: "oa-turn-1",
+                        provider: .codex,
+                        providerSessionID: "provider-1",
+                        providerTurnID: "provider-turn-1",
+                        messageIDs: ["assistant-1"],
+                        createdAt: date(2),
+                        updatedAt: date(2),
+                        checkpointReferences: []
+                    ),
+                    AssistantConversationTurnRecord(
+                        threadID: threadID,
+                        openAssistTurnID: "oa-turn-2",
+                        provider: .codex,
+                        providerSessionID: "provider-2",
+                        providerTurnID: "provider-turn-2",
+                        messageIDs: ["assistant-2"],
+                        createdAt: date(4),
+                        updatedAt: date(4),
+                        checkpointReferences: []
+                    )
+                ],
+                updatedAt: date(5)
+            )
+        )
+
+        let service = CodexThreadRewriteService(
+            sessionCatalog: CodexSessionCatalog(homeDirectory: homeDirectory),
+            conversationStore: conversationStore,
+            backupRootDirectoryURL: backupDirectory
+        )
+
+        let turns = try service.editableTurns(sessionID: threadID)
+        _ = try service.truncateBeforeTurn(
+            sessionID: threadID,
+            turnAnchorID: turns[1].anchorID
+        )
+
+        let rewrittenSnapshot = try XCTUnwrap(conversationStore.loadSnapshot(threadID: threadID))
+        let eventLogURL = try XCTUnwrap(conversationStore.eventLogFileURL(for: threadID))
+        let eventLogContents = try String(contentsOf: eventLogURL, encoding: .utf8)
+
+        XCTAssertEqual(
+            rewrittenSnapshot.timeline.filter { $0.kind == .userMessage }.compactMap(\.text),
+            ["Turn one"]
+        )
+        XCTAssertEqual(rewrittenSnapshot.turns.map(\.openAssistTurnID), ["oa-turn-1"])
+        XCTAssertFalse(eventLogContents.contains("Turn two"))
+        XCTAssertFalse(eventLogContents.contains("Answer two"))
+        XCTAssertEqual(
+            rewrittenSnapshot.lastAppliedEventSequence,
+            eventLogContents.split(whereSeparator: \.isNewline).count
+        )
+    }
+
+    func testHybridConversationSnapshotCancelPendingEditRestoresEventLogBackup() throws {
+        let homeDirectory = try makeTemporaryHomeDirectory()
+        let conversationDirectory = try makeTemporaryDirectory(named: "ConversationRewriteStore")
+        let backupDirectory = try makeTemporaryDirectory(named: "ConversationRewriteBackups")
+        let threadID = "openassist-thread-hybrid-cancel"
+
+        let conversationStore = AssistantConversationStore(baseDirectoryURL: conversationDirectory)
+        try conversationStore.rewriteHybridSnapshotAndEventLog(
+            AssistantConversationSnapshot(
+                version: 2,
+                threadID: threadID,
+                timeline: [
+                    .userMessage(
+                        id: "user-1",
+                        sessionID: threadID,
+                        text: "Turn one",
+                        createdAt: date(1),
+                        source: .runtime
+                    ),
+                    .assistantFinal(
+                        id: "assistant-1",
+                        sessionID: threadID,
+                        turnID: "oa-turn-1",
+                        text: "Answer one",
+                        createdAt: date(2),
+                        updatedAt: date(2),
+                        isStreaming: false,
+                        providerBackend: .codex,
+                        providerModelID: "gpt-5.4",
+                        source: .runtime
+                    ),
+                    .userMessage(
+                        id: "user-2",
+                        sessionID: threadID,
+                        text: "Turn two",
+                        createdAt: date(3),
+                        source: .runtime
+                    )
+                ],
+                transcript: [
+                    AssistantTranscriptEntry(
+                        id: UUID(uuidString: "00000000-0000-0000-0000-000000000601")!,
+                        role: .user,
+                        text: "Turn one",
+                        createdAt: date(1)
+                    ),
+                    AssistantTranscriptEntry(
+                        id: UUID(uuidString: "00000000-0000-0000-0000-000000000602")!,
+                        role: .assistant,
+                        text: "Answer one",
+                        createdAt: date(2),
+                        providerBackend: .codex,
+                        providerModelID: "gpt-5.4"
+                    ),
+                    AssistantTranscriptEntry(
+                        id: UUID(uuidString: "00000000-0000-0000-0000-000000000603")!,
+                        role: .user,
+                        text: "Turn two",
+                        createdAt: date(3)
+                    )
+                ],
+                turns: [
+                    AssistantConversationTurnRecord(
+                        threadID: threadID,
+                        openAssistTurnID: "oa-turn-1",
+                        provider: .codex,
+                        providerSessionID: "provider-1",
+                        providerTurnID: "provider-turn-1",
+                        messageIDs: ["assistant-1"],
+                        createdAt: date(2),
+                        updatedAt: date(2),
+                        checkpointReferences: []
+                    )
+                ],
+                updatedAt: date(4)
+            )
+        )
+
+        let originalEventLogURL = try XCTUnwrap(conversationStore.eventLogFileURL(for: threadID))
+        let originalEventLogContents = try String(contentsOf: originalEventLogURL, encoding: .utf8)
+
+        let service = CodexThreadRewriteService(
+            sessionCatalog: CodexSessionCatalog(homeDirectory: homeDirectory),
+            conversationStore: conversationStore,
+            backupRootDirectoryURL: backupDirectory
+        )
+
+        let turns = try service.editableTurns(sessionID: threadID)
+        _ = try service.beginEditLastTurn(
+            sessionID: threadID,
+            turnAnchorID: try XCTUnwrap(turns.last?.anchorID)
+        )
+
+        let truncatedEventLogContents = try String(contentsOf: originalEventLogURL, encoding: .utf8)
+        XCTAssertFalse(truncatedEventLogContents.contains("Turn two"))
+
+        _ = try service.cancelPendingEdit(sessionID: threadID)
+
+        let restoredSnapshot = try XCTUnwrap(conversationStore.loadSnapshot(threadID: threadID))
+        let restoredEventLogContents = try String(contentsOf: originalEventLogURL, encoding: .utf8)
+
+        XCTAssertEqual(
+            restoredSnapshot.timeline.filter { $0.kind == .userMessage }.compactMap(\.text),
+            ["Turn one", "Turn two"]
+        )
+        XCTAssertEqual(restoredEventLogContents, originalEventLogContents)
+    }
+
     private func makeTemporaryHomeDirectory() throws -> URL {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("CodexThreadRewriteTests-\(UUID().uuidString)", isDirectory: true)
@@ -219,6 +739,18 @@ final class CodexThreadRewriteServiceTests: XCTestCase {
     private func makeImageDataURL() throws -> String {
         let imageBytes = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
         return "data:image/png;base64,\(imageBytes.base64EncodedString())"
+    }
+
+    private func makeTemporaryDirectory(named prefix: String) throws -> URL {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("\(prefix)-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        temporaryDirectories.append(directory)
+        return directory
+    }
+
+    private func date(_ seconds: TimeInterval) -> Date {
+        Date(timeIntervalSince1970: 1_700_000_000 + seconds)
     }
 
     private func awaitValue<T>(_ operation: @escaping () async -> T) -> T {

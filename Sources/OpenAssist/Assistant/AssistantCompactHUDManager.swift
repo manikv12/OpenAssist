@@ -1,7 +1,6 @@
 import AppKit
 import Combine
 import SwiftUI
-import UserNotifications
 
 // MARK: - Manager
 
@@ -322,6 +321,17 @@ final class AssistantCompactHUDManager: AssistantCompactPresenter {
             await self?.refreshSessionsForOrb()
         }
 
+        model.onNewTemporarySession = { [weak self] in
+            await self?.controller.startNewTemporarySession()
+            await self?.refreshSessionsForOrb()
+        }
+
+        model.onPromoteTemporarySession = { [weak self] sessionID in
+            guard let self else { return }
+            self.controller.promoteTemporarySession(sessionID)
+            self.syncModelFromController()
+        }
+
         model.onChooseModel = { [weak self] modelID in
             self?.controller.chooseModel(modelID)
             self?.syncModelFromController()
@@ -535,14 +545,6 @@ final class AssistantCompactHUDManager: AssistantCompactPresenter {
         guard isEnabled, shouldPresent(state) else {
             hide()
             return
-        }
-
-        if let detail = state.detail, !detail.isEmpty {
-            if state.phase == .success, model.state.phase != .success {
-                sendCompletionNotification(message: detail)
-            } else if state.phase == .failed, model.state.phase != .failed {
-                sendCompletionNotification(message: detail)
-            }
         }
 
         show(state: effectiveDisplayState(for: state))
@@ -885,6 +887,7 @@ final class AssistantCompactHUDManager: AssistantCompactPresenter {
                 preserveCurrentNotchScreenAsPreferredDisplay()
                 isNotchDockRevealed = true
                 syncNotchDockPresentation()
+                syncNotchPermissionTextEntry()
                 reposition()
                 panel?.orderFrontRegardless()
             } else if !model.isExpanded {
@@ -896,11 +899,18 @@ final class AssistantCompactHUDManager: AssistantCompactPresenter {
 
         guard !model.isExpanded else { return }
         reposition()
-        if request != nil {
+        if let request {
             if panel == nil { createPanel() }
-            panel?.orderFrontRegardless()
+            if request.hasStructuredUserInput {
+                panel?.allowsKeyStatus = true
+                panel?.makeKeyAndOrderFront(nil)
+            } else {
+                panel?.allowsKeyStatus = false
+                panel?.orderFrontRegardless()
+            }
             startClickOutsideMonitor()
         } else {
+            panel?.allowsKeyStatus = false
             stopClickOutsideMonitor()
         }
     }
@@ -1255,7 +1265,10 @@ final class AssistantCompactHUDManager: AssistantCompactPresenter {
         guard presentationStyle == .notch else { return }
         guard !model.isExpanded else { return }
 
-        let needsKeyEntry = model.showDoneDetail || model.showWorkingDetail || model.showCompactComposer
+        let needsKeyEntry = model.showDoneDetail
+            || model.showWorkingDetail
+            || model.showCompactComposer
+            || (model.pendingPermissionRequest?.hasStructuredUserInput == true)
         guard needsKeyEntry else {
             model.shouldFocusTextField = false
             panel?.allowsKeyStatus = false
@@ -1278,7 +1291,25 @@ final class AssistantCompactHUDManager: AssistantCompactPresenter {
         model.shouldFocusTextField = false
         DispatchQueue.main.async { [weak self] in
             guard let self, self.presentationStyle == .notch, !self.model.isExpanded else { return }
-            guard self.model.showDoneDetail || self.model.showCompactComposer else { return }
+            guard self.model.showDoneDetail || self.model.showCompactComposer || self.model.pendingPermissionRequest?.hasStructuredUserInput == true else { return }
+            self.model.shouldFocusTextField = true
+        }
+    }
+
+    private func syncNotchPermissionTextEntry() {
+        guard presentationStyle == .notch else { return }
+        guard !model.isExpanded else { return }
+        guard model.pendingPermissionRequest?.hasStructuredUserInput == true else { return }
+
+        if panel == nil { createPanel() }
+        panel?.allowsKeyStatus = true
+        NSApp.activate(ignoringOtherApps: true)
+        panel?.makeKeyAndOrderFront(nil)
+
+        model.shouldFocusTextField = false
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.presentationStyle == .notch, !self.model.isExpanded else { return }
+            guard self.model.pendingPermissionRequest?.hasStructuredUserInput == true else { return }
             self.model.shouldFocusTextField = true
         }
     }
@@ -1790,17 +1821,6 @@ final class AssistantCompactHUDManager: AssistantCompactPresenter {
         return NSScreen.screens.first(where: { $0.frame.contains(mouseLocation) })
     }
 
-    private func sendCompletionNotification(message: String) {
-        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { granted, _ in
-            guard granted else { return }
-            let content = UNMutableNotificationContent()
-            content.title = "Open Assist Assistant"
-            content.body = message
-            content.sound = .default
-            let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
-            UNUserNotificationCenter.current().add(request)
-        }
-    }
 }
 
 typealias AssistantOrbHUDManager = AssistantCompactHUDManager

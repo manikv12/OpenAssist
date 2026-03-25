@@ -116,45 +116,51 @@ struct CodexInstallSupport {
         self.allowShellLookup = allowShellLookup
     }
 
-    func inspect() async -> AssistantInstallGuidance {
-        async let codexPath = which("codex")
+    func inspect(backend: AssistantRuntimeBackend = .codex) async -> AssistantInstallGuidance {
+        async let runtimePath = which(backend.executableName)
         async let brewPath = which("brew")
         async let npmPath = which("npm")
 
-        let resolvedCodex = await codexPath
+        let resolvedRuntime = await runtimePath
         let resolvedBrew = await brewPath
         let resolvedNPM = await npmPath
-        let commands = installCommands()
+        let commands = backend.installCommands
 
         let primaryTitle: String
         let primaryDetail: String
-        if resolvedCodex != nil {
-            primaryTitle = "Codex is installed"
-            primaryDetail = "Codex App Server is available on this Mac. Open Assist can sign in with ChatGPT, browse saved threads, and stream live assistant progress."
-        } else {
-            primaryTitle = "Install Codex"
-            primaryDetail = "Open Assist needs Codex before the assistant can run."
+        switch backend {
+        case .codex:
+            if resolvedRuntime != nil {
+                primaryTitle = "Codex is installed"
+                primaryDetail = "Codex App Server is available on this Mac. Open Assist can sign in with ChatGPT, browse saved threads, and stream live assistant progress."
+            } else {
+                primaryTitle = "Install Codex"
+                primaryDetail = "Open Assist needs Codex before the assistant can run."
+            }
+        case .copilot:
+            if resolvedRuntime != nil {
+                primaryTitle = "GitHub Copilot is installed"
+                primaryDetail = "GitHub Copilot CLI is available on this Mac. Open Assist can connect over ACP, browse Copilot sessions, and stream live assistant progress."
+            } else {
+                primaryTitle = "Install Copilot CLI"
+                primaryDetail = "Open Assist needs GitHub Copilot CLI before the assistant can use Copilot."
+            }
         }
 
         return AssistantInstallGuidance(
-            codexDetected: resolvedCodex != nil,
+            backend: backend,
+            codexDetected: resolvedRuntime != nil,
             brewDetected: resolvedBrew != nil,
             npmDetected: resolvedNPM != nil,
-            codexPath: resolvedCodex,
+            codexPath: resolvedRuntime,
             brewPath: resolvedBrew,
             npmPath: resolvedNPM,
             primaryTitle: primaryTitle,
             primaryDetail: primaryDetail,
             installCommands: commands,
-            loginCommands: ["codex login"],
-            docsURL: URL(string: "https://developers.openai.com/codex/app-server")
+            loginCommands: backend.loginCommands,
+            docsURL: backend.docsURL
         )
-    }
-
-    private func installCommands() -> [String] {
-        [
-            "npm install -g @openai/codex"
-        ]
     }
 
     private func which(_ binary: String) async -> String? {

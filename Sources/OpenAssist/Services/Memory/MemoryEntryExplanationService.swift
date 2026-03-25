@@ -23,6 +23,11 @@ actor MemoryEntryExplanationService {
         let oauthSession: PromptRewriteOAuthSession?
     }
 
+    private struct ResolvedConfiguration {
+        let configuration: LiveConfiguration
+        let credential: ProviderCredential
+    }
+
     private let session: URLSession
 
     init(session: URLSession = .shared) {
@@ -33,37 +38,20 @@ actor MemoryEntryExplanationService {
         entry: MemoryIndexedEntry,
         onPartialText: (@Sendable (String) -> Void)? = nil
     ) async -> MemoryEntryExplanationResult {
-        guard let configuration = liveConfiguration() else {
-            return .failure("Connect a provider first to explain memories with AI.")
-        }
-
-        let credential: ProviderCredential
-        do {
-            credential = try await resolveCredential(for: configuration)
-        } catch {
-            let detail = error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
-            if detail.isEmpty {
-                return .failure("Could not refresh provider authentication.")
-            }
-            return .failure("Could not refresh provider authentication: \(detail)")
-        }
-
-        if configuration.providerMode.requiresAPIKey {
-            if case .none = credential {
-                return .failure("No provider credentials available. Connect OAuth or add an API key.")
-            }
+        guard let resolved = await resolvedLiveConfiguration() else {
+            return .failure("Connect at least one provider first to explain memories with AI.")
         }
 
         do {
             let request = try buildRequest(
-                configuration: configuration,
-                credential: credential,
+                configuration: resolved.configuration,
+                credential: resolved.credential,
                 entry: entry
             )
             return try await executeRequest(
                 request,
-                configuration: configuration,
-                credential: credential,
+                configuration: resolved.configuration,
+                credential: resolved.credential,
                 emptyResultMessage: "Provider returned an empty explanation.",
                 onPartialText: onPartialText
             )
@@ -87,25 +75,8 @@ actor MemoryEntryExplanationService {
             return .failure("Could not find the full message for this selection.")
         }
 
-        guard let configuration = liveConfiguration() else {
-            return .failure("Connect a provider first to explain selected text with AI.")
-        }
-
-        let credential: ProviderCredential
-        do {
-            credential = try await resolveCredential(for: configuration)
-        } catch {
-            let detail = error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
-            if detail.isEmpty {
-                return .failure("Could not refresh provider authentication.")
-            }
-            return .failure("Could not refresh provider authentication: \(detail)")
-        }
-
-        if configuration.providerMode.requiresAPIKey {
-            if case .none = credential {
-                return .failure("No provider credentials available. Connect OAuth or add an API key.")
-            }
+        guard let resolved = await resolvedLiveConfiguration() else {
+            return .failure("Connect at least one provider first to explain selected text with AI.")
         }
 
         let normalizedQuestion = question?
@@ -153,15 +124,15 @@ actor MemoryEntryExplanationService {
 
         do {
             let request = try buildRequest(
-                configuration: configuration,
-                credential: credential,
+                configuration: resolved.configuration,
+                credential: resolved.credential,
                 systemPrompt: systemPrompt,
                 userPrompt: userPrompt
             )
             return try await executeRequest(
                 request,
-                configuration: configuration,
-                credential: credential,
+                configuration: resolved.configuration,
+                credential: resolved.credential,
                 emptyResultMessage: "Provider returned an empty answer.",
                 onPartialText: onPartialText
             )
@@ -403,36 +374,142 @@ actor MemoryEntryExplanationService {
         return .none
     }
 
-    private func liveConfiguration() -> LiveConfiguration? {
-        let defaults = UserDefaults.standard
-        let providerMode = loadProviderMode(defaults: defaults)
+    private func resolvedLiveConfiguration() async -> ResolvedConfiguration? {
+        for configuration in liveConfigurations() {
+            let credential: ProviderCredential
+            do {
+                credential = try await resolveCredential(for: configuration)
+            } catch {
+                continue
+            }
 
-        let model = defaults
+            if configuration.providerMode.requiresAPIKey,
+               case .none = credential {
+                continue
+            }
+
+            return ResolvedConfiguration(
+                configuration: configuration,
+                credential: credential
+            )
+        }
+
+        return nil
+    }
+
+    private func liveConfigurations() -> [LiveConfiguration] {
+        let defaults = UserDefaults.standard
+        let selectedProviderMode = loadProviderMode(defaults: defaults)
+        let legacyModel = defaults
             .string(forKey: "OpenAssist.promptRewriteOpenAIModel")?
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        let baseURL = defaults
+            .nonEmpty
+        let legacyBaseURL = defaults
             .string(forKey: "OpenAssist.promptRewriteOpenAIBaseURL")?
             .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nonEmpty
 
-        let oauthSession = PromptRewriteOAuthCredentialStore.loadSession(for: providerMode)
-        var resolvedModel = (model?.isEmpty == false) ? model! : providerMode.defaultModel
-        if providerMode == .openAI,
-           oauthSession != nil,
-           resolvedModel == PromptRewriteProviderMode.openAI.defaultModel {
-            resolvedModel = "gpt-5.3-codex"
-        }
-        let resolvedBaseURL = (baseURL?.isEmpty == false) ? baseURL! : providerMode.defaultBaseURL
-        let apiKey = loadProviderAPIKey(for: providerMode)
-        let hasCredentials = oauthSession != nil || !apiKey.isEmpty || !providerMode.requiresAPIKey
-        guard hasCredentials else { return nil }
-
-        return LiveConfiguration(
-            providerMode: providerMode,
-            model: resolvedModel,
-            baseURL: resolvedBaseURL,
-            apiKey: apiKey,
-            oauthSession: oauthSession
+        var modelsByProvider = normalizedProviderScopedStringDictionary(
+            defaults.dictionary(forKey: "OpenAssist.promptRewriteModelByProvider")
         )
+        var baseURLsByProvider = normalizedProviderScopedStringDictionary(
+            defaults.dictionary(forKey: "OpenAssist.promptRewriteBaseURLByProvider")
+        )
+
+        if modelsByProvider[selectedProviderMode.rawValue] == nil,
+           modelsByProvider.isEmpty,
+           let legacyModel {
+            modelsByProvider[selectedProviderMode.rawValue] = legacyModel
+        }
+
+        if baseURLsByProvider[selectedProviderMode.rawValue] == nil,
+           baseURLsByProvider.isEmpty,
+           let legacyBaseURL {
+            baseURLsByProvider[selectedProviderMode.rawValue] = legacyBaseURL
+        }
+
+        let orderedModes = [selectedProviderMode]
+            + PromptRewriteProviderMode.allCases.filter { $0 != selectedProviderMode }
+
+        var configurations: [LiveConfiguration] = []
+        for providerMode in orderedModes {
+            let oauthSession = PromptRewriteOAuthCredentialStore.loadSession(for: providerMode)
+            let apiKey = loadProviderAPIKey(for: providerMode)
+            let hasCredentials = oauthSession != nil || !apiKey.isEmpty || !providerMode.requiresAPIKey
+            guard hasCredentials else { continue }
+
+            let restoredModel = modelsByProvider[providerMode.rawValue]
+                ?? (providerMode == selectedProviderMode ? legacyModel : nil)
+                ?? providerMode.defaultModel
+            let restoredBaseURL = baseURLsByProvider[providerMode.rawValue]
+                ?? (providerMode == selectedProviderMode ? legacyBaseURL : nil)
+                ?? providerMode.defaultBaseURL
+            let sanitized = sanitizedConfiguration(
+                for: providerMode,
+                model: restoredModel,
+                baseURL: restoredBaseURL,
+                hasOAuthSession: oauthSession != nil,
+                hasAPIKey: !apiKey.isEmpty
+            )
+
+            configurations.append(
+                LiveConfiguration(
+                    providerMode: providerMode,
+                    model: sanitized.model,
+                    baseURL: sanitized.baseURL,
+                    apiKey: apiKey,
+                    oauthSession: oauthSession
+                )
+            )
+        }
+
+        return configurations
+    }
+
+    private func sanitizedConfiguration(
+        for providerMode: PromptRewriteProviderMode,
+        model: String,
+        baseURL: String,
+        hasOAuthSession: Bool,
+        hasAPIKey: Bool
+    ) -> (model: String, baseURL: String) {
+        let trimmedModel = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedBaseURL = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        var resolvedModel = trimmedModel.isEmpty ? providerMode.defaultModel : trimmedModel
+        var resolvedBaseURL = trimmedBaseURL.isEmpty ? providerMode.defaultBaseURL : trimmedBaseURL
+
+        guard providerMode == .openAI else {
+            return (resolvedModel, resolvedBaseURL)
+        }
+
+        let usingOpenAIOAuthOnly = hasOAuthSession && !hasAPIKey
+        guard usingOpenAIOAuthOnly else {
+            return (resolvedModel, resolvedBaseURL)
+        }
+
+        resolvedBaseURL = providerMode.defaultBaseURL
+        if !PromptRewriteModelCatalogService.isOpenAIOAuthCompatibleModelID(resolvedModel) {
+            resolvedModel = PromptRewriteModelCatalogService.defaultOpenAIOAuthModelID
+        }
+        return (resolvedModel, resolvedBaseURL)
+    }
+
+    private func normalizedProviderScopedStringDictionary(
+        _ dictionary: [String: Any]?
+    ) -> [String: String] {
+        guard let dictionary else { return [:] }
+        let validProviderIDs = Set(PromptRewriteProviderMode.allCases.map(\.rawValue))
+        var normalized: [String: String] = [:]
+
+        for (rawKey, rawValue) in dictionary {
+            guard validProviderIDs.contains(rawKey) else { continue }
+            guard let value = rawValue as? String else { continue }
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { continue }
+            normalized[rawKey] = trimmed
+        }
+
+        return normalized
     }
 
     private func loadProviderMode(defaults: UserDefaults) -> PromptRewriteProviderMode {

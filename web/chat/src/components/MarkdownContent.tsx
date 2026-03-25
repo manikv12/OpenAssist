@@ -1,4 +1,4 @@
-import { memo, useCallback, useDeferredValue } from "react";
+import { memo, useCallback, useMemo } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { Components } from "react-markdown";
@@ -63,14 +63,13 @@ const remarkPlugins = [remarkGfm];
 
 function MarkdownContentInner({
   markdown,
-  isStreaming = false,
 }: {
   markdown: string;
-  isStreaming?: boolean;
 }) {
-  const deferredMarkdown = useDeferredValue(markdown);
-  const renderedMarkdown =
-    isStreaming && markdown.length > 900 ? deferredMarkdown : markdown;
+  const renderedMarkdown = useMemo(
+    () => normalizeMarkdownStructure(markdown),
+    [markdown]
+  );
 
   const handleLinkClick = useCallback(
     (e: React.MouseEvent<HTMLAnchorElement>) => {
@@ -127,6 +126,57 @@ function MarkdownContentInner({
 }
 
 export const MarkdownContent = memo(MarkdownContentInner);
+
+function normalizeMarkdownStructure(markdown: string): string {
+  const normalized = markdown.replace(/\r\n/g, "\n");
+  const segments = normalized.split(/(```[\s\S]*?```|~~~[\s\S]*?~~~)/g);
+
+  return segments
+    .map((segment) => {
+      if (segment.startsWith("```") || segment.startsWith("~~~")) {
+        return segment;
+      }
+
+      return expandCompactOrderedLists(segment);
+    })
+    .join("");
+}
+
+function expandCompactOrderedLists(segment: string): string {
+  const prepared = segment.replace(/(:)\s+(?=1\.\s)/g, "$1\n");
+
+  return prepared
+    .split("\n")
+    .map((line) => {
+      const prefixMatch = line.match(/^(\s*(?:>\s*)*)\d+\.\s/);
+      if (!prefixMatch) {
+        return line;
+      }
+
+      const splitStarts = [...line.matchAll(/(\s+)(\d+)\.\s/g)]
+        .map((marker) => marker.index)
+        .filter((index): index is number => typeof index === "number");
+
+      if (splitStarts.length === 0) {
+        return line;
+      }
+
+      const prefix = prefixMatch[1] || "";
+      const rebuilt: string[] = [];
+      let sliceStart = 0;
+
+      for (const markerIndex of splitStarts) {
+        const whitespace = line.slice(markerIndex).match(/^\s+/)?.[0] || "";
+        const itemStart = markerIndex + whitespace.length;
+        rebuilt.push(line.slice(sliceStart, itemStart).trimEnd());
+        sliceStart = itemStart;
+      }
+
+      rebuilt.push(line.slice(sliceStart));
+      return rebuilt.filter(Boolean).join(`\n${prefix}`);
+    })
+    .join("\n");
+}
 
 function normalizeMermaidSource(language: string, code: string): string {
   if (language === "mermaid") {

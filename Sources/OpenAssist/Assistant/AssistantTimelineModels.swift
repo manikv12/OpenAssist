@@ -545,6 +545,8 @@ struct AssistantTimelineItem: Identifiable, Equatable, Codable, Sendable {
     var planText: String?
     var planEntries: [AssistantPlanEntry]?
     var imageAttachments: [Data]?
+    var providerBackend: AssistantRuntimeBackend?
+    var providerModelID: String?
     var source: AssistantTimelineSource
 
     var sortDate: Date {
@@ -564,6 +566,44 @@ struct AssistantTimelineItem: Identifiable, Equatable, Codable, Sendable {
         }
     }
 
+    init(
+        id: String,
+        sessionID: String?,
+        turnID: String?,
+        kind: AssistantTimelineItemKind,
+        createdAt: Date,
+        updatedAt: Date,
+        text: String?,
+        isStreaming: Bool,
+        emphasis: Bool,
+        activity: AssistantActivityItem?,
+        permissionRequest: AssistantPermissionRequest?,
+        planText: String?,
+        planEntries: [AssistantPlanEntry]?,
+        imageAttachments: [Data]? = nil,
+        providerBackend: AssistantRuntimeBackend? = nil,
+        providerModelID: String? = nil,
+        source: AssistantTimelineSource
+    ) {
+        self.id = id
+        self.sessionID = sessionID
+        self.turnID = turnID
+        self.kind = kind
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+        self.text = text
+        self.isStreaming = isStreaming
+        self.emphasis = emphasis
+        self.activity = activity
+        self.permissionRequest = permissionRequest
+        self.planText = planText
+        self.planEntries = planEntries
+        self.imageAttachments = imageAttachments
+        self.providerBackend = providerBackend
+        self.providerModelID = providerModelID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+        self.source = source
+    }
+
     static func userMessage(
         id: String = UUID().uuidString,
         sessionID: String?,
@@ -571,6 +611,8 @@ struct AssistantTimelineItem: Identifiable, Equatable, Codable, Sendable {
         text: String,
         createdAt: Date = Date(),
         imageAttachments: [Data]? = nil,
+        providerBackend: AssistantRuntimeBackend? = nil,
+        providerModelID: String? = nil,
         source: AssistantTimelineSource
     ) -> AssistantTimelineItem {
         AssistantTimelineItem(
@@ -588,6 +630,8 @@ struct AssistantTimelineItem: Identifiable, Equatable, Codable, Sendable {
             planText: nil,
             planEntries: nil,
             imageAttachments: imageAttachments,
+            providerBackend: providerBackend,
+            providerModelID: providerModelID,
             source: source
         )
     }
@@ -600,6 +644,8 @@ struct AssistantTimelineItem: Identifiable, Equatable, Codable, Sendable {
         createdAt: Date,
         updatedAt: Date = Date(),
         isStreaming: Bool,
+        providerBackend: AssistantRuntimeBackend? = nil,
+        providerModelID: String? = nil,
         source: AssistantTimelineSource
     ) -> AssistantTimelineItem {
         AssistantTimelineItem(
@@ -616,6 +662,8 @@ struct AssistantTimelineItem: Identifiable, Equatable, Codable, Sendable {
             permissionRequest: nil,
             planText: nil,
             planEntries: nil,
+            providerBackend: providerBackend,
+            providerModelID: providerModelID,
             source: source
         )
     }
@@ -629,6 +677,8 @@ struct AssistantTimelineItem: Identifiable, Equatable, Codable, Sendable {
         updatedAt: Date = Date(),
         isStreaming: Bool,
         imageAttachments: [Data]? = nil,
+        providerBackend: AssistantRuntimeBackend? = nil,
+        providerModelID: String? = nil,
         source: AssistantTimelineSource
     ) -> AssistantTimelineItem {
         AssistantTimelineItem(
@@ -646,6 +696,8 @@ struct AssistantTimelineItem: Identifiable, Equatable, Codable, Sendable {
             planText: nil,
             planEntries: nil,
             imageAttachments: imageAttachments,
+            providerBackend: providerBackend,
+            providerModelID: providerModelID,
             source: source
         )
     }
@@ -665,6 +717,8 @@ struct AssistantTimelineItem: Identifiable, Equatable, Codable, Sendable {
             permissionRequest: nil,
             planText: nil,
             planEntries: nil,
+            providerBackend: nil,
+            providerModelID: nil,
             source: activity.source
         )
     }
@@ -691,6 +745,8 @@ struct AssistantTimelineItem: Identifiable, Equatable, Codable, Sendable {
             permissionRequest: request,
             planText: nil,
             planEntries: nil,
+            providerBackend: nil,
+            providerModelID: nil,
             source: source
         )
     }
@@ -720,6 +776,8 @@ struct AssistantTimelineItem: Identifiable, Equatable, Codable, Sendable {
             permissionRequest: nil,
             planText: text,
             planEntries: entries,
+            providerBackend: nil,
+            providerModelID: nil,
             source: source
         )
     }
@@ -749,6 +807,8 @@ struct AssistantTimelineItem: Identifiable, Equatable, Codable, Sendable {
             planText: nil,
             planEntries: nil,
             imageAttachments: imageAttachments,
+            providerBackend: nil,
+            providerModelID: nil,
             source: source
         )
     }

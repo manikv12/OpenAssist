@@ -22,7 +22,8 @@ final class AssistantMemoryRetrievalService {
         statusBase: String? = nil,
         additionalLongTermEntries: [AssistantMemoryEntry] = []
     ) throws -> AssistantBuiltMemoryContext {
-        let scope = longTermScope ?? makeScopeContext(threadID: threadID, cwd: cwd)
+        let threadScope = makeScopeContext(threadID: threadID, cwd: cwd)
+        let scope = longTermScope ?? threadScope
         let initialChange = try threadMemoryService.loadTrackedDocument(for: threadID, seedTask: prompt)
 
         let resolvedChange: AssistantThreadMemoryChange
@@ -49,15 +50,41 @@ final class AssistantMemoryRetrievalService {
         }
 
         let agentStateLines = try fetchAssistantAgentStateLines(threadID: threadID)
-        let longTermEntries = try fetchRankedLongTermEntries(
-            prompt: prompt,
-            threadID: threadID,
-            scope: scope
-        )
-        let mergedLongTermEntries = mergeLongTermEntries(
-            primary: longTermEntries,
-            additional: additionalLongTermEntries
-        )
+        let mergedLongTermEntries: [AssistantMemoryEntry]
+        let longTermScopeIdentityKey = longTermScope?.identityKey?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let threadScopeIdentityKey = threadScope.identityKey?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if let longTermScope,
+           longTermScopeIdentityKey != nil,
+           longTermScopeIdentityKey != threadScopeIdentityKey {
+            let threadLongTermEntries = try fetchRankedLongTermEntries(
+                prompt: prompt,
+                threadID: threadID,
+                scope: threadScope
+            )
+            let scopedLongTermEntries = try fetchRankedLongTermEntries(
+                prompt: prompt,
+                threadID: threadID,
+                scope: longTermScope
+            )
+            let combined = mergeLongTermEntries(
+                primary: threadLongTermEntries,
+                additional: scopedLongTermEntries
+            )
+            mergedLongTermEntries = mergeLongTermEntries(
+                primary: combined,
+                additional: additionalLongTermEntries
+            )
+        } else {
+            let longTermEntries = try fetchRankedLongTermEntries(
+                prompt: prompt,
+                threadID: threadID,
+                scope: scope
+            )
+            mergedLongTermEntries = mergeLongTermEntries(
+                primary: longTermEntries,
+                additional: additionalLongTermEntries
+            )
+        }
 
         let summary = buildSummary(
             document: resolvedChange.document,

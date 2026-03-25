@@ -9,7 +9,8 @@ enum AssistantCommandSafetyClass: Equatable, Sendable {
 enum AssistantModePolicy {
     private static let restrictedDynamicToolNames: Set<String> = [
         "browser_use",
-        "app_action"
+        "app_action",
+        "computer_use"
     ]
 
     private static let simpleReadOnlyExecutables: Set<String> = [

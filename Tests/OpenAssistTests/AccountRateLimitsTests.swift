@@ -36,6 +36,44 @@ final class AccountRateLimitsTests: XCTestCase {
         XCTAssertEqual(updated.bucket(for: "gpt-5.3-codex-spark")?.limitID, "codex_other")
     }
 
+    func testNonSparkModelDoesNotFallBackToSparkOnlyBucket() throws {
+        let limits = try XCTUnwrap(
+            AccountRateLimits.fromPayload(
+                [
+                    "rateLimits": [
+                        "limitId": "codex_other",
+                        "limitName": "GPT-5.3-Codex-Spark",
+                        "primary": [
+                            "usedPercent": 3,
+                            "windowDurationMins": 300
+                        ],
+                        "secondary": [
+                            "usedPercent": 8,
+                            "windowDurationMins": 10_080
+                        ]
+                    ],
+                    "rateLimitsByLimitId": [
+                        "codex_other": [
+                            "limitId": "codex_other",
+                            "limitName": "GPT-5.3-Codex-Spark",
+                            "primary": [
+                                "usedPercent": 3,
+                                "windowDurationMins": 300
+                            ],
+                            "secondary": [
+                                "usedPercent": 8,
+                                "windowDurationMins": 10_080
+                            ]
+                        ]
+                    ]
+                ]
+            )
+        )
+
+        XCTAssertNil(limits.bucket(for: "gpt-5.4"))
+        XCTAssertEqual(limits.bucket(for: "gpt-5.3-codex-spark")?.limitID, "codex_other")
+    }
+
     private func fullRateLimitsPayload() -> [String: Any] {
         let codexSnapshot: [String: Any] = [
             "limitId": "codex",

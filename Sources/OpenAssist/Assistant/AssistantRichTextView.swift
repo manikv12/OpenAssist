@@ -397,29 +397,30 @@ final class AssistantRichTextContainerView: NSView, NSTextViewDelegate {
     }
 }
 
-final class AssistantInteractiveTextView: NSTextView {}
+final class AssistantInteractiveTextView: NSTextView {
+    override func mouseDown(with event: NSEvent) {
+        activateWindowForSelectionIfNeeded()
+        super.mouseDown(with: event)
+    }
+
+    override func rightMouseDown(with event: NSEvent) {
+        activateWindowForSelectionIfNeeded()
+        super.rightMouseDown(with: event)
+    }
+
+    private func activateWindowForSelectionIfNeeded() {
+        guard let panel = window as? NSPanel else { return }
+        guard panel.styleMask.contains(.nonactivatingPanel) else { return }
+
+        NSApp?.activate(ignoringOtherApps: true)
+        panel.makeKey()
+        panel.makeMain()
+    }
+}
 
 private enum AssistantRichTextLinkOpener {
     static func open(_ url: URL) -> Bool {
-        let scheme = url.scheme?.lowercased() ?? ""
-        if scheme == "http" || scheme == "https" {
-            NSWorkspace.shared.open(url)
-            return true
-        }
-
-        let path = url.path
-        if (scheme == "file" || scheme.isEmpty), !path.isEmpty {
-            if let vscodeURL = URL(string: "vscode://file\(path)"),
-               NSWorkspace.shared.urlForApplication(toOpen: vscodeURL) != nil {
-                NSWorkspace.shared.open(vscodeURL)
-                return true
-            }
-
-            NSWorkspace.shared.open(URL(fileURLWithPath: path))
-            return true
-        }
-
-        return false
+        AssistantWorkspaceFileOpener.open(url)
     }
 }
 
@@ -1150,7 +1151,7 @@ private struct AssistantRichTextTheme {
     let listNestedIndent: CGFloat
 
     init(variant: AssistantRichTextVariant) {
-        let isDarkAppearance = NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        let isDarkAppearance = NSApp?.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
 
         switch variant {
         case .chat(let textScale):

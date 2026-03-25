@@ -190,7 +190,7 @@ final class AssistantLiveVoiceCoordinator: AssistantLiveVoiceSessionControlling 
                 isHandsFreeLoopEnabled: false,
                 sessionID: store.selectedSessionID,
                 lastTranscript: nil,
-                statusMessage: "Choose a model and make sure Codex is ready before starting live voice.",
+                statusMessage: "Choose a model and make sure the selected assistant runtime is ready before starting live voice.",
                 lastError: nil,
                 permissionRequest: nil
             )

@@ -1,14 +1,35 @@
 import Foundation
+import UniformTypeIdentifiers
 
 @MainActor
 final class TelegramRemoteCoordinator: ObservableObject {
     static let shared = TelegramRemoteCoordinator()
+    private static let telegramDownloadLimitBytes = 20 * 1024 * 1024
+    private static let supportedAudioFileExtensions: Set<String> = [
+        "wav", "mp3", "mp4", "mpeg", "mpga", "m4a", "flac", "ogg", "opus", "oga", "webm"
+    ]
+    private static let supportedAudioMIMETypes: Set<String> = [
+        "audio/flac",
+        "audio/m4a",
+        "audio/mp3",
+        "audio/mp4",
+        "audio/mpeg",
+        "audio/ogg",
+        "audio/opus",
+        "audio/wav",
+        "audio/webm",
+        "application/ogg",
+        "video/mp4"
+    ]
     private static let botCommands: [TelegramBotCommand] = [
         .init(command: "start", description: "Open the Telegram remote home screen"),
         .init(command: "help", description: "Show the main Telegram commands"),
         .init(command: "new", description: "Start a new Open Assist session"),
+        .init(command: "clear", description: "Clear this Telegram screen and keep one fresh card"),
+        .init(command: "temp", description: "Start a temporary Open Assist chat"),
         .init(command: "projects", description: "Browse projects and their threads"),
         .init(command: "sessions", description: "Switch to another Open Assist session"),
+        .init(command: "backend", description: "Switch between Codex and GitHub Copilot"),
         .init(command: "models", description: "Change the active session model"),
         .init(command: "mode", description: "Switch between Plan and Agentic"),
         .init(command: "effort", description: "Change the model thinking level"),
@@ -26,6 +47,7 @@ final class TelegramRemoteCoordinator: ObservableObject {
         case home
         case projects
         case sessions
+        case backend
         case models
         case mode
         case effort
@@ -104,10 +126,13 @@ final class TelegramRemoteCoordinator: ObservableObject {
             resetStructuredInput()
         }
 
-        mutating func switchSessionView(to sessionID: String?) {
+        mutating func switchSessionView(
+            to sessionID: String?,
+            showTranscriptPreview: Bool = true
+        ) {
             viewGeneration += 1
             selectedSessionID = sessionID
-            shouldShowTranscriptPreview = true
+            shouldShowTranscriptPreview = showTranscriptPreview
             resetStructuredInput()
         }
 
@@ -139,7 +164,39 @@ final class TelegramRemoteCoordinator: ObservableObject {
         let token: String
     }
 
+    private struct TelegramAudioAttachment {
+        let fileID: String
+        let fileName: String
+        let mimeType: String
+        let fileSize: Int?
+        let kindDescription: String
+    }
+
+    private enum TelegramAudioRoutingError: LocalizedError {
+        case unsupportedAttachment
+        case fileUnavailable
+        case fileTooLarge
+        case missingCredentials(String)
+        case emptyTranscript
+
+        var errorDescription: String? {
+            switch self {
+            case .unsupportedAttachment:
+                return "Send a Telegram voice note or a supported audio file such as mp3, m4a, wav, ogg, opus, flac, or webm."
+            case .fileUnavailable:
+                return "Telegram did not provide a downloadable file for that attachment."
+            case .fileTooLarge:
+                return "Telegram bots can only download audio files up to 20 MB."
+            case .missingCredentials(let message):
+                return message
+            case .emptyTranscript:
+                return "The audio upload finished, but no transcript text came back."
+            }
+        }
+    }
+
     private let bridge = AssistantRemoteBridge()
+    private let transcriptionService = AudioTranscriptionService.shared
     private weak var settings: SettingsStore?
     private var configuration: Configuration?
     private var client: TelegramBotClient?
@@ -149,6 +206,7 @@ final class TelegramRemoteCoordinator: ObservableObject {
     private var typingIndicatorChatID: Int64?
     private var didRegisterBotCommands = false
     private var shouldDrainBacklog = false
+    private var shouldClearRecoveredChatHistory = false
     private var chatState = ChatState()
 
     private init() {}
@@ -172,6 +230,7 @@ final class TelegramRemoteCoordinator: ObservableObject {
         if !newConfiguration.enabled {
             client = nil
             shouldDrainBacklog = false
+            shouldClearRecoveredChatHistory = false
             connectionStatusMessage = "Disabled"
             return
         }
@@ -179,10 +238,14 @@ final class TelegramRemoteCoordinator: ObservableObject {
         guard !newConfiguration.token.isEmpty else {
             client = nil
             shouldDrainBacklog = false
+            shouldClearRecoveredChatHistory = false
             connectionStatusMessage = "Add your Telegram bot token to start."
             return
         }
 
+        let recoveredTrackedMessageIDs = settings.telegramTrackedMessageIDs
+        chatState.trackedMessageIDs = recoveredTrackedMessageIDs
+        shouldClearRecoveredChatHistory = !recoveredTrackedMessageIDs.isEmpty
         client = TelegramBotClient(token: newConfiguration.token)
         didRegisterBotCommands = false
         shouldDrainBacklog = settings.telegramLastProcessedUpdateID == 0
@@ -293,6 +356,7 @@ final class TelegramRemoteCoordinator: ObservableObject {
         typingIndicatorChatID = nil
         didRegisterBotCommands = false
         shouldDrainBacklog = false
+        shouldClearRecoveredChatHistory = false
         chatState = ChatState()
         if resetIdentity {
             botIdentityLabel = "No bot connected"
@@ -364,6 +428,10 @@ final class TelegramRemoteCoordinator: ObservableObject {
                 continue
             }
 
+            if shouldClearRecoveredChatHistory {
+                await clearTrackedChatHistory(chatID: ownerChatID)
+            }
+
             let snapshot = await refreshSelectedSessionView(chatID: ownerChatID)
             await updateTypingIndicator(chatID: ownerChatID, snapshot: snapshot)
             if chatState.controllerMenu == .home {
@@ -388,8 +456,11 @@ final class TelegramRemoteCoordinator: ObservableObject {
     }
 
     private func handle(message: TelegramMessage) async {
-        guard let text = message.text?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !text.isEmpty else {
+        let text = message.text?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedText = text.flatMap { $0.isEmpty ? nil : $0 }
+        let audioAttachment = telegramAudioAttachment(from: message)
+
+        guard normalizedText != nil || audioAttachment != nil || telegramMessageIncludesMedia(message) else {
             return
         }
 
@@ -404,7 +475,7 @@ final class TelegramRemoteCoordinator: ObservableObject {
         guard let settings else { return }
 
         if !settings.hasTelegramRemoteOwner {
-            await handlePendingPairing(text: text, message: message)
+            await handlePendingPairing(text: normalizedText ?? "", message: message)
             return
         }
 
@@ -418,20 +489,32 @@ final class TelegramRemoteCoordinator: ObservableObject {
 
         trackMessageID(message.messageID)
 
-        if let customQuestionID = chatState.awaitingCustomAnswerQuestionID,
-           !text.hasPrefix("/") {
+        if let normalizedText,
+           let customQuestionID = chatState.awaitingCustomAnswerQuestionID,
+           !normalizedText.hasPrefix("/") {
             chatState.awaitingCustomAnswerQuestionID = nil
-            chatState.structuredAnswers[customQuestionID] = [text]
+            chatState.structuredAnswers[customQuestionID] = [normalizedText]
             await continueStructuredInput(chatID: message.chat.id)
             return
         }
 
-        if let command = normalizedCommand(from: text) {
-            await handle(command: command, rawText: text, chatID: message.chat.id)
+        if let normalizedText, let command = normalizedCommand(from: normalizedText) {
+            await handle(command: command, rawText: normalizedText, chatID: message.chat.id)
             return
         }
 
-        await sendPrompt(text, chatID: message.chat.id)
+        if let normalizedText {
+            await sendPrompt(normalizedText, chatID: message.chat.id)
+            return
+        }
+
+        guard let audioAttachment else {
+            await renderHomeMenu(chatID: message.chat.id, notice: TelegramAudioRoutingError.unsupportedAttachment.localizedDescription)
+            await refreshSelectedSessionView(chatID: message.chat.id, force: true)
+            return
+        }
+
+        await handle(audioAttachment: audioAttachment, chatID: message.chat.id)
     }
 
     private func handle(callbackQuery: TelegramCallbackQuery) async {
@@ -467,6 +550,8 @@ final class TelegramRemoteCoordinator: ObservableObject {
                 await renderProjectMenu(chatID: chat.id)
             case "menu:sessions":
                 await renderSessionMenu(chatID: chat.id)
+            case "menu:backend":
+                await renderBackendMenu(chatID: chat.id)
             case "menu:models":
                 await renderModelMenu(chatID: chat.id)
             case "menu:mode":
@@ -477,17 +562,21 @@ final class TelegramRemoteCoordinator: ObservableObject {
                 await renderHomeMenu(chatID: chat.id, notice: nil)
                 await refreshSelectedSessionView(chatID: chat.id, force: true)
             case "act:new":
-                await applySelectedProjectFilter()
-                _ = await bridge.startNewSession()
-                chatState.switchSessionView(to: bridge.statusSnapshot().selectedSessionID)
-                await clearTrackedChatHistory(chatID: chat.id)
-                await renderHomeMenu(chatID: chat.id, notice: "Started a new session.")
-                await refreshSelectedSessionView(chatID: chat.id, force: true)
+                await startFreshSession(chatID: chat.id, isTemporary: false, moveControllerToBottom: false)
+            case "act:clear":
+                await clearChatWindow(chatID: chat.id)
+            case "act:temp":
+                await startFreshSession(chatID: chat.id, isTemporary: true, moveControllerToBottom: false)
+            case "act:keep":
+                await keepSelectedTemporarySession(chatID: chat.id)
             case "act:refresh":
                 await renderHomeMenu(chatID: chat.id, notice: "Refreshed the active session view.")
                 await refreshSelectedSessionView(chatID: chat.id, force: true)
             case "act:usage":
                 await renderHomeMenu(chatID: chat.id, notice: await usageSummaryText())
+                await refreshSelectedSessionView(chatID: chat.id, force: true)
+            case "act:provider":
+                await renderHomeMenu(chatID: chat.id, notice: await providerUsageSummaryText())
                 await refreshSelectedSessionView(chatID: chat.id, force: true)
             case "act:stop":
                 await bridge.cancelActiveTurn()
@@ -497,6 +586,8 @@ final class TelegramRemoteCoordinator: ObservableObject {
                 try await handleSessionSelection(data: data, chatID: chat.id)
             case let data where data.hasPrefix("sel:p:"):
                 try await handleProjectSelection(data: data, chatID: chat.id)
+            case let data where data.hasPrefix("sel:backend:"):
+                try await handleBackendSelection(data: data, chatID: chat.id)
             case let data where data.hasPrefix("sel:m:"):
                 try await handleModelSelection(data: data, chatID: chat.id)
             case let data where data.hasPrefix("sel:mode:"):
@@ -539,19 +630,20 @@ final class TelegramRemoteCoordinator: ObservableObject {
             await renderHomeMenu(chatID: chatID, notice: helpText())
             await refreshSelectedSessionView(chatID: chatID, force: true)
         case "/new":
-            await applySelectedProjectFilter()
-            _ = await bridge.startNewSession()
-            chatState.switchSessionView(to: bridge.statusSnapshot().selectedSessionID)
-            await clearTrackedChatHistory(chatID: chatID)
-            await moveControllerMessageToBottom(chatID: chatID)
-            await renderHomeMenu(chatID: chatID, notice: "Started a new session.")
-            await refreshSelectedSessionView(chatID: chatID, force: true)
+            await startFreshSession(chatID: chatID, isTemporary: false, moveControllerToBottom: true)
+        case "/clear":
+            await clearChatWindow(chatID: chatID)
+        case "/temp":
+            await startFreshSession(chatID: chatID, isTemporary: true, moveControllerToBottom: true)
         case "/projects":
             await moveControllerMessageToBottom(chatID: chatID)
             await renderProjectMenu(chatID: chatID)
         case "/sessions":
             await moveControllerMessageToBottom(chatID: chatID)
             await renderSessionMenu(chatID: chatID)
+        case "/backend":
+            await moveControllerMessageToBottom(chatID: chatID)
+            await renderBackendMenu(chatID: chatID)
         case "/models":
             await moveControllerMessageToBottom(chatID: chatID)
             await renderModelMenu(chatID: chatID)
@@ -630,67 +722,317 @@ final class TelegramRemoteCoordinator: ObservableObject {
         chatState.selectedSessionID = sessions.first?.id
     }
 
-    private func sendPrompt(_ text: String, chatID: Int64) async {
+    private func startFreshSession(
+        chatID: Int64,
+        isTemporary: Bool,
+        moveControllerToBottom: Bool
+    ) async {
         await applySelectedProjectFilter()
-        if chatState.selectedSessionID?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false {
-            _ = await bridge.startNewSession()
-            chatState.switchSessionView(to: bridge.statusSnapshot().selectedSessionID)
+        let snapshot: AssistantRemoteSessionSnapshot?
+        if isTemporary {
+            snapshot = await bridge.startNewTemporarySession()
+        } else {
+            snapshot = await bridge.startNewSession()
+        }
+        chatState.switchSessionView(to: snapshot?.session.id ?? bridge.statusSnapshot().selectedSessionID)
+        await clearTrackedChatHistory(chatID: chatID)
+        if moveControllerToBottom {
+            await moveControllerMessageToBottom(chatID: chatID)
+        }
+        await renderHomeMenu(
+            chatID: chatID,
+            notice: isTemporary ? "Started a temporary chat." : "Started a new session."
+        )
+        await refreshSelectedSessionView(chatID: chatID, force: true)
+    }
+
+    private func keepSelectedTemporarySession(chatID: Int64) async {
+        let selectedSessionID = chatState.selectedSessionID?.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let selectedSessionID, !selectedSessionID.isEmpty else {
+            await renderHomeMenu(chatID: chatID, notice: "No session is selected right now.")
+            await refreshSelectedSessionView(chatID: chatID, force: true)
+            return
         }
 
-        chatState.shouldShowTranscriptPreview = false
+        let promoted = await bridge.promoteTemporarySession(sessionID: selectedSessionID)
+        await renderHomeMenu(
+            chatID: chatID,
+            notice: promoted ? "Kept this chat as a regular session." : "This chat is already a regular session."
+        )
+        await refreshSelectedSessionView(chatID: chatID, force: true)
+    }
+
+    private func clearChatWindow(chatID: Int64) async {
+        let selectedSessionID = chatState.selectedSessionID?.trimmingCharacters(in: .whitespacesAndNewlines)
+        await clearTrackedChatHistory(chatID: chatID)
+        chatState.switchSessionView(
+            to: selectedSessionID,
+            showTranscriptPreview: false
+        )
+        await renderHomeMenu(
+            chatID: chatID,
+            notice: "Screen cleared. This keeps only one fresh Telegram card here."
+        )
+    }
+
+    private func sendPrompt(
+        _ text: String,
+        chatID: Int64,
+        successNotice: String = "Message sent to the active session."
+    ) async {
+        await applySelectedProjectFilter()
+
         if slot(for: .transcript).messageID != nil {
             await clearSlot(chatID: chatID, kind: .transcript)
         }
         detachSlot(.stream)
 
         let selectedSessionID = chatState.selectedSessionID
-        _ = await bridge.sendPrompt(text, sessionID: selectedSessionID)
-        await renderHomeMenu(chatID: chatID, notice: "Message sent to the active session.")
+        let snapshot = await bridge.sendPrompt(text, sessionID: selectedSessionID)
+        chatState.switchSessionView(
+            to: snapshot?.session.id ?? bridge.statusSnapshot().selectedSessionID,
+            showTranscriptPreview: false
+        )
+        await renderHomeMenu(chatID: chatID, notice: successNotice)
         await refreshSelectedSessionView(chatID: chatID, force: true)
+    }
+
+    private func handle(audioAttachment: TelegramAudioAttachment, chatID: Int64) async {
+        guard let client, let settings else { return }
+
+        do {
+            await renderHomeMenu(chatID: chatID, notice: "Downloading the \(audioAttachment.kindDescription) from Telegram…")
+            _ = try? await client.sendChatAction(chatID: chatID, action: "typing")
+
+            let telegramFile = try await client.getFile(fileID: audioAttachment.fileID)
+            guard let filePath = telegramFile.filePath?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !filePath.isEmpty else {
+                throw TelegramAudioRoutingError.fileUnavailable
+            }
+
+            let knownFileSize = audioAttachment.fileSize ?? telegramFile.fileSize
+            if let knownFileSize, knownFileSize > Self.telegramDownloadLimitBytes {
+                throw TelegramAudioRoutingError.fileTooLarge
+            }
+
+            let fileData = try await client.downloadFile(filePath: filePath)
+            if fileData.count > Self.telegramDownloadLimitBytes {
+                throw TelegramAudioRoutingError.fileTooLarge
+            }
+
+            await renderHomeMenu(chatID: chatID, notice: "Transcribing the \(audioAttachment.kindDescription)…")
+            let configuration = try makeTelegramTranscriptionConfiguration(using: settings)
+            let transcript = try await transcriptionService.transcribe(
+                upload: AudioTranscriptionUpload(
+                    fileData: fileData,
+                    fileName: audioAttachment.fileName,
+                    mimeType: audioAttachment.mimeType
+                ),
+                configuration: configuration
+            )
+            let trimmedTranscript = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmedTranscript.isEmpty else {
+                throw TelegramAudioRoutingError.emptyTranscript
+            }
+
+            await sendPrompt(
+                trimmedTranscript,
+                chatID: chatID,
+                successNotice: "Transcribed the \(audioAttachment.kindDescription) and sent it to the active session."
+            )
+        } catch {
+            let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            await renderHomeMenu(chatID: chatID, notice: "Audio transcription failed: \(message)")
+            await refreshSelectedSessionView(chatID: chatID, force: true)
+        }
+    }
+
+    private func makeTelegramTranscriptionConfiguration(
+        using settings: SettingsStore
+    ) throws -> AudioTranscriptionRequestConfiguration {
+        let provider = settings.cloudTranscriptionProvider
+        let model = settings.cloudTranscriptionModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        let baseURL = settings.cloudTranscriptionBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        let apiKey = (
+            provider == .gemini
+                ? settings.googleAIStudioAPIKey
+                : settings.cloudTranscriptionAPIKey
+        )
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if provider.requiresAPIKey && apiKey.isEmpty {
+            let guidance = provider == .gemini
+                ? "Open AI Studio and add a Google AI Studio API key before using Telegram audio transcription with Gemini."
+                : "Open Settings > Recognition and add a \(provider.displayName) API key before using Telegram audio transcription."
+            throw TelegramAudioRoutingError.missingCredentials(guidance)
+        }
+
+        return AudioTranscriptionRequestConfiguration(
+            provider: provider,
+            model: model.isEmpty ? provider.defaultModel : model,
+            baseURL: baseURL.isEmpty ? provider.defaultBaseURL : baseURL,
+            apiKey: apiKey,
+            requestTimeoutSeconds: settings.cloudTranscriptionRequestTimeoutSeconds,
+            biasPhrases: []
+        )
+    }
+
+    private func telegramMessageIncludesMedia(_ message: TelegramMessage) -> Bool {
+        message.voice != nil || message.audio != nil || message.document != nil
+    }
+
+    private func telegramAudioAttachment(from message: TelegramMessage) -> TelegramAudioAttachment? {
+        if let voice = message.voice {
+            let fileName = "telegram-voice-\(message.messageID).ogg"
+            return TelegramAudioAttachment(
+                fileID: voice.fileID,
+                fileName: fileName,
+                mimeType: resolvedAudioMimeType(rawValue: voice.mimeType, fileName: fileName, fallback: "audio/ogg"),
+                fileSize: voice.fileSize,
+                kindDescription: "voice note"
+            )
+        }
+
+        if let audio = message.audio {
+            let fileName = normalizedAudioFileName(
+                rawValue: audio.fileName,
+                fallback: "telegram-audio-\(message.messageID).m4a"
+            )
+            return TelegramAudioAttachment(
+                fileID: audio.fileID,
+                fileName: fileName,
+                mimeType: resolvedAudioMimeType(rawValue: audio.mimeType, fileName: fileName, fallback: "audio/m4a"),
+                fileSize: audio.fileSize,
+                kindDescription: "audio file"
+            )
+        }
+
+        if let document = message.document, isSupportedAudioDocument(document) {
+            let fileName = normalizedAudioFileName(
+                rawValue: document.fileName,
+                fallback: "telegram-audio-\(message.messageID).bin"
+            )
+            return TelegramAudioAttachment(
+                fileID: document.fileID,
+                fileName: fileName,
+                mimeType: resolvedAudioMimeType(rawValue: document.mimeType, fileName: fileName, fallback: "application/octet-stream"),
+                fileSize: document.fileSize,
+                kindDescription: "audio file"
+            )
+        }
+
+        return nil
+    }
+
+    private func isSupportedAudioDocument(_ document: TelegramDocument) -> Bool {
+        let normalizedMimeType = document.mimeType?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        if let normalizedMimeType, normalizedMimeType.hasPrefix("audio/") {
+            return true
+        }
+        if let normalizedMimeType, Self.supportedAudioMIMETypes.contains(normalizedMimeType) {
+            return true
+        }
+        let fileExtension = document.fileName?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .split(separator: ".")
+            .last?
+            .lowercased()
+        if let fileExtension, Self.supportedAudioFileExtensions.contains(fileExtension) {
+            return true
+        }
+        return false
+    }
+
+    private func normalizedAudioFileName(rawValue: String?, fallback: String) -> String {
+        guard let trimmed = rawValue?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !trimmed.isEmpty else {
+            return fallback
+        }
+        return trimmed
+    }
+
+    private func resolvedAudioMimeType(rawValue: String?, fileName: String, fallback: String) -> String {
+        let trimmed = rawValue?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !trimmed.isEmpty {
+            return trimmed
+        }
+
+        let fileExtension = URL(fileURLWithPath: fileName).pathExtension
+        if !fileExtension.isEmpty,
+           let inferredMimeType = UTType(filenameExtension: fileExtension)?.preferredMIMEType,
+           !inferredMimeType.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return inferredMimeType
+        }
+
+        return fallback
     }
 
     private func renderHomeMenu(chatID: Int64, notice: String?) async {
         let status = await telegramSessionContext()
         let projectName = await currentProjectName()
-        let selectedSessionLine: String
-        if let title = status.selectedSessionTitle, !title.isEmpty {
-            selectedSessionLine = title
-        } else {
-            selectedSessionLine = "No session selected"
-        }
+        let selectedSessionLine = formattedSelectedSessionLine(
+            sessionID: status.selectedSessionID,
+            title: status.selectedSessionTitle,
+            isTemporary: status.selectedSessionIsTemporary
+        )
 
         var lines = [
             "Open Assist Telegram Remote",
             "",
             "Project: \(projectName ?? "All projects")",
-            "Session: \(selectedSessionLine)"
+            "Session: \(selectedSessionLine)",
+            "Backend: \(status.assistantBackendName)"
         ]
+
+        if status.selectedSessionIsTemporary {
+            lines.append("Type: Temporary chat")
+        }
 
         if let notice, !notice.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             lines.append("")
             lines.append(notice)
         } else if status.selectedSessionID == nil {
             lines.append("")
-            lines.append("Send a message or tap New to start.")
+            lines.append("Send a message, tap New, or tap Temp to start.")
         }
 
-        let markup = TelegramInlineKeyboardMarkup(inlineKeyboard: [
+        var rows: [[TelegramInlineKeyboardButton]] = [
             [
                 .init(text: "Projects", callbackData: "menu:projects"),
-                .init(text: "Sessions", callbackData: "menu:sessions"),
-                .init(text: "New", callbackData: "act:new")
+                .init(text: "Sessions", callbackData: "menu:sessions")
             ],
             [
-                .init(text: "Models", callbackData: "menu:models"),
+                .init(text: "New", callbackData: "act:new"),
+                .init(text: "Temp", callbackData: "act:temp")
+            ],
+            [
+                .init(text: "Clear", callbackData: "act:clear")
+            ],
+            [
+                .init(text: "Backend", callbackData: "menu:backend"),
+                .init(text: "Models", callbackData: "menu:models")
+            ],
+            [
                 .init(text: "Mode", callbackData: "menu:mode"),
                 .init(text: "Effort", callbackData: "menu:effort")
             ],
             [
                 .init(text: "Usage", callbackData: "act:usage"),
+                .init(text: "Provider", callbackData: "act:provider")
+            ],
+            [
                 .init(text: "Refresh", callbackData: "act:refresh"),
                 .init(text: "Stop", callbackData: "act:stop")
             ]
-        ])
+        ]
+
+        if status.selectedSessionIsTemporary {
+            rows.insert([.init(text: "Keep Chat", callbackData: "act:keep")], at: 2)
+        }
+
+        let markup = TelegramInlineKeyboardMarkup(inlineKeyboard: rows)
 
         chatState.controllerMenu = .home
         let text = lines.joined(separator: "\n")
@@ -722,7 +1064,7 @@ final class TelegramRemoteCoordinator: ObservableObject {
         rows.append([.init(text: "Back", callbackData: "nav:home")])
 
         let text = projects.isEmpty
-            ? "No projects yet. You can still use /new to start an ungrouped session."
+            ? "No projects yet. You can still use /new or /temp to start an ungrouped session."
             : "Choose a project first, then open a thread inside that project."
 
         await upsertControllerMessage(
@@ -740,7 +1082,10 @@ final class TelegramRemoteCoordinator: ObservableObject {
 
         var rows = sessions.enumerated().map { index, session in
             [TelegramInlineKeyboardButton(
-                text: session.id == chatState.selectedSessionID ? "• \(session.title)" : session.title,
+                text: TelegramRemoteRenderer.sessionMenuLabel(
+                    session,
+                    isSelected: session.id.caseInsensitiveCompare(chatState.selectedSessionID ?? "") == .orderedSame
+                ),
                 callbackData: "sel:s:\(index)"
             )]
         }
@@ -749,9 +1094,9 @@ final class TelegramRemoteCoordinator: ObservableObject {
         let text: String
         if sessions.isEmpty {
             if let projectName = await currentProjectName() {
-                text = "No sessions found inside \(projectName). Tap Back and use /new to start one there."
+                text = "No sessions found inside \(projectName). Tap Back and use New or Temp to start one there."
             } else {
-                text = "No sessions yet. Tap Back and send a message to start a new session."
+                text = "No sessions yet. Tap Back, use New or Temp, or send a message to start a regular session."
             }
         } else {
             if let projectName = await currentProjectName() {
@@ -764,7 +1109,25 @@ final class TelegramRemoteCoordinator: ObservableObject {
         await upsertControllerMessage(
             chatID: chatID,
             text: text,
-            signature: "sessions:\(sessions.map(\.id).joined(separator: ",")):\(chatState.selectedSessionID ?? "")",
+            signature: "sessions:\(sessions.map { "\($0.id)|\($0.title)|\($0.isTemporary)" }.joined(separator: ",")):\(chatState.selectedSessionID ?? "")",
+            markup: TelegramInlineKeyboardMarkup(inlineKeyboard: rows)
+        )
+    }
+
+    private func renderBackendMenu(chatID: Int64) async {
+        chatState.controllerMenu = .backend
+        let status = await telegramSessionContext()
+        let rows = bridge.availableBackends().map { backend in
+            [TelegramInlineKeyboardButton(
+                text: backend == status.assistantBackend ? "• \(backend.displayName)" : backend.displayName,
+                callbackData: "sel:backend:\(backend.rawValue)"
+            )]
+        } + [[.init(text: "Back", callbackData: "nav:home")]]
+
+        await upsertControllerMessage(
+            chatID: chatID,
+            text: "Choose which assistant backend Telegram should drive for this app.",
+            signature: "backend:\(status.assistantBackend.rawValue)",
             markup: TelegramInlineKeyboardMarkup(inlineKeyboard: rows)
         )
     }
@@ -822,18 +1185,28 @@ final class TelegramRemoteCoordinator: ObservableObject {
 
     private func renderEffortMenu(chatID: Int64) async {
         chatState.controllerMenu = .effort
-        let selectedEffort = await telegramSessionContext().reasoningEffort
-        var rows = AssistantReasoningEffort.allCases.map { effort in
-            [TelegramInlineKeyboardButton(
-                text: effort == selectedEffort ? "• \(effort.label)" : effort.label,
-                callbackData: "sel:eff:\(effort.rawValue)"
-            )]
+        let status = await telegramSessionContext()
+        let selectedEffort = status.reasoningEffort
+        var rows: [[TelegramInlineKeyboardButton]] = []
+        if status.canAdjustReasoningEffort {
+            rows = status.supportedReasoningEfforts.map { effort in
+                [TelegramInlineKeyboardButton(
+                    text: effort == selectedEffort ? "• \(effort.label)" : effort.label,
+                    callbackData: "sel:eff:\(effort.rawValue)"
+                )]
+            }
         }
         rows.append([.init(text: "Back", callbackData: "nav:home")])
+        let text: String
+        if status.canAdjustReasoningEffort {
+            text = "Choose the reasoning effort for the active session."
+        } else {
+            text = "\(status.assistantBackendName) does not expose adjustable reasoning effort for the active model in Telegram right now. Current effort: \(selectedEffort.label)."
+        }
         await upsertControllerMessage(
             chatID: chatID,
-            text: "Choose the reasoning effort for the active session.",
-            signature: "effort:\(selectedEffort.rawValue)",
+            text: text,
+            signature: "effort:\(status.assistantBackend.rawValue):\(selectedEffort.rawValue):\(status.supportedReasoningEfforts.map(\.rawValue).joined(separator: ",")):\(status.canAdjustReasoningEffort)",
             markup: TelegramInlineKeyboardMarkup(inlineKeyboard: rows)
         )
     }
@@ -866,6 +1239,11 @@ final class TelegramRemoteCoordinator: ObservableObject {
             kind: .header,
             text: TelegramRemoteRenderer.sessionHeaderText(snapshot: snapshot),
             signaturePrefix: "header",
+            markup: snapshot.session.isTemporary
+                ? TelegramInlineKeyboardMarkup(inlineKeyboard: [[
+                    .init(text: "Keep Chat", callbackData: "act:keep")
+                ]])
+                : nil,
             expectedGeneration: expectedGeneration
         )
 
@@ -1075,6 +1453,24 @@ final class TelegramRemoteCoordinator: ObservableObject {
         await refreshSelectedSessionView(chatID: chatID, force: true)
     }
 
+    private func handleBackendSelection(data: String, chatID: Int64) async throws {
+        let rawValue = data.replacingOccurrences(of: "sel:backend:", with: "")
+        guard let backend = AssistantRuntimeBackend(rawValue: rawValue) else {
+            throw TelegramBotClientError.server(message: "That backend is no longer supported.")
+        }
+
+        let changed = await bridge.selectBackend(backend)
+        chatState.switchSessionView(to: bridge.statusSnapshot().selectedSessionID)
+        await clearTrackedChatHistory(chatID: chatID)
+        await renderHomeMenu(
+            chatID: chatID,
+            notice: changed
+                ? "Switched the assistant backend to \(backend.displayName)."
+                : "\(backend.displayName) is already active."
+        )
+        await refreshSelectedSessionView(chatID: chatID, force: true)
+    }
+
     private func handleModeSelection(data: String, chatID: Int64) async throws {
         let rawValue = data.replacingOccurrences(of: "sel:mode:", with: "")
         guard let mode = AssistantInteractionMode(rawValue: rawValue)?.normalizedForActiveUse else {
@@ -1089,6 +1485,15 @@ final class TelegramRemoteCoordinator: ObservableObject {
         let rawValue = data.replacingOccurrences(of: "sel:eff:", with: "")
         guard let effort = AssistantReasoningEffort(rawValue: rawValue) else {
             throw TelegramBotClientError.server(message: "That effort value is not supported.")
+        }
+        let status = await telegramSessionContext()
+        guard status.canAdjustReasoningEffort else {
+            throw TelegramBotClientError.server(
+                message: "\(status.assistantBackendName) does not expose adjustable reasoning effort for the active model."
+            )
+        }
+        guard status.supportedReasoningEfforts.contains(effort) else {
+            throw TelegramBotClientError.server(message: "That effort is not available for the current model.")
         }
         await bridge.setReasoningEffort(effort, sessionID: chatState.selectedSessionID)
         await renderHomeMenu(chatID: chatID, notice: "Updated the reasoning effort.")
@@ -1166,16 +1571,20 @@ final class TelegramRemoteCoordinator: ObservableObject {
 
     private func trackMessageID(_ messageID: Int) {
         chatState.trackMessage(messageID)
+        settings?.telegramTrackedMessageIDs = chatState.trackedMessageIDs
     }
 
     private func forgetMessageID(_ messageID: Int) {
         chatState.forgetMessage(messageID)
+        settings?.telegramTrackedMessageIDs = chatState.trackedMessageIDs
     }
 
     private func clearTrackedChatHistory(chatID: Int64) async {
         let messageIDs = Array(Set(chatState.trackedMessageIDs)).sorted()
         guard !messageIDs.isEmpty else {
             chatState.clearTrackedPresentationState()
+            settings?.telegramTrackedMessageIDs = []
+            shouldClearRecoveredChatHistory = false
             return
         }
 
@@ -1184,6 +1593,8 @@ final class TelegramRemoteCoordinator: ObservableObject {
         }
 
         chatState.clearTrackedPresentationState()
+        settings?.telegramTrackedMessageIDs = []
+        shouldClearRecoveredChatHistory = false
     }
 
     private func clearReplyOverflowMessages(chatID: Int64) async {
@@ -1531,15 +1942,25 @@ final class TelegramRemoteCoordinator: ObservableObject {
 
         let modelID = snapshot.session.latestModel?.trimmingCharacters(in: .whitespacesAndNewlines)
         let normalizedModelID = (modelID?.isEmpty == false) ? modelID : nil
+        let reasoningEffort = snapshot.session.latestReasoningEffort ?? fallback.reasoningEffort
+        let effortState = bridge.reasoningEffortState(
+            modelID: normalizedModelID,
+            currentEffort: reasoningEffort,
+            backend: snapshot.session.activeProviderBackend ?? fallback.assistantBackend
+        )
 
         return AssistantRemoteStatusSnapshot(
             runtimeHealth: fallback.runtimeHealth,
+            assistantBackend: snapshot.session.activeProviderBackend ?? fallback.assistantBackend,
             selectedSessionID: snapshot.session.id,
             selectedSessionTitle: snapshot.session.title,
+            selectedSessionIsTemporary: snapshot.session.isTemporary,
             selectedModelID: normalizedModelID,
-            selectedModelSummary: normalizedModelID ?? "No model saved",
+            selectedModelSummary: normalizedModelID ?? fallback.selectedModelSummary,
             interactionMode: snapshot.session.latestInteractionMode?.normalizedForActiveUse ?? .agentic,
-            reasoningEffort: snapshot.session.latestReasoningEffort ?? .high,
+            reasoningEffort: reasoningEffort,
+            supportedReasoningEfforts: effortState.efforts,
+            canAdjustReasoningEffort: effortState.canAdjust,
             fastModeEnabled: snapshot.session.fastModeEnabled,
             tokenUsage: fallback.tokenUsage,
             lastStatusMessage: fallback.lastStatusMessage
@@ -1547,9 +1968,10 @@ final class TelegramRemoteCoordinator: ObservableObject {
     }
 
     private func currentProjectName() async -> String? {
+        let availableProjects = await bridge.availableProjects()
         if let selectedProjectID = chatState.selectedProjectID?.trimmingCharacters(in: .whitespacesAndNewlines),
            !selectedProjectID.isEmpty {
-            return await bridge.availableProjects().first(where: {
+            return availableProjects.first(where: {
                 $0.id.caseInsensitiveCompare(selectedProjectID) == .orderedSame
             })?.name
         }
@@ -1559,7 +1981,12 @@ final class TelegramRemoteCoordinator: ObservableObject {
               let snapshot = await bridge.sessionSnapshot(sessionID: selectedSessionID) else {
             return nil
         }
-        return snapshot.session.projectName
+        guard let sessionProjectID = snapshot.session.projectID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+            return snapshot.session.projectName
+        }
+        return availableProjects.first(where: {
+            $0.id.caseInsensitiveCompare(sessionProjectID) == .orderedSame
+        })?.name
     }
 
     private func applySelectedProjectFilter() async {
@@ -1636,7 +2063,7 @@ final class TelegramRemoteCoordinator: ObservableObject {
         """
         Send a normal message to continue the selected session.
 
-        Commands: /new, /projects, /sessions, /models, /mode, /effort, /usage, /status, /stop
+        Commands: /new, /clear, /temp, /projects, /sessions, /backend, /models, /mode, /effort, /usage, /status, /stop
         """
     }
 
@@ -1858,6 +2285,17 @@ final class TelegramRemoteCoordinator: ObservableObject {
             || message.contains("tag")
     }
 
+    private func formattedSelectedSessionLine(
+        sessionID: String?,
+        title: String?,
+        isTemporary: Bool
+    ) -> String {
+        guard sessionID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty != nil else {
+            return "No session selected"
+        }
+        return TelegramRemoteRenderer.displaySessionTitle(title: title, isTemporary: isTemporary)
+    }
+
     private func usageSummaryText() async -> String {
         if let selectedSessionID = chatState.selectedSessionID?.trimmingCharacters(in: .whitespacesAndNewlines),
            !selectedSessionID.isEmpty {
@@ -1871,9 +2309,13 @@ final class TelegramRemoteCoordinator: ObservableObject {
 
         var lines = [
             "Usage",
-            "Session: \(status.selectedSessionTitle ?? "No session selected")",
+            "Session: \(formattedSelectedSessionLine(sessionID: status.selectedSessionID, title: status.selectedSessionTitle, isTemporary: status.selectedSessionIsTemporary))",
             "Context: \(usage.exactContextSummary)"
         ]
+
+        if status.selectedSessionIsTemporary {
+            lines.append("Type: Temporary chat")
+        }
 
         if let fraction = usage.contextUsageFraction {
             lines.append("Context used: \(Int(round(fraction * 100)))%")
@@ -1889,6 +2331,14 @@ final class TelegramRemoteCoordinator: ObservableObject {
         return lines.joined(separator: "\n")
     }
 
+    private func providerUsageSummaryText() async -> String {
+        let status = await telegramSessionContext()
+        return TelegramRemoteRenderer.providerUsageText(
+            status: status,
+            rateLimits: bridge.rateLimitsSnapshot()
+        )
+    }
+
     private func statusSummaryText() async -> String {
         let status = await telegramSessionContext()
         let projectName = await currentProjectName() ?? "All projects"
@@ -1896,12 +2346,17 @@ final class TelegramRemoteCoordinator: ObservableObject {
         var lines = [
             "Status",
             "Project: \(projectName)",
-            "Session: \(status.selectedSessionTitle ?? "No session selected")",
+            "Session: \(formattedSelectedSessionLine(sessionID: status.selectedSessionID, title: status.selectedSessionTitle, isTemporary: status.selectedSessionIsTemporary))",
+            "Backend: \(status.assistantBackendName)",
             "Model: \(status.selectedModelSummary)",
             "Mode: \(status.interactionMode.label)",
             "Effort: \(status.reasoningEffort.label)",
             "Runtime: \(status.runtimeHealth.summary)"
         ]
+
+        if status.selectedSessionIsTemporary {
+            lines.append("Type: Temporary chat")
+        }
 
         if let lastStatusMessage = status.lastStatusMessage?.trimmingCharacters(in: .whitespacesAndNewlines),
            !lastStatusMessage.isEmpty {

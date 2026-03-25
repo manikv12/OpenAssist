@@ -798,6 +798,32 @@ struct AssistantSessionRow: View {
         }
     }
 
+    private var archiveExpiryLabel: String? {
+        guard let expiresAt = session.archiveExpiresAt else { return nil }
+        let seconds = Int(expiresAt.timeIntervalSinceNow)
+
+        if seconds <= 0 {
+            return "expired"
+        }
+        if seconds < 60 {
+            return "<1m"
+        }
+        if seconds < 60 * 60 {
+            return "\(max(1, seconds / 60))m left"
+        }
+        if seconds < 60 * 60 * 24 {
+            return "\(max(1, seconds / (60 * 60)))h left"
+        }
+        if seconds < 60 * 60 * 24 * 7 {
+            return "\(max(1, seconds / (60 * 60 * 24)))d left"
+        }
+        return "\(max(1, seconds / (60 * 60 * 24 * 7)))w left"
+    }
+
+    private var trailingLabel: String? {
+        session.isArchived ? archiveExpiryLabel : relativeTimestamp
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: scaled(4)) {
             HStack(alignment: .center, spacing: scaled(10)) {
@@ -829,16 +855,36 @@ struct AssistantSessionRow: View {
             }
 
             HStack(spacing: scaled(6)) {
-                if let projectName = session.projectName?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
-                    Text(projectName)
+                if session.isArchived {
+                    Text("Archived")
                         .font(.system(size: scaled(10), weight: .semibold))
-                        .foregroundStyle(AppVisualTheme.accentTint.opacity(0.94))
+                        .foregroundStyle(AppVisualTheme.accentTint.opacity(0.96))
                         .padding(.horizontal, scaled(7))
                         .padding(.vertical, scaled(3))
                         .background(
                             Capsule(style: .continuous)
                                 .fill(AppVisualTheme.accentTint.opacity(0.14))
                         )
+                        .lineLimit(1)
+                }
+
+                if session.isTemporary {
+                    Text("Temporary")
+                        .font(.system(size: scaled(10), weight: .semibold))
+                        .foregroundStyle(Color.orange.opacity(0.95))
+                        .padding(.horizontal, scaled(7))
+                        .padding(.vertical, scaled(3))
+                        .background(
+                            Capsule(style: .continuous)
+                                .fill(Color.orange.opacity(0.16))
+                        )
+                        .lineLimit(1)
+                }
+
+                if let projectName = session.projectName?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
+                    Text(projectName)
+                        .font(.system(size: scaled(9.5), weight: .medium))
+                        .foregroundStyle(AppVisualTheme.accentTint.opacity(isSelected ? 0.78 : 0.58))
                         .lineLimit(1)
                 }
 
@@ -850,8 +896,8 @@ struct AssistantSessionRow: View {
 
                 Spacer(minLength: scaled(4))
 
-                if let relativeTimestamp {
-                    Text(relativeTimestamp)
+                if let trailingLabel {
+                    Text(trailingLabel)
                         .font(.system(size: scaled(11), weight: .regular))
                         .foregroundStyle(AppVisualTheme.foreground(isSelected ? 0.44 : 0.30))
                         .lineLimit(1)
@@ -868,8 +914,485 @@ struct AssistantSessionRow: View {
         )
         .contentShape(RoundedRectangle(cornerRadius: scaled(8), style: .continuous))
         .animation(.easeInOut(duration: 0.18), value: session.title)
-        .animation(.easeInOut(duration: 0.18), value: relativeTimestamp)
+        .animation(.easeInOut(duration: 0.18), value: trailingLabel)
         .animation(.easeInOut(duration: 0.18), value: isSelected)
+    }
+}
+
+struct AssistantArchiveSessionSheet: View {
+    private static let presetHours: [Int] = [24, 24 * 7, 24 * 30]
+
+    let session: AssistantSessionSummary
+    let defaultRetentionHours: Int
+    let onConfirm: (Int, Bool) -> Void
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var selectedHours: Int
+    @State private var saveAsDefault = false
+
+    init(
+        session: AssistantSessionSummary,
+        defaultRetentionHours: Int,
+        onConfirm: @escaping (Int, Bool) -> Void
+    ) {
+        self.session = session
+        self.defaultRetentionHours = min(24 * 365, max(1, defaultRetentionHours))
+        self.onConfirm = onConfirm
+        _selectedHours = State(initialValue: min(24 * 365, max(1, defaultRetentionHours)))
+    }
+
+    private var retentionOptions: [Int] {
+        Array(Set(Self.presetHours + [defaultRetentionHours])).sorted()
+    }
+
+    private var expirationDate: Date {
+        Date().addingTimeInterval(TimeInterval(selectedHours * 60 * 60))
+    }
+
+    private var expirationDescription: String {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .short
+        return formatter.string(from: expirationDate)
+    }
+
+    private func retentionLabel(for hours: Int) -> String {
+        if hours % (24 * 30) == 0 {
+            let months = hours / (24 * 30)
+            return months == 1 ? "1 month" : "\(months) months"
+        }
+        if hours % (24 * 7) == 0 {
+            let weeks = hours / (24 * 7)
+            return weeks == 1 ? "1 week" : "\(weeks) weeks"
+        }
+        if hours % 24 == 0 {
+            let days = hours / 24
+            return days == 1 ? "24 hours" : "\(days) days"
+        }
+        return hours == 1 ? "1 hour" : "\(hours) hours"
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Archive Chat")
+                    .font(.system(size: 19, weight: .bold))
+                Text("“\(session.title)” will move to Archived and stay recoverable until the cleanup time.")
+                    .font(.system(size: 12.5, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Auto-cleanup time")
+                    .font(.system(size: 12.5, weight: .semibold))
+
+                Picker("Auto-cleanup time", selection: $selectedHours) {
+                    ForEach(retentionOptions, id: \.self) { hours in
+                        Text(retentionLabel(for: hours)).tag(hours)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.radioGroup)
+
+                Toggle("Use this as my new default", isOn: $saveAsDefault)
+                    .font(.system(size: 12.5, weight: .medium))
+
+                Text("This chat will be permanently removed after \(expirationDescription).")
+                    .font(.system(size: 11.5, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            HStack {
+                Spacer()
+
+                Button("Cancel") {
+                    dismiss()
+                }
+                .buttonStyle(.bordered)
+
+                Button("Archive") {
+                    onConfirm(selectedHours, saveAsDefault)
+                    dismiss()
+                }
+                .buttonStyle(.borderedProminent)
+            }
+        }
+        .padding(20)
+        .frame(minWidth: 420)
+        .background(AppChromeBackground())
+    }
+}
+
+struct AssistantSidebarSubagentRow: View {
+    let agent: SubagentState
+    let isSelected: Bool
+    var textScale: CGFloat = 1.0
+
+    private func scaled(_ value: CGFloat) -> CGFloat {
+        value * textScale
+    }
+
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 30)) { timeline in
+            HStack(alignment: .top, spacing: scaled(10)) {
+                VStack(spacing: scaled(4)) {
+                    Circle()
+                        .fill(subagentStatusTint(agent.status))
+                        .frame(width: scaled(7), height: scaled(7))
+
+                    RoundedRectangle(cornerRadius: scaled(1.5), style: .continuous)
+                        .fill(agentNameTint(agent).opacity(0.32))
+                        .frame(width: scaled(2.5))
+                }
+                .frame(width: scaled(10))
+
+                VStack(alignment: .leading, spacing: scaled(3)) {
+                    HStack(alignment: .firstTextBaseline, spacing: scaled(6)) {
+                        Text(agent.promptPreview ?? agent.displayName)
+                            .font(.system(size: scaled(11.5), weight: .semibold))
+                            .foregroundStyle(isSelected ? AppVisualTheme.foreground(0.94) : AppVisualTheme.foreground(0.84))
+                            .lineLimit(1)
+
+                        Spacer(minLength: scaled(4))
+
+                        if let elapsedText = elapsedText(for: agent, now: timeline.date) {
+                            Text(elapsedText)
+                                .font(.system(size: scaled(10.5), weight: .medium))
+                                .foregroundStyle(AppVisualTheme.foreground(isSelected ? 0.42 : 0.30))
+                                .lineLimit(1)
+                        }
+                    }
+
+                    HStack(alignment: .firstTextBaseline, spacing: scaled(5)) {
+                        Text(agent.displayName)
+                            .font(.system(size: scaled(10.5), weight: .semibold))
+                            .foregroundStyle(agentNameTint(agent))
+                            .lineLimit(1)
+
+                        if let roleLabel = agent.roleLabel {
+                            Text("(\(roleLabel.lowercased()))")
+                                .font(.system(size: scaled(10.5), weight: .medium))
+                                .foregroundStyle(AppVisualTheme.foreground(0.48))
+                                .lineLimit(1)
+                        }
+
+                        Text(agent.statusText.lowercased())
+                            .font(.system(size: scaled(10.5), weight: .medium))
+                            .foregroundStyle(AppVisualTheme.foreground(0.48))
+                            .lineLimit(1)
+
+                        Spacer(minLength: scaled(4))
+
+                        if agent.threadID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty != nil {
+                            Image(systemName: "arrow.up.right.square")
+                                .font(.system(size: scaled(10), weight: .semibold))
+                                .foregroundStyle(AppVisualTheme.foreground(isSelected ? 0.54 : 0.36))
+                        }
+                    }
+                }
+            }
+            .padding(.leading, scaled(26))
+            .padding(.trailing, scaled(12))
+            .padding(.vertical, scaled(7))
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: scaled(8), style: .continuous)
+                    .fill(isSelected ? AppVisualTheme.foreground(0.10) : AppVisualTheme.foreground(0.035))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: scaled(8), style: .continuous)
+                            .stroke(AppVisualTheme.surfaceStroke(isSelected ? 0.16 : 0.08), lineWidth: 0.6)
+                    )
+            )
+            .contentShape(RoundedRectangle(cornerRadius: scaled(8), style: .continuous))
+        }
+    }
+}
+
+struct AssistantParentWorkCard: View {
+    let snapshot: AssistantSessionActiveWorkSnapshot
+    let onOpenThread: (String) -> Void
+    var onReviewChanges: (() -> Void)? = nil
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            VStack(alignment: .leading, spacing: 14) {
+                headerRow
+
+                if snapshot.hasChecklist {
+                    VStack(alignment: .leading, spacing: 10) {
+                        ForEach(Array(snapshot.planEntries.enumerated()), id: \.element.id) { index, entry in
+                            planEntryRow(entry, index: index + 1)
+                        }
+                    }
+                }
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 14)
+
+            if snapshot.hasFileChanges {
+                Divider()
+                    .overlay(AppVisualTheme.surfaceStroke(0.12))
+                fileChangesRow
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 12)
+            }
+
+            if snapshot.hasBackgroundAgents {
+                Divider()
+                    .overlay(AppVisualTheme.surfaceStroke(0.12))
+                agentsSection
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 12)
+            }
+        }
+        .background(
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .fill(AssistantWindowChrome.messagePanel)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 18, style: .continuous)
+                        .stroke(AssistantWindowChrome.border, lineWidth: 0.7)
+                )
+        )
+    }
+
+    private var headerRow: some View {
+        HStack(alignment: .center, spacing: 10) {
+            Image(systemName: snapshot.hasChecklist ? "checklist" : "person.3.sequence.fill")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(AppVisualTheme.foreground(0.58))
+
+            Text(snapshot.hasChecklist
+                 ? "\(snapshot.completedTaskCount) out of \(snapshot.totalTaskCount) tasks completed"
+                 : "Working on current request")
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(AppVisualTheme.foreground(0.92))
+                .lineLimit(2)
+
+            Spacer(minLength: 8)
+
+            Text("\(snapshot.subagents.count) background agent\(snapshot.subagents.count == 1 ? "" : "s")")
+                .font(.system(size: 11.5, weight: .medium))
+                .foregroundStyle(AppVisualTheme.foreground(0.46))
+                .lineLimit(1)
+        }
+    }
+
+    @ViewBuilder
+    private func planEntryRow(_ entry: AssistantPlanEntry, index: Int) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            HStack(alignment: .center, spacing: 8) {
+                Image(systemName: planStatusSymbol(for: entry.status))
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(planStatusTint(for: entry.status))
+                    .frame(width: 14, height: 14)
+
+                Text("\(index).")
+                    .font(.system(size: 13, weight: .semibold, design: .rounded))
+                    .foregroundStyle(AppVisualTheme.foreground(0.56))
+            }
+            .padding(.top, 1)
+
+            Text(entry.content)
+                .font(.system(size: 13.5, weight: .medium))
+                .foregroundStyle(AppVisualTheme.foreground(0.88))
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private var fileChangesRow: some View {
+        HStack(alignment: .center, spacing: 10) {
+            Label(
+                "\(snapshot.fileChangeCount) file\(snapshot.fileChangeCount == 1 ? "" : "s") changed",
+                systemImage: "doc.badge.gearshape"
+            )
+            .font(.system(size: 12.5, weight: .medium))
+            .foregroundStyle(AppVisualTheme.foreground(0.60))
+
+            Spacer(minLength: 8)
+
+            if let onReviewChanges {
+                Button("Review changes", action: onReviewChanges)
+                    .buttonStyle(.plain)
+                    .font(.system(size: 12.5, weight: .semibold))
+                    .foregroundStyle(AppVisualTheme.accentTint.opacity(0.96))
+            }
+        }
+    }
+
+    private var agentsSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                Image(systemName: "person.2.wave.2.fill")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(AppVisualTheme.foreground(0.56))
+
+                Text("\(snapshot.subagents.count) background agent\(snapshot.subagents.count == 1 ? "" : "s")")
+                    .font(.system(size: 12.5, weight: .semibold))
+                    .foregroundStyle(AppVisualTheme.foreground(0.74))
+
+                Spacer(minLength: 8)
+            }
+
+            TimelineView(.periodic(from: .now, by: 30)) { timeline in
+                VStack(alignment: .leading, spacing: 10) {
+                    ForEach(snapshot.subagents) { agent in
+                        HStack(alignment: .center, spacing: 12) {
+                            Circle()
+                                .fill(subagentStatusTint(agent.status))
+                                .frame(width: 8, height: 8)
+
+                            VStack(alignment: .leading, spacing: 4) {
+                                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                                    Text(agent.displayName)
+                                        .font(.system(size: 13.5, weight: .semibold))
+                                        .foregroundStyle(agentNameTint(agent))
+                                        .lineLimit(1)
+
+                                    if let roleLabel = agent.roleLabel {
+                                        Text("(\(roleLabel.lowercased()))")
+                                            .font(.system(size: 12.5, weight: .medium))
+                                            .foregroundStyle(AppVisualTheme.foreground(0.50))
+                                            .lineLimit(1)
+                                    }
+
+                                    Text("is \(agent.statusText.lowercased())")
+                                        .font(.system(size: 12.5, weight: .medium))
+                                        .foregroundStyle(AppVisualTheme.foreground(0.58))
+                                        .lineLimit(1)
+
+                                    Spacer(minLength: 4)
+
+                                    if let elapsedText = elapsedText(for: agent, now: timeline.date) {
+                                        Text(elapsedText)
+                                            .font(.system(size: 11.5, weight: .medium))
+                                            .foregroundStyle(AppVisualTheme.foreground(0.34))
+                                            .lineLimit(1)
+                                    }
+                                }
+
+                                if let preview = agent.promptPreview {
+                                    Text(preview)
+                                        .font(.system(size: 11.5, weight: .regular))
+                                        .foregroundStyle(AppVisualTheme.foreground(0.42))
+                                        .lineLimit(2)
+                                }
+                            }
+
+                            Spacer(minLength: 8)
+
+                            if let threadID = agent.threadID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
+                                Button("Open") {
+                                    onOpenThread(threadID)
+                                }
+                                .buttonStyle(.plain)
+                                .font(.system(size: 12.5, weight: .semibold))
+                                .foregroundStyle(AppVisualTheme.accentTint.opacity(0.96))
+                            } else {
+                                Text("Open")
+                                    .font(.system(size: 12.5, weight: .semibold))
+                                    .foregroundStyle(AppVisualTheme.foreground(0.26))
+                            }
+                        }
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 10)
+                        .background(
+                            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                .fill(AppVisualTheme.foreground(0.035))
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                        .stroke(AppVisualTheme.surfaceStroke(0.10), lineWidth: 0.6)
+                                )
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    private func planStatusSymbol(for status: String) -> String {
+        let normalized = status
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "-", with: "_")
+            .lowercased()
+        switch normalized {
+        case "completed":
+            return "checkmark.circle.fill"
+        case "in_progress", "running":
+            return "circle.dotted"
+        default:
+            return "circle"
+        }
+    }
+
+    private func planStatusTint(for status: String) -> Color {
+        let normalized = status
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "-", with: "_")
+            .lowercased()
+        switch normalized {
+        case "completed":
+            return .green.opacity(0.92)
+        case "in_progress", "running":
+            return AppVisualTheme.accentTint.opacity(0.96)
+        default:
+            return AppVisualTheme.foreground(0.40)
+        }
+    }
+
+}
+
+@MainActor
+private func agentNameTint(_ agent: SubagentState) -> Color {
+    let normalizedRole = agent.role?
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .lowercased()
+
+    switch normalizedRole {
+    case "explorer":
+        return Color(red: 0.98, green: 0.42, blue: 0.42)
+    case "worker":
+        return Color(red: 0.25, green: 0.55, blue: 0.98)
+    default:
+        return AppVisualTheme.accentTint.opacity(0.94)
+    }
+}
+
+@MainActor
+private func subagentStatusTint(_ status: SubagentStatus) -> Color {
+    switch status {
+    case .spawning, .running:
+        return AppVisualTheme.accentTint.opacity(0.94)
+    case .waiting:
+        return .orange.opacity(0.92)
+    case .completed:
+        return .green.opacity(0.92)
+    case .errored:
+        return .red.opacity(0.92)
+    case .closed:
+        return AppVisualTheme.foreground(0.34)
+    }
+}
+
+@MainActor
+private func elapsedText(for agent: SubagentState, now: Date) -> String? {
+    guard let referenceDate = agent.startedAt ?? agent.updatedAt ?? agent.endedAt else {
+        return nil
+    }
+
+    let targetDate = agent.status.isActive ? now : (agent.endedAt ?? agent.updatedAt ?? now)
+    let seconds = max(0, Int(targetDate.timeIntervalSince(referenceDate)))
+
+    switch seconds {
+    case 0..<60:
+        return "\(max(1, seconds))s"
+    case 60..<(60 * 60):
+        return "\(max(1, seconds / 60))m"
+    case (60 * 60)..<(60 * 60 * 24):
+        return "\(max(1, seconds / (60 * 60)))h"
+    default:
+        return "\(max(1, seconds / (60 * 60 * 24)))d"
     }
 }
 
@@ -1463,6 +1986,936 @@ struct SessionInstructionsPopover: View {
         }
         .padding(14)
         .frame(width: 340)
+    }
+}
+
+struct AssistantThreadSkillChip: View {
+    let state: AssistantThreadSkillState
+    let onRemove: () -> Void
+    let onRepair: () -> Void
+
+    private var tint: Color {
+        state.isMissing ? .orange : AppVisualTheme.accentTint
+    }
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: state.isMissing ? "exclamationmark.triangle.fill" : "sparkles")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(tint.opacity(0.95))
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(state.displayName)
+                    .font(.system(size: 10.5, weight: .semibold))
+                    .foregroundStyle(AppVisualTheme.foreground(0.78))
+                    .lineLimit(1)
+                Text(state.isMissing ? "Missing from ~/.codex/skills" : state.summaryText)
+                    .font(.system(size: 9.5, weight: .medium))
+                    .foregroundStyle(AppVisualTheme.foreground(0.44))
+                    .lineLimit(1)
+            }
+
+            if state.isMissing {
+                Button("Repair", action: onRepair)
+                    .buttonStyle(.plain)
+                    .font(.system(size: 9.5, weight: .semibold))
+                    .foregroundStyle(.orange.opacity(0.92))
+            }
+
+            Button(action: onRemove) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 8, weight: .bold))
+                    .foregroundStyle(AppVisualTheme.foreground(0.45))
+                    .frame(width: 18, height: 18)
+                    .background(
+                        Circle()
+                            .fill(AppVisualTheme.surfaceFill(0.06))
+                    )
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .background(
+            Capsule(style: .continuous)
+                .fill((state.isMissing ? Color.orange : AppVisualTheme.accentTint).opacity(0.10))
+                .overlay(
+                    Capsule(style: .continuous)
+                        .stroke((state.isMissing ? Color.orange : AppVisualTheme.accentTint).opacity(0.18), lineWidth: 0.6)
+                )
+        )
+    }
+}
+
+struct AssistantSkillsPane: View {
+    @ObservedObject var assistant: AssistantStore
+    let onImportFolder: () -> Void
+    let onImportGitHub: () -> Void
+    let onCreateSkill: () -> Void
+    let onDeleteSkill: (AssistantSkillDescriptor) -> Void
+    let onTrySkill: (AssistantSkillDescriptor, String) -> Void
+    @State private var selectedSkill: AssistantSkillDescriptor?
+
+    private var selectedThreadTitle: String? {
+        guard let selectedSessionID = assistant.selectedSessionID else { return nil }
+        return assistant.sessions.first(where: { $0.id == selectedSessionID })?.title
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            header
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    activeThreadSection
+
+                    ForEach(AssistantSkillLibraryGroup.allCases) { group in
+                        librarySection(group)
+                    }
+                }
+                .padding(16)
+            }
+        }
+        .sheet(item: $selectedSkill) { skill in
+            AssistantSkillDetailSheet(
+                assistant: assistant,
+                skill: skill,
+                onTrySkill: onTrySkill,
+                onDeleteSkill: { skillToDelete in
+                    onDeleteSkill(skillToDelete)
+                }
+            )
+        }
+    }
+
+    private var header: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .center, spacing: 10) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .fill(AppVisualTheme.accentTint.opacity(0.14))
+                        .frame(width: 34, height: 34)
+                    Image(systemName: "sparkles.rectangle.stack.fill")
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(AppVisualTheme.accentTint)
+                }
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Skills")
+                        .font(.system(size: 16, weight: .bold))
+                        .foregroundStyle(AppVisualTheme.foreground(0.92))
+                    Text("Manage reusable skills for your threads")
+                        .font(.system(size: 11.5, weight: .medium))
+                        .foregroundStyle(AppVisualTheme.foreground(0.44))
+                }
+                Spacer()
+
+                Button {
+                    assistant.refreshSkills()
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(AppVisualTheme.foreground(0.56))
+                        .frame(width: 28, height: 28)
+                        .background(
+                            Circle()
+                                .fill(AppVisualTheme.surfaceFill(0.08))
+                                .overlay(Circle().stroke(AppVisualTheme.surfaceStroke(0.10), lineWidth: 0.5))
+                        )
+                }
+                .buttonStyle(.plain)
+                .help("Refresh skills")
+            }
+
+            HStack(spacing: 8) {
+                Button {
+                    onImportFolder()
+                } label: {
+                    Label("Import Folder", systemImage: "folder.badge.plus")
+                        .font(.system(size: 11, weight: .semibold))
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+
+                Button {
+                    onImportGitHub()
+                } label: {
+                    Label("Import GitHub", systemImage: "arrow.triangle.branch")
+                        .font(.system(size: 11, weight: .semibold))
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+
+                Spacer()
+
+                Button {
+                    onCreateSkill()
+                } label: {
+                    Label("New Skill", systemImage: "plus")
+                        .font(.system(size: 11, weight: .semibold))
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+            }
+        }
+        .padding(.horizontal, 18)
+        .padding(.vertical, 16)
+        .background(
+            AppVisualTheme.surfaceFill(0.03)
+        )
+        .overlay(
+            Rectangle()
+                .fill(AppVisualTheme.surfaceStroke(0.08))
+                .frame(height: 0.5),
+            alignment: .bottom
+        )
+    }
+
+    @ViewBuilder
+    private var activeThreadSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Image(systemName: "link.circle.fill")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(AppVisualTheme.accentTint.opacity(0.80))
+
+                Text("Active on this thread")
+                    .font(.system(size: 12.5, weight: .bold))
+                    .foregroundStyle(AppVisualTheme.foreground(0.82))
+
+                if let selectedThreadTitle = selectedThreadTitle?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
+                    Text(selectedThreadTitle)
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(AppVisualTheme.foreground(0.36))
+                        .lineLimit(1)
+                }
+
+                Spacer()
+            }
+
+            if !assistant.canAttachSkillsToSelectedThread {
+                activeThreadEmptyState(icon: "message.badge", text: "Open a thread first, then attach skills to it.")
+            } else if assistant.activeThreadSkills.isEmpty {
+                activeThreadEmptyState(icon: "tray", text: "No skills attached to this thread yet.")
+            } else {
+                VStack(alignment: .leading, spacing: 8) {
+                    ForEach(assistant.activeThreadSkills) { state in
+                        let resolvedIcon = state.descriptor?.resolvedSymbolName ?? (state.isMissing ? "exclamationmark.triangle.fill" : "sparkles")
+                        let tint: Color = state.isMissing ? .orange : AppVisualTheme.accentTint
+
+                        HStack(alignment: .center, spacing: 12) {
+                            ZStack {
+                                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                    .fill(tint.opacity(0.12))
+                                    .frame(width: 36, height: 36)
+                                Image(systemName: resolvedIcon)
+                                    .font(.system(size: 15, weight: .semibold))
+                                    .foregroundStyle(tint.opacity(0.90))
+                            }
+
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(state.displayName)
+                                    .font(.system(size: 12, weight: .semibold))
+                                    .foregroundStyle(AppVisualTheme.foreground(0.86))
+                                    .lineLimit(1)
+                                Text(state.summaryText)
+                                    .font(.system(size: 11, weight: .medium))
+                                    .foregroundStyle(state.isMissing ? .orange.opacity(0.85) : AppVisualTheme.foreground(0.44))
+                                    .lineLimit(2)
+                            }
+
+                            Spacer(minLength: 8)
+
+                            HStack(spacing: 6) {
+                                if state.isMissing {
+                                    Button("Repair") {
+                                        assistant.repairMissingSkillBindings()
+                                    }
+                                    .buttonStyle(.bordered)
+                                    .controlSize(.mini)
+                                } else if let descriptor = state.descriptor {
+                                    Button {
+                                        selectedSkill = descriptor
+                                    } label: {
+                                        Image(systemName: "eye")
+                                            .font(.system(size: 11, weight: .semibold))
+                                            .foregroundStyle(AppVisualTheme.foreground(0.52))
+                                            .frame(width: 26, height: 26)
+                                            .background(Circle().fill(AppVisualTheme.surfaceFill(0.08)))
+                                    }
+                                    .buttonStyle(.plain)
+                                    .help("Preview")
+                                }
+
+                                Button {
+                                    assistant.detachSkill(state.skillName)
+                                } label: {
+                                    Image(systemName: "xmark")
+                                        .font(.system(size: 9, weight: .bold))
+                                        .foregroundStyle(AppVisualTheme.foreground(0.40))
+                                        .frame(width: 22, height: 22)
+                                        .background(Circle().fill(AppVisualTheme.surfaceFill(0.06)))
+                                }
+                                .buttonStyle(.plain)
+                                .help("Remove")
+                            }
+                        }
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 10)
+                        .background(
+                            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                .fill(tint.opacity(0.04))
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                        .stroke(tint.opacity(state.isMissing ? 0.22 : 0.10), lineWidth: 0.6)
+                                )
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    private func activeThreadEmptyState(icon: String, text: String) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: icon)
+                .font(.system(size: 14, weight: .medium))
+                .foregroundStyle(AppVisualTheme.foreground(0.28))
+            Text(text)
+                .font(.system(size: 11.5, weight: .medium))
+                .foregroundStyle(AppVisualTheme.foreground(0.40))
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(AppVisualTheme.surfaceFill(0.03))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .strokeBorder(AppVisualTheme.surfaceStroke(0.06), style: StrokeStyle(lineWidth: 0.7, dash: [5, 4]))
+                )
+        )
+    }
+
+    @ViewBuilder
+    private func librarySection(_ group: AssistantSkillLibraryGroup) -> some View {
+        let skills = assistant.skills(in: group)
+
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 6) {
+                Text(group.title.uppercased())
+                    .font(.system(size: 10.5, weight: .bold))
+                    .foregroundStyle(AppVisualTheme.foreground(0.38))
+                    .tracking(0.8)
+
+                if !skills.isEmpty {
+                    Text("\(skills.count)")
+                        .font(.system(size: 9.5, weight: .bold, design: .rounded))
+                        .foregroundStyle(AppVisualTheme.foreground(0.32))
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(
+                            Capsule(style: .continuous)
+                                .fill(AppVisualTheme.surfaceFill(0.08))
+                        )
+                }
+
+                Spacer()
+            }
+
+            if skills.isEmpty {
+                HStack(spacing: 8) {
+                    Image(systemName: "tray")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(AppVisualTheme.foreground(0.26))
+                    Text(group.emptyStateText)
+                        .font(.system(size: 11.5, weight: .medium))
+                        .foregroundStyle(AppVisualTheme.foreground(0.38))
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 12)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .fill(AppVisualTheme.surfaceFill(0.03))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                .strokeBorder(AppVisualTheme.surfaceStroke(0.06), style: StrokeStyle(lineWidth: 0.7, dash: [5, 4]))
+                        )
+                )
+            } else {
+                VStack(alignment: .leading, spacing: 8) {
+                    ForEach(skills) { skill in
+                        skillRow(skill)
+                    }
+                }
+            }
+        }
+    }
+
+    private func skillRow(_ skill: AssistantSkillDescriptor) -> some View {
+        let isAttached = assistant.isSkillAttachedToSelectedThread(skill)
+        let iconTint: Color = skill.isReadOnly ? AppVisualTheme.foreground(0.62) : AppVisualTheme.accentTint
+
+        return Button {
+            selectedSkill = skill
+        } label: {
+            HStack(alignment: .center, spacing: 14) {
+                // Icon
+                ZStack {
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .fill(
+                            LinearGradient(
+                                colors: [iconTint.opacity(0.16), iconTint.opacity(0.08)],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            )
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                .stroke(iconTint.opacity(0.14), lineWidth: 0.5)
+                        )
+                        .frame(width: 42, height: 42)
+                    Image(systemName: skill.resolvedSymbolName)
+                        .font(.system(size: 17, weight: .semibold))
+                        .symbolRenderingMode(.hierarchical)
+                        .foregroundStyle(iconTint)
+                }
+
+                // Text content
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 7) {
+                        Text(skill.displayName)
+                            .font(.system(size: 12.5, weight: .semibold))
+                            .foregroundStyle(AppVisualTheme.foreground(0.90))
+                            .lineLimit(1)
+
+                        if isAttached {
+                            Image(systemName: "checkmark.circle.fill")
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundStyle(Color.green.opacity(0.82))
+                        }
+                    }
+
+                    Text(skill.summaryText)
+                        .font(.system(size: 11.5, weight: .medium))
+                        .foregroundStyle(AppVisualTheme.foreground(0.46))
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                Spacer(minLength: 8)
+
+                // Actions
+                HStack(spacing: 6) {
+                    if isAttached {
+                        Button("Detach") {
+                            assistant.detachSkill(skill.name)
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.mini)
+                    } else {
+                        Button {
+                            assistant.attachSkill(skill)
+                        } label: {
+                            Text("Attach")
+                                .font(.system(size: 11, weight: .semibold))
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.mini)
+                        .disabled(!assistant.canAttachSkillsToSelectedThread)
+                    }
+
+                    Menu {
+                        Button("Preview") {
+                            selectedSkill = skill
+                        }
+
+                        Divider()
+
+                        Button("Open in Finder") {
+                            assistant.revealSkill(skill)
+                        }
+
+                        if !skill.isReadOnly {
+                            Button("Duplicate") {
+                                assistant.duplicateSkill(skill)
+                            }
+                            Divider()
+                            Button("Delete", role: .destructive) {
+                                onDeleteSkill(skill)
+                            }
+                        }
+                    } label: {
+                        Image(systemName: "ellipsis")
+                            .font(.system(size: 11, weight: .bold))
+                            .foregroundStyle(AppVisualTheme.foreground(0.44))
+                            .frame(width: 26, height: 26)
+                            .background(
+                                Circle()
+                                    .fill(AppVisualTheme.surfaceFill(0.06))
+                                    .overlay(Circle().stroke(AppVisualTheme.surfaceStroke(0.06), lineWidth: 0.5))
+                            )
+                    }
+                    .menuStyle(.borderlessButton)
+                    .fixedSize()
+                }
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 11)
+            .background(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(AppVisualTheme.surfaceFill(0.04))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .stroke(
+                                isAttached ? AppVisualTheme.accentTint.opacity(0.14) : AppVisualTheme.surfaceStroke(0.07),
+                                lineWidth: 0.6
+                            )
+                    )
+            )
+            .contentShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+struct AssistantSkillDetailSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @ObservedObject var assistant: AssistantStore
+    let skill: AssistantSkillDescriptor
+    let onTrySkill: (AssistantSkillDescriptor, String) -> Void
+    let onDeleteSkill: (AssistantSkillDescriptor) -> Void
+
+    private let preview: AssistantSkillPreviewDocument
+
+    init(
+        assistant: AssistantStore,
+        skill: AssistantSkillDescriptor,
+        onTrySkill: @escaping (AssistantSkillDescriptor, String) -> Void,
+        onDeleteSkill: @escaping (AssistantSkillDescriptor) -> Void
+    ) {
+        self.assistant = assistant
+        self.skill = skill
+        self.onTrySkill = onTrySkill
+        self.onDeleteSkill = onDeleteSkill
+        self.preview = assistantSkillPreviewDocument(for: skill)
+    }
+
+    private var isAttached: Bool {
+        assistant.isSkillAttachedToSelectedThread(skill)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            header
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    examplePromptCard
+                    instructionsCard
+                }
+                .padding(.horizontal, 24)
+                .padding(.top, 8)
+                .padding(.bottom, 20)
+            }
+
+            footer
+        }
+        .frame(minWidth: 860, minHeight: 700)
+        .background(AppChromeBackground())
+    }
+
+    private var header: some View {
+        let iconTint: Color = skill.isReadOnly ? AppVisualTheme.foreground(0.62) : AppVisualTheme.accentTint
+
+        return HStack(alignment: .top, spacing: 18) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    .fill(
+                        LinearGradient(
+                            colors: [iconTint.opacity(0.18), iconTint.opacity(0.06)],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 18, style: .continuous)
+                            .stroke(iconTint.opacity(0.16), lineWidth: 0.6)
+                    )
+                    .frame(width: 64, height: 64)
+
+                Image(systemName: skill.resolvedSymbolName)
+                    .font(.system(size: 26, weight: .semibold))
+                    .symbolRenderingMode(.hierarchical)
+                    .foregroundStyle(iconTint)
+            }
+
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 10) {
+                    Text(skill.displayName)
+                        .font(.system(size: 26, weight: .bold))
+                        .foregroundStyle(AppVisualTheme.foreground(0.94))
+
+                    Text(skill.source.badgeTitle)
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundStyle(skill.isReadOnly ? AppVisualTheme.foreground(0.60) : AppVisualTheme.accentTint)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(
+                            Capsule(style: .continuous)
+                                .fill(
+                                    skill.isReadOnly
+                                        ? AppVisualTheme.surfaceFill(0.10)
+                                        : AppVisualTheme.accentTint.opacity(0.12)
+                                )
+                                .overlay(
+                                    Capsule(style: .continuous)
+                                        .stroke(
+                                            skill.isReadOnly
+                                                ? AppVisualTheme.surfaceStroke(0.08)
+                                                : AppVisualTheme.accentTint.opacity(0.14),
+                                            lineWidth: 0.5
+                                        )
+                                )
+                        )
+                }
+
+                Text(skill.summaryText)
+                    .font(.system(size: 15, weight: .medium))
+                    .foregroundStyle(AppVisualTheme.foreground(0.52))
+
+                HStack(spacing: 10) {
+                    if isAttached {
+                        Label("Attached", systemImage: "checkmark.circle.fill")
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(Color.green.opacity(0.82))
+                    } else {
+                        Label("Try will open a new thread", systemImage: "plus.message.fill")
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(AppVisualTheme.foreground(0.42))
+                    }
+                }
+            }
+
+            Spacer(minLength: 16)
+
+            VStack(alignment: .trailing, spacing: 10) {
+                Button {
+                    dismiss()
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundStyle(AppVisualTheme.foreground(0.50))
+                        .frame(width: 28, height: 28)
+                        .background(
+                            Circle()
+                                .fill(AppVisualTheme.surfaceFill(0.08))
+                                .overlay(Circle().stroke(AppVisualTheme.surfaceStroke(0.08), lineWidth: 0.5))
+                        )
+                }
+                .buttonStyle(.plain)
+
+                Menu {
+                    Button("Open in Finder") {
+                        assistant.revealSkill(skill)
+                    }
+                    if !skill.isReadOnly {
+                        Divider()
+                        Button("Duplicate") {
+                            assistant.duplicateSkill(skill)
+                        }
+                        Button("Delete", role: .destructive) {
+                            onDeleteSkill(skill)
+                            dismiss()
+                        }
+                    }
+                } label: {
+                    Image(systemName: "ellipsis")
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundStyle(AppVisualTheme.foreground(0.44))
+                        .frame(width: 28, height: 28)
+                        .background(
+                            Circle()
+                                .fill(AppVisualTheme.surfaceFill(0.06))
+                                .overlay(Circle().stroke(AppVisualTheme.surfaceStroke(0.06), lineWidth: 0.5))
+                        )
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+            }
+        }
+        .padding(.horizontal, 24)
+        .padding(.vertical, 22)
+    }
+
+    private var examplePromptCard: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("Example Prompt")
+                    .font(.system(size: 12.5, weight: .semibold))
+                    .foregroundStyle(AppVisualTheme.foreground(0.82))
+
+                Spacer()
+
+                Button {
+                    copyAssistantTextToPasteboard(preview.examplePrompt)
+                } label: {
+                    Image(systemName: "doc.on.doc")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(AppVisualTheme.foreground(0.58))
+                }
+                .buttonStyle(.plain)
+                .help("Copy example prompt")
+            }
+
+            Text(preview.examplePrompt)
+                .font(.system(size: 15, weight: .medium, design: .monospaced))
+                .foregroundStyle(AppVisualTheme.foreground(0.86))
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(16)
+                .background(
+                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        .fill(AppVisualTheme.surfaceFill(0.08))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                                .stroke(AppVisualTheme.surfaceStroke(0.08), lineWidth: 0.7)
+                        )
+                )
+        }
+        .padding(18)
+        .background(
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .fill(AppVisualTheme.surfaceFill(0.04))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 22, style: .continuous)
+                        .stroke(AppVisualTheme.surfaceStroke(0.07), lineWidth: 0.8)
+                )
+        )
+    }
+
+    private var instructionsCard: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Skill Instructions")
+                .font(.system(size: 12.5, weight: .semibold))
+                .foregroundStyle(AppVisualTheme.foreground(0.82))
+
+            AssistantMarkdownSegmentsView(
+                text: preview.bodyMarkdown,
+                contentID: "skill-detail-\(skill.id)",
+                preferredMaxWidth: nil,
+                textScale: 0.98
+            )
+        }
+        .padding(18)
+        .background(
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .fill(AppVisualTheme.surfaceFill(0.04))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 22, style: .continuous)
+                        .stroke(AppVisualTheme.surfaceStroke(0.07), lineWidth: 0.8)
+                )
+        )
+    }
+
+    private var footer: some View {
+        HStack(spacing: 10) {
+            if isAttached {
+                Button {
+                    assistant.detachSkill(skill.name)
+                } label: {
+                    Label("Detach", systemImage: "minus.circle")
+                        .font(.system(size: 12, weight: .semibold))
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.regular)
+            } else {
+                Button {
+                    assistant.attachSkill(skill)
+                } label: {
+                    Label("Attach to Thread", systemImage: "plus.circle")
+                        .font(.system(size: 12, weight: .semibold))
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.regular)
+                .disabled(!assistant.canAttachSkillsToSelectedThread)
+            }
+
+            Spacer()
+
+            Button("Close") {
+                dismiss()
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.regular)
+
+            Button {
+                onTrySkill(skill, preview.examplePrompt)
+                dismiss()
+            } label: {
+                Label("Try in New Thread", systemImage: "plus.message.fill")
+                    .font(.system(size: 12, weight: .semibold))
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.regular)
+        }
+        .padding(.horizontal, 24)
+        .padding(.vertical, 16)
+        .background(
+            AppVisualTheme.surfaceFill(0.03)
+        )
+        .overlay(
+            Rectangle()
+                .fill(AppVisualTheme.surfaceStroke(0.08))
+                .frame(height: 0.5),
+            alignment: .top
+        )
+    }
+}
+
+struct AssistantGitHubSkillImportSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @State private var reference: String = ""
+    let onImport: (String) -> Void
+
+    private var canImport: Bool {
+        reference.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty != nil
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Import Skill From GitHub")
+                .font(.system(size: 18, weight: .bold))
+
+            Text("Paste a GitHub tree URL or a short repo path like `openai/skills/skills/.curated/pdf`.")
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+
+            TextField("GitHub URL or repo path", text: $reference)
+                .textFieldStyle(.roundedBorder)
+
+            Text("If a thread is open, Open Assist will attach the imported skill to that thread.")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+
+            HStack {
+                Spacer()
+
+                Button("Cancel") {
+                    dismiss()
+                }
+                .buttonStyle(.bordered)
+
+                Button("Import") {
+                    onImport(reference.trimmingCharacters(in: .whitespacesAndNewlines))
+                    dismiss()
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(!canImport)
+            }
+        }
+        .padding(20)
+        .frame(width: 460)
+        .background(AppChromeBackground())
+    }
+}
+
+struct AssistantSkillWizardSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @State private var draft = AssistantSkillWizardDraft()
+    let onCreate: (AssistantSkillWizardDraft) -> Void
+
+    private var canCreate: Bool {
+        draft.name.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty != nil
+            && draft.description.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty != nil
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Create Skill")
+                .font(.system(size: 18, weight: .bold))
+
+            Text("This wizard creates a Codex-compatible skill folder inside `~/.codex/skills`.")
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+
+            VStack(alignment: .leading, spacing: 10) {
+                TextField("Skill name", text: $draft.name)
+                    .textFieldStyle(.roundedBorder)
+
+                TextField("Short description", text: $draft.description)
+                    .textFieldStyle(.roundedBorder)
+
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("When should Open Assist use this skill?")
+                        .font(.system(size: 11.5, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                    TextEditor(text: $draft.whenToUse)
+                        .font(.system(size: 12))
+                        .frame(height: 70)
+                        .padding(8)
+                        .background(
+                            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                .fill(Color(.textBackgroundColor).opacity(0.5))
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                        .stroke(Color.secondary.opacity(0.2), lineWidth: 0.8)
+                                )
+                        )
+                }
+
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Example requests (one per line)")
+                        .font(.system(size: 11.5, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                    TextEditor(text: $draft.exampleRequests)
+                        .font(.system(size: 12))
+                        .frame(height: 84)
+                        .padding(8)
+                        .background(
+                            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                .fill(Color(.textBackgroundColor).opacity(0.5))
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                        .stroke(Color.secondary.opacity(0.2), lineWidth: 0.8)
+                                )
+                        )
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 8) {
+                Toggle("Create `agents/openai.yaml`", isOn: $draft.includeOpenAIMetadata)
+                Toggle("Create `scripts/` folder", isOn: $draft.includeScriptsDirectory)
+                Toggle("Create `references/` folder", isOn: $draft.includeReferencesDirectory)
+                Toggle("Create `assets/` folder", isOn: $draft.includeAssetsDirectory)
+            }
+            .toggleStyle(.switch)
+            .font(.system(size: 12.5))
+
+            Text("If a thread is open, Open Assist will attach the new skill to that thread.")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+
+            HStack {
+                Spacer()
+
+                Button("Cancel") {
+                    dismiss()
+                }
+                .buttonStyle(.bordered)
+
+                Button("Create Skill") {
+                    onCreate(draft)
+                    dismiss()
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(!canCreate)
+            }
+        }
+        .padding(20)
+        .frame(width: 520)
+        .background(AppChromeBackground())
     }
 }
 

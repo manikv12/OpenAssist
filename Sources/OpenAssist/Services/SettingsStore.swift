@@ -44,7 +44,7 @@ enum TranscriptionEngineType: String, CaseIterable, Identifiable {
         case .whisperCpp:
             return "Uses local whisper.cpp models downloaded to this Mac. No cloud transcription is used."
         case .cloudProviders:
-            return "Uses cloud transcription providers with your API key. Audio is uploaded for transcription."
+            return "Uses remote transcription providers with either your API key or the ChatGPT / Codex session already signed in on this Mac."
         }
     }
 }
@@ -54,6 +54,7 @@ enum CloudTranscriptionProvider: String, CaseIterable, Identifiable {
     case groq = "Groq"
     case deepgram = "Deepgram"
     case gemini = "Google Gemini (AI Studio)"
+    case codexSession = "ChatGPT / Codex Session"
 
     var id: Self { self }
 
@@ -71,6 +72,8 @@ enum CloudTranscriptionProvider: String, CaseIterable, Identifiable {
             return "nova-3"
         case .gemini:
             return "gemini-2.5-flash"
+        case .codexSession:
+            return "gpt-4o-mini-transcribe"
         }
     }
 
@@ -84,6 +87,17 @@ enum CloudTranscriptionProvider: String, CaseIterable, Identifiable {
             return "https://api.deepgram.com/v1/listen"
         case .gemini:
             return "https://generativelanguage.googleapis.com/v1beta"
+        case .codexSession:
+            return "https://chatgpt.com/backend-api"
+        }
+    }
+
+    var requiresAPIKey: Bool {
+        switch self {
+        case .codexSession:
+            return false
+        case .openAI, .groq, .deepgram, .gemini:
+            return true
         }
     }
 
@@ -97,6 +111,8 @@ enum CloudTranscriptionProvider: String, CaseIterable, Identifiable {
             return "Deepgram speech-to-text API with low-latency cloud transcription."
         case .gemini:
             return "Google Gemini generateContent audio transcription using AI Studio API key."
+        case .codexSession:
+            return "Uses the ChatGPT or Codex sign-in already active on this Mac instead of a separate transcription API key."
         }
     }
 }
@@ -584,6 +600,7 @@ final class SettingsStore: ObservableObject {
         static let telegramPendingChatID = "OpenAssist.telegramPendingChatID"
         static let telegramPendingDisplayName = "OpenAssist.telegramPendingDisplayName"
         static let telegramLastProcessedUpdateID = "OpenAssist.telegramLastProcessedUpdateID"
+        static let telegramTrackedMessageIDs = "OpenAssist.telegramTrackedMessageIDs"
         static let promptRewriteEnabled = "OpenAssist.promptRewriteEnabled"
         static let promptRewriteAutoInsertEnabled = "OpenAssist.promptRewriteAutoInsertEnabled"
         static let memoryIndexingEnabled = "OpenAssist.memoryIndexingEnabled"
@@ -608,6 +625,7 @@ final class SettingsStore: ObservableObject {
         static let promptRewriteConversationHistoryDisabledContextIDs = "OpenAssist.promptRewriteConversationHistoryDisabledContextIDs"
         static let promptRewriteCrossIDEConversationSharingEnabled = "OpenAssist.promptRewriteCrossIDEConversationSharingEnabled"
         static let promptRewriteCrossIDEConversationSharingDefaultedMigrationV1 = SettingsStore.crossIDEConversationSharingMigrationDefaultsKey
+        static let googleAIStudioImageGenerationModel = "OpenAssist.googleAIStudioImageGenerationModel"
         static let localAISetupCompleted = "OpenAssist.localAISetupCompleted"
         static let localAISelectedModelID = "OpenAssist.localAISelectedModelID"
         static let localAIManagedRuntimeEnabled = "OpenAssist.localAIManagedRuntimeEnabled"
@@ -629,15 +647,22 @@ final class SettingsStore: ObservableObject {
         static let assistantTTSFallbackToMacOS = "OpenAssist.assistantTTSFallbackToMacOS"
         static let assistantTTSFallbackVoiceIdentifier = "OpenAssist.assistantTTSFallbackVoiceIdentifier"
         static let assistantInterruptCurrentSpeechOnNewReply = "OpenAssist.assistantInterruptCurrentSpeechOnNewReply"
+        static let assistantBackend = "OpenAssist.assistantBackend"
         static let assistantPreferredModelID = "OpenAssist.assistantPreferredModelID"
+        static let assistantPreferredSubagentModelID = "OpenAssist.assistantPreferredSubagentModelID"
         static let assistantOwnedThreadIDs = "OpenAssist.assistantOwnedThreadIDs"
+        static let assistantArchiveDefaultRetentionHours = "OpenAssist.assistantArchiveDefaultRetentionHours"
         static let browserAutomationEnabled = "OpenAssist.browserAutomationEnabled"
+        static let assistantComputerUseEnabled = "OpenAssist.assistantComputerUseEnabled"
         static let browserSelectedProfileID = "OpenAssist.browserSelectedProfileID"
+        static let settingsLastViewedSection = "OpenAssist.settingsLastViewedSection"
+        static let settingsGettingStartedDismissed = "OpenAssist.settingsGettingStartedDismissed"
         static let assistantAlwaysApprovedToolKinds = "OpenAssist.assistantAlwaysApprovedToolKinds"
         static let assistantConversationalToolUsePreference = "OpenAssist.assistantConversationalToolUsePreference"
         static let assistantCustomInstructions = "OpenAssist.assistantCustomInstructions"
         static let assistantMaxToolCallsPerTurn = "OpenAssist.assistantMaxToolCallsPerTurn"
         static let assistantMaxRepeatedCommandAttemptsPerTurn = "OpenAssist.assistantMaxRepeatedCommandAttemptsPerTurn"
+        static let assistantTrackCodeChangesInGitRepos = "OpenAssist.assistantTrackCodeChangesInGitRepos"
         static let assistantMemoryEnabled = "OpenAssist.assistantMemoryEnabled"
         static let assistantMemoryReviewEnabled = "OpenAssist.assistantMemoryReviewEnabled"
         static let assistantMemorySummaryMaxChars = "OpenAssist.assistantMemorySummaryMaxChars"
@@ -869,6 +894,10 @@ final class SettingsStore: ObservableObject {
                 cloudTranscriptionAPIKey,
                 for: cloudTranscriptionProvider
             )
+            if cloudTranscriptionProvider == .gemini,
+               googleAIStudioAPIKey != cloudTranscriptionAPIKey {
+                googleAIStudioAPIKey = cloudTranscriptionAPIKey
+            }
             save()
         }
     }
@@ -1287,6 +1316,40 @@ final class SettingsStore: ObservableObject {
                 promptRewriteOpenAIAPIKey,
                 for: promptRewriteProviderMode
             )
+            if promptRewriteProviderMode == .google,
+               googleAIStudioAPIKey != promptRewriteOpenAIAPIKey {
+                googleAIStudioAPIKey = promptRewriteOpenAIAPIKey
+            }
+            save()
+        }
+    }
+
+    @Published var googleAIStudioAPIKey: String {
+        didSet {
+            Self.storeGoogleAIStudioAPIKey(googleAIStudioAPIKey)
+            if promptRewriteProviderMode == .google,
+               promptRewriteOpenAIAPIKey != googleAIStudioAPIKey {
+                promptRewriteOpenAIAPIKey = googleAIStudioAPIKey
+            }
+            if cloudTranscriptionProvider == .gemini,
+               cloudTranscriptionAPIKey != googleAIStudioAPIKey {
+                cloudTranscriptionAPIKey = googleAIStudioAPIKey
+            }
+            save()
+        }
+    }
+
+    @Published var googleAIStudioImageGenerationModel: String {
+        didSet {
+            let normalized = Self.normalizedIdentifier(googleAIStudioImageGenerationModel)
+            if normalized != googleAIStudioImageGenerationModel {
+                googleAIStudioImageGenerationModel = normalized
+                return
+            }
+            if normalized.isEmpty {
+                googleAIStudioImageGenerationModel = Self.googleAIStudioImageGenerationDefaultModel
+                return
+            }
             save()
         }
     }
@@ -1474,7 +1537,31 @@ final class SettingsStore: ObservableObject {
         }
     }
 
+    @Published var assistantBackendRawValue: String {
+        didSet {
+            let normalized = (
+                AssistantRuntimeBackend(rawValue: assistantBackendRawValue) ?? .codex
+            ).rawValue
+            guard normalized == assistantBackendRawValue else {
+                assistantBackendRawValue = normalized
+                return
+            }
+            save()
+        }
+    }
+
+    var assistantBackend: AssistantRuntimeBackend {
+        get { AssistantRuntimeBackend(rawValue: assistantBackendRawValue) ?? .codex }
+        set { assistantBackendRawValue = newValue.rawValue }
+    }
+
     @Published var assistantPreferredModelID: String {
+        didSet {
+            save()
+        }
+    }
+
+    @Published var assistantPreferredSubagentModelID: String {
         didSet {
             save()
         }
@@ -1485,6 +1572,17 @@ final class SettingsStore: ObservableObject {
             let normalized = Self.normalizedStringList(assistantOwnedThreadIDs)
             guard normalized == assistantOwnedThreadIDs else {
                 assistantOwnedThreadIDs = normalized
+                return
+            }
+            save()
+        }
+    }
+
+    @Published var assistantArchiveDefaultRetentionHours: Int {
+        didSet {
+            let normalized = min(24 * 365, max(1, assistantArchiveDefaultRetentionHours))
+            guard normalized == assistantArchiveDefaultRetentionHours else {
+                assistantArchiveDefaultRetentionHours = normalized
                 return
             }
             save()
@@ -1503,7 +1601,25 @@ final class SettingsStore: ObservableObject {
         }
     }
 
+    @Published var assistantComputerUseEnabled: Bool {
+        didSet {
+            save()
+        }
+    }
+
     @Published var browserSelectedProfileID: String {
+        didSet {
+            save()
+        }
+    }
+
+    @Published var settingsLastViewedSection: String {
+        didSet {
+            save()
+        }
+    }
+
+    @Published var settingsGettingStartedDismissed: Bool {
         didSet {
             save()
         }
@@ -1524,6 +1640,12 @@ final class SettingsStore: ObservableObject {
 
     /// Maximum number of times the same command can repeat back-to-back in one turn before auto-cancelling. 0 = unlimited.
     @Published var assistantMaxRepeatedCommandAttemptsPerTurn: Int {
+        didSet {
+            save()
+        }
+    }
+
+    @Published var assistantTrackCodeChangesInGitRepos: Bool {
         didSet {
             save()
         }
@@ -1796,6 +1918,7 @@ final class SettingsStore: ObservableObject {
             CloudTranscriptionRequestTimeoutDefaults.maximumSeconds,
             max(CloudTranscriptionRequestTimeoutDefaults.minimumSeconds, storedCloudRequestTimeoutSeconds)
         )
+        googleAIStudioAPIKey = Self.loadGoogleAIStudioAPIKey()
         cloudTranscriptionAPIKey = Self.loadCloudTranscriptionProviderAPIKey(for: selectedCloudProvider)
 
         selectedWhisperModelID = defaults.string(forKey: Keys.selectedWhisperModelID) ?? ""
@@ -2093,6 +2216,10 @@ final class SettingsStore: ObservableObject {
         )
 
         promptRewriteOpenAIAPIKey = selectedPromptProviderAPIKey
+        googleAIStudioImageGenerationModel = defaults
+            .string(forKey: Keys.googleAIStudioImageGenerationModel)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nonEmpty ?? Self.googleAIStudioImageGenerationDefaultModel
 
         if defaults.object(forKey: Keys.localAISetupCompleted) == nil {
             localAISetupCompleted = false
@@ -2206,11 +2333,30 @@ final class SettingsStore: ObservableObject {
             assistantInterruptCurrentSpeechOnNewReply = defaults.bool(forKey: Keys.assistantInterruptCurrentSpeechOnNewReply)
         }
 
+        assistantBackendRawValue = (
+            AssistantRuntimeBackend(
+                rawValue: defaults.string(forKey: Keys.assistantBackend) ?? ""
+            ) ?? .codex
+        ).rawValue
         assistantPreferredModelID = defaults
             .string(forKey: Keys.assistantPreferredModelID)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        assistantPreferredSubagentModelID = defaults
+            .string(forKey: Keys.assistantPreferredSubagentModelID)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         assistantOwnedThreadIDs = Self.normalizedStringList(
             defaults.stringArray(forKey: Keys.assistantOwnedThreadIDs) ?? []
+        )
+        assistantArchiveDefaultRetentionHours = min(
+            24 * 365,
+            max(
+                1,
+                Self.restoredInteger(
+                    defaults: defaults,
+                    key: Keys.assistantArchiveDefaultRetentionHours,
+                    defaultValue: 24
+                )
+            )
         )
         assistantAlwaysApprovedToolKinds = Set(
             defaults.stringArray(forKey: Keys.assistantAlwaysApprovedToolKinds) ?? []
@@ -2220,8 +2366,20 @@ final class SettingsStore: ObservableObject {
         } else {
             browserAutomationEnabled = defaults.bool(forKey: Keys.browserAutomationEnabled)
         }
+        if defaults.object(forKey: Keys.assistantComputerUseEnabled) == nil {
+            assistantComputerUseEnabled = false
+        } else {
+            assistantComputerUseEnabled = defaults.bool(forKey: Keys.assistantComputerUseEnabled)
+        }
         browserSelectedProfileID = defaults.string(forKey: Keys.browserSelectedProfileID)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        settingsLastViewedSection = defaults.string(forKey: Keys.settingsLastViewedSection)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if defaults.object(forKey: Keys.settingsGettingStartedDismissed) == nil {
+            settingsGettingStartedDismissed = false
+        } else {
+            settingsGettingStartedDismissed = defaults.bool(forKey: Keys.settingsGettingStartedDismissed)
+        }
         assistantCustomInstructions = defaults.string(forKey: Keys.assistantCustomInstructions) ?? ""
         assistantMaxToolCallsPerTurn = Self.restoredInteger(
             defaults: defaults,
@@ -2233,6 +2391,11 @@ final class SettingsStore: ObservableObject {
             key: Keys.assistantMaxRepeatedCommandAttemptsPerTurn,
             defaultValue: 3
         )
+        if defaults.object(forKey: Keys.assistantTrackCodeChangesInGitRepos) == nil {
+            assistantTrackCodeChangesInGitRepos = true
+        } else {
+            assistantTrackCodeChangesInGitRepos = defaults.bool(forKey: Keys.assistantTrackCodeChangesInGitRepos)
+        }
         if defaults.object(forKey: Keys.assistantMemoryEnabled) == nil {
             assistantMemoryEnabled = true
         } else {
@@ -2391,6 +2554,10 @@ final class SettingsStore: ObservableObject {
             promptRewriteCrossIDEConversationSharingEnabled,
             forKey: Keys.promptRewriteCrossIDEConversationSharingEnabled
         )
+        defaults.set(
+            googleAIStudioImageGenerationModel.trimmingCharacters(in: .whitespacesAndNewlines),
+            forKey: Keys.googleAIStudioImageGenerationModel
+        )
         defaults.set(localAISetupCompleted, forKey: Keys.localAISetupCompleted)
         defaults.set(localAISelectedModelID.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Keys.localAISelectedModelID)
         defaults.set(localAIManagedRuntimeEnabled, forKey: Keys.localAIManagedRuntimeEnabled)
@@ -2415,16 +2582,29 @@ final class SettingsStore: ObservableObject {
             assistantInterruptCurrentSpeechOnNewReply,
             forKey: Keys.assistantInterruptCurrentSpeechOnNewReply
         )
+        defaults.set(assistantBackendRawValue, forKey: Keys.assistantBackend)
         defaults.set(assistantPreferredModelID.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Keys.assistantPreferredModelID)
+        defaults.set(
+            assistantPreferredSubagentModelID.trimmingCharacters(in: .whitespacesAndNewlines),
+            forKey: Keys.assistantPreferredSubagentModelID
+        )
         defaults.set(Self.normalizedStringList(assistantOwnedThreadIDs), forKey: Keys.assistantOwnedThreadIDs)
+        defaults.set(assistantArchiveDefaultRetentionHours, forKey: Keys.assistantArchiveDefaultRetentionHours)
         defaults.set(Array(assistantAlwaysApprovedToolKinds), forKey: Keys.assistantAlwaysApprovedToolKinds)
         defaults.set(browserAutomationEnabled, forKey: Keys.browserAutomationEnabled)
+        defaults.set(assistantComputerUseEnabled, forKey: Keys.assistantComputerUseEnabled)
         defaults.set(browserSelectedProfileID.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Keys.browserSelectedProfileID)
+        defaults.set(settingsLastViewedSection.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Keys.settingsLastViewedSection)
+        defaults.set(settingsGettingStartedDismissed, forKey: Keys.settingsGettingStartedDismissed)
         defaults.set(assistantCustomInstructions, forKey: Keys.assistantCustomInstructions)
         defaults.set(assistantMaxToolCallsPerTurn, forKey: Keys.assistantMaxToolCallsPerTurn)
         defaults.set(
             assistantMaxRepeatedCommandAttemptsPerTurn,
             forKey: Keys.assistantMaxRepeatedCommandAttemptsPerTurn
+        )
+        defaults.set(
+            assistantTrackCodeChangesInGitRepos,
+            forKey: Keys.assistantTrackCodeChangesInGitRepos
         )
         defaults.set(assistantMemoryEnabled, forKey: Keys.assistantMemoryEnabled)
         defaults.set(assistantMemoryReviewEnabled, forKey: Keys.assistantMemoryReviewEnabled)
@@ -2624,7 +2804,12 @@ final class SettingsStore: ObservableObject {
         return !key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
+    var hasGoogleAIStudioAPIKey: Bool {
+        !googleAIStudioAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
     func hasCloudTranscriptionAPIKey(for provider: CloudTranscriptionProvider) -> Bool {
+        guard provider.requiresAPIKey else { return true }
         let key = Self.loadCloudTranscriptionProviderAPIKey(for: provider)
         return !key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
@@ -2640,6 +2825,20 @@ final class SettingsStore: ObservableObject {
         if force || normalizedBaseURL.isEmpty {
             cloudTranscriptionBaseURL = provider.defaultBaseURL
         }
+    }
+
+    var googleAIStudioImageGenerationModelResolved: String {
+        googleAIStudioImageGenerationModel.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+            ?? Self.googleAIStudioImageGenerationDefaultModel
+    }
+
+    var geminiImageGenerationConfiguration: GeminiImageGenerationConfiguration {
+        GeminiImageGenerationConfiguration(
+            apiKey: googleAIStudioAPIKey.trimmingCharacters(in: .whitespacesAndNewlines),
+            model: googleAIStudioImageGenerationModelResolved,
+            baseURL: CloudTranscriptionProvider.gemini.defaultBaseURL,
+            requestTimeoutSeconds: 90
+        )
     }
 
     var automationAPIToken: String {
@@ -2660,6 +2859,7 @@ final class SettingsStore: ObservableObject {
                 clearTelegramPendingPairing()
                 clearTelegramRemoteOwner()
                 telegramLastProcessedUpdateID = 0
+                telegramTrackedMessageIDs = []
             }
 
             Self.storeTelegramBotToken(normalizedNewValue)
@@ -2670,6 +2870,16 @@ final class SettingsStore: ObservableObject {
     var telegramLastProcessedUpdateID: Int {
         get { defaults.integer(forKey: Keys.telegramLastProcessedUpdateID) }
         set { defaults.set(newValue, forKey: Keys.telegramLastProcessedUpdateID) }
+    }
+
+    var telegramTrackedMessageIDs: [Int] {
+        get {
+            let stored = defaults.array(forKey: Keys.telegramTrackedMessageIDs) as? [Int] ?? []
+            return Self.normalizedTelegramMessageIDs(stored)
+        }
+        set {
+            defaults.set(Self.normalizedTelegramMessageIDs(newValue), forKey: Keys.telegramTrackedMessageIDs)
+        }
     }
 
     var hasTelegramRemoteOwner: Bool {
@@ -2705,6 +2915,7 @@ final class SettingsStore: ObservableObject {
         performBatchedSave {
             telegramOwnerUserID = ""
             telegramOwnerChatID = ""
+            telegramTrackedMessageIDs = []
         }
     }
 
@@ -2946,6 +3157,20 @@ final class SettingsStore: ObservableObject {
         }
     }
 
+    private static func normalizedTelegramMessageIDs(_ values: [Int]) -> [Int] {
+        var seen = Set<Int>()
+        let normalized = values.filter { value in
+            guard value > 0 else { return false }
+            return seen.insert(value).inserted
+        }
+
+        if normalized.count > 400 {
+            return Array(normalized.suffix(400))
+        }
+
+        return normalized
+    }
+
     private static func normalizedProviderScopedStringDictionary(_ values: [String: Any]?) -> [String: String] {
         guard let values else { return [:] }
         let validProviderIDs = Set(PromptRewriteProviderMode.allCases.map(\.rawValue))
@@ -2977,6 +3202,8 @@ final class SettingsStore: ObservableObject {
     }
 
     private static let openAIOAuthFallbackModelID = "gpt-5.2"
+    static let googleAIStudioAPIKeychainAccount = "google-ai-studio-api-key"
+    static let googleAIStudioImageGenerationDefaultModel = "gemini-2.5-flash-image"
 
     private static func isOpenAIOAuthCompatibleModelID(_ modelID: String) -> Bool {
         let normalized = modelID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -3154,16 +3381,26 @@ final class SettingsStore: ObservableObject {
         _ = SecItemDelete(query as CFDictionary)
     }
 
-    private static func cloudTranscriptionKeychainAccount(for provider: CloudTranscriptionProvider) -> String {
+    static func cloudTranscriptionKeychainAccount(for provider: CloudTranscriptionProvider) -> String {
+        if provider == .gemini {
+            return googleAIStudioAPIKeychainAccount
+        }
         let normalized = provider.rawValue
             .lowercased()
             .replacingOccurrences(of: "(", with: "")
             .replacingOccurrences(of: ")", with: "")
+            .replacingOccurrences(of: "/", with: "-")
             .replacingOccurrences(of: " ", with: "-")
         return "\(cloudTranscriptionProviderAPIKeychainAccountPrefix).\(normalized)"
     }
 
     private static func loadCloudTranscriptionProviderAPIKey(for provider: CloudTranscriptionProvider) -> String {
+        guard provider.requiresAPIKey else {
+            return ""
+        }
+        if provider == .gemini {
+            return loadGoogleAIStudioAPIKey()
+        }
         let account = cloudTranscriptionKeychainAccount(for: provider)
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
@@ -3187,6 +3424,14 @@ final class SettingsStore: ObservableObject {
         _ rawValue: String,
         for provider: CloudTranscriptionProvider
     ) {
+        guard provider.requiresAPIKey else {
+            deleteCloudTranscriptionProviderAPIKey(for: provider)
+            return
+        }
+        if provider == .gemini {
+            storeGoogleAIStudioAPIKey(rawValue)
+            return
+        }
         let value = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
         if value.isEmpty {
             deleteCloudTranscriptionProviderAPIKey(for: provider)
@@ -3217,6 +3462,10 @@ final class SettingsStore: ObservableObject {
     }
 
     private static func deleteCloudTranscriptionProviderAPIKey(for provider: CloudTranscriptionProvider) {
+        if provider == .gemini {
+            deleteGoogleAIStudioAPIKey()
+            return
+        }
         let account = cloudTranscriptionKeychainAccount(for: provider)
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
@@ -3235,8 +3484,13 @@ final class SettingsStore: ObservableObject {
     private static let promptRewriteProviderAPIKeychainService = "com.developingadventures.OpenAssist"
     private static let promptRewriteProviderAPIKeychainAccountPrefix = "prompt-rewrite-provider-api-key"
     private static let legacyPromptRewriteOpenAIAPIKeychainAccount = "prompt-rewrite-openai-api-key"
+    private static let legacyPromptRewriteGoogleAPIKeychainAccount = "prompt-rewrite-provider-api-key.google-ai-studio-gemini"
+    private static let legacyCloudTranscriptionGeminiAPIKeychainAccount = "cloud-transcription-provider-api-key.google-gemini-ai-studio"
 
-    private static func keychainAccount(for providerMode: PromptRewriteProviderMode) -> String {
+    static func keychainAccount(for providerMode: PromptRewriteProviderMode) -> String {
+        if providerMode == .google {
+            return googleAIStudioAPIKeychainAccount
+        }
         let normalized = providerMode.rawValue
             .lowercased()
             .replacingOccurrences(of: "(", with: "")
@@ -3247,6 +3501,9 @@ final class SettingsStore: ObservableObject {
 
     private static func loadPromptRewriteProviderAPIKey(for providerMode: PromptRewriteProviderMode) -> String {
         guard providerMode.requiresAPIKey else { return "" }
+        if providerMode == .google {
+            return loadGoogleAIStudioAPIKey()
+        }
         let account = keychainAccount(for: providerMode)
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
@@ -3294,6 +3551,10 @@ final class SettingsStore: ObservableObject {
             deletePromptRewriteProviderAPIKey(for: providerMode)
             return
         }
+        if providerMode == .google {
+            storeGoogleAIStudioAPIKey(rawValue)
+            return
+        }
         let value = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
         if value.isEmpty {
             deletePromptRewriteProviderAPIKey(for: providerMode)
@@ -3333,6 +3594,10 @@ final class SettingsStore: ObservableObject {
     }
 
     private static func deletePromptRewriteProviderAPIKey(for providerMode: PromptRewriteProviderMode) {
+        if providerMode == .google {
+            deleteGoogleAIStudioAPIKey()
+            return
+        }
         let account = keychainAccount(for: providerMode)
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
@@ -3352,6 +3617,95 @@ final class SettingsStore: ObservableObject {
             kSecAttrAccount as String: legacyPromptRewriteOpenAIAPIKeychainAccount
         ]
         _ = SecItemDelete(legacyQuery as CFDictionary)
+    }
+
+    private static func loadGoogleAIStudioAPIKey() -> String {
+        let sharedQuery: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: promptRewriteProviderAPIKeychainService,
+            kSecAttrAccount as String: googleAIStudioAPIKeychainAccount,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+
+        var item: CFTypeRef?
+        let sharedStatus = SecItemCopyMatching(sharedQuery as CFDictionary, &item)
+        if sharedStatus == errSecSuccess,
+           let data = item as? Data,
+           let value = String(data: data, encoding: .utf8) {
+            return value
+        }
+
+        let legacyAccounts = [
+            legacyPromptRewriteGoogleAPIKeychainAccount,
+            legacyCloudTranscriptionGeminiAPIKeychainAccount
+        ]
+        for account in legacyAccounts {
+            let legacyQuery: [String: Any] = [
+                kSecClass as String: kSecClassGenericPassword,
+                kSecAttrService as String: promptRewriteProviderAPIKeychainService,
+                kSecAttrAccount as String: account,
+                kSecReturnData as String: true,
+                kSecMatchLimit as String: kSecMatchLimitOne
+            ]
+            var legacyItem: CFTypeRef?
+            let legacyStatus = SecItemCopyMatching(legacyQuery as CFDictionary, &legacyItem)
+            guard legacyStatus == errSecSuccess,
+                  let legacyData = legacyItem as? Data,
+                  let legacyValue = String(data: legacyData, encoding: .utf8) else {
+                continue
+            }
+            storeGoogleAIStudioAPIKey(legacyValue)
+            _ = SecItemDelete(legacyQuery as CFDictionary)
+            return legacyValue
+        }
+
+        return ""
+    }
+
+    private static func storeGoogleAIStudioAPIKey(_ rawValue: String) {
+        let value = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        if value.isEmpty {
+            deleteGoogleAIStudioAPIKey()
+            return
+        }
+
+        let data = Data(value.utf8)
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: promptRewriteProviderAPIKeychainService,
+            kSecAttrAccount as String: googleAIStudioAPIKeychainAccount
+        ]
+
+        let updateStatus = SecItemUpdate(
+            query as CFDictionary,
+            [kSecValueData as String: data] as CFDictionary
+        )
+        if updateStatus == errSecSuccess {
+            return
+        }
+
+        if updateStatus == errSecItemNotFound {
+            var create = query
+            create[kSecValueData as String] = data
+            _ = SecItemAdd(create as CFDictionary, nil)
+        }
+    }
+
+    private static func deleteGoogleAIStudioAPIKey() {
+        let accounts = [
+            googleAIStudioAPIKeychainAccount,
+            legacyPromptRewriteGoogleAPIKeychainAccount,
+            legacyCloudTranscriptionGeminiAPIKeychainAccount
+        ]
+        for account in accounts {
+            let query: [String: Any] = [
+                kSecClass as String: kSecClassGenericPassword,
+                kSecAttrService as String: promptRewriteProviderAPIKeychainService,
+                kSecAttrAccount as String: account
+            ]
+            _ = SecItemDelete(query as CFDictionary)
+        }
     }
 
     private static func loadAssistantHumeCredential(account: String) -> String {

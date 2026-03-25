@@ -29,6 +29,7 @@ struct AssistantProject: Identifiable, Codable, Hashable, Sendable {
     var name: String
     var linkedFolderPath: String?
     var iconSymbolName: String?
+    var isHidden: Bool
     let createdAt: Date
     var updatedAt: Date
 
@@ -37,6 +38,7 @@ struct AssistantProject: Identifiable, Codable, Hashable, Sendable {
         name: String,
         linkedFolderPath: String? = nil,
         iconSymbolName: String? = nil,
+        isHidden: Bool = false,
         createdAt: Date = Date(),
         updatedAt: Date = Date()
     ) {
@@ -44,8 +46,30 @@ struct AssistantProject: Identifiable, Codable, Hashable, Sendable {
         self.name = name
         self.linkedFolderPath = linkedFolderPath
         self.iconSymbolName = Self.normalizedIconSymbolName(iconSymbolName)
+        self.isHidden = isHidden
         self.createdAt = createdAt
         self.updatedAt = updatedAt
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case name
+        case linkedFolderPath
+        case iconSymbolName
+        case isHidden
+        case createdAt
+        case updatedAt
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        name = try container.decode(String.self, forKey: .name)
+        linkedFolderPath = try container.decodeIfPresent(String.self, forKey: .linkedFolderPath)
+        iconSymbolName = Self.normalizedIconSymbolName(try container.decodeIfPresent(String.self, forKey: .iconSymbolName))
+        isHidden = try container.decodeIfPresent(Bool.self, forKey: .isHidden) ?? false
+        createdAt = try container.decode(Date.self, forKey: .createdAt)
+        updatedAt = try container.decode(Date.self, forKey: .updatedAt)
     }
 
     var displayIconSymbolName: String {
@@ -58,6 +82,20 @@ struct AssistantProject: Identifiable, Codable, Hashable, Sendable {
 
     var defaultIconSymbolName: String {
         linkedFolderPath == nil ? "square.stack.3d.up.fill" : "folder.fill"
+    }
+
+    static func suggestedName(forLinkedFolderPath linkedFolderPath: String?) -> String {
+        guard let normalizedPath = normalizedLinkedFolderPath(linkedFolderPath) else {
+            return "Project"
+        }
+
+        let folderURL = URL(fileURLWithPath: normalizedPath, isDirectory: true)
+        let suggestedName = folderURL.lastPathComponent.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !suggestedName.isEmpty, suggestedName != "/" {
+            return suggestedName
+        }
+
+        return "Project"
     }
 
     static func normalizedLinkedFolderPath(_ linkedFolderPath: String?) -> String? {
@@ -109,7 +147,7 @@ struct AssistantProjectStoreSnapshot: Codable {
     var brainByProjectID: [String: AssistantProjectBrainState]
 
     static let empty = AssistantProjectStoreSnapshot(
-        version: 2,
+        version: 3,
         projects: [],
         threadAssignments: [:],
         brainByProjectID: [:]
@@ -127,7 +165,7 @@ struct AssistantProjectDeletionResult: Sendable {
 }
 
 final class AssistantProjectStore {
-    private static let currentSnapshotVersion = 2
+    private static let currentSnapshotVersion = 3
     private let fileManager: FileManager
     private let fileURL: URL
     private var cachedSnapshot: AssistantProjectStoreSnapshot?
@@ -157,6 +195,14 @@ final class AssistantProjectStore {
 
     func projects() -> [AssistantProject] {
         loadSnapshot().projects
+    }
+
+    func visibleProjects() -> [AssistantProject] {
+        loadSnapshot().projects.filter { !$0.isHidden }
+    }
+
+    func hiddenProjects() -> [AssistantProject] {
+        loadSnapshot().projects.filter { $0.isHidden }
     }
 
     func snapshot() -> AssistantProjectStoreSnapshot {
@@ -285,6 +331,16 @@ final class AssistantProjectStore {
     }
 
     @discardableResult
+    func hideProject(id projectID: String, now: Date = Date()) throws -> AssistantProject {
+        try setProjectHidden(projectID, isHidden: true, now: now)
+    }
+
+    @discardableResult
+    func unhideProject(id projectID: String, now: Date = Date()) throws -> AssistantProject {
+        try setProjectHidden(projectID, isHidden: false, now: now)
+    }
+
+    @discardableResult
     func deleteProject(id projectID: String) throws -> AssistantProject {
         try deleteProjectResult(id: projectID).project
     }
@@ -312,6 +368,25 @@ final class AssistantProjectStore {
             project: removed,
             removedThreadIDs: removedThreadIDs.sorted()
         )
+    }
+
+    private func setProjectHidden(
+        _ projectID: String,
+        isHidden: Bool,
+        now: Date = Date()
+    ) throws -> AssistantProject {
+        let normalizedProjectID = try requiredProjectID(projectID)
+        var snapshot = loadSnapshot()
+        guard let index = snapshot.projects.firstIndex(where: {
+            $0.id.caseInsensitiveCompare(normalizedProjectID) == .orderedSame
+        }) else {
+            throw AssistantProjectStoreError.projectNotFound
+        }
+
+        snapshot.projects[index].isHidden = isHidden
+        snapshot.projects[index].updatedAt = now
+        try saveSnapshot(snapshot)
+        return snapshot.projects[index]
     }
 
     func assignThread(

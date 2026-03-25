@@ -23,6 +23,8 @@ extension Notification.Name {
     static let openAssistMinimizeAssistantToOrb = Notification.Name("OpenAssist.minimizeAssistantToOrb")
     static let openAssistRunScheduledJob = Notification.Name("OpenAssist.runScheduledJob")
     static let openAssistSwitchToSession = Notification.Name("OpenAssist.switchToSession")
+    static let openAssistStartNewAssistantThread = Notification.Name("OpenAssist.startNewAssistantThread")
+    static let openAssistStartNewTemporaryAssistantThread = Notification.Name("OpenAssist.startNewTemporaryAssistantThread")
 }
 
 @MainActor
@@ -677,6 +679,16 @@ struct OpenAssistApp: App {
         }
         .commands {
             CommandGroup(after: .toolbar) {
+                Button("New Thread") {
+                    NotificationCenter.default.post(name: .openAssistStartNewAssistantThread, object: nil)
+                }
+                .keyboardShortcut("n", modifiers: [.command, .control])
+
+                Button("New Temporary Chat") {
+                    NotificationCenter.default.post(name: .openAssistStartNewTemporaryAssistantThread, object: nil)
+                }
+                .keyboardShortcut("n", modifiers: [.command, .shift])
+
                 Button("Zoom In") {
                     NotificationCenter.default.post(name: .openAssistAssistantZoomIn, object: nil)
                 }
@@ -759,6 +771,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
     private var settingsRequestObserver: NSObjectProtocol?
     private var assistantRequestObserver: NSObjectProtocol?
     private var assistantSetupRequestObserver: NSObjectProtocol?
+    private var assistantNewThreadObserver: NSObjectProtocol?
+    private var assistantNewTemporaryThreadObserver: NSObjectProtocol?
     private var assistantStartVoiceCaptureObserver: NSObjectProtocol?
     private var assistantStopVoiceCaptureObserver: NSObjectProtocol?
     private var assistantMinimizeToCompactObserver: NSObjectProtocol?
@@ -797,6 +811,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
     private var assistantVoiceBaselineNoise: Float = 0
     private var assistantVoiceBaselineSamples: [Float] = []
     private var assistantVoiceBaselineCalibrated = false
+
+    private var effectiveCloudTranscriptionAPIKey: String {
+        settings.cloudTranscriptionProvider == .gemini
+            ? settings.googleAIStudioAPIKey
+            : settings.cloudTranscriptionAPIKey
+    }
 
     private enum AssistantVoiceStopMode {
         case silenceAutoStop
@@ -1096,6 +1116,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         windowCoordinator?.onAssistantWindowVisibilityChanged = { [weak self] isVisible in
             self?.isAssistantWindowVisible = isVisible
             self?.syncAssistantCompactVisibility()
+            Task { @MainActor [weak self] in
+                await self?.assistantController.handleAssistantWindowVisibilityChanged(isVisible)
+            }
         }
         settings.refreshMicrophones(notifyChange: false)
         syncWhisperModelSelectionIfNeeded()
@@ -1114,7 +1137,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             provider: settings.cloudTranscriptionProvider,
             model: settings.cloudTranscriptionModel,
             baseURL: settings.cloudTranscriptionBaseURL,
-            apiKey: settings.cloudTranscriptionAPIKey,
+            apiKey: effectiveCloudTranscriptionAPIKey,
             requestTimeoutSeconds: settings.cloudTranscriptionRequestTimeoutSeconds
         )
         transcriber.setTranscriptionEngine(settings.transcriptionEngine)
@@ -1309,9 +1332,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             forName: .openAssistOpenSettings,
             object: nil,
             queue: .main
-        ) { [weak self] _ in
+        ) { [weak self] notification in
             Task { @MainActor in
-                self?.windowCoordinator?.openSettingsWindow()
+                let route = notification.object as? SettingsRoute
+                self?.windowCoordinator?.openSettingsWindow(route: route)
             }
         }
 
@@ -1332,7 +1356,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         ) { [weak self] _ in
             Task { @MainActor in
                 self?.openAssistantWindow()
-                self?.windowCoordinator?.openSettingsWindow()
+                self?.windowCoordinator?.openSettingsWindow(route: .gettingStartedHome)
+            }
+        }
+
+        assistantNewThreadObserver = NotificationCenter.default.addObserver(
+            forName: .openAssistStartNewAssistantThread,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                await self?.startAssistantThreadFromCommand()
+            }
+        }
+
+        assistantNewTemporaryThreadObserver = NotificationCenter.default.addObserver(
+            forName: .openAssistStartNewTemporaryAssistantThread,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                await self?.startTemporaryAssistantThreadFromCommand()
             }
         }
 
@@ -1492,6 +1536,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             NotificationCenter.default.removeObserver(assistantSetupRequestObserver)
             self.assistantSetupRequestObserver = nil
         }
+        if let assistantNewThreadObserver {
+            NotificationCenter.default.removeObserver(assistantNewThreadObserver)
+            self.assistantNewThreadObserver = nil
+        }
+        if let assistantNewTemporaryThreadObserver {
+            NotificationCenter.default.removeObserver(assistantNewTemporaryThreadObserver)
+            self.assistantNewTemporaryThreadObserver = nil
+        }
         if let assistantStartVoiceCaptureObserver {
             NotificationCenter.default.removeObserver(assistantStartVoiceCaptureObserver)
             self.assistantStartVoiceCaptureObserver = nil
@@ -1527,6 +1579,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         stopStatusIconAnimation()
         transcriber.stopRecording(emitFinalText: false)
         postInsertCorrectionMonitor.stopMonitoring(commitSession: false)
+        assistantController.purgeTemporarySessionsForApplicationTermination()
         assistantCompactHUD?.hide()
         waveform.hide()
         windowCoordinator?.closeAllWindows()
@@ -1658,7 +1711,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
                 NSWorkspace.shared.open(url)
             }
             self.pendingUpdateCheckFallbackWorkItem = nil
-            NSApp.setActivationPolicy(.accessory)
+            self.windowCoordinator?.syncActivationPolicyToCurrentWindows()
             CrashReporter.logWarning(
                 "Update check timed out after \(Int(UpdateCheckFallback.timeoutSeconds))s feed=\(feedURL.absoluteString)"
             )
@@ -1708,8 +1761,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
     func updater(_ updater: SPUUpdater, didFinishUpdateCycleFor updateCheck: SPUUpdateCheck, error: (any Error)?) {
         cancelPendingUpdateCheckFallback()
 
-        // Restore LSUIElement (accessory) mode after Sparkle's update UI is dismissed
-        NSApp.setActivationPolicy(.accessory)
+        // Return to accessory mode only when no real work window is still open.
+        windowCoordinator?.syncActivationPolicyToCurrentWindows()
 
         guard updateCheckStatusStore.isChecking else { return }
 
@@ -1786,6 +1839,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
                 windowCoordinator?.openPermissionOnboardingWindow(onComplete: { [weak self] in
                     Task { @MainActor in
                         self?.updatePermissionGate(openOnboardingIfNeeded: true, reconfigureHotkeysIfReady: true)
+                        self?.windowCoordinator?.openSettingsWindow(route: .gettingStartedHome)
                     }
                 })
                 requestStartupPermissionPromptIfNeeded()
@@ -1970,6 +2024,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             rootView: AssistantWindowView(assistant: assistantController)
             .environmentObject(settings)
         )
+    }
+
+    private func startAssistantThreadFromCommand() async {
+        openAssistantWindow()
+        await assistantController.startNewSession()
+    }
+
+    private func startTemporaryAssistantThreadFromCommand() async {
+        openAssistantWindow()
+        await assistantController.startNewTemporarySession()
     }
 
     private func minimizeAssistantToCompact() {
@@ -2637,7 +2701,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             cloudTranscriptionModel: settings.cloudTranscriptionModel,
             cloudTranscriptionBaseURL: settings.cloudTranscriptionBaseURL,
             cloudTranscriptionRequestTimeoutSeconds: settings.cloudTranscriptionRequestTimeoutSeconds,
-            cloudTranscriptionAPIKey: settings.cloudTranscriptionAPIKey,
+            cloudTranscriptionAPIKey: effectiveCloudTranscriptionAPIKey,
             selectedWhisperModelID: settings.selectedWhisperModelID,
             whisperUseCoreML: settings.whisperUseCoreML,
             whisperAutoUnloadIdleContextEnabled: settings.whisperAutoUnloadIdleContextEnabled,
@@ -2709,7 +2773,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
                 provider: settings.cloudTranscriptionProvider,
                 model: settings.cloudTranscriptionModel,
                 baseURL: settings.cloudTranscriptionBaseURL,
-                apiKey: settings.cloudTranscriptionAPIKey,
+                apiKey: effectiveCloudTranscriptionAPIKey,
                 requestTimeoutSeconds: settings.cloudTranscriptionRequestTimeoutSeconds
             )
         }
@@ -3066,7 +3130,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
                 setUIStatus(.message("Install a whisper model in Settings > Recognition to start dictation"))
                 windowCoordinator?.openSettingsWindow()
             } else if settings.transcriptionEngine == .cloudProviders,
-                      settings.cloudTranscriptionAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                      settings.cloudTranscriptionProvider.requiresAPIKey,
+                      effectiveCloudTranscriptionAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 setUIStatus(.message("Add a cloud provider API key in Settings > Recognition to start dictation"))
                 windowCoordinator?.openSettingsWindow()
             }
@@ -4491,110 +4556,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
 }
 
 struct SettingsView: View {
-    private enum SettingsSection: CaseIterable, Identifiable {
-        case essentials
-        case shortcuts
-        case speech
-        case aiModels
-        case computerControl
-        case integrations
-        case corrections
-        case about
-
-        var id: Self { self }
-
-        var title: String {
-            switch self {
-            case .essentials: return "Essentials"
-            case .shortcuts: return "Shortcuts"
-            case .speech: return "Speech & Input"
-            case .aiModels: return "AI & Models"
-            case .computerControl: return "Automation"
-            case .integrations: return "Integrations"
-            case .corrections: return "Corrections"
-            case .about: return "About & Permissions"
-            }
-        }
-
-        var subtitle: String {
-            switch self {
-            case .essentials: return "Daily assistant, voice capture, and feedback controls"
-            case .shortcuts: return "Dictation and agent shortcut keys"
-            case .speech: return "Microphone, engine, whisper models, timing, and text quality"
-            case .aiModels: return "Prompt rewrite, memory assistant, and provider connections"
-            case .computerControl: return "Browser reuse, automation permissions, helper status, and direct app actions"
-            case .integrations: return "Local automation and agent notifications"
-            case .corrections: return "Learn from and manage text fixes"
-            case .about: return "Permission health, diagnostics, and uninstall"
-            }
-        }
-
-        var iconName: String {
-            switch self {
-            case .essentials: return "sparkles"
-            case .shortcuts: return "keyboard"
-            case .speech: return "waveform.and.mic"
-            case .aiModels: return "shippingbox.fill"
-            case .computerControl: return "point.3.connected.trianglepath.dotted"
-            case .integrations: return "point.3.connected.trianglepath.dotted"
-            case .corrections: return "text.badge.checkmark"
-            case .about: return "info.circle"
-            }
-        }
-
-        var tint: Color {
-            switch self {
-            case .essentials:
-                return Color(red: 0.30, green: 0.58, blue: 0.95)
-            case .shortcuts:
-                return Color(red: 0.94, green: 0.58, blue: 0.24)
-            case .speech:
-                return Color(red: 0.27, green: 0.72, blue: 0.54)
-            case .aiModels:
-                return Color(red: 0.45, green: 0.56, blue: 0.92)
-            case .computerControl:
-                return Color(red: 0.23, green: 0.67, blue: 0.76)
-            case .integrations:
-                return Color(red: 0.84, green: 0.52, blue: 0.28)
-            case .corrections:
-                return Color(red: 0.21, green: 0.70, blue: 0.73)
-            case .about:
-                return Color(red: 0.56, green: 0.62, blue: 0.72)
-            }
-        }
-
-        var searchTerms: [String] {
-            switch self {
-            case .essentials:
-                return ["essential", "clipboard", "waveform", "accessibility", "output", "sound", "feedback"]
-            case .shortcuts:
-                return ["shortcut", "keyboard", "hold to talk", "continuous", "hotkey"]
-            case .speech:
-                return ["recognition", "engine", "punctuation", "context", "cleanup", "delay", "text quality", "speech", "whisper", "model", "download", "install", "core ml", "tiny", "base", "small", "medium", "large"]
-            case .aiModels:
-                return ["ai", "prompt", "rewrite", "memory", "provider", "oauth", "api key", "openai", "anthropic", "google", "gemini", "studio", "style", "conversation", "history"]
-            case .computerControl:
-                return ["automation", "browser", "browser profile", "apple events", "finder", "terminal", "calendar", "system settings", "helper", "messages", "notes", "contacts", "reminders"]
-            case .integrations:
-                return ["integrations", "automation", "api", "localhost", "claude", "codex", "cloud", "hooks", "notification", "speech", "sound", "token", "port"]
-            case .corrections:
-                return ["adaptive", "learned", "correction", "replacement", "sound", "edit", "remove", "clear"]
-            case .about:
-                return ["about", "permission", "uninstall", "version", "crash logs"]
-            }
-        }
-    }
-
     private enum ShortcutCaptureTarget {
         case holdToTalk
         case continuousToggle
         case assistantLiveVoice
-    }
-
-    private enum IntegrationsPage {
-        case overview
-        case automationNotifications
-        case telegramRemote
     }
 
     private struct ShortcutBinding: Equatable {
@@ -4617,32 +4582,6 @@ struct SettingsView: View {
         }
     }
 
-    private struct SettingSearchEntry: Identifiable {
-        let section: SettingsSection
-        let title: String
-        let detail: String
-        let keywords: [String]
-        let integrationsPage: IntegrationsPage?
-
-        init(
-            section: SettingsSection,
-            title: String,
-            detail: String,
-            keywords: [String],
-            integrationsPage: IntegrationsPage? = nil
-        ) {
-            self.section = section
-            self.title = title
-            self.detail = detail
-            self.keywords = keywords
-            self.integrationsPage = integrationsPage
-        }
-
-        var id: String {
-            "\(section.title)-\(title)"
-        }
-    }
-
     private enum ReservedShortcut {
         static let pasteLastKeyCode: UInt16 = 9 // V
         static let pasteLastModifiersRaw: UInt = NSEvent.ModifierFlags([.command, .option]).rawValue
@@ -4657,6 +4596,8 @@ struct SettingsView: View {
         .init(id: "command", label: "⌘", flag: .command)
     ]
 
+    private let initialRoute: SettingsRoute?
+
     @EnvironmentObject private var settings: SettingsStore
     @StateObject private var whisperModelManager = WhisperModelManager.shared
     @StateObject private var adaptiveCorrectionStore = AdaptiveCorrectionStore.shared
@@ -4665,10 +4606,13 @@ struct SettingsView: View {
     @StateObject private var updateCheckStatusStore = UpdateCheckStatusStore.shared
     @StateObject private var automationAPICoordinator = AutomationAPICoordinator.shared
     @StateObject private var telegramRemoteCoordinator = TelegramRemoteCoordinator.shared
-    @State private var selectedSection: SettingsSection = .essentials
-    @State private var selectedIntegrationsPage: IntegrationsPage = .overview
+    @State private var selectedSection: SettingsSection = .gettingStarted
+    @State private var selectedIntegrationsPage: SettingsAdvancedPage = .overview
     @State private var searchQuery = ""
     @State private var hoveredSection: SettingsSection?
+    @State private var expandedSettingsCards: Set<String> = []
+    @State private var focusedCardID: String?
+    @State private var didApplyInitialRoute = false
     @State private var isCapturingShortcut = false
     @State private var shortcutCaptureTarget: ShortcutCaptureTarget?
     @State private var shortcutCaptureMessage: String?
@@ -4724,8 +4668,13 @@ struct SettingsView: View {
     @State private var automationActionMessage: String?
     @State private var telegramActionMessage: String?
     @State private var telegramBotTokenDraft = ""
-    @State private var computerPermissionSnapshot = PermissionCenter.snapshot(using: .shared)
+
+    init(initialRoute: SettingsRoute? = nil) {
+        self.initialRoute = initialRoute
+    }
+    @State private var computerPermissionSnapshot = PermissionCenter.snapshot(using: .shared, includeExtendedPermissions: false)
     @State private var computerControlStatus: HelperCapabilityStatus?
+    @State private var computerControlRefreshTask: Task<Void, Never>?
     @State private var installClaudeNotificationHook = false
     @State private var installClaudeStopHook = false
     @State private var installClaudeSubagentStopHook = false
@@ -4843,36 +4792,45 @@ struct SettingsView: View {
             if let firstMatch = filteredSearchEntries.first {
                 navigateToSearchEntry(firstMatch)
             } else if let firstSection = filteredSections.first {
-                selectedSection = firstSection
+                applyRoute(SettingsRoute(section: firstSection))
             }
         }
         .onChange(of: selectedSection) { _ in
             cancelShortcutCapture()
-            if selectedSection != .integrations {
+            if selectedSection != .advanced {
                 selectedIntegrationsPage = .overview
             }
-            if selectedSection == .computerControl || selectedSection == .about {
+            if selectedSection == .browserAppControl || selectedSection == .permissionsPrivacy || selectedSection == .advanced {
                 refreshComputerControlState()
+            }
+            if selectedSection != .gettingStarted {
+                settings.settingsLastViewedSection = selectedSection.rawValue
+                if coreGettingStartedReady {
+                    settings.settingsGettingStartedDismissed = true
+                }
             }
         }
         .onAppear {
             sanitizePinnedConversationContextSelection()
             refreshComputerControlState()
+            applyInitialOrDefaultSettingsRouteIfNeeded()
         }
         .onChange(of: promptRewriteConversationStore.contextSummaries) { _ in
             sanitizePinnedConversationContextSelection()
         }
         .onChange(of: settings.browserAutomationEnabled) { _ in
             refreshComputerControlState()
+            AssistantStore.shared.syncRuntimeContext()
         }
         .onChange(of: settings.browserSelectedProfileID) { _ in
             refreshComputerControlState()
+            AssistantStore.shared.syncRuntimeContext()
         }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             refreshComputerControlState()
         }
         .onReceive(NotificationCenter.default.publisher(for: .openAssistOpenAssistantSetup)) { _ in
-            NotificationCenter.default.post(name: .openAssistOpenAIMemoryStudio, object: nil)
+            applyRoute(.gettingStartedHome, persistSelection: false)
         }
         .sheet(isPresented: $isCorrectionEditorPresented) {
             correctionEditorSheet
@@ -4882,31 +4840,219 @@ struct SettingsView: View {
         }
     }
 
+    private var storedLastViewedSettingsSection: SettingsSection? {
+        let rawValue = settings.settingsLastViewedSection.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !rawValue.isEmpty else { return nil }
+        return SettingsSection(rawValue: rawValue)
+    }
+
+    private var requiredVoicePermissionsReady: Bool {
+        settings.accessibilityTrusted
+            && microphoneAuthorized
+            && (settings.transcriptionEngine != .appleSpeech || speechRecognitionAuthorized)
+    }
+
+    private var assistantProviderReady: Bool {
+        if settings.localAISetupCompleted {
+            return true
+        }
+
+        return PromptRewriteProviderMode.allCases.contains { provider in
+            settings.isPromptRewriteProviderConnected(provider)
+        }
+    }
+
+    private var voiceSetupReady: Bool {
+        requiredVoicePermissionsReady && isHoldToTalkShortcutValid && isAssistantLiveVoiceShortcutValid
+    }
+
+    private var browserAutomationSetupReady: Bool {
+        selectedComputerControlProfile != nil
+            && computerPermissionSnapshot.accessibilityGranted
+            && computerPermissionSnapshot.appleEventsGranted
+    }
+
+    private var coreGettingStartedReady: Bool {
+        requiredVoicePermissionsReady && assistantProviderReady && voiceSetupReady
+    }
+
+    private var defaultSettingsRoute: SettingsRoute {
+        if !coreGettingStartedReady || !settings.settingsGettingStartedDismissed {
+            return .gettingStartedHome
+        }
+
+        let preferredSection = storedLastViewedSettingsSection ?? .dailyUse
+        if preferredSection == .gettingStarted {
+            return SettingsRoute(section: .dailyUse)
+        }
+        return SettingsRoute(section: preferredSection)
+    }
+
+    private var gettingStartedSteps: [GettingStartedStep] {
+        [
+            GettingStartedStep(
+                id: "permissions",
+                title: "Required permissions",
+                detail: "Allow Accessibility, Microphone, and Speech Recognition if Apple Speech is selected.",
+                status: requiredVoicePermissionsReady ? .ready : .needsAttention,
+                primaryActionTitle: requiredVoicePermissionsReady ? "Review permissions" : "Grant permissions",
+                destination: SettingsRoute(section: .permissionsPrivacy, cardID: "permissions.overview")
+            ),
+            GettingStartedStep(
+                id: "assistant",
+                title: "Connect assistant or provider",
+                detail: "Use AI Studio for advanced AI providers, models, memory, and local AI.",
+                status: assistantProviderReady ? .ready : .notStarted,
+                primaryActionTitle: "Open AI Studio",
+                destination: SettingsRoute(
+                    section: .advanced,
+                    cardID: "advanced.aiStudio",
+                    opensAIStudio: true
+                )
+            ),
+            GettingStartedStep(
+                id: "voice",
+                title: "Try voice dictation",
+                detail: "Check your microphone, transcription engine, and shortcuts in one place.",
+                status: voiceSetupReady ? .ready : (requiredVoicePermissionsReady ? .notStarted : .needsAttention),
+                primaryActionTitle: "Open voice setup",
+                destination: SettingsRoute(section: .voiceDictation, cardID: "voice.tasks")
+            ),
+            GettingStartedStep(
+                id: "automation",
+                title: "Set up browser and app control",
+                detail: "Optional. Only do this if you want browser reuse, app actions, or Computer Use.",
+                status: browserAutomationSetupReady ? .ready : .notStarted,
+                primaryActionTitle: "Open browser and app control",
+                destination: SettingsRoute(section: .browserAppControl, cardID: "browser.tasks")
+            ),
+            GettingStartedStep(
+                id: "advanced",
+                title: "Open advanced AI settings",
+                detail: SettingsNavigationModel.aiStudioDescription,
+                status: settings.localAISetupCompleted || settings.hasGoogleAIStudioAPIKey ? .ready : .notStarted,
+                primaryActionTitle: "Open AI Studio",
+                destination: SettingsRoute(
+                    section: .advanced,
+                    cardID: "advanced.aiStudio",
+                    opensAIStudio: true
+                )
+            )
+        ]
+    }
+
+    private func applyInitialOrDefaultSettingsRouteIfNeeded() {
+        guard !didApplyInitialRoute else { return }
+        didApplyInitialRoute = true
+        applyRoute(initialRoute ?? defaultSettingsRoute, persistSelection: initialRoute == nil)
+    }
+
+    private func applyRoute(_ route: SettingsRoute, persistSelection: Bool = true) {
+        cancelShortcutCapture()
+        selectedSection = route.section
+        selectedIntegrationsPage = route.advancedPage ?? .overview
+
+        if let cardID = route.cardID {
+            expandedSettingsCards.insert(cardID)
+            if focusedCardID == cardID {
+                focusedCardID = nil
+                DispatchQueue.main.async {
+                    focusedCardID = cardID
+                }
+            } else {
+                focusedCardID = cardID
+            }
+        } else {
+            focusedCardID = nil
+        }
+
+        if persistSelection, route.section != .gettingStarted {
+            settings.settingsLastViewedSection = route.section.rawValue
+        }
+
+        if route.opensAIStudio {
+            openAIStudio()
+        }
+    }
+
+    private func openAIStudio() {
+        cancelShortcutCapture()
+        NotificationCenter.default.post(name: .openAssistOpenAIMemoryStudio, object: nil)
+    }
+
     @ViewBuilder
     private func settingsHeroCard(for section: SettingsSection) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(section.title)
-                .font(.system(size: 22, weight: .bold))
-                .foregroundStyle(AppVisualTheme.foreground(0.94))
-            Text(section.subtitle)
-                .font(.system(size: 13, weight: .regular))
-                .foregroundStyle(AppVisualTheme.foreground(0.58))
+        HStack(alignment: .top, spacing: 14) {
+            AppIconBadge(
+                symbol: section.iconName,
+                tint: section.tint,
+                size: 38,
+                symbolSize: 17,
+                isEmphasized: true
+            )
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Settings Section")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(section.tint.opacity(0.92))
+                    .textCase(.uppercase)
+                    .tracking(0.8)
+
+                Text(section.title)
+                    .font(.system(size: 28, weight: .bold))
+                    .foregroundStyle(AppVisualTheme.foreground(0.96))
+
+                Text(section.subtitle)
+                    .font(.system(size: 13.5, weight: .medium))
+                    .foregroundStyle(AppVisualTheme.foreground(0.62))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Spacer(minLength: 0)
+
+            Text("\(SettingsSection.sidebarSections.firstIndex(of: section).map { $0 + 1 } ?? 0) / \(SettingsSection.sidebarSections.count)")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(section.tint.opacity(0.92))
+                .padding(.horizontal, 10)
+                .padding(.vertical, 7)
+                .background(
+                    Capsule(style: .continuous)
+                        .fill(section.tint.opacity(0.12))
+                        .overlay(
+                            Capsule(style: .continuous)
+                                .stroke(section.tint.opacity(0.22), lineWidth: 0.7)
+                        )
+                )
         }
-        .padding(.horizontal, 4)
-        .padding(.vertical, 6)
+        .padding(.horizontal, 18)
+        .padding(.vertical, 18)
+        .background(
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .fill(AppVisualTheme.foreground(0.03))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 18, style: .continuous)
+                        .fill(
+                            LinearGradient(
+                                colors: [
+                                    section.tint.opacity(0.12),
+                                    Color.clear
+                                ],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            )
+                        )
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 18, style: .continuous)
+                        .stroke(section.tint.opacity(0.16), lineWidth: 0.8)
+                )
+        )
     }
 
     @ViewBuilder
     private var sidebarBrandHeader: some View {
         HStack(spacing: 10) {
-            Image(systemName: "waveform")
-                .font(.system(size: 14, weight: .semibold))
-                .foregroundStyle(AppVisualTheme.accentTint.opacity(0.80))
-                .frame(width: 26, height: 26)
-                .background(
-                    RoundedRectangle(cornerRadius: 6, style: .continuous)
-                        .fill(AppVisualTheme.accentTint.opacity(0.10))
-                )
+            appLogoImage(size: 28)
 
             VStack(alignment: .leading, spacing: 1) {
                 Text("Open Assist")
@@ -4935,7 +5081,7 @@ struct SettingsView: View {
             VStack(spacing: 4) {
                 ForEach(filteredSections) { section in
                     Button {
-                        selectedSection = section
+                        applyRoute(SettingsRoute(section: section))
                     } label: {
                         sidebarSectionRow(for: section)
                     }
@@ -4973,85 +5119,135 @@ struct SettingsView: View {
         let isHovered = hoveredSection == section
         let matchCount = matchCount(for: section)
 
-        HStack(spacing: 10) {
-            Image(systemName: section.iconName)
-                .font(.system(size: 12, weight: .medium))
-                .foregroundStyle(isSelected ? section.tint.opacity(0.95) : AppVisualTheme.foreground(0.54))
-                .frame(width: 22, height: 22)
+        HStack(alignment: .top, spacing: 12) {
+            AppIconBadge(
+                symbol: section.iconName,
+                tint: isSelected ? section.tint : AppVisualTheme.secondaryForeground(0.72),
+                size: 30,
+                symbolSize: 13,
+                isEmphasized: isSelected
+            )
 
-            Text(section.title)
-                .font(.system(size: 13, weight: isSelected ? .semibold : .regular))
-                .foregroundStyle(isSelected ? AppVisualTheme.foreground(0.96) : AppVisualTheme.foreground(0.82))
+            VStack(alignment: .leading, spacing: 3) {
+                Text(section.title)
+                    .font(.system(size: 13.5, weight: isSelected ? .semibold : .medium))
+                    .foregroundStyle(isSelected ? AppVisualTheme.foreground(0.97) : AppVisualTheme.foreground(0.86))
+
+                Text(section.subtitle)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(isSelected ? AppVisualTheme.foreground(0.66) : AppVisualTheme.foreground(0.50))
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
 
             Spacer(minLength: 0)
 
-            if !trimmedSearchQuery.isEmpty && matchCount > 0 {
-                Text("\(matchCount)")
-                    .font(.system(size: 10, weight: .medium))
-                    .foregroundStyle(AppVisualTheme.foreground(0.40))
+            VStack(alignment: .trailing, spacing: 8) {
+                if !trimmedSearchQuery.isEmpty && matchCount > 0 {
+                    Text("\(matchCount)")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(section.tint.opacity(0.92))
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 4)
+                        .background(
+                            Capsule(style: .continuous)
+                                .fill(section.tint.opacity(0.12))
+                        )
+                }
+
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 10, weight: .bold))
+                    .foregroundStyle(isSelected ? section.tint.opacity(0.92) : AppVisualTheme.foreground(0.28))
+                    .padding(7)
+                    .background(
+                        Circle()
+                            .fill(isSelected ? section.tint.opacity(0.12) : AppVisualTheme.foreground(0.04))
+                    )
             }
         }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 6)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
         .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(Rectangle())
         .background(
-            RoundedRectangle(cornerRadius: 7, style: .continuous)
-                .fill(isSelected ? AppVisualTheme.foreground(0.08) : (isHovered ? AppVisualTheme.foreground(0.04) : Color.clear))
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(
+                    isSelected
+                        ? section.tint.opacity(0.10)
+                        : (isHovered ? AppVisualTheme.foreground(0.04) : Color.clear)
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .stroke(
+                            isSelected
+                                ? section.tint.opacity(0.20)
+                                : AppVisualTheme.foreground(isHovered ? 0.08 : 0.03),
+                            lineWidth: 0.8
+                        )
+                )
         )
     }
 
     @ViewBuilder
     private var settingsDetailPane: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
-                settingsHeroCard(for: selectedSection)
+        ScrollViewReader { proxy in
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    settingsHeroCard(for: selectedSection)
 
-                if !trimmedSearchQuery.isEmpty {
-                    searchHighlightsCard
+                    if !trimmedSearchQuery.isEmpty {
+                        searchHighlightsCard
+                    }
+                    sectionContent(for: selectedSection)
                 }
-                sectionContent(for: selectedSection)
+                .padding(.top, 34)
+                .padding(.horizontal, 18)
+                .padding(.bottom, 20)
+                .frame(maxWidth: .infinity, alignment: .topLeading)
             }
-            .padding(.top, 34)
-            .padding(.horizontal, 18)
-            .padding(.bottom, 20)
-            .frame(maxWidth: .infinity, alignment: .topLeading)
+            .onChange(of: focusedCardID) { target in
+                guard let target else { return }
+                DispatchQueue.main.async {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        proxy.scrollTo(target, anchor: .top)
+                    }
+                }
+            }
         }
     }
 
     @ViewBuilder
     private func settingsSectionHeader(for section: SettingsSection) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 8) {
-                AppIconBadge(
-                    symbol: section.iconName,
-                    tint: section.tint,
-                    size: 22,
-                    symbolSize: 10
-                )
+        HStack(spacing: 10) {
+            AppIconBadge(
+                symbol: section.iconName,
+                tint: section.tint,
+                size: 26,
+                symbolSize: 11
+            )
 
-                VStack(alignment: .leading, spacing: 1) {
-                    Text("\(section.title) Controls")
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundStyle(section.tint.opacity(0.88))
-                    Text("Section details")
-                        .font(.system(size: 12, weight: .semibold))
-                        .foregroundStyle(AppVisualTheme.mutedText)
-                }
-
-                Spacer(minLength: 0)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(section.title)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(section.tint.opacity(0.92))
+                Text("Common actions first")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(AppVisualTheme.mutedText)
             }
 
-            LinearGradient(
-                colors: [
-                    section.tint.opacity(0.35),
-                    AppVisualTheme.foreground(0.09),
-                    Color.clear
-                ],
-                startPoint: .leading,
-                endPoint: .trailing
-            )
-            .frame(height: 1)
+            Rectangle()
+                .fill(
+                    LinearGradient(
+                        colors: [
+                            section.tint.opacity(0.24),
+                            AppVisualTheme.foreground(0.06),
+                            Color.clear
+                        ],
+                        startPoint: .leading,
+                        endPoint: .trailing
+                    )
+                )
+                .frame(height: 1)
         }
         .padding(.leading, 2)
         .padding(.trailing, 4)
@@ -5074,38 +5270,43 @@ struct SettingsView: View {
                     Button {
                         navigateToSearchEntry(entry)
                     } label: {
-                        HStack(alignment: .top, spacing: 10) {
+                        HStack(alignment: .center, spacing: 12) {
                             AppIconBadge(
                                 symbol: entry.section.iconName,
                                 tint: entry.section.tint,
-                                size: 24,
-                                symbolSize: 11
+                                size: 28,
+                                symbolSize: 12,
+                                isEmphasized: true
                             )
-                            VStack(alignment: .leading, spacing: 2) {
+
+                            VStack(alignment: .leading, spacing: 3) {
                                 Text(entry.title)
                                     .font(.callout.weight(.semibold))
-                                    .foregroundStyle(AppVisualTheme.foreground(0.94))
+                                    .foregroundStyle(AppVisualTheme.foreground(0.96))
                                 Text(entry.detail)
                                     .font(.caption)
                                     .foregroundStyle(AppVisualTheme.mutedText)
                             }
+
                             Spacer()
-                            Text(entry.section.title)
-                                .font(.caption.weight(.medium))
-                                .foregroundStyle(entry.section.tint)
+
+                            VStack(alignment: .trailing, spacing: 8) {
+                                Text(entry.section.title)
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(entry.section.tint)
+                                Image(systemName: "arrow.up.right")
+                                    .font(.system(size: 10, weight: .bold))
+                                    .foregroundStyle(entry.section.tint.opacity(0.92))
+                            }
                         }
-                        .padding(10)
+                        .padding(12)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .background(
-                            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                .fill(AppVisualTheme.foreground(0.06))
+                            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                .fill(AppVisualTheme.foreground(0.05))
                                 .overlay(
-                                    RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                        .fill(entry.section.tint.opacity(0.08))
-                                )
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                        .stroke(entry.section.tint.opacity(0.22), lineWidth: 0.65)
+                                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                        .stroke(entry.section.tint.opacity(0.18), lineWidth: 0.8)
                                 )
                         )
                     }
@@ -5116,37 +5317,289 @@ struct SettingsView: View {
     }
 
     @ViewBuilder
+    private var gettingStartedSection: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            settingsSectionHeader(for: .gettingStarted)
+
+            settingsCard(
+                id: "gettingStarted.checklist",
+                title: "Getting Started Checklist",
+                subtitle: coreGettingStartedReady
+                    ? "Core setup looks ready. You can still come back here any time for optional steps."
+                    : "Finish the important first steps without hunting through many pages.",
+                symbol: "list.bullet.clipboard.fill",
+                tint: SettingsSection.gettingStarted.tint
+            ) {
+                VStack(alignment: .leading, spacing: 10) {
+                    ForEach(gettingStartedSteps) { step in
+                        gettingStartedStepRow(step)
+                    }
+                }
+
+                HStack {
+                    Spacer()
+                    Button(coreGettingStartedReady ? "Open Daily Use" : "Stay on Setup") {
+                        if coreGettingStartedReady {
+                            applyRoute(SettingsRoute(section: .dailyUse, cardID: "daily.tasks"))
+                        } else {
+                            applyRoute(.gettingStartedHome, persistSelection: false)
+                        }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                }
+            }
+
+            taskCardGroup(
+                id: "gettingStarted.tasks",
+                title: "Quick Setup Shortcuts",
+                subtitle: "Pick the task you want instead of digging through the whole settings tree.",
+                symbol: "sparkles.rectangle.stack.fill",
+                tint: SettingsSection.gettingStarted.tint,
+                tasks: [
+                    ("Set up assistant", "Open AI Studio for advanced AI providers and model setup.", SettingsRoute(section: .advanced, cardID: "advanced.aiStudio", opensAIStudio: true)),
+                    ("Try voice dictation", "Check microphone, shortcuts, and dictation controls.", SettingsRoute(section: .voiceDictation, cardID: "voice.tasks")),
+                    ("Set up browser and app control", "Review browser reuse, app actions, and Computer Use.", SettingsRoute(section: .browserAppControl, cardID: "browser.tasks")),
+                    ("Open advanced AI settings", SettingsNavigationModel.aiStudioDescription, SettingsRoute(section: .advanced, cardID: "advanced.aiStudio", opensAIStudio: true))
+                ]
+            )
+        }
+    }
+
+    @ViewBuilder
+    private var dailyUseSection: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            settingsSectionHeader(for: .dailyUse)
+
+            taskCardGroup(
+                id: "daily.tasks",
+                title: "Daily Tasks",
+                subtitle: "The most common things people want are grouped here first.",
+                symbol: "sparkles",
+                tint: SettingsSection.dailyUse.tint,
+                tasks: [
+                    ("Ask the assistant", "Turn the AI rewrite helper on and review the everyday assistant controls.", SettingsRoute(section: .dailyUse, cardID: "daily.assistant")),
+                    ("Use the agent shortcut", "Jump straight to the voice shortcut that sends speech into Open Assist.", SettingsRoute(section: .voiceDictation, cardID: "shortcuts.agentShortcut")),
+                    ("Use voice dictation", "Open microphone, engine, and shortcut settings.", SettingsRoute(section: .voiceDictation, cardID: "voice.tasks")),
+                    ("Use browser and app automation", "Open browser profile, permissions, and Computer Use controls.", SettingsRoute(section: .browserAppControl, cardID: "browser.tasks")),
+                    ("Advanced AI settings", SettingsNavigationModel.aiStudioDescription, SettingsRoute(section: .advanced, cardID: "advanced.aiStudio", opensAIStudio: true))
+                ]
+            )
+
+            aiMemoryAssistantCard
+            essentialsSection
+        }
+    }
+
+    @ViewBuilder
+    private var voiceDictationSection: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            settingsSectionHeader(for: .voiceDictation)
+
+            taskCardGroup(
+                id: "voice.tasks",
+                title: "Voice & Dictation Tasks",
+                subtitle: "Use this page to test the microphone, pick the engine, and set the shortcuts you actually use.",
+                symbol: "waveform.and.mic",
+                tint: SettingsSection.voiceDictation.tint,
+                tasks: [
+                    ("Test microphone", "Check the input device and auto-detect behavior.", SettingsRoute(section: .voiceDictation, cardID: "speech.inputDevice")),
+                    ("Pick transcription engine", "Switch Apple Speech, whisper.cpp, or a cloud provider.", SettingsRoute(section: .voiceDictation, cardID: "speech.transcriptionEngine")),
+                    ("Change agent shortcut", "Set the shortcut that records directly into Open Assist.", SettingsRoute(section: .voiceDictation, cardID: "shortcuts.agentShortcut")),
+                    ("Manage corrections", "Review learned corrections and add your own replacements.", SettingsRoute(section: .voiceDictation, cardID: "corrections.adaptive"))
+                ]
+            )
+
+            shortcutsSection
+            speechSection
+            correctionsSection
+        }
+    }
+
+    @ViewBuilder
+    private var browserAppControlSection: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            settingsSectionHeader(for: .browserAppControl)
+
+            taskCardGroup(
+                id: "browser.tasks",
+                title: "Browser & App Control Tasks",
+                subtitle: "This is where browser reuse, app actions, and Computer Use now live together.",
+                symbol: "point.3.connected.trianglepath.dotted",
+                tint: SettingsSection.browserAppControl.tint,
+                tasks: [
+                    ("Review permissions", "Check Accessibility, Screen Recording, Apple Events, and Full Disk Access.", SettingsRoute(section: .browserAppControl, cardID: "automation.permissions")),
+                    ("Choose browser profile", "Pick the signed-in Chrome, Brave, or Edge profile to reuse.", SettingsRoute(section: .browserAppControl, cardID: "automation.browserProfile")),
+                    ("Turn on Computer Use", "Control the visible desktop with screenshots plus mouse and keyboard actions.", SettingsRoute(section: .browserAppControl, cardID: "automation.computerUse")),
+                    ("See helper status", "Check whether the local automation helper is ready.", SettingsRoute(section: .browserAppControl, cardID: "automation.helperStatus"))
+                ]
+            )
+
+            computerControlSection
+        }
+    }
+
+    @ViewBuilder
+    private var permissionsPrivacySection: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            settingsSectionHeader(for: .permissionsPrivacy)
+
+            settingsCard(
+                id: "permissions.overview",
+                title: "Permission Overview",
+                subtitle: "See the live status first, then jump to the exact Mac permission you need.",
+                symbol: "hand.raised.fill",
+                tint: SettingsSection.permissionsPrivacy.tint
+            ) {
+                VStack(alignment: .leading, spacing: 10) {
+                    statusBadgeRow(
+                        title: requiredVoicePermissionsReady ? "Core permissions look ready" : "Core permissions still need attention",
+                        detail: requiredVoicePermissionsReady
+                            ? "Accessibility, microphone, and the current speech engine permissions look good."
+                            : "Open Assist needs Accessibility, Microphone, and sometimes Speech Recognition before voice features work well.",
+                        color: requiredVoicePermissionsReady ? .green : .orange
+                    )
+
+                    permissionRow(
+                        name: "Accessibility",
+                        granted: settings.accessibilityTrusted,
+                        hint: "Needed for global shortcuts and text insertion across apps.",
+                        action: {
+                            PermissionCenter.requestAccessibilityPermission(
+                                using: settings,
+                                promptIfNeeded: true,
+                                openSettingsIfDenied: true
+                            )
+                        }
+                    )
+
+                    permissionRow(
+                        name: "Microphone",
+                        granted: microphoneAuthorized,
+                        hint: "Needed to capture speech.",
+                        action: {
+                            requestMicrophonePermission()
+                        }
+                    )
+
+                    permissionRow(
+                        name: "Speech Recognition",
+                        granted: settings.transcriptionEngine == .appleSpeech ? speechRecognitionAuthorized : true,
+                        hint: settings.transcriptionEngine == .appleSpeech
+                            ? "Needed while Apple Speech is selected."
+                            : "Optional while whisper.cpp or a cloud engine is selected.",
+                        action: {
+                            requestSpeechRecognitionPermission()
+                        }
+                    )
+
+                    permissionRow(
+                        name: "Screen Recording",
+                        granted: computerPermissionSnapshot.screenRecordingGranted,
+                        hint: "Needed for Computer Use to capture the current screen.",
+                        action: {
+                            PermissionCenter.requestScreenRecordingPermission(openSettingsIfDenied: true)
+                            refreshComputerControlState()
+                        }
+                    )
+
+                    permissionRow(
+                        name: "Automation / Apple Events",
+                        granted: computerPermissionSnapshot.appleEventsGranted,
+                        hint: "Needed for direct browser and app scripting.",
+                        action: {
+                            PermissionCenter.requestAppleEventsPermission(openSettingsIfDenied: true)
+                            refreshComputerControlState()
+                        }
+                    )
+
+                    permissionRow(
+                        name: "Full Disk Access",
+                        granted: computerPermissionSnapshot.fullDiskAccessGranted,
+                        hint: "Optional. Only needed for protected folders and app data.",
+                        action: {
+                            PermissionCenter.openPrivacySettingsPane(query: "Full Disk Access")
+                            refreshComputerControlState()
+                        }
+                    )
+
+                    HStack(spacing: 8) {
+                        Button("Check Again") {
+                            settings.refreshAccessibilityStatus(prompt: false)
+                            refreshComputerControlState()
+                        }
+                        .buttonStyle(.bordered)
+
+                        Button("Open Privacy Settings") {
+                            PermissionCenter.openPrivacySettingsPane(query: "Privacy")
+                        }
+                        .buttonStyle(.bordered)
+                    }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var advancedSection: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            settingsSectionHeader(for: .advanced)
+
+            settingsCard(
+                id: "advanced.aiStudio",
+                title: "AI Studio",
+                subtitle: SettingsNavigationModel.aiStudioDescription,
+                symbol: "brain.head.profile",
+                tint: SettingsSection.advanced.tint
+            ) {
+                Text("Use AI Studio when you want the deeper AI setup: provider sign-in, model choices, memory, and local AI.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+
+                HStack {
+                    Button("Open AI Studio") {
+                        openAIStudio()
+                    }
+                    .buttonStyle(.borderedProminent)
+
+                    Spacer()
+                }
+            }
+
+            aiProviderStatusCard
+            integrationsSection
+            aboutSection
+        }
+    }
+
+    @ViewBuilder
     private func sectionContent(for section: SettingsSection) -> some View {
         switch section {
-        case .essentials:
-            essentialsSection
-        case .shortcuts:
-            shortcutsSection
-        case .speech:
-            speechSection
-        case .aiModels:
-            aiModelsSection
-        case .computerControl:
-            computerControlSection
-        case .integrations:
-            integrationsSection
-        case .corrections:
-            correctionsSection
-        case .about:
-            aboutSection
+        case .gettingStarted:
+            gettingStartedSection
+        case .dailyUse:
+            dailyUseSection
+        case .voiceDictation:
+            voiceDictationSection
+        case .browserAppControl:
+            browserAppControlSection
+        case .permissionsPrivacy:
+            permissionsPrivacySection
+        case .advanced:
+            advancedSection
         }
     }
 
     @ViewBuilder
     private var essentialsSection: some View {
         VStack(alignment: .leading, spacing: 14) {
-            settingsSectionHeader(for: .essentials)
-            accessibilityCard
+            settingsSectionHeader(for: .dailyUse)
 
             settingsDisclosureCard(
+                id: "daily.output",
                 title: "Dictation Output",
                 symbol: "doc.on.clipboard",
-                tint: AppVisualTheme.accentTint,
+                tint: SettingsSection.dailyUse.tint,
                 isExpanded: $showDictationOutputSettings
             ) {
                 Toggle("Also copy transcript to system clipboard", isOn: $settings.copyToClipboard)
@@ -5154,10 +5607,11 @@ struct SettingsView: View {
             }
 
             settingsDisclosureCard(
+                id: "daily.sounds",
                 title: "Dictation Sounds",
                 subtitle: "Choose the sounds for each dictation event.",
                 symbol: "speaker.wave.2.fill",
-                tint: AppVisualTheme.accentTint,
+                tint: SettingsSection.dailyUse.tint,
                 isExpanded: $showDictationSoundSettings
             ) {
                 VStack(alignment: .leading, spacing: 10) {
@@ -5198,10 +5652,11 @@ struct SettingsView: View {
             }
 
             settingsDisclosureCard(
+                id: "daily.appearance",
                 title: "Appearance & Visual Feedback",
                 subtitle: "Customize waveform colors and visual style.",
                 symbol: "sparkles.tv.fill",
-                tint: AppVisualTheme.accentTint,
+                tint: SettingsSection.dailyUse.tint,
                 isExpanded: $showWaveformAppearanceSettings
             ) {
                 Picker("Color Theme", selection: $settings.colorThemeRawValue) {
@@ -5258,10 +5713,11 @@ struct SettingsView: View {
             }
 
             settingsDisclosureCard(
+                id: "daily.reference",
                 title: "Quick Reference",
                 subtitle: "Reminders for common dictation actions.",
                 symbol: "lightbulb.fill",
-                tint: AppVisualTheme.accentTint,
+                tint: SettingsSection.dailyUse.tint,
                 isExpanded: $showQuickReferenceTips
             ) {
                 VStack(alignment: .leading, spacing: 6) {
@@ -5304,8 +5760,9 @@ struct SettingsView: View {
     @ViewBuilder
     private var shortcutsSection: some View {
         VStack(alignment: .leading, spacing: 14) {
-            settingsSectionHeader(for: .shortcuts)
-            settingsCard(
+            settingsSectionHeader(for: .voiceDictation)
+            settingsCollapsibleCard(
+                id: "shortcuts.holdToTalk",
                 title: "Hold-to-Talk Shortcut",
                 subtitle: "Hold this shortcut while speaking.",
                 symbol: "mic.badge.plus",
@@ -5363,7 +5820,8 @@ struct SettingsView: View {
                 }
             }
 
-            settingsCard(
+            settingsCollapsibleCard(
+                id: "shortcuts.continuousToggle",
                 title: "Continuous Toggle Shortcut",
                 subtitle: "Press once to start, press again to stop.",
                 symbol: "repeat.circle.fill",
@@ -5418,7 +5876,8 @@ struct SettingsView: View {
                 }
             }
 
-            settingsCard(
+            settingsCollapsibleCard(
+                id: "shortcuts.agentShortcut",
                 title: "Agent Shortcut",
                 subtitle: "Hold while speaking. Release to paste into the assistant box.",
                 symbol: "waveform.badge.mic",
@@ -5477,8 +5936,10 @@ struct SettingsView: View {
                 }
             }
 
-            settingsCard(
+            settingsCollapsibleCard(
+                id: "shortcuts.reservedShortcut",
                 title: "Reserved Shortcut",
+                subtitle: "Paste Last Transcript stays fixed so this shortcut is always available.",
                 symbol: "lock.fill",
                 tint: .gray
             ) {
@@ -5497,8 +5958,10 @@ struct SettingsView: View {
 
     @ViewBuilder
     private var microphoneInputCard: some View {
-        settingsCard(
+        settingsCollapsibleCard(
+            id: "speech.inputDevice",
             title: "Input Device",
+            subtitle: "Choose your microphone manually or let Open Assist pick one automatically.",
             symbol: "mic.fill",
             tint: AppVisualTheme.accentTint
         ) {
@@ -5529,14 +5992,16 @@ struct SettingsView: View {
     @ViewBuilder
     private var speechSection: some View {
         VStack(alignment: .leading, spacing: 14) {
-            settingsSectionHeader(for: .speech)
+            settingsSectionHeader(for: .voiceDictation)
             microphoneInputCard
 
-            settingsCard(
-                title: "Transcription Engine",
-                symbol: "waveform",
-                tint: AppVisualTheme.accentTint
-            ) {
+                settingsCollapsibleCard(
+                    id: "speech.transcriptionEngine",
+                    title: "Transcription Engine",
+                    subtitle: "Pick Apple Speech, whisper.cpp, or a remote transcription provider.",
+                    symbol: "waveform",
+                    tint: AppVisualTheme.accentTint
+                ) {
                 HStack {
                     Text("Engine")
                         .font(.callout.weight(.medium))
@@ -5557,7 +6022,8 @@ struct SettingsView: View {
             }
 
             if settings.transcriptionEngine == .appleSpeech {
-                settingsCard(
+                settingsCollapsibleCard(
+                    id: "speech.appleSpeechBehavior",
                     title: "Apple Speech Behavior",
                     subtitle: "Keep common recognition controls visible and tuck advanced tuning below.",
                     symbol: "apple.logo",
@@ -5613,7 +6079,8 @@ struct SettingsView: View {
                     }
                 }
             } else if settings.transcriptionEngine == .whisperCpp {
-                settingsCard(
+                settingsCollapsibleCard(
+                    id: "speech.modelRuntime",
                     title: "Model Runtime",
                     subtitle: "Control whisper.cpp runtime options and active model.",
                     symbol: "cpu.fill",
@@ -5647,7 +6114,8 @@ struct SettingsView: View {
                     }
                 }
 
-                settingsCard(
+                settingsCollapsibleCard(
+                    id: "speech.modelLibrary",
                     title: "Model Library",
                     subtitle: "Use focused controls first, then expand filters when you need to narrow down.",
                     symbol: "shippingbox.fill",
@@ -5733,9 +6201,10 @@ struct SettingsView: View {
                     }
                 }
             } else {
-                settingsCard(
+                settingsCollapsibleCard(
+                    id: "speech.cloudProvider",
                     title: "Cloud Provider",
-                    subtitle: "Bring your own API key and model for cloud transcription.",
+                    subtitle: "Use a provider API key or reuse the ChatGPT / Codex session already signed in on this Mac.",
                     symbol: "network",
                     tint: AppVisualTheme.accentTint
                 ) {
@@ -5810,14 +6279,16 @@ struct SettingsView: View {
                         }
                     }
 
-                    HStack {
-                        Text("Base URL")
-                            .font(.callout.weight(.medium))
-                        Spacer()
-                        TextField("Base URL", text: $settings.cloudTranscriptionBaseURL)
-                            .textFieldStyle(.roundedBorder)
-                            .frame(width: 260)
-                            .autocorrectionDisabled()
+                    if settings.cloudTranscriptionProvider != .codexSession {
+                        HStack {
+                            Text("Base URL")
+                                .font(.callout.weight(.medium))
+                            Spacer()
+                            TextField("Base URL", text: $settings.cloudTranscriptionBaseURL)
+                                .textFieldStyle(.roundedBorder)
+                                .frame(width: 260)
+                                .autocorrectionDisabled()
+                        }
                     }
 
                     HStack {
@@ -5830,36 +6301,45 @@ struct SettingsView: View {
                     }
                     Slider(value: $settings.cloudTranscriptionRequestTimeoutSeconds, in: 5...180, step: 1)
 
-                    HStack(spacing: 8) {
-                        if cloudTranscriptionAPIKeyVisible {
-                            TextField("\(settings.cloudTranscriptionProvider.displayName) API key", text: $settings.cloudTranscriptionAPIKey)
-                                .textFieldStyle(.roundedBorder)
-                                .autocorrectionDisabled()
-                        } else {
-                            SecureField("\(settings.cloudTranscriptionProvider.displayName) API key", text: $settings.cloudTranscriptionAPIKey)
-                                .textFieldStyle(.roundedBorder)
+                    if settings.cloudTranscriptionProvider.requiresAPIKey {
+                        HStack(spacing: 8) {
+                            let apiKeyBinding = cloudTranscriptionAPIKeyBinding
+                            if cloudTranscriptionAPIKeyVisible {
+                                TextField("\(settings.cloudTranscriptionProvider.displayName) API key", text: apiKeyBinding)
+                                    .textFieldStyle(.roundedBorder)
+                                    .autocorrectionDisabled()
+                            } else {
+                                SecureField("\(settings.cloudTranscriptionProvider.displayName) API key", text: apiKeyBinding)
+                                    .textFieldStyle(.roundedBorder)
+                            }
+
+                            Toggle("Show", isOn: $cloudTranscriptionAPIKeyVisible)
+                                .toggleStyle(.checkbox)
+                                .fixedSize()
+
+                            Button {
+                                let pasteboard = NSPasteboard.general
+                                pasteboard.clearContents()
+                                _ = pasteboard.setString(effectiveCloudTranscriptionAPIKey, forType: .string)
+                            } label: {
+                                Image(systemName: "doc.on.doc")
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            .help("Copy API key to clipboard")
+                            .disabled(effectiveCloudTranscriptionAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                         }
 
-                        Toggle("Show", isOn: $cloudTranscriptionAPIKeyVisible)
-                            .toggleStyle(.checkbox)
-                            .fixedSize()
-
-                        Button {
-                            let pasteboard = NSPasteboard.general
-                            pasteboard.clearContents()
-                            _ = pasteboard.setString(settings.cloudTranscriptionAPIKey, forType: .string)
-                        } label: {
-                            Image(systemName: "doc.on.doc")
-                        }
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
-                        .help("Copy API key to clipboard")
-                        .disabled(settings.cloudTranscriptionAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        Text(settings.cloudTranscriptionProvider == .gemini
+                             ? "This Gemini credential is shared with AI Studio prompt rewrite and assistant image generation."
+                             : "Credentials are stored in macOS Keychain.")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Text("No separate API key is required. Open Assist uses the ChatGPT or Codex session already active on this Mac.")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
                     }
-
-                    Text("Credentials are stored in macOS Keychain.")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
 
                     HStack {
                         Button("Reset Provider Defaults") {
@@ -5872,7 +6352,8 @@ struct SettingsView: View {
                 }
             }
 
-            settingsCard(
+            settingsCollapsibleCard(
+                id: "speech.textQuality",
                 title: "Text Quality & Timing",
                 subtitle: "Keep finalize timing visible and place deep text processing in advanced controls.",
                 symbol: "text.badge.checkmark",
@@ -5938,7 +6419,8 @@ struct SettingsView: View {
                 }
             }
 
-            settingsCard(
+            settingsCollapsibleCard(
+                id: "speech.adaptiveCorrectionsLink",
                 title: "Adaptive Corrections",
                 subtitle: "Learning controls and correction management moved to a dedicated section.",
                 symbol: "wand.and.rays",
@@ -5950,7 +6432,7 @@ struct SettingsView: View {
 
                 HStack {
                     Button("Open Corrections") {
-                        selectedSection = .corrections
+                        applyRoute(SettingsRoute(section: .voiceDictation, cardID: "corrections.adaptive"))
                     }
                     .buttonStyle(.borderedProminent)
 
@@ -6008,7 +6490,7 @@ struct SettingsView: View {
     @ViewBuilder
     private var aiModelsSection: some View {
         VStack(alignment: .leading, spacing: 14) {
-            settingsSectionHeader(for: .aiModels)
+            settingsSectionHeader(for: .advanced)
 
             aiMemoryAssistantCard
             aiProviderStatusCard
@@ -6021,10 +6503,11 @@ struct SettingsView: View {
     @ViewBuilder
     private var aiMemoryAssistantCard: some View {
         settingsCard(
-            title: "AI Prompt Assistant",
-            subtitle: "Core toggles first, with style and history controls in collapsible groups.",
+            id: "daily.assistant",
+            title: "Assistant Basics",
+            subtitle: "Everyday assistant writing controls first, with advanced AI setup kept in AI Studio.",
             symbol: "brain.head.profile",
-            tint: AppVisualTheme.accentTint
+            tint: SettingsSection.dailyUse.tint
         ) {
             Toggle("Enable AI prompt correction", isOn: $settings.promptRewriteEnabled)
             if FeatureFlags.aiMemoryEnabled {
@@ -6037,15 +6520,14 @@ struct SettingsView: View {
 
             Divider()
 
-            Text("Advanced rewrite style, conversation-aware history, and context mappings are managed in AI Studio.")
+            Text(SettingsNavigationModel.aiStudioDescription)
                 .font(.caption2)
                 .foregroundStyle(.secondary)
 
             HStack {
                 Spacer()
-                Button("AI Studio…") {
-                    cancelShortcutCapture()
-                    NotificationCenter.default.post(name: .openAssistOpenAIMemoryStudio, object: nil)
+                Button("Open AI Studio") {
+                    openAIStudio()
                 }
                 .buttonStyle(.bordered)
             }
@@ -6062,10 +6544,11 @@ struct SettingsView: View {
     @ViewBuilder
     private var aiProviderStatusCard: some View {
         settingsCard(
+            id: "advanced.providerStatus",
             title: "Provider Connection Status",
-            subtitle: "AI Studio for OAuth and API-key provider setup plus prompt model controls.",
+            subtitle: "Check which AI providers are ready, then open AI Studio if you need to change them.",
             symbol: "network.badge.shield.half.filled",
-            tint: AppVisualTheme.accentTint
+            tint: SettingsSection.advanced.tint
         ) {
             VStack(alignment: .leading, spacing: 8) {
                 HStack {
@@ -6083,8 +6566,8 @@ struct SettingsView: View {
                 HStack {
                     Text("Google Gemini")
                     Spacer()
-                    Text(settings.hasPromptRewriteAPIKey(for: .google) ? "API key set" : "API key missing")
-                        .foregroundStyle(settings.hasPromptRewriteAPIKey(for: .google) ? AppVisualTheme.accentTint : .secondary)
+                    Text(settings.hasGoogleAIStudioAPIKey ? "AI Studio key set" : "AI Studio key missing")
+                        .foregroundStyle(settings.hasGoogleAIStudioAPIKey ? AppVisualTheme.accentTint : .secondary)
                 }
                 HStack {
                     Text("Local AI (Ollama)")
@@ -6099,9 +6582,8 @@ struct SettingsView: View {
                 }
                 HStack {
                     Spacer()
-                    Button("AI Studio…") {
-                        cancelShortcutCapture()
-                        NotificationCenter.default.post(name: .openAssistOpenAIMemoryStudio, object: nil)
+                    Button("Open AI Studio") {
+                        openAIStudio()
                     }
                     .buttonStyle(.borderedProminent)
                 }
@@ -6137,6 +6619,25 @@ struct SettingsView: View {
 
     private var maskedTelegramBotToken: String {
         telegramRemoteCoordinator.maskedBotToken(for: settings)
+    }
+
+    private var effectiveCloudTranscriptionAPIKey: String {
+        settings.cloudTranscriptionProvider == .gemini
+            ? settings.googleAIStudioAPIKey
+            : settings.cloudTranscriptionAPIKey
+    }
+
+    private var cloudTranscriptionAPIKeyBinding: Binding<String> {
+        Binding(
+            get: { effectiveCloudTranscriptionAPIKey },
+            set: { newValue in
+                if settings.cloudTranscriptionProvider == .gemini {
+                    settings.googleAIStudioAPIKey = newValue
+                } else {
+                    settings.cloudTranscriptionAPIKey = newValue
+                }
+            }
+        )
     }
 
     private var automationAPIPortTextBinding: Binding<String> {
@@ -6277,7 +6778,7 @@ struct SettingsView: View {
             Button {
                 selectedIntegrationsPage = .overview
             } label: {
-                Label("Back to Integrations", systemImage: "chevron.left")
+                Label("Back to Advanced", systemImage: "chevron.left")
                     .font(.callout.weight(.medium))
             }
             .buttonStyle(.plain)
@@ -6300,7 +6801,7 @@ struct SettingsView: View {
             Button {
                 selectedIntegrationsPage = .overview
             } label: {
-                Label("Back to Integrations", systemImage: "chevron.left")
+                Label("Back to Advanced", systemImage: "chevron.left")
                     .font(.callout.weight(.medium))
             }
             .buttonStyle(.plain)
@@ -6323,9 +6824,10 @@ struct SettingsView: View {
             switch selectedIntegrationsPage {
             case .overview:
                 VStack(alignment: .leading, spacing: 14) {
-                    settingsSectionHeader(for: .integrations)
+                    settingsSectionHeader(for: .advanced)
 
-                    settingsCard(
+                    settingsCollapsibleCard(
+                        id: "integrations.overview.automationNotifications",
                         title: "Automation & Notifications",
                         subtitle: "Keep integrations simple here, then open the focused page when you need the details.",
                         symbol: "point.3.connected.trianglepath.dotted",
@@ -6347,7 +6849,8 @@ struct SettingsView: View {
                         }
                     }
 
-                    settingsCard(
+                    settingsCollapsibleCard(
+                        id: "integrations.overview.telegramRemote",
                         title: "Telegram Remote",
                         subtitle: "Control one Open Assist session at a time from your private Telegram chat.",
                         symbol: "paperplane.fill",
@@ -6380,7 +6883,8 @@ struct SettingsView: View {
                             .foregroundStyle(.secondary)
                     }
 
-                    settingsCard(
+                    settingsCollapsibleCard(
+                        id: "integrations.notifications.sources",
                         title: "Sources",
                         subtitle: "Choose which tools are allowed to notify through Open Assist.",
                         symbol: "switch.2",
@@ -6395,7 +6899,8 @@ struct SettingsView: View {
                             .foregroundStyle(.secondary)
                     }
 
-                    settingsCard(
+                    settingsCollapsibleCard(
+                        id: "integrations.notifications.delivery",
                         title: "Delivery",
                         subtitle: "These sound, speech, and desktop alert choices are shared across every source.",
                         symbol: "speaker.wave.3.fill",
@@ -6468,7 +6973,8 @@ struct SettingsView: View {
                         }
                     }
 
-                    settingsCard(
+                    settingsCollapsibleCard(
+                        id: "integrations.notifications.localAPI",
                         title: "Local API & Examples",
                         subtitle: "Set up Claude Code from this page, then copy the Codex CLI example if you need it.",
                         symbol: "terminal.fill",
@@ -6585,7 +7091,8 @@ struct SettingsView: View {
                         }
                     }
 
-                    settingsCard(
+                    settingsCollapsibleCard(
+                        id: "integrations.notifications.status",
                         title: "Status",
                         subtitle: "Quick status for the local API, Codex CLI, and Codex Cloud beta.",
                         symbol: "info.circle.fill",
@@ -6645,7 +7152,8 @@ struct SettingsView: View {
                             .foregroundStyle(.secondary)
                     }
 
-                    settingsCard(
+                    settingsCollapsibleCard(
+                        id: "integrations.telegram.setup",
                         title: "Setup",
                         subtitle: "Paste your bot token, then approve your private Telegram DM.",
                         symbol: "paperplane.fill",
@@ -6724,7 +7232,8 @@ struct SettingsView: View {
                         .fixedSize(horizontal: false, vertical: true)
                     }
 
-                    settingsCard(
+                    settingsCollapsibleCard(
+                        id: "integrations.telegram.pairing",
                         title: "Pairing",
                         subtitle: "Only one approved private Telegram DM can control Open Assist in this first version.",
                         symbol: "person.crop.circle.badge.checkmark",
@@ -6781,7 +7290,8 @@ struct SettingsView: View {
                         }
                     }
 
-                    settingsCard(
+                    settingsCollapsibleCard(
+                        id: "integrations.telegram.behavior",
                         title: "Behavior",
                         subtitle: "Telegram shows one active session view so different Open Assist sessions do not get mixed together.",
                         symbol: "rectangle.3.group.bubble.left.fill",
@@ -6795,7 +7305,8 @@ struct SettingsView: View {
                         .fixedSize(horizontal: false, vertical: true)
                     }
 
-                    settingsCard(
+                    settingsCollapsibleCard(
+                        id: "integrations.telegram.status",
                         title: "Status",
                         subtitle: "See bot identity, pairing state, and polling health.",
                         symbol: "info.circle.fill",
@@ -6842,9 +7353,10 @@ struct SettingsView: View {
     @ViewBuilder
     private var correctionsSection: some View {
         VStack(alignment: .leading, spacing: 14) {
-            settingsSectionHeader(for: .corrections)
+            settingsSectionHeader(for: .voiceDictation)
 
-            settingsCard(
+            settingsCollapsibleCard(
+                id: "corrections.adaptive",
                 title: "Adaptive Corrections",
                 subtitle: "Learn from quick edits and manage learned replacements.",
                 symbol: "text.badge.checkmark",
@@ -7746,7 +8258,7 @@ struct SettingsView: View {
     private func refreshCloudTranscriptionModels(showMessage: Bool) {
         let provider = settings.cloudTranscriptionProvider
         let baseURL = settings.cloudTranscriptionBaseURL
-        let apiKey = settings.cloudTranscriptionAPIKey
+        let apiKey = effectiveCloudTranscriptionAPIKey
 
         let requestToken = UUID()
         cloudTranscriptionModelRequestToken = requestToken
@@ -7801,8 +8313,140 @@ struct SettingsView: View {
     }
 
     @ViewBuilder
+    private func gettingStartedStepRow(_ step: GettingStartedStep) -> some View {
+        HStack(alignment: .top, spacing: 12) {
+            AppIconBadge(
+                symbol: step.status == .ready ? "checkmark.circle.fill" : "circle.dashed",
+                tint: step.status.tint,
+                size: 28,
+                symbolSize: 12,
+                isEmphasized: step.status == .ready
+            )
+
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 8) {
+                    Text(step.title)
+                        .font(.callout.weight(.semibold))
+                        .foregroundStyle(AppVisualTheme.foreground(0.94))
+
+                    Text(step.status.label)
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(step.status.tint)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(
+                            Capsule()
+                                .fill(step.status.tint.opacity(0.14))
+                        )
+                }
+
+                Text(step.detail)
+                    .font(.caption)
+                    .foregroundStyle(AppVisualTheme.mutedText)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Spacer(minLength: 0)
+
+            Button(step.primaryActionTitle) {
+                applyRoute(step.destination, persistSelection: false)
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.small)
+        }
+        .padding(.vertical, 8)
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(AppVisualTheme.foreground(0.06))
+                .frame(height: 1)
+                .padding(.leading, 40)
+        }
+    }
+
+    @ViewBuilder
+    private func taskCardGroup(
+        id: String,
+        title: String,
+        subtitle: String,
+        symbol: String,
+        tint: Color,
+        tasks: [(title: String, detail: String, destination: SettingsRoute)]
+    ) -> some View {
+        settingsCard(
+            id: id,
+            title: title,
+            subtitle: subtitle,
+            symbol: symbol,
+            tint: tint
+        ) {
+            VStack(alignment: .leading, spacing: 10) {
+                ForEach(Array(tasks.enumerated()), id: \.offset) { _, task in
+                    routeActionCard(
+                        title: task.title,
+                        detail: task.detail,
+                        tint: tint,
+                        destination: task.destination
+                    )
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func routeActionCard(
+        title: String,
+        detail: String,
+        tint: Color,
+        destination: SettingsRoute
+    ) -> some View {
+        Button {
+            applyRoute(destination)
+        } label: {
+            HStack(alignment: .center, spacing: 12) {
+                AppIconBadge(
+                    symbol: destination.section.iconName,
+                    tint: tint,
+                    size: 28,
+                    symbolSize: 12
+                )
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(title)
+                        .font(.callout.weight(.semibold))
+                        .foregroundStyle(AppVisualTheme.foreground(0.95))
+                    Text(detail)
+                        .font(.caption)
+                        .foregroundStyle(AppVisualTheme.mutedText)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                Spacer(minLength: 0)
+
+                VStack(alignment: .trailing, spacing: 6) {
+                    Text(destination.opensAIStudio ? "AI Studio" : "Open")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(tint.opacity(0.92))
+                    Image(systemName: "arrow.up.right")
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundStyle(tint.opacity(0.92))
+                }
+            }
+            .padding(.vertical, 10)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(AppVisualTheme.foreground(0.06))
+                .frame(height: 1)
+                .padding(.leading, 40)
+        }
+    }
+
+    @ViewBuilder
     @MainActor
     private func settingsCard<Content: View>(
+        id: String? = nil,
         title: String,
         subtitle: String? = nil,
         symbol: String? = nil,
@@ -7810,28 +8454,29 @@ struct SettingsView: View {
         @ViewBuilder content: () -> Content
     ) -> some View {
         let tint = tint ?? AppVisualTheme.accentTint
+        let isFocused = focusedCardID == id
+        let cardIdentity = id ?? "settings-card-\(title)-\(subtitle ?? "")"
         VStack(alignment: .leading, spacing: 12) {
             HStack(alignment: .top, spacing: 10) {
                 if let symbol {
-                    Image(systemName: symbol)
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundStyle(tint.opacity(0.85))
-                        .frame(width: 22, height: 22)
-                        .background(
-                            RoundedRectangle(cornerRadius: 5, style: .continuous)
-                                .fill(tint.opacity(0.12))
-                        )
+                    AppIconBadge(
+                        symbol: symbol,
+                        tint: tint,
+                        size: 30,
+                        symbolSize: 13,
+                        isEmphasized: true
+                    )
                 }
 
                 VStack(alignment: .leading, spacing: 2) {
                     Text(title)
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(AppVisualTheme.foreground(0.90))
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(AppVisualTheme.foreground(0.95))
 
                     if let subtitle {
                         Text(subtitle)
-                            .font(.system(size: 11, weight: .regular))
-                            .foregroundStyle(AppVisualTheme.foreground(0.54))
+                            .font(.system(size: 11.5, weight: .medium))
+                            .foregroundStyle(AppVisualTheme.foreground(0.58))
                     }
                 }
 
@@ -7840,20 +8485,37 @@ struct SettingsView: View {
 
             content()
         }
-        .padding(14)
+        .padding(16)
         .background(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(AppVisualTheme.foreground(0.03))
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .fill(AppVisualTheme.foreground(0.035))
                 .overlay(
-                    RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .stroke(AppVisualTheme.foreground(0.06), lineWidth: 0.5)
+                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        .fill(
+                            LinearGradient(
+                                colors: [
+                                    tint.opacity(0.06),
+                                    Color.clear
+                                ],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            )
+                        )
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        .stroke(isFocused ? tint.opacity(0.65) : AppVisualTheme.foreground(0.06), lineWidth: isFocused ? 1.1 : 0.5)
                 )
         )
+        .shadow(color: isFocused ? tint.opacity(0.16) : .black.opacity(0.06), radius: isFocused ? 12 : 6, x: 0, y: 5)
+        .toggleStyle(.switch)
+        .id(cardIdentity)
     }
 
     @MainActor
     @ViewBuilder
     private func settingsDisclosureCard<Content: View>(
+        id: String? = nil,
         title: String,
         subtitle: String? = nil,
         symbol: String? = nil,
@@ -7862,41 +8524,56 @@ struct SettingsView: View {
         @ViewBuilder content: @escaping () -> Content
     ) -> some View {
         let tint = tint ?? AppVisualTheme.accentTint
+        let isFocused = focusedCardID == id
+        let cardIdentity = id ?? "settings-disclosure-\(title)-\(subtitle ?? "")"
         VStack(alignment: .leading, spacing: 10) {
             Button {
                 withAnimation(.easeInOut(duration: 0.2)) { isExpanded.wrappedValue.toggle() }
             } label: {
                 HStack(alignment: .top, spacing: 10) {
                     if let symbol {
-                        Image(systemName: symbol)
-                            .font(.system(size: 12, weight: .medium))
-                            .foregroundStyle(tint.opacity(0.85))
-                            .frame(width: 22, height: 22)
-                            .background(
-                                RoundedRectangle(cornerRadius: 5, style: .continuous)
-                                    .fill(tint.opacity(0.12))
-                            )
+                        AppIconBadge(
+                            symbol: symbol,
+                            tint: tint,
+                            size: 30,
+                            symbolSize: 13,
+                            isEmphasized: isExpanded.wrappedValue || isFocused
+                        )
                     }
 
                     VStack(alignment: .leading, spacing: 2) {
                         Text(title)
-                            .font(.system(size: 13, weight: .semibold))
-                            .foregroundStyle(AppVisualTheme.foreground(0.90))
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(AppVisualTheme.foreground(0.95))
 
                         if let subtitle {
                             Text(subtitle)
-                                .font(.system(size: 11, weight: .regular))
-                                .foregroundStyle(AppVisualTheme.foreground(0.54))
+                                .font(.system(size: 11.5, weight: .medium))
+                                .foregroundStyle(AppVisualTheme.foreground(0.58))
                         }
                     }
 
                     Spacer(minLength: 0)
 
-                    Image(systemName: "chevron.right")
-                        .rotationEffect(.degrees(isExpanded.wrappedValue ? 90 : 0))
-                        .font(.system(size: 10, weight: .medium))
-                        .foregroundStyle(AppVisualTheme.foreground(0.34))
-                        .padding(.top, 2)
+                    HStack(spacing: 6) {
+                        Text(isExpanded.wrappedValue ? "Hide" : "Open")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(tint.opacity(0.92))
+                        Image(systemName: "chevron.right")
+                            .rotationEffect(.degrees(isExpanded.wrappedValue ? 90 : 0))
+                            .font(.system(size: 10, weight: .bold))
+                            .foregroundStyle(tint.opacity(0.92))
+                    }
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 6)
+                    .background(
+                        Capsule(style: .continuous)
+                            .fill(tint.opacity(0.12))
+                            .overlay(
+                                Capsule(style: .continuous)
+                                    .stroke(tint.opacity(0.18), lineWidth: 0.7)
+                            )
+                    )
                 }
                 .contentShape(Rectangle())
             }
@@ -7909,14 +8586,64 @@ struct SettingsView: View {
                 .padding(.top, 4)
             }
         }
-        .padding(14)
+        .padding(16)
         .background(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(AppVisualTheme.foreground(0.03))
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .fill(AppVisualTheme.foreground(0.035))
                 .overlay(
-                    RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .stroke(AppVisualTheme.foreground(0.07), lineWidth: 0.5)
+                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        .fill(
+                            LinearGradient(
+                                colors: [
+                                    tint.opacity(0.06),
+                                    Color.clear
+                                ],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            )
+                        )
                 )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        .stroke(isFocused ? tint.opacity(0.65) : AppVisualTheme.foreground(0.07), lineWidth: isFocused ? 1.1 : 0.5)
+                )
+        )
+        .shadow(color: isFocused ? tint.opacity(0.16) : .black.opacity(0.06), radius: isFocused ? 12 : 6, x: 0, y: 5)
+        .toggleStyle(.switch)
+        .id(cardIdentity)
+    }
+
+    private func settingsCardExpansion(_ id: String) -> Binding<Bool> {
+        Binding(
+            get: { expandedSettingsCards.contains(id) },
+            set: { isExpanded in
+                if isExpanded {
+                    expandedSettingsCards.insert(id)
+                } else {
+                    expandedSettingsCards.remove(id)
+                }
+            }
+        )
+    }
+
+    @MainActor
+    @ViewBuilder
+    private func settingsCollapsibleCard<Content: View>(
+        id: String,
+        title: String,
+        subtitle: String? = nil,
+        symbol: String? = nil,
+        tint: Color? = nil,
+        @ViewBuilder content: @escaping () -> Content
+    ) -> some View {
+        settingsDisclosureCard(
+            id: id,
+            title: title,
+            subtitle: subtitle,
+            symbol: symbol,
+            tint: tint,
+            isExpanded: settingsCardExpansion(id),
+            content: content
         )
     }
 
@@ -8030,105 +8757,23 @@ struct SettingsView: View {
     }
 
     private var trimmedSearchQuery: String {
-        searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        SettingsNavigationModel.normalizedSearchQuery(searchQuery)
     }
 
     private var searchEntries: [SettingSearchEntry] {
-        [
-            .init(section: .essentials, title: "Accessibility access", detail: "Grant or verify accessibility permission", keywords: ["accessibility", "permission", "grant"]),
-            .init(section: .essentials, title: "Copy transcript to clipboard", detail: "Automatically copy inserted voice results", keywords: ["clipboard", "copy", "output"]),
-            .init(section: .essentials, title: "Dictation sound profile", detail: "Choose tones for start, stop, processing, and pasted cues", keywords: ["sound", "start", "listening", "feedback", "processing", "stop", "pasted"]),
-            .init(section: .essentials, title: "Waveform theme", detail: "Choose visual waveform style", keywords: ["waveform", "theme", "appearance"]),
-            .init(section: .shortcuts, title: "Hold-to-talk shortcut", detail: "Set keys for press-and-hold voice capture", keywords: ["hold", "shortcut", "keyboard"]),
-            .init(section: .shortcuts, title: "Mute shortcut system sounds", detail: "Optionally suppress beeps while hold-to-talk is pressed", keywords: ["mute", "beep", "sound", "hold", "shortcut"]),
-            .init(section: .shortcuts, title: "Manual shortcut map", detail: "Click modifiers and choose a key manually", keywords: ["manual", "map", "shortcut", "click", "keys"]),
-            .init(section: .shortcuts, title: "Continuous toggle shortcut", detail: "Set keys for start/stop continuous voice capture", keywords: ["continuous", "toggle", "shortcut"]),
-            .init(section: .shortcuts, title: "Agent shortcut", detail: "Hold to speak, then release to paste into the assistant box", keywords: ["assistant", "agent", "voice", "shortcut", "keyboard", "hold", "paste"]),
-            .init(section: .shortcuts, title: "Paste last transcript", detail: "Reserved shortcut: ⌥⌘V", keywords: ["paste", "last transcript", "reserved"]),
-            .init(section: .speech, title: "Auto-detect microphone", detail: "Automatically use best available input", keywords: ["microphone", "input", "auto"]),
-            .init(section: .speech, title: "Microphone device picker", detail: "Choose a specific microphone manually", keywords: ["microphone", "device", "picker"]),
-            .init(section: .speech, title: "Transcription engine", detail: "Switch between Apple Speech, whisper.cpp, and cloud providers", keywords: ["engine", "whisper", "apple", "cloud", "openai", "groq", "deepgram", "gemini", "api key", "recognition"]),
-            .init(section: .speech, title: "Contextual language bias", detail: "Improve recognition with likely words", keywords: ["context", "bias", "recognition"]),
-            .init(section: .speech, title: "Preserve words across pauses", detail: "Prevent dropped words in short pauses", keywords: ["pause", "preserve", "recognition"]),
-            .init(section: .speech, title: "Recognition mode", detail: "Choose local/cloud behavior for Apple Speech", keywords: ["on-device", "cloud", "privacy", "recognition"]),
-            .init(section: .speech, title: "Automatic punctuation", detail: "Enable punctuation from Apple Speech", keywords: ["punctuation", "speech"]),
-            .init(section: .speech, title: "Finalize delay", detail: "Control speed vs stability before insertion", keywords: ["delay", "finalize", "timing"]),
-            .init(section: .speech, title: "Cleanup mode", detail: "Light or aggressive text cleanup", keywords: ["cleanup", "mode"]),
-            .init(section: .speech, title: "Custom phrases", detail: "Add names, acronyms, and domain language", keywords: ["phrases", "vocabulary", "context"]),
-            .init(section: .speech, title: "whisper model install", detail: "Download and manage all whisper.cpp models", keywords: ["model", "download", "whisper", "tiny", "base", "small", "medium", "large"]),
-            .init(section: .speech, title: "whisper Core ML", detail: "Use Core ML encoder when available", keywords: ["core ml", "ane", "whisper", "speed"]),
-            .init(section: .speech, title: "whisper idle unload", detail: "Unload whisper context after inactivity to reduce memory", keywords: ["memory", "idle", "unload", "whisper", "context"]),
-            .init(section: .corrections, title: "Adaptive corrections", detail: "Learn from your quick word/phrase fixes", keywords: ["adaptive", "learned", "corrections", "backspace"]),
-            .init(section: .corrections, title: "Correction learned sound", detail: "Choose a tone when a new correction is learned", keywords: ["sound", "beep", "feedback", "correction", "learned"]),
-            .init(section: .corrections, title: "Learned corrections list", detail: "View, remove, or clear saved corrections", keywords: ["learned", "list", "remove", "clear"]),
-            .init(section: .aiModels, title: "AI prompt correction toggle", detail: "Enable or disable AI prompt rewrite assistance", keywords: ["prompt", "rewrite", "toggle", "enable", "ai"]),
-            .init(section: .aiModels, title: "Auto-insert high-confidence suggestions", detail: "Skip preview and insert AI suggestion immediately when confidence is at least 85%", keywords: ["auto", "insert", "confidence", "rewrite", "preview"]),
-            .init(section: .aiModels, title: "Markdown suggestion conversion", detail: "Always convert AI suggestions to Markdown before insertion", keywords: ["markdown", "format", "rewrite", "insert", "assistant"]),
-            .init(section: .aiModels, title: "Rewrite style preset", detail: "Choose formal, casual, architect, developer, or writer voice", keywords: ["style", "tone", "formal", "casual", "architect", "senior", "junior", "writer"]),
-            .init(section: .aiModels, title: "Custom style instructions", detail: "Provide tone-only rewrite guidance without changing refine-only behavior", keywords: ["custom", "style", "persona", "voice", "architect", "developer", "writer", "instruction", "tone-only"]),
-            .init(section: .aiModels, title: "Conversation-aware rewrite history", detail: "Opt in to rolling history scoped by app and screen", keywords: ["conversation", "history", "context", "app", "screen", "rewrite"]),
-            .init(section: .aiModels, title: "Rewrite conversation timeout", detail: "Expire conversation buckets after inactivity", keywords: ["timeout", "expire", "conversation", "history", "minutes"]),
-            .init(section: .aiModels, title: "Rewrite history source switch", detail: "Pin to a saved context or use automatic app/screen context", keywords: ["switch", "pin", "context", "history", "conversation"]),
-            .init(section: .aiModels, title: "Provider connection status", detail: "See OAuth and API key status for OpenAI, Anthropic, and Google Gemini", keywords: ["provider", "oauth", "api key", "openai", "anthropic", "google", "gemini", "connection"]),
-            .init(section: .aiModels, title: "AI Studio", detail: "Launch dedicated AI page for provider and prompt model controls", keywords: ["ai", "studio", "providers", "models", "rewrite"]),
-            .init(section: .computerControl, title: "Automation permissions", detail: "Review Automation and Full Disk Access for browser and app actions", keywords: ["automation", "apple events", "full disk", "browser"]),
-            .init(section: .computerControl, title: "Browser profile", detail: "Choose the Chrome, Brave, or Edge profile Open Assist should reuse", keywords: ["browser", "profile", "chrome", "brave", "edge", "session"]),
-            .init(section: .computerControl, title: "Helper status", detail: "See local automation helper readiness and current setup issues", keywords: ["helper", "status", "issues", "readiness"]),
-            .init(section: .computerControl, title: "Supported app actions", detail: "See Finder, Terminal, Calendar, System Settings, Reminders, Contacts, Notes, and Messages actions", keywords: ["finder", "terminal", "calendar", "system settings", "app action", "messages", "notes", "contacts", "reminders"]),
-            .init(section: .computerControl, title: "Approval behavior", detail: "Understand session approvals and high-risk confirmation rules", keywords: ["approval", "allow", "session", "confirmation", "risky"]),
-            .init(section: .integrations, title: "Automation & notifications", detail: "Open the focused page for Claude Code, Codex CLI, and Codex Cloud alerts", keywords: ["automation", "notifications", "sources", "codex", "claude"], integrationsPage: .automationNotifications),
-            .init(section: .integrations, title: "Enable automation API", detail: "Run a localhost API for Claude Code and Codex CLI", keywords: ["automation", "api", "localhost", "server", "claude", "codex"], integrationsPage: .automationNotifications),
-            .init(section: .integrations, title: "Automation API token", detail: "Copy or rotate the local bearer token", keywords: ["token", "bearer", "auth", "copy", "rotate"], integrationsPage: .automationNotifications),
-            .init(section: .integrations, title: "Claude hook examples", detail: "Copy sample Notification and Stop hook snippets", keywords: ["claude", "hook", "notification", "stop", "subagent", "curl"], integrationsPage: .automationNotifications),
-            .init(section: .integrations, title: "Codex CLI notify config", detail: "Copy the Codex CLI notify snippet for ~/.codex/config.toml", keywords: ["codex", "notify", "config", "toml", "cloud"], integrationsPage: .automationNotifications),
-            .init(section: .integrations, title: "Codex Cloud beta", detail: "Watch local codex cloud tasks and alert when they are ready or fail", keywords: ["codex", "cloud", "beta", "polling", "ready", "failed"], integrationsPage: .automationNotifications),
-            .init(section: .integrations, title: "Automation notification permission", detail: "Allow desktop notifications for local API alerts", keywords: ["notification", "permission", "desktop", "grant"], integrationsPage: .automationNotifications),
-            .init(section: .integrations, title: "Telegram remote", detail: "Control the selected Open Assist session from a private Telegram bot chat", keywords: ["telegram", "remote", "bot", "chat", "session"], integrationsPage: .telegramRemote),
-            .init(section: .integrations, title: "Telegram bot token", detail: "Paste, copy, test, or clear your Telegram bot token", keywords: ["telegram", "botfather", "token", "paste", "copy"], integrationsPage: .telegramRemote),
-            .init(section: .integrations, title: "Telegram pairing", detail: "Approve or forget the private Telegram chat that can control Open Assist", keywords: ["telegram", "pairing", "approve", "private", "chat"], integrationsPage: .telegramRemote),
-            .init(section: .integrations, title: "Telegram setup steps", detail: "Follow the built-in BotFather and /start setup guide", keywords: ["telegram", "setup", "steps", "botfather", "start"], integrationsPage: .telegramRemote),
-            .init(section: .integrations, title: "Telegram session switching", detail: "Switch sessions without mixing messages from different chats", keywords: ["telegram", "switch", "session", "messages", "mixed"], integrationsPage: .telegramRemote),
-            .init(section: .about, title: "Permission overview", detail: "See accessibility, mic, and speech status", keywords: ["permissions", "accessibility", "microphone", "speech"]),
-            .init(section: .about, title: "Crash logs", detail: "Open existing crash logs in Finder", keywords: ["crash", "logs", "diagnostics"]),
-            .init(section: .about, title: "Uninstall Open Assist", detail: "Remove app and clear saved settings", keywords: ["uninstall", "remove", "reset"])
-        ]
+        SettingsNavigationModel.searchEntries
     }
 
     private var filteredSearchEntries: [SettingSearchEntry] {
-        guard !trimmedSearchQuery.isEmpty else { return [] }
-        return searchEntries.filter { entry in
-            let haystack = ([entry.title, entry.detail] + entry.keywords).joined(separator: " ").lowercased()
-            return haystack.contains(trimmedSearchQuery)
-        }
+        SettingsNavigationModel.filteredSearchEntries(for: searchQuery)
     }
 
     private func navigateToSearchEntry(_ entry: SettingSearchEntry) {
-        selectedSection = entry.section
-        if entry.section == .integrations {
-            selectedIntegrationsPage = entry.integrationsPage ?? .overview
-        }
+        applyRoute(entry.destination)
     }
 
     private var filteredSections: [SettingsSection] {
-        let availableSections = SettingsSection.allCases
-
-        guard !trimmedSearchQuery.isEmpty else {
-            return availableSections
-        }
-
-        let query = trimmedSearchQuery
-        let fromSectionTerms = availableSections.filter { section in
-            let sectionHaystack = ([section.title, section.subtitle] + section.searchTerms)
-                .joined(separator: " ")
-                .lowercased()
-            return sectionHaystack.contains(query)
-        }
-        let fromEntries = Set(filteredSearchEntries.map(\.section))
-
-        let combined = availableSections.filter { section in
-            fromSectionTerms.contains(section) || fromEntries.contains(section)
-        }
-        return combined
+        SettingsNavigationModel.filteredSections(for: searchQuery)
     }
 
     private var canSubmitCorrectionDraft: Bool {
@@ -8265,15 +8910,40 @@ struct SettingsView: View {
     @ViewBuilder
     private var computerControlSection: some View {
         VStack(alignment: .leading, spacing: 14) {
-            settingsSectionHeader(for: .computerControl)
+            settingsSectionHeader(for: .browserAppControl)
 
-            settingsCard(
+            settingsCollapsibleCard(
+                id: "automation.permissions",
                 title: "Automation Permissions",
-                subtitle: "Grant only the Mac permissions needed for browser reuse and direct app actions.",
+                subtitle: "Grant only the Mac permissions needed for browser reuse, direct app actions, and Computer Use.",
                 symbol: "hand.raised.fill",
-                tint: SettingsSection.computerControl.tint
+                tint: SettingsSection.browserAppControl.tint
             ) {
                 VStack(alignment: .leading, spacing: 10) {
+                    permissionRow(
+                        name: "Accessibility",
+                        granted: computerPermissionSnapshot.accessibilityGranted,
+                        hint: "Needed for Computer Use to click and type on the live desktop.",
+                        action: {
+                            PermissionCenter.requestAccessibilityPermission(
+                                using: settings,
+                                promptIfNeeded: true,
+                                openSettingsIfDenied: true
+                            )
+                            refreshComputerControlState()
+                        }
+                    )
+
+                    permissionRow(
+                        name: "Screen Recording",
+                        granted: computerPermissionSnapshot.screenRecordingGranted,
+                        hint: "Needed for Computer Use to capture the current screen.",
+                        action: {
+                            PermissionCenter.requestScreenRecordingPermission(openSettingsIfDenied: true)
+                            refreshComputerControlState()
+                        }
+                    )
+
                     permissionRow(
                         name: "Automation / Apple Events",
                         granted: computerPermissionSnapshot.appleEventsGranted,
@@ -8312,22 +8982,24 @@ struct SettingsView: View {
                 }
             }
 
-            settingsCard(
+            settingsCollapsibleCard(
+                id: "automation.appAccess",
                 title: "Automation App Access",
                 subtitle: "Ask macOS for the same per-app Automation entries that older builds may already have.",
                 symbol: "switch.2",
-                tint: SettingsSection.computerControl.tint
+                tint: SettingsSection.browserAppControl.tint
             ) {
                 AutomationAccessSettingsView {
                     refreshComputerControlState()
                 }
             }
 
-            settingsCard(
+            settingsCollapsibleCard(
+                id: "automation.helperStatus",
                 title: "Local Helper Status",
-                subtitle: "See whether the local automation layer is ready to run browser and app actions.",
+                subtitle: "See whether the local automation layer is ready to run browser, app, and Computer Use actions.",
                 symbol: "desktopcomputer",
-                tint: SettingsSection.computerControl.tint
+                tint: SettingsSection.browserAppControl.tint
             ) {
                 VStack(alignment: .leading, spacing: 10) {
                     if let computerControlStatus {
@@ -8341,12 +9013,12 @@ struct SettingsView: View {
                             statusBadgeRow(
                                 title: "Selected Browser Profile",
                                 detail: selectedProfile,
-                                color: SettingsSection.computerControl.tint
+                                color: SettingsSection.browserAppControl.tint
                             )
                         }
 
                         if computerControlStatus.issues.isEmpty {
-                            Text("Everything needed for local browser and app actions looks ready.")
+                            Text("Everything needed for local browser, app, and Computer Use actions looks ready.")
                                 .font(.callout)
                                 .foregroundStyle(.secondary)
                         } else {
@@ -8374,64 +9046,101 @@ struct SettingsView: View {
                 }
             }
 
-            settingsCard(
+            settingsCollapsibleCard(
+                id: "automation.computerUse",
+                title: "Computer Use",
+                subtitle: "Control the visible desktop with screenshots plus mouse and keyboard actions in Agentic mode.",
+                symbol: "cursorarrow.motionlines",
+                tint: SettingsSection.browserAppControl.tint
+            ) {
+                VStack(alignment: .leading, spacing: 10) {
+                    Toggle("Enable Computer Use", isOn: $settings.assistantComputerUseEnabled)
+
+                    statusBadgeRow(
+                        title: settings.assistantComputerUseEnabled ? "Computer Use is On" : "Computer Use is Off",
+                        detail: settings.assistantComputerUseEnabled
+                            ? "Agentic mode can use the `computer_use` tool when the task needs screenshot-based desktop interaction."
+                            : "Turn this on to allow screenshot-based desktop interaction in Agentic mode.",
+                        color: settings.assistantComputerUseEnabled ? .green : .orange
+                    )
+
+                    statusBadgeRow(
+                        title: "Readiness",
+                        detail: computerUseReadinessDetail,
+                        color: computerUseReady ? .green : .orange
+                    )
+
+                    Text("Use `browser_use` for signed-in browser reuse, `app_action` for structured supported apps, and `computer_use` only when the task needs generic visual interaction.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            settingsCollapsibleCard(
+                id: "automation.browserProfile",
                 title: "Browser Profile",
                 subtitle: "Reuse a real signed-in browser profile for Chrome, Brave, or Edge.",
                 symbol: "globe",
-                tint: SettingsSection.computerControl.tint
+                tint: SettingsSection.browserAppControl.tint
             ) {
                 BrowserAutomationSettingsView(settings: settings)
             }
 
-            settingsCard(
+            settingsCollapsibleCard(
+                id: "automation.supportedActions",
                 title: "Supported Direct App Actions",
                 subtitle: "These app actions run directly without any extra live-control layer.",
                 symbol: "app.connected.to.app.below.fill",
-                tint: SettingsSection.computerControl.tint
+                tint: SettingsSection.browserAppControl.tint
             ) {
                 VStack(alignment: .leading, spacing: 10) {
                     statusBadgeRow(
                         title: "Finder",
                         detail: "Open folders, reveal files, and select items.",
-                        color: SettingsSection.computerControl.tint
+                        color: SettingsSection.browserAppControl.tint
                     )
                     statusBadgeRow(
                         title: "Terminal",
                         detail: "Open Terminal and run a command.",
-                        color: SettingsSection.computerControl.tint
+                        color: SettingsSection.browserAppControl.tint
                     )
                     statusBadgeRow(
                         title: "Calendar",
                         detail: "Prepare an event draft first, then create it when you confirm.",
-                        color: SettingsSection.computerControl.tint
+                        color: SettingsSection.browserAppControl.tint
                     )
                     statusBadgeRow(
                         title: "System Settings",
                         detail: "Jump directly to a settings page or search target.",
-                        color: SettingsSection.computerControl.tint
+                        color: SettingsSection.browserAppControl.tint
                     )
                     statusBadgeRow(
                         title: "Reminders, Contacts, Notes, Messages",
                         detail: "Read supported data directly through native frameworks.",
-                        color: SettingsSection.computerControl.tint
+                        color: SettingsSection.browserAppControl.tint
                     )
                 }
             }
 
-            settingsCard(
+            settingsCollapsibleCard(
+                id: "automation.approvalBehavior",
                 title: "Approval Behavior",
-                subtitle: "Open Assist explains what each browser or app automation approval means.",
+                subtitle: "Open Assist explains what each browser, app, or Computer Use approval means.",
                 symbol: "checkmark.shield.fill",
-                tint: SettingsSection.computerControl.tint
+                tint: SettingsSection.browserAppControl.tint
             ) {
                 VStack(alignment: .leading, spacing: 8) {
-                    Text("`app_action` and `browser_use` only run in Agentic mode.")
+                    Text("`app_action`, `browser_use`, and `computer_use` only run in Agentic mode.")
                         .font(.callout)
                         .foregroundStyle(.secondary)
-                    Text("“Allow for Session” remembers approval only for the current conversation and tool type.")
+                    Text("“Allow for Session” remembers approval only for the current conversation. For Computer Use, it is tracked per visible app.")
                         .font(.callout)
                         .foregroundStyle(.secondary)
-                    Text("High-risk actions like send, post, submit, purchase, and delete always ask again.")
+                    Text("High-risk actions like send, post, submit, purchase, confirm, transfer, and delete always ask again.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                    Text("Computer Use will not type passwords, OTPs, API keys, or other secrets. Sign in manually when a page or app asks for them.")
                         .font(.callout)
                         .foregroundStyle(.secondary)
                 }
@@ -8452,17 +9161,46 @@ struct SettingsView: View {
     }
 
     private func refreshComputerControlState() {
-        computerPermissionSnapshot = PermissionCenter.snapshot(using: settings)
-
-        Task {
+        computerControlRefreshTask?.cancel()
+        let currentProfile = selectedComputerControlProfile
+        let speechRecognitionRequired = settings.transcriptionEngine == .appleSpeech
+        let computerUseEnabled = settings.assistantComputerUseEnabled
+        computerControlRefreshTask = Task {
+            let snapshot = await Task.detached(priority: .utility) {
+                PermissionCenter.snapshot(speechRecognitionRequired: speechRecognitionRequired)
+            }.value
+            guard !Task.isCancelled else { return }
             let status = await LocalAutomationHelper.shared.capabilityStatus(
-                selectedBrowserProfile: selectedComputerControlProfile,
-                settings: settings
+                selectedBrowserProfile: currentProfile,
+                permissionSnapshot: snapshot,
+                computerUseEnabled: computerUseEnabled
             )
-            await MainActor.run {
-                computerControlStatus = status
-            }
+            guard !Task.isCancelled else { return }
+            computerPermissionSnapshot = snapshot
+            computerControlStatus = status
         }
+    }
+
+    private var computerUseReady: Bool {
+        settings.assistantComputerUseEnabled
+            && computerPermissionSnapshot.accessibilityGranted
+            && computerPermissionSnapshot.screenRecordingGranted
+    }
+
+    private var computerUseReadinessDetail: String {
+        if !settings.assistantComputerUseEnabled {
+            return "Computer Use is disabled in settings."
+        }
+        if !computerPermissionSnapshot.accessibilityGranted && !computerPermissionSnapshot.screenRecordingGranted {
+            return "Grant Accessibility and Screen Recording first."
+        }
+        if !computerPermissionSnapshot.accessibilityGranted {
+            return "Grant Accessibility so Open Assist can click and type."
+        }
+        if !computerPermissionSnapshot.screenRecordingGranted {
+            return "Grant Screen Recording so Open Assist can capture the current screen."
+        }
+        return "Computer Use is ready for screenshot-based desktop control."
     }
 
     private var holdToTalkShortcutSegments: [String] {
@@ -8652,13 +9390,14 @@ struct SettingsView: View {
     @ViewBuilder
     private var aboutSection: some View {
         VStack(alignment: .leading, spacing: 14) {
-            settingsSectionHeader(for: .about)
+            settingsSectionHeader(for: .advanced)
 
-            settingsCard(
+            settingsCollapsibleCard(
+                id: "advanced.appInfo",
                 title: "App Info",
                 subtitle: "Current version and release details.",
                 symbol: "app.badge.fill",
-                tint: AppVisualTheme.accentTint
+                tint: SettingsSection.advanced.tint
             ) {
                 HStack(spacing: 12) {
                     appLogoImage(size: 48)
@@ -8678,74 +9417,13 @@ struct SettingsView: View {
                 }
             }
 
-            settingsCard(
-                title: "Permissions",
-                subtitle: "Grant access for assistant, voice capture, and reliable text insertion.",
-                symbol: "hand.raised.fill",
-                tint: AppVisualTheme.accentTint
-            ) {
-                VStack(alignment: .leading, spacing: 10) {
-                    permissionRow(
-                        name: "Accessibility",
-                        granted: settings.accessibilityTrusted,
-                        hint: "Required for text insertion and global hotkeys",
-                        action: {
-                            PermissionCenter.requestAccessibilityPermission(
-                                using: settings,
-                                promptIfNeeded: true,
-                                openSettingsIfDenied: false
-                            )
-                        }
-                    )
-
-                    permissionRow(
-                        name: "Microphone",
-                        granted: microphoneAuthorized,
-                        hint: "Required to capture speech",
-                        action: {
-                            requestMicrophonePermission()
-                        }
-                    )
-
-                    permissionRow(
-                        name: "Speech Recognition",
-                        granted: settings.transcriptionEngine == .appleSpeech ? speechRecognitionAuthorized : true,
-                        hint: settings.transcriptionEngine == .appleSpeech
-                            ? "Required when Apple Speech engine is selected"
-                            : "Not required while whisper.cpp engine is selected",
-                        action: {
-                            requestSpeechRecognitionPermission()
-                        }
-                    )
-
-                    permissionRow(
-                        name: "Automation / Apple Events",
-                        granted: computerPermissionSnapshot.appleEventsGranted,
-                        hint: "Needed for direct browser and app scripting",
-                        action: {
-                            PermissionCenter.requestAppleEventsPermission(openSettingsIfDenied: true)
-                            refreshComputerControlState()
-                        }
-                    )
-
-                    permissionRow(
-                        name: "Full Disk Access",
-                        granted: computerPermissionSnapshot.fullDiskAccessGranted,
-                        hint: "Optional for protected folders and app data",
-                        action: {
-                            PermissionCenter.openPrivacySettingsPane(query: "Full Disk Access")
-                            refreshComputerControlState()
-                        }
-                    )
-                }
-            }
-
             if CrashReporter.hasLogs {
-                settingsCard(
+                settingsCollapsibleCard(
+                    id: "advanced.diagnostics",
                     title: "Diagnostics",
                     subtitle: "Crash reports were detected on this Mac.",
                     symbol: "stethoscope",
-                    tint: AppVisualTheme.accentTint
+                    tint: SettingsSection.advanced.tint
                 ) {
                     HStack {
                         Text("Crash logs available")
@@ -8760,7 +9438,8 @@ struct SettingsView: View {
                 }
             }
 
-            settingsCard(
+            settingsCollapsibleCard(
+                id: "advanced.uninstall",
                 title: "Uninstall",
                 subtitle: "Remove Open Assist, reset permissions, and clear local app data.",
                 symbol: "trash.fill",
@@ -8994,8 +9673,8 @@ struct SettingsView: View {
     private func permissionRow(name: String, granted: Bool, hint: String, action: @escaping () -> Void) -> some View {
         HStack(spacing: 10) {
             AppIconBadge(
-                symbol: granted ? "checkmark" : "exclamationmark.triangle.fill",
-                tint: granted ? AppVisualTheme.accentTint : AppVisualTheme.baseTint,
+                symbol: granted ? "checkmark.shield.fill" : "hand.raised.slash.fill",
+                tint: granted ? Color.green : AppVisualTheme.baseTint,
                 size: 24,
                 symbolSize: 10,
                 isEmphasized: granted
@@ -9010,6 +9689,7 @@ struct SettingsView: View {
                     .foregroundStyle(AppVisualTheme.mutedText)
             }
             Spacer()
+            PermissionStateBadge(granted: granted)
             if !granted {
                 Button("Grant…") {
                     action()

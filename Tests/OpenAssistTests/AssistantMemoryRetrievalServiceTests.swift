@@ -224,6 +224,79 @@ final class AssistantMemoryRetrievalServiceTests: XCTestCase {
         XCTAssertEqual(built.statusMessage, "Using automation memory")
     }
 
+    func testPrepareTurnContextMergesThreadAndProjectScopedLessons() throws {
+        let memoryRoot = try makeTemporaryDirectory(named: "assistant-memory")
+        let databaseURL = try makeDatabaseURL()
+        let store = try MemorySQLiteStore(databaseURL: databaseURL)
+        let threadMemoryService = AssistantThreadMemoryService(baseDirectoryURL: memoryRoot)
+        let retrievalService = AssistantMemoryRetrievalService(
+            store: store,
+            threadMemoryService: threadMemoryService
+        )
+
+        let threadScope = retrievalService.makeScopeContext(
+            threadID: "thread-project-2",
+            cwd: "/tmp/openassist"
+        )
+        let projectScope = retrievalService.makeScopeContext(
+            threadID: "thread-project-2",
+            cwd: "/tmp/openassist",
+            projectIdentityKey: "assistant-project:proj-2",
+            projectNameOverride: "OpenAssist",
+            repositoryNameOverride: "OpenAssist"
+        )
+
+        try store.upsertAssistantMemoryEntry(
+            AssistantMemoryEntry(
+                provider: .codex,
+                scopeKey: threadScope.scopeKey,
+                bundleID: threadScope.bundleID,
+                projectKey: threadScope.projectKey,
+                identityKey: threadScope.identityKey,
+                threadID: "thread-project-2",
+                memoryType: .constraint,
+                title: "Keep it simple",
+                summary: "Explain regex implementation details in simpler words.",
+                detail: "Use easy wording when explaining regex implementation because the user prefers simpler English.",
+                keywords: ["regex", "implementation", "simple", "easier", "explain", "english"],
+                confidence: 0.95,
+                metadata: ["memory_domain": "assistant"]
+            )
+        )
+
+        try store.upsertAssistantMemoryEntry(
+            AssistantMemoryEntry(
+                provider: .codex,
+                scopeKey: projectScope.scopeKey,
+                bundleID: projectScope.bundleID,
+                projectKey: projectScope.projectKey,
+                identityKey: projectScope.identityKey,
+                threadID: nil,
+                memoryType: .lesson,
+                title: "Regex implementation",
+                summary: "In OpenAssist, prefer ripgrep for fast regex-based code search.",
+                detail: "Use ripgrep for regex-heavy repository search tasks.",
+                keywords: ["regex", "ripgrep", "search", "openassist"],
+                confidence: 0.9,
+                metadata: ["memory_domain": "assistant"]
+            )
+        )
+
+        let built = try retrievalService.prepareTurnContext(
+            threadID: "thread-project-2",
+            prompt: "Can you explain our regex search implementation in easier words?",
+            cwd: "/tmp/openassist",
+            summaryMaxChars: 1400,
+            longTermScope: projectScope,
+            projectContextBlock: "Project context:\n- Project name: OpenAssist"
+        )
+
+        let summary = try XCTUnwrap(built.summary)
+        XCTAssertTrue(summary.contains("simpler"), summary)
+        XCTAssertTrue(summary.contains("ripgrep"), summary)
+        XCTAssertTrue(summary.contains("Project context:"))
+    }
+
     private func makeTemporaryDirectory(named name: String) throws -> URL {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("\(name)-\(UUID().uuidString)", isDirectory: true)

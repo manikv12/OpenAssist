@@ -2,7 +2,7 @@ import Foundation
 
 // MARK: - Models
 
-enum SupportedBrowser: String, CaseIterable, Identifiable, Codable {
+enum SupportedBrowser: String, CaseIterable, Identifiable, Codable, Sendable {
     case chrome = "Google Chrome"
     case brave = "Brave Browser"
     case edge = "Microsoft Edge"
@@ -71,7 +71,7 @@ enum SupportedBrowser: String, CaseIterable, Identifiable, Codable {
     }
 }
 
-struct BrowserProfile: Identifiable, Hashable, Codable {
+struct BrowserProfile: Identifiable, Hashable, Codable, Sendable {
     let browser: SupportedBrowser
     let directoryName: String
     let displayName: String

@@ -33,10 +33,24 @@ struct ScheduledJobsView: View {
     private var jobListColumn: some View {
         VStack(spacing: 0) {
             // Header
-            HStack {
-                Text("Jobs")
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(AppVisualTheme.mutedText)
+            HStack(spacing: 8) {
+                Text("JOBS")
+                    .font(.system(size: 10.5, weight: .bold))
+                    .foregroundStyle(AppVisualTheme.foreground(0.38))
+                    .tracking(0.8)
+
+                if !coordinator.jobs.isEmpty {
+                    Text("\(coordinator.jobs.count)")
+                        .font(.system(size: 9.5, weight: .bold, design: .rounded))
+                        .foregroundStyle(AppVisualTheme.foreground(0.32))
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(
+                            Capsule(style: .continuous)
+                                .fill(AppVisualTheme.surfaceFill(0.08))
+                        )
+                }
+
                 Spacer()
                 Button {
                     editingState = .new
@@ -44,8 +58,15 @@ struct ScheduledJobsView: View {
                     Image(systemName: "plus")
                         .font(.system(size: 11, weight: .semibold))
                         .foregroundStyle(AppVisualTheme.accentTint)
-                        .frame(width: 22, height: 22)
-                        .background(AppVisualTheme.accentTint.opacity(0.12), in: RoundedRectangle(cornerRadius: 6))
+                        .frame(width: 24, height: 24)
+                        .background(
+                            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                                .fill(AppVisualTheme.accentTint.opacity(0.12))
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                                        .stroke(AppVisualTheme.accentTint.opacity(0.14), lineWidth: 0.5)
+                                )
+                        )
                 }
                 .buttonStyle(.plain)
                 .help("New scheduled job")
@@ -86,22 +107,41 @@ struct ScheduledJobsView: View {
     }
 
     private var listEmptyState: some View {
-        VStack(spacing: 8) {
-            Image(systemName: "clock.badge.checkmark")
-                .font(.system(size: 24))
-                .foregroundStyle(AppVisualTheme.mutedText.opacity(0.5))
-            Text("No jobs yet")
-                .font(.system(size: 12))
-                .foregroundStyle(AppVisualTheme.mutedText)
+        VStack(spacing: 12) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .fill(AppVisualTheme.foreground(0.03))
+                    .frame(width: 48, height: 48)
+                Image(systemName: "clock.badge.checkmark")
+                    .font(.system(size: 22, weight: .medium))
+                    .foregroundStyle(AppVisualTheme.foreground(0.26))
+            }
+
+            VStack(spacing: 4) {
+                Text("No jobs yet")
+                    .font(.system(size: 12.5, weight: .semibold))
+                    .foregroundStyle(AppVisualTheme.foreground(0.52))
+                Text("Schedule recurring tasks")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(AppVisualTheme.foreground(0.32))
+            }
+
             Button {
                 editingState = .new
             } label: {
-                Text("Add First Job")
-                    .font(.system(size: 11, weight: .medium))
+                Label("Create Job", systemImage: "plus")
+                    .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(AppVisualTheme.accentTint)
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 5)
-                    .background(AppVisualTheme.accentTint.opacity(0.12), in: RoundedRectangle(cornerRadius: 7))
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .fill(AppVisualTheme.accentTint.opacity(0.12))
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                    .stroke(AppVisualTheme.accentTint.opacity(0.16), lineWidth: 0.5)
+                            )
+                    )
             }
             .buttonStyle(.plain)
         }
@@ -146,16 +186,24 @@ struct ScheduledJobsView: View {
     }
 
     private var rightPanelPlaceholder: some View {
-        VStack(spacing: 10) {
-            Image(systemName: "calendar.badge.clock")
-                .font(.system(size: 28))
-                .foregroundStyle(AppVisualTheme.mutedText.opacity(0.4))
-            Text("Select a job to edit")
-                .font(.system(size: 13))
-                .foregroundStyle(AppVisualTheme.mutedText)
-            Text("or tap + to create a new one")
-                .font(.system(size: 11))
-                .foregroundStyle(AppVisualTheme.mutedText.opacity(0.6))
+        VStack(spacing: 14) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    .fill(AppVisualTheme.foreground(0.03))
+                    .frame(width: 56, height: 56)
+                Image(systemName: "calendar.badge.clock")
+                    .font(.system(size: 24, weight: .medium))
+                    .foregroundStyle(AppVisualTheme.foreground(0.24))
+            }
+
+            VStack(spacing: 4) {
+                Text("Select a job to edit")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(AppVisualTheme.foreground(0.52))
+                Text("or tap + to create a new one")
+                    .font(.system(size: 11.5, weight: .medium))
+                    .foregroundStyle(AppVisualTheme.foreground(0.32))
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
@@ -172,17 +220,26 @@ private struct JobListRow: View {
 
     var body: some View {
         Button(action: onTap) {
-            HStack(spacing: 8) {
-                Image(systemName: job.jobType.iconName)
-                    .font(.system(size: 11))
-                    .foregroundStyle(isSelected ? AppVisualTheme.foreground(0.9) : typeColor)
-                    .frame(width: 20, height: 20)
-                    .background(
-                        isSelected
-                            ? typeColor.opacity(0.25)
-                            : typeColor.opacity(0.10),
-                        in: RoundedRectangle(cornerRadius: 5)
-                    )
+            HStack(spacing: 10) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .fill(
+                            LinearGradient(
+                                colors: [typeColor.opacity(isSelected ? 0.24 : 0.14), typeColor.opacity(isSelected ? 0.14 : 0.06)],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            )
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                .stroke(typeColor.opacity(isSelected ? 0.24 : 0.10), lineWidth: 0.5)
+                        )
+                        .frame(width: 28, height: 28)
+                    Image(systemName: job.jobType.iconName)
+                        .font(.system(size: 12, weight: .semibold))
+                        .symbolRenderingMode(.hierarchical)
+                        .foregroundStyle(typeColor)
+                }
 
                 VStack(alignment: .leading, spacing: 2) {
                     Text(job.name)
@@ -190,8 +247,8 @@ private struct JobListRow: View {
                         .foregroundStyle(isSelected ? AppVisualTheme.foreground(0.95) : AppVisualTheme.foreground(0.78))
                         .lineLimit(1)
                     Text(job.scheduleDescription)
-                        .font(.system(size: 10))
-                        .foregroundStyle(isSelected ? AppVisualTheme.foreground(0.55) : AppVisualTheme.mutedText.opacity(0.7))
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(isSelected ? AppVisualTheme.foreground(0.50) : AppVisualTheme.foreground(0.36))
                         .lineLimit(1)
                 }
 
@@ -208,17 +265,15 @@ private struct JobListRow: View {
                         .frame(width: 32)
                 }
             }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 7)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
             .background(
-                isSelected
-                    ? AppVisualTheme.accentTint.opacity(0.10)
-                    : AppVisualTheme.foreground(0.0),
-                in: RoundedRectangle(cornerRadius: 8)
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(isSelected ? AppVisualTheme.accentTint.opacity(0.08) : Color.clear)
             )
             .overlay(
-                RoundedRectangle(cornerRadius: 8)
-                    .stroke(isSelected ? AppVisualTheme.accentTint.opacity(0.20) : .clear, lineWidth: 1)
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .stroke(isSelected ? AppVisualTheme.accentTint.opacity(0.16) : Color.clear, lineWidth: 0.6)
             )
         }
         .buttonStyle(.plain)
@@ -1010,17 +1065,18 @@ struct JobEditPanel: View {
     @ViewBuilder
     private func formSection<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
         VStack(alignment: .leading, spacing: 0) {
-            Text(title)
-                .font(.system(size: 10, weight: .semibold))
-                .foregroundStyle(AppVisualTheme.mutedText.opacity(0.70))
+            Text(title.uppercased())
+                .font(.system(size: 10, weight: .bold))
+                .foregroundStyle(AppVisualTheme.foreground(0.34))
+                .tracking(0.7)
                 .padding(.horizontal, 14)
                 .padding(.top, 16)
                 .padding(.bottom, 6)
             VStack(spacing: 0) {
                 content()
             }
-            .background(AppVisualTheme.foreground(0.035), in: RoundedRectangle(cornerRadius: 9))
-            .overlay(RoundedRectangle(cornerRadius: 9).stroke(AppVisualTheme.foreground(0.06), lineWidth: 1))
+            .background(AppVisualTheme.foreground(0.035), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).stroke(AppVisualTheme.foreground(0.06), lineWidth: 0.6))
             .padding(.horizontal, 12)
         }
     }

@@ -1,5 +1,6 @@
 import { memo, useCallback, useState } from "react";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
+import { copyPlainText } from "../clipboard";
 
 interface Props {
   code: string;
@@ -11,11 +12,7 @@ function CodeBlockInner({ code, language, theme }: Props) {
   const [copied, setCopied] = useState(false);
 
   const handleCopy = useCallback(() => {
-    navigator.clipboard.writeText(code).catch(() => {
-      try {
-        window.webkit?.messageHandlers?.copyText?.postMessage(code);
-      } catch {}
-    });
+    void copyPlainText(code).catch(() => {});
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
   }, [code]);
@@ -24,7 +21,7 @@ function CodeBlockInner({ code, language, theme }: Props) {
     <div className="code-block-wrapper">
       <div className="code-block-header">
         <span className="code-block-lang">{language}</span>
-        <button className="code-block-copy" onClick={handleCopy}>
+        <button type="button" className="code-block-copy" onClick={handleCopy}>
           {copied ? (
             <>
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">

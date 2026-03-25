@@ -76,6 +76,103 @@ final class AssistantProjectStoreTests: XCTestCase {
         XCTAssertEqual(linkedProject.displayIconSymbolName, "folder.fill")
     }
 
+    func testSuggestedProjectNameUsesLinkedFolderName() {
+        XCTAssertEqual(
+            AssistantProject.suggestedName(forLinkedFolderPath: "/tmp/OpenAssist"),
+            "OpenAssist"
+        )
+    }
+
+    func testSuggestedProjectNameFallsBackWhenFolderPathIsMissing() {
+        XCTAssertEqual(
+            AssistantProject.suggestedName(forLinkedFolderPath: "   "),
+            "Project"
+        )
+    }
+
+    func testHiddenProjectRoundTripKeepsAssignmentsAndBrainState() throws {
+        let directory = try makeTemporaryDirectory(named: "assistant-project-hidden")
+        let store = AssistantProjectStore(baseDirectoryURL: directory)
+
+        let project = try store.createProject(name: "Research")
+        try store.assignThread("thread-1", toProjectID: project.id)
+        try store.updateThreadDigest(
+            projectID: project.id,
+            threadID: "thread-1",
+            threadTitle: "Gather notes",
+            summary: "Assistant: Captured the latest notes.",
+            fingerprint: "fingerprint-1",
+            processedAt: Date(timeIntervalSinceReferenceDate: 1_000)
+        )
+
+        _ = try store.hideProject(id: project.id)
+
+        let hiddenProject = try XCTUnwrap(store.project(forProjectID: project.id))
+        XCTAssertTrue(hiddenProject.isHidden)
+        XCTAssertEqual(store.assignedProjectID(forThreadID: "thread-1"), project.id)
+        XCTAssertEqual(store.visibleProjects().count, 0)
+        XCTAssertEqual(store.hiddenProjects().count, 1)
+
+        let hiddenContext = try XCTUnwrap(store.context(forThreadID: "thread-1"))
+        XCTAssertEqual(hiddenContext.project.id, project.id)
+        XCTAssertTrue(hiddenContext.project.isHidden)
+        XCTAssertEqual(hiddenContext.brainState.threadDigestsByThreadID["thread-1"]?.threadTitle, "Gather notes")
+
+        let reloadedStore = AssistantProjectStore(baseDirectoryURL: directory)
+        let reloadedProject = try XCTUnwrap(reloadedStore.project(forProjectID: project.id))
+        XCTAssertTrue(reloadedProject.isHidden)
+        XCTAssertEqual(reloadedStore.assignedProjectID(forThreadID: "thread-1"), project.id)
+
+        _ = try reloadedStore.unhideProject(id: project.id)
+        let unhiddenProject = try XCTUnwrap(reloadedStore.project(forProjectID: project.id))
+        XCTAssertFalse(unhiddenProject.isHidden)
+        XCTAssertEqual(reloadedStore.visibleProjects().count, 1)
+        XCTAssertEqual(reloadedStore.hiddenProjects().count, 0)
+    }
+
+    func testLegacyProjectSnapshotWithoutHiddenFlagDefaultsToVisible() throws {
+        let directory = try makeTemporaryDirectory(named: "assistant-project-legacy")
+        let fileURL = directory.appendingPathComponent("projects.json")
+
+        let createdAt = Date(timeIntervalSinceReferenceDate: 1_000)
+        let updatedAt = Date(timeIntervalSinceReferenceDate: 1_100)
+        let legacySnapshot: [String: Any] = [
+            "version": 2,
+            "projects": [[
+                "id": "project-legacy",
+                "name": "Legacy Project",
+                "linkedFolderPath": "/tmp/legacy",
+                "iconSymbolName": "briefcase.fill",
+                "createdAt": createdAt.timeIntervalSinceReferenceDate,
+                "updatedAt": updatedAt.timeIntervalSinceReferenceDate
+            ]],
+            "threadAssignments": [
+                "thread-legacy": "project-legacy"
+            ],
+            "brainByProjectID": [
+                "project-legacy": [
+                    "projectSummary": "Legacy summary",
+                    "threadDigestsByThreadID": [:],
+                    "lastProcessedTranscriptFingerprintByThreadID": [:]
+                ]
+            ]
+        ]
+
+        let data = try JSONSerialization.data(withJSONObject: legacySnapshot, options: [.sortedKeys, .prettyPrinted])
+        try data.write(to: fileURL)
+
+        let store = AssistantProjectStore(baseDirectoryURL: directory)
+        let project = try XCTUnwrap(store.project(forProjectID: "project-legacy"))
+        XCTAssertFalse(project.isHidden)
+        XCTAssertEqual(store.visibleProjects().count, 1)
+        XCTAssertEqual(store.hiddenProjects().count, 0)
+
+        let context = try XCTUnwrap(store.context(forThreadID: "thread-legacy"))
+        XCTAssertEqual(context.project.name, "Legacy Project")
+        XCTAssertFalse(context.project.isHidden)
+        XCTAssertEqual(context.brainState.projectSummary, "Legacy summary")
+    }
+
     func testDeleteProjectClearsAssignmentsAndReturnsRemovedThreads() throws {
         let directory = try makeTemporaryDirectory(named: "assistant-project-delete")
         let store = AssistantProjectStore(baseDirectoryURL: directory)

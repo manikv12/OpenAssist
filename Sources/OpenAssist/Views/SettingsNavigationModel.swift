@@ -1,124 +1,171 @@
 import SwiftUI
 
-enum SettingsSection: String, CaseIterable, Identifiable {
-    case overview
-    case assistant
+enum SettingsSection: String, CaseIterable, Identifiable, Sendable {
+    case gettingStarted
+    case dailyUse
     case voiceDictation
-    case automationRemote
-    case appPermissions
+    case browserAppControl
+    case permissionsPrivacy
+    case advanced
 
     var id: Self { self }
 
+    static let sidebarSections: [SettingsSection] = Self.allCases
+
     var title: String {
         switch self {
-        case .overview:
-            return "Overview"
-        case .assistant:
-            return "Assistant"
+        case .gettingStarted:
+            return "Getting Started"
+        case .dailyUse:
+            return "Daily Use"
         case .voiceDictation:
             return "Voice & Dictation"
-        case .automationRemote:
-            return "Automation & Remote"
-        case .appPermissions:
-            return "App & Permissions"
+        case .browserAppControl:
+            return "Browser & App Control"
+        case .permissionsPrivacy:
+            return "Permissions & Privacy"
+        case .advanced:
+            return "Advanced"
         }
     }
 
     var subtitle: String {
         switch self {
-        case .overview:
-            return "See what Open Assist helps with and where to start."
-        case .assistant:
-            return "Everyday AI controls, provider status, and AI Studio entry points."
+        case .gettingStarted:
+            return "A simple setup home with the most important next steps."
+        case .dailyUse:
+            return "The controls most people use often, with clear shortcuts to deeper setup."
         case .voiceDictation:
-            return "Dictation setup, speech engines, shortcuts, and text cleanup."
-        case .automationRemote:
-            return "Browser control, local API alerts, and Telegram remote access."
-        case .appPermissions:
-            return "Appearance, permissions, app info, diagnostics, and uninstall."
+            return "Microphone, dictation, shortcuts, Whisper, and correction controls."
+        case .browserAppControl:
+            return "Browser reuse, direct app actions, computer use, and approval behavior."
+        case .permissionsPrivacy:
+            return "See what access is granted and open the right macOS privacy screens."
+        case .advanced:
+            return "AI Studio, provider status, integrations, diagnostics, and app maintenance."
         }
     }
 
     var iconName: String {
         switch self {
-        case .overview:
-            return "square.grid.2x2"
-        case .assistant:
-            return "brain.head.profile"
+        case .gettingStarted:
+            return "flag.checkered.2.crossed"
+        case .dailyUse:
+            return "sparkles"
         case .voiceDictation:
             return "waveform.and.mic"
-        case .automationRemote:
+        case .browserAppControl:
             return "point.3.connected.trianglepath.dotted"
-        case .appPermissions:
-            return "gearshape.2"
+        case .permissionsPrivacy:
+            return "hand.raised.fill"
+        case .advanced:
+            return "slider.horizontal.3"
         }
     }
 
     var tint: Color {
         switch self {
-        case .overview:
-            return Color(red: 0.32, green: 0.62, blue: 0.94)
-        case .assistant:
-            return Color(red: 0.45, green: 0.56, blue: 0.92)
+        case .gettingStarted:
+            return Color(red: 0.33, green: 0.63, blue: 0.95)
+        case .dailyUse:
+            return Color(red: 0.31, green: 0.58, blue: 0.95)
         case .voiceDictation:
             return Color(red: 0.27, green: 0.72, blue: 0.54)
-        case .automationRemote:
+        case .browserAppControl:
             return Color(red: 0.23, green: 0.67, blue: 0.76)
-        case .appPermissions:
+        case .permissionsPrivacy:
             return Color(red: 0.84, green: 0.58, blue: 0.24)
+        case .advanced:
+            return Color(red: 0.47, green: 0.55, blue: 0.92)
         }
     }
 
     var searchTerms: [String] {
         switch self {
-        case .overview:
-            return ["overview", "start", "ask", "speak", "act", "what is open assist", "setup summary"]
-        case .assistant:
-            return ["assistant", "ai", "prompt", "rewrite", "memory", "provider", "oauth", "api key", "openai", "anthropic", "google", "gemini", "studio", "agent shortcut"]
+        case .gettingStarted:
+            return ["getting started", "setup", "first run", "onboarding", "start", "checklist"]
+        case .dailyUse:
+            return ["daily", "assistant", "clipboard", "appearance", "sounds", "common tasks"]
         case .voiceDictation:
-            return ["voice", "dictation", "speech", "shortcut", "hold to talk", "continuous", "microphone", "whisper", "model", "cleanup", "correction", "phrases"]
-        case .automationRemote:
-            return ["automation", "remote", "browser", "telegram", "claude", "codex", "notifications", "api", "apple events", "local api", "browser profile"]
-        case .appPermissions:
-            return ["app", "permissions", "appearance", "theme", "version", "updates", "diagnostics", "crash logs", "uninstall"]
+            return ["voice", "dictation", "speech", "shortcut", "hold to talk", "microphone", "whisper", "cleanup", "correction"]
+        case .browserAppControl:
+            return ["browser", "automation", "computer use", "app action", "screen recording", "apple events", "profile", "finder", "terminal"]
+        case .permissionsPrivacy:
+            return ["permissions", "privacy", "accessibility", "microphone", "speech recognition", "full disk"]
+        case .advanced:
+            return ["advanced", "ai studio", "providers", "models", "integrations", "telegram", "diagnostics", "uninstall"]
         }
     }
 }
 
-enum SettingsAutomationPage: String, CaseIterable, Identifiable {
+enum SettingsAdvancedPage: String, CaseIterable, Identifiable, Sendable {
     case overview
-    case browserAndApps
-    case notificationsAndAPI
+    case automationNotifications
     case telegramRemote
 
     var id: Self { self }
+}
 
-    var title: String {
+struct SettingsRoute: Equatable, Sendable {
+    let section: SettingsSection
+    let cardID: String?
+    let advancedPage: SettingsAdvancedPage?
+    let opensAIStudio: Bool
+
+    init(
+        section: SettingsSection,
+        cardID: String? = nil,
+        advancedPage: SettingsAdvancedPage? = nil,
+        opensAIStudio: Bool = false
+    ) {
+        self.section = section
+        self.cardID = cardID
+        self.advancedPage = advancedPage
+        self.opensAIStudio = opensAIStudio
+    }
+
+    static let gettingStartedHome = SettingsRoute(section: .gettingStarted, cardID: "gettingStarted.checklist")
+}
+
+enum GettingStartedStepStatus: Equatable, Sendable {
+    case notStarted
+    case needsAttention
+    case ready
+
+    var label: String {
         switch self {
-        case .overview:
-            return "Overview"
-        case .browserAndApps:
-            return "Browser & App Control"
-        case .notificationsAndAPI:
-            return "Notifications & Local API"
-        case .telegramRemote:
-            return "Telegram Remote"
+        case .notStarted:
+            return "Not started"
+        case .needsAttention:
+            return "Needs attention"
+        case .ready:
+            return "Ready"
+        }
+    }
+
+    var tint: Color {
+        switch self {
+        case .notStarted:
+            return .orange
+        case .needsAttention:
+            return .orange
+        case .ready:
+            return .green
         }
     }
 }
 
-struct SettingsNavigationTarget: Equatable {
-    let section: SettingsSection
-    let automationPage: SettingsAutomationPage?
-
-    init(section: SettingsSection, automationPage: SettingsAutomationPage? = nil) {
-        self.section = section
-        self.automationPage = automationPage
-    }
+struct GettingStartedStep: Identifiable, Equatable, Sendable {
+    let id: String
+    let title: String
+    let detail: String
+    let status: GettingStartedStepStatus
+    let primaryActionTitle: String
+    let destination: SettingsRoute
 }
 
-struct SettingSearchEntry: Identifiable, Equatable {
-    let destination: SettingsNavigationTarget
+struct SettingSearchEntry: Identifiable, Equatable, Sendable {
+    let destination: SettingsRoute
     let title: String
     let detail: String
     let keywords: [String]
@@ -128,267 +175,188 @@ struct SettingSearchEntry: Identifiable, Equatable {
     }
 
     var id: String {
-        let automationKey = destination.automationPage?.rawValue ?? "root"
-        return "\(section.rawValue)-\(automationKey)-\(title)"
+        let card = destination.cardID ?? "root"
+        let advancedPage = destination.advancedPage?.rawValue ?? "overview"
+        return "\(section.rawValue)-\(advancedPage)-\(card)-\(title)"
     }
 }
 
 enum SettingsNavigationModel {
+    static let aiStudioDescription = "Advanced AI providers, models, memory, and local AI"
+
     static let searchEntries: [SettingSearchEntry] = [
         .init(
-            destination: SettingsNavigationTarget(section: .overview),
-            title: "Ask, Speak, and Act overview",
-            detail: "See the main ways Open Assist helps you on your Mac",
-            keywords: ["overview", "ask", "speak", "act", "what is the app for", "start"]
+            destination: .gettingStartedHome,
+            title: "Getting started",
+            detail: "Open the setup checklist with the most important next steps",
+            keywords: ["getting started", "setup", "start", "onboarding", "first run", "checklist"]
         ),
         .init(
-            destination: SettingsNavigationTarget(section: .assistant),
-            title: "AI prompt correction",
-            detail: "Enable or disable everyday AI writing help",
-            keywords: ["prompt", "rewrite", "toggle", "enable", "ai"]
+            destination: SettingsRoute(section: .dailyUse, cardID: "daily.tasks"),
+            title: "Daily task shortcuts",
+            detail: "Jump to common tasks like assistant, voice, browser control, and AI setup",
+            keywords: ["daily", "task", "shortcut", "assistant", "voice", "browser", "common"]
         ),
         .init(
-            destination: SettingsNavigationTarget(section: .assistant),
-            title: "Auto-insert high-confidence suggestions",
-            detail: "Insert AI suggestions automatically when confidence is high",
-            keywords: ["auto", "insert", "confidence", "rewrite", "preview"]
+            destination: SettingsRoute(section: .dailyUse, cardID: "daily.assistant"),
+            title: "Assistant basics",
+            detail: "Everyday assistant writing and suggestion controls",
+            keywords: ["assistant", "rewrite", "prompt", "auto insert", "markdown"]
         ),
         .init(
-            destination: SettingsNavigationTarget(section: .assistant),
-            title: "Markdown suggestion conversion",
-            detail: "Always convert AI suggestions to Markdown before insertion",
-            keywords: ["markdown", "format", "rewrite", "insert", "assistant"]
-        ),
-        .init(
-            destination: SettingsNavigationTarget(section: .assistant),
-            title: "Provider connection summary",
-            detail: "See which AI providers are ready",
-            keywords: ["provider", "oauth", "api key", "openai", "anthropic", "google", "gemini", "connection"]
-        ),
-        .init(
-            destination: SettingsNavigationTarget(section: .assistant),
-            title: "AI Studio",
-            detail: "Open advanced provider, model, and memory controls",
-            keywords: ["ai", "studio", "providers", "models", "memory", "advanced"]
-        ),
-        .init(
-            destination: SettingsNavigationTarget(section: .assistant),
-            title: "Agent shortcut",
-            detail: "Hold to speak and paste into the assistant box",
-            keywords: ["assistant", "agent", "voice", "shortcut", "keyboard", "hold", "paste"]
-        ),
-        .init(
-            destination: SettingsNavigationTarget(section: .voiceDictation),
-            title: "Microphone device picker",
-            detail: "Choose a microphone or auto-detect one",
-            keywords: ["microphone", "input", "device", "picker", "auto"]
-        ),
-        .init(
-            destination: SettingsNavigationTarget(section: .voiceDictation),
-            title: "Transcription engine",
-            detail: "Switch between Apple Speech, whisper.cpp, and cloud providers",
-            keywords: ["engine", "whisper", "apple", "cloud", "openai", "groq", "deepgram", "gemini", "recognition"]
-        ),
-        .init(
-            destination: SettingsNavigationTarget(section: .voiceDictation),
+            destination: SettingsRoute(section: .dailyUse, cardID: "daily.output"),
             title: "Dictation output",
             detail: "Control clipboard behavior for inserted voice results",
             keywords: ["clipboard", "copy", "output", "dictation"]
         ),
         .init(
-            destination: SettingsNavigationTarget(section: .voiceDictation),
+            destination: SettingsRoute(section: .dailyUse, cardID: "daily.sounds"),
             title: "Dictation sounds",
             detail: "Choose start, stop, processing, and pasted sound cues",
             keywords: ["sound", "start", "listening", "feedback", "processing", "stop", "pasted"]
         ),
         .init(
-            destination: SettingsNavigationTarget(section: .voiceDictation),
-            title: "Hold-to-talk shortcut",
-            detail: "Set keys for press-and-hold dictation",
-            keywords: ["hold", "shortcut", "keyboard", "voice"]
-        ),
-        .init(
-            destination: SettingsNavigationTarget(section: .voiceDictation),
-            title: "Continuous toggle shortcut",
-            detail: "Set keys for start and stop continuous dictation",
-            keywords: ["continuous", "toggle", "shortcut", "keyboard"]
-        ),
-        .init(
-            destination: SettingsNavigationTarget(section: .voiceDictation),
-            title: "Paste last transcript",
-            detail: "Reserved shortcut: Option-Command-V",
-            keywords: ["paste", "last transcript", "reserved", "history"]
-        ),
-        .init(
-            destination: SettingsNavigationTarget(section: .voiceDictation),
-            title: "Finalize delay",
-            detail: "Control speed versus stability before insertion",
-            keywords: ["delay", "finalize", "timing"]
-        ),
-        .init(
-            destination: SettingsNavigationTarget(section: .voiceDictation),
-            title: "Cleanup mode",
-            detail: "Light or aggressive text cleanup",
-            keywords: ["cleanup", "mode", "text quality"]
-        ),
-        .init(
-            destination: SettingsNavigationTarget(section: .voiceDictation),
-            title: "Custom phrases",
-            detail: "Add names, acronyms, and domain language",
-            keywords: ["phrases", "vocabulary", "context"]
-        ),
-        .init(
-            destination: SettingsNavigationTarget(section: .voiceDictation),
-            title: "Whisper model library",
-            detail: "Download and manage whisper.cpp models",
-            keywords: ["model", "download", "whisper", "tiny", "base", "small", "medium", "large"]
-        ),
-        .init(
-            destination: SettingsNavigationTarget(section: .voiceDictation),
-            title: "Whisper Core ML",
-            detail: "Use Core ML encoder when available",
-            keywords: ["core ml", "ane", "whisper", "speed"]
-        ),
-        .init(
-            destination: SettingsNavigationTarget(section: .voiceDictation),
-            title: "Adaptive corrections",
-            detail: "Learn from your quick word and phrase fixes",
-            keywords: ["adaptive", "learned", "corrections", "backspace"]
-        ),
-        .init(
-            destination: SettingsNavigationTarget(section: .voiceDictation),
-            title: "Learned corrections list",
-            detail: "View, remove, or clear saved corrections",
-            keywords: ["learned", "list", "remove", "clear"]
-        ),
-        .init(
-            destination: SettingsNavigationTarget(section: .automationRemote, automationPage: .browserAndApps),
-            title: "Automation permissions",
-            detail: "Review Apple Events and Full Disk Access for browser and app actions",
-            keywords: ["automation", "apple events", "full disk", "browser", "permissions"]
-        ),
-        .init(
-            destination: SettingsNavigationTarget(section: .automationRemote, automationPage: .browserAndApps),
-            title: "Browser profile",
-            detail: "Choose the Chrome, Brave, or Edge profile Open Assist should reuse",
-            keywords: ["browser", "profile", "chrome", "brave", "edge", "session"]
-        ),
-        .init(
-            destination: SettingsNavigationTarget(section: .automationRemote, automationPage: .browserAndApps),
-            title: "Helper status",
-            detail: "See local automation helper readiness and setup issues",
-            keywords: ["helper", "status", "issues", "readiness"]
-        ),
-        .init(
-            destination: SettingsNavigationTarget(section: .automationRemote, automationPage: .browserAndApps),
-            title: "Supported direct app actions",
-            detail: "See Finder, Terminal, Calendar, System Settings, Reminders, Contacts, Notes, and Messages actions",
-            keywords: ["finder", "terminal", "calendar", "system settings", "app action", "messages", "notes", "contacts", "reminders"]
-        ),
-        .init(
-            destination: SettingsNavigationTarget(section: .automationRemote, automationPage: .browserAndApps),
-            title: "Approval behavior",
-            detail: "Understand session approvals and high-risk confirmation rules",
-            keywords: ["approval", "allow", "session", "confirmation", "risky"]
-        ),
-        .init(
-            destination: SettingsNavigationTarget(section: .automationRemote, automationPage: .notificationsAndAPI),
-            title: "Automation notifications",
-            detail: "Open the page for Claude Code, Codex CLI, and Codex Cloud alerts",
-            keywords: ["automation", "notifications", "sources", "codex", "claude"]
-        ),
-        .init(
-            destination: SettingsNavigationTarget(section: .automationRemote, automationPage: .notificationsAndAPI),
-            title: "Enable automation API",
-            detail: "Run a localhost API for Claude Code and Codex CLI",
-            keywords: ["automation", "api", "localhost", "server", "claude", "codex"]
-        ),
-        .init(
-            destination: SettingsNavigationTarget(section: .automationRemote, automationPage: .notificationsAndAPI),
-            title: "Automation API token",
-            detail: "Copy or rotate the local bearer token",
-            keywords: ["token", "bearer", "auth", "copy", "rotate"]
-        ),
-        .init(
-            destination: SettingsNavigationTarget(section: .automationRemote, automationPage: .notificationsAndAPI),
-            title: "Claude hooks",
-            detail: "Install Notification and Stop hooks into Claude Code",
-            keywords: ["claude", "hook", "notification", "stop", "subagent"]
-        ),
-        .init(
-            destination: SettingsNavigationTarget(section: .automationRemote, automationPage: .notificationsAndAPI),
-            title: "Codex CLI notify config",
-            detail: "Copy the Codex CLI notify snippet for ~/.codex/config.toml",
-            keywords: ["codex", "notify", "config", "toml", "cloud"]
-        ),
-        .init(
-            destination: SettingsNavigationTarget(section: .automationRemote, automationPage: .notificationsAndAPI),
-            title: "Codex Cloud beta",
-            detail: "Watch local codex cloud tasks and alert when they are ready or fail",
-            keywords: ["codex", "cloud", "beta", "polling", "ready", "failed"]
-        ),
-        .init(
-            destination: SettingsNavigationTarget(section: .automationRemote, automationPage: .notificationsAndAPI),
-            title: "Desktop notification permission",
-            detail: "Allow desktop notifications for local API alerts",
-            keywords: ["notification", "permission", "desktop", "grant"]
-        ),
-        .init(
-            destination: SettingsNavigationTarget(section: .automationRemote, automationPage: .telegramRemote),
-            title: "Telegram remote",
-            detail: "Control the selected Open Assist session from a private Telegram bot chat",
-            keywords: ["telegram", "remote", "bot", "chat", "session"]
-        ),
-        .init(
-            destination: SettingsNavigationTarget(section: .automationRemote, automationPage: .telegramRemote),
-            title: "Telegram bot token",
-            detail: "Paste, copy, test, or clear your Telegram bot token",
-            keywords: ["telegram", "botfather", "token", "paste", "copy"]
-        ),
-        .init(
-            destination: SettingsNavigationTarget(section: .automationRemote, automationPage: .telegramRemote),
-            title: "Telegram pairing",
-            detail: "Approve or forget the private Telegram chat that can control Open Assist",
-            keywords: ["telegram", "pairing", "approve", "private", "chat"]
-        ),
-        .init(
-            destination: SettingsNavigationTarget(section: .automationRemote, automationPage: .telegramRemote),
-            title: "Telegram setup steps",
-            detail: "Follow the built-in BotFather and /start setup guide",
-            keywords: ["telegram", "setup", "steps", "botfather", "start"]
-        ),
-        .init(
-            destination: SettingsNavigationTarget(section: .automationRemote, automationPage: .telegramRemote),
-            title: "Telegram session switching",
-            detail: "Switch sessions without mixing messages from different chats",
-            keywords: ["telegram", "switch", "session", "messages", "mixed"]
-        ),
-        .init(
-            destination: SettingsNavigationTarget(section: .appPermissions),
+            destination: SettingsRoute(section: .dailyUse, cardID: "daily.appearance"),
             title: "Appearance",
             detail: "Choose theme, window style, and waveform look",
             keywords: ["appearance", "theme", "style", "waveform", "color"]
         ),
         .init(
-            destination: SettingsNavigationTarget(section: .appPermissions),
-            title: "Permission overview",
-            detail: "See accessibility, microphone, speech, and automation status",
-            keywords: ["permissions", "accessibility", "microphone", "speech", "automation"]
+            destination: SettingsRoute(section: .voiceDictation, cardID: "voice.tasks"),
+            title: "Voice setup",
+            detail: "Open the voice and dictation quick-start area",
+            keywords: ["voice", "dictation", "test dictation", "microphone", "shortcut"]
         ),
         .init(
-            destination: SettingsNavigationTarget(section: .appPermissions),
+            destination: SettingsRoute(section: .voiceDictation, cardID: "shortcuts.agentShortcut"),
+            title: "Agent shortcut",
+            detail: "Hold to speak and paste into the assistant box",
+            keywords: ["assistant", "agent", "voice", "shortcut", "keyboard", "hold", "paste"]
+        ),
+        .init(
+            destination: SettingsRoute(section: .voiceDictation, cardID: "shortcuts.holdToTalk"),
+            title: "Hold-to-talk shortcut",
+            detail: "Set keys for press-and-hold dictation",
+            keywords: ["hold", "shortcut", "keyboard", "voice"]
+        ),
+        .init(
+            destination: SettingsRoute(section: .voiceDictation, cardID: "shortcuts.continuousToggle"),
+            title: "Continuous toggle shortcut",
+            detail: "Set keys for start and stop continuous dictation",
+            keywords: ["continuous", "toggle", "shortcut", "keyboard"]
+        ),
+        .init(
+            destination: SettingsRoute(section: .voiceDictation, cardID: "speech.inputDevice"),
+            title: "Microphone device picker",
+            detail: "Choose a microphone or auto-detect one",
+            keywords: ["microphone", "input", "device", "picker", "auto"]
+        ),
+        .init(
+            destination: SettingsRoute(section: .voiceDictation, cardID: "speech.transcriptionEngine"),
+            title: "Transcription engine",
+            detail: "Switch between Apple Speech, whisper.cpp, and cloud providers",
+            keywords: ["engine", "whisper", "apple", "cloud", "openai", "groq", "deepgram", "gemini", "recognition"]
+        ),
+        .init(
+            destination: SettingsRoute(section: .voiceDictation, cardID: "speech.modelLibrary"),
+            title: "Whisper model library",
+            detail: "Download and manage whisper.cpp models",
+            keywords: ["model", "download", "whisper", "tiny", "base", "small", "medium", "large"]
+        ),
+        .init(
+            destination: SettingsRoute(section: .voiceDictation, cardID: "speech.textQuality"),
+            title: "Text quality",
+            detail: "Finalize delay, cleanup mode, and custom phrases",
+            keywords: ["cleanup", "mode", "text quality", "finalize", "phrases", "delay"]
+        ),
+        .init(
+            destination: SettingsRoute(section: .voiceDictation, cardID: "corrections.adaptive"),
+            title: "Adaptive corrections",
+            detail: "Learn from your quick word and phrase fixes",
+            keywords: ["adaptive", "learned", "corrections", "backspace"]
+        ),
+        .init(
+            destination: SettingsRoute(section: .browserAppControl, cardID: "browser.tasks"),
+            title: "Browser and app control",
+            detail: "Open the quick-start area for automation, browser reuse, and computer use",
+            keywords: ["browser", "app control", "automation", "computer use", "setup"]
+        ),
+        .init(
+            destination: SettingsRoute(section: .browserAppControl, cardID: "automation.permissions"),
+            title: "Automation permissions",
+            detail: "Review Accessibility, Screen Recording, Apple Events, and Full Disk Access",
+            keywords: ["automation", "apple events", "accessibility", "screen recording", "full disk", "browser", "permissions"]
+        ),
+        .init(
+            destination: SettingsRoute(section: .browserAppControl, cardID: "automation.browserProfile"),
+            title: "Browser profile",
+            detail: "Choose the Chrome, Brave, or Edge profile Open Assist should reuse",
+            keywords: ["browser", "profile", "chrome", "brave", "edge", "session"]
+        ),
+        .init(
+            destination: SettingsRoute(section: .browserAppControl, cardID: "automation.computerUse"),
+            title: "Computer use",
+            detail: "Turn screenshot-based desktop control on or off and review readiness",
+            keywords: ["computer use", "desktop control", "mouse", "keyboard", "screenshot", "click", "type"]
+        ),
+        .init(
+            destination: SettingsRoute(section: .browserAppControl, cardID: "automation.helperStatus"),
+            title: "Helper status",
+            detail: "See local automation helper readiness and setup issues",
+            keywords: ["helper", "status", "issues", "readiness"]
+        ),
+        .init(
+            destination: SettingsRoute(section: .permissionsPrivacy, cardID: "permissions.overview"),
+            title: "Permission overview",
+            detail: "See accessibility, microphone, speech, screen, and automation status",
+            keywords: ["permissions", "accessibility", "microphone", "speech", "automation", "screen recording"]
+        ),
+        .init(
+            destination: SettingsRoute(section: .advanced, cardID: "advanced.aiStudio"),
+            title: "AI Studio",
+            detail: aiStudioDescription,
+            keywords: ["ai", "studio", "providers", "models", "memory", "advanced", "local ai"]
+        ),
+        .init(
+            destination: SettingsRoute(section: .advanced, cardID: "advanced.providerStatus"),
+            title: "Provider connection status",
+            detail: "See which AI providers are ready",
+            keywords: ["provider", "oauth", "api key", "openai", "anthropic", "google", "gemini", "connection"]
+        ),
+        .init(
+            destination: SettingsRoute(
+                section: .advanced,
+                cardID: "integrations.notifications.localAPI",
+                advancedPage: .automationNotifications
+            ),
+            title: "Automation notifications",
+            detail: "Open the page for Claude Code, Codex CLI, and Codex Cloud alerts",
+            keywords: ["automation", "notifications", "sources", "codex", "claude", "local api"]
+        ),
+        .init(
+            destination: SettingsRoute(
+                section: .advanced,
+                cardID: "integrations.telegram.setup",
+                advancedPage: .telegramRemote
+            ),
+            title: "Telegram remote",
+            detail: "Control the selected Open Assist session from a private Telegram bot chat",
+            keywords: ["telegram", "remote", "bot", "chat", "session"]
+        ),
+        .init(
+            destination: SettingsRoute(section: .advanced, cardID: "advanced.appInfo"),
             title: "App info",
             detail: "See the version and check for updates",
             keywords: ["version", "updates", "app info", "build"]
         ),
         .init(
-            destination: SettingsNavigationTarget(section: .appPermissions),
+            destination: SettingsRoute(section: .advanced, cardID: "advanced.diagnostics"),
             title: "Crash logs",
             detail: "Open existing crash logs in Finder",
             keywords: ["crash", "logs", "diagnostics"]
         ),
         .init(
-            destination: SettingsNavigationTarget(section: .appPermissions),
+            destination: SettingsRoute(section: .advanced, cardID: "advanced.uninstall"),
             title: "Uninstall Open Assist",
             detail: "Remove the app and clear local settings",
             keywords: ["uninstall", "remove", "reset"]
@@ -407,17 +375,17 @@ enum SettingsNavigationModel {
     static func filteredSections(for query: String) -> [SettingsSection] {
         let normalized = normalizedSearchQuery(query)
         guard !normalized.isEmpty else {
-            return SettingsSection.allCases
+            return SettingsSection.sidebarSections
         }
 
-        let fromSectionTerms = SettingsSection.allCases.filter { section in
-            let sectionHaystack = ([section.title, section.subtitle] + section.searchTerms)
+        let fromSectionTerms = SettingsSection.sidebarSections.filter { section in
+            let haystack = ([section.title, section.subtitle] + section.searchTerms)
                 .joined(separator: " ")
                 .lowercased()
-            return sectionHaystack.contains(normalized)
+            return haystack.contains(normalized)
         }
         let fromEntries = Set(filteredSearchEntries(for: normalized).map(\.section))
-        return SettingsSection.allCases.filter { section in
+        return SettingsSection.sidebarSections.filter { section in
             fromSectionTerms.contains(section) || fromEntries.contains(section)
         }
     }

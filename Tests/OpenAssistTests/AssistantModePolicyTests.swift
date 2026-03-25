@@ -215,6 +215,20 @@ final class AssistantModePolicyTests: XCTestCase {
         XCTAssertTrue(
             AssistantModePolicy.isAllowed(
                 mode: .plan,
+                activityKind: .dynamicToolCall,
+                toolName: "generate_image"
+            )
+        )
+        XCTAssertTrue(
+            AssistantModePolicy.isAllowed(
+                mode: .plan,
+                activityKind: .dynamicToolCall,
+                toolName: "computer_use"
+            )
+        )
+        XCTAssertTrue(
+            AssistantModePolicy.isAllowed(
+                mode: .plan,
                 activityKind: .mcpToolCall
             )
         )
@@ -250,11 +264,25 @@ final class AssistantModePolicyTests: XCTestCase {
                 toolName: "app_action"
             )
         )
+        XCTAssertFalse(
+            AssistantModePolicy.isAllowed(
+                mode: .conversational,
+                activityKind: .dynamicToolCall,
+                toolName: "computer_use"
+            )
+        )
         XCTAssertTrue(
             AssistantModePolicy.isAllowed(
                 mode: .conversational,
                 activityKind: .dynamicToolCall,
                 toolName: "web_lookup"
+            )
+        )
+        XCTAssertTrue(
+            AssistantModePolicy.isAllowed(
+                mode: .conversational,
+                activityKind: .dynamicToolCall,
+                toolName: "generate_image"
             )
         )
         XCTAssertFalse(
