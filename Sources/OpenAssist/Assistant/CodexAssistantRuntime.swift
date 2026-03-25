@@ -2198,37 +2198,25 @@ final class CodexAssistantRuntime {
                 ? "Checking the browser after sign-in"
                 : "Using the selected browser profile"
             updateHUD(phase: .acting, title: displayName, detail: workingDetail)
-            do {
-                result = try await (
-                    browserLoginResume
-                        ? browserUseService.resumeAfterLogin(
-                            arguments: arguments,
-                            preferredModelID: preferredModelID
-                        )
-                        : browserUseService.run(
-                            arguments: arguments,
-                            preferredModelID: preferredModelID
-                        )
-                )
-            } catch let error as AssistantBrowserUseServiceError {
-                switch error {
-                case .loginRequired(let prompt):
-                    await presentBrowserLoginRequest(
-                        id: requestID,
+            result = await (
+                browserLoginResume
+                    ? browserUseService.resumeAfterLogin(
                         arguments: arguments,
-                        prompt: prompt,
-                        taskSummary: dynamicToolTaskSummary(for: toolName, arguments: arguments)
+                        preferredModelID: preferredModelID
                     )
-                    return
-                }
-            } catch {
-                let summary = error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
-                    ?? "Browser Use failed."
-                result = AssistantToolExecutionResult(
-                    contentItems: [.init(type: "inputText", text: summary, imageURL: nil)],
-                    success: false,
-                    summary: summary
+                    : browserUseService.run(
+                        arguments: arguments,
+                        preferredModelID: preferredModelID
+                    )
+            )
+            if let prompt = result?.loginPrompt {
+                await presentBrowserLoginRequest(
+                    id: requestID,
+                    arguments: arguments,
+                    prompt: prompt,
+                    taskSummary: dynamicToolTaskSummary(for: toolName, arguments: arguments)
                 )
+                return
             }
         case AssistantAppActionToolDefinition.name:
             workingDetail = "Using a supported Mac app"

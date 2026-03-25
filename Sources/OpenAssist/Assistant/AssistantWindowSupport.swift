@@ -382,7 +382,7 @@ func assistantSelectedSessionToolActivity(
 
 func assistantSelectedSessionActiveWorkSnapshot(
     selectedSessionID: String?,
-    activeRuntimeSessionID: String?,
+    activeRuntimeSessionID _: String?,
     planEntries: [AssistantPlanEntry],
     subagents: [SubagentState],
     toolCalls: [AssistantToolCallState],
@@ -409,8 +409,8 @@ func assistantSelectedSessionActiveWorkSnapshot(
 
 func assistantSidebarChildSubagents(
     parentSessionID: String,
-    selectedSessionID: String?,
-    activeRuntimeSessionID: String?,
+    selectedSessionID _: String?,
+    activeRuntimeSessionID _: String?,
     subagents: [SubagentState]
 ) -> [SubagentState] {
     return subagents.filter { agent in
@@ -420,7 +420,7 @@ func assistantSidebarChildSubagents(
 
 func assistantParentThreadLinkState(
     selectedSessionID: String?,
-    activeRuntimeSessionID: String?,
+    activeRuntimeSessionID _: String?,
     subagents: [SubagentState]
 ) -> AssistantParentThreadLinkState? {
     guard let selectedSessionID = selectedSessionID?

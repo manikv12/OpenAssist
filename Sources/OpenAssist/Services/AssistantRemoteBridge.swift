@@ -204,13 +204,13 @@ final class AssistantRemoteBridge {
         let normalizedSessionID = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !normalizedSessionID.isEmpty else { return nil }
 
-        if let session = assistant.sessions.first(where: { $0.id == normalizedSessionID }) {
+        if let session = assistant.sessions.first(where: { $0.id.caseInsensitiveCompare(normalizedSessionID) == .orderedSame }) {
             await assistant.openSession(session)
             return await assistant.remoteSessionSnapshot(sessionID: normalizedSessionID)
         }
 
         await assistant.refreshSessions(limit: 200)
-        if let refreshedSession = assistant.sessions.first(where: { $0.id == normalizedSessionID }) {
+        if let refreshedSession = assistant.sessions.first(where: { $0.id.caseInsensitiveCompare(normalizedSessionID) == .orderedSame }) {
             await assistant.openSession(refreshedSession)
             return await assistant.remoteSessionSnapshot(sessionID: normalizedSessionID)
         }
