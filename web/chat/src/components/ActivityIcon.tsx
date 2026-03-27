@@ -33,7 +33,7 @@ function ActivityIconInner({ kind, status }: Props) {
       symbol={symbol}
       className={`activity-svg-icon ${statusClass}`}
       size={16}
-      strokeWidth="2"
+      strokeWidth={2}
     />
   );
 }
