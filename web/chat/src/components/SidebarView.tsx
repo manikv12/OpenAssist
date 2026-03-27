@@ -694,11 +694,16 @@ export function SidebarView({
               <button
                 type="button"
                 className="oa-react-sidebar__icon-button oa-react-sidebar__new-thread"
+                disabled={!state.canCreateThread}
                 onClick={() => {
                   closeContextMenu();
                   onDispatchCommand("newThread");
                 }}
-                title="New thread"
+                title={
+                  state.canCreateThread
+                    ? "New thread"
+                    : "You can't start a new thread right now."
+                }
               >
                 <SidebarIcon symbol="plus" />
               </button>
