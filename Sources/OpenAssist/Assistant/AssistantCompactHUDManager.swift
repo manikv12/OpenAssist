@@ -627,9 +627,13 @@ final class AssistantCompactHUDManager: AssistantCompactPresenter {
                 panelSize: panel.frame.size
             )
         }
-        panel.contentViewController = NSHostingController(
+        let hostingController = NSHostingController(
             rootView: AssistantCompactHUDView(style: presentationStyle, model: model)
         )
+        // The HUD manager drives panel sizing manually for orb/notch states.
+        // Disable SwiftUI's automatic window resizing to avoid AppKit layout loops.
+        hostingController.sizingOptions = []
+        panel.contentViewController = hostingController
         self.panel = panel
     }
 

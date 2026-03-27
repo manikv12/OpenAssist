@@ -1,0 +1,354 @@
+import AppKit
+import SwiftUI
+import WebKit
+
+struct AssistantSidebarWebNavItem: Equatable {
+    let id: String
+    let label: String
+    let symbol: String
+
+    func toJSON() -> [String: Any] {
+        [
+            "id": id,
+            "label": label,
+            "symbol": symbol,
+        ]
+    }
+}
+
+struct AssistantSidebarWebProject: Equatable {
+    let id: String
+    let name: String
+    let symbol: String
+    let subtitle: String
+    let isSelected: Bool
+    let hasLinkedFolder: Bool
+    let hasCustomIcon: Bool
+
+    func toJSON() -> [String: Any] {
+        [
+            "id": id,
+            "name": name,
+            "symbol": symbol,
+            "subtitle": subtitle,
+            "isSelected": isSelected,
+            "hasLinkedFolder": hasLinkedFolder,
+            "hasCustomIcon": hasCustomIcon,
+        ]
+    }
+}
+
+struct AssistantSidebarWebHiddenProject: Equatable {
+    let id: String
+    let name: String
+    let symbol: String
+
+    func toJSON() -> [String: Any] {
+        [
+            "id": id,
+            "name": name,
+            "symbol": symbol,
+        ]
+    }
+}
+
+struct AssistantSidebarWebSession: Equatable {
+    let id: String
+    let title: String
+    let subtitle: String
+    let timeLabel: String?
+    let isSelected: Bool
+    let isTemporary: Bool
+    let projectID: String?
+
+    func toJSON() -> [String: Any] {
+        var json: [String: Any] = [
+            "id": id,
+            "title": title,
+            "subtitle": subtitle,
+            "isSelected": isSelected,
+            "isTemporary": isTemporary,
+        ]
+        if let timeLabel, !timeLabel.isEmpty {
+            json["timeLabel"] = timeLabel
+        }
+        if let projectID, !projectID.isEmpty {
+            json["projectId"] = projectID
+        }
+        return json
+    }
+}
+
+struct AssistantSidebarWebState: Equatable {
+    let selectedPane: String
+    let isCollapsed: Bool
+    let collapsedPreviewPane: String?
+    let canCreateThread: Bool
+    let canCollapse: Bool
+    let projectsTitle: String
+    let projectsHelperText: String?
+    let threadsTitle: String
+    let threadsHelperText: String?
+    let archivedTitle: String
+    let archivedHelperText: String?
+    let projectsExpanded: Bool
+    let threadsExpanded: Bool
+    let archivedExpanded: Bool
+    let canLoadMoreThreads: Bool
+    let canLoadMoreArchived: Bool
+    let archivedCount: Int
+    let hiddenProjectCount: Int
+    let navItems: [AssistantSidebarWebNavItem]
+    let allProjects: [AssistantSidebarWebProject]
+    let hiddenProjects: [AssistantSidebarWebHiddenProject]
+    let projects: [AssistantSidebarWebProject]
+    let threads: [AssistantSidebarWebSession]
+    let archived: [AssistantSidebarWebSession]
+
+    func toJSON() -> [String: Any] {
+        var json: [String: Any] = [
+            "selectedPane": selectedPane,
+            "isCollapsed": isCollapsed,
+            "canCreateThread": canCreateThread,
+            "canCollapse": canCollapse,
+            "projectsTitle": projectsTitle,
+            "threadsTitle": threadsTitle,
+            "archivedTitle": archivedTitle,
+            "projectsExpanded": projectsExpanded,
+            "threadsExpanded": threadsExpanded,
+            "archivedExpanded": archivedExpanded,
+            "canLoadMoreThreads": canLoadMoreThreads,
+            "canLoadMoreArchived": canLoadMoreArchived,
+            "archivedCount": archivedCount,
+            "hiddenProjectCount": hiddenProjectCount,
+            "navItems": navItems.map { $0.toJSON() },
+            "allProjects": allProjects.map { $0.toJSON() },
+            "hiddenProjects": hiddenProjects.map { $0.toJSON() },
+            "projects": projects.map { $0.toJSON() },
+            "threads": threads.map { $0.toJSON() },
+            "archived": archived.map { $0.toJSON() },
+        ]
+        if let projectsHelperText, !projectsHelperText.isEmpty {
+            json["projectsHelperText"] = projectsHelperText
+        }
+        if let threadsHelperText, !threadsHelperText.isEmpty {
+            json["threadsHelperText"] = threadsHelperText
+        }
+        if let archivedHelperText, !archivedHelperText.isEmpty {
+            json["archivedHelperText"] = archivedHelperText
+        }
+        if let collapsedPreviewPane, !collapsedPreviewPane.isEmpty {
+            json["collapsedPreviewPane"] = collapsedPreviewPane
+        }
+        return json
+    }
+}
+
+struct AssistantSidebarWebView: NSViewRepresentable {
+    let state: AssistantSidebarWebState
+    var accentColor: Color? = nil
+    let onCommand: (String, [String: Any]?) -> Void
+
+    func makeCoordinator() -> AssistantSidebarWebCoordinator {
+        AssistantSidebarWebCoordinator(onCommand: onCommand)
+    }
+
+    func makeNSView(context: Context) -> AssistantSidebarWebContainerView {
+        let container = AssistantSidebarWebContainerView(coordinator: context.coordinator)
+        container.applyState(state)
+        if let accentColor {
+            container.applyAccentColor(accentColor)
+        }
+        return container
+    }
+
+    func updateNSView(_ container: AssistantSidebarWebContainerView, context: Context) {
+        container.coordinator = context.coordinator
+        container.applyState(state)
+        if let accentColor {
+            container.applyAccentColor(accentColor)
+        }
+    }
+}
+
+final class AssistantSidebarWebCoordinator: NSObject, WKScriptMessageHandler {
+    var onCommand: (String, [String: Any]?) -> Void
+
+    init(onCommand: @escaping (String, [String: Any]?) -> Void) {
+        self.onCommand = onCommand
+    }
+
+    func userContentController(
+        _ userContentController: WKUserContentController,
+        didReceive message: WKScriptMessage
+    ) {
+        guard message.name == "sidebarCommand",
+            let body = message.body as? [String: Any],
+            let type = body["type"] as? String
+        else {
+            return
+        }
+
+        let payload = body["payload"] as? [String: Any]
+        DispatchQueue.main.async { [onCommand] in
+            onCommand(type, payload)
+        }
+    }
+}
+
+final class AssistantSidebarWebContainerView: NSView {
+    var coordinator: AssistantSidebarWebCoordinator
+
+    private static var cachedHTMLString: String?
+
+    private let webView: WKWebView
+    private var isReady = false
+    private var pendingState: AssistantSidebarWebState?
+    private var pendingAccentCSS: String?
+    private var lastAppliedState: AssistantSidebarWebState?
+    private var lastAppliedAccentCSS: String?
+
+    init(coordinator: AssistantSidebarWebCoordinator) {
+        self.coordinator = coordinator
+
+        let config = WKWebViewConfiguration()
+        let userContentController = config.userContentController
+        let initialModeScript = WKUserScript(
+            source: "window.__OPENASSIST_INITIAL_VIEW_MODE = 'sidebar';",
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: true
+        )
+        userContentController.addUserScript(initialModeScript)
+        userContentController.add(coordinator, name: "sidebarCommand")
+
+        let webView = AssistantInteractiveWebView(frame: .zero, configuration: config)
+        webView.setValue(false, forKey: "drawsBackground")
+        webView.allowsMagnification = false
+        self.webView = webView
+
+        super.init(frame: .zero)
+        wantsLayer = true
+        webView.navigationDelegate = self
+        addSubview(webView)
+
+        let readyHandler = AssistantSidebarReadyHandler { [weak self] in
+            self?.handleReady()
+        }
+        webView.configuration.userContentController.add(readyHandler, name: "ready")
+
+        loadTemplate()
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override var isFlipped: Bool { true }
+
+    override func layout() {
+        super.layout()
+        webView.frame = bounds
+    }
+
+    func applyState(_ state: AssistantSidebarWebState) {
+        guard lastAppliedState != state else { return }
+        lastAppliedState = state
+        sendState(state)
+    }
+
+    private func handleReady() {
+        isReady = true
+        webView.evaluateJavaScript("chatBridge.setViewMode('sidebar')", completionHandler: nil)
+        if let pendingAccentCSS {
+            webView.evaluateJavaScript(pendingAccentCSS, completionHandler: nil)
+            self.pendingAccentCSS = nil
+        }
+        if let pendingState {
+            sendState(pendingState)
+            self.pendingState = nil
+        }
+    }
+
+    private func loadTemplate() {
+        if let html = Self.cachedHTMLString {
+            webView.loadHTMLString(html, baseURL: nil)
+            return
+        }
+
+        let url: URL? =
+            Bundle.main.url(forResource: "markdown-chat", withExtension: "html")
+            ?? Bundle(identifier: "OpenAssist_OpenAssist")?.url(
+                forResource: "markdown-chat", withExtension: "html")
+            ?? {
+                let execDir = Bundle.main.bundleURL.deletingLastPathComponent()
+                let candidates = [
+                    execDir.appendingPathComponent(
+                        "OpenAssist_OpenAssist.bundle/markdown-chat.html"),
+                    execDir.appendingPathComponent("markdown-chat.html"),
+                ]
+                return candidates.first { FileManager.default.fileExists(atPath: $0.path) }
+            }()
+
+        guard let url,
+            let html = try? String(contentsOf: url, encoding: .utf8)
+        else {
+            return
+        }
+
+        Self.cachedHTMLString = html
+        webView.loadHTMLString(html, baseURL: nil)
+    }
+
+    private func sendState(_ state: AssistantSidebarWebState) {
+        guard isReady else {
+            pendingState = state
+            return
+        }
+
+        guard let data = try? JSONSerialization.data(withJSONObject: state.toJSON()),
+            let jsonString = String(data: data, encoding: .utf8)
+        else {
+            return
+        }
+
+        webView.evaluateJavaScript(
+            "chatBridge.setViewMode('sidebar'); chatBridge.setSidebarState(\(jsonString));",
+            completionHandler: nil
+        )
+    }
+
+    func applyAccentColor(_ color: Color) {
+        let js = AssistantWebViewThemeBridge.accentJavaScript(color)
+        guard lastAppliedAccentCSS != js else { return }
+        lastAppliedAccentCSS = js
+        guard isReady else {
+            pendingAccentCSS = js
+            return
+        }
+        webView.evaluateJavaScript(js, completionHandler: nil)
+    }
+}
+
+extension AssistantSidebarWebContainerView: WKNavigationDelegate {
+    func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        isReady = false
+        loadTemplate()
+    }
+}
+
+private final class AssistantSidebarReadyHandler: NSObject, WKScriptMessageHandler {
+    private let onReady: () -> Void
+
+    init(onReady: @escaping () -> Void) {
+        self.onReady = onReady
+    }
+
+    func userContentController(
+        _ userContentController: WKUserContentController,
+        didReceive message: WKScriptMessage
+    ) {
+        if message.name == "ready" {
+            onReady()
+        }
+    }
+}

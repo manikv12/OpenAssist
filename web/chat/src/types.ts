@@ -127,3 +127,104 @@ export interface ScrollState {
   isScrolledUp: boolean;
   distanceFromTop: number;
 }
+
+export type AssistantSidebarPaneID = "threads" | "archived" | "automations" | "skills";
+export type AssistantSidebarCollapsedPreviewPane =
+  | AssistantSidebarPaneID
+  | "projects";
+
+export interface AssistantSidebarNavItem {
+  id: Exclude<AssistantSidebarPaneID, "archived">;
+  label: string;
+  symbol: string;
+}
+
+export interface AssistantSidebarProjectItem {
+  id: string;
+  name: string;
+  symbol: string;
+  subtitle: string;
+  isSelected: boolean;
+  hasLinkedFolder: boolean;
+  hasCustomIcon: boolean;
+}
+
+export interface AssistantSidebarHiddenProjectItem {
+  id: string;
+  name: string;
+  symbol: string;
+}
+
+export interface AssistantSidebarSessionItem {
+  id: string;
+  title: string;
+  subtitle: string;
+  timeLabel?: string;
+  isSelected: boolean;
+  isTemporary: boolean;
+  projectId?: string;
+}
+
+export interface AssistantSidebarState {
+  selectedPane: AssistantSidebarPaneID;
+  isCollapsed: boolean;
+  collapsedPreviewPane?: AssistantSidebarCollapsedPreviewPane;
+  canCreateThread: boolean;
+  canCollapse: boolean;
+  projectsTitle: string;
+  projectsHelperText?: string;
+  threadsTitle: string;
+  threadsHelperText?: string;
+  archivedTitle: string;
+  archivedHelperText?: string;
+  projectsExpanded: boolean;
+  threadsExpanded: boolean;
+  archivedExpanded: boolean;
+  canLoadMoreThreads: boolean;
+  canLoadMoreArchived: boolean;
+  archivedCount: number;
+  hiddenProjectCount: number;
+  navItems: AssistantSidebarNavItem[];
+  allProjects: AssistantSidebarProjectItem[];
+  hiddenProjects: AssistantSidebarHiddenProjectItem[];
+  projects: AssistantSidebarProjectItem[];
+  threads: AssistantSidebarSessionItem[];
+  archived: AssistantSidebarSessionItem[];
+}
+
+export interface AssistantComposerOption {
+  id: string;
+  label: string;
+}
+
+export interface AssistantComposerAttachment {
+  id: string;
+  filename: string;
+  kind: "file" | "image";
+}
+
+export interface AssistantComposerSkill {
+  skillName: string;
+  displayName: string;
+  isMissing: boolean;
+}
+
+export interface AssistantComposerState {
+  draftText: string;
+  placeholder: string;
+  isEnabled: boolean;
+  canSend: boolean;
+  isBusy: boolean;
+  isVoiceCapturing: boolean;
+  canUseVoiceInput: boolean;
+  showStopVoicePlayback: boolean;
+  canOpenSkills: boolean;
+  selectedInteractionMode: string;
+  interactionModes: AssistantComposerOption[];
+  selectedModelId?: string;
+  modelOptions: AssistantComposerOption[];
+  selectedReasoningId: string;
+  reasoningOptions: AssistantComposerOption[];
+  activeSkills: AssistantComposerSkill[];
+  attachments: AssistantComposerAttachment[];
+}

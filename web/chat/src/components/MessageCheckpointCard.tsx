@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { MessageCheckpointInfo } from "../types";
+import { AppIcon } from "./AppIcon";
 
 interface Props {
   info: MessageCheckpointInfo;
@@ -203,10 +204,7 @@ export function MessageCheckpointCard({ info }: Props) {
           <div className="msg-cp-actions">
             <button type="button" className="msg-cp-btn" onClick={handleUndo}>
               Undo
-              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                <polyline points="1 4 1 10 7 10" />
-                <path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10" />
-              </svg>
+              <AppIcon symbol="undo" size={13} strokeWidth={2} />
             </button>
           </div>
         )}
@@ -247,14 +245,12 @@ export function MessageCheckpointCard({ info }: Props) {
                   {fileDel > 0 && <span className="msg-cp-del">-{fileDel}</span>}
                   {file.isBinary && <span className="msg-cp-bin">binary</span>}
                 </span>
-                <svg
+                <AppIcon
+                  symbol="chevron.down"
                   className={`msg-cp-file-chevron${isOpen ? " is-open" : ""}`}
-                  width="12" height="12" viewBox="0 0 24 24"
-                  fill="none" stroke="currentColor" strokeWidth="2"
-                  strokeLinecap="round" strokeLinejoin="round"
-                >
-                  <polyline points="6 9 12 15 18 9" />
-                </svg>
+                  size={12}
+                  strokeWidth={2}
+                />
               </button>
 
               {isOpen && parsed && !parsed.binary && parsed.hunks.length > 0 && (

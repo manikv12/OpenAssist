@@ -1,4 +1,5 @@
 import { memo } from "react";
+import { AppIcon } from "./AppIcon";
 
 interface ChevronIconProps {
   expanded?: boolean;
@@ -14,22 +15,12 @@ function ChevronIconInner({
     .join(" ");
 
   return (
-    <svg
+    <AppIcon
+      symbol="chevron.right"
       className={classes}
-      width="14"
-      height="14"
-      viewBox="0 0 14 14"
-      fill="none"
-      aria-hidden="true"
-    >
-      <path
-        d="M5 3.5L8.75 7L5 10.5"
-        stroke="currentColor"
-        strokeWidth="1.7"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-      />
-    </svg>
+      size={14}
+      strokeWidth={1.7}
+    />
   );
 }
 

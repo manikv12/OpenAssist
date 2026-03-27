@@ -130,6 +130,26 @@ final class AssistantProjectStoreTests: XCTestCase {
         XCTAssertEqual(reloadedStore.hiddenProjects().count, 0)
     }
 
+    func testCreateProjectWithSameLinkedFolderReusesExistingProjectAndUnhidesIt() throws {
+        let directory = try makeTemporaryDirectory(named: "assistant-project-shared-folder")
+        let store = AssistantProjectStore(baseDirectoryURL: directory)
+
+        let original = try store.createProject(
+            name: "Workspace",
+            linkedFolderPath: "/tmp/shared-workspace"
+        )
+        _ = try store.hideProject(id: original.id)
+
+        let reused = try store.createProject(
+            name: "Another Name",
+            linkedFolderPath: "/tmp/shared-workspace"
+        )
+
+        XCTAssertEqual(reused.id, original.id)
+        XCTAssertEqual(store.projects().count, 1)
+        XCTAssertFalse(try XCTUnwrap(store.project(forProjectID: original.id)).isHidden)
+    }
+
     func testLegacyProjectSnapshotWithoutHiddenFlagDefaultsToVisible() throws {
         let directory = try makeTemporaryDirectory(named: "assistant-project-legacy")
         let fileURL = directory.appendingPathComponent("projects.json")
@@ -171,6 +191,143 @@ final class AssistantProjectStoreTests: XCTestCase {
         XCTAssertEqual(context.project.name, "Legacy Project")
         XCTAssertFalse(context.project.isHidden)
         XCTAssertEqual(context.brainState.projectSummary, "Legacy summary")
+    }
+
+    func testReloadMergesDuplicateProjectsThatShareLinkedFolder() throws {
+        let directory = try makeTemporaryDirectory(named: "assistant-project-duplicate-folder")
+        let fileURL = directory.appendingPathComponent("projects.json")
+
+        let createdAt = Date(timeIntervalSinceReferenceDate: 1_000)
+        let updatedAt = Date(timeIntervalSinceReferenceDate: 1_200)
+        let duplicateSnapshot: [String: Any] = [
+            "version": 3,
+            "projects": [
+                [
+                    "id": "project-visible",
+                    "name": "Visible Project",
+                    "linkedFolderPath": "/tmp/shared-folder",
+                    "createdAt": createdAt.timeIntervalSinceReferenceDate,
+                    "updatedAt": updatedAt.timeIntervalSinceReferenceDate,
+                    "isHidden": false
+                ],
+                [
+                    "id": "project-hidden",
+                    "name": "Hidden Duplicate",
+                    "linkedFolderPath": "/tmp/shared-folder",
+                    "iconSymbolName": "briefcase.fill",
+                    "createdAt": createdAt.addingTimeInterval(20).timeIntervalSinceReferenceDate,
+                    "updatedAt": updatedAt.addingTimeInterval(20).timeIntervalSinceReferenceDate,
+                    "isHidden": true
+                ]
+            ],
+            "threadAssignments": [
+                "thread-visible": "project-visible",
+                "thread-hidden": "project-hidden"
+            ],
+            "brainByProjectID": [
+                "project-visible": [
+                    "projectSummary": "Visible summary",
+                    "threadDigestsByThreadID": [
+                        "thread-visible": [
+                            "threadID": "thread-visible",
+                            "threadTitle": "Visible Thread",
+                            "summary": "Visible digest",
+                            "updatedAt": updatedAt.timeIntervalSinceReferenceDate
+                        ]
+                    ],
+                    "lastProcessedTranscriptFingerprintByThreadID": [
+                        "thread-visible": "visible-fingerprint"
+                    ],
+                    "lastProcessedAt": updatedAt.timeIntervalSinceReferenceDate
+                ],
+                "project-hidden": [
+                    "projectSummary": "Hidden summary",
+                    "threadDigestsByThreadID": [
+                        "thread-hidden": [
+                            "threadID": "thread-hidden",
+                            "threadTitle": "Hidden Thread",
+                            "summary": "Hidden digest",
+                            "updatedAt": updatedAt.addingTimeInterval(10).timeIntervalSinceReferenceDate
+                        ]
+                    ],
+                    "lastProcessedTranscriptFingerprintByThreadID": [
+                        "thread-hidden": "hidden-fingerprint"
+                    ],
+                    "lastProcessedAt": updatedAt.addingTimeInterval(10).timeIntervalSinceReferenceDate
+                ]
+            ]
+        ]
+
+        let data = try JSONSerialization.data(
+            withJSONObject: duplicateSnapshot,
+            options: [.sortedKeys, .prettyPrinted]
+        )
+        try data.write(to: fileURL)
+
+        let store = AssistantProjectStore(baseDirectoryURL: directory)
+        XCTAssertEqual(store.projects().count, 1)
+
+        let mergedProject = try XCTUnwrap(store.project(forProjectID: "project-visible"))
+        XCTAssertFalse(mergedProject.isHidden)
+        XCTAssertEqual(mergedProject.iconSymbolName, "briefcase.fill")
+        XCTAssertEqual(store.assignedProjectID(forThreadID: "thread-visible"), "project-visible")
+        XCTAssertEqual(store.assignedProjectID(forThreadID: "thread-hidden"), "project-visible")
+
+        let mergedBrain = store.brainState(forProjectID: "project-visible")
+        XCTAssertEqual(mergedBrain.projectSummary, "Visible summary")
+        XCTAssertEqual(mergedBrain.threadDigestsByThreadID["thread-visible"]?.threadTitle, "Visible Thread")
+        XCTAssertEqual(mergedBrain.threadDigestsByThreadID["thread-hidden"]?.threadTitle, "Hidden Thread")
+        XCTAssertEqual(
+            mergedBrain.lastProcessedTranscriptFingerprintByThreadID["thread-hidden"],
+            "hidden-fingerprint"
+        )
+        XCTAssertNil(store.project(forProjectID: "project-hidden"))
+    }
+
+    func testReloadMergesDuplicateProjectsThatShareLinkedFolderIgnoringCase() throws {
+        let directory = try makeTemporaryDirectory(named: "assistant-project-duplicate-folder-case")
+        let fileURL = directory.appendingPathComponent("projects.json")
+
+        let createdAt = Date(timeIntervalSinceReferenceDate: 2_000)
+        let updatedAt = Date(timeIntervalSinceReferenceDate: 2_100)
+        let duplicateSnapshot: [String: Any] = [
+            "version": 3,
+            "projects": [
+                [
+                    "id": "project-upper",
+                    "name": "Upper Case",
+                    "linkedFolderPath": "/tmp/Shared-Folder",
+                    "createdAt": createdAt.timeIntervalSinceReferenceDate,
+                    "updatedAt": updatedAt.timeIntervalSinceReferenceDate,
+                    "isHidden": false
+                ],
+                [
+                    "id": "project-lower",
+                    "name": "Lower Case",
+                    "linkedFolderPath": "/tmp/shared-folder",
+                    "createdAt": createdAt.addingTimeInterval(20).timeIntervalSinceReferenceDate,
+                    "updatedAt": updatedAt.addingTimeInterval(20).timeIntervalSinceReferenceDate,
+                    "isHidden": true
+                ]
+            ],
+            "threadAssignments": [
+                "thread-upper": "project-upper",
+                "thread-lower": "project-lower"
+            ],
+            "brainByProjectID": [:]
+        ]
+
+        let data = try JSONSerialization.data(
+            withJSONObject: duplicateSnapshot,
+            options: [.sortedKeys, .prettyPrinted]
+        )
+        try data.write(to: fileURL)
+
+        let store = AssistantProjectStore(baseDirectoryURL: directory)
+        XCTAssertEqual(store.projects().count, 1)
+        XCTAssertEqual(store.assignedProjectID(forThreadID: "thread-upper"), "project-upper")
+        XCTAssertEqual(store.assignedProjectID(forThreadID: "thread-lower"), "project-upper")
+        XCTAssertNil(store.project(forProjectID: "project-lower"))
     }
 
     func testDeleteProjectClearsAssignmentsAndReturnsRemovedThreads() throws {

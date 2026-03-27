@@ -38,13 +38,15 @@ private struct AssistantMarkdownWebNSView: NSViewRepresentable {
 
     func makeNSView(context: Context) -> AssistantMarkdownWebContainerView {
         let container = AssistantMarkdownWebContainerView(coordinator: context.coordinator)
-        container.apply(contentID: contentID, text: text, isStreaming: isStreaming, textScale: textScale)
+        container.apply(
+            contentID: contentID, text: text, isStreaming: isStreaming, textScale: textScale)
         return container
     }
 
     func updateNSView(_ container: AssistantMarkdownWebContainerView, context: Context) {
         _ = context.coordinator
-        container.apply(contentID: contentID, text: text, isStreaming: isStreaming, textScale: textScale)
+        container.apply(
+            contentID: contentID, text: text, isStreaming: isStreaming, textScale: textScale)
     }
 }
 
@@ -146,19 +148,27 @@ final class AssistantMarkdownWebContainerView: NSView, WKNavigationDelegate {
 
     // MARK: - Template Loading
 
+    func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        isReady = false
+        loadTemplate()
+    }
+
     private func loadTemplate() {
         if let html = Self.cachedHTMLString {
             webView.loadHTMLString(html, baseURL: nil)
             return
         }
 
-        let url: URL? = Bundle.main.url(forResource: "markdown-chat", withExtension: "html")
-            ?? Bundle(identifier: "OpenAssist_OpenAssist")?.url(forResource: "markdown-chat", withExtension: "html")
+        let url: URL? =
+            Bundle.main.url(forResource: "markdown-chat", withExtension: "html")
+            ?? Bundle(identifier: "OpenAssist_OpenAssist")?.url(
+                forResource: "markdown-chat", withExtension: "html")
             ?? {
                 let execDir = Bundle.main.bundleURL.deletingLastPathComponent()
                 let candidates = [
-                    execDir.appendingPathComponent("OpenAssist_OpenAssist.bundle/markdown-chat.html"),
-                    execDir.appendingPathComponent("markdown-chat.html")
+                    execDir.appendingPathComponent(
+                        "OpenAssist_OpenAssist.bundle/markdown-chat.html"),
+                    execDir.appendingPathComponent("markdown-chat.html"),
                 ]
                 return candidates.first { FileManager.default.fileExists(atPath: $0.path) }
             }()
@@ -235,7 +245,8 @@ final class AssistantMarkdownWebContainerView: NSView, WKNavigationDelegate {
         }
 
         guard let jsonData = try? JSONEncoder().encode(text),
-              let jsonString = String(data: jsonData, encoding: .utf8) else {
+            let jsonString = String(data: jsonData, encoding: .utf8)
+        else {
             return
         }
 
@@ -259,7 +270,8 @@ final class AssistantMarkdownWebContainerView: NSView, WKNavigationDelegate {
         decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
     ) {
         if navigationAction.navigationType == .linkActivated,
-           let url = navigationAction.request.url {
+            let url = navigationAction.request.url
+        {
             coordinator.handleLinkClick(url.absoluteString)
             decisionHandler(.cancel)
             return

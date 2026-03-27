@@ -1,4 +1,5 @@
 import { memo, useCallback, useEffect, useRef, useState } from "react";
+import { AppIcon } from "./AppIcon";
 
 interface Props {
   visible: boolean;
@@ -140,13 +141,13 @@ function FindBarInner({ visible, onClose }: Props) {
         {matchCount > 0 ? `${currentMatch}/${matchCount}` : query ? "No results" : ""}
       </span>
       <button className="find-nav-btn" onClick={() => navigateMatch("prev")} title="Previous (Shift+Enter)">
-        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="18 15 12 9 6 15"/></svg>
+        <AppIcon symbol="chevron.up" size={12} strokeWidth={2.5} />
       </button>
       <button className="find-nav-btn" onClick={() => navigateMatch("next")} title="Next (Enter)">
-        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
+        <AppIcon symbol="chevron.down" size={12} strokeWidth={2.5} />
       </button>
       <button className="find-close-btn" onClick={onClose} title="Close (Esc)">
-        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        <AppIcon symbol="xmark" size={12} strokeWidth={2.5} />
       </button>
     </div>
   );
