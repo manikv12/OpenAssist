@@ -9,6 +9,36 @@ private enum AssistantSidebarPane {
     case skills
 }
 
+extension AssistantSidebarPane {
+    fileprivate var shellID: String {
+        switch self {
+        case .threads:
+            return "threads"
+        case .archived:
+            return "archived"
+        case .automations:
+            return "automations"
+        case .skills:
+            return "skills"
+        }
+    }
+
+    fileprivate init?(shellID: String) {
+        switch shellID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "threads":
+            self = .threads
+        case "archived":
+            self = .archived
+        case "automations":
+            self = .automations
+        case "skills":
+            self = .skills
+        default:
+            return nil
+        }
+    }
+}
+
 private struct AssistantProjectIconOption: Identifiable {
     let title: String
     let symbol: String
@@ -33,7 +63,9 @@ private struct AssistantWorkspaceLaunchTarget: Identifiable {
     @MainActor
     var applicationURL: URL? {
         for bundleIdentifier in bundleIdentifiers {
-            if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleIdentifier) {
+            if let url = NSWorkspace.shared.urlForApplication(
+                withBundleIdentifier: bundleIdentifier)
+            {
                 return url
             }
         }
@@ -67,12 +99,19 @@ struct AssistantWindowView: View {
         .init(title: "Terminal", symbol: "terminal.fill"),
         .init(title: "Sparkles", symbol: "sparkles"),
         .init(title: "Star", symbol: "star.fill"),
-        .init(title: "Brain", symbol: "brain")
+        .init(title: "Brain", symbol: "brain"),
     ]
     private static let workspaceLaunchTargets: [AssistantWorkspaceLaunchTarget] = [
         .init(
             title: "VS Code",
-            bundleIdentifiers: ["com.microsoft.VSCode", "com.microsoft.VSCodeInsiders"],
+            bundleIdentifiers: ["com.microsoft.VSCode"],
+            fallbackSymbol: "chevron.left.forwardslash.chevron.right",
+            launchStyle: .openDocuments,
+            remembersAsPreferred: true
+        ),
+        .init(
+            title: "VS Code Insiders",
+            bundleIdentifiers: ["com.microsoft.VSCodeInsiders"],
             fallbackSymbol: "chevron.left.forwardslash.chevron.right",
             launchStyle: .openDocuments,
             remembersAsPreferred: true
@@ -125,12 +164,21 @@ struct AssistantWindowView: View {
             fallbackSymbol: "curlybraces.square.fill",
             launchStyle: .openDocuments,
             remembersAsPreferred: true
-        )
+        ),
     ]
+    private static let sidebarRelativeDateFormatter: RelativeDateTimeFormatter = {
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .short
+        formatter.dateTimeStyle = .named
+        return formatter
+    }()
 
     private struct ChatLayoutMetrics {
         let windowWidth: CGFloat
         let sidebarWidth: CGFloat
+        let collapsedSidebarWidth: CGFloat
+        let collapsedSidebarPreviewWidth: CGFloat
+        let visibleSidebarWidth: CGFloat
         let outerPadding: CGFloat
         let timelineHorizontalPadding: CGFloat
         let contentMaxWidth: CGFloat
@@ -153,6 +201,7 @@ struct AssistantWindowView: View {
 
     @EnvironmentObject private var settings: SettingsStore
     @ObservedObject var assistant: AssistantStore
+    @ObservedObject private var jobQueue = JobQueueCoordinator.shared
 
     @State private var isRefreshing = false
     @State private var toolCallsExpanded = false
@@ -181,11 +230,13 @@ struct AssistantWindowView: View {
     @State private var chatWebContainer: AssistantChatWebContainerView?
     @StateObject private var selectionTracker = AssistantTextSelectionTracker.shared
     @AppStorage("assistantSidebarCollapsed") private var isSidebarCollapsed = false
+    @State private var collapsedSidebarPreviewPane: String?
     @AppStorage("assistantSidebarProjectsExpanded") private var areProjectsExpanded = true
     @AppStorage("assistantSidebarThreadsExpanded") private var areThreadsExpanded = true
     @AppStorage("assistantSidebarArchivedExpanded") private var areArchivedExpanded = true
     @AppStorage("assistantChatTextScale") private var chatTextScale: Double = 1.0
-    @AppStorage("assistantPreferredWorkspaceLaunchTargetID") private var preferredWorkspaceLaunchTargetID = ""
+    @AppStorage("assistantPreferredWorkspaceLaunchTargetID") private
+        var preferredWorkspaceLaunchTargetID = ""
 
     /// Uses the pre-computed render items from AssistantStore (rebuilt only when
     /// timelineItems changes, not on every @Published update).
@@ -225,7 +276,8 @@ struct AssistantWindowView: View {
 
     private var chatWebRewindState: AssistantChatWebRewindState? {
         guard let mutation = assistant.historyMutationState,
-              mutation.isPendingComposerEdit else {
+            mutation.isPendingComposerEdit
+        else {
             return nil
         }
 
@@ -327,7 +379,8 @@ struct AssistantWindowView: View {
 
     private func sessionStatus(forSessionID sessionID: String?) -> AssistantSessionStatus? {
         guard let sid = sessionID?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
-              !sid.isEmpty else { return nil }
+            !sid.isEmpty
+        else { return nil }
         return sessionStatusByNormalizedID[sid]
     }
 
@@ -335,7 +388,8 @@ struct AssistantWindowView: View {
         autoScrollPinnedToBottom
             && !userHasScrolledUp
             && !isPreservingHistoryScrollPosition
-            && Date().timeIntervalSince(chatScrollTracking.lastManualScrollAt) >= Self.manualScrollFollowPause
+            && Date().timeIntervalSince(chatScrollTracking.lastManualScrollAt)
+                >= Self.manualScrollFollowPause
     }
 
     private var isAgentBusy: Bool {
@@ -382,14 +436,17 @@ struct AssistantWindowView: View {
         value * sidebarTextScale
     }
 
-    private func scaledSidebarWidth(for safeWindowWidth: CGFloat, outerPadding: CGFloat) -> CGFloat {
+    private func scaledSidebarWidth(for safeWindowWidth: CGFloat, outerPadding: CGFloat) -> CGFloat
+    {
         let baseSidebarWidth = min(260.0, max(210.0, safeWindowWidth * 0.22))
         let expandedSidebarWidth = baseSidebarWidth * max(1.0, sidebarTextScale)
         let maxSidebarWidth = max(210.0, safeWindowWidth - (outerPadding * 2) - 320.0 - 0.5)
         return min(expandedSidebarWidth, maxSidebarWidth)
     }
 
-    private func sidebarActivityState(for session: AssistantSessionSummary) -> AssistantSessionRow.ActivityState {
+    private func sidebarActivityState(for session: AssistantSessionSummary)
+        -> AssistantSessionRow.ActivityState
+    {
         let activity = assistant.sessionActivitySnapshot(for: session.id)
         return assistantSidebarActivityState(
             forSessionID: session.id,
@@ -498,18 +555,26 @@ struct AssistantWindowView: View {
             return "Enable the assistant in Settings, then come back here."
         }
         if !canChat {
-            return "Open Setup to connect to \(assistant.visibleAssistantBackendName), then come back to chat."
+            return
+                "Open Setup to connect to \(assistant.visibleAssistantBackendName), then come back to chat."
         }
-        return assistant.conversationBlockedReason ?? "Send a message to start a conversation with the assistant."
+        return assistant.conversationBlockedReason
+            ?? "Send a message to start a conversation with the assistant."
     }
 
     private var activeSessionSummary: AssistantSessionSummary? {
         guard let selectedSessionID = assistant.selectedSessionID else { return nil }
-        return assistant.sessions.first(where: { assistantTimelineSessionIDsMatch($0.id, selectedSessionID) })
+        return assistant.sessions.first(where: {
+            assistantTimelineSessionIDsMatch($0.id, selectedSessionID)
+        })
     }
 
     private var activeSessionProject: AssistantProject? {
-        guard let projectID = activeSessionSummary?.projectID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+        guard
+            let projectID = activeSessionSummary?.projectID?.trimmingCharacters(
+                in: .whitespacesAndNewlines
+            ).nonEmpty
+        else {
             return nil
         }
         return assistant.visibleProjects.first(where: {
@@ -521,7 +586,9 @@ struct AssistantWindowView: View {
     private var activeSessionTitle: String {
         guard let activeSessionSummary else { return "No session selected" }
         if activeSessionSummary.isTemporary,
-           activeSessionSummary.title.caseInsensitiveCompare("New Assistant Session") == .orderedSame {
+            activeSessionSummary.title.caseInsensitiveCompare("New Assistant Session")
+                == .orderedSame
+        {
             return "Temporary Chat"
         }
         return activeSessionSummary.title
@@ -544,7 +611,9 @@ struct AssistantWindowView: View {
             return preferred
         }
 
-        return Self.workspaceLaunchTargets.first(where: { $0.remembersAsPreferred && $0.isInstalled })
+        return Self.workspaceLaunchTargets.first(where: {
+            $0.remembersAsPreferred && $0.isInstalled
+        })
             ?? Self.workspaceLaunchTargets.first(where: { $0.isInstalled })
             ?? Self.workspaceLaunchTargets.first
             ?? AssistantWorkspaceLaunchTarget(
@@ -557,13 +626,15 @@ struct AssistantWindowView: View {
     }
 
     private func existingDirectoryURL(for path: String?) -> URL? {
-        guard let normalizedPath = path?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+        guard let normalizedPath = path?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+        else {
             return nil
         }
 
         let candidateURL = URL(fileURLWithPath: normalizedPath)
         var isDirectory: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: candidateURL.path, isDirectory: &isDirectory) else {
+        guard FileManager.default.fileExists(atPath: candidateURL.path, isDirectory: &isDirectory)
+        else {
             return nil
         }
 
@@ -594,10 +665,140 @@ struct AssistantWindowView: View {
         assistant.visibleArchivedSidebarSessions.count
     }
 
+    private var composerWebHeight: CGFloat {
+        let hasAccessoryRows =
+            !assistant.activeThreadSkills.isEmpty || !assistant.attachments.isEmpty
+        return hasAccessoryRows ? 212 : 184
+    }
+
+    private var sidebarWebState: AssistantSidebarWebState {
+        AssistantSidebarWebState(
+            selectedPane: selectedSidebarPane.shellID,
+            isCollapsed: isSidebarCollapsed,
+            collapsedPreviewPane: collapsedSidebarPreviewPane,
+            canCreateThread: assistant.canCreateThread,
+            canCollapse: true,
+            projectsTitle: projectSectionTitle,
+            projectsHelperText: sidebarProjectsHelperText,
+            threadsTitle: "Threads",
+            threadsHelperText: threadsFilterHelperText,
+            archivedTitle: "Archived",
+            archivedHelperText: visibleArchivedSessionCount == 0
+                ? nil : "Older chats you saved for later.",
+            projectsExpanded: areProjectsExpanded,
+            threadsExpanded: areThreadsExpanded,
+            archivedExpanded: areArchivedExpanded,
+            canLoadMoreThreads: visibleSidebarSessionCount > assistant.visibleSessionsLimit,
+            canLoadMoreArchived: visibleArchivedSessionCount > assistant.visibleSessionsLimit,
+            archivedCount: visibleArchivedSessionCount,
+            hiddenProjectCount: assistant.hiddenProjects.count,
+            navItems: [
+                .init(
+                    id: AssistantSidebarPane.threads.shellID, label: "Threads",
+                    symbol: "bubble.left.and.bubble.right"),
+                .init(
+                    id: AssistantSidebarPane.automations.shellID, label: "Automations",
+                    symbol: "clock"),
+                .init(id: AssistantSidebarPane.skills.shellID, label: "Skills", symbol: "sparkles"),
+            ],
+            allProjects: assistant.visibleProjects.map { project in
+                let isSelected =
+                    assistant.selectedProjectFilterID?.caseInsensitiveCompare(project.id)
+                    == .orderedSame
+                return AssistantSidebarWebProject(
+                    id: project.id,
+                    name: project.name,
+                    symbol: project.displayIconSymbolName,
+                    subtitle: projectThreadSubtitle(for: project, focused: isSelected),
+                    isSelected: isSelected,
+                    hasLinkedFolder: project.linkedFolderPath?.trimmingCharacters(
+                        in: .whitespacesAndNewlines
+                    ).nonEmpty != nil,
+                    hasCustomIcon: project.iconSymbolName?.trimmingCharacters(
+                        in: .whitespacesAndNewlines
+                    ).nonEmpty != nil
+                )
+            },
+            hiddenProjects: assistant.hiddenProjects.map { project in
+                AssistantSidebarWebHiddenProject(
+                    id: project.id,
+                    name: project.name,
+                    symbol: project.displayIconSymbolName
+                )
+            },
+            projects: displayedSidebarProjects.map { project in
+                let isSelected =
+                    assistant.selectedProjectFilterID?.caseInsensitiveCompare(project.id)
+                    == .orderedSame
+                return AssistantSidebarWebProject(
+                    id: project.id,
+                    name: project.name,
+                    symbol: project.displayIconSymbolName,
+                    subtitle: projectThreadSubtitle(for: project, focused: isSelected),
+                    isSelected: isSelected,
+                    hasLinkedFolder: project.linkedFolderPath?.trimmingCharacters(
+                        in: .whitespacesAndNewlines
+                    ).nonEmpty != nil,
+                    hasCustomIcon: project.iconSymbolName?.trimmingCharacters(
+                        in: .whitespacesAndNewlines
+                    ).nonEmpty != nil
+                )
+            },
+            threads: assistant.visibleSidebarSessions
+                .prefix(assistant.visibleSessionsLimit)
+                .map { sidebarWebSession(for: $0) },
+            archived: assistant.visibleArchivedSidebarSessions
+                .prefix(assistant.visibleSessionsLimit)
+                .map { sidebarWebSession(for: $0) }
+        )
+    }
+
+    private var composerWebState: AssistantComposerWebState {
+        AssistantComposerWebState(
+            draftText: assistant.promptDraft,
+            placeholder: composerPlaceholder,
+            isEnabled: settings.assistantBetaEnabled && !isVoiceCapturing,
+            canSend: canSendMessage && !isVoiceCapturing,
+            isBusy: isAgentBusy,
+            isVoiceCapturing: isVoiceCapturing,
+            canUseVoiceInput: settings.assistantVoiceTaskEntryEnabled,
+            showStopVoicePlayback: assistant.assistantVoicePlaybackActive && !isAgentBusy,
+            canOpenSkills: assistant.canAttachSkillsToSelectedThread,
+            selectedInteractionMode: assistant.interactionMode.normalizedForActiveUse.rawValue,
+            interactionModes: AssistantInteractionMode.allCases.map {
+                AssistantComposerWebOption(id: $0.rawValue, label: $0.label)
+            },
+            selectedModelID: assistant.selectedModelID,
+            modelOptions: assistant.visibleModels.map {
+                AssistantComposerWebOption(id: $0.id, label: $0.displayName)
+            },
+            selectedReasoningID: assistant.reasoningEffort.rawValue,
+            reasoningOptions: supportedEfforts.map {
+                AssistantComposerWebOption(id: $0.rawValue, label: $0.label)
+            },
+            activeSkills: assistant.activeThreadSkills.map {
+                AssistantComposerWebSkill(
+                    skillName: $0.skillName,
+                    displayName: $0.displayName,
+                    isMissing: $0.isMissing
+                )
+            },
+            attachments: assistant.attachments.map {
+                AssistantComposerWebAttachment(
+                    id: $0.id.uuidString,
+                    filename: $0.filename,
+                    kind: $0.isImage ? "image" : "file"
+                )
+            }
+        )
+    }
+
     private var sidebarSessionAnimationKey: String {
-        (assistant.visibleSidebarSessions + assistant.visibleArchivedSidebarSessions).map { session in
+        (assistant.visibleSidebarSessions + assistant.visibleArchivedSidebarSessions).map {
+            session in
             let updatedAt = session.updatedAt ?? session.createdAt ?? .distantPast
-            return "\(session.id)|\(session.title)|\(session.isArchived)|\(updatedAt.timeIntervalSince1970)"
+            return
+                "\(session.id)|\(session.title)|\(session.isArchived)|\(updatedAt.timeIntervalSince1970)"
         }
         .joined(separator: "||")
     }
@@ -608,7 +809,10 @@ struct AssistantWindowView: View {
 
     private var projectThreadCountByProjectID: [String: Int] {
         assistant.visibleSidebarSessions.reduce(into: [:]) { result, session in
-            guard let projectID = session.projectID?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() else {
+            guard
+                let projectID = session.projectID?.trimmingCharacters(in: .whitespacesAndNewlines)
+                    .lowercased()
+            else {
                 return
             }
             result[projectID, default: 0] += 1
@@ -628,6 +832,18 @@ struct AssistantWindowView: View {
 
     private var projectSectionTitle: String {
         isProjectFocusModeActive ? "Project" : "Projects"
+    }
+
+    private var sidebarProjectsHelperText: String? {
+        if isProjectFocusModeActive {
+            return "Click the current project again to go back to all projects."
+        }
+
+        let hiddenProjectCount = assistant.hiddenProjects.count
+        guard hiddenProjectCount > 0 else { return nil }
+        return hiddenProjectCount == 1
+            ? "1 project is hidden right now."
+            : "\(hiddenProjectCount) projects are hidden right now."
     }
 
     private var threadsFilterHelperText: String? {
@@ -650,15 +866,59 @@ struct AssistantWindowView: View {
 
     private func showArchivedSidebar() {
         selectedSidebarPane = .archived
-        guard let firstArchivedSession = assistant.visibleArchivedSidebarSessions.first else { return }
-        let isAlreadySelected = assistant.selectedSessionID?.caseInsensitiveCompare(firstArchivedSession.id) == .orderedSame
+        guard let firstArchivedSession = assistant.visibleArchivedSidebarSessions.first else {
+            return
+        }
+        let isAlreadySelected =
+            assistant.selectedSessionID?.caseInsensitiveCompare(firstArchivedSession.id)
+            == .orderedSame
         guard !isAlreadySelected else { return }
         Task { await assistant.openSession(firstArchivedSession) }
+    }
+
+    private func sidebarWebSession(for session: AssistantSessionSummary)
+        -> AssistantSidebarWebSession
+    {
+        AssistantSidebarWebSession(
+            id: session.id,
+            title: session.title,
+            subtitle: session.subtitle,
+            timeLabel: sidebarTimeLabel(for: session),
+            isSelected: assistant.selectedSessionID.map {
+                assistantTimelineSessionIDsMatch(session.id, $0)
+            } ?? false,
+            isTemporary: session.isTemporary,
+            projectID: session.projectID
+        )
+    }
+
+    private func sidebarTimeLabel(for session: AssistantSessionSummary) -> String? {
+        guard let referenceDate = session.updatedAt ?? session.createdAt else { return nil }
+        return Self.sidebarRelativeDateFormatter.localizedString(
+            for: referenceDate, relativeTo: Date())
     }
 
     private func setSidebarCollapsed(_ collapsed: Bool) {
         withAnimation(sidebarToggleAnimation) {
             isSidebarCollapsed = collapsed
+            collapsedSidebarPreviewPane = nil
+        }
+    }
+
+    private func sidebarProject(for projectID: String) -> AssistantProject? {
+        let normalizedProjectID = projectID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedProjectID.isEmpty else { return nil }
+        return (assistant.visibleProjects + assistant.hiddenProjects).first {
+            $0.id.trimmingCharacters(in: .whitespacesAndNewlines)
+                .caseInsensitiveCompare(normalizedProjectID) == .orderedSame
+        }
+    }
+
+    private func sidebarSession(for sessionID: String) -> AssistantSessionSummary? {
+        let normalizedSessionID = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedSessionID.isEmpty else { return nil }
+        return assistant.sessions.first {
+            assistantTimelineSessionIDsMatch($0.id, normalizedSessionID)
         }
     }
 
@@ -688,20 +948,337 @@ struct AssistantWindowView: View {
         Task { await assistant.startNewSession() }
     }
 
+    private func handleSidebarWebCommand(type: String, payload: [String: Any]?) {
+        switch type {
+        case "newThread":
+            startNewThreadFromSidebar()
+        case "setSidebarCollapsed":
+            guard let collapsed = payload?["collapsed"] as? Bool else { return }
+            setSidebarCollapsed(collapsed)
+        case "setSelectedPane":
+            guard let paneID = payload?["pane"] as? String,
+                let pane = AssistantSidebarPane(shellID: paneID)
+            else {
+                return
+            }
+            if pane == .archived {
+                showArchivedSidebar()
+            } else {
+                selectedSidebarPane = pane
+            }
+        case "setCollapsedPreviewPane":
+            let isOpen = payload?["open"] as? Bool ?? false
+            let paneID = (payload?["pane"] as? String)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .nonEmpty
+            withAnimation(sidebarToggleAnimation) {
+                collapsedSidebarPreviewPane = isOpen ? paneID : nil
+            }
+        case "toggleProjectsExpanded":
+            withAnimation(sidebarDisclosureAnimation) {
+                areProjectsExpanded.toggle()
+            }
+        case "toggleThreadsExpanded":
+            withAnimation(sidebarDisclosureAnimation) {
+                areThreadsExpanded.toggle()
+            }
+        case "toggleArchivedExpanded":
+            withAnimation(sidebarDisclosureAnimation) {
+                areArchivedExpanded.toggle()
+            }
+        case "selectProjectFilter":
+            selectedSidebarPane = .threads
+            let projectID = (payload?["projectId"] as? String)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .nonEmpty
+            Task { await assistant.selectProjectFilter(projectID) }
+        case "openSession":
+            guard
+                let sessionID = (payload?["sessionId"] as? String)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .nonEmpty
+            else {
+                return
+            }
+            if let paneID = payload?["pane"] as? String,
+                paneID.caseInsensitiveCompare(AssistantSidebarPane.archived.shellID) == .orderedSame
+            {
+                selectedSidebarPane = .archived
+            } else {
+                selectedSidebarPane = .threads
+            }
+            openThread(sessionID)
+        case "loadMoreSessions":
+            assistant.loadMoreSessions()
+        case "createProjectPrompt":
+            presentCreateProjectPrompt()
+        case "createProjectFromFolderPrompt":
+            presentCreateProjectFromFolderPrompt()
+        case "createNamedProjectPrompt":
+            presentNamedProjectPrompt()
+        case "unhideProject":
+            guard
+                let projectID = (payload?["projectId"] as? String)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .nonEmpty
+            else {
+                return
+            }
+            Task { await assistant.unhideProject(projectID) }
+        case "inspectProjectMemory":
+            guard
+                let projectID = (payload?["projectId"] as? String)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .nonEmpty,
+                let project = sidebarProject(for: projectID)
+            else {
+                return
+            }
+            assistant.inspectMemory(for: project)
+        case "renameProjectPrompt":
+            guard
+                let projectID = (payload?["projectId"] as? String)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .nonEmpty,
+                let project = sidebarProject(for: projectID)
+            else {
+                return
+            }
+            presentRenameProjectPrompt(for: project)
+        case "changeProjectIconPrompt":
+            guard
+                let projectID = (payload?["projectId"] as? String)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .nonEmpty,
+                let project = sidebarProject(for: projectID)
+            else {
+                return
+            }
+            presentProjectIconPrompt(for: project)
+        case "setProjectIcon":
+            guard
+                let projectID = (payload?["projectId"] as? String)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .nonEmpty
+            else {
+                return
+            }
+            let symbol = (payload?["symbol"] as? String)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .nonEmpty
+            assistant.updateProjectIcon(projectID, symbol: symbol)
+        case "linkProjectFolder":
+            guard
+                let projectID = (payload?["projectId"] as? String)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .nonEmpty,
+                let project = sidebarProject(for: projectID)
+            else {
+                return
+            }
+            presentProjectFolderPicker(for: project)
+        case "removeProjectFolderLink":
+            guard
+                let projectID = (payload?["projectId"] as? String)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .nonEmpty
+            else {
+                return
+            }
+            assistant.updateProjectLinkedFolder(projectID, path: nil)
+        case "hideProject":
+            guard
+                let projectID = (payload?["projectId"] as? String)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .nonEmpty
+            else {
+                return
+            }
+            Task { await assistant.hideProject(projectID) }
+        case "deleteProject":
+            guard
+                let projectID = (payload?["projectId"] as? String)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .nonEmpty,
+                let project = sidebarProject(for: projectID)
+            else {
+                return
+            }
+            pendingDeleteProject = project
+        case "renameSessionPrompt":
+            guard
+                let sessionID = (payload?["sessionId"] as? String)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .nonEmpty,
+                let session = sidebarSession(for: sessionID)
+            else {
+                return
+            }
+            presentRenameSessionPrompt(for: session)
+        case "promoteTemporarySession":
+            let sessionID = (payload?["sessionId"] as? String)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .nonEmpty
+            assistant.promoteTemporarySession(sessionID)
+        case "assignSessionToProject":
+            guard
+                let sessionID = (payload?["sessionId"] as? String)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .nonEmpty
+            else {
+                return
+            }
+            let projectID = (payload?["projectId"] as? String)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .nonEmpty
+            assistant.assignSessionToProject(sessionID, projectID: projectID)
+        case "removeSessionFromProject":
+            guard
+                let sessionID = (payload?["sessionId"] as? String)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .nonEmpty
+            else {
+                return
+            }
+            assistant.assignSessionToProject(sessionID, projectID: nil)
+        case "archiveSession":
+            guard
+                let sessionID = (payload?["sessionId"] as? String)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .nonEmpty
+            else {
+                return
+            }
+            Task {
+                await assistant.archiveSession(
+                    sessionID,
+                    retentionHours: settings.assistantArchiveDefaultRetentionHours,
+                    updateDefaultRetention: false
+                )
+            }
+        case "unarchiveSession":
+            guard
+                let sessionID = (payload?["sessionId"] as? String)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .nonEmpty
+            else {
+                return
+            }
+            Task {
+                await assistant.unarchiveSession(sessionID)
+                guard selectedSidebarPane == .archived else { return }
+                await MainActor.run {
+                    showArchivedSidebar()
+                }
+            }
+        case "deleteSessionPermanently":
+            guard
+                let sessionID = (payload?["sessionId"] as? String)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .nonEmpty,
+                let session = sidebarSession(for: sessionID)
+            else {
+                return
+            }
+            pendingPermanentDeleteSession = session
+        case "openAssistantSetup":
+            NotificationCenter.default.post(name: .openAssistOpenAssistantSetup, object: nil)
+        default:
+            break
+        }
+    }
+
+    private func handleComposerWebCommand(type: String, payload: [String: Any]?) {
+        switch type {
+        case "updatePromptDraft":
+            assistant.promptDraft = (payload?["text"] as? String) ?? ""
+        case "sendPrompt":
+            sendCurrentPrompt()
+        case "openFilePicker":
+            openFilePicker()
+        case "openSkillsPane":
+            selectedSidebarPane = .skills
+        case "removeAttachment":
+            guard
+                let attachmentID = (payload?["attachmentId"] as? String)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .nonEmpty
+            else {
+                return
+            }
+            assistant.attachments.removeAll {
+                $0.id.uuidString.caseInsensitiveCompare(attachmentID) == .orderedSame
+            }
+        case "detachSkill":
+            guard
+                let skillName = (payload?["skillName"] as? String)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .nonEmpty
+            else {
+                return
+            }
+            assistant.detachSkill(skillName)
+        case "repairMissingSkillBindings":
+            assistant.repairMissingSkillBindings()
+        case "setInteractionMode":
+            guard let rawMode = payload?["mode"] as? String,
+                let mode = AssistantInteractionMode(rawValue: rawMode)
+            else {
+                return
+            }
+            assistant.interactionMode = mode
+        case "setModel":
+            guard
+                let modelID = (payload?["modelId"] as? String)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .nonEmpty
+            else {
+                return
+            }
+            assistant.chooseModel(modelID)
+        case "setReasoningEffort":
+            guard let effortID = payload?["effort"] as? String,
+                let effort = AssistantReasoningEffort(rawValue: effortID)
+            else {
+                return
+            }
+            assistant.reasoningEffort = effort
+        case "cancelActiveTurn":
+            Task { await assistant.cancelActiveTurn() }
+        case "startVoiceCapture":
+            NotificationCenter.default.post(
+                name: .openAssistStartAssistantVoiceCapture, object: nil)
+        case "stopVoiceCapture":
+            NotificationCenter.default.post(name: .openAssistStopAssistantVoiceCapture, object: nil)
+        case "stopVoicePlayback":
+            assistant.stopAssistantVoicePlayback()
+        default:
+            break
+        }
+    }
+
     private func chatLayoutMetrics(for windowWidth: CGFloat) -> ChatLayoutMetrics {
         let safeWindowWidth = max(windowWidth, 640)
         let outerPadding = safeWindowWidth < 900 ? 2.0 : 4.0
         let sidebarWidth = scaledSidebarWidth(for: safeWindowWidth, outerPadding: outerPadding)
-        let visibleSidebarWidth = isSidebarCollapsed ? 0.0 : sidebarWidth
-        let detailWidth = max(320.0, safeWindowWidth - visibleSidebarWidth - (outerPadding * 2) - (isSidebarCollapsed ? 0.0 : 0.5))
+        let collapsedSidebarWidth = safeWindowWidth < 900 ? 60.0 : 64.0
+        let collapsedSidebarPreviewWidth = min(sidebarWidth, max(248.0, safeWindowWidth * 0.28))
+        let visibleSidebarWidth = isSidebarCollapsed ? collapsedSidebarWidth : sidebarWidth
+        let detailWidth = max(
+            320.0,
+            safeWindowWidth - visibleSidebarWidth - (outerPadding * 2) - 0.5)
         let isNarrow = detailWidth < 760
         let isMedium = detailWidth < 1080
         let timelineHorizontalPadding = isNarrow ? 16.0 : (isMedium ? 24.0 : 32.0)
-        let maxColumnWidth = isNarrow ? detailWidth - (timelineHorizontalPadding * 2) : min(780.0, detailWidth * 0.82)
-        let contentMaxWidth = max(280.0, min(detailWidth - (timelineHorizontalPadding * 2), maxColumnWidth))
+        let maxColumnWidth =
+            isNarrow
+            ? detailWidth - (timelineHorizontalPadding * 2) : min(780.0, detailWidth * 0.82)
+        let contentMaxWidth = max(
+            280.0, min(detailWidth - (timelineHorizontalPadding * 2), maxColumnWidth))
         let topBarMaxWidth = min(detailWidth - 16, contentMaxWidth + (isNarrow ? 8 : 28))
         let composerMaxWidth = min(detailWidth - 16, contentMaxWidth + (isNarrow ? 0 : 18))
-        let userBubbleMaxWidth = min(contentMaxWidth * (isNarrow ? 0.96 : 0.80), isNarrow ? 540.0 : 640.0)
+        let userBubbleMaxWidth = min(
+            contentMaxWidth * (isNarrow ? 0.96 : 0.80), isNarrow ? 540.0 : 640.0)
         let userMediaMaxWidth = min(userBubbleMaxWidth, isNarrow ? 320.0 : 420.0)
         let assistantMediaMaxWidth = min(contentMaxWidth, isNarrow ? 440.0 : 660.0)
         let leadingReserve = isNarrow ? 36.0 : (isMedium ? 56.0 : 80.0)
@@ -717,6 +1294,9 @@ struct AssistantWindowView: View {
         return ChatLayoutMetrics(
             windowWidth: safeWindowWidth,
             sidebarWidth: sidebarWidth,
+            collapsedSidebarWidth: collapsedSidebarWidth,
+            collapsedSidebarPreviewWidth: collapsedSidebarPreviewWidth,
+            visibleSidebarWidth: visibleSidebarWidth,
             outerPadding: outerPadding,
             timelineHorizontalPadding: timelineHorizontalPadding,
             contentMaxWidth: contentMaxWidth,
@@ -750,42 +1330,51 @@ struct AssistantWindowView: View {
 
     private func assistantSplitBackground(layout: ChatLayoutMetrics) -> some View {
         AppSplitChromeBackground(
-            leadingPaneFraction: min(0.32, max(0.20, layout.sidebarWidth / max(layout.windowWidth, 1))),
+            leadingPaneFraction: min(
+                0.32, max(0.12, layout.visibleSidebarWidth / max(layout.windowWidth, 1))),
             leadingPaneMaxWidth: 280,
-            leadingPaneWidth: layout.sidebarWidth,
+            leadingPaneWidth: layout.visibleSidebarWidth,
             leadingTint: AppVisualTheme.sidebarTint,
             trailingTint: AppVisualTheme.windowBackground,
             accent: AppVisualTheme.accentTint,
-            leadingPaneTransparent: true
+            leadingPaneTransparent: isSidebarCollapsed
         )
     }
 
     var body: some View {
         GeometryReader { proxy in
             let layout = chatLayoutMetrics(for: proxy.size.width)
+            let collapsedOverlayWidth =
+                collapsedSidebarPreviewPane == nil
+                ? layout.collapsedSidebarWidth
+                : layout.collapsedSidebarPreviewWidth
 
-            ZStack {
-                if !isSidebarCollapsed {
-                    assistantSplitBackground(layout: layout)
-                } else {
-                    AppVisualTheme.windowBackground
-                        .ignoresSafeArea()
-                }
+            ZStack(alignment: .leading) {
+                assistantSplitBackground(layout: layout)
 
                 HStack(spacing: 0) {
-                    if !isSidebarCollapsed {
-                        sidebar(layout: layout)
-
-                        Rectangle()
-                            .fill(AppVisualTheme.surfaceFill(0.06))
-                            .frame(width: 0.5)
-                            .frame(maxHeight: .infinity)
+                    if isSidebarCollapsed {
+                        Color.clear
+                            .frame(width: layout.collapsedSidebarWidth)
+                    } else {
+                        sidebar(layout: layout, width: layout.sidebarWidth)
                     }
+
+                    Rectangle()
+                        .fill(AppVisualTheme.surfaceFill(0.06))
+                        .frame(width: 0.5)
+                        .frame(maxHeight: .infinity)
 
                     detailPane(layout: layout)
                 }
                 .padding(.horizontal, layout.outerPadding)
                 .padding(.bottom, 4)
+
+                if isSidebarCollapsed {
+                    sidebar(layout: layout, width: collapsedOverlayWidth)
+                        .padding(.leading, layout.outerPadding)
+                        .padding(.bottom, 4)
+                }
             }
         }
         .onAppear {
@@ -849,7 +1438,9 @@ struct AssistantWindowView: View {
                 pendingDeleteProject = nil
             }
         } message: { project in
-            Text("This removes the Open Assist project “\(project.name)”. Threads will stay saved, but they will no longer belong to this project.")
+            Text(
+                "This removes the Open Assist project “\(project.name)”. Threads will stay saved, but they will no longer belong to this project."
+            )
         }
         .sheet(isPresented: $assistant.showBrowserProfilePicker) {
             BrowserProfilePickerSheet(
@@ -864,9 +1455,12 @@ struct AssistantWindowView: View {
         .sheet(isPresented: $assistant.showMemorySuggestionReview) {
             AssistantMemorySuggestionReviewSheet(assistant: assistant)
         }
-        .sheet(isPresented: $assistant.showMemoryInspector, onDismiss: {
-            assistant.dismissMemoryInspector()
-        }) {
+        .sheet(
+            isPresented: $assistant.showMemoryInspector,
+            onDismiss: {
+                assistant.dismissMemoryInspector()
+            }
+        ) {
             AssistantMemoryInspectorSheet(assistant: assistant)
         }
         .sheet(isPresented: $showGitHubSkillImportSheet) {
@@ -914,7 +1508,8 @@ struct AssistantWindowView: View {
         }
         .onChange(of: selectionTracker.selectionContext) { context in
             guard let context else {
-                guard !AssistantSelectionActionHUDManager.shared.retainsPresentationWithoutSelection else {
+                guard !AssistantSelectionActionHUDManager.shared.retainsPresentationWithoutSelection
+                else {
                     return
                 }
                 AssistantSelectionActionHUDManager.shared.hide()
@@ -924,7 +1519,8 @@ struct AssistantWindowView: View {
             presentSelectionActions(for: context)
         }
         .onChange(of: assistant.selectedSessionID) { newSessionID in
-            guard newSessionID?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false else {
+            guard newSessionID?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+            else {
                 return
             }
             selectionTracker.clearSelection()
@@ -937,477 +1533,13 @@ struct AssistantWindowView: View {
         }
     }
 
-    private func sidebar(layout: ChatLayoutMetrics) -> some View {
-        VStack(alignment: .leading, spacing: 0) {
-            // New thread button
-            Button {
-                startNewThreadFromSidebar()
-            } label: {
-                HStack(spacing: sidebarScaled(8)) {
-                    Image(systemName: "square.and.pencil")
-                        .font(.system(size: sidebarScaled(12), weight: .medium))
-                        .foregroundStyle(AppVisualTheme.foreground(0.70))
-                    Text("New thread")
-                        .font(.system(size: sidebarScaled(13), weight: .medium))
-                        .foregroundStyle(AppVisualTheme.foreground(0.82))
-                    Spacer()
-                }
-                .padding(.horizontal, sidebarScaled(10))
-                .padding(.vertical, sidebarScaled(8))
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .disabled(!assistant.canCreateThread)
-            .padding(.bottom, sidebarScaled(8))
-
-            // Sidebar actions
-            VStack(alignment: .leading, spacing: sidebarScaled(2)) {
-                sidebarNavButton(
-                    symbol: "bubble.left.and.bubble.right",
-                    label: "Threads",
-                    isSelected: selectedSidebarPane == .threads
-                ) {
-                    selectedSidebarPane = .threads
-                }
-                sidebarNavButton(
-                    symbol: "clock",
-                    label: "Automations",
-                    isSelected: selectedSidebarPane == .automations
-                ) {
-                    selectedSidebarPane = .automations
-                }
-                sidebarNavButton(
-                    symbol: "sparkles",
-                    label: "Skills",
-                    isSelected: selectedSidebarPane == .skills
-                ) {
-                    selectedSidebarPane = .skills
-                }
-            }
-            .padding(.bottom, sidebarScaled(12))
-
-            Rectangle()
-                .fill(AssistantWindowChrome.sidebarDivider)
-                .frame(height: 0.5)
-                .padding(.horizontal, sidebarScaled(4))
-                .padding(.bottom, sidebarScaled(12))
-
-            if !assistant.sessions.isEmpty {
-            }
-
-            // Sidebar content controls
-            HStack(alignment: .center, spacing: 0) {
-                Spacer()
-
-                HStack(spacing: sidebarScaled(4)) {
-                    Button {
-                        guard !isRefreshing else { return }
-                        Task { await refreshEverything() }
-                    } label: {
-                        Image(systemName: "arrow.clockwise")
-                            .font(.system(size: sidebarScaled(10), weight: .medium))
-                            .foregroundStyle(AppVisualTheme.foreground(0.34))
-                            .frame(width: sidebarScaled(22), height: sidebarScaled(22))
-                            .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(isRefreshing)
-
-                    Button {
-                        setSidebarCollapsed(true)
-                    } label: {
-                        Image(systemName: "sidebar.left")
-                            .font(.system(size: sidebarScaled(10), weight: .medium))
-                            .foregroundStyle(AppVisualTheme.foreground(0.34))
-                            .frame(width: sidebarScaled(22), height: sidebarScaled(22))
-                            .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
-            .padding(.horizontal, sidebarScaled(6))
-            .padding(.bottom, sidebarScaled(8))
-
-            ScrollView {
-                VStack(alignment: .leading, spacing: sidebarScaled(8)) {
-                    if selectedSidebarPane != .archived {
-                        VStack(alignment: .leading, spacing: sidebarScaled(4)) {
-                            HStack(spacing: sidebarScaled(8)) {
-                                Text(projectSectionTitle)
-                                    .font(.system(size: sidebarScaled(12.5), weight: .bold))
-                                    .foregroundStyle(AppVisualTheme.foreground(0.82))
-
-                                Spacer()
-
-                                if isProjectFocusModeActive {
-                                    Button {
-                                        selectedSidebarPane = .threads
-                                        Task { await assistant.selectProjectFilter(nil) }
-                                    } label: {
-                                        HStack(spacing: sidebarScaled(4)) {
-                                            Image(systemName: "chevron.left")
-                                                .font(.system(size: sidebarScaled(8.5), weight: .semibold))
-                                            Text("All Projects")
-                                                .font(.system(size: sidebarScaled(10.5), weight: .semibold))
-                                        }
-                                    }
-                                    .foregroundStyle(AppVisualTheme.foreground(0.62))
-                                    .buttonStyle(.plain)
-                                    .help("Go back to all projects")
-                                }
-
-                                Button {
-                                    withAnimation(sidebarDisclosureAnimation) {
-                                        areProjectsExpanded.toggle()
-                                    }
-                                } label: {
-                                    Image(systemName: areProjectsExpanded ? "chevron.down" : "chevron.right")
-                                        .font(.system(size: sidebarScaled(9), weight: .semibold))
-                                        .foregroundStyle(AppVisualTheme.foreground(0.52))
-                                        .frame(width: sidebarScaled(18), height: sidebarScaled(18))
-                                }
-                                .buttonStyle(.plain)
-                                .help(areProjectsExpanded ? "Collapse projects" : "Expand projects")
-
-                                Button {
-                                    presentCreateProjectPrompt()
-                                } label: {
-                                    Image(systemName: "plus")
-                                        .font(.system(size: sidebarScaled(10), weight: .semibold))
-                                        .foregroundStyle(AppVisualTheme.foreground(0.48))
-                                        .frame(width: sidebarScaled(18), height: sidebarScaled(18))
-                                }
-                                .buttonStyle(.plain)
-                                .help("Create project")
-                                .contextMenu {
-                                    Button {
-                                        presentCreateProjectFromFolderPrompt()
-                                    } label: {
-                                        Label("Open Folder as Project", systemImage: "folder.badge.plus")
-                                    }
-
-                                    Button {
-                                        presentNamedProjectPrompt()
-                                    } label: {
-                                        Label("Create Named Project", systemImage: "square.stack.3d.up.badge.plus")
-                                    }
-
-                                    Divider()
-
-                                    if assistant.hiddenProjects.isEmpty {
-                                        Button("No hidden projects") {}
-                                            .disabled(true)
-                                    } else {
-                                        Menu {
-                                            ForEach(assistant.hiddenProjects) { project in
-                                                Button {
-                                                    Task { await assistant.unhideProject(project.id) }
-                                                } label: {
-                                                    Label(project.name, systemImage: project.displayIconSymbolName)
-                                                }
-                                            }
-                                        } label: {
-                                            Label("Unhide Project", systemImage: "eye")
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        if areProjectsExpanded {
-                            if assistant.visibleProjects.isEmpty {
-                                VStack(alignment: .leading, spacing: sidebarScaled(2)) {
-                                    Text(assistant.hiddenProjects.isEmpty ? "No projects yet" : "All projects are hidden")
-                                        .font(.system(size: sidebarScaled(12), weight: .regular))
-                                        .foregroundStyle(AppVisualTheme.foreground(0.34))
-
-                                    if !assistant.hiddenProjects.isEmpty {
-                                        Text("Right-click the + button to unhide one.")
-                                            .font(.system(size: sidebarScaled(10.5), weight: .regular))
-                                            .foregroundStyle(AppVisualTheme.foreground(0.28))
-                                    }
-                                }
-                                .padding(.horizontal, sidebarScaled(10))
-                                .padding(.top, sidebarScaled(4))
-                            } else {
-                                ForEach(displayedSidebarProjects) { project in
-                                    let isFocusedProject = assistant.selectedProjectFilterID?.caseInsensitiveCompare(project.id) == .orderedSame
-                                    let projectRow = AssistantProjectFilterRow(
-                                        title: project.name,
-                                        subtitle: projectThreadSubtitle(for: project, focused: isFocusedProject),
-                                        isSelected: isFocusedProject,
-                                        symbol: project.displayIconSymbolName,
-                                        folderMissing: project.linkedFolderPath != nil
-                                            && !FileManager.default.fileExists(atPath: project.linkedFolderPath ?? ""),
-                                        textScale: sidebarTextScale
-                                    )
-
-                                    if isFocusedProject {
-                                        projectRow
-                                            .contextMenu { projectContextMenu(for: project) }
-                                    } else {
-                                        Button {
-                                            selectedSidebarPane = .threads
-                                            Task { await assistant.selectProjectFilter(project.id) }
-                                        } label: {
-                                            projectRow
-                                        }
-                                        .buttonStyle(.plain)
-                                        .contextMenu { projectContextMenu(for: project) }
-                                    }
-                                }
-
-                                if isProjectFocusModeActive {
-                                    Text("You are viewing one project. Go back to All Projects to browse the rest.")
-                                        .font(.system(size: sidebarScaled(10.5), weight: .medium))
-                                        .foregroundStyle(AppVisualTheme.foreground(0.36))
-                                        .padding(.horizontal, sidebarScaled(10))
-                                        .padding(.top, sidebarScaled(2))
-                                        .fixedSize(horizontal: false, vertical: true)
-                                }
-                            }
-                        }
-
-                        Rectangle()
-                            .fill(AssistantWindowChrome.sidebarDivider)
-                            .frame(height: 0.5)
-                            .padding(.vertical, sidebarScaled(4))
-
-                        VStack(alignment: .leading, spacing: sidebarScaled(4)) {
-                        HStack(spacing: sidebarScaled(8)) {
-                            Text("Threads")
-                                .font(.system(size: sidebarScaled(12.5), weight: .bold))
-                                .foregroundStyle(AppVisualTheme.foreground(0.82))
-
-                            Spacer()
-
-                            Button {
-                                withAnimation(sidebarDisclosureAnimation) {
-                                    areThreadsExpanded.toggle()
-                                }
-                            } label: {
-                                Image(systemName: areThreadsExpanded ? "chevron.down" : "chevron.right")
-                                    .font(.system(size: sidebarScaled(9), weight: .semibold))
-                                    .foregroundStyle(AppVisualTheme.foreground(0.52))
-                                    .frame(width: sidebarScaled(18), height: sidebarScaled(18))
-                            }
-                            .buttonStyle(.plain)
-                            .help(areThreadsExpanded ? "Collapse threads" : "Expand threads")
-
-                            Button {
-                                startNewThreadFromSidebar()
-                            } label: {
-                                Image(systemName: "plus")
-                                    .font(.system(size: sidebarScaled(10), weight: .semibold))
-                                    .foregroundStyle(AppVisualTheme.foreground(0.48))
-                                    .frame(width: sidebarScaled(18), height: sidebarScaled(18))
-                            }
-                            .buttonStyle(.plain)
-                            .disabled(!assistant.canCreateThread)
-                            .help(
-                                assistant.selectedProjectFilter == nil
-                                    ? "Create thread"
-                                    : "Create thread in this project"
-                            )
-                        }
-
-                        if let threadsFilterHelperText {
-                            Text(threadsFilterHelperText)
-                                .font(.system(size: sidebarScaled(10.5), weight: .medium))
-                                .foregroundStyle(AppVisualTheme.foreground(0.44))
-                                .padding(.horizontal, sidebarScaled(2))
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-
-                        if areThreadsExpanded {
-                            if visibleSidebarSessionCount == 0 {
-                                Text(assistant.selectedProjectFilterID == nil ? "No threads yet" : "No threads in this project yet")
-                                    .font(.system(size: sidebarScaled(12), weight: .regular))
-                                    .foregroundStyle(AppVisualTheme.foreground(0.34))
-                                    .padding(.horizontal, sidebarScaled(10))
-                                    .padding(.vertical, sidebarScaled(16))
-                            } else {
-                                ForEach(assistant.visibleSidebarSessions.prefix(assistant.visibleSessionsLimit)) { session in
-                                    VStack(alignment: .leading, spacing: 0) {
-                                        Button {
-                                            guard session.isLocalSession else { return }
-                                            selectedSidebarPane = .threads
-                                            Task { await assistant.openSession(session) }
-                                        } label: {
-                                            AssistantSessionRow(
-                                                session: session,
-                                                isSelected: assistant.selectedSessionID == session.id,
-                                                activityState: sidebarActivityState(for: session),
-                                                textScale: sidebarTextScale
-                                            )
-                                        }
-                                        .buttonStyle(.plain)
-                                        .contextMenu { threadContextMenu(for: session) }
-
-                                        let childAgents = sidebarChildSubagents(for: session)
-                                        if !childAgents.isEmpty {
-                                            VStack(alignment: .leading, spacing: 0) {
-                                                ForEach(childAgents) { agent in
-                                                    Button {
-                                                        guard let threadID = agent.threadID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
-                                                            return
-                                                        }
-                                                        selectedSidebarPane = .threads
-                                                        openThread(threadID)
-                                                    } label: {
-                                                        AssistantSidebarSubagentRow(
-                                                            agent: agent,
-                                                            isSelected: assistant.selectedSessionID == agent.threadID,
-                                                            textScale: sidebarTextScale
-                                                        )
-                                                    }
-                                                    .buttonStyle(.plain)
-                                                    .disabled(agent.threadID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty == nil)
-                                                }
-                                            }
-                                            .padding(.top, sidebarScaled(2))
-                                        }
-                                    }
-                                    .transition(sidebarRowTransition)
-                                }
-
-                                if visibleSidebarSessionCount > assistant.visibleSessionsLimit {
-                                    Button {
-                                        assistant.loadMoreSessions()
-                                    } label: {
-                                        Text("Load more")
-                                            .font(.system(size: sidebarScaled(11), weight: .medium))
-                                            .foregroundStyle(AppVisualTheme.foreground(0.44))
-                                            .padding(.vertical, sidebarScaled(6))
-                                            .frame(maxWidth: .infinity)
-                                    }
-                                    .buttonStyle(.plain)
-                                    .padding(.top, sidebarScaled(2))
-                                }
-                            }
-                        }
-                    }
-
-                    }
-
-                    if selectedSidebarPane == .archived {
-                        VStack(alignment: .leading, spacing: sidebarScaled(4)) {
-                            HStack(spacing: sidebarScaled(8)) {
-                                Text("Archived")
-                                    .font(.system(size: sidebarScaled(12.5), weight: .bold))
-                                    .foregroundStyle(AppVisualTheme.foreground(0.82))
-
-                                Spacer()
-
-                                Button {
-                                    withAnimation(sidebarDisclosureAnimation) {
-                                        areArchivedExpanded.toggle()
-                                    }
-                                } label: {
-                                    Image(systemName: areArchivedExpanded ? "chevron.down" : "chevron.right")
-                                        .font(.system(size: sidebarScaled(9), weight: .semibold))
-                                        .foregroundStyle(AppVisualTheme.foreground(0.52))
-                                        .frame(width: sidebarScaled(18), height: sidebarScaled(18))
-                                }
-                                .buttonStyle(.plain)
-                                .help(areArchivedExpanded ? "Collapse archived chats" : "Expand archived chats")
-                            }
-
-                            if areArchivedExpanded {
-                                if visibleArchivedSessionCount == 0 {
-                                    Text("No archived chats")
-                                        .font(.system(size: sidebarScaled(12), weight: .regular))
-                                        .foregroundStyle(AppVisualTheme.foreground(0.34))
-                                        .padding(.horizontal, sidebarScaled(10))
-                                        .padding(.vertical, sidebarScaled(16))
-                                } else {
-                                    Text("Right-click an archived chat to unarchive it or delete it forever.")
-                                        .font(.system(size: sidebarScaled(10.5), weight: .medium))
-                                        .foregroundStyle(AppVisualTheme.foreground(0.44))
-                                        .padding(.horizontal, sidebarScaled(2))
-                                        .fixedSize(horizontal: false, vertical: true)
-
-                                    ForEach(assistant.visibleArchivedSidebarSessions.prefix(assistant.visibleSessionsLimit)) { session in
-                                        Button {
-                                            guard session.isLocalSession else { return }
-                                            Task { await assistant.openSession(session) }
-                                        } label: {
-                                            AssistantSessionRow(
-                                                session: session,
-                                                isSelected: assistant.selectedSessionID == session.id,
-                                                activityState: sidebarActivityState(for: session),
-                                                textScale: sidebarTextScale
-                                            )
-                                        }
-                                        .buttonStyle(.plain)
-                                        .contextMenu { threadContextMenu(for: session) }
-                                    }
-
-                                    if visibleArchivedSessionCount > assistant.visibleSessionsLimit {
-                                        Button {
-                                            assistant.loadMoreSessions()
-                                        } label: {
-                                            Text("Load more")
-                                                .font(.system(size: sidebarScaled(11), weight: .medium))
-                                                .foregroundStyle(AppVisualTheme.foreground(0.44))
-                                                .padding(.vertical, sidebarScaled(6))
-                                                .frame(maxWidth: .infinity)
-                                        }
-                                        .buttonStyle(.plain)
-                                        .padding(.top, sidebarScaled(2))
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                .animation(
-                    sidebarListAnimation,
-                    value: sidebarSessionAnimationKey
-                )
-                .padding(.horizontal, sidebarScaled(4))
-            }
-            .appScrollbars()
-
-            Spacer(minLength: 0)
-
-            Rectangle()
-                .fill(AssistantWindowChrome.sidebarDivider)
-                .frame(height: 0.5)
-                .padding(.horizontal, sidebarScaled(4))
-                .padding(.bottom, sidebarScaled(8))
-
-            VStack(alignment: .leading, spacing: sidebarScaled(2)) {
-                Button {
-                    NotificationCenter.default.post(name: .openAssistOpenAssistantSetup, object: nil)
-                } label: {
-                    HStack(spacing: sidebarScaled(8)) {
-                        Image(systemName: "gearshape")
-                            .font(.system(size: sidebarScaled(12), weight: .medium))
-                            .foregroundStyle(AppVisualTheme.foreground(0.50))
-                        Text("Settings")
-                            .font(.system(size: sidebarScaled(13), weight: .regular))
-                            .foregroundStyle(AppVisualTheme.foreground(0.60))
-                        Spacer()
-                    }
-                    .padding(.horizontal, sidebarScaled(10))
-                    .padding(.vertical, sidebarScaled(6))
-                    .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-
-                sidebarNavButton(
-                    symbol: "archivebox",
-                    label: "Archived",
-                    isSelected: selectedSidebarPane == .archived
-                ) {
-                    showArchivedSidebar()
-                }
-            }
-        }
-        .padding(.horizontal, sidebarScaled(10))
-        .padding(.vertical, sidebarScaled(12))
-        .frame(width: layout.sidebarWidth)
+    private func sidebar(layout: ChatLayoutMetrics, width: CGFloat) -> some View {
+        AssistantSidebarWebView(
+            state: sidebarWebState,
+            accentColor: AppVisualTheme.accentTint,
+            onCommand: handleSidebarWebCommand
+        )
+        .frame(width: width)
         .frame(maxHeight: .infinity, alignment: .top)
     }
 
@@ -1437,10 +1569,12 @@ struct AssistantWindowView: View {
                     .font(.system(size: 18, weight: .bold))
                     .foregroundStyle(AppVisualTheme.foreground(0.88))
 
-                Text("New archives will use this cleanup time automatically. Change it here only when you want a different default.")
-                    .font(.system(size: 12.5, weight: .medium))
-                    .foregroundStyle(AppVisualTheme.foreground(0.50))
-                    .fixedSize(horizontal: false, vertical: true)
+                Text(
+                    "New archives will use this cleanup time automatically. Change it here only when you want a different default."
+                )
+                .font(.system(size: 12.5, weight: .medium))
+                .foregroundStyle(AppVisualTheme.foreground(0.50))
+                .fixedSize(horizontal: false, vertical: true)
 
                 Picker(
                     "Default cleanup time",
@@ -1477,11 +1611,13 @@ struct AssistantWindowView: View {
                     Text("No archived chats")
                         .font(.system(size: 18, weight: .semibold))
                         .foregroundStyle(AppVisualTheme.foreground(0.72))
-                    Text("Archived chats will appear here. You can unarchive them or delete them forever from the right-click menu.")
-                        .font(.system(size: 13, weight: .medium))
-                        .foregroundStyle(AppVisualTheme.foreground(0.44))
-                        .multilineTextAlignment(.center)
-                        .frame(maxWidth: 320)
+                    Text(
+                        "Archived chats will appear here. You can unarchive them or delete them forever from the right-click menu."
+                    )
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(AppVisualTheme.foreground(0.44))
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 320)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if hasArchivedSelection {
@@ -1528,11 +1664,15 @@ struct AssistantWindowView: View {
             HStack(spacing: sidebarScaled(8)) {
                 Image(systemName: symbol)
                     .font(.system(size: sidebarScaled(11), weight: .medium))
-                    .foregroundStyle(isSelected ? AppVisualTheme.accentTint : AppVisualTheme.foreground(0.44))
+                    .foregroundStyle(
+                        isSelected ? AppVisualTheme.accentTint : AppVisualTheme.foreground(0.44)
+                    )
                     .frame(width: sidebarScaled(16))
                 Text(label)
                     .font(.system(size: sidebarScaled(13), weight: .regular))
-                    .foregroundStyle(isSelected ? AppVisualTheme.foreground(0.88) : AppVisualTheme.foreground(0.60))
+                    .foregroundStyle(
+                        isSelected
+                            ? AppVisualTheme.foreground(0.88) : AppVisualTheme.foreground(0.60))
                 Spacer()
             }
             .padding(.horizontal, sidebarScaled(10))
@@ -1548,14 +1688,15 @@ struct AssistantWindowView: View {
 
     @ViewBuilder
     private func projectContextMenu(for project: AssistantProject) -> some View {
-                            Button {
-                                assistant.inspectMemory(for: project)
-                            } label: {
-                                Label("View Memory", systemImage: "brain")
-                            }
+        Button {
+            assistant.inspectMemory(for: project)
+        } label: {
+            Label("View Memory", systemImage: "brain")
+        }
 
         if let selectedSession = activeSessionSummary,
-           selectedSession.projectID?.caseInsensitiveCompare(project.id) != .orderedSame {
+            selectedSession.projectID?.caseInsensitiveCompare(project.id) != .orderedSame
+        {
             Divider()
 
             Button {
@@ -1605,7 +1746,9 @@ struct AssistantWindowView: View {
         Button {
             presentProjectFolderPicker(for: project)
         } label: {
-            Label(project.linkedFolderPath == nil ? "Link Folder" : "Change Folder", systemImage: "folder")
+            Label(
+                project.linkedFolderPath == nil ? "Link Folder" : "Change Folder",
+                systemImage: "folder")
         }
 
         if project.linkedFolderPath != nil {
@@ -1673,7 +1816,8 @@ struct AssistantWindowView: View {
             if !assistant.visibleProjects.isEmpty {
                 Menu {
                     ForEach(assistant.visibleProjects) { project in
-                        let isCurrentProject = session.projectID?.caseInsensitiveCompare(project.id) == .orderedSame
+                        let isCurrentProject =
+                            session.projectID?.caseInsensitiveCompare(project.id) == .orderedSame
                         Button {
                             assistant.assignSessionToProject(session.id, projectID: project.id)
                         } label: {
@@ -1720,7 +1864,6 @@ struct AssistantWindowView: View {
         }
     }
 
-
     private func chatDetail(layout: ChatLayoutMetrics) -> some View {
         VStack(spacing: 0) {
             chatTopBar(layout: layout)
@@ -1735,7 +1878,8 @@ struct AssistantWindowView: View {
                 reviewPanel: inlineTrackedCodePanel,
                 rewindState: chatWebRewindState,
                 showTypingIndicator: shouldShowPendingAssistantPlaceholder,
-                typingTitle: assistant.hudState.title.isEmpty ? "Thinking" : assistant.hudState.title,
+                typingTitle: assistant.hudState.title.isEmpty
+                    ? "Thinking" : assistant.hudState.title,
                 typingDetail: assistant.hudState.detail ?? "Working on your message",
                 textScale: CGFloat(chatTextScale),
                 canLoadOlderHistory: canLoadOlderHistory,
@@ -1753,7 +1897,8 @@ struct AssistantWindowView: View {
                     assistant.selectAssistantBackend(backend)
                 },
                 onOpenRuntimeSettings: {
-                    NotificationCenter.default.post(name: .openAssistOpenSettings, object: SettingsRoute.gettingStartedHome)
+                    NotificationCenter.default.post(
+                        name: .openAssistOpenSettings, object: SettingsRoute.gettingStartedHome)
                 },
                 onUndoMessage: { anchorID in
                     Task { await assistant.undoUserMessage(anchorID: anchorID) }
@@ -1789,7 +1934,8 @@ struct AssistantWindowView: View {
                 resetVisibleHistoryWindow()
             }
             .onChange(of: assistant.selectedSessionID) { newSessionID in
-                guard newSessionID?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false else {
+                guard newSessionID?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+                else {
                     return
                 }
                 resetVisibleHistoryWindow()
@@ -1812,7 +1958,7 @@ struct AssistantWindowView: View {
             LinearGradient(
                 colors: [
                     AssistantWindowChrome.contentTop,
-                    AssistantWindowChrome.contentBottom
+                    AssistantWindowChrome.contentBottom,
                 ],
                 startPoint: .top,
                 endPoint: .bottom
@@ -1829,19 +1975,8 @@ struct AssistantWindowView: View {
     }
 
     private var automationDetail: some View {
-        let trafficLightClearance: CGFloat = 52
         return VStack(spacing: 0) {
             HStack(alignment: .center, spacing: 12) {
-                if isSidebarCollapsed {
-                    Button {
-                        setSidebarCollapsed(false)
-                    } label: {
-                        topBarIconButton(symbol: "sidebar.right")
-                    }
-                    .buttonStyle(.plain)
-                    .help("Show sidebar")
-                }
-
                 ZStack {
                     RoundedRectangle(cornerRadius: 10, style: .continuous)
                         .fill(Color(red: 0.46, green: 0.79, blue: 0.66).opacity(0.14))
@@ -1862,7 +1997,6 @@ struct AssistantWindowView: View {
                 Spacer()
             }
             .padding(.horizontal, 18)
-            .padding(.leading, isSidebarCollapsed ? trafficLightClearance : 0)
             .padding(.vertical, 14)
             .background(
                 AppVisualTheme.surfaceFill(0.03)
@@ -1883,7 +2017,7 @@ struct AssistantWindowView: View {
             LinearGradient(
                 colors: [
                     AssistantWindowChrome.contentTop,
-                    AssistantWindowChrome.contentBottom
+                    AssistantWindowChrome.contentBottom,
                 ],
                 startPoint: .top,
                 endPoint: .bottom
@@ -1900,27 +2034,7 @@ struct AssistantWindowView: View {
     }
 
     private var skillsDetail: some View {
-        let trafficLightClearance: CGFloat = 52
         return VStack(spacing: 0) {
-            if isSidebarCollapsed {
-                HStack(alignment: .center, spacing: 12) {
-                    Button {
-                        setSidebarCollapsed(false)
-                    } label: {
-                        topBarIconButton(symbol: "sidebar.right")
-                    }
-                    .buttonStyle(.plain)
-                    .help("Show sidebar")
-
-                    Spacer()
-                }
-                .padding(.horizontal, 18)
-                .padding(.leading, trafficLightClearance)
-                .padding(.top, 10)
-                .contentShape(Rectangle())
-                .onTapGesture(count: 2, perform: toggleKeyWindowFullScreen)
-            }
-
             AssistantSkillsPane(
                 assistant: assistant,
                 onImportFolder: openSkillFolderImportPanel,
@@ -1935,7 +2049,7 @@ struct AssistantWindowView: View {
             LinearGradient(
                 colors: [
                     AssistantWindowChrome.contentTop,
-                    AssistantWindowChrome.contentBottom
+                    AssistantWindowChrome.contentBottom,
                 ],
                 startPoint: .top,
                 endPoint: .bottom
@@ -2027,7 +2141,8 @@ struct AssistantWindowView: View {
                     AssistantParentWorkCard(
                         snapshot: workSnapshot,
                         onOpenThread: openThread,
-                        onReviewChanges: latestFileChangeMessageID == nil ? nil : revealLatestFileChangeActivity
+                        onReviewChanges: latestFileChangeMessageID == nil
+                            ? nil : revealLatestFileChangeActivity
                     )
                     .padding(.horizontal, 12)
                     .padding(.bottom, 10)
@@ -2091,7 +2206,10 @@ struct AssistantWindowView: View {
                 )
                 .help(activeSessionWorkspaceURL?.path ?? project.name)
             } else if activeSessionSummary?.projectID == nil,
-                      let projectName = activeSessionSummary?.projectName?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
+                let projectName = activeSessionSummary?.projectName?.trimmingCharacters(
+                    in: .whitespacesAndNewlines
+                ).nonEmpty
+            {
                 AssistantStatusBadge(
                     title: projectName,
                     tint: AppVisualTheme.accentTint,
@@ -2115,22 +2233,10 @@ struct AssistantWindowView: View {
     private func chatTopBar(layout: ChatLayoutMetrics) -> some View {
         let sideControlWidth: CGFloat = 138
         let titleHorizontalPadding: CGFloat = 16
-        let trafficLightClearance: CGFloat = 52
 
         return HStack(spacing: 0) {
-            HStack(spacing: 6) {
-                if isSidebarCollapsed {
-                    Button {
-                        setSidebarCollapsed(false)
-                    } label: {
-                        topBarIconButton(symbol: "sidebar.right")
-                    }
-                    .buttonStyle(.plain)
-                    .help("Show sessions sidebar")
-                }
-            }
-            .padding(.leading, isSidebarCollapsed ? trafficLightClearance : 0)
-            .frame(width: sideControlWidth, alignment: .leading)
+            HStack(spacing: 0) {}
+                .frame(width: sideControlWidth, alignment: .leading)
 
             Spacer(minLength: 0)
 
@@ -2184,7 +2290,10 @@ struct AssistantWindowView: View {
                 } label: {
                     Image(systemName: "brain")
                         .font(.system(size: 11, weight: .medium))
-                        .foregroundStyle(sessionMemoryIsActive ? Color.green.opacity(0.85) : AppVisualTheme.foreground(0.28))
+                        .foregroundStyle(
+                            sessionMemoryIsActive
+                                ? Color.green.opacity(0.85) : AppVisualTheme.foreground(0.28)
+                        )
                         .padding(5)
                         .background(
                             RoundedRectangle(cornerRadius: 5, style: .continuous)
@@ -2219,7 +2328,7 @@ struct AssistantWindowView: View {
             LinearGradient(
                 colors: [
                     AssistantWindowChrome.contentTop,
-                    AssistantWindowChrome.contentBottom
+                    AssistantWindowChrome.contentBottom,
                 ],
                 startPoint: .top,
                 endPoint: .bottom
@@ -2244,11 +2353,15 @@ struct AssistantWindowView: View {
                     .frame(width: 28, height: 28)
                     .background(
                         RoundedRectangle(cornerRadius: 8, style: .continuous)
-                            .fill(AppVisualTheme.surfaceFill(isWorkspaceLaunchPrimaryHovered ? 0.12 : 0.0))
+                            .fill(
+                                AppVisualTheme.surfaceFill(
+                                    isWorkspaceLaunchPrimaryHovered ? 0.12 : 0.0)
+                            )
                             .overlay(
                                 RoundedRectangle(cornerRadius: 8, style: .continuous)
                                     .stroke(
-                                        AppVisualTheme.surfaceStroke(isWorkspaceLaunchPrimaryHovered ? 0.18 : 0.0),
+                                        AppVisualTheme.surfaceStroke(
+                                            isWorkspaceLaunchPrimaryHovered ? 0.18 : 0.0),
                                         lineWidth: 0.6
                                     )
                             )
@@ -2278,34 +2391,34 @@ struct AssistantWindowView: View {
                     Divider()
                 }
 
-            ForEach(Self.workspaceLaunchTargets) { target in
-                Button {
-                    if target.remembersAsPreferred {
-                        preferredWorkspaceLaunchTargetID = target.id
-                    }
-                    openCurrentWorkspace(in: target)
-                } label: {
-                    HStack(spacing: 8) {
-                        workspaceLaunchTargetIcon(target, size: 18)
-                        Text(target.title)
-                        if target.id == primaryWorkspaceLaunchTarget.id {
-                            Spacer(minLength: 8)
-                            Image(systemName: "checkmark")
+                ForEach(Self.workspaceLaunchTargets) { target in
+                    Button {
+                        if target.remembersAsPreferred {
+                            preferredWorkspaceLaunchTargetID = target.id
                         }
-                        if !target.isInstalled {
-                            Spacer(minLength: 8)
-                            Text("Not installed")
-                                .foregroundStyle(.secondary)
+                        openCurrentWorkspace(in: target)
+                    } label: {
+                        HStack(spacing: 8) {
+                            workspaceLaunchTargetIcon(target, size: 18)
+                            Text(target.title)
+                            if target.id == primaryWorkspaceLaunchTarget.id {
+                                Spacer(minLength: 8)
+                                Image(systemName: "checkmark")
+                            }
+                            if !target.isInstalled {
+                                Spacer(minLength: 8)
+                                Text("Not installed")
+                                    .foregroundStyle(.secondary)
+                            }
                         }
                     }
+                    .disabled(activeSessionWorkspaceURL == nil || !target.isInstalled)
                 }
-                .disabled(activeSessionWorkspaceURL == nil || !target.isInstalled)
-            }
             } label: {
                 Image(systemName: "chevron.down")
                     .resizable()
                     .aspectRatio(contentMode: .fit)
-                    .frame(width: 7, height: 4.5)
+                    .frame(width: 5.5, height: 3.5)
                     .foregroundStyle(AppVisualTheme.foreground(0.36))
                     .padding(.vertical, 1)
             }
@@ -2352,7 +2465,8 @@ struct AssistantWindowView: View {
 
     private func openCurrentWorkspace(in target: AssistantWorkspaceLaunchTarget) {
         guard let workspaceURL = activeSessionWorkspaceURL else {
-            assistant.lastStatusMessage = "This chat does not have a folder yet. Open a project chat first."
+            assistant.lastStatusMessage =
+                "This chat does not have a folder yet. Open a project chat first."
             return
         }
 
@@ -2381,7 +2495,8 @@ struct AssistantWindowView: View {
                         CrashReporter.logError(
                             "Workspace launch failed target=\(target.title) path=\(workspaceURL.path) error=\(error.localizedDescription)"
                         )
-                        assistant.lastStatusMessage = "Could not open this folder in \(target.title)."
+                        assistant.lastStatusMessage =
+                            "Could not open this folder in \(target.title)."
                     } else {
                         assistant.lastStatusMessage = "Opened this folder in \(target.title)."
                     }
@@ -2393,7 +2508,9 @@ struct AssistantWindowView: View {
     private func topBarIconButton(symbol: String, emphasized: Bool = false) -> some View {
         Image(systemName: symbol)
             .font(.system(size: 12, weight: .medium))
-            .foregroundStyle(emphasized ? AppVisualTheme.accentTint : AppVisualTheme.foreground(0.50))
+            .foregroundStyle(
+                emphasized ? AppVisualTheme.accentTint : AppVisualTheme.foreground(0.50)
+            )
             .frame(width: 28, height: 28)
             .background(
                 RoundedRectangle(cornerRadius: 7, style: .continuous)
@@ -2460,9 +2577,12 @@ struct AssistantWindowView: View {
         }
     }
 
-    private func statusBarRateLimitInline(window: RateLimitWindow, bucketLabel: String?) -> some View {
+    private func statusBarRateLimitInline(window: RateLimitWindow, bucketLabel: String?)
+        -> some View
+    {
         let isHigh = window.usedPercent > 80
-        let percentColor: Color = isHigh ? .red.opacity(0.85) : AppVisualTheme.accentTint.opacity(0.75)
+        let percentColor: Color =
+            isHigh ? .red.opacity(0.85) : AppVisualTheme.accentTint.opacity(0.75)
         let baseLabel = window.windowLabel.isEmpty ? "Usage" : window.windowLabel
         let label = [bucketLabel, baseLabel]
             .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty }
@@ -2598,7 +2718,8 @@ struct AssistantWindowView: View {
         let alert = NSAlert()
         alert.alertStyle = .informational
         alert.messageText = "Rename Session"
-        alert.informativeText = "Choose a friendly name for this thread. It will stay the same until you rename it again."
+        alert.informativeText =
+            "Choose a friendly name for this thread. It will stay the same until you rename it again."
         alert.accessoryView = field
         alert.addButton(withTitle: "Rename")
         alert.addButton(withTitle: "Cancel")
@@ -2612,7 +2733,8 @@ struct AssistantWindowView: View {
         let alert = NSAlert()
         alert.alertStyle = .informational
         alert.messageText = "Add Project"
-        alert.informativeText = "You can open a folder and add it as one project, or create a project by name now and link a folder later."
+        alert.informativeText =
+            "You can open a folder and add it as one project, or create a project by name now and link a folder later."
         alert.addButton(withTitle: "Open Folder")
         alert.addButton(withTitle: "Create by Name")
         alert.addButton(withTitle: "Cancel")
@@ -2630,7 +2752,8 @@ struct AssistantWindowView: View {
     private func presentNamedProjectPrompt() {
         presentProjectNamePrompt(
             title: "Create Project",
-            message: "Give this project a simple name. You can add threads to it now and link a local folder later.",
+            message:
+                "Give this project a simple name. You can add threads to it now and link a local folder later.",
             confirmTitle: "Create",
             initialValue: assistant.selectedProjectFilter?.name ?? ""
         ) { proposedName in
@@ -2649,13 +2772,15 @@ struct AssistantWindowView: View {
         panel.resolvesAliases = true
 
         guard panel.runModal() == .OK,
-              let folderURL = panel.url else {
+            let folderURL = panel.url
+        else {
             return
         }
 
         presentProjectNamePrompt(
             title: "Add Project From Folder",
-            message: "We used the folder name as the project name. You can keep it or type a different name.",
+            message:
+                "We used the folder name as the project name. You can keep it or type a different name.",
             confirmTitle: "Add Project",
             initialValue: AssistantProject.suggestedName(forLinkedFolderPath: folderURL.path)
         ) { proposedName in
@@ -2666,7 +2791,8 @@ struct AssistantWindowView: View {
     private func presentRenameProjectPrompt(for project: AssistantProject) {
         presentProjectNamePrompt(
             title: "Rename Project",
-            message: "Choose the new name for this project. Its threads and memory will stay attached.",
+            message:
+                "Choose the new name for this project. Its threads and memory will stay attached.",
             confirmTitle: "Rename",
             initialValue: project.name
         ) { proposedName in
@@ -2683,7 +2809,8 @@ struct AssistantWindowView: View {
         let alert = NSAlert()
         alert.alertStyle = .informational
         alert.messageText = "Change Project Icon"
-        alert.informativeText = "Type an SF Symbol name, like folder.fill or star.fill. Leave it blank to use the default icon."
+        alert.informativeText =
+            "Type an SF Symbol name, like folder.fill or star.fill. Leave it blank to use the default icon."
         alert.accessoryView = field
         alert.addButton(withTitle: "Save")
         alert.addButton(withTitle: "Cancel")
@@ -2699,7 +2826,8 @@ struct AssistantWindowView: View {
             let errorAlert = NSAlert()
             errorAlert.alertStyle = .warning
             errorAlert.messageText = "Unknown Icon"
-            errorAlert.informativeText = "That symbol name was not found. Try folder.fill, star.fill, or pick one of the preset icons."
+            errorAlert.informativeText =
+                "That symbol name was not found. Try folder.fill, star.fill, or pick one of the preset icons."
             errorAlert.addButton(withTitle: "OK")
             errorAlert.runModal()
             return
@@ -2717,7 +2845,9 @@ struct AssistantWindowView: View {
         panel.canCreateDirectories = false
         panel.allowsMultipleSelection = false
         panel.resolvesAliases = true
-        if let linkedFolderPath = project.linkedFolderPath?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
+        if let linkedFolderPath = project.linkedFolderPath?.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        ).nonEmpty {
             let existingURL = URL(fileURLWithPath: linkedFolderPath, isDirectory: true)
             if FileManager.default.fileExists(atPath: existingURL.path) {
                 panel.directoryURL = existingURL
@@ -2754,7 +2884,9 @@ struct AssistantWindowView: View {
         onSubmit(proposedName)
     }
 
-    private func copyMessageButton(text: String, helpText: String, isVisible: Bool = true) -> some View {
+    private func copyMessageButton(text: String, helpText: String, isVisible: Bool = true)
+        -> some View
+    {
         Button {
             copyAssistantTextToPasteboard(text)
         } label: {
@@ -2809,12 +2941,15 @@ struct AssistantWindowView: View {
     }
 
     private func loadOlderHistoryIfNeeded(topOffset: CGFloat, with proxy: ScrollViewProxy) {
-        let hasRecentManualScrollIntent = Date().timeIntervalSince(chatScrollTracking.lastManualScrollAt) <= Self.manualLoadOlderPause
+        let hasRecentManualScrollIntent =
+            Date().timeIntervalSince(chatScrollTracking.lastManualScrollAt)
+            <= Self.manualLoadOlderPause
         guard !assistant.isTransitioningSession,
-              hasRecentManualScrollIntent,
-              canLoadOlderHistory,
-              topOffset > -Self.loadOlderThreshold,
-              !isLoadingOlderHistory else {
+            hasRecentManualScrollIntent,
+            canLoadOlderHistory,
+            topOffset > -Self.loadOlderThreshold,
+            !isLoadingOlderHistory
+        else {
             return
         }
 
@@ -2823,8 +2958,9 @@ struct AssistantWindowView: View {
 
     private func loadOlderHistoryBatch(with proxy: ScrollViewProxy) {
         guard !assistant.isTransitioningSession,
-              !isLoadingOlderHistory,
-              let anchorID = visibleRenderItems.first.flatMap(historyPreservationAnchorID(for:)) else {
+            !isLoadingOlderHistory,
+            let anchorID = visibleRenderItems.first.flatMap(historyPreservationAnchorID(for:))
+        else {
             return
         }
 
@@ -2915,7 +3051,8 @@ struct AssistantWindowView: View {
 
                 if !canChat {
                     Button("Open Settings") {
-                        NotificationCenter.default.post(name: .openAssistOpenSettings, object: SettingsRoute.gettingStartedHome)
+                        NotificationCenter.default.post(
+                            name: .openAssistOpenSettings, object: SettingsRoute.gettingStartedHome)
                     }
                     .buttonStyle(.borderedProminent)
                 }
@@ -2975,7 +3112,9 @@ struct AssistantWindowView: View {
     }
 
     @ViewBuilder
-    private func renderTimelineRow(_ item: AssistantTimelineRenderItem, layout: ChatLayoutMetrics) -> some View {
+    private func renderTimelineRow(_ item: AssistantTimelineRenderItem, layout: ChatLayoutMetrics)
+        -> some View
+    {
         switch item {
         case .timeline(let timelineItem):
             timelineRow(timelineItem, layout: layout)
@@ -3012,7 +3151,8 @@ struct AssistantWindowView: View {
     }
 
     @ViewBuilder
-    private func timelineRow(_ item: AssistantTimelineItem, layout: ChatLayoutMetrics) -> some View {
+    private func timelineRow(_ item: AssistantTimelineItem, layout: ChatLayoutMetrics) -> some View
+    {
         switch item.kind {
         case .userMessage:
             timelineUserBubble(
@@ -3169,7 +3309,8 @@ struct AssistantWindowView: View {
     }
 
     private func pendingAssistantResponseRow(layout: ChatLayoutMetrics) -> some View {
-        let detail = assistant.hudState.detail?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+        let detail =
+            assistant.hudState.detail?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
             ?? "Working on your message"
 
         return HStack(alignment: .top, spacing: 0) {
@@ -3184,9 +3325,11 @@ struct AssistantWindowView: View {
                     )
 
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(assistant.hudState.title.isEmpty ? "Thinking" : assistant.hudState.title)
-                            .font(.system(size: 12, weight: .semibold))
-                            .foregroundStyle(AppVisualTheme.foreground(0.82))
+                        Text(
+                            assistant.hudState.title.isEmpty ? "Thinking" : assistant.hudState.title
+                        )
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(AppVisualTheme.foreground(0.82))
 
                         Text(detail)
                             .font(.system(size: 11.5, weight: .medium))
@@ -3246,12 +3389,20 @@ struct AssistantWindowView: View {
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
                     if !isStandardAssistant {
                         Text(title)
-                            .font(.system(size: compact ? 11 : 11.5, weight: isCompactStatusRow ? .medium : .semibold))
-                            .foregroundStyle(AppVisualTheme.foreground(isCompactStatusRow ? 0.50 : (compact ? 0.62 : 0.72)))
+                            .font(
+                                .system(
+                                    size: compact ? 11 : 11.5,
+                                    weight: isCompactStatusRow ? .medium : .semibold)
+                            )
+                            .foregroundStyle(
+                                AppVisualTheme.foreground(
+                                    isCompactStatusRow ? 0.50 : (compact ? 0.62 : 0.72)))
 
                         Text(timestamp.formatted(date: .omitted, time: .shortened))
                             .font(.system(size: 9.5, weight: .regular))
-                            .foregroundStyle(AppVisualTheme.foreground(isCompactStatusRow ? 0.20 : (compact ? 0.26 : 0.32)))
+                            .foregroundStyle(
+                                AppVisualTheme.foreground(
+                                    isCompactStatusRow ? 0.20 : (compact ? 0.26 : 0.32)))
                     }
 
                     Spacer(minLength: 8)
@@ -3259,7 +3410,8 @@ struct AssistantWindowView: View {
                     if showsInlineCopyButton {
                         copyMessageButton(
                             text: text,
-                            helpText: title == "Assistant" ? "Copy assistant message" : "Copy message",
+                            helpText: title == "Assistant"
+                                ? "Copy assistant message" : "Copy message",
                             isVisible: inlineCopyButtonIsVisible(for: messageID)
                         )
                     }
@@ -3290,7 +3442,8 @@ struct AssistantWindowView: View {
             Spacer(minLength: 0)
         }
 
-        return rowContent
+        return
+            rowContent
             .padding(.horizontal, isStandardAssistant ? 0 : (compact ? 10 : 14))
             .padding(.vertical, isStandardAssistant ? (compact ? 6 : 10) : (compact ? 6 : 12))
             .background {
@@ -3324,7 +3477,9 @@ struct AssistantWindowView: View {
             .padding(
                 .trailing,
                 isStandardAssistant
-                    ? (compact ? layout.assistantTrailingPaddingCompact : layout.assistantTrailingPaddingRegular)
+                    ? (compact
+                        ? layout.assistantTrailingPaddingCompact
+                        : layout.assistantTrailingPaddingRegular)
                     : layout.assistantTrailingPaddingStatus
             )
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -3361,7 +3516,8 @@ struct AssistantWindowView: View {
 
     private func isSelectionInsightTimelineItem(_ item: AssistantTimelineItem) -> Bool {
         guard item.kind == .system,
-              let text = item.text?.trimmingCharacters(in: .whitespacesAndNewlines) else {
+            let text = item.text?.trimmingCharacters(in: .whitespacesAndNewlines)
+        else {
             return false
         }
 
@@ -3376,7 +3532,8 @@ struct AssistantWindowView: View {
         screenRect: CGRect
     ) {
         guard !selectedText.isEmpty else {
-            guard !AssistantSelectionActionHUDManager.shared.retainsPresentationWithoutSelection else { return }
+            guard !AssistantSelectionActionHUDManager.shared.retainsPresentationWithoutSelection
+            else { return }
             AssistantSelectionActionHUDManager.shared.hide()
             return
         }
@@ -3390,7 +3547,9 @@ struct AssistantWindowView: View {
         presentSelectionActions(for: context)
     }
 
-    private func presentSelectionActions(for selection: AssistantTextSelectionTracker.SelectionContext) {
+    private func presentSelectionActions(
+        for selection: AssistantTextSelectionTracker.SelectionContext
+    ) {
         AssistantSelectionActionHUDManager.shared.show(
             anchorRect: selection.anchorRectOnScreen,
             onExplain: {
@@ -3402,7 +3561,9 @@ struct AssistantWindowView: View {
         )
     }
 
-    private func explainSelectedText(using selection: AssistantTextSelectionTracker.SelectionContext) {
+    private func explainSelectedText(
+        using selection: AssistantTextSelectionTracker.SelectionContext
+    ) {
         let preview = selectionPreview(for: selection.selectedText)
         AssistantSelectionActionHUDManager.shared.showLoading(
             anchorRect: selection.anchorRectOnScreen,
@@ -3453,7 +3614,9 @@ struct AssistantWindowView: View {
         }
     }
 
-    private func askQuestionAboutSelection(using selection: AssistantTextSelectionTracker.SelectionContext) {
+    private func askQuestionAboutSelection(
+        using selection: AssistantTextSelectionTracker.SelectionContext
+    ) {
         let preview = selectionPreview(for: selection.selectedText)
         AssistantSelectionActionHUDManager.shared.showQuestionComposer(
             anchorRect: selection.anchorRectOnScreen,
@@ -3523,7 +3686,8 @@ struct AssistantWindowView: View {
     }
 
     private func selectionPreview(for selectedText: String) -> String {
-        let selectionPreview = selectedText
+        let selectionPreview =
+            selectedText
             .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
             .trimmingCharacters(in: .whitespacesAndNewlines)
         if selectionPreview.count > 180 {
@@ -3542,11 +3706,13 @@ struct AssistantWindowView: View {
     ) {
         let openSettingsAction: (() -> Void)?
         if isError,
-           bodyText.localizedCaseInsensitiveContains("connect a provider")
-            || bodyText.localizedCaseInsensitiveContains("api key")
-            || bodyText.localizedCaseInsensitiveContains("oauth") {
+            bodyText.localizedCaseInsensitiveContains("connect a provider")
+                || bodyText.localizedCaseInsensitiveContains("api key")
+                || bodyText.localizedCaseInsensitiveContains("oauth")
+        {
             openSettingsAction = {
-                NotificationCenter.default.post(name: .openAssistOpenSettings, object: SettingsRoute.gettingStartedHome)
+                NotificationCenter.default.post(
+                    name: .openAssistOpenSettings, object: SettingsRoute.gettingStartedHome)
             }
         } else {
             openSettingsAction = nil
@@ -3559,9 +3725,11 @@ struct AssistantWindowView: View {
             bodyText: bodyText,
             isError: isError,
             isStreaming: isStreaming,
-            onAsk: isError ? nil : {
-                askQuestionAboutSelection(using: selection)
-            },
+            onAsk: isError
+                ? nil
+                : {
+                    askQuestionAboutSelection(using: selection)
+                },
             onClose: {
                 AssistantSelectionActionHUDManager.shared.hide()
             },
@@ -3627,7 +3795,9 @@ struct AssistantWindowView: View {
         }
     }
 
-    private func timelineActivityRow(_ activity: AssistantActivityItem, layout: ChatLayoutMetrics) -> some View {
+    private func timelineActivityRow(_ activity: AssistantActivityItem, layout: ChatLayoutMetrics)
+        -> some View
+    {
         let openTargets = activityOpenTargets(for: activity)
         let imagePreviews = assistantImagePreviews(from: openTargets)
         let detailSections = activityDetailSections(from: activity.rawDetails)
@@ -3639,7 +3809,8 @@ struct AssistantWindowView: View {
                 iconName: activityIconName(activity),
                 iconTint: activityIconTint(activity),
                 title: activityHeadline(activity, openTargetCount: openTargets.count),
-                subtitle: canExpand && !isExpanded ? activitySecondaryText(activity, openTargets: openTargets) : nil,
+                subtitle: canExpand && !isExpanded
+                    ? activitySecondaryText(activity, openTargets: openTargets) : nil,
                 statusLabel: activityStatusLabel(activity),
                 statusTint: activityStatusTint(activity),
                 timestamp: activity.updatedAt,
@@ -3663,7 +3834,9 @@ struct AssistantWindowView: View {
         .padding(.vertical, 4)
     }
 
-    private func timelineActivityGroupRow(_ group: AssistantTimelineActivityGroup, layout: ChatLayoutMetrics) -> some View {
+    private func timelineActivityGroupRow(
+        _ group: AssistantTimelineActivityGroup, layout: ChatLayoutMetrics
+    ) -> some View {
         let openTargets = activityOpenTargets(for: group)
         let imagePreviews = assistantImagePreviews(from: openTargets)
         let isExpanded = expandedActivityIDs.contains(group.id)
@@ -3674,7 +3847,8 @@ struct AssistantWindowView: View {
                 iconName: activityGroupIconName(group),
                 iconTint: activityGroupIconTint(group),
                 title: activityGroupHeadline(group),
-                subtitle: canExpand && !isExpanded ? activityGroupSecondaryText(group, openTargets: openTargets) : nil,
+                subtitle: canExpand && !isExpanded
+                    ? activityGroupSecondaryText(group, openTargets: openTargets) : nil,
                 statusLabel: activityGroupStatusLabel(group),
                 statusTint: activityGroupStatusTint(group),
                 timestamp: group.lastUpdatedAt,
@@ -3689,7 +3863,7 @@ struct AssistantWindowView: View {
                     openTargets: openTargets,
                     imagePreviews: imagePreviews
                 )
-                    .padding(.leading, 26)
+                .padding(.leading, 26)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -3771,7 +3945,9 @@ struct AssistantWindowView: View {
             .animation(.spring(response: 0.24, dampingFraction: 0.88), value: expanded)
     }
 
-    private func timelineActivityOpenTargetsList(_ targets: [AssistantActivityOpenTarget]) -> some View {
+    private func timelineActivityOpenTargetsList(_ targets: [AssistantActivityOpenTarget])
+        -> some View
+    {
         VStack(alignment: .leading, spacing: 4) {
             ForEach(Array(targets.prefix(6))) { target in
                 Button {
@@ -3817,14 +3993,18 @@ struct AssistantWindowView: View {
         }
     }
 
-    private func activityOpenTargets(for activity: AssistantActivityItem) -> [AssistantActivityOpenTarget] {
+    private func activityOpenTargets(for activity: AssistantActivityItem)
+        -> [AssistantActivityOpenTarget]
+    {
         assistantActivityOpenTargets(
             for: activity,
             sessionCWD: sessionWorkingDirectory(for: activity.sessionID)
         )
     }
 
-    private func activityOpenTargets(for group: AssistantTimelineActivityGroup) -> [AssistantActivityOpenTarget] {
+    private func activityOpenTargets(for group: AssistantTimelineActivityGroup)
+        -> [AssistantActivityOpenTarget]
+    {
         var results: [AssistantActivityOpenTarget] = []
         var seen = Set<String>()
 
@@ -3840,22 +4020,24 @@ struct AssistantWindowView: View {
 
     private func sessionWorkingDirectory(for sessionID: String?) -> String? {
         if let sessionID,
-           let cwd = assistant.sessions.first(where: {
-               assistantTimelineSessionIDsMatch($0.id, sessionID)
-           })?.effectiveCWD?.assistantNonEmpty
-            ?? assistant.sessions.first(where: {
+            let cwd = assistant.sessions.first(where: {
                 assistantTimelineSessionIDsMatch($0.id, sessionID)
-            })?.cwd?.assistantNonEmpty {
+            })?.effectiveCWD?.assistantNonEmpty
+                ?? assistant.sessions.first(where: {
+                    assistantTimelineSessionIDsMatch($0.id, sessionID)
+                })?.cwd?.assistantNonEmpty
+        {
             return cwd
         }
 
         if let selectedSessionID = assistant.selectedSessionID,
-           let cwd = assistant.sessions.first(where: {
-               assistantTimelineSessionIDsMatch($0.id, selectedSessionID)
-           })?.effectiveCWD?.assistantNonEmpty
-            ?? assistant.sessions.first(where: {
+            let cwd = assistant.sessions.first(where: {
                 assistantTimelineSessionIDsMatch($0.id, selectedSessionID)
-            })?.cwd?.assistantNonEmpty {
+            })?.effectiveCWD?.assistantNonEmpty
+                ?? assistant.sessions.first(where: {
+                    assistantTimelineSessionIDsMatch($0.id, selectedSessionID)
+                })?.cwd?.assistantNonEmpty
+        {
             return cwd
         }
 
@@ -3872,10 +4054,14 @@ struct AssistantWindowView: View {
         }
     }
 
-    private func activityDetailSections(from rawDetails: String?) -> [TimelineActivityDetailSectionData] {
-        guard let trimmed = rawDetails?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .assistantNonEmpty else {
+    private func activityDetailSections(from rawDetails: String?)
+        -> [TimelineActivityDetailSectionData]
+    {
+        guard
+            let trimmed = rawDetails?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .assistantNonEmpty
+        else {
             return []
         }
 
@@ -3954,7 +4140,8 @@ struct AssistantWindowView: View {
                     .foregroundStyle(AppVisualTheme.foreground(0.34))
                     .textCase(.uppercase)
 
-                ForEach(Array(group.activities.prefix(6).enumerated()), id: \.element.id) { _, activity in
+                ForEach(Array(group.activities.prefix(6).enumerated()), id: \.element.id) {
+                    _, activity in
                     VStack(alignment: .leading, spacing: 3) {
                         HStack(spacing: 8) {
                             Image(systemName: activityIconName(activity))
@@ -4052,9 +4239,12 @@ struct AssistantWindowView: View {
         }
     }
 
-    private func timelineActivityDetailSection(_ section: TimelineActivityDetailSectionData) -> some View {
+    private func timelineActivityDetailSection(_ section: TimelineActivityDetailSectionData)
+        -> some View
+    {
         let formattedText = assistantFormattedActivityDetailText(section.text)
-        let shouldScroll = formattedText.count > 420 || formattedText.filter(\.isNewline).count >= 10
+        let shouldScroll =
+            formattedText.count > 420 || formattedText.filter(\.isNewline).count >= 10
 
         return VStack(alignment: .leading, spacing: 4) {
             Text(section.title)
@@ -4118,7 +4308,8 @@ struct AssistantWindowView: View {
         NSWorkspace.shared.open(target.url)
     }
 
-    private func activityHeadline(_ activity: AssistantActivityItem, openTargetCount: Int) -> String {
+    private func activityHeadline(_ activity: AssistantActivityItem, openTargetCount: Int) -> String
+    {
         switch activity.kind {
         case .commandExecution:
             return openTargetCount > 0
@@ -4175,7 +4366,8 @@ struct AssistantWindowView: View {
 
         var fragments: [String] = []
         if !exploredFiles.isEmpty {
-            fragments.append("explored \(exploredFiles.count) file\(exploredFiles.count == 1 ? "" : "s")")
+            fragments.append(
+                "explored \(exploredFiles.count) file\(exploredFiles.count == 1 ? "" : "s")")
         }
         if !editedFiles.isEmpty {
             fragments.append("edited \(editedFiles.count) file\(editedFiles.count == 1 ? "" : "s")")
@@ -4242,10 +4434,12 @@ struct AssistantWindowView: View {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 10) {
                         if !selectedSessionToolActivity.activeCalls.isEmpty {
-                            toolActivitySection(title: "Active", calls: selectedSessionToolActivity.activeCalls)
+                            toolActivitySection(
+                                title: "Active", calls: selectedSessionToolActivity.activeCalls)
                         }
                         if !selectedSessionToolActivity.recentCalls.isEmpty {
-                            toolActivitySection(title: "Recent", calls: selectedSessionToolActivity.recentCalls)
+                            toolActivitySection(
+                                title: "Recent", calls: selectedSessionToolActivity.recentCalls)
                         }
                     }
                     .padding(.top, 8)
@@ -4286,8 +4480,10 @@ struct AssistantWindowView: View {
                             .foregroundStyle(AppVisualTheme.foreground(0.72))
                             .frame(maxWidth: .infinity, alignment: .leading)
 
-                        if let detail = call.detail?.trimmingCharacters(in: .whitespacesAndNewlines),
-                           !detail.isEmpty {
+                        if let detail = call.detail?.trimmingCharacters(
+                            in: .whitespacesAndNewlines),
+                            !detail.isEmpty
+                        {
                             Text(detail)
                                 .font(.system(size: 11))
                                 .foregroundStyle(AppVisualTheme.foreground(0.48))
@@ -4313,12 +4509,15 @@ struct AssistantWindowView: View {
     }
 
     private var toolActivitySummary: String {
-        switch (selectedSessionToolActivity.activeCalls.count, selectedSessionToolActivity.recentCalls.count) {
-        case let (active, recent) where active > 0 && recent > 0:
+        switch (
+            selectedSessionToolActivity.activeCalls.count,
+            selectedSessionToolActivity.recentCalls.count
+        ) {
+        case (let active, let recent) where active > 0 && recent > 0:
             return "\(active) active, \(recent) recent activities"
-        case let (active, _) where active > 0:
+        case (let active, _) where active > 0:
             return "\(active) active tool\(active == 1 ? "" : "s")"
-        case let (_, recent):
+        case (_, let recent):
             return "\(recent) recent activit\(recent == 1 ? "y" : "ies")"
         }
     }
@@ -4345,7 +4544,8 @@ struct AssistantWindowView: View {
     }
 
     private func statusLabel(for call: AssistantToolCallState) -> String {
-        let normalized = call.status.replacingOccurrences(of: "([A-Z])", with: " $1", options: .regularExpression)
+        let normalized = call.status.replacingOccurrences(
+            of: "([A-Z])", with: " $1", options: .regularExpression)
         return normalized.capitalized
     }
 
@@ -4563,338 +4763,99 @@ struct AssistantWindowView: View {
         )
     }
 
-    private var chatComposer: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            if let blockedReason = assistant.conversationBlockedReason {
-                composerStatusBanner(
-                    symbol: assistant.isLoadingModels ? "hourglass" : "exclamationmark.circle",
-                    text: blockedReason,
-                    tint: assistant.isLoadingModels ? AppVisualTheme.foreground(0.50) : .orange
-                )
-                .padding(.bottom, 6)
+    @ViewBuilder
+    private var chatComposerBanners: some View {
+        if let blockedReason = assistant.conversationBlockedReason {
+            composerStatusBanner(
+                symbol: assistant.isLoadingModels ? "hourglass" : "exclamationmark.circle",
+                text: blockedReason,
+                tint: assistant.isLoadingModels ? AppVisualTheme.foreground(0.50) : .orange
+            )
+            .padding(.bottom, 6)
+        }
+
+        if let suggestion = assistant.modeSwitchSuggestion {
+            composerStatusBanner(
+                symbol: suggestion.source == .blocked ? "arrow.triangle.branch" : "lightbulb",
+                text: suggestion.message,
+                tint: suggestion.source == .blocked ? .orange : AppVisualTheme.foreground(0.50)
+            ) {
+                modeSwitchSuggestionButtons(suggestion)
             }
+            .padding(.bottom, 6)
+        }
 
-            if let suggestion = assistant.modeSwitchSuggestion {
-                composerStatusBanner(
-                    symbol: suggestion.source == .blocked ? "arrow.triangle.branch" : "lightbulb",
-                    text: suggestion.message,
-                    tint: suggestion.source == .blocked ? .orange : AppVisualTheme.foreground(0.50)
-                ) {
-                    modeSwitchSuggestionButtons(suggestion)
-                }
-                .padding(.bottom, 6)
-            }
-
-            if let bannerText = assistant.historyMutationState?.bannerText {
-                composerStatusBanner(
-                    symbol: assistant.historyMutationState?.kind == .undo ? "arrow.uturn.backward.circle" : "pencil.circle",
-                    text: bannerText,
-                    tint: AppVisualTheme.accentTint
-                ) {
-                    if assistant.canStepHistoryMutationBackward {
-                        Button("Previous message") {
-                            Task { await assistant.stepHistoryMutationBackward() }
-                        }
-                        .buttonStyle(.plain)
-                        .font(.system(size: 10.5, weight: .semibold))
-                        .foregroundStyle(AppVisualTheme.foreground(0.92))
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 6)
-                        .background(
-                            Capsule(style: .continuous)
-                                .fill(AppVisualTheme.accentTint.opacity(0.18))
-                                .overlay(
-                                    Capsule(style: .continuous)
-                                        .stroke(AppVisualTheme.surfaceStroke(0.10), lineWidth: 0.5)
-                                )
-                        )
-                    }
-
-                    Button {
-                        Task { await assistant.redoUndoneUserMessage() }
-                    } label: {
-                        Image(systemName: "arrow.uturn.forward.circle")
-                            .font(.system(size: 14, weight: .semibold))
-                            .frame(width: 28, height: 28)
-                            .contentShape(Circle())
+        if let bannerText = assistant.historyMutationState?.bannerText {
+            composerStatusBanner(
+                symbol: assistant.historyMutationState?.kind == .undo
+                    ? "arrow.uturn.backward.circle" : "pencil.circle",
+                text: bannerText,
+                tint: AppVisualTheme.accentTint
+            ) {
+                if assistant.canStepHistoryMutationBackward {
+                    Button("Previous message") {
+                        Task { await assistant.stepHistoryMutationBackward() }
                     }
                     .buttonStyle(.plain)
+                    .font(.system(size: 10.5, weight: .semibold))
                     .foregroundStyle(AppVisualTheme.foreground(0.92))
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
                     .background(
-                        Circle()
+                        Capsule(style: .continuous)
                             .fill(AppVisualTheme.accentTint.opacity(0.18))
                             .overlay(
-                                Circle()
+                                Capsule(style: .continuous)
                                     .stroke(AppVisualTheme.surfaceStroke(0.10), lineWidth: 0.5)
                             )
                     )
-                    .help("Redo the original request")
-                    .accessibilityLabel("Redo")
                 }
-                .padding(.bottom, 6)
-            }
 
-            if !assistant.activeThreadSkills.isEmpty {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 8) {
-                        ForEach(assistant.activeThreadSkills) { state in
-                            threadSkillChip(state)
-                        }
-                    }
+                Button {
+                    Task { await assistant.redoUndoneUserMessage() }
+                } label: {
+                    Image(systemName: "arrow.uturn.forward.circle")
+                        .font(.system(size: 14, weight: .semibold))
+                        .frame(width: 28, height: 28)
+                        .contentShape(Circle())
                 }
-                .padding(.horizontal, 2)
-                .padding(.bottom, 4)
-            }
-
-
-            // Attachment chips above composer
-            if !assistant.attachments.isEmpty {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 8) {
-                        ForEach(assistant.attachments) { attachment in
-                            attachmentChip(attachment)
-                        }
-                    }
-                    .padding(.horizontal, 2)
-                }
-                .padding(.bottom, 4)
-            }
-
-            VStack(alignment: .leading, spacing: 0) {
-                ZStack(alignment: .topTrailing) {
-                    ZStack(alignment: .topLeading) {
-                        if trimmedPromptDraft.isEmpty {
-                            Text(composerPlaceholder)
-                                .font(.system(size: 14, weight: .regular))
-                                .foregroundStyle(AppVisualTheme.foreground(0.36))
-                                .padding(.leading, assistantComposerTextHorizontalInset + assistantComposerLineFragmentPadding)
-                                .padding(.top, assistantComposerTextVerticalInset)
-                                .allowsHitTesting(false)
-                        }
-
-                        ComposerTextView(
-                            text: $assistant.promptDraft,
-                            isEnabled: settings.assistantBetaEnabled && !isVoiceCapturing,
-                            onSubmit: { sendCurrentPrompt() },
-                            onToggleMode: { toggleInteractionMode() },
-                            onPasteAttachment: { attachment in
-                                assistant.attachments.append(attachment)
-                            }
+                .buttonStyle(.plain)
+                .foregroundStyle(AppVisualTheme.foreground(0.92))
+                .background(
+                    Circle()
+                        .fill(AppVisualTheme.accentTint.opacity(0.18))
+                        .overlay(
+                            Circle()
+                                .stroke(AppVisualTheme.surfaceStroke(0.10), lineWidth: 0.5)
                         )
-                        .frame(minHeight: assistantComposerMinTextHeight, maxHeight: assistantComposerMaxTextHeight)
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-
-                    if isVoiceCapturing {
-                        AssistantStatusBadge(title: "Listening", tint: .orange, symbol: "mic.fill")
-                            .padding(.trailing, 16)
-                            .padding(.top, 14)
-                            .allowsHitTesting(false)
-                    }
-                }
-                .padding(.horizontal, 16)
-                .padding(.top, 10)
-
-                HStack(alignment: .center, spacing: 8) {
-                    Menu {
-                        Button {
-                            openImagePicker()
-                        } label: {
-                            Label("Attach Photo", systemImage: "photo")
-                        }
-
-                        Button {
-                            openFilePicker()
-                        } label: {
-                            Label("Attach File", systemImage: "paperclip")
-                        }
-
-                        Divider()
-
-                        Menu {
-                            if assistant.availableSkills.isEmpty {
-                                Text("No skills found")
-                            } else {
-                                ForEach(AssistantSkillLibraryGroup.allCases) { group in
-                                    let skills = assistant.skills(in: group)
-                                    if !skills.isEmpty {
-                                        Section(group.title) {
-                                            ForEach(skills) { skill in
-                                                Button {
-                                                    if assistant.isSkillAttachedToSelectedThread(skill) {
-                                                        assistant.detachSkill(skill.name)
-                                                    } else {
-                                                        assistant.attachSkill(skill)
-                                                    }
-                                                } label: {
-                                                    HStack {
-                                                        Text(skill.displayName)
-                                                        if assistant.isSkillAttachedToSelectedThread(skill) {
-                                                            Image(systemName: "checkmark")
-                                                        }
-                                                    }
-                                                }
-                                                .disabled(!assistant.canAttachSkillsToSelectedThread)
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        } label: {
-                            Label("Add Skill", systemImage: "sparkles")
-                        }
-
-                        Button {
-                            selectedSidebarPane = .skills
-                        } label: {
-                            Label("Manage Skills", systemImage: "slider.horizontal.3")
-                        }
-                    } label: {
-                        Image(systemName: "plus")
-                            .font(.system(size: 13, weight: .medium))
-                            .foregroundStyle(AppVisualTheme.foreground(assistant.attachments.isEmpty ? 0.45 : 0.80))
-                    }
-                    .menuStyle(.borderlessButton)
-                    .fixedSize()
-                    .help("Add a photo, file, or skill")
-
-                    // Mode picker (moved from status bar)
-                    AssistantModePicker(selection: assistant.interactionMode) { mode in
-                        assistant.interactionMode = mode
-                    }
-
-                    Divider()
-                        .frame(height: 12)
-
-                    // Model picker
-                    Menu {
-                        ForEach(assistant.visibleModels) { model in
-                            Button {
-                                assistant.chooseModel(model.id)
-                            } label: {
-                                HStack {
-                                    Text(model.displayName)
-                                    if model.id == assistant.selectedModelID {
-                                        Image(systemName: "checkmark")
-                                    }
-                                }
-                            }
-                        }
-                    } label: {
-                        HStack(spacing: 4) {
-                            Text(assistant.selectedModelSummary)
-                                .font(.system(size: 12, weight: .medium))
-                                .foregroundStyle(AppVisualTheme.foreground(0.70))
-                            if !assistant.visibleModels.isEmpty {
-                                Image(systemName: "chevron.down")
-                                    .font(.system(size: 7, weight: .semibold))
-                                    .foregroundStyle(AppVisualTheme.foreground(0.38))
-                            }
-                        }
-                    }
-                    .menuStyle(.borderlessButton)
-                    .fixedSize()
-                    .disabled(assistant.visibleModels.isEmpty)
-
-                    // Reasoning effort
-                    Menu {
-                        ForEach(supportedEfforts, id: \.self) { effort in
-                            Button {
-                                assistant.reasoningEffort = effort
-                            } label: {
-                                HStack {
-                                    Text(effort.label)
-                                    if effort == assistant.reasoningEffort {
-                                        Image(systemName: "checkmark")
-                                    }
-                                }
-                            }
-                        }
-                    } label: {
-                        HStack(spacing: 4) {
-                            Text(assistant.reasoningEffort.label)
-                                .font(.system(size: 12, weight: .medium))
-                                .foregroundStyle(AppVisualTheme.foreground(0.60))
-                            Image(systemName: "chevron.down")
-                                .font(.system(size: 7, weight: .semibold))
-                                .foregroundStyle(AppVisualTheme.foreground(0.32))
-                        }
-                    }
-                    .menuStyle(.borderlessButton)
-                    .fixedSize()
-                    .disabled(reasoningSelectionDisabled)
-
-                    Spacer(minLength: 4)
-
-                    // Action buttons
-                    if isAgentBusy {
-                        Button {
-                            Task { await assistant.cancelActiveTurn() }
-                        } label: {
-                            AssistantToolbarCircleButtonLabel(
-                                symbol: "stop.fill",
-                                tint: AppVisualTheme.primaryText,
-                                size: 28,
-                                emphasized: true
-                            )
-                        }
-                        .buttonStyle(.plain)
-                        .help("Stop the current turn")
-                    } else {
-                        if assistant.assistantVoicePlaybackActive {
-                            Button {
-                                assistant.stopAssistantVoicePlayback()
-                            } label: {
-                                AssistantToolbarCircleButtonLabel(
-                                    symbol: "speaker.slash.fill",
-                                    tint: .orange,
-                                    size: 24,
-                                    emphasized: true
-                                )
-                            }
-                            .buttonStyle(.plain)
-                            .help("Stop assistant speech")
-                        }
-
-                        AssistantPushToTalkButton(
-                            isListening: isVoiceCapturing,
-                            level: CGFloat(assistant.voiceCaptureLevel),
-                            isEnabled: settings.assistantVoiceTaskEntryEnabled,
-                            size: 26
-                        ) { isPressed in
-                            if isPressed {
-                                NotificationCenter.default.post(name: .openAssistStartAssistantVoiceCapture, object: nil)
-                            } else if isVoiceCapturing {
-                                NotificationCenter.default.post(name: .openAssistStopAssistantVoiceCapture, object: nil)
-                            }
-                        }
-
-                        Button { sendCurrentPrompt() } label: {
-                            AssistantToolbarCircleButtonLabel(
-                                symbol: "arrow.up",
-                                tint: AppVisualTheme.accentTint,
-                                size: 28,
-                                isEnabled: canSendMessage && !isVoiceCapturing,
-                                emphasized: canSendMessage && !isVoiceCapturing
-                            )
-                        }
-                        .buttonStyle(.plain)
-                        .disabled(!canSendMessage || isVoiceCapturing)
-                    }
-                }
-                .padding(.horizontal, 14)
-                .padding(.top, 6)
-                .padding(.bottom, 10)
+                )
+                .help("Redo the original request")
+                .accessibilityLabel("Redo")
             }
+            .padding(.bottom, 6)
+        }
+    }
+
+    private var chatComposer: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            chatComposerBanners
+
+            AssistantComposerWebView(
+                state: composerWebState,
+                accentColor: AppVisualTheme.accentTint,
+                onCommand: handleComposerWebCommand
+            )
+            .frame(height: composerWebHeight)
             .background(
-                RoundedRectangle(cornerRadius: 18, style: .continuous)
-                    .fill(AppVisualTheme.surfaceFill(0.40))
+                RoundedRectangle(cornerRadius: 24, style: .continuous)
+                    .fill(AppVisualTheme.surfaceFill(0.18))
             )
             .overlay(
-                RoundedRectangle(cornerRadius: 18, style: .continuous)
-                    .stroke(AppVisualTheme.surfaceStroke(0.25), lineWidth: 1)
+                RoundedRectangle(cornerRadius: 24, style: .continuous)
+                    .stroke(AppVisualTheme.surfaceStroke(0.18), lineWidth: 0.8)
             )
-            .shadow(color: Color.black.opacity(0.06), radius: 4, x: 0, y: 2)
+            .shadow(color: Color.black.opacity(0.10), radius: 14, x: 0, y: 4)
+            .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
             .onDrop(of: [.fileURL, .image, .png, .jpeg], isTargeted: nil) { providers in
                 handleDrop(providers)
                 return true
@@ -4913,8 +4874,11 @@ struct AssistantWindowView: View {
 
     private var sessionMemoryIsActive: Bool {
         guard settings.assistantMemoryEnabled else { return false }
-        guard let message = assistant.memoryStatusMessage?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !message.isEmpty else {
+        guard
+            let message = assistant.memoryStatusMessage?.trimmingCharacters(
+                in: .whitespacesAndNewlines),
+            !message.isEmpty
+        else {
             return false
         }
         return message.lowercased().contains("using")
@@ -4953,7 +4917,8 @@ struct AssistantWindowView: View {
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
-                .help(isLiveVoicePanelCollapsed ? "Expand voice controls" : "Collapse voice controls")
+                .help(
+                    isLiveVoicePanelCollapsed ? "Expand voice controls" : "Collapse voice controls")
             }
 
             // Expanded controls
@@ -5029,7 +4994,9 @@ struct AssistantWindowView: View {
     }
 
     @ViewBuilder
-    private func composerToolbarGroup<Content: View>(@ViewBuilder content: () -> Content) -> some View {
+    private func composerToolbarGroup<Content: View>(@ViewBuilder content: () -> Content)
+        -> some View
+    {
         HStack(spacing: 6) {
             content()
         }
@@ -5069,7 +5036,9 @@ struct AssistantWindowView: View {
     }
 
     @ViewBuilder
-    private func modeSwitchSuggestionButtons(_ suggestion: AssistantModeSwitchSuggestion) -> some View {
+    private func modeSwitchSuggestionButtons(_ suggestion: AssistantModeSwitchSuggestion)
+        -> some View
+    {
         HStack(spacing: 6) {
             ForEach(suggestion.choices) { choice in
                 Button(choice.title) {
@@ -5082,7 +5051,10 @@ struct AssistantWindowView: View {
                 .padding(.vertical, 6)
                 .background(
                     Capsule(style: .continuous)
-                        .fill(AppVisualTheme.accentTint.opacity(suggestion.source == .blocked ? 0.24 : 0.18))
+                        .fill(
+                            AppVisualTheme.accentTint.opacity(
+                                suggestion.source == .blocked ? 0.24 : 0.18)
+                        )
                         .overlay(
                             Capsule(style: .continuous)
                                 .stroke(AppVisualTheme.surfaceStroke(0.10), lineWidth: 0.5)
@@ -5114,7 +5086,9 @@ struct AssistantWindowView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, 14)
         .padding(.vertical, 4)
-        .animation(.spring(response: 0.22, dampingFraction: 0.86), value: assistant.visibleAssistantBackend)
+        .animation(
+            .spring(response: 0.22, dampingFraction: 0.86), value: assistant.visibleAssistantBackend
+        )
         .animation(.easeInOut(duration: 0.18), value: assistant.isSelectedSessionBackendPinned)
 
         return Group {
@@ -5179,7 +5153,9 @@ struct AssistantWindowView: View {
         guard let selectedModel = assistant.selectedModel else {
             return AssistantReasoningEffort.allCases
         }
-        let efforts = selectedModel.supportedReasoningEfforts.compactMap { AssistantReasoningEffort(rawValue: $0) }
+        let efforts = selectedModel.supportedReasoningEfforts.compactMap {
+            AssistantReasoningEffort(rawValue: $0)
+        }
         if efforts.isEmpty, assistant.visibleAssistantBackend == .copilot {
             return [assistant.reasoningEffort]
         }
@@ -5188,7 +5164,8 @@ struct AssistantWindowView: View {
 
     private var reasoningSelectionDisabled: Bool {
         guard let selectedModel = assistant.selectedModel else { return true }
-        return assistant.visibleAssistantBackend == .copilot && selectedModel.supportedReasoningEfforts.isEmpty
+        return assistant.visibleAssistantBackend == .copilot
+            && selectedModel.supportedReasoningEfforts.isEmpty
     }
 
     private var runtimeDotColor: Color {
@@ -5215,7 +5192,8 @@ struct AssistantWindowView: View {
             tone: runtimePanelTone,
             statusSummary: assistant.runtimeHealth.summary,
             statusDetail: filteredDetail,
-            accountSummary: assistant.accountSnapshot.isLoggedIn ? assistant.accountSnapshot.summary : nil,
+            accountSummary: assistant.accountSnapshot.isLoggedIn
+                ? assistant.accountSnapshot.summary : nil,
             backendHelpText: assistant.selectedSessionBackendHelpText,
             backends: assistant.selectableAssistantBackends.map { backend in
                 AssistantChatWebRuntimeBackendOption(
@@ -5255,7 +5233,9 @@ struct AssistantWindowView: View {
         }
     }
 
-    private func permissionCard(_ request: AssistantPermissionRequest, state: AssistantPermissionCardState) -> some View {
+    private func permissionCard(
+        _ request: AssistantPermissionRequest, state: AssistantPermissionCardState
+    ) -> some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
                 Text(state.cardTitle)
@@ -5309,10 +5289,13 @@ struct AssistantWindowView: View {
                     }
                 }
 
-                if let toolKind = request.toolKind, !toolKind.isEmpty, toolKind != "modeSwitch", toolKind != "userInput", toolKind != "browserLogin" {
+                if let toolKind = request.toolKind, !toolKind.isEmpty, toolKind != "modeSwitch",
+                    toolKind != "userInput", toolKind != "browserLogin"
+                {
                     Button("Always Allow") {
                         assistant.alwaysAllowToolKind(toolKind)
-                        let sessionOption = request.options.first(where: { $0.id == "acceptForSession" })
+                        let sessionOption =
+                            request.options.first(where: { $0.id == "acceptForSession" })
                             ?? request.options.first(where: { $0.isDefault })
                         if let optionID = sessionOption?.id {
                             Task { await assistant.resolvePermission(optionID: optionID) }
@@ -5329,9 +5312,11 @@ struct AssistantWindowView: View {
                 .foregroundStyle(.secondary)
 
             case .completed:
-                Text("This approval prompt is part of the session history. It only means the request flow finished, not that the tool succeeded.")
-                    .font(.caption)
-                    .foregroundStyle(AppVisualTheme.mutedText)
+                Text(
+                    "This approval prompt is part of the session history. It only means the request flow finished, not that the tool succeeded."
+                )
+                .font(.caption)
+                .foregroundStyle(AppVisualTheme.mutedText)
 
             case .notActive:
                 Text("This request is no longer active in the live session.")
@@ -5370,7 +5355,9 @@ struct AssistantWindowView: View {
         }
     }
 
-    private func proposedPlanCard(_ plan: String, isStreaming: Bool, showsActions: Bool) -> some View {
+    private func proposedPlanCard(_ plan: String, isStreaming: Bool, showsActions: Bool)
+        -> some View
+    {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
                 Image(systemName: "doc.text")
@@ -5394,7 +5381,8 @@ struct AssistantWindowView: View {
 
             ScrollView(.vertical, showsIndicators: true) {
                 AssistantMarkdownText(
-                    contentID: "proposed-plan-\(assistant.selectedSessionID ?? "session")-\(plan.hashValue)",
+                    contentID:
+                        "proposed-plan-\(assistant.selectedSessionID ?? "session")-\(plan.hashValue)",
                     text: plan,
                     role: .assistant,
                     isStreaming: isStreaming,
@@ -5402,8 +5390,8 @@ struct AssistantWindowView: View {
                     selectionMessageText: plan,
                     selectionTracker: selectionTracker
                 )
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
             .frame(maxHeight: 280)
 
@@ -5514,7 +5502,8 @@ struct AssistantWindowView: View {
             accessibility: snapshot.accessibilityGranted ? .granted : .missing,
             screenRecording: snapshot.screenRecordingGranted ? .granted : .missing,
             microphone: snapshot.microphoneGranted ? .granted : .missing,
-            speechRecognition: snapshot.speechRecognitionGranted || !snapshot.speechRecognitionRequired ? .granted : .missing,
+            speechRecognition: snapshot.speechRecognitionGranted
+                || !snapshot.speechRecognitionRequired ? .granted : .missing,
             appleEvents: snapshot.appleEventsKnown
                 ? (snapshot.appleEventsGranted ? .granted : .missing)
                 : .unknown,
@@ -5652,7 +5641,8 @@ struct AssistantWindowView: View {
     private func confirmDeleteSkill(_ skill: AssistantSkillDescriptor) {
         let alert = NSAlert()
         alert.messageText = "Delete skill?"
-        alert.informativeText = "This removes “\(skill.displayName)” from ~/.codex/skills. Thread bindings will stay, but they will show as missing."
+        alert.informativeText =
+            "This removes “\(skill.displayName)” from ~/.codex/skills. Thread bindings will stay, but they will show as missing."
         alert.alertStyle = .warning
         alert.addButton(withTitle: "Delete")
         alert.addButton(withTitle: "Cancel")
@@ -5668,7 +5658,8 @@ struct AssistantWindowView: View {
             await assistant.startNewSession()
 
             if assistant.canAttachSkillsToSelectedThread,
-               !assistant.isSkillAttachedToSelectedThread(skill) {
+                !assistant.isSkillAttachedToSelectedThread(skill)
+            {
                 assistant.attachSkill(skill)
             }
 
@@ -5694,7 +5685,8 @@ private struct CollapsibleImageAttachments: View {
     @State private var isExpanded = false
 
     private var label: String {
-        imageAttachments.count == 1 ? "Show screenshot" : "Show \(imageAttachments.count) screenshots"
+        imageAttachments.count == 1
+            ? "Show screenshot" : "Show \(imageAttachments.count) screenshots"
     }
 
     var body: some View {

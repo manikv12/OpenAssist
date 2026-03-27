@@ -165,7 +165,7 @@ struct AssistantProjectDeletionResult: Sendable {
 }
 
 final class AssistantProjectStore {
-    private static let currentSnapshotVersion = 3
+    private static let currentSnapshotVersion = 4
     private let fileManager: FileManager
     private let fileURL: URL
     private var cachedSnapshot: AssistantProjectStoreSnapshot?
@@ -244,11 +244,23 @@ final class AssistantProjectStore {
         linkedFolderPath: String? = nil,
         now: Date = Date()
     ) throws -> AssistantProject {
-        let normalizedName = try validatedUniqueName(name, excludingProjectID: nil)
         var snapshot = loadSnapshot()
+        let normalizedFolderPath = normalizedLinkedFolderPath(linkedFolderPath)
+        if let existingIndex = projectIndex(
+            forLinkedFolderPath: normalizedFolderPath,
+            excludingProjectID: nil,
+            in: snapshot
+        ) {
+            snapshot.projects[existingIndex].isHidden = false
+            snapshot.projects[existingIndex].updatedAt = now
+            try saveSnapshot(snapshot)
+            return snapshot.projects[existingIndex]
+        }
+
+        let normalizedName = try validatedUniqueName(name, excludingProjectID: nil)
         let project = AssistantProject(
             name: normalizedName,
-            linkedFolderPath: normalizedLinkedFolderPath(linkedFolderPath),
+            linkedFolderPath: normalizedFolderPath,
             createdAt: now,
             updatedAt: now
         )
@@ -291,7 +303,34 @@ final class AssistantProjectStore {
             throw AssistantProjectStoreError.projectNotFound
         }
 
-        snapshot.projects[index].linkedFolderPath = normalizedLinkedFolderPath(linkedFolderPath)
+        let normalizedFolderPath = normalizedLinkedFolderPath(linkedFolderPath)
+        if let duplicateIndex = projectIndex(
+            forLinkedFolderPath: normalizedFolderPath,
+            excludingProjectID: normalizedProjectID,
+            in: snapshot
+        ) {
+            let currentProject = snapshot.projects[index]
+            let duplicateProject = snapshot.projects[duplicateIndex]
+            let survivingProjectID =
+                preferredProjectIDForSharedLinkedFolder(
+                    currentProject: currentProject,
+                    existingProject: duplicateProject
+                )
+            let removedProjectID =
+                survivingProjectID.caseInsensitiveCompare(currentProject.id) == .orderedSame
+                ? duplicateProject.id
+                : currentProject.id
+            let mergedProject = mergeProjects(
+                keepingProjectID: survivingProjectID,
+                removingProjectID: removedProjectID,
+                now: now,
+                into: &snapshot
+            )
+            try saveSnapshot(snapshot)
+            return mergedProject
+        }
+
+        snapshot.projects[index].linkedFolderPath = normalizedFolderPath
         snapshot.projects[index].updatedAt = now
         try saveSnapshot(snapshot)
         return snapshot.projects[index]
@@ -517,8 +556,13 @@ final class AssistantProjectStore {
         if snapshot.version < Self.currentSnapshotVersion {
             snapshot.version = Self.currentSnapshotVersion
         }
-        cachedSnapshot = snapshot
-        return snapshot
+        let normalized = normalizeDuplicateLinkedFolderProjects(in: snapshot)
+        if normalized.changed {
+            try? saveSnapshot(normalized.snapshot)
+        } else {
+            cachedSnapshot = normalized.snapshot
+        }
+        return normalized.snapshot
     }
 
     private func saveSnapshot(_ snapshot: AssistantProjectStoreSnapshot) throws {
@@ -579,5 +623,187 @@ final class AssistantProjectStore {
 
     private func normalizedLinkedFolderPath(_ linkedFolderPath: String?) -> String? {
         AssistantProject.normalizedLinkedFolderPath(linkedFolderPath)
+    }
+
+    private func projectIndex(
+        forLinkedFolderPath linkedFolderPath: String?,
+        excludingProjectID projectID: String?,
+        in snapshot: AssistantProjectStoreSnapshot
+    ) -> Int? {
+        guard let normalizedFolderPath = normalizedLinkedFolderPath(linkedFolderPath) else {
+            return nil
+        }
+        let excludedProjectID = normalizedProjectID(projectID)
+        return snapshot.projects.firstIndex { project in
+            guard let projectPath = normalizedLinkedFolderPath(project.linkedFolderPath) else {
+                return false
+            }
+            guard projectPath.caseInsensitiveCompare(normalizedFolderPath) == .orderedSame else {
+                return false
+            }
+            guard let excludedProjectID else { return true }
+            return project.id.caseInsensitiveCompare(excludedProjectID) != .orderedSame
+        }
+    }
+
+    private func preferredProjectIDForSharedLinkedFolder(
+        currentProject: AssistantProject,
+        existingProject: AssistantProject
+    ) -> String {
+        if currentProject.isHidden != existingProject.isHidden {
+            return currentProject.isHidden ? existingProject.id : currentProject.id
+        }
+
+        let currentHasCustomIcon = currentProject.iconSymbolName != nil
+        let existingHasCustomIcon = existingProject.iconSymbolName != nil
+        if currentHasCustomIcon != existingHasCustomIcon {
+            return currentHasCustomIcon ? currentProject.id : existingProject.id
+        }
+
+        if currentProject.updatedAt != existingProject.updatedAt {
+            return currentProject.updatedAt > existingProject.updatedAt
+                ? currentProject.id
+                : existingProject.id
+        }
+
+        return currentProject.createdAt <= existingProject.createdAt
+            ? currentProject.id
+            : existingProject.id
+    }
+
+    private func mergeProjects(
+        keepingProjectID: String,
+        removingProjectID: String,
+        now: Date,
+        into snapshot: inout AssistantProjectStoreSnapshot
+    ) -> AssistantProject {
+        guard
+            let keepingIndex = snapshot.projects.firstIndex(where: {
+                $0.id.caseInsensitiveCompare(keepingProjectID) == .orderedSame
+            }),
+            let removingIndex = snapshot.projects.firstIndex(where: {
+                $0.id.caseInsensitiveCompare(removingProjectID) == .orderedSame
+            })
+        else {
+            return snapshot.projects.first { project in
+                project.id.caseInsensitiveCompare(keepingProjectID) == .orderedSame
+            } ?? AssistantProject(name: "Project")
+        }
+
+        let keepingProject = snapshot.projects[keepingIndex]
+        let removingProject = snapshot.projects[removingIndex]
+        let mergedBrain = mergeBrainState(
+            primary: snapshot.brainByProjectID[keepingProject.id] ?? AssistantProjectBrainState(),
+            secondary: snapshot.brainByProjectID[removingProject.id] ?? AssistantProjectBrainState()
+        )
+
+        snapshot.threadAssignments = snapshot.threadAssignments.mapValues { assignedProjectID in
+            assignedProjectID.caseInsensitiveCompare(removingProject.id) == .orderedSame
+                ? keepingProject.id
+                : assignedProjectID
+        }
+
+        var mergedProject = keepingProject
+        mergedProject.linkedFolderPath = keepingProject.linkedFolderPath ?? removingProject.linkedFolderPath
+        mergedProject.iconSymbolName = keepingProject.iconSymbolName ?? removingProject.iconSymbolName
+        mergedProject.isHidden = keepingProject.isHidden && removingProject.isHidden
+        mergedProject.updatedAt = max(max(keepingProject.updatedAt, removingProject.updatedAt), now)
+
+        snapshot.projects[keepingIndex] = mergedProject
+        snapshot.brainByProjectID[keepingProject.id] = mergedBrain
+        snapshot.brainByProjectID.removeValue(forKey: removingProject.id)
+        snapshot.projects.remove(at: removingIndex)
+
+        return snapshot.projects.first(where: {
+            $0.id.caseInsensitiveCompare(keepingProject.id) == .orderedSame
+        }) ?? mergedProject
+    }
+
+    private func mergeBrainState(
+        primary: AssistantProjectBrainState,
+        secondary: AssistantProjectBrainState
+    ) -> AssistantProjectBrainState {
+        var merged = primary
+
+        if merged.projectSummary?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false {
+            merged.projectSummary = secondary.projectSummary
+        }
+
+        for (threadID, digest) in secondary.threadDigestsByThreadID {
+            if let existing = merged.threadDigestsByThreadID[threadID] {
+                if digest.updatedAt > existing.updatedAt {
+                    merged.threadDigestsByThreadID[threadID] = digest
+                    if let fingerprint = secondary.lastProcessedTranscriptFingerprintByThreadID[threadID] {
+                        merged.lastProcessedTranscriptFingerprintByThreadID[threadID] = fingerprint
+                    }
+                } else if merged.lastProcessedTranscriptFingerprintByThreadID[threadID] == nil,
+                          let fingerprint = secondary.lastProcessedTranscriptFingerprintByThreadID[threadID] {
+                    merged.lastProcessedTranscriptFingerprintByThreadID[threadID] = fingerprint
+                }
+            } else {
+                merged.threadDigestsByThreadID[threadID] = digest
+                if let fingerprint = secondary.lastProcessedTranscriptFingerprintByThreadID[threadID] {
+                    merged.lastProcessedTranscriptFingerprintByThreadID[threadID] = fingerprint
+                }
+            }
+        }
+
+        for (threadID, fingerprint) in secondary.lastProcessedTranscriptFingerprintByThreadID
+        where merged.lastProcessedTranscriptFingerprintByThreadID[threadID] == nil {
+            merged.lastProcessedTranscriptFingerprintByThreadID[threadID] = fingerprint
+        }
+
+        switch (merged.lastProcessedAt, secondary.lastProcessedAt) {
+        case (.some(let current), .some(let incoming)):
+            merged.lastProcessedAt = max(current, incoming)
+        case (.none, .some(let incoming)):
+            merged.lastProcessedAt = incoming
+        default:
+            break
+        }
+
+        return merged
+    }
+
+    private func normalizeDuplicateLinkedFolderProjects(
+        in snapshot: AssistantProjectStoreSnapshot
+    ) -> (snapshot: AssistantProjectStoreSnapshot, changed: Bool) {
+        var normalizedSnapshot = snapshot
+        var changed = false
+
+        let groupedProjects = Dictionary(
+            grouping: normalizedSnapshot.projects.compactMap { project -> (String, AssistantProject)? in
+                guard let linkedFolderPath = normalizedLinkedFolderPath(project.linkedFolderPath) else {
+                    return nil
+                }
+                return (linkedFolderPath, project)
+            },
+            by: { $0.0 }
+        )
+
+        for group in groupedProjects.values where group.count > 1 {
+            let projects = group.map(\.1)
+            guard var survivingProject = projects.first else { continue }
+
+            for candidate in projects.dropFirst() {
+                let preferredProjectID = preferredProjectIDForSharedLinkedFolder(
+                    currentProject: candidate,
+                    existingProject: survivingProject
+                )
+                let removingProjectID =
+                    preferredProjectID.caseInsensitiveCompare(candidate.id) == .orderedSame
+                    ? survivingProject.id
+                    : candidate.id
+                survivingProject = mergeProjects(
+                    keepingProjectID: preferredProjectID,
+                    removingProjectID: removingProjectID,
+                    now: max(candidate.updatedAt, survivingProject.updatedAt),
+                    into: &normalizedSnapshot
+                )
+                changed = true
+            }
+        }
+
+        return (normalizedSnapshot, changed)
     }
 }

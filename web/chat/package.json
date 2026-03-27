@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "@panzoom/panzoom": "^4.6.1",
+    "lucide-react": "^1.7.0",
     "mermaid": "^11.13.0",
     "react": "^19.1.0",
     "react-collapsed": "^4.2.0",

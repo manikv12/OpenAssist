@@ -110,7 +110,7 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
             window.titleVisibility = .hidden
             window.titlebarAppearsTransparent = true
             window.isOpaque = false
-            window.backgroundColor = .clear
+            window.backgroundColor = AppVisualTheme.windowBackdropNSColor
             window.toolbarStyle = .unifiedCompact
             window.isMovableByWindowBackground = false
             window.contentViewController = hostingController
@@ -169,7 +169,7 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
             window.titleVisibility = .hidden
             window.titlebarAppearsTransparent = true
             window.isOpaque = false
-            window.backgroundColor = .clear
+            window.backgroundColor = AppVisualTheme.windowBackdropNSColor
             window.toolbarStyle = .unifiedCompact
             window.isMovableByWindowBackground = false
             window.contentViewController = hostingController
@@ -217,7 +217,7 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
             window.titleVisibility = .hidden
             window.titlebarAppearsTransparent = true
             window.isOpaque = false
-            window.backgroundColor = .clear
+            window.backgroundColor = AppVisualTheme.windowBackdropNSColor
             window.toolbarStyle = .unifiedCompact
             window.isMovableByWindowBackground = false
             window.contentViewController = hostingController
@@ -272,7 +272,7 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
             window.titleVisibility = .hidden
             window.titlebarAppearsTransparent = true
             window.isOpaque = false
-            window.backgroundColor = .clear
+            window.backgroundColor = AppVisualTheme.windowBackdropNSColor
             let toolbar = NSToolbar(identifier: "assistantToolbar")
             toolbar.showsBaselineSeparator = false
             window.toolbar = toolbar
@@ -355,7 +355,7 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
             panel.titleVisibility = .hidden
             panel.titlebarAppearsTransparent = true
             panel.isOpaque = false
-            panel.backgroundColor = .clear
+            panel.backgroundColor = AppVisualTheme.windowBackdropNSColor
             panel.isMovableByWindowBackground = false
             panel.toolbarStyle = .unifiedCompact
             panel.contentViewController = hostingController

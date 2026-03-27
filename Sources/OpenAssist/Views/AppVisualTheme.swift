@@ -23,6 +23,9 @@ enum AppVisualTheme {
     static var quaternaryText: Color { Color(nsColor: .quaternaryLabelColor) }
     static var separatorColor: Color { Color(nsColor: .separatorColor) }
     static var windowBackground: Color { Color(nsColor: .windowBackgroundColor) }
+    static var windowBackdropNSColor: NSColor {
+        NSColor.windowBackgroundColor.withAlphaComponent(isDarkAppearance ? 0.86 : 0.92)
+    }
     static var textBackground: Color { Color(nsColor: .textBackgroundColor) }
     static var controlBackground: Color { Color(nsColor: .controlBackgroundColor) }
     static var selectedContentBackground: Color { Color(nsColor: .selectedContentBackgroundColor) }
@@ -398,12 +401,15 @@ struct AppSplitChromeBackground: View {
         GeometryReader { proxy in
             let calculatedWidth = proxy.size.width * leadingPaneFraction
             let dynamicWidth = min(leadingPaneMaxWidth, max(200, calculatedWidth))
-            let preferredWidth = leadingPaneWidth ?? dynamicWidth
             let maxAllowedWidth = max(180, proxy.size.width - 220)
-            let leadingWidth = min(maxAllowedWidth, max(180, preferredWidth))
+            let leadingWidth =
+                leadingPaneWidth.map { min(maxAllowedWidth, max(0, $0)) }
+                ?? min(maxAllowedWidth, max(180, dynamicWidth))
 
             ZStack {
-                tokens.canvasDeep.opacity(0.88)
+                if !tokens.useMaterial {
+                    tokens.canvasDeep.opacity(0.88)
+                }
 
                 HStack(spacing: 0) {
                     Group {
@@ -413,16 +419,16 @@ struct AppSplitChromeBackground: View {
                                     material: .sidebar,
                                     blendingMode: tokens.backgroundBlendingMode
                                 )
-                                .opacity(leadingPaneTransparent ? 0.74 : 0.82)
+                                .opacity(leadingPaneTransparent ? 0.58 : 0.72)
                             } else {
-                                tokens.surfaceBottom.opacity(leadingPaneTransparent ? 0.88 : 0.94)
+                                tokens.surfaceBottom.opacity(leadingPaneTransparent ? 0.72 : 0.88)
                             }
 
                             LinearGradient(
                                 colors: [
-                                    tokens.surfaceTop.opacity(leadingPaneTransparent ? 0.56 : 0.66),
-                                    leadingTint.opacity(leadingPaneTransparent ? 0.18 : 0.22),
-                                    tokens.surfaceBottom.opacity(leadingPaneTransparent ? 0.84 : 0.94)
+                                    tokens.surfaceTop.opacity(leadingPaneTransparent ? 0.40 : 0.58),
+                                    leadingTint.opacity(leadingPaneTransparent ? 0.16 : 0.20),
+                                    tokens.surfaceBottom.opacity(leadingPaneTransparent ? 0.62 : 0.86)
                                 ],
                                 startPoint: .topLeading,
                                 endPoint: .bottomTrailing
@@ -442,20 +448,20 @@ struct AppSplitChromeBackground: View {
                                 material: tokens.backgroundMaterial,
                                 blendingMode: tokens.backgroundBlendingMode
                             )
-                            .opacity(0.34)
+                            .opacity(0.82)
                         }
 
                         LinearGradient(
                             colors: [
-                                tokens.canvasBase.opacity(0.98),
-                                tokens.surfaceBottom.opacity(0.84),
-                                tokens.canvasDeep.opacity(0.98)
+                                tokens.canvasBase.opacity(tokens.useMaterial ? 0.20 : 0.98),
+                                tokens.surfaceBottom.opacity(tokens.useMaterial ? 0.14 : 0.84),
+                                tokens.canvasDeep.opacity(tokens.useMaterial ? 0.22 : 0.98)
                             ],
                             startPoint: .topLeading,
                             endPoint: .bottomTrailing
                         )
 
-                        trailingTint.opacity(0.14)
+                        trailingTint.opacity(tokens.useMaterial ? 0.18 : 0.14)
 
                         RadialGradient(
                             colors: [

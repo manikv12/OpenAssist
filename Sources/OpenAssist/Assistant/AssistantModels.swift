@@ -2291,23 +2291,25 @@ final class AssistantStore: ObservableObject {
         projects.filter { $0.isHidden }
     }
 
-    private var projectFilteredSidebarSessions: [AssistantSessionSummary] {
+    private var visibleSidebarProjectSessions: [AssistantSessionSummary] {
         let visibleProjectIDs = Set(visibleProjects.map { $0.id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() })
-        let visibleProjectSessions = sessions.filter { session in
+        return sessions.filter { session in
             guard let projectID = session.projectID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty?.lowercased() else {
                 return true
             }
             return visibleProjectIDs.contains(projectID)
         }
+    }
 
+    private var projectFilteredSidebarSessions: [AssistantSessionSummary] {
         let projectFilteredSessions: [AssistantSessionSummary]
         if let selectedProject = selectedProjectFilter {
-            projectFilteredSessions = visibleProjectSessions.filter {
+            projectFilteredSessions = visibleSidebarProjectSessions.filter {
                 $0.projectID?.trimmingCharacters(in: .whitespacesAndNewlines)
                     .caseInsensitiveCompare(selectedProject.id) == .orderedSame
             }
         } else {
-            projectFilteredSessions = visibleProjectSessions
+            projectFilteredSessions = visibleSidebarProjectSessions
         }
 
         return projectFilteredSessions
@@ -2321,7 +2323,7 @@ final class AssistantStore: ObservableObject {
     }
 
     var visibleArchivedSidebarSessions: [AssistantSessionSummary] {
-        projectFilteredSidebarSessions.filter { session in
+        visibleSidebarProjectSessions.filter { session in
             session.isArchived
                 && assistantShouldListSessionInSidebar(session, selectedSessionID: selectedSessionID)
         }
@@ -4110,6 +4112,7 @@ final class AssistantStore: ObservableObject {
 
         isRefreshingSessions = true
         defer { isRefreshingSessions = false }
+        let effectiveLimit = max(limit, 200)
         reloadProjectsFromStore()
         reloadTemporarySessionsFromStore()
 
@@ -4131,7 +4134,7 @@ final class AssistantStore: ObservableObject {
             let managedSessionIDs = Set(ownedSessionIDs.compactMap { normalizedSessionID($0) })
 
             async let catalogSessionsTask = loadCatalogSessions(
-                limit: limit,
+                limit: effectiveLimit,
                 ownedSessionIDs: ownedSessionIDs,
                 preferredSessionID: capturedSelectedSessionID
             )
@@ -4139,7 +4142,7 @@ final class AssistantStore: ObservableObject {
                 managedSessionIDs: managedSessionIDs
             )
             async let copilotSessionsTask = loadManagedCopilotSessions(
-                limit: limit,
+                limit: effectiveLimit,
                 managedSessionIDs: managedSessionIDs
             )
 
@@ -4167,7 +4170,7 @@ final class AssistantStore: ObservableObject {
             }
 
             withAnimation(.spring(response: 0.26, dampingFraction: 0.86)) {
-                sessions = Array(merged.prefix(limit))
+                sessions = Array(merged.prefix(effectiveLimit))
             }
             persistManagedSessionsSnapshot()
             ensureSessionVisible(selectedSessionID)
@@ -8285,9 +8288,13 @@ final class AssistantStore: ObservableObject {
             let updatedProject = try projectStore.updateLinkedFolderPath(for: projectID, path: path)
             reloadProjectsFromStore()
             sessions = applyStoredSessionMetadata(to: sessions)
+            if selectedProjectFilterID?.caseInsensitiveCompare(projectID) == .orderedSame,
+               updatedProject.id.caseInsensitiveCompare(projectID) != .orderedSame {
+                selectedProjectFilterID = updatedProject.id
+            }
 
             if previousFolderPath != updatedProject.linkedFolderPath,
-               let representativeThreadID = representativeThreadID(forProjectID: projectID) {
+               let representativeThreadID = representativeThreadID(forProjectID: updatedProject.id) {
                 _ = try? projectMemoryService.createFolderChangeStaleSuggestions(
                     project: updatedProject,
                     fallbackCWD: updatedProject.linkedFolderPath,

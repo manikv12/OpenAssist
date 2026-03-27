@@ -1,8 +1,12 @@
 import { startTransition, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ChatView } from "./components/ChatView";
+import { ComposerView } from "./components/ComposerView";
 import { FindBar } from "./components/FindBar";
+import { SidebarView } from "./components/SidebarView";
 import { useTextSelection } from "./hooks/useTextSelection";
 import type {
+  AssistantComposerState,
+  AssistantSidebarState,
   ChatMessage,
   CodeReviewPanelState,
   MessageCheckpointInfo,
@@ -13,6 +17,17 @@ import type {
 } from "./types";
 
 const HISTORY_TRUNCATE_TRANSITION_MS = 180;
+type AppViewMode = "chat" | "sidebar" | "composer";
+
+function normalizeViewMode(mode?: string | null): AppViewMode {
+  if (mode === "sidebar") return "sidebar";
+  if (mode === "composer") return "composer";
+  return "chat";
+}
+
+function initialViewMode(): AppViewMode {
+  return normalizeViewMode(window.__OPENASSIST_INITIAL_VIEW_MODE);
+}
 
 function clearMessageTransitionState(message: ChatMessage): ChatMessage {
   if (!message.transitionState) {
@@ -151,6 +166,9 @@ function resolveVisibleCheckpointMessageIndex(
 }
 
 export function App() {
+  const [viewMode, setViewMode] = useState<AppViewMode>(initialViewMode);
+  const [sidebarState, setSidebarState] = useState<AssistantSidebarState | null>(null);
+  const [composerState, setComposerState] = useState<AssistantComposerState | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [typing, setTyping] = useState<TypingState>({ visible: false });
   const [runtimePanel, setRuntimePanel] = useState<RuntimePanelState | null>(null);
@@ -207,6 +225,30 @@ export function App() {
       });
     } catch {}
   }, []);
+
+  const handleSidebarCommand = useCallback(
+    (type: string, payload?: Record<string, unknown>) => {
+      try {
+        window.webkit?.messageHandlers?.sidebarCommand?.postMessage({
+          type,
+          payload: payload ?? null,
+        });
+      } catch {}
+    },
+    []
+  );
+
+  const handleComposerCommand = useCallback(
+    (type: string, payload?: Record<string, unknown>) => {
+      try {
+        window.webkit?.messageHandlers?.composerCommand?.postMessage({
+          type,
+          payload: payload ?? null,
+        });
+      } catch {}
+    },
+    []
+  );
 
   // Text selection tracking for Ask/Explain feature
   useTextSelection();
@@ -480,6 +522,18 @@ export function App() {
       closeFind: () => {
         setFindVisible(false);
       },
+
+      setViewMode: (mode: AppViewMode | string) => {
+        setViewMode(normalizeViewMode(mode));
+      },
+
+      setSidebarState: (nextState: AssistantSidebarState | null) => {
+        setSidebarState(nextState);
+      },
+
+      setComposerState: (nextState: AssistantComposerState | null) => {
+        setComposerState(nextState);
+      },
     };
 
     (window as any).chatBridge = bridge;
@@ -494,6 +548,18 @@ export function App() {
       delete (window as any).chatBridge;
     };
   }, []);
+
+  if (viewMode === "sidebar") {
+    return (
+      <SidebarView state={sidebarState} onDispatchCommand={handleSidebarCommand} />
+    );
+  }
+
+  if (viewMode === "composer") {
+    return (
+      <ComposerView state={composerState} onDispatchCommand={handleComposerCommand} />
+    );
+  }
 
   return (
     <>
@@ -519,9 +585,16 @@ export function App() {
 // Type declarations for webkit bridge
 declare global {
   interface Window {
+    __OPENASSIST_INITIAL_VIEW_MODE?: AppViewMode;
     webkit?: {
       messageHandlers?: {
         ready?: { postMessage: (v: boolean) => void };
+        sidebarCommand?: {
+          postMessage: (payload: { type: string; payload?: Record<string, unknown> | null }) => void;
+        };
+        composerCommand?: {
+          postMessage: (payload: { type: string; payload?: Record<string, unknown> | null }) => void;
+        };
         scrollState?: { postMessage: (v: any) => void };
         loadOlderHistory?: { postMessage: (v: boolean) => void };
         linkClicked?: { postMessage: (url: string) => void };

@@ -1,0 +1,24 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:OpenAssist}",
+            "name": "Debug OpenAssist",
+            "target": "OpenAssist",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug OpenAssist"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:OpenAssist}",
+            "name": "Release OpenAssist",
+            "target": "OpenAssist",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release OpenAssist"
+        }
+    ]
+}
