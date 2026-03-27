@@ -9,6 +9,7 @@ permissions:
   contents: write
   pages: write
   id-token: write
+  pull-requests: read
 
 jobs:
   build-and-release:
@@ -123,13 +124,22 @@ jobs:
           </rss>
           EOF
 
+      - name: Generate release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 Scripts/generate_release_notes.py \
+            --repo "${{ github.repository }}" \
+            --tag "${{ github.ref_name }}" \
+            --output dist/release-notes.md
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           name: Open Assist ${{ github.ref_name }}
           tag_name: ${{ github.ref_name }}
           draft: false
-          generate_release_notes: true
+          body_path: dist/release-notes.md
           files: "dist/Open Assist.dmg"
 
       - name: Prepare Pages content
