@@ -284,6 +284,52 @@ final class AssistantProjectStoreTests: XCTestCase {
         XCTAssertNil(store.project(forProjectID: "project-hidden"))
     }
 
+    func testReloadMergesDuplicateProjectsThatShareLinkedFolderIgnoringCase() throws {
+        let directory = try makeTemporaryDirectory(named: "assistant-project-duplicate-folder-case")
+        let fileURL = directory.appendingPathComponent("projects.json")
+
+        let createdAt = Date(timeIntervalSinceReferenceDate: 2_000)
+        let updatedAt = Date(timeIntervalSinceReferenceDate: 2_100)
+        let duplicateSnapshot: [String: Any] = [
+            "version": 3,
+            "projects": [
+                [
+                    "id": "project-upper",
+                    "name": "Upper Case",
+                    "linkedFolderPath": "/tmp/Shared-Folder",
+                    "createdAt": createdAt.timeIntervalSinceReferenceDate,
+                    "updatedAt": updatedAt.timeIntervalSinceReferenceDate,
+                    "isHidden": false
+                ],
+                [
+                    "id": "project-lower",
+                    "name": "Lower Case",
+                    "linkedFolderPath": "/tmp/shared-folder",
+                    "createdAt": createdAt.addingTimeInterval(20).timeIntervalSinceReferenceDate,
+                    "updatedAt": updatedAt.addingTimeInterval(20).timeIntervalSinceReferenceDate,
+                    "isHidden": true
+                ]
+            ],
+            "threadAssignments": [
+                "thread-upper": "project-upper",
+                "thread-lower": "project-lower"
+            ],
+            "brainByProjectID": [:]
+        ]
+
+        let data = try JSONSerialization.data(
+            withJSONObject: duplicateSnapshot,
+            options: [.sortedKeys, .prettyPrinted]
+        )
+        try data.write(to: fileURL)
+
+        let store = AssistantProjectStore(baseDirectoryURL: directory)
+        XCTAssertEqual(store.projects().count, 1)
+        XCTAssertEqual(store.assignedProjectID(forThreadID: "thread-upper"), "project-upper")
+        XCTAssertEqual(store.assignedProjectID(forThreadID: "thread-lower"), "project-upper")
+        XCTAssertNil(store.project(forProjectID: "project-lower"))
+    }
+
     func testDeleteProjectClearsAssignmentsAndReturnsRemovedThreads() throws {
         let directory = try makeTemporaryDirectory(named: "assistant-project-delete")
         let store = AssistantProjectStore(baseDirectoryURL: directory)

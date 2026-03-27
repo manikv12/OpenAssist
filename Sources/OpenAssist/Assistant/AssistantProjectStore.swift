@@ -625,6 +625,10 @@ final class AssistantProjectStore {
         AssistantProject.normalizedLinkedFolderPath(linkedFolderPath)
     }
 
+    private func linkedFolderComparisonKey(_ linkedFolderPath: String?) -> String? {
+        normalizedLinkedFolderPath(linkedFolderPath)?.lowercased()
+    }
+
     private func projectIndex(
         forLinkedFolderPath linkedFolderPath: String?,
         excludingProjectID projectID: String?,
@@ -773,7 +777,7 @@ final class AssistantProjectStore {
 
         let groupedProjects = Dictionary(
             grouping: normalizedSnapshot.projects.compactMap { project -> (String, AssistantProject)? in
-                guard let linkedFolderPath = normalizedLinkedFolderPath(project.linkedFolderPath) else {
+                guard let linkedFolderPath = linkedFolderComparisonKey(project.linkedFolderPath) else {
                     return nil
                 }
                 return (linkedFolderPath, project)
