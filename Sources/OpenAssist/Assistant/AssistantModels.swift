@@ -623,13 +623,23 @@ enum AssistantTranscriptRole: String, Codable, Sendable {
 
 /// An attachment (image or file) queued for sending with the next prompt.
 struct AssistantAttachment: Identifiable, Equatable, Codable, Sendable {
-    let id = UUID()
+    let id: UUID
     let filename: String
     let data: Data
     let mimeType: String
+    private let cachedPreviewDataURL: String?
+
+    init(id: UUID = UUID(), filename: String, data: Data, mimeType: String) {
+        self.id = id
+        self.filename = filename
+        self.data = data
+        self.mimeType = mimeType
+        self.cachedPreviewDataURL = Self.makePreviewDataURL(data: data, mimeType: mimeType)
+    }
 
     var isImage: Bool { mimeType.hasPrefix("image/") }
-    var dataURL: String { "data:\(mimeType);base64,\(data.base64EncodedString())" }
+    var previewDataURL: String? { cachedPreviewDataURL }
+    var dataURL: String { cachedPreviewDataURL ?? "data:\(mimeType);base64,\(data.base64EncodedString())" }
 
     /// Build the Codex input item for this attachment.
     func toInputItem() -> [String: Any] {
@@ -649,6 +659,36 @@ struct AssistantAttachment: Identifiable, Equatable, Codable, Sendable {
 
     static func == (lhs: AssistantAttachment, rhs: AssistantAttachment) -> Bool {
         lhs.id == rhs.id
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case filename
+        case data
+        case mimeType
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let id = try container.decode(UUID.self, forKey: .id)
+        let filename = try container.decode(String.self, forKey: .filename)
+        let data = try container.decode(Data.self, forKey: .data)
+        let mimeType = try container.decode(String.self, forKey: .mimeType)
+        self.init(id: id, filename: filename, data: data, mimeType: mimeType)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(filename, forKey: .filename)
+        try container.encode(data, forKey: .data)
+        try container.encode(mimeType, forKey: .mimeType)
+    }
+
+    private static func makePreviewDataURL(data: Data, mimeType: String) -> String? {
+        mimeType.hasPrefix("image/")
+            ? "data:\(mimeType);base64,\(data.base64EncodedString())"
+            : nil
     }
 }
 
@@ -6407,13 +6447,15 @@ final class AssistantStore: ObservableObject {
         return conversationStore.threadNoteModificationDate(threadID: normalizedThreadID)
     }
 
-    func saveThreadNote(threadID: String?, text: String) {
-        guard let normalizedThreadID = normalizedSessionID(threadID) else { return }
+    func saveThreadNote(threadID: String?, text: String) -> Bool {
+        guard let normalizedThreadID = normalizedSessionID(threadID) else { return false }
         do {
             try conversationStore.saveThreadNote(threadID: normalizedThreadID, text: text)
+            return true
         } catch {
             lastStatusMessage = "Could not save the thread note."
             CrashReporter.logError("Thread note save failed: \(error.localizedDescription)")
+            return false
         }
     }
 

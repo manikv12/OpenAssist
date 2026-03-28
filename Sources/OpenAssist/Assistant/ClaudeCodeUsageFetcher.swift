@@ -331,7 +331,7 @@ struct ClaudeCodeUsageFetcher {
 
         return ClaudeCodeOAuthCredentials(
             accessToken: payload.accessToken,
-            refreshToken: payload.refreshToken,
+            refreshToken: payload.refreshToken?.nonEmpty ?? refreshToken,
             expiresAt: Date().addingTimeInterval(max(60, payload.expiresIn)),
             rateLimitTier: credentials.rateLimitTier,
             subscriptionType: credentials.subscriptionType
@@ -452,7 +452,7 @@ private struct ClaudeCodeStoredOAuthCredentials: Codable {
 
 private struct ClaudeCodeOAuthTokenResponse: Decodable {
     let accessToken: String
-    let refreshToken: String
+    let refreshToken: String?
     let expiresIn: TimeInterval
 
     enum CodingKeys: String, CodingKey {

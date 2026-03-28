@@ -432,13 +432,17 @@ struct AssistantWindowView: View {
         }
 
         threadNoteSavingThreadIDs.insert(threadID)
-        assistant.saveThreadNote(threadID: threadID, text: draftText)
-        if draftText.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty != nil {
-            threadNoteLastSavedAtByThreadID[threadID] = Date()
-        } else {
-            threadNoteLastSavedAtByThreadID.removeValue(forKey: threadID)
+        let saveSucceeded = assistant.saveThreadNote(threadID: threadID, text: draftText)
+        if saveSucceeded {
+            if let savedAt = assistant.threadNoteLastSavedAt(threadID: threadID) {
+                threadNoteLastSavedAtByThreadID[threadID] = savedAt
+            } else {
+                threadNoteLastSavedAtByThreadID.removeValue(forKey: threadID)
+            }
         }
-        threadNoteSavingThreadIDs.remove(threadID)
+        DispatchQueue.main.async {
+            threadNoteSavingThreadIDs.remove(threadID)
+        }
     }
 
     private func toggleThreadNoteDrawer() {
@@ -996,7 +1000,7 @@ struct AssistantWindowView: View {
                     id: $0.id.uuidString,
                     filename: $0.filename,
                     kind: $0.isImage ? "image" : "file",
-                    previewDataURL: $0.isImage ? $0.dataURL : nil
+                    previewDataURL: $0.previewDataURL
                 )
             }
         )

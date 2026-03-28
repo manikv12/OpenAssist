@@ -304,6 +304,41 @@ final class ClaudeCodeUsageFetcherTests: XCTestCase {
         XCTAssertEqual(cachedCredentials?.refreshToken, "new-refresh-token")
     }
 
+    func testRefreshCredentialsKeepsExistingRefreshTokenWhenResponseOmitsIt() async throws {
+        let session = makeStubbedSession { request in
+            XCTAssertEqual(request.url?.absoluteString, "https://console.anthropic.com/v1/oauth/token")
+            let body = #"""
+            {
+              "access_token": "refreshed-token",
+              "expires_in": 3600
+            }
+            """#
+
+            return (
+                HTTPURLResponse(
+                    url: request.url!,
+                    statusCode: 200,
+                    httpVersion: nil,
+                    headerFields: ["Content-Type": "application/json"]
+                )!,
+                Data(body.utf8)
+            )
+        }
+
+        let refreshed = try await ClaudeCodeUsageFetcher(session: session).refreshCredentials(
+            credentials: ClaudeCodeOAuthCredentials(
+                accessToken: "expired-token",
+                refreshToken: "existing-refresh-token",
+                expiresAt: Date.distantPast,
+                rateLimitTier: "default_claude_team",
+                subscriptionType: "team"
+            )
+        )
+
+        XCTAssertEqual(refreshed.accessToken, "refreshed-token")
+        XCTAssertEqual(refreshed.refreshToken, "existing-refresh-token")
+    }
+
     private func makeStubbedSession(
         handler: @escaping @Sendable (URLRequest) throws -> (HTTPURLResponse, Data)
     ) -> URLSession {
