@@ -320,7 +320,7 @@ enum ToolPermissionRegistry {
         lines.append("""
         ### Computer Use
 
-        The `computer_use` tool is for generic visual desktop interaction when `browser_use` and `app_action` are not enough. It needs Computer Use enabled in Settings plus Accessibility and Screen Recording permissions. Use `computer_use` only for screenshot-based observe, click, drag, scroll, keypress, type, or wait steps on the visible desktop.
+        The `computer_use` tool is for generic visual desktop interaction when `browser_use`, `app_action`, and the Accessibility UI tools are not enough. It needs Computer Use enabled in Settings plus Accessibility and Screen Recording permissions. Use `computer_use` only for screenshot-based observe, click, drag, scroll, keypress, type, or wait steps on the visible desktop.
         """ )
         lines.append("")
         lines.append("""
@@ -332,7 +332,7 @@ enum ToolPermissionRegistry {
         lines.append("""
         ### Accessibility UI Tools
 
-        The `ui_inspect`, `ui_click`, `ui_type`, and `ui_press_key` tools use macOS Accessibility APIs to inspect app controls, focus fields, click elements, and send keys without relying only on screenshot coordinates.
+        The `ui_inspect`, `ui_click`, `ui_type`, and `ui_press_key` tools use macOS Accessibility APIs to inspect app controls, focus fields, click elements, and send keys without relying only on screenshot coordinates. Prefer these UI tools before `computer_use` whenever the target app exposes accessible controls.
         """)
 
         return lines.joined(separator: "\n")

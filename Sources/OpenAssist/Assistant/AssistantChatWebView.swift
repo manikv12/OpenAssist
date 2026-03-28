@@ -10,6 +10,7 @@ struct AssistantChatWebView: NSViewRepresentable {
     let runtimePanel: AssistantChatWebRuntimePanel?
     let reviewPanel: AssistantChatWebCodeReviewPanel?
     let rewindState: AssistantChatWebRewindState?
+    let threadNoteState: AssistantChatWebThreadNoteState?
     let showTypingIndicator: Bool
     let typingTitle: String
     let typingDetail: String
@@ -18,13 +19,17 @@ struct AssistantChatWebView: NSViewRepresentable {
     var accentColor: Color? = nil
     let onScrollStateChanged: (Bool, Bool) -> Void  // (isPinned, isScrolledUp)
     let onLoadOlderHistory: () -> Void
+    let onLoadActivityDetails: (String) -> Void
+    let onCollapseActivityDetails: (String) -> Void
     let onSelectRuntimeBackend: (String) -> Void
     let onOpenRuntimeSettings: () -> Void
     let onUndoMessage: (String) -> Void
     let onEditMessage: (String) -> Void
     let onUndoCodeCheckpoint: () -> Void
     let onRedoHistoryMutation: () -> Void
+    let onRestoreCodeCheckpoint: (String) -> Void
     let onCloseCodeReviewPanel: () -> Void
+    let onThreadNoteCommand: (AssistantChatWebThreadNoteCommand) -> Void
     var onTextSelected: ((String, String, String, CGRect) -> Void)? = nil
     var onContainerReady: ((AssistantChatWebContainerView) -> Void)? = nil
 
@@ -32,13 +37,17 @@ struct AssistantChatWebView: NSViewRepresentable {
         AssistantChatWebCoordinator(
             onScrollStateChanged: onScrollStateChanged,
             onLoadOlderHistory: onLoadOlderHistory,
+            onLoadActivityDetails: onLoadActivityDetails,
+            onCollapseActivityDetails: onCollapseActivityDetails,
             onSelectRuntimeBackend: onSelectRuntimeBackend,
             onOpenRuntimeSettings: onOpenRuntimeSettings,
             onUndoMessage: onUndoMessage,
             onEditMessage: onEditMessage,
             onUndoCodeCheckpoint: onUndoCodeCheckpoint,
             onRedoHistoryMutation: onRedoHistoryMutation,
-            onCloseCodeReviewPanel: onCloseCodeReviewPanel
+            onRestoreCodeCheckpoint: onRestoreCodeCheckpoint,
+            onCloseCodeReviewPanel: onCloseCodeReviewPanel,
+            onThreadNoteCommand: onThreadNoteCommand
         )
     }
 
@@ -50,6 +59,7 @@ struct AssistantChatWebView: NSViewRepresentable {
         container.applyRuntimePanel(runtimePanel)
         container.applyReviewPanel(reviewPanel)
         container.applyRewindState(rewindState)
+        container.applyThreadNoteState(threadNoteState)
         container.applyTypingIndicator(
             showTypingIndicator, title: typingTitle, detail: typingDetail)
         container.applyTextScale(textScale)
@@ -63,11 +73,25 @@ struct AssistantChatWebView: NSViewRepresentable {
 
     func updateNSView(_ container: AssistantChatWebContainerView, context: Context) {
         container.coordinator = context.coordinator
+        context.coordinator.onScrollStateChanged = onScrollStateChanged
+        context.coordinator.onLoadOlderHistory = onLoadOlderHistory
+        context.coordinator.onLoadActivityDetails = onLoadActivityDetails
+        context.coordinator.onCollapseActivityDetails = onCollapseActivityDetails
+        context.coordinator.onSelectRuntimeBackend = onSelectRuntimeBackend
+        context.coordinator.onOpenRuntimeSettings = onOpenRuntimeSettings
+        context.coordinator.onUndoMessage = onUndoMessage
+        context.coordinator.onEditMessage = onEditMessage
+        context.coordinator.onUndoCodeCheckpoint = onUndoCodeCheckpoint
+        context.coordinator.onRedoHistoryMutation = onRedoHistoryMutation
+        context.coordinator.onRestoreCodeCheckpoint = onRestoreCodeCheckpoint
+        context.coordinator.onCloseCodeReviewPanel = onCloseCodeReviewPanel
+        context.coordinator.onThreadNoteCommand = onThreadNoteCommand
         context.coordinator.onTextSelected = onTextSelected
         container.applyMessages(messages)
         container.applyRuntimePanel(runtimePanel)
         container.applyReviewPanel(reviewPanel)
         container.applyRewindState(rewindState)
+        container.applyThreadNoteState(threadNoteState)
         container.applyTypingIndicator(
             showTypingIndicator, title: typingTitle, detail: typingDetail)
         container.applyTextScale(textScale)
@@ -82,7 +106,7 @@ struct AssistantChatWebView: NSViewRepresentable {
 
 struct AssistantChatWebMessage: Equatable {
     let id: String
-    let type: String  // "user", "assistant", "activity", "activityGroup", "system"
+    let type: String  // "user", "assistant", "activity", "activityGroup", "activitySummary", "system"
     let text: String?
     let isStreaming: Bool
     let timestamp: Date
@@ -105,6 +129,8 @@ struct AssistantChatWebMessage: Equatable {
 
     // Activity group
     let groupItems: [AssistantChatWebActivityGroupItem]?
+    let loadActivityDetailsID: String?
+    let collapseActivityDetailsID: String?
 
     func toJSON() -> [String: Any] {
         var json: [String: Any] = [
@@ -149,6 +175,12 @@ struct AssistantChatWebMessage: Equatable {
 
         if let groupItems, !groupItems.isEmpty {
             json["groupItems"] = groupItems.map { $0.toJSON() }
+        }
+        if let loadActivityDetailsID {
+            json["loadActivityDetailsID"] = loadActivityDetailsID
+        }
+        if let collapseActivityDetailsID {
+            json["collapseActivityDetailsID"] = collapseActivityDetailsID
         }
 
         return json
@@ -284,6 +316,50 @@ struct AssistantChatWebRewindState: Equatable {
             json["redoHostMessageID"] = redoHostMessageID
         }
         return json
+    }
+}
+
+struct AssistantChatWebThreadNoteState: Equatable {
+    let threadID: String?
+    let text: String
+    let isOpen: Bool
+    let hasNote: Bool
+    let isSaving: Bool
+    let lastSavedAtLabel: String?
+    let canEdit: Bool
+    let placeholder: String
+
+    func toJSON() -> [String: Any] {
+        [
+            "threadId": threadID ?? NSNull(),
+            "text": text,
+            "isOpen": isOpen,
+            "hasNote": hasNote,
+            "isSaving": isSaving,
+            "lastSavedAtLabel": lastSavedAtLabel ?? NSNull(),
+            "canEdit": canEdit,
+            "placeholder": placeholder,
+        ]
+    }
+}
+
+struct AssistantChatWebThreadNoteCommand {
+    let type: String
+    let threadID: String?
+    let text: String?
+    let isOpen: Bool?
+
+    init?(body: Any) {
+        guard let payload = body as? [String: Any],
+              let type = payload["type"] as? String else {
+            return nil
+        }
+        self.type = type
+        self.threadID = (payload["threadId"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .assistantNonEmpty
+        self.text = payload["text"] as? String
+        self.isOpen = payload["isOpen"] as? Bool
     }
 }
 
@@ -606,13 +682,17 @@ private func assistantChatWebActivityTargets(
 final class AssistantChatWebCoordinator: NSObject, WKScriptMessageHandler {
     var onScrollStateChanged: (Bool, Bool) -> Void
     var onLoadOlderHistory: () -> Void
+    var onLoadActivityDetails: (String) -> Void
+    var onCollapseActivityDetails: (String) -> Void
     var onSelectRuntimeBackend: (String) -> Void
     var onOpenRuntimeSettings: () -> Void
     var onUndoMessage: (String) -> Void
     var onEditMessage: (String) -> Void
     var onUndoCodeCheckpoint: () -> Void
     var onRedoHistoryMutation: () -> Void
+    var onRestoreCodeCheckpoint: (String) -> Void
     var onCloseCodeReviewPanel: () -> Void
+    var onThreadNoteCommand: (AssistantChatWebThreadNoteCommand) -> Void
     var onTextSelected: ((String, String, String, CGRect) -> Void)?  // selectedText, messageID, parentText, screenRect
     weak var webViewContainer: AssistantChatWebContainerView?
     private let imageQuickLookController = AssistantChatImageQuickLookController()
@@ -620,23 +700,31 @@ final class AssistantChatWebCoordinator: NSObject, WKScriptMessageHandler {
     init(
         onScrollStateChanged: @escaping (Bool, Bool) -> Void,
         onLoadOlderHistory: @escaping () -> Void,
+        onLoadActivityDetails: @escaping (String) -> Void,
+        onCollapseActivityDetails: @escaping (String) -> Void,
         onSelectRuntimeBackend: @escaping (String) -> Void,
         onOpenRuntimeSettings: @escaping () -> Void,
         onUndoMessage: @escaping (String) -> Void,
         onEditMessage: @escaping (String) -> Void,
         onUndoCodeCheckpoint: @escaping () -> Void,
         onRedoHistoryMutation: @escaping () -> Void,
-        onCloseCodeReviewPanel: @escaping () -> Void
+        onRestoreCodeCheckpoint: @escaping (String) -> Void,
+        onCloseCodeReviewPanel: @escaping () -> Void,
+        onThreadNoteCommand: @escaping (AssistantChatWebThreadNoteCommand) -> Void
     ) {
         self.onScrollStateChanged = onScrollStateChanged
         self.onLoadOlderHistory = onLoadOlderHistory
+        self.onLoadActivityDetails = onLoadActivityDetails
+        self.onCollapseActivityDetails = onCollapseActivityDetails
         self.onSelectRuntimeBackend = onSelectRuntimeBackend
         self.onOpenRuntimeSettings = onOpenRuntimeSettings
         self.onUndoMessage = onUndoMessage
         self.onEditMessage = onEditMessage
         self.onUndoCodeCheckpoint = onUndoCodeCheckpoint
         self.onRedoHistoryMutation = onRedoHistoryMutation
+        self.onRestoreCodeCheckpoint = onRestoreCodeCheckpoint
         self.onCloseCodeReviewPanel = onCloseCodeReviewPanel
+        self.onThreadNoteCommand = onThreadNoteCommand
     }
 
     func userContentController(
@@ -656,6 +744,18 @@ final class AssistantChatWebCoordinator: NSObject, WKScriptMessageHandler {
         case "loadOlderHistory":
             DispatchQueue.main.async { [self] in
                 onLoadOlderHistory()
+            }
+        case "loadActivityDetails":
+            if let renderItemID = message.body as? String {
+                DispatchQueue.main.async { [self] in
+                    onLoadActivityDetails(renderItemID)
+                }
+            }
+        case "collapseActivityDetails":
+            if let renderItemID = message.body as? String {
+                DispatchQueue.main.async { [self] in
+                    onCollapseActivityDetails(renderItemID)
+                }
             }
         case "selectRuntimeBackend":
             if let backendID = message.body as? String {
@@ -729,9 +829,24 @@ final class AssistantChatWebCoordinator: NSObject, WKScriptMessageHandler {
             DispatchQueue.main.async { [self] in
                 onRedoHistoryMutation()
             }
+        case "restoreCodeCheckpoint":
+            if let checkpointID = message.body as? String {
+                CrashReporter.logInfo(
+                    "Assistant chat web received restoreCodeCheckpoint checkpointID=\(checkpointID)"
+                )
+                DispatchQueue.main.async { [self] in
+                    onRestoreCodeCheckpoint(checkpointID)
+                }
+            }
         case "closeCodeReviewPanel":
             DispatchQueue.main.async { [self] in
                 onCloseCodeReviewPanel()
+            }
+        case "threadNoteCommand":
+            if let command = AssistantChatWebThreadNoteCommand(body: message.body) {
+                DispatchQueue.main.async { [self] in
+                    onThreadNoteCommand(command)
+                }
             }
         default:
             break
@@ -909,8 +1024,6 @@ private final class AssistantChatImageQuickLookController: NSWindowController {
 final class AssistantChatWebContainerView: NSView, WKNavigationDelegate {
     var coordinator: AssistantChatWebCoordinator
 
-    private static var cachedHTMLString: String?
-
     private let webView: WKWebView
     private var isReady = false
     private var pendingMessages: [AssistantChatWebMessage]?
@@ -920,6 +1033,7 @@ final class AssistantChatWebContainerView: NSView, WKNavigationDelegate {
     private var pendingRuntimePanel: AssistantChatWebRuntimePanel?
     private var pendingReviewPanel: AssistantChatWebCodeReviewPanel?
     private var pendingRewindState: AssistantChatWebRewindState?
+    private var pendingThreadNoteState: AssistantChatWebThreadNoteState?
     private var pendingAccentCSS: String?
     private var lastAppliedTyping: (Bool, String, String)?
     private var lastAppliedTextScale: CGFloat?
@@ -930,6 +1044,8 @@ final class AssistantChatWebContainerView: NSView, WKNavigationDelegate {
     private var hasAppliedReviewPanel = false
     private var lastAppliedRewindState: AssistantChatWebRewindState?
     private var hasAppliedRewindState = false
+    private var lastAppliedThreadNoteState: AssistantChatWebThreadNoteState?
+    private var hasAppliedThreadNoteState = false
     private var lastAppliedAccentCSS: String?
 
     // Throttling for streaming updates
@@ -946,6 +1062,8 @@ final class AssistantChatWebContainerView: NSView, WKNavigationDelegate {
         let uc = config.userContentController
         uc.add(coordinator, name: "scrollState")
         uc.add(coordinator, name: "loadOlderHistory")
+        uc.add(coordinator, name: "loadActivityDetails")
+        uc.add(coordinator, name: "collapseActivityDetails")
         uc.add(coordinator, name: "selectRuntimeBackend")
         uc.add(coordinator, name: "openRuntimeSettings")
         uc.add(coordinator, name: "linkClicked")
@@ -956,7 +1074,9 @@ final class AssistantChatWebContainerView: NSView, WKNavigationDelegate {
         uc.add(coordinator, name: "editMessage")
         uc.add(coordinator, name: "undoCodeCheckpoint")
         uc.add(coordinator, name: "redoHistoryMutation")
+        uc.add(coordinator, name: "restoreCodeCheckpoint")
         uc.add(coordinator, name: "closeCodeReviewPanel")
+        uc.add(coordinator, name: "threadNoteCommand")
 
         let webView = AssistantInteractiveWebView(frame: .zero, configuration: config)
         webView.setValue(false, forKey: "drawsBackground")
@@ -1005,6 +1125,10 @@ final class AssistantChatWebContainerView: NSView, WKNavigationDelegate {
             if let rewindState = self.pendingRewindState {
                 self.sendRewindState(rewindState)
                 self.pendingRewindState = nil
+            }
+            if let threadNoteState = self.pendingThreadNoteState {
+                self.sendThreadNoteState(threadNoteState)
+                self.pendingThreadNoteState = nil
             }
         }
         uc.add(readyHandler, name: "ready")
@@ -1073,11 +1197,6 @@ final class AssistantChatWebContainerView: NSView, WKNavigationDelegate {
     }
 
     private func loadTemplate() {
-        if let html = Self.cachedHTMLString {
-            webView.loadHTMLString(html, baseURL: nil)
-            return
-        }
-
         let url: URL? =
             Bundle.main.url(forResource: "markdown-chat", withExtension: "html")
             ?? Bundle(identifier: "OpenAssist_OpenAssist")?.url(
@@ -1093,8 +1212,7 @@ final class AssistantChatWebContainerView: NSView, WKNavigationDelegate {
             }()
 
         guard let url, let html = try? String(contentsOf: url, encoding: .utf8) else { return }
-        Self.cachedHTMLString = html
-        webView.loadHTMLString(html, baseURL: nil)
+        webView.loadHTMLString(html, baseURL: url.deletingLastPathComponent())
     }
 
     // MARK: - Public API
@@ -1148,6 +1266,15 @@ final class AssistantChatWebContainerView: NSView, WKNavigationDelegate {
         hasAppliedRewindState = true
         lastAppliedRewindState = rewindState
         sendRewindState(rewindState)
+    }
+
+    func applyThreadNoteState(_ threadNoteState: AssistantChatWebThreadNoteState?) {
+        if hasAppliedThreadNoteState, lastAppliedThreadNoteState == threadNoteState {
+            return
+        }
+        hasAppliedThreadNoteState = true
+        lastAppliedThreadNoteState = threadNoteState
+        sendThreadNoteState(threadNoteState)
     }
 
     func applyTypingIndicator(_ visible: Bool, title: String, detail: String) {
@@ -1382,6 +1509,28 @@ final class AssistantChatWebContainerView: NSView, WKNavigationDelegate {
         )
     }
 
+    private func sendThreadNoteState(_ threadNoteState: AssistantChatWebThreadNoteState?) {
+        guard isReady else {
+            pendingThreadNoteState = threadNoteState
+            return
+        }
+
+        guard let threadNoteState else {
+            webView.evaluateJavaScript("chatBridge.setThreadNoteState(null)", completionHandler: nil)
+            return
+        }
+
+        guard let data = try? JSONSerialization.data(withJSONObject: threadNoteState.toJSON()),
+              let jsonString = String(data: data, encoding: .utf8) else {
+            return
+        }
+
+        webView.evaluateJavaScript(
+            "chatBridge.setThreadNoteState(\(jsonString))",
+            completionHandler: nil
+        )
+    }
+
     // MARK: - Navigation Delegate
 
     func webView(
@@ -1432,7 +1581,9 @@ extension AssistantChatWebMessage {
             activityStatusLabel: activityStatusLabel,
             detailSections: detailSections,
             activityTargets: activityTargets,
-            groupItems: groupItems
+            groupItems: groupItems,
+            loadActivityDetailsID: loadActivityDetailsID,
+            collapseActivityDetailsID: collapseActivityDetailsID
         )
     }
 }
@@ -1595,7 +1746,9 @@ extension AssistantChatWebMessage {
         switch item.kind {
         case .assistantProgress, .assistantFinal, .plan:
             providerLabel = item.providerBackend?.shortDisplayName
-        case .userMessage, .activity, .permission, .system:
+        case .system:
+            providerLabel = item.providerBackend?.shortDisplayName
+        case .userMessage, .activity, .permission:
             providerLabel = nil
         }
 
@@ -1619,7 +1772,9 @@ extension AssistantChatWebMessage {
             activityStatusLabel: activityStatusLabel,
             detailSections: detailSections?.isEmpty == false ? detailSections : nil,
             activityTargets: activityTargets?.isEmpty == false ? activityTargets : nil,
-            groupItems: nil
+            groupItems: nil,
+            loadActivityDetailsID: nil,
+            collapseActivityDetailsID: nil
         )
     }
 
@@ -1680,8 +1835,290 @@ extension AssistantChatWebMessage {
             activityStatusLabel: nil,
             detailSections: nil,
             activityTargets: nil,
-            groupItems: groupItems
+            groupItems: groupItems,
+            loadActivityDetailsID: nil,
+            collapseActivityDetailsID: nil
         )
+    }
+
+    static func collapsedActivitySummary(
+        renderItem: AssistantTimelineRenderItem
+    ) -> AssistantChatWebMessage? {
+        activitySummary(renderItem: renderItem, action: .expand)
+    }
+
+    static func expandedActivitySummary(
+        renderItem: AssistantTimelineRenderItem
+    ) -> AssistantChatWebMessage? {
+        activitySummary(renderItem: renderItem, action: .collapse)
+    }
+
+    static func collapsedConversationSummary(
+        hiddenRenderItems: [AssistantTimelineRenderItem],
+        blockID: String,
+        expanded: Bool
+    ) -> AssistantChatWebMessage? {
+        guard !hiddenRenderItems.isEmpty else { return nil }
+
+        let activities = hiddenRenderItems.flatMap { renderItem -> [AssistantActivityItem] in
+            switch renderItem {
+            case .timeline(let item):
+                guard item.kind == .activity, let activity = item.activity else { return [] }
+                return [activity]
+            case .activityGroup(let group):
+                return group.activities
+            }
+        }
+
+        let firstTimestamp = hiddenRenderItems.first.map(renderItemSortDate) ?? .now
+        let dominantKind =
+            activities.isEmpty ? nil : collapsedActivityDominantKind(for: activities)
+        let status = activities.isEmpty ? AssistantActivityStatus.completed : collapsedActivityStatus(for: activities)
+
+        return AssistantChatWebMessage(
+            id: "activity-summary-\(blockID)",
+            type: "activitySummary",
+            text: nil,
+            isStreaming: false,
+            timestamp: firstTimestamp,
+            turnID: nil,
+            images: nil,
+            emphasis: false,
+            canUndo: false,
+            canEdit: false,
+            rewriteAnchorID: nil,
+            providerLabel: nil,
+            activityIcon: dominantKind,
+            activityTitle: "Worked for \(collapsedConversationDurationLabel(for: hiddenRenderItems))",
+            activityDetail: collapsedConversationSummaryDetail(for: hiddenRenderItems, activities: activities),
+            activityStatus: activityStatusString(for: status),
+            activityStatusLabel: status.rawValue.capitalized,
+            detailSections: nil,
+            activityTargets: nil,
+            groupItems: nil,
+            loadActivityDetailsID: expanded ? nil : blockID,
+            collapseActivityDetailsID: expanded ? blockID : nil
+        )
+    }
+
+    private enum ActivitySummaryAction {
+        case expand
+        case collapse
+    }
+
+    private static func activitySummary(
+        renderItem: AssistantTimelineRenderItem,
+        action: ActivitySummaryAction
+    ) -> AssistantChatWebMessage? {
+        let activities: [AssistantActivityItem]
+        let summaryID = "activity-summary-\(renderItem.id)"
+        let timestamp: Date
+
+        switch renderItem {
+        case .timeline(let item):
+            guard item.kind == .activity, let activity = item.activity else {
+                return nil
+            }
+            activities = [activity]
+            timestamp = item.sortDate
+        case .activityGroup(let group):
+            guard !group.activities.isEmpty else { return nil }
+            activities = group.activities
+            timestamp = group.sortDate
+        }
+
+        let dominantKind = collapsedActivityDominantKind(for: activities)
+
+        return AssistantChatWebMessage(
+            id: summaryID,
+            type: "activitySummary",
+            text: nil,
+            isStreaming: false,
+            timestamp: timestamp,
+            turnID: nil,
+            images: nil,
+            emphasis: false,
+            canUndo: false,
+            canEdit: false,
+            rewriteAnchorID: nil,
+            providerLabel: nil,
+            activityIcon: dominantKind,
+            activityTitle: "Worked for \(collapsedActivityDurationLabel(for: activities))",
+            activityDetail: collapsedActivitySummaryDetail(for: activities),
+            activityStatus: activityStatusString(for: collapsedActivityStatus(for: activities)),
+            activityStatusLabel: collapsedActivityStatus(for: activities).rawValue.capitalized,
+            detailSections: nil,
+            activityTargets: nil,
+            groupItems: nil,
+            loadActivityDetailsID: action == .expand ? renderItem.id : nil,
+            collapseActivityDetailsID: action == .collapse ? renderItem.id : nil
+        )
+    }
+
+    private static func collapsedActivityStatus(
+        for activities: [AssistantActivityItem]
+    ) -> AssistantActivityStatus {
+        if activities.contains(where: { $0.status == .failed }) {
+            return .failed
+        }
+        if activities.contains(where: { $0.status == .interrupted }) {
+            return .interrupted
+        }
+        if activities.contains(where: { $0.status == .waiting }) {
+            return .waiting
+        }
+        if activities.contains(where: { $0.status.isActive }) {
+            return .running
+        }
+        return .completed
+    }
+
+    private static func collapsedActivityDominantKind(
+        for activities: [AssistantActivityItem]
+    ) -> String? {
+        let counts = Dictionary(grouping: activities, by: \.kind).mapValues(\.count)
+        return counts.max(by: { lhs, rhs in
+            if lhs.value == rhs.value {
+                return lhs.key.rawValue > rhs.key.rawValue
+            }
+            return lhs.value < rhs.value
+        })?.key.rawValue
+    }
+
+    private static func collapsedActivitySummaryDetail(
+        for activities: [AssistantActivityItem]
+    ) -> String? {
+        guard !activities.isEmpty else { return nil }
+
+        let counts = Dictionary(grouping: activities, by: \.kind).mapValues(\.count)
+        var fragments: [String] = []
+
+        if let commands = counts[.commandExecution], commands > 0 {
+            fragments.append("\(commands) command\(commands == 1 ? "" : "s")")
+        }
+        if let fileChanges = counts[.fileChange], fileChanges > 0 {
+            fragments.append("\(fileChanges) file change\(fileChanges == 1 ? "" : "s")")
+        }
+        if let searches = counts[.webSearch], searches > 0 {
+            fragments.append("\(searches) search\(searches == 1 ? "" : "es")")
+        }
+        if let browserSteps = counts[.browserAutomation], browserSteps > 0 {
+            fragments.append("\(browserSteps) browser step\(browserSteps == 1 ? "" : "s")")
+        }
+        let toolUses = (counts[.mcpToolCall] ?? 0) + (counts[.dynamicToolCall] ?? 0)
+        if toolUses > 0 {
+            fragments.append("\(toolUses) tool use\(toolUses == 1 ? "" : "s")")
+        }
+        if let subagentSteps = counts[.subagent], subagentSteps > 0 {
+            fragments.append("\(subagentSteps) subagent step\(subagentSteps == 1 ? "" : "s")")
+        }
+
+        if fragments.isEmpty {
+            let count = activities.count
+            return "\(count) activit\(count == 1 ? "y" : "ies")"
+        }
+
+        return fragments.prefix(3).joined(separator: ", ")
+    }
+
+    private static func collapsedActivityDurationLabel(
+        for activities: [AssistantActivityItem]
+    ) -> String {
+        let start = activities.map(\.startedAt).min() ?? .now
+        let end = activities.map(\.updatedAt).max() ?? start
+        let totalSeconds = max(1, Int(ceil(end.timeIntervalSince(start))))
+
+        let hours = totalSeconds / 3600
+        let minutes = (totalSeconds % 3600) / 60
+        let seconds = totalSeconds % 60
+
+        if hours > 0 {
+            if minutes > 0 {
+                return "\(hours)h \(minutes)m"
+            }
+            return "\(hours)h"
+        }
+
+        if minutes > 0 {
+            if seconds > 0 {
+                return "\(minutes)m \(seconds)s"
+            }
+            return "\(minutes)m"
+        }
+
+        return "\(seconds)s"
+    }
+
+    private static func collapsedConversationDurationLabel(
+        for renderItems: [AssistantTimelineRenderItem]
+    ) -> String {
+        let activities = renderItems.flatMap { renderItem -> [AssistantActivityItem] in
+            switch renderItem {
+            case .timeline(let item):
+                guard item.kind == .activity, let activity = item.activity else { return [] }
+                return [activity]
+            case .activityGroup(let group):
+                return group.activities
+            }
+        }
+
+        if !activities.isEmpty {
+            return collapsedActivityDurationLabel(for: activities)
+        }
+
+        let start = renderItems.map(renderItemSortDate).min() ?? .now
+        let end = renderItems.map(\.lastUpdatedAt).max() ?? start
+        let totalSeconds = max(1, Int(ceil(end.timeIntervalSince(start))))
+
+        let minutes = totalSeconds / 60
+        let seconds = totalSeconds % 60
+
+        if minutes > 0 {
+            if seconds > 0 {
+                return "\(minutes)m \(seconds)s"
+            }
+            return "\(minutes)m"
+        }
+
+        return "\(seconds)s"
+    }
+
+    private static func collapsedConversationSummaryDetail(
+        for renderItems: [AssistantTimelineRenderItem],
+        activities: [AssistantActivityItem]
+    ) -> String? {
+        let assistantReplyCount = renderItems.reduce(into: 0) { count, renderItem in
+            guard case .timeline(let item) = renderItem else { return }
+            switch item.kind {
+            case .assistantProgress, .assistantFinal, .plan:
+                if item.text?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty != nil {
+                    count += 1
+                }
+            default:
+                break
+            }
+        }
+
+        let activityCount = activities.count
+        var fragments: [String] = []
+
+        if assistantReplyCount > 0 {
+            fragments.append("\(assistantReplyCount) update\(assistantReplyCount == 1 ? "" : "s")")
+        }
+        if activityCount > 0 {
+            fragments.append("\(activityCount) tool step\(activityCount == 1 ? "" : "s")")
+        }
+
+        return fragments.isEmpty ? nil : fragments.joined(separator: ", ")
+    }
+
+    private static func renderItemSortDate(_ renderItem: AssistantTimelineRenderItem) -> Date {
+        switch renderItem {
+        case .timeline(let item):
+            return item.sortDate
+        case .activityGroup(let group):
+            return group.sortDate
+        }
     }
 
     private static func iconForActivityKind(_ kind: AssistantActivityKind) -> String {

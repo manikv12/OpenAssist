@@ -495,4 +495,73 @@ final class AssistantConversationStoreTests: XCTestCase {
             })
         )
     }
+
+    func testThreadNoteRoundTripsFromNotesMarkdown() throws {
+        let fileManager = FileManager.default
+        let directoryURL = fileManager.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? fileManager.removeItem(at: directoryURL) }
+
+        let store = AssistantConversationStore(
+            fileManager: fileManager,
+            baseDirectoryURL: directoryURL
+        )
+
+        let threadID = "note-thread"
+        let noteText = """
+        # Decisions
+        - Keep notes attached to the thread
+        - Save as Markdown
+        """
+
+        try store.saveThreadNote(threadID: threadID, text: noteText)
+
+        XCTAssertEqual(store.loadThreadNote(threadID: threadID), noteText)
+        XCTAssertTrue(
+            fileManager.fileExists(
+                atPath: try XCTUnwrap(store.threadNoteFileURL(for: threadID)).path
+            )
+        )
+    }
+
+    func testDeleteThreadArtifactsRemovesConversationFilesAndNotesTogether() throws {
+        let fileManager = FileManager.default
+        let directoryURL = fileManager.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? fileManager.removeItem(at: directoryURL) }
+
+        let store = AssistantConversationStore(
+            fileManager: fileManager,
+            baseDirectoryURL: directoryURL
+        )
+
+        let threadID = "delete-thread"
+        try store.storeSnapshot(
+            AssistantConversationSnapshot(
+                version: 2,
+                threadID: threadID,
+                timeline: [],
+                transcript: [],
+                turns: [],
+                updatedAt: Date()
+            )
+        )
+        try store.appendTranscriptResetEvent(threadID: threadID)
+        try store.saveThreadNote(threadID: threadID, text: "Delete me too")
+
+        let snapshotURL = try XCTUnwrap(store.snapshotFileURL(for: threadID))
+        let eventLogURL = try XCTUnwrap(store.eventLogFileURL(for: threadID))
+        let noteURL = try XCTUnwrap(store.threadNoteFileURL(for: threadID))
+
+        XCTAssertTrue(fileManager.fileExists(atPath: snapshotURL.path))
+        XCTAssertTrue(fileManager.fileExists(atPath: eventLogURL.path))
+        XCTAssertTrue(fileManager.fileExists(atPath: noteURL.path))
+
+        store.deleteThreadArtifacts(threadID: threadID)
+
+        XCTAssertFalse(fileManager.fileExists(atPath: snapshotURL.path))
+        XCTAssertFalse(fileManager.fileExists(atPath: eventLogURL.path))
+        XCTAssertFalse(fileManager.fileExists(atPath: noteURL.path))
+        XCTAssertEqual(store.loadThreadNote(threadID: threadID), "")
+    }
 }

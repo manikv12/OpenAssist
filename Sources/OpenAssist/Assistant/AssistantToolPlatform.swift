@@ -43,6 +43,18 @@ struct CopilotBackendAdapter: AssistantBackendAdapter {
     )
 }
 
+struct ClaudeCodeBackendAdapter: AssistantBackendAdapter {
+    let backend: AssistantRuntimeBackend = .claudeCode
+    let capabilities = AssistantBackendCapabilities(
+        supportsStructuredToolCalls: false,
+        supportsImageInput: false,
+        maxPracticalToolCount: nil,
+        supportsLongToolOutputs: true,
+        supportsContinuation: true,
+        preferredToolSurface: .granular
+    )
+}
+
 enum AssistantBackendAdapterRegistry {
     static func adapter(for backend: AssistantRuntimeBackend) -> any AssistantBackendAdapter {
         switch backend {
@@ -50,6 +62,8 @@ enum AssistantBackendAdapterRegistry {
             return CodexBackendAdapter()
         case .copilot:
             return CopilotBackendAdapter()
+        case .claudeCode:
+            return ClaudeCodeBackendAdapter()
         }
     }
 }
@@ -411,7 +425,7 @@ enum AssistantToolCatalog {
                 inputSchema: AssistantComputerUseToolDefinition.inputSchema,
                 modes: [.agentic],
                 surfaceStyles: [.compact, .granular],
-                permissionLeadText: "Computer Use captures the visible screen on this Mac, then uses mouse or keyboard actions on the live desktop when browser and app tools are not enough.",
+                permissionLeadText: "Computer Use captures the visible screen on this Mac, then uses mouse or keyboard actions on the live desktop when browser, app, and Accessibility UI tools are not enough.",
                 executionKind: .computerUse,
                 availability: { SettingsStore.shared.assistantComputerUseEnabled },
                 summaryProvider: { arguments in

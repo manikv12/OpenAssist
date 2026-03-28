@@ -120,7 +120,6 @@ export function MessageCheckpointCard({ info }: Props) {
     checkpoint,
     checkpointIndex,
     currentCheckpointPosition,
-    hasActiveTurn,
     actionsLocked,
   } = info;
   const [expandedFile, setExpandedFile] = useState<string | null>(null);
@@ -130,10 +129,9 @@ export function MessageCheckpointCard({ info }: Props) {
   const isUndone = checkpointIndex > currentCheckpointPosition;
   const isNextRedo = checkpointIndex === currentCheckpointPosition + 1;
   const canUndo =
-    !hasActiveTurn &&
     !actionsLocked &&
-    isCurrent &&
-    checkpointIndex === info.totalCheckpointCount - 1;
+    isCurrent;
+  const canRestore = !actionsLocked && isUndone;
 
   const parsedFiles = useMemo(
     () => parseUnifiedDiff(checkpoint.patch),
@@ -154,6 +152,12 @@ export function MessageCheckpointCard({ info }: Props) {
   const handleUndo = useCallback(() => {
     try { window.webkit?.messageHandlers?.undoCodeCheckpoint?.postMessage(true); } catch {}
   }, []);
+
+  const handleRestore = useCallback(() => {
+    try {
+      window.webkit?.messageHandlers?.restoreCodeCheckpoint?.postMessage(checkpoint.id);
+    } catch {}
+  }, [checkpoint.id]);
 
   const toggleFile = useCallback((path: string) => {
     setExpandedFile((prev) => (prev === path ? null : path));
@@ -200,12 +204,20 @@ export function MessageCheckpointCard({ info }: Props) {
           </span>
           <span className="msg-cp-state">{stateLabel}</span>
         </div>
-        {canUndo && (
+        {(canUndo || canRestore) && (
           <div className="msg-cp-actions">
-            <button type="button" className="msg-cp-btn" onClick={handleUndo}>
-              Undo
-              <AppIcon symbol="undo" size={13} strokeWidth={2} />
-            </button>
+            {canUndo && (
+              <button type="button" className="msg-cp-btn" onClick={handleUndo}>
+                Undo
+                <AppIcon symbol="undo" size={13} strokeWidth={2} />
+              </button>
+            )}
+            {canRestore && (
+              <button type="button" className="msg-cp-btn" onClick={handleRestore}>
+                Restore to Here
+                <AppIcon symbol="arrow.counterclockwise" size={13} strokeWidth={2} />
+              </button>
+            )}
           </div>
         )}
       </div>

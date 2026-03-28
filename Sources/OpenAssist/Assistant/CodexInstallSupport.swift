@@ -145,6 +145,14 @@ struct CodexInstallSupport {
                 primaryTitle = "Install Copilot CLI"
                 primaryDetail = "Open Assist needs GitHub Copilot CLI before the assistant can use Copilot."
             }
+        case .claudeCode:
+            if resolvedRuntime != nil {
+                primaryTitle = "Claude Code is installed"
+                primaryDetail = "Claude Code CLI is available on this Mac. Open Assist can run Claude Code in headless mode, reuse Claude sessions between turns, and show replies back in the assistant timeline."
+            } else {
+                primaryTitle = "Install Claude Code"
+                primaryDetail = "Open Assist needs Claude Code CLI before the assistant can use Claude Code."
+            }
         }
 
         return AssistantInstallGuidance(

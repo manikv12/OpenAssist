@@ -790,6 +790,8 @@ struct AssistantTimelineItem: Identifiable, Equatable, Codable, Sendable {
         createdAt: Date = Date(),
         emphasis: Bool = false,
         imageAttachments: [Data]? = nil,
+        providerBackend: AssistantRuntimeBackend? = nil,
+        providerModelID: String? = nil,
         source: AssistantTimelineSource
     ) -> AssistantTimelineItem {
         AssistantTimelineItem(
@@ -807,8 +809,8 @@ struct AssistantTimelineItem: Identifiable, Equatable, Codable, Sendable {
             planText: nil,
             planEntries: nil,
             imageAttachments: imageAttachments,
-            providerBackend: nil,
-            providerModelID: nil,
+            providerBackend: providerBackend,
+            providerModelID: providerModelID,
             source: source
         )
     }

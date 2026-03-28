@@ -376,6 +376,83 @@ final class AssistantConversationCheckpointStoreTests: XCTestCase {
         )
     }
 
+    func testTrackingStateCanPersistHistoryBranchState() throws {
+        let homeDirectory = try makeTemporaryDirectory(named: "ConversationCheckpointHome")
+        let trackingDirectory = try makeTemporaryDirectory(named: "ConversationCheckpointTracking")
+        let memoryRoot = try makeTemporaryDirectory(named: "ConversationCheckpointMemory")
+        let databaseURL = try makeTemporaryDirectory(named: "ConversationCheckpointDB")
+            .appendingPathComponent("memory.sqlite3", isDirectory: false)
+
+        let sessionCatalog = CodexSessionCatalog(homeDirectory: homeDirectory)
+        let threadMemoryService = AssistantThreadMemoryService(baseDirectoryURL: memoryRoot)
+        let memoryStore = try MemorySQLiteStore(databaseURL: databaseURL)
+        let suggestionService = AssistantMemorySuggestionService(
+            threadMemoryService: threadMemoryService,
+            store: memoryStore
+        )
+        let agentStateService = ConversationAgentStateService(storeFactory: { memoryStore })
+        let checkpointStore = AssistantConversationCheckpointStore(
+            sessionCatalog: sessionCatalog,
+            threadMemoryService: threadMemoryService,
+            memorySuggestionService: suggestionService,
+            memoryStore: memoryStore,
+            agentStateService: agentStateService,
+            baseDirectoryURL: trackingDirectory
+        )
+
+        let attachment = AssistantAttachment(
+            filename: "note.txt",
+            data: Data("draft".utf8),
+            mimeType: "text/plain"
+        )
+        let branchState = AssistantHistoryBranchState(
+            kind: .undo,
+            sessionID: "thread-branch",
+            currentAnchorID: "anchor-a",
+            currentCheckpointPosition: 1,
+            currentPrompt: "restore this draft",
+            currentAttachments: [attachment],
+            futureStates: [
+                AssistantHistoryFutureState(
+                    restoreAnchorID: "anchor-b",
+                    title: "Second message",
+                    snapshotID: "history-snapshot-b",
+                    checkpointPosition: 2,
+                    currentAnchorIDAfterRestore: nil,
+                    composerPrompt: "",
+                    composerAttachments: []
+                )
+            ]
+        )
+        let state = AssistantCodeTrackingState(
+            sessionID: "thread-branch",
+            availability: .unavailable,
+            repoRootPath: nil,
+            repoLabel: nil,
+            checkpoints: [],
+            currentCheckpointPosition: 1,
+            historyBranchState: branchState
+        )
+
+        try checkpointStore.saveTrackingState(state)
+
+        let loadedState = try XCTUnwrap(checkpointStore.loadTrackingState(for: "thread-branch"))
+        XCTAssertEqual(loadedState.sessionID, state.sessionID)
+        XCTAssertEqual(loadedState.availability, state.availability)
+        XCTAssertEqual(loadedState.currentCheckpointPosition, state.currentCheckpointPosition)
+
+        let loadedBranchState = try XCTUnwrap(loadedState.historyBranchState)
+        XCTAssertEqual(loadedBranchState.kind, branchState.kind)
+        XCTAssertEqual(loadedBranchState.sessionID, branchState.sessionID)
+        XCTAssertEqual(loadedBranchState.currentAnchorID, branchState.currentAnchorID)
+        XCTAssertEqual(loadedBranchState.currentCheckpointPosition, branchState.currentCheckpointPosition)
+        XCTAssertEqual(loadedBranchState.currentPrompt, branchState.currentPrompt)
+        XCTAssertEqual(loadedBranchState.currentAttachments.map(\.filename), branchState.currentAttachments.map(\.filename))
+        XCTAssertEqual(loadedBranchState.currentAttachments.map(\.data), branchState.currentAttachments.map(\.data))
+        XCTAssertEqual(loadedBranchState.currentAttachments.map(\.mimeType), branchState.currentAttachments.map(\.mimeType))
+        XCTAssertEqual(loadedBranchState.futureStates, branchState.futureStates)
+    }
+
     private func makeTemporaryDirectory(named name: String) throws -> URL {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("\(name)-\(UUID().uuidString)", isDirectory: true)

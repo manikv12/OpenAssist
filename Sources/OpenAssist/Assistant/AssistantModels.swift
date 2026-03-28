@@ -629,14 +629,14 @@ struct AssistantAttachment: Identifiable, Equatable, Codable, Sendable {
     let mimeType: String
 
     var isImage: Bool { mimeType.hasPrefix("image/") }
+    var dataURL: String { "data:\(mimeType);base64,\(data.base64EncodedString())" }
 
     /// Build the Codex input item for this attachment.
     func toInputItem() -> [String: Any] {
         if isImage {
-            let base64 = data.base64EncodedString()
             return [
                 "type": "image",
-                "url": "data:\(mimeType);base64,\(base64)"
+                "url": dataURL
             ]
         } else {
             let text = String(data: data, encoding: .utf8) ?? data.base64EncodedString()
@@ -1247,7 +1247,7 @@ enum AssistantInteractionMode: String, CaseIterable, Codable, Sendable {
 
     var hint: String {
         switch normalizedForActiveUse {
-        case .plan: return "Use Codex plan mode and ask for approval when execution is needed"
+        case .plan: return "Use the provider's plan mode and ask for approval when execution is needed"
         case .agentic: return "Full tool access to inspect and make changes"
         case .conversational: return "Full tool access to inspect and make changes"
         }
@@ -1582,25 +1582,34 @@ struct AssistantHistoryRollbackSnapshot: Equatable, Codable, Sendable {
     let agentPreferences: ConversationAgentPreferencesRecord?
 }
 
-struct AssistantHistoryMutationState: Equatable, Codable, Sendable {
+struct AssistantHistoryFutureState: Equatable, Codable, Sendable, Identifiable {
+    let restoreAnchorID: String
+    let title: String
+    let snapshotID: String
+    let checkpointPosition: Int
+    let currentAnchorIDAfterRestore: String?
+    let composerPrompt: String
+    let composerAttachments: [AssistantAttachment]
+
+    var id: String { snapshotID }
+}
+
+struct AssistantHistoryRestoreItem: Equatable, Identifiable {
+    let id: String
+    let anchorID: String
+    let title: String
+}
+
+struct AssistantHistoryBranchState: Equatable, Codable, Sendable {
     let kind: AssistantHistoryMutationKind
     let sessionID: String
-    let anchorID: String
-    let originalAnchorID: String
-    let isPendingComposerEdit: Bool
-    let rewriteBackup: CodexRewriteBackup?
-    let previousDraft: String
-    let previousAttachments: [AssistantAttachment]
-    let restoredPrompt: String
-    let restoredAttachments: [AssistantAttachment]
-    let removedAnchorIDs: [String]
-    let retainedAnchorIDs: [String]
-    let originalCheckpointPosition: Int
+    let currentAnchorID: String
     let currentCheckpointPosition: Int
-    let rollbackSnapshot: AssistantHistoryRollbackSnapshot?
+    let currentPrompt: String
+    let currentAttachments: [AssistantAttachment]
+    let futureStates: [AssistantHistoryFutureState]
 
     var bannerText: String? {
-        guard isPendingComposerEdit else { return nil }
         switch kind {
         case .edit:
             return "Editing your last message below. Change it, then press Send."
@@ -1609,6 +1618,10 @@ struct AssistantHistoryMutationState: Equatable, Codable, Sendable {
         case .checkpoint:
             return "Code rewind is ready. The restored request is in the text box below. Change it, then press Send."
         }
+    }
+
+    var canRedo: Bool {
+        !futureStates.isEmpty
     }
 }
 
@@ -1737,7 +1750,7 @@ struct AssistantCodeTrackingState: Codable, Equatable, Sendable {
     var repoLabel: String?
     var checkpoints: [AssistantCodeCheckpointSummary]
     var currentCheckpointPosition: Int
-    var rewindState: AssistantHistoryMutationState?
+    var historyBranchState: AssistantHistoryBranchState?
 
     static func empty(sessionID: String) -> AssistantCodeTrackingState {
         AssistantCodeTrackingState(
@@ -1747,7 +1760,7 @@ struct AssistantCodeTrackingState: Codable, Equatable, Sendable {
             repoLabel: nil,
             checkpoints: [],
             currentCheckpointPosition: -1,
-            rewindState: nil
+            historyBranchState: nil
         )
     }
 
@@ -2239,6 +2252,36 @@ final class AssistantStore: ObservableObject {
             )
             await waitForCachedModels(threadID: session.id, backend: backend)
             await warmRuntime.stop()
+        case .claudeCode:
+            let warmRuntime = runtime ?? makeBackgroundWarmupRuntime(
+                preferredSessionID: session.id,
+                backend: backend
+            )
+            let shouldStopRuntime = runtime == nil
+            let guidance = await installSupport.inspect(backend: backend)
+            guard guidance.codexDetected else {
+                if shouldStopRuntime {
+                    await warmRuntime.stop()
+                }
+                return
+            }
+
+            await ensureRuntimeBackend(warmRuntime, matches: backend)
+            do {
+                _ = try await warmRuntime.refreshEnvironment(codexPath: guidance.codexPath)
+                if shouldStopRuntime {
+                    await waitForCachedModels(threadID: session.id, backend: backend)
+                }
+            } catch {
+                if shouldStopRuntime {
+                    await warmRuntime.stop()
+                }
+                return
+            }
+
+            if shouldStopRuntime {
+                await warmRuntime.stop()
+            }
         }
     }
 
@@ -2423,7 +2466,8 @@ final class AssistantStore: ObservableObject {
     @Published private(set) var currentMemoryFileURL: URL?
     @Published private(set) var memoryStatusMessage: String?
     @Published private(set) var pendingMemorySuggestions: [AssistantMemorySuggestion] = []
-    @Published private(set) var historyMutationState: AssistantHistoryMutationState?
+    @Published private(set) var historyBranchState: AssistantHistoryBranchState?
+    @Published private(set) var isRestoringHistoryBranch: Bool = false
     @Published private(set) var historyActionsRevision: Int = 0
     @Published private(set) var selectedCodeTrackingState: AssistantCodeTrackingState?
     @Published private(set) var selectedCodeReviewPanelState: AssistantCodeReviewPanelState?
@@ -3052,6 +3096,40 @@ final class AssistantStore: ObservableObject {
         providerRuntimeSurfaceByThreadID[normalizedThreadID] = snapshots
     }
 
+    private func scopedProviderSurfaceModelID(
+        threadID: String?,
+        backend: AssistantRuntimeBackend,
+        prefersVisibleSelection: Bool = false
+    ) -> String? {
+        if prefersVisibleSelection, visibleAssistantBackend == backend {
+            return selectedModelID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+        }
+
+        guard let normalizedThreadID = normalizedSessionID(threadID),
+              let session = sessions.first(where: { sessionsMatch($0.id, normalizedThreadID) }) else {
+            return prefersVisibleSelection
+                ? selectedModelID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+                : nil
+        }
+
+        if session.isProviderIndependentThreadV2 {
+            return session.providerBinding(for: backend)?
+                .latestModelID?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .nonEmpty
+        }
+
+        guard self.backend(for: session) == backend else {
+            return prefersVisibleSelection
+                ? selectedModelID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+                : nil
+        }
+
+        return session.latestModel?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nonEmpty
+    }
+
     private func restoreVisibleProviderSurface(
         threadID: String?,
         backend: AssistantRuntimeBackend,
@@ -3413,14 +3491,22 @@ final class AssistantStore: ObservableObject {
             Task { @MainActor in
                 guard let self, let runtime else { return }
                 let resolvedSessionID = self.resolveRuntimeSessionID(for: runtime, preferredSessionID: preferredSessionID)
+                let shouldPublishVisibleSurface = self.shouldPublishVisibleRuntimeSurface(
+                    from: runtime,
+                    preferredSessionID: preferredSessionID
+                )
                 self.updateProviderSurfaceSnapshot(
                     threadID: resolvedSessionID,
                     backend: runtime.backend
                 ) { snapshot in
                     snapshot.tokenUsage = usage
-                    snapshot.selectedModelID = self.selectedModelID
+                    snapshot.selectedModelID = self.scopedProviderSurfaceModelID(
+                        threadID: resolvedSessionID,
+                        backend: runtime.backend,
+                        prefersVisibleSelection: shouldPublishVisibleSurface
+                    )
                 }
-                guard self.shouldPublishVisibleRuntimeSurface(from: runtime, preferredSessionID: preferredSessionID) else {
+                guard shouldPublishVisibleSurface else {
                     return
                 }
                 self.tokenUsage = usage
@@ -3430,14 +3516,22 @@ final class AssistantStore: ObservableObject {
             Task { @MainActor in
                 guard let self, let runtime else { return }
                 let resolvedSessionID = self.resolveRuntimeSessionID(for: runtime, preferredSessionID: preferredSessionID)
+                let shouldPublishVisibleSurface = self.shouldPublishVisibleRuntimeSurface(
+                    from: runtime,
+                    preferredSessionID: preferredSessionID
+                )
                 self.updateProviderSurfaceSnapshot(
                     threadID: resolvedSessionID,
                     backend: runtime.backend
                 ) { snapshot in
                     snapshot.rateLimits = limits
-                    snapshot.selectedModelID = self.selectedModelID
+                    snapshot.selectedModelID = self.scopedProviderSurfaceModelID(
+                        threadID: resolvedSessionID,
+                        backend: runtime.backend,
+                        prefersVisibleSelection: shouldPublishVisibleSurface
+                    )
                 }
-                guard self.shouldPublishVisibleRuntimeSurface(from: runtime, preferredSessionID: preferredSessionID) else {
+                guard shouldPublishVisibleSurface else {
                     return
                 }
                 self.rateLimits = limits
@@ -3457,6 +3551,10 @@ final class AssistantStore: ObservableObject {
             Task { @MainActor in
                 guard let self, let runtime else { return }
                 let resolvedSessionID = self.resolveRuntimeSessionID(for: runtime, preferredSessionID: preferredSessionID)
+                let shouldPublishVisibleSurface = self.shouldPublishVisibleRuntimeSurface(
+                    from: runtime,
+                    preferredSessionID: preferredSessionID
+                )
                 if !models.isEmpty {
                     self.providerAvailableModelsByBackend[runtime.backend] = models
                 }
@@ -3467,9 +3565,13 @@ final class AssistantStore: ObservableObject {
                     if !models.isEmpty {
                         snapshot.availableModels = models
                     }
-                    snapshot.selectedModelID = self.selectedModelID
+                    snapshot.selectedModelID = self.scopedProviderSurfaceModelID(
+                        threadID: resolvedSessionID,
+                        backend: runtime.backend,
+                        prefersVisibleSelection: shouldPublishVisibleSurface
+                    )
                 }
-                guard self.shouldPublishVisibleRuntimeSurface(from: runtime, preferredSessionID: preferredSessionID) else {
+                guard shouldPublishVisibleSurface else {
                     return
                 }
                 let resolvedModels = models.isEmpty
@@ -3618,6 +3720,23 @@ final class AssistantStore: ObservableObject {
         return "The selected model \(assistantDisplayModelName(selectedModel.displayName)) cannot read image attachments. Choose a model that supports image input and try again. Attached images can still be analyzed directly when the model supports them, but live browser or app automation needs Agentic mode."
     }
 
+    static func humanizedAssistantErrorMessage(_ rawMessage: String) -> String {
+        let trimmed = rawMessage.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.first == "{",
+              let data = trimmed.data(using: .utf8),
+              let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return trimmed
+        }
+
+        for key in ["detail", "message", "error"] {
+            if let text = (payload[key] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
+                return text
+            }
+        }
+
+        return trimmed
+    }
+
     var isRuntimeReadyForConversation: Bool {
         switch runtimeHealth.availability {
         case .ready, .active:
@@ -3632,7 +3751,7 @@ final class AssistantStore: ObservableObject {
     }
 
     var canCreateThread: Bool {
-        historyMutationState?.isPendingComposerEdit != true
+        true
     }
 
     var conversationBlockedReason: String? {
@@ -3663,9 +3782,6 @@ final class AssistantStore: ObservableObject {
         }
         if selectedModel == nil {
             return "Choose a model before starting a conversation. Then confirm the reasoning level."
-        }
-        if backend == .copilot, !attachments.isEmpty {
-            return "Attachments are not wired through GitHub Copilot ACP in Open Assist yet. Remove the attachment or switch back to Codex for attachment-based turns."
         }
         if attachments.contains(where: \.isImage), !selectedModelSupportsImageInput {
             let modelName = selectedModel?.displayName ?? "The selected model"
@@ -4053,6 +4169,11 @@ final class AssistantStore: ObservableObject {
             availableModels = resolvedModels
             applyPreferredModelSelection(using: resolvedModels)
             if let selectedSessionID {
+                let scopedModelID = scopedProviderSurfaceModelID(
+                    threadID: selectedSessionID,
+                    backend: backend,
+                    prefersVisibleSelection: true
+                )
                 updateProviderSurfaceSnapshot(
                     threadID: selectedSessionID,
                     backend: backend
@@ -4061,7 +4182,7 @@ final class AssistantStore: ObservableObject {
                     if !details.models.isEmpty {
                         snapshot.availableModels = details.models
                     }
-                    snapshot.selectedModelID = self.selectedModelID
+                    snapshot.selectedModelID = scopedModelID
                 }
             }
             runtimeHealth = details.health
@@ -4916,13 +5037,6 @@ final class AssistantStore: ObservableObject {
             lastStatusMessage = "This older chat is not supported in the new thread view anymore, so Open Assist now hides it from the sidebar."
             return
         }
-        if let mutation = historyMutationState,
-           mutation.isPendingComposerEdit,
-           !sessionsMatch(mutation.sessionID, normalizedSessionID) {
-            lastStatusMessage = "Finish the current undo or edit before switching threads."
-            return
-        }
-
         let desiredBackend = backend(for: session)
         let sessionRuntime = ensureRuntime(for: normalizedSessionID)
         if sessionRuntime.backend != desiredBackend {
@@ -4969,7 +5083,8 @@ final class AssistantStore: ObservableObject {
             await openOpenAssistSession(
                 session,
                 normalizedSessionID: normalizedSessionID,
-                previousSelectedSessionID: previousSelectedSessionID
+                previousSelectedSessionID: previousSelectedSessionID,
+                requestID: requestID
             )
             return
         }
@@ -4978,7 +5093,8 @@ final class AssistantStore: ObservableObject {
             await openCopilotSession(
                 session,
                 normalizedSessionID: normalizedSessionID,
-                previousSelectedSessionID: previousSelectedSessionID
+                previousSelectedSessionID: previousSelectedSessionID,
+                requestID: requestID
             )
             return
         }
@@ -5081,27 +5197,46 @@ final class AssistantStore: ObservableObject {
     private func openOpenAssistSession(
         _ session: AssistantSessionSummary,
         normalizedSessionID: String,
-        previousSelectedSessionID: String?
+        previousSelectedSessionID: String?,
+        requestID: UUID
     ) async {
         ensureSessionVisible(normalizedSessionID)
         let cachedTimeline = timelineItemsBySessionID[normalizedSessionID] ?? []
         let cachedTranscript = transcriptEntriesBySessionID[normalizedSessionID] ?? []
-        let persistedTimeline = await loadPersistedTimeline(
-            sessionID: normalizedSessionID,
-            limit: currentTimelineHistoryLimit(
-                for: normalizedSessionID,
-                minimum: Self.HistoryLoading.initialTimelineLimit
-            )
+        let timelineLimit = currentTimelineHistoryLimit(
+            for: normalizedSessionID,
+            minimum: Self.HistoryLoading.initialTimelineLimit
         )
-        let persistedTranscript = await loadPersistedTranscript(
-            sessionID: normalizedSessionID,
-            limit: currentTranscriptHistoryLimit(
-                for: normalizedSessionID,
-                minimum: Self.HistoryLoading.initialTranscriptLimit
-            )
+        let transcriptLimit = currentTranscriptHistoryLimit(
+            for: normalizedSessionID,
+            minimum: Self.HistoryLoading.initialTranscriptLimit
         )
-        let mergedTimeline = mergeTimelineHistory(persistedTimeline, with: cachedTimeline)
-        let mergedTranscript = mergeTranscriptHistory(persistedTranscript, with: cachedTranscript)
+        let hasUsableCachedHistory = hasRenderableTimelineHistory(cachedTimeline)
+
+        if hasUsableCachedHistory || !cachedTranscript.isEmpty {
+            setVisibleTimeline(cachedTimeline, for: normalizedSessionID)
+            setVisibleTranscript(cachedTranscript, for: normalizedSessionID)
+            refreshEditableTurns(for: normalizedSessionID)
+            refreshMemoryState(for: normalizedSessionID)
+            isTransitioningSession = false
+        } else {
+            setVisibleHistoryLoadingState(for: normalizedSessionID)
+            isTransitioningSession = true
+        }
+
+        let recentChunk = await loadRecentHistoryChunk(
+            sessionID: normalizedSessionID,
+            timelineLimit: timelineLimit,
+            transcriptLimit: transcriptLimit
+        )
+
+        guard sessionLoadRequestID == requestID,
+              sessionsMatch(selectedSessionID, normalizedSessionID) else {
+            return
+        }
+
+        let mergedTimeline = mergeTimelineHistory(recentChunk.timeline, with: cachedTimeline)
+        let mergedTranscript = mergeTranscriptHistory(recentChunk.transcript, with: cachedTranscript)
 
         if !mergedTimeline.isEmpty {
             setVisibleTimeline(mergedTimeline, for: normalizedSessionID)
@@ -5109,6 +5244,7 @@ final class AssistantStore: ObservableObject {
             setVisibleTimeline(cachedTimeline, for: normalizedSessionID)
         }
         setVisibleTranscript(mergedTranscript.isEmpty ? cachedTranscript : mergedTranscript, for: normalizedSessionID)
+        canLoadMoreHistoryBySessionID[normalizedSessionID] = recentChunk.hasMore
         refreshEditableTurns(for: normalizedSessionID)
         refreshMemoryState(for: normalizedSessionID)
         isTransitioningSession = false
@@ -5137,26 +5273,54 @@ final class AssistantStore: ObservableObject {
     private func openCopilotSession(
         _ session: AssistantSessionSummary,
         normalizedSessionID: String,
-        previousSelectedSessionID: String?
+        previousSelectedSessionID: String?,
+        requestID: UUID
     ) async {
         ensureSessionVisible(normalizedSessionID)
         let cachedTimeline = timelineItemsBySessionID[normalizedSessionID] ?? []
         let cachedTranscript = transcriptEntriesBySessionID[normalizedSessionID] ?? []
-        let persistedTimeline = await loadPersistedTimeline(
-            sessionID: normalizedSessionID,
-            limit: currentTimelineHistoryLimit(
-                for: normalizedSessionID,
-                minimum: Self.HistoryLoading.initialTimelineLimit
-            )
+        let timelineLimit = currentTimelineHistoryLimit(
+            for: normalizedSessionID,
+            minimum: Self.HistoryLoading.initialTimelineLimit
         )
-        let mergedTimeline = mergeTimelineHistory(persistedTimeline, with: cachedTimeline)
+        let transcriptLimit = currentTranscriptHistoryLimit(
+            for: normalizedSessionID,
+            minimum: Self.HistoryLoading.initialTranscriptLimit
+        )
+        let hasUsableCachedHistory = hasRenderableTimelineHistory(cachedTimeline)
+
+        if hasUsableCachedHistory || !cachedTranscript.isEmpty {
+            setVisibleTimeline(cachedTimeline, for: normalizedSessionID)
+            setVisibleTranscript(cachedTranscript, for: normalizedSessionID)
+            refreshEditableTurns(for: normalizedSessionID)
+            refreshMemoryState(for: normalizedSessionID)
+            isTransitioningSession = false
+        } else {
+            setVisibleHistoryLoadingState(for: normalizedSessionID)
+            isTransitioningSession = true
+        }
+
+        let recentChunk = await loadRecentHistoryChunk(
+            sessionID: normalizedSessionID,
+            timelineLimit: timelineLimit,
+            transcriptLimit: transcriptLimit
+        )
+
+        guard sessionLoadRequestID == requestID,
+              sessionsMatch(selectedSessionID, normalizedSessionID) else {
+            return
+        }
+
+        let mergedTimeline = mergeTimelineHistory(recentChunk.timeline, with: cachedTimeline)
+        let mergedTranscript = mergeTranscriptHistory(recentChunk.transcript, with: cachedTranscript)
 
         if !mergedTimeline.isEmpty {
             setVisibleTimeline(mergedTimeline, for: normalizedSessionID)
         } else {
             setVisibleTimeline(cachedTimeline, for: normalizedSessionID)
         }
-        setVisibleTranscript(cachedTranscript, for: normalizedSessionID)
+        setVisibleTranscript(mergedTranscript.isEmpty ? cachedTranscript : mergedTranscript, for: normalizedSessionID)
+        canLoadMoreHistoryBySessionID[normalizedSessionID] = recentChunk.hasMore
         refreshEditableTurns(for: normalizedSessionID)
         refreshMemoryState(for: normalizedSessionID)
         isTransitioningSession = false
@@ -5382,20 +5546,23 @@ final class AssistantStore: ObservableObject {
             pendingResumeContextSnapshotsBySessionID.removeValue(forKey: sessionID)
             ensureSessionVisible(sessionID)
         } catch {
+            let friendlyErrorText = Self.humanizedAssistantErrorMessage(error.localizedDescription)
             hudState = AssistantHUDState(
                 phase: .failed,
                 title: "Send failed",
-                detail: error.localizedDescription
+                detail: friendlyErrorText
             )
-            lastStatusMessage = error.localizedDescription
+            lastStatusMessage = friendlyErrorText
             promptDraft = trimmed
-            appendTranscriptEntry(AssistantTranscriptEntry(role: .error, text: error.localizedDescription, emphasis: true))
+            appendTranscriptEntry(AssistantTranscriptEntry(role: .error, text: friendlyErrorText, emphasis: true))
             appendTimelineItem(
                 .system(
                     sessionID: selectedSessionID,
-                    text: error.localizedDescription,
+                    text: friendlyErrorText,
                     createdAt: Date(),
                     emphasis: true,
+                    providerBackend: executionRuntime?.backend,
+                    providerModelID: selectedModelID,
                     source: .runtime
                 )
             )
@@ -5492,9 +5659,13 @@ final class AssistantStore: ObservableObject {
     }
 
     func undoUserMessage(anchorID: String) async {
-        let sessionID = selectedSessionID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
-        let targetCheckpointPosition = sessionID.map { effectiveCodeTrackingState(for: $0).currentCheckpointPosition } ?? -1
-        await beginHistoryRewind(
+        guard let sessionID = selectedSessionID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+            lastStatusMessage = "Open the thread first, then try again."
+            return
+        }
+        let trackingState = effectiveCodeTrackingState(for: sessionID)
+        let targetCheckpointPosition = checkpointPositionBeforeUserAnchor(anchorID, in: trackingState)
+        await beginHistoryBranch(
             at: anchorID,
             kind: .undo,
             targetCheckpointPosition: targetCheckpointPosition
@@ -5502,9 +5673,13 @@ final class AssistantStore: ObservableObject {
     }
 
     func beginEditLastUserMessage(anchorID: String) async {
-        let sessionID = selectedSessionID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
-        let targetCheckpointPosition = sessionID.map { effectiveCodeTrackingState(for: $0).currentCheckpointPosition } ?? -1
-        await beginHistoryRewind(
+        guard let sessionID = selectedSessionID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+            lastStatusMessage = "Open the thread first, then try again."
+            return
+        }
+        let trackingState = effectiveCodeTrackingState(for: sessionID)
+        let targetCheckpointPosition = checkpointPositionBeforeUserAnchor(anchorID, in: trackingState)
+        await beginHistoryBranch(
             at: anchorID,
             kind: .edit,
             targetCheckpointPosition: targetCheckpointPosition
@@ -5512,139 +5687,22 @@ final class AssistantStore: ObservableObject {
     }
 
     func redoUndoneUserMessage() async {
-        await redoActiveHistoryMutation()
+        await restoreNearestHistoryBranchFutureState()
     }
 
-    func stepHistoryMutationBackward() async {
-        guard let mutation = historyMutationState,
-              mutation.isPendingComposerEdit else {
-            return
-        }
-        guard !runtime.hasActiveTurn else {
-            lastStatusMessage = "Wait for the current Codex task to finish before going back again."
-            return
-        }
-
-        let sessionID = mutation.sessionID
-        let previousDraft = promptDraft
-        let previousAttachments = attachments
-        let currentTrackingState = effectiveCodeTrackingState(for: sessionID)
-        let currentCheckpointPosition = currentTrackingState.currentCheckpointPosition
-
-        let previousTurn: CodexEditableTurn
-        do {
-            let turns = try threadRewriteService.editableTurns(sessionID: sessionID)
-            guard let lastTurn = turns.last else {
-                lastStatusMessage = "There is no earlier message to go back to."
-                return
-            }
-            previousTurn = lastTurn
-        } catch {
-            lastStatusMessage = error.localizedDescription
-            return
-        }
-
-        let targetCheckpointPosition = checkpointPositionBeforeUserAnchor(
-            previousTurn.anchorID,
-            in: currentTrackingState
-        )
-        var restoredTrackingState = currentTrackingState
-        var stepBackup: CodexRewriteBackup?
-        var rollbackSnapshot: AssistantHistoryRollbackSnapshot?
-
-        do {
-            restoredTrackingState = try await restoreTrackedCodeFilesIfNeeded(
-                sessionID: sessionID,
-                state: currentTrackingState,
-                targetCheckpointPosition: targetCheckpointPosition,
-                publishState: false
-            )
-
-            let outcome = try threadRewriteService.truncateBeforeTurn(
-                sessionID: sessionID,
-                turnAnchorID: previousTurn.anchorID
-            )
-            stepBackup = outcome.backup
-            try await ensureRuntime(for: sessionID).resumeSessionSilently(
-                runtimeResumeSessionID(forThreadID: sessionID),
-                cwd: resolvedSessionCWD(for: sessionID),
-                preferredModelID: selectedModelID
-            )
-
-            rollbackSnapshot = try await applyHistoryRewriteRollback(
-                for: sessionID,
-                retainedAnchorIDs: outcome.retainedTurns.map(\.anchorID),
-                removedAnchorIDs: outcome.removedTurns.map(\.anchorID),
-                captureSnapshot: true,
-                keepRemovedCheckpoints: true
-            )
-
-            let restoredPrompt = outcome.removedTurns.first?.text ?? previousTurn.text
-            let restoredAttachments = (outcome.removedTurns.first?.imageAttachments ?? previousTurn.imageAttachments)
-                .map(assistantAttachment(from:))
-
-            promptDraft = restoredPrompt
-            attachments = restoredAttachments
-
-            let updatedMutation = AssistantHistoryMutationState(
-                kind: mutation.kind,
-                sessionID: sessionID,
-                anchorID: previousTurn.anchorID,
-                originalAnchorID: mutation.originalAnchorID,
-                isPendingComposerEdit: true,
-                rewriteBackup: mutation.rewriteBackup,
-                previousDraft: mutation.previousDraft,
-                previousAttachments: mutation.previousAttachments,
-                restoredPrompt: restoredPrompt,
-                restoredAttachments: restoredAttachments,
-                removedAnchorIDs: outcome.removedTurns.map(\.anchorID),
-                retainedAnchorIDs: outcome.retainedTurns.map(\.anchorID),
-                originalCheckpointPosition: mutation.originalCheckpointPosition,
-                currentCheckpointPosition: restoredTrackingState.currentCheckpointPosition,
-                rollbackSnapshot: mutation.rollbackSnapshot
-            )
-
-            historyMutationState = updatedMutation
-            persistHistoryMutationState(
-                updatedMutation,
-                currentTrackingState: restoredTrackingState
-            )
-
-            await reloadAfterHistoryRewrite(for: sessionID)
-            await reconcileProjectDigest(for: sessionID)
-            refreshEditableTurns(for: sessionID)
-            if let stepBackup {
-                threadRewriteService.deleteBackup(stepBackup)
-            }
-            lastStatusMessage = "Moved back one more message. The older request is now in the text box."
-        } catch {
-            if let stepBackup {
-                try? threadRewriteService.restoreBackup(stepBackup)
-                threadRewriteService.deleteBackup(stepBackup)
-            }
-            try? await restoreHistoryRollback(for: sessionID, snapshot: rollbackSnapshot)
-            _ = try? await restoreTrackedCodeFilesIfNeeded(
-                sessionID: sessionID,
-                state: restoredTrackingState,
-                targetCheckpointPosition: currentCheckpointPosition,
-                publishState: false
-            )
-            promptDraft = previousDraft
-            attachments = previousAttachments
-            historyMutationState = mutation
-            persistHistoryMutationState(mutation, currentTrackingState: currentTrackingState)
-            await reloadAfterHistoryRewrite(for: sessionID)
-            await reconcileProjectDigest(for: sessionID)
-            refreshEditableTurns(for: sessionID)
-            lastStatusMessage = error.localizedDescription
-        }
+    func stepHistoryBranchBackward() async {
+        _ = await stepHistoryBranchBackwardOnce()
     }
 
     func cancelPendingHistoryEdit() async {
-        await redoActiveHistoryMutation()
+        await restoreNearestHistoryBranchFutureState()
     }
 
-    private func beginHistoryRewind(
+    func restoreHistoryRestoreItem(_ restoreID: String) async {
+        await restoreHistoryBranchFutureState(id: restoreID)
+    }
+
+    private func beginHistoryBranch(
         at anchorID: String,
         kind: AssistantHistoryMutationKind,
         targetCheckpointPosition: Int
@@ -5655,12 +5713,17 @@ final class AssistantStore: ObservableObject {
             lastStatusMessage = "Open the thread first, then try again."
             return
         }
-        guard historyMutationState == nil else {
-            lastStatusMessage = "Finish the current rewind before starting another one."
+
+        if let branch = historyBranchState,
+           sessionsMatch(branch.sessionID, sessionID) {
+            guard kind != .edit else {
+                lastStatusMessage = "Finish the current rewind before editing another message."
+                return
+            }
+            await rewindActiveHistoryBranch(to: normalizedAnchorID)
             return
         }
-        guard !runtime.hasActiveTurn else {
-            lastStatusMessage = "Wait for the current Codex task to finish before rewinding."
+        guard !isRestoringHistoryBranch else {
             return
         }
         if kind != .checkpoint {
@@ -5670,15 +5733,31 @@ final class AssistantStore: ObservableObject {
             }
         }
 
+        isRestoringHistoryBranch = true
+        defer { isRestoringHistoryBranch = false }
+
+        await abortActiveTurnIfNeeded(for: sessionID)
         let previousDraft = promptDraft
         let previousAttachments = attachments
         let originalTrackingState = effectiveCodeTrackingState(for: sessionID)
-        let originalCheckpointPosition = originalTrackingState.currentCheckpointPosition
         var restoredTrackingState = originalTrackingState
         var rewriteBackup: CodexRewriteBackup?
-        var rollbackSnapshot: AssistantHistoryRollbackSnapshot?
+        var headFutureState: AssistantHistoryFutureState?
 
         do {
+            let turns = try threadRewriteService.editableTurns(sessionID: sessionID)
+            guard let targetTurn = turns.first(where: { $0.anchorID == normalizedAnchorID }) else {
+                throw CodexThreadRewriteError.turnNotFound(normalizedAnchorID)
+            }
+            headFutureState = try await captureHistoryFutureState(
+                sessionID: sessionID,
+                restoreTurn: targetTurn,
+                checkpointPosition: originalTrackingState.currentCheckpointPosition,
+                currentAnchorIDAfterRestore: nil,
+                composerPrompt: previousDraft,
+                composerAttachments: previousAttachments
+            )
+
             restoredTrackingState = try await restoreTrackedCodeFilesIfNeeded(
                 sessionID: sessionID,
                 state: originalTrackingState,
@@ -5697,11 +5776,11 @@ final class AssistantStore: ObservableObject {
                 preferredModelID: selectedModelID
             )
 
-            rollbackSnapshot = try await applyHistoryRewriteRollback(
+            _ = try await applyHistoryRewriteRollback(
                 for: sessionID,
                 retainedAnchorIDs: outcome.retainedTurns.map(\.anchorID),
                 removedAnchorIDs: outcome.removedTurns.map(\.anchorID),
-                captureSnapshot: true,
+                captureSnapshot: false,
                 keepRemovedCheckpoints: true
             )
 
@@ -5711,33 +5790,28 @@ final class AssistantStore: ObservableObject {
             promptDraft = restoredPrompt
             attachments = restoredAttachments
 
-            let mutation = AssistantHistoryMutationState(
+            let branchState = AssistantHistoryBranchState(
                 kind: kind,
                 sessionID: sessionID,
-                anchorID: normalizedAnchorID,
-                originalAnchorID: normalizedAnchorID,
-                isPendingComposerEdit: true,
-                rewriteBackup: outcome.backup,
-                previousDraft: previousDraft,
-                previousAttachments: previousAttachments,
-                restoredPrompt: restoredPrompt,
-                restoredAttachments: restoredAttachments,
-                removedAnchorIDs: outcome.removedTurns.map(\.anchorID),
-                retainedAnchorIDs: outcome.retainedTurns.map(\.anchorID),
-                originalCheckpointPosition: originalCheckpointPosition,
+                currentAnchorID: normalizedAnchorID,
                 currentCheckpointPosition: restoredTrackingState.currentCheckpointPosition,
-                rollbackSnapshot: rollbackSnapshot
+                currentPrompt: restoredPrompt,
+                currentAttachments: restoredAttachments,
+                futureStates: headFutureState.map { [$0] } ?? []
             )
 
-            historyMutationState = mutation
-            persistHistoryMutationState(
-                mutation,
+            historyBranchState = branchState
+            persistHistoryBranchState(
+                branchState,
                 currentTrackingState: restoredTrackingState
             )
 
             await reloadAfterHistoryRewrite(for: sessionID)
             await reconcileProjectDigest(for: sessionID)
             refreshEditableTurns(for: sessionID)
+            if let rewriteBackup {
+                threadRewriteService.deleteBackup(rewriteBackup)
+            }
             switch kind {
             case .checkpoint:
                 lastStatusMessage = "Code undone. The old request is back in the text box so you can edit it."
@@ -5751,17 +5825,20 @@ final class AssistantStore: ObservableObject {
                 try? threadRewriteService.restoreBackup(rewriteBackup)
                 threadRewriteService.deleteBackup(rewriteBackup)
             }
-            try? await restoreHistoryRollback(for: sessionID, snapshot: rollbackSnapshot)
+            if let headFutureState {
+                try? await restoreHistorySnapshot(sessionID: sessionID, snapshotID: headFutureState.snapshotID)
+                deleteHistorySnapshots(sessionID: sessionID, snapshotIDs: [headFutureState.snapshotID])
+            }
             _ = try? await restoreTrackedCodeFilesIfNeeded(
                 sessionID: sessionID,
                 state: restoredTrackingState,
-                targetCheckpointPosition: originalCheckpointPosition,
+                targetCheckpointPosition: originalTrackingState.currentCheckpointPosition,
                 publishState: false
             )
             promptDraft = previousDraft
             attachments = previousAttachments
-            historyMutationState = nil
-            clearPersistedHistoryMutationState(for: sessionID, currentTrackingState: originalTrackingState)
+            historyBranchState = nil
+            clearPersistedHistoryBranchState(for: sessionID, currentTrackingState: originalTrackingState)
             refreshEditableTurns(for: sessionID)
             await reloadAfterHistoryRewrite(for: sessionID)
             await reconcileProjectDigest(for: sessionID)
@@ -5769,50 +5846,325 @@ final class AssistantStore: ObservableObject {
         }
     }
 
-    private func redoActiveHistoryMutation() async {
-        guard let mutation = historyMutationState,
-              mutation.isPendingComposerEdit else {
-            return
+    private func rewindActiveHistoryBranch(to anchorID: String) async {
+        while let branch = historyBranchState,
+              sessionsMatch(branch.sessionID, selectedSessionID),
+              branch.currentAnchorID != anchorID {
+            let stepped = await stepHistoryBranchBackwardOnce()
+            guard stepped else { return }
+        }
+    }
+
+    @discardableResult
+    private func stepHistoryBranchBackwardOnce() async -> Bool {
+        guard let branch = historyBranchState else {
+            return false
+        }
+        guard !isRestoringHistoryBranch else {
+            return false
         }
 
-        let sessionID = mutation.sessionID
-        let startingTrackingState = effectiveCodeTrackingState(for: sessionID)
-        var restoredTrackingState = startingTrackingState
+        let sessionID = branch.sessionID
+        let previousDraft = promptDraft
+        let previousAttachments = attachments
+        let currentTrackingState = effectiveCodeTrackingState(for: sessionID)
+        let currentCheckpointPosition = currentTrackingState.currentCheckpointPosition
+
+        let previousTurn: CodexEditableTurn
+        do {
+            let turns = try threadRewriteService.editableTurns(sessionID: sessionID)
+            guard let lastTurn = turns.last else {
+                lastStatusMessage = "There is no earlier message to go back to."
+                return false
+            }
+            previousTurn = lastTurn
+        } catch {
+            lastStatusMessage = error.localizedDescription
+            return false
+        }
+
+        isRestoringHistoryBranch = true
+        defer { isRestoringHistoryBranch = false }
+
+        await abortActiveTurnIfNeeded(for: sessionID)
+        var restoredTrackingState = currentTrackingState
+        var stepBackup: CodexRewriteBackup?
+        var currentFutureState: AssistantHistoryFutureState?
 
         do {
+            currentFutureState = try await captureCurrentHistoryFutureState(
+                sessionID: sessionID,
+                branch: branch,
+                checkpointPosition: currentTrackingState.currentCheckpointPosition
+            )
+
+            let targetCheckpointPosition = checkpointPositionBeforeUserAnchor(
+                previousTurn.anchorID,
+                in: currentTrackingState
+            )
             restoredTrackingState = try await restoreTrackedCodeFilesIfNeeded(
                 sessionID: sessionID,
-                state: startingTrackingState,
-                targetCheckpointPosition: mutation.originalCheckpointPosition,
+                state: currentTrackingState,
+                targetCheckpointPosition: targetCheckpointPosition,
                 publishState: false
             )
 
-            if let backup = mutation.rewriteBackup {
-                try threadRewriteService.restoreBackup(backup)
-            }
-            try await restoreHistoryRollback(
-                for: sessionID,
-                snapshot: mutation.rollbackSnapshot
+            let outcome = try threadRewriteService.truncateBeforeTurn(
+                sessionID: sessionID,
+                turnAnchorID: previousTurn.anchorID
+            )
+            stepBackup = outcome.backup
+            try await ensureRuntime(for: sessionID).resumeSessionSilently(
+                runtimeResumeSessionID(forThreadID: sessionID),
+                cwd: resolvedSessionCWD(for: sessionID),
+                preferredModelID: selectedModelID
             )
 
-            promptDraft = mutation.previousDraft
-            attachments = mutation.previousAttachments
-            historyMutationState = nil
-            clearPersistedHistoryMutationState(
+            _ = try await applyHistoryRewriteRollback(
                 for: sessionID,
+                retainedAnchorIDs: outcome.retainedTurns.map(\.anchorID),
+                removedAnchorIDs: outcome.removedTurns.map(\.anchorID),
+                captureSnapshot: false,
+                keepRemovedCheckpoints: true
+            )
+
+            let restoredPrompt = outcome.removedTurns.first?.text ?? previousTurn.text
+            let restoredAttachments = (outcome.removedTurns.first?.imageAttachments ?? previousTurn.imageAttachments)
+                .map(assistantAttachment(from:))
+
+            promptDraft = restoredPrompt
+            attachments = restoredAttachments
+
+            let updatedBranch = AssistantHistoryBranchState(
+                kind: branch.kind,
+                sessionID: sessionID,
+                currentAnchorID: previousTurn.anchorID,
+                currentCheckpointPosition: restoredTrackingState.currentCheckpointPosition,
+                currentPrompt: restoredPrompt,
+                currentAttachments: restoredAttachments,
+                futureStates: ([currentFutureState].compactMap { $0 }) + branch.futureStates
+            )
+
+            historyBranchState = updatedBranch
+            persistHistoryBranchState(
+                updatedBranch,
                 currentTrackingState: restoredTrackingState
             )
+
             await reloadAfterHistoryRewrite(for: sessionID)
             await reconcileProjectDigest(for: sessionID)
-            if let backup = mutation.rewriteBackup {
-                threadRewriteService.deleteBackup(backup)
-            }
             refreshEditableTurns(for: sessionID)
-            lastStatusMessage = "Restored the original branch."
+            if let stepBackup {
+                threadRewriteService.deleteBackup(stepBackup)
+            }
+            lastStatusMessage = "Moved back one more message. The older request is now in the text box."
+            return true
         } catch {
-            historyMutationState = mutation
-            persistHistoryMutationState(mutation, currentTrackingState: startingTrackingState)
+            if let stepBackup {
+                try? threadRewriteService.restoreBackup(stepBackup)
+                threadRewriteService.deleteBackup(stepBackup)
+            }
+            if let currentFutureState {
+                try? await restoreHistorySnapshot(sessionID: sessionID, snapshotID: currentFutureState.snapshotID)
+                deleteHistorySnapshots(sessionID: sessionID, snapshotIDs: [currentFutureState.snapshotID])
+            }
+            _ = try? await restoreTrackedCodeFilesIfNeeded(
+                sessionID: sessionID,
+                state: restoredTrackingState,
+                targetCheckpointPosition: currentCheckpointPosition,
+                publishState: false
+            )
+            promptDraft = previousDraft
+            attachments = previousAttachments
+            historyBranchState = branch
+            persistHistoryBranchState(branch, currentTrackingState: currentTrackingState)
+            await reloadAfterHistoryRewrite(for: sessionID)
+            await reconcileProjectDigest(for: sessionID)
+            refreshEditableTurns(for: sessionID)
             lastStatusMessage = error.localizedDescription
+            return false
+        }
+    }
+
+    private func restoreNearestHistoryBranchFutureState() async {
+        guard let futureID = historyBranchState?.futureStates.first?.id else {
+            return
+        }
+        await restoreHistoryBranchFutureState(id: futureID)
+    }
+
+    private func restoreHistoryBranchFutureState(id futureID: String) async {
+        guard let branch = historyBranchState,
+              let restoreIndex = branch.futureStates.firstIndex(where: { $0.id == futureID }) else {
+            return
+        }
+        guard !isRestoringHistoryBranch else {
+            return
+        }
+
+        let sessionID = branch.sessionID
+        let futureState = branch.futureStates[restoreIndex]
+        let remainingFutureStates = Array(branch.futureStates.dropFirst(restoreIndex + 1))
+        let previousDraft = promptDraft
+        let previousAttachments = attachments
+        let startingTrackingState = effectiveCodeTrackingState(for: sessionID)
+        var restoredTrackingState = startingTrackingState
+        var rollbackSnapshotID: String?
+
+        isRestoringHistoryBranch = true
+        defer { isRestoringHistoryBranch = false }
+
+        await abortActiveTurnIfNeeded(for: sessionID)
+
+        do {
+            rollbackSnapshotID = try await captureHistorySnapshot(sessionID: sessionID)
+            restoredTrackingState = try await restoreTrackedCodeFilesIfNeeded(
+                sessionID: sessionID,
+                state: startingTrackingState,
+                targetCheckpointPosition: futureState.checkpointPosition,
+                publishState: false
+            )
+            try await restoreHistorySnapshot(sessionID: sessionID, snapshotID: futureState.snapshotID)
+            try await ensureRuntime(for: sessionID).resumeSessionSilently(
+                runtimeResumeSessionID(forThreadID: sessionID),
+                cwd: resolvedSessionCWD(for: sessionID),
+                preferredModelID: selectedModelID
+            )
+
+            promptDraft = futureState.composerPrompt
+            attachments = futureState.composerAttachments
+
+            let consumedSnapshotIDs = Array(branch.futureStates.prefix(restoreIndex + 1).map(\.snapshotID))
+            if let nextCurrentAnchorID = futureState.currentAnchorIDAfterRestore {
+                let updatedBranch = AssistantHistoryBranchState(
+                    kind: branch.kind,
+                    sessionID: sessionID,
+                    currentAnchorID: nextCurrentAnchorID,
+                    currentCheckpointPosition: futureState.checkpointPosition,
+                    currentPrompt: futureState.composerPrompt,
+                    currentAttachments: futureState.composerAttachments,
+                    futureStates: remainingFutureStates
+                )
+                historyBranchState = updatedBranch
+                persistHistoryBranchState(updatedBranch, currentTrackingState: restoredTrackingState)
+                lastStatusMessage = "Restored that hidden message."
+            } else {
+                historyBranchState = nil
+                clearPersistedHistoryBranchState(for: sessionID, currentTrackingState: restoredTrackingState)
+                lastStatusMessage = "Restored the original branch."
+            }
+
+            deleteHistorySnapshots(sessionID: sessionID, snapshotIDs: consumedSnapshotIDs)
+            if let rollbackSnapshotID {
+                deleteHistorySnapshots(sessionID: sessionID, snapshotIDs: [rollbackSnapshotID])
+            }
+            await reloadAfterHistoryRewrite(for: sessionID)
+            await reconcileProjectDigest(for: sessionID)
+            refreshEditableTurns(for: sessionID)
+        } catch {
+            if let rollbackSnapshotID {
+                try? await restoreHistorySnapshot(sessionID: sessionID, snapshotID: rollbackSnapshotID)
+                deleteHistorySnapshots(sessionID: sessionID, snapshotIDs: [rollbackSnapshotID])
+            }
+            _ = try? await restoreTrackedCodeFilesIfNeeded(
+                sessionID: sessionID,
+                state: restoredTrackingState,
+                targetCheckpointPosition: startingTrackingState.currentCheckpointPosition,
+                publishState: false
+            )
+            promptDraft = previousDraft
+            attachments = previousAttachments
+            historyBranchState = branch
+            persistHistoryBranchState(branch, currentTrackingState: startingTrackingState)
+            lastStatusMessage = error.localizedDescription
+        }
+    }
+
+    private func createHistorySnapshotID() -> String {
+        "history-\(UUID().uuidString.lowercased())"
+    }
+
+    private func captureHistorySnapshot(sessionID: String) async throws -> String {
+        let snapshotID = createHistorySnapshotID()
+        try await conversationCheckpointStore.captureSnapshot(
+            sessionID: sessionID,
+            checkpointID: snapshotID,
+            phase: .after
+        )
+        return snapshotID
+    }
+
+    private func restoreHistorySnapshot(sessionID: String, snapshotID: String) async throws {
+        try await conversationCheckpointStore.restoreSnapshot(
+            sessionID: sessionID,
+            checkpointID: snapshotID,
+            phase: .after
+        )
+    }
+
+    private func deleteHistorySnapshots(sessionID: String, snapshotIDs: [String]) {
+        guard !snapshotIDs.isEmpty else { return }
+        conversationCheckpointStore.deleteCheckpoints(
+            sessionID: sessionID,
+            checkpointIDs: snapshotIDs
+        )
+    }
+
+    private func historyFutureStateTitle(for turn: CodexEditableTurn) -> String {
+        let trimmed = turn.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? "Earlier message" : trimmed
+    }
+
+    private func captureHistoryFutureState(
+        sessionID: String,
+        restoreTurn: CodexEditableTurn,
+        checkpointPosition: Int,
+        currentAnchorIDAfterRestore: String?,
+        composerPrompt: String,
+        composerAttachments: [AssistantAttachment]
+    ) async throws -> AssistantHistoryFutureState {
+        let snapshotID = try await captureHistorySnapshot(sessionID: sessionID)
+        return AssistantHistoryFutureState(
+            restoreAnchorID: restoreTurn.anchorID,
+            title: historyFutureStateTitle(for: restoreTurn),
+            snapshotID: snapshotID,
+            checkpointPosition: checkpointPosition,
+            currentAnchorIDAfterRestore: currentAnchorIDAfterRestore,
+            composerPrompt: composerPrompt,
+            composerAttachments: composerAttachments
+        )
+    }
+
+    private func captureCurrentHistoryFutureState(
+        sessionID: String,
+        branch: AssistantHistoryBranchState,
+        checkpointPosition: Int
+    ) async throws -> AssistantHistoryFutureState {
+        let turns = try threadRewriteService.editableTurns(sessionID: sessionID)
+        guard let restoreTurn = turns.last else {
+            throw CodexThreadRewriteError.turnNotFound(branch.currentAnchorID)
+        }
+        return try await captureHistoryFutureState(
+            sessionID: sessionID,
+            restoreTurn: restoreTurn,
+            checkpointPosition: checkpointPosition,
+            currentAnchorIDAfterRestore: branch.currentAnchorID,
+            composerPrompt: branch.currentPrompt,
+            composerAttachments: branch.currentAttachments
+        )
+    }
+
+    private func abortActiveTurnIfNeeded(for sessionID: String) async {
+        let sessionRuntime = ensureRuntime(for: sessionID)
+        guard sessionActivitySnapshot(for: sessionID).hasActiveTurn || sessionRuntime.hasActiveTurn else {
+            return
+        }
+        await sessionRuntime.cancelActiveTurn()
+        for _ in 0..<20 {
+            if !sessionActivitySnapshot(for: sessionID).hasActiveTurn && !sessionRuntime.hasActiveTurn {
+                return
+            }
+            try? await Task.sleep(nanoseconds: 50_000_000)
         }
     }
 
@@ -6045,6 +6397,26 @@ final class AssistantStore: ObservableObject {
         }
     }
 
+    func loadThreadNote(threadID: String?) -> String {
+        guard let normalizedThreadID = normalizedSessionID(threadID) else { return "" }
+        return conversationStore.loadThreadNote(threadID: normalizedThreadID)
+    }
+
+    func threadNoteLastSavedAt(threadID: String?) -> Date? {
+        guard let normalizedThreadID = normalizedSessionID(threadID) else { return nil }
+        return conversationStore.threadNoteModificationDate(threadID: normalizedThreadID)
+    }
+
+    func saveThreadNote(threadID: String?, text: String) {
+        guard let normalizedThreadID = normalizedSessionID(threadID) else { return }
+        do {
+            try conversationStore.saveThreadNote(threadID: normalizedThreadID, text: text)
+        } catch {
+            lastStatusMessage = "Could not save the thread note."
+            CrashReporter.logError("Thread note save failed: \(error.localizedDescription)")
+        }
+    }
+
     private func purgeExpiredArchivedSessionsIfNeeded() async {
         let expiredSessionIDs = Array(
             Set(
@@ -6074,15 +6446,24 @@ final class AssistantStore: ObservableObject {
         }
     }
 
+    private func clearHistoryBranchStateForDeletedSession(_ branch: AssistantHistoryBranchState) {
+        deleteHistorySnapshots(
+            sessionID: branch.sessionID,
+            snapshotIDs: branch.futureStates.map(\.snapshotID)
+        )
+        if sessionsMatch(historyBranchState?.sessionID, branch.sessionID) {
+            historyBranchState = nil
+        }
+    }
+
     private func deleteSession(_ sessionID: String?, showStatusMessage: Bool) async {
         let normalizedSessionID = sessionID?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .nonEmpty ?? ""
         guard !normalizedSessionID.isEmpty else { return }
-        if let mutation = historyMutationState,
-           sessionsMatch(mutation.sessionID, normalizedSessionID) {
-            discardHistoryMutationBackup(mutation)
-            historyMutationState = nil
+        if let branch = historyBranchState,
+           sessionsMatch(branch.sessionID, normalizedSessionID) {
+            clearHistoryBranchStateForDeletedSession(branch)
         }
 
         do {
@@ -6176,6 +6557,7 @@ final class AssistantStore: ObservableObject {
 
         let previousProjectID = projectStore.context(forThreadID: normalizedSessionID)?.project.id
         let deleted = try sessionCatalog.deleteSessionSynchronously(sessionID: normalizedSessionID)
+        conversationStore.deleteThreadArtifacts(threadID: normalizedSessionID)
         try? threadMemoryService.clearMemory(for: normalizedSessionID)
         try? memorySuggestionService.clearSuggestions(for: normalizedSessionID)
         _ = try? projectStore.removeThreadAssignment(normalizedSessionID)
@@ -6412,10 +6794,9 @@ final class AssistantStore: ObservableObject {
             lastStatusMessage = "There are no Open Assist sessions to delete."
             return
         }
-        if let mutation = historyMutationState {
-            discardHistoryMutationBackup(mutation)
+        if let branch = historyBranchState {
+            clearHistoryBranchStateForDeletedSession(branch)
         }
-        historyMutationState = nil
 
         do {
             for sessionID in ownedSessionIDs {
@@ -8783,13 +9164,12 @@ final class AssistantStore: ObservableObject {
         return nil
     }
 
-    var canStepHistoryMutationBackward: Bool {
-        guard let mutation = historyMutationState,
-              mutation.isPendingComposerEdit else {
+    var canStepHistoryBranchBackward: Bool {
+        guard let branch = historyBranchState else {
             return false
         }
 
-        let normalizedSessionID = mutation.sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedSessionID = branch.sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !normalizedSessionID.isEmpty else { return false }
 
         if let cachedTurns = editableTurnsBySessionID[normalizedSessionID] {
@@ -8802,6 +9182,21 @@ final class AssistantStore: ObservableObject {
         }
 
         return false
+    }
+
+    var historyRestoreItems: [AssistantHistoryRestoreItem] {
+        guard let branch = historyBranchState,
+              sessionsMatch(branch.sessionID, selectedSessionID) else {
+            return []
+        }
+
+        return branch.futureStates.map {
+            AssistantHistoryRestoreItem(
+                id: $0.id,
+                anchorID: $0.restoreAnchorID,
+                title: $0.title
+            )
+        }
     }
 
     private func latestCheckpointBoundaryDate(
@@ -8860,46 +9255,47 @@ final class AssistantStore: ObservableObject {
         return checkpointIndex - 1
     }
 
-    private func persistHistoryMutationState(
-        _ mutation: AssistantHistoryMutationState,
+    private func persistHistoryBranchState(
+        _ branch: AssistantHistoryBranchState,
         currentTrackingState: AssistantCodeTrackingState? = nil
     ) {
-        var state = currentTrackingState ?? effectiveCodeTrackingState(for: mutation.sessionID)
-        state.currentCheckpointPosition = mutation.currentCheckpointPosition
-        state.rewindState = mutation
+        var state = currentTrackingState ?? effectiveCodeTrackingState(for: branch.sessionID)
+        state.currentCheckpointPosition = branch.currentCheckpointPosition
+        state.historyBranchState = branch
         publishCodeTrackingState(state)
     }
 
-    private func clearPersistedHistoryMutationState(
+    private func clearPersistedHistoryBranchState(
         for sessionID: String,
         currentTrackingState: AssistantCodeTrackingState? = nil
     ) {
         var state = currentTrackingState ?? effectiveCodeTrackingState(for: sessionID)
-        state.rewindState = nil
+        state.historyBranchState = nil
         publishCodeTrackingState(state)
     }
 
-    private func synchronizePersistedHistoryMutationState(
+    private func synchronizePersistedHistoryBranchState(
         for sessionID: String,
         state: AssistantCodeTrackingState
     ) {
         guard sessionsMatch(selectedSessionID, sessionID) else {
-            if sessionsMatch(historyMutationState?.sessionID, sessionID) {
-                historyMutationState = nil
+            if sessionsMatch(historyBranchState?.sessionID, sessionID) {
+                historyBranchState = nil
             }
             return
         }
 
-        if let rewindState = state.rewindState {
-            let shouldRestoreComposer = historyMutationState == nil
-                || !sessionsMatch(historyMutationState?.sessionID, sessionID)
-            historyMutationState = rewindState
+        if let branchState = state.historyBranchState {
+            let shouldRestoreComposer = historyBranchState == nil
+                || !sessionsMatch(historyBranchState?.sessionID, sessionID)
+                || historyBranchState != branchState
+            historyBranchState = branchState
             if shouldRestoreComposer {
-                promptDraft = rewindState.restoredPrompt
-                attachments = rewindState.restoredAttachments
+                promptDraft = branchState.currentPrompt
+                attachments = branchState.currentAttachments
             }
-        } else if sessionsMatch(historyMutationState?.sessionID, sessionID) {
-            historyMutationState = nil
+        } else if sessionsMatch(historyBranchState?.sessionID, sessionID) {
+            historyBranchState = nil
         }
     }
 
@@ -8934,8 +9330,11 @@ final class AssistantStore: ObservableObject {
         let latestEditableAnchorID = editableTurns.last?.anchorID
         let trackingState = codeTrackingStateBySessionID[sessionID] ?? selectedCodeTrackingState
         let hasPendingCheckpointRedo = hasPendingTrackedCodeRedo(for: sessionID)
-        let canMutate = !runtime.hasActiveTurn
-            && historyMutationState == nil
+        let branchActive = sessionsMatch(historyBranchState?.sessionID, sessionID)
+        let canUndoMutate = !isRestoringHistoryBranch
+            && (!hasPendingCheckpointRedo || branchActive)
+        let canEditMutate = !isRestoringHistoryBranch
+            && !branchActive
             && !hasPendingCheckpointRedo
         let shouldConsiderCheckpointUndo =
             settings.assistantTrackCodeChangesInGitRepos
@@ -8954,8 +9353,8 @@ final class AssistantStore: ObservableObject {
             } ?? false
             metadata[item.id] = AssistantHistoryActionAvailability(
                 anchorID: turn.anchorID,
-                canUndo: canMutate && !shouldPreferCheckpointUndo,
-                canEdit: canMutate
+                canUndo: canUndoMutate && !shouldPreferCheckpointUndo,
+                canEdit: canEditMutate
                     && !shouldPreferCheckpointUndo
                     && turn.supportsEdit
                     && turn.anchorID == latestEditableAnchorID
@@ -9639,20 +10038,8 @@ final class AssistantStore: ObservableObject {
             return
         }
         CrashReporter.logInfo("Tracked coding undo requested sessionID=\(sessionID)")
-        guard !runtime.hasActiveTurn else {
-            lastStatusMessage = "Wait for the current Codex task to finish before undoing code."
-            return
-        }
-        guard historyMutationState == nil else {
-            lastStatusMessage = "Finish the current undo or edit before undoing code."
-            return
-        }
         guard let state = codeTrackingStateBySessionID[sessionID] ?? selectedCodeTrackingState else {
             lastStatusMessage = "There is no earlier tracked coding checkpoint to undo to."
-            return
-        }
-        guard !state.canRedo else {
-            lastStatusMessage = "Use Redo first before undoing another coding checkpoint."
             return
         }
         guard state.canUndo,
@@ -9664,7 +10051,7 @@ final class AssistantStore: ObservableObject {
         let checkpoint = state.checkpoints[state.currentCheckpointPosition]
         do {
             let anchorID = try resolveHistoryRewindAnchorID(for: checkpoint, sessionID: sessionID)
-            await beginHistoryRewind(
+            await beginHistoryBranch(
                 at: anchorID,
                 kind: .checkpoint,
                 targetCheckpointPosition: state.currentCheckpointPosition - 1
@@ -9675,166 +10062,44 @@ final class AssistantStore: ObservableObject {
     }
 
     func redoTrackedCodeCheckpoint() async {
-        if let mutation = historyMutationState,
-           mutation.isPendingComposerEdit {
-            await redoActiveHistoryMutation()
+        if let branch = historyBranchState,
+           sessionsMatch(branch.sessionID, selectedSessionID) {
+            await restoreNearestHistoryBranchFutureState()
             return
         }
 
-        guard let sessionID = selectedSessionID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+        guard selectedSessionID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty != nil else {
             lastStatusMessage = "Open the thread first, then try Redo Code."
             return
         }
-        CrashReporter.logInfo("Tracked coding redo requested sessionID=\(sessionID)")
-        guard !runtime.hasActiveTurn else {
-            lastStatusMessage = "Wait for the current Codex task to finish before redoing code."
-            return
-        }
-        if let persistedRewind = (codeTrackingStateBySessionID[sessionID] ?? selectedCodeTrackingState)?.rewindState,
-           persistedRewind.isPendingComposerEdit {
-            historyMutationState = persistedRewind
-            await redoActiveHistoryMutation()
-            return
-        }
-
-        lastStatusMessage = "Redo is available only while the current rewind is still pending."
+        lastStatusMessage = "Redo is available only while a rewind is still open."
     }
 
-    private func restoreTrackedCodeCheckpoint(
-        sessionID: String,
-        state: AssistantCodeTrackingState,
-        sourceCheckpoint: AssistantCodeCheckpointSummary,
-        sourcePhase: AssistantCodeCheckpointPhase,
-        restoreCheckpoint: AssistantCodeCheckpointSummary,
-        targetPhase: AssistantCodeCheckpointPhase,
-        resultingCheckpointPosition: Int
-    ) async {
-        guard let repoRootPath = state.repoRootPath,
-              let repoLabel = state.repoLabel else {
-            lastStatusMessage = "Tracked coding is unavailable because this thread is not inside a Git repository."
+    func restoreTrackedCodeCheckpoint(checkpointID: String) async {
+        guard let sessionID = selectedSessionID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+            lastStatusMessage = "Open the thread first, then try Restore."
+            return
+        }
+        guard let branch = historyBranchState,
+              sessionsMatch(branch.sessionID, sessionID) else {
+            lastStatusMessage = "Restore is available only while a rewind is still open."
+            return
+        }
+        guard let state = codeTrackingStateBySessionID[sessionID] ?? selectedCodeTrackingState,
+              let checkpointIndex = state.checkpoints.firstIndex(where: { $0.id == checkpointID }) else {
+            lastStatusMessage = "Open Assist could not find that saved checkpoint."
+            return
+        }
+        guard checkpointIndex > state.currentCheckpointPosition else {
+            lastStatusMessage = "That checkpoint is already visible."
+            return
+        }
+        guard let futureState = branch.futureStates.first(where: { $0.checkpointPosition == checkpointIndex }) else {
+            lastStatusMessage = "Open Assist could not find the hidden restore point for that checkpoint."
             return
         }
 
-        let repository = GitCheckpointRepositoryContext(
-            rootPath: repoRootPath,
-            label: repoLabel
-        )
-
-        let sourceSnapshot = sourcePhase == .before
-            ? sourceCheckpoint.beforeSnapshot
-            : sourceCheckpoint.afterSnapshot
-        let guardResult: AssistantCodeRestoreGuardResult
-        do {
-            guardResult = try await gitCheckpointService.restoreGuard(
-                repository: repository,
-                expectedWorktreeTree: sourceSnapshot.worktreeTree,
-                expectedIndexTree: sourceSnapshot.indexTree
-            )
-        } catch {
-            lastStatusMessage = error.localizedDescription
-            return
-        }
-
-        guard guardResult.isAllowed else {
-            lastStatusMessage = guardResult.message
-                ?? "Open Assist can’t undo right now because the repository changed after the last saved checkpoint."
-            return
-        }
-
-        do {
-            CrashReporter.logInfo(
-                "Tracked coding restore started sessionID=\(sessionID) checkpointID=\(restoreCheckpoint.id) targetPhase=\(targetPhase.rawValue) resultingPosition=\(resultingCheckpointPosition)"
-            )
-            try await gitCheckpointService.restore(
-                repository: repository,
-                files: restoreCheckpoint.changedFiles,
-                target: targetPhase
-            )
-
-            try? await waitForPendingConversationCheckpointCapture(
-                sessionID: sessionID,
-                checkpointID: restoreCheckpoint.id,
-                phase: targetPhase
-            )
-
-            var conversationRestoreError: Error?
-            do {
-                try await conversationCheckpointStore.restoreSnapshot(
-                    sessionID: sessionID,
-                    checkpointID: restoreCheckpoint.id,
-                    phase: targetPhase
-                )
-            } catch {
-                conversationRestoreError = error
-                CrashReporter.logWarning(
-                    "Tracked coding conversation restore skipped sessionID=\(sessionID) checkpointID=\(restoreCheckpoint.id) phase=\(targetPhase.rawValue) error=\(error.localizedDescription)"
-                )
-            }
-
-            var runtimeResumeError: Error?
-            do {
-                try await ensureRuntime(for: sessionID).resumeSessionSilently(
-                    runtimeResumeSessionID(forThreadID: sessionID),
-                    cwd: resolvedSessionCWD(for: sessionID),
-                    preferredModelID: selectedModelID
-                )
-            } catch {
-                runtimeResumeError = error
-                CrashReporter.logWarning(
-                    "Tracked coding runtime resume failed sessionID=\(sessionID) checkpointID=\(restoreCheckpoint.id) error=\(error.localizedDescription)"
-                )
-            }
-
-            var updatedState = state
-            updatedState.currentCheckpointPosition = resultingCheckpointPosition
-            publishCodeTrackingState(updatedState)
-
-            await reloadAfterCodeCheckpointRestore(for: sessionID)
-            Task { @MainActor [weak self] in
-                await self?.reconcileProjectDigest(for: sessionID)
-            }
-            if let conversationRestoreError {
-                let prefix = targetPhase == .before
-                    ? "The files were undone"
-                    : "The files were restored"
-                let suffix = runtimeResumeError == nil
-                    ? ""
-                    : " The session also needed a refresh."
-                lastStatusMessage = "\(prefix), but the saved chat snapshot was missing or incomplete, so the chat stayed where it was.\(suffix)"
-                CrashReporter.logWarning(
-                    "Tracked coding restore finished without chat snapshot sessionID=\(sessionID) checkpointID=\(restoreCheckpoint.id) error=\(conversationRestoreError.localizedDescription)"
-                )
-            } else if runtimeResumeError != nil {
-                lastStatusMessage = targetPhase == .before
-                    ? "Undid the last saved coding checkpoint and refreshed the files. The session needed an extra reload."
-                    : "Restored the next saved coding checkpoint and refreshed the files. The session needed an extra reload."
-            } else {
-                lastStatusMessage = targetPhase == .before
-                    ? "Undid the last saved coding checkpoint."
-                    : "Restored the next saved coding checkpoint."
-            }
-        } catch {
-            CrashReporter.logError(
-                "Tracked coding restore failed sessionID=\(sessionID) checkpointID=\(restoreCheckpoint.id) targetPhase=\(targetPhase.rawValue) error=\(error.localizedDescription)"
-            )
-            let rollbackPhase = sourcePhase
-            try? await gitCheckpointService.restore(
-                repository: repository,
-                files: sourceCheckpoint.changedFiles,
-                target: rollbackPhase
-            )
-            try? await waitForPendingConversationCheckpointCapture(
-                sessionID: sessionID,
-                checkpointID: sourceCheckpoint.id,
-                phase: rollbackPhase
-            )
-            try? await conversationCheckpointStore.restoreSnapshot(
-                sessionID: sessionID,
-                checkpointID: sourceCheckpoint.id,
-                phase: rollbackPhase
-            )
-            lastStatusMessage = error.localizedDescription
-        }
+        await restoreHistoryBranchFutureState(id: futureState.id)
     }
 
     private func trackedCodeTurnStatus(
@@ -9871,7 +10136,7 @@ final class AssistantStore: ObservableObject {
             "Tracked coding publish state sessionID=\(state.sessionID) checkpoints=\(state.checkpoints.count) currentPosition=\(state.currentCheckpointPosition) selectedMatch=\(sessionsMatch(selectedSessionID, state.sessionID))"
         )
         codeTrackingStateBySessionID[state.sessionID] = state
-        if !state.checkpoints.isEmpty || state.repoRootPath != nil || state.rewindState != nil {
+        if !state.checkpoints.isEmpty || state.repoRootPath != nil || state.historyBranchState != nil {
             do {
                 try conversationCheckpointStore.saveTrackingState(state)
             } catch {
@@ -9879,6 +10144,8 @@ final class AssistantStore: ObservableObject {
                     "Tracked coding state save failed sessionID=\(state.sessionID) error=\(error.localizedDescription)"
                 )
             }
+        } else {
+            conversationCheckpointStore.deleteTrackingState(for: state.sessionID)
         }
         if !state.checkpoints.isEmpty {
             pendingCodeCheckpointRecoveryRetryTasksBySessionID[state.sessionID]?.cancel()
@@ -9888,7 +10155,7 @@ final class AssistantStore: ObservableObject {
         if sessionsMatch(selectedSessionID, state.sessionID) {
             selectedCodeTrackingState = state
             synchronizeTrackedCodeReviewPanel(with: state)
-            synchronizePersistedHistoryMutationState(for: state.sessionID, state: state)
+            synchronizePersistedHistoryBranchState(for: state.sessionID, state: state)
         }
     }
 
@@ -10317,45 +10584,38 @@ final class AssistantStore: ObservableObject {
     }
 
     private func commitPendingHistoryEditIfNeeded(for sessionID: String) async {
-        guard let mutation = historyMutationState,
-              mutation.isPendingComposerEdit,
-              sessionsMatch(mutation.sessionID, sessionID) else {
+        guard let branch = historyBranchState,
+              sessionsMatch(branch.sessionID, sessionID) else {
             return
         }
 
+        let visibleAnchorIDs = (try? threadRewriteService.editableTurns(sessionID: branch.sessionID).map(\.anchorID)) ?? []
         try? threadMemoryService.deleteCheckpoints(
-            for: mutation.sessionID,
-            retaining: Set(mutation.retainedAnchorIDs)
+            for: branch.sessionID,
+            retaining: Set(visibleAnchorIDs)
         )
 
-        let startingTrackingState = effectiveCodeTrackingState(for: mutation.sessionID)
+        let startingTrackingState = effectiveCodeTrackingState(for: branch.sessionID)
         if let repoRootPath = startingTrackingState.repoRootPath {
             var updatedTrackingState = await truncatingFutureTrackedCodeCheckpointsIfNeeded(
                 startingTrackingState,
                 repositoryRootPath: repoRootPath
             )
-            updatedTrackingState.rewindState = nil
+            updatedTrackingState.historyBranchState = nil
             publishCodeTrackingState(updatedTrackingState)
         } else {
-            clearPersistedHistoryMutationState(
-                for: mutation.sessionID,
+            clearPersistedHistoryBranchState(
+                for: branch.sessionID,
                 currentTrackingState: startingTrackingState
             )
         }
 
-        if let backup = mutation.rewriteBackup {
-            threadRewriteService.deleteBackup(backup)
-        }
-        historyMutationState = nil
-        refreshEditableTurns(for: mutation.sessionID)
-    }
-
-    private func discardHistoryMutationBackup(_ mutation: AssistantHistoryMutationState) {
-        if let backup = mutation.rewriteBackup {
-            threadRewriteService.deleteBackup(backup)
-        } else if mutation.kind == .edit {
-            threadRewriteService.discardPendingEditBackup(sessionID: mutation.sessionID)
-        }
+        deleteHistorySnapshots(
+            sessionID: branch.sessionID,
+            snapshotIDs: branch.futureStates.map(\.snapshotID)
+        )
+        historyBranchState = nil
+        refreshEditableTurns(for: branch.sessionID)
     }
 
     private func resolvedSessionCWD(for sessionID: String) -> String? {

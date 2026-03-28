@@ -18,13 +18,18 @@ struct AssistantComposerWebAttachment: Equatable {
     let id: String
     let filename: String
     let kind: String
+    let previewDataURL: String?
 
     func toJSON() -> [String: Any] {
-        [
+        var json: [String: Any] = [
             "id": id,
             "filename": filename,
             "kind": kind,
         ]
+        if let previewDataURL, !previewDataURL.isEmpty {
+            json["previewDataUrl"] = previewDataURL
+        }
+        return json
     }
 }
 
@@ -90,10 +95,14 @@ struct AssistantComposerWebState: Equatable {
 struct AssistantComposerWebView: NSViewRepresentable {
     let state: AssistantComposerWebState
     var accentColor: Color? = nil
+    let onHeightChange: (CGFloat) -> Void
     let onCommand: (String, [String: Any]?) -> Void
 
     func makeCoordinator() -> AssistantComposerWebCoordinator {
-        AssistantComposerWebCoordinator(onCommand: onCommand)
+        AssistantComposerWebCoordinator(
+            onCommand: onCommand,
+            onHeightChange: onHeightChange
+        )
     }
 
     func makeNSView(context: Context) -> AssistantComposerWebContainerView {
@@ -106,6 +115,8 @@ struct AssistantComposerWebView: NSViewRepresentable {
     }
 
     func updateNSView(_ container: AssistantComposerWebContainerView, context: Context) {
+        context.coordinator.onCommand = onCommand
+        context.coordinator.onHeightChange = onHeightChange
         container.coordinator = context.coordinator
         container.applyState(state)
         if let accentColor {
@@ -116,15 +127,40 @@ struct AssistantComposerWebView: NSViewRepresentable {
 
 final class AssistantComposerWebCoordinator: NSObject, WKScriptMessageHandler {
     var onCommand: (String, [String: Any]?) -> Void
+    var onHeightChange: (CGFloat) -> Void
 
-    init(onCommand: @escaping (String, [String: Any]?) -> Void) {
+    init(
+        onCommand: @escaping (String, [String: Any]?) -> Void,
+        onHeightChange: @escaping (CGFloat) -> Void
+    ) {
         self.onCommand = onCommand
+        self.onHeightChange = onHeightChange
     }
 
     func userContentController(
         _ userContentController: WKUserContentController,
         didReceive message: WKScriptMessage
     ) {
+        if message.name == "composerHeightDidChange" {
+            let heightValue: CGFloat?
+            if let number = message.body as? NSNumber {
+                heightValue = CGFloat(truncating: number)
+            } else if let value = message.body as? Double {
+                heightValue = CGFloat(value)
+            } else if let value = message.body as? CGFloat {
+                heightValue = value
+            } else {
+                heightValue = nil
+            }
+
+            guard let height = heightValue, height.isFinite else { return }
+
+            DispatchQueue.main.async { [onHeightChange] in
+                onHeightChange(height)
+            }
+            return
+        }
+
         guard message.name == "composerCommand",
             let body = message.body as? [String: Any],
             let type = body["type"] as? String
@@ -163,6 +199,7 @@ final class AssistantComposerWebContainerView: NSView {
         )
         userContentController.addUserScript(initialModeScript)
         userContentController.add(coordinator, name: "composerCommand")
+        userContentController.add(coordinator, name: "composerHeightDidChange")
 
         let webView = AssistantInteractiveWebView(frame: .zero, configuration: config)
         webView.setValue(false, forKey: "drawsBackground")

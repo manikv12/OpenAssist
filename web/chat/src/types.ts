@@ -1,6 +1,6 @@
 export interface ChatMessage {
   id: string;
-  type: "user" | "assistant" | "activity" | "activityGroup" | "system";
+  type: "user" | "assistant" | "activity" | "activityGroup" | "activitySummary" | "system";
   text?: string;
   isStreaming: boolean;
   timestamp: number; // Unix ms
@@ -11,7 +11,7 @@ export interface ChatMessage {
   canEdit?: boolean;
   rewriteAnchorID?: string;
   providerLabel?: string;
-  transitionState?: "removing";
+  transitionState?: "removing" | "entering";
 
   // Activity-specific
   activityIcon?: string;
@@ -21,6 +21,8 @@ export interface ChatMessage {
   activityStatusLabel?: string;
   detailSections?: ActivityDetailSection[];
   activityTargets?: ActivityTarget[];
+  loadActivityDetailsID?: string;
+  collapseActivityDetailsID?: string;
 
   // Activity group
   groupItems?: ActivityGroupItem[];
@@ -122,6 +124,17 @@ export interface RewindState {
   redoHostMessageID?: string;
 }
 
+export interface ThreadNoteState {
+  threadId: string | null;
+  text: string;
+  isOpen: boolean;
+  hasNote: boolean;
+  isSaving: boolean;
+  lastSavedAtLabel?: string | null;
+  canEdit: boolean;
+  placeholder: string;
+}
+
 export interface ScrollState {
   isPinned: boolean;
   isScrolledUp: boolean;
@@ -201,6 +214,7 @@ export interface AssistantComposerAttachment {
   id: string;
   filename: string;
   kind: "file" | "image";
+  previewDataUrl?: string;
 }
 
 export interface AssistantComposerSkill {

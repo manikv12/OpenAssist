@@ -105,6 +105,35 @@ final class CodexInstallSupportTests: XCTestCase {
             "https://docs.github.com/copilot/concepts/agents/about-copilot-cli"
         )
     }
+
+    func testInspectShowsClaudeCodeGuidanceWhenClaudeCodeIsInstalled() async {
+        let support = CodexInstallSupport(
+            runner: WhichCommandRunner(
+                locations: [
+                    "claude": "/opt/homebrew/bin/claude"
+                ]
+            ),
+            searchPathsOverride: [],
+            allowShellLookup: false
+        )
+
+        let guidance = await support.inspect(backend: .claudeCode)
+
+        XCTAssertEqual(guidance.backend, .claudeCode)
+        XCTAssertTrue(guidance.codexDetected)
+        XCTAssertEqual(guidance.codexPath, "/opt/homebrew/bin/claude")
+        XCTAssertEqual(guidance.primaryTitle, "Claude Code is installed")
+        XCTAssertEqual(
+            guidance.primaryDetail,
+            "Claude Code CLI is available on this Mac. Open Assist can run Claude Code in headless mode, reuse Claude sessions between turns, and show replies back in the assistant timeline."
+        )
+        XCTAssertEqual(guidance.installCommands, ["npm install -g @anthropic-ai/claude-code"])
+        XCTAssertEqual(guidance.loginCommands, ["claude auth login"])
+        XCTAssertEqual(
+            guidance.docsURL?.absoluteString,
+            "https://code.claude.com/docs/en/headless"
+        )
+    }
 }
 
 private struct WhichCommandRunner: CommandRunning {

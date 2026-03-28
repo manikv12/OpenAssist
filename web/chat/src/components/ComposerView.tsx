@@ -11,7 +11,26 @@ const MAX_TEXTAREA_HEIGHT = 132;
 
 export function ComposerView({ state, onDispatchCommand }: ComposerViewProps) {
   const [draft, setDraft] = useState(state?.draftText ?? "");
+  const [isDropTarget, setIsDropTarget] = useState(false);
+  const composerRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const lastReportedHeightRef = useRef(0);
+
+  const reportComposerHeight = () => {
+    const composer = composerRef.current;
+    if (!composer) return;
+
+    const nextHeight = Math.ceil(composer.getBoundingClientRect().height);
+    if (Math.abs(nextHeight - lastReportedHeightRef.current) < 1) {
+      return;
+    }
+
+    lastReportedHeightRef.current = nextHeight;
+
+    try {
+      window.webkit?.messageHandlers?.composerHeightDidChange?.postMessage(nextHeight);
+    } catch {}
+  };
 
   useEffect(() => {
     setDraft(state?.draftText ?? "");
@@ -24,9 +43,42 @@ export function ComposerView({ state, onDispatchCommand }: ComposerViewProps) {
     textarea.style.height = `${Math.min(textarea.scrollHeight, MAX_TEXTAREA_HEIGHT)}px`;
   }, [draft]);
 
+  useLayoutEffect(() => {
+    reportComposerHeight();
+  }, [draft, state]);
+
+  useEffect(() => {
+    const composer = composerRef.current;
+    if (!composer) return;
+
+    if (typeof ResizeObserver === "undefined") {
+      reportComposerHeight();
+      return;
+    }
+
+    let frame = 0;
+    const observer = new ResizeObserver(() => {
+      cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(() => {
+        reportComposerHeight();
+      });
+    });
+
+    observer.observe(composer);
+    const textarea = textareaRef.current;
+    if (textarea) {
+      observer.observe(textarea);
+    }
+
+    return () => {
+      cancelAnimationFrame(frame);
+      observer.disconnect();
+    };
+  }, [state]);
+
   if (!state) {
     return (
-      <div className="oa-react-composer">
+      <div className="oa-react-composer" ref={composerRef}>
         <div className="oa-react-composer__empty">Loading composer…</div>
       </div>
     );
@@ -42,8 +94,54 @@ export function ComposerView({ state, onDispatchCommand }: ComposerViewProps) {
     onDispatchCommand("sendPrompt");
   };
 
+  const attachFiles = async (files: FileList | File[]) => {
+    const normalizedFiles = Array.from(files).filter((file) => file.size > 0 || file.type.length > 0);
+    if (!normalizedFiles.length) {
+      return false;
+    }
+
+    const attachments = await Promise.all(
+      normalizedFiles.map(
+        (file) =>
+          new Promise<{ filename: string; dataUrl: string } | null>((resolve) => {
+            const reader = new FileReader();
+            reader.onload = () => {
+              const dataUrl = typeof reader.result === "string" ? reader.result : null;
+              if (!dataUrl) {
+                resolve(null);
+                return;
+              }
+
+              resolve({
+                filename: file.name || "attachment",
+                dataUrl,
+              });
+            };
+            reader.onerror = () => resolve(null);
+            reader.readAsDataURL(file);
+          })
+      )
+    );
+
+    const readyAttachments = attachments.filter(
+      (attachment): attachment is { filename: string; dataUrl: string } => attachment !== null
+    );
+
+    if (!readyAttachments.length) {
+      return false;
+    }
+
+    onDispatchCommand("addAttachments", { attachments: readyAttachments });
+    return true;
+  };
+
+  const hasTransferFiles = (types: readonly string[] | DOMStringList | undefined) => {
+    if (!types) return false;
+    return Array.from(types).includes("Files");
+  };
+
   return (
-    <div className="oa-react-composer">
+    <div className="oa-react-composer" ref={composerRef}>
       {state.activeSkills.length ? (
         <div className="oa-react-composer__chip-row">
           {state.activeSkills.map((skill) => (
@@ -78,16 +176,56 @@ export function ComposerView({ state, onDispatchCommand }: ComposerViewProps) {
                 onDispatchCommand("removeAttachment", { attachmentId: attachment.id })
               }
             >
-              <span>{attachment.filename}</span>
-              <span className="oa-react-composer__chip-meta">
-                {(attachment.kind === "image" ? "Image" : "File") + " · Remove"}
+              {attachment.kind === "image" && attachment.previewDataUrl ? (
+                <img
+                  src={attachment.previewDataUrl}
+                  alt={attachment.filename}
+                  className="oa-react-composer__chip-preview"
+                />
+              ) : (
+                <span className="oa-react-composer__chip-icon" aria-hidden="true">
+                  <AppIcon symbol="doc.text" size={14} strokeWidth={2} />
+                </span>
+              )}
+              <span className="oa-react-composer__chip-copy">
+                <span className="oa-react-composer__chip-title">{attachment.filename}</span>
+                <span className="oa-react-composer__chip-meta">
+                  {(attachment.kind === "image" ? "Image" : "File") + " · Remove"}
+                </span>
               </span>
             </button>
           ))}
         </div>
       ) : null}
 
-      <div className="oa-react-composer__surface">
+      <div
+        className={`oa-react-composer__surface${isDropTarget ? " is-drop-target" : ""}`}
+        onDragEnter={(event) => {
+          if (!hasTransferFiles(event.dataTransfer?.types)) return;
+          event.preventDefault();
+          setIsDropTarget(true);
+        }}
+        onDragOver={(event) => {
+          if (!hasTransferFiles(event.dataTransfer?.types)) return;
+          event.preventDefault();
+          event.dataTransfer.dropEffect = "copy";
+          if (!isDropTarget) {
+            setIsDropTarget(true);
+          }
+        }}
+        onDragLeave={(event) => {
+          if (event.currentTarget.contains(event.relatedTarget as Node | null)) {
+            return;
+          }
+          setIsDropTarget(false);
+        }}
+        onDrop={(event) => {
+          if (!event.dataTransfer?.files?.length) return;
+          event.preventDefault();
+          setIsDropTarget(false);
+          void attachFiles(event.dataTransfer.files);
+        }}
+      >
         <textarea
           ref={textareaRef}
           className="oa-react-composer__textarea"
@@ -95,6 +233,24 @@ export function ComposerView({ state, onDispatchCommand }: ComposerViewProps) {
           disabled={!state.isEnabled}
           placeholder={state.placeholder}
           onChange={(event) => updateDraft(event.target.value)}
+          onPaste={(event) => {
+            if (!event.clipboardData) return;
+            if (!event.clipboardData.files.length && !hasTransferFiles(event.clipboardData.types)) {
+              return;
+            }
+
+            const items = Array.from(event.clipboardData.items || []);
+            const files = items
+              .filter((item) => item.kind === "file")
+              .map((item) => item.getAsFile())
+              .filter((file): file is File => file !== null);
+            const attachmentFiles = files.length ? files : Array.from(event.clipboardData.files);
+
+            if (!attachmentFiles.length) return;
+
+            event.preventDefault();
+            void attachFiles(attachmentFiles);
+          }}
           onKeyDown={(event) => {
             if (event.key === "Enter" && !event.shiftKey) {
               event.preventDefault();
