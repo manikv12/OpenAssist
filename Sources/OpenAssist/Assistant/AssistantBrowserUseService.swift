@@ -301,7 +301,7 @@ actor AssistantBrowserUseService {
                     summary: """
                     Browser Use can open sites, activate the browser, and read the current tab. This request needs live clicking or typing.
                     """,
-                    detail: "Only fall back to `computer_use` if the task truly depends on the visible page or browser UI and cannot be completed with normal browser navigation in the same signed-in window. If the site needs a manual sign-in first, pause and let the user log in before continuing.",
+                    detail: "Try `ui_inspect`, `ui_click`, `ui_type`, or `ui_press_key` first when the visible browser UI is exposed through macOS Accessibility. Only fall back to `computer_use` when the task truly depends on visible pixels in the same signed-in browser window. If the site needs a manual sign-in first, pause and let the user log in before continuing.",
                     success: false
                 )
             }

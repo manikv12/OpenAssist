@@ -3,6 +3,7 @@ import { ChatView } from "./components/ChatView";
 import { ComposerView } from "./components/ComposerView";
 import { FindBar } from "./components/FindBar";
 import { SidebarView } from "./components/SidebarView";
+import { ThreadNoteDrawer } from "./components/ThreadNoteDrawer";
 import { useTextSelection } from "./hooks/useTextSelection";
 import type {
   AssistantComposerState,
@@ -13,10 +14,13 @@ import type {
   ProviderTone,
   RewindState,
   RuntimePanelState,
+  ThreadNoteState,
   TypingState,
 } from "./types";
 
-const HISTORY_TRUNCATE_TRANSITION_MS = 180;
+const HISTORY_TRUNCATE_TRANSITION_MS = 110;
+const SESSION_SWAP_ENTER_TAIL_COUNT = 4;
+const SESSION_SWAP_ANIMATION_MESSAGE_LIMIT = 24;
 type AppViewMode = "chat" | "sidebar" | "composer";
 
 function normalizeViewMode(mode?: string | null): AppViewMode {
@@ -68,7 +72,7 @@ function buildTruncationTransition(
   previous: ChatMessage[],
   next: ChatMessage[]
 ): ChatMessage[] | null {
-  if (next.length >= previous.length) {
+  if (next.length === 0 || next.length >= previous.length) {
     return null;
   }
 
@@ -87,6 +91,62 @@ function buildTruncationTransition(
   }
 
   return [...next.map(clearMessageTransitionState), ...removedTail];
+}
+
+function buildExpansionTransition(
+  previous: ChatMessage[],
+  next: ChatMessage[]
+): ChatMessage[] | null {
+  if (previous.length === 0 || next.length <= previous.length) {
+    return null;
+  }
+
+  const keepsPrefix = previous.every((message, index) => next[index]?.id === message.id);
+  if (!keepsPrefix) {
+    return null;
+  }
+
+  const addedTail = next.slice(previous.length).map((message) => ({
+    ...clearMessageTransitionState(message),
+    transitionState: "entering" as const,
+  }));
+
+  if (addedTail.length === 0) {
+    return null;
+  }
+
+  return [...previous.map(clearMessageTransitionState), ...addedTail];
+}
+
+function buildSessionSwapTransition(
+  previous: ChatMessage[],
+  next: ChatMessage[]
+): ChatMessage[] | null {
+  if (next.length === 0) {
+    return null;
+  }
+
+  if (previous.length > 0) {
+    const nextIDs = new Set(next.map((message) => message.id));
+    const sharesMessages = previous.some((message) => nextIDs.has(message.id));
+    if (sharesMessages) {
+      return null;
+    }
+  }
+
+  if (next.length > SESSION_SWAP_ANIMATION_MESSAGE_LIMIT) {
+    return next.map(clearMessageTransitionState);
+  }
+
+  const enteringStartIndex = Math.max(0, next.length - SESSION_SWAP_ENTER_TAIL_COUNT);
+  return next.map((message, index) =>
+    index < enteringStartIndex
+      ? clearMessageTransitionState(message)
+      : {
+          ...clearMessageTransitionState(message),
+          transitionState: "entering" as const,
+        }
+  );
 }
 
 function resolveCheckpointMessageIndex(
@@ -176,6 +236,7 @@ export function App() {
     null
   );
   const [rewindState, setRewindState] = useState<RewindState | null>(null);
+  const [threadNoteState, setThreadNoteState] = useState<ThreadNoteState | null>(null);
   const [textScale, setTextScaleState] = useState(1.0);
   const [isPinnedToBottom, setIsPinnedToBottom] = useState(true);
   const [canLoadOlder, setCanLoadOlder] = useState(false);
@@ -185,6 +246,7 @@ export function App() {
   }, [runtimePanel]);
   const [findVisible, setFindVisible] = useState(false);
   const pendingTruncationTimeoutRef = useRef<number | null>(null);
+  const pendingEnterAnimationFrameRef = useRef<number | null>(null);
   const chatViewRef = useRef<{
     scrollToBottom: (animated: boolean) => void;
     revealMessage: (
@@ -244,6 +306,18 @@ export function App() {
         window.webkit?.messageHandlers?.composerCommand?.postMessage({
           type,
           payload: payload ?? null,
+        });
+      } catch {}
+    },
+    []
+  );
+
+  const handleThreadNoteCommand = useCallback(
+    (type: string, payload?: Record<string, unknown>) => {
+      try {
+        window.webkit?.messageHandlers?.threadNoteCommand?.postMessage({
+          type,
+          ...(payload ?? {}),
         });
       } catch {}
     },
@@ -398,11 +472,26 @@ export function App() {
 
   // Expose bridge API to Swift
   useEffect(() => {
-    const clearPendingTruncationTransition = () => {
+    const clearPendingMessageTransitions = () => {
       if (pendingTruncationTimeoutRef.current !== null) {
         window.clearTimeout(pendingTruncationTimeoutRef.current);
         pendingTruncationTimeoutRef.current = null;
       }
+      if (pendingEnterAnimationFrameRef.current !== null) {
+        window.cancelAnimationFrame(pendingEnterAnimationFrameRef.current);
+        pendingEnterAnimationFrameRef.current = null;
+      }
+    };
+
+    const settleEnteringMessages = (messages: ChatMessage[]) => {
+      pendingEnterAnimationFrameRef.current = window.requestAnimationFrame(() => {
+        pendingEnterAnimationFrameRef.current = window.requestAnimationFrame(() => {
+          startTransition(() => {
+            setMessages(messages);
+          });
+          pendingEnterAnimationFrameRef.current = null;
+        });
+      });
     };
 
     const bridge = {
@@ -410,34 +499,37 @@ export function App() {
         const deduped = dedupeMessages(msgs);
         const applyUpdate = () =>
           setMessages((prev) => {
-            clearPendingTruncationTransition();
+            clearPendingMessageTransitions();
 
             const stablePrevious = stableMessages(prev);
             const truncationTransition = buildTruncationTransition(
               stablePrevious,
               deduped
             );
+            const enteringTransition =
+              buildExpansionTransition(stablePrevious, deduped) ??
+              buildSessionSwapTransition(stablePrevious, deduped);
 
-            if (!truncationTransition) {
-              return deduped;
+            if (truncationTransition) {
+              pendingTruncationTimeoutRef.current = window.setTimeout(() => {
+                startTransition(() => {
+                  setMessages(deduped);
+                });
+                pendingTruncationTimeoutRef.current = null;
+              }, HISTORY_TRUNCATE_TRANSITION_MS);
+
+              return truncationTransition;
             }
 
-            pendingTruncationTimeoutRef.current = window.setTimeout(() => {
-              startTransition(() => {
-                setMessages(deduped);
-              });
-              pendingTruncationTimeoutRef.current = null;
-            }, HISTORY_TRUNCATE_TRANSITION_MS);
+            if (enteringTransition) {
+              settleEnteringMessages(deduped);
+              return enteringTransition;
+            }
 
-            return truncationTransition;
+            return deduped;
           });
 
-        if (deduped[deduped.length - 1]?.isStreaming) {
-          startTransition(applyUpdate);
-          return;
-        }
-
-        applyUpdate();
+        startTransition(applyUpdate);
       },
 
       updateLastMessage: (
@@ -445,7 +537,7 @@ export function App() {
         text: string,
         isStreaming: boolean
       ) => {
-        clearPendingTruncationTransition();
+        clearPendingMessageTransitions();
         startTransition(() => {
           setMessages((prev) => {
             const stablePrevious = stableMessages(prev);
@@ -465,7 +557,7 @@ export function App() {
       },
 
       appendMessage: (msg: ChatMessage) => {
-        clearPendingTruncationTransition();
+        clearPendingMessageTransitions();
         setMessages((prev) => [...stableMessages(prev), clearMessageTransitionState(msg)]);
       },
 
@@ -496,6 +588,10 @@ export function App() {
 
       setRewindState: (next: RewindState | null) => {
         setRewindState(next);
+      },
+
+      setThreadNoteState: (next: ThreadNoteState | null) => {
+        setThreadNoteState(next);
       },
 
       scrollToBottom: (animated: boolean) => {
@@ -544,7 +640,7 @@ export function App() {
     } catch {}
 
     return () => {
-      clearPendingTruncationTransition();
+      clearPendingMessageTransitions();
       delete (window as any).chatBridge;
     };
   }, []);
@@ -564,20 +660,34 @@ export function App() {
   return (
     <>
       <FindBar visible={findVisible} onClose={() => setFindVisible(false)} />
-      <ChatView
-        ref={chatViewRef}
-        messages={visibleMessages}
-        typing={typing}
-        activeProviderTone={activeProviderTone}
-        checkpointsByMessageID={checkpointsByMessageID}
-        rewindState={rewindState}
-        textScale={textScale}
-        isPinnedToBottom={isPinnedToBottom}
-        canLoadOlder={canLoadOlder}
-        onScrollState={handleScrollState}
-        onLoadOlder={handleLoadOlder}
-        onJumpToLatest={handleJumpToLatest}
-      />
+      <div
+        className={[
+          "chat-stage",
+          threadNoteState?.isOpen ? "has-thread-note-open" : "",
+        ]
+          .filter(Boolean)
+          .join(" ")}
+      >
+        <ChatView
+          ref={chatViewRef}
+          messages={visibleMessages}
+          typing={typing}
+          activeProviderTone={activeProviderTone}
+          checkpointsByMessageID={checkpointsByMessageID}
+          rewindState={rewindState}
+          textScale={textScale}
+          isPinnedToBottom={isPinnedToBottom}
+          canLoadOlder={canLoadOlder}
+          onScrollState={handleScrollState}
+          onLoadOlder={handleLoadOlder}
+          onJumpToLatest={handleJumpToLatest}
+        />
+
+        <ThreadNoteDrawer
+          state={threadNoteState}
+          onDispatchCommand={handleThreadNoteCommand}
+        />
+      </div>
     </>
   );
 }
@@ -595,8 +705,11 @@ declare global {
         composerCommand?: {
           postMessage: (payload: { type: string; payload?: Record<string, unknown> | null }) => void;
         };
+        composerHeightDidChange?: { postMessage: (height: number) => void };
         scrollState?: { postMessage: (v: any) => void };
         loadOlderHistory?: { postMessage: (v: boolean) => void };
+        loadActivityDetails?: { postMessage: (renderItemID: string) => void };
+        collapseActivityDetails?: { postMessage: (renderItemID: string) => void };
         linkClicked?: { postMessage: (url: string) => void };
         copyText?: { postMessage: (text: string) => void };
         selectRuntimeBackend?: { postMessage: (backendID: string) => void };
@@ -605,6 +718,10 @@ declare global {
         editMessage?: { postMessage: (anchorID: string) => void };
         undoCodeCheckpoint?: { postMessage: (value: boolean) => void };
         redoHistoryMutation?: { postMessage: (value: boolean) => void };
+        restoreCodeCheckpoint?: { postMessage: (checkpointID: string) => void };
+        threadNoteCommand?: {
+          postMessage: (payload: Record<string, unknown>) => void;
+        };
         openImage?: {
           postMessage: (payload: { dataUrl: string; suggestedName?: string }) => void;
         };

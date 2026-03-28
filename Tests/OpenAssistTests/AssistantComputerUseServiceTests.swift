@@ -16,9 +16,13 @@ final class AssistantComputerUseServiceTests: XCTestCase {
         }
     }
 
-    func testCoordinateActionRequiresObserveFirst() async {
+    func testCoordinateActionWithoutObservationAutoCapturesFreshScreenshot() async {
+        let actionLog = LockedComputerUseActionLog()
         let service = AssistantComputerUseService(
-            helper: .shared,
+            executeActions: { actions, previousSnapshot in
+                actionLog.append(actions: actions, previousSnapshot: previousSnapshot)
+                return self.makeSnapshot(token: "observe-auto")
+            },
             frontmostAppProvider: {
                 AssistantComputerUseFrontmostAppContext(
                     bundleIdentifier: "com.example.dashboard",
@@ -38,8 +42,12 @@ final class AssistantComputerUseServiceTests: XCTestCase {
         )
 
         XCTAssertFalse(result.success)
-        XCTAssertTrue(result.summary.contains("observe action first"))
-        XCTAssertFalse(result.contentItems.contains(where: { $0.type == "inputImage" }))
+        XCTAssertTrue(result.summary.contains("captured a fresh screenshot"))
+        XCTAssertTrue(result.summary.contains("Retry the action"))
+        XCTAssertTrue(result.contentItems.contains(where: { $0.type == "inputImage" }))
+        XCTAssertEqual(actionLog.callCount, 1)
+        XCTAssertEqual(actionLog.actions[safe: 0]?.first?["type"] as? String, "observe")
+        XCTAssertNil(actionLog.previousSnapshots[safe: 0] ?? nil)
     }
 
     func testObserveThenClickReusesSessionScreenshotAndReturnsFreshImage() async {
@@ -103,7 +111,8 @@ final class AssistantComputerUseServiceTests: XCTestCase {
         )
     }
 
-    func testChangingFrontmostAppRequiresFreshObserveBeforeCoordinateAction() async {
+    func testChangingFrontmostAppAutoRefreshesObservationBeforeRetry() async {
+        let actionLog = LockedComputerUseActionLog()
         let frontmostBox = LockedFrontmostAppBox(
             AssistantComputerUseFrontmostAppContext(
                 bundleIdentifier: "com.example.one",
@@ -111,8 +120,13 @@ final class AssistantComputerUseServiceTests: XCTestCase {
             )
         )
         let service = AssistantComputerUseService(
-            executeActions: { _, _ in
-                self.makeSnapshot(token: UUID().uuidString)
+            executeActions: { actions, previousSnapshot in
+                actionLog.append(actions: actions, previousSnapshot: previousSnapshot)
+                let index = actionLog.callCount - 1
+                return [
+                    self.makeSnapshot(token: "observe-initial"),
+                    self.makeSnapshot(token: "observe-refresh")
+                ][index]
             },
             frontmostAppProvider: {
                 frontmostBox.value
@@ -145,8 +159,12 @@ final class AssistantComputerUseServiceTests: XCTestCase {
         )
 
         XCTAssertFalse(result.success)
-        XCTAssertTrue(result.summary.contains("frontmost app changed"))
+        XCTAssertTrue(result.summary.contains("captured a fresh screenshot"))
+        XCTAssertTrue(result.summary.contains("App Two"))
         XCTAssertTrue(result.contentItems.contains(where: { $0.type == "inputImage" }))
+        XCTAssertEqual(actionLog.callCount, 2)
+        XCTAssertEqual(actionLog.actions[safe: 0]?.first?["type"] as? String, "observe")
+        XCTAssertEqual(actionLog.actions[safe: 1]?.first?["type"] as? String, "observe")
     }
 
     func testTypingSecretsIsRejected() async {

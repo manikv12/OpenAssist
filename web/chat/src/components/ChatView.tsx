@@ -19,6 +19,7 @@ import { UserMessage } from "./UserMessage";
 import { AssistantMessage } from "./AssistantMessage";
 import { ActivityRow } from "./ActivityRow";
 import { ActivityGroupRow } from "./ActivityGroupRow";
+import { ActivitySummaryRow } from "./ActivitySummaryRow";
 import { SystemMessage } from "./SystemMessage";
 import { TypingIndicator } from "./TypingIndicator";
 
@@ -241,8 +242,7 @@ export const ChatView = forwardRef<
       </div>
 
       {showJumpToLatest && (
-        <button className="jump-to-latest" onClick={onJumpToLatest}>
-          <span>Latest</span>
+        <button className="jump-to-latest" onClick={onJumpToLatest} title="Jump to latest">
           <AppIcon symbol="arrow.down" size={14} strokeWidth={2.5} />
         </button>
       )}
@@ -281,6 +281,8 @@ function MessageRow({
           isLatestRunningActivity={message.id === latestRunningMessageID}
         />
       );
+    case "activitySummary":
+      return <ActivitySummaryRow message={message} />;
     case "system":
       return <SystemMessage message={message} />;
     default:

@@ -49,6 +49,27 @@ final class CodexAssistantRuntimeExecutablePathTests: XCTestCase {
             )
         }
     }
+
+    @MainActor
+    func testClaudeCodeLoginRecoversExecutablePathWithoutRefresh() async throws {
+        let runtime = CodexAssistantRuntime(
+            installSupport: CodexInstallSupport(
+                runner: RuntimePathCommandRunner(
+                    locations: [
+                        "claude": "/opt/homebrew/bin/claude"
+                    ]
+                ),
+                searchPathsOverride: [],
+                allowShellLookup: false
+            )
+        )
+        runtime.backend = .claudeCode
+
+        let action = try await runtime.startLogin()
+
+        XCTAssertEqual(action, .runCommand("claude auth login"))
+        XCTAssertEqual(runtime.currentExecutablePathForTesting(), "/opt/homebrew/bin/claude")
+    }
 }
 
 private struct RuntimePathCommandRunner: CommandRunning {

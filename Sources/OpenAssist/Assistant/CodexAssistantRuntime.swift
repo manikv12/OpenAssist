@@ -27,6 +27,111 @@ private struct CodexResponsePayload: @unchecked Sendable {
     let raw: Any
 }
 
+struct ClaudeCodeInvocationResult: Equatable, Sendable {
+    let sessionID: String?
+    let responseText: String
+    let usage: TokenUsageBreakdown?
+    let modelContextWindow: Int?
+    let stopReason: String?
+}
+
+private struct CLIAttachmentMaterialization: Sendable {
+    let directoryURL: URL
+    let promptContext: String
+}
+
+private final class ClaudeCodeCommandCapture: @unchecked Sendable {
+    private let lock = NSLock()
+    private let newlineData = Data([UInt8(ascii: "\n")])
+    private var stdout = Data()
+    private var stderr = Data()
+    private var stdoutLineBuffer = Data()
+    private var stderrLineBuffer = Data()
+
+    func appendStdout(_ data: Data) -> [String] {
+        append(data, into: \.stdout, lineBuffer: \.stdoutLineBuffer)
+    }
+
+    func appendStderr(_ data: Data) -> [String] {
+        append(data, into: \.stderr, lineBuffer: \.stderrLineBuffer)
+    }
+
+    func finalize(
+        remainingStdout: Data,
+        remainingStderr: Data
+    ) -> (stdout: String, stderr: String, stdoutLines: [String], stderrLines: [String]) {
+        lock.lock()
+        defer { lock.unlock() }
+
+        let stdoutLines = Self.appendChunk(
+            remainingStdout,
+            newlineData: newlineData,
+            accumulator: &stdout,
+            lineBuffer: &stdoutLineBuffer
+        ) + Self.flushPartialLine(from: &stdoutLineBuffer)
+
+        let stderrLines = Self.appendChunk(
+            remainingStderr,
+            newlineData: newlineData,
+            accumulator: &stderr,
+            lineBuffer: &stderrLineBuffer
+        ) + Self.flushPartialLine(from: &stderrLineBuffer)
+
+        return (
+            stdout: String(decoding: stdout, as: UTF8.self),
+            stderr: String(decoding: stderr, as: UTF8.self),
+            stdoutLines: stdoutLines,
+            stderrLines: stderrLines
+        )
+    }
+
+    private func append(
+        _ data: Data,
+        into accumulatorKeyPath: ReferenceWritableKeyPath<ClaudeCodeCommandCapture, Data>,
+        lineBuffer lineBufferKeyPath: ReferenceWritableKeyPath<ClaudeCodeCommandCapture, Data>
+    ) -> [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return Self.appendChunk(
+            data,
+            newlineData: newlineData,
+            accumulator: &self[keyPath: accumulatorKeyPath],
+            lineBuffer: &self[keyPath: lineBufferKeyPath]
+        )
+    }
+
+    private static func appendChunk(
+        _ data: Data,
+        newlineData: Data,
+        accumulator: inout Data,
+        lineBuffer: inout Data
+    ) -> [String] {
+        guard !data.isEmpty else { return [] }
+        accumulator.append(data)
+        lineBuffer.append(data)
+
+        var lines: [String] = []
+        while let range = lineBuffer.firstRange(of: newlineData) {
+            let lineData = lineBuffer.subdata(in: lineBuffer.startIndex..<range.lowerBound)
+            lineBuffer.removeSubrange(lineBuffer.startIndex...range.lowerBound)
+            let line = String(decoding: lineData, as: UTF8.self)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if !line.isEmpty {
+                lines.append(line)
+            }
+        }
+        return lines
+    }
+
+    private static func flushPartialLine(from lineBuffer: inout Data) -> [String] {
+        guard !lineBuffer.isEmpty else { return [] }
+        defer { lineBuffer.removeAll(keepingCapacity: false) }
+        let line = String(decoding: lineBuffer, as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return line.isEmpty ? [] : [line]
+    }
+}
+
 private enum JSONRPCRequestID: Hashable, Sendable {
     case int(Int)
     case string(String)
@@ -144,6 +249,7 @@ final class CodexAssistantRuntime {
     var onTitleRequest: (@Sendable (_ sessionID: String, _ userPrompt: String, _ assistantResponse: String) -> Void)?
 
     private var transport: CodexAppServerTransport?
+    private var activeClaudeProcess: Process?
     private var activeSessionID: String?
     private var activeSessionCWD: String?
     private var activeTurnID: String?
@@ -155,6 +261,7 @@ final class CodexAssistantRuntime {
     private var bootstrapSessionID: String?
     private var currentAccountSnapshot: AssistantAccountSnapshot = .signedOut
     private var currentRateLimits: AccountRateLimits = .empty
+    private var currentTokenUsageSnapshot: TokenUsageSnapshot = .empty
     private var currentModels: [AssistantModelOption] = []
     private var toolCalls: [String: AssistantToolCallState] = [:]
     private var liveActivities: [String: AssistantActivityItem] = [:]
@@ -187,6 +294,8 @@ final class CodexAssistantRuntime {
     private var pendingCopilotFallbackReply: String?
     private var planTimelineID: String?
     private var planStartedAt: Date?
+    private var persistedCLIAttachmentSessionID: String?
+    private var persistedCLIAttachmentMaterialization: CLIAttachmentMaterialization?
     private let installSupport: CodexInstallSupport
 
     // Throttle state for high-frequency updates
@@ -288,8 +397,10 @@ final class CodexAssistantRuntime {
     }
 
     func clearCachedEnvironmentState() {
+        terminateActiveClaudeProcess()
         currentAccountSnapshot = .signedOut
         currentRateLimits = .empty
+        currentTokenUsageSnapshot = .empty
         currentModels = []
         currentCodexPath = nil
     }
@@ -307,6 +418,8 @@ final class CodexAssistantRuntime {
             return AssistantEnvironmentDetails(health: health, account: currentAccountSnapshot, models: currentModels)
         case .copilot:
             return try await refreshCopilotEnvironment(cwd: activeSessionCWD)
+        case .claudeCode:
+            return try await refreshClaudeCodeEnvironment(cwd: activeSessionCWD)
         }
     }
 
@@ -353,6 +466,13 @@ final class CodexAssistantRuntime {
             onStatusMessage?("Run `copilot login` in Terminal, then return to Open Assist.")
             onHealthUpdate?(makeHealth(availability: .loginRequired, summary: backend.loginRequiredSummary))
             return .runCommand(backend.loginCommands.first ?? "copilot login")
+        case .claudeCode:
+            guard await resolvedExecutablePath() != nil else {
+                throw CodexAssistantRuntimeError.runtimeUnavailable("Claude Code is not installed on this Mac.")
+            }
+            onStatusMessage?("Run `claude auth login` in Terminal, then return to Open Assist.")
+            onHealthUpdate?(makeHealth(availability: .loginRequired, summary: backend.loginRequiredSummary))
+            return .runCommand(backend.loginCommands.first ?? "claude auth login")
         }
     }
 
@@ -360,6 +480,7 @@ final class CodexAssistantRuntime {
         guard backend == .codex else {
             currentAccountSnapshot = .signedOut
             currentRateLimits = .empty
+            currentTokenUsageSnapshot = .empty
             currentModels = []
             onAccountUpdate?(currentAccountSnapshot)
             onRateLimitsUpdate?(currentRateLimits)
@@ -386,12 +507,20 @@ final class CodexAssistantRuntime {
                 announce: true
             )
         }
+        if backend == .claudeCode {
+            return try await startClaudeCodeSession(
+                cwd: cwd,
+                preferredModelID: preferredModelID ?? self.preferredModelID,
+                announce: true
+            )
+        }
         try await ensureTransport()
         toolCalls.removeAll()
         liveActivities.removeAll()
         clearSubagents(publish: false)
         repeatedCommandTracker.reset()
         resetStreamingTimelineState()
+        clearPersistedCLIAttachmentMaterialization()
         onToolCallUpdate?([])
         onPlanUpdate?([])
         onSubagentUpdate?([])
@@ -434,6 +563,15 @@ final class CodexAssistantRuntime {
             )
             return
         }
+        if backend == .claudeCode {
+            try await resumeClaudeCodeSession(
+                sessionID,
+                cwd: cwd,
+                preferredModelID: preferredModelID ?? self.preferredModelID,
+                announce: true
+            )
+            return
+        }
         try await ensureTransport()
         _ = try await sendRequest(
             method: "thread/resume",
@@ -467,6 +605,15 @@ final class CodexAssistantRuntime {
             )
             return
         }
+        if backend == .claudeCode {
+            try await resumeClaudeCodeSession(
+                sessionID,
+                cwd: cwd,
+                preferredModelID: preferredModelID ?? self.preferredModelID,
+                announce: false
+            )
+            return
+        }
         try await ensureTransport()
         _ = try await sendRequest(
             method: "thread/resume",
@@ -492,6 +639,14 @@ final class CodexAssistantRuntime {
         guard let activeSessionID else { return }
         if backend == .copilot {
             try await refreshCopilotCurrentSessionConfiguration(
+                sessionID: activeSessionID,
+                cwd: cwd,
+                preferredModelID: preferredModelID ?? self.preferredModelID
+            )
+            return
+        }
+        if backend == .claudeCode {
+            try await refreshClaudeCodeCurrentSessionConfiguration(
                 sessionID: activeSessionID,
                 cwd: cwd,
                 preferredModelID: preferredModelID ?? self.preferredModelID
@@ -558,6 +713,17 @@ final class CodexAssistantRuntime {
             )
             return
         }
+        if backend == .claudeCode {
+            try await sendClaudeCodePrompt(
+                sessionID: activeSessionID,
+                prompt: trimmed,
+                attachments: attachments,
+                preferredModelID: preferredModelID ?? self.preferredModelID,
+                resumeContext: resumeContext,
+                memoryContext: memoryContext
+            )
+            return
+        }
 
         turnToolCallCount = 0
         repeatedCommandTracker.reset()
@@ -608,6 +774,18 @@ final class CodexAssistantRuntime {
                 onStatusMessage?(error.localizedDescription)
             }
             self.activeTurnID = nil
+            allowsProposedPlanForActiveTurn = false
+            updateHUD(phase: .idle, title: "Cancelled", detail: nil)
+            if hadActiveTurn {
+                onTurnCompletion?(.interrupted)
+            }
+            onHealthUpdate?(makeHealth(availability: .ready, summary: backend.connectedSummary))
+            return
+        }
+        if backend == .claudeCode {
+            let hadActiveTurn = activeTurnID != nil
+            self.activeTurnID = nil
+            terminateActiveClaudeProcess()
             allowsProposedPlanForActiveTurn = false
             updateHUD(phase: .idle, title: "Cancelled", detail: nil)
             if hadActiveTurn {
@@ -683,6 +861,7 @@ final class CodexAssistantRuntime {
         clearSubagents(publish: false)
         repeatedCommandTracker.reset()
         resetStreamingTimelineState()
+        clearPersistedCLIAttachmentMaterialization()
         onToolCallUpdate?([])
         onPlanUpdate?([])
         onSubagentUpdate?([])
@@ -695,6 +874,8 @@ final class CodexAssistantRuntime {
             return []
         case .copilot:
             return try await listCopilotSessions(limit: limit)
+        case .claudeCode:
+            return []
         }
     }
 
@@ -705,6 +886,7 @@ final class CodexAssistantRuntime {
         metadataRefreshTask = nil
         transportStartupTask?.cancel()
         transportStartupTask = nil
+        terminateActiveClaudeProcess()
         await pendingPermissionContext?.cancel()
         pendingPermissionContext = nil
         if activeTurnID != nil {
@@ -726,6 +908,8 @@ final class CodexAssistantRuntime {
         onSubagentUpdate?([])
         onTimelineMutation?(.reset(sessionID: nil))
         onSessionChange?(nil)
+        currentTokenUsageSnapshot = .empty
+        onTokenUsageUpdate?(currentTokenUsageSnapshot)
         await transport?.stop()
         transport = nil
         onHealthUpdate?(makeHealth(availability: .idle, summary: "Assistant is idle"))
@@ -762,6 +946,9 @@ final class CodexAssistantRuntime {
     }
 
     private func ensureTransport(cwd: String? = nil) async throws {
+        if backend == .claudeCode {
+            throw CodexAssistantRuntimeError.runtimeUnavailable("Claude Code uses the headless CLI flow, not the ACP transport.")
+        }
         let desiredWorkingDirectory = backend == .copilot
             ? resolvedCopilotWorkingDirectory(cwd ?? activeSessionCWD)
             : nil
@@ -791,6 +978,8 @@ final class CodexAssistantRuntime {
                 throw CodexAssistantRuntimeError.codexMissing
             case .copilot:
                 throw CodexAssistantRuntimeError.runtimeUnavailable("GitHub Copilot CLI is not installed on this Mac.")
+            case .claudeCode:
+                throw CodexAssistantRuntimeError.runtimeUnavailable("Claude Code is not installed on this Mac.")
             }
         }
 
@@ -800,9 +989,7 @@ final class CodexAssistantRuntime {
             guard let self else { return }
 
             let transport = CodexAppServerTransport { [weak self] event in
-                Task { @MainActor [weak self] in
-                    await self?.handleIncomingEvent(event)
-                }
+                await self?.handleIncomingEvent(event)
             }
 
             do {
@@ -814,6 +1001,8 @@ final class CodexAssistantRuntime {
                         copilotExecutablePath: codexPath,
                         workingDirectory: desiredWorkingDirectory
                     )
+                case .claudeCode:
+                    throw CodexAssistantRuntimeError.runtimeUnavailable("Claude Code does not use the ACP transport.")
                 }
                 self.transport = transport
                 self.transportSessionID = nil
@@ -843,13 +1032,26 @@ final class CodexAssistantRuntime {
     }
 
     private func refreshAccountState() async throws -> AssistantAccountSnapshot {
-        CrashReporter.logInfo("Assistant runtime requesting account/read")
-        let response = try await requestWithTimeout(method: "account/read", params: ["refreshToken": false])
-        let account = parseAccountSnapshot(from: response.raw)
-        currentAccountSnapshot = account
-        onAccountUpdate?(account)
-        CrashReporter.logInfo("Assistant runtime account/read finished loggedIn=\(account.isLoggedIn) authMode=\(account.authMode.rawValue)")
-        return account
+        switch backend {
+        case .codex:
+            CrashReporter.logInfo("Assistant runtime requesting account/read")
+            let response = try await requestWithTimeout(method: "account/read", params: ["refreshToken": false])
+            let account = parseAccountSnapshot(from: response.raw)
+            currentAccountSnapshot = account
+            onAccountUpdate?(account)
+            CrashReporter.logInfo("Assistant runtime account/read finished loggedIn=\(account.isLoggedIn) authMode=\(account.authMode.rawValue)")
+            return account
+        case .copilot:
+            let account = signedInCopilotAccountSnapshot()
+            currentAccountSnapshot = account
+            onAccountUpdate?(account)
+            return account
+        case .claudeCode:
+            let account = try await refreshClaudeCodeAccountState()
+            currentAccountSnapshot = account
+            onAccountUpdate?(account)
+            return account
+        }
     }
 
     func resolveTranscriptionAuthContext(refreshToken: Bool = true) async throws -> CodexTranscriptionAuthContext {
@@ -924,6 +1126,35 @@ final class CodexAssistantRuntime {
             } catch {
                 CrashReporter.logInfo("Copilot usage refresh failed: \(error.localizedDescription)")
             }
+        case .claudeCode:
+            guard currentAccountSnapshot.isLoggedIn else {
+                currentRateLimits = .empty
+                onRateLimitsUpdate?(currentRateLimits)
+                return
+            }
+
+            let credentialsResolver = ClaudeCodeOAuthCredentialResolver(
+                fileManager: installSupport.fileManager,
+                homeDirectory: installSupport.homeDirectory
+            )
+
+            do {
+                guard let snapshot = try await ClaudeCodeUsageFetcher().fetchUsage(
+                    resolver: credentialsResolver
+                ) else {
+                    CrashReporter.logInfo("Claude Code usage refresh skipped because no OAuth credentials could be resolved.")
+                    return
+                }
+                currentRateLimits = snapshot.rateLimits
+                onRateLimitsUpdate?(currentRateLimits)
+
+                if let planType = snapshot.planType, currentAccountSnapshot.planType != planType {
+                    currentAccountSnapshot.planType = planType
+                    onAccountUpdate?(currentAccountSnapshot)
+                }
+            } catch {
+                CrashReporter.logInfo("Claude Code usage refresh failed: \(error.localizedDescription)")
+            }
         }
     }
 
@@ -945,6 +1176,12 @@ final class CodexAssistantRuntime {
                 announce: false
             )
             return currentModels
+        }
+        if backend == .claudeCode {
+            let models = staticClaudeCodeModels()
+            currentModels = models
+            onModelsUpdate?(models)
+            return models
         }
 
         CrashReporter.logInfo("Assistant runtime requesting model/list")
@@ -3027,6 +3264,7 @@ final class CodexAssistantRuntime {
                     text: text,
                     createdAt: Date(),
                     emphasis: emphasis,
+                    providerBackend: backend,
                     source: .runtime
                 )
             )
@@ -3313,6 +3551,17 @@ final class CodexAssistantRuntime {
         pendingCopilotFallbackReply
     }
 
+    func cliAttachmentContextForTesting(
+        sessionID: String,
+        attachments: [AssistantAttachment]
+    ) throws -> String? {
+        try resolvedCLIAttachmentContext(sessionID: sessionID, attachments: attachments)
+    }
+
+    func clearCLIAttachmentsForTesting() {
+        clearPersistedCLIAttachmentMaterialization()
+    }
+
     func subagentsForTesting() -> [SubagentState] {
         activeSubagents.values.sorted { lhs, rhs in
             if lhs.status.isActive != rhs.status.isActive {
@@ -3513,10 +3762,21 @@ final class CodexAssistantRuntime {
         )
     }
 
-    func processCopilotPromptCompletionForTesting(stopReason: String? = nil) {
+    func processCopilotPromptCompletionForTesting(
+        raw: [String: Any] = [:],
+        stopReason: String? = nil
+    ) {
         backend = .copilot
-        let payload = stopReason.map { ["stopReason": $0] } ?? [:]
+        var payload = raw
+        if let stopReason {
+            payload["stopReason"] = stopReason
+        }
         handleCopilotPromptCompletion(from: payload)
+    }
+
+    func processClaudeCodeOutputLineForTesting(_ line: String) {
+        backend = .claudeCode
+        handleClaudeCodeOutputLine(line)
     }
 
     func blockedToolUseMessage(
@@ -4157,7 +4417,7 @@ final class CodexAssistantRuntime {
             # Plan Mode
 
             You are in Plan mode. Produce a clear plan only.
-            Use the Codex app server's native plan behavior.
+            Use the provider's native plan behavior when available.
             You may inspect the workspace, search the web, and use tools when needed to ground the plan.
             If the user attaches images and the selected model supports image input, read those attached images directly when they help the plan.
             Do NOT claim to have already executed the work.
@@ -4245,10 +4505,10 @@ final class CodexAssistantRuntime {
 
         Do NOT use MCP browser tools like `browser_navigate`, `browser_click`, `browser_snapshot`, or `browser_run_code`. Those tools open a separate browser without the user's signed-in session.
 
-        Keep the work in the same signed-in browser session. Use `browser_use` first for opening sites, activating the browser, reading the current tab, and detecting when a manual login is needed. Use `osascript` against "\(appName)" only for simple reads or navigation that stay in the same browser window.
+        Keep the work in the same signed-in browser session. Use `browser_use` first for opening sites, activating the browser, reading the current tab, and detecting when a manual login is needed. If the visible browser chrome or page controls are exposed through macOS Accessibility, prefer `ui_inspect`, `ui_click`, `ui_type`, and `ui_press_key` before pixel-based control. Use `osascript` against "\(appName)" only for simple reads or navigation that stay in the same browser window.
 
         \(computerUseEnabled
-            ? "Use `computer_use` only as a last resort when the task truly depends on visible pixels in the already-open browser window and cannot be completed with `browser_use` or simple browser scripting in that same session."
+            ? "Use `computer_use` only as a last resort when the task truly depends on visible pixels in the already-open browser window and cannot be completed with `browser_use`, the Accessibility UI tools, or simple browser scripting in that same session."
             : "If the task truly needs pixel-based clicking, dragging, scrolling, or typing in the visible browser window, explain that Computer Use is currently turned off in settings instead of trying to open a separate browser context.")
 
         If a site asks the user to sign in, pause and ask the user to log in manually in the browser. Continue only after they press Proceed.
@@ -4759,6 +5019,802 @@ final class CodexAssistantRuntime {
         return nil
     }
 
+    private func refreshClaudeCodeEnvironment(cwd: String?) async throws -> AssistantEnvironmentDetails {
+        guard await resolvedExecutablePath() != nil else {
+            throw CodexAssistantRuntimeError.runtimeUnavailable("Claude Code is not installed on this Mac.")
+        }
+
+        let account = try await refreshAccountState()
+        let models = try await refreshModels()
+        await refreshRateLimits()
+
+        let health = makeHealth(
+            availability: account.isLoggedIn
+                ? (activeTurnID == nil ? .ready : .active)
+                : .loginRequired,
+            summary: account.isLoggedIn ? backend.connectedSummary : backend.loginRequiredSummary,
+            detail: account.isLoggedIn ? nil : "Run `claude auth login` in Terminal, then return to Open Assist."
+        )
+        onHealthUpdate?(health)
+        return AssistantEnvironmentDetails(health: health, account: account, models: models)
+    }
+
+    private func resolvedClaudeCodeWorkingDirectory(_ cwd: String?) -> String {
+        resolvedCopilotWorkingDirectory(cwd)
+    }
+
+    private func signedInClaudeCodeAccountSnapshot(email: String?, planType: String?) -> AssistantAccountSnapshot {
+        AssistantAccountSnapshot(
+            authMode: .chatGPT,
+            email: email?.nonEmpty ?? "Claude Code",
+            planType: planType?.nonEmpty,
+            requiresOpenAIAuth: false,
+            loginInProgress: false,
+            pendingLoginURL: nil,
+            pendingLoginID: nil
+        )
+    }
+
+    private func refreshClaudeCodeAccountState() async throws -> AssistantAccountSnapshot {
+        guard let executablePath = await resolvedExecutablePath() else {
+            throw CodexAssistantRuntimeError.runtimeUnavailable("Claude Code is not installed on this Mac.")
+        }
+        let result = try await runClaudeCodeCommand(
+            executablePath: executablePath,
+            arguments: ["auth", "status", "--json"],
+            workingDirectory: nil,
+            trackAsActiveTurn: false
+        )
+        guard result.exitCode == 0 else {
+            throw CodexAssistantRuntimeError.requestFailed(
+                Self.commandFailureMessage(
+                    stdout: result.stdout,
+                    stderr: result.stderr,
+                    fallback: "Claude Code auth status failed."
+                )
+            )
+        }
+        return try Self.parseClaudeCodeAccountSnapshot(from: result.stdout)
+    }
+
+    private func staticClaudeCodeModels() -> [AssistantModelOption] {
+        [
+            AssistantModelOption(
+                id: "sonnet",
+                displayName: "Claude Sonnet",
+                description: "Balanced Claude Code model alias.",
+                isDefault: true,
+                hidden: false,
+                supportedReasoningEfforts: [],
+                defaultReasoningEffort: nil
+            ),
+            AssistantModelOption(
+                id: "opus",
+                displayName: "Claude Opus",
+                description: "Higher-capability Claude Code model alias.",
+                isDefault: false,
+                hidden: false,
+                supportedReasoningEfforts: [],
+                defaultReasoningEffort: nil
+            )
+        ]
+    }
+
+    private func startClaudeCodeSession(
+        cwd: String?,
+        preferredModelID: String?,
+        announce: Bool
+    ) async throws -> String {
+        guard await resolvedExecutablePath() != nil else {
+            throw CodexAssistantRuntimeError.runtimeUnavailable("Claude Code is not installed on this Mac.")
+        }
+
+        let resolvedCWD = resolvedClaudeCodeWorkingDirectory(cwd)
+        if announce {
+            toolCalls.removeAll()
+            liveActivities.removeAll()
+            clearSubagents(publish: false)
+            repeatedCommandTracker.reset()
+            resetStreamingTimelineState()
+            onToolCallUpdate?([])
+            onPlanUpdate?([])
+            onSubagentUpdate?([])
+            onTimelineMutation?(.reset(sessionID: nil))
+            onPermissionRequest?(nil)
+            sessionTurnCount = 0
+            firstTurnUserPrompt = nil
+        }
+
+        let sessionID = UUID().uuidString.lowercased()
+        activeSessionID = sessionID
+        activeSessionCWD = resolvedCWD
+        currentTokenUsageSnapshot = .empty
+        onTokenUsageUpdate?(currentTokenUsageSnapshot)
+        if let requestedModelID = preferredModelID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
+            self.preferredModelID = requestedModelID
+        }
+
+        if announce {
+            onSessionChange?(sessionID)
+            onTranscript?(AssistantTranscriptEntry(role: .system, text: backend.startedSessionMessage, emphasis: true))
+        }
+
+        onHealthUpdate?(makeHealth(availability: .ready, summary: backend.connectedSummary))
+        updateHUD(phase: .idle, title: "Assistant is ready", detail: nil)
+        return sessionID
+    }
+
+    private func resumeClaudeCodeSession(
+        _ sessionID: String,
+        cwd: String?,
+        preferredModelID: String?,
+        announce: Bool
+    ) async throws {
+        guard await resolvedExecutablePath() != nil else {
+            throw CodexAssistantRuntimeError.runtimeUnavailable("Claude Code is not installed on this Mac.")
+        }
+
+        let resolvedCWD = resolvedClaudeCodeWorkingDirectory(cwd)
+        activeSessionID = sessionID
+        activeSessionCWD = resolvedCWD
+        sessionTurnCount = 1
+        currentTokenUsageSnapshot = .empty
+        onTokenUsageUpdate?(currentTokenUsageSnapshot)
+        if let requestedModelID = preferredModelID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
+            self.preferredModelID = requestedModelID
+        }
+
+        onSessionChange?(sessionID)
+        if announce {
+            onTranscript?(AssistantTranscriptEntry(role: .system, text: backend.loadedSessionMessage(sessionID), emphasis: true))
+        }
+        onHealthUpdate?(makeHealth(availability: .ready, summary: backend.connectedSummary))
+        updateHUD(phase: .idle, title: "Session ready", detail: nil)
+    }
+
+    private func refreshClaudeCodeCurrentSessionConfiguration(
+        sessionID: String,
+        cwd: String?,
+        preferredModelID: String?
+    ) async throws {
+        guard await resolvedExecutablePath() != nil else {
+            throw CodexAssistantRuntimeError.runtimeUnavailable("Claude Code is not installed on this Mac.")
+        }
+
+        activeSessionID = sessionID
+        activeSessionCWD = resolvedClaudeCodeWorkingDirectory(cwd)
+        if let requestedModelID = preferredModelID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
+            self.preferredModelID = requestedModelID
+        }
+        onHealthUpdate?(makeHealth(
+            availability: activeTurnID == nil ? .ready : .active,
+            summary: activeTurnID == nil ? backend.connectedSummary : backend.activeSummary
+        ))
+    }
+
+    private func sendClaudeCodePrompt(
+        sessionID: String,
+        prompt: String,
+        attachments: [AssistantAttachment],
+        preferredModelID: String?,
+        resumeContext: String?,
+        memoryContext: String?
+    ) async throws {
+        guard let executablePath = await resolvedExecutablePath() else {
+            throw CodexAssistantRuntimeError.runtimeUnavailable("Claude Code is not installed on this Mac.")
+        }
+
+        if !currentAccountSnapshot.isLoggedIn {
+            let account = try await refreshClaudeCodeAccountState()
+            guard account.isLoggedIn else {
+                throw CodexAssistantRuntimeError.runtimeUnavailable("Run `claude auth login` in Terminal before chatting with Claude Code.")
+            }
+        }
+
+        let resolvedCWD = resolvedClaudeCodeWorkingDirectory(activeSessionCWD)
+        try await refreshClaudeCodeCurrentSessionConfiguration(
+            sessionID: sessionID,
+            cwd: resolvedCWD,
+            preferredModelID: preferredModelID
+        )
+
+        turnToolCallCount = 0
+        repeatedCommandTracker.reset()
+        activeTurnID = activeTurnID ?? "claude-turn-\(UUID().uuidString)"
+        updateHUD(phase: .streaming, title: "Starting", detail: nil)
+        onHealthUpdate?(makeHealth(availability: .active, summary: backend.activeSummary))
+
+        let attachmentContext = try resolvedCLIAttachmentContext(
+            sessionID: sessionID,
+            attachments: attachments
+        )
+
+        var arguments = [
+            "-p",
+            buildClaudeCodePrompt(
+                prompt: prompt,
+                resumeContext: resumeContext,
+                memoryContext: memoryContext,
+                attachmentContext: attachmentContext
+            ),
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--include-partial-messages",
+            "--permission-mode",
+            Self.claudeCodePermissionMode(for: interactionMode)
+        ]
+        if let modelID = preferredModelID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
+            arguments.append(contentsOf: ["--model", modelID])
+        }
+        if sessionTurnCount == 0 {
+            arguments.append(contentsOf: ["--session-id", sessionID])
+        } else {
+            arguments.append(contentsOf: ["--resume", sessionID])
+        }
+
+        do {
+            let result = try await runClaudeCodeStreamingCommand(
+                executablePath: executablePath,
+                arguments: arguments,
+                workingDirectory: resolvedCWD
+            )
+            guard activeTurnID != nil else { return }
+            guard result.exitCode == 0 else {
+                throw CodexAssistantRuntimeError.requestFailed(
+                    Self.commandFailureMessage(
+                        stdout: result.stdout,
+                        stderr: result.stderr,
+                        fallback: "Claude Code could not finish this turn."
+                    )
+                )
+            }
+
+            let parsed = try Self.parseClaudeCodeInvocationResult(from: result.stdout)
+            if let resolvedSessionID = parsed.sessionID?.nonEmpty, resolvedSessionID != activeSessionID {
+                activeSessionID = resolvedSessionID
+                onSessionChange?(resolvedSessionID)
+            }
+            if !parsed.responseText.isEmpty {
+                ensureStreamingIdentifiers()
+                streamingBuffer = parsed.responseText
+                pendingStreamingDeltaBuffer = ""
+            }
+            if let usage = parsed.usage {
+                applyClaudeCodeTokenUsage(usage, modelContextWindow: parsed.modelContextWindow)
+            }
+
+            let stopReason = parsed.stopReason?.lowercased()
+            switch stopReason {
+            case "cancelled", "canceled", "interrupted":
+                handleTurnCompleted(["turn": ["status": "interrupted"]])
+            default:
+                handleTurnCompleted(["turn": ["status": "completed"]])
+            }
+        } catch {
+            guard activeTurnID != nil else { return }
+            handleTurnCompleted([
+                "turn": [
+                    "status": "failed",
+                    "error": ["message": error.localizedDescription]
+                ]
+            ])
+            throw error
+        }
+    }
+
+    private func buildClaudeCodePrompt(
+        prompt: String,
+        resumeContext: String?,
+        memoryContext: String?,
+        attachmentContext: String?
+    ) -> String {
+        var sections: [String] = []
+        if let attachmentContext = attachmentContext?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
+            sections.append(attachmentContext)
+        }
+        if let memoryContext = memoryContext?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
+            sections.append("Relevant memory:\n\(memoryContext)")
+        }
+        if let resumeContext = resumeContext?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
+            sections.append("Conversation context:\n\(resumeContext)")
+        }
+        sections.append(prompt)
+        return sections.joined(separator: "\n\n")
+    }
+
+    private func applyClaudeCodeTokenUsage(
+        _ usage: TokenUsageBreakdown,
+        modelContextWindow: Int?
+    ) {
+        let total = Self.addTokenUsageBreakdowns(currentTokenUsageSnapshot.total, usage)
+        currentTokenUsageSnapshot = TokenUsageSnapshot(
+            last: usage,
+            total: total,
+            modelContextWindow: modelContextWindow ?? currentTokenUsageSnapshot.modelContextWindow
+        )
+        onTokenUsageUpdate?(currentTokenUsageSnapshot)
+    }
+
+    private func handleClaudeCodeOutputLine(_ line: String) {
+        guard let payload = try? Self.parseClaudeCodeJSONObject(from: line) else { return }
+        handleClaudeCodeStreamPayload(payload)
+    }
+
+    private func handleClaudeCodeStreamPayload(_ payload: [String: Any]) {
+        if let resolvedSessionID = firstNonEmptyString(
+            payload["session_id"] as? String,
+            payload["sessionId"] as? String
+        ), resolvedSessionID != activeSessionID {
+            activeSessionID = resolvedSessionID
+            onSessionChange?(resolvedSessionID)
+        }
+
+        switch (payload["type"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "system":
+            updateHUD(
+                phase: .thinking,
+                title: interactionMode.normalizedForActiveUse == .plan ? "Planning" : "Thinking",
+                detail: nil
+            )
+        case "assistant":
+            guard streamingBuffer.isEmpty,
+                  let message = payload["message"] as? [String: Any],
+                  let text = Self.extractClaudeCodeMessageText(from: message) else {
+                return
+            }
+            guard acceptAssistantMessageDelta(
+                threadID: activeSessionID,
+                turnID: nil,
+                source: "claude.stream.assistant"
+            ) else {
+                return
+            }
+            ensureStreamingIdentifiers()
+            streamingBuffer = text
+            pendingStreamingDeltaBuffer = text
+            emitStreamingAssistantDelta(force: true)
+            updateHUD(
+                phase: .streaming,
+                title: interactionMode.normalizedForActiveUse == .plan ? "Planning" : "Responding",
+                detail: nil
+            )
+        case "stream_event":
+            guard let event = payload["event"] as? [String: Any] else { return }
+            handleClaudeCodeStreamEvent(event)
+        default:
+            return
+        }
+    }
+
+    private func handleClaudeCodeStreamEvent(_ event: [String: Any]) {
+        switch (event["type"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "message_start":
+            updateHUD(
+                phase: .thinking,
+                title: interactionMode.normalizedForActiveUse == .plan ? "Planning" : "Thinking",
+                detail: nil
+            )
+        case "content_block_start":
+            guard let block = event["content_block"] as? [String: Any] else { return }
+            let blockType = (block["type"] as? String)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+            if blockType == "tool_use" {
+                let title = firstNonEmptyString(block["name"] as? String, "Using tool") ?? "Using tool"
+                updateHUD(phase: .acting, title: title, detail: compactDetail(extractString(block["input"])))
+            } else if blockType == "text" {
+                updateHUD(
+                    phase: .streaming,
+                    title: interactionMode.normalizedForActiveUse == .plan ? "Planning" : "Responding",
+                    detail: nil
+                )
+            }
+        case "content_block_delta":
+            guard let delta = event["delta"] as? [String: Any],
+                  let text = delta["text"] as? String,
+                  !text.isEmpty else {
+                return
+            }
+            guard acceptAssistantMessageDelta(
+                threadID: activeSessionID,
+                turnID: nil,
+                source: "claude.stream.content_block_delta"
+            ) else {
+                return
+            }
+            ensureStreamingIdentifiers()
+            streamingBuffer += text
+            pendingStreamingDeltaBuffer += text
+            emitStreamingAssistantDelta(force: shouldForceStreamingDeltaFlush(for: text))
+            updateHUD(
+                phase: .streaming,
+                title: interactionMode.normalizedForActiveUse == .plan ? "Planning" : "Responding",
+                detail: nil
+            )
+        case "message_delta":
+            if let delta = event["delta"] as? [String: Any],
+               let stopReason = firstNonEmptyString(
+                    delta["stop_reason"] as? String,
+                    delta["stopReason"] as? String
+               )?.lowercased(),
+               stopReason == "tool_use" {
+                updateHUD(phase: .acting, title: "Using tools", detail: nil)
+            }
+        default:
+            return
+        }
+    }
+
+    private func runClaudeCodeStreamingCommand(
+        executablePath: String,
+        arguments: [String],
+        workingDirectory: String?
+    ) async throws -> CommandExecutionResult {
+        try await withCheckedThrowingContinuation { continuation in
+            let process = Process()
+            let stdout = Pipe()
+            let stderr = Pipe()
+            let capture = ClaudeCodeCommandCapture()
+
+            process.executableURL = URL(fileURLWithPath: executablePath)
+            process.arguments = arguments
+            process.environment = AssistantCommandEnvironment.mergedEnvironment()
+            if let workingDirectory {
+                process.currentDirectoryURL = URL(fileURLWithPath: workingDirectory, isDirectory: true)
+            }
+            process.standardOutput = stdout
+            process.standardError = stderr
+
+            stdout.fileHandleForReading.readabilityHandler = { [weak self] handle in
+                let data = handle.availableData
+                if data.isEmpty {
+                    handle.readabilityHandler = nil
+                    return
+                }
+                let lines = capture.appendStdout(data)
+                guard !lines.isEmpty else { return }
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    for line in lines {
+                        self.handleClaudeCodeOutputLine(line)
+                    }
+                }
+            }
+
+            stderr.fileHandleForReading.readabilityHandler = { handle in
+                let data = handle.availableData
+                if data.isEmpty {
+                    handle.readabilityHandler = nil
+                    return
+                }
+                _ = capture.appendStderr(data)
+            }
+
+            process.terminationHandler = { [weak self] completed in
+                stdout.fileHandleForReading.readabilityHandler = nil
+                stderr.fileHandleForReading.readabilityHandler = nil
+
+                let snapshot = capture.finalize(
+                    remainingStdout: stdout.fileHandleForReading.readDataToEndOfFile(),
+                    remainingStderr: stderr.fileHandleForReading.readDataToEndOfFile()
+                )
+
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    for line in snapshot.stdoutLines {
+                        self.handleClaudeCodeOutputLine(line)
+                    }
+                    if self.activeClaudeProcess === completed {
+                        self.activeClaudeProcess = nil
+                    }
+                    continuation.resume(
+                        returning: CommandExecutionResult(
+                            exitCode: completed.terminationStatus,
+                            stdout: snapshot.stdout,
+                            stderr: snapshot.stderr
+                        )
+                    )
+                }
+            }
+
+            do {
+                activeClaudeProcess = process
+                try process.run()
+            } catch {
+                activeClaudeProcess = nil
+                stdout.fileHandleForReading.readabilityHandler = nil
+                stderr.fileHandleForReading.readabilityHandler = nil
+                continuation.resume(
+                    throwing: CodexAssistantRuntimeError.runtimeUnavailable(
+                        "Could not launch Claude Code: \(error.localizedDescription)"
+                    )
+                )
+            }
+        }
+    }
+
+    private func runClaudeCodeCommand(
+        executablePath: String,
+        arguments: [String],
+        workingDirectory: String?,
+        trackAsActiveTurn: Bool
+    ) async throws -> CommandExecutionResult {
+        try await withCheckedThrowingContinuation { continuation in
+            let process = Process()
+            let stdout = Pipe()
+            let stderr = Pipe()
+
+            process.executableURL = URL(fileURLWithPath: executablePath)
+            process.arguments = arguments
+            process.environment = AssistantCommandEnvironment.mergedEnvironment()
+            if let workingDirectory {
+                process.currentDirectoryURL = URL(fileURLWithPath: workingDirectory, isDirectory: true)
+            }
+            process.standardOutput = stdout
+            process.standardError = stderr
+            process.terminationHandler = { [weak self] completed in
+                let outData = stdout.fileHandleForReading.readDataToEndOfFile()
+                let errData = stderr.fileHandleForReading.readDataToEndOfFile()
+                Task { @MainActor [weak self] in
+                    if trackAsActiveTurn, self?.activeClaudeProcess === completed {
+                        self?.activeClaudeProcess = nil
+                    }
+                    continuation.resume(
+                        returning: CommandExecutionResult(
+                            exitCode: completed.terminationStatus,
+                            stdout: String(decoding: outData, as: UTF8.self),
+                            stderr: String(decoding: errData, as: UTF8.self)
+                        )
+                    )
+                }
+            }
+
+            do {
+                if trackAsActiveTurn {
+                    activeClaudeProcess = process
+                }
+                try process.run()
+            } catch {
+                if trackAsActiveTurn {
+                    activeClaudeProcess = nil
+                }
+                continuation.resume(
+                    throwing: CodexAssistantRuntimeError.runtimeUnavailable(
+                        "Could not launch Claude Code: \(error.localizedDescription)"
+                    )
+                )
+            }
+        }
+    }
+
+    private func terminateActiveClaudeProcess() {
+        guard let activeClaudeProcess else { return }
+        if activeClaudeProcess.isRunning {
+            activeClaudeProcess.terminate()
+        }
+        self.activeClaudeProcess = nil
+    }
+
+    nonisolated static func parseClaudeCodeAccountSnapshot(from output: String) throws -> AssistantAccountSnapshot {
+        let payload = try parseClaudeCodeJSONObject(from: output)
+        let loggedIn = payload["loggedIn"] as? Bool ?? false
+        guard loggedIn else { return .signedOut }
+        return AssistantAccountSnapshot(
+            authMode: .chatGPT,
+            email: firstNonEmptyClaudeString(
+                payload["email"] as? String,
+                payload["orgName"] as? String,
+                "Claude Code"
+            ),
+            planType: firstNonEmptyClaudeString(
+                payload["subscriptionType"] as? String,
+                payload["apiProvider"] as? String
+            ),
+            requiresOpenAIAuth: false,
+            loginInProgress: false,
+            pendingLoginURL: nil,
+            pendingLoginID: nil
+        )
+    }
+
+    nonisolated static func claudeCodePermissionMode(for mode: AssistantInteractionMode) -> String {
+        switch mode.normalizedForActiveUse {
+        case .plan:
+            return "plan"
+        case .agentic, .conversational:
+            return "bypassPermissions"
+        }
+    }
+
+    nonisolated static func parseClaudeCodeInvocationResult(from output: String) throws -> ClaudeCodeInvocationResult {
+        let payload = try parseClaudeCodeInvocationPayload(from: output)
+        if payload["is_error"] as? Bool == true {
+            throw CodexAssistantRuntimeError.requestFailed(
+                commandFailureMessage(
+                    stdout: output,
+                    stderr: nil,
+                    fallback: "Claude Code reported an error."
+                )
+            )
+        }
+
+        let responseText = extractClaudeCodeResponseText(from: payload) ?? ""
+        let (usage, modelContextWindow) = parseClaudeCodeUsage(from: payload)
+        return ClaudeCodeInvocationResult(
+            sessionID: firstNonEmptyClaudeString(payload["session_id"] as? String),
+            responseText: responseText,
+            usage: usage,
+            modelContextWindow: modelContextWindow,
+            stopReason: firstNonEmptyClaudeString(payload["stop_reason"] as? String)
+        )
+    }
+
+    private nonisolated static func parseClaudeCodeInvocationPayload(from output: String) throws -> [String: Any] {
+        if let payload = try? parseClaudeCodeJSONObject(from: output) {
+            return payload
+        }
+
+        let payloads = output
+            .split(whereSeparator: \.isNewline)
+            .compactMap { line -> [String: Any]? in
+                let trimmed = String(line).trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmed.isEmpty else { return nil }
+                return try? parseClaudeCodeJSONObject(from: trimmed)
+            }
+
+        guard !payloads.isEmpty else {
+            throw CodexAssistantRuntimeError.invalidResponse("Claude Code did not return valid JSON.")
+        }
+
+        return payloads.reversed().first(where: {
+            (($0["type"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()) == "result"
+        }) ?? payloads.last!
+    }
+
+    private nonisolated static func parseClaudeCodeJSONObject(from output: String) throws -> [String: Any] {
+        guard let data = output.data(using: .utf8),
+              let payload = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw CodexAssistantRuntimeError.invalidResponse("Claude Code did not return valid JSON.")
+        }
+        return payload
+    }
+
+    private nonisolated static func extractClaudeCodeResponseText(from payload: [String: Any]) -> String? {
+        if let text = (payload["result"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
+            return text
+        }
+        if let result = payload["result"] as? [String: Any] {
+            if let text = (result["text"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
+                return text
+            }
+            if let content = result["content"] as? [[String: Any]] {
+                return extractClaudeCodeContentText(from: content)
+            }
+        }
+        if let message = payload["message"] as? [String: Any] {
+            return extractClaudeCodeMessageText(from: message)
+        }
+        return nil
+    }
+
+    private nonisolated static func extractClaudeCodeMessageText(from message: [String: Any]) -> String? {
+        if let text = (message["text"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
+            return text
+        }
+        if let content = message["content"] as? [[String: Any]] {
+            return extractClaudeCodeContentText(from: content)
+        }
+        return nil
+    }
+
+    private nonisolated static func extractClaudeCodeContentText(from content: [[String: Any]]) -> String? {
+        let joined = content.compactMap { item -> String? in
+            if (item["type"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "tool_use" {
+                return nil
+            }
+            if let text = (item["text"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
+                return text
+            }
+            if let nested = item["content"] as? [String: Any] {
+                return extractClaudeCodeMessageText(from: nested)
+            }
+            return nil
+        }
+        .joined(separator: "\n")
+        return joined.nonEmpty
+    }
+
+    private nonisolated static func parseClaudeCodeUsage(from payload: [String: Any]) -> (TokenUsageBreakdown?, Int?) {
+        let usage = payload["usage"] as? [String: Any]
+        let modelUsage = (payload["modelUsage"] as? [String: Any])?.values.first as? [String: Any]
+
+        let directInput = intValue(
+            usage?["input_tokens"],
+            modelUsage?["inputTokens"]
+        )
+        let cacheCreation = intValue(
+            usage?["cache_creation_input_tokens"],
+            modelUsage?["cacheCreationInputTokens"]
+        )
+        let cacheRead = intValue(
+            usage?["cache_read_input_tokens"],
+            modelUsage?["cacheReadInputTokens"]
+        )
+        let outputTokens = intValue(
+            usage?["output_tokens"],
+            modelUsage?["outputTokens"]
+        )
+        let reasoningOutputTokens = intValue(
+            usage?["reasoning_output_tokens"],
+            modelUsage?["reasoningOutputTokens"]
+        )
+        let contextWindow = intValue(modelUsage?["contextWindow"])
+
+        let effectiveInputTokens = directInput + cacheCreation + cacheRead
+        guard effectiveInputTokens > 0 || outputTokens > 0 || reasoningOutputTokens > 0 else {
+            return (nil, contextWindow > 0 ? contextWindow : nil)
+        }
+
+        let breakdown = TokenUsageBreakdown(
+            inputTokens: effectiveInputTokens,
+            outputTokens: outputTokens,
+            cachedInputTokens: cacheRead,
+            reasoningOutputTokens: reasoningOutputTokens,
+            totalTokens: effectiveInputTokens + outputTokens + reasoningOutputTokens
+        )
+        return (breakdown, contextWindow > 0 ? contextWindow : nil)
+    }
+
+    private nonisolated static func addTokenUsageBreakdowns(
+        _ lhs: TokenUsageBreakdown,
+        _ rhs: TokenUsageBreakdown
+    ) -> TokenUsageBreakdown {
+        TokenUsageBreakdown(
+            inputTokens: lhs.inputTokens + rhs.inputTokens,
+            outputTokens: lhs.outputTokens + rhs.outputTokens,
+            cachedInputTokens: lhs.cachedInputTokens + rhs.cachedInputTokens,
+            reasoningOutputTokens: lhs.reasoningOutputTokens + rhs.reasoningOutputTokens,
+            totalTokens: lhs.totalTokens + rhs.totalTokens
+        )
+    }
+
+    private nonisolated static func intValue(_ values: Any?...) -> Int {
+        for value in values {
+            if let intValue = value as? Int {
+                return intValue
+            }
+            if let number = value as? NSNumber {
+                return number.intValue
+            }
+            if let string = value as? String, let intValue = Int(string) {
+                return intValue
+            }
+        }
+        return 0
+    }
+
+    private nonisolated static func commandFailureMessage(
+        stdout: String?,
+        stderr: String?,
+        fallback: String
+    ) -> String {
+        firstNonEmptyClaudeString(
+            stderr?.trimmingCharacters(in: .whitespacesAndNewlines),
+            stdout?.trimmingCharacters(in: .whitespacesAndNewlines),
+            fallback
+        ) ?? fallback
+    }
+
+    private nonisolated static func firstNonEmptyClaudeString(_ candidates: String?...) -> String? {
+        for candidate in candidates {
+            if let value = candidate?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
+                return value
+            }
+        }
+        return nil
+    }
+
     private func resolvedCopilotWorkingDirectory(_ cwd: String?) -> String {
         if let trimmed = cwd?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
             var isDirectory: ObjCBool = false
@@ -5041,12 +6097,6 @@ final class CodexAssistantRuntime {
         resumeContext: String?,
         memoryContext: String?
     ) async throws {
-        guard attachments.isEmpty else {
-            throw CodexAssistantRuntimeError.runtimeUnavailable(
-                "Attachments are not wired through GitHub Copilot ACP in Open Assist yet."
-            )
-        }
-
         let resolvedCWD = resolvedCopilotWorkingDirectory(activeSessionCWD)
         try await refreshCopilotCurrentSessionConfiguration(
             sessionID: sessionID,
@@ -5064,6 +6114,11 @@ final class CodexAssistantRuntime {
         updateHUD(phase: .streaming, title: "Starting", detail: nil)
         onHealthUpdate?(makeHealth(availability: .active, summary: backend.activeSummary))
 
+        let attachmentContext = try resolvedCLIAttachmentContext(
+            sessionID: sessionID,
+            attachments: attachments
+        )
+
         do {
             let response = try await sendRequest(
                 method: "session/prompt",
@@ -5072,11 +6127,13 @@ final class CodexAssistantRuntime {
                     "prompt": buildCopilotPromptContent(
                         prompt: prompt,
                         resumeContext: resumeContext,
-                        memoryContext: memoryContext
+                        memoryContext: memoryContext,
+                        attachmentContext: attachmentContext
                     )
                 ]
             )
             guard activeTurnID != nil else { return }
+            await waitForCopilotResponseMaterializationIfNeeded()
             handleCopilotPromptCompletion(from: response.raw)
         } catch {
             guard activeTurnID != nil else { throw error }
@@ -5093,15 +6150,126 @@ final class CodexAssistantRuntime {
     private func buildCopilotPromptContent(
         prompt: String,
         resumeContext: String?,
-        memoryContext: String?
+        memoryContext: String?,
+        attachmentContext: String?
     ) -> [[String: Any]] {
-        let combined = [resumeContext, memoryContext, prompt]
+        let combined = [attachmentContext, resumeContext, memoryContext, prompt]
             .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty }
             .joined(separator: "\n\n")
         return [["type": "text", "text": combined]]
     }
 
+    private func materializeCLIFileAttachments(
+        _ attachments: [AssistantAttachment]
+    ) throws -> CLIAttachmentMaterialization? {
+        guard !attachments.isEmpty else { return nil }
+
+        let directoryURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("openassist-cli-attachments-\(UUID().uuidString)", isDirectory: true)
+
+        do {
+            try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+
+            var usedNames: Set<String> = []
+            var lines = [
+                "Local attachment files are available on disk for this session.",
+                "If the user's request depends on an attachment, inspect the relevant file directly from these paths before answering:"
+            ]
+
+            for (index, attachment) in attachments.enumerated() {
+                let filename = uniqueCLIAttachmentFilename(
+                    attachment.filename,
+                    fallbackIndex: index + 1,
+                    usedNames: &usedNames
+                )
+                let fileURL = directoryURL.appendingPathComponent(filename, isDirectory: false)
+                try attachment.data.write(to: fileURL, options: .atomic)
+                lines.append("- \(attachment.filename) [\(attachment.mimeType)]: \(fileURL.path)")
+            }
+
+            lines.append("These attachment paths stay available for follow-up turns in this session until new attachments replace them.")
+            return CLIAttachmentMaterialization(
+                directoryURL: directoryURL,
+                promptContext: lines.joined(separator: "\n")
+            )
+        } catch {
+            try? FileManager.default.removeItem(at: directoryURL)
+            throw CodexAssistantRuntimeError.requestFailed(
+                "Could not prepare local attachment files: \(error.localizedDescription)"
+            )
+        }
+    }
+
+    private func cleanupCLIFileAttachments(_ materialization: CLIAttachmentMaterialization?) {
+        guard let directoryURL = materialization?.directoryURL else { return }
+        try? FileManager.default.removeItem(at: directoryURL)
+    }
+
+    private func resolvedCLIAttachmentContext(
+        sessionID: String,
+        attachments: [AssistantAttachment]
+    ) throws -> String? {
+        let normalizedSessionID = sessionID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if persistedCLIAttachmentSessionID != normalizedSessionID {
+            clearPersistedCLIAttachmentMaterialization()
+        }
+
+        if !attachments.isEmpty {
+            clearPersistedCLIAttachmentMaterialization()
+            persistedCLIAttachmentMaterialization = try materializeCLIFileAttachments(attachments)
+            persistedCLIAttachmentSessionID = normalizedSessionID
+        }
+
+        return persistedCLIAttachmentMaterialization?.promptContext
+    }
+
+    private func clearPersistedCLIAttachmentMaterialization() {
+        cleanupCLIFileAttachments(persistedCLIAttachmentMaterialization)
+        persistedCLIAttachmentMaterialization = nil
+        persistedCLIAttachmentSessionID = nil
+    }
+
+    private func uniqueCLIAttachmentFilename(
+        _ filename: String,
+        fallbackIndex: Int,
+        usedNames: inout Set<String>
+    ) -> String {
+        let sanitized = sanitizedCLIAttachmentFilename(filename, fallbackIndex: fallbackIndex)
+        let normalizedSanitized = sanitized.lowercased()
+        if usedNames.insert(normalizedSanitized).inserted {
+            return sanitized
+        }
+
+        let url = URL(fileURLWithPath: sanitized)
+        let stem = url.deletingPathExtension().lastPathComponent.nonEmpty ?? "attachment-\(fallbackIndex)"
+        let ext = url.pathExtension
+
+        var suffix = 2
+        while true {
+            let candidate = ext.isEmpty ? "\(stem)-\(suffix)" : "\(stem)-\(suffix).\(ext)"
+            if usedNames.insert(candidate.lowercased()).inserted {
+                return candidate
+            }
+            suffix += 1
+        }
+    }
+
+    private func sanitizedCLIAttachmentFilename(_ filename: String, fallbackIndex: Int) -> String {
+        let trimmed = filename.trimmingCharacters(in: .whitespacesAndNewlines)
+        let candidate = URL(fileURLWithPath: trimmed.isEmpty ? "attachment-\(fallbackIndex)" : trimmed)
+            .lastPathComponent
+            .replacingOccurrences(of: "/", with: "-")
+            .replacingOccurrences(of: ":", with: "-")
+            .replacingOccurrences(of: "\\", with: "-")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        return candidate.nonEmpty ?? "attachment-\(fallbackIndex)"
+    }
+
     private func handleCopilotPromptCompletion(from raw: Any) {
+        if let directReply = copilotPromptCompletionReply(from: raw) {
+            storeCopilotFallbackReply(directReply)
+        }
         let stopReason = ((raw as? [String: Any])?["stopReason"] as? String)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
@@ -5114,6 +6282,26 @@ final class CodexAssistantRuntime {
         }
 
         Task { await refreshRateLimits() }
+    }
+
+    private func waitForCopilotResponseMaterializationIfNeeded(
+        maxWaitNanoseconds: UInt64 = 250_000_000
+    ) async {
+        guard backend == .copilot,
+              activeTurnID != nil,
+              streamingBuffer.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty == nil,
+              pendingCopilotFallbackReply?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty == nil else {
+            return
+        }
+
+        let deadline = DispatchTime.now().uptimeNanoseconds + maxWaitNanoseconds
+        while activeTurnID != nil,
+              streamingBuffer.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty == nil,
+              pendingCopilotFallbackReply?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty == nil,
+              DispatchTime.now().uptimeNanoseconds < deadline {
+            await Task.yield()
+            try? await Task.sleep(nanoseconds: 25_000_000)
+        }
     }
 
     private func listCopilotSessions(limit: Int) async throws -> [AssistantSessionSummary] {
@@ -5510,6 +6698,102 @@ final class CodexAssistantRuntime {
         return candidate
     }
 
+    private func copilotPromptCompletionReply(from raw: Any) -> String? {
+        guard let payload = raw as? [String: Any] else { return nil }
+
+        if let messages = payload["messages"] as? [Any] {
+            for message in messages.reversed() {
+                if let text = copilotVisibleMessageText(from: message),
+                   let reply = copilotFallbackReplyCandidate(from: text) {
+                    return reply
+                }
+            }
+        }
+
+        for key in ["assistantMessage", "assistant_message", "message", "response", "output", "content", "result"] {
+            if let text = copilotVisibleMessageText(from: payload[key]),
+               let reply = copilotFallbackReplyCandidate(from: text) {
+                return reply
+            }
+        }
+
+        return nil
+    }
+
+    private func copilotVisibleMessageText(from raw: Any?) -> String? {
+        if let text = raw as? String {
+            return text.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+        }
+
+        if let array = raw as? [Any] {
+            let assistantOnly = array.compactMap { element -> String? in
+                guard let dictionary = element as? [String: Any] else {
+                    return nil
+                }
+                if let role = (dictionary["role"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+                   role != "assistant",
+                   role != "model" {
+                    return nil
+                }
+                return copilotVisibleMessageText(from: dictionary)
+            }
+            .joined(separator: "\n")
+
+            if let text = assistantOnly.nonEmpty {
+                return text
+            }
+
+            let merged = array.compactMap { copilotVisibleMessageText(from: $0) }.joined(separator: "\n")
+            return merged.nonEmpty
+        }
+
+        guard let dictionary = raw as? [String: Any] else {
+            return nil
+        }
+
+        if let role = (dictionary["role"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+           role != "assistant",
+           role != "model" {
+            return nil
+        }
+
+        if let content = dictionary["content"] as? [[String: Any]] {
+            let joined = content.compactMap { item -> String? in
+                if let text = (item["text"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
+                    return text
+                }
+                if let nested = item["content"] as? [String: Any] {
+                    return copilotVisibleMessageText(from: nested)
+                }
+                return nil
+            }
+            .joined(separator: "\n")
+
+            if let text = joined.nonEmpty {
+                return text
+            }
+        }
+
+        if let content = dictionary["content"] {
+            if let text = copilotVisibleMessageText(from: content) {
+                return text
+            }
+        }
+
+        if let message = dictionary["message"] {
+            if let text = copilotVisibleMessageText(from: message) {
+                return text
+            }
+        }
+
+        return firstNonEmptyString(
+            (dictionary["text"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty,
+            extractString(dictionary["output"]),
+            extractString(dictionary["result"]),
+            extractString(dictionary["response"])
+        )
+    }
+
     private func storeCopilotFallbackReply(_ reply: String) {
         let trimmedReply = reply.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedReply.isEmpty else { return }
@@ -5762,7 +7046,7 @@ final class CodexAssistantRuntime {
 }
 
 private actor CodexAppServerTransport {
-    private let incoming: @Sendable (CodexIncomingEvent) -> Void
+    private let incoming: @Sendable (CodexIncomingEvent) async -> Void
     private var process: Process?
     private var stdinHandle: FileHandle?
     private var stdoutHandle: FileHandle?
@@ -5773,7 +7057,7 @@ private actor CodexAppServerTransport {
     private var responseContinuations: [JSONRPCRequestID: CheckedContinuation<CodexResponsePayload, Error>] = [:]
     private var bufferedResponses: [JSONRPCRequestID: Result<CodexResponsePayload, Error>] = [:]
 
-    init(incoming: @escaping @Sendable (CodexIncomingEvent) -> Void) {
+    init(incoming: @escaping @Sendable (CodexIncomingEvent) async -> Void) {
         self.incoming = incoming
     }
 
@@ -5854,7 +7138,9 @@ private actor CodexAppServerTransport {
             } else {
                 message = nil
             }
-            incoming(.processExited(message))
+            Task {
+                await incoming(.processExited(message))
+            }
         }
 
         do {
@@ -6021,7 +7307,7 @@ private actor CodexAppServerTransport {
                     || lower.contains("failed to parse thread id")
                     || lower.contains("deprecation")
                 if !isNoisy {
-                    incoming(.statusMessage(line))
+                    await incoming(.statusMessage(line))
                 }
             } else {
                 await handleOutputLine(line)
@@ -6033,7 +7319,7 @@ private actor CodexAppServerTransport {
         guard let data = line.data(using: .utf8),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             CrashReporter.logWarning("Assistant runtime received non-JSON output from Codex App Server")
-            incoming(.statusMessage("Received non-JSON output from Codex App Server."))
+            await incoming(.statusMessage("Received non-JSON output from Codex App Server."))
             return
         }
 
@@ -6063,9 +7349,9 @@ private actor CodexAppServerTransport {
         }
 
         if let requestID = parseRequestID(json["id"]) {
-            incoming(.serverRequest(id: requestID, method: method, params: params))
+            await incoming(.serverRequest(id: requestID, method: method, params: params))
         } else {
-            incoming(.notification(method: method, params: params))
+            await incoming(.notification(method: method, params: params))
         }
     }
 

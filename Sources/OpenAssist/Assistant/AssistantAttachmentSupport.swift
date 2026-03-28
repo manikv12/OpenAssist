@@ -93,6 +93,28 @@ enum AssistantAttachmentSupport {
         return AssistantAttachment(filename: filename, data: png, mimeType: "image/png")
     }
 
+    static func attachment(fromDataURL rawValue: String, suggestedFilename: String? = nil) -> AssistantAttachment? {
+        guard let commaIndex = rawValue.firstIndex(of: ",") else { return nil }
+
+        let metadata = String(rawValue[..<commaIndex])
+        let encodedPayload = String(rawValue[rawValue.index(after: commaIndex)...])
+
+        guard metadata.hasPrefix("data:"),
+              metadata.contains(";base64"),
+              let data = Data(base64Encoded: encodedPayload) else {
+            return nil
+        }
+
+        let mimeType = String(metadata.dropFirst(5).split(separator: ";").first ?? "application/octet-stream")
+        let filename = normalizedAttachmentFilename(
+            suggestedFilename,
+            mimeType: mimeType,
+            defaultStem: mimeType.hasPrefix("image/") ? "pasted-image" : "pasted-file"
+        )
+
+        return AssistantAttachment(filename: filename, data: data, mimeType: mimeType)
+    }
+
     static func attachment(from url: URL) -> AssistantAttachment? {
         guard let data = try? Data(contentsOf: url) else { return nil }
         return AssistantAttachment(
@@ -120,6 +142,65 @@ enum AssistantAttachmentSupport {
             return "text/plain"
         default:
             return "application/octet-stream"
+        }
+    }
+
+    private static func normalizedAttachmentFilename(
+        _ rawFilename: String?,
+        mimeType: String,
+        defaultStem: String
+    ) -> String {
+        let trimmedName = rawFilename?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "/", with: "-")
+            .replacingOccurrences(of: ":", with: "-")
+            .replacingOccurrences(of: "\\", with: "-")
+
+        let fallbackExtension =
+            UTType(mimeType: mimeType)?.preferredFilenameExtension
+            ?? fallbackExtension(for: mimeType)
+
+        guard let trimmedName, !trimmedName.isEmpty else {
+            if let fallbackExtension {
+                return "\(defaultStem).\(fallbackExtension)"
+            }
+            return defaultStem
+        }
+
+        if URL(fileURLWithPath: trimmedName).pathExtension.isEmpty,
+           let fallbackExtension {
+            return "\(trimmedName).\(fallbackExtension)"
+        }
+
+        return trimmedName
+    }
+
+    private static func fallbackExtension(for mimeType: String) -> String? {
+        switch mimeType.lowercased() {
+        case "image/png":
+            return "png"
+        case "image/jpeg", "image/jpg":
+            return "jpg"
+        case "image/gif":
+            return "gif"
+        case "image/webp":
+            return "webp"
+        case "image/tiff":
+            return "tiff"
+        case "application/pdf":
+            return "pdf"
+        case "application/json":
+            return "json"
+        case "text/plain":
+            return "txt"
+        case "text/html":
+            return "html"
+        case "text/xml":
+            return "xml"
+        case "text/yaml":
+            return "yaml"
+        default:
+            return nil
         }
     }
 }

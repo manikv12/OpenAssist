@@ -213,10 +213,13 @@ struct AssistantWindowView: View {
     @State private var autoScrollPinnedToBottom = true
     @State private var visibleHistoryLimit = Self.initialVisibleHistoryLimit
     @State private var chatViewportHeight: CGFloat = 0
+    @State private var composerMeasuredHeight: CGFloat?
     @State private var isLoadingOlderHistory = false
     @State private var hoveredInlineCopyMessageID: String?
     @State private var inlineCopyHideWorkItem: DispatchWorkItem?
     @State private var previewAttachment: AssistantAttachment?
+    @State private var expandedHistoricalActivityRenderItemIDs: Set<String> = []
+    @State private var expandedHistoricalConversationBlockIDs: Set<String> = []
     @State private var chatScrollTracking = AssistantChatScrollTracking()
     @State private var selectedSidebarPane: AssistantSidebarPane = .threads
     @State private var showSkillWizardSheet = false
@@ -228,6 +231,11 @@ struct AssistantWindowView: View {
     @State private var isWorkspaceLaunchPrimaryHovered = false
     @State private var cachedVisibleRenderItems: [AssistantTimelineRenderItem] = []
     @State private var chatWebContainer: AssistantChatWebContainerView?
+    @State private var isThreadNoteOpen = false
+    @State private var activeThreadNoteThreadID: String?
+    @State private var threadNoteDraftTextByThreadID: [String: String] = [:]
+    @State private var threadNoteLastSavedAtByThreadID: [String: Date] = [:]
+    @State private var threadNoteSavingThreadIDs: Set<String> = []
     @StateObject private var selectionTracker = AssistantTextSelectionTracker.shared
     @AppStorage("assistantSidebarCollapsed") private var isSidebarCollapsed = false
     @State private var collapsedSidebarPreviewPane: String?
@@ -265,18 +273,79 @@ struct AssistantWindowView: View {
             sessionStatusByNormalizedID: sessionStatusByNormalizedID,
             sessionWorkingDirectoryByNormalizedID: sessionWorkingDirectoryByNormalizedID
         )
-        return visibleRenderItems.flatMap {
-            AssistantChatWebMessage.from(
-                renderItem: $0,
-                historyActions: historyActions,
-                renderContext: renderContext
+        let collapsedConversationGroups = collapsedHistoricalConversationGroups(
+            in: visibleRenderItems
+        )
+        let collapsedConversationGroupByFirstHiddenIndex = Dictionary(
+            uniqueKeysWithValues: collapsedConversationGroups.map { ($0.firstHiddenIndex, $0) }
+        )
+        let collapsedConversationGroupByHiddenIndex = Dictionary(
+            uniqueKeysWithValues: collapsedConversationGroups.flatMap { group in
+                group.hiddenIndices.map { ($0, group) }
+            }
+        )
+        var messages: [AssistantChatWebMessage] = []
+
+        for (index, renderItem) in visibleRenderItems.enumerated() {
+            let expandedConversationGroup = collapsedConversationGroupByHiddenIndex[index].flatMap {
+                expandedHistoricalConversationBlockIDs.contains($0.id) ? $0 : nil
+            }
+
+            if let group = collapsedConversationGroupByFirstHiddenIndex[index],
+                let summary = AssistantChatWebMessage.collapsedConversationSummary(
+                    hiddenRenderItems: group.hiddenRenderItems,
+                    blockID: group.id,
+                    expanded: expandedHistoricalConversationBlockIDs.contains(group.id)
+                )
+            {
+                messages.append(summary)
+                if !expandedHistoricalConversationBlockIDs.contains(group.id) {
+                    continue
+                }
+            } else if let group = collapsedConversationGroupByHiddenIndex[index],
+                !expandedHistoricalConversationBlockIDs.contains(group.id)
+            {
+                continue
+            }
+
+            if expandedConversationGroup == nil,
+                shouldCollapseHistoricalActivityRenderItem(
+                    renderItem,
+                    at: index,
+                    in: visibleRenderItems
+                ),
+                let summary = AssistantChatWebMessage.collapsedActivitySummary(
+                    renderItem: renderItem
+                )
+            {
+                messages.append(summary)
+                continue
+            }
+
+            if expandedHistoricalActivityRenderItemIDs.contains(renderItem.id),
+                let summary = AssistantChatWebMessage.expandedActivitySummary(
+                    renderItem: renderItem
+                )
+            {
+                messages.append(summary)
+            }
+
+            messages.append(
+                contentsOf: AssistantChatWebMessage.from(
+                    renderItem: renderItem,
+                    historyActions: historyActions,
+                    renderContext: renderContext
+                )
             )
         }
+
+        return messages
     }
 
     private var chatWebRewindState: AssistantChatWebRewindState? {
-        guard let mutation = assistant.historyMutationState,
-            mutation.isPendingComposerEdit
+        guard let branch = assistant.historyBranchState,
+              assistant.selectedSessionID?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                == branch.sessionID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         else {
             return nil
         }
@@ -286,10 +355,132 @@ struct AssistantWindowView: View {
         })?.id
 
         return AssistantChatWebRewindState(
-            kind: mutation.kind.rawValue,
-            canStepBackward: assistant.canStepHistoryMutationBackward,
+            kind: branch.kind.rawValue,
+            canStepBackward: assistant.canStepHistoryBranchBackward,
             redoHostMessageID: redoHostMessageID
         )
+    }
+
+    private var selectedThreadNoteID: String? {
+        assistant.selectedSessionID?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nonEmpty?
+            .lowercased()
+    }
+
+    private var currentThreadNoteDraftText: String {
+        guard let threadID = selectedThreadNoteID else { return "" }
+        if let draft = threadNoteDraftTextByThreadID[threadID] {
+            return draft
+        }
+        return assistant.loadThreadNote(threadID: threadID)
+    }
+
+    private var chatWebThreadNoteState: AssistantChatWebThreadNoteState {
+        let threadID = selectedThreadNoteID
+        let text = currentThreadNoteDraftText
+        let hasNote = text.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty != nil
+        let savedAt = threadID.flatMap { threadNoteLastSavedAtByThreadID[$0] ?? assistant.threadNoteLastSavedAt(threadID: $0) }
+
+        return AssistantChatWebThreadNoteState(
+            threadID: threadID,
+            text: text,
+            isOpen: threadID == nil ? false : isThreadNoteOpen,
+            hasNote: hasNote,
+            isSaving: threadID.map { threadNoteSavingThreadIDs.contains($0) } ?? false,
+            lastSavedAtLabel: threadNoteSavedLabel(for: savedAt),
+            canEdit: threadID != nil,
+            placeholder: "Write decisions, next steps, constraints, and follow-ups for this thread. Type / for Markdown blocks."
+        )
+    }
+
+    private func threadNoteSavedLabel(for date: Date?) -> String? {
+        guard let date else { return nil }
+        let relative = Self.sidebarRelativeDateFormatter.localizedString(for: date, relativeTo: Date())
+        return relative == "now" ? "Saved now" : "Saved \(relative)"
+    }
+
+    private func syncThreadNoteSelection(_ sessionID: String?, persistCurrent: Bool) {
+        if persistCurrent {
+            persistThreadNoteIfNeeded(for: activeThreadNoteThreadID)
+        }
+
+        let nextThreadID = sessionID?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nonEmpty?
+            .lowercased()
+        activeThreadNoteThreadID = nextThreadID
+
+        guard let nextThreadID else {
+            isThreadNoteOpen = false
+            return
+        }
+
+        if threadNoteDraftTextByThreadID[nextThreadID] == nil {
+            threadNoteDraftTextByThreadID[nextThreadID] = assistant.loadThreadNote(threadID: nextThreadID)
+        }
+        if threadNoteLastSavedAtByThreadID[nextThreadID] == nil,
+           let savedAt = assistant.threadNoteLastSavedAt(threadID: nextThreadID) {
+            threadNoteLastSavedAtByThreadID[nextThreadID] = savedAt
+        }
+    }
+
+    private func persistThreadNoteIfNeeded(for threadID: String?) {
+        guard let threadID,
+              let draftText = threadNoteDraftTextByThreadID[threadID] else {
+            return
+        }
+
+        threadNoteSavingThreadIDs.insert(threadID)
+        let saveSucceeded = assistant.saveThreadNote(threadID: threadID, text: draftText)
+        if saveSucceeded {
+            if let savedAt = assistant.threadNoteLastSavedAt(threadID: threadID) {
+                threadNoteLastSavedAtByThreadID[threadID] = savedAt
+            } else {
+                threadNoteLastSavedAtByThreadID.removeValue(forKey: threadID)
+            }
+        }
+        DispatchQueue.main.async {
+            threadNoteSavingThreadIDs.remove(threadID)
+        }
+    }
+
+    private func toggleThreadNoteDrawer() {
+        if isThreadNoteOpen {
+            persistThreadNoteIfNeeded(for: selectedThreadNoteID)
+        } else {
+            syncThreadNoteSelection(assistant.selectedSessionID, persistCurrent: false)
+        }
+        isThreadNoteOpen.toggle()
+    }
+
+    private func handleThreadNoteCommand(_ command: AssistantChatWebThreadNoteCommand) {
+        let resolvedThreadID = command.threadID?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nonEmpty?
+            .lowercased() ?? selectedThreadNoteID
+
+        switch command.type {
+        case "setOpen":
+            guard let isOpen = command.isOpen else { return }
+            if !isOpen {
+                persistThreadNoteIfNeeded(for: resolvedThreadID)
+            } else {
+                syncThreadNoteSelection(resolvedThreadID, persistCurrent: false)
+            }
+            isThreadNoteOpen = isOpen
+        case "updateDraft":
+            guard let resolvedThreadID, let text = command.text else { return }
+            threadNoteDraftTextByThreadID[resolvedThreadID] = text
+        case "save":
+            guard let resolvedThreadID else { return }
+            if let text = command.text {
+                threadNoteDraftTextByThreadID[resolvedThreadID] = text
+            }
+            persistThreadNoteIfNeeded(for: resolvedThreadID)
+        default:
+            break
+        }
     }
 
     private func loadOlderHistoryBatchWeb() {
@@ -301,7 +492,7 @@ struct AssistantWindowView: View {
         } else {
             isLoadingOlderHistory = true
             Task {
-                await assistant.loadMoreHistoryForSelectedSession()
+                _ = await assistant.loadMoreHistoryForSelectedSession()
                 await MainActor.run {
                     visibleHistoryLimit += Self.historyBatchSize
                     recomputeVisibleRenderItems()
@@ -665,10 +856,31 @@ struct AssistantWindowView: View {
         assistant.visibleArchivedSidebarSessions.count
     }
 
-    private var composerWebHeight: CGFloat {
-        let hasAccessoryRows =
-            !assistant.activeThreadSkills.isEmpty || !assistant.attachments.isEmpty
-        return hasAccessoryRows ? 212 : 184
+    private func composerFallbackHeight(for layout: ChatLayoutMetrics) -> CGFloat {
+        let accessoryRowCount =
+            (assistant.activeThreadSkills.isEmpty ? 0 : 1)
+            + (assistant.attachments.isEmpty ? 0 : 1)
+
+        return 182 + (CGFloat(accessoryRowCount) * 34)
+    }
+
+    private func composerWebHeight(for layout: ChatLayoutMetrics) -> CGFloat {
+        let minHeight: CGFloat = 170
+        let maxHeight: CGFloat = 300
+        let proposedHeight = composerMeasuredHeight ?? composerFallbackHeight(for: layout)
+        return min(max(proposedHeight, minHeight), maxHeight)
+    }
+
+    private func updateComposerMeasuredHeight(_ height: CGFloat) {
+        guard height.isFinite else { return }
+
+        let boundedHeight = min(max(ceil(height), 140), 420)
+        guard composerMeasuredHeight == nil || abs((composerMeasuredHeight ?? 0) - boundedHeight) > 1
+        else {
+            return
+        }
+
+        composerMeasuredHeight = boundedHeight
     }
 
     private var sidebarWebState: AssistantSidebarWebState {
@@ -787,7 +999,8 @@ struct AssistantWindowView: View {
                 AssistantComposerWebAttachment(
                     id: $0.id.uuidString,
                     filename: $0.filename,
-                    kind: $0.isImage ? "image" : "file"
+                    kind: $0.isImage ? "image" : "file",
+                    previewDataURL: $0.previewDataURL
                 )
             }
         )
@@ -1209,6 +1422,25 @@ struct AssistantWindowView: View {
             assistant.attachments.removeAll {
                 $0.id.uuidString.caseInsensitiveCompare(attachmentID) == .orderedSame
             }
+        case "addAttachments":
+            guard let rawAttachments = payload?["attachments"] as? [[String: Any]] else {
+                return
+            }
+
+            let attachments = rawAttachments.compactMap { item -> AssistantAttachment? in
+                let filename = (item["filename"] as? String)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if let dataURL = item["dataUrl"] as? String {
+                    return AssistantAttachmentSupport.attachment(
+                        fromDataURL: dataURL,
+                        suggestedFilename: filename
+                    )
+                }
+                return nil
+            }
+
+            guard !attachments.isEmpty else { return }
+            assistant.attachments.append(contentsOf: attachments)
         case "detachSkill":
             guard
                 let skillName = (payload?["skillName"] as? String)?
@@ -1877,6 +2109,7 @@ struct AssistantWindowView: View {
                 runtimePanel: chatWebRuntimePanel,
                 reviewPanel: inlineTrackedCodePanel,
                 rewindState: chatWebRewindState,
+                threadNoteState: chatWebThreadNoteState,
                 showTypingIndicator: shouldShowPendingAssistantPlaceholder,
                 typingTitle: assistant.hudState.title.isEmpty
                     ? "Thinking" : assistant.hudState.title,
@@ -1891,6 +2124,20 @@ struct AssistantWindowView: View {
                 onLoadOlderHistory: {
                     guard canLoadOlderHistory, !isLoadingOlderHistory else { return }
                     loadOlderHistoryBatchWeb()
+                },
+                onLoadActivityDetails: { renderItemID in
+                    if renderItemID.hasPrefix("collapsed-conversation-") {
+                        expandedHistoricalConversationBlockIDs.insert(renderItemID)
+                    } else {
+                        expandedHistoricalActivityRenderItemIDs.insert(renderItemID)
+                    }
+                },
+                onCollapseActivityDetails: { renderItemID in
+                    if renderItemID.hasPrefix("collapsed-conversation-") {
+                        expandedHistoricalConversationBlockIDs.remove(renderItemID)
+                    } else {
+                        expandedHistoricalActivityRenderItemIDs.remove(renderItemID)
+                    }
                 },
                 onSelectRuntimeBackend: { backendID in
                     guard let backend = AssistantRuntimeBackend(rawValue: backendID) else { return }
@@ -1912,9 +2159,13 @@ struct AssistantWindowView: View {
                 onRedoHistoryMutation: {
                     Task { await assistant.redoUndoneUserMessage() }
                 },
+                onRestoreCodeCheckpoint: { checkpointID in
+                    Task { await assistant.restoreTrackedCodeCheckpoint(checkpointID: checkpointID) }
+                },
                 onCloseCodeReviewPanel: {
                     // Inline tracked coding does not need a separate native close action.
                 },
+                onThreadNoteCommand: handleThreadNoteCommand,
                 onTextSelected: { selectedText, messageID, parentText, screenRect in
                     handleWebViewTextSelection(
                         selectedText: selectedText,
@@ -1932,8 +2183,10 @@ struct AssistantWindowView: View {
             .frame(maxHeight: .infinity)
             .onAppear {
                 resetVisibleHistoryWindow()
+                syncThreadNoteSelection(assistant.selectedSessionID, persistCurrent: false)
             }
             .onChange(of: assistant.selectedSessionID) { newSessionID in
+                syncThreadNoteSelection(newSessionID, persistCurrent: true)
                 guard newSessionID?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
                 else {
                     return
@@ -2106,7 +2359,7 @@ struct AssistantWindowView: View {
             AssistantChatWebCodeReviewPanel(
                 trackingState: $0,
                 hasActiveTurn: assistant.hasActiveTurn,
-                actionsLocked: assistant.historyMutationState != nil,
+                actionsLocked: assistant.isRestoringHistoryBranch,
                 embedded: true
             )
         }
@@ -2153,7 +2406,7 @@ struct AssistantWindowView: View {
                         .clipped()
                 }
 
-                chatComposer
+                chatComposer(layout: layout)
             }
             .frame(maxWidth: layout.composerMaxWidth, alignment: .leading)
 
@@ -2233,6 +2486,7 @@ struct AssistantWindowView: View {
     private func chatTopBar(layout: ChatLayoutMetrics) -> some View {
         let sideControlWidth: CGFloat = 138
         let titleHorizontalPadding: CGFloat = 16
+        let hasThreadNote = currentThreadNoteDraftText.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty != nil
 
         return HStack(spacing: 0) {
             HStack(spacing: 0) {}
@@ -2272,6 +2526,19 @@ struct AssistantWindowView: View {
                 }
 
                 workspaceLaunchControl
+
+                if assistant.selectedSessionID != nil {
+                    Button {
+                        toggleThreadNoteDrawer()
+                    } label: {
+                        topBarIconButton(
+                            symbol: "note.text",
+                            emphasized: isThreadNoteOpen || hasThreadNote
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .help(isThreadNoteOpen ? "Close thread note" : "Open thread note")
+                }
 
                 Button {
                     showSessionInstructions.toggle()
@@ -2561,32 +2828,52 @@ struct AssistantWindowView: View {
     private var statusBarRateLimits: some View {
         if let bucket = assistant.selectedRateLimitBucket {
             HStack(spacing: 10) {
-                if let primary = bucket.primary {
-                    statusBarRateLimitInline(
-                        window: primary,
-                        bucketLabel: assistant.selectedRateLimitBucketLabel
-                    )
-                }
-                if let secondary = bucket.secondary {
+                if let selectedBucketLabel = assistant.selectedRateLimitBucketLabel,
+                   let secondary = bucket.secondary {
                     statusBarRateLimitInline(
                         window: secondary,
-                        bucketLabel: assistant.selectedRateLimitBucketLabel
+                        bucketLabel: selectedBucketLabel,
+                        showsResetInline: true
                     )
+                } else {
+                    if let primary = bucket.primary {
+                        statusBarRateLimitInline(
+                            window: primary,
+                            bucketLabel: assistant.selectedRateLimitBucketLabel,
+                            showsResetInline: assistant.selectedRateLimitBucketLabel != nil
+                        )
+                    }
+                    if let secondary = bucket.secondary {
+                        statusBarRateLimitInline(
+                            window: secondary,
+                            bucketLabel: assistant.selectedRateLimitBucketLabel,
+                            showsResetInline: assistant.selectedRateLimitBucketLabel != nil
+                        )
+                    }
                 }
             }
         }
     }
 
-    private func statusBarRateLimitInline(window: RateLimitWindow, bucketLabel: String?)
+    private func statusBarRateLimitInline(
+        window: RateLimitWindow,
+        bucketLabel: String?,
+        showsResetInline: Bool = false
+    )
         -> some View
     {
         let isHigh = window.usedPercent > 80
         let percentColor: Color =
             isHigh ? .red.opacity(0.85) : AppVisualTheme.accentTint.opacity(0.75)
+        let compactBucketLabel = bucketLabel?
+            .replacingOccurrences(of: "Claude ", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nonEmpty
         let baseLabel = window.windowLabel.isEmpty ? "Usage" : window.windowLabel
-        let label = [bucketLabel, baseLabel]
+        let label = [compactBucketLabel, baseLabel]
             .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty }
             .joined(separator: " ")
+        let resetLabel = showsResetInline ? window.resetsInLabel : nil
 
         return HStack(spacing: 4) {
             Image(systemName: "gauge.low")
@@ -2598,6 +2885,12 @@ struct AssistantWindowView: View {
             Text("\(window.usedPercent)%")
                 .font(.system(size: 10, weight: .semibold, design: .monospaced))
                 .foregroundStyle(percentColor)
+            if let resetLabel {
+                Text("resets \(resetLabel)")
+                    .font(.system(size: 9, weight: .regular))
+                    .foregroundStyle(AppVisualTheme.foreground(0.32))
+                    .lineLimit(1)
+            }
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 4)
@@ -2915,6 +3208,127 @@ struct AssistantWindowView: View {
         isPreservingHistoryScrollPosition = false
         chatScrollTracking.lastManualScrollAt = .distantPast
         expandedActivityIDs.removeAll()
+        expandedHistoricalActivityRenderItemIDs.removeAll()
+        expandedHistoricalConversationBlockIDs.removeAll()
+    }
+
+    private func shouldCollapseHistoricalActivityRenderItem(
+        _ renderItem: AssistantTimelineRenderItem,
+        at index: Int,
+        in renderItems: [AssistantTimelineRenderItem]
+    ) -> Bool {
+        guard !expandedHistoricalActivityRenderItemIDs.contains(renderItem.id) else {
+            return false
+        }
+
+        let activities = activityItems(for: renderItem)
+        guard !activities.isEmpty else { return false }
+        guard activities.allSatisfy({ !$0.status.isActive }) else { return false }
+
+        let laterItems = renderItems.dropFirst(index + 1)
+        return laterItems.contains(where: { activityItems(for: $0).isEmpty })
+    }
+
+    private func activityItems(for renderItem: AssistantTimelineRenderItem) -> [AssistantActivityItem] {
+        switch renderItem {
+        case .timeline(let item):
+            guard item.kind == .activity, let activity = item.activity else { return [] }
+            return [activity]
+        case .activityGroup(let group):
+            return group.activities
+        }
+    }
+
+    private struct CollapsedHistoricalConversationGroup {
+        let id: String
+        let firstHiddenIndex: Int
+        let hiddenIndices: [Int]
+        let hiddenRenderItems: [AssistantTimelineRenderItem]
+    }
+
+    private func collapsedHistoricalConversationGroups(
+        in renderItems: [AssistantTimelineRenderItem]
+    ) -> [CollapsedHistoricalConversationGroup] {
+        guard !renderItems.isEmpty else { return [] }
+
+        var groups: [CollapsedHistoricalConversationGroup] = []
+        var segmentStart = 0
+
+        func flushSegment(endExclusive: Int) {
+            guard segmentStart < endExclusive else { return }
+
+            let indices = Array(segmentStart..<endExclusive)
+            guard let lastAssistantIndex = indices.last(where: {
+                isCollapsibleAssistantResponseRenderItem(renderItems[$0])
+            }) else {
+                return
+            }
+
+            let hiddenIndices = indices.filter { index in
+                guard index < lastAssistantIndex else { return false }
+                return !isUserRenderItem(renderItems[index])
+                    && isHistoricalConversationRenderItem(renderItems[index])
+            }
+
+            guard !hiddenIndices.isEmpty else { return }
+
+            let hiddenRenderItems = hiddenIndices.map { renderItems[$0] }
+            let firstHiddenID = hiddenRenderItems.first?.id ?? UUID().uuidString
+            let lastVisibleID = renderItems[lastAssistantIndex].id
+            groups.append(
+                CollapsedHistoricalConversationGroup(
+                    id: "collapsed-conversation-\(firstHiddenID)-\(lastVisibleID)",
+                    firstHiddenIndex: hiddenIndices[0],
+                    hiddenIndices: hiddenIndices,
+                    hiddenRenderItems: hiddenRenderItems
+                )
+            )
+        }
+
+        for index in renderItems.indices {
+            if isUserRenderItem(renderItems[index]) {
+                flushSegment(endExclusive: index)
+                segmentStart = index + 1
+            }
+        }
+
+        flushSegment(endExclusive: renderItems.count)
+        return groups
+    }
+
+    private func isUserRenderItem(_ renderItem: AssistantTimelineRenderItem) -> Bool {
+        guard case .timeline(let item) = renderItem else { return false }
+        return item.kind == .userMessage
+    }
+
+    private func isCollapsibleAssistantResponseRenderItem(
+        _ renderItem: AssistantTimelineRenderItem
+    ) -> Bool {
+        guard case .timeline(let item) = renderItem else { return false }
+        switch item.kind {
+        case .assistantProgress, .assistantFinal, .plan:
+            return item.text?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty != nil
+        default:
+            return false
+        }
+    }
+
+    private func isHistoricalConversationRenderItem(
+        _ renderItem: AssistantTimelineRenderItem
+    ) -> Bool {
+        switch renderItem {
+        case .activityGroup(let group):
+            return group.activities.allSatisfy { !$0.status.isActive }
+        case .timeline(let item):
+            switch item.kind {
+            case .activity:
+                return item.activity?.status.isActive != true
+            case .assistantProgress, .assistantFinal, .plan:
+                return !item.isStreaming
+            default:
+                return true
+            }
+        }
     }
 
     private func handleUserScrollInteraction() {
@@ -4785,16 +5199,18 @@ struct AssistantWindowView: View {
             .padding(.bottom, 6)
         }
 
-        if let bannerText = assistant.historyMutationState?.bannerText {
+        if let branch = assistant.historyBranchState,
+           let bannerText = branch.bannerText {
             composerStatusBanner(
-                symbol: assistant.historyMutationState?.kind == .undo
-                    ? "arrow.uturn.backward.circle" : "pencil.circle",
+                symbol: branch.kind == .undo
+                    ? "arrow.uturn.backward.circle"
+                    : (branch.kind == .edit ? "pencil.circle" : "arrow.uturn.backward.circle"),
                 text: bannerText,
                 tint: AppVisualTheme.accentTint
             ) {
-                if assistant.canStepHistoryMutationBackward {
+                if assistant.canStepHistoryBranchBackward {
                     Button("Previous message") {
-                        Task { await assistant.stepHistoryMutationBackward() }
+                        Task { await assistant.stepHistoryBranchBackward() }
                     }
                     .buttonStyle(.plain)
                     .font(.system(size: 10.5, weight: .semibold))
@@ -4833,19 +5249,48 @@ struct AssistantWindowView: View {
                 .accessibilityLabel("Redo")
             }
             .padding(.bottom, 6)
+
+            if !assistant.historyRestoreItems.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 6) {
+                        ForEach(assistant.historyRestoreItems) { item in
+                            Button("Restore: \(item.title)") {
+                                Task { await assistant.restoreHistoryRestoreItem(item.id) }
+                            }
+                            .buttonStyle(.plain)
+                            .font(.system(size: 10.5, weight: .semibold))
+                            .lineLimit(1)
+                            .foregroundStyle(AppVisualTheme.foreground(0.92))
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 6)
+                            .background(
+                                Capsule(style: .continuous)
+                                    .fill(AppVisualTheme.surfaceFill(0.12))
+                                    .overlay(
+                                        Capsule(style: .continuous)
+                                            .stroke(AppVisualTheme.surfaceStroke(0.12), lineWidth: 0.5)
+                                    )
+                            )
+                        }
+                    }
+                    .padding(.horizontal, 2)
+                }
+                .padding(.bottom, 6)
+            }
         }
     }
 
-    private var chatComposer: some View {
+    private func chatComposer(layout: ChatLayoutMetrics) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             chatComposerBanners
 
             AssistantComposerWebView(
                 state: composerWebState,
                 accentColor: AppVisualTheme.accentTint,
+                onHeightChange: updateComposerMeasuredHeight,
                 onCommand: handleComposerWebCommand
             )
-            .frame(height: composerWebHeight)
+            .frame(height: composerWebHeight(for: layout))
             .background(
                 RoundedRectangle(cornerRadius: 24, style: .continuous)
                     .fill(AppVisualTheme.surfaceFill(0.18))

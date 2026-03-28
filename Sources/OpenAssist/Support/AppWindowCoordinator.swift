@@ -1,6 +1,74 @@
 import AppKit
 import SwiftUI
 
+enum AppWindowFrameFitter {
+    static func adaptedMinimumSize(
+        preferredMinimumSize: NSSize,
+        visibleFrame: NSRect?,
+        fallbackMinimumSize: NSSize = NSSize(width: 420, height: 320),
+        screenPadding: NSSize = NSSize(width: 24, height: 24)
+    ) -> NSSize {
+        guard let visibleFrame else {
+            return preferredMinimumSize
+        }
+
+        let availableWidth = max(
+            fallbackMinimumSize.width,
+            visibleFrame.width - screenPadding.width
+        )
+        let availableHeight = max(
+            fallbackMinimumSize.height,
+            visibleFrame.height - screenPadding.height
+        )
+
+        return NSSize(
+            width: min(preferredMinimumSize.width, availableWidth),
+            height: min(preferredMinimumSize.height, availableHeight)
+        )
+    }
+
+    static func centeredFrame(size: NSSize, in visibleFrame: NSRect) -> NSRect {
+        NSRect(
+            x: visibleFrame.midX - (size.width / 2),
+            y: visibleFrame.midY - (size.height / 2),
+            width: size.width,
+            height: size.height
+        )
+    }
+
+    static func fittedFrame(
+        _ frame: NSRect,
+        within visibleFrame: NSRect,
+        minimumSize: NSSize
+    ) -> NSRect {
+        let fittedSize = NSSize(
+            width: min(max(frame.width, minimumSize.width), visibleFrame.width),
+            height: min(max(frame.height, minimumSize.height), visibleFrame.height)
+        )
+
+        let needsRecentering =
+            abs(fittedSize.width - frame.width) > 0.5
+            || abs(fittedSize.height - frame.height) > 0.5
+            || !visibleFrame.intersects(frame)
+
+        let unclampedOrigin = needsRecentering
+            ? centeredFrame(size: fittedSize, in: visibleFrame).origin
+            : frame.origin
+
+        let minX = visibleFrame.minX
+        let maxX = visibleFrame.maxX - fittedSize.width
+        let minY = visibleFrame.minY
+        let maxY = visibleFrame.maxY - fittedSize.height
+
+        let clampedOrigin = NSPoint(
+            x: min(max(unclampedOrigin.x, minX), maxX),
+            y: min(max(unclampedOrigin.y, minY), maxY)
+        )
+
+        return NSRect(origin: clampedOrigin, size: fittedSize)
+    }
+}
+
 private final class AppHostWindow: NSWindow {
     override func sendEvent(_ event: NSEvent) {
         if shouldZoomOnDoubleClick(for: event) {
@@ -419,6 +487,15 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
         setActivationPolicyForOpenWindows()
     }
 
+    func windowDidChangeScreen(_ notification: Notification) {
+        guard let window = notification.object as? NSWindow,
+              window === assistantWindowController?.window else {
+            return
+        }
+
+        fitAssistantWindowToVisibleScreen(window)
+    }
+
     private func reinsertFromHistory(_ text: String) {
         guard !text.isEmpty else { return }
 
@@ -437,15 +514,7 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
         // resized it — respect that choice and skip size enforcement.
         guard !wasVisible else { return }
 
-        let activeVisibleFrame = (NSScreen.main ?? window.screen ?? NSScreen.screens.first)?.visibleFrame
-        let targetSize = targetAssistantWindowSize(for: activeVisibleFrame)
-        let needsReadableSize = window.frame.width < targetSize.width || window.frame.height < targetSize.height
-
-        if needsReadableSize {
-            window.setContentSize(targetSize)
-        }
-
-        centerWindowOnActiveScreen(window)
+        fitAssistantWindowToVisibleScreen(window)
     }
 
     private func targetAssistantWindowSize(for visibleFrame: NSRect?) -> NSSize {
@@ -453,8 +522,12 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
 
         let horizontalPadding: CGFloat = 48
         let verticalPadding: CGFloat = 56
-        let maxWidth = max(assistantMinimumSize.width, visibleFrame.width - horizontalPadding)
-        let maxHeight = max(assistantMinimumSize.height, visibleFrame.height - verticalPadding)
+        let adaptedMinimumSize = AppWindowFrameFitter.adaptedMinimumSize(
+            preferredMinimumSize: assistantMinimumSize,
+            visibleFrame: visibleFrame
+        )
+        let maxWidth = max(adaptedMinimumSize.width, visibleFrame.width - horizontalPadding)
+        let maxHeight = max(adaptedMinimumSize.height, visibleFrame.height - verticalPadding)
 
         return NSSize(
             width: min(assistantDefaultSize.width, maxWidth),
@@ -462,18 +535,55 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
         )
     }
 
+    private func fitAssistantWindowToVisibleScreen(_ window: NSWindow) {
+        guard let visibleFrame = preferredVisibleFrame(for: window) else {
+            return
+        }
+
+        let adaptedMinimumSize = AppWindowFrameFitter.adaptedMinimumSize(
+            preferredMinimumSize: assistantMinimumSize,
+            visibleFrame: visibleFrame
+        )
+        if window.minSize != adaptedMinimumSize {
+            window.minSize = adaptedMinimumSize
+        }
+
+        let fittedFrame = AppWindowFrameFitter.fittedFrame(
+            window.frame,
+            within: visibleFrame,
+            minimumSize: adaptedMinimumSize
+        )
+        guard fittedFrame.integral != window.frame.integral else {
+            return
+        }
+
+        window.setFrame(fittedFrame, display: false)
+    }
+
+    private func preferredVisibleFrame(for window: NSWindow) -> NSRect? {
+        if let screen = window.screen {
+            return screen.visibleFrame
+        }
+        if let screen = Self.screen(containing: window.frame) {
+            return screen.visibleFrame
+        }
+        return (NSScreen.main ?? NSScreen.screens.first)?.visibleFrame
+    }
+
     private func centerWindowOnActiveScreen(_ window: NSWindow) {
-        guard let visibleFrame = (NSScreen.main ?? NSScreen.screens.first)?.visibleFrame else {
+        guard let visibleFrame = preferredVisibleFrame(for: window) else {
             window.center()
             return
         }
 
-        let frame = window.frame
-        let origin = NSPoint(
-            x: visibleFrame.midX - (frame.width / 2),
-            y: visibleFrame.midY - (frame.height / 2)
-        )
-        window.setFrameOrigin(origin)
+        let frame = AppWindowFrameFitter.centeredFrame(size: window.frame.size, in: visibleFrame)
+        window.setFrameOrigin(frame.origin)
+    }
+
+    private static func screen(containing frame: NSRect) -> NSScreen? {
+        let center = NSPoint(x: frame.midX, y: frame.midY)
+        return NSScreen.screens.first(where: { $0.frame.contains(center) })
+            ?? NSScreen.screens.first(where: { $0.frame.intersects(frame) })
     }
 
     private func requestDockActivation() {

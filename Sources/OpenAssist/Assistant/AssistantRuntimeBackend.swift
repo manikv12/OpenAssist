@@ -3,6 +3,7 @@ import Foundation
 enum AssistantRuntimeBackend: String, CaseIterable, Identifiable, Codable, Sendable {
     case codex
     case copilot
+    case claudeCode
 
     var id: String { rawValue }
 
@@ -12,6 +13,8 @@ enum AssistantRuntimeBackend: String, CaseIterable, Identifiable, Codable, Senda
             return "Codex"
         case .copilot:
             return "GitHub Copilot"
+        case .claudeCode:
+            return "Claude Code"
         }
     }
 
@@ -21,6 +24,8 @@ enum AssistantRuntimeBackend: String, CaseIterable, Identifiable, Codable, Senda
             return "Codex"
         case .copilot:
             return "Copilot"
+        case .claudeCode:
+            return "Claude"
         }
     }
 
@@ -30,6 +35,8 @@ enum AssistantRuntimeBackend: String, CaseIterable, Identifiable, Codable, Senda
             return "codex"
         case .copilot:
             return "copilot"
+        case .claudeCode:
+            return "claude"
         }
     }
 
@@ -39,6 +46,8 @@ enum AssistantRuntimeBackend: String, CaseIterable, Identifiable, Codable, Senda
             return ["npm install -g @openai/codex"]
         case .copilot:
             return ["npm install -g @github/copilot"]
+        case .claudeCode:
+            return ["npm install -g @anthropic-ai/claude-code"]
         }
     }
 
@@ -48,6 +57,8 @@ enum AssistantRuntimeBackend: String, CaseIterable, Identifiable, Codable, Senda
             return ["codex login"]
         case .copilot:
             return ["copilot login"]
+        case .claudeCode:
+            return ["claude auth login"]
         }
     }
 
@@ -57,6 +68,8 @@ enum AssistantRuntimeBackend: String, CaseIterable, Identifiable, Codable, Senda
             return URL(string: "https://developers.openai.com/codex/app-server")
         case .copilot:
             return URL(string: "https://docs.github.com/copilot/concepts/agents/about-copilot-cli")
+        case .claudeCode:
+            return URL(string: "https://code.claude.com/docs/en/headless")
         }
     }
 
@@ -65,6 +78,8 @@ enum AssistantRuntimeBackend: String, CaseIterable, Identifiable, Codable, Senda
         case .codex:
             return .appServer
         case .copilot:
+            return .cli
+        case .claudeCode:
             return .cli
         }
     }
@@ -75,6 +90,8 @@ enum AssistantRuntimeBackend: String, CaseIterable, Identifiable, Codable, Senda
             return "Install Codex"
         case .copilot:
             return "Install Copilot CLI"
+        case .claudeCode:
+            return "Install Claude Code"
         }
     }
 
@@ -84,6 +101,8 @@ enum AssistantRuntimeBackend: String, CaseIterable, Identifiable, Codable, Senda
             return "Codex Docs"
         case .copilot:
             return "Copilot Docs"
+        case .claudeCode:
+            return "Claude Docs"
         }
     }
 
@@ -93,6 +112,8 @@ enum AssistantRuntimeBackend: String, CaseIterable, Identifiable, Codable, Senda
             return "Sign In with ChatGPT"
         case .copilot:
             return "Sign In to GitHub Copilot"
+        case .claudeCode:
+            return "Sign In to Claude Code"
         }
     }
 
@@ -114,6 +135,8 @@ enum AssistantRuntimeBackend: String, CaseIterable, Identifiable, Codable, Senda
             return "Sign in to Codex"
         case .copilot:
             return "Sign in to GitHub Copilot"
+        case .claudeCode:
+            return "Sign in to Claude Code"
         }
     }
 
@@ -123,6 +146,8 @@ enum AssistantRuntimeBackend: String, CaseIterable, Identifiable, Codable, Senda
             return "Sign in with ChatGPT to use Codex"
         case .copilot:
             return "Sign in to GitHub Copilot to use the assistant"
+        case .claudeCode:
+            return "Sign in to Claude Code to use the assistant"
         }
     }
 
@@ -136,6 +161,8 @@ enum AssistantRuntimeBackend: String, CaseIterable, Identifiable, Codable, Senda
             return "Connecting to Codex App Server"
         case .copilot:
             return "Connecting to GitHub Copilot"
+        case .claudeCode:
+            return "Preparing Claude Code"
         }
     }
 
@@ -145,6 +172,8 @@ enum AssistantRuntimeBackend: String, CaseIterable, Identifiable, Codable, Senda
             return "Could not start Codex App Server"
         case .copilot:
             return "Could not start GitHub Copilot"
+        case .claudeCode:
+            return "Could not start Claude Code"
         }
     }
 
@@ -178,6 +207,8 @@ enum AssistantRuntimeBackend: String, CaseIterable, Identifiable, Codable, Senda
             return "Signed out of Codex"
         case .copilot:
             return "Signed out of GitHub Copilot"
+        case .claudeCode:
+            return "Signed out of Claude Code"
         }
     }
 
@@ -187,6 +218,8 @@ enum AssistantRuntimeBackend: String, CaseIterable, Identifiable, Codable, Senda
             return "Started a new Codex thread."
         case .copilot:
             return "Started a new GitHub Copilot session."
+        case .claudeCode:
+            return "Started a new Claude Code session."
         }
     }
 
@@ -196,6 +229,8 @@ enum AssistantRuntimeBackend: String, CaseIterable, Identifiable, Codable, Senda
             return "Loaded Codex thread \(sessionID)."
         case .copilot:
             return "Loaded GitHub Copilot session \(sessionID)."
+        case .claudeCode:
+            return "Loaded Claude Code session \(sessionID)."
         }
     }
 }

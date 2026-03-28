@@ -6,7 +6,8 @@ final class AssistantBackendAvailabilityTests: XCTestCase {
     func testResolvedDefaultAssistantBackendFallsBackWhenPreferredBackendIsMissing() {
         let guidanceByBackend: [AssistantRuntimeBackend: AssistantInstallGuidance] = [
             .codex: makeGuidance(for: .codex, detected: true),
-            .copilot: makeGuidance(for: .copilot, detected: false)
+            .copilot: makeGuidance(for: .copilot, detected: false),
+            .claudeCode: makeGuidance(for: .claudeCode, detected: false)
         ]
 
         let backend = AssistantStore.resolvedDefaultAssistantBackend(
@@ -20,7 +21,8 @@ final class AssistantBackendAvailabilityTests: XCTestCase {
     func testResolvedSelectableAssistantBackendsHidesMissingCopilot() {
         let guidanceByBackend: [AssistantRuntimeBackend: AssistantInstallGuidance] = [
             .codex: makeGuidance(for: .codex, detected: true),
-            .copilot: makeGuidance(for: .copilot, detected: false)
+            .copilot: makeGuidance(for: .copilot, detected: false),
+            .claudeCode: makeGuidance(for: .claudeCode, detected: false)
         ]
 
         let backends = AssistantStore.resolvedSelectableAssistantBackends(
@@ -34,7 +36,8 @@ final class AssistantBackendAvailabilityTests: XCTestCase {
     func testResolvedSelectableAssistantBackendsFallsBackToCodexWhenNothingIsInstalled() {
         let guidanceByBackend: [AssistantRuntimeBackend: AssistantInstallGuidance] = [
             .codex: makeGuidance(for: .codex, detected: false),
-            .copilot: makeGuidance(for: .copilot, detected: false)
+            .copilot: makeGuidance(for: .copilot, detected: false),
+            .claudeCode: makeGuidance(for: .claudeCode, detected: false)
         ]
 
         let backends = AssistantStore.resolvedSelectableAssistantBackends(
@@ -43,6 +46,21 @@ final class AssistantBackendAvailabilityTests: XCTestCase {
         )
 
         XCTAssertEqual(backends, [.codex])
+    }
+
+    func testResolvedDefaultAssistantBackendKeepsClaudeWhenInstalled() {
+        let guidanceByBackend: [AssistantRuntimeBackend: AssistantInstallGuidance] = [
+            .codex: makeGuidance(for: .codex, detected: true),
+            .copilot: makeGuidance(for: .copilot, detected: false),
+            .claudeCode: makeGuidance(for: .claudeCode, detected: true)
+        ]
+
+        let backend = AssistantStore.resolvedDefaultAssistantBackend(
+            preferred: .claudeCode,
+            guidanceByBackend: guidanceByBackend
+        )
+
+        XCTAssertEqual(backend, .claudeCode)
     }
 
     private func makeGuidance(

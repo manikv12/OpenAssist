@@ -972,6 +972,63 @@ final class AssistantSessionInteractionTests: XCTestCase {
     }
 
     @MainActor
+    func testCLIAttachmentContextPersistsAcrossFollowUpTurnsInSameSession() throws {
+        let runtime = CodexAssistantRuntime()
+        let attachment = AssistantAttachment(
+            filename: "plan.md",
+            data: Data("hello from attachment".utf8),
+            mimeType: "text/markdown"
+        )
+
+        let initialContext = try XCTUnwrap(
+            runtime.cliAttachmentContextForTesting(
+                sessionID: "thread-a",
+                attachments: [attachment]
+            )
+        )
+        let attachmentPath = try XCTUnwrap(cliAttachmentPath(from: initialContext))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: attachmentPath))
+
+        let followUpContext = try XCTUnwrap(
+            runtime.cliAttachmentContextForTesting(
+                sessionID: "thread-a",
+                attachments: []
+            )
+        )
+        XCTAssertEqual(followUpContext, initialContext)
+
+        runtime.clearCLIAttachmentsForTesting()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: attachmentPath))
+    }
+
+    @MainActor
+    func testCLIAttachmentContextCleansUpWhenSessionChanges() throws {
+        let runtime = CodexAssistantRuntime()
+        let attachment = AssistantAttachment(
+            filename: "plan.md",
+            data: Data("hello from attachment".utf8),
+            mimeType: "text/markdown"
+        )
+
+        let initialContext = try XCTUnwrap(
+            runtime.cliAttachmentContextForTesting(
+                sessionID: "thread-a",
+                attachments: [attachment]
+            )
+        )
+        let attachmentPath = try XCTUnwrap(cliAttachmentPath(from: initialContext))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: attachmentPath))
+
+        XCTAssertNil(
+            try runtime.cliAttachmentContextForTesting(
+                sessionID: "thread-b",
+                attachments: []
+            )
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: attachmentPath))
+    }
+
+    @MainActor
     func testCombinedRuntimeInstructionsIncludesOneShotPlanWithoutDroppingOtherInstructions() {
         let instructions = AssistantStore.combinedRuntimeInstructions(
             global: "Use simple language.",
@@ -1687,6 +1744,76 @@ final class AssistantSessionInteractionTests: XCTestCase {
     }
 
     @MainActor
+    func testClaudeCodeStreamDeltaProducesVisibleAssistantText() {
+        let runtime = CodexAssistantRuntime()
+        let recorder = AssistantRuntimeEventRecorder()
+
+        runtime.onTranscriptMutation = { mutation in
+            if case let .appendDelta(_, _, _, delta, _, _, _) = mutation {
+                recorder.systemMessages.append(delta)
+            }
+        }
+        runtime.onTimelineMutation = { mutation in
+            if case let .appendTextDelta(_, _, _, _, delta, _, _, _, _, _) = mutation {
+                recorder.activityTitles.append(delta)
+            }
+        }
+
+        runtime.configureStreamingTurnForTesting(
+            sessionID: "claude-thread",
+            turnID: "claude-turn",
+            text: "",
+            mode: .agentic
+        )
+
+        runtime.processClaudeCodeOutputLineForTesting(
+            #"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"Hello\n"}},"session_id":"claude-thread"}"#
+        )
+
+        XCTAssertEqual(recorder.systemMessages.last, "Hello")
+        XCTAssertEqual(recorder.activityTitles.last, "Hello")
+    }
+
+    @MainActor
+    func testCopilotPromptCompletionPromotesDirectAssistantPayloadReply() async {
+        let runtime = CodexAssistantRuntime()
+        let recorder = AssistantRuntimeEventRecorder()
+
+        runtime.onTimelineMutation = { mutation in
+            if case let .upsert(item) = mutation {
+                recorder.timelineItems.append(item)
+            }
+        }
+
+        runtime.configureStreamingTurnForTesting(
+            sessionID: "copilot-thread",
+            turnID: "copilot-turn",
+            text: "",
+            mode: .agentic
+        )
+
+        runtime.processCopilotPromptCompletionForTesting(
+            raw: [
+                "message": [
+                    "role": "assistant",
+                    "content": [
+                        [
+                            "type": "text",
+                            "text": "Final answer: GitHub Copilot replied successfully."
+                        ]
+                    ]
+                ]
+            ]
+        )
+
+        let finalAssistant = recorder.timelineItems.last {
+            $0.kind == .assistantFinal && $0.isStreaming == false
+        }
+
+        XCTAssertEqual(finalAssistant?.text, "GitHub Copilot replied successfully.")
+    }
+
+    @MainActor
     func testCopilotInternalCompletionToolIgnoresUnifiedDiffOutput() async {
         let runtime = CodexAssistantRuntime()
         let recorder = AssistantRuntimeEventRecorder()
@@ -2087,4 +2214,14 @@ final class AssistantSessionInteractionTests: XCTestCase {
         XCTAssertEqual(recorder.hudStates.last?.phase, .failed)
         XCTAssertEqual(recorder.hudStates.last?.detail, message)
     }
+}
+
+private func cliAttachmentPath(from promptContext: String) -> String? {
+    promptContext
+        .split(separator: "\n")
+        .compactMap { line -> String? in
+            guard let range = line.range(of: ": ", options: .backwards) else { return nil }
+            return String(line[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        .first
 }

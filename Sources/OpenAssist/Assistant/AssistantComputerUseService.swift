@@ -394,8 +394,21 @@ actor AssistantComputerUseService {
             let frontmostBeforeAction = await frontmostAppContext()
 
             if request.action.isCoordinateBased, state.latestSnapshot == nil {
-                throw AssistantComputerUseServiceError.observeRequired(
-                    "Call computer_use with an observe action first so Open Assist can capture the current screen before using screenshot coordinates."
+                state = try await refreshObservationState(
+                    state: state,
+                    normalizedSessionID: normalizedSessionID
+                )
+                return Self.result(
+                    summary: Self.refreshedObservationMessage(
+                        lead: "Open Assist captured a fresh screenshot because this request did not have a current observation yet.",
+                        snapshot: state.latestSnapshot,
+                        appContext: AssistantComputerUseFrontmostAppContext(
+                            bundleIdentifier: state.frontmostAppBundleID,
+                            displayName: state.frontmostAppName ?? frontmostBeforeAction.displayName
+                        )
+                    ),
+                    success: false,
+                    snapshot: state.latestSnapshot
                 )
             }
 
@@ -403,8 +416,21 @@ actor AssistantComputerUseService {
                let observedBundle = state.frontmostAppBundleID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty,
                let currentBundle = frontmostBeforeAction.bundleIdentifier?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty,
                observedBundle.caseInsensitiveCompare(currentBundle) != .orderedSame {
-                throw AssistantComputerUseServiceError.staleObservation(
-                    "The frontmost app changed to \(frontmostBeforeAction.displayName). Use observe first so Open Assist can refresh the screenshot before clicking, dragging, moving, or scrolling."
+                state = try await refreshObservationState(
+                    state: state,
+                    normalizedSessionID: normalizedSessionID
+                )
+                return Self.result(
+                    summary: Self.refreshedObservationMessage(
+                        lead: "The frontmost app changed to \(frontmostBeforeAction.displayName), so Open Assist captured a fresh screenshot.",
+                        snapshot: state.latestSnapshot,
+                        appContext: AssistantComputerUseFrontmostAppContext(
+                            bundleIdentifier: state.frontmostAppBundleID,
+                            displayName: state.frontmostAppName ?? frontmostBeforeAction.displayName
+                        )
+                    ),
+                    success: false,
+                    snapshot: state.latestSnapshot
                 )
             }
 
@@ -664,6 +690,44 @@ actor AssistantComputerUseService {
         }
         guard needsClamp else { return nil }
         return "Some coordinates were outside the current screenshot and were clamped to the visible screen bounds."
+    }
+
+    private func refreshObservationState(
+        state: SessionState,
+        normalizedSessionID: String
+    ) async throws -> SessionState {
+        var refreshedState = state
+        let snapshot = try await executeActions(
+            [["type": "observe"]],
+            state.latestSnapshot
+        )
+        let frontmostAfterObserve = await frontmostAppContext()
+        if state.latestSnapshot?.imageDataURL == snapshot.imageDataURL {
+            refreshedState.noProgressCounter += 1
+        } else {
+            refreshedState.noProgressCounter = 0
+        }
+        refreshedState.latestSnapshot = snapshot
+        refreshedState.frontmostAppBundleID = frontmostAfterObserve.bundleIdentifier?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+        refreshedState.frontmostAppName = frontmostAfterObserve.displayName
+        refreshedState.lastActionSummary = "Observed the current screen."
+        sessionStateByID[normalizedSessionID] = refreshedState
+        return refreshedState
+    }
+
+    private static func refreshedObservationMessage(
+        lead: String,
+        snapshot: LocalAutomationDisplaySnapshot?,
+        appContext: AssistantComputerUseFrontmostAppContext
+    ) -> String {
+        var lines = [lead]
+        lines.append("Retry the action using coordinates from this screenshot.")
+        if let snapshot {
+            let size = "\(Int(snapshot.imageSize.width))x\(Int(snapshot.imageSize.height))"
+            lines.append("Coordinates use screenshot pixels with the origin at the top-left. Screenshot size: \(size).")
+        }
+        lines.append("Frontmost app: \(appContext.displayName).")
+        return lines.joined(separator: " ")
     }
 
     private static func result(

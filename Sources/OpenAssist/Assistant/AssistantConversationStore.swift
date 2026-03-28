@@ -245,6 +245,9 @@ private struct AssistantConversationEventRecord: Codable, Equatable {
 
 final class AssistantConversationStore {
     private static let hybridSnapshotVersion = 2
+    private static let threadNoteFilename = "notes.md"
+    private static let snapshotFilename = "conversation.json"
+    private static let eventLogFilename = "conversation.events.jsonl"
 
     private let fileManager: FileManager
     private let baseDirectoryURL: URL
@@ -396,19 +399,62 @@ final class AssistantConversationStore {
     }
 
     func snapshotFileURL(for threadID: String) -> URL? {
-        let safeThreadID = safePathComponent(threadID)
-        guard !safeThreadID.isEmpty else { return nil }
-        return baseDirectoryURL
-            .appendingPathComponent(safeThreadID, isDirectory: true)
-            .appendingPathComponent("conversation.json", isDirectory: false)
+        threadDirectoryURL(for: threadID)?
+            .appendingPathComponent(Self.snapshotFilename, isDirectory: false)
     }
 
     func eventLogFileURL(for threadID: String) -> URL? {
-        let safeThreadID = safePathComponent(threadID)
-        guard !safeThreadID.isEmpty else { return nil }
-        return baseDirectoryURL
-            .appendingPathComponent(safeThreadID, isDirectory: true)
-            .appendingPathComponent("conversation.events.jsonl", isDirectory: false)
+        threadDirectoryURL(for: threadID)?
+            .appendingPathComponent(Self.eventLogFilename, isDirectory: false)
+    }
+
+    func threadNoteFileURL(for threadID: String) -> URL? {
+        threadDirectoryURL(for: threadID)?
+            .appendingPathComponent(Self.threadNoteFilename, isDirectory: false)
+    }
+
+    func loadThreadNote(threadID: String) -> String {
+        guard let fileURL = threadNoteFileURL(for: threadID),
+              fileManager.fileExists(atPath: fileURL.path),
+              let contents = try? String(contentsOf: fileURL, encoding: .utf8) else {
+            return ""
+        }
+        return contents
+    }
+
+    func threadNoteModificationDate(threadID: String) -> Date? {
+        guard let fileURL = threadNoteFileURL(for: threadID),
+              let attributes = try? fileManager.attributesOfItem(atPath: fileURL.path) else {
+            return nil
+        }
+        return attributes[.modificationDate] as? Date
+    }
+
+    func saveThreadNote(threadID: String, text: String) throws {
+        let normalizedText = text.replacingOccurrences(of: "\r\n", with: "\n")
+        guard let fileURL = threadNoteFileURL(for: threadID) else { return }
+
+        if normalizedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            try? fileManager.removeItem(at: fileURL)
+            return
+        }
+
+        try fileManager.createDirectory(
+            at: fileURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try normalizedText.write(to: fileURL, atomically: true, encoding: .utf8)
+    }
+
+    func deleteThreadArtifacts(threadID: String) {
+        guard let directoryURL = threadDirectoryURL(for: threadID),
+              fileManager.fileExists(atPath: directoryURL.path) else {
+            nextSequenceByThreadID.removeValue(forKey: normalizedThreadID(threadID))
+            return
+        }
+
+        try? fileManager.removeItem(at: directoryURL)
+        nextSequenceByThreadID.removeValue(forKey: normalizedThreadID(threadID))
     }
 
     func deleteEventLog(threadID: String) {
@@ -602,6 +648,13 @@ final class AssistantConversationStore {
 
     private func normalizedThreadID(_ threadID: String) -> String {
         threadID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    private func threadDirectoryURL(for threadID: String) -> URL? {
+        let safeThreadID = safePathComponent(threadID)
+        guard !safeThreadID.isEmpty else { return nil }
+        return baseDirectoryURL
+            .appendingPathComponent(safeThreadID, isDirectory: true)
     }
 
     private func safePathComponent(_ value: String) -> String {
