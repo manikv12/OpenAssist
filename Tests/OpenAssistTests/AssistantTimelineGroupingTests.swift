@@ -92,6 +92,40 @@ final class AssistantTimelineGroupingTests: XCTestCase {
         XCTAssertEqual(targets.first?.url.path, fileURL.path)
     }
 
+    func testRepoRelativeFilePathCandidatesExtractPathsFromPatchDetails() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let candidates = assistantRepoRelativeFilePathCandidates(
+            from: """
+            *** Update File: Sources/OpenAssist/Assistant/AssistantWindowView.swift
+            @@
+            -old
+            +new
+            """,
+            sessionCWD: root.path,
+            repositoryRootPath: root.path
+        )
+
+        XCTAssertEqual(candidates, ["Sources/OpenAssist/Assistant/AssistantWindowView.swift"])
+    }
+
+    func testRepoRelativeFilePathCandidatesConvertAbsolutePathsInsideRepository() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let absolutePath = root
+            .appendingPathComponent("Sources", isDirectory: true)
+            .appendingPathComponent("Feature.swift")
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let candidates = assistantRepoRelativeFilePathCandidates(
+            from: "sed -i '' '\(absolutePath.path)'",
+            sessionCWD: root.path,
+            repositoryRootPath: root.path
+        )
+
+        XCTAssertEqual(candidates, ["Sources/Feature.swift"])
+    }
+
     func testActivityOpenTargetsBuildSearchURLForWebSearch() {
         let activity = AssistantActivityItem(
             id: "search-1",
@@ -381,6 +415,174 @@ final class AssistantTimelineGroupingTests: XCTestCase {
 
         XCTAssertEqual(visibleWindow.count, 2)
         XCTAssertEqual(visibleWindow.map(\.id), ["final-3", "final-4"])
+    }
+
+    func testVisibleWindowExpandsToIncludeRecentChatMessagesAndTurnStart() {
+        let baseDate = Date(timeIntervalSince1970: 1_741_400_300)
+        let items: [AssistantTimelineItem] = (1...4).flatMap { turn -> [AssistantTimelineItem] in
+            let startedAt = baseDate.addingTimeInterval(TimeInterval(turn * 10))
+            return [
+                AssistantTimelineItem.userMessage(
+                    id: "user-\(turn)",
+                    sessionID: "session-1",
+                    turnID: "turn-\(turn)",
+                    text: "User \(turn)",
+                    createdAt: startedAt,
+                    source: .runtime
+                ),
+                AssistantTimelineItem.activity(
+                    AssistantActivityItem(
+                        id: "activity-\(turn)",
+                        sessionID: "session-1",
+                        turnID: "turn-\(turn)",
+                        kind: .commandExecution,
+                        title: "Command",
+                        status: .completed,
+                        friendlySummary: "Ran a terminal command.",
+                        rawDetails: "echo \(turn)",
+                        startedAt: startedAt.addingTimeInterval(1),
+                        updatedAt: startedAt.addingTimeInterval(2),
+                        source: .runtime
+                    )
+                ),
+                AssistantTimelineItem.assistantFinal(
+                    id: "assistant-\(turn)",
+                    sessionID: "session-1",
+                    turnID: "turn-\(turn)",
+                    text: "Assistant \(turn)",
+                    createdAt: startedAt.addingTimeInterval(3),
+                    updatedAt: startedAt.addingTimeInterval(4),
+                    isStreaming: false,
+                    source: .runtime
+                )
+            ]
+        }
+
+        let renderItems = buildAssistantTimelineRenderItems(from: items)
+        let visibleWindow = assistantTimelineVisibleWindow(
+            from: renderItems,
+            visibleLimit: 6,
+            minimumVisibleChatMessages: 6
+        )
+
+        XCTAssertEqual(
+            visibleWindow.map(\.id),
+            [
+                "user-2",
+                "activity-2",
+                "assistant-2",
+                "user-3",
+                "activity-3",
+                "assistant-3",
+                "user-4",
+                "activity-4",
+                "assistant-4",
+            ]
+        )
+    }
+
+    func testProtectedRecentConversationStartKeepsWholeRecentTurnExpanded() {
+        let baseDate = Date(timeIntervalSince1970: 1_741_400_400)
+        let items: [AssistantTimelineItem] = (1...4).flatMap { turn -> [AssistantTimelineItem] in
+            let startedAt = baseDate.addingTimeInterval(TimeInterval(turn * 10))
+            return [
+                AssistantTimelineItem.userMessage(
+                    id: "user-\(turn)",
+                    sessionID: "session-1",
+                    turnID: "turn-\(turn)",
+                    text: "User \(turn)",
+                    createdAt: startedAt,
+                    source: .runtime
+                ),
+                AssistantTimelineItem.activity(
+                    AssistantActivityItem(
+                        id: "activity-\(turn)",
+                        sessionID: "session-1",
+                        turnID: "turn-\(turn)",
+                        kind: .commandExecution,
+                        title: "Command",
+                        status: .completed,
+                        friendlySummary: "Ran a terminal command.",
+                        rawDetails: "echo \(turn)",
+                        startedAt: startedAt.addingTimeInterval(1),
+                        updatedAt: startedAt.addingTimeInterval(2),
+                        source: .runtime
+                    )
+                ),
+                AssistantTimelineItem.assistantFinal(
+                    id: "assistant-\(turn)",
+                    sessionID: "session-1",
+                    turnID: "turn-\(turn)",
+                    text: "Assistant \(turn)",
+                    createdAt: startedAt.addingTimeInterval(3),
+                    updatedAt: startedAt.addingTimeInterval(4),
+                    isStreaming: false,
+                    source: .runtime
+                )
+            ]
+        }
+
+        let renderItems = buildAssistantTimelineRenderItems(from: items)
+        let protectedStartIndex = assistantTimelineProtectedRecentConversationStartIndex(
+            in: renderItems,
+            preservingRecentChatMessages: 3
+        )
+
+        XCTAssertEqual(protectedStartIndex, 6)
+    }
+
+    func testCollapsedConversationSummaryUsesLastAssistantReplyForDuration() {
+        let baseDate = Date(timeIntervalSince1970: 1_741_400_500)
+        let hiddenRenderItems = buildAssistantTimelineRenderItems(
+            from: [
+                .assistantProgress(
+                    id: "progress-1",
+                    sessionID: "session-1",
+                    turnID: "turn-1",
+                    text: "I found the project.",
+                    createdAt: baseDate.addingTimeInterval(1),
+                    updatedAt: baseDate.addingTimeInterval(1),
+                    isStreaming: false,
+                    source: .runtime
+                ),
+                .activity(
+                    AssistantActivityItem(
+                        id: "activity-1",
+                        sessionID: "session-1",
+                        turnID: "turn-1",
+                        kind: .commandExecution,
+                        title: "Command",
+                        status: .completed,
+                        friendlySummary: "Ran a command.",
+                        rawDetails: "pwd",
+                        startedAt: baseDate.addingTimeInterval(2),
+                        updatedAt: baseDate.addingTimeInterval(2),
+                        source: .runtime
+                    )
+                ),
+            ]
+        )
+        let terminalRenderItem = AssistantTimelineRenderItem.timeline(
+            .assistantFinal(
+                id: "final-1",
+                sessionID: "session-1",
+                turnID: "turn-1",
+                text: "I finished the check.",
+                createdAt: baseDate.addingTimeInterval(6),
+                updatedAt: baseDate.addingTimeInterval(6),
+                isStreaming: false,
+                source: .runtime
+            )
+        )
+
+        let summary = AssistantChatWebMessage.collapsedConversationSummary(
+            hiddenRenderItems: hiddenRenderItems,
+            terminalRenderItem: terminalRenderItem,
+            blockID: "turn-1",
+            expanded: false
+        )
+
+        XCTAssertEqual(summary?.activityTitle, "Worked for 5s")
     }
 
     func testNextVisibleLimitLoadsOlderHistoryInBatchesAndClamps() {

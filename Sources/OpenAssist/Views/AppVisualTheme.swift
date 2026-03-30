@@ -12,6 +12,30 @@ enum AppVisualTheme {
     static var canvasBase: Color { palette.canvasBase }
     static var canvasDeep: Color { palette.canvasDeep }
     static var sidebarTint: Color { palette.sidebarTint }
+    static var sidebarChromeTint: Color {
+        switch SettingsStore.shared.colorTheme {
+        case .noirGold:
+            return Color(red: 0.10, green: 0.11, blue: 0.14)
+        default:
+            return palette.sidebarTint
+        }
+    }
+    static var sidebarSurfaceTop: Color {
+        switch SettingsStore.shared.colorTheme {
+        case .noirGold:
+            return Color(red: 0.11, green: 0.11, blue: 0.14)
+        default:
+            return palette.surfaceTop
+        }
+    }
+    static var sidebarSurfaceBottom: Color {
+        switch SettingsStore.shared.colorTheme {
+        case .noirGold:
+            return Color(red: 0.05, green: 0.06, blue: 0.08)
+        default:
+            return palette.surfaceBottom
+        }
+    }
     static var panelTint: Color { palette.panelTint }
     static var rowSelection: Color { palette.rowSelection }
     static var historyTint: Color { palette.historyTint }
@@ -397,6 +421,11 @@ struct AppSplitChromeBackground: View {
             style: SettingsStore.shared.appChromeStyle,
             reduceTransparency: reduceTransparency
         )
+        let sidebarSurfaceTop = AppVisualTheme.sidebarSurfaceTop
+        let sidebarSurfaceBottom = AppVisualTheme.sidebarSurfaceBottom
+        let sidebarTint = SettingsStore.shared.colorTheme == .noirGold
+            ? AppVisualTheme.sidebarChromeTint
+            : leadingTint
 
         GeometryReader { proxy in
             let calculatedWidth = proxy.size.width * leadingPaneFraction
@@ -419,16 +448,16 @@ struct AppSplitChromeBackground: View {
                                     material: .sidebar,
                                     blendingMode: tokens.backgroundBlendingMode
                                 )
-                                .opacity(leadingPaneTransparent ? 0.58 : 0.72)
+                                .opacity(leadingPaneTransparent ? 0.64 : 0.80)
                             } else {
-                                tokens.surfaceBottom.opacity(leadingPaneTransparent ? 0.72 : 0.88)
+                                sidebarSurfaceBottom.opacity(leadingPaneTransparent ? 0.80 : 0.94)
                             }
 
                             LinearGradient(
                                 colors: [
-                                    tokens.surfaceTop.opacity(leadingPaneTransparent ? 0.40 : 0.58),
-                                    leadingTint.opacity(leadingPaneTransparent ? 0.16 : 0.20),
-                                    tokens.surfaceBottom.opacity(leadingPaneTransparent ? 0.62 : 0.86)
+                                    sidebarSurfaceTop.opacity(leadingPaneTransparent ? 0.52 : 0.68),
+                                    sidebarTint.opacity(leadingPaneTransparent ? 0.08 : 0.12),
+                                    sidebarSurfaceBottom.opacity(leadingPaneTransparent ? 0.80 : 0.94)
                                 ],
                                 startPoint: .topLeading,
                                 endPoint: .bottomTrailing

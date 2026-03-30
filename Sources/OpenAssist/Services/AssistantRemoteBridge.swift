@@ -29,6 +29,8 @@ struct AssistantRemoteReasoningEffortState: Sendable {
 struct AssistantRemoteProjectOption: Identifiable, Sendable {
     let id: String
     let name: String
+    let kind: AssistantProjectKind
+    let parentID: String?
     let linkedFolderPath: String?
     let sessionCount: Int
 }
@@ -96,7 +98,7 @@ final class AssistantRemoteBridge {
         }
 
         await assistant.refreshSessions(limit: refreshLimit)
-        let visibleProjectIDs = Set(assistant.visibleProjects.map {
+        let visibleProjectIDs = Set(assistant.visibleLeafProjects.map {
             $0.id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         })
         let selectedSessionID = assistant.selectedSessionID
@@ -121,6 +123,27 @@ final class AssistantRemoteBridge {
             return Array(visibleSessions.prefix(limit))
         }
 
+        if let selectedFolder = assistant.visibleFolders.first(where: {
+            $0.id.caseInsensitiveCompare(normalizedProjectID) == .orderedSame
+        }) {
+            let descendantProjectIDs = Set<String>(
+                assistant.visibleLeafProjects.compactMap { project in
+                    guard let parentID = project.parentID,
+                          parentID.caseInsensitiveCompare(selectedFolder.id) == .orderedSame else {
+                        return nil
+                    }
+                    return project.id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                }
+            )
+            let matchingSessions = visibleSessions.filter { session in
+                guard let sessionProjectID = session.projectID?.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines).nonEmpty?.lowercased() else {
+                    return false
+                }
+                return descendantProjectIDs.contains(sessionProjectID)
+            }
+            return Array(matchingSessions.prefix(limit))
+        }
+
         let matchingSessions = visibleSessions.filter { session in
             session.projectID?.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
                 .caseInsensitiveCompare(normalizedProjectID) == .orderedSame
@@ -132,8 +155,17 @@ final class AssistantRemoteBridge {
         await assistant.refreshSessions(limit: 40)
         return assistant.visibleProjects.map { project in
             let sessionCount = assistant.sessions.reduce(into: 0) { count, session in
-                guard let sessionProjectID = session.projectID?.trimmingCharacters(in: .whitespacesAndNewlines),
-                      sessionProjectID.caseInsensitiveCompare(project.id) == .orderedSame else {
+                guard let sessionProjectID = session.projectID?.trimmingCharacters(in: .whitespacesAndNewlines) else {
+                    return
+                }
+                if project.isFolder {
+                    guard let sessionProject = assistant.visibleLeafProjects.first(where: {
+                        $0.id.caseInsensitiveCompare(sessionProjectID) == .orderedSame
+                    }),
+                    sessionProject.parentID?.caseInsensitiveCompare(project.id) == .orderedSame else {
+                        return
+                    }
+                } else if sessionProjectID.caseInsensitiveCompare(project.id) != .orderedSame {
                     return
                 }
                 count += 1
@@ -141,6 +173,8 @@ final class AssistantRemoteBridge {
             return AssistantRemoteProjectOption(
                 id: project.id,
                 name: project.name,
+                kind: project.kind,
+                parentID: project.parentID,
                 linkedFolderPath: project.linkedFolderPath,
                 sessionCount: sessionCount
             )

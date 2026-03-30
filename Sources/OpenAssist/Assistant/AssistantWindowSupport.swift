@@ -84,6 +84,28 @@ enum AssistantWindowChrome {
     static var sectionHeader: Color { AppVisualTheme.secondaryText }
 }
 
+@MainActor
+final class AssistantProviderMenuTarget: NSObject {
+    static let shared = AssistantProviderMenuTarget()
+    var onSelect: ((String) -> Void)?
+
+    @objc func selectBackend(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String else { return }
+        onSelect?(raw)
+    }
+}
+
+@MainActor
+final class AssistantWorkspaceMenuTarget: NSObject {
+    static let shared = AssistantWorkspaceMenuTarget()
+    var onSelect: ((String) -> Void)?
+
+    @objc func selectTarget(_ sender: NSMenuItem) {
+        guard let targetID = sender.representedObject as? String else { return }
+        onSelect?(targetID)
+    }
+}
+
 enum TimelineDisclosureState {
     case collapsed
     case expanded
@@ -232,13 +254,43 @@ func buildAssistantTimelineRenderItems(from items: [AssistantTimelineItem]) -> [
 
 func assistantTimelineVisibleWindow(
     from items: [AssistantTimelineRenderItem],
-    visibleLimit: Int
+    visibleLimit: Int,
+    minimumVisibleChatMessages: Int = 0
 ) -> [AssistantTimelineRenderItem] {
     guard !items.isEmpty else { return [] }
 
     let normalizedLimit = max(1, visibleLimit)
-    guard items.count > normalizedLimit else { return items }
-    return Array(items.suffix(normalizedLimit))
+    var startIndex = max(0, items.count - normalizedLimit)
+
+    if minimumVisibleChatMessages > 0 {
+        let normalizedMinimum = max(1, minimumVisibleChatMessages)
+        var visibleChatMessageCount = items[startIndex...].reduce(into: 0) { count, item in
+            if assistantTimelineRenderItemCountsAsChatMessage(item) {
+                count += 1
+            }
+        }
+
+        while startIndex > 0 && visibleChatMessageCount < normalizedMinimum {
+            startIndex -= 1
+            if assistantTimelineRenderItemCountsAsChatMessage(items[startIndex]) {
+                visibleChatMessageCount += 1
+            }
+        }
+    }
+
+    if let firstVisibleChatMessageIndex = items.indices.dropFirst(startIndex).first(where: {
+        assistantTimelineRenderItemCountsAsChatMessage(items[$0])
+    }) {
+        startIndex = min(
+            startIndex,
+            assistantTimelineConversationStartIndex(
+                in: items,
+                for: firstVisibleChatMessageIndex
+            )
+        )
+    }
+
+    return Array(items[startIndex...])
 }
 
 func assistantTimelineNextVisibleLimit(
@@ -251,6 +303,134 @@ func assistantTimelineNextVisibleLimit(
     let normalizedCurrent = max(0, currentLimit)
     let normalizedBatch = max(1, batchSize)
     return min(totalCount, max(1, normalizedCurrent + normalizedBatch))
+}
+
+func assistantTimelineRenderItemCountsAsChatMessage(
+    _ renderItem: AssistantTimelineRenderItem
+) -> Bool {
+    switch renderItem {
+    case .activityGroup:
+        return false
+    case .timeline(let item):
+        return item.kind != .activity
+    }
+}
+
+func assistantTimelineConversationStartIndex(
+    in items: [AssistantTimelineRenderItem],
+    for index: Int
+) -> Int {
+    guard !items.isEmpty else { return 0 }
+
+    let clampedIndex = min(max(0, index), items.count - 1)
+    for candidate in stride(from: clampedIndex, through: 0, by: -1) {
+        guard case .timeline(let item) = items[candidate] else { continue }
+        if item.kind == .userMessage {
+            return candidate
+        }
+    }
+
+    return clampedIndex
+}
+
+func assistantTimelineProtectedRecentConversationStartIndex(
+    in items: [AssistantTimelineRenderItem],
+    preservingRecentChatMessages: Int
+) -> Int? {
+    guard !items.isEmpty, preservingRecentChatMessages > 0 else { return nil }
+
+    let chatMessageIndices = items.indices.filter {
+        assistantTimelineRenderItemCountsAsChatMessage(items[$0])
+    }
+    guard !chatMessageIndices.isEmpty else { return nil }
+
+    if chatMessageIndices.count <= preservingRecentChatMessages {
+        return 0
+    }
+
+    let earliestProtectedMessageIndex =
+        chatMessageIndices[chatMessageIndices.count - preservingRecentChatMessages]
+    return assistantTimelineConversationStartIndex(
+        in: items,
+        for: earliestProtectedMessageIndex
+    )
+}
+
+func assistantTimelineActivityItems(
+    for renderItem: AssistantTimelineRenderItem
+) -> [AssistantActivityItem] {
+    switch renderItem {
+    case .timeline(let item):
+        guard item.kind == .activity, let activity = item.activity else { return [] }
+        return [activity]
+    case .activityGroup(let group):
+        return group.activities
+    }
+}
+
+func assistantTimelineIsUserRenderItem(_ renderItem: AssistantTimelineRenderItem) -> Bool {
+    guard case .timeline(let item) = renderItem else { return false }
+    return item.kind == .userMessage
+}
+
+func assistantTimelineIsCollapsibleAssistantResponseRenderItem(
+    _ renderItem: AssistantTimelineRenderItem
+) -> Bool {
+    guard case .timeline(let item) = renderItem else { return false }
+    switch item.kind {
+    case .assistantProgress, .assistantFinal, .plan:
+        return item.text?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty != nil
+    default:
+        return false
+    }
+}
+
+func assistantTimelineIsHistoricalConversationRenderItem(
+    _ renderItem: AssistantTimelineRenderItem
+) -> Bool {
+    switch renderItem {
+    case .activityGroup(let group):
+        return group.activities.allSatisfy { !$0.status.isActive }
+    case .timeline(let item):
+        switch item.kind {
+        case .activity:
+            return item.activity?.status.isActive != true
+        case .assistantProgress, .assistantFinal, .plan:
+            return !item.isStreaming
+        default:
+            return true
+        }
+    }
+}
+
+func assistantTimelineCollapsedConversationHiddenIndices(
+    in renderItems: [AssistantTimelineRenderItem],
+    segmentIndices: [Int],
+    protectedRecentConversationStartIndex: Int?
+) -> [Int] {
+    guard !segmentIndices.isEmpty else { return [] }
+
+    guard let lastAssistantIndex = segmentIndices.last(where: {
+        assistantTimelineIsCollapsibleAssistantResponseRenderItem(renderItems[$0])
+    }) else {
+        return []
+    }
+
+    let segmentContainsToolActivity = segmentIndices.contains { index in
+        !assistantTimelineActivityItems(for: renderItems[index]).isEmpty
+    }
+
+    return segmentIndices.filter { index in
+        guard index < lastAssistantIndex else { return false }
+        if let protectedRecentConversationStartIndex,
+           index >= protectedRecentConversationStartIndex,
+           !segmentContainsToolActivity {
+            return false
+        }
+
+        return !assistantTimelineIsUserRenderItem(renderItems[index])
+            && assistantTimelineIsHistoricalConversationRenderItem(renderItems[index])
+    }
 }
 
 func assistantTimelineSessionIDsMatch(_ lhs: String?, _ rhs: String?) -> Bool {
@@ -396,6 +576,7 @@ func assistantSelectedSessionActiveWorkSnapshot(
 
     let childAgents = subagents.filter { agent in
         assistantTimelineSessionIDsMatch(agent.parentThreadID, selectedSessionID)
+            && agent.status.isActive
     }
     guard !childAgents.isEmpty else { return nil }
 
@@ -405,6 +586,13 @@ func assistantSelectedSessionActiveWorkSnapshot(
         subagents: childAgents,
         fileChangeCount: assistantFileChangeCount(in: toolCalls + recentToolCalls)
     )
+}
+
+func assistantCanCollapseHistoricalTurnSummaries(
+    hasActiveTurn: Bool,
+    activeWorkSnapshot: AssistantSessionActiveWorkSnapshot?
+) -> Bool {
+    !hasActiveTurn && activeWorkSnapshot == nil
 }
 
 func assistantSidebarChildSubagents(

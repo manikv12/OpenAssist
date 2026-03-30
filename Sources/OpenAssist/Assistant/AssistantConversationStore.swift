@@ -73,6 +73,121 @@ struct AssistantConversationSnapshot: Codable, Equatable, Sendable {
     }
 }
 
+enum AssistantNoteOwnerKind: String, Codable, Equatable, Hashable, Sendable {
+    case thread
+    case project
+}
+
+struct AssistantNoteSummary: Codable, Equatable, Sendable, Identifiable {
+    var id: String
+    var title: String
+    var fileName: String
+    var order: Int
+    var createdAt: Date
+    var updatedAt: Date
+}
+
+typealias AssistantThreadNoteSummary = AssistantNoteSummary
+
+struct AssistantNoteManifest: Codable, Equatable, Sendable {
+    static let currentVersion = 1
+
+    var version: Int
+    var selectedNoteID: String?
+    var notes: [AssistantNoteSummary]
+
+    init(
+        version: Int = AssistantNoteManifest.currentVersion,
+        selectedNoteID: String? = nil,
+        notes: [AssistantNoteSummary] = []
+    ) {
+        self.version = version
+        self.selectedNoteID = selectedNoteID
+        self.notes = notes
+    }
+
+    var orderedNotes: [AssistantNoteSummary] {
+        notes.sorted {
+            if $0.order == $1.order {
+                return $0.createdAt < $1.createdAt
+            }
+            return $0.order < $1.order
+        }
+    }
+
+    var selectedNote: AssistantNoteSummary? {
+        guard let selectedNoteID else {
+            return orderedNotes.first
+        }
+        return orderedNotes.first(where: { $0.id == selectedNoteID }) ?? orderedNotes.first
+    }
+}
+
+typealias AssistantThreadNoteManifest = AssistantNoteManifest
+
+struct AssistantNotesWorkspace: Equatable, Sendable {
+    var ownerKind: AssistantNoteOwnerKind
+    var ownerID: String
+    var manifest: AssistantNoteManifest
+    var selectedNoteText: String
+
+    init(
+        ownerKind: AssistantNoteOwnerKind,
+        ownerID: String,
+        manifest: AssistantNoteManifest,
+        selectedNoteText: String
+    ) {
+        self.ownerKind = ownerKind
+        self.ownerID = ownerID
+        self.manifest = manifest
+        self.selectedNoteText = selectedNoteText
+    }
+
+    init(
+        threadID: String,
+        manifest: AssistantNoteManifest,
+        selectedNoteText: String
+    ) {
+        self.init(
+            ownerKind: .thread,
+            ownerID: threadID,
+            manifest: manifest,
+            selectedNoteText: selectedNoteText
+        )
+    }
+
+    init(
+        projectID: String,
+        manifest: AssistantNoteManifest,
+        selectedNoteText: String
+    ) {
+        self.init(
+            ownerKind: .project,
+            ownerID: projectID,
+            manifest: manifest,
+            selectedNoteText: selectedNoteText
+        )
+    }
+
+    var threadID: String {
+        ownerKind == .thread ? ownerID : ""
+    }
+
+    var projectID: String {
+        ownerKind == .project ? ownerID : ""
+    }
+
+    var notes: [AssistantNoteSummary] {
+        manifest.orderedNotes
+    }
+
+    var selectedNote: AssistantNoteSummary? {
+        manifest.selectedNote
+    }
+}
+
+typealias AssistantThreadNotesWorkspace = AssistantNotesWorkspace
+
 private enum AssistantConversationEventStream: String, Codable {
     case transcript
     case timeline
@@ -245,7 +360,10 @@ private struct AssistantConversationEventRecord: Codable, Equatable {
 
 final class AssistantConversationStore {
     private static let hybridSnapshotVersion = 2
-    private static let threadNoteFilename = "notes.md"
+    private static let legacyThreadNoteFilename = "notes.md"
+    private static let threadNotesDirectoryName = "notes"
+    private static let threadNoteManifestFilename = "manifest.json"
+    private static let defaultThreadNoteTitle = "Untitled note"
     private static let snapshotFilename = "conversation.json"
     private static let eventLogFilename = "conversation.events.jsonl"
 
@@ -410,40 +528,250 @@ final class AssistantConversationStore {
 
     func threadNoteFileURL(for threadID: String) -> URL? {
         threadDirectoryURL(for: threadID)?
-            .appendingPathComponent(Self.threadNoteFilename, isDirectory: false)
+            .appendingPathComponent(Self.legacyThreadNoteFilename, isDirectory: false)
     }
 
     func loadThreadNote(threadID: String) -> String {
-        guard let fileURL = threadNoteFileURL(for: threadID),
-              fileManager.fileExists(atPath: fileURL.path),
-              let contents = try? String(contentsOf: fileURL, encoding: .utf8) else {
-            return ""
-        }
-        return contents
+        loadThreadNotesWorkspace(threadID: threadID).selectedNoteText
     }
 
     func threadNoteModificationDate(threadID: String) -> Date? {
-        guard let fileURL = threadNoteFileURL(for: threadID),
-              let attributes = try? fileManager.attributesOfItem(atPath: fileURL.path) else {
-            return nil
-        }
-        return attributes[.modificationDate] as? Date
+        loadThreadNotesWorkspace(threadID: threadID).selectedNote?.updatedAt
     }
 
     func saveThreadNote(threadID: String, text: String) throws {
+        let workspace = loadThreadNotesWorkspace(threadID: threadID)
+        let selectedNoteID = workspace.selectedNote?.id
+        _ = try saveThreadNote(threadID: threadID, noteID: selectedNoteID, text: text)
+    }
+
+    func loadThreadNotesWorkspace(threadID: String) -> AssistantThreadNotesWorkspace {
+        let normalizedThreadID = normalizedThreadID(threadID)
+        guard !normalizedThreadID.isEmpty else {
+            return AssistantThreadNotesWorkspace(
+                threadID: "",
+                manifest: AssistantThreadNoteManifest(),
+                selectedNoteText: ""
+            )
+        }
+
+        let manifest = resolvedThreadNoteManifest(threadID: normalizedThreadID)
+        let selectedText = manifest.selectedNote.map {
+            loadThreadNoteText(threadID: normalizedThreadID, fileName: $0.fileName)
+        } ?? ""
+
+        return AssistantThreadNotesWorkspace(
+            threadID: normalizedThreadID,
+            manifest: manifest,
+            selectedNoteText: selectedText
+        )
+    }
+
+    func createThreadNote(
+        threadID: String,
+        title: String? = nil,
+        selectNewNote: Bool = true
+    ) throws -> AssistantThreadNotesWorkspace {
+        let normalizedThreadID = normalizedThreadID(threadID)
+        guard !normalizedThreadID.isEmpty else {
+            return AssistantThreadNotesWorkspace(
+                threadID: "",
+                manifest: AssistantThreadNoteManifest(),
+                selectedNoteText: ""
+            )
+        }
+
+        var manifest = resolvedThreadNoteManifest(threadID: normalizedThreadID)
+        let noteID = UUID().uuidString.lowercased()
+        let now = Date()
+        let note = AssistantThreadNoteSummary(
+            id: noteID,
+            title: normalizedThreadNoteTitle(title),
+            fileName: "\(safePathComponent(noteID)).md",
+            order: manifest.orderedNotes.count,
+            createdAt: now,
+            updatedAt: now
+        )
+        manifest.notes.append(note)
+        manifest.notes = normalizedThreadNoteItems(manifest.notes)
+        if selectNewNote || manifest.selectedNoteID == nil {
+            manifest.selectedNoteID = note.id
+        }
+        try storeThreadNoteManifest(manifest, threadID: normalizedThreadID)
+
+        return AssistantThreadNotesWorkspace(
+            threadID: normalizedThreadID,
+            manifest: manifest,
+            selectedNoteText: ""
+        )
+    }
+
+    func renameThreadNote(
+        threadID: String,
+        noteID: String,
+        title: String
+    ) throws -> AssistantThreadNotesWorkspace {
+        let normalizedThreadID = normalizedThreadID(threadID)
+        var manifest = resolvedThreadNoteManifest(threadID: normalizedThreadID)
+        guard let index = manifest.notes.firstIndex(where: { $0.id == noteID }) else {
+            return loadThreadNotesWorkspace(threadID: normalizedThreadID)
+        }
+
+        manifest.notes[index].title = normalizedThreadNoteTitle(title)
+        manifest.notes[index].updatedAt = Date()
+        manifest.notes = normalizedThreadNoteItems(manifest.notes)
+        try storeThreadNoteManifest(manifest, threadID: normalizedThreadID)
+
+        let selectedText = manifest.selectedNote.map {
+            loadThreadNoteText(threadID: normalizedThreadID, fileName: $0.fileName)
+        } ?? ""
+        return AssistantThreadNotesWorkspace(
+            threadID: normalizedThreadID,
+            manifest: manifest,
+            selectedNoteText: selectedText
+        )
+    }
+
+    func selectThreadNote(
+        threadID: String,
+        noteID: String
+    ) throws -> AssistantThreadNotesWorkspace {
+        let normalizedThreadID = normalizedThreadID(threadID)
+        var manifest = resolvedThreadNoteManifest(threadID: normalizedThreadID)
+        if manifest.notes.contains(where: { $0.id == noteID }) {
+            manifest.selectedNoteID = noteID
+            try storeThreadNoteManifest(manifest, threadID: normalizedThreadID)
+        }
+        let selectedText = manifest.selectedNote.map {
+            loadThreadNoteText(threadID: normalizedThreadID, fileName: $0.fileName)
+        } ?? ""
+        return AssistantThreadNotesWorkspace(
+            threadID: normalizedThreadID,
+            manifest: manifest,
+            selectedNoteText: selectedText
+        )
+    }
+
+    @discardableResult
+    func saveThreadNote(
+        threadID: String,
+        noteID: String?,
+        text: String
+    ) throws -> AssistantThreadNotesWorkspace {
+        let normalizedThreadID = normalizedThreadID(threadID)
+        guard !normalizedThreadID.isEmpty else {
+            return AssistantThreadNotesWorkspace(
+                threadID: "",
+                manifest: AssistantThreadNoteManifest(),
+                selectedNoteText: ""
+            )
+        }
+
+        var manifest = resolvedThreadNoteManifest(threadID: normalizedThreadID)
+        let resolvedNoteID: String
+        if let noteID,
+           manifest.notes.contains(where: { $0.id == noteID }) {
+            resolvedNoteID = noteID
+        } else if let selectedNoteID = manifest.selectedNote?.id {
+            resolvedNoteID = selectedNoteID
+        } else {
+            return try createThreadNoteAndSave(
+                threadID: normalizedThreadID,
+                title: Self.defaultThreadNoteTitle,
+                text: text
+            )
+        }
+
+        guard let index = manifest.notes.firstIndex(where: { $0.id == resolvedNoteID }) else {
+            return loadThreadNotesWorkspace(threadID: normalizedThreadID)
+        }
+
         let normalizedText = text.replacingOccurrences(of: "\r\n", with: "\n")
-        guard let fileURL = threadNoteFileURL(for: threadID) else { return }
+        let note = manifest.notes[index]
+        guard let fileURL = threadNoteFileURL(
+            threadID: normalizedThreadID,
+            fileName: note.fileName
+        ) else {
+            return loadThreadNotesWorkspace(threadID: normalizedThreadID)
+        }
 
         if normalizedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             try? fileManager.removeItem(at: fileURL)
-            return
+        } else {
+            try fileManager.createDirectory(
+                at: fileURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try normalizedText.write(to: fileURL, atomically: true, encoding: .utf8)
         }
 
-        try fileManager.createDirectory(
-            at: fileURL.deletingLastPathComponent(),
-            withIntermediateDirectories: true
+        manifest.selectedNoteID = resolvedNoteID
+        manifest.notes[index].updatedAt = Date()
+        manifest.notes = normalizedThreadNoteItems(manifest.notes)
+        try storeThreadNoteManifest(manifest, threadID: normalizedThreadID)
+
+        return AssistantThreadNotesWorkspace(
+            threadID: normalizedThreadID,
+            manifest: manifest,
+            selectedNoteText: normalizedText
         )
-        try normalizedText.write(to: fileURL, atomically: true, encoding: .utf8)
+    }
+
+    func deleteThreadNote(
+        threadID: String,
+        noteID: String
+    ) throws -> AssistantThreadNotesWorkspace {
+        let normalizedThreadID = normalizedThreadID(threadID)
+        var manifest = resolvedThreadNoteManifest(threadID: normalizedThreadID)
+        guard let existingIndex = manifest.notes.firstIndex(where: { $0.id == noteID }) else {
+            return loadThreadNotesWorkspace(threadID: normalizedThreadID)
+        }
+
+        let removed = manifest.notes.remove(at: existingIndex)
+        if let fileURL = threadNoteFileURL(threadID: normalizedThreadID, fileName: removed.fileName) {
+            try? fileManager.removeItem(at: fileURL)
+        }
+
+        manifest.notes = normalizedThreadNoteItems(manifest.notes)
+        if manifest.selectedNoteID == noteID {
+            let fallbackIndex = min(existingIndex, max(0, manifest.notes.count - 1))
+            manifest.selectedNoteID = manifest.notes.indices.contains(fallbackIndex)
+                ? manifest.notes[fallbackIndex].id
+                : nil
+        }
+
+        try storeThreadNoteManifest(manifest, threadID: normalizedThreadID)
+        let selectedText = manifest.selectedNote.map {
+            loadThreadNoteText(threadID: normalizedThreadID, fileName: $0.fileName)
+        } ?? ""
+        return AssistantThreadNotesWorkspace(
+            threadID: normalizedThreadID,
+            manifest: manifest,
+            selectedNoteText: selectedText
+        )
+    }
+
+    func appendToSelectedThreadNote(
+        threadID: String,
+        text: String
+    ) throws -> AssistantThreadNotesWorkspace {
+        let normalizedThreadID = normalizedThreadID(threadID)
+        let trimmedAppendText = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedThreadID.isEmpty, !trimmedAppendText.isEmpty else {
+            return loadThreadNotesWorkspace(threadID: normalizedThreadID)
+        }
+
+        let workspace = loadThreadNotesWorkspace(threadID: normalizedThreadID)
+        let currentText = workspace.selectedNoteText.trimmingCharacters(in: .newlines)
+        let mergedText = currentText.isEmpty
+            ? trimmedAppendText
+            : currentText + "\n\n" + trimmedAppendText
+
+        return try saveThreadNote(
+            threadID: normalizedThreadID,
+            noteID: workspace.selectedNote?.id,
+            text: mergedText
+        )
     }
 
     func deleteThreadArtifacts(threadID: String) {
@@ -648,6 +976,200 @@ final class AssistantConversationStore {
 
     private func normalizedThreadID(_ threadID: String) -> String {
         threadID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    private func threadNotesDirectoryURL(for threadID: String) -> URL? {
+        threadDirectoryURL(for: threadID)?
+            .appendingPathComponent(Self.threadNotesDirectoryName, isDirectory: true)
+    }
+
+    private func threadNoteManifestFileURL(for threadID: String) -> URL? {
+        threadNotesDirectoryURL(for: threadID)?
+            .appendingPathComponent(Self.threadNoteManifestFilename, isDirectory: false)
+    }
+
+    private func threadNoteFileURL(threadID: String, fileName: String) -> URL? {
+        threadNotesDirectoryURL(for: threadID)?
+            .appendingPathComponent(fileName, isDirectory: false)
+    }
+
+    private func loadThreadNoteText(threadID: String, fileName: String) -> String {
+        guard let fileURL = threadNoteFileURL(threadID: threadID, fileName: fileName),
+              fileManager.fileExists(atPath: fileURL.path),
+              let contents = try? String(contentsOf: fileURL, encoding: .utf8) else {
+            return ""
+        }
+        return contents.replacingOccurrences(of: "\r\n", with: "\n")
+    }
+
+    private func resolvedThreadNoteManifest(threadID: String) -> AssistantThreadNoteManifest {
+        migrateLegacyThreadNoteIfNeeded(threadID: threadID)
+
+        guard let manifestURL = threadNoteManifestFileURL(for: threadID),
+              fileManager.fileExists(atPath: manifestURL.path),
+              let data = try? Data(contentsOf: manifestURL),
+              let decoded = try? JSONDecoder().decode(AssistantThreadNoteManifest.self, from: data)
+        else {
+            return AssistantThreadNoteManifest()
+        }
+
+        return normalizedThreadNoteManifest(decoded)
+    }
+
+    private func storeThreadNoteManifest(
+        _ manifest: AssistantThreadNoteManifest,
+        threadID: String
+    ) throws {
+        let normalizedManifest = normalizedThreadNoteManifest(manifest)
+        guard let manifestURL = threadNoteManifestFileURL(for: threadID) else { return }
+
+        if normalizedManifest.notes.isEmpty {
+            try? fileManager.removeItem(at: manifestURL)
+            if let notesDirectoryURL = threadNotesDirectoryURL(for: threadID) {
+                try? fileManager.removeItem(at: notesDirectoryURL)
+            }
+            return
+        }
+
+        try fileManager.createDirectory(
+            at: manifestURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let data = try encoder.encode(normalizedManifest)
+        try data.write(to: manifestURL, options: .atomic)
+    }
+
+    private func normalizedThreadNoteManifest(
+        _ manifest: AssistantThreadNoteManifest
+    ) -> AssistantThreadNoteManifest {
+        let normalizedNotes = normalizedThreadNoteItems(manifest.notes)
+        let selectedNoteID = normalizedNotes.contains(where: { $0.id == manifest.selectedNoteID })
+            ? manifest.selectedNoteID
+            : normalizedNotes.first?.id
+        return AssistantThreadNoteManifest(
+            version: max(manifest.version, AssistantThreadNoteManifest.currentVersion),
+            selectedNoteID: selectedNoteID,
+            notes: normalizedNotes
+        )
+    }
+
+    private func normalizedThreadNoteItems(
+        _ notes: [AssistantThreadNoteSummary]
+    ) -> [AssistantThreadNoteSummary] {
+        notes
+            .sorted {
+                if $0.order == $1.order {
+                    return $0.createdAt < $1.createdAt
+                }
+                return $0.order < $1.order
+            }
+            .enumerated()
+            .map { index, note in
+                var updated = note
+                updated.title = normalizedThreadNoteTitle(note.title)
+                updated.order = index
+                return updated
+            }
+    }
+
+    private func normalizedThreadNoteTitle(_ title: String?) -> String {
+        title?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nonEmpty
+            ?? Self.defaultThreadNoteTitle
+    }
+
+    private func createThreadNoteAndSave(
+        threadID: String,
+        title: String,
+        text: String
+    ) throws -> AssistantThreadNotesWorkspace {
+        let createdWorkspace = try createThreadNote(
+            threadID: threadID,
+            title: title,
+            selectNewNote: true
+        )
+        return try saveThreadNote(
+            threadID: threadID,
+            noteID: createdWorkspace.selectedNote?.id,
+            text: text
+        )
+    }
+
+    private func migrateLegacyThreadNoteIfNeeded(threadID: String) {
+        guard let legacyURL = threadNoteFileURL(for: threadID),
+              fileManager.fileExists(atPath: legacyURL.path),
+              let manifestURL = threadNoteManifestFileURL(for: threadID) else {
+            return
+        }
+
+        guard !fileManager.fileExists(atPath: manifestURL.path) else {
+            try? fileManager.removeItem(at: legacyURL)
+            return
+        }
+
+        guard let legacyText = try? String(contentsOf: legacyURL, encoding: .utf8)
+            .replacingOccurrences(of: "\r\n", with: "\n") else {
+            return
+        }
+
+        let trimmedLegacyText = legacyText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmedLegacyText.isEmpty {
+            try? fileManager.removeItem(at: legacyURL)
+            return
+        }
+
+        let noteID = UUID().uuidString.lowercased()
+        let now = Date()
+        let migratedNote = AssistantThreadNoteSummary(
+            id: noteID,
+            title: inferredLegacyThreadNoteTitle(from: legacyText),
+            fileName: "\(safePathComponent(noteID)).md",
+            order: 0,
+            createdAt: now,
+            updatedAt: now
+        )
+        let migratedManifest = AssistantThreadNoteManifest(
+            selectedNoteID: migratedNote.id,
+            notes: [migratedNote]
+        )
+
+        do {
+            guard let migratedNoteURL = threadNoteFileURL(
+                threadID: threadID,
+                fileName: migratedNote.fileName
+            ) else {
+                return
+            }
+            try fileManager.createDirectory(
+                at: migratedNoteURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try legacyText.write(to: migratedNoteURL, atomically: true, encoding: .utf8)
+            try storeThreadNoteManifest(migratedManifest, threadID: threadID)
+            try? fileManager.removeItem(at: legacyURL)
+        } catch {
+            return
+        }
+    }
+
+    private func inferredLegacyThreadNoteTitle(from text: String) -> String {
+        let lines = text.components(separatedBy: .newlines)
+        for line in lines {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.hasPrefix("#") {
+                let heading = String(
+                    trimmed.drop(while: { $0 == "#" || $0 == " " || $0 == "\t" })
+                )
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if !heading.isEmpty {
+                    return heading
+                }
+            }
+        }
+        return Self.defaultThreadNoteTitle
     }
 
     private func threadDirectoryURL(for threadID: String) -> URL? {

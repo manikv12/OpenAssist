@@ -1053,6 +1053,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // MCP server mode: run as a headless stdio MCP server and exit
+        if let mcpIndex = CommandLine.arguments.firstIndex(of: "--mcp-server"),
+           let portIndex = CommandLine.arguments.firstIndex(of: "--port"),
+           portIndex + 1 < CommandLine.arguments.count,
+           let port = UInt16(CommandLine.arguments[portIndex + 1]) {
+            _ = mcpIndex // suppress unused warning
+            AssistantMCPServerMain.run(bridgePort: port)
+            // run(bridgePort:) calls exit() and never returns
+        }
+
         Self.shared = self
         CrashReporter.install()
         NSApp.setActivationPolicy(.accessory)
@@ -4625,6 +4635,7 @@ struct SettingsView: View {
     @State private var showQuickReferenceTips = false
     @State private var showAppleSpeechAdvancedSettings = false
     @State private var showRecognitionAdvancedSettings = false
+    @State private var showCloudProviderAdvancedOptions = false
     @State private var whisperModelSearchQuery = ""
     @State private var whisperFamilyFilter = "all"
     @State private var whisperShowInstalledOnly = false
@@ -4730,6 +4741,119 @@ struct SettingsView: View {
                 .font(.caption)
                 .foregroundStyle(Color.red.opacity(0.92))
         }
+    }
+
+    private var sidebarUpdateSymbolName: String {
+        switch updateCheckStatusStore.state {
+        case .idle, .checking:
+            return "arrow.triangle.2.circlepath.circle.fill"
+        case .upToDate:
+            return "checkmark.circle.fill"
+        case .updateAvailable:
+            return "arrow.down.circle.fill"
+        case .failed:
+            return "exclamationmark.triangle.fill"
+        }
+    }
+
+    private var sidebarUpdateTint: Color {
+        switch updateCheckStatusStore.state {
+        case .idle, .checking:
+            return AppVisualTheme.accentTint
+        case .upToDate:
+            return Color.green.opacity(0.92)
+        case .updateAvailable:
+            return AppVisualTheme.accentTint
+        case .failed:
+            return Color.red.opacity(0.92)
+        }
+    }
+
+    private var sidebarUpdateTitle: String {
+        switch updateCheckStatusStore.state {
+        case .idle:
+            return "App Updates"
+        case .checking:
+            return "Checking for Updates"
+        case .upToDate:
+            return "App Is Up to Date"
+        case .updateAvailable(let version):
+            return "Update \(version) Ready"
+        case .failed:
+            return "Update Check Failed"
+        }
+    }
+
+    private var sidebarUpdateDetail: String {
+        switch updateCheckStatusStore.state {
+        case .idle:
+            return appVersionDisplayText
+        case .checking:
+            return "Looking for a newer version now."
+        case .upToDate:
+            return appVersionDisplayText
+        case .updateAvailable(let version):
+            return "Version \(version) is available to install."
+        case .failed(let message):
+            return message
+        }
+    }
+
+    private var sidebarUpdateButtonTitle: String {
+        if updateCheckStatusStore.isChecking {
+            return "Checking…"
+        }
+        switch updateCheckStatusStore.state {
+        case .updateAvailable:
+            return "Open Updater"
+        default:
+            return "Check Now"
+        }
+    }
+
+    @ViewBuilder
+    private var sidebarUpdateFooter: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .top, spacing: 10) {
+                AppIconBadge(
+                    symbol: sidebarUpdateSymbolName,
+                    tint: sidebarUpdateTint,
+                    size: 28,
+                    symbolSize: 12
+                )
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(sidebarUpdateTitle)
+                        .font(.system(size: 12.5, weight: .semibold))
+                        .foregroundStyle(AppVisualTheme.foreground(0.92))
+
+                    Text(sidebarUpdateDetail)
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(AppVisualTheme.foreground(0.58))
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                Spacer(minLength: 0)
+            }
+
+            Button(sidebarUpdateButtonTitle) {
+                AppDelegate.shared?.checkForUpdatesFromSettings()
+            }
+            .buttonStyle(.bordered)
+            .disabled(updateCheckStatusStore.isChecking)
+        }
+        .padding(12)
+        .background(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(AppVisualTheme.surfaceFill(0.10))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .stroke(
+                            sidebarUpdateTint.opacity(0.18),
+                            lineWidth: 0.8
+                        )
+                )
+        )
     }
 
     var body: some View {
@@ -4853,13 +4977,11 @@ struct SettingsView: View {
     }
 
     private var assistantProviderReady: Bool {
-        if settings.localAISetupCompleted {
-            return true
+        let selectedProvider = settings.promptRewriteProviderMode
+        if selectedProvider == .ollama {
+            return settings.localAISetupCompleted
         }
-
-        return PromptRewriteProviderMode.allCases.contains { provider in
-            settings.isPromptRewriteProviderConnected(provider)
-        }
+        return settings.isPromptRewriteProviderConnected(selectedProvider)
     }
 
     private var voiceSetupReady: Bool {
@@ -4874,6 +4996,37 @@ struct SettingsView: View {
 
     private var coreGettingStartedReady: Bool {
         requiredVoicePermissionsReady && assistantProviderReady && voiceSetupReady
+    }
+
+    private var selectedPromptModelLabel: String {
+        let model = settings.promptRewriteOpenAIModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        return model.isEmpty ? settings.promptRewriteProviderMode.defaultModel : model
+    }
+
+    private var promptRewriteResponseStyleBinding: Binding<OpenAssistResponseStylePreset> {
+        Binding(
+            get: {
+                OpenAssistResponseStylePreset.forPromptRewriteTimeout(
+                    settings.promptRewriteRequestTimeoutSeconds
+                )
+            },
+            set: { newPreset in
+                settings.promptRewriteRequestTimeoutSeconds = newPreset.promptRewriteTimeoutSeconds
+            }
+        )
+    }
+
+    private var cloudTranscriptionResponseStyleBinding: Binding<OpenAssistResponseStylePreset> {
+        Binding(
+            get: {
+                OpenAssistResponseStylePreset.forCloudTranscriptionTimeout(
+                    settings.cloudTranscriptionRequestTimeoutSeconds
+                )
+            },
+            set: { newPreset in
+                settings.cloudTranscriptionRequestTimeoutSeconds = newPreset.cloudTranscriptionTimeoutSeconds
+            }
+        )
     }
 
     private var defaultSettingsRoute: SettingsRoute {
@@ -4892,7 +5045,7 @@ struct SettingsView: View {
         [
             GettingStartedStep(
                 id: "permissions",
-                title: "Required permissions",
+                title: "Permissions",
                 detail: "Allow Accessibility, Microphone, and Speech Recognition if Apple Speech is selected.",
                 status: requiredVoicePermissionsReady ? .ready : .needsAttention,
                 primaryActionTitle: requiredVoicePermissionsReady ? "Review permissions" : "Grant permissions",
@@ -4900,10 +5053,10 @@ struct SettingsView: View {
             ),
             GettingStartedStep(
                 id: "assistant",
-                title: "Connect assistant or provider",
-                detail: "Use AI Studio for advanced AI providers, models, memory, and local AI.",
+                title: "Connect AI",
+                detail: "Pick your main provider and model. Open AI Studio only for deeper AI setup.",
                 status: assistantProviderReady ? .ready : .notStarted,
-                primaryActionTitle: "Open AI Studio",
+                primaryActionTitle: "Open advanced AI",
                 destination: SettingsRoute(
                     section: .advanced,
                     cardID: "advanced.aiStudio",
@@ -4912,7 +5065,7 @@ struct SettingsView: View {
             ),
             GettingStartedStep(
                 id: "voice",
-                title: "Try voice dictation",
+                title: "Try voice",
                 detail: "Check your microphone, transcription engine, and shortcuts in one place.",
                 status: voiceSetupReady ? .ready : (requiredVoicePermissionsReady ? .notStarted : .needsAttention),
                 primaryActionTitle: "Open voice setup",
@@ -4920,15 +5073,15 @@ struct SettingsView: View {
             ),
             GettingStartedStep(
                 id: "automation",
-                title: "Set up browser and app control",
+                title: "Set up automation",
                 detail: "Optional. Only do this if you want browser reuse, app actions, or Computer Use.",
                 status: browserAutomationSetupReady ? .ready : .notStarted,
-                primaryActionTitle: "Open browser and app control",
+                primaryActionTitle: "Open automation",
                 destination: SettingsRoute(section: .browserAppControl, cardID: "browser.tasks")
             ),
             GettingStartedStep(
                 id: "advanced",
-                title: "Open advanced AI settings",
+                title: "More AI options",
                 detail: SettingsNavigationModel.aiStudioDescription,
                 status: settings.localAISetupCompleted || settings.hasGoogleAIStudioAPIKey ? .ready : .notStarted,
                 primaryActionTitle: "Open AI Studio",
@@ -4986,65 +5139,37 @@ struct SettingsView: View {
             AppIconBadge(
                 symbol: section.iconName,
                 tint: section.tint,
-                size: 38,
-                symbolSize: 17,
-                isEmphasized: true
+                size: 34,
+                symbolSize: 15
             )
 
             VStack(alignment: .leading, spacing: 6) {
-                Text("Settings Section")
+                Text("Preferences")
                     .font(.system(size: 11, weight: .semibold))
-                    .foregroundStyle(section.tint.opacity(0.92))
+                    .foregroundStyle(AppVisualTheme.foreground(0.48))
                     .textCase(.uppercase)
                     .tracking(0.8)
 
                 Text(section.title)
-                    .font(.system(size: 28, weight: .bold))
+                    .font(.system(size: 30, weight: .semibold))
                     .foregroundStyle(AppVisualTheme.foreground(0.96))
 
                 Text(section.subtitle)
-                    .font(.system(size: 13.5, weight: .medium))
+                    .font(.system(size: 13.5, weight: .regular))
                     .foregroundStyle(AppVisualTheme.foreground(0.62))
                     .fixedSize(horizontal: false, vertical: true)
             }
 
             Spacer(minLength: 0)
-
-            Text("\(SettingsSection.sidebarSections.firstIndex(of: section).map { $0 + 1 } ?? 0) / \(SettingsSection.sidebarSections.count)")
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundStyle(section.tint.opacity(0.92))
-                .padding(.horizontal, 10)
-                .padding(.vertical, 7)
-                .background(
-                    Capsule(style: .continuous)
-                        .fill(section.tint.opacity(0.12))
-                        .overlay(
-                            Capsule(style: .continuous)
-                                .stroke(section.tint.opacity(0.22), lineWidth: 0.7)
-                        )
-                )
         }
         .padding(.horizontal, 18)
         .padding(.vertical, 18)
         .background(
             RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .fill(AppVisualTheme.foreground(0.03))
+                .fill(AppVisualTheme.surfaceFill(0.08))
                 .overlay(
                     RoundedRectangle(cornerRadius: 18, style: .continuous)
-                        .fill(
-                            LinearGradient(
-                                colors: [
-                                    section.tint.opacity(0.12),
-                                    Color.clear
-                                ],
-                                startPoint: .topLeading,
-                                endPoint: .bottomTrailing
-                            )
-                        )
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: 18, style: .continuous)
-                        .stroke(section.tint.opacity(0.16), lineWidth: 0.8)
+                        .stroke(AppVisualTheme.surfaceStroke(0.14), lineWidth: 0.8)
                 )
         )
     }
@@ -5105,6 +5230,8 @@ struct SettingsView: View {
             }
 
             Spacer(minLength: 0)
+
+            sidebarUpdateFooter
         }
         .padding(.top, 16)
         .padding(.horizontal, 14)
@@ -5122,10 +5249,9 @@ struct SettingsView: View {
         HStack(alignment: .top, spacing: 12) {
             AppIconBadge(
                 symbol: section.iconName,
-                tint: isSelected ? section.tint : AppVisualTheme.secondaryForeground(0.72),
+                tint: isSelected ? AppVisualTheme.accentTint : AppVisualTheme.secondaryForeground(0.72),
                 size: 30,
-                symbolSize: 13,
-                isEmphasized: isSelected
+                symbolSize: 13
             )
 
             VStack(alignment: .leading, spacing: 3) {
@@ -5146,23 +5272,18 @@ struct SettingsView: View {
                 if !trimmedSearchQuery.isEmpty && matchCount > 0 {
                     Text("\(matchCount)")
                         .font(.system(size: 10, weight: .semibold))
-                        .foregroundStyle(section.tint.opacity(0.92))
+                        .foregroundStyle(AppVisualTheme.accentTint.opacity(0.92))
                         .padding(.horizontal, 7)
                         .padding(.vertical, 4)
                         .background(
                             Capsule(style: .continuous)
-                                .fill(section.tint.opacity(0.12))
+                                .fill(AppVisualTheme.accentTint.opacity(0.10))
                         )
                 }
 
                 Image(systemName: "chevron.right")
                     .font(.system(size: 10, weight: .bold))
-                    .foregroundStyle(isSelected ? section.tint.opacity(0.92) : AppVisualTheme.foreground(0.28))
-                    .padding(7)
-                    .background(
-                        Circle()
-                            .fill(isSelected ? section.tint.opacity(0.12) : AppVisualTheme.foreground(0.04))
-                    )
+                    .foregroundStyle(isSelected ? AppVisualTheme.accentTint.opacity(0.92) : AppVisualTheme.foreground(0.28))
             }
         }
         .padding(.horizontal, 12)
@@ -5173,15 +5294,15 @@ struct SettingsView: View {
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .fill(
                     isSelected
-                        ? section.tint.opacity(0.10)
-                        : (isHovered ? AppVisualTheme.foreground(0.04) : Color.clear)
+                        ? AppVisualTheme.surfaceFill(0.16)
+                        : (isHovered ? AppVisualTheme.surfaceFill(0.08) : Color.clear)
                 )
                 .overlay(
                     RoundedRectangle(cornerRadius: 14, style: .continuous)
                         .stroke(
                             isSelected
-                                ? section.tint.opacity(0.20)
-                                : AppVisualTheme.foreground(isHovered ? 0.08 : 0.03),
+                                ? AppVisualTheme.accentTint.opacity(0.18)
+                                : AppVisualTheme.surfaceStroke(isHovered ? 0.12 : 0.05),
                             lineWidth: 0.8
                         )
                 )
@@ -5229,8 +5350,8 @@ struct SettingsView: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text(section.title)
                     .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(section.tint.opacity(0.92))
-                Text("Common actions first")
+                    .foregroundStyle(AppVisualTheme.foreground(0.84))
+                Text("Start here")
                     .font(.system(size: 11, weight: .medium))
                     .foregroundStyle(AppVisualTheme.mutedText)
             }
@@ -5239,7 +5360,7 @@ struct SettingsView: View {
                 .fill(
                     LinearGradient(
                         colors: [
-                            section.tint.opacity(0.24),
+                            AppVisualTheme.accentTint.opacity(0.18),
                             AppVisualTheme.foreground(0.06),
                             Color.clear
                         ],
@@ -5317,16 +5438,88 @@ struct SettingsView: View {
     }
 
     @ViewBuilder
+    private var setupOverviewCard: some View {
+        settingsCard(
+            id: "gettingStarted.setupOverview",
+            title: coreGettingStartedReady ? "Open Assist is ready" : "Finish setup",
+            subtitle: coreGettingStartedReady
+                ? "You can start using the app now, or keep tuning the details below."
+                : "Start here. Use the simple choices first, and open advanced AI only if you need it.",
+            symbol: "sparkles.rectangle.stack.fill",
+            tint: SettingsSection.gettingStarted.tint
+        ) {
+            VStack(alignment: .leading, spacing: 10) {
+                statusBadgeRow(
+                    title: assistantProviderReady ? "AI is connected" : "AI still needs setup",
+                    detail: assistantProviderReady
+                        ? "\(settings.promptRewriteProviderMode.displayName) is ready with \(selectedPromptModelLabel)."
+                        : "Connect your main AI so Open Assist can answer and rewrite reliably.",
+                    color: assistantProviderReady ? .green : .orange
+                )
+
+                statusBadgeRow(
+                    title: voiceSetupReady ? "Voice basics are ready" : "Voice is optional",
+                    detail: voiceSetupReady
+                        ? "Microphone, shortcut, and speech access look good."
+                        : "You can keep going without voice, or finish it later in the Voice section.",
+                    color: voiceSetupReady ? .green : SettingsSection.gettingStarted.tint
+                )
+
+                Divider()
+
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Text("Response style")
+                            .font(.callout.weight(.semibold))
+                            .foregroundStyle(AppVisualTheme.foreground(0.92))
+                        Spacer()
+                        Text(promptRewriteResponseStyleBinding.wrappedValue.displayName)
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(SettingsSection.gettingStarted.tint.opacity(0.92))
+                    }
+
+                    Picker("Response style", selection: promptRewriteResponseStyleBinding) {
+                        ForEach(OpenAssistResponseStylePreset.allCases) { preset in
+                            Text(preset.displayName).tag(preset)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+
+                    Text(promptRewriteResponseStyleBinding.wrappedValue.detail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                HStack(spacing: 10) {
+                    Button("Open Assistant") {
+                        NotificationCenter.default.post(name: .openAssistOpenAssistant, object: nil)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(!assistantProviderReady)
+
+                    Button("Advanced AI settings") {
+                        openAIStudio()
+                    }
+                    .buttonStyle(.bordered)
+
+                    Spacer()
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
     private var gettingStartedSection: some View {
         VStack(alignment: .leading, spacing: 14) {
             settingsSectionHeader(for: .gettingStarted)
+            setupOverviewCard
 
             settingsCard(
                 id: "gettingStarted.checklist",
-                title: "Getting Started Checklist",
+                title: "Setup Checklist",
                 subtitle: coreGettingStartedReady
-                    ? "Core setup looks ready. You can still come back here any time for optional steps."
-                    : "Finish the important first steps without hunting through many pages.",
+                    ? "The main setup is done. Use this as a quick review when you come back."
+                    : "These are the only important steps left.",
                 symbol: "list.bullet.clipboard.fill",
                 tint: SettingsSection.gettingStarted.tint
             ) {
@@ -5338,7 +5531,7 @@ struct SettingsView: View {
 
                 HStack {
                     Spacer()
-                    Button(coreGettingStartedReady ? "Open Daily Use" : "Stay on Setup") {
+                    Button(coreGettingStartedReady ? "Open AI & Assistant" : "Stay on Setup") {
                         if coreGettingStartedReady {
                             applyRoute(SettingsRoute(section: .dailyUse, cardID: "daily.tasks"))
                         } else {
@@ -5352,14 +5545,14 @@ struct SettingsView: View {
 
             taskCardGroup(
                 id: "gettingStarted.tasks",
-                title: "Quick Setup Shortcuts",
-                subtitle: "Pick the task you want instead of digging through the whole settings tree.",
+                title: "Next Things You Might Want",
+                subtitle: "Optional shortcuts after the main setup is done.",
                 symbol: "sparkles.rectangle.stack.fill",
                 tint: SettingsSection.gettingStarted.tint,
                 tasks: [
-                    ("Set up assistant", "Open AI Studio for advanced AI providers and model setup.", SettingsRoute(section: .advanced, cardID: "advanced.aiStudio", opensAIStudio: true)),
-                    ("Try voice dictation", "Check microphone, shortcuts, and dictation controls.", SettingsRoute(section: .voiceDictation, cardID: "voice.tasks")),
-                    ("Set up browser and app control", "Review browser reuse, app actions, and Computer Use.", SettingsRoute(section: .browserAppControl, cardID: "browser.tasks")),
+                    ("AI and assistant basics", "See your current provider, response style, and everyday AI controls.", SettingsRoute(section: .dailyUse, cardID: "daily.assistant")),
+                    ("Try voice dictation", "Check microphone, shortcuts, and speech controls.", SettingsRoute(section: .voiceDictation, cardID: "voice.tasks")),
+                    ("Set up automation", "Review browser reuse, app actions, and Computer Use.", SettingsRoute(section: .browserAppControl, cardID: "browser.tasks")),
                     ("Open advanced AI settings", SettingsNavigationModel.aiStudioDescription, SettingsRoute(section: .advanced, cardID: "advanced.aiStudio", opensAIStudio: true))
                 ]
             )
@@ -5373,15 +5566,15 @@ struct SettingsView: View {
 
             taskCardGroup(
                 id: "daily.tasks",
-                title: "Daily Tasks",
-                subtitle: "The most common things people want are grouped here first.",
+                title: "AI & Assistant Shortcuts",
+                subtitle: "The main AI controls are grouped here first.",
                 symbol: "sparkles",
                 tint: SettingsSection.dailyUse.tint,
                 tasks: [
-                    ("Ask the assistant", "Turn the AI rewrite helper on and review the everyday assistant controls.", SettingsRoute(section: .dailyUse, cardID: "daily.assistant")),
+                    ("Review AI basics", "See your current provider, model, and everyday AI behavior.", SettingsRoute(section: .dailyUse, cardID: "daily.assistant")),
                     ("Use the agent shortcut", "Jump straight to the voice shortcut that sends speech into Open Assist.", SettingsRoute(section: .voiceDictation, cardID: "shortcuts.agentShortcut")),
                     ("Use voice dictation", "Open microphone, engine, and shortcut settings.", SettingsRoute(section: .voiceDictation, cardID: "voice.tasks")),
-                    ("Use browser and app automation", "Open browser profile, permissions, and Computer Use controls.", SettingsRoute(section: .browserAppControl, cardID: "browser.tasks")),
+                    ("Use automation", "Open browser profile, permissions, and Computer Use controls.", SettingsRoute(section: .browserAppControl, cardID: "browser.tasks")),
                     ("Advanced AI settings", SettingsNavigationModel.aiStudioDescription, SettingsRoute(section: .advanced, cardID: "advanced.aiStudio", opensAIStudio: true))
                 ]
             )
@@ -6221,87 +6414,117 @@ struct SettingsView: View {
                         .frame(width: 260)
                     }
 
-                    Text(settings.cloudTranscriptionProvider.helpText)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
+	                    Text(settings.cloudTranscriptionProvider.helpText)
+	                        .font(.caption)
+	                        .foregroundStyle(.secondary)
+	                        .fixedSize(horizontal: false, vertical: true)
 
-                    VStack(alignment: .leading, spacing: 8) {
-                        HStack {
-                            Text("Model")
-                                .font(.callout.weight(.medium))
-                            Spacer()
-                            TextField("Model ID", text: $settings.cloudTranscriptionModel)
-                                .textFieldStyle(.roundedBorder)
-                                .frame(width: 260)
-                                .autocorrectionDisabled()
-                        }
+	                    VStack(alignment: .leading, spacing: 8) {
+	                        HStack {
+	                            Text("Connection style")
+	                                .font(.callout.weight(.semibold))
+	                            Spacer()
+	                            Text(cloudTranscriptionResponseStyleBinding.wrappedValue.displayName)
+	                                .font(.caption.weight(.semibold))
+	                                .foregroundStyle(AppVisualTheme.accentTint.opacity(0.92))
+	                        }
 
-                        HStack(spacing: 8) {
-                            Button {
-                                refreshCloudTranscriptionModels(showMessage: true)
-                            } label: {
-                                if cloudTranscriptionModelsLoading {
-                                    ProgressView()
-                                        .controlSize(.small)
-                                } else {
-                                    Label("Load Models", systemImage: "arrow.clockwise")
-                                }
-                            }
-                            .buttonStyle(.bordered)
-                            .disabled(cloudTranscriptionModelsLoading)
+	                        Picker("Connection style", selection: cloudTranscriptionResponseStyleBinding) {
+	                            ForEach(OpenAssistResponseStylePreset.allCases) { preset in
+	                                Text(preset.displayName).tag(preset)
+	                            }
+	                        }
+	                        .pickerStyle(.segmented)
 
-                            if !cloudTranscriptionAvailableModels.isEmpty {
-                                Menu("Use Fetched Model") {
-                                    ForEach(cloudTranscriptionAvailableModels.prefix(80)) { option in
-                                        Button(option.displayName) {
-                                            settings.cloudTranscriptionModel = option.id
-                                        }
-                                    }
-                                }
-                                .menuStyle(.borderlessButton)
-                            }
+	                        Text(cloudTranscriptionResponseStyleBinding.wrappedValue.detail)
+	                            .font(.caption)
+	                            .foregroundStyle(.secondary)
+	                    }
 
-                            Spacer()
+	                    DisclosureGroup(
+	                        "Advanced provider options",
+	                        isExpanded: $showCloudProviderAdvancedOptions
+	                    ) {
+	                        VStack(alignment: .leading, spacing: 10) {
+	                            VStack(alignment: .leading, spacing: 8) {
+	                                HStack {
+	                                    Text("Model")
+	                                        .font(.callout.weight(.medium))
+	                                    Spacer()
+	                                    TextField("Model ID", text: $settings.cloudTranscriptionModel)
+	                                        .textFieldStyle(.roundedBorder)
+	                                        .frame(width: 260)
+	                                        .autocorrectionDisabled()
+	                                }
 
-                            if !cloudTranscriptionAvailableModels.isEmpty {
-                                Text("\(cloudTranscriptionAvailableModels.count) models")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-                        }
+	                                HStack(spacing: 8) {
+	                                    Button {
+	                                        refreshCloudTranscriptionModels(showMessage: true)
+	                                    } label: {
+	                                        if cloudTranscriptionModelsLoading {
+	                                            ProgressView()
+	                                                .controlSize(.small)
+	                                        } else {
+	                                            Label("Load Models", systemImage: "arrow.clockwise")
+	                                        }
+	                                    }
+	                                    .buttonStyle(.bordered)
+	                                    .disabled(cloudTranscriptionModelsLoading)
 
-                        if let cloudTranscriptionModelStatusMessage {
-                            Text(cloudTranscriptionModelStatusMessage)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-                    }
+	                                    if !cloudTranscriptionAvailableModels.isEmpty {
+	                                        Menu("Use Fetched Model") {
+	                                            ForEach(cloudTranscriptionAvailableModels.prefix(80)) { option in
+	                                                Button(option.displayName) {
+	                                                    settings.cloudTranscriptionModel = option.id
+	                                                }
+	                                            }
+	                                        }
+	                                        .menuStyle(.borderlessButton)
+	                                    }
 
-                    if settings.cloudTranscriptionProvider != .codexSession {
-                        HStack {
-                            Text("Base URL")
-                                .font(.callout.weight(.medium))
-                            Spacer()
-                            TextField("Base URL", text: $settings.cloudTranscriptionBaseURL)
-                                .textFieldStyle(.roundedBorder)
-                                .frame(width: 260)
-                                .autocorrectionDisabled()
-                        }
-                    }
+	                                    Spacer()
 
-                    HStack {
-                        Text("Request timeout")
-                            .font(.callout.weight(.medium))
-                        Spacer()
-                        Text("\(Int(settings.cloudTranscriptionRequestTimeoutSeconds.rounded())) sec")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    Slider(value: $settings.cloudTranscriptionRequestTimeoutSeconds, in: 5...180, step: 1)
+	                                    if !cloudTranscriptionAvailableModels.isEmpty {
+	                                        Text("\(cloudTranscriptionAvailableModels.count) models")
+	                                            .font(.caption)
+	                                            .foregroundStyle(.secondary)
+	                                    }
+	                                }
 
-                    if settings.cloudTranscriptionProvider.requiresAPIKey {
+	                                if let cloudTranscriptionModelStatusMessage {
+	                                    Text(cloudTranscriptionModelStatusMessage)
+	                                        .font(.caption)
+	                                        .foregroundStyle(.secondary)
+	                                        .fixedSize(horizontal: false, vertical: true)
+	                                }
+	                            }
+
+	                            if settings.cloudTranscriptionProvider != .codexSession {
+	                                HStack {
+	                                    Text("Base URL")
+	                                        .font(.callout.weight(.medium))
+	                                    Spacer()
+	                                    TextField("Base URL", text: $settings.cloudTranscriptionBaseURL)
+	                                        .textFieldStyle(.roundedBorder)
+	                                        .frame(width: 260)
+	                                        .autocorrectionDisabled()
+	                                }
+	                            }
+
+	                            HStack {
+	                                Text("Request timeout")
+	                                    .font(.callout.weight(.medium))
+	                                Spacer()
+	                                Text("\(Int(settings.cloudTranscriptionRequestTimeoutSeconds.rounded())) sec")
+	                                    .font(.caption)
+	                                    .foregroundStyle(.secondary)
+	                            }
+	                            Slider(value: $settings.cloudTranscriptionRequestTimeoutSeconds, in: 5...180, step: 1)
+	                        }
+	                        .padding(.top, 8)
+	                    }
+
+	                    if settings.cloudTranscriptionProvider.requiresAPIKey {
                         HStack(spacing: 8) {
                             let apiKeyBinding = cloudTranscriptionAPIKeyBinding
                             if cloudTranscriptionAPIKeyVisible {
@@ -6504,11 +6727,41 @@ struct SettingsView: View {
     private var aiMemoryAssistantCard: some View {
         settingsCard(
             id: "daily.assistant",
-            title: "Assistant Basics",
-            subtitle: "Everyday assistant writing controls first, with advanced AI setup kept in AI Studio.",
+            title: "AI & Assistant Basics",
+            subtitle: "Keep the everyday AI choices here. Use AI Studio only for deeper setup.",
             symbol: "brain.head.profile",
             tint: SettingsSection.dailyUse.tint
         ) {
+            settingsSummaryRow(label: "Current provider", value: settings.promptRewriteProviderMode.displayName)
+            settingsSummaryRow(label: "Current model", value: selectedPromptModelLabel)
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Text("Response style")
+                        .font(.callout.weight(.semibold))
+                        .foregroundStyle(AppVisualTheme.foreground(0.92))
+                    Spacer()
+                    Text(promptRewriteResponseStyleBinding.wrappedValue.displayName)
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(SettingsSection.dailyUse.tint.opacity(0.92))
+                }
+
+                Picker("Response style", selection: promptRewriteResponseStyleBinding) {
+                    ForEach(OpenAssistResponseStylePreset.allCases) { preset in
+                        Text(preset.displayName).tag(preset)
+                    }
+                }
+                .pickerStyle(.segmented)
+
+                Text(promptRewriteResponseStyleBinding.wrappedValue.detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Divider()
+
             Toggle("Enable AI prompt correction", isOn: $settings.promptRewriteEnabled)
             if FeatureFlags.aiMemoryEnabled {
                 Toggle("Enable AI memory assistant", isOn: $settings.memoryIndexingEnabled)
@@ -6526,18 +6779,11 @@ struct SettingsView: View {
 
             HStack {
                 Spacer()
-                Button("Open AI Studio") {
+                Button("More AI options") {
                     openAIStudio()
                 }
                 .buttonStyle(.bordered)
             }
-
-            Text("Current rewrite provider: \(settings.promptRewriteProviderMode.displayName)")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            Text("Structured suggestions keep their formatting when inserted, including bullets and question lists. Rewrites are instructed to keep dialogue flow continuous.")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
         }
     }
 
@@ -6545,44 +6791,34 @@ struct SettingsView: View {
     private var aiProviderStatusCard: some View {
         settingsCard(
             id: "advanced.providerStatus",
-            title: "Provider Connection Status",
-            subtitle: "Check which AI providers are ready, then open AI Studio if you need to change them.",
+            title: "AI Status",
+            subtitle: "A simpler summary of the AI setup you are actually using.",
             symbol: "network.badge.shield.half.filled",
             tint: SettingsSection.advanced.tint
         ) {
             VStack(alignment: .leading, spacing: 8) {
-                HStack {
-                    Text("OpenAI")
-                    Spacer()
-                    Text(settings.hasPromptRewriteOAuthSession(for: .openAI) ? "Connected" : "Not connected")
-                        .foregroundStyle(settings.hasPromptRewriteOAuthSession(for: .openAI) ? AppVisualTheme.accentTint : .secondary)
-                }
-                HStack {
-                    Text("Anthropic")
-                    Spacer()
-                    Text(settings.hasPromptRewriteOAuthSession(for: .anthropic) ? "Connected" : "Not connected")
-                        .foregroundStyle(settings.hasPromptRewriteOAuthSession(for: .anthropic) ? AppVisualTheme.accentTint : .secondary)
-                }
-                HStack {
-                    Text("Google Gemini")
-                    Spacer()
-                    Text(settings.hasGoogleAIStudioAPIKey ? "AI Studio key set" : "AI Studio key missing")
-                        .foregroundStyle(settings.hasGoogleAIStudioAPIKey ? AppVisualTheme.accentTint : .secondary)
-                }
-                HStack {
-                    Text("Local AI (Ollama)")
-                    Spacer()
-                    Text(localAISetupStatusLabel)
-                        .foregroundStyle(localAISetupService.isReady ? AppVisualTheme.accentTint : .secondary)
-                }
+                settingsSummaryRow(label: "Active provider", value: settings.promptRewriteProviderMode.displayName)
+                settingsSummaryRow(label: "Active model", value: selectedPromptModelLabel)
+                settingsSummaryRow(
+                    label: "Response style",
+                    value: promptRewriteResponseStyleBinding.wrappedValue.displayName
+                )
+                settingsSummaryRow(
+                    label: "Local AI",
+                    value: localAISetupStatusLabel,
+                    tint: localAISetupService.isReady ? AppVisualTheme.accentTint : AppVisualTheme.foreground(0.72)
+                )
                 if settings.localAISetupCompleted {
-                    Text("Model: \(settings.localAISelectedModelID.isEmpty ? "(not selected)" : settings.localAISelectedModelID)")
-                        .font(.caption2)
+                    Text("Installed local model: \(settings.localAISelectedModelID.isEmpty ? "(not selected)" : settings.localAISelectedModelID)")
+                        .font(.caption)
                         .foregroundStyle(.secondary)
                 }
+                Text(readyProviderFootnote)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
                 HStack {
                     Spacer()
-                    Button("Open AI Studio") {
+                    Button("Advanced AI settings") {
                         openAIStudio()
                     }
                     .buttonStyle(.borderedProminent)
@@ -6611,6 +6847,23 @@ struct SettingsView: View {
             }
             return "Not installed"
         }
+    }
+
+    private var readyProviderFootnote: String {
+        var readyProviders: [String] = []
+        if settings.hasPromptRewriteOAuthSession(for: .openAI) {
+            readyProviders.append("OpenAI")
+        }
+        if settings.hasPromptRewriteOAuthSession(for: .anthropic) {
+            readyProviders.append("Anthropic")
+        }
+        if settings.hasGoogleAIStudioAPIKey {
+            readyProviders.append("Gemini")
+        }
+        if readyProviders.isEmpty {
+            return "No extra providers are connected yet."
+        }
+        return "Also ready: \(readyProviders.joined(separator: ", "))"
     }
 
     private var maskedAutomationToken: String {
@@ -8423,12 +8676,12 @@ struct SettingsView: View {
                 Spacer(minLength: 0)
 
                 VStack(alignment: .trailing, spacing: 6) {
-                    Text(destination.opensAIStudio ? "AI Studio" : "Open")
+                    Text(destination.opensAIStudio ? "Advanced" : "Open")
                         .font(.caption.weight(.semibold))
-                        .foregroundStyle(tint.opacity(0.92))
+                        .foregroundStyle(AppVisualTheme.accentTint.opacity(0.92))
                     Image(systemName: "arrow.up.right")
                         .font(.system(size: 10, weight: .bold))
-                        .foregroundStyle(tint.opacity(0.92))
+                        .foregroundStyle(AppVisualTheme.accentTint.opacity(0.92))
                 }
             }
             .padding(.vertical, 10)
@@ -8488,26 +8741,16 @@ struct SettingsView: View {
         .padding(16)
         .background(
             RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .fill(AppVisualTheme.foreground(0.035))
+                .fill(AppVisualTheme.surfaceFill(0.08))
                 .overlay(
                     RoundedRectangle(cornerRadius: 16, style: .continuous)
-                        .fill(
-                            LinearGradient(
-                                colors: [
-                                    tint.opacity(0.06),
-                                    Color.clear
-                                ],
-                                startPoint: .topLeading,
-                                endPoint: .bottomTrailing
-                            )
+                        .stroke(
+                            isFocused ? tint.opacity(0.28) : AppVisualTheme.surfaceStroke(0.12),
+                            lineWidth: isFocused ? 1.0 : 0.7
                         )
                 )
-                .overlay(
-                    RoundedRectangle(cornerRadius: 16, style: .continuous)
-                        .stroke(isFocused ? tint.opacity(0.65) : AppVisualTheme.foreground(0.06), lineWidth: isFocused ? 1.1 : 0.5)
-                )
         )
-        .shadow(color: isFocused ? tint.opacity(0.16) : .black.opacity(0.06), radius: isFocused ? 12 : 6, x: 0, y: 5)
+        .shadow(color: .black.opacity(isFocused ? 0.10 : 0.04), radius: isFocused ? 10 : 4, x: 0, y: 3)
         .toggleStyle(.switch)
         .id(cardIdentity)
     }
@@ -8589,26 +8832,16 @@ struct SettingsView: View {
         .padding(16)
         .background(
             RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .fill(AppVisualTheme.foreground(0.035))
+                .fill(AppVisualTheme.surfaceFill(0.08))
                 .overlay(
                     RoundedRectangle(cornerRadius: 16, style: .continuous)
-                        .fill(
-                            LinearGradient(
-                                colors: [
-                                    tint.opacity(0.06),
-                                    Color.clear
-                                ],
-                                startPoint: .topLeading,
-                                endPoint: .bottomTrailing
-                            )
+                        .stroke(
+                            isFocused ? tint.opacity(0.28) : AppVisualTheme.surfaceStroke(0.12),
+                            lineWidth: isFocused ? 1.0 : 0.7
                         )
                 )
-                .overlay(
-                    RoundedRectangle(cornerRadius: 16, style: .continuous)
-                        .stroke(isFocused ? tint.opacity(0.65) : AppVisualTheme.foreground(0.07), lineWidth: isFocused ? 1.1 : 0.5)
-                )
         )
-        .shadow(color: isFocused ? tint.opacity(0.16) : .black.opacity(0.06), radius: isFocused ? 12 : 6, x: 0, y: 5)
+        .shadow(color: .black.opacity(isFocused ? 0.10 : 0.04), radius: isFocused ? 10 : 4, x: 0, y: 3)
         .toggleStyle(.switch)
         .id(cardIdentity)
     }
@@ -9667,6 +9900,25 @@ struct SettingsView: View {
                         .stroke(AppVisualTheme.foreground(0.10), lineWidth: 0.7)
                 )
         )
+    }
+
+    @ViewBuilder
+    private func settingsSummaryRow(
+        label: String,
+        value: String,
+        tint: Color? = nil
+    ) -> some View {
+        HStack(spacing: 10) {
+            Text(label)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(AppVisualTheme.foreground(0.50))
+            Spacer()
+            Text(value)
+                .font(.callout.weight(.medium))
+                .foregroundStyle(tint ?? AppVisualTheme.foreground(0.84))
+                .multilineTextAlignment(.trailing)
+        }
+        .padding(.vertical, 2)
     }
 
     @ViewBuilder

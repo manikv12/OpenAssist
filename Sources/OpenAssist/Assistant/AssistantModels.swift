@@ -401,6 +401,38 @@ struct AccountRateLimits: Equatable, Sendable {
     }
 }
 
+struct StatusBarRateLimitEntry: Equatable, Sendable {
+    var window: RateLimitWindow
+    var showsResetInline: Bool
+}
+
+extension AccountRateLimitBucket {
+    func statusBarEntries(bucketLabel: String?) -> [StatusBarRateLimitEntry] {
+        let hasBucketLabel = bucketLabel?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty != nil
+        var entries: [StatusBarRateLimitEntry] = []
+
+        if let primary {
+            entries.append(
+                StatusBarRateLimitEntry(
+                    window: primary,
+                    showsResetInline: false
+                )
+            )
+        }
+
+        if let secondary {
+            entries.append(
+                StatusBarRateLimitEntry(
+                    window: secondary,
+                    showsResetInline: hasBucketLabel
+                )
+            )
+        }
+
+        return entries
+    }
+}
+
 struct TokenUsageBreakdown: Equatable, Sendable {
     var inputTokens: Int
     var outputTokens: Int
@@ -723,6 +755,98 @@ struct AssistantTranscriptEntry: Identifiable, Equatable, Codable, Sendable {
     }
 }
 
+struct SelectionSideAssistantChatSummarySnapshot: Equatable, Sendable {
+    let fingerprint: String
+    let summary: String
+}
+
+enum SelectionSideAssistantChatSummaryBuilder {
+    static func build(
+        sessionID: String,
+        sessionTitle: String?,
+        sessionSummary: String?,
+        transcriptEntries: [AssistantTranscriptEntry],
+        maxEntries: Int = 6,
+        maxCharsPerEntry: Int = 80,
+        maxTotalChars: Int = 520
+    ) -> SelectionSideAssistantChatSummarySnapshot? {
+        let meaningfulEntries = transcriptEntries
+            .filter { entry in
+                guard !entry.isStreaming else { return false }
+                return roleLabel(for: entry.role) != nil
+                    && entry.text.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty != nil
+            }
+            .suffix(maxEntries)
+
+        let normalizedTitle = sessionTitle?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nonEmpty
+        let normalizedSessionSummary = sessionSummary?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nonEmpty
+
+        guard normalizedTitle != nil || normalizedSessionSummary != nil || !meaningfulEntries.isEmpty else {
+            return nil
+        }
+
+        var lines: [String] = ["# Recent Chat Context"]
+        var fingerprintParts: [String] = [sessionID.lowercased()]
+
+        if !meaningfulEntries.isEmpty {
+            for entry in meaningfulEntries {
+                guard let label = roleLabel(for: entry.role) else { continue }
+                let trimmedText = entry.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmedText.isEmpty else { continue }
+                let summarized = snippet(trimmedText, limit: maxCharsPerEntry)
+                lines.append("- \(label): \(summarized)")
+                fingerprintParts.append("\(entry.id.uuidString)|\(entry.role.rawValue)|\(trimmedText)")
+            }
+        } else {
+            if let normalizedTitle {
+                lines.append("- Thread: \(snippet(normalizedTitle, limit: 100))")
+                fingerprintParts.append("title:\(normalizedTitle.lowercased())")
+            }
+
+            if let normalizedSessionSummary {
+                lines.append("- Focus: \(snippet(normalizedSessionSummary, limit: 140))")
+                fingerprintParts.append("summary:\(normalizedSessionSummary.lowercased())")
+            }
+        }
+
+        let rawSummary = lines.joined(separator: "\n")
+        let normalizedSummary = snippet(rawSummary, limit: maxTotalChars)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedSummary.isEmpty else { return nil }
+
+        let fingerprint = String(
+            MemoryIdentifier.stableHexDigest(for: fingerprintParts.joined(separator: "\n")).prefix(16)
+        )
+        return SelectionSideAssistantChatSummarySnapshot(
+            fingerprint: fingerprint,
+            summary: normalizedSummary
+        )
+    }
+
+    private static func roleLabel(for role: AssistantTranscriptRole) -> String? {
+        switch role {
+        case .user:
+            return "User"
+        case .assistant:
+            return "Assistant"
+        case .error:
+            return "Error"
+        case .system, .status, .tool, .permission:
+            return nil
+        }
+    }
+
+    private static func snippet(_ value: String, limit: Int) -> String {
+        let normalized = MemoryTextNormalizer.normalizedBody(value)
+        guard normalized.count > limit else { return normalized }
+        return String(normalized.prefix(max(0, limit - 3))) + "..."
+    }
+}
+
 enum AssistantTranscriptMutation: Equatable, Sendable {
     case reset(sessionID: String?)
     case upsert(AssistantTranscriptEntry, sessionID: String?)
@@ -735,6 +859,58 @@ enum AssistantTranscriptMutation: Equatable, Sendable {
         emphasis: Bool,
         isStreaming: Bool
     )
+}
+
+private final class SelectionSideAssistantResponseRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var assistantTextByEntryID: [UUID: String] = [:]
+
+    func record(_ mutation: AssistantTranscriptMutation) {
+        lock.lock()
+        defer { lock.unlock() }
+        switch mutation {
+        case .reset:
+            assistantTextByEntryID.removeAll()
+            latestAssistantTextStorage = ""
+        case .upsert(let entry, _):
+            guard entry.role == .assistant else { return }
+            assistantTextByEntryID[entry.id] = entry.text
+            latestAssistantTextStorage = entry.text
+        case .appendDelta(let id, _, let role, let delta, _, _, _):
+            guard role == .assistant else { return }
+            let updatedText = (assistantTextByEntryID[id] ?? "") + delta
+            assistantTextByEntryID[id] = updatedText
+            latestAssistantTextStorage = updatedText
+        }
+    }
+
+    func latestAssistantText() -> String {
+        lock.lock()
+        defer { lock.unlock() }
+        return latestAssistantTextStorage
+    }
+
+    private var latestAssistantTextStorage: String = ""
+}
+
+private final class SelectionSideAssistantContinuationBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<MemoryEntryExplanationResult, Never>?
+
+    init(_ continuation: CheckedContinuation<MemoryEntryExplanationResult, Never>) {
+        self.continuation = continuation
+    }
+
+    func resume(_ result: MemoryEntryExplanationResult) {
+        lock.lock()
+        guard let continuation else {
+            lock.unlock()
+            return
+        }
+        self.continuation = nil
+        lock.unlock()
+        continuation.resume(returning: result)
+    }
 }
 
 enum AssistantSessionSource: String, Codable, Sendable, CaseIterable {
@@ -1204,7 +1380,16 @@ func assistantShouldShowSessionInSidebar(
 }
 
 func assistantSessionSupportsCurrentThreadUI(_ session: AssistantSessionSummary) -> Bool {
-    session.isProviderIndependentThreadV2
+    if session.isProviderIndependentThreadV2 {
+        return true
+    }
+
+    switch session.source {
+    case .cli, .vscode, .appServer:
+        return true
+    case .openAssist, .other:
+        return false
+    }
 }
 
 func assistantShouldListSessionInSidebar(
@@ -1216,17 +1401,32 @@ func assistantShouldListSessionInSidebar(
         return false
     }
 
-    // Hide provider-independent placeholder threads unless they are the
-    // currently selected draft. Telegram can create empty V2 records before
-    // the first real message arrives, and listing them makes the sidebar feel
-    // broken because opening them appears to reuse the previous thread's chat.
-    if session.isProviderIndependentThreadV2,
-       !session.hasConversationContent,
+    // Hide empty sessions unless they are the currently selected draft.
+    // This keeps placeholder or partially recovered records from cluttering
+    // the sidebar until they have real conversation history.
+    if !session.hasConversationContent,
        normalizedAssistantSessionKey(session.id) != normalizedAssistantSessionKey(selectedSessionID) {
         return false
     }
 
     return true
+}
+
+func assistantShouldHideShadowProviderSession(
+    _ session: AssistantSessionSummary,
+    selectedSessionID: String?,
+    canonicalThreadID: String?
+) -> Bool {
+    guard !session.isCanonicalThread,
+          let normalizedCanonicalThreadID = normalizedAssistantSessionKey(canonicalThreadID),
+          normalizedCanonicalThreadID != normalizedAssistantSessionKey(session.id) else {
+        return false
+    }
+
+    // Keep the row visible if it is currently selected so the UI does not
+    // suddenly drop the user's active thread while they are mid-inspection.
+    return normalizedAssistantSessionKey(selectedSessionID)
+        != normalizedAssistantSessionKey(session.id)
 }
 
 func assistantMergedSessionsForCleanup(
@@ -1833,6 +2033,18 @@ struct AssistantCodeReviewPanelState: Equatable, Sendable {
     let selectedCheckpointID: String
 }
 
+enum AssistantProjectFilter: Equatable, Sendable {
+    case folder(String)
+    case project(String)
+
+    var id: String {
+        switch self {
+        case .folder(let id), .project(let id):
+            return id
+        }
+    }
+}
+
 typealias AssistantFeatureController = AssistantStore
 
 @MainActor
@@ -2352,22 +2564,59 @@ final class AssistantStore: ObservableObject {
         let runtime = runtimeFactory()
         runtime.backend = backend
         bindRuntimeCallbacks(runtime, preferredSessionID: preferredSessionID)
+        runtime.onHealthUpdate = nil
+        runtime.onTranscript = nil
+        runtime.onTranscriptMutation = nil
+        runtime.onTimelineMutation = nil
+        runtime.onHUDUpdate = nil
+        runtime.onPlanUpdate = nil
+        runtime.onToolCallUpdate = nil
+        runtime.onPermissionRequest = nil
+        runtime.onSessionChange = nil
         runtime.onStatusMessage = nil
+        runtime.onTokenUsageUpdate = nil
+        runtime.onSubagentUpdate = nil
+        runtime.onProposedPlan = nil
+        runtime.onModeRestriction = nil
+        runtime.onTurnCompletion = nil
+        runtime.onTitleRequest = nil
         return runtime
     }
 
-    var selectedProjectFilter: AssistantProject? {
-        guard let selectedProjectFilterID = selectedProjectFilterID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+    var selectedProjectFilterID: String? {
+        selectedProjectFilter?.id
+    }
+
+    var selectedProject: AssistantProject? {
+        guard case let .project(projectID)? = selectedProjectFilter else {
             return nil
         }
-        return visibleProjects.first(where: {
+        return visibleLeafProjects.first(where: {
             $0.id.trimmingCharacters(in: .whitespacesAndNewlines)
-                .caseInsensitiveCompare(selectedProjectFilterID) == .orderedSame
+                .caseInsensitiveCompare(projectID) == .orderedSame
+        })
+    }
+
+    var selectedFolder: AssistantProject? {
+        guard case let .folder(folderID)? = selectedProjectFilter else {
+            return nil
+        }
+        return visibleFolders.first(where: {
+            $0.id.trimmingCharacters(in: .whitespacesAndNewlines)
+                .caseInsensitiveCompare(folderID) == .orderedSame
         })
     }
 
     var visibleProjects: [AssistantProject] {
-        projects.filter { !$0.isHidden }
+        projectStore.visibleProjects()
+    }
+
+    var visibleFolders: [AssistantProject] {
+        visibleProjects.filter(\.isFolder)
+    }
+
+    var visibleLeafProjects: [AssistantProject] {
+        visibleProjects.filter(\.isProject)
     }
 
     var hiddenProjects: [AssistantProject] {
@@ -2375,7 +2624,7 @@ final class AssistantStore: ObservableObject {
     }
 
     private var visibleSidebarProjectSessions: [AssistantSessionSummary] {
-        let visibleProjectIDs = Set(visibleProjects.map { $0.id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() })
+        let visibleProjectIDs = Set(visibleLeafProjects.map { $0.id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() })
         return sessions.filter { session in
             guard let projectID = session.projectID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty?.lowercased() else {
                 return true
@@ -2384,14 +2633,38 @@ final class AssistantStore: ObservableObject {
         }
     }
 
+    var visibleSidebarSessionsIgnoringProjectFilter: [AssistantSessionSummary] {
+        visibleSidebarProjectSessions.filter { session in
+            !session.isArchived
+                && assistantShouldListSessionInSidebar(session, selectedSessionID: selectedSessionID)
+                && !assistantShouldHideShadowProviderSession(
+                    session,
+                    selectedSessionID: selectedSessionID,
+                    canonicalThreadID: canonicalThreadID(forProviderSessionID: session.id)
+                )
+        }
+    }
+
     private var projectFilteredSidebarSessions: [AssistantSessionSummary] {
         let projectFilteredSessions: [AssistantSessionSummary]
-        if let selectedProject = selectedProjectFilter {
+        switch selectedProjectFilter {
+        case .project(let projectID):
             projectFilteredSessions = visibleSidebarProjectSessions.filter {
                 $0.projectID?.trimmingCharacters(in: .whitespacesAndNewlines)
-                    .caseInsensitiveCompare(selectedProject.id) == .orderedSame
+                    .caseInsensitiveCompare(projectID) == .orderedSame
             }
-        } else {
+        case .folder(let folderID):
+            let descendantProjectIDs = projectStore.descendantProjectIDs(ofFolderID: folderID)
+            let normalizedDescendantProjectIDs = Set(
+                descendantProjectIDs.map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+            )
+            projectFilteredSessions = visibleSidebarProjectSessions.filter {
+                guard let projectID = $0.projectID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty?.lowercased() else {
+                    return false
+                }
+                return normalizedDescendantProjectIDs.contains(projectID)
+            }
+        case nil:
             projectFilteredSessions = visibleSidebarProjectSessions
         }
 
@@ -2402,13 +2675,23 @@ final class AssistantStore: ObservableObject {
         projectFilteredSidebarSessions.filter { session in
             !session.isArchived
                 && assistantShouldListSessionInSidebar(session, selectedSessionID: selectedSessionID)
+                && !assistantShouldHideShadowProviderSession(
+                    session,
+                    selectedSessionID: selectedSessionID,
+                    canonicalThreadID: canonicalThreadID(forProviderSessionID: session.id)
+                )
         }
     }
 
     var visibleArchivedSidebarSessions: [AssistantSessionSummary] {
-        visibleSidebarProjectSessions.filter { session in
+        projectFilteredSidebarSessions.filter { session in
             session.isArchived
                 && assistantShouldListSessionInSidebar(session, selectedSessionID: selectedSessionID)
+                && !assistantShouldHideShadowProviderSession(
+                    session,
+                    selectedSessionID: selectedSessionID,
+                    canonicalThreadID: canonicalThreadID(forProviderSessionID: session.id)
+                )
         }
     }
     @Published private(set) var timelineItems: [AssistantTimelineItem] = []
@@ -2447,7 +2730,7 @@ final class AssistantStore: ObservableObject {
             }
         }
     }
-    @Published private(set) var selectedProjectFilterID: String?
+    @Published private(set) var selectedProjectFilter: AssistantProjectFilter?
     @Published var assistantEnabled = false
     @Published var lastStatusMessage: String?
     @Published var showBrowserProfilePicker = false
@@ -2585,6 +2868,7 @@ final class AssistantStore: ObservableObject {
     private var pendingFreshSessionIDs: Set<String> = []
     private var pendingFreshSessionSourcesByID: [String: AssistantSessionSource] = [:]
     private var temporarySessionIDs: Set<String> = []
+    private var deletedSessionIDs: Set<String> = []
     private var lastSubmittedAttachments: [AssistantAttachment] = []
     private var lastSpokenAssistantTimelineItemID: String?
     private var lastSpokenAssistantTurnID: String?
@@ -3069,7 +3353,13 @@ final class AssistantStore: ObservableObject {
         toolCalls = state.toolCalls
         recentToolCalls = state.recentToolCalls
         pendingPermissionRequest = state.pendingPermissionRequest
-        hudState = state.hudState ?? .idle
+        // Preserve the .listening phase during active voice capture so that
+        // runtime HUD updates (e.g. a previous turn going idle) don't reset
+        // the UI away from the listening indicator while the user is still
+        // holding the voice shortcut.
+        if hudState.phase != .listening {
+            hudState = state.hudState ?? .idle
+        }
         proposedPlan = state.proposedPlan
         proposedPlanSessionID = state.proposedPlan?.nonEmpty == nil ? nil : selectedSessionID
         recomputeAggregatedSubagents()
@@ -3331,7 +3621,7 @@ final class AssistantStore: ObservableObject {
                         executionState.hudState = state
                         executionState.hasActiveTurn = runtime.hasActiveTurn
                     }
-                } else if self.sessionRuntimesBySessionID.isEmpty {
+                } else if self.sessionRuntimesBySessionID.isEmpty, self.hudState.phase != .listening {
                     self.hudState = state
                 }
             }
@@ -3360,6 +3650,7 @@ final class AssistantStore: ObservableObject {
                 }
                 await self.finalizeTrackedCodeCheckpoint(
                     for: completionSessionID,
+                    turnID: completionTurnID,
                     status: status
                 )
                 if let completionSessionID {
@@ -3775,6 +4066,31 @@ final class AssistantStore: ObservableObject {
         }
 
         return trimmed
+    }
+
+    static func isRecoverableProviderSessionErrorMessage(
+        _ rawMessage: String,
+        backend: AssistantRuntimeBackend
+    ) -> Bool {
+        guard backend == .copilot else { return false }
+
+        let normalized = humanizedAssistantErrorMessage(rawMessage)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        guard !normalized.isEmpty else { return false }
+
+        let recoverableFragments = [
+            "stream disconnected before completion",
+            "an error occurred while processing your request",
+            "include the request id",
+            "codex app server stopped",
+            "codex app server closed",
+            "codex app server is not running",
+            "github copilot exited because of a signal",
+            "github copilot exited with code"
+        ]
+
+        return recoverableFragments.contains { normalized.contains($0) }
     }
 
     var isRuntimeReadyForConversation: Bool {
@@ -4289,14 +4605,15 @@ final class AssistantStore: ObservableObject {
 
         await purgeExpiredArchivedSessionsIfNeeded()
 
-        let ownedSessionIDs = resolvedOwnedSessionIDs()
+        let trackedSessionIDs = trackedSidebarSessionIDs()
+        let projectLinkedSessionIDs = trackedProjectLinkedSessionIDs()
         do {
             let capturedSelectedSessionID = selectedSessionID
-            let managedSessionIDs = Set(ownedSessionIDs.compactMap { normalizedSessionID($0) })
+            let managedSessionIDs = Set(trackedSessionIDs.compactMap { normalizedSessionID($0) })
 
             async let catalogSessionsTask = loadCatalogSessions(
                 limit: effectiveLimit,
-                ownedSessionIDs: ownedSessionIDs,
+                trackedSessionIDs: trackedSessionIDs,
                 preferredSessionID: capturedSelectedSessionID
             )
             async let openAssistSessionsTask = loadOpenAssistSessions(
@@ -4310,7 +4627,16 @@ final class AssistantStore: ObservableObject {
             let catalogSessions = try await catalogSessionsTask
             let openAssistSessions = await openAssistSessionsTask
             let copilotSessions = await copilotSessionsTask
-            var merged = deduplicateSessions(catalogSessions + openAssistSessions + copilotSessions)
+            let knownSessionIDs = Set(
+                (catalogSessions + openAssistSessions + copilotSessions).compactMap { normalizedSessionID($0.id) }
+            )
+            let recoveredProjectSessions = recoverProjectLinkedOpenAssistSessions(
+                projectLinkedSessionIDs: projectLinkedSessionIDs,
+                excluding: knownSessionIDs
+            )
+            var merged = deduplicateSessions(
+                catalogSessions + openAssistSessions + copilotSessions + recoveredProjectSessions
+            )
             let persistedSessionIDs = Set(merged.compactMap { normalizedSessionID($0.id) })
             reconcilePendingFreshSessions(with: persistedSessionIDs)
             merged = mergePendingFreshSessions(into: merged)
@@ -4331,7 +4657,11 @@ final class AssistantStore: ObservableObject {
             }
 
             withAnimation(.spring(response: 0.26, dampingFraction: 0.86)) {
-                sessions = Array(merged.prefix(effectiveLimit))
+                sessions = retainedProjectLinkedSessions(
+                    from: merged,
+                    limit: effectiveLimit,
+                    pinnedSessionIDs: projectLinkedSessionIDs
+                )
             }
             persistManagedSessionsSnapshot()
             ensureSessionVisible(selectedSessionID)
@@ -4383,18 +4713,159 @@ final class AssistantStore: ObservableObject {
         ))
     }
 
+    private func trackedSidebarSessionIDs() -> [String] {
+        var ordered: [String] = []
+        var seen = Set<String>()
+
+        for candidate in resolvedOwnedSessionIDs() {
+            guard let normalizedCandidate = normalizedSessionID(candidate),
+                  seen.insert(normalizedCandidate).inserted else {
+                continue
+            }
+            ordered.append(candidate)
+        }
+
+        for candidate in projectStore.snapshot().threadAssignments.keys.sorted() {
+            guard let normalizedCandidate = normalizedSessionID(candidate),
+                  seen.insert(normalizedCandidate).inserted else {
+                continue
+            }
+            ordered.append(candidate)
+        }
+
+        return ordered
+    }
+
+    private func trackedProjectLinkedSessionIDs() -> Set<String> {
+        Set(
+            projectStore.snapshot().threadAssignments.keys.compactMap { candidate in
+                guard let normalizedCandidate = normalizedSessionID(candidate),
+                      !deletedSessionIDs.contains(normalizedCandidate) else {
+                    return nil
+                }
+                return normalizedCandidate
+            }
+        )
+    }
+
+    private func recoverProjectLinkedOpenAssistSessions(
+        projectLinkedSessionIDs: Set<String>,
+        excluding knownSessionIDs: Set<String>
+    ) -> [AssistantSessionSummary] {
+        guard !projectLinkedSessionIDs.isEmpty else { return [] }
+
+        return projectLinkedSessionIDs.compactMap { sessionID in
+            guard !knownSessionIDs.contains(sessionID) else {
+                return nil
+            }
+            return loadConversationStoreSessionSummary(threadID: sessionID)
+        }
+    }
+
+    private func loadConversationStoreSessionSummary(threadID: String) -> AssistantSessionSummary? {
+        guard let normalizedThreadID = normalizedSessionID(threadID) else {
+            return nil
+        }
+
+        let notesWorkspace = conversationStore.loadThreadNotesWorkspace(threadID: normalizedThreadID)
+        let snapshot = conversationStore.loadSnapshot(threadID: normalizedThreadID)
+        guard let snapshot = snapshot ?? notesWorkspace.selectedNote.map({ _ in
+            AssistantConversationSnapshot.empty(threadID: normalizedThreadID)
+        }) else {
+            return nil
+        }
+
+        let latestUserMessage = snapshot.transcript.reversed().first(where: { $0.role == .user })?.text.assistantNonEmpty
+        let latestAssistantMessage = snapshot.transcript.reversed().first(where: { $0.role == .assistant })?.text.assistantNonEmpty
+        let selectedNoteTitle = notesWorkspace.selectedNote?.title.assistantNonEmpty
+        let createdAt = snapshot.transcript.first?.createdAt
+            ?? snapshot.timeline.first?.createdAt
+            ?? snapshot.turns.compactMap(\.createdAt).min()
+            ?? notesWorkspace.notes.map(\.createdAt).min()
+            ?? snapshot.updatedAt
+        let updatedAt = max(
+            snapshot.updatedAt,
+            notesWorkspace.notes.map(\.updatedAt).max() ?? snapshot.updatedAt
+        )
+
+        return AssistantSessionSummary(
+            id: normalizedThreadID,
+            title: conversationStoreSessionTitle(
+                latestUserMessage: latestUserMessage,
+                latestAssistantMessage: latestAssistantMessage,
+                selectedNoteTitle: selectedNoteTitle
+            ),
+            source: .openAssist,
+            threadArchitectureVersion: .providerIndependentV2,
+            conversationPersistence: .hybridJSONL,
+            status: .idle,
+            createdAt: createdAt,
+            updatedAt: updatedAt,
+            summary: latestAssistantMessage ?? latestUserMessage ?? selectedNoteTitle,
+            latestUserMessage: latestUserMessage,
+            latestAssistantMessage: latestAssistantMessage
+        )
+    }
+
+    private func conversationStoreSessionTitle(
+        latestUserMessage: String?,
+        latestAssistantMessage: String?,
+        selectedNoteTitle: String?
+    ) -> String {
+        let preferredTitle = latestUserMessage?.assistantNonEmpty
+            ?? selectedNoteTitle?.assistantNonEmpty
+            ?? latestAssistantMessage?.assistantNonEmpty
+            ?? "Saved Open Assist Chat"
+        let collapsedTitle = preferredTitle
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+        let normalizedTitle = collapsedTitle.assistantNonEmpty ?? "Saved Open Assist Chat"
+        guard normalizedTitle.count > 84 else {
+            return normalizedTitle
+        }
+        return String(normalizedTitle.prefix(83)).trimmingCharacters(in: .whitespacesAndNewlines) + "…"
+    }
+
+    private func retainedProjectLinkedSessions(
+        from sessions: [AssistantSessionSummary],
+        limit: Int,
+        pinnedSessionIDs: Set<String>
+    ) -> [AssistantSessionSummary] {
+        var retained = Array(sessions.prefix(limit))
+        guard !pinnedSessionIDs.isEmpty else {
+            return retained
+        }
+
+        let retainedIDs = Set(retained.compactMap { normalizedSessionID($0.id) })
+        let missingPinnedSessions = sessions.filter { session in
+            guard let normalizedID = normalizedSessionID(session.id) else {
+                return false
+            }
+            return pinnedSessionIDs.contains(normalizedID) && !retainedIDs.contains(normalizedID)
+        }
+
+        guard !missingPinnedSessions.isEmpty else {
+            return retained
+        }
+
+        retained.append(contentsOf: missingPinnedSessions)
+        return sortSessionsByRecency(deduplicateSessions(retained))
+    }
+
     private func loadCatalogSessions(
         limit: Int,
-        ownedSessionIDs: [String],
+        trackedSessionIDs: [String],
         preferredSessionID: String?
     ) async throws -> [AssistantSessionSummary] {
-        async let byIDTask: [AssistantSessionSummary] = ownedSessionIDs.isEmpty
+        async let byIDTask: [AssistantSessionSummary] = trackedSessionIDs.isEmpty
             ? []
             : sessionCatalog.loadSessions(
-                limit: max(limit, ownedSessionIDs.count),
+                limit: max(limit, trackedSessionIDs.count),
                 preferredThreadID: preferredSessionID,
                 preferredCWD: nil,
-                sessionIDs: ownedSessionIDs
+                sessionIDs: trackedSessionIDs
             )
         async let byOriginatorTask: [AssistantSessionSummary] = sessionCatalog.loadSessions(
             limit: limit,
@@ -4452,7 +4923,7 @@ final class AssistantStore: ObservableObject {
     }
 
     private func persistManagedSessionsSnapshot() {
-        let managedSessionIDs = Set(resolvedOwnedSessionIDs().compactMap { normalizedSessionID($0) })
+        let managedSessionIDs = Set(trackedSidebarSessionIDs().compactMap { normalizedSessionID($0) })
         let managedSessions = sessions.filter { session in
             guard let normalizedID = normalizedSessionID(session.id) else {
                 return false
@@ -4836,6 +5307,57 @@ final class AssistantStore: ObservableObject {
         syncRuntimeContext()
     }
 
+    func selectionSideAssistantVisibleModels(
+        for backend: AssistantRuntimeBackend
+    ) -> [AssistantModelOption] {
+        cachedAvailableModels(threadID: selectedSessionID, backend: backend)
+            .filter { !$0.hidden }
+    }
+
+    func selectionSideAssistantResolvedModelID(
+        for backend: AssistantRuntimeBackend,
+        preferredModelID: String?
+    ) -> String? {
+        let models = cachedAvailableModels(threadID: selectedSessionID, backend: backend)
+        return Self.resolvedModelSelection(
+            from: nil,
+            backend: backend,
+            availableModels: models,
+            preferredModelID: preferredModelID,
+            surfaceModelID: nil
+        )
+    }
+
+    func loadSelectionSideAssistantVisibleModels(
+        for backend: AssistantRuntimeBackend
+    ) async -> [AssistantModelOption] {
+        let cachedModels = selectionSideAssistantVisibleModels(for: backend)
+        if !cachedModels.isEmpty {
+            return cachedModels
+        }
+
+        let guidance = await installSupport.inspect(backend: backend)
+        guard guidance.codexDetected else {
+            return []
+        }
+
+        let warmRuntime = runtimeFactory()
+        warmRuntime.backend = backend
+
+        do {
+            let details = try await warmRuntime.refreshEnvironment(codexPath: guidance.codexPath)
+            if !details.models.isEmpty {
+                providerAvailableModelsByBackend[backend] = details.models
+            }
+        } catch {
+            await warmRuntime.stop()
+            return selectionSideAssistantVisibleModels(for: backend)
+        }
+
+        await warmRuntime.stop()
+        return selectionSideAssistantVisibleModels(for: backend)
+    }
+
     func startAccountLogin() {
         Task { @MainActor in
             let backend = self.assistantBackend
@@ -4901,8 +5423,9 @@ final class AssistantStore: ObservableObject {
     @discardableResult
     private func createOpenAssistThread(cwd: String? = nil, isTemporary: Bool) -> String {
         let sessionID = Self.makeOpenAssistThreadID()
+        deletedSessionIDs.remove(sessionID.lowercased())
         let requestedCWD = cwd ?? selectedProjectLinkedFolderPathIfUsable()
-        let targetProjectID = selectedProjectFilter?.id
+        let targetProjectID = selectedProject?.id
         let now = Date()
         let thread = AssistantSessionSummary(
             id: sessionID,
@@ -4915,7 +5438,7 @@ final class AssistantStore: ObservableObject {
             activeProvider: nil,
             providerBindingsByBackend: [],
             status: .idle,
-            cwd: requestedCWD ?? FileManager.default.homeDirectoryForCurrentUser.path,
+            cwd: requestedCWD,
             effectiveCWD: requestedCWD,
             createdAt: now,
             updatedAt: now,
@@ -4928,7 +5451,7 @@ final class AssistantStore: ObservableObject {
             latestAssistantMessage: nil,
             isTemporary: isTemporary,
             projectID: targetProjectID,
-            projectName: selectedProjectFilter?.name,
+            projectName: selectedProject?.name,
             linkedProjectFolderPath: requestedCWD
         )
 
@@ -5586,6 +6109,30 @@ final class AssistantStore: ObservableObject {
             pendingResumeContextSnapshotsBySessionID.removeValue(forKey: sessionID)
             ensureSessionVisible(sessionID)
         } catch {
+            let recoveredBrokenCopilotSession = await recoverStoredProviderSessionIfNeeded(
+                after: error,
+                threadID: executionSessionID,
+                backend: executionRuntime?.backend ?? assistantBackend,
+                statusMessageOverride: "GitHub Copilot had an internal session problem. Open Assist repaired the Copilot session. Press Send one more time."
+            )
+
+            if recoveredBrokenCopilotSession {
+                let recoveryMessage = lastStatusMessage
+                    ?? "GitHub Copilot had an internal session problem. Open Assist repaired the Copilot session. Press Send one more time."
+                hudState = AssistantHUDState(
+                    phase: .failed,
+                    title: "Copilot recovered",
+                    detail: recoveryMessage
+                )
+                promptDraft = trimmed
+                if let runtimeSessionID = executionSessionID
+                    ?? executionRuntime?.currentSessionID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+                    ?? selectedSessionID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
+                    await discardPendingTrackedCodeCheckpoint(for: runtimeSessionID)
+                }
+                return
+            }
+
             let friendlyErrorText = Self.humanizedAssistantErrorMessage(error.localizedDescription)
             hudState = AssistantHUDState(
                 phase: .failed,
@@ -6442,6 +6989,11 @@ final class AssistantStore: ObservableObject {
         return conversationStore.loadThreadNote(threadID: normalizedThreadID)
     }
 
+    func loadThreadNotesWorkspace(threadID: String?) -> AssistantThreadNotesWorkspace? {
+        guard let normalizedThreadID = normalizedSessionID(threadID) else { return nil }
+        return conversationStore.loadThreadNotesWorkspace(threadID: normalizedThreadID)
+    }
+
     func threadNoteLastSavedAt(threadID: String?) -> Date? {
         guard let normalizedThreadID = normalizedSessionID(threadID) else { return nil }
         return conversationStore.threadNoteModificationDate(threadID: normalizedThreadID)
@@ -6456,6 +7008,264 @@ final class AssistantStore: ObservableObject {
             lastStatusMessage = "Could not save the thread note."
             CrashReporter.logError("Thread note save failed: \(error.localizedDescription)")
             return false
+        }
+    }
+
+    func createThreadNote(
+        threadID: String?,
+        title: String? = nil
+    ) -> AssistantThreadNotesWorkspace? {
+        guard let normalizedThreadID = normalizedSessionID(threadID) else { return nil }
+        do {
+            return try conversationStore.createThreadNote(
+                threadID: normalizedThreadID,
+                title: title
+            )
+        } catch {
+            lastStatusMessage = "Could not create the thread note."
+            CrashReporter.logError("Thread note create failed: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    func renameThreadNote(
+        threadID: String?,
+        noteID: String?,
+        title: String
+    ) -> AssistantThreadNotesWorkspace? {
+        guard let normalizedThreadID = normalizedSessionID(threadID),
+              let noteID = noteID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+            return nil
+        }
+        do {
+            return try conversationStore.renameThreadNote(
+                threadID: normalizedThreadID,
+                noteID: noteID,
+                title: title
+            )
+        } catch {
+            lastStatusMessage = "Could not rename the thread note."
+            CrashReporter.logError("Thread note rename failed: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    func selectThreadNote(
+        threadID: String?,
+        noteID: String?
+    ) -> AssistantThreadNotesWorkspace? {
+        guard let normalizedThreadID = normalizedSessionID(threadID),
+              let noteID = noteID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+            return nil
+        }
+        do {
+            return try conversationStore.selectThreadNote(
+                threadID: normalizedThreadID,
+                noteID: noteID
+            )
+        } catch {
+            lastStatusMessage = "Could not switch thread notes."
+            CrashReporter.logError("Thread note select failed: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    func saveThreadNote(
+        threadID: String?,
+        noteID: String?,
+        text: String
+    ) -> AssistantThreadNotesWorkspace? {
+        guard let normalizedThreadID = normalizedSessionID(threadID) else { return nil }
+        let normalizedNoteID = noteID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+        do {
+            return try conversationStore.saveThreadNote(
+                threadID: normalizedThreadID,
+                noteID: normalizedNoteID,
+                text: text
+            )
+        } catch {
+            lastStatusMessage = "Could not save the thread note."
+            CrashReporter.logError("Thread note save failed: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    func deleteThreadNote(
+        threadID: String?,
+        noteID: String?
+    ) -> AssistantThreadNotesWorkspace? {
+        guard let normalizedThreadID = normalizedSessionID(threadID),
+              let noteID = noteID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+            return nil
+        }
+        do {
+            return try conversationStore.deleteThreadNote(
+                threadID: normalizedThreadID,
+                noteID: noteID
+            )
+        } catch {
+            lastStatusMessage = "Could not delete the thread note."
+            CrashReporter.logError("Thread note delete failed: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    func appendToSelectedThreadNote(
+        threadID: String?,
+        text: String
+    ) -> AssistantThreadNotesWorkspace? {
+        guard let normalizedThreadID = normalizedSessionID(threadID) else { return nil }
+        do {
+            return try conversationStore.appendToSelectedThreadNote(
+                threadID: normalizedThreadID,
+                text: text
+            )
+        } catch {
+            lastStatusMessage = "Could not add that text to the current note."
+            CrashReporter.logError("Thread note append failed: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    func loadProjectNotesWorkspace(projectID: String?) -> AssistantNotesWorkspace? {
+        guard let normalizedProjectID = projectID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+            return nil
+        }
+        do {
+            return try projectStore.loadProjectNotesWorkspace(projectID: normalizedProjectID)
+        } catch {
+            lastStatusMessage = "Could not load the project notes."
+            CrashReporter.logError("Project note load failed: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    func projectNoteLastSavedAt(projectID: String?) -> Date? {
+        guard let normalizedProjectID = projectID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+            return nil
+        }
+        return try? projectStore.projectNoteModificationDate(projectID: normalizedProjectID)
+    }
+
+    func createProjectNote(
+        projectID: String?,
+        title: String? = nil
+    ) -> AssistantNotesWorkspace? {
+        guard let normalizedProjectID = projectID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+            return nil
+        }
+        do {
+            return try projectStore.createProjectNote(
+                projectID: normalizedProjectID,
+                title: title
+            )
+        } catch {
+            lastStatusMessage = "Could not create the project note."
+            CrashReporter.logError("Project note create failed: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    func renameProjectNote(
+        projectID: String?,
+        noteID: String?,
+        title: String
+    ) -> AssistantNotesWorkspace? {
+        guard let normalizedProjectID = projectID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty,
+              let noteID = noteID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+            return nil
+        }
+        do {
+            return try projectStore.renameProjectNote(
+                projectID: normalizedProjectID,
+                noteID: noteID,
+                title: title
+            )
+        } catch {
+            lastStatusMessage = "Could not rename the project note."
+            CrashReporter.logError("Project note rename failed: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    func selectProjectNote(
+        projectID: String?,
+        noteID: String?
+    ) -> AssistantNotesWorkspace? {
+        guard let normalizedProjectID = projectID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty,
+              let noteID = noteID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+            return nil
+        }
+        do {
+            return try projectStore.selectProjectNote(
+                projectID: normalizedProjectID,
+                noteID: noteID
+            )
+        } catch {
+            lastStatusMessage = "Could not switch project notes."
+            CrashReporter.logError("Project note select failed: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    func saveProjectNote(
+        projectID: String?,
+        noteID: String?,
+        text: String
+    ) -> AssistantNotesWorkspace? {
+        guard let normalizedProjectID = projectID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+            return nil
+        }
+        let normalizedNoteID = noteID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+        do {
+            return try projectStore.saveProjectNote(
+                projectID: normalizedProjectID,
+                noteID: normalizedNoteID,
+                text: text
+            )
+        } catch {
+            lastStatusMessage = "Could not save the project note."
+            CrashReporter.logError("Project note save failed: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    func deleteProjectNote(
+        projectID: String?,
+        noteID: String?
+    ) -> AssistantNotesWorkspace? {
+        guard let normalizedProjectID = projectID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty,
+              let noteID = noteID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+            return nil
+        }
+        do {
+            return try projectStore.deleteProjectNote(
+                projectID: normalizedProjectID,
+                noteID: noteID
+            )
+        } catch {
+            lastStatusMessage = "Could not delete the project note."
+            CrashReporter.logError("Project note delete failed: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    func appendToSelectedProjectNote(
+        projectID: String?,
+        text: String
+    ) -> AssistantNotesWorkspace? {
+        guard let normalizedProjectID = projectID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+            return nil
+        }
+        do {
+            return try projectStore.appendToSelectedProjectNote(
+                projectID: normalizedProjectID,
+                text: text
+            )
+        } catch {
+            lastStatusMessage = "Could not add that text to the current project note."
+            CrashReporter.logError("Project note append failed: \(error.localizedDescription)")
+            return nil
         }
     }
 
@@ -6581,12 +7391,21 @@ final class AssistantStore: ObservableObject {
         _ sessionID: String,
         stopRuntimeIfNeeded: Bool
     ) async throws -> Bool {
-        if stopRuntimeIfNeeded,
-           let sessionRuntime = runtime(for: sessionID),
-           sessionRuntime.currentSessionID?.caseInsensitiveCompare(sessionID) == .orderedSame {
-            await sessionRuntime.stop()
+        let normalizedSessionID = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedSessionID.isEmpty else { return false }
+
+        markSessionPendingDeletion(normalizedSessionID)
+        do {
+            if stopRuntimeIfNeeded,
+               let sessionRuntime = runtime(for: normalizedSessionID),
+               sessionRuntime.currentSessionID?.caseInsensitiveCompare(normalizedSessionID) == .orderedSame {
+                await sessionRuntime.stop()
+            }
+            return try deleteSessionArtifactsLocally(normalizedSessionID)
+        } catch {
+            deletedSessionIDs.remove(normalizedSessionID.lowercased())
+            throw error
         }
-        return try deleteSessionArtifactsLocally(sessionID)
     }
 
     @discardableResult
@@ -6724,7 +7543,10 @@ final class AssistantStore: ObservableObject {
             if sessionsMatch(transcriptSessionID, sessionID) {
                 setVisibleTranscript([], for: nil)
             }
-            if sessionsMatch(pendingPermissionRequest?.sessionID, sessionID) {
+            let pendingPermissionThreadID =
+                canonicalThreadID(forProviderSessionID: pendingPermissionRequest?.sessionID)
+                ?? pendingPermissionRequest?.sessionID
+            if sessionsMatch(pendingPermissionThreadID, sessionID) {
                 pendingPermissionRequest = nil
             }
         }
@@ -7073,6 +7895,230 @@ final class AssistantStore: ObservableObject {
         }
     }
 
+    func requestSelectionSideAssistantReply(
+        _ selectedText: String,
+        in parentMessageText: String,
+        question: String,
+        backend overrideBackend: AssistantRuntimeBackend? = nil,
+        preferredModelID overrideModelID: String? = nil,
+        mainChatSummary overrideMainChatSummary: String? = nil,
+        conversationHistory: [SelectionAskConversationTurn] = [],
+        onPartialText: (@Sendable (String) -> Void)? = nil
+    ) async -> MemoryEntryExplanationResult {
+        let normalizedSelection = selectedText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedSelection.isEmpty else {
+            return .failure("Select some text first.")
+        }
+
+        let normalizedParentMessage = parentMessageText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedParentMessage.isEmpty else {
+            return .failure("Could not find the full message for this selection.")
+        }
+
+        let normalizedQuestion = question.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedQuestion.isEmpty else {
+            return .failure("Ask a question first.")
+        }
+
+        let backend = overrideBackend ?? visibleAssistantBackend
+        let installGuidance = await installSupport.inspect(backend: backend)
+        guard installGuidance.codexDetected else {
+            return .failure(installGuidance.primaryDetail)
+        }
+
+        let availableModels = selectionSideAssistantVisibleModels(for: backend)
+        let resolvedModels = availableModels.isEmpty
+            ? await loadSelectionSideAssistantVisibleModels(for: backend)
+            : availableModels
+        let inheritedPreferredModelID: String? = {
+            if let overrideModelID {
+                return overrideModelID
+            }
+            return backend == visibleAssistantBackend ? selectedModelID : nil
+        }()
+
+        let preferredModelID = Self.resolvedModelSelection(
+            from: nil,
+            backend: backend,
+            availableModels: resolvedModels,
+            preferredModelID: inheritedPreferredModelID,
+            surfaceModelID: nil
+        )
+        guard let preferredModelID else {
+            return .failure("Choose a model before using the side assistant.")
+        }
+
+        let mainChatSummary = overrideMainChatSummary?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nonEmpty
+            ?? selectionSideAssistantChatSummarySnapshot()?.summary
+
+        if backend == .codex {
+            CrashReporter.logInfo(
+                "Selection side assistant direct request started backend=\(backend.rawValue) requestedModel=\(inheritedPreferredModelID ?? "none") resolvedModel=\(preferredModelID) historyTurns=\(conversationHistory.count) selectionChars=\(normalizedSelection.count) questionChars=\(normalizedQuestion.count) mainChatSummaryChars=\(mainChatSummary?.count ?? 0)"
+            )
+
+            if let directResult = await MemoryEntryExplanationService.shared.explainSelectedTextDirectIfAvailable(
+                normalizedSelection,
+                parentMessageText: normalizedParentMessage,
+                question: normalizedQuestion,
+                preferredProviderMode: .openAI,
+                preferredModel: preferredModelID,
+                conversationHistory: conversationHistory,
+                wholeChatSummary: mainChatSummary,
+                onPartialText: onPartialText
+            ) {
+                switch directResult {
+                case .success(let responseText):
+                    CrashReporter.logInfo(
+                        "Selection side assistant direct request completed backend=\(backend.rawValue) model=\(preferredModelID) responseChars=\(responseText.count)"
+                    )
+                case .failure(let message):
+                    CrashReporter.logWarning(
+                        "Selection side assistant direct request failed backend=\(backend.rawValue) model=\(preferredModelID) message=\(message)"
+                    )
+                }
+                return directResult
+            }
+
+            CrashReporter.logInfo(
+                "Selection side assistant direct request unavailable backend=\(backend.rawValue) model=\(preferredModelID); falling back to runtime"
+            )
+        }
+
+        let prompt = SelectionAskPromptBuilder.makePrompt(
+            selectedText: normalizedSelection,
+            parentMessageText: normalizedParentMessage,
+            question: normalizedQuestion,
+            conversationHistory: conversationHistory,
+            wholeChatSummary: mainChatSummary
+        )
+
+        CrashReporter.logInfo(
+            "Selection side assistant request started backend=\(backend.rawValue) requestedModel=\(inheritedPreferredModelID ?? "none") resolvedModel=\(preferredModelID) historyTurns=\(conversationHistory.count) selectionChars=\(normalizedSelection.count) questionChars=\(normalizedQuestion.count) mainChatSummaryChars=\(mainChatSummary?.count ?? 0)"
+        )
+
+        let selectedSessionID = selectedSessionID ?? runtime.currentSessionID
+        let resolvedCWD = selectedSessionID.flatMap { resolvedSessionCWD(for: $0) }
+        let selectedReasoningEffort = backend == .codex ? AssistantReasoningEffort.low.wireValue : nil
+        let selectedServiceTier = backend == .codex ? "fast" : nil
+        let selectedInteractionMode: AssistantInteractionMode = .conversational
+
+        let temporaryRuntime = CodexAssistantRuntime(preferredModelID: preferredModelID)
+        temporaryRuntime.backend = backend
+        temporaryRuntime.interactionMode = selectedInteractionMode
+        temporaryRuntime.reasoningEffort = selectedReasoningEffort
+        temporaryRuntime.serviceTier = selectedServiceTier
+        temporaryRuntime.activeSkills = []
+        temporaryRuntime.customInstructions = """
+        \(prompt.systemPrompt)
+
+        This is an internal side-assistant turn inside Open Assist.
+        Do not use tools, browse the web, open apps, run commands, edit files, or ask for permissions.
+        Answer directly from the supplied chat context and question.
+        """
+
+        let recorder = SelectionSideAssistantResponseRecorder()
+
+        let result: MemoryEntryExplanationResult = await withCheckedContinuation { continuation in
+            let continuationBox = SelectionSideAssistantContinuationBox(continuation)
+            let timeoutTask = Task {
+                do {
+                    try await Task.sleep(nanoseconds: 30_000_000_000)
+                } catch {
+                    return
+                }
+                continuationBox.resume(.failure("The side assistant took too long to reply. Please try again."))
+                await temporaryRuntime.cancelPendingPermissionRequest()
+                await temporaryRuntime.cancelActiveTurn()
+            }
+
+            temporaryRuntime.onTranscriptMutation = { mutation in
+                recorder.record(mutation)
+                if let partialText = recorder.latestAssistantText()
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .nonEmpty {
+                    onPartialText?(partialText)
+                }
+            }
+
+            temporaryRuntime.onPermissionRequest = { _ in
+                Task { @MainActor in
+                    await temporaryRuntime.cancelPendingPermissionRequest()
+                    await temporaryRuntime.cancelActiveTurn()
+                }
+            }
+
+            temporaryRuntime.onTurnCompletion = { status in
+                timeoutTask.cancel()
+                let finalText = recorder.latestAssistantText()
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .nonEmpty
+
+                switch status {
+                case .completed:
+                    if let finalText {
+                        continuationBox.resume(.success(finalText))
+                    } else {
+                        continuationBox.resume(.failure("The side assistant returned an empty answer."))
+                    }
+                case .interrupted:
+                    if let finalText {
+                        continuationBox.resume(.success(finalText))
+                    } else {
+                        continuationBox.resume(.failure("The side assistant stopped before it finished."))
+                    }
+                case .failed(let message):
+                    if let finalText {
+                        continuationBox.resume(.success(finalText))
+                    } else {
+                        continuationBox.resume(.failure(message))
+                    }
+                }
+            }
+
+            Task { @MainActor in
+                do {
+                    _ = try await temporaryRuntime.startNewSession(
+                        cwd: resolvedCWD,
+                        preferredModelID: preferredModelID
+                    )
+                    try await temporaryRuntime.sendPrompt(
+                        prompt.userPrompt,
+                        attachments: [],
+                        preferredModelID: preferredModelID,
+                        modelSupportsImageInput: true,
+                        resumeContext: nil,
+                        memoryContext: nil
+                    )
+                } catch {
+                    timeoutTask.cancel()
+                    let errorMessage = error.localizedDescription.localizedCaseInsensitiveContains("did not answer")
+                        ? "\(backend.displayName) did not answer the Ask request in time. Please try again."
+                        : error.localizedDescription
+                    continuationBox.resume(.failure(errorMessage))
+                }
+            }
+        }
+
+        Task { @MainActor in
+            await temporaryRuntime.stop()
+        }
+
+        switch result {
+        case .success(let responseText):
+            CrashReporter.logInfo(
+                "Selection side assistant request completed backend=\(backend.rawValue) model=\(preferredModelID) responseChars=\(responseText.count)"
+            )
+        case .failure(let message):
+            CrashReporter.logWarning(
+                "Selection side assistant request failed backend=\(backend.rawValue) model=\(preferredModelID) message=\(message)"
+            )
+        }
+
+        return result
+    }
+
     func explainSelectedText(
         _ selectedText: String,
         in parentMessageText: String,
@@ -7176,6 +8222,23 @@ final class AssistantStore: ObservableObject {
             )
             lastStatusMessage = detail
         }
+    }
+
+    func selectionSideAssistantChatSummarySnapshot() -> SelectionSideAssistantChatSummarySnapshot? {
+        let targetSessionID = selectedSessionID ?? runtime.currentSessionID
+        let sessionTranscript = targetSessionID.flatMap { transcriptEntriesBySessionID[$0] } ?? transcript
+        let sessionSummary = targetSessionID.flatMap { sessionID in
+            sessions.first(where: { sessionsMatch($0.id, sessionID) })
+        }
+
+        return SelectionSideAssistantChatSummaryBuilder.build(
+            sessionID: targetSessionID ?? "active-thread",
+            sessionTitle: sessionSummary?.title,
+            sessionSummary: sessionSummary?.summary
+                ?? sessionSummary?.latestAssistantMessage
+                ?? sessionSummary?.latestUserMessage,
+            transcriptEntries: sessionTranscript
+        )
     }
 
     func acceptMemorySuggestion(_ suggestion: AssistantMemorySuggestion) {
@@ -7713,7 +8776,7 @@ final class AssistantStore: ObservableObject {
                 hasConversationContent: lastSubmittedPrompt?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty != nil,
                 hasActiveTurn: runtime.hasActiveTurn
             ),
-            cwd: runtime.currentSessionCWD ?? FileManager.default.homeDirectoryForCurrentUser.path,
+            cwd: runtime.currentSessionCWD,
             createdAt: Date(),
             updatedAt: Date(),
             summary: lastSubmittedPrompt,
@@ -7916,6 +8979,7 @@ final class AssistantStore: ObservableObject {
         guard let sessionID = sessionID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
             return
         }
+        deletedSessionIDs.remove(sessionID.lowercased())
         var updated = settings.assistantOwnedThreadIDs
         updated.removeAll { $0.caseInsensitiveCompare(sessionID) == .orderedSame }
         updated.insert(sessionID, at: 0)
@@ -7943,6 +9007,7 @@ final class AssistantStore: ObservableObject {
             let trimmed = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty else { continue }
             let normalized = trimmed.lowercased()
+            guard !deletedSessionIDs.contains(normalized) else { continue }
             if seen.insert(normalized).inserted {
                 ordered.append(trimmed)
             }
@@ -7950,14 +9015,16 @@ final class AssistantStore: ObservableObject {
 
         if let currentSessionID = managedSessionID(for: runtime) {
             let normalized = currentSessionID.lowercased()
-            if seen.insert(normalized).inserted {
+            if !deletedSessionIDs.contains(normalized),
+               seen.insert(normalized).inserted {
                 ordered.insert(currentSessionID, at: 0)
             }
         }
 
         if let selectedSessionID = selectedSessionID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
             let normalized = selectedSessionID.lowercased()
-            if seen.insert(normalized).inserted {
+            if !deletedSessionIDs.contains(normalized),
+               seen.insert(normalized).inserted {
                 ordered.insert(selectedSessionID, at: 0)
             }
         }
@@ -8602,17 +9669,21 @@ final class AssistantStore: ObservableObject {
 
     private func reloadProjectsFromStore() {
         projects = projectStore.projects()
-        if let selectedProjectFilterID,
-           !visibleProjects.contains(where: {
-               $0.id.trimmingCharacters(in: .whitespacesAndNewlines)
-                   .caseInsensitiveCompare(selectedProjectFilterID) == .orderedSame
-           }) {
-            self.selectedProjectFilterID = nil
+        if let selectedProjectFilter,
+           !isProjectFilterVisible(selectedProjectFilter) {
+            self.selectedProjectFilter = nil
         }
     }
 
     private func reloadTemporarySessionsFromStore() {
         temporarySessionIDs = temporarySessionStore.temporarySessionIDs()
+    }
+
+    private func markSessionPendingDeletion(_ sessionID: String?) {
+        guard let normalizedSessionID = normalizedSessionID(sessionID) else { return }
+        deletedSessionIDs.insert(normalizedSessionID)
+        cancelPendingConversationSnapshotSave(sessionID: normalizedSessionID)
+        dirtyConversationSnapshotSessionIDs.remove(normalizedSessionID)
     }
 
     private func setTemporaryFlag(
@@ -8644,36 +9715,81 @@ final class AssistantStore: ObservableObject {
         return temporarySessionIDs.contains(normalizedSessionID)
     }
 
-    func selectProjectFilter(_ projectID: String?) async {
-        let normalizedProjectID = projectID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
-        if let normalizedProjectID,
-           selectedProjectFilterID?.caseInsensitiveCompare(normalizedProjectID) == .orderedSame {
-            selectedProjectFilterID = nil
+    private func resolvedProjectFilter(for itemID: String?) -> AssistantProjectFilter? {
+        guard let normalizedItemID = itemID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty,
+              let project = visibleProjects.first(where: {
+                  $0.id.trimmingCharacters(in: .whitespacesAndNewlines)
+                      .caseInsensitiveCompare(normalizedItemID) == .orderedSame
+              }) else {
+            return nil
+        }
+
+        return project.isFolder ? .folder(project.id) : .project(project.id)
+    }
+
+    private func isProjectFilterVisible(_ filter: AssistantProjectFilter) -> Bool {
+        switch filter {
+        case .folder(let folderID):
+            return visibleFolders.contains(where: {
+                $0.id.trimmingCharacters(in: .whitespacesAndNewlines)
+                    .caseInsensitiveCompare(folderID) == .orderedSame
+            })
+        case .project(let projectID):
+            return visibleLeafProjects.contains(where: {
+                $0.id.trimmingCharacters(in: .whitespacesAndNewlines)
+                    .caseInsensitiveCompare(projectID) == .orderedSame
+            })
+        }
+    }
+
+    private func ensureSelectedSessionRemainsVisible(
+        afterRemovingProjectID removedProjectID: String?
+    ) async {
+        let selectedSessionStillVisible = selectedSessionID.flatMap { currentSelectedSessionID in
+            visibleSidebarSessions.first(where: { sessionsMatch($0.id, currentSelectedSessionID) })
+        } != nil
+        guard !selectedSessionStillVisible else { return }
+
+        if let firstVisibleSession = visibleSidebarSessions.first {
+            await openSession(firstVisibleSession)
+        } else if isTemporarySession(selectedSessionID) {
+            await deleteSession(selectedSessionID, showStatusMessage: false)
+        } else {
+            if let staleSessionID = selectedSessionID ?? removedProjectID {
+                clearInMemorySessionState(for: staleSessionID)
+            }
+            refreshMemoryState(for: nil)
+        }
+    }
+
+    func selectProjectFilter(
+        _ projectID: String?,
+        autoSelectVisibleSessionIfNeeded: Bool = true
+    ) async {
+        let nextFilter = resolvedProjectFilter(for: projectID)
+        if let nextFilter,
+           selectedProjectFilter == nextFilter {
+            selectedProjectFilter = nil
             return
         }
 
-        if let normalizedProjectID,
-           !visibleProjects.contains(where: {
-               $0.id.trimmingCharacters(in: .whitespacesAndNewlines)
-                   .caseInsensitiveCompare(normalizedProjectID) == .orderedSame
-           }) {
-            selectedProjectFilterID = nil
+        if let nextFilter,
+           !isProjectFilterVisible(nextFilter) {
+            selectedProjectFilter = nil
             return
         }
 
         let previousSelectedSessionID = selectedSessionID
 
-        selectedProjectFilterID = normalizedProjectID
+        selectedProjectFilter = nextFilter
 
-        guard let normalizedProjectID else { return }
+        guard nextFilter != nil else { return }
+        guard autoSelectVisibleSessionIfNeeded else { return }
         let selectedSessionStillVisible = selectedSessionID.flatMap { currentSelectedSessionID in
             visibleSidebarSessions.first(where: { sessionsMatch($0.id, currentSelectedSessionID) })
         } != nil
         if !selectedSessionStillVisible,
-           let firstVisibleSession = visibleSidebarSessions.first(where: {
-               $0.projectID?.trimmingCharacters(in: .whitespacesAndNewlines)
-                   .caseInsensitiveCompare(normalizedProjectID) == .orderedSame
-           }) {
+           let firstVisibleSession = visibleSidebarSessions.first {
             await openSession(firstVisibleSession)
         } else if !selectedSessionStillVisible,
                   isTemporarySession(previousSelectedSessionID) {
@@ -8681,12 +9797,30 @@ final class AssistantStore: ObservableObject {
         }
     }
 
-    func createProject(name: String, linkedFolderPath: String? = nil) {
+    func createProject(
+        name: String,
+        linkedFolderPath: String? = nil,
+        parentID: String? = nil
+    ) {
         do {
-            let project = try projectStore.createProject(name: name, linkedFolderPath: linkedFolderPath)
+            let project = try projectStore.createProject(
+                name: name,
+                linkedFolderPath: linkedFolderPath,
+                parentID: parentID
+            )
             reloadProjectsFromStore()
             sessions = applyStoredSessionMetadata(to: sessions)
             refreshMemoryInspectorIfNeeded(affectedProjectIDs: [project.id])
+        } catch {
+            lastStatusMessage = error.localizedDescription
+        }
+    }
+
+    func createFolder(name: String) {
+        do {
+            _ = try projectStore.createFolder(name: name)
+            reloadProjectsFromStore()
+            sessions = applyStoredSessionMetadata(to: sessions)
         } catch {
             lastStatusMessage = error.localizedDescription
         }
@@ -8711,9 +9845,10 @@ final class AssistantStore: ObservableObject {
             let updatedProject = try projectStore.updateLinkedFolderPath(for: projectID, path: path)
             reloadProjectsFromStore()
             sessions = applyStoredSessionMetadata(to: sessions)
-            if selectedProjectFilterID?.caseInsensitiveCompare(projectID) == .orderedSame,
+            if case .project(let selectedProjectID)? = selectedProjectFilter,
+               selectedProjectID.caseInsensitiveCompare(projectID) == .orderedSame,
                updatedProject.id.caseInsensitiveCompare(projectID) != .orderedSame {
-                selectedProjectFilterID = updatedProject.id
+                selectedProjectFilter = .project(updatedProject.id)
             }
 
             if previousFolderPath != updatedProject.linkedFolderPath,
@@ -8745,47 +9880,38 @@ final class AssistantStore: ObservableObject {
         }
     }
 
+    func moveProject(_ projectID: String, toFolderID folderID: String?) {
+        do {
+            let movedProject = try projectStore.moveProject(id: projectID, toFolderID: folderID)
+            reloadProjectsFromStore()
+            sessions = applyStoredSessionMetadata(to: sessions)
+            refreshMemoryState(for: selectedSessionID)
+            refreshMemoryInspectorIfNeeded(affectedProjectIDs: [movedProject.id])
+        } catch {
+            lastStatusMessage = error.localizedDescription
+        }
+    }
+
     func hideProject(_ projectID: String) async {
         do {
             let normalizedProjectID = projectID.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !normalizedProjectID.isEmpty else { return }
-            guard projectStore.project(forProjectID: normalizedProjectID) != nil else {
+            guard let project = projectStore.project(forProjectID: normalizedProjectID) else {
                 throw AssistantProjectStoreError.projectNotFound
             }
-
-            let previousProjects = projects
-            let currentSelectedProjectID = selectedSession?.projectID?.trimmingCharacters(in: .whitespacesAndNewlines)
-            let shouldSwitchAway = currentSelectedProjectID?.caseInsensitiveCompare(normalizedProjectID) == .orderedSame
-            let shouldUpdateFilter = selectedProjectFilterID?.caseInsensitiveCompare(normalizedProjectID) == .orderedSame
 
             let hiddenProject = try projectStore.hideProject(id: normalizedProjectID)
             reloadProjectsFromStore()
             sessions = applyStoredSessionMetadata(to: sessions)
             refreshMemoryInspectorIfNeeded(affectedProjectIDs: [normalizedProjectID], closeIfMissing: true)
-
-            if shouldUpdateFilter || shouldSwitchAway {
-                let fallbackProject = Self.fallbackVisibleProject(
-                    afterHiding: normalizedProjectID,
-                    in: previousProjects
-                )
-                selectedProjectFilterID = fallbackProject?.id
-
-                if shouldSwitchAway {
-                    if let fallbackSession = fallbackProject.flatMap({ fallback in
-                        sessions.first(where: {
-                            $0.projectID?.trimmingCharacters(in: .whitespacesAndNewlines)
-                                .caseInsensitiveCompare(fallback.id) == .orderedSame
-                        })
-                    }) {
-                        await openSession(fallbackSession)
-                    } else {
-                        clearInMemorySessionState(for: selectedSessionID ?? normalizedProjectID)
-                        refreshMemoryState(for: nil)
-                    }
-                }
+            if let selectedProjectFilter,
+               !isProjectFilterVisible(selectedProjectFilter) {
+                self.selectedProjectFilter = nil
             }
+            await ensureSelectedSessionRemainsVisible(afterRemovingProjectID: project.isProject ? project.id : nil)
 
-            lastStatusMessage = "Hidden project “\(hiddenProject.name)”."
+            let itemLabel = hiddenProject.isFolder ? "group" : "project"
+            lastStatusMessage = "Hidden \(itemLabel) “\(hiddenProject.name)”."
         } catch {
             lastStatusMessage = error.localizedDescription
         }
@@ -8799,27 +9925,31 @@ final class AssistantStore: ObservableObject {
             reloadProjectsFromStore()
             sessions = applyStoredSessionMetadata(to: sessions)
             refreshMemoryInspectorIfNeeded(affectedProjectIDs: [normalizedProjectID], closeIfMissing: true)
-            lastStatusMessage = "Unhidden project “\(unhiddenProject.name)”."
+            let itemLabel = unhiddenProject.isFolder ? "group" : "project"
+            lastStatusMessage = "Unhidden \(itemLabel) “\(unhiddenProject.name)”."
         } catch {
             lastStatusMessage = error.localizedDescription
         }
     }
 
-    func deleteProject(_ projectID: String) {
+    func deleteProject(_ projectID: String) async {
         do {
             guard let project = projectStore.project(forProjectID: projectID) else { return }
             let deletion = try projectStore.deleteProjectResult(id: projectID)
-            try projectMemoryService.invalidateAllProjectLessons(
-                project: project,
-                fallbackCWD: project.linkedFolderPath,
-                reason: "The project was deleted from Open Assist."
-            )
+            if project.isProject {
+                try projectMemoryService.invalidateAllProjectLessons(
+                    project: project,
+                    fallbackCWD: project.linkedFolderPath,
+                    reason: "The project was deleted from Open Assist."
+                )
+            }
 
             reloadProjectsFromStore()
             sessions = applyStoredSessionMetadata(to: sessions)
 
-            if selectedProjectFilterID?.caseInsensitiveCompare(projectID) == .orderedSame {
-                selectedProjectFilterID = nil
+            if let selectedProjectFilter,
+               !isProjectFilterVisible(selectedProjectFilter) {
+                self.selectedProjectFilter = nil
             }
 
             for threadID in deletion.removedThreadIDs where sessionsMatch(threadID, selectedSessionID) {
@@ -8830,6 +9960,7 @@ final class AssistantStore: ObservableObject {
                 affectedProjectIDs: [projectID],
                 closeIfMissing: true
             )
+            await ensureSelectedSessionRemainsVisible(afterRemovingProjectID: project.isProject ? project.id : nil)
         } catch {
             lastStatusMessage = error.localizedDescription
         }
@@ -8947,7 +10078,7 @@ final class AssistantStore: ObservableObject {
     }
 
     private func selectedProjectLinkedFolderPathIfUsable() -> String? {
-        guard let linkedFolderPath = selectedProjectFilter?.linkedFolderPath else {
+        guard let linkedFolderPath = selectedProject?.linkedFolderPath else {
             return nil
         }
         return resolvedProjectLinkedFolderPath(linkedFolderPath)
@@ -9652,6 +10783,7 @@ final class AssistantStore: ObservableObject {
 
     private func scheduleTrackedCodeCheckpointFinalizeRetryAfterPendingStart(
         for sessionID: String,
+        turnID: String?,
         status: AssistantTurnCompletionStatus,
         startTask: Task<Void, Never>
     ) {
@@ -9665,6 +10797,7 @@ final class AssistantStore: ObservableObject {
             self.pendingCodeCheckpointRecoveryRetryTasksBySessionID.removeValue(forKey: sessionID)
             await self.finalizeTrackedCodeCheckpoint(
                 for: sessionID,
+                turnID: turnID,
                 status: status
             )
         }
@@ -9672,6 +10805,7 @@ final class AssistantStore: ObservableObject {
 
     private func finalizeTrackedCodeCheckpoint(
         for sessionID: String?,
+        turnID: String? = nil,
         status: AssistantTurnCompletionStatus
     ) async {
         guard let normalizedSessionID = sessionID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
@@ -9685,6 +10819,7 @@ final class AssistantStore: ObservableObject {
            let task = pendingCodeCheckpointStartTasksBySessionID[normalizedSessionID] {
             scheduleTrackedCodeCheckpointFinalizeRetryAfterPendingStart(
                 for: normalizedSessionID,
+                turnID: turnID,
                 status: status,
                 startTask: task
             )
@@ -9704,6 +10839,7 @@ final class AssistantStore: ObservableObject {
                await recoverIncompleteTrackedCodeCheckpointsIfNeeded(
                     for: normalizedSessionID,
                     repository: repository,
+                    turnID: turnID,
                     status: status
                ) {
                 CrashReporter.logInfo(
@@ -9730,10 +10866,17 @@ final class AssistantStore: ObservableObject {
                 phase: .after
             )
             capturedAfterSnapshot = afterSnapshot
+            let touchedPaths = trackedCodeTouchedPaths(
+                for: normalizedSessionID,
+                turnID: turnID,
+                startedAt: baseline.startedAt,
+                repositoryRootPath: baseline.repository.rootPath
+            )
             let capture = try await gitCheckpointService.buildCaptureResult(
                 repository: baseline.repository,
                 before: baseline.beforeSnapshot,
-                after: afterSnapshot
+                after: afterSnapshot,
+                includedPaths: touchedPaths.isEmpty ? nil : touchedPaths
             )
 
             guard !capture.changedFiles.isEmpty else {
@@ -9838,6 +10981,7 @@ final class AssistantStore: ObservableObject {
     private func recoverIncompleteTrackedCodeCheckpointsIfNeeded(
         for sessionID: String,
         repository: GitCheckpointRepositoryContext,
+        turnID: String?,
         status: AssistantTurnCompletionStatus?
     ) async -> Bool {
         let normalizedSessionID = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -9895,6 +11039,12 @@ final class AssistantStore: ObservableObject {
         let lastAssistantTurnID = lastAssistantMessage?.turnID?.nonEmpty
         let lastUserMessageID = lastUserMessage?.id
         let lastUserAnchorID = (try? threadRewriteService.editableTurns(sessionID: normalizedSessionID))?.last?.anchorID
+        let touchedPaths = trackedCodeTouchedPaths(
+            for: normalizedSessionID,
+            turnID: turnID ?? lastAssistantTurnID,
+            startedAt: nil,
+            repositoryRootPath: repository.rootPath
+        )
 
         for refState in recoverableRefs {
             do {
@@ -9933,7 +11083,8 @@ final class AssistantStore: ObservableObject {
                 let capture = try await gitCheckpointService.buildCaptureResult(
                     repository: repository,
                     before: beforeSnapshot,
-                    after: afterSnapshot
+                    after: afterSnapshot,
+                    includedPaths: touchedPaths.isEmpty ? nil : touchedPaths
                 )
 
                 if capture.changedFiles.isEmpty {
@@ -10270,6 +11421,7 @@ final class AssistantStore: ObservableObject {
             if await recoverIncompleteTrackedCodeCheckpointsIfNeeded(
                 for: normalizedSessionID,
                 repository: repository,
+                turnID: nil,
                 status: nil
             ) {
                 return
@@ -10670,6 +11822,47 @@ final class AssistantStore: ObservableObject {
             return matchingSession.effectiveCWD ?? matchingSession.cwd
         }
         return selectedSession?.effectiveCWD ?? selectedSession?.cwd
+    }
+
+    private func trackedCodeTouchedPaths(
+        for sessionID: String,
+        turnID: String?,
+        startedAt: Date?,
+        repositoryRootPath: String
+    ) -> Set<String> {
+        let normalizedSessionID = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedSessionID.isEmpty else { return [] }
+
+        let normalizedTurnID = turnID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+        let sessionTimeline = timelineItemsBySessionID[normalizedSessionID] ?? timelineItems
+        let sessionCWD = resolvedSessionCWD(for: normalizedSessionID)
+
+        let paths = sessionTimeline.compactMap(\.activity)
+            .filter { activity in
+                switch activity.kind {
+                case .fileChange, .commandExecution:
+                    break
+                default:
+                    return false
+                }
+
+                if let normalizedTurnID {
+                    return activity.turnID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty == normalizedTurnID
+                }
+                if let startedAt {
+                    return activity.updatedAt >= startedAt || activity.startedAt >= startedAt
+                }
+                return true
+            }
+            .flatMap {
+                assistantRepoRelativeFilePathCandidates(
+                    from: $0.rawDetails,
+                    sessionCWD: sessionCWD,
+                    repositoryRootPath: repositoryRootPath
+                )
+            }
+
+        return Set(paths)
     }
 
     private func latestUserMessage(for sessionID: String) -> String? {
@@ -11073,6 +12266,7 @@ final class AssistantStore: ObservableObject {
         let header = """
         # Recovered Thread Context
         This session was reopened. Use these recent notes only as a short reminder if earlier thread state is missing.
+        Continue from the latest user intent and recent assistant state. Do not repeat work that these notes show is already completed unless the user asks to revisit it.
         """
 
         let body = lines.joined(separator: "\n")
@@ -11141,6 +12335,13 @@ final class AssistantStore: ObservableObject {
                             if isMissingRolloutError(error) {
                                 return try await recoverMissingRollout(for: selectedSessionID)
                             }
+                            if await recoverStoredProviderSessionIfNeeded(
+                                after: error,
+                                threadID: selectedSessionID,
+                                backend: providerBackend
+                            ) {
+                                return selectedSessionID
+                            }
                             throw error
                         }
                         return selectedSessionID
@@ -11157,11 +12358,18 @@ final class AssistantStore: ObservableObject {
                             backend: providerBackend,
                             providerSessionID: selectedRuntime.currentSessionID ?? providerSessionID
                         )
-                        pendingResumeContextSessionIDs.insert(selectedSessionID)
+                        markPendingResumeContext(for: selectedSessionID)
                         return selectedSessionID
                     } catch {
                         if isMissingRolloutError(error) {
                             return try await recoverMissingRollout(for: selectedSessionID)
+                        }
+                        if await recoverStoredProviderSessionIfNeeded(
+                            after: error,
+                            threadID: selectedSessionID,
+                            backend: providerBackend
+                        ) {
+                            return selectedSessionID
                         }
                         throw error
                     }
@@ -11176,6 +12384,7 @@ final class AssistantStore: ObservableObject {
                     backend: providerBackend,
                     providerSessionID: startedProviderSessionID
                 )
+                markPendingResumeContext(for: selectedSessionID)
                 return selectedSessionID
             }
 
@@ -11190,6 +12399,13 @@ final class AssistantStore: ObservableObject {
                         } catch {
                             if isMissingRolloutError(error) {
                                 return try await recoverMissingRollout(for: selectedSessionID)
+                            }
+                            if await recoverStoredProviderSessionIfNeeded(
+                                after: error,
+                                threadID: selectedSessionID,
+                                backend: selectedSession.map { backend(for: $0) } ?? assistantBackend
+                            ) {
+                                return selectedSessionID
                             }
                             throw error
                         }
@@ -11222,11 +12438,18 @@ final class AssistantStore: ObservableObject {
                         cwd: resolvedSessionCWD(for: selectedSession.id),
                         preferredModelID: selectedModelID
                     )
-                    pendingResumeContextSessionIDs.insert(selectedSession.id)
+                    markPendingResumeContext(for: selectedSession.id)
                     return selectedSession.id
                 } catch {
                     if isMissingRolloutError(error) {
                         return try await recoverMissingRollout(for: selectedSession.id)
+                    }
+                    if await recoverStoredProviderSessionIfNeeded(
+                        after: error,
+                        threadID: selectedSession.id,
+                        backend: backend(for: selectedSession)
+                    ) {
+                        return selectedSession.id
                     }
                     throw error
                 }
@@ -11379,6 +12602,16 @@ final class AssistantStore: ObservableObject {
         }
     }
 
+    private func markPendingResumeContext(for sessionID: String?) {
+        guard let normalizedSessionID = normalizedSessionID(sessionID) else { return }
+        pendingResumeContextSessionIDs.insert(normalizedSessionID)
+        if let snapshot = buildResumeContextSnapshot(for: normalizedSessionID)?.nonEmpty {
+            pendingResumeContextSnapshotsBySessionID[normalizedSessionID] = snapshot
+        } else {
+            pendingResumeContextSnapshotsBySessionID.removeValue(forKey: normalizedSessionID)
+        }
+    }
+
     func loadMoreHistoryForSelectedSession() async -> Bool {
         guard let selectedSessionID = selectedSessionID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty,
               let selectedSession,
@@ -11523,6 +12756,58 @@ final class AssistantStore: ObservableObject {
         guard !message.isEmpty else { return false }
         return message.contains("no rollout found for thread id")
             || message.contains("failed to load rollout")
+    }
+
+    private func shouldRecoverStoredProviderSession(
+        after error: Error,
+        threadID: String?,
+        backend: AssistantRuntimeBackend
+    ) -> Bool {
+        guard let normalizedThreadID = normalizedSessionID(threadID),
+              let session = sessions.first(where: { sessionsMatch($0.id, normalizedThreadID) }),
+              session.isCanonicalThread,
+              providerSessionID(for: session, backend: backend) != nil else {
+            return false
+        }
+
+        return Self.isRecoverableProviderSessionErrorMessage(
+            error.localizedDescription,
+            backend: backend
+        )
+    }
+
+    @discardableResult
+    private func recoverStoredProviderSessionIfNeeded(
+        after error: Error,
+        threadID: String?,
+        backend: AssistantRuntimeBackend,
+        statusMessageOverride: String? = nil
+    ) async -> Bool {
+        guard shouldRecoverStoredProviderSession(
+            after: error,
+            threadID: threadID,
+            backend: backend
+        ),
+        let normalizedThreadID = normalizedSessionID(threadID) else {
+            return false
+        }
+
+        CrashReporter.logWarning(
+            "Recovering stored provider session threadID=\(normalizedThreadID) backend=\(backend.rawValue) error=\(error.localizedDescription)"
+        )
+
+        do {
+            _ = try await recoverMissingRollout(for: normalizedThreadID)
+            if let statusMessageOverride = statusMessageOverride?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
+                lastStatusMessage = statusMessageOverride
+            }
+            return true
+        } catch {
+            CrashReporter.logError(
+                "Stored provider session recovery failed threadID=\(normalizedThreadID) backend=\(backend.rawValue) error=\(error.localizedDescription)"
+            )
+            return false
+        }
     }
 
     private struct SessionHistorySlice {
@@ -12186,7 +13471,11 @@ final class AssistantStore: ObservableObject {
         eventAppender: (_ normalizedSessionID: String) throws -> Void
     ) {
         guard let normalizedSessionID = normalizedSessionID(sessionID),
-              isProviderIndependentThreadV2(sessionID: normalizedSessionID) else {
+              Self.shouldPersistConversationMutation(
+                normalizedSessionID: normalizedSessionID,
+                isProviderIndependentThreadV2: isProviderIndependentThreadV2(sessionID: normalizedSessionID),
+                deletedSessionIDs: deletedSessionIDs
+              ) else {
             return
         }
 
@@ -12205,6 +13494,22 @@ final class AssistantStore: ObservableObject {
         }
 
         try? saveConversationSnapshotNow(sessionID: normalizedSessionID)
+    }
+
+    static func shouldPersistConversationMutation(
+        normalizedSessionID: String?,
+        isProviderIndependentThreadV2: Bool,
+        deletedSessionIDs: Set<String>
+    ) -> Bool {
+        guard let normalizedSessionID = normalizedSessionID?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nonEmpty?
+            .lowercased(),
+              isProviderIndependentThreadV2 else {
+            return false
+        }
+
+        return !deletedSessionIDs.contains(normalizedSessionID)
     }
 
     private func flushPersistedHistoryIfNeeded(sessionID: String?) {
@@ -12255,14 +13560,7 @@ final class AssistantStore: ObservableObject {
         if let providerBackend = session.activeProviderBackend {
             return providerBackend
         }
-        switch session.source {
-        case .openAssist:
-            return assistantBackend
-        case .cli:
-            return .copilot
-        case .appServer, .vscode, .other:
-            return .codex
-        }
+        return assistantBackend
     }
 
     private func providerSessionID(
@@ -12338,6 +13636,14 @@ final class AssistantStore: ObservableObject {
             }
             return true
         } catch {
+            if !suppressErrors,
+               await recoverStoredProviderSessionIfNeeded(
+                after: error,
+                threadID: session.id,
+                backend: backend
+               ) {
+                return true
+            }
             if !suppressErrors {
                 lastStatusMessage = error.localizedDescription
             }
@@ -12526,7 +13832,7 @@ final class AssistantStore: ObservableObject {
                         hasConversationContent: false,
                         hasActiveTurn: runtime.hasActiveTurn
                     ),
-                    cwd: resolvedSessionCWD(for: sessionID) ?? FileManager.default.homeDirectoryForCurrentUser.path,
+                    cwd: resolvedSessionCWD(for: sessionID),
                     createdAt: Date(),
                     updatedAt: Date(),
                     summary: nil,

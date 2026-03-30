@@ -127,11 +127,24 @@ let mermaidCounter = 0;
 const INLINE_PREVIEW_MAX_HEIGHT = 560;
 const INLINE_PREVIEW_PADDING_X = 32;
 const INLINE_PREVIEW_PADDING_Y = 40;
+const NOTE_INLINE_COLLAPSE_HEIGHT = 250;
+const FALLBACK_SVG_WIDTH = 800;
+const FALLBACK_SVG_HEIGHT = 500;
 
-function MermaidDiagramInner({ code }: { code: string }) {
+function MermaidDiagramInner({
+  code,
+  showViewerHint = true,
+  displayMode = "default",
+}: {
+  code: string;
+  showViewerHint?: boolean;
+  displayMode?: "default" | "noteCompact";
+}) {
   const [svg, setSvg] = useState("");
   const [error, setError] = useState("");
   const [expanded, setExpanded] = useState(false);
+  const [isInlineCollapsible, setIsInlineCollapsible] = useState(false);
+  const [isInlineExpanded, setIsInlineExpanded] = useState(false);
   const [themeVersion, setThemeVersion] = useState(0);
   const previewRef = useRef<HTMLDivElement>(null);
 
@@ -203,6 +216,17 @@ function MermaidDiagramInner({ code }: { code: string }) {
       svgEl.style.height = `${height * scale}px`;
       svgEl.style.maxWidth = "none";
       svgEl.style.maxHeight = "none";
+
+      if (displayMode === "noteCompact") {
+        const nextIsCollapsible = height * scale > NOTE_INLINE_COLLAPSE_HEIGHT;
+        setIsInlineCollapsible(nextIsCollapsible);
+        if (!nextIsCollapsible) {
+          setIsInlineExpanded(false);
+        }
+      } else {
+        setIsInlineCollapsible(false);
+        setIsInlineExpanded(false);
+      }
     };
 
     fitInline();
@@ -220,7 +244,7 @@ function MermaidDiagramInner({ code }: { code: string }) {
       observer.disconnect();
       window.removeEventListener("resize", fitInline);
     };
-  }, [svg]);
+  }, [displayMode, svg]);
 
   if (error) {
     return (
@@ -239,21 +263,53 @@ function MermaidDiagramInner({ code }: { code: string }) {
     return <div className="mermaid-loading">Rendering diagram…</div>;
   }
 
+  const isNoteCompact = displayMode === "noteCompact";
+
   return (
     <>
-      <button
-        type="button"
-        className="mermaid-inline-card"
-        aria-label="Open diagram viewer"
-        onClick={() => setExpanded(true)}
+      <div
+        className={[
+          "mermaid-inline-card",
+          isNoteCompact ? "is-note-compact" : "",
+        ]
+          .filter(Boolean)
+          .join(" ")}
       >
-        <div className="mermaid-inline-card-header">
-          <span className="mermaid-inline-card-hint">Click to open viewer</span>
-        </div>
-        <div ref={previewRef} className="mermaid-inline">
-          <div dangerouslySetInnerHTML={{ __html: svg }} />
-        </div>
-      </button>
+        {showViewerHint ? (
+          <div className="mermaid-inline-card-header">
+            <span className="mermaid-inline-card-hint">Click to open viewer</span>
+          </div>
+        ) : null}
+        <button
+          type="button"
+          className="mermaid-inline-card-preview"
+          aria-label="Open diagram viewer"
+          onClick={() => setExpanded(true)}
+        >
+          <div
+            ref={previewRef}
+            className={[
+              "mermaid-inline",
+              isInlineCollapsible && !isInlineExpanded ? "is-collapsed" : "",
+            ]
+              .filter(Boolean)
+              .join(" ")}
+          >
+            <div dangerouslySetInnerHTML={{ __html: svg }} />
+          </div>
+        </button>
+        {isInlineCollapsible ? (
+          <div className="mermaid-inline-card-footer">
+            <button
+              type="button"
+              className="mermaid-inline-toggle"
+              onClick={() => setIsInlineExpanded((value) => !value)}
+            >
+              {isInlineExpanded ? "Show less" : "Show more"}
+            </button>
+          </div>
+        ) : null}
+      </div>
 
       {expanded && (
         <MermaidInteractiveOverlay svg={svg} onClose={() => setExpanded(false)} />
@@ -450,23 +506,33 @@ function MermaidInteractiveOverlay({
         onClick={(event) => event.stopPropagation()}
       >
         <div className="mermaid-overlay-toolbar">
-          <span className="mermaid-overlay-title">Diagram preview</span>
+          <div className="mermaid-overlay-heading">
+            <span className="mermaid-overlay-title">Diagram preview</span>
+            <span className="mermaid-overlay-subtitle">
+              Drag to move. Scroll to zoom.
+            </span>
+          </div>
           <div className="mermaid-overlay-controls">
-            <button className="mermaid-ctrl-btn" onClick={zoomOut} title="Zoom out">
-              −
-            </button>
-            <span className="mermaid-ctrl-scale">{Math.round(scale * 100)}%</span>
-            <button className="mermaid-ctrl-btn" onClick={zoomIn} title="Zoom in">
-              +
-            </button>
+            <div className="mermaid-zoom-cluster">
+              <button className="mermaid-ctrl-btn" onClick={zoomOut} title="Zoom out">
+                <MinusIcon />
+              </button>
+              <span className="mermaid-ctrl-scale">{Math.round(scale * 100)}%</span>
+              <button className="mermaid-ctrl-btn" onClick={zoomIn} title="Zoom in">
+                <PlusIcon />
+              </button>
+            </div>
             <button className="mermaid-ctrl-chip" onClick={() => fit(true)}>
-              Fit
+              <FitIcon />
+              <span>Fit</span>
             </button>
             <button className="mermaid-ctrl-chip" onClick={handleCopySvg}>
-              {copiedSvg ? "Copied" : "Copy SVG"}
+              <CopyIcon />
+              <span>{copiedSvg ? "Copied" : "Copy SVG"}</span>
             </button>
             <button className="mermaid-ctrl-chip mermaid-ctrl-close" onClick={onClose}>
-              Close
+              <CloseIcon />
+              <span>Close</span>
             </button>
           </div>
         </div>
@@ -483,19 +549,75 @@ function MermaidInteractiveOverlay({
 }
 
 function measureSvg(svgEl: SVGSVGElement) {
-  const viewBox = svgEl.viewBox?.baseVal;
-  if (viewBox && viewBox.width > 0 && viewBox.height > 0) {
-    return { width: viewBox.width, height: viewBox.height };
-  }
+  try {
+    const viewBox = svgEl.viewBox?.baseVal;
+    if (viewBox && viewBox.width > 0 && viewBox.height > 0) {
+      return { width: viewBox.width, height: viewBox.height };
+    }
 
-  const width = parseFloat(svgEl.getAttribute("width") || "0");
-  const height = parseFloat(svgEl.getAttribute("height") || "0");
-  if (width > 0 && height > 0) {
-    return { width, height };
-  }
+    const width = parseFloat(svgEl.getAttribute("width") || "0");
+    const height = parseFloat(svgEl.getAttribute("height") || "0");
+    if (Number.isFinite(width) && Number.isFinite(height) && width > 0 && height > 0) {
+      return { width, height };
+    }
 
-  const box = svgEl.getBBox();
-  return { width: box.width || 800, height: box.height || 500 };
+    const box = svgEl.getBBox();
+    return {
+      width: Number.isFinite(box.width) && box.width > 0 ? box.width : FALLBACK_SVG_WIDTH,
+      height: Number.isFinite(box.height) && box.height > 0 ? box.height : FALLBACK_SVG_HEIGHT,
+    };
+  } catch {
+    return {
+      width: FALLBACK_SVG_WIDTH,
+      height: FALLBACK_SVG_HEIGHT,
+    };
+  }
+}
+
+function PlusIcon() {
+  return (
+    <svg viewBox="0 0 16 16" aria-hidden="true">
+      <path d="M8 3.5v9" />
+      <path d="M3.5 8h9" />
+    </svg>
+  );
+}
+
+function MinusIcon() {
+  return (
+    <svg viewBox="0 0 16 16" aria-hidden="true">
+      <path d="M3.5 8h9" />
+    </svg>
+  );
+}
+
+function FitIcon() {
+  return (
+    <svg viewBox="0 0 16 16" aria-hidden="true">
+      <path d="M6 3.25H3.25V6" />
+      <path d="M10 3.25h2.75V6" />
+      <path d="M12.75 10v2.75H10" />
+      <path d="M6 12.75H3.25V10" />
+    </svg>
+  );
+}
+
+function CopyIcon() {
+  return (
+    <svg viewBox="0 0 16 16" aria-hidden="true">
+      <rect x="5.25" y="3.25" width="7.5" height="9" rx="1.4" />
+      <path d="M3.75 10.75H3.4A1.15 1.15 0 0 1 2.25 9.6V4.4A1.15 1.15 0 0 1 3.4 3.25H8.6" />
+    </svg>
+  );
+}
+
+function CloseIcon() {
+  return (
+    <svg viewBox="0 0 16 16" aria-hidden="true">
+      <path d="M4 4l8 8" />
+      <path d="M12 4l-8 8" />
+    </svg>
+  );
 }
 
 export const MermaidDiagram = memo(MermaidDiagramInner);

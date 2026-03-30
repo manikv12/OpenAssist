@@ -47,7 +47,7 @@ struct ClaudeCodeBackendAdapter: AssistantBackendAdapter {
     let backend: AssistantRuntimeBackend = .claudeCode
     let capabilities = AssistantBackendCapabilities(
         supportsStructuredToolCalls: false,
-        supportsImageInput: false,
+        supportsImageInput: true,
         maxPracticalToolCount: nil,
         supportsLongToolOutputs: true,
         supportsContinuation: true,
@@ -606,6 +606,7 @@ actor ToolSessionStore {
 struct AssistantToolExecutionContext {
     let toolName: String
     let arguments: Any
+    let attachments: [AssistantAttachment]
     let sessionID: String?
     let preferredModelID: String?
     let browserLoginResume: Bool
@@ -694,6 +695,7 @@ final class AssistantToolExecutor {
         case .imageGeneration:
             return await imageGenerationService.run(
                 arguments: context.arguments,
+                referenceImages: context.attachments.filter(\.isImage),
                 preferredModelID: context.preferredModelID
             )
         case .execCommand:
@@ -767,7 +769,7 @@ final class AssistantToolExecutor {
         case .appAction:
             return "Using a supported Mac app"
         case .computerUse:
-            return "Using screenshot-based desktop control"
+            return "Resolving the target, observing the UI, acting, and verifying the result"
         case .imageGeneration:
             return "Generating an image with Google Gemini"
         case .execCommand:

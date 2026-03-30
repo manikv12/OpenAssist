@@ -1,0 +1,446 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Thread Note Mockup</title>
+    <style>
+      :root {
+        --bg: #0b0e14;
+        --panel: #151821;
+        --panel-2: #10131a;
+        --stroke: rgba(255, 255, 255, 0.08);
+        --stroke-soft: rgba(255, 255, 255, 0.05);
+        --text: rgba(255, 255, 255, 0.95);
+        --muted: rgba(255, 255, 255, 0.52);
+        --muted-soft: rgba(255, 255, 255, 0.36);
+        --accent: #c9a15a;
+        --accent-soft: rgba(201, 161, 90, 0.12);
+        --editor-black: #0b0f15;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        font-family:
+          "SF Pro Text",
+          "SF Pro Display",
+          -apple-system,
+          BlinkMacSystemFont,
+          "Segoe UI",
+          sans-serif;
+        background:
+          radial-gradient(circle at top, rgba(52, 60, 84, 0.18), transparent 34%),
+          linear-gradient(180deg, #0b0e14, #090b10);
+        color: var(--text);
+      }
+
+      .wrap {
+        max-width: 1820px;
+        margin: 0 auto;
+        padding: 36px 28px 44px;
+      }
+
+      .header {
+        display: flex;
+        justify-content: space-between;
+        align-items: flex-end;
+        gap: 20px;
+        margin-bottom: 24px;
+      }
+
+      .title {
+        font-size: 32px;
+        font-weight: 760;
+        letter-spacing: -0.04em;
+        margin: 0;
+      }
+
+      .subtitle {
+        margin: 8px 0 0;
+        font-size: 15px;
+        line-height: 1.5;
+        color: var(--muted);
+        max-width: 720px;
+      }
+
+      .chips {
+        display: flex;
+        gap: 10px;
+        flex-wrap: wrap;
+      }
+
+      .chip {
+        padding: 9px 12px;
+        border-radius: 999px;
+        border: 1px solid var(--stroke-soft);
+        background: rgba(255, 255, 255, 0.03);
+        font-size: 12px;
+        color: var(--muted);
+      }
+
+      .grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 22px;
+      }
+
+      .card {
+        border-radius: 24px;
+        padding: 16px;
+        background: linear-gradient(180deg, rgba(255, 255, 255, 0.04), rgba(255, 255, 255, 0.02));
+        border: 1px solid var(--stroke);
+        box-shadow: 0 30px 80px rgba(0, 0, 0, 0.35);
+      }
+
+      .card-head {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 14px;
+      }
+
+      .card-title {
+        font-size: 13px;
+        font-weight: 700;
+        letter-spacing: 0.14em;
+        text-transform: uppercase;
+        color: rgba(255, 255, 255, 0.7);
+      }
+
+      .card-note {
+        font-size: 12px;
+        color: var(--muted);
+      }
+
+      .shot {
+        position: relative;
+        overflow: hidden;
+        border-radius: 18px;
+        border: 1px solid rgba(255, 255, 255, 0.06);
+        background: #090c12;
+        aspect-ratio: 3422 / 1970;
+      }
+
+      .shot img {
+        display: block;
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+      }
+
+      .proposed .shot::after {
+        content: "";
+        position: absolute;
+        inset: 0;
+        background: linear-gradient(180deg, rgba(8, 10, 14, 0.06), rgba(8, 10, 14, 0.02));
+      }
+
+      .note-shell {
+        position: absolute;
+        left: 37.2%;
+        top: 2.5%;
+        width: 58.8%;
+        height: 76.5%;
+        border-radius: 28px;
+        padding: 18px 18px 16px;
+        background:
+          radial-gradient(circle at top left, rgba(201, 161, 90, 0.05), transparent 26%),
+          linear-gradient(180deg, rgba(255, 255, 255, 0.045), rgba(255, 255, 255, 0.012)),
+          linear-gradient(180deg, rgba(23, 26, 33, 0.95), rgba(16, 19, 27, 0.98));
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        box-shadow:
+          0 30px 70px rgba(0, 0, 0, 0.32),
+          inset 0 1px 0 rgba(255, 255, 255, 0.05);
+      }
+
+      .note-shell::before {
+        content: "";
+        position: absolute;
+        inset: 0;
+        border-radius: 28px;
+        background:
+          radial-gradient(circle at top right, rgba(255, 255, 255, 0.03), transparent 22%),
+          linear-gradient(180deg, rgba(255, 255, 255, 0.015), transparent 18%);
+        pointer-events: none;
+      }
+
+      .eyebrow {
+        font-size: 10px;
+        letter-spacing: 0.18em;
+        text-transform: uppercase;
+        color: rgba(255, 255, 255, 0.48);
+        font-weight: 700;
+      }
+
+      .selector {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        margin-top: 8px;
+        padding: 8px 14px;
+        min-width: 290px;
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.028);
+        border: 1px solid rgba(255, 255, 255, 0.06);
+        color: rgba(255, 255, 255, 0.92);
+        font-size: 13px;
+        font-weight: 650;
+      }
+
+      .selector small {
+        color: rgba(255, 255, 255, 0.52);
+        font-weight: 600;
+      }
+
+      .selector .dot {
+        width: 5px;
+        height: 5px;
+        border-radius: 50%;
+        background: var(--accent);
+        box-shadow: 0 0 12px rgba(201, 161, 90, 0.4);
+      }
+
+      .toolbar {
+        position: absolute;
+        right: 18px;
+        top: 14px;
+        display: flex;
+        gap: 8px;
+      }
+
+      .tool {
+        width: 32px;
+        height: 32px;
+        border-radius: 12px;
+        background: rgba(255, 255, 255, 0.03);
+        border: 1px solid rgba(255, 255, 255, 0.06);
+      }
+
+      .note-title {
+        margin-top: 14px;
+        font-size: 28px;
+        line-height: 1.04;
+        font-weight: 760;
+        letter-spacing: -0.05em;
+        color: color-mix(in srgb, var(--accent) 18%, white 82%);
+      }
+
+      .meta {
+        margin-top: 12px;
+        font-size: 9px;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+        color: rgba(255, 255, 255, 0.3);
+      }
+
+      .organize {
+        position: absolute;
+        top: 96px;
+        right: 18px;
+        padding: 7px 11px;
+        border-radius: 999px;
+        font-size: 11px;
+        font-weight: 650;
+        color: rgba(255, 255, 255, 0.88);
+        background: rgba(255, 255, 255, 0.04);
+        border: 1px solid rgba(255, 255, 255, 0.06);
+      }
+
+      .editor {
+        position: absolute;
+        left: 14px;
+        right: 14px;
+        top: 166px;
+        bottom: 16px;
+        border-radius: 24px;
+        padding: 22px 22px 20px;
+        background:
+          radial-gradient(circle at top left, rgba(201, 161, 90, 0.035), transparent 22%),
+          linear-gradient(180deg, rgba(255, 255, 255, 0.016), rgba(255, 255, 255, 0.005)),
+          linear-gradient(180deg, rgba(11, 15, 21, 0.98), rgba(9, 12, 18, 0.99));
+        border: 1px solid rgba(255, 255, 255, 0.06);
+        box-shadow:
+          inset 0 1px 0 rgba(255, 255, 255, 0.02),
+          0 12px 30px rgba(0, 0, 0, 0.18);
+      }
+
+      .editor h2 {
+        margin: 0 0 14px;
+        font-size: 18px;
+        font-weight: 760;
+        letter-spacing: -0.04em;
+        color: color-mix(in srgb, var(--accent) 24%, white 76%);
+      }
+
+      .editor p,
+      .editor li {
+        margin: 0 0 12px;
+        color: rgba(255, 255, 255, 0.86);
+        font-size: 14px;
+        line-height: 1.55;
+      }
+
+      .editor .subhead {
+        margin-top: 14px;
+        margin-bottom: 10px;
+        color: color-mix(in srgb, var(--accent) 16%, white 84%);
+        font-weight: 720;
+      }
+
+      .editor ul {
+        margin: 0 0 12px 0;
+        padding-left: 20px;
+      }
+
+      .editor li::marker {
+        color: rgba(201, 161, 90, 0.8);
+      }
+
+      .code {
+        margin-top: 12px;
+        padding: 14px 16px;
+        border-radius: 18px;
+        background: linear-gradient(180deg, rgba(19, 24, 34, 0.98), rgba(15, 18, 27, 0.98));
+        border: 1px solid rgba(255, 255, 255, 0.05);
+        color: rgba(228, 233, 243, 0.9);
+        font-family:
+          "SF Mono",
+          SFMono-Regular,
+          Menlo,
+          Monaco,
+          Consolas,
+          monospace;
+        font-size: 13px;
+        line-height: 1.65;
+        white-space: pre-wrap;
+      }
+
+      .handle-preview {
+        position: absolute;
+        right: -14px;
+        top: 50%;
+        transform: translateY(-50%);
+        width: 28px;
+        height: 88px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        border-radius: 18px;
+        background: linear-gradient(180deg, rgba(18, 21, 28, 0.86), rgba(13, 16, 23, 0.94));
+        border: 1px solid rgba(255, 255, 255, 0.05);
+        box-shadow: 0 14px 30px rgba(0, 0, 0, 0.25);
+      }
+
+      .handle-preview span {
+        font-size: 22px;
+        color: var(--accent);
+        text-shadow:
+          0 0 14px rgba(201, 161, 90, 0.34),
+          0 0 24px rgba(201, 161, 90, 0.18);
+      }
+
+      .legend {
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+        margin-top: 16px;
+      }
+
+      .legend-item {
+        padding: 8px 10px;
+        border-radius: 12px;
+        background: rgba(255, 255, 255, 0.03);
+        border: 1px solid rgba(255, 255, 255, 0.05);
+        color: rgba(255, 255, 255, 0.7);
+        font-size: 12px;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <div class="header">
+        <div>
+          <h1 class="title">Thread Notes Mockup</h1>
+          <p class="subtitle">
+            Proposed direction: reduce the gold gradient a lot, keep only a tiny accent on
+            headings and controls, and make the real note writing surface as dark as the
+            assistant chat area for better readability.
+          </p>
+        </div>
+        <div class="chips">
+          <div class="chip">Less gold wash</div>
+          <div class="chip">Black editor surface</div>
+          <div class="chip">Subtle accent only</div>
+        </div>
+      </div>
+
+      <div class="grid">
+        <section class="card">
+          <div class="card-head">
+            <div class="card-title">Current</div>
+            <div class="card-note">Notes feel warmer and the editor surface blends into the shell.</div>
+          </div>
+          <div class="shot">
+            <img src="./thread-note-source.png" alt="Current thread notes" />
+          </div>
+        </section>
+
+        <section class="card proposed">
+          <div class="card-head">
+            <div class="card-title">Proposed</div>
+            <div class="card-note">Outer shell stays calm; content surface becomes darker and clearer.</div>
+          </div>
+          <div class="shot">
+            <img src="./thread-note-source.png" alt="Proposed thread notes" />
+
+            <div class="note-shell">
+              <div class="eyebrow">Thread notes</div>
+              <div class="selector">
+                <span class="dot"></span>
+                <span>IOS APP :</span>
+                <small>1 of 1</small>
+              </div>
+
+              <div class="toolbar">
+                <div class="tool"></div>
+                <div class="tool"></div>
+                <div class="tool"></div>
+              </div>
+
+              <div class="note-title">IOS App:</div>
+              <div class="meta">Saved 5 min. ago</div>
+              <div class="organize">Organize note</div>
+
+              <div class="editor">
+                <h2>IOS App:</h2>
+                <p><strong>1.</strong> API hosted by Mac</p>
+                <p>WebSocket for live event stream. REST/HTTP JSON for normal actions.</p>
+                <p class="subhead">Simple idea</p>
+                <ul>
+                  <li>Phone sends request. Mac starts working. Stream small JSON events.</li>
+                  <li>Keep the note area high-contrast so long text stays easy to read.</li>
+                </ul>
+                <div class="code">{"type":"assistant_delta","text":"I'm checking your project..."}
+{"type":"tool_started","tool":"search_code"}
+{"type":"tool_finished","tool":"search_code"}</div>
+              </div>
+
+              <div class="handle-preview"><span>‹</span></div>
+            </div>
+          </div>
+
+          <div class="legend">
+            <div class="legend-item">Very small accent on headings</div>
+            <div class="legend-item">Editor surface close to assistant chat black</div>
+            <div class="legend-item">Handle uses theme color again</div>
+          </div>
+        </section>
+      </div>
+    </div>
+  </body>
+</html>

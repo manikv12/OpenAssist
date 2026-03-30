@@ -36,7 +36,19 @@ enum AssistantScreenCaptureToolDefinition {
         "properties": [
             "display": [
                 "type": "string",
-                "description": "Optional display hint. Current implementation captures the active display."
+                "description": "Optional display hint."
+            ],
+            "display_id": [
+                "type": "integer",
+                "description": "Optional exact display id."
+            ],
+            "window_id": [
+                "type": "integer",
+                "description": "Optional exact window id to capture instead of a whole display."
+            ],
+            "frontmost": [
+                "type": "boolean",
+                "description": "When true, capture the frontmost visible window instead of the active display."
             ]
         ],
         "additionalProperties": true
@@ -135,9 +147,21 @@ actor AssistantWindowAutomationService {
 
     struct ScreenCaptureRequest: Equatable, Sendable {
         let displayHint: String?
+        let displayID: Int?
+        let windowID: Int?
+        let frontmost: Bool
 
         var summaryLine: String {
-            "Capture the active display"
+            if let windowID {
+                return "Capture window \(windowID)"
+            }
+            if frontmost {
+                return "Capture the frontmost window"
+            }
+            if let displayID {
+                return "Capture display \(displayID)"
+            }
+            return "Capture the active display"
         }
     }
 
@@ -173,10 +197,12 @@ actor AssistantWindowAutomationService {
     struct WindowInfo: Equatable, Sendable {
         let windowID: Int
         let ownerName: String
+        let ownerPID: pid_t
         let title: String
         let bounds: CGRect
         let layer: Int
         let alpha: Double
+        let displayID: CGDirectDisplayID?
     }
 
     static func parseViewImageRequest(from arguments: Any) throws -> ViewImageRequest {
@@ -194,7 +220,10 @@ actor AssistantWindowAutomationService {
         return ScreenCaptureRequest(
             displayHint: (dictionary["display"] as? String)?
                 .trimmingCharacters(in: .whitespacesAndNewlines)
-                .nonEmpty
+                .nonEmpty,
+            displayID: integer(from: dictionary["display_id"]),
+            windowID: integer(from: dictionary["window_id"]),
+            frontmost: boolean(from: dictionary["frontmost"]) ?? false
         )
     }
 
@@ -265,13 +294,51 @@ actor AssistantWindowAutomationService {
     ) async -> AssistantToolExecutionResult {
         _ = preferredModelID
         do {
-            _ = try Self.parseScreenCaptureRequest(from: arguments)
+            let request = try Self.parseScreenCaptureRequest(from: arguments)
             guard CGPreflightScreenCaptureAccess() else {
                 throw AssistantWindowAutomationServiceError.screenRecordingRequired
             }
-            guard let screen = Self.activeScreen(),
-                  let screenNumber = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber,
-                  let image = CGDisplayCreateImage(CGDirectDisplayID(screenNumber.uint32Value)) else {
+
+            if request.frontmost || request.windowID != nil {
+                guard let window = Self.resolveWindow(
+                    windowID: request.windowID,
+                    appName: nil,
+                    title: nil,
+                    preferFrontmost: true
+                ), let image = Self.captureWindowImage(for: window) else {
+                    throw AssistantWindowAutomationServiceError.windowNotFound
+                }
+                let dataURL = try Self.pngDataURL(for: image)
+                let title = window.title.isEmpty ? "(untitled)" : window.title
+                let message = "Captured window \(window.windowID) from \(window.ownerName): \(title)"
+                return AssistantToolExecutionResult(
+                    contentItems: [
+                        .init(type: "inputText", text: message, imageURL: nil),
+                        .init(type: "inputImage", text: nil, imageURL: dataURL)
+                    ],
+                    success: true,
+                    summary: message
+                )
+            }
+
+            if let displayID = request.displayID {
+                guard let image = Self.captureDisplayImage(displayID: CGDirectDisplayID(displayID)) else {
+                    throw AssistantWindowAutomationServiceError.captureFailed
+                }
+                let dataURL = try Self.pngDataURL(for: image)
+                let message = "Captured display \(displayID)."
+                return AssistantToolExecutionResult(
+                    contentItems: [
+                        .init(type: "inputText", text: message, imageURL: nil),
+                        .init(type: "inputImage", text: nil, imageURL: dataURL)
+                    ],
+                    success: true,
+                    summary: message
+                )
+            }
+
+            guard let active = Self.activeDisplayInfo(),
+                  let image = Self.captureDisplayImage(displayID: active.displayID) else {
                 throw AssistantWindowAutomationServiceError.captureFailed
             }
             let dataURL = try Self.pngDataURL(for: image)
@@ -353,18 +420,7 @@ actor AssistantWindowAutomationService {
             guard let window = Self.resolveWindow(request: request) else {
                 throw AssistantWindowAutomationServiceError.windowNotFound
             }
-            let captureRect = CGRect(
-                x: floor(window.bounds.minX),
-                y: floor(window.bounds.minY),
-                width: ceil(window.bounds.width),
-                height: ceil(window.bounds.height)
-            )
-            guard let image = CGWindowListCreateImage(
-                captureRect,
-                .optionOnScreenOnly,
-                kCGNullWindowID,
-                [.bestResolution]
-            ) else {
+            guard let image = Self.captureWindowImage(for: window) else {
                 throw AssistantWindowAutomationServiceError.captureFailed
             }
             let dataURL = try Self.pngDataURL(for: image)
@@ -388,25 +444,64 @@ actor AssistantWindowAutomationService {
         }
     }
 
-    private static func resolveWindow(request: WindowCaptureRequest) -> WindowInfo? {
+    static func resolveWindow(request: WindowCaptureRequest) -> WindowInfo? {
+        resolveWindow(
+            windowID: request.windowID,
+            appName: request.appName,
+            title: request.title,
+            preferFrontmost: false
+        )
+    }
+
+    static func resolveWindow(
+        windowID: Int? = nil,
+        appName: String? = nil,
+        title: String? = nil,
+        preferFrontmost: Bool,
+        preferredOwnerPID: pid_t? = nil
+    ) -> WindowInfo? {
         let windows = visibleWindows()
-        if let windowID = request.windowID {
+        if let windowID {
             return windows.first(where: { $0.windowID == windowID })
         }
-        if let appName = request.appName?.lowercased() {
-            return windows.first(where: { $0.ownerName.lowercased().contains(appName) })
+
+        let loweredApp = appName?.lowercased()
+        let loweredTitle = title?.lowercased()
+        let frontmostPID = preferredOwnerPID ?? NSWorkspace.shared.frontmostApplication?.processIdentifier
+
+        func matches(_ window: WindowInfo) -> Bool {
+            if let loweredApp, !window.ownerName.lowercased().contains(loweredApp) {
+                return false
+            }
+            if let loweredTitle, !window.title.lowercased().contains(loweredTitle) {
+                return false
+            }
+            return true
         }
-        if let title = request.title?.lowercased() {
-            return windows.first(where: { $0.title.lowercased().contains(title) })
+
+        if preferFrontmost, let frontmostPID {
+            if let matchingFrontmost = windows.first(where: { $0.ownerPID == frontmostPID && matches($0) }) {
+                return matchingFrontmost
+            }
         }
+
+        if let matching = windows.first(where: matches) {
+            return matching
+        }
+
+        if preferFrontmost, let frontmostPID {
+            return windows.first(where: { $0.ownerPID == frontmostPID })
+        }
+
         return windows.first
     }
 
-    private static func visibleWindows() -> [WindowInfo] {
+    static func visibleWindows() -> [WindowInfo] {
         let raw = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
         return raw.compactMap { item in
             guard let windowID = integer(from: item[kCGWindowNumber as String]),
                   let ownerName = item[kCGWindowOwnerName as String] as? String,
+                  let ownerPIDNumber = item[kCGWindowOwnerPID as String] as? NSNumber,
                   let boundsDictionary = item[kCGWindowBounds as String] as? [String: Any],
                   let bounds = CGRect(dictionaryRepresentation: boundsDictionary as CFDictionary),
                   bounds.width >= 80,
@@ -419,10 +514,12 @@ actor AssistantWindowAutomationService {
             return WindowInfo(
                 windowID: windowID,
                 ownerName: ownerName,
+                ownerPID: pid_t(ownerPIDNumber.intValue),
                 title: title,
                 bounds: bounds,
                 layer: layer,
-                alpha: alpha
+                alpha: alpha,
+                displayID: displayID(for: bounds)
             )
         }
         .filter { $0.layer == 0 && $0.alpha > 0.01 }
@@ -453,11 +550,70 @@ actor AssistantWindowAutomationService {
         return nil
     }
 
+    private static func boolean(from value: Any?) -> Bool? {
+        if let bool = value as? Bool {
+            return bool
+        }
+        if let number = value as? NSNumber {
+            return number.boolValue
+        }
+        if let text = value as? String {
+            switch text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+            case "true", "yes", "1":
+                return true
+            case "false", "no", "0":
+                return false
+            default:
+                return nil
+            }
+        }
+        return nil
+    }
+
     private static func activeScreen() -> NSScreen? {
         let mouseLocation = NSEvent.mouseLocation
         return NSScreen.screens.first(where: { $0.frame.contains(mouseLocation) })
             ?? NSScreen.main
             ?? NSScreen.screens.first
+    }
+
+    static func activeDisplayInfo() -> (displayID: CGDirectDisplayID, frame: CGRect)? {
+        guard let screen = activeScreen(),
+              let screenNumber = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else {
+            return nil
+        }
+        return (CGDirectDisplayID(screenNumber.uint32Value), screen.frame)
+    }
+
+    static func captureDisplayImage(displayID: CGDirectDisplayID) -> CGImage? {
+        CGDisplayCreateImage(displayID)
+    }
+
+    static func captureWindowImage(for window: WindowInfo) -> CGImage? {
+        CGWindowListCreateImage(
+            .null,
+            .optionIncludingWindow,
+            CGWindowID(window.windowID),
+            [.bestResolution]
+        )
+    }
+
+    static func screen(for displayID: CGDirectDisplayID) -> NSScreen? {
+        NSScreen.screens.first { screen in
+            guard let screenNumber = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else {
+                return false
+            }
+            return screenNumber.uint32Value == displayID
+        }
+    }
+
+    private static func displayID(for bounds: CGRect) -> CGDirectDisplayID? {
+        let midpoint = CGPoint(x: bounds.midX, y: bounds.midY)
+        guard let screen = NSScreen.screens.first(where: { $0.frame.contains(midpoint) }) ?? NSScreen.main,
+              let screenNumber = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else {
+            return nil
+        }
+        return CGDirectDisplayID(screenNumber.uint32Value)
     }
 
     private static func dataURL(for image: NSImage) throws -> String? {

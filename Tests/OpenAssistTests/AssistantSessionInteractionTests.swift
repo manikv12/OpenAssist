@@ -71,6 +71,36 @@ final class AssistantSessionInteractionTests: XCTestCase {
     }
 
     @MainActor
+    func testRecoverableCopilotProviderSessionErrorRecognizesInternalProcessingFailure() {
+        XCTAssertTrue(
+            AssistantStore.isRecoverableProviderSessionErrorMessage(
+                "stream disconnected before completion: An error occurred while processing your request. Please include the request ID 47b48761-427a-4703-95a2-fb23d4fa2dd9 in your message.",
+                backend: .copilot
+            )
+        )
+    }
+
+    @MainActor
+    func testRecoverableCopilotProviderSessionErrorRecognizesTransportClosure() {
+        XCTAssertTrue(
+            AssistantStore.isRecoverableProviderSessionErrorMessage(
+                "Codex App Server closed.",
+                backend: .copilot
+            )
+        )
+    }
+
+    @MainActor
+    func testRecoverableProviderSessionErrorDoesNotTriggerForCodex() {
+        XCTAssertFalse(
+            AssistantStore.isRecoverableProviderSessionErrorMessage(
+                "Codex App Server closed.",
+                backend: .codex
+            )
+        )
+    }
+
+    @MainActor
     func testProviderIndependentThreadOnlyPinsProviderSwitchWhileTurnIsActive() {
         let session = AssistantSessionSummary(
             id: "openassist-v2-thread",
@@ -558,6 +588,177 @@ final class AssistantSessionInteractionTests: XCTestCase {
         XCTAssertEqual(
             runtime.activitySummaryForTesting(kind: .dynamicToolCall, title: computerState?.title ?? ""),
             "Controlled the visible desktop."
+        )
+    }
+
+    @MainActor
+    func testLocallySuccessfulImageToolCompletionOverridesFailedProviderStatus() {
+        let runtime = CodexAssistantRuntime()
+        let recorder = AssistantRuntimeEventRecorder()
+
+        runtime.onTimelineMutation = { mutation in
+            if case let .upsert(item) = mutation {
+                recorder.timelineItems.append(item)
+            }
+        }
+
+        runtime.processActivityEventForTesting([
+            "id": "call-image-1",
+            "type": "dynamicToolCall",
+            "tool": "generate_image",
+            "status": "running",
+            "arguments": ["prompt": "Create a playful backyard photo."]
+        ])
+
+        runtime.recordSuccessfulDynamicToolCallForTesting(id: "call-image-1")
+
+        runtime.processActivityEventForTesting([
+            "id": "call-image-1",
+            "type": "dynamicToolCall",
+            "tool": "generate_image",
+            "status": "failed",
+            "result": "Generated an image with Google Gemini."
+        ], isCompleted: true)
+
+        let finalActivity = recorder.timelineItems
+            .compactMap(\.activity)
+            .last(where: { $0.id == "call-image-1" })
+
+        XCTAssertEqual(finalActivity?.title, "Image Generation")
+        XCTAssertEqual(finalActivity?.status, .completed)
+    }
+
+    @MainActor
+    func testDynamicToolSuccessTrackingUsesProviderItemID() {
+        let runtime = CodexAssistantRuntime()
+        let recorder = AssistantRuntimeEventRecorder()
+
+        runtime.onTimelineMutation = { mutation in
+            if case let .upsert(item) = mutation {
+                recorder.timelineItems.append(item)
+            }
+        }
+
+        let requestParams: [String: Any] = [
+            "itemId": "call-image-2",
+            "callId": "rpc-image-2",
+            "tool": "generate_image",
+            "arguments": ["prompt": "Create a playful backyard photo."]
+        ]
+
+        XCTAssertEqual(
+            runtime.dynamicToolRequestActivityIDForTesting(from: requestParams),
+            "call-image-2"
+        )
+
+        runtime.processActivityEventForTesting([
+            "id": "call-image-2",
+            "type": "dynamicToolCall",
+            "tool": "generate_image",
+            "status": "running",
+            "arguments": ["prompt": "Create a playful backyard photo."]
+        ])
+
+        runtime.recordSuccessfulDynamicToolCallForTesting(
+            requestID: "rpc-image-2",
+            params: requestParams
+        )
+
+        runtime.processActivityEventForTesting([
+            "id": "call-image-2",
+            "type": "dynamicToolCall",
+            "tool": "generate_image",
+            "status": "failed",
+            "result": "Generated an image with Google Gemini."
+        ], isCompleted: true)
+
+        let finalActivity = recorder.timelineItems
+            .compactMap(\.activity)
+            .last(where: { $0.id == "call-image-2" })
+
+        XCTAssertEqual(finalActivity?.title, "Image Generation")
+        XCTAssertEqual(finalActivity?.status, .completed)
+    }
+
+    @MainActor
+    func testImageResultPayloadOverridesFailedProviderStatus() {
+        let runtime = CodexAssistantRuntime()
+        let recorder = AssistantRuntimeEventRecorder()
+
+        runtime.onTimelineMutation = { mutation in
+            if case let .upsert(item) = mutation {
+                recorder.timelineItems.append(item)
+            }
+        }
+
+        runtime.processActivityEventForTesting([
+            "id": "call-image-3",
+            "type": "dynamicToolCall",
+            "tool": "generate_image",
+            "status": "running",
+            "arguments": ["prompt": "Create a playful backyard photo."]
+        ])
+
+        runtime.processActivityEventForTesting([
+            "id": "call-image-3",
+            "type": "dynamicToolCall",
+            "tool": "generate_image",
+            "status": "failed",
+            "result": [
+                "content": [
+                    ["type": "inputText", "text": "Generated an image with Google Gemini."],
+                    ["type": "inputImage", "image_url": ["url": "data:image/png;base64,Zm9v"]]
+                ]
+            ]
+        ], isCompleted: true)
+
+        let finalActivity = recorder.timelineItems
+            .compactMap(\.activity)
+            .last(where: { $0.id == "call-image-3" })
+
+        XCTAssertEqual(finalActivity?.title, "Image Generation")
+        XCTAssertEqual(finalActivity?.status, .completed)
+    }
+
+    @MainActor
+    func testSuccessfulImageTurnRewritesContradictoryFailureFallbackMessage() async throws {
+        let runtime = CodexAssistantRuntime()
+        let recorder = AssistantRuntimeEventRecorder()
+
+        runtime.onTranscriptMutation = { mutation in
+            if case let .upsert(entry, _) = mutation {
+                recorder.transcriptEntries.append(entry)
+            }
+        }
+        runtime.onTimelineMutation = { mutation in
+            if case let .upsert(item) = mutation {
+                recorder.timelineItems.append(item)
+            }
+        }
+
+        runtime.configureSessionForTesting(sessionID: "thread-1", turnID: "turn-1")
+        runtime.setCurrentTurnHadSuccessfulImageGenerationForTesting(true)
+        await runtime.processAgentMessageDeltaNotificationForTesting(
+            delta: "The image tool failed again, so I’m making a polished custom image file locally instead.",
+            threadID: "thread-1",
+            turnID: "turn-1"
+        )
+        await runtime.processTurnCompletedForTesting()
+
+        let finalTranscript = try XCTUnwrap(
+            recorder.transcriptEntries.last(where: { !$0.isStreaming && $0.role == .assistant })
+        )
+        XCTAssertEqual(
+            finalTranscript.text,
+            "I already generated an image above, and I’m also making a polished custom image file locally instead."
+        )
+
+        let finalTimeline = try XCTUnwrap(
+            recorder.timelineItems.last(where: { $0.kind == .assistantFinal && $0.isStreaming == false })
+        )
+        XCTAssertEqual(
+            finalTimeline.text,
+            "I already generated an image above, and I’m also making a polished custom image file locally instead."
         )
     }
 
@@ -1398,6 +1599,44 @@ final class AssistantSessionInteractionTests: XCTestCase {
     }
 
     @MainActor
+    func testBuildInstructionsWithoutWorkspaceBlocksHomeDirectoryDiscovery() async {
+        let runtime = CodexAssistantRuntime()
+        runtime.configureSessionForTesting(sessionID: "thread-1", cwd: nil)
+
+        let instructions = await runtime.buildInstructionsForTesting()
+
+        XCTAssertTrue(instructions.contains("# Workspace Boundary"))
+        XCTAssertTrue(instructions.contains("does not have an attached workspace folder"))
+        XCTAssertTrue(instructions.contains("Do NOT scan the user's home directory"))
+        XCTAssertTrue(instructions.contains("thread-attached skills"))
+    }
+
+    @MainActor
+    func testBuildInstructionsWithWorkspaceKeepsSearchInsideWorkspace() async {
+        let runtime = CodexAssistantRuntime()
+        runtime.configureSessionForTesting(
+            sessionID: "thread-1",
+            cwd: "/Users/test/OpenAssist"
+        )
+
+        let instructions = await runtime.buildInstructionsForTesting()
+
+        XCTAssertTrue(instructions.contains("# Workspace Boundary"))
+        XCTAssertTrue(instructions.contains("`/Users/test/OpenAssist`"))
+        XCTAssertTrue(instructions.contains("Stay inside this workspace"))
+        XCTAssertTrue(instructions.contains("Do NOT search parent folders, sibling projects, or the user's home directory"))
+    }
+
+    @MainActor
+    func testThreadStartParamsOmitCWDWhenNoWorkspaceIsAttached() async {
+        let runtime = CodexAssistantRuntime()
+
+        let params = await runtime.threadStartParamsForTesting(cwd: nil)
+
+        XCTAssertNil(params["cwd"])
+    }
+
+    @MainActor
     func testShouldPreserveProposedPlanOnlyForMatchingSession() {
         XCTAssertTrue(
             AssistantStore.shouldPreserveProposedPlan(
@@ -1971,6 +2210,43 @@ final class AssistantSessionInteractionTests: XCTestCase {
     }
 
     @MainActor
+    func testBuildResumeContextCarriesRecentNextStepAcrossProviderHandoff() {
+        let transcript: [AssistantTranscriptEntry] = [
+            AssistantTranscriptEntry(
+                role: .assistant,
+                text: "I changed ComposerView.tsx and styles.css to stop the blinking cursor during voice capture."
+            ),
+            AssistantTranscriptEntry(
+                role: .user,
+                text: "Did you also deploy it, build and deploy it?"
+            ),
+            AssistantTranscriptEntry(
+                role: .assistant,
+                text: "No, I only made the code changes. Would you like me to build it?"
+            )
+        ]
+
+        let context = AssistantStore.buildResumeContext(
+            transcriptEntries: transcript,
+            sessionSummary: nil
+        )
+
+        XCTAssertNotNil(context)
+        XCTAssertTrue(
+            context?.contains("Continue from the latest user intent and recent assistant state.") == true
+        )
+        XCTAssertTrue(
+            context?.contains("User: Did you also deploy it, build and deploy it?") == true
+        )
+        XCTAssertTrue(
+            context?.contains("Assistant: No, I only made the code changes. Would you like me to build it?") == true
+        )
+        XCTAssertTrue(
+            context?.contains("Do not repeat work that these notes show is already completed") == true
+        )
+    }
+
+    @MainActor
     func testGeneratedSessionTitleOnlyReplacesFallbackStyleTitles() {
         XCTAssertTrue(
             AssistantStore.shouldApplyGeneratedSessionTitle(
@@ -2213,6 +2489,83 @@ final class AssistantSessionInteractionTests: XCTestCase {
         XCTAssertTrue(recorder.statusMessages.isEmpty)
         XCTAssertEqual(recorder.hudStates.last?.phase, .failed)
         XCTAssertEqual(recorder.hudStates.last?.detail, message)
+    }
+
+    @MainActor
+    func testDeletedProviderIndependentThreadDoesNotPersistLateConversationMutations() {
+        XCTAssertFalse(
+            AssistantStore.shouldPersistConversationMutation(
+                normalizedSessionID: "openassist-thread",
+                isProviderIndependentThreadV2: true,
+                deletedSessionIDs: Set(["openassist-thread"])
+            )
+        )
+
+        XCTAssertTrue(
+            AssistantStore.shouldPersistConversationMutation(
+                normalizedSessionID: "openassist-thread",
+                isProviderIndependentThreadV2: true,
+                deletedSessionIDs: []
+            )
+        )
+    }
+
+    @MainActor
+    func testShadowProviderSessionIsHiddenWhenCanonicalThreadExists() {
+        let shadowSession = AssistantSessionSummary(
+            id: "codex-provider-session",
+            title: "Can you check my screen",
+            source: .appServer,
+            status: .idle,
+            latestUserMessage: "Can you check my screen"
+        )
+
+        XCTAssertTrue(
+            assistantShouldHideShadowProviderSession(
+                shadowSession,
+                selectedSessionID: nil,
+                canonicalThreadID: "openassist-thread"
+            )
+        )
+    }
+
+    @MainActor
+    func testSelectedShadowProviderSessionStaysVisibleWhileInspectingIt() {
+        let shadowSession = AssistantSessionSummary(
+            id: "codex-provider-session",
+            title: "Can you check my screen",
+            source: .appServer,
+            status: .idle,
+            latestUserMessage: "Can you check my screen"
+        )
+
+        XCTAssertFalse(
+            assistantShouldHideShadowProviderSession(
+                shadowSession,
+                selectedSessionID: "codex-provider-session",
+                canonicalThreadID: "openassist-thread"
+            )
+        )
+    }
+
+    @MainActor
+    func testCanonicalThreadIsNeverTreatedAsShadowProviderSession() {
+        let canonicalSession = AssistantSessionSummary(
+            id: "openassist-thread",
+            title: "Can you check my screen",
+            source: .openAssist,
+            threadArchitectureVersion: .providerIndependentV2,
+            status: .idle,
+            latestUserMessage: "Can you check my screen"
+        )
+
+        XCTAssertFalse(
+            assistantShouldHideShadowProviderSession(
+                canonicalSession,
+                selectedSessionID: nil,
+                canonicalThreadID: "openassist-thread"
+            )
+        )
     }
 }
 

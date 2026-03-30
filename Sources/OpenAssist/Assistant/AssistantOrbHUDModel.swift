@@ -57,6 +57,10 @@ final class AssistantOrbHUDModel: ObservableObject {
     }
 
     // Model selection
+    @Published var visibleAssistantBackend: AssistantRuntimeBackend = .codex
+    @Published var selectableAssistantBackends: [AssistantRuntimeBackend] = []
+    @Published var isSelectedSessionBackendPinned = false
+    @Published var selectedSessionBackendHelpText: String?
     @Published var availableModels: [AssistantModelOption] = []
     @Published var selectedModelSummary: String = ""
     @Published var controllerModeSwitchSuggestion: AssistantModeSwitchSuggestion? {
@@ -100,6 +104,7 @@ final class AssistantOrbHUDModel: ObservableObject {
     var onNewSession: (() async -> Void)?
     var onNewTemporarySession: (() async -> Void)?
     var onPromoteTemporarySession: ((String?) -> Void)?
+    var onChooseBackend: ((AssistantRuntimeBackend) -> Void)?
     var onChooseModel: ((String) -> Void)?
     var onOpenAttachmentPicker: (() -> Void)?
     var onAddAttachment: ((AssistantAttachment) -> Void)?
@@ -398,13 +403,17 @@ final class AssistantOrbHUDModel: ObservableObject {
     }
 
     func updatePreviewImages(_ images: [Data]) {
-        storedPreviewImages = images
+        if storedPreviewImages != images {
+            storedPreviewImages = images
+        }
         if storedDoneDetailText == nil,
            !images.isEmpty,
            dismissedDoneDetailSignature == nil,
            storedProposedPlanText?.nonEmpty == nil,
            state.phase == .success || state.phase == .failed {
-            showDoneDetail = true
+            if !showDoneDetail {
+                showDoneDetail = true
+            }
         }
     }
 

@@ -80,9 +80,84 @@ final class AssistantImageGenerationServiceTests: XCTestCase {
         XCTAssertEqual(result.summary, "Generated an image with Google Gemini.")
         XCTAssertGreaterThanOrEqual(result.contentItems.count, 2, "Unexpected result: \(result.summary)")
         XCTAssertEqual(result.contentItems.first?.text, "Generated an image with Google Gemini.")
+        XCTAssertTrue(result.contentItems.contains(where: { $0.text == "The image tool succeeded." }))
         XCTAssertTrue(result.contentItems.contains(where: { $0.text == "Here is your generated image." }))
         let imageItem = try XCTUnwrap(result.contentItems.first(where: { $0.type == "inputImage" }))
         XCTAssertTrue(imageItem.imageURL?.hasPrefix("data:image/png;base64,") == true)
+    }
+
+    func testGenerateImageIncludesReferenceImagePartsWhenAttachmentsArePresent() async throws {
+        let requestBox = LockedURLRequestBox()
+        let session = makeStubbedSession { request in
+            requestBox.request = request
+
+            let imageData = Data([0x89, 0x50, 0x4E, 0x47])
+            let responseJSON: [String: Any] = [
+                "candidates": [[
+                    "content": [
+                        "parts": [[
+                            "inlineData": [
+                                "mimeType": "image/png",
+                                "data": imageData.base64EncodedString()
+                            ]
+                        ]]
+                    ]
+                ]]
+            ]
+            let responseData = try JSONSerialization.data(withJSONObject: responseJSON)
+            return (
+                HTTPURLResponse(
+                    url: request.url!,
+                    statusCode: 200,
+                    httpVersion: nil,
+                    headerFields: ["Content-Type": "application/json"]
+                )!,
+                responseData
+            )
+        }
+
+        let service = AssistantImageGenerationService(
+            session: session,
+            configurationProvider: {
+                GeminiImageGenerationConfiguration(
+                    apiKey: "test-key",
+                    model: "gemini-2.5-flash-image",
+                    baseURL: "https://generativelanguage.googleapis.com/v1beta",
+                    requestTimeoutSeconds: 30
+                )
+            }
+        )
+
+        let referenceImage = AssistantAttachment(
+            filename: "reference.png",
+            data: Data([0x01, 0x02, 0x03]),
+            mimeType: "image/png"
+        )
+
+        let result = await service.run(
+            arguments: ["prompt": "Match this app icon closely."],
+            referenceImages: [referenceImage],
+            preferredModelID: nil
+        )
+
+        let request = try XCTUnwrap(requestBox.request)
+        let body = try XCTUnwrap(request.httpBody ?? readBody(from: request))
+        let root = try XCTUnwrap(try JSONSerialization.jsonObject(with: body) as? [String: Any])
+        let contents = try XCTUnwrap(root["contents"] as? [[String: Any]])
+        let first = try XCTUnwrap(contents.first)
+        let parts = try XCTUnwrap(first["parts"] as? [[String: Any]])
+
+        let inlineImagePart = try XCTUnwrap(parts.first?["inline_data"] as? [String: Any])
+        XCTAssertEqual(inlineImagePart["mime_type"] as? String, "image/png")
+        XCTAssertEqual(inlineImagePart["data"] as? String, Data([0x01, 0x02, 0x03]).base64EncodedString())
+        XCTAssertEqual(parts.last?["text"] as? String, "Match this app icon closely.")
+        XCTAssertTrue(result.success)
+        XCTAssertTrue(result.contentItems.contains(where: { $0.text == "The image tool succeeded." }))
+        XCTAssertTrue(
+            result.contentItems.contains(where: {
+                $0.text == "Used the attached image reference(s) while generating this image."
+            })
+        )
     }
 
     func testGenerateImageReturnsHelpfulMessageWhenKeyIsMissing() async {

@@ -25,25 +25,26 @@ import {
   Globe,
   Layers3,
   Lock,
-  MessageSquareText,
+  MessageSquare,
   Mic,
-  PanelLeftClose,
-  PanelLeftOpen,
+  PanelLeft,
   Pencil,
   Pin,
   Play,
+  Plug,
   Plus,
   RotateCcw,
   Search,
   Settings,
-  Sparkles,
   Star,
-  TerminalSquare,
+  Terminal,
+  Timer,
   Trash2,
   Undo2,
   VolumeX,
   Wrench,
   X,
+  Zap,
   type LucideIcon,
 } from "lucide-react";
 
@@ -55,7 +56,7 @@ interface AppIconProps {
 }
 
 const symbolIconMap: Record<string, LucideIcon> = {
-  "bubble.left.and.bubble.right": MessageSquareText,
+  "bubble.left.and.bubble.right": MessageSquare,
   "doc.text": FileText,
   "folder.badge.plus": FolderPlus,
   folder: Folder,
@@ -63,21 +64,22 @@ const symbolIconMap: Record<string, LucideIcon> = {
   "square.stack.3d.up.fill": Layers3,
   "briefcase.fill": BriefcaseBusiness,
   "book.closed.fill": BookOpen,
-  "terminal.fill": TerminalSquare,
-  sparkles: Sparkles,
+  "terminal.fill": Terminal,
+  sparkles: Zap,
   "star.fill": Star,
   brain: BrainCircuit,
   "clock.badge.checkmark.fill": Clock3,
-  clock: Clock3,
+  clock: Timer,
   archivebox: Archive,
   gearshape: Settings,
-  "sidebar.left": PanelLeftClose,
-  "sidebar.right": PanelLeftOpen,
+  "sidebar.left": PanelLeft,
+  "sidebar.right": PanelLeft,
   "chevron.down": ChevronDown,
   "chevron.left": ChevronLeft,
   "chevron.up": ChevronUp,
   "chevron.right": ChevronRight,
   plus: Plus,
+  "plus.square.on.square": Plus,
   "mic.fill": Mic,
   "speaker.slash.fill": VolumeX,
   "arrow.up": ArrowUp,
@@ -101,6 +103,7 @@ const symbolIconMap: Record<string, LucideIcon> = {
   "tray.and.arrow.up": CircleArrowUp,
   "arrow.counterclockwise": RotateCcw,
   "arrow.down.circle": CircleArrowDown,
+  plug: Plug,
 };
 
 function resolveIcon(symbol: string): LucideIcon {
@@ -115,12 +118,12 @@ function resolveIcon(symbol: string): LucideIcon {
   if (symbol.includes("trash")) return Trash2;
   if (symbol.includes("pencil")) return Pencil;
   if (symbol.includes("pin")) return Pin;
-  if (symbol.includes("sparkle")) return Sparkles;
+  if (symbol.includes("sparkle")) return Zap;
   if (symbol.includes("brain")) return BrainCircuit;
   if (symbol.includes("book")) return BookOpen;
   if (symbol.includes("briefcase")) return BriefcaseBusiness;
-  if (symbol.includes("terminal")) return TerminalSquare;
-  if (symbol.includes("bubble") || symbol.includes("message")) return MessageSquareText;
+  if (symbol.includes("terminal")) return Terminal;
+  if (symbol.includes("bubble") || symbol.includes("message")) return MessageSquare;
   if (symbol.includes("gear") || symbol.includes("slider")) return Settings;
   if (symbol.includes("globe") || symbol.includes("browser")) return Globe;
   if (symbol.includes("lock") || symbol.includes("permission")) return Lock;
@@ -151,7 +154,7 @@ export function AppIcon({
   symbol,
   className,
   size,
-  strokeWidth = 1.9,
+  strokeWidth = 1.6,
 }: AppIconProps) {
   const Icon = resolveIcon(symbol);
 

@@ -223,6 +223,27 @@ actor AssistantAccessibilityAutomationService {
         let title: String
     }
 
+    struct UIResolvedWindowContext: Sendable {
+        let appName: String
+        let windowTitle: String
+    }
+
+    struct UISemanticActionResult: Sendable {
+        let summary: String
+        let appName: String
+        let windowTitle: String
+        let targetDescription: String
+        let actuator: String
+        let confidence: Double
+        let verificationText: String?
+    }
+
+    struct UIElementDescriptor: Sendable {
+        let label: String?
+        let role: String?
+        let boundsDescription: String?
+    }
+
     private struct ElementMatch {
         let element: AXUIElement
         let label: String?
@@ -345,38 +366,14 @@ actor AssistantAccessibilityAutomationService {
         _ = preferredModelID
         do {
             let request = try Self.parseClickRequest(from: arguments)
-            guard AXIsProcessTrusted() else {
-                throw AssistantAccessibilityAutomationServiceError.accessibilityRequired
-            }
-
-            let target = try await resolvedWindowElement(
+            let outcome = try await performSemanticClick(
                 appName: request.appName,
-                windowTitle: request.windowTitle
-            )
-            let match = try findElement(
-                in: target.window,
+                windowTitle: request.windowTitle,
                 labelFilter: request.label,
-                roleFilter: request.role
+                roleFilter: request.role,
+                buttonName: request.button
             )
-
-            if try performPrimaryAction(on: match.element) {
-                let summary = "Clicked \(match.label ?? match.role ?? "the target element")."
-                return Self.result(summary: summary, lines: [summary], success: true)
-            }
-
-            guard let frame = match.frame else {
-                throw AssistantAccessibilityAutomationServiceError.actionFailed(
-                    "The matching UI element does not expose a clickable action or usable bounds."
-                )
-            }
-
-            try await helper.clickScreenPoint(
-                CGPoint(x: frame.midX, y: frame.midY),
-                buttonName: request.button,
-                clickCount: 1
-            )
-            let summary = "Clicked \(match.label ?? match.role ?? "the target element") using its screen position."
-            return Self.result(summary: summary, lines: [summary], success: true)
+            return Self.result(summary: outcome.summary, lines: [outcome.summary], success: true)
         } catch {
             return Self.failureResult(error.localizedDescription)
         }
@@ -389,34 +386,14 @@ actor AssistantAccessibilityAutomationService {
         _ = preferredModelID
         do {
             let request = try Self.parseTypeRequest(from: arguments)
-            guard AXIsProcessTrusted() else {
-                throw AssistantAccessibilityAutomationServiceError.accessibilityRequired
-            }
-
-            if request.label != nil || request.role != nil || request.appName != nil || request.windowTitle != nil {
-                let target = try await resolvedWindowElement(
-                    appName: request.appName,
-                    windowTitle: request.windowTitle
-                )
-                let match = try findElement(
-                    in: target.window,
-                    labelFilter: request.label,
-                    roleFilter: request.role
-                )
-                try await focusElementForTyping(match)
-            }
-
-            let outcome = await MainActor.run {
-                TextInserter.insert(request.text, copyToClipboard: false)
-            }
-            guard outcome == .pasted else {
-                throw AssistantAccessibilityAutomationServiceError.typingFailed(
-                    "Open Assist could not type into the selected field. Try focusing the field manually and run the step again."
-                )
-            }
-
-            let summary = request.label?.nonEmpty.map { "Typed into \($0)." } ?? "Typed into the focused field."
-            return Self.result(summary: summary, lines: [summary], success: true)
+            let outcome = try await performSemanticType(
+                text: request.text,
+                appName: request.appName,
+                windowTitle: request.windowTitle,
+                labelFilter: request.label,
+                roleFilter: request.role
+            )
+            return Self.result(summary: outcome.summary, lines: [outcome.summary], success: true)
         } catch {
             return Self.failureResult(error.localizedDescription)
         }
@@ -435,6 +412,121 @@ actor AssistantAccessibilityAutomationService {
         } catch {
             return Self.failureResult(error.localizedDescription)
         }
+    }
+
+    func performSemanticClick(
+        appName: String?,
+        windowTitle: String?,
+        labelFilter: String?,
+        roleFilter: String?,
+        buttonName: String? = nil
+    ) async throws -> UISemanticActionResult {
+        guard AXIsProcessTrusted() else {
+            throw AssistantAccessibilityAutomationServiceError.accessibilityRequired
+        }
+
+        let target = try await resolvedWindowElement(appName: appName, windowTitle: windowTitle)
+        let match = try findElement(in: target.window, labelFilter: labelFilter, roleFilter: roleFilter)
+        let targetDescription = match.label ?? match.role ?? "the target element"
+
+        if try performPrimaryAction(on: match.element) {
+            return UISemanticActionResult(
+                summary: "Clicked \(targetDescription).",
+                appName: target.appName,
+                windowTitle: target.windowTitle,
+                targetDescription: targetDescription,
+                actuator: "ax",
+                confidence: 0.92,
+                verificationText: nil
+            )
+        }
+
+        guard let frame = match.frame else {
+            throw AssistantAccessibilityAutomationServiceError.actionFailed(
+                "The matching UI element does not expose a clickable action or usable bounds."
+            )
+        }
+
+        try await helper.clickScreenPoint(
+            CGPoint(x: frame.midX, y: frame.midY),
+            buttonName: buttonName,
+            clickCount: 1
+        )
+        return UISemanticActionResult(
+            summary: "Clicked \(targetDescription) using its screen position.",
+            appName: target.appName,
+            windowTitle: target.windowTitle,
+            targetDescription: targetDescription,
+            actuator: "ax-bounds",
+            confidence: 0.82,
+            verificationText: nil
+        )
+    }
+
+    func performSemanticType(
+        text: String,
+        appName: String?,
+        windowTitle: String?,
+        labelFilter: String?,
+        roleFilter: String?
+    ) async throws -> UISemanticActionResult {
+        guard AXIsProcessTrusted() else {
+            throw AssistantAccessibilityAutomationServiceError.accessibilityRequired
+        }
+
+        var resolvedContext: UIResolvedWindowContext?
+        if labelFilter != nil || roleFilter != nil || appName != nil || windowTitle != nil {
+            let target = try await resolvedWindowElement(appName: appName, windowTitle: windowTitle)
+            let match = try findElement(in: target.window, labelFilter: labelFilter, roleFilter: roleFilter)
+            try await focusElementForTyping(match)
+            resolvedContext = UIResolvedWindowContext(appName: target.appName, windowTitle: target.windowTitle)
+        }
+
+        let insertionResult = await MainActor.run {
+            TextInserter.insert(text, copyToClipboard: false)
+        }
+        guard insertionResult == .pasted else {
+            throw AssistantAccessibilityAutomationServiceError.typingFailed(
+                "Open Assist could not type into the selected field. Try focusing the field manually and run the step again."
+            )
+        }
+
+        return UISemanticActionResult(
+            summary: labelFilter?.nonEmpty.map { "Typed into \($0)." } ?? "Typed into the focused field.",
+            appName: resolvedContext?.appName ?? "Current App",
+            windowTitle: resolvedContext?.windowTitle ?? "",
+            targetDescription: labelFilter?.nonEmpty ?? "focused field",
+            actuator: "ui-type",
+            confidence: labelFilter?.nonEmpty == nil ? 0.78 : 0.9,
+            verificationText: focusedElementValue()
+        )
+    }
+
+    func elementDescription(at point: CGPoint) -> UIElementDescriptor? {
+        guard AXIsProcessTrusted() else { return nil }
+        let systemWide = AXUIElementCreateSystemWide()
+        var element: AXUIElement?
+        let result = AXUIElementCopyElementAtPosition(systemWide, Float(point.x), Float(point.y), &element)
+        guard result == .success,
+              let element else {
+            return nil
+        }
+        return UIElementDescriptor(
+            label: Self.normalizedLabel(axStringAttribute(kAXTitleAttribute as CFString, from: element))
+                ?? Self.normalizedLabel(axStringValueAttribute(kAXValueAttribute as CFString, from: element))
+                ?? Self.normalizedLabel(axStringAttribute(kAXDescriptionAttribute as CFString, from: element)),
+            role: Self.normalizedLabel(axStringAttribute(kAXRoleAttribute as CFString, from: element))
+                ?? Self.normalizedLabel(axStringAttribute(kAXSubroleAttribute as CFString, from: element)),
+            boundsDescription: axFrame(of: element).map(Self.boundsDescription(for:))
+        )
+    }
+
+    func resolvedWindowContext(
+        appName: String?,
+        windowTitle: String?
+    ) async throws -> UIResolvedWindowContext {
+        let target = try await resolvedWindowElement(appName: appName, windowTitle: windowTitle)
+        return UIResolvedWindowContext(appName: target.appName, windowTitle: target.windowTitle)
     }
 
     private func resolvedWindowElement(
@@ -854,5 +946,24 @@ actor AssistantAccessibilityAutomationService {
             return []
         }
         return actionNamesRef as? [String] ?? []
+    }
+
+    private func focusedElementValue() -> String? {
+        let systemWide = AXUIElementCreateSystemWide()
+        var focusedRef: CFTypeRef?
+        let focusedResult = AXUIElementCopyAttributeValue(
+            systemWide,
+            kAXFocusedUIElementAttribute as CFString,
+            &focusedRef
+        )
+        guard focusedResult == .success,
+              let focusedRef,
+              CFGetTypeID(focusedRef) == AXUIElementGetTypeID() else {
+            return nil
+        }
+        let element = unsafeBitCast(focusedRef, to: AXUIElement.self)
+        return Self.normalizedLabel(
+            axStringValueAttribute(kAXValueAttribute as CFString, from: element)
+        )
     }
 }

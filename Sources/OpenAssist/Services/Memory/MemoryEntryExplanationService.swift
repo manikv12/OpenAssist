@@ -6,6 +6,342 @@ enum MemoryEntryExplanationResult {
     case failure(String)
 }
 
+struct SelectionAskConversationTurn: Equatable, Sendable {
+    enum Role: String, Equatable, Sendable {
+        case user
+        case assistant
+
+        var transcriptLabel: String {
+            switch self {
+            case .user:
+                return "User"
+            case .assistant:
+                return "Assistant"
+            }
+        }
+    }
+
+    let role: Role
+    let text: String
+
+    init(role: Role, text: String) {
+        self.role = role
+        self.text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
+struct SelectionAskPrompt: Equatable, Sendable {
+    let systemPrompt: String
+    let userPrompt: String
+}
+
+struct ThreadNoteChartPrompt: Equatable, Sendable {
+    let systemPrompt: String
+    let userPrompt: String
+}
+
+enum SelectionAskPromptBuilder {
+    static func makePrompt(
+        selectedText: String,
+        parentMessageText: String,
+        question: String? = nil,
+        conversationHistory: [SelectionAskConversationTurn] = [],
+        wholeChatSummary: String? = nil
+    ) -> SelectionAskPrompt {
+        let normalizedSelection = selectedText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedParentMessage = parentMessageText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedQuestion = question?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+        let normalizedWholeChatSummary = wholeChatSummary?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nonEmpty
+
+        if let normalizedQuestion {
+            let shouldSuggestReplies = questionNeedsReplySuggestions(normalizedQuestion)
+            let contextualParentMessage = focusedContextSnippet(
+                parentMessage: normalizedParentMessage,
+                selectedText: normalizedSelection,
+                limit: 500
+            ).nonEmpty
+            let recentHistory = Array(
+                conversationHistory
+                    .filter { !$0.text.isEmpty }
+                    .suffix(3)
+            )
+
+            let historySection: String
+            if recentHistory.isEmpty {
+                historySection = ""
+            } else {
+                let transcript = recentHistory
+                    .map { "\($0.role.transcriptLabel): \(snippet($0.text, limit: 120))" }
+                    .joined(separator: "\n")
+                historySection = """
+
+                Previous side-assistant conversation:
+                \(transcript)
+                """
+            }
+
+            let wholeChatSection: String
+            if let normalizedWholeChatSummary {
+                wholeChatSection = """
+
+                Recent chat context:
+                \(snippet(normalizedWholeChatSummary, limit: 600))
+                """
+            } else {
+                wholeChatSection = ""
+            }
+
+            let parentMessageSection: String
+            if let contextualParentMessage {
+                parentMessageSection = """
+
+                Nearby message context:
+                \(contextualParentMessage)
+                """
+            } else {
+                parentMessageSection = ""
+            }
+
+            return SelectionAskPrompt(
+                systemPrompt: """
+                You are a side assistant for an ongoing chat.
+                Answer in a natural, conversational way for a non-technical user.
+                Use easy words, short paragraphs, and keep it concise.
+                Use the selected text, nearby message context, recent chat context, and previous side-assistant turns as helpful background.
+                If the user asks what to say next, give concrete suggestions instead of repeating the text.
+                \(shouldSuggestReplies
+                    ? "End with a short section exactly titled \"You could reply:\" and give 2 or 3 short reply ideas."
+                    : "Do not include a section titled \"You could reply:\" unless the user is clearly asking for wording, a reply, or a response to send.")
+                Output plain text only.
+                If you are not sure, say that plainly.
+                """,
+                userPrompt: """
+                You are helping with this ongoing chat.
+
+                Selected text:
+                \(snippet(normalizedSelection, limit: 600))\(parentMessageSection)\(wholeChatSection)\(historySection)
+
+                New question:
+                \(normalizedQuestion)
+                """
+            )
+        }
+
+        return SelectionAskPrompt(
+            systemPrompt: """
+            You explain selected text in simple terms for a non-technical user.
+            Output plain text only.
+            Use short paragraphs and easy words.
+            Stay faithful to the selected text.
+            If the text uses jargon, explain it with simpler wording.
+            """,
+            userPrompt: """
+            Explain this selected text in simple terms.
+
+            Selected text:
+            \(snippet(normalizedSelection, limit: 12_000))
+
+            Full message context:
+            \(snippet(normalizedParentMessage, limit: 18_000))
+            """
+        )
+    }
+
+    private static func snippet(_ value: String, limit: Int) -> String {
+        let normalized = value
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard normalized.count > limit else { return normalized }
+        return String(normalized.prefix(max(0, limit - 3))) + "..."
+    }
+
+    private static func focusedContextSnippet(
+        parentMessage: String,
+        selectedText: String,
+        limit: Int
+    ) -> String {
+        let normalizedParent = parentMessage
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedSelection = selectedText
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard !normalizedParent.isEmpty else { return "" }
+        guard normalizedParent != normalizedSelection else { return "" }
+        guard !normalizedSelection.isEmpty,
+              let range = normalizedParent.range(of: normalizedSelection) else {
+            return snippet(normalizedParent, limit: limit)
+        }
+        guard normalizedParent.count > limit else { return normalizedParent }
+        guard normalizedSelection.count < limit else {
+            return snippet(normalizedSelection, limit: limit)
+        }
+
+        let lowerDistance = normalizedParent.distance(from: normalizedParent.startIndex, to: range.lowerBound)
+        let upperDistance = normalizedParent.distance(from: normalizedParent.startIndex, to: range.upperBound)
+        let remainingBudget = max(0, limit - normalizedSelection.count)
+        let prefixBudget = remainingBudget / 2
+        let suffixBudget = remainingBudget - prefixBudget
+        let startOffset = max(0, lowerDistance - prefixBudget)
+        let endOffset = min(normalizedParent.count, upperDistance + suffixBudget)
+        let startIndex = normalizedParent.index(normalizedParent.startIndex, offsetBy: startOffset)
+        let endIndex = normalizedParent.index(normalizedParent.startIndex, offsetBy: endOffset)
+
+        var focused = String(normalizedParent[startIndex..<endIndex])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if startOffset > 0 {
+            focused = "..." + focused
+        }
+        if endOffset < normalizedParent.count {
+            focused += "..."
+        }
+        return focused
+    }
+
+    private static func questionNeedsReplySuggestions(_ question: String) -> Bool {
+        let normalized = question
+            .lowercased()
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        let replyIndicators = [
+            "what should i say",
+            "what do i say",
+            "what can i say",
+            "what could i say",
+            "what should i send",
+            "how should i say",
+            "how do i say",
+            "how should i answer",
+            "how should i respond",
+            "what should i reply",
+            "say back",
+            "reply back",
+            "message back",
+            "respond back",
+            "draft a reply",
+            "suggest a reply",
+            "what to reply",
+            "what to respond",
+            "what to say next",
+            "what should i tell",
+            "word this",
+            "write a response"
+        ]
+
+        return replyIndicators.contains { normalized.contains($0) }
+    }
+}
+
+enum ThreadNoteChartPromptBuilder {
+    static func makePrompt(
+        selectedText: String,
+        parentMessageText: String,
+        currentDraft: String? = nil,
+        styleInstruction: String? = nil
+    ) -> ThreadNoteChartPrompt {
+        let normalizedSelection = selectedText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedParentMessage = parentMessageText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedCurrentDraft = currentDraft?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nonEmpty
+        let normalizedStyleInstruction = styleInstruction?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nonEmpty
+
+        let supportedTypes = """
+        Supported Mermaid types:
+        - flowchart
+        - sequenceDiagram
+        - classDiagram
+        - stateDiagram-v2
+        - erDiagram
+        - journey
+        - gantt
+        - pie
+        - gitGraph
+        - mindmap
+        - timeline
+        - quadrantChart
+        - architecture-beta
+        - block-beta
+        """
+
+        let systemPrompt = """
+        You turn selected chat content into a Mermaid chart for a non-technical user.
+        Output markdown only.
+        Return exactly:
+        1. a short markdown heading
+        2. one Mermaid fenced code block
+        Do not include extra explanation before or after the chart.
+        Do not output more than one Mermaid block.
+        Keep node labels short, clear, and easy to scan.
+        Prefer simple structure over dense detail.
+        Use only supported Mermaid types.
+        For hierarchy or stack breakdowns, prefer mindmap, block-beta, architecture-beta, or a grouped flowchart.
+        For step-by-step processes, prefer flowchart or sequenceDiagram.
+        For dated phases, prefer timeline or gantt.
+        For data/entity relationships, prefer erDiagram or classDiagram.
+        For flowcharts, if a subgraph label has spaces or punctuation, write it like subgraph Core["RAPID Core (shared)"].
+        Do not write flowchart subgraph titles like subgraph Core[RAPID Core (shared)].
+        Quote labels that contain punctuation such as parentheses, slashes, colons, or commas.
+        Use ASCII characters only.
+
+        \(supportedTypes)
+        """
+
+        let userPrompt: String
+        if let normalizedStyleInstruction {
+            let currentDraftSection = normalizedCurrentDraft.map {
+                """
+
+                Current chart draft:
+                \(snippet($0, limit: 14_000))
+                """
+            } ?? ""
+
+            userPrompt = """
+            Regenerate the chart from this selected chat content.
+
+            Selected text:
+            \(snippet(normalizedSelection, limit: 10_000))
+
+            Full message context:
+            \(snippet(normalizedParentMessage, limit: 16_000))\(currentDraftSection)
+
+            Change request:
+            \(snippet(normalizedStyleInstruction, limit: 1_200))
+            """
+        } else {
+            userPrompt = """
+            Create the best Mermaid chart for this selected chat content.
+
+            Selected text:
+            \(snippet(normalizedSelection, limit: 10_000))
+
+            Full message context:
+            \(snippet(normalizedParentMessage, limit: 16_000))
+            """
+        }
+
+        return ThreadNoteChartPrompt(
+            systemPrompt: systemPrompt,
+            userPrompt: userPrompt
+        )
+    }
+
+    private static func snippet(_ value: String, limit: Int) -> String {
+        let normalized = value
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard normalized.count > limit else { return normalized }
+        return String(normalized.prefix(max(0, limit - 3))) + "..."
+    }
+}
+
 actor MemoryEntryExplanationService {
     static let shared = MemoryEntryExplanationService()
 
@@ -64,6 +400,8 @@ actor MemoryEntryExplanationService {
         _ selectedText: String,
         parentMessageText: String,
         question: String? = nil,
+        conversationHistory: [SelectionAskConversationTurn] = [],
+        wholeChatSummary: String? = nil,
         onPartialText: (@Sendable (String) -> Void)? = nil
     ) async -> MemoryEntryExplanationResult {
         let normalizedSelection = selectedText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -79,55 +417,21 @@ actor MemoryEntryExplanationService {
             return .failure("Connect at least one provider first to explain selected text with AI.")
         }
 
-        let normalizedQuestion = question?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .nonEmpty
-        let systemPrompt: String
-        let userPrompt: String
-
-        if let normalizedQuestion {
-            systemPrompt = """
-            You answer questions about selected text in simple terms for a non-technical user.
-            Output plain text only.
-            Use short paragraphs and easy words.
-            Stay faithful to the selected text.
-            If the answer is not clearly supported by the text, say that plainly.
-            """
-            userPrompt = """
-            Selected text:
-            \(snippet(normalizedSelection, limit: 12_000))
-
-            Full message context:
-            \(snippet(normalizedParentMessage, limit: 18_000))
-
-            Question:
-            \(normalizedQuestion)
-            """
-        } else {
-            systemPrompt = """
-            You explain selected text in simple terms for a non-technical user.
-            Output plain text only.
-            Use short paragraphs and easy words.
-            Stay faithful to the selected text.
-            If the text uses jargon, explain it with simpler wording.
-            """
-            userPrompt = """
-            Explain this selected text in simple terms.
-
-            Selected text:
-            \(snippet(normalizedSelection, limit: 12_000))
-
-            Full message context:
-            \(snippet(normalizedParentMessage, limit: 18_000))
-            """
-        }
+        let prompt = SelectionAskPromptBuilder.makePrompt(
+            selectedText: normalizedSelection,
+            parentMessageText: normalizedParentMessage,
+            question: question,
+            conversationHistory: conversationHistory,
+            wholeChatSummary: wholeChatSummary
+        )
 
         do {
             let request = try buildRequest(
                 configuration: resolved.configuration,
                 credential: resolved.credential,
-                systemPrompt: systemPrompt,
-                userPrompt: userPrompt
+                systemPrompt: prompt.systemPrompt,
+                userPrompt: prompt.userPrompt,
+                maxOutputTokens: 520
             )
             return try await executeRequest(
                 request,
@@ -138,6 +442,173 @@ actor MemoryEntryExplanationService {
             )
         } catch {
             return .failure("Could not build explanation request. Check provider base URL.")
+        }
+    }
+
+    func explainSelectedTextDirectIfAvailable(
+        _ selectedText: String,
+        parentMessageText: String,
+        question: String,
+        preferredProviderMode: PromptRewriteProviderMode,
+        preferredModel: String?,
+        conversationHistory: [SelectionAskConversationTurn] = [],
+        wholeChatSummary: String? = nil,
+        onPartialText: (@Sendable (String) -> Void)? = nil
+    ) async -> MemoryEntryExplanationResult? {
+        let normalizedSelection = selectedText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedSelection.isEmpty else {
+            return .failure("Select some text first.")
+        }
+        let normalizedParentMessage = parentMessageText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedParentMessage.isEmpty else {
+            return .failure("Could not find the full message for this selection.")
+        }
+
+        guard let resolved = await resolvedLiveConfiguration(
+            preferredProviderMode: preferredProviderMode,
+            preferredModel: preferredModel
+        ) else {
+            return nil
+        }
+
+        let prompt = SelectionAskPromptBuilder.makePrompt(
+            selectedText: normalizedSelection,
+            parentMessageText: normalizedParentMessage,
+            question: question,
+            conversationHistory: conversationHistory,
+            wholeChatSummary: wholeChatSummary
+        )
+
+        do {
+            let request = try buildRequest(
+                configuration: resolved.configuration,
+                credential: resolved.credential,
+                systemPrompt: prompt.systemPrompt,
+                userPrompt: prompt.userPrompt,
+                maxOutputTokens: 260
+            )
+            return try await executeRequest(
+                request,
+                configuration: resolved.configuration,
+                credential: resolved.credential,
+                emptyResultMessage: "Provider returned an empty answer.",
+                onPartialText: onPartialText
+            )
+        } catch {
+            return .failure("Could not build explanation request. Check provider base URL.")
+        }
+    }
+
+    func organizeThreadNote(
+        noteText: String,
+        selectedText: String? = nil,
+        onPartialText: (@Sendable (String) -> Void)? = nil
+    ) async -> MemoryEntryExplanationResult {
+        let normalizedNoteText = noteText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedSelectedText = selectedText?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nonEmpty
+
+        guard !normalizedNoteText.isEmpty || normalizedSelectedText != nil else {
+            return .failure("There is no note text to organize yet.")
+        }
+
+        guard let resolved = await resolvedLiveConfiguration() else {
+            return .failure("Connect at least one provider first to organize notes with AI.")
+        }
+
+        let systemPrompt = """
+        You organize thread notes for a non-technical user.
+        Output markdown only.
+        Use simple wording, short headings, and clear bullet points.
+        Keep important facts, decisions, action items, and constraints.
+        Do not invent missing details.
+        Do not wrap the whole answer in a code fence.
+        """
+
+        let userPrompt: String
+        if let normalizedSelectedText {
+            userPrompt = """
+            Organize this selected portion of a thread note into cleaner markdown.
+
+            Full note context:
+            \(snippet(normalizedNoteText, limit: 18_000))
+
+            Selected portion to organize:
+            \(snippet(normalizedSelectedText, limit: 12_000))
+            """
+        } else {
+            userPrompt = """
+            Organize this full thread note into cleaner markdown.
+
+            Note:
+            \(snippet(normalizedNoteText, limit: 18_000))
+            """
+        }
+
+        do {
+            let request = try buildRequest(
+                configuration: resolved.configuration,
+                credential: resolved.credential,
+                systemPrompt: systemPrompt,
+                userPrompt: userPrompt,
+                maxOutputTokens: 520
+            )
+            return try await executeRequest(
+                request,
+                configuration: resolved.configuration,
+                credential: resolved.credential,
+                emptyResultMessage: "Provider returned an empty note draft.",
+                onPartialText: onPartialText
+            )
+        } catch {
+            return .failure("Could not build note organization request. Check provider base URL.")
+        }
+    }
+
+    func generateThreadNoteChart(
+        selectedText: String,
+        parentMessageText: String,
+        currentDraft: String? = nil,
+        styleInstruction: String? = nil
+    ) async -> MemoryEntryExplanationResult {
+        let normalizedSelection = selectedText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedSelection.isEmpty else {
+            return .failure("Select some text first.")
+        }
+
+        let normalizedParentMessage = parentMessageText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedParentMessage.isEmpty else {
+            return .failure("Could not find the full message for this selection.")
+        }
+
+        guard let resolved = await resolvedLiveConfiguration() else {
+            return .failure("Connect at least one provider first to generate charts with AI.")
+        }
+
+        let prompt = ThreadNoteChartPromptBuilder.makePrompt(
+            selectedText: normalizedSelection,
+            parentMessageText: normalizedParentMessage,
+            currentDraft: currentDraft,
+            styleInstruction: styleInstruction
+        )
+
+        do {
+            let request = try buildRequest(
+                configuration: resolved.configuration,
+                credential: resolved.credential,
+                systemPrompt: prompt.systemPrompt,
+                userPrompt: prompt.userPrompt,
+                maxOutputTokens: 520
+            )
+            return try await executeRequest(
+                request,
+                configuration: resolved.configuration,
+                credential: resolved.credential,
+                emptyResultMessage: "Provider returned an empty chart draft."
+            )
+        } catch {
+            return .failure("Could not build chart generation request. Check provider base URL.")
         }
     }
 
@@ -179,7 +650,8 @@ actor MemoryEntryExplanationService {
             Memory summary instruction:
             \(memoryInstructionSummary)
             """,
-            userPrompt: userPrompt
+            userPrompt: userPrompt,
+            maxOutputTokens: 520
         )
     }
 
@@ -187,7 +659,8 @@ actor MemoryEntryExplanationService {
         configuration: LiveConfiguration,
         credential: ProviderCredential,
         systemPrompt: String,
-        userPrompt: String
+        userPrompt: String,
+        maxOutputTokens: Int
     ) throws -> URLRequest {
         let trimmedSystemPrompt = systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
         let trimmedUserPrompt = userPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -226,13 +699,14 @@ actor MemoryEntryExplanationService {
                     ["role": "user", "content": trimmedUserPrompt]
                 ],
                 "temperature": 0.2,
-                "max_tokens": 520
+                "max_tokens": maxOutputTokens
             ]
         case .openAI, .google, .openRouter, .groq, .ollama:
             endpoint = openAICompatibleEndpoint(from: configuration.baseURL)
             payload = [
                 "model": configuration.model,
                 "temperature": 0.2,
+                "max_tokens": maxOutputTokens,
                 "messages": [
                     ["role": "system", "content": trimmedSystemPrompt],
                     ["role": "user", "content": trimmedUserPrompt]
@@ -374,8 +848,32 @@ actor MemoryEntryExplanationService {
         return .none
     }
 
-    private func resolvedLiveConfiguration() async -> ResolvedConfiguration? {
-        for configuration in liveConfigurations() {
+    private func resolvedLiveConfiguration(
+        preferredProviderMode: PromptRewriteProviderMode? = nil,
+        preferredModel: String? = nil
+    ) async -> ResolvedConfiguration? {
+        let preferredModel = preferredModel?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nonEmpty
+
+        let candidateConfigurations: [LiveConfiguration]
+        if let preferredProviderMode {
+            candidateConfigurations = liveConfigurations()
+                .filter { $0.providerMode == preferredProviderMode }
+                .map { configuration in
+                    LiveConfiguration(
+                        providerMode: configuration.providerMode,
+                        model: preferredModel ?? configuration.model,
+                        baseURL: configuration.baseURL,
+                        apiKey: configuration.apiKey,
+                        oauthSession: configuration.oauthSession
+                    )
+                }
+        } else {
+            candidateConfigurations = liveConfigurations()
+        }
+
+        for configuration in candidateConfigurations {
             let credential: ProviderCredential
             do {
                 credential = try await resolveCredential(for: configuration)

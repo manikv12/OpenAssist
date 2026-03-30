@@ -51,12 +51,38 @@ export interface ActivityTarget {
   detail?: string;
 }
 
-export type ProviderTone = "codex" | "copilot" | "default";
+export type ProviderTone = "codex" | "copilot" | "claude" | "default";
 
 export interface TypingState {
   visible: boolean;
   title?: string;
   detail?: string;
+}
+
+export interface ActiveWorkItem {
+  id: string;
+  title: string;
+  kind?: string;
+  status: "running" | "completed" | "failed";
+  statusLabel?: string;
+  detail?: string;
+}
+
+export interface ActiveWorkSubagent {
+  id: string;
+  name: string;
+  role?: string;
+  status: "running" | "completed" | "failed";
+  statusLabel?: string;
+  detail?: string;
+}
+
+export interface ActiveWorkState {
+  title: string;
+  detail?: string;
+  activeCalls: ActiveWorkItem[];
+  recentCalls: ActiveWorkItem[];
+  subagents: ActiveWorkSubagent[];
 }
 
 export interface RuntimeBackendOption {
@@ -124,15 +150,51 @@ export interface RewindState {
   redoHostMessageID?: string;
 }
 
+export interface ThreadNoteItem {
+  id: string;
+  title: string;
+  updatedAtLabel?: string | null;
+  ownerKind: "thread" | "project" | string;
+  ownerId: string;
+  sourceLabel: string;
+}
+
+export interface ThreadNoteSource {
+  ownerKind: "thread" | "project" | string;
+  ownerId: string;
+  ownerTitle: string;
+  sourceLabel: string;
+}
+
+export interface ThreadNoteAIDraftPreview {
+  mode: "organize" | "chart" | string;
+  sourceKind: "selection" | "whole" | "chatSelection" | string;
+  markdown: string;
+  isError: boolean;
+}
+
 export interface ThreadNoteState {
   threadId: string | null;
+  ownerKind?: "thread" | "project" | string | null;
+  ownerId?: string | null;
+  ownerTitle: string;
+  presentation: "drawer" | "projectFullScreen" | string;
+  availableSources: ThreadNoteSource[];
+  notes: ThreadNoteItem[];
+  selectedNoteId: string | null;
+  selectedNoteTitle: string;
   text: string;
   isOpen: boolean;
-  hasNote: boolean;
+  isExpanded: boolean;
+  viewMode: "edit" | "preview" | "split" | string;
+  hasAnyNotes: boolean;
   isSaving: boolean;
+  isGeneratingAIDraft: boolean;
+  aiDraftMode?: "organize" | "chart" | string | null;
   lastSavedAtLabel?: string | null;
   canEdit: boolean;
   placeholder: string;
+  aiDraftPreview?: ThreadNoteAIDraftPreview | null;
 }
 
 export interface ScrollState {
@@ -157,9 +219,15 @@ export interface AssistantSidebarProjectItem {
   name: string;
   symbol: string;
   subtitle: string;
+  kind: "folder" | "project";
+  depth: number;
   isSelected: boolean;
+  isExpanded: boolean;
+  parentId?: string;
+  menuTitle: string;
   hasLinkedFolder: boolean;
   hasCustomIcon: boolean;
+  folderMissing: boolean;
 }
 
 export interface AssistantSidebarHiddenProjectItem {
@@ -173,12 +241,15 @@ export interface AssistantSidebarSessionItem {
   title: string;
   subtitle: string;
   timeLabel?: string;
+  activityState?: "running" | "waiting" | "failed";
   isSelected: boolean;
   isTemporary: boolean;
   projectId?: string;
 }
 
 export interface AssistantSidebarState {
+  projectFilterKind: "all" | "folder" | "project";
+  projectFilterId?: string;
   selectedPane: AssistantSidebarPaneID;
   isCollapsed: boolean;
   collapsedPreviewPane?: AssistantSidebarCollapsedPreviewPane;

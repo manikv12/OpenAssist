@@ -6,27 +6,49 @@ enum AssistantProjectStoreError: LocalizedError {
     case invalidProjectIconName
     case duplicateProjectName(String)
     case projectNotFound
+    case invalidParentFolder
+    case cannotNestFolders
+    case cannotMoveFolder
+    case cannotAssignThreadToFolder
+    case foldersCannotLinkFolders
     case invalidThreadID
 
     var errorDescription: String? {
         switch self {
         case .invalidProjectName:
-            return "Enter a project name first."
+            return "Enter a group or project name first."
         case .invalidProjectIconName:
             return "Enter a valid SF Symbol name."
         case .duplicateProjectName(let name):
-            return "A project named “\(name)” already exists."
+            return "An item named “\(name)” already exists here."
         case .projectNotFound:
-            return "That project could not be found."
+            return "That group or project could not be found."
+        case .invalidParentFolder:
+            return "Choose a valid group first."
+        case .cannotNestFolders:
+            return "Groups can only live at the top level."
+        case .cannotMoveFolder:
+            return "Only projects can move into groups."
+        case .cannotAssignThreadToFolder:
+            return "Chats can only be assigned to projects."
+        case .foldersCannotLinkFolders:
+            return "Groups cannot link to a local folder."
         case .invalidThreadID:
             return "Enter a thread ID first."
         }
     }
 }
 
+enum AssistantProjectKind: String, Codable, Hashable, Sendable {
+    case folder
+    case project
+}
+
 struct AssistantProject: Identifiable, Codable, Hashable, Sendable {
     let id: String
+    var kind: AssistantProjectKind
     var name: String
+    var parentID: String?
     var linkedFolderPath: String?
     var iconSymbolName: String?
     var isHidden: Bool
@@ -35,7 +57,9 @@ struct AssistantProject: Identifiable, Codable, Hashable, Sendable {
 
     init(
         id: String = UUID().uuidString,
+        kind: AssistantProjectKind = .project,
         name: String,
+        parentID: String? = nil,
         linkedFolderPath: String? = nil,
         iconSymbolName: String? = nil,
         isHidden: Bool = false,
@@ -43,8 +67,10 @@ struct AssistantProject: Identifiable, Codable, Hashable, Sendable {
         updatedAt: Date = Date()
     ) {
         self.id = id
+        self.kind = kind
         self.name = name
-        self.linkedFolderPath = linkedFolderPath
+        self.parentID = parentID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+        self.linkedFolderPath = kind == .folder ? nil : linkedFolderPath
         self.iconSymbolName = Self.normalizedIconSymbolName(iconSymbolName)
         self.isHidden = isHidden
         self.createdAt = createdAt
@@ -53,7 +79,9 @@ struct AssistantProject: Identifiable, Codable, Hashable, Sendable {
 
     enum CodingKeys: String, CodingKey {
         case id
+        case kind
         case name
+        case parentID
         case linkedFolderPath
         case iconSymbolName
         case isHidden
@@ -64,8 +92,13 @@ struct AssistantProject: Identifiable, Codable, Hashable, Sendable {
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         id = try container.decode(String.self, forKey: .id)
+        kind = try container.decodeIfPresent(AssistantProjectKind.self, forKey: .kind) ?? .project
         name = try container.decode(String.self, forKey: .name)
-        linkedFolderPath = try container.decodeIfPresent(String.self, forKey: .linkedFolderPath)
+        parentID = try container.decodeIfPresent(String.self, forKey: .parentID)?
+            .trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+        linkedFolderPath = kind == .folder
+            ? nil
+            : try container.decodeIfPresent(String.self, forKey: .linkedFolderPath)
         iconSymbolName = Self.normalizedIconSymbolName(try container.decodeIfPresent(String.self, forKey: .iconSymbolName))
         isHidden = try container.decodeIfPresent(Bool.self, forKey: .isHidden) ?? false
         createdAt = try container.decode(Date.self, forKey: .createdAt)
@@ -80,8 +113,19 @@ struct AssistantProject: Identifiable, Codable, Hashable, Sendable {
         return defaultIconSymbolName
     }
 
+    var isFolder: Bool {
+        kind == .folder
+    }
+
+    var isProject: Bool {
+        kind == .project
+    }
+
     var defaultIconSymbolName: String {
-        linkedFolderPath == nil ? "square.stack.3d.up.fill" : "folder.fill"
+        if kind == .folder {
+            return "square.grid.2x2.fill"
+        }
+        return linkedFolderPath == nil ? "square.stack.3d.up.fill" : "folder.fill"
     }
 
     static func suggestedName(forLinkedFolderPath linkedFolderPath: String?) -> String {
@@ -147,7 +191,7 @@ struct AssistantProjectStoreSnapshot: Codable {
     var brainByProjectID: [String: AssistantProjectBrainState]
 
     static let empty = AssistantProjectStoreSnapshot(
-        version: 3,
+        version: 5,
         projects: [],
         threadAssignments: [:],
         brainByProjectID: [:]
@@ -165,7 +209,11 @@ struct AssistantProjectDeletionResult: Sendable {
 }
 
 final class AssistantProjectStore {
-    private static let currentSnapshotVersion = 4
+    private static let currentSnapshotVersion = 5
+    private static let projectNotesRootDirectoryName = "ProjectNotes"
+    private static let projectNotesDirectoryName = "notes"
+    private static let projectNoteManifestFilename = "manifest.json"
+    private static let defaultProjectNoteTitle = "Untitled note"
     private let fileManager: FileManager
     private let fileURL: URL
     private var cachedSnapshot: AssistantProjectStoreSnapshot?
@@ -198,11 +246,40 @@ final class AssistantProjectStore {
     }
 
     func visibleProjects() -> [AssistantProject] {
-        loadSnapshot().projects.filter { !$0.isHidden }
+        let snapshot = loadSnapshot()
+        return snapshot.projects.filter { isVisible($0, in: snapshot) }
     }
 
     func hiddenProjects() -> [AssistantProject] {
         loadSnapshot().projects.filter { $0.isHidden }
+    }
+
+    func childProjects(of parentID: String?) -> [AssistantProject] {
+        let snapshot = loadSnapshot()
+        let normalizedParentID = normalizedProjectID(parentID)
+        return snapshot.projects.filter { project in
+            switch (project.parentID, normalizedParentID) {
+            case (nil, nil):
+                return true
+            case let (.some(projectParentID), .some(normalizedParentID)):
+                return projectParentID.caseInsensitiveCompare(normalizedParentID) == .orderedSame
+            default:
+                return false
+            }
+        }
+    }
+
+    func descendantProjectIDs(ofFolderID folderID: String) -> Set<String> {
+        let snapshot = loadSnapshot()
+        let normalizedFolderID = normalizedProjectID(folderID)?.lowercased() ?? ""
+        guard !normalizedFolderID.isEmpty else { return [] }
+        return Set(snapshot.projects.compactMap { project in
+            guard project.isProject,
+                  project.parentID?.lowercased() == normalizedFolderID else {
+                return nil
+            }
+            return project.id
+        })
     }
 
     func snapshot() -> AssistantProjectStoreSnapshot {
@@ -239,27 +316,259 @@ final class AssistantProjectStore {
         return loadSnapshot().threadAssignments[normalizedThreadID]
     }
 
+    func loadProjectNote(projectID: String) throws -> String {
+        try loadProjectNotesWorkspace(projectID: projectID).selectedNoteText
+    }
+
+    func projectNoteModificationDate(projectID: String) throws -> Date? {
+        try loadProjectNotesWorkspace(projectID: projectID).selectedNote?.updatedAt
+    }
+
+    func loadProjectNotesWorkspace(projectID: String) throws -> AssistantNotesWorkspace {
+        let normalizedProjectID = try requiredLeafProjectID(projectID)
+        let manifest = resolvedProjectNoteManifest(projectID: normalizedProjectID)
+        let selectedText = manifest.selectedNote.map {
+            loadProjectNoteText(projectID: normalizedProjectID, fileName: $0.fileName)
+        } ?? ""
+
+        return AssistantNotesWorkspace(
+            projectID: normalizedProjectID,
+            manifest: manifest,
+            selectedNoteText: selectedText
+        )
+    }
+
+    func createProjectNote(
+        projectID: String,
+        title: String? = nil,
+        selectNewNote: Bool = true
+    ) throws -> AssistantNotesWorkspace {
+        let normalizedProjectID = try requiredLeafProjectID(projectID)
+        var manifest = resolvedProjectNoteManifest(projectID: normalizedProjectID)
+        let noteID = UUID().uuidString.lowercased()
+        let now = Date()
+        let note = AssistantNoteSummary(
+            id: noteID,
+            title: normalizedProjectNoteTitle(title),
+            fileName: "\(safePathComponent(noteID)).md",
+            order: manifest.orderedNotes.count,
+            createdAt: now,
+            updatedAt: now
+        )
+        manifest.notes.append(note)
+        manifest.notes = normalizedProjectNoteItems(manifest.notes)
+        if selectNewNote || manifest.selectedNoteID == nil {
+            manifest.selectedNoteID = note.id
+        }
+        try storeProjectNoteManifest(manifest, projectID: normalizedProjectID)
+
+        return AssistantNotesWorkspace(
+            projectID: normalizedProjectID,
+            manifest: manifest,
+            selectedNoteText: ""
+        )
+    }
+
+    func renameProjectNote(
+        projectID: String,
+        noteID: String,
+        title: String
+    ) throws -> AssistantNotesWorkspace {
+        let normalizedProjectID = try requiredLeafProjectID(projectID)
+        var manifest = resolvedProjectNoteManifest(projectID: normalizedProjectID)
+        guard let index = manifest.notes.firstIndex(where: { $0.id == noteID }) else {
+            return try loadProjectNotesWorkspace(projectID: normalizedProjectID)
+        }
+
+        manifest.notes[index].title = normalizedProjectNoteTitle(title)
+        manifest.notes[index].updatedAt = Date()
+        manifest.notes = normalizedProjectNoteItems(manifest.notes)
+        try storeProjectNoteManifest(manifest, projectID: normalizedProjectID)
+
+        let selectedText = manifest.selectedNote.map {
+            loadProjectNoteText(projectID: normalizedProjectID, fileName: $0.fileName)
+        } ?? ""
+        return AssistantNotesWorkspace(
+            projectID: normalizedProjectID,
+            manifest: manifest,
+            selectedNoteText: selectedText
+        )
+    }
+
+    func selectProjectNote(
+        projectID: String,
+        noteID: String
+    ) throws -> AssistantNotesWorkspace {
+        let normalizedProjectID = try requiredLeafProjectID(projectID)
+        var manifest = resolvedProjectNoteManifest(projectID: normalizedProjectID)
+        if manifest.notes.contains(where: { $0.id == noteID }) {
+            manifest.selectedNoteID = noteID
+            try storeProjectNoteManifest(manifest, projectID: normalizedProjectID)
+        }
+
+        let selectedText = manifest.selectedNote.map {
+            loadProjectNoteText(projectID: normalizedProjectID, fileName: $0.fileName)
+        } ?? ""
+        return AssistantNotesWorkspace(
+            projectID: normalizedProjectID,
+            manifest: manifest,
+            selectedNoteText: selectedText
+        )
+    }
+
+    @discardableResult
+    func saveProjectNote(
+        projectID: String,
+        noteID: String?,
+        text: String
+    ) throws -> AssistantNotesWorkspace {
+        let normalizedProjectID = try requiredLeafProjectID(projectID)
+        var manifest = resolvedProjectNoteManifest(projectID: normalizedProjectID)
+        let resolvedNoteID: String
+        if let noteID,
+           manifest.notes.contains(where: { $0.id == noteID }) {
+            resolvedNoteID = noteID
+        } else if let selectedNoteID = manifest.selectedNote?.id {
+            resolvedNoteID = selectedNoteID
+        } else {
+            return try createProjectNoteAndSave(
+                projectID: normalizedProjectID,
+                title: Self.defaultProjectNoteTitle,
+                text: text
+            )
+        }
+
+        guard let index = manifest.notes.firstIndex(where: { $0.id == resolvedNoteID }) else {
+            return try loadProjectNotesWorkspace(projectID: normalizedProjectID)
+        }
+
+        let normalizedText = text.replacingOccurrences(of: "\r\n", with: "\n")
+        let note = manifest.notes[index]
+        guard let fileURL = projectNoteFileURL(
+            projectID: normalizedProjectID,
+            fileName: note.fileName
+        ) else {
+            return try loadProjectNotesWorkspace(projectID: normalizedProjectID)
+        }
+
+        if normalizedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            try? fileManager.removeItem(at: fileURL)
+        } else {
+            try fileManager.createDirectory(
+                at: fileURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try normalizedText.write(to: fileURL, atomically: true, encoding: .utf8)
+        }
+
+        manifest.selectedNoteID = resolvedNoteID
+        manifest.notes[index].updatedAt = Date()
+        manifest.notes = normalizedProjectNoteItems(manifest.notes)
+        try storeProjectNoteManifest(manifest, projectID: normalizedProjectID)
+
+        return AssistantNotesWorkspace(
+            projectID: normalizedProjectID,
+            manifest: manifest,
+            selectedNoteText: normalizedText
+        )
+    }
+
+    func deleteProjectNote(
+        projectID: String,
+        noteID: String
+    ) throws -> AssistantNotesWorkspace {
+        let normalizedProjectID = try requiredLeafProjectID(projectID)
+        var manifest = resolvedProjectNoteManifest(projectID: normalizedProjectID)
+        guard let existingIndex = manifest.notes.firstIndex(where: { $0.id == noteID }) else {
+            return try loadProjectNotesWorkspace(projectID: normalizedProjectID)
+        }
+
+        let removed = manifest.notes.remove(at: existingIndex)
+        if let fileURL = projectNoteFileURL(projectID: normalizedProjectID, fileName: removed.fileName) {
+            try? fileManager.removeItem(at: fileURL)
+        }
+
+        manifest.notes = normalizedProjectNoteItems(manifest.notes)
+        if manifest.selectedNoteID == noteID {
+            let fallbackIndex = min(existingIndex, max(0, manifest.notes.count - 1))
+            manifest.selectedNoteID = manifest.notes.indices.contains(fallbackIndex)
+                ? manifest.notes[fallbackIndex].id
+                : nil
+        }
+
+        try storeProjectNoteManifest(manifest, projectID: normalizedProjectID)
+        let selectedText = manifest.selectedNote.map {
+            loadProjectNoteText(projectID: normalizedProjectID, fileName: $0.fileName)
+        } ?? ""
+        return AssistantNotesWorkspace(
+            projectID: normalizedProjectID,
+            manifest: manifest,
+            selectedNoteText: selectedText
+        )
+    }
+
+    func appendToSelectedProjectNote(
+        projectID: String,
+        text: String
+    ) throws -> AssistantNotesWorkspace {
+        let normalizedProjectID = try requiredLeafProjectID(projectID)
+        let trimmedAppendText = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedAppendText.isEmpty else {
+            return try loadProjectNotesWorkspace(projectID: normalizedProjectID)
+        }
+
+        let workspace = try loadProjectNotesWorkspace(projectID: normalizedProjectID)
+        let currentText = workspace.selectedNoteText.trimmingCharacters(in: .newlines)
+        let mergedText = currentText.isEmpty
+            ? trimmedAppendText
+            : currentText + "\n\n" + trimmedAppendText
+
+        return try saveProjectNote(
+            projectID: normalizedProjectID,
+            noteID: workspace.selectedNote?.id,
+            text: mergedText
+        )
+    }
+
     func createProject(
         name: String,
         linkedFolderPath: String? = nil,
+        parentID: String? = nil,
         now: Date = Date()
     ) throws -> AssistantProject {
         var snapshot = loadSnapshot()
+        let normalizedParentID = try validatedParentFolderID(parentID, in: snapshot)
         let normalizedFolderPath = normalizedLinkedFolderPath(linkedFolderPath)
         if let existingIndex = projectIndex(
             forLinkedFolderPath: normalizedFolderPath,
             excludingProjectID: nil,
             in: snapshot
         ) {
+            _ = try validatedUniqueName(
+                snapshot.projects[existingIndex].name,
+                parentID: normalizedParentID,
+                excludingProjectID: snapshot.projects[existingIndex].id,
+                in: snapshot
+            )
             snapshot.projects[existingIndex].isHidden = false
+            snapshot.projects[existingIndex].parentID = normalizedParentID
             snapshot.projects[existingIndex].updatedAt = now
+            snapshot.brainByProjectID[snapshot.projects[existingIndex].id] =
+                snapshot.brainByProjectID[snapshot.projects[existingIndex].id] ?? AssistantProjectBrainState()
             try saveSnapshot(snapshot)
             return snapshot.projects[existingIndex]
         }
 
-        let normalizedName = try validatedUniqueName(name, excludingProjectID: nil)
+        let normalizedName = try validatedUniqueName(
+            name,
+            parentID: normalizedParentID,
+            excludingProjectID: nil,
+            in: snapshot
+        )
         let project = AssistantProject(
+            kind: .project,
             name: normalizedName,
+            parentID: normalizedParentID,
             linkedFolderPath: normalizedFolderPath,
             createdAt: now,
             updatedAt: now
@@ -270,19 +579,46 @@ final class AssistantProjectStore {
         return project
     }
 
+    func createFolder(
+        name: String,
+        now: Date = Date()
+    ) throws -> AssistantProject {
+        var snapshot = loadSnapshot()
+        let normalizedName = try validatedUniqueName(
+            name,
+            parentID: nil,
+            excludingProjectID: nil,
+            in: snapshot
+        )
+        let folder = AssistantProject(
+            kind: .folder,
+            name: normalizedName,
+            createdAt: now,
+            updatedAt: now
+        )
+        snapshot.projects.append(folder)
+        try saveSnapshot(snapshot)
+        return folder
+    }
+
     func renameProject(
         id projectID: String,
         to newName: String,
         now: Date = Date()
     ) throws -> AssistantProject {
         let normalizedProjectID = try requiredProjectID(projectID)
-        let normalizedName = try validatedUniqueName(newName, excludingProjectID: normalizedProjectID)
         var snapshot = loadSnapshot()
         guard let index = snapshot.projects.firstIndex(where: {
             $0.id.caseInsensitiveCompare(normalizedProjectID) == .orderedSame
         }) else {
             throw AssistantProjectStoreError.projectNotFound
         }
+        let normalizedName = try validatedUniqueName(
+            newName,
+            parentID: snapshot.projects[index].parentID,
+            excludingProjectID: normalizedProjectID,
+            in: snapshot
+        )
 
         snapshot.projects[index].name = normalizedName
         snapshot.projects[index].updatedAt = now
@@ -301,6 +637,9 @@ final class AssistantProjectStore {
             $0.id.caseInsensitiveCompare(normalizedProjectID) == .orderedSame
         }) else {
             throw AssistantProjectStoreError.projectNotFound
+        }
+        guard snapshot.projects[index].isProject else {
+            throw AssistantProjectStoreError.foldersCannotLinkFolders
         }
 
         let normalizedFolderPath = normalizedLinkedFolderPath(linkedFolderPath)
@@ -369,6 +708,36 @@ final class AssistantProjectStore {
         return snapshot.projects[index]
     }
 
+    func moveProject(
+        id projectID: String,
+        toFolderID folderID: String?,
+        now: Date = Date()
+    ) throws -> AssistantProject {
+        let normalizedProjectID = try requiredProjectID(projectID)
+        var snapshot = loadSnapshot()
+        guard let index = snapshot.projects.firstIndex(where: {
+            $0.id.caseInsensitiveCompare(normalizedProjectID) == .orderedSame
+        }) else {
+            throw AssistantProjectStoreError.projectNotFound
+        }
+        guard snapshot.projects[index].isProject else {
+            throw AssistantProjectStoreError.cannotMoveFolder
+        }
+
+        let normalizedFolderID = try validatedParentFolderID(folderID, in: snapshot)
+        let normalizedName = try validatedUniqueName(
+            snapshot.projects[index].name,
+            parentID: normalizedFolderID,
+            excludingProjectID: normalizedProjectID,
+            in: snapshot
+        )
+        snapshot.projects[index].name = normalizedName
+        snapshot.projects[index].parentID = normalizedFolderID
+        snapshot.projects[index].updatedAt = now
+        try saveSnapshot(snapshot)
+        return snapshot.projects[index]
+    }
+
     @discardableResult
     func hideProject(id projectID: String, now: Date = Date()) throws -> AssistantProject {
         try setProjectHidden(projectID, isHidden: true, now: now)
@@ -385,7 +754,10 @@ final class AssistantProjectStore {
     }
 
     @discardableResult
-    func deleteProjectResult(id projectID: String) throws -> AssistantProjectDeletionResult {
+    func deleteProjectResult(
+        id projectID: String,
+        now: Date = Date()
+    ) throws -> AssistantProjectDeletionResult {
         let normalizedProjectID = try requiredProjectID(projectID)
         var snapshot = loadSnapshot()
         guard let index = snapshot.projects.firstIndex(where: {
@@ -395,12 +767,39 @@ final class AssistantProjectStore {
         }
 
         let removed = snapshot.projects.remove(at: index)
-        let removedThreadIDs = snapshot.threadAssignments.compactMap { threadID, assignedProjectID in
-            assignedProjectID.caseInsensitiveCompare(normalizedProjectID) == .orderedSame ? threadID : nil
-        }
-        snapshot.brainByProjectID.removeValue(forKey: normalizedProjectID)
-        snapshot.threadAssignments = snapshot.threadAssignments.filter { _, assignedProjectID in
-            assignedProjectID.caseInsensitiveCompare(normalizedProjectID) != .orderedSame
+        let removedThreadIDs: [String]
+        if removed.isFolder {
+            let childProjects = snapshot.projects.filter {
+                $0.parentID?.caseInsensitiveCompare(normalizedProjectID) == .orderedSame
+            }
+            let rootSiblingNames = Set(
+                snapshot.projects.compactMap { project -> String? in
+                    guard project.parentID == nil else { return nil }
+                    return MemoryTextNormalizer.collapsedWhitespace(project.name).lowercased()
+                }
+            )
+            for childProject in childProjects {
+                let normalizedChildName = MemoryTextNormalizer.collapsedWhitespace(childProject.name).lowercased()
+                if rootSiblingNames.contains(normalizedChildName) {
+                    throw AssistantProjectStoreError.duplicateProjectName(childProject.name)
+                }
+            }
+            for childIndex in snapshot.projects.indices where
+                snapshot.projects[childIndex].parentID?.caseInsensitiveCompare(normalizedProjectID) == .orderedSame {
+                snapshot.projects[childIndex].parentID = nil
+                snapshot.projects[childIndex].updatedAt = max(snapshot.projects[childIndex].updatedAt, now)
+            }
+            removedThreadIDs = []
+            snapshot.brainByProjectID.removeValue(forKey: normalizedProjectID)
+        } else {
+            removedThreadIDs = snapshot.threadAssignments.compactMap { threadID, assignedProjectID in
+                assignedProjectID.caseInsensitiveCompare(normalizedProjectID) == .orderedSame ? threadID : nil
+            }
+            snapshot.brainByProjectID.removeValue(forKey: normalizedProjectID)
+            snapshot.threadAssignments = snapshot.threadAssignments.filter { _, assignedProjectID in
+                assignedProjectID.caseInsensitiveCompare(normalizedProjectID) != .orderedSame
+            }
+            deleteProjectNoteArtifacts(projectID: normalizedProjectID)
         }
         try saveSnapshot(snapshot)
         return AssistantProjectDeletionResult(
@@ -441,6 +840,9 @@ final class AssistantProjectStore {
         }) else {
             throw AssistantProjectStoreError.projectNotFound
         }
+        guard snapshot.projects[index].isProject else {
+            throw AssistantProjectStoreError.cannotAssignThreadToFolder
+        }
 
         snapshot.threadAssignments[normalizedThreadID] = normalizedProjectID
         snapshot.projects[index].updatedAt = now
@@ -473,7 +875,7 @@ final class AssistantProjectStore {
         fingerprint: String,
         processedAt: Date = Date()
     ) throws {
-        let normalizedProjectID = try requiredProjectID(projectID)
+        let normalizedProjectID = try requiredLeafProjectID(projectID)
         let normalizedThreadID = try requiredThreadID(threadID)
         var snapshot = loadSnapshot()
         var brain = snapshot.brainByProjectID[normalizedProjectID] ?? AssistantProjectBrainState()
@@ -494,7 +896,7 @@ final class AssistantProjectStore {
         threadID: String,
         processedAt: Date = Date()
     ) throws {
-        let normalizedProjectID = try requiredProjectID(projectID)
+        let normalizedProjectID = try requiredLeafProjectID(projectID)
         guard let normalizedThreadID = normalizedThreadID(threadID) else { return }
         var snapshot = loadSnapshot()
         var brain = snapshot.brainByProjectID[normalizedProjectID] ?? AssistantProjectBrainState()
@@ -522,7 +924,7 @@ final class AssistantProjectStore {
         forProjectID projectID: String,
         processedAt: Date = Date()
     ) throws {
-        let normalizedProjectID = try requiredProjectID(projectID)
+        let normalizedProjectID = try requiredLeafProjectID(projectID)
         var snapshot = loadSnapshot()
         var brain = snapshot.brainByProjectID[normalizedProjectID] ?? AssistantProjectBrainState()
         brain.projectSummary = summary?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
@@ -535,10 +937,156 @@ final class AssistantProjectStore {
         _ state: AssistantProjectBrainState,
         forProjectID projectID: String
     ) throws {
-        let normalizedProjectID = try requiredProjectID(projectID)
+        let normalizedProjectID = try requiredLeafProjectID(projectID)
         var snapshot = loadSnapshot()
         snapshot.brainByProjectID[normalizedProjectID] = state
         try saveSnapshot(snapshot)
+    }
+
+    private func projectNotesRootDirectoryURL() -> URL {
+        fileURL.deletingLastPathComponent()
+            .appendingPathComponent(Self.projectNotesRootDirectoryName, isDirectory: true)
+    }
+
+    private func projectNotesDirectoryURL(for projectID: String) -> URL? {
+        let safeProjectID = safePathComponent(projectID)
+        guard !safeProjectID.isEmpty else { return nil }
+        return projectNotesRootDirectoryURL()
+            .appendingPathComponent(safeProjectID, isDirectory: true)
+            .appendingPathComponent(Self.projectNotesDirectoryName, isDirectory: true)
+    }
+
+    private func projectNoteManifestFileURL(for projectID: String) -> URL? {
+        projectNotesDirectoryURL(for: projectID)?
+            .appendingPathComponent(Self.projectNoteManifestFilename, isDirectory: false)
+    }
+
+    private func projectNoteFileURL(projectID: String, fileName: String) -> URL? {
+        projectNotesDirectoryURL(for: projectID)?
+            .appendingPathComponent(fileName, isDirectory: false)
+    }
+
+    private func loadProjectNoteText(projectID: String, fileName: String) -> String {
+        guard let fileURL = projectNoteFileURL(projectID: projectID, fileName: fileName),
+              fileManager.fileExists(atPath: fileURL.path),
+              let contents = try? String(contentsOf: fileURL, encoding: .utf8) else {
+            return ""
+        }
+        return contents.replacingOccurrences(of: "\r\n", with: "\n")
+    }
+
+    private func resolvedProjectNoteManifest(projectID: String) -> AssistantNoteManifest {
+        guard let manifestURL = projectNoteManifestFileURL(for: projectID),
+              fileManager.fileExists(atPath: manifestURL.path),
+              let data = try? Data(contentsOf: manifestURL),
+              let decoded = try? JSONDecoder().decode(AssistantNoteManifest.self, from: data) else {
+            return AssistantNoteManifest()
+        }
+
+        return normalizedProjectNoteManifest(decoded)
+    }
+
+    private func storeProjectNoteManifest(
+        _ manifest: AssistantNoteManifest,
+        projectID: String
+    ) throws {
+        let normalizedManifest = normalizedProjectNoteManifest(manifest)
+        guard let manifestURL = projectNoteManifestFileURL(for: projectID) else { return }
+
+        if normalizedManifest.notes.isEmpty {
+            try? fileManager.removeItem(at: manifestURL)
+            if let notesDirectoryURL = projectNotesDirectoryURL(for: projectID) {
+                try? fileManager.removeItem(at: notesDirectoryURL)
+                let projectNotesRoot = notesDirectoryURL.deletingLastPathComponent()
+                try? removeDirectoryIfEmpty(projectNotesRoot)
+                try? removeDirectoryIfEmpty(projectNotesRoot.deletingLastPathComponent())
+            }
+            return
+        }
+
+        try fileManager.createDirectory(
+            at: manifestURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let data = try encoder.encode(normalizedManifest)
+        try data.write(to: manifestURL, options: .atomic)
+    }
+
+    private func normalizedProjectNoteManifest(
+        _ manifest: AssistantNoteManifest
+    ) -> AssistantNoteManifest {
+        let normalizedNotes = normalizedProjectNoteItems(manifest.notes)
+        let selectedNoteID = normalizedNotes.contains(where: { $0.id == manifest.selectedNoteID })
+            ? manifest.selectedNoteID
+            : normalizedNotes.first?.id
+        return AssistantNoteManifest(
+            version: max(manifest.version, AssistantNoteManifest.currentVersion),
+            selectedNoteID: selectedNoteID,
+            notes: normalizedNotes
+        )
+    }
+
+    private func normalizedProjectNoteItems(
+        _ notes: [AssistantNoteSummary]
+    ) -> [AssistantNoteSummary] {
+        notes
+            .sorted {
+                if $0.order == $1.order {
+                    return $0.createdAt < $1.createdAt
+                }
+                return $0.order < $1.order
+            }
+            .enumerated()
+            .map { index, note in
+                var updated = note
+                updated.title = normalizedProjectNoteTitle(note.title)
+                updated.order = index
+                return updated
+            }
+    }
+
+    private func normalizedProjectNoteTitle(_ title: String?) -> String {
+        title?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nonEmpty
+            ?? Self.defaultProjectNoteTitle
+    }
+
+    private func createProjectNoteAndSave(
+        projectID: String,
+        title: String,
+        text: String
+    ) throws -> AssistantNotesWorkspace {
+        let createdWorkspace = try createProjectNote(
+            projectID: projectID,
+            title: title,
+            selectNewNote: true
+        )
+        return try saveProjectNote(
+            projectID: projectID,
+            noteID: createdWorkspace.selectedNote?.id,
+            text: text
+        )
+    }
+
+    private func deleteProjectNoteArtifacts(projectID: String) {
+        guard let notesDirectoryURL = projectNotesDirectoryURL(for: projectID) else { return }
+        let projectDirectoryURL = notesDirectoryURL.deletingLastPathComponent()
+        let projectNotesRoot = projectDirectoryURL.deletingLastPathComponent()
+        try? fileManager.removeItem(at: projectDirectoryURL)
+        try? removeDirectoryIfEmpty(projectNotesRoot)
+    }
+
+    private func removeDirectoryIfEmpty(_ directoryURL: URL) throws {
+        guard fileManager.fileExists(atPath: directoryURL.path) else { return }
+        let contents = try fileManager.contentsOfDirectory(
+            at: directoryURL,
+            includingPropertiesForKeys: nil
+        )
+        guard contents.isEmpty else { return }
+        try fileManager.removeItem(at: directoryURL)
     }
 
     private func loadSnapshot() -> AssistantProjectStoreSnapshot {
@@ -556,8 +1104,10 @@ final class AssistantProjectStore {
         if snapshot.version < Self.currentSnapshotVersion {
             snapshot.version = Self.currentSnapshotVersion
         }
-        let normalized = normalizeDuplicateLinkedFolderProjects(in: snapshot)
-        if normalized.changed {
+        let normalizedHierarchy = normalizeHierarchy(in: snapshot)
+        let normalized = normalizeDuplicateLinkedFolderProjects(in: normalizedHierarchy.snapshot)
+        let changed = normalizedHierarchy.changed || normalized.changed
+        if changed {
             try? saveSnapshot(normalized.snapshot)
         } else {
             cachedSnapshot = normalized.snapshot
@@ -581,7 +1131,9 @@ final class AssistantProjectStore {
 
     private func validatedUniqueName(
         _ name: String,
-        excludingProjectID projectID: String?
+        parentID: String?,
+        excludingProjectID projectID: String?,
+        in snapshot: AssistantProjectStoreSnapshot
     ) throws -> String {
         let normalizedName = MemoryTextNormalizer.collapsedWhitespace(name)
         guard !normalizedName.isEmpty else {
@@ -589,14 +1141,38 @@ final class AssistantProjectStore {
         }
 
         let excludedProjectID = normalizedProjectID(projectID)
-        if loadSnapshot().projects.contains(where: {
+        let normalizedParentID = normalizedProjectID(parentID)
+        if snapshot.projects.contains(where: {
             $0.name.caseInsensitiveCompare(normalizedName) == .orderedSame
+                && (($0.parentID == nil && normalizedParentID == nil)
+                    || $0.parentID?.caseInsensitiveCompare(normalizedParentID ?? "") == .orderedSame)
                 && $0.id.caseInsensitiveCompare(excludedProjectID ?? "") != .orderedSame
         }) {
             throw AssistantProjectStoreError.duplicateProjectName(normalizedName)
         }
 
         return normalizedName
+    }
+
+    private func validatedParentFolderID(
+        _ parentID: String?,
+        in snapshot: AssistantProjectStoreSnapshot
+    ) throws -> String? {
+        guard let normalizedParentID = normalizedProjectID(parentID) else {
+            return nil
+        }
+        guard let parent = snapshot.projects.first(where: {
+            $0.id.caseInsensitiveCompare(normalizedParentID) == .orderedSame
+        }) else {
+            throw AssistantProjectStoreError.invalidParentFolder
+        }
+        guard parent.isFolder else {
+            throw AssistantProjectStoreError.invalidParentFolder
+        }
+        guard parent.parentID == nil else {
+            throw AssistantProjectStoreError.cannotNestFolders
+        }
+        return parent.id
     }
 
     private func normalizedProjectID(_ projectID: String?) -> String? {
@@ -606,6 +1182,17 @@ final class AssistantProjectStore {
     private func requiredProjectID(_ projectID: String?) throws -> String {
         guard let normalizedProjectID = normalizedProjectID(projectID) else {
             throw AssistantProjectStoreError.projectNotFound
+        }
+        return normalizedProjectID
+    }
+
+    private func requiredLeafProjectID(_ projectID: String?) throws -> String {
+        let normalizedProjectID = try requiredProjectID(projectID)
+        guard let project = project(forProjectID: normalizedProjectID) else {
+            throw AssistantProjectStoreError.projectNotFound
+        }
+        guard project.isProject else {
+            throw AssistantProjectStoreError.cannotAssignThreadToFolder
         }
         return normalizedProjectID
     }
@@ -625,6 +1212,16 @@ final class AssistantProjectStore {
         AssistantProject.normalizedLinkedFolderPath(linkedFolderPath)
     }
 
+    private func safePathComponent(_ value: String) -> String {
+        value
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(
+                of: #"[^A-Za-z0-9._-]+"#,
+                with: "-",
+                options: .regularExpression
+            )
+    }
+
     private func linkedFolderComparisonKey(_ linkedFolderPath: String?) -> String? {
         normalizedLinkedFolderPath(linkedFolderPath)?.lowercased()
     }
@@ -639,6 +1236,9 @@ final class AssistantProjectStore {
         }
         let excludedProjectID = normalizedProjectID(projectID)
         return snapshot.projects.firstIndex { project in
+            guard project.isProject else {
+                return false
+            }
             guard let projectPath = normalizedLinkedFolderPath(project.linkedFolderPath) else {
                 return false
             }
@@ -710,6 +1310,7 @@ final class AssistantProjectStore {
         var mergedProject = keepingProject
         mergedProject.linkedFolderPath = keepingProject.linkedFolderPath ?? removingProject.linkedFolderPath
         mergedProject.iconSymbolName = keepingProject.iconSymbolName ?? removingProject.iconSymbolName
+        mergedProject.parentID = keepingProject.parentID ?? removingProject.parentID
         mergedProject.isHidden = keepingProject.isHidden && removingProject.isHidden
         mergedProject.updatedAt = max(max(keepingProject.updatedAt, removingProject.updatedAt), now)
 
@@ -777,6 +1378,9 @@ final class AssistantProjectStore {
 
         let groupedProjects = Dictionary(
             grouping: normalizedSnapshot.projects.compactMap { project -> (String, AssistantProject)? in
+                guard project.isProject else {
+                    return nil
+                }
                 guard let linkedFolderPath = linkedFolderComparisonKey(project.linkedFolderPath) else {
                     return nil
                 }
@@ -809,5 +1413,88 @@ final class AssistantProjectStore {
         }
 
         return (normalizedSnapshot, changed)
+    }
+
+    private func normalizeHierarchy(
+        in snapshot: AssistantProjectStoreSnapshot
+    ) -> (snapshot: AssistantProjectStoreSnapshot, changed: Bool) {
+        var normalizedSnapshot = snapshot
+        var changed = false
+
+        for index in normalizedSnapshot.projects.indices {
+            if normalizedSnapshot.projects[index].isFolder {
+                if normalizedSnapshot.projects[index].parentID != nil {
+                    normalizedSnapshot.projects[index].parentID = nil
+                    changed = true
+                }
+                if normalizedSnapshot.projects[index].linkedFolderPath != nil {
+                    normalizedSnapshot.projects[index].linkedFolderPath = nil
+                    changed = true
+                }
+            }
+        }
+
+        let foldersByID = Dictionary(
+            uniqueKeysWithValues: normalizedSnapshot.projects.filter(\.isFolder).map { ($0.id.lowercased(), $0) }
+        )
+
+        for index in normalizedSnapshot.projects.indices where normalizedSnapshot.projects[index].isProject {
+            guard let parentID = normalizedSnapshot.projects[index].parentID?.lowercased() else {
+                continue
+            }
+            guard let parent = foldersByID[parentID], parent.parentID == nil else {
+                normalizedSnapshot.projects[index].parentID = nil
+                changed = true
+                continue
+            }
+        }
+
+        let validProjectIDs = Set(
+            normalizedSnapshot.projects.filter(\.isProject).map { $0.id.lowercased() }
+        )
+        let filteredAssignments = normalizedSnapshot.threadAssignments.filter { _, assignedProjectID in
+            validProjectIDs.contains(assignedProjectID.lowercased())
+        }
+        if filteredAssignments.count != normalizedSnapshot.threadAssignments.count {
+            normalizedSnapshot.threadAssignments = filteredAssignments
+            changed = true
+        }
+
+        let filteredBrain = normalizedSnapshot.brainByProjectID.filter { projectID, _ in
+            validProjectIDs.contains(projectID.lowercased())
+        }
+        if filteredBrain.count != normalizedSnapshot.brainByProjectID.count {
+            normalizedSnapshot.brainByProjectID = filteredBrain
+            changed = true
+        }
+
+        return (normalizedSnapshot, changed)
+    }
+
+    private func isVisible(
+        _ project: AssistantProject,
+        in snapshot: AssistantProjectStoreSnapshot
+    ) -> Bool {
+        guard !project.isHidden else {
+            return false
+        }
+
+        let projectsByID = Dictionary(
+            uniqueKeysWithValues: snapshot.projects.map { ($0.id.lowercased(), $0) }
+        )
+        var ancestorID = project.parentID?.lowercased()
+        var visited = Set<String>()
+        while let currentAncestorID = ancestorID, !currentAncestorID.isEmpty, !visited.contains(currentAncestorID) {
+            visited.insert(currentAncestorID)
+            guard let ancestor = projectsByID[currentAncestorID] else {
+                break
+            }
+            if ancestor.isHidden {
+                return false
+            }
+            ancestorID = ancestor.parentID?.lowercased()
+        }
+
+        return true
     }
 }

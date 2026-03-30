@@ -1,6 +1,101 @@
 import { useEffect } from "react";
 
 /**
+ * Convert a DOM tree (from selection) into rough markdown so that list items,
+ * bold, italic, code, headings, etc. are preserved when pasting into a note.
+ */
+function htmlToMarkdown(root: HTMLElement): string {
+  return convertChildren(root).replace(/\n{3,}/g, "\n\n").trim();
+
+  function convertNode(node: Node): string {
+    if (node.nodeType === Node.TEXT_NODE) {
+      return node.textContent ?? "";
+    }
+    if (node.nodeType !== Node.ELEMENT_NODE) return "";
+    const el = node as HTMLElement;
+    const tag = el.tagName.toLowerCase();
+    const inner = convertChildren(el);
+
+    switch (tag) {
+      case "strong":
+      case "b":
+        return `**${inner}**`;
+      case "em":
+      case "i":
+        return `*${inner}*`;
+      case "code":
+        if (el.parentElement?.tagName.toLowerCase() === "pre") return inner;
+        return `\`${inner}\``;
+      case "pre": {
+        const code = el.querySelector("code");
+        const lang =
+          [...(code?.classList ?? [])].find((c) => c.startsWith("language-"))?.replace("language-", "") ?? "";
+        const text = code?.textContent ?? inner;
+        return `\n\`\`\`${lang}\n${text}\n\`\`\`\n`;
+      }
+      case "h1":
+        return `\n# ${inner}\n`;
+      case "h2":
+        return `\n## ${inner}\n`;
+      case "h3":
+        return `\n### ${inner}\n`;
+      case "h4":
+        return `\n#### ${inner}\n`;
+      case "h5":
+        return `\n##### ${inner}\n`;
+      case "h6":
+        return `\n###### ${inner}\n`;
+      case "blockquote":
+        return `\n${inner.split("\n").map((l) => `> ${l}`).join("\n")}\n`;
+      case "a":
+        return `[${inner}](${el.getAttribute("href") ?? ""})`;
+      case "br":
+        return "\n";
+      case "hr":
+        return "\n---\n";
+      case "p":
+        return `\n${inner}\n`;
+      case "ul":
+      case "ol":
+        return `\n${convertListItems(el, tag === "ol")}\n`;
+      case "li":
+        return inner;
+      case "input":
+        if (el.getAttribute("type") === "checkbox") {
+          return (el as HTMLInputElement).checked ? "[x] " : "[ ] ";
+        }
+        return "";
+      case "del":
+      case "s":
+        return `~~${inner}~~`;
+      case "img":
+        return `![${el.getAttribute("alt") ?? ""}](${el.getAttribute("src") ?? ""})`;
+      default:
+        return inner;
+    }
+  }
+
+  function convertChildren(el: HTMLElement): string {
+    let result = "";
+    el.childNodes.forEach((child) => {
+      result += convertNode(child);
+    });
+    return result;
+  }
+
+  function convertListItems(list: HTMLElement, ordered: boolean): string {
+    const items: string[] = [];
+    let index = parseInt(list.getAttribute("start") ?? "1", 10);
+    list.querySelectorAll(":scope > li").forEach((li) => {
+      const content = convertChildren(li as HTMLElement).replace(/^\n+|\n+$/g, "");
+      const prefix = ordered ? `${index++}. ` : "- ";
+      items.push(`${prefix}${content}`);
+    });
+    return items.join("\n");
+  }
+}
+
+/**
  * Monitors text selection changes in the chat and reports them to Swift.
  * Sends: selectedText, messageID, parentMessageText, and selection bounding rect.
  */
@@ -23,8 +118,8 @@ export function useTextSelection() {
         return;
       }
 
-      const selectedText = selection.toString();
-      if (!selectedText.trim()) return;
+      const plainText = selection.toString();
+      if (!plainText.trim()) return;
 
       // Walk up from the selection anchor to find the parent message row
       const anchorNode = selection.anchorNode;
@@ -40,6 +135,12 @@ export function useTextSelection() {
       // Get selection bounding rect (relative to viewport)
       const range = selection.getRangeAt(0);
       const rect = range.getBoundingClientRect();
+
+      // Extract markdown from the selected HTML so formatting is preserved
+      const fragment = range.cloneContents();
+      const container = document.createElement("div");
+      container.appendChild(fragment);
+      const selectedText = htmlToMarkdown(container) || plainText;
 
       try {
         window.webkit?.messageHandlers?.textSelected?.postMessage({

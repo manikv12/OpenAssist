@@ -7,6 +7,17 @@ enum AssistantRuntimeBackend: String, CaseIterable, Identifiable, Codable, Senda
 
     var id: String { rawValue }
 
+    var brandHue: (red: Double, green: Double, blue: Double) {
+        switch self {
+        case .codex:
+            return (0.498, 0.580, 1.0)     // #7f94ff
+        case .copilot:
+            return (0.784, 0.596, 0.992)   // #c898fd
+        case .claudeCode:
+            return (1.0, 0.702, 0.420)     // #ffb36b
+        }
+    }
+
     var displayName: String {
         switch self {
         case .codex:

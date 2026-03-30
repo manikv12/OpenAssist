@@ -1,3 +1,4 @@
+import { useState, useRef, useEffect } from "react";
 import type { RuntimePanelState } from "../types";
 
 interface Props {
@@ -7,10 +8,26 @@ interface Props {
 }
 
 export function RuntimePanel({ panel, onSelectBackend, onOpenSettings }: Props) {
+  const [open, setOpen] = useState(false);
+  const dropdownRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    function handleClickOutside(e: MouseEvent) {
+      if (dropdownRef.current && !dropdownRef.current.contains(e.target as Node)) {
+        setOpen(false);
+      }
+    }
+    if (open) {
+      document.addEventListener("mousedown", handleClickOutside);
+      return () => document.removeEventListener("mousedown", handleClickOutside);
+    }
+  }, [open]);
+
   if (!panel) {
     return null;
   }
 
+  const selected = panel.backends.find((b) => b.isSelected);
   const hasSetupAction = typeof panel.setupButtonTitle === "string" && panel.setupButtonTitle.length > 0;
 
   return (
@@ -20,24 +37,45 @@ export function RuntimePanel({ panel, onSelectBackend, onOpenSettings }: Props) 
           <span className="runtime-panel__dot" aria-hidden="true" />
           <span>Runtime</span>
         </div>
-        <div className="runtime-panel__chips" role="group" aria-label="Provider">
-          {panel.backends.map((backend) => (
-            <button
-              key={backend.id}
-              type="button"
-              className={[
-                "runtime-chip",
-                backend.isSelected ? "is-selected" : "",
-              ]
-                .filter(Boolean)
-                .join(" ")}
-              disabled={backend.isDisabled}
-              aria-pressed={backend.isSelected}
-              onClick={() => onSelectBackend(backend.id)}
-            >
-              {backend.label}
-            </button>
-          ))}
+        <div className="runtime-dropdown" ref={dropdownRef}>
+          <button
+            type="button"
+            className="runtime-dropdown__trigger"
+            onClick={() => setOpen((v) => !v)}
+            aria-haspopup="listbox"
+            aria-expanded={open}
+          >
+            <span className="runtime-dropdown__dot" />
+            <span>{selected?.label ?? "Select"}</span>
+            <svg className="runtime-dropdown__chevron" width="10" height="6" viewBox="0 0 10 6" fill="none" aria-hidden="true">
+              <path d="M1 1l4 4 4-4" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
+            </svg>
+          </button>
+          {open && (
+            <ul className="runtime-dropdown__menu" role="listbox">
+              {panel.backends.map((backend) => (
+                <li
+                  key={backend.id}
+                  role="option"
+                  aria-selected={backend.isSelected}
+                  className={[
+                    "runtime-dropdown__item",
+                    backend.isSelected ? "is-selected" : "",
+                    backend.isDisabled ? "is-disabled" : "",
+                  ].filter(Boolean).join(" ")}
+                  onClick={() => {
+                    if (!backend.isDisabled) {
+                      onSelectBackend(backend.id);
+                      setOpen(false);
+                    }
+                  }}
+                >
+                  <span className="runtime-dropdown__item-dot" />
+                  {backend.label}
+                </li>
+              ))}
+            </ul>
+          )}
         </div>
       </div>
 

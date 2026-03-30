@@ -9,6 +9,36 @@ struct LocalAutomationDisplaySnapshot {
     let imageSize: CGSize
     let screenFrame: CGRect
     let imageDataURL: String
+    let captureKind: String
+    let windowID: Int?
+    let displayID: CGDirectDisplayID?
+    let targetAppName: String?
+    let windowTitle: String?
+    let capturedAt: Date
+
+    init(
+        image: CGImage,
+        imageSize: CGSize,
+        screenFrame: CGRect,
+        imageDataURL: String,
+        captureKind: String = "display",
+        windowID: Int? = nil,
+        displayID: CGDirectDisplayID? = nil,
+        targetAppName: String? = nil,
+        windowTitle: String? = nil,
+        capturedAt: Date = Date()
+    ) {
+        self.image = image
+        self.imageSize = imageSize
+        self.screenFrame = screenFrame
+        self.imageDataURL = imageDataURL
+        self.captureKind = captureKind
+        self.windowID = windowID
+        self.displayID = displayID
+        self.targetAppName = targetAppName
+        self.windowTitle = windowTitle
+        self.capturedAt = capturedAt
+    }
 }
 
 enum LocalAutomationError: LocalizedError {
@@ -123,14 +153,25 @@ actor LocalAutomationHelper {
             initialSnapshot = try captureSnapshot()
         }
         var coordinateSnapshot = initialSnapshot
+        var preferredWindowID = previousSnapshot?.windowID
+        var preferredDisplayID = previousSnapshot?.displayID
         for action in actions {
             let type = (action["type"] as? String)?
                 .trimmingCharacters(in: .whitespacesAndNewlines)
                 .lowercased() ?? ""
+            if let actionWindowID = integer(from: action["window_id"]) {
+                preferredWindowID = actionWindowID
+            }
+            if let actionDisplayID = integer(from: action["display_id"]) {
+                preferredDisplayID = CGDirectDisplayID(actionDisplayID)
+            }
 
             switch type {
             case "observe", "screenshot":
-                coordinateSnapshot = try captureSnapshot()
+                coordinateSnapshot = try captureSnapshot(
+                    preferredWindowID: preferredWindowID,
+                    preferredDisplayID: preferredDisplayID
+                )
             case "click":
                 let point = try screenPoint(from: action, snapshot: coordinateSnapshot)
                 try await click(at: point, button: button(from: action["button"] as? String), clickCount: 1)
@@ -167,7 +208,21 @@ actor LocalAutomationHelper {
             try await pause(for: 0.18)
         }
 
-        return try captureSnapshot()
+        return try captureSnapshot(
+            preferredWindowID: preferredWindowID ?? coordinateSnapshot.windowID,
+            preferredDisplayID: preferredDisplayID ?? coordinateSnapshot.displayID
+        )
+    }
+
+    func capturePreferredSnapshot(
+        previousSnapshot: LocalAutomationDisplaySnapshot? = nil,
+        windowID: Int? = nil,
+        displayID: CGDirectDisplayID? = nil
+    ) throws -> LocalAutomationDisplaySnapshot {
+        try captureSnapshot(
+            preferredWindowID: windowID ?? previousSnapshot?.windowID,
+            preferredDisplayID: displayID ?? previousSnapshot?.displayID
+        )
     }
 
     func activateBrowser(_ browser: SupportedBrowser) async throws {
@@ -399,7 +454,51 @@ actor LocalAutomationHelper {
         }
     }
 
-    private func captureSnapshot() throws -> LocalAutomationDisplaySnapshot {
+    private func captureSnapshot(
+        preferredWindowID: Int? = nil,
+        preferredDisplayID: CGDirectDisplayID? = nil
+    ) throws -> LocalAutomationDisplaySnapshot {
+        if let preferredWindowID,
+           let window = AssistantWindowAutomationService.resolveWindow(
+                windowID: preferredWindowID,
+                appName: nil,
+                title: nil,
+                preferFrontmost: false
+           ),
+           let image = AssistantWindowAutomationService.captureWindowImage(for: window) {
+            let imageSize = CGSize(width: image.width, height: image.height)
+            let imageDataURL = try Self.pngDataURL(for: image)
+            return LocalAutomationDisplaySnapshot(
+                image: image,
+                imageSize: imageSize,
+                screenFrame: window.bounds,
+                imageDataURL: imageDataURL,
+                captureKind: "window",
+                windowID: window.windowID,
+                displayID: window.displayID,
+                targetAppName: window.ownerName,
+                windowTitle: window.title
+            )
+        }
+
+        if let preferredDisplayID,
+           let image = AssistantWindowAutomationService.captureDisplayImage(displayID: preferredDisplayID),
+           let screen = AssistantWindowAutomationService.screen(for: preferredDisplayID) {
+            let imageSize = CGSize(width: image.width, height: image.height)
+            let imageDataURL = try Self.pngDataURL(for: image)
+            return LocalAutomationDisplaySnapshot(
+                image: image,
+                imageSize: imageSize,
+                screenFrame: screen.frame,
+                imageDataURL: imageDataURL,
+                captureKind: "display",
+                windowID: nil,
+                displayID: preferredDisplayID,
+                targetAppName: nil,
+                windowTitle: nil
+            )
+        }
+
         guard let screen = Self.activeScreen() else {
             throw LocalAutomationError.screenshotFailed
         }
@@ -418,7 +517,12 @@ actor LocalAutomationHelper {
             image: image,
             imageSize: imageSize,
             screenFrame: screen.frame,
-            imageDataURL: imageDataURL
+            imageDataURL: imageDataURL,
+            captureKind: "display",
+            windowID: nil,
+            displayID: displayID,
+            targetAppName: nil,
+            windowTitle: nil
         )
     }
 
@@ -663,6 +767,11 @@ actor LocalAutomationHelper {
             return Double(text.trimmingCharacters(in: .whitespacesAndNewlines))
         }
         return nil
+    }
+
+    private func integer(from raw: Any?) -> Int? {
+        guard let value = number(from: raw) else { return nil }
+        return Int(value.rounded())
     }
 
     private func calendarDate(from text: String) throws -> Date {

@@ -39,12 +39,10 @@ struct AssistantOrbHUDView: View {
     private let overlayBottomDock: CGFloat = 108
 
     private var showingPopup: Bool {
-        (
-            model.showDoneDetail
+        (model.showDoneDetail
             || model.showWorkingDetail
             || model.pendingPermissionRequest != nil
-            || model.modeSwitchSuggestion != nil
-        ) && !model.isExpanded
+            || model.modeSwitchSuggestion != nil) && !model.isExpanded
     }
 
     /// The popup content area height = total popup height minus the orb section (156pt).
@@ -57,7 +55,8 @@ struct AssistantOrbHUDView: View {
     }
 
     private var overlayContentMaxHeight: CGFloat {
-        let totalHeight = model.isExpanded
+        let totalHeight =
+            model.isExpanded
             ? AssistantOrbHUDModel.Layout.expandedSize.height
             : model.popupSize.height
         return max(180, totalHeight - overlayBottomDock)
@@ -98,8 +97,12 @@ struct AssistantOrbHUDView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
         .frame(
-            width: model.isExpanded ? AssistantOrbHUDModel.Layout.expandedSize.width : (showingPopup ? model.popupSize.width : 140),
-            height: model.isExpanded ? AssistantOrbHUDModel.Layout.expandedSize.height : (showingPopup ? model.popupSize.height : 156),
+            width: model.isExpanded
+                ? AssistantOrbHUDModel.Layout.expandedSize.width
+                : (showingPopup ? model.popupSize.width : 140),
+            height: model.isExpanded
+                ? AssistantOrbHUDModel.Layout.expandedSize.height
+                : (showingPopup ? model.popupSize.height : 156),
             alignment: .bottom
         )
         .popover(item: $previewAttachment, attachmentAnchor: .point(.center)) { attachment in
@@ -142,14 +145,18 @@ struct AssistantOrbHUDView: View {
             }
             .padding(.bottom, overlayBottomDock)
             .transition(.opacity)
-        } else if model.showWorkingDetail && !model.showDoneDetail && model.pendingPermissionRequest == nil {
+        } else if model.showWorkingDetail && !model.showDoneDetail
+            && model.pendingPermissionRequest == nil
+        {
             VStack(spacing: 0) {
                 resizeHandle
                 workingDetailPopup(maxHeight: overlayContentMaxHeight)
             }
             .padding(.bottom, overlayBottomDock)
             .transition(.opacity)
-        } else if model.pendingPermissionRequest != nil && !model.showDoneDetail && !model.showWorkingDetail {
+        } else if model.pendingPermissionRequest != nil && !model.showDoneDetail
+            && !model.showWorkingDetail
+        {
             VStack(spacing: 0) {
                 resizeHandle
                 permissionPopup(maxHeight: overlayContentMaxHeight)
@@ -159,7 +166,8 @@ struct AssistantOrbHUDView: View {
         } else if model.modeSwitchSuggestion != nil
             && !model.showDoneDetail
             && !model.showWorkingDetail
-            && model.pendingPermissionRequest == nil {
+            && model.pendingPermissionRequest == nil
+        {
             VStack(spacing: 0) {
                 resizeHandle
                 modeSwitchPopup(maxHeight: overlayContentMaxHeight)
@@ -180,7 +188,7 @@ struct AssistantOrbHUDView: View {
                             colors: [
                                 glowColor.opacity(0.20),
                                 glowColor.opacity(0.10),
-                                Color.clear
+                                Color.clear,
                             ],
                             center: .center,
                             startRadius: 8,
@@ -213,7 +221,9 @@ struct AssistantOrbHUDView: View {
                         .contentTransition(.opacity)
                 }
 
-                if let detail = model.state.detail, !detail.isEmpty, !model.showDoneDetail, !model.showWorkingDetail {
+                if let detail = model.state.detail, !detail.isEmpty, !model.showDoneDetail,
+                    !model.showWorkingDetail
+                {
                     Text(detail)
                         .font(.system(size: 9.5, weight: .medium))
                         .foregroundStyle(AppVisualTheme.foreground(0.72))
@@ -243,7 +253,8 @@ struct AssistantOrbHUDView: View {
 
     private var orbSphereView: some View {
         let paused = model.state.phase == .idle
-        return TimelineView(.animation(minimumInterval: orbRefreshInterval, paused: paused)) { context in
+        return TimelineView(.animation(minimumInterval: orbRefreshInterval, paused: paused)) {
+            context in
             OrbSphere(
                 phase: model.state.phase,
                 level: CGFloat(model.level),
@@ -347,7 +358,7 @@ struct AssistantOrbHUDView: View {
     }
 
     private func modeSwitchPopup(maxHeight: CGFloat) -> some View {
-        let tint = Color.orange
+        let tint = AppVisualTheme.accentTint
 
         return VStack(spacing: 0) {
             OrbPopupHeader(
@@ -378,7 +389,9 @@ struct AssistantOrbHUDView: View {
     }
 
     @ViewBuilder
-    private func modeSwitchInlineCard(_ suggestion: AssistantModeSwitchSuggestion, tint: Color) -> some View {
+    private func modeSwitchInlineCard(_ suggestion: AssistantModeSwitchSuggestion, tint: Color)
+        -> some View
+    {
         VStack(alignment: .leading, spacing: 10) {
             Text(suggestion.message)
                 .font(.system(size: 11.5, weight: .medium))
@@ -475,9 +488,11 @@ struct AssistantOrbHUDView: View {
                             }
                         }
                     } else {
-                        Text("Detailed step output has not arrived yet, but the agent is still working.")
-                            .font(.system(size: 10.5, weight: .medium))
-                            .foregroundStyle(AppVisualTheme.foreground(0.48))
+                        Text(
+                            "Detailed step output has not arrived yet, but the agent is still working."
+                        )
+                        .font(.system(size: 10.5, weight: .medium))
+                        .foregroundStyle(AppVisualTheme.foreground(0.48))
                     }
                 }
                 .padding(.horizontal, 16)
@@ -502,10 +517,12 @@ struct AssistantOrbHUDView: View {
                     Image(systemName: "sparkles")
                         .font(.system(size: 10, weight: .semibold))
                         .foregroundStyle(tint.opacity(0.85))
-                    Text("Typing here interrupts the current turn and applies your new instruction.")
-                        .font(.system(size: 10.5, weight: .medium))
-                        .foregroundStyle(AppVisualTheme.foreground(0.58))
-                        .fixedSize(horizontal: false, vertical: true)
+                    Text(
+                        "Typing here interrupts the current turn and applies your new instruction."
+                    )
+                    .font(.system(size: 10.5, weight: .medium))
+                    .foregroundStyle(AppVisualTheme.foreground(0.58))
+                    .fixedSize(horizontal: false, vertical: true)
                     Spacer(minLength: 0)
                 }
                 .padding(.horizontal, 10)
@@ -547,7 +564,9 @@ struct AssistantOrbHUDView: View {
                             Image(nsImage: nsImage)
                                 .resizable()
                                 .aspectRatio(contentMode: .fit)
-                                .frame(maxWidth: .infinity, maxHeight: maxHeight, alignment: .leading)
+                                .frame(
+                                    maxWidth: .infinity, maxHeight: maxHeight, alignment: .leading
+                                )
                                 .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
                                 .overlay(
                                     RoundedRectangle(cornerRadius: 16, style: .continuous)
@@ -601,7 +620,8 @@ struct AssistantOrbHUDView: View {
                                 .lineLimit(4)
                                 .padding(10)
                                 .frame(maxWidth: .infinity, alignment: .leading)
-                                .orbInsetSurface(tint: orangeTint, cornerRadius: 14, fillOpacity: 0.08)
+                                .orbInsetSurface(
+                                    tint: orangeTint, cornerRadius: 14, fillOpacity: 0.08)
                         }
 
                         if request.hasStructuredUserInput {
@@ -629,7 +649,9 @@ struct AssistantOrbHUDView: View {
                                     }
                                 }
 
-                                if let toolKind = request.toolKind, !toolKind.isEmpty, toolKind != "userInput", toolKind != "browserLogin" {
+                                if let toolKind = request.toolKind, !toolKind.isEmpty,
+                                    toolKind != "userInput", toolKind != "browserLogin"
+                                {
                                     OrbPermissionChoiceButton(
                                         title: "Always Allow",
                                         tint: orangeTint,
@@ -637,14 +659,18 @@ struct AssistantOrbHUDView: View {
                                         icon: "checkmark.shield.fill"
                                     ) {
                                         model.onAlwaysAllowPermission?(toolKind)
-                                        if let optionID = assistantAlwaysAllowOptionID(for: request) {
+                                        if let optionID = assistantAlwaysAllowOptionID(for: request)
+                                        {
                                             model.onResolvePermission?(optionID)
                                         }
                                     }
                                 }
                             }
 
-                            OrbSecondaryActionButton(title: "Cancel Request", symbol: "xmark", tint: AppVisualTheme.foreground(0.55)) {
+                            OrbSecondaryActionButton(
+                                title: "Cancel Request", symbol: "xmark",
+                                tint: AppVisualTheme.foreground(0.55)
+                            ) {
                                 model.onCancelPermission?()
                             }
                             .frame(maxWidth: .infinity, alignment: .center)
@@ -738,7 +764,9 @@ struct AssistantOrbHUDView: View {
                                 Button {
                                     model.showFollowUpPreview(for: session)
                                 } label: {
-                                    Label("Show Follow-Up", systemImage: "bubble.left.and.bubble.right.fill")
+                                    Label(
+                                        "Show Follow-Up",
+                                        systemImage: "bubble.left.and.bubble.right.fill")
                                 }
 
                                 if session.isTemporary {
@@ -768,11 +796,11 @@ struct AssistantOrbHUDView: View {
             // Message input with inline mode + model picker
             VStack(spacing: 6) {
                 if !model.attachments.isEmpty {
-                    orbAttachmentStrip(tint: glowColor)
+                    orbAttachmentStrip(tint: AppVisualTheme.accentTint)
                 }
 
                 HStack(alignment: .center, spacing: 6) {
-                    orbAttachmentButton(tint: glowColor, size: 24)
+                    orbAttachmentButton(tint: AppVisualTheme.accentTint, size: 24)
 
                     AssistantModePicker(selection: model.interactionMode, style: .micro) { mode in
                         model.setInteractionMode(mode)
@@ -797,11 +825,11 @@ struct AssistantOrbHUDView: View {
 
                     HStack(spacing: 5) {
                         orbVoiceToggleButton(size: 20)
-                        liveVoiceEndButton(tint: glowColor)
+                        liveVoiceEndButton(tint: AppVisualTheme.accentTint)
 
                         OrbFloatingActionButton(
                             symbol: "arrow.up",
-                            tint: glowColor,
+                            tint: AppVisualTheme.accentTint,
                             isEnabled: canSend && !model.isVoiceRecording,
                             size: 20
                         ) {
@@ -918,7 +946,8 @@ struct AssistantOrbHUDView: View {
     }
 
     private var canSend: Bool {
-        !model.messageText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !model.attachments.isEmpty
+        !model.messageText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            || !model.attachments.isEmpty
     }
 
     private var orbDropTypes: [UTType] {
@@ -966,11 +995,13 @@ struct AssistantOrbHUDView: View {
         case .sending:
             return model.liveVoiceSnapshot.transcriptStatusText ?? "Waiting for the final answer"
         case .waitingForPermission:
-            return model.liveVoiceSnapshot.transcriptStatusText ?? "Approve to continue the live turn"
+            return model.liveVoiceSnapshot.transcriptStatusText
+                ?? "Approve to continue the live turn"
         case .speaking:
             return model.liveVoiceSnapshot.transcriptStatusText ?? "Tap speaker to interrupt"
         case .paused:
-            return model.liveVoiceSnapshot.transcriptStatusText ?? model.liveVoiceSnapshot.displayText
+            return model.liveVoiceSnapshot.transcriptStatusText
+                ?? model.liveVoiceSnapshot.displayText
         }
     }
 
@@ -1186,8 +1217,11 @@ struct AssistantOrbHUDView: View {
         if request.toolKind == "browserLogin" {
             return "LOGIN NEEDED"
         }
-        let normalizedTitle = request.toolTitle.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        if normalizedTitle.contains("information") || normalizedTitle.contains("input") || normalizedTitle.contains("question") {
+        let normalizedTitle = request.toolTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        if normalizedTitle.contains("information") || normalizedTitle.contains("input")
+            || normalizedTitle.contains("question")
+        {
             return "INPUT NEEDED"
         }
         if normalizedTitle.contains("login") || normalizedTitle.contains("sign in") {
@@ -1257,7 +1291,8 @@ struct AssistantOrbHUDView: View {
 
     private func sessionMatches(_ lhs: String?, _ rhs: String?) -> Bool {
         guard let lhs = lhs?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty,
-              let rhs = rhs?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+            let rhs = rhs?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+        else {
             return false
         }
         return lhs.caseInsensitiveCompare(rhs) == .orderedSame
@@ -1293,7 +1328,8 @@ struct AssistantNotchHUDView: View {
     }
 
     private var showingWorkingPeek: Bool {
-        model.showWorkingDetail && !isTrayExpanded && !showingPermissionPeek && !showingCompletionPeek
+        model.showWorkingDetail && !isTrayExpanded && !showingPermissionPeek
+            && !showingCompletionPeek
     }
 
     private var showingComposerPeek: Bool {
@@ -1314,7 +1350,8 @@ struct AssistantNotchHUDView: View {
     }
 
     private var showingCompactCard: Bool {
-        showingPermissionPeek || showingCompletionPeek || showingWorkingPeek || showingComposerPeek || showingModeSwitchPeek
+        showingPermissionPeek || showingCompletionPeek || showingWorkingPeek || showingComposerPeek
+            || showingModeSwitchPeek
     }
 
     private var glowColor: Color {
@@ -1338,7 +1375,8 @@ struct AssistantNotchHUDView: View {
     }
 
     private var canSend: Bool {
-        !model.messageText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !model.attachments.isEmpty
+        !model.messageText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            || !model.attachments.isEmpty
     }
 
     @ViewBuilder
@@ -1448,7 +1486,9 @@ struct AssistantNotchHUDView: View {
     }
 
     private var collapsedContainerHeight: CGFloat {
-        model.notchDockRevealed ? Layout.collapsedSize.height : max(2, model.notchDockVisibleHeight) + notchActiveGlowExtension
+        model.notchDockRevealed
+            ? Layout.collapsedSize.height
+            : max(2, model.notchDockVisibleHeight) + notchActiveGlowExtension
     }
 
     private var bodyHeight: CGFloat {
@@ -1462,15 +1502,20 @@ struct AssistantNotchHUDView: View {
     }
 
     private var liveSummary: String {
-        if let detail = model.state.detail?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
+        if let detail = model.state.detail?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+        {
             return detail
         }
         // Only show tool activity details while the assistant is actively working
         if model.state.phase.isActive {
-            if let hudDetail = model.workingToolActivity.first?.hudDetail?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
+            if let hudDetail = model.workingToolActivity.first?.hudDetail?.trimmingCharacters(
+                in: .whitespacesAndNewlines
+            ).nonEmpty {
                 return hudDetail
             }
-            if let activityDetail = model.workingToolActivity.first?.detail?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
+            if let activityDetail = model.workingToolActivity.first?.detail?.trimmingCharacters(
+                in: .whitespacesAndNewlines
+            ).nonEmpty {
                 return activityDetail
             }
         }
@@ -1506,8 +1551,13 @@ struct AssistantNotchHUDView: View {
                 }
 
                 collapsedPill
-                    .frame(width: Layout.collapsedSize.width, height: Layout.collapsedSize.height, alignment: .top)
-                    .opacity((!isTrayExpanded && !showingCompactCard) ? (model.notchDockRevealed ? 1 : 0) : 1)
+                    .frame(
+                        width: Layout.collapsedSize.width, height: Layout.collapsedSize.height,
+                        alignment: .top
+                    )
+                    .opacity(
+                        (!isTrayExpanded && !showingCompactCard)
+                            ? (model.notchDockRevealed ? 1 : 0) : 1)
             }
             .frame(height: collapsedContainerHeight)
             .clipped()
@@ -1532,7 +1582,8 @@ struct AssistantNotchHUDView: View {
         .animation(.easeInOut(duration: 0.35), value: model.state.phase)
         .animation(.spring(response: 0.32, dampingFraction: 0.88), value: isTrayExpanded)
         .animation(.spring(response: 0.32, dampingFraction: 0.88), value: showingCompactCard)
-        .popover(item: $previewAttachment, attachmentAnchor: .point(.center), arrowEdge: .top) { attachment in
+        .popover(item: $previewAttachment, attachmentAnchor: .point(.center), arrowEdge: .top) {
+            attachment in
             if let nsImage = NSImage(data: attachment.data) {
                 VStack {
                     HStack {
@@ -1562,7 +1613,9 @@ struct AssistantNotchHUDView: View {
     private var hiddenDockHandle: some View {
         let handleHeight = max(2, model.notchDockVisibleHeight)
         VStack(spacing: 0) {
-            if model.notchUsesHardwareOutline, model.notchHardwareOutlineSize.width > 0, model.notchHardwareOutlineSize.height > 0 {
+            if model.notchUsesHardwareOutline, model.notchHardwareOutlineSize.width > 0,
+                model.notchHardwareOutlineSize.height > 0
+            {
                 HardwareNotchDockHandle(
                     width: bodyWidth,
                     height: handleHeight,
@@ -1657,7 +1710,8 @@ struct AssistantNotchHUDView: View {
                                     .fill(collapsedBadgeTint.opacity(0.10))
                                     .overlay(
                                         Capsule(style: .continuous)
-                                            .stroke(collapsedBadgeTint.opacity(0.14), lineWidth: 0.5)
+                                            .stroke(
+                                                collapsedBadgeTint.opacity(0.14), lineWidth: 0.5)
                                     )
                             )
 
@@ -1674,7 +1728,9 @@ struct AssistantNotchHUDView: View {
                                             .fill(AppVisualTheme.surfaceFill(0.05))
                                             .overlay(
                                                 Circle()
-                                                    .stroke(AppVisualTheme.surfaceStroke(0.08), lineWidth: 0.5)
+                                                    .stroke(
+                                                        AppVisualTheme.surfaceStroke(0.08),
+                                                        lineWidth: 0.5)
                                             )
                                     )
                             }
@@ -1696,7 +1752,8 @@ struct AssistantNotchHUDView: View {
                     )
                     .overlay(
                         Capsule(style: .continuous)
-                            .stroke(AppVisualTheme.surfaceStroke(isDark ? 0.08 : 0.10), lineWidth: 0.5)
+                            .stroke(
+                                AppVisualTheme.surfaceStroke(isDark ? 0.08 : 0.10), lineWidth: 0.5)
                     )
             }
         }
@@ -1733,9 +1790,12 @@ struct AssistantNotchHUDView: View {
     private func completionPeekCard(_ detail: String) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 8) {
-                Image(systemName: model.state.phase == .failed ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
-                    .font(.system(size: 10.5, weight: .semibold))
-                    .foregroundStyle(model.state.phase == .failed ? Color.orange : glowColor)
+                Image(
+                    systemName: model.state.phase == .failed
+                        ? "exclamationmark.triangle.fill" : "checkmark.circle.fill"
+                )
+                .font(.system(size: 10.5, weight: .semibold))
+                .foregroundStyle(model.state.phase == .failed ? Color.orange : glowColor)
 
                 Text(model.state.phase == .failed ? "Needs attention" : "Response ready")
                     .font(.system(size: 11.5, weight: .semibold))
@@ -1748,13 +1808,17 @@ struct AssistantNotchHUDView: View {
 
                 Spacer(minLength: 0)
 
-                OrbIconOnlySecondaryButton(symbol: "rectangle.split.3x1.fill", tint: AppVisualTheme.accentTint) {
+                OrbIconOnlySecondaryButton(
+                    symbol: "rectangle.split.3x1.fill", tint: AppVisualTheme.accentTint
+                ) {
                     withAnimation(.spring(response: 0.26, dampingFraction: 0.90)) {
                         model.expand()
                     }
                 }
 
-                OrbIconOnlySecondaryButton(symbol: "arrow.up.right.square", tint: AppVisualTheme.accentTint) {
+                OrbIconOnlySecondaryButton(
+                    symbol: "arrow.up.right.square", tint: AppVisualTheme.accentTint
+                ) {
                     model.openSelectedSessionInMainWindow()
                 }
 
@@ -1793,7 +1857,7 @@ struct AssistantNotchHUDView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
 
             compactFollowUpComposer(
-                tint: glowColor,
+                tint: AppVisualTheme.accentTint,
                 placeholder: model.isVoiceRecording ? "Listening..." : "Follow up...",
                 helperText: "Send the next step from here."
             )
@@ -1801,7 +1865,9 @@ struct AssistantNotchHUDView: View {
         .padding(14)
         .frame(maxWidth: .infinity, alignment: .topLeading)
         .frame(maxHeight: compactCardHeight)
-        .notchInsetSurface(tint: model.state.phase == .failed ? .orange : glowColor, cornerRadius: 22, fillOpacity: 0.10)
+        .notchInsetSurface(
+            tint: model.state.phase == .failed ? .orange : glowColor, cornerRadius: 22,
+            fillOpacity: 0.10)
     }
 
     private var workingPeekCard: some View {
@@ -1827,13 +1893,17 @@ struct AssistantNotchHUDView: View {
                     }
                 }
 
-                OrbIconOnlySecondaryButton(symbol: "rectangle.split.3x1.fill", tint: AppVisualTheme.accentTint) {
+                OrbIconOnlySecondaryButton(
+                    symbol: "rectangle.split.3x1.fill", tint: AppVisualTheme.accentTint
+                ) {
                     withAnimation(.spring(response: 0.26, dampingFraction: 0.90)) {
                         model.expand()
                     }
                 }
 
-                OrbIconOnlySecondaryButton(symbol: "arrow.up.right.square", tint: AppVisualTheme.accentTint) {
+                OrbIconOnlySecondaryButton(
+                    symbol: "arrow.up.right.square", tint: AppVisualTheme.accentTint
+                ) {
                     model.openSelectedSessionInMainWindow()
                 }
 
@@ -1914,9 +1984,11 @@ struct AssistantNotchHUDView: View {
                             }
                         }
                     } else {
-                        Text("Detailed step output has not arrived yet, but the assistant is still working.")
-                            .font(.system(size: 10.5, weight: .medium))
-                            .foregroundStyle(AppVisualTheme.foreground(0.52))
+                        Text(
+                            "Detailed step output has not arrived yet, but the assistant is still working."
+                        )
+                        .font(.system(size: 10.5, weight: .medium))
+                        .foregroundStyle(AppVisualTheme.foreground(0.52))
                     }
                 }
                 .padding(.horizontal, 2)
@@ -1925,8 +1997,9 @@ struct AssistantNotchHUDView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
 
             compactFollowUpComposer(
-                tint: glowColor,
-                placeholder: model.isVoiceRecording ? "Listening..." : "Steer it or add the next step...",
+                tint: AppVisualTheme.accentTint,
+                placeholder: model.isVoiceRecording
+                    ? "Listening..." : "Steer it or add the next step...",
                 helperText: "Sending here updates the current work."
             )
         }
@@ -1954,13 +2027,17 @@ struct AssistantNotchHUDView: View {
 
                 Spacer(minLength: 0)
 
-                OrbIconOnlySecondaryButton(symbol: "rectangle.split.3x1.fill", tint: AppVisualTheme.accentTint) {
+                OrbIconOnlySecondaryButton(
+                    symbol: "rectangle.split.3x1.fill", tint: AppVisualTheme.accentTint
+                ) {
                     withAnimation(.spring(response: 0.26, dampingFraction: 0.90)) {
                         model.expand()
                     }
                 }
 
-                OrbIconOnlySecondaryButton(symbol: "arrow.up.right.square", tint: AppVisualTheme.accentTint) {
+                OrbIconOnlySecondaryButton(
+                    symbol: "arrow.up.right.square", tint: AppVisualTheme.accentTint
+                ) {
                     model.openSelectedSessionInMainWindow()
                 }
 
@@ -2002,7 +2079,7 @@ struct AssistantNotchHUDView: View {
             HStack(spacing: 8) {
                 Image(systemName: "arrow.triangle.branch")
                     .font(.system(size: 10.5, weight: .semibold))
-                    .foregroundStyle(Color.orange)
+                    .foregroundStyle(AppVisualTheme.accentTint)
 
                 Text("Mode switch")
                     .font(.system(size: 11.5, weight: .semibold))
@@ -2015,7 +2092,9 @@ struct AssistantNotchHUDView: View {
 
                 Spacer(minLength: 0)
 
-                OrbIconOnlySecondaryButton(symbol: "rectangle.split.3x1.fill", tint: AppVisualTheme.accentTint) {
+                OrbIconOnlySecondaryButton(
+                    symbol: "rectangle.split.3x1.fill", tint: AppVisualTheme.accentTint
+                ) {
                     withAnimation(.spring(response: 0.26, dampingFraction: 0.90)) {
                         model.expand()
                     }
@@ -2047,7 +2126,7 @@ struct AssistantNotchHUDView: View {
         .padding(14)
         .frame(maxWidth: .infinity, alignment: .topLeading)
         .frame(maxHeight: compactCardHeight)
-        .notchInsetSurface(tint: .orange, cornerRadius: 22, fillOpacity: 0.11)
+        .notchInsetSurface(tint: AppVisualTheme.accentTint, cornerRadius: 22, fillOpacity: 0.11)
     }
 
     private func permissionPeekCard(_ request: AssistantPermissionRequest) -> some View {
@@ -2068,7 +2147,9 @@ struct AssistantNotchHUDView: View {
 
                 Spacer(minLength: 0)
 
-                OrbIconOnlySecondaryButton(symbol: "rectangle.split.3x1.fill", tint: AppVisualTheme.accentTint) {
+                OrbIconOnlySecondaryButton(
+                    symbol: "rectangle.split.3x1.fill", tint: AppVisualTheme.accentTint
+                ) {
                     withAnimation(.spring(response: 0.26, dampingFraction: 0.90)) {
                         model.expand()
                     }
@@ -2163,7 +2244,10 @@ struct AssistantNotchHUDView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         }
         .padding(14)
-        .frame(maxWidth: Layout.compactCardSize.width, maxHeight: compactCardHeight, alignment: .topLeading)
+        .frame(
+            maxWidth: Layout.compactCardSize.width, maxHeight: compactCardHeight,
+            alignment: .topLeading
+        )
         .notchInsetSurface(tint: .orange, cornerRadius: 22, fillOpacity: 0.12)
     }
 
@@ -2223,7 +2307,9 @@ struct AssistantNotchHUDView: View {
         }
     }
 
-    private func compactModeSwitchInlineCard(_ suggestion: AssistantModeSwitchSuggestion) -> some View {
+    private func compactModeSwitchInlineCard(_ suggestion: AssistantModeSwitchSuggestion)
+        -> some View
+    {
         VStack(alignment: .leading, spacing: 8) {
             Text(suggestion.message)
                 .font(.system(size: 10.5, weight: .medium))
@@ -2235,7 +2321,7 @@ struct AssistantNotchHUDView: View {
                     OrbSecondaryActionButton(
                         title: choice.title,
                         symbol: choice.mode.icon,
-                        tint: .orange
+                        tint: AppVisualTheme.accentTint
                     ) {
                         model.interactionMode = choice.mode
                         model.onApplyModeSwitchSuggestion?(choice)
@@ -2245,7 +2331,7 @@ struct AssistantNotchHUDView: View {
         }
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .notchInsetSurface(tint: .orange, cornerRadius: 18, fillOpacity: 0.09)
+        .notchInsetSurface(tint: AppVisualTheme.accentTint, cornerRadius: 18, fillOpacity: 0.09)
     }
 
     private var notchStatusBadge: some View {
@@ -2262,7 +2348,9 @@ struct AssistantNotchHUDView: View {
                     ForEach(0..<3, id: \.self) { index in
                         Capsule(style: .continuous)
                             .fill(collapsedBadgeTint.opacity(0.82))
-                            .frame(width: 2.5, height: 8 + (CGFloat(index) * 3) + CGFloat(model.level * 8))
+                            .frame(
+                                width: 2.5,
+                                height: 8 + (CGFloat(index) * 3) + CGFloat(model.level * 8))
                     }
                 }
             } else {
@@ -2285,7 +2373,9 @@ struct AssistantNotchHUDView: View {
                     compactNewSessionTextButton(title: "New")
 
                     if model.selectedSessionIsTemporary {
-                        OrbSecondaryActionButton(title: "Keep", symbol: "pin", tint: AppVisualTheme.accentTint) {
+                        OrbSecondaryActionButton(
+                            title: "Keep", symbol: "pin", tint: AppVisualTheme.accentTint
+                        ) {
                             model.promoteSelectedTemporarySession()
                         }
                     }
@@ -2321,7 +2411,9 @@ struct AssistantNotchHUDView: View {
                                 Button {
                                     model.showFollowUpPreview(for: session)
                                 } label: {
-                                    Label("Show Follow-Up", systemImage: "bubble.left.and.bubble.right.fill")
+                                    Label(
+                                        "Show Follow-Up",
+                                        systemImage: "bubble.left.and.bubble.right.fill")
                                 }
 
                                 Button {
@@ -2450,7 +2542,10 @@ struct AssistantNotchHUDView: View {
                 subtitle: "Stay in compact view",
                 symbol: "paperplane.fill"
             ) {
-                OrbSecondaryActionButton(title: "Open Chat", symbol: "arrow.up.right.square", tint: AppVisualTheme.accentTint) {
+                OrbSecondaryActionButton(
+                    title: "Open Chat", symbol: "arrow.up.right.square",
+                    tint: AppVisualTheme.accentTint
+                ) {
                     model.openSelectedSessionInMainWindow()
                 }
             }
@@ -2467,7 +2562,7 @@ struct AssistantNotchHUDView: View {
                             OrbSecondaryActionButton(
                                 title: choice.title,
                                 symbol: choice.mode.icon,
-                                tint: .orange
+                                tint: AppVisualTheme.accentTint
                             ) {
                                 model.interactionMode = choice.mode
                                 model.onApplyModeSwitchSuggestion?(choice)
@@ -2476,7 +2571,8 @@ struct AssistantNotchHUDView: View {
                     }
                 }
                 .padding(12)
-                .notchInsetSurface(tint: .orange, cornerRadius: 18, fillOpacity: 0.09)
+                .notchInsetSurface(
+                    tint: AppVisualTheme.accentTint, cornerRadius: 18, fillOpacity: 0.09)
             }
 
             if let name = model.targetSessionName {
@@ -2489,6 +2585,7 @@ struct AssistantNotchHUDView: View {
 
             HStack(alignment: .center, spacing: 8) {
                 notchAttachmentButton(tint: AppVisualTheme.accentTint)
+                notchProviderPicker(tint: AppVisualTheme.accentTint)
                 AssistantModePicker(selection: model.interactionMode, style: .compact) { mode in
                     model.setInteractionMode(mode)
                 }
@@ -2589,7 +2686,8 @@ struct AssistantNotchHUDView: View {
     @ViewBuilder
     private func compactKeepChatTopBarButton() -> some View {
         if model.selectedSessionIsTemporary {
-            OrbSecondaryActionButton(title: "Keep", symbol: "pin", tint: AppVisualTheme.accentTint) {
+            OrbSecondaryActionButton(title: "Keep", symbol: "pin", tint: AppVisualTheme.accentTint)
+            {
                 model.promoteSelectedTemporarySession()
             }
             .help("Keep this temporary chat as a regular thread.")
@@ -2675,6 +2773,60 @@ struct AssistantNotchHUDView: View {
                         .stroke(AppVisualTheme.surfaceStroke(0.06), lineWidth: 0.6)
                 )
         )
+    }
+
+    private func notchProviderPicker(tint: Color) -> some View {
+        let isDisabled =
+            model.isSelectedSessionBackendPinned || model.selectableAssistantBackends.count <= 1
+        let picker = Menu {
+            ForEach(model.selectableAssistantBackends) { backend in
+                Button {
+                    model.onChooseBackend?(backend)
+                } label: {
+                    Text(backend.displayName)
+                }
+            }
+        } label: {
+            HStack(spacing: 6) {
+                AssistantGlyphBadge(
+                    symbol: "point.3.filled.connected.trianglepath.dotted",
+                    tint: tint,
+                    side: 16,
+                    fillOpacity: 0.14,
+                    strokeOpacity: 0.22,
+                    symbolScale: 0.46
+                )
+                Text(model.visibleAssistantBackend.shortDisplayName)
+                    .font(.system(size: 9.5, weight: .medium))
+                    .foregroundStyle(AppVisualTheme.foreground(0.60))
+                    .lineLimit(1)
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 5.5, weight: .bold))
+                    .foregroundStyle(AppVisualTheme.foreground(0.18))
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 5)
+            .background(
+                Capsule(style: .continuous)
+                    .fill(AppVisualTheme.surfaceFill(0.06))
+                    .overlay(
+                        Capsule(style: .continuous)
+                            .stroke(AppVisualTheme.surfaceStroke(0.06), lineWidth: 0.5)
+                    )
+            )
+        }
+        .menuStyle(.borderlessButton)
+        .disabled(isDisabled)
+
+        return Group {
+            if let helpText = model.selectedSessionBackendHelpText?.trimmingCharacters(
+                in: .whitespacesAndNewlines
+            ).nonEmpty {
+                picker.help(helpText)
+            } else {
+                picker
+            }
+        }
     }
 
     private func notchModelPicker(tint: Color) -> some View {
@@ -2799,7 +2951,8 @@ struct AssistantNotchHUDView: View {
                                     .resizable()
                                     .aspectRatio(contentMode: .fill)
                                     .frame(width: 22, height: 22)
-                                    .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                                    .clipShape(
+                                        RoundedRectangle(cornerRadius: 6, style: .continuous))
                             }
                             .buttonStyle(.plain)
                         } else {
@@ -2868,20 +3021,23 @@ struct AssistantNotchHUDView: View {
 
     private var completionPeekSummary: String {
         guard let detail = model.doneDetailText?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !detail.isEmpty else {
+            !detail.isEmpty
+        else {
             return model.state.phase == .failed
                 ? "The agent finished with an issue. Open the notch to review the result."
                 : "The latest reply is ready. Open the notch to read it."
         }
 
-        return detail
+        return
+            detail
             .replacingOccurrences(of: "\n", with: " ")
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private func sessionMatches(_ lhs: String?, _ rhs: String?) -> Bool {
         guard let lhs = lhs?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty,
-              let rhs = rhs?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+            let rhs = rhs?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+        else {
             return false
         }
         return lhs.caseInsensitiveCompare(rhs) == .orderedSame
@@ -2913,7 +3069,9 @@ struct AssistantNotchHUDView: View {
                             Image(nsImage: nsImage)
                                 .resizable()
                                 .aspectRatio(contentMode: .fit)
-                                .frame(maxWidth: .infinity, maxHeight: maxHeight, alignment: .leading)
+                                .frame(
+                                    maxWidth: .infinity, maxHeight: maxHeight, alignment: .leading
+                                )
                                 .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
                                 .overlay(
                                     RoundedRectangle(cornerRadius: 16, style: .continuous)

@@ -80,6 +80,11 @@ actor AssistantImageGenerationService {
         let mimeType: String
     }
 
+    private struct ReferenceImage: Sendable {
+        let data: Data
+        let mimeType: String
+    }
+
     private let session: URLSession
     private let configurationProvider: @MainActor @Sendable () -> GeminiImageGenerationConfiguration
 
@@ -93,11 +98,19 @@ actor AssistantImageGenerationService {
         self.configurationProvider = configurationProvider
     }
 
-    func run(arguments: Any, preferredModelID _: String?) async -> AssistantToolExecutionResult {
+    func run(
+        arguments: Any,
+        referenceImages: [AssistantAttachment] = [],
+        preferredModelID _: String?
+    ) async -> AssistantToolExecutionResult {
         do {
             let request = try Self.parseRequest(from: arguments)
             let configuration = await MainActor.run { configurationProvider() }
-            return try await generateImage(for: request, configuration: configuration)
+            return try await generateImage(
+                for: request,
+                referenceImages: referenceImages.compactMap(Self.referenceImage(from:)),
+                configuration: configuration
+            )
         } catch let error as AssistantImageGenerationServiceError {
             let summary = error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
             return Self.failureResult(summary: summary)
@@ -135,6 +148,7 @@ actor AssistantImageGenerationService {
 
     private func generateImage(
         for request: ParsedRequest,
+        referenceImages: [ReferenceImage],
         configuration: GeminiImageGenerationConfiguration
     ) async throws -> AssistantToolExecutionResult {
         let apiKey = configuration.apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -162,13 +176,21 @@ actor AssistantImageGenerationService {
             throw AssistantImageGenerationServiceError.invalidBaseURL
         }
 
+        var parts: [[String: Any]] = referenceImages.map { image in
+            [
+                "inline_data": [
+                    "mime_type": image.mimeType,
+                    "data": image.data.base64EncodedString()
+                ]
+            ]
+        }
+        parts.append(["text": request.prompt])
+
         let payload: [String: Any] = [
             "contents": [
                 [
                     "role": "user",
-                    "parts": [
-                        ["text": request.prompt]
-                    ]
+                    "parts": parts
                 ]
             ],
             "generationConfig": [
@@ -204,8 +226,16 @@ actor AssistantImageGenerationService {
             : "Generated \(decoded.images.count) images with Google Gemini."
 
         var items: [AssistantToolExecutionResult.ContentItem] = [
-            .init(type: "inputText", text: summary, imageURL: nil)
+            .init(type: "inputText", text: summary, imageURL: nil),
+            .init(type: "inputText", text: "The image tool succeeded.", imageURL: nil)
         ]
+        if !referenceImages.isEmpty {
+            items.append(.init(
+                type: "inputText",
+                text: "Used the attached image reference(s) while generating this image.",
+                imageURL: nil
+            ))
+        }
         if let detail = decoded.text?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
             items.append(.init(type: "inputText", text: detail, imageURL: nil))
         }
@@ -287,6 +317,15 @@ actor AssistantImageGenerationService {
 
     private func dataURLString(for image: GeneratedImage) -> String {
         "data:\(image.mimeType);base64,\(image.data.base64EncodedString())"
+    }
+
+    private static func referenceImage(from attachment: AssistantAttachment) -> ReferenceImage? {
+        guard attachment.isImage else { return nil }
+        let mimeType = attachment.mimeType.trimmingCharacters(in: .whitespacesAndNewlines)
+        return ReferenceImage(
+            data: attachment.data,
+            mimeType: mimeType.isEmpty ? "image/png" : mimeType
+        )
     }
 
     private func urlByAppendingPath(baseURL: String, path: String) -> URL? {

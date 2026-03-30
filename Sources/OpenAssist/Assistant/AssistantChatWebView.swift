@@ -11,6 +11,7 @@ struct AssistantChatWebView: NSViewRepresentable {
     let reviewPanel: AssistantChatWebCodeReviewPanel?
     let rewindState: AssistantChatWebRewindState?
     let threadNoteState: AssistantChatWebThreadNoteState?
+    let activeWorkState: AssistantChatWebActiveWorkState?
     let showTypingIndicator: Bool
     let typingTitle: String
     let typingDetail: String
@@ -60,6 +61,7 @@ struct AssistantChatWebView: NSViewRepresentable {
         container.applyReviewPanel(reviewPanel)
         container.applyRewindState(rewindState)
         container.applyThreadNoteState(threadNoteState)
+        container.applyActiveWorkState(activeWorkState)
         container.applyTypingIndicator(
             showTypingIndicator, title: typingTitle, detail: typingDetail)
         container.applyTextScale(textScale)
@@ -92,6 +94,7 @@ struct AssistantChatWebView: NSViewRepresentable {
         container.applyReviewPanel(reviewPanel)
         container.applyRewindState(rewindState)
         container.applyThreadNoteState(threadNoteState)
+        container.applyActiveWorkState(activeWorkState)
         container.applyTypingIndicator(
             showTypingIndicator, title: typingTitle, detail: typingDetail)
         container.applyTextScale(textScale)
@@ -319,35 +322,278 @@ struct AssistantChatWebRewindState: Equatable {
     }
 }
 
-struct AssistantChatWebThreadNoteState: Equatable {
-    let threadID: String?
-    let text: String
-    let isOpen: Bool
-    let hasNote: Bool
-    let isSaving: Bool
-    let lastSavedAtLabel: String?
-    let canEdit: Bool
-    let placeholder: String
+struct AssistantChatWebThreadNoteItem: Equatable {
+    let id: String
+    let title: String
+    let updatedAtLabel: String?
+    let ownerKind: String
+    let ownerID: String
+    let sourceLabel: String
+
+    func toJSON() -> [String: Any] {
+        var json: [String: Any] = [
+            "id": id,
+            "title": title,
+            "ownerKind": ownerKind,
+            "ownerId": ownerID,
+            "sourceLabel": sourceLabel,
+        ]
+        if let updatedAtLabel {
+            json["updatedAtLabel"] = updatedAtLabel
+        }
+        return json
+    }
+}
+
+struct AssistantChatWebThreadNoteAIPreview: Equatable {
+    let mode: String
+    let sourceKind: String
+    let markdown: String
+    let isError: Bool
 
     func toJSON() -> [String: Any] {
         [
+            "mode": mode,
+            "sourceKind": sourceKind,
+            "markdown": markdown,
+            "isError": isError,
+        ]
+    }
+}
+
+struct AssistantChatWebThreadNoteSource: Equatable {
+    let ownerKind: String
+    let ownerID: String
+    let ownerTitle: String
+    let sourceLabel: String
+
+    func toJSON() -> [String: Any] {
+        [
+            "ownerKind": ownerKind,
+            "ownerId": ownerID,
+            "ownerTitle": ownerTitle,
+            "sourceLabel": sourceLabel,
+        ]
+    }
+}
+
+struct AssistantChatWebThreadNoteState: Equatable {
+    let threadID: String?
+    let ownerKind: String?
+    let ownerID: String?
+    let ownerTitle: String
+    let presentation: String
+    let availableSources: [AssistantChatWebThreadNoteSource]
+    let notes: [AssistantChatWebThreadNoteItem]
+    let selectedNoteID: String?
+    let selectedNoteTitle: String
+    let text: String
+    let isOpen: Bool
+    let isExpanded: Bool
+    let viewMode: String
+    let hasAnyNotes: Bool
+    let isSaving: Bool
+    let isGeneratingAIDraft: Bool
+    let aiDraftMode: String?
+    let lastSavedAtLabel: String?
+    let canEdit: Bool
+    let placeholder: String
+    let aiDraftPreview: AssistantChatWebThreadNoteAIPreview?
+
+    func toJSON() -> [String: Any] {
+        var json: [String: Any] = [
             "threadId": threadID ?? NSNull(),
+            "ownerKind": ownerKind ?? NSNull(),
+            "ownerId": ownerID ?? NSNull(),
+            "ownerTitle": ownerTitle,
+            "presentation": presentation,
+            "availableSources": availableSources.map { $0.toJSON() },
+            "notes": notes.map { $0.toJSON() },
+            "selectedNoteId": selectedNoteID ?? NSNull(),
+            "selectedNoteTitle": selectedNoteTitle,
             "text": text,
             "isOpen": isOpen,
-            "hasNote": hasNote,
+            "isExpanded": isExpanded,
+            "viewMode": viewMode,
+            "hasAnyNotes": hasAnyNotes,
             "isSaving": isSaving,
+            "isGeneratingAIDraft": isGeneratingAIDraft,
+            "aiDraftMode": aiDraftMode ?? NSNull(),
             "lastSavedAtLabel": lastSavedAtLabel ?? NSNull(),
             "canEdit": canEdit,
             "placeholder": placeholder,
         ]
+        if let aiDraftPreview {
+            json["aiDraftPreview"] = aiDraftPreview.toJSON()
+        } else {
+            json["aiDraftPreview"] = NSNull()
+        }
+        return json
+    }
+}
+
+struct AssistantChatWebActiveWorkState: Equatable {
+    let title: String
+    let detail: String?
+    let activeCalls: [AssistantChatWebActiveWorkItem]
+    let recentCalls: [AssistantChatWebActiveWorkItem]
+    let subagents: [AssistantChatWebActiveWorkSubagent]
+
+    var hasVisibleContent: Bool {
+        !activeCalls.isEmpty
+            || !recentCalls.isEmpty
+            || !subagents.isEmpty
+    }
+
+    func toJSON() -> [String: Any] {
+        var json: [String: Any] = [
+            "title": title,
+            "activeCalls": activeCalls.map { $0.toJSON() },
+            "recentCalls": recentCalls.map { $0.toJSON() },
+            "subagents": subagents.map { $0.toJSON() },
+        ]
+        if let detail, !detail.isEmpty {
+            json["detail"] = detail
+        }
+        return json
+    }
+}
+
+struct AssistantChatWebActiveWorkItem: Equatable {
+    let id: String
+    let title: String
+    let kind: String?
+    let status: String
+    let statusLabel: String
+    let detail: String?
+
+    func toJSON() -> [String: Any] {
+        var json: [String: Any] = [
+            "id": id,
+            "title": title,
+            "status": status,
+            "statusLabel": statusLabel,
+        ]
+        if let kind, !kind.isEmpty {
+            json["kind"] = kind
+        }
+        if let detail, !detail.isEmpty {
+            json["detail"] = detail
+        }
+        return json
+    }
+}
+
+struct AssistantChatWebActiveWorkSubagent: Equatable {
+    let id: String
+    let name: String
+    let role: String?
+    let status: String
+    let statusLabel: String
+    let detail: String?
+
+    func toJSON() -> [String: Any] {
+        var json: [String: Any] = [
+            "id": id,
+            "name": name,
+            "status": status,
+            "statusLabel": statusLabel,
+        ]
+        if let role, !role.isEmpty {
+            json["role"] = role
+        }
+        if let detail, !detail.isEmpty {
+            json["detail"] = detail
+        }
+        return json
+    }
+}
+
+private func assistantChatWebWorkStatus(from rawStatus: String?) -> (status: String, label: String) {
+    let normalized = rawStatus?
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .nonEmpty?
+        .replacingOccurrences(of: "-", with: " ")
+        .lowercased()
+
+    switch normalized {
+    case "completed", "done", "succeeded", "success":
+        return ("completed", "Completed")
+    case "failed", "error", "errored", "interrupted", "cancelled", "canceled":
+        return ("failed", "Needs Attention")
+    case "waiting":
+        return ("running", "Waiting")
+    case "pending":
+        return ("running", "Pending")
+    case "in progress", "inprogress":
+        return ("running", "Running")
+    case let value? where !value.isEmpty:
+        return ("running", value.capitalized)
+    default:
+        return ("running", "Running")
+    }
+}
+
+private func assistantChatWebWorkKind(from rawKind: String?) -> String? {
+    guard let normalized = rawKind?
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .nonEmpty else {
+        return nil
+    }
+
+    switch normalized {
+    case "collabAgentToolCall":
+        return "subagent"
+    default:
+        return normalized
+    }
+}
+
+extension AssistantChatWebActiveWorkItem {
+    init(toolCall: AssistantToolCallState) {
+        let resolvedStatus = assistantChatWebWorkStatus(from: toolCall.status)
+        self.init(
+            id: toolCall.id,
+            title: toolCall.title,
+            kind: assistantChatWebWorkKind(from: toolCall.kind),
+            status: resolvedStatus.status,
+            statusLabel: resolvedStatus.label,
+            detail: toolCall.detail?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+        )
+    }
+}
+
+extension AssistantChatWebActiveWorkSubagent {
+    init(subagent: SubagentState) {
+        let resolvedStatus = assistantChatWebWorkStatus(from: subagent.statusText)
+        self.init(
+            id: subagent.id,
+            name: subagent.displayName,
+            role: subagent.roleLabel,
+            status: resolvedStatus.status,
+            statusLabel: subagent.statusText,
+            detail: subagent.promptPreview
+        )
     }
 }
 
 struct AssistantChatWebThreadNoteCommand {
     let type: String
     let threadID: String?
+    let ownerKind: String?
+    let ownerID: String?
+    let noteID: String?
     let text: String?
+    let title: String?
     let isOpen: Bool?
+    let isExpanded: Bool?
+    let viewMode: String?
+    let selectedText: String?
+    let requestKind: String?
+    let draftMode: String?
+    let currentDraftMarkdown: String?
+    let styleInstruction: String?
+    let viewportRect: CGRect?
 
     init?(body: Any) {
         guard let payload = body as? [String: Any],
@@ -358,8 +604,35 @@ struct AssistantChatWebThreadNoteCommand {
         self.threadID = (payload["threadId"] as? String)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .assistantNonEmpty
+        self.ownerKind = (payload["ownerKind"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .assistantNonEmpty
+        self.ownerID = (payload["ownerId"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .assistantNonEmpty
+        self.noteID = (payload["noteId"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .assistantNonEmpty
         self.text = payload["text"] as? String
+        self.title = payload["title"] as? String
         self.isOpen = payload["isOpen"] as? Bool
+        self.isExpanded = payload["isExpanded"] as? Bool
+        self.viewMode = payload["viewMode"] as? String
+        self.selectedText = payload["selectedText"] as? String
+        self.requestKind = payload["requestKind"] as? String
+        self.draftMode = payload["draftMode"] as? String
+        self.currentDraftMarkdown = payload["currentDraftMarkdown"] as? String
+        self.styleInstruction = payload["styleInstruction"] as? String
+        if let rectInfo = payload["rect"] as? [String: Any] {
+            self.viewportRect = CGRect(
+                x: rectInfo["x"] as? Double ?? 0,
+                y: rectInfo["y"] as? Double ?? 0,
+                width: rectInfo["width"] as? Double ?? 0,
+                height: rectInfo["height"] as? Double ?? 0
+            )
+        } else {
+            self.viewportRect = nil
+        }
     }
 }
 
@@ -1034,6 +1307,7 @@ final class AssistantChatWebContainerView: NSView, WKNavigationDelegate {
     private var pendingReviewPanel: AssistantChatWebCodeReviewPanel?
     private var pendingRewindState: AssistantChatWebRewindState?
     private var pendingThreadNoteState: AssistantChatWebThreadNoteState?
+    private var pendingActiveWorkState: AssistantChatWebActiveWorkState?
     private var pendingAccentCSS: String?
     private var lastAppliedTyping: (Bool, String, String)?
     private var lastAppliedTextScale: CGFloat?
@@ -1046,6 +1320,8 @@ final class AssistantChatWebContainerView: NSView, WKNavigationDelegate {
     private var hasAppliedRewindState = false
     private var lastAppliedThreadNoteState: AssistantChatWebThreadNoteState?
     private var hasAppliedThreadNoteState = false
+    private var lastAppliedActiveWorkState: AssistantChatWebActiveWorkState?
+    private var hasAppliedActiveWorkState = false
     private var lastAppliedAccentCSS: String?
 
     // Throttling for streaming updates
@@ -1129,6 +1405,10 @@ final class AssistantChatWebContainerView: NSView, WKNavigationDelegate {
             if let threadNoteState = self.pendingThreadNoteState {
                 self.sendThreadNoteState(threadNoteState)
                 self.pendingThreadNoteState = nil
+            }
+            if let activeWorkState = self.pendingActiveWorkState {
+                self.sendActiveWorkState(activeWorkState)
+                self.pendingActiveWorkState = nil
             }
         }
         uc.add(readyHandler, name: "ready")
@@ -1275,6 +1555,15 @@ final class AssistantChatWebContainerView: NSView, WKNavigationDelegate {
         hasAppliedThreadNoteState = true
         lastAppliedThreadNoteState = threadNoteState
         sendThreadNoteState(threadNoteState)
+    }
+
+    func applyActiveWorkState(_ activeWorkState: AssistantChatWebActiveWorkState?) {
+        if hasAppliedActiveWorkState, lastAppliedActiveWorkState == activeWorkState {
+            return
+        }
+        hasAppliedActiveWorkState = true
+        lastAppliedActiveWorkState = activeWorkState
+        sendActiveWorkState(activeWorkState)
     }
 
     func applyTypingIndicator(_ visible: Bool, title: String, detail: String) {
@@ -1527,6 +1816,28 @@ final class AssistantChatWebContainerView: NSView, WKNavigationDelegate {
 
         webView.evaluateJavaScript(
             "chatBridge.setThreadNoteState(\(jsonString))",
+            completionHandler: nil
+        )
+    }
+
+    private func sendActiveWorkState(_ activeWorkState: AssistantChatWebActiveWorkState?) {
+        guard isReady else {
+            pendingActiveWorkState = activeWorkState
+            return
+        }
+
+        guard let activeWorkState, activeWorkState.hasVisibleContent else {
+            webView.evaluateJavaScript("chatBridge.setActiveWorkState(null)", completionHandler: nil)
+            return
+        }
+
+        guard let data = try? JSONSerialization.data(withJSONObject: activeWorkState.toJSON()),
+              let jsonString = String(data: data, encoding: .utf8) else {
+            return
+        }
+
+        webView.evaluateJavaScript(
+            "chatBridge.setActiveWorkState(\(jsonString))",
             completionHandler: nil
         )
     }
@@ -1855,11 +2166,13 @@ extension AssistantChatWebMessage {
 
     static func collapsedConversationSummary(
         hiddenRenderItems: [AssistantTimelineRenderItem],
+        terminalRenderItem: AssistantTimelineRenderItem,
         blockID: String,
         expanded: Bool
     ) -> AssistantChatWebMessage? {
         guard !hiddenRenderItems.isEmpty else { return nil }
 
+        let summaryRenderItems = hiddenRenderItems + [terminalRenderItem]
         let activities = hiddenRenderItems.flatMap { renderItem -> [AssistantActivityItem] in
             switch renderItem {
             case .timeline(let item):
@@ -1889,8 +2202,8 @@ extension AssistantChatWebMessage {
             rewriteAnchorID: nil,
             providerLabel: nil,
             activityIcon: dominantKind,
-            activityTitle: "Worked for \(collapsedConversationDurationLabel(for: hiddenRenderItems))",
-            activityDetail: collapsedConversationSummaryDetail(for: hiddenRenderItems, activities: activities),
+            activityTitle: "Worked for \(collapsedConversationDurationLabel(for: summaryRenderItems))",
+            activityDetail: collapsedConversationSummaryDetail(for: summaryRenderItems, activities: activities),
             activityStatus: activityStatusString(for: status),
             activityStatusLabel: status.rawValue.capitalized,
             detailSections: nil,
@@ -2052,20 +2365,6 @@ extension AssistantChatWebMessage {
     private static func collapsedConversationDurationLabel(
         for renderItems: [AssistantTimelineRenderItem]
     ) -> String {
-        let activities = renderItems.flatMap { renderItem -> [AssistantActivityItem] in
-            switch renderItem {
-            case .timeline(let item):
-                guard item.kind == .activity, let activity = item.activity else { return [] }
-                return [activity]
-            case .activityGroup(let group):
-                return group.activities
-            }
-        }
-
-        if !activities.isEmpty {
-            return collapsedActivityDurationLabel(for: activities)
-        }
-
         let start = renderItems.map(renderItemSortDate).min() ?? .now
         let end = renderItems.map(\.lastUpdatedAt).max() ?? start
         let totalSeconds = max(1, Int(ceil(end.timeIntervalSince(start))))
