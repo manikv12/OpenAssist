@@ -188,6 +188,7 @@ final class AssistantCompactHUDManager: AssistantCompactPresenter {
 
         // HUD state from runtime
         controller.$hudState
+            .removeDuplicates()
             .receive(on: RunLoop.main)
             .sink { [weak self] state in
                 self?.syncModelFromController()
@@ -196,26 +197,24 @@ final class AssistantCompactHUDManager: AssistantCompactPresenter {
             .store(in: &cancellables)
 
         controller.$interactionMode
+            .removeDuplicates()
             .receive(on: RunLoop.main)
             .sink { [weak self] mode in
-                self?.model.interactionMode = mode
+                guard let self, self.model.interactionMode != mode else { return }
+                self.model.interactionMode = mode
             }
             .store(in: &cancellables)
 
         controller.$sessions
+            .removeDuplicates()
             .receive(on: RunLoop.main)
-            .sink { [weak self] sessions in
-                self?.model.sessions = sessions
-                self?.syncModelFromController()
-            }
+            .sink { [weak self] _ in self?.syncModelFromController() }
             .store(in: &cancellables)
 
         controller.$selectedSessionID
+            .removeDuplicates()
             .receive(on: RunLoop.main)
-            .sink { [weak self] selectedSessionID in
-                self?.model.selectedSessionID = selectedSessionID
-                self?.syncModelFromController()
-            }
+            .sink { [weak self] _ in self?.syncModelFromController() }
             .store(in: &cancellables)
 
         controller.$timelineItems
@@ -226,26 +225,37 @@ final class AssistantCompactHUDManager: AssistantCompactPresenter {
             .store(in: &cancellables)
 
         controller.$attachments
+            .removeDuplicates()
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.syncModelFromController() }
+            .store(in: &cancellables)
+
+        controller.$installGuidanceByBackend
+            .removeDuplicates()
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in self?.syncModelFromController() }
             .store(in: &cancellables)
 
         controller.$availableModels
+            .removeDuplicates()
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in self?.syncModelFromController() }
             .store(in: &cancellables)
 
         controller.$selectedModelID
+            .removeDuplicates()
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in self?.syncModelFromController() }
             .store(in: &cancellables)
 
         controller.$toolCalls
+            .removeDuplicates()
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in self?.syncModelFromController() }
             .store(in: &cancellables)
 
         controller.$recentToolCalls
+            .removeDuplicates()
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in self?.syncModelFromController() }
             .store(in: &cancellables)
@@ -330,6 +340,14 @@ final class AssistantCompactHUDManager: AssistantCompactPresenter {
             guard let self else { return }
             self.controller.promoteTemporarySession(sessionID)
             self.syncModelFromController()
+        }
+
+        model.onChooseBackend = { [weak self] backend in
+            guard let self else { return }
+            Task { @MainActor in
+                _ = await self.controller.switchAssistantBackend(backend)
+                self.syncModelFromController()
+            }
         }
 
         model.onChooseModel = { [weak self] modelID in
@@ -429,31 +447,35 @@ final class AssistantCompactHUDManager: AssistantCompactPresenter {
 
         // Permission request from controller
         controller.$pendingPermissionRequest
+            .removeDuplicates()
             .receive(on: RunLoop.main)
             .sink { [weak self] request in
-                self?.model.pendingPermissionRequest = request
+                self?.setModelValue(\.pendingPermissionRequest, to: request)
                 self?.handlePermissionRequestChange(request)
             }
             .store(in: &cancellables)
 
         controller.$modeSwitchSuggestion
+            .removeDuplicates()
             .receive(on: RunLoop.main)
             .sink { [weak self] suggestion in
-                self?.model.controllerModeSwitchSuggestion = suggestion
+                self?.setModelValue(\.controllerModeSwitchSuggestion, to: suggestion)
                 self?.handleModeSwitchSuggestionChange(suggestion)
             }
             .store(in: &cancellables)
 
         controller.$liveVoiceSessionSnapshot
+            .removeDuplicates()
             .receive(on: RunLoop.main)
             .sink { [weak self] snapshot in
                 guard let self else { return }
                 let previousPhase = self.lastLiveVoiceSessionPhase
                 self.lastLiveVoiceSessionPhase = snapshot.phase
                 self.handleNotchLiveVoiceTurnHandoff(from: previousPhase, to: snapshot)
-                self.model.liveVoiceSnapshot = snapshot
-                self.model.isVoiceRecording = snapshot.isListening
+                self.setModelValue(\.liveVoiceSnapshot, to: snapshot)
+                self.setModelValue(\.isVoiceRecording, to: snapshot.isListening)
                 self.syncModelFromController()
+                self.update(state: self.controller.hudState)
             }
             .store(in: &cancellables)
 
@@ -747,6 +769,14 @@ final class AssistantCompactHUDManager: AssistantCompactPresenter {
             && currentDisplayID == targetDisplayID
             && (dockRevealChanged || sizeChanged)
             && !model.isExpanded
+
+        guard panel.frame != frame else {
+            lastAppliedNotchDockReveal = isNotchDockRevealed
+            if presentationStyle == .orb && savedOrigin == nil {
+                persistCollapsedOrigin(from: frame.origin, panelSize: persistedPanelSize)
+            }
+            return
+        }
 
         CATransaction.begin()
         CATransaction.setDisableActions(!shouldAnimateNotch)
@@ -1204,26 +1234,26 @@ final class AssistantCompactHUDManager: AssistantCompactPresenter {
     }
 
     private func syncNotchDockPresentation(for screen: NSScreen?) {
-        model.notchDockRevealed = isNotchDockRevealed
+        setModelValue(\.notchDockRevealed, to: isNotchDockRevealed)
         if let screen {
             let anchorMode = notchAnchorMode(for: screen)
             switch anchorMode {
             case let .hardwareNotch(gapRect):
-                model.notchUsesHardwareOutline = true
-                model.notchHardwareOutlineSize = gapRect.size
-                model.notchDockVisibleWidth = gapRect.width
-                model.notchDockVisibleHeight = notchDockVisibleHeight(for: screen)
+                setModelValue(\.notchUsesHardwareOutline, to: true)
+                setModelValue(\.notchHardwareOutlineSize, to: gapRect.size)
+                setModelValue(\.notchDockVisibleWidth, to: gapRect.width)
+                setModelValue(\.notchDockVisibleHeight, to: notchDockVisibleHeight(for: screen))
             case .syntheticNotch:
-                model.notchUsesHardwareOutline = false
-                model.notchHardwareOutlineSize = .zero
-                model.notchDockVisibleWidth = 160
-                model.notchDockVisibleHeight = notchDockVisibleHeight(for: screen)
+                setModelValue(\.notchUsesHardwareOutline, to: false)
+                setModelValue(\.notchHardwareOutlineSize, to: .zero)
+                setModelValue(\.notchDockVisibleWidth, to: 160)
+                setModelValue(\.notchDockVisibleHeight, to: notchDockVisibleHeight(for: screen))
             }
         } else {
-            model.notchUsesHardwareOutline = false
-            model.notchHardwareOutlineSize = .zero
-            model.notchDockVisibleWidth = 160
-            model.notchDockVisibleHeight = Layout.notchDockHiddenVisibleHeight
+            setModelValue(\.notchUsesHardwareOutline, to: false)
+            setModelValue(\.notchHardwareOutlineSize, to: .zero)
+            setModelValue(\.notchDockVisibleWidth, to: 160)
+            setModelValue(\.notchDockVisibleHeight, to: Layout.notchDockHiddenVisibleHeight)
         }
         syncPanelMouseBehavior()
     }
@@ -1359,21 +1389,32 @@ final class AssistantCompactHUDManager: AssistantCompactPresenter {
     }
 
     private func syncModelFromController() {
-        model.sessions = controller.sessions
-        model.selectedSessionID = controller.selectedSessionID
-        model.interactionMode = controller.interactionMode
-        model.busySessionID = activeSessionIDForOrb()
-        model.availableModels = controller.visibleModels
-        model.selectedModelSummary = controller.selectedModelSummary
-        model.attachments = controller.attachments
-        model.controllerModeSwitchSuggestion = controller.modeSwitchSuggestion
-        model.workingToolActivity = Array(controller.visibleToolActivity.prefix(6))
-        model.activeSessionSummary = activeSessionSummaryForOrb()
-        model.canStopActiveTurn = controller.hasActiveTurn
-        model.liveVoiceSnapshot = controller.liveVoiceSessionSnapshot
-        model.isVoiceRecording = controller.liveVoiceSessionSnapshot.isListening
-        model.update(state: effectiveDisplayState(for: controller.hudState))
+        setModelValue(\.sessions, to: controller.sessions)
+        setModelValue(\.selectedSessionID, to: controller.selectedSessionID)
+        setModelValue(\.interactionMode, to: controller.interactionMode)
+        setModelValue(\.visibleAssistantBackend, to: controller.visibleAssistantBackend)
+        setModelValue(\.selectableAssistantBackends, to: controller.selectableAssistantBackends)
+        setModelValue(\.isSelectedSessionBackendPinned, to: controller.isSelectedSessionBackendPinned)
+        setModelValue(\.selectedSessionBackendHelpText, to: controller.selectedSessionBackendHelpText)
+        setModelValue(\.busySessionID, to: activeSessionIDForOrb())
+        setModelValue(\.availableModels, to: controller.visibleModels)
+        setModelValue(\.selectedModelSummary, to: controller.selectedModelSummary)
+        setModelValue(\.attachments, to: controller.attachments)
+        setModelValue(\.controllerModeSwitchSuggestion, to: controller.modeSwitchSuggestion)
+        setModelValue(\.workingToolActivity, to: Array(controller.visibleToolActivity.prefix(6)))
+        setModelValue(\.activeSessionSummary, to: activeSessionSummaryForOrb())
+        setModelValue(\.canStopActiveTurn, to: controller.hasActiveTurn)
+        setModelValue(\.liveVoiceSnapshot, to: controller.liveVoiceSessionSnapshot)
+        setModelValue(\.isVoiceRecording, to: controller.liveVoiceSessionSnapshot.isListening)
         model.updatePreviewImages(latestTimelineImageAttachments())
+    }
+
+    private func setModelValue<Value: Equatable>(
+        _ keyPath: ReferenceWritableKeyPath<AssistantOrbHUDModel, Value>,
+        to newValue: Value
+    ) {
+        guard model[keyPath: keyPath] != newValue else { return }
+        model[keyPath: keyPath] = newValue
     }
 
     private func activeSessionIDForOrb() -> String? {

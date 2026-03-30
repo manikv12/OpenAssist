@@ -7,12 +7,15 @@ interface Props {
   providerTone?: ProviderTone;
 }
 
-function TypingIndicatorInner({ title, providerTone = "default" }: Props) {
+function TypingIndicatorInner({ title, detail, providerTone = "default" }: Props) {
   const resolvedTitle = title || "Thinking";
+  const resolvedDetail = detail?.trim();
 
   return (
     <div className="message-row typing-row">
-      <span className="typing-title" data-provider={providerTone}>{resolvedTitle}</span>
+      <div className="typing-copy">
+        <span className="typing-title" data-provider={providerTone}>{resolvedTitle}</span>
+      </div>
     </div>
   );
 }

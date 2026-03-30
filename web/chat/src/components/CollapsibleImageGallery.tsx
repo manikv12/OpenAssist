@@ -7,6 +7,7 @@ interface CollapsibleImageGalleryProps {
   className?: string;
   imageClassName?: string;
   defaultExpanded?: boolean;
+  inline?: boolean;
   headerTitle?: string;
   collapsedDetail?: string;
   expandedDetail?: string;
@@ -18,6 +19,7 @@ function CollapsibleImageGalleryInner({
   className,
   imageClassName,
   defaultExpanded = false,
+  inline = false,
   headerTitle,
   collapsedDetail,
   expandedDetail,
@@ -129,6 +131,30 @@ function CollapsibleImageGalleryInner({
 
     setPreviewIndex(index);
   };
+
+  if (inline) {
+    return (
+      <div className={["collapsible-images inline-images", className].filter(Boolean).join(" ")}>
+        <div className="image-list">
+          {images.map((image, index) => (
+            <button
+              key={`${index}-${image.slice(0, 32)}`}
+              type="button"
+              className="image-thumb"
+              onClick={() => openImage(image, index)}
+              aria-label={`${canOpenNativePreview ? "Open" : "Preview"} ${itemName} ${index + 1}`}
+            >
+              <img
+                src={image}
+                alt={`${itemName} ${index + 1}`}
+                className={imageClasses}
+              />
+            </button>
+          ))}
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className={rootClassName}>

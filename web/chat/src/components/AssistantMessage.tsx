@@ -7,10 +7,11 @@ import { CollapsibleImageGallery } from "./CollapsibleImageGallery";
 import { MessageCheckpointCard } from "./MessageCheckpointCard";
 import { useSmoothTextStream } from "../hooks/useSmoothTextStream";
 
-function providerTheme(label?: string): "codex" | "copilot" | "default" {
+function providerTheme(label?: string): "codex" | "copilot" | "claude" | "default" {
   const normalized = (label || "").trim().toLowerCase();
   if (normalized.includes("copilot")) return "copilot";
   if (normalized.includes("codex")) return "codex";
+  if (normalized.includes("claude") || normalized.includes("anthropic")) return "claude";
   return "default";
 }
 

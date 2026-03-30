@@ -2,6 +2,35 @@ import XCTest
 @testable import OpenAssist
 
 final class AssistantWindowSupportTests: XCTestCase {
+    func testActiveWorkStateRequiresStructuredItemsToBeVisible() {
+        let thinkingOnly = AssistantChatWebActiveWorkState(
+            title: "Thinking",
+            detail: "Working on your message",
+            activeCalls: [],
+            recentCalls: [],
+            subagents: []
+        )
+        XCTAssertFalse(thinkingOnly.hasVisibleContent)
+
+        let withToolCall = AssistantChatWebActiveWorkState(
+            title: "Thinking",
+            detail: "Working on your message",
+            activeCalls: [
+                AssistantChatWebActiveWorkItem(
+                    id: "tool-1",
+                    title: "Browser",
+                    kind: "browserAutomation",
+                    status: "running",
+                    statusLabel: "Running",
+                    detail: "Opening page"
+                )
+            ],
+            recentCalls: [],
+            subagents: []
+        )
+        XCTAssertTrue(withToolCall.hasVisibleContent)
+    }
+
     func testPendingPlaceholderOnlyShowsForOwningThread() {
         XCTAssertTrue(
             assistantShouldShowPendingAssistantPlaceholder(
@@ -147,6 +176,256 @@ final class AssistantWindowSupportTests: XCTestCase {
             recentToolCalls: []
         )
         XCTAssertNil(hiddenSnapshot)
+    }
+
+    func testSelectedSessionActiveWorkSnapshotIgnoresFinishedChildAgents() {
+        let completedSubagent = SubagentState(
+            id: "agent-1",
+            parentThreadID: "thread-a",
+            threadID: "child-1",
+            nickname: "Harvey",
+            role: "worker",
+            status: .completed,
+            prompt: "Implement the card",
+            startedAt: Date(timeIntervalSince1970: 10),
+            updatedAt: Date(timeIntervalSince1970: 20),
+            endedAt: Date(timeIntervalSince1970: 30)
+        )
+
+        let snapshot = assistantSelectedSessionActiveWorkSnapshot(
+            selectedSessionID: "thread-a",
+            activeRuntimeSessionID: "thread-a",
+            planEntries: [],
+            subagents: [completedSubagent],
+            toolCalls: [],
+            recentToolCalls: []
+        )
+
+        XCTAssertNil(snapshot)
+    }
+
+    func testHistoricalTurnSummariesOnlyCollapseWhenTurnIsFullySettled() {
+        XCTAssertFalse(
+            assistantCanCollapseHistoricalTurnSummaries(
+                hasActiveTurn: true,
+                activeWorkSnapshot: nil
+            )
+        )
+
+        let activeWorkSnapshot = AssistantSessionActiveWorkSnapshot(
+            sessionID: "thread-a",
+            planEntries: [],
+            subagents: [],
+            fileChangeCount: 0
+        )
+        XCTAssertFalse(
+            assistantCanCollapseHistoricalTurnSummaries(
+                hasActiveTurn: false,
+                activeWorkSnapshot: activeWorkSnapshot
+            )
+        )
+
+        XCTAssertTrue(
+            assistantCanCollapseHistoricalTurnSummaries(
+                hasActiveTurn: false,
+                activeWorkSnapshot: nil
+            )
+        )
+    }
+
+    func testThreadNoteAIDraftStateSerializesChartPreviewFields() {
+        let state = AssistantChatWebThreadNoteState(
+            threadID: "thread-1",
+            ownerKind: "project",
+            ownerID: "project-1",
+            ownerTitle: "Alpha",
+            presentation: "projectFullScreen",
+            availableSources: [
+                AssistantChatWebThreadNoteSource(
+                    ownerKind: "thread",
+                    ownerID: "thread-1",
+                    ownerTitle: "Thread A",
+                    sourceLabel: "Thread notes"
+                ),
+                AssistantChatWebThreadNoteSource(
+                    ownerKind: "project",
+                    ownerID: "project-1",
+                    ownerTitle: "Alpha",
+                    sourceLabel: "Project notes"
+                ),
+            ],
+            notes: [
+                AssistantChatWebThreadNoteItem(
+                    id: "note-1",
+                    title: "Main note",
+                    updatedAtLabel: "Saved now",
+                    ownerKind: "project",
+                    ownerID: "project-1",
+                    sourceLabel: "Project notes"
+                )
+            ],
+            selectedNoteID: "note-1",
+            selectedNoteTitle: "Main note",
+            text: "Draft note",
+            isOpen: true,
+            isExpanded: false,
+            viewMode: "edit",
+            hasAnyNotes: true,
+            isSaving: false,
+            isGeneratingAIDraft: true,
+            aiDraftMode: "chart",
+            lastSavedAtLabel: "Saved now",
+            canEdit: true,
+            placeholder: "Write note",
+            aiDraftPreview: AssistantChatWebThreadNoteAIPreview(
+                mode: "chart",
+                sourceKind: "chatSelection",
+                markdown: "## Stack\n\n```mermaid\nmindmap\n  root((SaaS))\n```",
+                isError: false
+            )
+        )
+
+        let json = state.toJSON()
+
+        XCTAssertEqual(json["ownerKind"] as? String, "project")
+        XCTAssertEqual(json["ownerId"] as? String, "project-1")
+        XCTAssertEqual(json["presentation"] as? String, "projectFullScreen")
+        XCTAssertEqual(json["isGeneratingAIDraft"] as? Bool, true)
+        XCTAssertEqual(json["aiDraftMode"] as? String, "chart")
+        let sources = json["availableSources"] as? [[String: Any]]
+        XCTAssertEqual(sources?.count, 2)
+        let preview = json["aiDraftPreview"] as? [String: Any]
+        XCTAssertEqual(preview?["mode"] as? String, "chart")
+        XCTAssertEqual(preview?["sourceKind"] as? String, "chatSelection")
+        XCTAssertEqual(preview?["isError"] as? Bool, false)
+    }
+
+    func testCollapsedConversationHiddenIndicesIncludeProtectedRecentToolTurn() {
+        let baseDate = Date(timeIntervalSince1970: 1_741_500_000)
+        let renderItems = buildAssistantTimelineRenderItems(
+            from: [
+                .userMessage(
+                    id: "user-1",
+                    sessionID: "session-1",
+                    turnID: "turn-1",
+                    text: "Check the workspace",
+                    createdAt: baseDate,
+                    source: .runtime
+                ),
+                .assistantProgress(
+                    id: "progress-1",
+                    sessionID: "session-1",
+                    turnID: "turn-1",
+                    text: "I found the right project.",
+                    createdAt: baseDate.addingTimeInterval(1),
+                    updatedAt: baseDate.addingTimeInterval(1),
+                    isStreaming: false,
+                    source: .runtime
+                ),
+                .activity(
+                    AssistantActivityItem(
+                        id: "activity-1",
+                        sessionID: "session-1",
+                        turnID: "turn-1",
+                        kind: .commandExecution,
+                        title: "Command",
+                        status: .completed,
+                        friendlySummary: "Ran a command.",
+                        rawDetails: "pwd",
+                        startedAt: baseDate.addingTimeInterval(2),
+                        updatedAt: baseDate.addingTimeInterval(2),
+                        source: .runtime
+                    )
+                ),
+                .assistantProgress(
+                    id: "progress-2",
+                    sessionID: "session-1",
+                    turnID: "turn-1",
+                    text: "I am checking the dashboard files now.",
+                    createdAt: baseDate.addingTimeInterval(3),
+                    updatedAt: baseDate.addingTimeInterval(3),
+                    isStreaming: false,
+                    source: .runtime
+                ),
+                .activity(
+                    AssistantActivityItem(
+                        id: "activity-2",
+                        sessionID: "session-1",
+                        turnID: "turn-1",
+                        kind: .webSearch,
+                        title: "Web Search",
+                        status: .completed,
+                        friendlySummary: "Searched the web.",
+                        rawDetails: "nail salon dashboard",
+                        startedAt: baseDate.addingTimeInterval(4),
+                        updatedAt: baseDate.addingTimeInterval(4),
+                        source: .runtime
+                    )
+                ),
+                .assistantFinal(
+                    id: "final-1",
+                    sessionID: "session-1",
+                    turnID: "turn-1",
+                    text: "I found the renderer and the right files.",
+                    createdAt: baseDate.addingTimeInterval(6),
+                    updatedAt: baseDate.addingTimeInterval(6),
+                    isStreaming: false,
+                    source: .runtime
+                ),
+            ]
+        )
+
+        let hiddenIndices = assistantTimelineCollapsedConversationHiddenIndices(
+            in: renderItems,
+            segmentIndices: Array(renderItems.indices),
+            protectedRecentConversationStartIndex: 0
+        )
+
+        XCTAssertEqual(hiddenIndices, [1, 2, 3, 4])
+    }
+
+    func testCollapsedConversationHiddenIndicesKeepProtectedRecentPlainTextTurnVisible() {
+        let baseDate = Date(timeIntervalSince1970: 1_741_500_100)
+        let renderItems = buildAssistantTimelineRenderItems(
+            from: [
+                .userMessage(
+                    id: "user-1",
+                    sessionID: "session-1",
+                    turnID: "turn-1",
+                    text: "Explain the result",
+                    createdAt: baseDate,
+                    source: .runtime
+                ),
+                .assistantProgress(
+                    id: "progress-1",
+                    sessionID: "session-1",
+                    turnID: "turn-1",
+                    text: "I am summarizing what changed.",
+                    createdAt: baseDate.addingTimeInterval(1),
+                    updatedAt: baseDate.addingTimeInterval(1),
+                    isStreaming: false,
+                    source: .runtime
+                ),
+                .assistantFinal(
+                    id: "final-1",
+                    sessionID: "session-1",
+                    turnID: "turn-1",
+                    text: "Here is the summary.",
+                    createdAt: baseDate.addingTimeInterval(3),
+                    updatedAt: baseDate.addingTimeInterval(3),
+                    isStreaming: false,
+                    source: .runtime
+                ),
+            ]
+        )
+
+        let hiddenIndices = assistantTimelineCollapsedConversationHiddenIndices(
+            in: renderItems,
+            segmentIndices: Array(renderItems.indices),
+            protectedRecentConversationStartIndex: 0
+        )
+
+        XCTAssertEqual(hiddenIndices, [])
     }
 
     func testSidebarChildSubagentsAppearForMatchingParentThread() {

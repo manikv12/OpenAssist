@@ -70,7 +70,7 @@ final class TelegramRemoteRendererTests: XCTestCase {
             transcriptEntries: [
                 AssistantTranscriptEntry(role: .user, text: "What is on the screen?"),
                 AssistantTranscriptEntry(role: .assistant, text: "I can see Telegram and Codex open on the screen."),
-                AssistantTranscriptEntry(role: .status, text: "Codex finished this turn.")
+                AssistantTranscriptEntry(role: .status, text: "This turn was interrupted.")
             ],
             pendingPermissionRequest: nil,
             hudState: .idle,
@@ -93,7 +93,7 @@ final class TelegramRemoteRendererTests: XCTestCase {
             ),
             transcriptEntries: [
                 AssistantTranscriptEntry(role: .user, text: "Show me the latest screenshot"),
-                AssistantTranscriptEntry(role: .status, text: "Codex finished this turn."),
+                AssistantTranscriptEntry(role: .status, text: "This turn was interrupted."),
                 AssistantTranscriptEntry(role: .assistant, text: "Here is the latest screenshot.")
             ],
             pendingPermissionRequest: nil,
@@ -105,7 +105,7 @@ final class TelegramRemoteRendererTests: XCTestCase {
         let catchUp = TelegramRemoteRenderer.catchUpText(snapshot: snapshot)
 
         XCTAssertNotNil(catchUp)
-        XCTAssertFalse(catchUp?.contains("Codex finished this turn.") == true)
+        XCTAssertFalse(catchUp?.contains("This turn was interrupted.") == true)
         XCTAssertTrue(catchUp?.contains("Here is the latest screenshot.") == true)
     }
 

@@ -516,11 +516,132 @@ final class AssistantConversationStoreTests: XCTestCase {
 
         try store.saveThreadNote(threadID: threadID, text: noteText)
 
-        XCTAssertEqual(store.loadThreadNote(threadID: threadID), noteText)
-        XCTAssertTrue(
-            fileManager.fileExists(
-                atPath: try XCTUnwrap(store.threadNoteFileURL(for: threadID)).path
-            )
+        let workspace = store.loadThreadNotesWorkspace(threadID: threadID)
+        let selectedNote = try XCTUnwrap(workspace.selectedNote)
+        let manifestURL = directoryURL
+            .appendingPathComponent(threadID, isDirectory: true)
+            .appendingPathComponent("notes", isDirectory: true)
+            .appendingPathComponent("manifest.json", isDirectory: false)
+        let noteURL = directoryURL
+            .appendingPathComponent(threadID, isDirectory: true)
+            .appendingPathComponent("notes", isDirectory: true)
+            .appendingPathComponent(selectedNote.fileName, isDirectory: false)
+
+        XCTAssertEqual(workspace.selectedNoteText, noteText)
+        XCTAssertEqual(workspace.notes.count, 1)
+        XCTAssertTrue(fileManager.fileExists(atPath: manifestURL.path))
+        XCTAssertTrue(fileManager.fileExists(atPath: noteURL.path))
+    }
+
+    func testThreadNotesTrackSelectionAndStableOrderAcrossMultipleNotes() throws {
+        let fileManager = FileManager.default
+        let directoryURL = fileManager.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? fileManager.removeItem(at: directoryURL) }
+
+        let store = AssistantConversationStore(
+            fileManager: fileManager,
+            baseDirectoryURL: directoryURL
+        )
+
+        let threadID = "multi-note-thread"
+        let first = try store.createThreadNote(threadID: threadID, title: "First note")
+        let second = try store.createThreadNote(threadID: threadID, title: "Second note")
+        let secondNoteID = try XCTUnwrap(second.selectedNote?.id)
+        _ = try store.saveThreadNote(threadID: threadID, noteID: secondNoteID, text: "Second body")
+        let firstNoteID = try XCTUnwrap(first.selectedNote?.id)
+        let selectedFirst = try store.selectThreadNote(threadID: threadID, noteID: firstNoteID)
+
+        XCTAssertEqual(selectedFirst.notes.map(\.title), ["First note", "Second note"])
+        XCTAssertEqual(selectedFirst.manifest.selectedNoteID, firstNoteID)
+        XCTAssertEqual(selectedFirst.selectedNote?.order, 0)
+        XCTAssertEqual(selectedFirst.notes.last?.order, 1)
+    }
+
+    func testLegacyNotesMarkdownMigratesIntoManifestBackedNote() throws {
+        let fileManager = FileManager.default
+        let directoryURL = fileManager.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? fileManager.removeItem(at: directoryURL) }
+
+        let store = AssistantConversationStore(
+            fileManager: fileManager,
+            baseDirectoryURL: directoryURL
+        )
+
+        let threadID = "legacy-note-thread"
+        let legacyThreadDirectory = directoryURL.appendingPathComponent(threadID, isDirectory: true)
+        try fileManager.createDirectory(at: legacyThreadDirectory, withIntermediateDirectories: true)
+        let legacyURL = legacyThreadDirectory.appendingPathComponent("notes.md", isDirectory: false)
+        let legacyText = """
+        # Migration title
+        Old note text
+        """
+        try legacyText.write(to: legacyURL, atomically: true, encoding: .utf8)
+
+        let workspace = store.loadThreadNotesWorkspace(threadID: threadID)
+
+        XCTAssertEqual(workspace.notes.count, 1)
+        XCTAssertEqual(workspace.selectedNote?.title, "Migration title")
+        XCTAssertEqual(workspace.selectedNoteText, legacyText)
+        XCTAssertFalse(fileManager.fileExists(atPath: legacyURL.path))
+    }
+
+    func testAppendToSelectedThreadNoteCreatesDefaultNoteWhenMissing() throws {
+        let fileManager = FileManager.default
+        let directoryURL = fileManager.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? fileManager.removeItem(at: directoryURL) }
+
+        let store = AssistantConversationStore(
+            fileManager: fileManager,
+            baseDirectoryURL: directoryURL
+        )
+
+        let workspace = try store.appendToSelectedThreadNote(
+            threadID: "chart-thread",
+            text: """
+            ## Stack Overview
+
+            ```mermaid
+            mindmap
+              root((SaaS Stack))
+            ```
+            """
+        )
+
+        XCTAssertEqual(workspace.notes.count, 1)
+        XCTAssertEqual(workspace.selectedNote?.title, "Untitled note")
+        XCTAssertTrue(workspace.selectedNoteText.contains("## Stack Overview"))
+        XCTAssertTrue(workspace.selectedNoteText.contains("```mermaid"))
+    }
+
+    func testAppendToSelectedThreadNoteAddsBlankLineBetweenEntries() throws {
+        let fileManager = FileManager.default
+        let directoryURL = fileManager.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? fileManager.removeItem(at: directoryURL) }
+
+        let store = AssistantConversationStore(
+            fileManager: fileManager,
+            baseDirectoryURL: directoryURL
+        )
+
+        let threadID = "append-thread"
+        try store.saveThreadNote(threadID: threadID, text: "First note block")
+
+        let workspace = try store.appendToSelectedThreadNote(
+            threadID: threadID,
+            text: "## Second block"
+        )
+
+        XCTAssertEqual(
+            workspace.selectedNoteText,
+            """
+            First note block
+
+            ## Second block
+            """
         )
     }
 
@@ -551,16 +672,24 @@ final class AssistantConversationStoreTests: XCTestCase {
 
         let snapshotURL = try XCTUnwrap(store.snapshotFileURL(for: threadID))
         let eventLogURL = try XCTUnwrap(store.eventLogFileURL(for: threadID))
-        let noteURL = try XCTUnwrap(store.threadNoteFileURL(for: threadID))
+        let workspace = store.loadThreadNotesWorkspace(threadID: threadID)
+        let noteFileName = try XCTUnwrap(workspace.selectedNote?.fileName)
+        let noteDirectoryURL = directoryURL
+            .appendingPathComponent(threadID, isDirectory: true)
+            .appendingPathComponent("notes", isDirectory: true)
+        let manifestURL = noteDirectoryURL.appendingPathComponent("manifest.json", isDirectory: false)
+        let noteURL = noteDirectoryURL.appendingPathComponent(noteFileName, isDirectory: false)
 
         XCTAssertTrue(fileManager.fileExists(atPath: snapshotURL.path))
         XCTAssertTrue(fileManager.fileExists(atPath: eventLogURL.path))
+        XCTAssertTrue(fileManager.fileExists(atPath: manifestURL.path))
         XCTAssertTrue(fileManager.fileExists(atPath: noteURL.path))
 
         store.deleteThreadArtifacts(threadID: threadID)
 
         XCTAssertFalse(fileManager.fileExists(atPath: snapshotURL.path))
         XCTAssertFalse(fileManager.fileExists(atPath: eventLogURL.path))
+        XCTAssertFalse(fileManager.fileExists(atPath: manifestURL.path))
         XCTAssertFalse(fileManager.fileExists(atPath: noteURL.path))
         XCTAssertEqual(store.loadThreadNote(threadID: threadID), "")
     }

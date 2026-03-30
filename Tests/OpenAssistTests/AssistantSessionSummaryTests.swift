@@ -142,7 +142,7 @@ final class AssistantSessionSummaryTests: XCTestCase {
         XCTAssertEqual(summary.modelID, "gemini-3-pro-preview")
     }
 
-    func testOnlyProviderIndependentThreadsAppearInModernSidebar() {
+    func testSidebarShowsCurrentAndLegacyManagedSessionsWithHistory() {
         let legacyThread = AssistantSessionSummary(
             id: "openassist-legacy",
             title: "Legacy",
@@ -162,15 +162,25 @@ final class AssistantSessionSummaryTests: XCTestCase {
             id: "copilot-legacy",
             title: "CLI",
             source: .cli,
-            status: .idle
+            status: .idle,
+            latestUserMessage: "hello"
+        )
+        let appServerSession = AssistantSessionSummary(
+            id: "openassist-legacy-runtime",
+            title: "Legacy runtime",
+            source: .appServer,
+            status: .completed,
+            latestAssistantMessage: "done"
         )
 
         XCTAssertFalse(assistantSessionSupportsCurrentThreadUI(legacyThread))
         XCTAssertFalse(assistantShouldListSessionInSidebar(legacyThread, selectedSessionID: nil))
         XCTAssertTrue(assistantSessionSupportsCurrentThreadUI(v2Thread))
         XCTAssertTrue(assistantShouldListSessionInSidebar(v2Thread, selectedSessionID: nil))
-        XCTAssertFalse(assistantSessionSupportsCurrentThreadUI(cliSession))
-        XCTAssertFalse(assistantShouldListSessionInSidebar(cliSession, selectedSessionID: nil))
+        XCTAssertTrue(assistantSessionSupportsCurrentThreadUI(cliSession))
+        XCTAssertTrue(assistantShouldListSessionInSidebar(cliSession, selectedSessionID: nil))
+        XCTAssertTrue(assistantSessionSupportsCurrentThreadUI(appServerSession))
+        XCTAssertTrue(assistantShouldListSessionInSidebar(appServerSession, selectedSessionID: nil))
     }
 
     func testEmptyProviderIndependentDraftIsHiddenUnlessSelected() {

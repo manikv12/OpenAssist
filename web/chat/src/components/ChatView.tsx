@@ -1,5 +1,6 @@
 import {
   forwardRef,
+  memo,
   useCallback,
   useEffect,
   useImperativeHandle,
@@ -8,6 +9,7 @@ import {
   useState,
 } from "react";
 import type {
+  ActiveWorkState,
   ChatMessage,
   MessageCheckpointInfo,
   ProviderTone,
@@ -22,10 +24,12 @@ import { ActivityGroupRow } from "./ActivityGroupRow";
 import { ActivitySummaryRow } from "./ActivitySummaryRow";
 import { SystemMessage } from "./SystemMessage";
 import { TypingIndicator } from "./TypingIndicator";
+import { ActiveWorkCard } from "./ActiveWorkCard";
 
 interface Props {
   messages: ChatMessage[];
   typing: TypingState;
+  activeWork: ActiveWorkState | null;
   activeProviderTone?: ProviderTone;
   checkpointsByMessageID: Map<string, MessageCheckpointInfo>;
   rewindState: RewindState | null;
@@ -51,6 +55,7 @@ export const ChatView = forwardRef<
   {
     messages,
     typing,
+    activeWork,
     activeProviderTone = "default",
     checkpointsByMessageID,
     rewindState,
@@ -63,6 +68,13 @@ export const ChatView = forwardRef<
   },
   ref
 ) {
+  const hasStructuredActiveWork = Boolean(
+    activeWork &&
+      (activeWork.activeCalls.length > 0 ||
+        activeWork.recentCalls.length > 0 ||
+        activeWork.subagents.length > 0)
+  );
+
   const latestRunningMessageID = (() => {
     for (let index = messages.length - 1; index >= 0; index -= 1) {
       const message = messages[index];
@@ -179,7 +191,7 @@ export const ChatView = forwardRef<
         scrollToBottom(false);
       });
     }
-  }, [messages, typing, checkpointsByMessageID, isPinnedToBottom, scrollToBottom]);
+  }, [messages, typing, hasStructuredActiveWork, checkpointsByMessageID, isPinnedToBottom, scrollToBottom]);
 
   const handleLoadOlder = useCallback(() => {
     const container = containerRef.current;
@@ -223,7 +235,14 @@ export const ChatView = forwardRef<
             />
           ))}
 
-          {typing.visible && (
+          {hasStructuredActiveWork && activeWork && (
+            <ActiveWorkCard
+              state={activeWork}
+              providerTone={activeProviderTone}
+            />
+          )}
+
+          {typing.visible && !hasStructuredActiveWork && (
             <TypingIndicator
               title={typing.title}
               detail={typing.detail}
@@ -233,12 +252,12 @@ export const ChatView = forwardRef<
 
           <div ref={bottomRef} className="scroll-anchor" />
         </div>
+        </div>
 
         {/* Top fade */}
         <div className="fade-top" />
         {/* Bottom fade */}
         <div className="fade-bottom" />
-        </div>
       </div>
 
       {showJumpToLatest && (
@@ -251,7 +270,7 @@ export const ChatView = forwardRef<
   );
 });
 
-function MessageRow({
+const MessageRow = memo(function MessageRow({
   message,
   checkpointsByMessageID,
   latestRunningMessageID,
@@ -288,4 +307,4 @@ function MessageRow({
     default:
       return null;
   }
-}
+});

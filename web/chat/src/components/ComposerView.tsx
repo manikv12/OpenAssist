@@ -15,6 +15,8 @@ export function ComposerView({ state, onDispatchCommand }: ComposerViewProps) {
   const composerRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const lastReportedHeightRef = useRef(0);
+  const wasVoiceCapturingRef = useRef(Boolean(state?.isVoiceCapturing));
+  const pendingVoiceFocusRef = useRef(false);
 
   const reportComposerHeight = () => {
     const composer = composerRef.current;
@@ -35,6 +37,37 @@ export function ComposerView({ state, onDispatchCommand }: ComposerViewProps) {
   useEffect(() => {
     setDraft(state?.draftText ?? "");
   }, [state?.draftText]);
+
+  useEffect(() => {
+    const wasVoiceCapturing = wasVoiceCapturingRef.current;
+    const isVoiceCapturing = Boolean(state?.isVoiceCapturing);
+    const hasDraftText = Boolean(state?.draftText?.trim());
+
+    if (wasVoiceCapturing && !isVoiceCapturing && hasDraftText) {
+      pendingVoiceFocusRef.current = true;
+    }
+
+    wasVoiceCapturingRef.current = isVoiceCapturing;
+  }, [state?.draftText, state?.isVoiceCapturing]);
+
+  useEffect(() => {
+    if (!pendingVoiceFocusRef.current || !state?.isEnabled || state.isVoiceCapturing) {
+      return;
+    }
+
+    const textarea = textareaRef.current;
+    if (!textarea) return;
+
+    pendingVoiceFocusRef.current = false;
+
+    const frame = requestAnimationFrame(() => {
+      textarea.focus();
+      const end = textarea.value.length;
+      textarea.setSelectionRange(end, end);
+    });
+
+    return () => cancelAnimationFrame(frame);
+  }, [state?.draftText, state?.isEnabled, state?.isVoiceCapturing]);
 
   useLayoutEffect(() => {
     const textarea = textareaRef.current;
@@ -228,9 +261,10 @@ export function ComposerView({ state, onDispatchCommand }: ComposerViewProps) {
       >
         <textarea
           ref={textareaRef}
-          className="oa-react-composer__textarea"
+          className={`oa-react-composer__textarea${state.isVoiceCapturing ? " is-voice-capturing" : ""}`}
           value={draft}
           disabled={!state.isEnabled}
+          readOnly={state.isVoiceCapturing}
           placeholder={state.placeholder}
           onChange={(event) => updateDraft(event.target.value)}
           onPaste={(event) => {

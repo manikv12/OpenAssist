@@ -37,6 +37,28 @@ enum AssistantActivityStatus: String, Codable, Sendable {
     }
 }
 
+struct AssistantAutomationActivityMetadata: Equatable, Codable, Sendable {
+    var stage: String?
+    var actuator: String?
+    var target: String?
+    var confidence: Double?
+    var verificationResult: String?
+
+    init(
+        stage: String? = nil,
+        actuator: String? = nil,
+        target: String? = nil,
+        confidence: Double? = nil,
+        verificationResult: String? = nil
+    ) {
+        self.stage = stage?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+        self.actuator = actuator?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+        self.target = target?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+        self.confidence = confidence
+        self.verificationResult = verificationResult?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+    }
+}
+
 struct AssistantActivityItem: Identifiable, Equatable, Codable, Sendable {
     let id: String
     var sessionID: String?
@@ -49,8 +71,37 @@ struct AssistantActivityItem: Identifiable, Equatable, Codable, Sendable {
     var startedAt: Date
     var updatedAt: Date
     var source: AssistantTimelineSource
+    var automationMetadata: AssistantAutomationActivityMetadata?
 
     var isActive: Bool { status.isActive }
+
+    init(
+        id: String,
+        sessionID: String?,
+        turnID: String?,
+        kind: AssistantActivityKind,
+        title: String,
+        status: AssistantActivityStatus,
+        friendlySummary: String,
+        rawDetails: String?,
+        startedAt: Date,
+        updatedAt: Date,
+        source: AssistantTimelineSource,
+        automationMetadata: AssistantAutomationActivityMetadata? = nil
+    ) {
+        self.id = id
+        self.sessionID = sessionID
+        self.turnID = turnID
+        self.kind = kind
+        self.title = title
+        self.status = status
+        self.friendlySummary = friendlySummary
+        self.rawDetails = rawDetails
+        self.startedAt = startedAt
+        self.updatedAt = updatedAt
+        self.source = source
+        self.automationMetadata = automationMetadata
+    }
 }
 
 enum AssistantActivityOpenTargetKind: String, Equatable, Sendable {
@@ -128,6 +179,33 @@ func assistantActivityOpenTargets(
 
         return []
     }
+}
+
+func assistantRepoRelativeFilePathCandidates(
+    from rawDetails: String?,
+    sessionCWD: String?,
+    repositoryRootPath: String
+) -> [String] {
+    guard let rawDetails = rawDetails?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty,
+          let repositoryRootURL = assistantStandardizedDirectoryURL(from: repositoryRootPath) else {
+        return []
+    }
+
+    let sessionRootURL = assistantStandardizedDirectoryURL(from: sessionCWD)
+    var results: [String] = []
+    var seen = Set<String>()
+
+    for candidate in assistantExtractFilePathCandidates(from: rawDetails) {
+        for relativePath in assistantRepoRelativePathCandidates(
+            from: candidate,
+            sessionRootURL: sessionRootURL,
+            repositoryRootURL: repositoryRootURL
+        ) where seen.insert(relativePath).inserted {
+            results.append(relativePath)
+        }
+    }
+
+    return results
 }
 
 func assistantActivityImagePreviews(
@@ -307,6 +385,110 @@ private func assistantResolvedFileTargets(
     }
 
     return results
+}
+
+private func assistantStandardizedDirectoryURL(from path: String?) -> URL? {
+    guard let path = path?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+        return nil
+    }
+    return URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL
+}
+
+private func assistantRepoRelativePathCandidates(
+    from candidate: String,
+    sessionRootURL: URL?,
+    repositoryRootURL: URL
+) -> [String] {
+    guard let normalizedCandidate = assistantNormalizedPathCandidate(candidate) else {
+        return []
+    }
+
+    var absoluteCandidates: [URL] = []
+    if normalizedCandidate.lowercased().hasPrefix("file://"),
+       let fileURL = URL(string: normalizedCandidate),
+       fileURL.isFileURL {
+        absoluteCandidates.append(fileURL.standardizedFileURL)
+    } else if normalizedCandidate.hasPrefix("/") {
+        absoluteCandidates.append(URL(fileURLWithPath: normalizedCandidate).standardizedFileURL)
+    } else {
+        if assistantLooksLikeAbsolutePathMissingLeadingSlash(
+            normalizedCandidate,
+            repositoryRootURL: repositoryRootURL,
+            sessionRootURL: sessionRootURL
+        ) {
+            absoluteCandidates.append(
+                URL(fileURLWithPath: "/" + normalizedCandidate).standardizedFileURL
+            )
+        } else {
+            absoluteCandidates.append(
+                repositoryRootURL
+                    .appendingPathComponent(normalizedCandidate, isDirectory: false)
+                    .standardizedFileURL
+            )
+            if let sessionRootURL,
+               sessionRootURL.path != repositoryRootURL.path {
+                absoluteCandidates.append(
+                    sessionRootURL
+                        .appendingPathComponent(normalizedCandidate, isDirectory: false)
+                        .standardizedFileURL
+                )
+            }
+        }
+    }
+
+    var results: [String] = []
+    var seen = Set<String>()
+    for absoluteCandidate in absoluteCandidates {
+        guard let relativePath = assistantRepoRelativePath(
+            from: absoluteCandidate,
+            repositoryRootURL: repositoryRootURL
+        ), seen.insert(relativePath).inserted else {
+            continue
+        }
+        results.append(relativePath)
+    }
+
+    return results
+}
+
+private func assistantLooksLikeAbsolutePathMissingLeadingSlash(
+    _ candidate: String,
+    repositoryRootURL: URL,
+    sessionRootURL: URL?
+) -> Bool {
+    let rootPrefixes = [
+        repositoryRootURL.path,
+        sessionRootURL?.path,
+        "/Users",
+        "/private",
+        "/var",
+        "/tmp",
+        "/Volumes",
+        "/System",
+        "/Applications",
+        "/Library"
+    ]
+    .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty }
+    .map { $0.hasPrefix("/") ? String($0.dropFirst()) : $0 }
+
+    return rootPrefixes.contains { prefix in
+        candidate == prefix || candidate.hasPrefix(prefix + "/")
+    }
+}
+
+private func assistantRepoRelativePath(
+    from absoluteURL: URL,
+    repositoryRootURL: URL
+) -> String? {
+    let repositoryRootPath = repositoryRootURL.standardizedFileURL.path
+    let absolutePath = absoluteURL.standardizedFileURL.path
+    guard absolutePath == repositoryRootPath || absolutePath.hasPrefix(repositoryRootPath + "/") else {
+        return nil
+    }
+    guard absolutePath.count > repositoryRootPath.count + 1 else {
+        return nil
+    }
+    return String(absolutePath.dropFirst(repositoryRootPath.count + 1))
 }
 
 private func assistantImageOpenTargets(
@@ -848,12 +1030,21 @@ func assistantPermissionCardState(
     pendingRequest: AssistantPermissionRequest?,
     sessionStatus: AssistantSessionStatus?
 ) -> AssistantPermissionCardState {
-    if assistantPermissionRequestsMatch(request, pendingRequest) {
-        return request.toolKind == "userInput" ? .waitingForInput : .waitingForApproval
+    switch sessionStatus {
+    case .waitingForApproval:
+        return .waitingForApproval
+    case .waitingForInput:
+        return .waitingForInput
+    case .completed:
+        return .completed
+    case .idle, .failed:
+        return .notActive
+    case .active, .unknown, .none:
+        break
     }
 
-    if sessionStatus == .completed {
-        return .completed
+    if assistantPermissionRequestsMatch(request, pendingRequest) {
+        return request.toolKind == "userInput" ? .waitingForInput : .waitingForApproval
     }
 
     return .notActive

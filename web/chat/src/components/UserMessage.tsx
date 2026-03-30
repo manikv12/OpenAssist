@@ -68,7 +68,7 @@ function UserMessageInner({ message }: { message: ChatMessage }) {
           itemName="image"
           className="user-images"
           imageClassName="user-image"
-          defaultExpanded
+          inline
         />
 
         {showText && <div className="user-bubble">{text}</div>}

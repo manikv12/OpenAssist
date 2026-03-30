@@ -1,8 +1,10 @@
 import {
+  memo,
   useEffect,
   useRef,
   useState,
   type CSSProperties,
+  type DragEvent as ReactDragEvent,
   type MouseEvent as ReactMouseEvent,
   type RefObject,
   type ReactNode,
@@ -84,9 +86,11 @@ function compactLabel(label: string, maxLength = 26) {
 
 export function SidebarView({
   state,
+  textScale = 1,
   onDispatchCommand,
 }: {
   state: AssistantSidebarState | null;
+  textScale?: number;
   onDispatchCommand: (type: string, payload?: Record<string, unknown>) => void;
 }) {
   const [contextMenu, setContextMenu] = useState<SidebarContextMenuState | null>(null);
@@ -95,8 +99,14 @@ export function SidebarView({
     y: number;
   } | null>(null);
   const [collapsedPreview, setCollapsedPreview] = useState<CollapsedPreviewState | null>(null);
+  const [draggedProjectId, setDraggedProjectId] = useState<string | null>(null);
+  const [dropTargetProjectId, setDropTargetProjectId] = useState<string | null>(null);
+  const [rootDropActive, setRootDropActive] = useState(false);
   const contextMenuRef = useRef<HTMLDivElement | null>(null);
   const collapsedPreviewCloseRef = useRef<number | null>(null);
+  const sidebarScaleStyle = {
+    "--oa-sidebar-scale": String(Math.max(0.8, textScale)),
+  } as CSSProperties;
 
   const closeContextMenu = () => {
     setContextMenu(null);
@@ -158,14 +168,30 @@ export function SidebarView({
     document.addEventListener("keydown", handleKeyDown);
     document.addEventListener("scroll", handleViewportChange, true);
     window.addEventListener("resize", handleViewportChange);
+    window.addEventListener("blur", handleViewportChange);
 
     return () => {
       document.removeEventListener("pointerdown", handlePointerDown);
       document.removeEventListener("keydown", handleKeyDown);
       document.removeEventListener("scroll", handleViewportChange, true);
       window.removeEventListener("resize", handleViewportChange);
+      window.removeEventListener("blur", handleViewportChange);
     };
   }, [contextMenu]);
+
+  useEffect(() => {
+    const handleCloseRequest = () => {
+      closeContextMenu();
+    };
+
+    window.addEventListener("openassist:close-sidebar-context-menu", handleCloseRequest);
+    return () => {
+      window.removeEventListener(
+        "openassist:close-sidebar-context-menu",
+        handleCloseRequest
+      );
+    };
+  }, []);
 
   useEffect(() => {
     if (!contextMenu || !contextMenuRef.current) {
@@ -228,7 +254,7 @@ export function SidebarView({
 
   if (!state) {
     return (
-      <aside className="oa-react-sidebar">
+      <aside className="oa-react-sidebar" style={sidebarScaleStyle}>
         <div className="oa-react-sidebar__empty">Loading sidebar…</div>
       </aside>
     );
@@ -278,10 +304,35 @@ export function SidebarView({
     sessionPane === "archived" ? state.canLoadMoreArchived : state.canLoadMoreThreads;
   const allSessions = [...state.threads, ...state.archived];
   const activeSession = allSessions.find((session) => session.isSelected) ?? null;
-  const availableProjects = state.allProjects.length ? state.allProjects : state.projects;
+  const allKnownProjects = state.allProjects.length ? state.allProjects : state.projects;
+  const availableProjects = allKnownProjects.filter(
+    (project) => project.kind === "project"
+  );
+  const projectById = new Map(allKnownProjects.map((project) => [project.id, project]));
+  const draggedProject = draggedProjectId ? projectById.get(draggedProjectId) ?? null : null;
+  const projectInfoByID = new Map<
+    string,
+    { name: string; hasLinkedFolder: boolean; menuTitle: string }
+  >(
+    allKnownProjects.map((project) => [
+      project.id,
+      {
+        name: project.name,
+        hasLinkedFolder: project.hasLinkedFolder,
+        menuTitle: project.menuTitle,
+      },
+    ])
+  );
 
   const projectSectionContextMenuEntries = (): SidebarContextMenuEntry[] => {
     const entries: SidebarContextMenuEntry[] = [
+      {
+        kind: "action",
+        id: "create-folder",
+        label: "Create Group",
+        symbol: "square.grid.2x2",
+        command: "createFolderPrompt",
+      },
       {
         kind: "action",
         id: "open-folder-as-project",
@@ -331,7 +382,7 @@ export function SidebarView({
       {
         kind: "note",
         id: "no-hidden-projects",
-        label: "No hidden projects right now",
+        label: "No hidden groups or projects right now",
       },
     ];
   };
@@ -339,18 +390,20 @@ export function SidebarView({
   const projectContextMenuEntries = (
     project: AssistantSidebarProjectItem
   ): SidebarContextMenuEntry[] => {
-    const entries: SidebarContextMenuEntry[] = [
-      {
+    const entries: SidebarContextMenuEntry[] = [];
+
+    if (project.kind === "project") {
+      entries.push({
         kind: "action",
         id: `inspect-project-memory-${project.id}`,
         label: "View Memory",
         symbol: "brain",
         command: "inspectProjectMemory",
         payload: { projectId: project.id },
-      },
-    ];
+      });
+    }
 
-    if (activeSession && !sameSidebarID(activeSession.projectId, project.id)) {
+    if (project.kind === "project" && activeSession && !sameSidebarID(activeSession.projectId, project.id)) {
       entries.push(
         { kind: "separator", id: `project-move-divider-${project.id}` },
         {
@@ -372,70 +425,104 @@ export function SidebarView({
       {
         kind: "action",
         id: `rename-project-${project.id}`,
-        label: "Rename Project",
+        label: project.kind === "folder" ? "Rename Group" : "Rename Project",
         symbol: "pencil",
         command: "renameProjectPrompt",
-        payload: { projectId: project.id },
-      },
-      {
-        kind: "submenu",
-        id: `project-change-icon-${project.id}`,
-        label: "Change Icon",
-        symbol: project.symbol,
-        entries: [
-          {
-            kind: "action",
-            id: `project-default-icon-${project.id}`,
-            label: "Use Default Icon",
-            symbol: "arrow.counterclockwise",
-            disabled: !project.hasCustomIcon,
-            command: "setProjectIcon",
-            payload: { projectId: project.id, symbol: "" },
-          },
-          { kind: "separator", id: `project-icon-divider-${project.id}` },
-          ...PROJECT_ICON_OPTIONS.map<SidebarContextMenuEntry>((option) => ({
-            kind: "action",
-            id: `project-icon-${project.id}-${option.symbol}`,
-            label: option.label,
-            symbol: option.symbol,
-            disabled: sameSidebarID(project.symbol, option.symbol),
-            command: "setProjectIcon",
-            payload: {
-              projectId: project.id,
-              symbol: option.symbol,
-            },
-          })),
-          { kind: "separator", id: `project-icon-custom-divider-${project.id}` },
-          {
-            kind: "action",
-            id: `project-custom-icon-${project.id}`,
-            label: "Custom Symbol…",
-            symbol: "sparkles",
-            command: "changeProjectIconPrompt",
-            payload: { projectId: project.id },
-          },
-        ],
-      },
-      { kind: "separator", id: `project-folder-divider-${project.id}` },
-      {
-        kind: "action",
-        id: `project-folder-link-${project.id}`,
-        label: project.hasLinkedFolder ? "Change Folder" : "Link Folder",
-        symbol: "folder",
-        command: "linkProjectFolder",
         payload: { projectId: project.id },
       }
     );
 
-    if (project.hasLinkedFolder) {
-      entries.push({
-        kind: "action",
-        id: `project-folder-unlink-${project.id}`,
-        label: "Remove Folder Link",
-        symbol: "folder.badge.minus",
-        command: "removeProjectFolderLink",
-        payload: { projectId: project.id },
-      });
+    entries.push({
+      kind: "submenu",
+      id: `project-change-icon-${project.id}`,
+      label: "Change Icon",
+      symbol: project.symbol,
+      entries: [
+        {
+          kind: "action",
+          id: `project-default-icon-${project.id}`,
+          label: "Use Default Icon",
+          symbol: "arrow.counterclockwise",
+          disabled: !project.hasCustomIcon,
+          command: "setProjectIcon",
+          payload: { projectId: project.id, symbol: "" },
+        },
+        { kind: "separator", id: `project-icon-divider-${project.id}` },
+        ...PROJECT_ICON_OPTIONS.map<SidebarContextMenuEntry>((option) => ({
+          kind: "action",
+          id: `project-icon-${project.id}-${option.symbol}`,
+          label: option.label,
+          symbol: option.symbol,
+          disabled: sameSidebarID(project.symbol, option.symbol),
+          command: "setProjectIcon",
+          payload: {
+            projectId: project.id,
+            symbol: option.symbol,
+          },
+        })),
+        { kind: "separator", id: `project-icon-custom-divider-${project.id}` },
+        {
+          kind: "action",
+          id: `project-custom-icon-${project.id}`,
+          label: "Custom Symbol…",
+          symbol: "sparkles",
+          command: "changeProjectIconPrompt",
+          payload: { projectId: project.id },
+        },
+      ],
+    });
+
+    if (project.kind === "project") {
+      entries.push(
+        { kind: "separator", id: `project-folder-divider-${project.id}` },
+        {
+          kind: "action",
+          id: `project-folder-link-${project.id}`,
+          label: project.hasLinkedFolder ? "Change Folder" : "Link Folder",
+          symbol: "folder",
+          command: "linkProjectFolder",
+          payload: { projectId: project.id },
+        },
+        {
+          kind: "action",
+          id: `project-move-folder-${project.id}`,
+          label: "Move to Group",
+          symbol: "square.grid.2x2",
+          command: "moveProjectToFolderPrompt",
+          payload: { projectId: project.id },
+        },
+        {
+          kind: "action",
+          id: `project-move-root-${project.id}`,
+          label: "Move to Top Level",
+          symbol: "arrow.up.left.and.arrow.down.right",
+          disabled: !project.parentId,
+          command: "moveProjectToRoot",
+          payload: { projectId: project.id },
+        }
+      );
+
+      if (project.hasLinkedFolder) {
+        entries.push({
+          kind: "action",
+          id: `project-folder-unlink-${project.id}`,
+          label: "Remove Folder Link",
+          symbol: "folder.badge.minus",
+          command: "removeProjectFolderLink",
+          payload: { projectId: project.id },
+        });
+      }
+    } else {
+      entries.push(
+        {
+          kind: "action",
+          id: `folder-create-project-${project.id}`,
+          label: "Create Project Inside Group",
+          symbol: "plus",
+          command: "createProjectInFolderPrompt",
+          payload: { projectId: project.id },
+        }
+      );
     }
 
     entries.push(
@@ -443,7 +530,7 @@ export function SidebarView({
       {
         kind: "action",
         id: `hide-project-${project.id}`,
-        label: "Hide Project",
+        label: project.kind === "folder" ? "Hide Group" : "Hide Project",
         symbol: "eye.slash",
         command: "hideProject",
         payload: { projectId: project.id },
@@ -451,7 +538,7 @@ export function SidebarView({
       {
         kind: "action",
         id: `delete-project-${project.id}`,
-        label: "Delete Project",
+        label: project.kind === "folder" ? "Delete Group" : "Delete Project",
         symbol: "trash",
         destructive: true,
         command: "deleteProject",
@@ -517,7 +604,7 @@ export function SidebarView({
         ...availableProjects.map<SidebarContextMenuEntry>((project) => ({
           kind: "action",
           id: `assign-session-${session.id}-${project.id}`,
-          label: `${session.projectId ? "Move to" : "Add to"} ${project.name}`,
+          label: `${session.projectId ? "Move to" : "Add to"} ${project.menuTitle}`,
           symbol: project.symbol,
           disabled: sameSidebarID(session.projectId, project.id),
           command: "assignSessionToProject",
@@ -582,10 +669,67 @@ export function SidebarView({
     return entries;
   };
 
+  const resetProjectDragState = () => {
+    setDraggedProjectId(null);
+    setDropTargetProjectId(null);
+    setRootDropActive(false);
+  };
+
+  const handleProjectDragStart = (
+    event: ReactDragEvent<HTMLButtonElement>,
+    project: AssistantSidebarProjectItem
+  ) => {
+    event.dataTransfer.effectAllowed = "move";
+    event.dataTransfer.setData("text/plain", project.id);
+    setDraggedProjectId(project.id);
+    setDropTargetProjectId(null);
+    setRootDropActive(false);
+  };
+
+  const handleProjectDropIntoGroup = (
+    event: ReactDragEvent<HTMLElement>,
+    group: AssistantSidebarProjectItem
+  ) => {
+    if (group.kind !== "folder") {
+      return;
+    }
+    const projectId = draggedProjectId ?? event.dataTransfer.getData("text/plain");
+    const draggedProjectInfo = projectId ? projectById.get(projectId) ?? null : null;
+    if (
+      !projectId ||
+      sameSidebarID(projectId, group.id) ||
+      sameSidebarID(draggedProjectInfo?.parentId, group.id)
+    ) {
+      resetProjectDragState();
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    closeContextMenu();
+    onDispatchCommand("moveProjectToFolder", {
+      projectId,
+      folderId: group.id,
+    });
+    resetProjectDragState();
+  };
+
+  const handleProjectDropToRoot = (event: ReactDragEvent<HTMLElement>) => {
+    const projectId = draggedProjectId ?? event.dataTransfer.getData("text/plain");
+    if (!projectId) {
+      resetProjectDragState();
+      return;
+    }
+    event.preventDefault();
+    closeContextMenu();
+    onDispatchCommand("moveProjectToRoot", { projectId });
+    resetProjectDragState();
+  };
+
   if (state.isCollapsed) {
     return (
       <CollapsedSidebarRail
         state={state}
+        style={sidebarScaleStyle}
         preview={collapsedPreview}
         onPreviewEnter={openCollapsedPreview}
         onPreviewLeave={scheduleCollapsedPreviewClose}
@@ -596,20 +740,7 @@ export function SidebarView({
   }
 
   return (
-    <aside className="oa-react-sidebar">
-      {state.canCollapse ? (
-        <div className="oa-react-sidebar__header">
-          <button
-            type="button"
-            className="oa-react-sidebar__icon-button"
-            onClick={() => onDispatchCommand("setSidebarCollapsed", { collapsed: true })}
-            title="Hide sidebar"
-          >
-            <SidebarIcon symbol="sidebar.left" />
-          </button>
-        </div>
-      ) : null}
-
+    <aside className="oa-react-sidebar" style={sidebarScaleStyle}>
       <div className="oa-react-sidebar__nav">
         {state.navItems.map((item) => (
           <NavButton
@@ -622,6 +753,16 @@ export function SidebarView({
             }}
           />
         ))}
+        {state.canCollapse ? (
+          <button
+            type="button"
+            className="oa-react-sidebar__icon-button oa-react-sidebar__collapse-btn"
+            onClick={() => onDispatchCommand("setSidebarCollapsed", { collapsed: true })}
+            title="Hide sidebar"
+          >
+            <SidebarIcon symbol="sidebar.left" />
+          </button>
+        ) : null}
       </div>
 
       <div className="oa-react-sidebar__scroll">
@@ -645,14 +786,33 @@ export function SidebarView({
                 onContextMenu={(event) =>
                   openContextMenu(event, projectSectionContextMenuEntries())
                 }
-                title="Create project"
+                title="Create group or project"
               >
-                <SidebarIcon symbol="folder.badge.plus" />
+                <SidebarIcon symbol="plus.square.on.square" />
               </button>
             }
           >
             {state.projects.length ? (
               <div className="oa-react-sidebar__list">
+                {draggedProject?.parentId ? (
+                  <div
+                    className={`oa-react-sidebar__drop-target ${
+                      rootDropActive ? "is-active" : ""
+                    }`}
+                    onDragOver={(event) => {
+                      event.preventDefault();
+                      event.dataTransfer.dropEffect = "move";
+                      setRootDropActive(true);
+                      setDropTargetProjectId(null);
+                    }}
+                    onDragLeave={() => {
+                      setRootDropActive(false);
+                    }}
+                    onDrop={handleProjectDropToRoot}
+                  >
+                    Drop here to move this project to the top level
+                  </div>
+                ) : null}
                 {state.projects.map((project) => (
                   <ProjectRow
                     key={project.id}
@@ -663,16 +823,51 @@ export function SidebarView({
                         projectId: project.isSelected ? "" : project.id,
                       });
                     }}
+                    onToggleExpanded={() => {
+                      if (project.kind !== "folder") {
+                        return;
+                      }
+                      closeContextMenu();
+                      onDispatchCommand("toggleProjectExpanded", {
+                        projectId: project.id,
+                        expanded: !project.isExpanded,
+                      });
+                    }}
                     onContextMenu={(event) =>
                       openContextMenu(event, projectContextMenuEntries(project))
                     }
+                    onDragStart={(event) => handleProjectDragStart(event, project)}
+                    onDragEnd={resetProjectDragState}
+                    onDragOver={(event) => {
+                      if (
+                        project.kind !== "folder" ||
+                        !draggedProject ||
+                        sameSidebarID(draggedProject.id, project.id) ||
+                        sameSidebarID(draggedProject.parentId, project.id)
+                      ) {
+                        return;
+                      }
+                      event.preventDefault();
+                      event.stopPropagation();
+                      event.dataTransfer.dropEffect = "move";
+                      setDropTargetProjectId(project.id);
+                      setRootDropActive(false);
+                    }}
+                    onDragLeave={() => {
+                      if (sameSidebarID(dropTargetProjectId, project.id)) {
+                        setDropTargetProjectId(null);
+                      }
+                    }}
+                    onDrop={(event) => handleProjectDropIntoGroup(event, project)}
+                    isDragging={sameSidebarID(draggedProjectId, project.id)}
+                    isDropTarget={sameSidebarID(dropTargetProjectId, project.id)}
                   />
                 ))}
               </div>
             ) : (
               <div className="oa-react-sidebar__empty">
                 {state.hiddenProjectCount > 0
-                  ? "Projects are hidden right now. Right-click the add folder button to unhide them."
+                  ? "Groups or projects are hidden right now. Right-click the add button to unhide them."
                   : "No projects yet."}
               </div>
             )}
@@ -716,6 +911,18 @@ export function SidebarView({
                 <SessionRow
                   key={session.id}
                   session={session}
+                  projectName={(() => {
+                    if (!session.projectId) {
+                      return undefined;
+                    }
+                    const projectInfo = projectInfoByID.get(session.projectId);
+                    if (!projectInfo) {
+                      return undefined;
+                    }
+                    return state.projectFilterKind === "folder" || projectInfo.hasLinkedFolder
+                      ? projectInfo.name
+                      : undefined;
+                  })()}
                   onClick={() => {
                     closeContextMenu();
                     onDispatchCommand("openSession", {
@@ -793,7 +1000,7 @@ export function SidebarView({
   );
 }
 
-function NavButton({
+const NavButton = memo(function NavButton({
   item,
   isSelected,
   onClick,
@@ -812,9 +1019,9 @@ function NavButton({
       <span>{item.label}</span>
     </button>
   );
-}
+});
 
-function SidebarSection({
+const SidebarSection = memo(function SidebarSection({
   title,
   helperText,
   expanded,
@@ -853,72 +1060,138 @@ function SidebarSection({
       {expanded ? children : null}
     </section>
   );
-}
+});
 
-function ProjectRow({
+const ProjectRow = memo(function ProjectRow({
   project,
   onClick,
+  onToggleExpanded,
   onContextMenu,
+  onDragStart,
+  onDragEnd,
+  onDragOver,
+  onDragLeave,
+  onDrop,
+  isDragging,
+  isDropTarget,
 }: {
   project: AssistantSidebarProjectItem;
   onClick: () => void;
+  onToggleExpanded: () => void;
   onContextMenu: (event: ReactMouseEvent<HTMLButtonElement>) => void;
+  onDragStart: (event: ReactDragEvent<HTMLButtonElement>) => void;
+  onDragEnd: () => void;
+  onDragOver: (event: ReactDragEvent<HTMLButtonElement>) => void;
+  onDragLeave: () => void;
+  onDrop: (event: ReactDragEvent<HTMLButtonElement>) => void;
+  isDragging: boolean;
+  isDropTarget: boolean;
 }) {
+  const style = {
+    paddingLeft: `calc(${10 + project.depth * 18}px * var(--oa-sidebar-scale))`,
+  } as CSSProperties;
+
   return (
     <button
       type="button"
-      className={`oa-react-sidebar__row ${project.isSelected ? "is-selected" : ""}`}
+      className={`oa-react-sidebar__row oa-react-sidebar__row--project ${
+        project.kind === "folder" ? "oa-react-sidebar__row--folder" : ""
+      } ${project.isSelected ? "is-selected" : ""} ${
+        isDropTarget ? "is-drop-target" : ""
+      } ${isDragging ? "is-dragging" : ""}`}
       onClick={onClick}
       onContextMenu={onContextMenu}
+      draggable={project.kind === "project"}
+      onDragStart={onDragStart}
+      onDragEnd={onDragEnd}
+      onDragOver={onDragOver}
+      onDragLeave={onDragLeave}
+      onDrop={onDrop}
+      style={style}
     >
+      {project.kind === "folder" ? (
+        <span
+          className="oa-react-sidebar__row-folder-chevron oa-react-sidebar__row-folder-chevron--interactive"
+          onClick={(event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            onToggleExpanded();
+          }}
+        >
+          <SidebarIcon symbol={project.isExpanded ? "chevron.down" : "chevron.right"} />
+        </span>
+      ) : (
+        <span className="oa-react-sidebar__row-folder-chevron oa-react-sidebar__row-folder-chevron--spacer" />
+      )}
       <span className="oa-react-sidebar__row-icon">
         <SidebarIcon symbol={project.symbol} />
       </span>
       <span className="oa-react-sidebar__row-copy">
-        <span className="oa-react-sidebar__row-title">{project.name}</span>
+        <span className="oa-react-sidebar__row-title-line">
+          <span className="oa-react-sidebar__row-title-wrap">
+            <span className="oa-react-sidebar__row-title">{project.name}</span>
+          </span>
+        </span>
         <span className="oa-react-sidebar__row-subtitle">{project.subtitle}</span>
       </span>
     </button>
   );
-}
+});
 
-function SessionRow({
+const SessionRow = memo(function SessionRow({
   session,
+  projectName,
   onClick,
   onContextMenu,
 }: {
   session: AssistantSidebarSessionItem;
+  projectName?: string;
   onClick: () => void;
   onContextMenu: (event: ReactMouseEvent<HTMLButtonElement>) => void;
 }) {
+  const isWorking =
+    session.activityState === "running" || session.activityState === "waiting";
+
   return (
     <button
       type="button"
-      className={`oa-react-sidebar__row ${session.isSelected ? "is-selected" : ""}`}
+      className={`oa-react-sidebar__row oa-react-sidebar__row--session ${
+        session.isSelected ? "is-selected" : ""
+      }`}
       onClick={onClick}
       onContextMenu={onContextMenu}
     >
-      <span className="oa-react-sidebar__row-icon">
-        <SidebarIcon symbol="doc.text" />
-      </span>
       <span className="oa-react-sidebar__row-copy">
         <span className="oa-react-sidebar__row-title-line">
-          <span className="oa-react-sidebar__row-title">{session.title}</span>
+          <span className="oa-react-sidebar__row-title-wrap">
+            {isWorking ? (
+              <span
+                aria-hidden="true"
+                className={`oa-react-sidebar__thread-activity oa-react-sidebar__thread-activity--${
+                  session.activityState ?? "running"
+                }`}
+              />
+            ) : null}
+            <span className="oa-react-sidebar__row-title">{session.title}</span>
+          </span>
           {session.timeLabel ? (
             <span className="oa-react-sidebar__row-meta">{session.timeLabel}</span>
           ) : null}
         </span>
-        <span className="oa-react-sidebar__row-subtitle">{session.subtitle}</span>
+        {projectName ? (
+          <span className="oa-react-sidebar__row-subtitle">{projectName}</span>
+        ) : null}
       </span>
       {session.isTemporary ? (
         <span className="oa-react-sidebar__badge">Temp</span>
       ) : null}
     </button>
   );
-}
+});
 
 function CollapsedSidebarRail({
   state,
+  style,
   preview,
   onPreviewEnter,
   onPreviewLeave,
@@ -926,6 +1199,7 @@ function CollapsedSidebarRail({
   onDispatchCommand,
 }: {
   state: AssistantSidebarState;
+  style?: CSSProperties;
   preview: CollapsedPreviewState | null;
   onPreviewEnter: (pane: AssistantSidebarCollapsedPreviewPane, top: number) => void;
   onPreviewLeave: () => void;
@@ -935,7 +1209,7 @@ function CollapsedSidebarRail({
   const hasSelectedProject = state.projects.some((project) => project.isSelected);
 
   return (
-    <aside className="oa-react-sidebar oa-react-sidebar--collapsed">
+    <aside className="oa-react-sidebar oa-react-sidebar--collapsed" style={style}>
       <div className="oa-react-sidebar__collapsed-shell" onMouseLeave={onPreviewLeave}>
         <div className="oa-react-sidebar__collapsed-rail">
           <div className="oa-react-sidebar__collapsed-group">
@@ -954,7 +1228,7 @@ function CollapsedSidebarRail({
               onClick={() => onDispatchCommand("setSelectedPane", { pane: "threads" })}
             />
             <CollapsedRailButton
-              symbol="folder"
+              symbol="square.grid.2x2"
               label="Projects"
               isSelected={hasSelectedProject}
               onMouseEnter={(event) =>
@@ -1123,7 +1397,7 @@ function CollapsedSidebarPreview({
         ) : (
           <div className="oa-react-sidebar__collapsed-preview-note">
             {state.hiddenProjectCount > 0
-              ? "Projects are hidden right now."
+              ? "Groups or projects are hidden right now."
               : "No projects yet."}
           </div>
         )
@@ -1194,7 +1468,7 @@ function CollapsedSessionPreviewRow({
   return (
     <button
       type="button"
-      className={`oa-react-sidebar__collapsed-preview-row ${
+      className={`oa-react-sidebar__collapsed-preview-row oa-react-sidebar__collapsed-preview-row--session ${
         session.isSelected ? "is-selected" : ""
       }`}
       onClick={() =>
@@ -1204,14 +1478,8 @@ function CollapsedSessionPreviewRow({
         })
       }
     >
-      <span className="oa-react-sidebar__collapsed-preview-icon">
-        <SidebarIcon symbol="doc.text" />
-      </span>
       <span className="oa-react-sidebar__collapsed-preview-copy">
         <span className="oa-react-sidebar__collapsed-preview-name">{session.title}</span>
-        <span className="oa-react-sidebar__collapsed-preview-meta">
-          {session.subtitle}
-        </span>
       </span>
       {session.timeLabel ? (
         <span className="oa-react-sidebar__collapsed-preview-time">

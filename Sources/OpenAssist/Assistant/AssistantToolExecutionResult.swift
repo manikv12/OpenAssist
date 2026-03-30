@@ -23,16 +23,19 @@ struct AssistantToolExecutionResult: Sendable {
     let summary: String
     /// Non-nil when the tool requires the user to log in before proceeding.
     let loginPrompt: AssistantBrowserLoginPrompt?
+    let activityMetadata: AssistantAutomationActivityMetadata?
 
     init(
         contentItems: [ContentItem],
         success: Bool,
         summary: String,
-        loginPrompt: AssistantBrowserLoginPrompt? = nil
+        loginPrompt: AssistantBrowserLoginPrompt? = nil,
+        activityMetadata: AssistantAutomationActivityMetadata? = nil
     ) {
         self.contentItems = contentItems
         self.success = success
         self.summary = summary
         self.loginPrompt = loginPrompt
+        self.activityMetadata = activityMetadata
     }
 }

@@ -289,12 +289,27 @@ final class GitCheckpointService {
     func buildCaptureResult(
         repository: GitCheckpointRepositoryContext,
         before: GitCheckpointSnapshot,
-        after: GitCheckpointSnapshot
+        after: GitCheckpointSnapshot,
+        includedPaths: Set<String>? = nil
     ) async throws -> GitCheckpointCaptureResult {
+        let pathFilter = includedPaths?.sorted()
+        if let pathFilter, pathFilter.isEmpty {
+            return GitCheckpointCaptureResult(
+                patch: "",
+                changedFiles: [],
+                summary: "No Git-tracked code changes were saved in this turn.",
+                ignoredTouchedPaths: diffIgnoredPaths(
+                    before: before.ignoredFingerprints,
+                    after: after.ignoredFingerprints
+                )
+            )
+        }
+
         let changedStatuses = try await changedPathStatuses(
             repositoryRootPath: repository.rootPath,
             beforeCommit: before.worktreeCommit,
-            afterCommit: after.worktreeCommit
+            afterCommit: after.worktreeCommit,
+            paths: pathFilter
         )
         let changedPaths = changedStatuses.map(\.path)
         guard !changedPaths.isEmpty else {
@@ -312,12 +327,14 @@ final class GitCheckpointService {
         let binaryPaths = try await binaryPathSet(
             repositoryRootPath: repository.rootPath,
             beforeCommit: before.worktreeCommit,
-            afterCommit: after.worktreeCommit
+            afterCommit: after.worktreeCommit,
+            paths: pathFilter
         )
         let patch = try await diffPatch(
             repositoryRootPath: repository.rootPath,
             beforeCommit: before.worktreeCommit,
-            afterCommit: after.worktreeCommit
+            afterCommit: after.worktreeCommit,
+            paths: pathFilter
         )
 
         let files = try await changedStatuses.asyncMap { status in
@@ -588,11 +605,16 @@ final class GitCheckpointService {
     private func changedPathStatuses(
         repositoryRootPath: String,
         beforeCommit: String,
-        afterCommit: String
+        afterCommit: String,
+        paths: [String]? = nil
     ) async throws -> [(path: String, kind: AssistantCodeCheckpointChangeKind)] {
+        var arguments = ["diff", "--no-renames", "--name-status", "-z", beforeCommit, afterCommit, "--"]
+        if let paths {
+            arguments.append(contentsOf: paths)
+        }
         let result = try await runGit(
             currentDirectoryPath: repositoryRootPath,
-            arguments: ["diff", "--no-renames", "--name-status", "-z", beforeCommit, afterCommit, "--"]
+            arguments: arguments
         )
 
         let chunks = result.stdout.split(separator: "\0").map(String.init)
@@ -612,11 +634,16 @@ final class GitCheckpointService {
     private func binaryPathSet(
         repositoryRootPath: String,
         beforeCommit: String,
-        afterCommit: String
+        afterCommit: String,
+        paths: [String]? = nil
     ) async throws -> Set<String> {
+        var arguments = ["diff", "--no-renames", "--numstat", "-z", beforeCommit, afterCommit, "--"]
+        if let paths {
+            arguments.append(contentsOf: paths)
+        }
         let result = try await runGit(
             currentDirectoryPath: repositoryRootPath,
-            arguments: ["diff", "--no-renames", "--numstat", "-z", beforeCommit, afterCommit, "--"]
+            arguments: arguments
         )
 
         let rows = result.stdout.split(separator: "\0").map(String.init)
@@ -634,11 +661,16 @@ final class GitCheckpointService {
     private func diffPatch(
         repositoryRootPath: String,
         beforeCommit: String,
-        afterCommit: String
+        afterCommit: String,
+        paths: [String]? = nil
     ) async throws -> String {
+        var arguments = ["diff", "--no-renames", "--binary", beforeCommit, afterCommit, "--"]
+        if let paths {
+            arguments.append(contentsOf: paths)
+        }
         let result = try await runGit(
             currentDirectoryPath: repositoryRootPath,
-            arguments: ["diff", "--no-renames", "--binary", beforeCommit, afterCommit, "--"]
+            arguments: arguments
         )
         return result.stdout
     }

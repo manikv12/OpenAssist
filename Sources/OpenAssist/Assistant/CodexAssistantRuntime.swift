@@ -150,7 +150,7 @@ private enum CodexIncomingEvent: @unchecked Sendable {
     case notification(method: String, params: [String: Any])
     case serverRequest(id: JSONRPCRequestID, method: String, params: [String: Any])
     case statusMessage(String)
-    case processExited(String?)
+    case processExited(message: String?, expected: Bool)
 }
 
 struct AssistantRepeatedCommandLimitHit: Equatable, Sendable {
@@ -249,10 +249,13 @@ final class CodexAssistantRuntime {
     var onTitleRequest: (@Sendable (_ sessionID: String, _ userPrompt: String, _ assistantResponse: String) -> Void)?
 
     private var transport: CodexAppServerTransport?
+    private var mcpToolBridge: AssistantMCPToolBridge?
+    private var mcpConfigFilePath: String?
     private var activeClaudeProcess: Process?
     private var activeSessionID: String?
     private var activeSessionCWD: String?
     private var activeTurnID: String?
+    private var currentTurnAttachments: [AssistantAttachment] = []
     private var preferredModelID: String?
     private var preferredSubagentModelID: String?
     private var currentCodexPath: String?
@@ -265,6 +268,7 @@ final class CodexAssistantRuntime {
     private var currentModels: [AssistantModelOption] = []
     private var toolCalls: [String: AssistantToolCallState] = [:]
     private var liveActivities: [String: AssistantActivityItem] = [:]
+    private var locallySuccessfulDynamicToolCallIDs: Set<String> = []
     private var pendingPermissionContext: PendingPermissionContext?
     private var loginRefreshTask: Task<Void, Never>?
     private var metadataRefreshTask: Task<Void, Never>?
@@ -530,7 +534,8 @@ final class CodexAssistantRuntime {
         firstTurnUserPrompt = nil
 
         let requestedModelID = preferredModelID ?? self.preferredModelID
-        CrashReporter.logInfo("Assistant runtime requesting thread/start model=\(requestedModelID ?? "server-default") cwd=\((cwd ?? FileManager.default.homeDirectoryForCurrentUser.path))")
+        let loggedCWD = cwd?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty ?? "none"
+        CrashReporter.logInfo("Assistant runtime requesting thread/start model=\(requestedModelID ?? "server-default") cwd=\(loggedCWD)")
 
         let response = try await sendRequest(
             method: "thread/start",
@@ -685,8 +690,10 @@ final class CodexAssistantRuntime {
         allowsProposedPlanForActiveTurn = interactionMode == .plan
         blockedToolUseHandledForActiveTurn = false
         blockedToolUseInterruptionMessage = nil
+        currentTurnAttachments = attachments
         currentTurnIncludesImageAttachments = attachments.contains(where: \.isImage)
         currentTurnModelSupportsImageInput = modelSupportsImageInput
+        currentTurnHadSuccessfulImageGeneration = false
         redirectedImageToolCallForActiveTurn = false
 
         // Track the first user prompt for title generation
@@ -1228,6 +1235,18 @@ final class CodexAssistantRuntime {
         }
     }
 
+    private func copilotRequestWithTimeout(
+        method: String,
+        params: [String: Any],
+        timeoutNanoseconds: UInt64
+    ) async throws -> CodexResponsePayload {
+        try await requestWithTimeout(
+            method: method,
+            params: params,
+            timeoutNanoseconds: timeoutNanoseconds
+        )
+    }
+
     private func connectedHealthForCurrentState(detail: String? = nil) -> AssistantRuntimeHealth {
         if activeTurnID != nil {
             return makeHealth(availability: .active, summary: backend.activeSummary, detail: detail)
@@ -1323,7 +1342,8 @@ final class CodexAssistantRuntime {
         case .statusMessage(let message):
             CrashReporter.logInfo("Assistant runtime status: \(message)")
             onStatusMessage?(message)
-        case .processExited(let message):
+        case .processExited(let message, let expected):
+            guard !expected else { return }
             flushStreamingBuffer()
             flushCommentaryBuffer()
             finalizeActiveActivities(with: .interrupted)
@@ -2210,19 +2230,20 @@ final class CodexAssistantRuntime {
 
     private func handleDynamicToolCall(id: JSONRPCRequestID, params: [String: Any]) async {
         let tool = dynamicToolName(from: params) ?? "Tool"
+        let activityID = dynamicToolRequestActivityID(from: params)
 
         guard let descriptor = toolExecutor.descriptor(for: tool),
               let toolKind = dynamicToolKind(for: tool) else {
             do {
                 try await transport?.sendResponse(
                     id: id,
-                    result: [
-                        "contentItems": [[
+                    result: dynamicToolResponseResult(
+                        contentItems: [[
                             "type": "inputText",
                             "text": "Open Assist does not support the dynamic tool `\(tool)` yet."
                         ]],
-                        "success": false
-                    ]
+                        success: false
+                    )
                 )
             } catch {
                 await MainActor.run {
@@ -2258,7 +2279,8 @@ final class CodexAssistantRuntime {
             await executeDynamicToolCall(
                 toolName: tool,
                 requestID: id,
-                arguments: arguments
+                arguments: arguments,
+                activityID: activityID
             )
             return
         }
@@ -2268,6 +2290,7 @@ final class CodexAssistantRuntime {
                 toolName: tool,
                 requestID: id,
                 arguments: arguments,
+                activityID: activityID,
                 sessionID: sessionID
             )
             return
@@ -2279,6 +2302,7 @@ final class CodexAssistantRuntime {
                 toolName: tool,
                 requestID: id,
                 arguments: arguments,
+                activityID: activityID,
                 sessionID: sessionID
             )
             return
@@ -2335,6 +2359,7 @@ final class CodexAssistantRuntime {
                     toolName: tool,
                     requestID: id,
                     arguments: arguments,
+                    activityID: activityID,
                     sessionID: sessionID
                 )
             case "accept":
@@ -2342,6 +2367,7 @@ final class CodexAssistantRuntime {
                     toolName: tool,
                     requestID: id,
                     arguments: arguments,
+                    activityID: activityID,
                     sessionID: sessionID
                 )
             case "cancel":
@@ -2349,10 +2375,10 @@ final class CodexAssistantRuntime {
                 do {
                     try await self.transport?.sendResponse(
                         id: id,
-                        result: [
-                            "contentItems": [["type": "inputText", "text": message]],
-                            "success": false
-                        ]
+                        result: self.dynamicToolResponseResult(
+                            contentItems: [["type": "inputText", "text": message]],
+                            success: false
+                        )
                     )
                 } catch {
                     await MainActor.run {
@@ -2365,10 +2391,10 @@ final class CodexAssistantRuntime {
                 do {
                     try await self.transport?.sendResponse(
                         id: id,
-                        result: [
-                            "contentItems": [["type": "inputText", "text": message]],
-                            "success": false
-                        ]
+                        result: self.dynamicToolResponseResult(
+                            contentItems: [["type": "inputText", "text": message]],
+                            success: false
+                        )
                     )
                 } catch {
                     await MainActor.run {
@@ -2382,10 +2408,10 @@ final class CodexAssistantRuntime {
             do {
                 try await self.transport?.sendResponse(
                     id: id,
-                    result: [
-                        "contentItems": [["type": "inputText", "text": message]],
-                        "success": false
-                    ]
+                    result: self.dynamicToolResponseResult(
+                        contentItems: [["type": "inputText", "text": message]],
+                        success: false
+                    )
                 )
             } catch {
                 await MainActor.run {
@@ -2415,6 +2441,7 @@ final class CodexAssistantRuntime {
         toolName: String,
         requestID: JSONRPCRequestID,
         arguments: Any,
+        activityID: String? = nil,
         sessionID: String? = nil,
         browserLoginResume: Bool = false
     ) async {
@@ -2431,10 +2458,10 @@ final class CodexAssistantRuntime {
             do {
                 try await transport?.sendResponse(
                     id: requestID,
-                    result: [
-                        "contentItems": failedResult.contentItems.map { $0.dictionaryRepresentation() },
-                        "success": false
-                    ]
+                    result: dynamicToolResponseResult(
+                        contentItems: failedResult.contentItems.map { $0.dictionaryRepresentation() },
+                        success: false
+                    )
                 )
             } catch {
                 await MainActor.run { self.onStatusMessage?(error.localizedDescription) }
@@ -2452,11 +2479,13 @@ final class CodexAssistantRuntime {
             AssistantToolExecutionContext(
                 toolName: toolName,
                 arguments: arguments,
+                attachments: currentTurnAttachments,
                 sessionID: sessionID ?? activeSessionID ?? "",
                 preferredModelID: preferredModelID,
                 browserLoginResume: browserLoginResume
             )
         )
+        applyToolResultToLiveActivity(activityID: activityID, result: result)
         if let prompt = result.loginPrompt {
             await presentBrowserLoginRequest(
                 id: requestID,
@@ -2470,11 +2499,20 @@ final class CodexAssistantRuntime {
         do {
             try await transport?.sendResponse(
                 id: requestID,
-                result: [
-                    "contentItems": result.contentItems.map { $0.dictionaryRepresentation() },
-                    "success": result.success
-                ]
+                result: dynamicToolResponseResult(
+                    contentItems: result.contentItems.map { $0.dictionaryRepresentation() },
+                    success: result.success
+                )
             )
+            let markerIDs = dynamicToolSuccessMarkerIDs(
+                activityID: activityID,
+                requestID: requestID
+            )
+            if result.success {
+                markerIDs.forEach { locallySuccessfulDynamicToolCallIDs.insert($0) }
+            } else {
+                markerIDs.forEach { locallySuccessfulDynamicToolCallIDs.remove($0) }
+            }
         } catch {
             await MainActor.run {
                 onStatusMessage?(error.localizedDescription)
@@ -2510,6 +2548,9 @@ final class CodexAssistantRuntime {
 
         if !result.summary.isEmpty {
             onStatusMessage?(result.summary)
+        }
+        if result.success, toolName == AssistantImageGenerationToolDefinition.name {
+            currentTurnHadSuccessfulImageGeneration = true
         }
         updateHUD(
             phase: result.success ? .acting : .failed,
@@ -2635,10 +2676,10 @@ final class CodexAssistantRuntime {
         do {
             try await transport?.sendResponse(
                 id: id,
-                result: [
-                    "contentItems": [["type": "inputText", "text": message]],
-                    "success": false
-                ]
+                result: dynamicToolResponseResult(
+                    contentItems: [["type": "inputText", "text": message]],
+                    success: false
+                )
             )
         } catch {
             await MainActor.run {
@@ -2663,12 +2704,13 @@ final class CodexAssistantRuntime {
             streamingStartedAt = nil
             return
         }
+        let finalizedStreamingText = correctedAssistantImageFailureFallbackIfNeeded(streamingBuffer)
         onTranscriptMutation?(
             .upsert(
                 AssistantTranscriptEntry(
                     id: entryID,
                     role: .assistant,
-                    text: streamingBuffer,
+                    text: finalizedStreamingText,
                     createdAt: streamingStartedAt ?? Date(),
                     emphasis: false,
                     isStreaming: false
@@ -2683,7 +2725,7 @@ final class CodexAssistantRuntime {
                         id: timelineID,
                         sessionID: activeSessionID,
                         turnID: activeTurnID,
-                        text: streamingBuffer,
+                        text: finalizedStreamingText,
                         createdAt: streamingStartedAt ?? Date(),
                         updatedAt: Date(),
                         isStreaming: false,
@@ -2694,10 +2736,10 @@ final class CodexAssistantRuntime {
         }
         if allowsProposedPlanForActiveTurn,
            planTimelineID == nil,
-           streamingBuffer.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty != nil {
-            proposedPlanBuffer = streamingBuffer
-            onProposedPlan?(streamingBuffer)
-            emitPlanTimeline(text: streamingBuffer, isStreaming: false)
+           finalizedStreamingText.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty != nil {
+            proposedPlanBuffer = finalizedStreamingText
+            onProposedPlan?(finalizedStreamingText)
+            emitPlanTimeline(text: finalizedStreamingText, isStreaming: false)
         }
         streamingEntryID = nil
         streamingBuffer = ""
@@ -2756,10 +2798,15 @@ final class CodexAssistantRuntime {
             pendingActivityTimelineEmitByID[activity.id]?.cancel()
             pendingActivityTimelineEmitByID[activity.id] = nil
             lastActivityTimelineEmitTimeByID[activity.id] = nil
+            let locallySucceeded = locallySuccessfulDynamicToolCallIDs.contains(activity.id)
+            let imageToolSucceeded = imageToolCompletionLooksSuccessful(item)
 
             if let existing = liveActivities[activity.id] {
                 if activity.rawDetails?.nonEmpty == nil {
                     activity.rawDetails = existing.rawDetails
+                }
+                if activity.automationMetadata == nil {
+                    activity.automationMetadata = existing.automationMetadata
                 }
                 if activity.updatedAt < existing.updatedAt {
                     activity.updatedAt = existing.updatedAt
@@ -2767,9 +2814,14 @@ final class CodexAssistantRuntime {
             }
 
             if isCompleted {
-                if activity.status.isActive {
+                if locallySucceeded || imageToolSucceeded || activity.status.isActive {
                     activity.status = .completed
                 }
+                if dynamicToolName(from: item) == AssistantImageGenerationToolDefinition.name,
+                   activity.status == .completed {
+                    currentTurnHadSuccessfulImageGeneration = true
+                }
+                locallySuccessfulDynamicToolCallIDs.remove(activity.id)
                 liveActivities.removeValue(forKey: activity.id)
             } else {
                 liveActivities[activity.id] = activity
@@ -2862,14 +2914,16 @@ final class CodexAssistantRuntime {
 
     private func handleTurnCompleted(_ params: [String: Any]) {
         materializeCopilotFallbackReplyIfNeeded()
-        let responsePreview = streamingBuffer.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
-        let completedTurnResponse = streamingBuffer
+        let completedTurnResponse = correctedAssistantImageFailureFallbackIfNeeded(streamingBuffer)
+        let responsePreview = completedTurnResponse.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
         flushStreamingBuffer()
         flushCommentaryBuffer()
         defer {
             allowsProposedPlanForActiveTurn = false
             activeTurnID = nil
             pendingCopilotFallbackReply = nil
+            currentTurnAttachments = []
+            currentTurnHadSuccessfulImageGeneration = false
         }
 
         guard let turn = params["turn"] as? [String: Any] else {
@@ -2882,7 +2936,7 @@ final class CodexAssistantRuntime {
         case "completed":
             finalizeActiveActivities(with: .completed)
             onTurnCompletion?(.completed)
-            onTranscript?(AssistantTranscriptEntry(role: .status, text: "\(backend.shortDisplayName) finished this turn."))
+            // Turn completion is shown via HUD phase, no transcript status needed.
             updateHUD(phase: .success, title: "Finished", detail: responsePreview)
             onHealthUpdate?(makeHealth(availability: .ready, summary: backend.connectedSummary))
 
@@ -3230,6 +3284,61 @@ final class CodexAssistantRuntime {
         )
     }
 
+    private func applyToolResultToLiveActivity(
+        activityID: String?,
+        result: AssistantToolExecutionResult
+    ) {
+        guard let activityID,
+              var activity = liveActivities[activityID] else {
+            return
+        }
+
+        if let metadata = result.activityMetadata {
+            activity.automationMetadata = metadata
+        }
+
+        if let plannerLine = automationPlannerLine(from: result.activityMetadata) {
+            let summaryLine = compactDetail(result.summary)
+            let mergedDetail = [plannerLine, summaryLine]
+                .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty }
+                .joined(separator: "\n")
+            if !mergedDetail.isEmpty {
+                activity.rawDetails = mergedDetail
+            }
+        } else if let summaryLine = compactDetail(result.summary) {
+            activity.rawDetails = summaryLine
+        }
+
+        if let summary = result.summary.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
+            activity.friendlySummary = summary
+        }
+
+        activity.updatedAt = Date()
+        liveActivities[activityID] = activity
+        emitActivityTimelineUpdate(activity, force: true)
+    }
+
+    private func automationPlannerLine(
+        from metadata: AssistantAutomationActivityMetadata?
+    ) -> String? {
+        guard let metadata else { return nil }
+        var parts: [String] = []
+        if let stage = metadata.stage?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
+            parts.append(stage)
+        }
+        if let actuator = metadata.actuator?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
+            parts.append(actuator)
+        }
+        if let target = metadata.target?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
+            parts.append(target)
+        }
+        if let verification = metadata.verificationResult?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
+            parts.append("verification: \(verification)")
+        }
+        guard !parts.isEmpty else { return nil }
+        return parts.joined(separator: " • ")
+    }
+
     private func emitPlanTimeline(text: String, isStreaming: Bool) {
         if planTimelineID == nil {
             planTimelineID = "plan-\(activeTurnID ?? UUID().uuidString)"
@@ -3281,6 +3390,7 @@ final class CodexAssistantRuntime {
             emitActivityTimelineUpdate(finalized, force: true)
         }
         liveActivities.removeAll()
+        locallySuccessfulDynamicToolCallIDs.removeAll()
         toolCalls.removeAll()
         pendingToolCallEmit?.cancel()
         pendingToolCallEmit = nil
@@ -3300,6 +3410,7 @@ final class CodexAssistantRuntime {
         pendingToolCallEmit = nil
         pendingActivityTimelineEmitByID.values.forEach { $0.cancel() }
         pendingActivityTimelineEmitByID.removeAll()
+        locallySuccessfulDynamicToolCallIDs.removeAll()
         lastActivityTimelineEmitTimeByID.removeAll()
         streamingEntryID = nil
         streamingBuffer = ""
@@ -3620,6 +3731,30 @@ final class CodexAssistantRuntime {
         handleItemStartedOrCompleted(["item": item], isCompleted: isCompleted)
     }
 
+    func recordSuccessfulDynamicToolCallForTesting(id: String) {
+        locallySuccessfulDynamicToolCallIDs.insert(id)
+    }
+
+    func recordSuccessfulDynamicToolCallForTesting(
+        requestID: String,
+        params: [String: Any],
+        success: Bool = true
+    ) {
+        let markerIDs = dynamicToolSuccessMarkerIDs(
+            activityID: dynamicToolRequestActivityID(from: params),
+            requestID: .string(requestID)
+        )
+        if success {
+            markerIDs.forEach { locallySuccessfulDynamicToolCallIDs.insert($0) }
+        } else {
+            markerIDs.forEach { locallySuccessfulDynamicToolCallIDs.remove($0) }
+        }
+    }
+
+    func dynamicToolRequestActivityIDForTesting(from params: [String: Any]) -> String? {
+        dynamicToolRequestActivityID(from: params)
+    }
+
     func configureImageAttachmentContextForTesting(
         includesImages: Bool,
         modelSupportsImageInput: Bool,
@@ -3628,6 +3763,10 @@ final class CodexAssistantRuntime {
         currentTurnIncludesImageAttachments = includesImages
         currentTurnModelSupportsImageInput = modelSupportsImageInput
         redirectedImageToolCallForActiveTurn = redirectedAlready
+    }
+
+    func setCurrentTurnHadSuccessfulImageGenerationForTesting(_ value: Bool) {
+        currentTurnHadSuccessfulImageGeneration = value
     }
 
     func shouldRedirectBlockedImageToolRequestForTesting(method: String) -> Bool {
@@ -3666,6 +3805,17 @@ final class CodexAssistantRuntime {
         )
     }
 
+    func threadStartParamsForTesting(
+        mode: AssistantInteractionMode = .agentic,
+        cwd: String? = nil,
+        modelID: String? = "gpt-5.4"
+    ) async -> [String: Any] {
+        let previousMode = interactionMode
+        interactionMode = mode
+        defer { interactionMode = previousMode }
+        return await threadStartParams(cwd: cwd, modelID: modelID)
+    }
+
     func buildInstructionsForTesting() async -> String {
         await buildInstructions()
     }
@@ -3698,10 +3848,12 @@ final class CodexAssistantRuntime {
 
     func configureSessionForTesting(
         sessionID: String = "thread-1",
-        turnID: String? = nil
+        turnID: String? = nil,
+        cwd: String? = nil
     ) {
         activeSessionID = sessionID
         activeTurnID = turnID
+        activeSessionCWD = cwd?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
     }
 
     func processAgentMessageDeltaNotificationForTesting(
@@ -3737,7 +3889,7 @@ final class CodexAssistantRuntime {
     }
 
     func processProcessExitedForTesting(message: String? = nil) async {
-        await handleIncomingEvent(.processExited(message))
+        await handleIncomingEvent(.processExited(message: message, expected: false))
     }
 
     func processServerRequestForTesting(
@@ -3868,10 +4020,10 @@ final class CodexAssistantRuntime {
         do {
             try await transport?.sendResponse(
                 id: id,
-                result: [
-                    "contentItems": [["type": "inputText", "text": message]],
-                    "success": false
-                ]
+                result: dynamicToolResponseResult(
+                    contentItems: [["type": "inputText", "text": message]],
+                    success: false
+                )
             )
         } catch {
             await MainActor.run {
@@ -4004,6 +4156,18 @@ final class CodexAssistantRuntime {
         toolExecutor.descriptor(for: toolName)?.summaryProvider(arguments) ?? "Use a dynamic tool"
     }
 
+    private func dynamicToolResponseResult(
+        contentItems: [[String: Any]],
+        success: Bool
+    ) -> [String: Any] {
+        [
+            "content": contentItems,
+            "contentItems": contentItems,
+            "success": success,
+            "isError": !success
+        ]
+    }
+
     private static func imageDataItems(
         in contentItems: [AssistantToolExecutionResult.ContentItem]
     ) -> [Data] {
@@ -4113,10 +4277,10 @@ final class CodexAssistantRuntime {
             case "item/tool/call":
                 try await transport?.sendResponse(
                     id: id,
-                    result: [
-                        "contentItems": [["type": "inputText", "text": message]],
-                        "success": false
-                    ]
+                    result: dynamicToolResponseResult(
+                        contentItems: [["type": "inputText", "text": message]],
+                        success: false
+                    )
                 )
             default:
                 break
@@ -4307,6 +4471,7 @@ final class CodexAssistantRuntime {
     var interactionMode: AssistantInteractionMode = .agentic
     private var currentTurnIncludesImageAttachments = false
     private var currentTurnModelSupportsImageInput = false
+    private var currentTurnHadSuccessfulImageGeneration = false
     private var redirectedImageToolCallForActiveTurn = false
     private var blockedToolUseHandledForActiveTurn = false
     private var blockedToolUseInterruptionMessage: String?
@@ -4344,6 +4509,29 @@ final class CodexAssistantRuntime {
         return nil
     }
 
+    private func dynamicToolRequestActivityID(from payload: [String: Any]) -> String? {
+        let candidatePayloads: [[String: Any]] = [
+            payload,
+            payload["item"] as? [String: Any],
+            payload["toolCall"] as? [String: Any],
+            payload["tool_call"] as? [String: Any]
+        ].compactMap { $0 }
+
+        for candidate in candidatePayloads {
+            if let activityID = firstNonEmptyString(
+                candidate["itemId"] as? String,
+                candidate["item_id"] as? String,
+                candidate["callId"] as? String,
+                candidate["call_id"] as? String,
+                candidate["id"] as? String
+            ) {
+                return activityID
+            }
+        }
+
+        return nil
+    }
+
     private func dynamicToolArguments(from payload: [String: Any]) -> Any {
         if let arguments = payload["arguments"] {
             return arguments
@@ -4372,7 +4560,9 @@ final class CodexAssistantRuntime {
             "ephemeral": false
         ]
         params["dynamicTools"] = dynamicToolSpecs(for: interactionMode)
-        params["cwd"] = cwd ?? FileManager.default.homeDirectoryForCurrentUser.path
+        if let cwd = cwd?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
+            params["cwd"] = cwd
+        }
         if let modelID = modelID?.nonEmpty {
             params["model"] = modelID
         }
@@ -4429,6 +4619,8 @@ final class CodexAssistantRuntime {
             sections.append(ToolPermissionRegistry.instructionBlock(snapshot: snapshot))
         }
 
+        sections.append(workspaceBoundaryInstructions())
+
         if let custom = customInstructions?.trimmingCharacters(in: .whitespacesAndNewlines),
            !custom.isEmpty {
             sections.append("# Custom Instructions\n\n\(custom)")
@@ -4440,6 +4632,29 @@ final class CodexAssistantRuntime {
             sections.append(browserInstructions)
         }
         return sections.joined(separator: "\n\n")
+    }
+
+    private func workspaceBoundaryInstructions() -> String {
+        if let workspacePath = activeSessionCWD?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
+            return """
+            # Workspace Boundary
+
+            This thread is attached to the workspace `\(workspacePath)`.
+            Stay inside this workspace unless the user clearly asks you to inspect somewhere else.
+            Do NOT search parent folders, sibling projects, or the user's home directory just to find a likely app, repo, or file.
+            You may still read thread-attached skills, direct attachments, or files the user explicitly points you to.
+            If the needed files appear to be outside this workspace, pause and ask the user to attach the right project or explicitly allow broader exploration.
+            """
+        }
+
+        return """
+        # Workspace Boundary
+
+        This thread does not have an attached workspace folder.
+        Do NOT scan the user's home directory or unrelated folders trying to guess where the project lives.
+        Work only with the files already provided in the thread, thread-attached skills, or paths the user explicitly names.
+        If you need project files that are not already attached, ask the user to attach a project folder or explicitly allow exploration outside the current thread context.
+        """
     }
 
     private func activeSkillInstructionsBlock() -> String? {
@@ -4876,6 +5091,150 @@ final class CodexAssistantRuntime {
         }
     }
 
+    private func dynamicToolActivityID(for id: JSONRPCRequestID) -> String {
+        switch id {
+        case .int(let value):
+            return String(value)
+        case .string(let value):
+            return value
+        }
+    }
+
+    private func dynamicToolSuccessMarkerIDs(
+        activityID: String?,
+        requestID: JSONRPCRequestID
+    ) -> [String] {
+        let fallbackID = dynamicToolActivityID(for: requestID)
+        var ids: [String] = []
+
+        if let normalizedActivityID = activityID?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !normalizedActivityID.isEmpty {
+            ids.append(normalizedActivityID)
+        }
+
+        if !ids.contains(fallbackID) {
+            ids.append(fallbackID)
+        }
+
+        return ids
+    }
+
+    private func correctedAssistantImageFailureFallbackIfNeeded(_ text: String) -> String {
+        guard currentTurnHadSuccessfulImageGeneration else { return text }
+
+        let replacements: [(String, String)] = [
+            (
+                "The image tool failed again, so I’m making",
+                "I already generated an image above, and I’m also making"
+            ),
+            (
+                "The image tool failed again, so I'm making",
+                "I already generated an image above, and I’m also making"
+            ),
+            (
+                "The image tool failed, so I’m making",
+                "I already generated an image above, and I’m also making"
+            ),
+            (
+                "The image tool failed, so I'm making",
+                "I already generated an image above, and I’m also making"
+            ),
+            (
+                "Image generation failed again, so I’m making",
+                "I already generated an image above, and I’m also making"
+            ),
+            (
+                "Image generation failed again, so I'm making",
+                "I already generated an image above, and I’m also making"
+            ),
+            (
+                "Image generation failed, so I’m making",
+                "I already generated an image above, and I’m also making"
+            ),
+            (
+                "Image generation failed, so I'm making",
+                "I already generated an image above, and I’m also making"
+            )
+        ]
+
+        for (source, replacement) in replacements {
+            if text.range(of: source, options: [.caseInsensitive, .diacriticInsensitive]) != nil {
+                return text.replacingOccurrences(
+                    of: source,
+                    with: replacement,
+                    options: [.caseInsensitive, .diacriticInsensitive]
+                )
+            }
+        }
+
+        return text
+    }
+
+    private func imageToolCompletionLooksSuccessful(_ item: [String: Any]) -> Bool {
+        guard normalizedActivityType(item["type"] as? String) == "dynamicToolCall",
+              dynamicToolName(from: item) == AssistantImageGenerationToolDefinition.name else {
+            return false
+        }
+
+        if rawContainsGeneratedImageContent(item["result"]) || rawContainsGeneratedImageContent(item["output"]) {
+            return true
+        }
+
+        let summary = firstNonEmptyString(
+            extractString(item["result"]),
+            extractString(item["output"]),
+            item["summary"] as? String
+        )?.lowercased()
+
+        guard let summary else { return false }
+        return summary.contains("generated an image")
+            || summary.contains("generated images")
+            || summary.contains("here is your generated image")
+    }
+
+    private func rawContainsGeneratedImageContent(_ raw: Any?) -> Bool {
+        switch raw {
+        case let text as String:
+            let normalized = text.lowercased()
+            return normalized.contains("data:image/")
+                || normalized.contains("generated an image")
+                || normalized.contains("generated images")
+        case let dictionary as [String: Any]:
+            if let type = dictionary["type"] as? String,
+               type == "inputImage" {
+                return true
+            }
+
+            if let imageURL = dictionary["image_url"] as? String,
+               imageURL.lowercased().contains("data:image/") {
+                return true
+            }
+
+            if let imageURL = dictionary["imageURL"] as? String,
+               imageURL.lowercased().contains("data:image/") {
+                return true
+            }
+
+            if rawContainsGeneratedImageContent(dictionary["image_url"])
+                || rawContainsGeneratedImageContent(dictionary["imageURL"])
+                || rawContainsGeneratedImageContent(dictionary["url"]) {
+                return true
+            }
+
+            for value in dictionary.values {
+                if rawContainsGeneratedImageContent(value) {
+                    return true
+                }
+            }
+
+            return false
+        case let array as [Any]:
+            return array.contains { rawContainsGeneratedImageContent($0) }
+        default:
+            return false
+        }
+    }
+
     private func firstNonEmptyString(_ candidates: String?...) -> String? {
         for candidate in candidates {
             if let trimmed = candidate?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -5251,6 +5610,12 @@ final class CodexAssistantRuntime {
             arguments.append(contentsOf: ["--session-id", sessionID])
         } else {
             arguments.append(contentsOf: ["--resume", sessionID])
+        }
+
+        // MCP tool bridge for computer use
+        await ensureMCPToolBridge()
+        if let mcpConfigPath = await writeMCPConfigFile() {
+            arguments.append(contentsOf: ["--mcp-config", mcpConfigPath])
         }
 
         do {
@@ -5868,6 +6233,68 @@ final class CodexAssistantRuntime {
         )
     }
 
+    // MARK: - MCP Tool Bridge
+
+    private func ensureMCPToolBridge() async {
+        if mcpToolBridge != nil { return }
+        guard SettingsStore.shared.assistantComputerUseEnabled else { return }
+        let bridge = AssistantMCPToolBridge()
+        await bridge.setDelegate(self)
+        do {
+            try await bridge.start()
+            // Wait briefly for the port to resolve
+            try await Task.sleep(nanoseconds: 100_000_000)
+            mcpToolBridge = bridge
+        } catch {
+            CrashReporter.logInfo("MCP tool bridge failed to start: \(error.localizedDescription)")
+        }
+    }
+
+    private func stopMCPToolBridge() async {
+        await mcpToolBridge?.stop()
+        mcpToolBridge = nil
+        if let path = mcpConfigFilePath {
+            try? FileManager.default.removeItem(atPath: path)
+            mcpConfigFilePath = nil
+        }
+    }
+
+    private func mcpServerConfigs() async -> [[String: Any]] {
+        guard let bridge = mcpToolBridge,
+              let bridgePort = await bridge.port,
+              let execPath = Bundle.main.executablePath else {
+            return []
+        }
+        return [[
+            "name": MCPProtocol.serverName,
+            "command": execPath,
+            "args": ["--mcp-server", "--port", String(bridgePort)]
+        ]]
+    }
+
+    private func writeMCPConfigFile() async -> String? {
+        guard let bridge = mcpToolBridge,
+              let bridgePort = await bridge.port,
+              let execPath = Bundle.main.executablePath else {
+            return nil
+        }
+        let config: [String: Any] = [
+            "mcpServers": [
+                MCPProtocol.serverName: [
+                    "command": execPath,
+                    "args": ["--mcp-server", "--port", String(bridgePort)]
+                ]
+            ]
+        ]
+        let path = NSTemporaryDirectory() + "openassist-mcp-config-\(ProcessInfo.processInfo.processIdentifier).json"
+        guard let data = try? JSONSerialization.data(withJSONObject: config, options: [.prettyPrinted]) else {
+            return nil
+        }
+        FileManager.default.createFile(atPath: path, contents: data)
+        mcpConfigFilePath = path
+        return path
+    }
+
     private func startCopilotSession(
         cwd: String?,
         preferredModelID: String?,
@@ -5907,12 +6334,13 @@ final class CodexAssistantRuntime {
         }
 
         try await ensureTransport(cwd: resolvedCWD)
-        let response = try await sendRequest(
+        let response = try await copilotRequestWithTimeout(
             method: "session/new",
             params: [
                 "cwd": resolvedCWD,
                 "mcpServers": []
-            ]
+            ],
+            timeoutNanoseconds: 20_000_000_000
         )
 
         guard let payload = response.raw as? [String: Any],
@@ -5955,13 +6383,14 @@ final class CodexAssistantRuntime {
 
         if transportSessionID != sessionID {
             do {
-                let response = try await sendRequest(
+                let response = try await copilotRequestWithTimeout(
                     method: "session/load",
                     params: [
                         "sessionId": sessionID,
                         "cwd": resolvedCWD,
                         "mcpServers": []
-                    ]
+                    ],
+                    timeoutNanoseconds: 20_000_000_000
                 )
                 applyCopilotConfiguration(from: response.raw)
             } catch {
@@ -6016,13 +6445,14 @@ final class CodexAssistantRuntime {
         try await ensureTransport(cwd: resolvedCWD)
         if transportSessionID != sessionID {
             do {
-                let response = try await sendRequest(
+                let response = try await copilotRequestWithTimeout(
                     method: "session/load",
                     params: [
                         "sessionId": sessionID,
                         "cwd": resolvedCWD,
                         "mcpServers": []
-                    ]
+                    ],
+                    timeoutNanoseconds: 20_000_000_000
                 )
                 applyCopilotConfiguration(from: response.raw)
             } catch {
@@ -6051,36 +6481,39 @@ final class CodexAssistantRuntime {
         sessionID: String,
         preferredModelID: String?
     ) async throws {
-        _ = try await sendRequest(
+        _ = try await copilotRequestWithTimeout(
             method: "session/set_mode",
             params: [
                 "sessionId": sessionID,
                 "modeId": copilotModeID(for: interactionMode)
-            ]
+            ],
+            timeoutNanoseconds: 12_000_000_000
         )
 
         if let requestedModelID = preferredModelID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty,
            currentCopilotModelID() != requestedModelID {
-            let response = try await sendRequest(
+            let response = try await copilotRequestWithTimeout(
                 method: "session/set_config_option",
                 params: [
                     "sessionId": sessionID,
                     "configId": "model",
                     "value": requestedModelID
-                ]
+                ],
+                timeoutNanoseconds: 12_000_000_000
             )
             applyCopilotConfiguration(from: response.raw)
         }
 
         if let reasoningEffort = reasoningEffort?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
             do {
-                let response = try await sendRequest(
+                let response = try await copilotRequestWithTimeout(
                     method: "session/set_config_option",
                     params: [
                         "sessionId": sessionID,
                         "configId": "reasoning_effort",
                         "value": reasoningEffort
-                    ]
+                    ],
+                    timeoutNanoseconds: 12_000_000_000
                 )
                 applyCopilotConfiguration(from: response.raw)
             } catch {
@@ -6120,7 +6553,7 @@ final class CodexAssistantRuntime {
         )
 
         do {
-            let response = try await sendRequest(
+            let response = try await copilotRequestWithTimeout(
                 method: "session/prompt",
                 params: [
                     "sessionId": sessionID,
@@ -6130,7 +6563,8 @@ final class CodexAssistantRuntime {
                         memoryContext: memoryContext,
                         attachmentContext: attachmentContext
                     )
-                ]
+                ],
+                timeoutNanoseconds: 120_000_000_000
             )
             guard activeTurnID != nil else { return }
             await waitForCopilotResponseMaterializationIfNeeded()
@@ -6306,7 +6740,11 @@ final class CodexAssistantRuntime {
 
     private func listCopilotSessions(limit: Int) async throws -> [AssistantSessionSummary] {
         try await ensureTransport(cwd: currentTransportWorkingDirectory ?? activeSessionCWD)
-        let response = try await sendRequest(method: "session/list", params: [:])
+        let response = try await copilotRequestWithTimeout(
+            method: "session/list",
+            params: [:],
+            timeoutNanoseconds: 15_000_000_000
+        )
         return Self.parseCopilotSessions(
             from: response.raw,
             limit: limit,
@@ -7056,6 +7494,7 @@ private actor CodexAppServerTransport {
     private var nextClientRequestID = 1
     private var responseContinuations: [JSONRPCRequestID: CheckedContinuation<CodexResponsePayload, Error>] = [:]
     private var bufferedResponses: [JSONRPCRequestID: Result<CodexResponsePayload, Error>] = [:]
+    private var expectedTermination = false
 
     init(incoming: @escaping @Sendable (CodexIncomingEvent) async -> Void) {
         self.incoming = incoming
@@ -7129,17 +7568,9 @@ private actor CodexAppServerTransport {
         process.standardInput = stdinPipe
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe
-        process.terminationHandler = { [incoming] process in
-            let message: String?
-            if process.terminationReason == .uncaughtSignal {
-                message = "\(launchLabel) exited because of a signal."
-            } else if process.terminationStatus != 0 {
-                message = "\(launchLabel) exited with code \(process.terminationStatus)."
-            } else {
-                message = nil
-            }
+        process.terminationHandler = { [weak self] process in
             Task {
-                await incoming(.processExited(message))
+                await self?.handleProcessTermination(process, launchLabel: launchLabel)
             }
         }
 
@@ -7167,6 +7598,7 @@ private actor CodexAppServerTransport {
     }
 
     func stop() async {
+        expectedTermination = true
         let continuations = responseContinuations
         responseContinuations.removeAll()
         bufferedResponses.removeAll()
@@ -7185,6 +7617,23 @@ private actor CodexAppServerTransport {
             process.terminate()
         }
         process = nil
+    }
+
+    private func handleProcessTermination(_ terminatedProcess: Process, launchLabel: String) async {
+        let wasExpected = expectedTermination || process == nil || process !== terminatedProcess
+        expectedTermination = false
+        guard !wasExpected else { return }
+
+        let message: String?
+        if terminatedProcess.terminationReason == .uncaughtSignal {
+            message = "\(launchLabel) exited because of a signal."
+        } else if terminatedProcess.terminationStatus != 0 {
+            message = "\(launchLabel) exited with code \(terminatedProcess.terminationStatus)."
+        } else {
+            message = nil
+        }
+
+        await incoming(.processExited(message: message, expected: false))
     }
 
     func sendRequest(method: String, params: [String: Any]) async throws -> CodexResponsePayload {
@@ -7403,6 +7852,32 @@ private final class PendingPermissionContext {
 
     func cancel() async {
         await cancelHandler()
+    }
+}
+
+// MARK: - MCP Tool Bridge Delegate
+
+extension CodexAssistantRuntime: AssistantMCPToolBridgeDelegate {
+    nonisolated func mcpBridgeExecute(
+        toolName: String,
+        arguments: Any,
+        sessionID: String
+    ) async -> AssistantToolExecutionResult {
+        let resolvedSessionID: String = await MainActor.run {
+            sessionID.isEmpty ? (self.activeSessionID ?? "") : sessionID
+        }
+        let resolvedModelID: String? = await MainActor.run {
+            self.preferredModelID
+        }
+        let context = AssistantToolExecutionContext(
+            toolName: toolName,
+            arguments: arguments,
+            attachments: [],
+            sessionID: resolvedSessionID,
+            preferredModelID: resolvedModelID,
+            browserLoginResume: false
+        )
+        return await self.toolExecutor.execute(context)
     }
 }
 

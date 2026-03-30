@@ -15,34 +15,34 @@ enum SettingsSection: String, CaseIterable, Identifiable, Sendable {
     var title: String {
         switch self {
         case .gettingStarted:
-            return "Getting Started"
+            return "Setup"
         case .dailyUse:
-            return "Daily Use"
+            return "AI & Assistant"
         case .voiceDictation:
-            return "Voice & Dictation"
+            return "Voice"
         case .browserAppControl:
-            return "Browser & App Control"
+            return "Automation"
         case .permissionsPrivacy:
-            return "Permissions & Privacy"
+            return "Privacy & Permissions"
         case .advanced:
-            return "Advanced"
+            return "Advanced & Integrations"
         }
     }
 
     var subtitle: String {
         switch self {
         case .gettingStarted:
-            return "A simple setup home with the most important next steps."
+            return "Finish the main setup steps without digging through technical controls."
         case .dailyUse:
-            return "The controls most people use often, with clear shortcuts to deeper setup."
+            return "The everyday AI controls most people care about."
         case .voiceDictation:
-            return "Microphone, dictation, shortcuts, Whisper, and correction controls."
+            return "Microphone, dictation, shortcuts, and speech quality."
         case .browserAppControl:
-            return "Browser reuse, direct app actions, computer use, and approval behavior."
+            return "Browser reuse, app control, computer use, and approvals."
         case .permissionsPrivacy:
-            return "See what access is granted and open the right macOS privacy screens."
+            return "See what access is granted and open the right macOS screens."
         case .advanced:
-            return "AI Studio, provider status, integrations, diagnostics, and app maintenance."
+            return "AI Studio, integrations, diagnostics, and deeper app controls."
         }
     }
 
@@ -85,7 +85,7 @@ enum SettingsSection: String, CaseIterable, Identifiable, Sendable {
         case .gettingStarted:
             return ["getting started", "setup", "first run", "onboarding", "start", "checklist"]
         case .dailyUse:
-            return ["daily", "assistant", "clipboard", "appearance", "sounds", "common tasks"]
+            return ["assistant", "ai", "rewrite", "appearance", "sounds", "common tasks"]
         case .voiceDictation:
             return ["voice", "dictation", "speech", "shortcut", "hold to talk", "microphone", "whisper", "cleanup", "correction"]
         case .browserAppControl:
@@ -182,26 +182,26 @@ struct SettingSearchEntry: Identifiable, Equatable, Sendable {
 }
 
 enum SettingsNavigationModel {
-    static let aiStudioDescription = "Advanced AI providers, models, memory, and local AI"
+    static let aiStudioDescription = "Advanced AI setup, provider details, local AI, and memory tools"
 
     static let searchEntries: [SettingSearchEntry] = [
         .init(
             destination: .gettingStartedHome,
-            title: "Getting started",
-            detail: "Open the setup checklist with the most important next steps",
+            title: "Setup",
+            detail: "Open the guided setup home with the most important next steps",
             keywords: ["getting started", "setup", "start", "onboarding", "first run", "checklist"]
         ),
         .init(
             destination: SettingsRoute(section: .dailyUse, cardID: "daily.tasks"),
-            title: "Daily task shortcuts",
-            detail: "Jump to common tasks like assistant, voice, browser control, and AI setup",
-            keywords: ["daily", "task", "shortcut", "assistant", "voice", "browser", "common"]
+            title: "AI and assistant shortcuts",
+            detail: "Jump to common tasks like assistant, voice, automation, and advanced AI",
+            keywords: ["daily", "task", "shortcut", "assistant", "voice", "browser", "common", "ai"]
         ),
         .init(
             destination: SettingsRoute(section: .dailyUse, cardID: "daily.assistant"),
-            title: "Assistant basics",
-            detail: "Everyday assistant writing and suggestion controls",
-            keywords: ["assistant", "rewrite", "prompt", "auto insert", "markdown"]
+            title: "AI and assistant basics",
+            detail: "Everyday AI behavior, rewrite controls, and response style",
+            keywords: ["assistant", "rewrite", "prompt", "auto insert", "markdown", "ai"]
         ),
         .init(
             destination: SettingsRoute(section: .dailyUse, cardID: "daily.output"),

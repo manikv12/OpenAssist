@@ -6,6 +6,7 @@ import { SidebarView } from "./components/SidebarView";
 import { ThreadNoteDrawer } from "./components/ThreadNoteDrawer";
 import { useTextSelection } from "./hooks/useTextSelection";
 import type {
+  ActiveWorkState,
   AssistantComposerState,
   AssistantSidebarState,
   ChatMessage,
@@ -51,6 +52,7 @@ function providerTone(value?: string | null): ProviderTone {
   const normalized = (value || "").trim().toLowerCase();
   if (normalized.includes("copilot")) return "copilot";
   if (normalized.includes("codex")) return "codex";
+  if (normalized.includes("claude") || normalized.includes("anthropic")) return "claude";
   return "default";
 }
 
@@ -237,6 +239,7 @@ export function App() {
   );
   const [rewindState, setRewindState] = useState<RewindState | null>(null);
   const [threadNoteState, setThreadNoteState] = useState<ThreadNoteState | null>(null);
+  const [activeWorkState, setActiveWorkState] = useState<ActiveWorkState | null>(null);
   const [textScale, setTextScaleState] = useState(1.0);
   const [isPinnedToBottom, setIsPinnedToBottom] = useState(true);
   const [canLoadOlder, setCanLoadOlder] = useState(false);
@@ -594,6 +597,10 @@ export function App() {
         setThreadNoteState(next);
       },
 
+      setActiveWorkState: (next: ActiveWorkState | null) => {
+        setActiveWorkState(next);
+      },
+
       scrollToBottom: (animated: boolean) => {
         chatViewRef.current?.scrollToBottom(animated);
       },
@@ -647,7 +654,11 @@ export function App() {
 
   if (viewMode === "sidebar") {
     return (
-      <SidebarView state={sidebarState} onDispatchCommand={handleSidebarCommand} />
+      <SidebarView
+        state={sidebarState}
+        textScale={textScale}
+        onDispatchCommand={handleSidebarCommand}
+      />
     );
   }
 
@@ -657,31 +668,37 @@ export function App() {
     );
   }
 
+  const isProjectNotesMode = threadNoteState?.presentation === "projectFullScreen";
+
   return (
     <>
       <FindBar visible={findVisible} onClose={() => setFindVisible(false)} />
       <div
         className={[
           "chat-stage",
+          isProjectNotesMode ? "is-project-notes-mode" : "",
           threadNoteState?.isOpen ? "has-thread-note-open" : "",
         ]
           .filter(Boolean)
           .join(" ")}
       >
-        <ChatView
-          ref={chatViewRef}
-          messages={visibleMessages}
-          typing={typing}
-          activeProviderTone={activeProviderTone}
-          checkpointsByMessageID={checkpointsByMessageID}
-          rewindState={rewindState}
-          textScale={textScale}
-          isPinnedToBottom={isPinnedToBottom}
-          canLoadOlder={canLoadOlder}
-          onScrollState={handleScrollState}
-          onLoadOlder={handleLoadOlder}
-          onJumpToLatest={handleJumpToLatest}
-        />
+        {!isProjectNotesMode ? (
+          <ChatView
+            ref={chatViewRef}
+            messages={visibleMessages}
+            typing={typing}
+            activeWork={activeWorkState}
+            activeProviderTone={activeProviderTone}
+            checkpointsByMessageID={checkpointsByMessageID}
+            rewindState={rewindState}
+            textScale={textScale}
+            isPinnedToBottom={isPinnedToBottom}
+            canLoadOlder={canLoadOlder}
+            onScrollState={handleScrollState}
+            onLoadOlder={handleLoadOlder}
+            onJumpToLatest={handleJumpToLatest}
+          />
+        ) : null}
 
         <ThreadNoteDrawer
           state={threadNoteState}
@@ -696,6 +713,9 @@ export function App() {
 declare global {
   interface Window {
     __OPENASSIST_INITIAL_VIEW_MODE?: AppViewMode;
+    chatBridge?: {
+      setActiveWorkState?: (next: ActiveWorkState | null) => void;
+    };
     webkit?: {
       messageHandlers?: {
         ready?: { postMessage: (v: boolean) => void };

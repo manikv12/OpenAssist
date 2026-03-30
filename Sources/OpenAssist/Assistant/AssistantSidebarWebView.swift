@@ -21,20 +21,35 @@ struct AssistantSidebarWebProject: Equatable {
     let name: String
     let symbol: String
     let subtitle: String
+    let kind: String
+    let depth: Int
     let isSelected: Bool
+    let isExpanded: Bool
+    let parentID: String?
+    let menuTitle: String
     let hasLinkedFolder: Bool
     let hasCustomIcon: Bool
+    let folderMissing: Bool
 
     func toJSON() -> [String: Any] {
-        [
+        var json: [String: Any] = [
             "id": id,
             "name": name,
             "symbol": symbol,
             "subtitle": subtitle,
+            "kind": kind,
+            "depth": depth,
             "isSelected": isSelected,
+            "isExpanded": isExpanded,
+            "menuTitle": menuTitle,
             "hasLinkedFolder": hasLinkedFolder,
             "hasCustomIcon": hasCustomIcon,
+            "folderMissing": folderMissing,
         ]
+        if let parentID, !parentID.isEmpty {
+            json["parentId"] = parentID
+        }
+        return json
     }
 }
 
@@ -57,6 +72,7 @@ struct AssistantSidebarWebSession: Equatable {
     let title: String
     let subtitle: String
     let timeLabel: String?
+    let activityState: String?
     let isSelected: Bool
     let isTemporary: Bool
     let projectID: String?
@@ -72,6 +88,9 @@ struct AssistantSidebarWebSession: Equatable {
         if let timeLabel, !timeLabel.isEmpty {
             json["timeLabel"] = timeLabel
         }
+        if let activityState, !activityState.isEmpty {
+            json["activityState"] = activityState
+        }
         if let projectID, !projectID.isEmpty {
             json["projectId"] = projectID
         }
@@ -80,6 +99,8 @@ struct AssistantSidebarWebSession: Equatable {
 }
 
 struct AssistantSidebarWebState: Equatable {
+    let projectFilterKind: String
+    let projectFilterID: String?
     let selectedPane: String
     let isCollapsed: Bool
     let collapsedPreviewPane: String?
@@ -107,6 +128,7 @@ struct AssistantSidebarWebState: Equatable {
 
     func toJSON() -> [String: Any] {
         var json: [String: Any] = [
+            "projectFilterKind": projectFilterKind,
             "selectedPane": selectedPane,
             "isCollapsed": isCollapsed,
             "canCreateThread": canCreateThread,
@@ -128,6 +150,9 @@ struct AssistantSidebarWebState: Equatable {
             "threads": threads.map { $0.toJSON() },
             "archived": archived.map { $0.toJSON() },
         ]
+        if let projectFilterID, !projectFilterID.isEmpty {
+            json["projectFilterId"] = projectFilterID
+        }
         if let projectsHelperText, !projectsHelperText.isEmpty {
             json["projectsHelperText"] = projectsHelperText
         }
@@ -146,6 +171,7 @@ struct AssistantSidebarWebState: Equatable {
 
 struct AssistantSidebarWebView: NSViewRepresentable {
     let state: AssistantSidebarWebState
+    var textScale: CGFloat = 1.0
     var accentColor: Color? = nil
     let onCommand: (String, [String: Any]?) -> Void
 
@@ -156,6 +182,7 @@ struct AssistantSidebarWebView: NSViewRepresentable {
     func makeNSView(context: Context) -> AssistantSidebarWebContainerView {
         let container = AssistantSidebarWebContainerView(coordinator: context.coordinator)
         container.applyState(state)
+        container.applyTextScale(textScale)
         if let accentColor {
             container.applyAccentColor(accentColor)
         }
@@ -165,6 +192,7 @@ struct AssistantSidebarWebView: NSViewRepresentable {
     func updateNSView(_ container: AssistantSidebarWebContainerView, context: Context) {
         container.coordinator = context.coordinator
         container.applyState(state)
+        container.applyTextScale(textScale)
         if let accentColor {
             container.applyAccentColor(accentColor)
         }
@@ -205,8 +233,12 @@ final class AssistantSidebarWebContainerView: NSView {
     private var isReady = false
     private var pendingState: AssistantSidebarWebState?
     private var pendingAccentCSS: String?
+    private var pendingTextScale: CGFloat?
     private var lastAppliedState: AssistantSidebarWebState?
     private var lastAppliedAccentCSS: String?
+    private var lastAppliedTextScale: CGFloat?
+    private var outsideClickMonitor: Any?
+    private var windowObservers: [NSObjectProtocol] = []
 
     init(coordinator: AssistantSidebarWebCoordinator) {
         self.coordinator = coordinator
@@ -243,7 +275,18 @@ final class AssistantSidebarWebContainerView: NSView {
         fatalError("init(coder:) has not been implemented")
     }
 
+    deinit {
+        stopOutsideClickMonitor()
+        removeWindowObservers()
+    }
+
     override var isFlipped: Bool { true }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        refreshOutsideClickMonitor()
+        refreshWindowObservers()
+    }
 
     override func layout() {
         super.layout()
@@ -262,6 +305,10 @@ final class AssistantSidebarWebContainerView: NSView {
         if let pendingAccentCSS {
             webView.evaluateJavaScript(pendingAccentCSS, completionHandler: nil)
             self.pendingAccentCSS = nil
+        }
+        if let pendingTextScale {
+            sendTextScale(pendingTextScale)
+            self.pendingTextScale = nil
         }
         if let pendingState {
             sendState(pendingState)
@@ -326,6 +373,81 @@ final class AssistantSidebarWebContainerView: NSView {
             return
         }
         webView.evaluateJavaScript(js, completionHandler: nil)
+    }
+
+    func applyTextScale(_ scale: CGFloat) {
+        let nextScale = max(0.8, scale)
+        guard lastAppliedTextScale != nextScale else { return }
+        lastAppliedTextScale = nextScale
+        guard isReady else {
+            pendingTextScale = nextScale
+            return
+        }
+        sendTextScale(nextScale)
+    }
+
+    private func sendTextScale(_ scale: CGFloat) {
+        webView.evaluateJavaScript(
+            "chatBridge.setTextScale(\(Double(scale)))",
+            completionHandler: nil
+        )
+    }
+
+    private func refreshOutsideClickMonitor() {
+        stopOutsideClickMonitor()
+        guard window != nil else { return }
+        outsideClickMonitor = NSEvent.addLocalMonitorForEvents(
+            matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]
+        ) { [weak self] event in
+            guard let self else { return event }
+            guard let window = self.window, event.window === window else { return event }
+
+            let pointInSelf = self.convert(event.locationInWindow, from: nil)
+            if self.bounds.contains(pointInSelf) {
+                return event
+            }
+
+            self.requestContextMenuDismiss()
+            return event
+        }
+    }
+
+    private func stopOutsideClickMonitor() {
+        if let outsideClickMonitor {
+            NSEvent.removeMonitor(outsideClickMonitor)
+            self.outsideClickMonitor = nil
+        }
+    }
+
+    private func refreshWindowObservers() {
+        removeWindowObservers()
+        guard let window else { return }
+        let notificationCenter = NotificationCenter.default
+        windowObservers.append(
+            notificationCenter.addObserver(
+                forName: NSWindow.didResignKeyNotification,
+                object: window,
+                queue: .main
+            ) { [weak self] _ in
+                self?.requestContextMenuDismiss()
+            }
+        )
+    }
+
+    private func removeWindowObservers() {
+        let notificationCenter = NotificationCenter.default
+        for observer in windowObservers {
+            notificationCenter.removeObserver(observer)
+        }
+        windowObservers.removeAll()
+    }
+
+    private func requestContextMenuDismiss() {
+        guard isReady else { return }
+        webView.evaluateJavaScript(
+            "window.dispatchEvent(new Event('openassist:close-sidebar-context-menu'));",
+            completionHandler: nil
+        )
     }
 }
 

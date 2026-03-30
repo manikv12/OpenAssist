@@ -78,6 +78,7 @@ final class TelegramRemoteCoordinator: ObservableObject {
         var controllerMenu: ControllerMenu = .home
         var controllerMessageID: Int?
         var controllerSignature: String?
+        var projectMenuFolderID: String?
         var projectMenuProjectIDs: [String] = []
         var sessionMenuSessionIDs: [String] = []
         var modelMenuModelIDs: [String] = []
@@ -547,6 +548,7 @@ final class TelegramRemoteCoordinator: ObservableObject {
         do {
             switch data {
             case "menu:projects":
+                chatState.projectMenuFolderID = nil
                 await renderProjectMenu(chatID: chat.id)
             case "menu:sessions":
                 await renderSessionMenu(chatID: chat.id)
@@ -561,6 +563,9 @@ final class TelegramRemoteCoordinator: ObservableObject {
             case "nav:home":
                 await renderHomeMenu(chatID: chat.id, notice: nil)
                 await refreshSelectedSessionView(chatID: chat.id, force: true)
+            case "nav:projects-root":
+                chatState.projectMenuFolderID = nil
+                await renderProjectMenu(chatID: chat.id)
             case "act:new":
                 await startFreshSession(chatID: chat.id, isTemporary: false, moveControllerToBottom: false)
             case "act:clear":
@@ -586,6 +591,11 @@ final class TelegramRemoteCoordinator: ObservableObject {
                 try await handleSessionSelection(data: data, chatID: chat.id)
             case let data where data.hasPrefix("sel:p:"):
                 try await handleProjectSelection(data: data, chatID: chat.id)
+            case let data where data.hasPrefix("nav:projects-folder:"):
+                chatState.projectMenuFolderID = data.replacingOccurrences(of: "nav:projects-folder:", with: "")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .nonEmpty
+                await renderProjectMenu(chatID: chat.id)
             case let data where data.hasPrefix("sel:backend:"):
                 try await handleBackendSelection(data: data, chatID: chat.id)
             case let data where data.hasPrefix("sel:m:"):
@@ -637,6 +647,7 @@ final class TelegramRemoteCoordinator: ObservableObject {
             await startFreshSession(chatID: chatID, isTemporary: true, moveControllerToBottom: true)
         case "/projects":
             await moveControllerMessageToBottom(chatID: chatID)
+            chatState.projectMenuFolderID = nil
             await renderProjectMenu(chatID: chatID)
         case "/sessions":
             await moveControllerMessageToBottom(chatID: chatID)
@@ -1044,33 +1055,90 @@ final class TelegramRemoteCoordinator: ObservableObject {
         let projects = await bridge.availableProjects()
         chatState.projectMenuProjectIDs = projects.map(\.id)
         chatState.controllerMenu = .projects
+        let rootFolders = projects.filter { $0.kind == .folder && $0.parentID == nil }
+        let rootProjects = projects.filter { $0.kind == .project && $0.parentID == nil }
 
-        var rows: [[TelegramInlineKeyboardButton]] = [[
-            .init(
-                text: chatState.selectedProjectID == nil ? "• All projects" : "All projects",
-                callbackData: "sel:p:all"
-            )
-        ]]
+        var rows: [[TelegramInlineKeyboardButton]] = []
+        let text: String
 
-        rows += projects.enumerated().map { index, project in
-            let label = "\(project.name) (\(project.sessionCount))"
-            return [
-                TelegramInlineKeyboardButton(
-                    text: project.id == chatState.selectedProjectID ? "• \(label)" : label,
-                    callbackData: "sel:p:\(index)"
+        if let folderID = chatState.projectMenuFolderID,
+           let folder = projects.first(where: { $0.id.caseInsensitiveCompare(folderID) == .orderedSame }) {
+            let childProjects = projects.filter {
+                $0.kind == .project && $0.parentID?.caseInsensitiveCompare(folder.id) == .orderedSame
+            }
+
+            rows.append([
+                .init(
+                    text: chatState.selectedProjectID?.caseInsensitiveCompare(folder.id) == .orderedSame
+                        ? "• All in \(folder.name) (\(folder.sessionCount))"
+                        : "All in \(folder.name) (\(folder.sessionCount))",
+                    callbackData: "sel:p:\(folder.id)"
                 )
-            ]
-        }
-        rows.append([.init(text: "Back", callbackData: "nav:home")])
+            ])
 
-        let text = projects.isEmpty
-            ? "No projects yet. You can still use /new or /temp to start an ungrouped session."
-            : "Choose a project first, then open a thread inside that project."
+            rows += childProjects.map { project in
+                let label = "\(project.name) (\(project.sessionCount))"
+                return [
+                    TelegramInlineKeyboardButton(
+                        text: project.id.caseInsensitiveCompare(chatState.selectedProjectID ?? "") == .orderedSame
+                            ? "• \(label)"
+                            : label,
+                        callbackData: "sel:p:\(project.id)"
+                    )
+                ]
+            }
+            rows.append([.init(text: "Back to Projects", callbackData: "nav:projects-root")])
+            rows.append([.init(text: "Back", callbackData: "nav:home")])
+
+            text = childProjects.isEmpty
+                ? "\(folder.name) does not have any projects yet. You can still choose all chats in this group, or go back."
+                : "Choose all chats in the group \(folder.name), or pick one project inside it."
+        } else {
+            rows.append([
+                .init(
+                    text: chatState.selectedProjectID == nil ? "• All projects" : "All projects",
+                    callbackData: "sel:p:all"
+                )
+            ])
+
+            rows += rootFolders.flatMap { folder in
+                let label = "\(folder.name) (\(folder.sessionCount))"
+                return [[
+                    TelegramInlineKeyboardButton(
+                        text: chatState.selectedProjectID?.caseInsensitiveCompare(folder.id) == .orderedSame
+                            ? "• \(label)"
+                            : label,
+                        callbackData: "sel:p:\(folder.id)"
+                    ),
+                    TelegramInlineKeyboardButton(
+                        text: "Open",
+                        callbackData: "nav:projects-folder:\(folder.id)"
+                    )
+                ]]
+            }
+
+            rows += rootProjects.map { project in
+                let label = "\(project.name) (\(project.sessionCount))"
+                return [
+                    TelegramInlineKeyboardButton(
+                        text: project.id.caseInsensitiveCompare(chatState.selectedProjectID ?? "") == .orderedSame
+                            ? "• \(label)"
+                            : label,
+                        callbackData: "sel:p:\(project.id)"
+                    )
+                ]
+            }
+            rows.append([.init(text: "Back", callbackData: "nav:home")])
+
+            text = projects.isEmpty
+                ? "No projects yet. You can still use /new or /temp to start an ungrouped session."
+                : "Choose all chats, a group, or a project. Open a group to see the projects inside it."
+        }
 
         await upsertControllerMessage(
             chatID: chatID,
             text: text,
-            signature: "projects:\(projects.map(\.id).joined(separator: ",")):\(chatState.selectedProjectID ?? "all")",
+            signature: "projects:\(chatState.projectMenuFolderID ?? "root"):\(projects.map(\.id).joined(separator: ",")):\(chatState.selectedProjectID ?? "all")",
             markup: TelegramInlineKeyboardMarkup(inlineKeyboard: rows)
         )
     }
@@ -1407,11 +1475,12 @@ final class TelegramRemoteCoordinator: ObservableObject {
         if data == "sel:p:all" {
             selectedProjectID = nil
         } else {
-            let rawIndex = data.replacingOccurrences(of: "sel:p:", with: "")
-            guard let index = Int(rawIndex), chatState.projectMenuProjectIDs.indices.contains(index) else {
+            let projectID = data.replacingOccurrences(of: "sel:p:", with: "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !projectID.isEmpty else {
                 throw TelegramBotClientError.server(message: "That project button expired. Open /projects again.")
             }
-            selectedProjectID = chatState.projectMenuProjectIDs[index]
+            selectedProjectID = projectID
         }
 
         chatState.selectedProjectID = selectedProjectID
@@ -1435,7 +1504,7 @@ final class TelegramRemoteCoordinator: ObservableObject {
         }
         await renderHomeMenu(
             chatID: chatID,
-            notice: selectedProjectID == nil ? "Showing all projects." : "Project updated."
+            notice: selectedProjectID == nil ? "Showing all chats." : "Filter updated."
         )
         await refreshSelectedSessionView(chatID: chatID, force: true)
     }

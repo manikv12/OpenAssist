@@ -40,7 +40,13 @@ enum AssistantWorkspaceFileOpener {
     private static let targets: [Target] = [
         .init(
             title: "VS Code",
-            bundleIdentifiers: ["com.microsoft.VSCode", "com.microsoft.VSCodeInsiders"],
+            bundleIdentifiers: ["com.microsoft.VSCode"],
+            launchStyle: .openDocuments,
+            remembersAsPreferred: true
+        ),
+        .init(
+            title: "VS Code Insiders",
+            bundleIdentifiers: ["com.microsoft.VSCodeInsiders"],
             launchStyle: .openDocuments,
             remembersAsPreferred: true
         ),

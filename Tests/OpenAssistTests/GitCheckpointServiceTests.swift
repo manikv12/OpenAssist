@@ -143,6 +143,46 @@ final class GitCheckpointServiceTests: XCTestCase {
         )
     }
 
+    func testCaptureResultCanBeLimitedToTouchedPaths() async throws {
+        let repositoryURL = try makeGitRepository()
+        let service = GitCheckpointService()
+        let resolvedContext = try await service.repositoryContext(for: repositoryURL.path)
+        let context = try XCTUnwrap(resolvedContext)
+
+        try write("assistant before\n", to: repositoryURL.appendingPathComponent("assistant.txt"))
+        try write("external before\n", to: repositoryURL.appendingPathComponent("external.txt"))
+        try runGit(["add", "assistant.txt", "external.txt"], in: repositoryURL)
+        try runGit(["commit", "-m", "Add tracked fixtures"], in: repositoryURL)
+
+        let checkpointID = UUID().uuidString
+        let before = try await service.captureSnapshot(
+            repository: context,
+            sessionID: "thread-filtered-capture",
+            checkpointID: checkpointID,
+            phase: .before
+        )
+
+        try write("assistant after\n", to: repositoryURL.appendingPathComponent("assistant.txt"))
+        try write("external after\n", to: repositoryURL.appendingPathComponent("external.txt"))
+
+        let after = try await service.captureSnapshot(
+            repository: context,
+            sessionID: "thread-filtered-capture",
+            checkpointID: checkpointID,
+            phase: .after
+        )
+        let capture = try await service.buildCaptureResult(
+            repository: context,
+            before: before,
+            after: after,
+            includedPaths: ["assistant.txt"]
+        )
+
+        XCTAssertEqual(capture.changedFiles.map(\.path), ["assistant.txt"])
+        XCTAssertTrue(capture.patch.contains("assistant.txt"))
+        XCTAssertFalse(capture.patch.contains("external.txt"))
+    }
+
     func testStoredCheckpointRefsExposeIncompleteBeforeSnapshot() async throws {
         let repositoryURL = try makeGitRepository()
         let service = GitCheckpointService()

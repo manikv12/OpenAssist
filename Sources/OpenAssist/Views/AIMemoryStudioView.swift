@@ -38,6 +38,7 @@ struct AIMemoryStudioView: View {
     @State private var openAIDeviceUserCode: String?
     @State private var openAIDeviceVerificationURL: URL?
     @State private var showLocalModelDeleteConfirmation = false
+    @State private var showPromptModelAdvancedOptions = false
 
     @State private var memoryActionMessage: String?
     @State private var isMemoryIndexingInProgress = false
@@ -113,9 +114,9 @@ struct AIMemoryStudioView: View {
             case .dashboard:
                 return "Overview"
             case .models:
-                return "Provider & Models"
+                return "Connections & Models"
             case .conversationMemory:
-                return "Conversation Memory"
+                return "Memory"
             case .memorySources:
                 return "Memory Sources"
             case .sourceFolders:
@@ -125,15 +126,15 @@ struct AIMemoryStudioView: View {
             case .actions:
                 return "Maintenance"
             case .assistantSetup:
-                return "Setup"
+                return "Assistant Setup"
             case .assistantVoice:
-                return "Voice"
+                return "Assistant Voice"
             case .assistantMemory:
-                return "Memory"
+                return "Assistant Memory"
             case .assistantInstructions:
-                return "Custom Instructions"
+                return "Instructions"
             case .assistantLimits:
-                return "Limits"
+                return "Assistant Advanced"
             case .assistantSessions:
                 return "Recent Sessions"
             }
@@ -142,31 +143,31 @@ struct AIMemoryStudioView: View {
         var subtitle: String {
             switch self {
             case .dashboard:
-                return "Big-picture status and quick actions."
+                return "See the current AI setup and the quickest next steps."
             case .models:
-                return "Connect provider securely and choose the prompt model."
+                return "Choose the main provider, connect it, and pick the model."
             case .conversationMemory:
-                return "Per-screen context history, size, and compaction."
+                return "Shared context, saved history, and conversation memory."
             case .memorySources:
-                return "Manage detected providers and enabled sources."
+                return "Choose which apps and sources can feed memory."
             case .sourceFolders:
-                return "Review source folder inclusion rules."
+                return "Choose which folders are included in memory."
             case .browser:
-                return "Browse indexed memories by filters."
+                return "Search and inspect saved memory entries."
             case .actions:
-                return "Rescan, rebuild, and cleanup controls."
+                return "Rescan, rebuild, and cleanup tools."
             case .assistantSetup:
-                return "Enable, model, account, and browser automation."
+                return "Turn on the assistant and choose its main behavior."
             case .assistantVoice:
-                return "Assistant reply speech, Hume voice setup, fallback, and health."
+                return "Reply voice, Hume setup, fallback, and health."
             case .assistantMemory:
                 return "Thread memory, long-term lessons, and review controls."
             case .assistantInstructions:
-                return "Persistent instructions sent to every assistant session."
+                return "Instructions sent with every assistant session."
             case .assistantLimits:
-                return "Tool call and repeated command safety limits."
+                return "Safety limits and advanced assistant behavior."
             case .assistantSessions:
-                return "Saved Codex sessions in Open Assist."
+                return "Saved assistant sessions in Open Assist."
             }
         }
 
@@ -394,6 +395,7 @@ struct AIMemoryStudioView: View {
 
                 ScrollView {
                     VStack(alignment: .leading, spacing: 16) {
+                        studioPageHeader
                         studioPageContent
                     }
                     .padding(18)
@@ -508,15 +510,15 @@ struct AIMemoryStudioView: View {
             leadingPaneFraction: 0.31,
             leadingPaneMaxWidth: studioSidebarWidth + 26,
             leadingPaneWidth: studioSidebarWidth + 10,
-            leadingTint: AppVisualTheme.sidebarTint,
-            trailingTint: .black,
+            leadingTint: AppVisualTheme.sidebarChromeTint,
+            trailingTint: AppVisualTheme.canvasDeep,
             accent: AppVisualTheme.accentTint,
             leadingPaneTransparent: true
         )
     }
 
     private var studioSidebar: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: 14) {
             Button {
                 NotificationCenter.default.post(
                     name: .openAssistOpenSettings,
@@ -526,7 +528,7 @@ struct AIMemoryStudioView: View {
                 HStack(spacing: 4) {
                     Image(systemName: "chevron.left")
                         .font(.caption2.weight(.bold))
-                    Text("Settings")
+                    Text("Back to Settings")
                         .font(.caption.weight(.medium))
                 }
                 .foregroundStyle(AppVisualTheme.mutedText)
@@ -538,45 +540,21 @@ struct AIMemoryStudioView: View {
             .padding(.bottom, 4)
 
             VStack(alignment: .leading, spacing: 2) {
-                Text("AI Studio")
+                Text("AI Studio (Advanced)")
                     .font(.system(size: 15, weight: .semibold))
                     .foregroundStyle(AppVisualTheme.foreground(0.92))
-                Text(selectedStudioPage.subtitle)
+                Text("Deeper AI setup lives here. Everyday choices stay in Settings.")
                     .font(.system(size: 11, weight: .regular))
-                    .foregroundStyle(AppVisualTheme.foreground(0.44))
-                    .lineLimit(2)
+                    .foregroundStyle(AppVisualTheme.foreground(0.48))
+                    .fixedSize(horizontal: false, vertical: true)
             }
 
             VStack(spacing: 6) {
-                sidebarMetricRow(label: "Assistant", value: promptAssistantStateLabel, tint: promptAssistantStateTint)
-                sidebarMetricRow(
-                    label: "Providers",
-                    value: "\(connectedModelProviderCount)/\(PromptRewriteProviderMode.allCases.count)",
-                    tint: AppVisualTheme.accentTint
-                )
-                sidebarMetricRow(
-                    label: "Contexts",
-                    value: "\(conversationContextDetails.count)",
-                    tint: AppVisualTheme.accentTint
-                )
-                if isMemoryFeatureEnabled {
+                ForEach(Array(studioSidebarStatusItems.enumerated()), id: \.offset) { _, item in
                     sidebarMetricRow(
-                        label: "Folders",
-                        value: "\(enabledSourceFolderCount)/\(totalSourceFoldersForEnabledProvidersCount)",
-                        tint: AppVisualTheme.accentTint
-                    )
-                    sidebarMetricRow(
-                        label: "Visible",
-                        value: "\(memoryBrowserVisibleCount)",
-                        tint: AppVisualTheme.accentTint
-                    )
-                } else {
-                    sidebarMetricRow(
-                        label: "Model",
-                        value: settings.promptRewriteOpenAIModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                            ? settings.promptRewriteProviderMode.defaultModel
-                            : settings.promptRewriteOpenAIModel,
-                        tint: AppVisualTheme.accentTint
+                        label: item.label,
+                        value: item.value,
+                        tint: item.tint
                     )
                 }
             }
@@ -584,7 +562,7 @@ struct AIMemoryStudioView: View {
             Divider()
                 .overlay(AppVisualTheme.surfaceStroke(0.08))
 
-            Text("Workspace")
+            Text("Core AI")
                 .font(.subheadline.weight(.semibold))
                 .foregroundStyle(.secondary)
                 .padding(.leading, 2)
@@ -631,19 +609,23 @@ struct AIMemoryStudioView: View {
         HStack(spacing: 8) {
             Text(label)
                 .font(.system(size: 10, weight: .medium))
-                .foregroundStyle(AppVisualTheme.foreground(0.40))
+                .foregroundStyle(AppVisualTheme.foreground(0.46))
             Spacer(minLength: 0)
             Text(value)
                 .font(.system(size: 11, weight: .medium))
                 .lineLimit(1)
                 .truncationMode(.tail)
-                .foregroundStyle(AppVisualTheme.foreground(0.70))
+                .foregroundStyle(tint)
         }
         .padding(.horizontal, 8)
-        .padding(.vertical, 5)
+        .padding(.vertical, 6)
         .background(
-            RoundedRectangle(cornerRadius: 6, style: .continuous)
-                .fill(AppVisualTheme.surfaceFill(0.03))
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(AppVisualTheme.surfaceFill(0.06))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .stroke(AppVisualTheme.surfaceStroke(0.08), lineWidth: 0.6)
+                )
         )
     }
 
@@ -654,7 +636,7 @@ struct AIMemoryStudioView: View {
         HStack(spacing: 10) {
             Image(systemName: page.iconName)
                 .font(.system(size: 11, weight: .medium))
-                .foregroundStyle(isSelected ? page.tint.opacity(0.85) : AppVisualTheme.foreground(0.40))
+                .foregroundStyle(isSelected ? AppVisualTheme.accentTint.opacity(0.90) : AppVisualTheme.foreground(0.40))
                 .frame(width: 20, height: 20)
 
             Text(page.title)
@@ -669,8 +651,81 @@ struct AIMemoryStudioView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(Rectangle())
         .background(
-            RoundedRectangle(cornerRadius: 7, style: .continuous)
-                .fill(isSelected ? AppVisualTheme.foreground(0.07) : Color.clear)
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(isSelected ? AppVisualTheme.surfaceFill(0.10) : Color.clear)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .stroke(
+                            isSelected ? AppVisualTheme.accentTint.opacity(0.16) : Color.clear,
+                            lineWidth: 0.7
+                        )
+                )
+        )
+    }
+
+    @ViewBuilder
+    private var studioPageHeader: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .top, spacing: 14) {
+                AppIconBadge(
+                    symbol: selectedStudioPage.iconName,
+                    tint: AppVisualTheme.accentTint,
+                    size: 36,
+                    symbolSize: 15
+                )
+
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("AI Studio")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(AppVisualTheme.foreground(0.48))
+                        .textCase(.uppercase)
+                        .tracking(0.8)
+
+                    Text(selectedStudioPage.title)
+                        .font(.system(size: 29, weight: .semibold))
+                        .foregroundStyle(AppVisualTheme.foreground(0.96))
+
+                    Text(selectedStudioPage.subtitle)
+                        .font(.system(size: 13.5, weight: .regular))
+                        .foregroundStyle(AppVisualTheme.foreground(0.62))
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    Text("These are the deeper AI controls. Most people only need the simpler Setup and AI & Assistant pages in Settings.")
+                        .font(.caption)
+                        .foregroundStyle(AppVisualTheme.foreground(0.52))
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                Spacer(minLength: 0)
+
+                Button("Back to Settings") {
+                    NotificationCenter.default.post(
+                        name: .openAssistOpenSettings,
+                        object: SettingsRoute(section: .advanced, cardID: "advanced.aiStudio")
+                    )
+                }
+                .buttonStyle(.bordered)
+            }
+
+            LazyVGrid(
+                columns: [GridItem(.adaptive(minimum: 170), spacing: 12)],
+                alignment: .leading,
+                spacing: 10
+            ) {
+                ForEach(Array(studioHeaderSummaryItems.enumerated()), id: \.offset) { _, item in
+                    studioSummaryTile(label: item.label, value: item.value)
+                }
+            }
+        }
+        .padding(.horizontal, 18)
+        .padding(.vertical, 18)
+        .background(
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .fill(AppVisualTheme.surfaceFill(0.08))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 18, style: .continuous)
+                        .stroke(AppVisualTheme.surfaceStroke(0.14), lineWidth: 0.8)
+                )
         )
     }
 
@@ -709,10 +764,10 @@ struct AIMemoryStudioView: View {
     private var studioOverviewPage: some View {
         VStack(alignment: .leading, spacing: 14) {
             settingsCard(
-                title: isMemoryFeatureEnabled ? "AI Memory Assistant" : "AI Prompt Assistant",
+                title: isMemoryFeatureEnabled ? "AI & Assistant Overview" : "AI Prompt Overview",
                 subtitle: isMemoryFeatureEnabled
-                    ? "Toggle assistant-level prompt behavior."
-                    : "Toggle prompt correction and formatting behavior.",
+                    ? "The main assistant switches and quick actions live here."
+                    : "The main prompt correction switches live here.",
                 symbol: "brain.head.profile",
                 tint: promptAssistantStateTint
             ) {
@@ -836,11 +891,11 @@ struct AIMemoryStudioView: View {
     private var studioModelPage: some View {
         VStack(alignment: .leading, spacing: 14) {
             providerConnectionCard
-            googleAIStudioCard
+            promptModelConfigCard
             if settings.promptRewriteProviderMode == .ollama {
                 localAISetupCard
             }
-            promptModelConfigCard
+            googleAIStudioCard
         }
     }
 
@@ -2352,12 +2407,6 @@ struct AIMemoryStudioView: View {
         }
     }
 
-    private var connectedModelProviderCount: Int {
-        PromptRewriteProviderMode.allCases.filter { mode in
-            settings.isPromptRewriteProviderConnected(mode)
-        }.count
-    }
-
     private var isMemoryFeatureEnabled: Bool {
         FeatureFlags.aiMemoryEnabled
     }
@@ -2365,6 +2414,96 @@ struct AIMemoryStudioView: View {
     private var availableStudioPages: [StudioPage] {
         let base = isMemoryFeatureEnabled ? StudioPage.allCases : aiCorePages
         return base.filter { !$0.isAssistantPage }
+    }
+
+    private var selectedPromptModelLabel: String {
+        let model = settings.promptRewriteOpenAIModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        return model.isEmpty ? settings.promptRewriteProviderMode.defaultModel : model
+    }
+
+    private var promptRewriteResponseStyleBinding: Binding<OpenAssistResponseStylePreset> {
+        Binding(
+            get: {
+                OpenAssistResponseStylePreset.forPromptRewriteTimeout(
+                    settings.promptRewriteRequestTimeoutSeconds
+                )
+            },
+            set: { newPreset in
+                settings.promptRewriteRequestTimeoutSeconds = newPreset.promptRewriteTimeoutSeconds
+            }
+        )
+    }
+
+    private var localAISetupStatusLabel: String {
+        if localAISetupService.setupState == .ready {
+            return "Ready"
+        }
+        if localAISetupService.setupState.isBusy {
+            return "Setting up"
+        }
+        if localAISetupService.runtimeDetection.installed {
+            return "Needs repair"
+        }
+        return "Not installed"
+    }
+
+    private var assistantSetupStatusLabel: String {
+        switch assistantSetupStage {
+        case .installCodex:
+            return "Needs install"
+        case .signIn:
+            return "Needs sign in"
+        case .enableAssistant:
+            return "Needs enable"
+        case .configureAssistant:
+            return "Ready"
+        case .needsAttention:
+            return "Needs attention"
+        }
+    }
+
+    private var assistantSetupStatusTint: Color {
+        switch assistantSetupStage {
+        case .configureAssistant:
+            return Color.green.opacity(0.92)
+        case .needsAttention:
+            return Color.red.opacity(0.92)
+        default:
+            return AppVisualTheme.foreground(0.78)
+        }
+    }
+
+    private var studioSidebarStatusItems: [(label: String, value: String, tint: Color)] {
+        [
+            ("Assistant", assistantSetupStatusLabel, assistantSetupStatusTint),
+            ("Backend", assistant.visibleAssistantBackendName, AppVisualTheme.accentTint),
+            ("Model", assistant.selectedModelSummary, AppVisualTheme.foreground(0.84)),
+            (
+                "Local AI",
+                localAISetupStatusLabel,
+                localAISetupService.setupState == .ready
+                    ? Color.green.opacity(0.92)
+                    : AppVisualTheme.foreground(0.78)
+            )
+        ]
+    }
+
+    private var studioHeaderSummaryItems: [(label: String, value: String)] {
+        if selectedStudioPage.isAssistantPage {
+            return [
+                ("Assistant setup", assistantSetupStatusLabel),
+                ("Assistant backend", assistant.visibleAssistantBackendName),
+                ("Assistant model", assistant.selectedModelSummary),
+                ("Sub-agent model", assistant.selectedSubagentModelSummary)
+            ]
+        }
+
+        return [
+            ("Main provider", settings.promptRewriteProviderMode.displayName),
+            ("Correction model", selectedPromptModelLabel),
+            ("Response style", promptRewriteResponseStyleBinding.wrappedValue.displayName),
+            ("Local AI", localAISetupStatusLabel)
+        ]
     }
 
     private var assistantSetupStage: AIStudioAssistantSetupStage {
@@ -2411,10 +2550,6 @@ struct AIMemoryStudioView: View {
 
     private var enabledSourceFolderCount: Int {
         sourceFoldersForEnabledProviders.filter { settings.isMemorySourceFolderEnabled($0.id) }.count
-    }
-
-    private var promptAssistantStateLabel: String {
-        settings.promptRewriteEnabled ? "Enabled" : "Paused"
     }
 
     private var promptAssistantStateTint: Color {
@@ -2958,8 +3093,8 @@ struct AIMemoryStudioView: View {
     @ViewBuilder
     private var providerConnectionCard: some View {
         settingsCard(
-            title: "Provider Authentication",
-            subtitle: "Connect each provider securely before configuring models.",
+            title: "Connections",
+            subtitle: "Choose the main AI provider here, then connect it securely.",
             symbol: "bolt.badge.a",
             tint: AppVisualTheme.accentTint
         ) {
@@ -2986,8 +3121,8 @@ struct AIMemoryStudioView: View {
     @ViewBuilder
     private var googleAIStudioCard: some View {
         settingsCard(
-            title: "Google AI Studio (Shared Gemini Key)",
-            subtitle: "One key for Gemini prompt rewrite, Gemini transcription, and assistant image generation.",
+            title: "Gemini Shared Key",
+            subtitle: "One Gemini key that can be reused across Open Assist features.",
             symbol: "sparkles.rectangle.stack",
             tint: AppVisualTheme.accentTint
         ) {
@@ -3033,8 +3168,8 @@ struct AIMemoryStudioView: View {
     @ViewBuilder
     private var localAISetupCard: some View {
         settingsCard(
-            title: "Local AI Setup (No Account Needed)",
-            subtitle: "Pick a model and let Open Assist install runtime + model automatically.",
+            title: "Local AI",
+            subtitle: "Pick a model and let Open Assist set up the local runtime for you.",
             symbol: "shippingbox.fill",
             tint: AppVisualTheme.accentTint
         ) {
@@ -3201,8 +3336,8 @@ struct AIMemoryStudioView: View {
         let mode = settings.promptRewriteProviderMode
 
         settingsCard(
-            title: "Prompt Model",
-            subtitle: "Choose model and endpoint used by prompt rewrite.",
+            title: "Model & Connection",
+            subtitle: "Pick the model first. Open advanced connection options only if you need custom endpoints or timeouts.",
             symbol: "cpu.fill",
             tint: AppVisualTheme.accentTint
         ) {
@@ -3232,42 +3367,74 @@ struct AIMemoryStudioView: View {
                 .frame(maxWidth: 420, alignment: .leading)
             }
 
-            TextField("Model (e.g. \(mode.defaultModel))", text: $settings.promptRewriteOpenAIModel)
-                .textFieldStyle(.roundedBorder)
-            Text("Pick a detected model, or type a custom model ID.")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Text("Response style")
+                        .font(.callout.weight(.semibold))
+                        .foregroundStyle(AppVisualTheme.foreground(0.92))
+                    Spacer()
+                    Text(promptRewriteResponseStyleBinding.wrappedValue.displayName)
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(AppVisualTheme.accentTint.opacity(0.92))
+                }
 
-            TextField("Base URL", text: $settings.promptRewriteOpenAIBaseURL)
-                .textFieldStyle(.roundedBorder)
+                Picker("Response style", selection: promptRewriteResponseStyleBinding) {
+                    ForEach(OpenAssistResponseStylePreset.allCases) { preset in
+                        Text(preset.displayName).tag(preset)
+                    }
+                }
+                .pickerStyle(.segmented)
 
-            HStack {
-                Text("Rewrite request timeout")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Text("\(Int(settings.promptRewriteRequestTimeoutSeconds.rounded())) s")
+                Text(promptRewriteResponseStyleBinding.wrappedValue.detail)
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
 
-            Slider(
-                value: $settings.promptRewriteRequestTimeoutSeconds,
-                in: 3...120,
-                step: 1
-            )
-
-            Text("Applies to all models/providers. Increase this if local models are timing out on slower Macs.")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-
             Toggle("Always convert generated suggestions to Markdown", isOn: $settings.promptRewriteAlwaysConvertToMarkdown)
 
-            Button("Use \(mode.displayName) Defaults") {
+            Button("Use \(mode.displayName) recommended defaults") {
                 settings.applyPromptRewriteProviderDefaultsIfNeeded(force: true)
                 refreshPromptRewriteModels(showMessage: true)
             }
             .buttonStyle(.bordered)
+
+            DisclosureGroup(
+                "Advanced connection options",
+                isExpanded: $showPromptModelAdvancedOptions
+            ) {
+                VStack(alignment: .leading, spacing: 10) {
+                    TextField("Custom model ID (e.g. \(mode.defaultModel))", text: $settings.promptRewriteOpenAIModel)
+                        .textFieldStyle(.roundedBorder)
+
+                    Text("Pick a detected model above first. Only type a custom model ID when you need a special model name.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+
+                    TextField("Base URL", text: $settings.promptRewriteOpenAIBaseURL)
+                        .textFieldStyle(.roundedBorder)
+
+                    HStack {
+                        Text("Rewrite request timeout")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Text("\(Int(settings.promptRewriteRequestTimeoutSeconds.rounded())) s")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    Slider(
+                        value: $settings.promptRewriteRequestTimeoutSeconds,
+                        in: 3...120,
+                        step: 1
+                    )
+
+                    Text("Increase this only if slower local or remote models are timing out.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(.top, 8)
+            }
 
             if let promptRewriteModelStatusMessage {
                 Text(promptRewriteModelStatusMessage)
@@ -3292,7 +3459,7 @@ struct AIMemoryStudioView: View {
 
     @ViewBuilder
     private var providerModeSection: some View {
-        Picker("Rewrite provider", selection: $settings.promptRewriteProviderModeRawValue) {
+        Picker("Main provider", selection: $settings.promptRewriteProviderModeRawValue) {
             ForEach(PromptRewriteProviderMode.allCases) { mode in
                 Text(mode.displayName).tag(mode.rawValue)
             }
@@ -6185,11 +6352,37 @@ struct AIMemoryStudioView: View {
             content()
         }
         .padding(16)
-        .appThemedSurface(
-            cornerRadius: 12,
-            tint: tint,
-            strokeOpacity: 0.16,
-            tintOpacity: 0.035
+        .background(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .fill(AppVisualTheme.surfaceFill(0.08))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        .stroke(AppVisualTheme.surfaceStroke(0.12), lineWidth: 0.8)
+                )
+        )
+        .shadow(color: .black.opacity(0.04), radius: 4, x: 0, y: 3)
+    }
+
+    @ViewBuilder
+    private func studioSummaryTile(label: String, value: String) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text(label)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(AppVisualTheme.foreground(0.48))
+            Text(value)
+                .font(.callout.weight(.medium))
+                .foregroundStyle(AppVisualTheme.foreground(0.90))
+                .lineLimit(2)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(12)
+        .background(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(AppVisualTheme.surfaceFill(0.06))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .stroke(AppVisualTheme.surfaceStroke(0.10), lineWidth: 0.7)
+                )
         )
     }
 }

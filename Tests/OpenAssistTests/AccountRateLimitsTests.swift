@@ -74,6 +74,31 @@ final class AccountRateLimitsTests: XCTestCase {
         XCTAssertEqual(limits.bucket(for: "gpt-5.3-codex-spark")?.limitID, "codex_other")
     }
 
+    func testStatusBarEntriesShowSparkFiveHourAndWeeklyWindows() throws {
+        let bucket = AccountRateLimitBucket(
+            limitID: "codex_other",
+            limitName: "spark",
+            primary: try XCTUnwrap(
+                RateLimitWindow(from: [
+                    "usedPercent": 77,
+                    "windowDurationMins": 300
+                ])
+            ),
+            secondary: try XCTUnwrap(
+                RateLimitWindow(from: [
+                    "usedPercent": 8,
+                    "windowDurationMins": 10_080
+                ])
+            )
+        )
+
+        let entries = bucket.statusBarEntries(bucketLabel: "Spark")
+
+        XCTAssertEqual(entries.count, 2)
+        XCTAssertEqual(entries.map(\.window.windowLabel), ["5h", "Weekly"])
+        XCTAssertEqual(entries.map(\.showsResetInline), [false, true])
+    }
+
     private func fullRateLimitsPayload() -> [String: Any] {
         let codexSnapshot: [String: Any] = [
             "limitId": "codex",

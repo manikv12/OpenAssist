@@ -4,6 +4,7 @@ import remarkGfm from "remark-gfm";
 import type { Components } from "react-markdown";
 import { CodeBlock } from "./CodeBlock";
 import { MermaidDiagram } from "./MermaidDiagram";
+import { normalizeMermaidSource } from "./mermaidUtils";
 
 const codeTheme: Record<string, React.CSSProperties> = {
   'code[class*="language-"]': {
@@ -63,8 +64,10 @@ const remarkPlugins = [remarkGfm];
 
 function MarkdownContentInner({
   markdown,
+  mermaidDisplayMode = "default",
 }: {
   markdown: string;
+  mermaidDisplayMode?: "default" | "noteCompact";
 }) {
   const renderedMarkdown = useMemo(
     () => normalizeMarkdownStructure(markdown),
@@ -102,6 +105,7 @@ function MarkdownContentInner({
           return (
             <MermaidDiagram
               code={normalizeMermaidSource(language, codeString)}
+              displayMode={mermaidDisplayMode}
             />
           );
         }
@@ -176,57 +180,4 @@ function expandCompactOrderedLists(segment: string): string {
       return rebuilt.filter(Boolean).join(`\n${prefix}`);
     })
     .join("\n");
-}
-
-function normalizeMermaidSource(language: string, code: string): string {
-  if (language === "mermaid") {
-    return code;
-  }
-
-  const variant = language.slice("mermaid".length).toLowerCase();
-  if (!variant) {
-    return code;
-  }
-
-  const header = mermaidVariantHeader(variant);
-  if (!header) {
-    return code;
-  }
-
-  const trimmed = code.trimStart();
-  const normalizedHeader = header.toLowerCase();
-  if (trimmed.toLowerCase().startsWith(normalizedHeader)) {
-    return code;
-  }
-  if (header === "flowchart" && /^graph\b/i.test(trimmed)) {
-    return code;
-  }
-
-  return `${header}\n${code}`;
-}
-
-function mermaidVariantHeader(variant: string): string | null {
-  const variants: Record<string, string> = {
-    flowchart: "flowchart",
-    graph: "graph",
-    sequencediagram: "sequenceDiagram",
-    classdiagram: "classDiagram",
-    statediagram: "stateDiagram-v2",
-    statediagramv2: "stateDiagram-v2",
-    erdiagram: "erDiagram",
-    journey: "journey",
-    gantt: "gantt",
-    pie: "pie",
-    gitgraph: "gitGraph",
-    mindmap: "mindmap",
-    timeline: "timeline",
-    requirementdiagram: "requirementDiagram",
-    quadrantschart: "quadrantChart",
-    quadrantchart: "quadrantChart",
-    sankey: "sankey-beta",
-    architecture: "architecture-beta",
-    blockdiagram: "block-beta",
-  };
-
-  return variants[variant] || null;
 }

@@ -130,6 +130,120 @@ final class AssistantProjectStoreTests: XCTestCase {
         XCTAssertEqual(reloadedStore.hiddenProjects().count, 0)
     }
 
+    func testFolderHierarchyRoundTripPersistsKindsAndParentIDs() throws {
+        let directory = try makeTemporaryDirectory(named: "assistant-project-folder-roundtrip")
+        let store = AssistantProjectStore(baseDirectoryURL: directory)
+
+        let folder = try store.createFolder(name: "Amwins")
+        let childProject = try store.createProject(name: "NLS", parentID: folder.id)
+        let rootProject = try store.createProject(name: "OpenAssist")
+
+        let reloadedStore = AssistantProjectStore(baseDirectoryURL: directory)
+        let reloadedFolder = try XCTUnwrap(reloadedStore.project(forProjectID: folder.id))
+        let reloadedChild = try XCTUnwrap(reloadedStore.project(forProjectID: childProject.id))
+        let reloadedRootProject = try XCTUnwrap(reloadedStore.project(forProjectID: rootProject.id))
+
+        XCTAssertEqual(reloadedFolder.kind, .folder)
+        XCTAssertNil(reloadedFolder.parentID)
+        XCTAssertEqual(reloadedChild.kind, .project)
+        XCTAssertEqual(reloadedChild.parentID, folder.id)
+        XCTAssertEqual(reloadedRootProject.kind, .project)
+        XCTAssertNil(reloadedRootProject.parentID)
+        XCTAssertEqual(
+            reloadedStore.descendantProjectIDs(ofFolderID: folder.id),
+            Set([childProject.id])
+        )
+    }
+
+    func testProjectNamesAreUniqueWithinSameParentButCanRepeatAcrossFolders() throws {
+        let directory = try makeTemporaryDirectory(named: "assistant-project-sibling-names")
+        let store = AssistantProjectStore(baseDirectoryURL: directory)
+
+        let folderA = try store.createFolder(name: "Amwins")
+        let folderB = try store.createFolder(name: "Rapid")
+        _ = try store.createProject(name: "NLS", parentID: folderA.id)
+        _ = try store.createProject(name: "NLS", parentID: folderB.id)
+
+        XCTAssertThrowsError(try store.createProject(name: "NLS", parentID: folderA.id)) { error in
+            XCTAssertTrue(error.localizedDescription.contains("already exists"))
+        }
+        XCTAssertThrowsError(try store.createFolder(name: "amwins")) { error in
+            XCTAssertTrue(error.localizedDescription.contains("already exists"))
+        }
+    }
+
+    func testAssignThreadRejectsFolders() throws {
+        let directory = try makeTemporaryDirectory(named: "assistant-project-folder-assignment")
+        let store = AssistantProjectStore(baseDirectoryURL: directory)
+        let folder = try store.createFolder(name: "Amwins")
+
+        XCTAssertThrowsError(try store.assignThread("thread-1", toProjectID: folder.id)) { error in
+            guard let storeError = error as? AssistantProjectStoreError else {
+                return XCTFail("Unexpected error type: \(error)")
+            }
+            if case .cannotAssignThreadToFolder = storeError {
+                // expected
+            } else {
+                XCTFail("Expected cannotAssignThreadToFolder, got \(storeError)")
+            }
+        }
+    }
+
+    func testDeleteFolderMovesChildProjectsToRootAndKeepsAssignments() throws {
+        let directory = try makeTemporaryDirectory(named: "assistant-project-delete-folder")
+        let store = AssistantProjectStore(baseDirectoryURL: directory)
+
+        let folder = try store.createFolder(name: "Amwins")
+        let project = try store.createProject(name: "NLS", parentID: folder.id)
+        try store.assignThread("thread-1", toProjectID: project.id)
+
+        let deletion = try store.deleteProjectResult(id: folder.id)
+
+        XCTAssertEqual(deletion.project.id, folder.id)
+        XCTAssertTrue(deletion.removedThreadIDs.isEmpty)
+        XCTAssertNil(store.project(forProjectID: folder.id))
+
+        let rehomedProject = try XCTUnwrap(store.project(forProjectID: project.id))
+        XCTAssertNil(rehomedProject.parentID)
+        XCTAssertEqual(store.assignedProjectID(forThreadID: "thread-1"), project.id)
+        XCTAssertEqual(store.descendantProjectIDs(ofFolderID: folder.id), [])
+    }
+
+    func testDeleteFolderRejectsDuplicateRootNameWhenChildWouldMoveToTopLevel() throws {
+        let directory = try makeTemporaryDirectory(named: "assistant-project-delete-folder-duplicate")
+        let store = AssistantProjectStore(baseDirectoryURL: directory)
+
+        let folder = try store.createFolder(name: "Amwins")
+        _ = try store.createProject(name: "NLS")
+        let childProject = try store.createProject(name: "NLS", parentID: folder.id)
+
+        XCTAssertThrowsError(try store.deleteProjectResult(id: folder.id)) { error in
+            XCTAssertTrue(error.localizedDescription.contains("already exists"))
+        }
+
+        let unchangedChild = try XCTUnwrap(store.project(forProjectID: childProject.id))
+        XCTAssertEqual(unchangedChild.parentID, folder.id)
+    }
+
+    func testHiddenFolderHidesChildrenButKeepsAssignments() throws {
+        let directory = try makeTemporaryDirectory(named: "assistant-project-hidden-folder")
+        let store = AssistantProjectStore(baseDirectoryURL: directory)
+
+        let folder = try store.createFolder(name: "Amwins")
+        let project = try store.createProject(name: "NLS", parentID: folder.id)
+        try store.assignThread("thread-1", toProjectID: project.id)
+
+        _ = try store.hideProject(id: folder.id)
+
+        XCTAssertEqual(store.visibleProjects().count, 0)
+        XCTAssertEqual(store.hiddenProjects().map(\.id), [folder.id])
+        XCTAssertEqual(store.assignedProjectID(forThreadID: "thread-1"), project.id)
+
+        let reloadedStore = AssistantProjectStore(baseDirectoryURL: directory)
+        XCTAssertEqual(reloadedStore.visibleProjects().count, 0)
+        XCTAssertEqual(reloadedStore.assignedProjectID(forThreadID: "thread-1"), project.id)
+    }
+
     func testCreateProjectWithSameLinkedFolderReusesExistingProjectAndUnhidesIt() throws {
         let directory = try makeTemporaryDirectory(named: "assistant-project-shared-folder")
         let store = AssistantProjectStore(baseDirectoryURL: directory)
@@ -184,6 +298,8 @@ final class AssistantProjectStoreTests: XCTestCase {
         let store = AssistantProjectStore(baseDirectoryURL: directory)
         let project = try XCTUnwrap(store.project(forProjectID: "project-legacy"))
         XCTAssertFalse(project.isHidden)
+        XCTAssertEqual(project.kind, .project)
+        XCTAssertNil(project.parentID)
         XCTAssertEqual(store.visibleProjects().count, 1)
         XCTAssertEqual(store.hiddenProjects().count, 0)
 
@@ -354,6 +470,95 @@ final class AssistantProjectStoreTests: XCTestCase {
         XCTAssertNil(store.assignedProjectID(forThreadID: "thread-b"))
         XCTAssertNil(store.brainState(forProjectID: project.id).projectSummary)
         XCTAssertTrue(store.brainState(forProjectID: project.id).threadDigestsByThreadID.isEmpty)
+    }
+
+    func testProjectNotesRoundTripPersistsSelectionOrderingAndText() throws {
+        let directory = try makeTemporaryDirectory(named: "assistant-project-notes")
+        let store = AssistantProjectStore(baseDirectoryURL: directory)
+        let project = try store.createProject(name: "OpenAssist")
+
+        let emptyWorkspace = try store.loadProjectNotesWorkspace(projectID: project.id)
+        XCTAssertTrue(emptyWorkspace.notes.isEmpty)
+        XCTAssertNil(emptyWorkspace.selectedNote)
+
+        let firstWorkspace = try store.createProjectNote(projectID: project.id, title: "Architecture")
+        let firstNote = try XCTUnwrap(firstWorkspace.selectedNote)
+        XCTAssertEqual(firstNote.title, "Architecture")
+
+        let savedFirst = try store.saveProjectNote(
+            projectID: project.id,
+            noteID: firstNote.id,
+            text: "Initial architecture note"
+        )
+        XCTAssertEqual(savedFirst.selectedNoteText, "Initial architecture note")
+
+        let secondWorkspace = try store.createProjectNote(projectID: project.id, title: "Release Plan")
+        let secondNote = try XCTUnwrap(secondWorkspace.selectedNote)
+        XCTAssertEqual(secondWorkspace.notes.map(\.title), ["Architecture", "Release Plan"])
+
+        _ = try store.saveProjectNote(
+            projectID: project.id,
+            noteID: secondNote.id,
+            text: "Version 1 release plan"
+        )
+
+        let reselectedFirst = try store.selectProjectNote(projectID: project.id, noteID: firstNote.id)
+        XCTAssertEqual(reselectedFirst.selectedNote?.id, firstNote.id)
+
+        let appended = try store.appendToSelectedProjectNote(
+            projectID: project.id,
+            text: "Captured from chat"
+        )
+        XCTAssertEqual(
+            appended.selectedNoteText,
+            "Initial architecture note\n\nCaptured from chat"
+        )
+
+        let renamed = try store.renameProjectNote(
+            projectID: project.id,
+            noteID: secondNote.id,
+            title: "Release Notes"
+        )
+        XCTAssertEqual(renamed.notes.map(\.title), ["Architecture", "Release Notes"])
+        XCTAssertEqual(renamed.selectedNote?.id, firstNote.id)
+
+        let reloadedStore = AssistantProjectStore(baseDirectoryURL: directory)
+        let reloadedWorkspace = try reloadedStore.loadProjectNotesWorkspace(projectID: project.id)
+        XCTAssertEqual(reloadedWorkspace.selectedNote?.id, firstNote.id)
+        XCTAssertEqual(reloadedWorkspace.selectedNoteText, "Initial architecture note\n\nCaptured from chat")
+        XCTAssertEqual(reloadedWorkspace.notes.map(\.title), ["Architecture", "Release Notes"])
+    }
+
+    func testSavingEmptyProjectNoteRemovesNoteFileAndDeleteProjectCleansProjectNotesDirectory() throws {
+        let directory = try makeTemporaryDirectory(named: "assistant-project-note-cleanup")
+        let store = AssistantProjectStore(baseDirectoryURL: directory)
+        let project = try store.createProject(name: "Cleanup Project")
+
+        let createdWorkspace = try store.createProjectNote(projectID: project.id, title: "Scratchpad")
+        let note = try XCTUnwrap(createdWorkspace.selectedNote)
+
+        _ = try store.saveProjectNote(
+            projectID: project.id,
+            noteID: note.id,
+            text: "Temporary text"
+        )
+
+        let projectNotesDirectory = directory
+            .appendingPathComponent("ProjectNotes", isDirectory: true)
+            .appendingPathComponent(project.id.lowercased(), isDirectory: true)
+            .appendingPathComponent("notes", isDirectory: true)
+        let noteFileURL = projectNotesDirectory.appendingPathComponent(note.fileName)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: noteFileURL.path))
+
+        _ = try store.saveProjectNote(projectID: project.id, noteID: note.id, text: "   ")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: noteFileURL.path))
+
+        _ = try store.deleteProjectResult(id: project.id)
+
+        let projectNoteOwnerDirectory = directory
+            .appendingPathComponent("ProjectNotes", isDirectory: true)
+            .appendingPathComponent(project.id.lowercased(), isDirectory: true)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: projectNoteOwnerDirectory.path))
     }
 
     func testProjectNamesAreCaseInsensitiveUnique() throws {
