@@ -228,9 +228,16 @@ function getMermaidTheme(mode: MermaidRenderMode): MermaidThemeConfig {
   };
 }
 
+// Module-level state for deduplicating mermaid.initialize() calls and
+// serialising mermaid.render() calls so concurrent diagram instances don't race
+// on the global Mermaid singleton.
+let lastMermaidConfig: string = "";
+// Each render is chained onto this promise so only one runs at a time.
+let mermaidRenderQueue: Promise<void> = Promise.resolve();
+
 function configureMermaidTheme(mode: MermaidRenderMode): MermaidThemeConfig {
   const theme = getMermaidTheme(mode);
-  mermaid.initialize({
+  const config = {
     startOnLoad: false,
     theme: "base",
     securityLevel: "loose",
@@ -245,7 +252,13 @@ function configureMermaidTheme(mode: MermaidRenderMode): MermaidThemeConfig {
       rankSpacing: 84,
       padding: 20,
     },
-  });
+  };
+
+  const serialized = JSON.stringify(config);
+  if (serialized !== lastMermaidConfig) {
+    lastMermaidConfig = serialized;
+    mermaid.initialize(config);
+  }
 
   return theme;
 }
@@ -305,22 +318,29 @@ function MermaidDiagramInner({
     let cancelled = false;
     const id = `mermaid-${++mermaidCounter}`;
 
-    (async () => {
-      try {
-        const theme = configureMermaidTheme(sourceAnalysis.renderMode);
-        const { svg: rendered } = await mermaid.render(id, code.trim());
-        if (!cancelled) {
-          setSvg(rendered);
-          setError("");
-        }
-      } catch (err: any) {
-        if (!cancelled) {
-          setError(err?.message || "Render failed");
-          setSvg("");
-        }
-        document.getElementById(`d${id}`)?.remove();
-      }
-    })();
+    mermaidRenderQueue = mermaidRenderQueue.then(
+      () =>
+        new Promise<void>((resolve) => {
+          (async () => {
+            try {
+              configureMermaidTheme(sourceAnalysis.renderMode);
+              const { svg: rendered } = await mermaid.render(id, code.trim());
+              if (!cancelled) {
+                setSvg(rendered);
+                setError("");
+              }
+            } catch (err: any) {
+              if (!cancelled) {
+                setError(err?.message || "Render failed");
+                setSvg("");
+              }
+              document.getElementById(`d${id}`)?.remove();
+            } finally {
+              resolve();
+            }
+          })();
+        })
+    );
 
     return () => {
       cancelled = true;

@@ -1326,12 +1326,19 @@ const SidebarNoteRow = memo(function SidebarNoteRow({
   onOpenThread?: () => void;
 }) {
   return (
-    <button
-      type="button"
+    <div
+      role="button"
+      tabIndex={0}
       className={`oa-react-sidebar__row oa-react-sidebar__row--note ${
         note.isSelected ? "is-selected" : ""
       }`}
       onClick={onClick}
+      onKeyDown={(event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          onClick();
+        }
+      }}
     >
       <span className="oa-react-sidebar__row-icon">
         <SidebarIcon symbol={note.ownerKind === "project" ? "note.text" : "text.bubble"} />
@@ -1360,7 +1367,7 @@ const SidebarNoteRow = memo(function SidebarNoteRow({
           Open
         </button>
       ) : null}
-    </button>
+    </div>
   );
 });
 

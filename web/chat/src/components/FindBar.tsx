@@ -39,7 +39,7 @@ function FindBarInner({ visible, onClose }: Props) {
 
       const containers = Array.from(
         document.querySelectorAll(
-          ".chat-messages, .thread-note-editor-body, .thread-note-rendered-markdown"
+          ".chat-messages, .thread-note-rendered-markdown"
         )
       );
       if (containers.length === 0) {
@@ -57,7 +57,7 @@ function FindBarInner({ visible, onClose }: Props) {
           if (
             !parentElement ||
             parentElement.closest(
-              "mark.find-highlight, .find-bar, button, input, textarea, select"
+              "mark.find-highlight, .find-bar, .thread-note-editor-body, button, input, textarea, select"
             )
           ) {
             continue;

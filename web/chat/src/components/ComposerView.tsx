@@ -214,7 +214,12 @@ export function ComposerView({ state, onDispatchCommand }: ComposerViewProps) {
     );
   }
 
-  const updateDraft = (value: string) => {
+  const updateDraft = (value: string, { fromHistory = false }: { fromHistory?: boolean } = {}) => {
+    if (!fromHistory && historyIndexRef.current !== -1) {
+      // User edited recalled text — leave history browsing mode.
+      historyIndexRef.current = -1;
+      savedDraftRef.current = "";
+    }
     draftRef.current = value;
     lastLocalDraftRef.current = value;
     setDraft(value);
@@ -411,18 +416,22 @@ export function ComposerView({ state, onDispatchCommand }: ComposerViewProps) {
               return;
             }
 
-            // Arrow-up / arrow-down prompt history (only when cursor is at
-            // the very start/end of a single-line value, or the field is empty).
+            // Arrow-up / arrow-down prompt history. Navigate when the cursor is
+            // on the first line (for ArrowUp) or the last line (for ArrowDown),
+            // regardless of whether the recalled text contains newlines.
             const textarea = textareaRef.current;
             if (textarea && (event.key === "ArrowUp" || event.key === "ArrowDown")) {
               const value = textarea.value;
-              const isMultiline = value.includes("\n");
-              const cursorAtStart = textarea.selectionStart === 0 && textarea.selectionEnd === 0;
-              const cursorAtEnd =
-                textarea.selectionStart === value.length && textarea.selectionEnd === value.length;
-              const isEmpty = value.length === 0;
+              const cursorStart = textarea.selectionStart;
+              const cursorEnd = textarea.selectionEnd;
+              // Cursor is on the first line when there is no newline before it.
+              const cursorOnFirstLine =
+                cursorStart === cursorEnd && !value.slice(0, cursorStart).includes("\n");
+              // Cursor is on the last line when there is no newline after it.
+              const cursorOnLastLine =
+                cursorStart === cursorEnd && !value.slice(cursorEnd).includes("\n");
 
-              if (event.key === "ArrowUp" && !isMultiline && (cursorAtStart || isEmpty)) {
+              if (event.key === "ArrowUp" && cursorOnFirstLine) {
                 if (!promptHistory.length) return;
                 event.preventDefault();
                 if (historyIndexRef.current === -1) {
@@ -434,17 +443,17 @@ export function ComposerView({ state, onDispatchCommand }: ComposerViewProps) {
                 } else {
                   return; // Already at oldest entry.
                 }
-                updateDraft(promptHistory[historyIndexRef.current]);
-              } else if (event.key === "ArrowDown" && !isMultiline && (cursorAtEnd || isEmpty)) {
+                updateDraft(promptHistory[historyIndexRef.current], { fromHistory: true });
+              } else if (event.key === "ArrowDown" && cursorOnLastLine) {
                 if (historyIndexRef.current === -1) return; // Not browsing history.
                 event.preventDefault();
                 if (historyIndexRef.current < promptHistory.length - 1) {
                   historyIndexRef.current += 1;
-                  updateDraft(promptHistory[historyIndexRef.current]);
+                  updateDraft(promptHistory[historyIndexRef.current], { fromHistory: true });
                 } else {
                   // Past the newest entry — restore saved draft.
                   historyIndexRef.current = -1;
-                  updateDraft(savedDraftRef.current);
+                  updateDraft(savedDraftRef.current, { fromHistory: true });
                 }
               }
             }
