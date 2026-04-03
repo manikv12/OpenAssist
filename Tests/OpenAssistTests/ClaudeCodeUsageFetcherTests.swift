@@ -113,6 +113,89 @@ final class ClaudeCodeUsageFetcherTests: XCTestCase {
         XCTAssertEqual(opusBucket.secondary?.resetsAt, snapshot.rateLimits.secondary?.resetsAt)
     }
 
+    func testFetcherFallsBackToCachedUsageWhenUsageRequestFails() async throws {
+        let tempHome = try makeTemporaryHomeDirectory()
+        defer { try? FileManager.default.removeItem(at: tempHome) }
+
+        try writeClaudeCredentials(
+            at: tempHome.appendingPathComponent(".claude", isDirectory: true),
+            accessToken: "config-token",
+            subscriptionType: "team"
+        )
+        try writeClaudeUsageCache(
+            at: tempHome.appendingPathComponent(".claude", isDirectory: true),
+            weeklyUsage: 27,
+            sonnetWeeklyUsage: 9
+        )
+
+        let resolver = ClaudeCodeOAuthCredentialResolver(
+            environment: [:],
+            fileManager: .default,
+            homeDirectory: tempHome,
+            keychain: StubClaudeKeychainReader(),
+            applicationSupportDirectory: tempHome.appendingPathComponent("Application Support", isDirectory: true)
+        )
+
+        let snapshot = try await ClaudeCodeUsageFetcher(session: makeStubbedSession { request in
+            XCTAssertEqual(request.url?.absoluteString, "https://api.anthropic.com/api/oauth/usage")
+            return (
+                HTTPURLResponse(
+                    url: request.url!,
+                    statusCode: 500,
+                    httpVersion: nil,
+                    headerFields: ["Content-Type": "application/json"]
+                )!,
+                Data("{}".utf8)
+            )
+        }).fetchUsage(resolver: resolver)
+
+        XCTAssertEqual(snapshot?.planType, "team")
+        XCTAssertEqual(snapshot?.rateLimits.secondary?.usedPercent, 27)
+        XCTAssertEqual(snapshot?.rateLimits.bucket(for: "sonnet")?.secondary?.usedPercent, 9)
+    }
+
+    func testFetcherFallsBackToCachedUsageFromConfiguredClaudeConfigDirectory() async throws {
+        let tempHome = try makeTemporaryHomeDirectory()
+        defer { try? FileManager.default.removeItem(at: tempHome) }
+
+        let configRoot = tempHome.appendingPathComponent("custom-claude", isDirectory: true)
+        try writeClaudeCredentials(
+            at: configRoot,
+            accessToken: "configured-token",
+            subscriptionType: "max"
+        )
+        try writeClaudeUsageCache(
+            at: configRoot,
+            weeklyUsage: 41,
+            sonnetWeeklyUsage: 11
+        )
+
+        let resolver = ClaudeCodeOAuthCredentialResolver(
+            environment: ["CLAUDE_CONFIG_DIR": configRoot.path],
+            fileManager: .default,
+            homeDirectory: tempHome,
+            keychain: StubClaudeKeychainReader(),
+            applicationSupportDirectory: tempHome.appendingPathComponent("Application Support", isDirectory: true)
+        )
+
+        let snapshot = try await ClaudeCodeUsageFetcher(session: makeStubbedSession { request in
+            XCTAssertEqual(request.url?.absoluteString, "https://api.anthropic.com/api/oauth/usage")
+            return (
+                HTTPURLResponse(
+                    url: request.url!,
+                    statusCode: 500,
+                    httpVersion: nil,
+                    headerFields: ["Content-Type": "application/json"]
+                )!,
+                Data("{}".utf8)
+            )
+        }).fetchUsage(resolver: resolver)
+
+        XCTAssertEqual(snapshot?.planType, "max")
+        XCTAssertEqual(snapshot?.rateLimits.secondary?.usedPercent, 41)
+        XCTAssertEqual(snapshot?.rateLimits.bucket(for: "sonnet")?.secondary?.usedPercent, 11)
+    }
+
     func testCredentialResolverReadsClaudeCredentialsFromConfig() throws {
         let tempHome = try makeTemporaryHomeDirectory()
         defer { try? FileManager.default.removeItem(at: tempHome) }
@@ -352,6 +435,54 @@ final class ClaudeCodeUsageFetcherTests: XCTestCase {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         return url
+    }
+
+    private func writeClaudeCredentials(
+        at directory: URL,
+        accessToken: String,
+        subscriptionType: String
+    ) throws {
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let configURL = directory.appendingPathComponent(".credentials.json")
+        try Data(
+            """
+            {
+              "claudeAiOauth": {
+                "accessToken": "\(accessToken)",
+                "expiresAt": 4102444800000,
+                "rateLimitTier": "default_claude_team",
+                "subscriptionType": "\(subscriptionType)"
+              }
+            }
+            """.utf8
+        ).write(to: configURL)
+    }
+
+    private func writeClaudeUsageCache(
+        at directory: URL,
+        weeklyUsage: Int,
+        sonnetWeeklyUsage: Int
+    ) throws {
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let usageURL = directory.appendingPathComponent("usage-cache.json")
+        try Data(
+            """
+            {
+              "five_hour": {
+                "utilization": 0,
+                "resets_at": null
+              },
+              "seven_day": {
+                "utilization": \(weeklyUsage),
+                "resets_at": "2026-04-05T00:00:00.000Z"
+              },
+              "seven_day_sonnet": {
+                "utilization": \(sonnetWeeklyUsage),
+                "resets_at": "2026-04-06T00:00:00.000Z"
+              }
+            }
+            """.utf8
+        ).write(to: usageURL)
     }
 }
 

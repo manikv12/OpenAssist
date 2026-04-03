@@ -105,6 +105,22 @@ struct ClaudeCodeOAuthCredentialResolver {
         }
     }
 
+    func resolvePlanTypeHint() -> String? {
+        loadOpenAssistCachedCredentials()?.subscriptionType?.nonEmpty
+            ?? loadStoredCredentials()?.subscriptionType?.nonEmpty
+    }
+
+    fileprivate func resolveCachedUsageResponse() -> ClaudeCodeOAuthUsageResponse? {
+        for url in candidateUsageCacheURLs() {
+            guard fileManager.fileExists(atPath: url.path) else { continue }
+            guard let data = try? Data(contentsOf: url) else { continue }
+            if let usage = try? JSONDecoder().decode(ClaudeCodeOAuthUsageResponse.self, from: data) {
+                return usage
+            }
+        }
+        return nil
+    }
+
     private func loadStoredCredentials() -> ClaudeCodeOAuthCredentials? {
         for url in candidateConfigURLs() {
             guard fileManager.fileExists(atPath: url.path) else { continue }
@@ -126,6 +142,14 @@ struct ClaudeCodeOAuthCredentialResolver {
     }
 
     private func candidateConfigURLs() -> [URL] {
+        candidateConfigRootURLs().map { $0.appendingPathComponent(".credentials.json") }
+    }
+
+    private func candidateUsageCacheURLs() -> [URL] {
+        candidateConfigRootURLs().map { $0.appendingPathComponent("usage-cache.json") }
+    }
+
+    private func candidateConfigRootURLs() -> [URL] {
         var urls: [URL] = []
 
         if let configuredRoots = environment["CLAUDE_CONFIG_DIR"]?
@@ -133,9 +157,7 @@ struct ClaudeCodeOAuthCredentialResolver {
             .map({ $0.trimmingCharacters(in: .whitespacesAndNewlines) })
             .filter({ !$0.isEmpty }) {
             urls.append(
-                contentsOf: configuredRoots.map {
-                    URL(fileURLWithPath: $0, isDirectory: true).appendingPathComponent(".credentials.json")
-                }
+                contentsOf: configuredRoots.map { URL(fileURLWithPath: $0, isDirectory: true) }
             )
         }
 
@@ -146,20 +168,16 @@ struct ClaudeCodeOAuthCredentialResolver {
             urls.append(
                 baseURL
                     .appendingPathComponent("claude", isDirectory: true)
-                    .appendingPathComponent(".credentials.json")
             )
         }
 
         urls.append(
-            homeDirectory
-                .appendingPathComponent(".claude", isDirectory: true)
-                .appendingPathComponent(".credentials.json")
+            homeDirectory.appendingPathComponent(".claude", isDirectory: true)
         )
         urls.append(
             homeDirectory
                 .appendingPathComponent(".config", isDirectory: true)
                 .appendingPathComponent("claude", isDirectory: true)
-                .appendingPathComponent(".credentials.json")
         )
 
         var seen: Set<String> = []
@@ -247,13 +265,24 @@ struct ClaudeCodeUsageFetcher {
     }
 
     func fetchUsage(resolver: ClaudeCodeOAuthCredentialResolver) async throws -> ClaudeCodeUsageSnapshot? {
+        let planTypeHint = resolver.resolvePlanTypeHint()
         guard var credentials = resolver.resolveCredentials() else {
-            return nil
+            return cachedUsageSnapshot(resolver: resolver, planType: planTypeHint)
         }
 
         if credentials.isExpired, credentials.refreshToken?.nonEmpty != nil {
-            credentials = try await refreshCredentials(credentials: credentials)
-            resolver.persistCredentials(credentials)
+            do {
+                credentials = try await refreshCredentials(credentials: credentials)
+                resolver.persistCredentials(credentials)
+            } catch {
+                if let cachedSnapshot = cachedUsageSnapshot(
+                    resolver: resolver,
+                    planType: credentials.subscriptionType ?? planTypeHint
+                ) {
+                    return cachedSnapshot
+                }
+                throw error
+            }
         }
 
         do {
@@ -261,12 +290,28 @@ struct ClaudeCodeUsageFetcher {
         } catch {
             guard isAuthenticationFailure(error),
                   credentials.refreshToken?.nonEmpty != nil else {
+                if let cachedSnapshot = cachedUsageSnapshot(
+                    resolver: resolver,
+                    planType: credentials.subscriptionType ?? planTypeHint
+                ) {
+                    return cachedSnapshot
+                }
                 throw error
             }
 
-            let refreshed = try await refreshCredentials(credentials: credentials)
-            resolver.persistCredentials(refreshed)
-            return try await fetchUsage(credentials: refreshed)
+            do {
+                let refreshed = try await refreshCredentials(credentials: credentials)
+                resolver.persistCredentials(refreshed)
+                return try await fetchUsage(credentials: refreshed)
+            } catch {
+                if let cachedSnapshot = cachedUsageSnapshot(
+                    resolver: resolver,
+                    planType: credentials.subscriptionType ?? planTypeHint
+                ) {
+                    return cachedSnapshot
+                }
+                throw error
+            }
         }
     }
 
@@ -356,25 +401,25 @@ struct ClaudeCodeUsageFetcher {
         )
 
         var additionalBuckets: [AccountRateLimitBucket] = []
-        if sessionWindow != nil || sonnetWindow != nil || weeklyWindow != nil {
+        if let resolvedSonnetWindow = sonnetWindow {
             additionalBuckets.append(
                 AccountRateLimitBucket(
                     limitID: "sonnet",
-                    limitName: "Claude Sonnet",
-                    primary: sessionWindow,
-                    secondary: sonnetWindow ?? weeklyWindow,
+                    limitName: "Sonnet",
+                    primary: resolvedSonnetWindow,
+                    secondary: sessionWindow,
                     hasCredits: true,
                     unlimited: false
                 )
             )
         }
-        if sessionWindow != nil || opusWindow != nil || weeklyWindow != nil {
+        if let resolvedOpusWindow = opusWindow {
             additionalBuckets.append(
                 AccountRateLimitBucket(
                     limitID: "opus",
-                    limitName: "Claude Opus",
-                    primary: sessionWindow,
-                    secondary: opusWindow ?? weeklyWindow,
+                    limitName: "Opus",
+                    primary: resolvedOpusWindow,
+                    secondary: sessionWindow,
                     hasCredits: true,
                     unlimited: false
                 )
@@ -431,6 +476,15 @@ struct ClaudeCodeUsageFetcher {
     private func isAuthenticationFailure(_ error: Error) -> Bool {
         guard let urlError = error as? URLError else { return false }
         return urlError.code == .userAuthenticationRequired
+    }
+
+    private func cachedUsageSnapshot(
+        resolver: ClaudeCodeOAuthCredentialResolver,
+        planType: String?
+    ) -> ClaudeCodeUsageSnapshot? {
+        guard let usage = resolver.resolveCachedUsageResponse() else { return nil }
+        let snapshot = mapUsageResponse(usage, planType: planType)
+        return snapshot.rateLimits.isEmpty ? nil : snapshot
     }
 
     private static let defaultUserAgent = "claude-code/2.1.0"

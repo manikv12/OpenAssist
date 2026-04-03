@@ -114,7 +114,7 @@ struct AssistantChatWebMessage: Equatable {
     let isStreaming: Bool
     let timestamp: Date
     let turnID: String?
-    let images: [Data]?
+    let images: [AssistantChatWebInlineImage]?
     let emphasis: Bool
     let canUndo: Bool
     let canEdit: Bool
@@ -151,17 +151,7 @@ struct AssistantChatWebMessage: Equatable {
         if let providerLabel { json["providerLabel"] = providerLabel }
 
         if let images, !images.isEmpty {
-            json["images"] = images.compactMap { data -> String? in
-                let base64 = data.base64EncodedString()
-                // Detect PNG vs JPEG
-                if data.count > 8 {
-                    let bytes = [UInt8](data.prefix(8))
-                    if bytes[0] == 0x89 && bytes[1] == 0x50 {
-                        return "data:image/png;base64,\(base64)"
-                    }
-                }
-                return "data:image/jpeg;base64,\(base64)"
-            }
+            json["images"] = images.map(\.dataURL)
         }
 
         if let activityIcon { json["activityIcon"] = activityIcon }
@@ -187,6 +177,65 @@ struct AssistantChatWebMessage: Equatable {
         }
 
         return json
+    }
+}
+
+struct AssistantChatWebInlineImage: Equatable {
+    let digest: String
+    let dataURL: String
+
+    static func == (lhs: AssistantChatWebInlineImage, rhs: AssistantChatWebInlineImage) -> Bool {
+        lhs.digest == rhs.digest
+    }
+
+    static func payloads(from images: [Data]?) -> [AssistantChatWebInlineImage]? {
+        guard let images, !images.isEmpty else { return nil }
+        return images.map(Self.payload(from:))
+    }
+
+    private static func payload(from data: Data) -> AssistantChatWebInlineImage {
+        let digest = MemoryIdentifier.stableHexDigest(data: data)
+        if let cachedDataURL = AssistantChatWebInlineImageDataURLCache.shared.dataURL(for: digest) {
+            return AssistantChatWebInlineImage(digest: digest, dataURL: cachedDataURL)
+        }
+
+        let dataURL = makeDataURL(from: data)
+        AssistantChatWebInlineImageDataURLCache.shared.store(
+            dataURL,
+            for: digest,
+            cost: data.count
+        )
+        return AssistantChatWebInlineImage(digest: digest, dataURL: dataURL)
+    }
+
+    private static func makeDataURL(from data: Data) -> String {
+        let base64 = data.base64EncodedString()
+        if data.count > 8 {
+            let bytes = [UInt8](data.prefix(8))
+            if bytes[0] == 0x89 && bytes[1] == 0x50 {
+                return "data:image/png;base64,\(base64)"
+            }
+        }
+        return "data:image/jpeg;base64,\(base64)"
+    }
+}
+
+private final class AssistantChatWebInlineImageDataURLCache {
+    static let shared = AssistantChatWebInlineImageDataURLCache()
+
+    private let cache = NSCache<NSString, NSString>()
+
+    private init() {
+        cache.countLimit = 192
+        cache.totalCostLimit = 64 * 1024 * 1024
+    }
+
+    func dataURL(for digest: String) -> String? {
+        cache.object(forKey: digest as NSString) as String?
+    }
+
+    func store(_ dataURL: String, for digest: String, cost: Int) {
+        cache.setObject(dataURL as NSString, forKey: digest as NSString, cost: cost)
     }
 }
 
@@ -377,12 +426,87 @@ struct AssistantChatWebThreadNoteSource: Equatable {
     }
 }
 
+struct AssistantChatWebThreadNoteRelationshipItem: Equatable {
+    let ownerKind: String
+    let ownerID: String
+    let noteID: String
+    let title: String
+    let sourceLabel: String
+    let isMissing: Bool
+    let occurrenceCount: Int
+
+    func toJSON() -> [String: Any] {
+        [
+            "ownerKind": ownerKind,
+            "ownerId": ownerID,
+            "noteId": noteID,
+            "title": title,
+            "sourceLabel": sourceLabel,
+            "isMissing": isMissing,
+            "occurrenceCount": occurrenceCount,
+        ]
+    }
+}
+
+struct AssistantChatWebThreadNoteGraph: Equatable {
+    let mermaidCode: String
+    let nodeCount: Int
+    let edgeCount: Int
+
+    func toJSON() -> [String: Any] {
+        [
+            "mermaidCode": mermaidCode,
+            "nodeCount": nodeCount,
+            "edgeCount": edgeCount,
+        ]
+    }
+}
+
+struct AssistantChatWebThreadNoteHistoryItem: Equatable {
+    let id: String
+    let title: String
+    let savedAtLabel: String
+    let preview: String
+
+    func toJSON() -> [String: Any] {
+        [
+            "id": id,
+            "title": title,
+            "savedAtLabel": savedAtLabel,
+            "preview": preview,
+        ]
+    }
+}
+
+struct AssistantChatWebThreadDeletedNoteItem: Equatable {
+    let id: String
+    let title: String
+    let deletedAtLabel: String
+    let preview: String
+
+    func toJSON() -> [String: Any] {
+        [
+            "id": id,
+            "title": title,
+            "deletedAtLabel": deletedAtLabel,
+            "preview": preview,
+        ]
+    }
+}
+
 struct AssistantChatWebThreadNoteState: Equatable {
     let threadID: String?
     let ownerKind: String?
     let ownerID: String?
     let ownerTitle: String
     let presentation: String
+    let notesScope: String?
+    let workspaceProjectID: String?
+    let workspaceProjectTitle: String?
+    let workspaceOwnerSubtitle: String?
+    let canCreateNote: Bool
+    let owningThreadID: String?
+    let owningThreadTitle: String?
     let availableSources: [AssistantChatWebThreadNoteSource]
     let notes: [AssistantChatWebThreadNoteItem]
     let selectedNoteID: String?
@@ -399,6 +523,13 @@ struct AssistantChatWebThreadNoteState: Equatable {
     let canEdit: Bool
     let placeholder: String
     let aiDraftPreview: AssistantChatWebThreadNoteAIPreview?
+    let outgoingLinks: [AssistantChatWebThreadNoteRelationshipItem]
+    let backlinks: [AssistantChatWebThreadNoteRelationshipItem]
+    let graph: AssistantChatWebThreadNoteGraph?
+    let canNavigateBack: Bool
+    let previousLinkedNoteTitle: String?
+    let historyVersions: [AssistantChatWebThreadNoteHistoryItem]
+    let recentlyDeletedNotes: [AssistantChatWebThreadDeletedNoteItem]
 
     func toJSON() -> [String: Any] {
         var json: [String: Any] = [
@@ -407,6 +538,13 @@ struct AssistantChatWebThreadNoteState: Equatable {
             "ownerId": ownerID ?? NSNull(),
             "ownerTitle": ownerTitle,
             "presentation": presentation,
+            "notesScope": notesScope ?? NSNull(),
+            "workspaceProjectId": workspaceProjectID ?? NSNull(),
+            "workspaceProjectTitle": workspaceProjectTitle ?? NSNull(),
+            "workspaceOwnerSubtitle": workspaceOwnerSubtitle ?? NSNull(),
+            "canCreateNote": canCreateNote,
+            "owningThreadId": owningThreadID ?? NSNull(),
+            "owningThreadTitle": owningThreadTitle ?? NSNull(),
             "availableSources": availableSources.map { $0.toJSON() },
             "notes": notes.map { $0.toJSON() },
             "selectedNoteId": selectedNoteID ?? NSNull(),
@@ -422,6 +560,13 @@ struct AssistantChatWebThreadNoteState: Equatable {
             "lastSavedAtLabel": lastSavedAtLabel ?? NSNull(),
             "canEdit": canEdit,
             "placeholder": placeholder,
+            "outgoingLinks": outgoingLinks.map { $0.toJSON() },
+            "backlinks": backlinks.map { $0.toJSON() },
+            "graph": graph?.toJSON() ?? NSNull(),
+            "canNavigateBack": canNavigateBack,
+            "previousLinkedNoteTitle": previousLinkedNoteTitle ?? NSNull(),
+            "historyVersions": historyVersions.map { $0.toJSON() },
+            "recentlyDeletedNotes": recentlyDeletedNotes.map { $0.toJSON() },
         ]
         if let aiDraftPreview {
             json["aiDraftPreview"] = aiDraftPreview.toJSON()
@@ -583,6 +728,8 @@ struct AssistantChatWebThreadNoteCommand {
     let ownerKind: String?
     let ownerID: String?
     let noteID: String?
+    let historyVersionID: String?
+    let deletedNoteID: String?
     let text: String?
     let title: String?
     let isOpen: Bool?
@@ -594,6 +741,49 @@ struct AssistantChatWebThreadNoteCommand {
     let currentDraftMarkdown: String?
     let styleInstruction: String?
     let viewportRect: CGRect?
+    let scope: String?
+
+    init(
+        type: String,
+        threadID: String?,
+        ownerKind: String?,
+        ownerID: String?,
+        noteID: String?,
+        historyVersionID: String?,
+        deletedNoteID: String?,
+        text: String?,
+        title: String?,
+        isOpen: Bool?,
+        isExpanded: Bool?,
+        viewMode: String?,
+        selectedText: String?,
+        requestKind: String?,
+        draftMode: String?,
+        currentDraftMarkdown: String?,
+        styleInstruction: String?,
+        viewportRect: CGRect?,
+        scope: String?
+    ) {
+        self.type = type
+        self.threadID = threadID
+        self.ownerKind = ownerKind
+        self.ownerID = ownerID
+        self.noteID = noteID
+        self.historyVersionID = historyVersionID
+        self.deletedNoteID = deletedNoteID
+        self.text = text
+        self.title = title
+        self.isOpen = isOpen
+        self.isExpanded = isExpanded
+        self.viewMode = viewMode
+        self.selectedText = selectedText
+        self.requestKind = requestKind
+        self.draftMode = draftMode
+        self.currentDraftMarkdown = currentDraftMarkdown
+        self.styleInstruction = styleInstruction
+        self.viewportRect = viewportRect
+        self.scope = scope
+    }
 
     init?(body: Any) {
         guard let payload = body as? [String: Any],
@@ -613,6 +803,12 @@ struct AssistantChatWebThreadNoteCommand {
         self.noteID = (payload["noteId"] as? String)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .assistantNonEmpty
+        self.historyVersionID = (payload["historyVersionId"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .assistantNonEmpty
+        self.deletedNoteID = (payload["deletedNoteId"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .assistantNonEmpty
         self.text = payload["text"] as? String
         self.title = payload["title"] as? String
         self.isOpen = payload["isOpen"] as? Bool
@@ -623,6 +819,9 @@ struct AssistantChatWebThreadNoteCommand {
         self.draftMode = payload["draftMode"] as? String
         self.currentDraftMarkdown = payload["currentDraftMarkdown"] as? String
         self.styleInstruction = payload["styleInstruction"] as? String
+        self.scope = (payload["scope"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .assistantNonEmpty
         if let rectInfo = payload["rect"] as? [String: Any] {
             self.viewportRect = CGRect(
                 x: rectInfo["x"] as? Double ?? 0,
@@ -1127,6 +1326,34 @@ final class AssistantChatWebCoordinator: NSObject, WKScriptMessageHandler {
     }
 
     func handleLinkClick(_ urlString: String) {
+        if let target = AssistantNoteLinkCodec.parseTarget(from: urlString) {
+            let command = AssistantChatWebThreadNoteCommand(
+                type: "openLinkedNote",
+                threadID: nil,
+                ownerKind: target.ownerKind.rawValue,
+                ownerID: target.ownerID,
+                noteID: target.noteID,
+                historyVersionID: nil,
+                deletedNoteID: nil,
+                text: nil,
+                title: nil,
+                isOpen: nil,
+                isExpanded: nil,
+                viewMode: nil,
+                selectedText: nil,
+                requestKind: nil,
+                draftMode: nil,
+                currentDraftMarkdown: nil,
+                styleInstruction: nil,
+                viewportRect: nil,
+                scope: nil
+            )
+            DispatchQueue.main.async { [self] in
+                onThreadNoteCommand(command)
+            }
+            return
+        }
+
         AssistantWorkspaceFileOpener.openLink(urlString)
     }
 
@@ -1329,7 +1556,7 @@ final class AssistantChatWebContainerView: NSView, WKNavigationDelegate {
     private var pendingStreamingMessages: [AssistantChatWebMessage]?
     private var lastRequestedMessages: [AssistantChatWebMessage] = []
     private var lastRenderedMessages: [AssistantChatWebMessage] = []
-    private static let throttleInterval: TimeInterval = 1.0 / 30.0
+    private static let throttleInterval: TimeInterval = 1.0 / 15.0
 
     init(coordinator: AssistantChatWebCoordinator) {
         self.coordinator = coordinator
@@ -1501,7 +1728,7 @@ final class AssistantChatWebContainerView: NSView, WKNavigationDelegate {
         guard messages != lastRequestedMessages else { return }
         lastRequestedMessages = messages
 
-        let isStreaming = messages.last?.isStreaming ?? false
+        let isStreaming = AssistantChatWebStreamingUpdatePlanner.hasStreamingMessages(messages)
         if isStreaming {
             // Throttle during streaming to avoid overwhelming the web view
             pendingStreamingMessages = messages
@@ -1630,8 +1857,11 @@ final class AssistantChatWebContainerView: NSView, WKNavigationDelegate {
             return
         }
         pendingStreamingMessages = nil
-        if canIncrementallyStream(messages) {
-            sendLastMessageUpdate(messages)
+        if let update = AssistantChatWebStreamingUpdatePlanner.incrementalTextUpdate(
+            from: lastRenderedMessages,
+            to: messages
+        ) {
+            sendMessageTextUpdate(update, renderedMessages: messages)
         } else {
             sendMessages(messages)
         }
@@ -1660,49 +1890,29 @@ final class AssistantChatWebContainerView: NSView, WKNavigationDelegate {
         webView.evaluateJavaScript("chatBridge.setMessages(\(jsonString))", completionHandler: nil)
     }
 
-    private func sendLastMessageUpdate(_ messages: [AssistantChatWebMessage]) {
-        guard isReady, let lastMessage = messages.last else {
-            pendingMessages = messages
+    private func sendMessageTextUpdate(
+        _ update: AssistantChatWebStreamingTextUpdate,
+        renderedMessages: [AssistantChatWebMessage]
+    ) {
+        guard isReady else {
+            pendingMessages = renderedMessages
             return
         }
 
-        let text = lastMessage.text ?? ""
-        guard let idData = try? JSONEncoder().encode(lastMessage.id),
-            let textData = try? JSONEncoder().encode(text),
+        guard let idData = try? JSONEncoder().encode(update.messageID),
+            let textData = try? JSONEncoder().encode(update.text),
             let idString = String(data: idData, encoding: .utf8),
             let textString = String(data: textData, encoding: .utf8)
         else {
-            sendMessages(messages)
+            sendMessages(renderedMessages)
             return
         }
 
-        lastRenderedMessages = messages
+        lastRenderedMessages = renderedMessages
         webView.evaluateJavaScript(
-            "chatBridge.updateLastMessage(\(idString),\(textString),\(lastMessage.isStreaming))",
+            "chatBridge.updateMessage(\(idString),\(textString),\(update.isStreaming))",
             completionHandler: nil
         )
-    }
-
-    private func canIncrementallyStream(_ messages: [AssistantChatWebMessage]) -> Bool {
-        guard !lastRenderedMessages.isEmpty,
-            messages.count == lastRenderedMessages.count,
-            let lastMessage = messages.last,
-            let previousLastMessage = lastRenderedMessages.last,
-            lastMessage.id == previousLastMessage.id,
-            messages.dropLast().elementsEqual(lastRenderedMessages.dropLast())
-        else {
-            return false
-        }
-
-        let stablePreviousLast = previousLastMessage.withStreamingText(
-            previousLastMessage.text,
-            isStreaming: lastMessage.isStreaming
-        )
-        let stableIncomingLast = lastMessage.withStreamingText(
-            previousLastMessage.text,
-            isStreaming: lastMessage.isStreaming
-        )
-        return stablePreviousLast == stableIncomingLast
     }
 
     private func sendTypingIndicator(_ visible: Bool, title: String, detail: String) {
@@ -1899,6 +2109,73 @@ extension AssistantChatWebMessage {
     }
 }
 
+struct AssistantChatWebStreamingTextUpdate: Equatable {
+    let messageID: String
+    let text: String
+    let isStreaming: Bool
+}
+
+enum AssistantChatWebStreamingUpdatePlanner {
+    static func hasStreamingMessages(_ messages: [AssistantChatWebMessage]) -> Bool {
+        messages.contains(where: \.isStreaming)
+    }
+
+    static func incrementalTextUpdate(
+        from previousMessages: [AssistantChatWebMessage],
+        to nextMessages: [AssistantChatWebMessage]
+    ) -> AssistantChatWebStreamingTextUpdate? {
+        guard !previousMessages.isEmpty,
+            previousMessages.count == nextMessages.count
+        else {
+            return nil
+        }
+
+        var changedPairs: [(previous: AssistantChatWebMessage, next: AssistantChatWebMessage)] = []
+        changedPairs.reserveCapacity(1)
+
+        for (previous, next) in zip(previousMessages, nextMessages) {
+            guard previous.id == next.id else { return nil }
+            if previous != next {
+                changedPairs.append((previous: previous, next: next))
+                if changedPairs.count > 1 {
+                    return nil
+                }
+            }
+        }
+
+        guard let changedPair = changedPairs.first else { return nil }
+        return textUpdateIfEligible(previous: changedPair.previous, next: changedPair.next)
+    }
+
+    private static func textUpdateIfEligible(
+        previous: AssistantChatWebMessage,
+        next: AssistantChatWebMessage
+    ) -> AssistantChatWebStreamingTextUpdate? {
+        let comparablePrevious = previous.withStreamingText(
+            previous.text,
+            isStreaming: next.isStreaming
+        )
+        let comparableNext = next.withStreamingText(
+            previous.text,
+            isStreaming: next.isStreaming
+        )
+
+        guard comparablePrevious == comparableNext else {
+            return nil
+        }
+
+        guard previous.text != next.text || previous.isStreaming != next.isStreaming else {
+            return nil
+        }
+
+        return AssistantChatWebStreamingTextUpdate(
+            messageID: next.id,
+            text: next.text ?? "",
+            isStreaming: next.isStreaming
+        )
+    }
+}
+
 // MARK: - Ready Handler
 
 private final class ReadyHandler: NSObject, WKScriptMessageHandler {
@@ -2070,7 +2347,7 @@ extension AssistantChatWebMessage {
             isStreaming: item.isStreaming,
             timestamp: item.sortDate,
             turnID: item.turnID?.nonEmpty,
-            images: item.imageAttachments,
+            images: AssistantChatWebInlineImage.payloads(from: item.imageAttachments),
             emphasis: item.emphasis,
             canUndo: historyAction?.canUndo ?? false,
             canEdit: historyAction?.canEdit ?? false,

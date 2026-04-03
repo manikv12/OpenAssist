@@ -12,6 +12,7 @@ import {
 import type {
   AssistantSidebarCollapsedPreviewPane,
   AssistantSidebarNavItem,
+  AssistantSidebarNoteItem,
   AssistantSidebarProjectItem,
   AssistantSidebarSessionItem,
   AssistantSidebarState,
@@ -102,6 +103,7 @@ export function SidebarView({
   const [draggedProjectId, setDraggedProjectId] = useState<string | null>(null);
   const [dropTargetProjectId, setDropTargetProjectId] = useState<string | null>(null);
   const [rootDropActive, setRootDropActive] = useState(false);
+  const [noteSearch, setNoteSearch] = useState("");
   const contextMenuRef = useRef<HTMLDivElement | null>(null);
   const collapsedPreviewCloseRef = useRef<number | null>(null);
   const sidebarScaleStyle = {
@@ -252,6 +254,10 @@ export function SidebarView({
     setCollapsedPreview(null);
   }, [state?.collapsedPreviewPane, state?.isCollapsed]);
 
+  useEffect(() => {
+    setNoteSearch("");
+  }, [state?.selectedPane, state?.selectedNotesProjectId, state?.notesScope]);
+
   if (!state) {
     return (
       <aside className="oa-react-sidebar" style={sidebarScaleStyle}>
@@ -323,6 +329,16 @@ export function SidebarView({
       },
     ])
   );
+  const isNotesPane = state.selectedPane === "notes";
+  const notesSearch = noteSearch.trim().toLowerCase();
+  const filteredNotes = notesSearch
+    ? state.notes.filter((note) => {
+        const haystack = [note.title, note.subtitle, note.sourceLabel]
+          .join(" ")
+          .toLowerCase();
+        return haystack.includes(notesSearch);
+      })
+    : state.notes;
 
   const projectSectionContextMenuEntries = (): SidebarContextMenuEntry[] => {
     const entries: SidebarContextMenuEntry[] = [
@@ -396,9 +412,9 @@ export function SidebarView({
       entries.push({
         kind: "action",
         id: `inspect-project-memory-${project.id}`,
-        label: "View Memory",
-        symbol: "brain",
-        command: "inspectProjectMemory",
+        label: "Project Notes",
+        symbol: "note.text",
+        command: "openProjectNotes",
         payload: { projectId: project.id },
       });
     }
@@ -819,9 +835,15 @@ export function SidebarView({
                     project={project}
                     onClick={() => {
                       closeContextMenu();
-                      onDispatchCommand("selectProjectFilter", {
-                        projectId: project.isSelected ? "" : project.id,
-                      });
+                      if (isNotesPane) {
+                        onDispatchCommand("selectNotesProject", {
+                          projectId: project.id,
+                        });
+                      } else {
+                        onDispatchCommand("selectProjectFilter", {
+                          projectId: project.isSelected ? "" : project.id,
+                        });
+                      }
                     }}
                     onToggleExpanded={() => {
                       if (project.kind !== "folder") {
@@ -874,87 +896,192 @@ export function SidebarView({
           </SidebarSection>
         )}
 
-        <SidebarSection
-          title={sessionsTitle}
-          helperText={sessionsHelper}
-          expanded={sessionsExpanded}
-          onToggle={() => {
-            closeContextMenu();
-            onDispatchCommand(
-              sessionPane === "archived" ? "toggleArchivedExpanded" : "toggleThreadsExpanded"
-            );
-          }}
-          action={
-            sessionPane === "threads" ? (
-              <button
-                type="button"
-                className="oa-react-sidebar__icon-button oa-react-sidebar__new-thread"
-                disabled={!state.canCreateThread}
-                onClick={() => {
-                  closeContextMenu();
-                  onDispatchCommand("newThread");
-                }}
-                title={
-                  state.canCreateThread
-                    ? "New thread"
-                    : "You can't start a new thread right now."
-                }
-              >
-                <SidebarIcon symbol="plus" />
-              </button>
-            ) : undefined
-          }
-        >
-          {sessions.length ? (
-            <div className="oa-react-sidebar__list">
-              {sessions.map((session) => (
-                <SessionRow
-                  key={session.id}
-                  session={session}
-                  projectName={(() => {
-                    if (!session.projectId) {
-                      return undefined;
-                    }
-                    const projectInfo = projectInfoByID.get(session.projectId);
-                    if (!projectInfo) {
-                      return undefined;
-                    }
-                    return state.projectFilterKind === "folder" || projectInfo.hasLinkedFolder
-                      ? projectInfo.name
-                      : undefined;
-                  })()}
+        {isNotesPane ? (
+          <SidebarSection
+            title={state.notesTitle}
+            helperText={state.notesHelperText}
+            expanded={state.notesExpanded}
+            onToggle={() => {
+              closeContextMenu();
+              onDispatchCommand("toggleNotesExpanded");
+            }}
+            action={
+              state.canCreateProjectNote ? (
+                <button
+                  type="button"
+                  className="oa-react-sidebar__icon-button oa-react-sidebar__new-thread"
                   onClick={() => {
                     closeContextMenu();
-                    onDispatchCommand("openSession", {
-                      sessionId: session.id,
-                      pane: sessionPane,
-                    });
+                    onDispatchCommand("createSidebarNote");
                   }}
-                  onContextMenu={(event) =>
-                    openContextMenu(event, threadContextMenuEntries(session))
-                  }
-                />
-              ))}
-            </div>
-          ) : (
-            <div className="oa-react-sidebar__empty">
-              {sessionPane === "archived" ? "No archived chats." : "No threads yet."}
-            </div>
-          )}
+                  title="New project note"
+                >
+                  <SidebarIcon symbol="plus" />
+                </button>
+              ) : undefined
+            }
+          >
+            <div className="oa-react-sidebar__notes-toolbar">
+              <div className="oa-react-sidebar__scope-toggle" role="tablist" aria-label="Note scope">
+                <button
+                  type="button"
+                  className={`oa-react-sidebar__scope-pill ${
+                    state.notesScope === "project" ? "is-selected" : ""
+                  }`}
+                  aria-pressed={state.notesScope === "project"}
+                  onClick={() => {
+                    closeContextMenu();
+                    onDispatchCommand("setNotesScope", { scope: "project" });
+                  }}
+                >
+                  Project notes
+                </button>
+                <button
+                  type="button"
+                  className={`oa-react-sidebar__scope-pill ${
+                    state.notesScope === "thread" ? "is-selected" : ""
+                  }`}
+                  aria-pressed={state.notesScope === "thread"}
+                  onClick={() => {
+                    closeContextMenu();
+                    onDispatchCommand("setNotesScope", { scope: "thread" });
+                  }}
+                >
+                  Thread notes
+                </button>
+              </div>
 
-          {canLoadMore ? (
-            <button
-              type="button"
-              className="oa-react-sidebar__load-more"
-              onClick={() => {
-                closeContextMenu();
-                onDispatchCommand("loadMoreSessions");
-              }}
-            >
-              Load more
-            </button>
-          ) : null}
-        </SidebarSection>
+              <input
+                type="search"
+                className="oa-react-sidebar__notes-search"
+                value={noteSearch}
+                onChange={(event) => setNoteSearch(event.target.value)}
+                placeholder="Search notes"
+                aria-label="Search notes"
+              />
+            </div>
+
+            {filteredNotes.length ? (
+              <div className="oa-react-sidebar__list">
+                {filteredNotes.map((note) => (
+                  <SidebarNoteRow
+                    key={note.id}
+                    note={note}
+                    onClick={() => {
+                      closeContextMenu();
+                      onDispatchCommand("selectSidebarNote", {
+                        ownerKind: note.ownerKind,
+                        ownerId: note.ownerId,
+                        noteId: note.noteId,
+                      });
+                    }}
+                    onOpenThread={
+                      note.threadId
+                        ? () => {
+                            closeContextMenu();
+                            onDispatchCommand("openSession", {
+                              sessionId: note.threadId,
+                              pane: "threads",
+                            });
+                          }
+                        : undefined
+                    }
+                  />
+                ))}
+              </div>
+            ) : (
+              <div className="oa-react-sidebar__empty">
+                {noteSearch.trim()
+                  ? `No notes match "${noteSearch.trim()}".`
+                  : state.notesScope === "project"
+                    ? "No project notes yet."
+                    : "No thread notes yet for this project."}
+              </div>
+            )}
+          </SidebarSection>
+        ) : (
+          <SidebarSection
+            title={sessionsTitle}
+            helperText={sessionsHelper}
+            expanded={sessionsExpanded}
+            onToggle={() => {
+              closeContextMenu();
+              onDispatchCommand(
+                sessionPane === "archived" ? "toggleArchivedExpanded" : "toggleThreadsExpanded"
+              );
+            }}
+            action={
+              sessionPane === "threads" ? (
+                <button
+                  type="button"
+                  className="oa-react-sidebar__icon-button oa-react-sidebar__new-thread"
+                  disabled={!state.canCreateThread}
+                  onClick={() => {
+                    closeContextMenu();
+                    onDispatchCommand("newThread");
+                  }}
+                  title={
+                    state.canCreateThread
+                      ? "New thread"
+                      : "You can't start a new thread right now."
+                  }
+                >
+                  <SidebarIcon symbol="plus" />
+                </button>
+              ) : undefined
+            }
+          >
+            {sessions.length ? (
+              <div className="oa-react-sidebar__list">
+                {sessions.map((session) => (
+                  <SessionRow
+                    key={session.id}
+                    session={session}
+                    projectName={(() => {
+                      if (!session.projectId) {
+                        return undefined;
+                      }
+                      const projectInfo = projectInfoByID.get(session.projectId);
+                      if (!projectInfo) {
+                        return undefined;
+                      }
+                      return state.projectFilterKind === "folder" || projectInfo.hasLinkedFolder
+                        ? projectInfo.name
+                        : undefined;
+                    })()}
+                    onClick={() => {
+                      closeContextMenu();
+                      onDispatchCommand("openSession", {
+                        sessionId: session.id,
+                        pane: sessionPane,
+                      });
+                    }}
+                    onContextMenu={(event) =>
+                      openContextMenu(event, threadContextMenuEntries(session))
+                    }
+                  />
+                ))}
+              </div>
+            ) : (
+              <div className="oa-react-sidebar__empty">
+                {sessionPane === "archived" ? "No archived chats." : "No threads yet."}
+              </div>
+            )}
+
+            {canLoadMore ? (
+              <button
+                type="button"
+                className="oa-react-sidebar__load-more"
+                onClick={() => {
+                  closeContextMenu();
+                  onDispatchCommand("loadMoreSessions");
+                }}
+              >
+                Load more
+              </button>
+            ) : null}
+          </SidebarSection>
+        )}
       </div>
 
       <div className="oa-react-sidebar__footer">
@@ -1189,6 +1316,61 @@ const SessionRow = memo(function SessionRow({
   );
 });
 
+const SidebarNoteRow = memo(function SidebarNoteRow({
+  note,
+  onClick,
+  onOpenThread,
+}: {
+  note: AssistantSidebarNoteItem;
+  onClick: () => void;
+  onOpenThread?: () => void;
+}) {
+  return (
+    <div
+      role="button"
+      tabIndex={0}
+      className={`oa-react-sidebar__row oa-react-sidebar__row--note ${
+        note.isSelected ? "is-selected" : ""
+      }`}
+      onClick={onClick}
+      onKeyDown={(event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          onClick();
+        }
+      }}
+    >
+      <span className="oa-react-sidebar__row-icon">
+        <SidebarIcon symbol={note.ownerKind === "project" ? "note.text" : "text.bubble"} />
+      </span>
+      <span className="oa-react-sidebar__row-copy">
+        <span className="oa-react-sidebar__row-title-line">
+          <span className="oa-react-sidebar__row-title-wrap">
+            <span className="oa-react-sidebar__row-title">{note.title}</span>
+          </span>
+          {note.isArchivedThread ? (
+            <span className="oa-react-sidebar__row-meta">Archived</span>
+          ) : null}
+        </span>
+        <span className="oa-react-sidebar__row-subtitle">{note.subtitle}</span>
+      </span>
+      {onOpenThread ? (
+        <button
+          type="button"
+          className="oa-react-sidebar__row-badge oa-react-sidebar__row-badge--link"
+          onClick={(event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            onOpenThread();
+          }}
+        >
+          Open
+        </button>
+      ) : null}
+    </div>
+  );
+});
+
 function CollapsedSidebarRail({
   state,
   style,
@@ -1207,6 +1389,9 @@ function CollapsedSidebarRail({
   onDispatchCommand: (type: string, payload?: Record<string, unknown>) => void;
 }) {
   const hasSelectedProject = state.projects.some((project) => project.isSelected);
+  const hasSelectedNotesProject = state.projects.some(
+    (project) => project.id === state.selectedNotesProjectId
+  );
 
   return (
     <aside className="oa-react-sidebar oa-react-sidebar--collapsed" style={style}>
@@ -1228,9 +1413,18 @@ function CollapsedSidebarRail({
               onClick={() => onDispatchCommand("setSelectedPane", { pane: "threads" })}
             />
             <CollapsedRailButton
+              symbol="note.text"
+              label="Notes"
+              isSelected={state.selectedPane === "notes"}
+              onMouseEnter={(event) =>
+                onPreviewEnter("notes", event.currentTarget.offsetTop - 8)
+              }
+              onClick={() => onDispatchCommand("setSelectedPane", { pane: "notes" })}
+            />
+            <CollapsedRailButton
               symbol="square.grid.2x2"
               label="Projects"
-              isSelected={hasSelectedProject}
+              isSelected={state.selectedPane === "notes" ? hasSelectedNotesProject : hasSelectedProject}
               onMouseEnter={(event) =>
                 onPreviewEnter("projects", event.currentTarget.offsetTop - 8)
               }
@@ -1341,6 +1535,7 @@ function CollapsedSidebarPreview({
   } as CSSProperties;
 
   const projectItems = state.projects.slice(0, 4);
+  const noteItems = state.notes.slice(0, 4);
   const threadItems = state.threads.slice(0, 4);
   const archivedItems = state.archived.slice(0, 4);
 
@@ -1354,6 +1549,8 @@ function CollapsedSidebarPreview({
       <div className="oa-react-sidebar__collapsed-preview-title">
         {preview.pane === "projects"
           ? "Projects"
+          : preview.pane === "notes"
+            ? "Notes"
           : preview.pane === "threads"
             ? "Threads"
             : preview.pane === "archived"
@@ -1374,10 +1571,17 @@ function CollapsedSidebarPreview({
                   project.isSelected ? "is-selected" : ""
                 }`}
                 onClick={() => {
-                  onDispatchCommand("setSelectedPane", { pane: "threads" });
-                  onDispatchCommand("selectProjectFilter", {
-                    projectId: project.isSelected ? "" : project.id,
-                  });
+                  if (state.selectedPane === "notes") {
+                    onDispatchCommand("setSelectedPane", { pane: "notes" });
+                    onDispatchCommand("selectNotesProject", {
+                      projectId: project.id,
+                    });
+                  } else {
+                    onDispatchCommand("setSelectedPane", { pane: "threads" });
+                    onDispatchCommand("selectProjectFilter", {
+                      projectId: project.isSelected ? "" : project.id,
+                    });
+                  }
                 }}
               >
                 <span className="oa-react-sidebar__collapsed-preview-icon">
@@ -1399,6 +1603,50 @@ function CollapsedSidebarPreview({
             {state.hiddenProjectCount > 0
               ? "Groups or projects are hidden right now."
               : "No projects yet."}
+          </div>
+        )
+      ) : null}
+
+      {preview.pane === "notes" ? (
+        noteItems.length ? (
+          <div className="oa-react-sidebar__collapsed-preview-list">
+            {noteItems.map((note) => (
+              <button
+                key={note.id}
+                type="button"
+                className={`oa-react-sidebar__collapsed-preview-row ${
+                  note.isSelected ? "is-selected" : ""
+                }`}
+                onClick={() => {
+                  onDispatchCommand("setSelectedPane", { pane: "notes" });
+                  onDispatchCommand("selectSidebarNote", {
+                    ownerKind: note.ownerKind,
+                    ownerId: note.ownerId,
+                    noteId: note.noteId,
+                  });
+                }}
+              >
+                <span className="oa-react-sidebar__collapsed-preview-icon">
+                  <SidebarIcon
+                    symbol={note.ownerKind === "project" ? "note.text" : "text.bubble"}
+                  />
+                </span>
+                <span className="oa-react-sidebar__collapsed-preview-copy">
+                  <span className="oa-react-sidebar__collapsed-preview-name">
+                    {note.title}
+                  </span>
+                  <span className="oa-react-sidebar__collapsed-preview-meta">
+                    {note.subtitle}
+                  </span>
+                </span>
+              </button>
+            ))}
+          </div>
+        ) : (
+          <div className="oa-react-sidebar__collapsed-preview-note">
+            {state.notesScope === "project"
+              ? "No project notes yet."
+              : "No thread notes yet for this project."}
           </div>
         )
       ) : null}

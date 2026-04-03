@@ -462,6 +462,7 @@ struct AssistantSessionActiveWorkSnapshot: Equatable {
     let sessionID: String
     let planEntries: [AssistantPlanEntry]
     let subagents: [SubagentState]
+    let selectedAgent: SubagentState?
     let fileChangeCount: Int
 
     var completedTaskCount: Int {
@@ -481,7 +482,7 @@ struct AssistantSessionActiveWorkSnapshot: Equatable {
     }
 
     var hasBackgroundAgents: Bool {
-        !subagents.isEmpty
+        selectedAgent == nil && !subagents.isEmpty
     }
 }
 
@@ -500,6 +501,8 @@ func assistantSessionOwnsLiveRuntimeState(
 func assistantShouldShowPendingAssistantPlaceholder(
     selectedSessionID: String?,
     activeRuntimeSessionID: String?,
+    awaitingAssistantStart: Bool,
+    hasActiveTurn: Bool,
     hasPendingPermissionRequest: Bool,
     hasVisibleStreamingAssistantMessage: Bool,
     hudPhase: AssistantHUDPhase
@@ -507,13 +510,19 @@ func assistantShouldShowPendingAssistantPlaceholder(
     guard selectedSessionID?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false else {
         return false
     }
-    guard assistantSessionOwnsLiveRuntimeState(
+    let ownsLiveRuntimeState = assistantSessionOwnsLiveRuntimeState(
         sessionID: selectedSessionID,
         activeRuntimeSessionID: activeRuntimeSessionID
-    ) else {
+    ) || awaitingAssistantStart || hasActiveTurn
+    guard ownsLiveRuntimeState else {
         return false
     }
     guard !hasPendingPermissionRequest else { return false }
+
+    if hasActiveTurn {
+        return true
+    }
+
     guard !hasVisibleStreamingAssistantMessage else { return false }
 
     switch hudPhase {
@@ -562,7 +571,7 @@ func assistantSelectedSessionToolActivity(
 
 func assistantSelectedSessionActiveWorkSnapshot(
     selectedSessionID: String?,
-    activeRuntimeSessionID _: String?,
+    activeRuntimeSessionID: String?,
     planEntries: [AssistantPlanEntry],
     subagents: [SubagentState],
     toolCalls: [AssistantToolCallState],
@@ -574,17 +583,29 @@ func assistantSelectedSessionActiveWorkSnapshot(
         return nil
     }
 
+    let selectedAgent = subagents.first { agent in
+        assistantTimelineSessionIDsMatch(agent.threadID, selectedSessionID)
+            && agent.status.isActive
+    }
+    let ownsLiveRuntime = assistantTimelineSessionIDsMatch(selectedSessionID, activeRuntimeSessionID)
+    guard ownsLiveRuntime || selectedAgent != nil else {
+        return nil
+    }
     let childAgents = subagents.filter { agent in
         assistantTimelineSessionIDsMatch(agent.parentThreadID, selectedSessionID)
             && agent.status.isActive
     }
-    guard !childAgents.isEmpty else { return nil }
+    let fileChangeCount = assistantFileChangeCount(in: toolCalls + recentToolCalls)
+    guard selectedAgent != nil || !childAgents.isEmpty || !planEntries.isEmpty || fileChangeCount > 0 else {
+        return nil
+    }
 
     return AssistantSessionActiveWorkSnapshot(
         sessionID: selectedSessionID,
         planEntries: planEntries,
         subagents: childAgents,
-        fileChangeCount: assistantFileChangeCount(in: toolCalls + recentToolCalls)
+        selectedAgent: selectedAgent,
+        fileChangeCount: fileChangeCount
     )
 }
 

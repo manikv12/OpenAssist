@@ -73,6 +73,26 @@ struct AssistantConversationSnapshot: Codable, Equatable, Sendable {
     }
 }
 
+private extension AssistantConversationSnapshot {
+    var hasConversationContent: Bool {
+        !timeline.isEmpty || !transcript.isEmpty
+    }
+}
+
+struct AssistantConversationThreadSummary: Identifiable, Equatable, Sendable {
+    let threadID: String
+    let lastUpdatedAt: Date
+    let hasSnapshot: Bool
+    let hasEventLog: Bool
+    let hasNotes: Bool
+    let hasConversationContent: Bool
+    let latestUserMessage: String?
+    let latestAssistantMessage: String?
+    let noteTitle: String?
+
+    var id: String { threadID }
+}
+
 enum AssistantNoteOwnerKind: String, Codable, Equatable, Hashable, Sendable {
     case thread
     case project
@@ -360,6 +380,7 @@ private struct AssistantConversationEventRecord: Codable, Equatable {
 
 final class AssistantConversationStore {
     private static let hybridSnapshotVersion = 2
+    private static let noteRecoveryDirectoryName = "Recovery"
     private static let legacyThreadNoteFilename = "notes.md"
     private static let threadNotesDirectoryName = "notes"
     private static let threadNoteManifestFilename = "manifest.json"
@@ -369,7 +390,10 @@ final class AssistantConversationStore {
 
     private let fileManager: FileManager
     private let baseDirectoryURL: URL
+    private let noteRecoveryStore: AssistantNoteRecoveryStore
     private var nextSequenceByThreadID: [String: Int] = [:]
+    private var cachedSavedConversationThreadSummaries: [Bool: [AssistantConversationThreadSummary]] = [:]
+    private var cachedSavedConversationThreadSummariesStamp: Date?
 
     init(
         fileManager: FileManager = .default,
@@ -386,6 +410,15 @@ final class AssistantConversationStore {
                 .appendingPathComponent("OpenAssist", isDirectory: true)
                 .appendingPathComponent("AssistantConversationStore", isDirectory: true)
         }
+        self.noteRecoveryStore = AssistantNoteRecoveryStore(
+            fileManager: fileManager,
+            recoveryRootURL: self.baseDirectoryURL
+                .appendingPathComponent(Self.noteRecoveryDirectoryName, isDirectory: true)
+        )
+    }
+
+    var storageURL: URL {
+        baseDirectoryURL
     }
 
     func loadSnapshot(threadID: String) -> AssistantConversationSnapshot? {
@@ -463,6 +496,43 @@ final class AssistantConversationStore {
         )
     }
 
+    func savedConversationThreads(includeNotesOnly: Bool = true) -> [AssistantConversationThreadSummary] {
+        let currentStamp = fileModificationDate(for: baseDirectoryURL)
+        if cachedSavedConversationThreadSummariesStamp == currentStamp,
+           let cachedSummaries = cachedSavedConversationThreadSummaries[includeNotesOnly] {
+            return cachedSummaries
+        }
+
+        guard let directoryURLs = try? fileManager.contentsOfDirectory(
+            at: baseDirectoryURL,
+            includingPropertiesForKeys: [
+                .isDirectoryKey,
+                .contentModificationDateKey
+            ],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return []
+        }
+
+        let summaries = directoryURLs.compactMap { directoryURL -> AssistantConversationThreadSummary? in
+            guard isDirectory(at: directoryURL),
+                  directoryURL.lastPathComponent.caseInsensitiveCompare(Self.noteRecoveryDirectoryName) != .orderedSame
+            else { return nil }
+            return summarizeConversationThread(at: directoryURL, includeNotesOnly: includeNotesOnly)
+        }
+
+        let sortedSummaries = summaries.sorted {
+            if $0.lastUpdatedAt != $1.lastUpdatedAt {
+                return $0.lastUpdatedAt > $1.lastUpdatedAt
+            }
+            return $0.threadID.localizedCaseInsensitiveCompare($1.threadID) == .orderedAscending
+        }
+
+        cachedSavedConversationThreadSummariesStamp = currentStamp
+        cachedSavedConversationThreadSummaries[includeNotesOnly] = sortedSummaries
+        return sortedSummaries
+    }
+
     func saveSnapshot(
         threadID: String,
         timeline: [AssistantTimelineItem],
@@ -508,12 +578,14 @@ final class AssistantConversationStore {
             nextSequenceByThreadID[normalizedThreadID(snapshot.threadID)] ?? 1,
             snapshot.lastAppliedEventSequence + 1
         )
+        invalidateSavedConversationThreadSummariesCache()
     }
 
     func deleteSnapshot(threadID: String) {
         guard let fileURL = snapshotFileURL(for: threadID) else { return }
         try? fileManager.removeItem(at: fileURL)
         nextSequenceByThreadID.removeValue(forKey: normalizedThreadID(threadID))
+        invalidateSavedConversationThreadSummariesCache()
     }
 
     func snapshotFileURL(for threadID: String) -> URL? {
@@ -565,6 +637,26 @@ final class AssistantConversationStore {
             manifest: manifest,
             selectedNoteText: selectedText
         )
+    }
+
+    func loadThreadStoredNotes(threadID: String) -> [AssistantStoredNote] {
+        let normalizedThreadID = normalizedThreadID(threadID)
+        guard !normalizedThreadID.isEmpty else {
+            return []
+        }
+
+        let manifest = resolvedThreadNoteManifest(threadID: normalizedThreadID)
+        return manifest.orderedNotes.map { note in
+            AssistantStoredNote(
+                ownerKind: .thread,
+                ownerID: normalizedThreadID,
+                noteID: note.id,
+                title: note.title,
+                fileName: note.fileName,
+                updatedAt: note.updatedAt,
+                text: loadThreadNoteText(threadID: normalizedThreadID, fileName: note.fileName)
+            )
+        }
     }
 
     func createThreadNote(
@@ -656,7 +748,9 @@ final class AssistantConversationStore {
     func saveThreadNote(
         threadID: String,
         noteID: String?,
-        text: String
+        text: String,
+        forceHistorySnapshot: Bool = false,
+        now: Date = Date()
     ) throws -> AssistantThreadNotesWorkspace {
         let normalizedThreadID = normalizedThreadID(threadID)
         guard !normalizedThreadID.isEmpty else {
@@ -695,6 +789,18 @@ final class AssistantConversationStore {
             return loadThreadNotesWorkspace(threadID: normalizedThreadID)
         }
 
+        let previousText = loadThreadNoteText(threadID: normalizedThreadID, fileName: note.fileName)
+        if previousText != normalizedText {
+            noteRecoveryStore.captureHistorySnapshot(
+                note: note,
+                ownerKind: .thread,
+                ownerID: normalizedThreadID,
+                text: previousText,
+                at: now,
+                force: forceHistorySnapshot || normalizedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            )
+        }
+
         if normalizedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             try? fileManager.removeItem(at: fileURL)
         } else {
@@ -706,7 +812,7 @@ final class AssistantConversationStore {
         }
 
         manifest.selectedNoteID = resolvedNoteID
-        manifest.notes[index].updatedAt = Date()
+        manifest.notes[index].updatedAt = now
         manifest.notes = normalizedThreadNoteItems(manifest.notes)
         try storeThreadNoteManifest(manifest, threadID: normalizedThreadID)
 
@@ -719,7 +825,8 @@ final class AssistantConversationStore {
 
     func deleteThreadNote(
         threadID: String,
-        noteID: String
+        noteID: String,
+        now: Date = Date()
     ) throws -> AssistantThreadNotesWorkspace {
         let normalizedThreadID = normalizedThreadID(threadID)
         var manifest = resolvedThreadNoteManifest(threadID: normalizedThreadID)
@@ -728,6 +835,14 @@ final class AssistantConversationStore {
         }
 
         let removed = manifest.notes.remove(at: existingIndex)
+        let removedText = loadThreadNoteText(threadID: normalizedThreadID, fileName: removed.fileName)
+        noteRecoveryStore.captureDeletedNote(
+            note: removed,
+            ownerKind: .thread,
+            ownerID: normalizedThreadID,
+            text: removedText,
+            at: now
+        )
         if let fileURL = threadNoteFileURL(threadID: normalizedThreadID, fileName: removed.fileName) {
             try? fileManager.removeItem(at: fileURL)
         }
@@ -774,21 +889,178 @@ final class AssistantConversationStore {
         )
     }
 
+    func threadNoteHistoryVersions(
+        threadID: String,
+        noteID: String
+    ) -> [AssistantNoteHistoryVersion] {
+        let normalizedThreadID = normalizedThreadID(threadID)
+        guard !normalizedThreadID.isEmpty else { return [] }
+        return noteRecoveryStore.historyVersions(
+            ownerKind: .thread,
+            ownerID: normalizedThreadID,
+            noteID: noteID
+        )
+    }
+
+    func restoreThreadNoteHistoryVersion(
+        threadID: String,
+        noteID: String,
+        versionID: String,
+        now: Date = Date()
+    ) throws -> AssistantThreadNotesWorkspace {
+        let normalizedThreadID = normalizedThreadID(threadID)
+        guard !normalizedThreadID.isEmpty else {
+            return loadThreadNotesWorkspace(threadID: normalizedThreadID)
+        }
+        var manifest = resolvedThreadNoteManifest(threadID: normalizedThreadID)
+        guard let noteIndex = manifest.notes.firstIndex(where: { $0.id == noteID }),
+              let payload = noteRecoveryStore.restoreHistoryVersion(
+                ownerKind: .thread,
+                ownerID: normalizedThreadID,
+                noteID: noteID,
+                versionID: versionID
+              ) else {
+            return loadThreadNotesWorkspace(threadID: normalizedThreadID)
+        }
+
+        let currentNote = manifest.notes[noteIndex]
+        let currentText = loadThreadNoteText(threadID: normalizedThreadID, fileName: currentNote.fileName)
+        if currentText != payload.text || currentNote.title != payload.note.title {
+            noteRecoveryStore.captureHistorySnapshot(
+                note: currentNote,
+                ownerKind: .thread,
+                ownerID: normalizedThreadID,
+                text: currentText,
+                at: now,
+                force: true
+            )
+        }
+
+        manifest.notes[noteIndex].title = normalizedThreadNoteTitle(payload.note.title)
+        manifest.notes[noteIndex].updatedAt = now
+        manifest.selectedNoteID = noteID
+        try writeThreadNoteText(
+            threadID: normalizedThreadID,
+            fileName: currentNote.fileName,
+            text: payload.text
+        )
+        manifest.notes = normalizedThreadNoteItems(manifest.notes)
+        try storeThreadNoteManifest(manifest, threadID: normalizedThreadID)
+        return AssistantThreadNotesWorkspace(
+            threadID: normalizedThreadID,
+            manifest: manifest,
+            selectedNoteText: payload.text
+        )
+    }
+
+    func deleteThreadNoteHistoryVersion(
+        threadID: String,
+        noteID: String,
+        versionID: String
+    ) -> AssistantThreadNotesWorkspace {
+        let normalizedThreadID = normalizedThreadID(threadID)
+        noteRecoveryStore.deleteHistoryVersion(
+            ownerKind: .thread,
+            ownerID: normalizedThreadID,
+            noteID: noteID,
+            versionID: versionID
+        )
+        return loadThreadNotesWorkspace(threadID: normalizedThreadID)
+    }
+
+    func recentlyDeletedThreadNotes(
+        threadID: String,
+        referenceDate: Date = Date()
+    ) -> [AssistantDeletedNoteSnapshot] {
+        let normalizedThreadID = normalizedThreadID(threadID)
+        guard !normalizedThreadID.isEmpty else { return [] }
+        return noteRecoveryStore.recentlyDeletedNotes(
+            ownerKind: .thread,
+            ownerID: normalizedThreadID,
+            referenceDate: referenceDate
+        )
+    }
+
+    func restoreDeletedThreadNote(
+        threadID: String,
+        deletedNoteID: String,
+        now: Date = Date()
+    ) throws -> AssistantThreadNotesWorkspace {
+        let normalizedThreadID = normalizedThreadID(threadID)
+        guard !normalizedThreadID.isEmpty,
+              let payload = noteRecoveryStore.restoreDeletedNote(
+                ownerKind: .thread,
+                ownerID: normalizedThreadID,
+                deletedID: deletedNoteID,
+                referenceDate: now
+              ) else {
+            return loadThreadNotesWorkspace(threadID: normalizedThreadID)
+        }
+
+        var manifest = resolvedThreadNoteManifest(threadID: normalizedThreadID)
+        let restoredNoteID = manifest.notes.contains(where: {
+            $0.id.caseInsensitiveCompare(payload.note.id) == .orderedSame
+        }) ? UUID().uuidString.lowercased() : payload.note.id
+        let restoredFileName = manifest.notes.contains(where: {
+            $0.fileName.caseInsensitiveCompare(payload.note.fileName) == .orderedSame
+        }) ? "\(safePathComponent(restoredNoteID)).md" : payload.note.fileName
+        let restoredNote = AssistantThreadNoteSummary(
+            id: restoredNoteID,
+            title: normalizedThreadNoteTitle(payload.note.title),
+            fileName: restoredFileName,
+            order: manifest.orderedNotes.count,
+            createdAt: payload.note.createdAt,
+            updatedAt: now
+        )
+        manifest.notes.append(restoredNote)
+        manifest.selectedNoteID = restoredNote.id
+        manifest.notes = normalizedThreadNoteItems(manifest.notes)
+        try writeThreadNoteText(
+            threadID: normalizedThreadID,
+            fileName: restoredNote.fileName,
+            text: payload.text
+        )
+        try storeThreadNoteManifest(manifest, threadID: normalizedThreadID)
+        return AssistantThreadNotesWorkspace(
+            threadID: normalizedThreadID,
+            manifest: manifest,
+            selectedNoteText: payload.text
+        )
+    }
+
+    func permanentlyDeleteDeletedThreadNote(
+        threadID: String,
+        deletedNoteID: String
+    ) {
+        let normalizedThreadID = normalizedThreadID(threadID)
+        guard !normalizedThreadID.isEmpty else { return }
+        noteRecoveryStore.permanentlyDeleteDeletedNote(
+            ownerKind: .thread,
+            ownerID: normalizedThreadID,
+            deletedID: deletedNoteID
+        )
+    }
+
     func deleteThreadArtifacts(threadID: String) {
+        let normalizedID = normalizedThreadID(threadID)
+        noteRecoveryStore.removeAllRecoveryData(ownerKind: .thread, ownerID: normalizedID)
         guard let directoryURL = threadDirectoryURL(for: threadID),
               fileManager.fileExists(atPath: directoryURL.path) else {
-            nextSequenceByThreadID.removeValue(forKey: normalizedThreadID(threadID))
+            nextSequenceByThreadID.removeValue(forKey: normalizedID)
+            invalidateSavedConversationThreadSummariesCache()
             return
         }
 
         try? fileManager.removeItem(at: directoryURL)
-        nextSequenceByThreadID.removeValue(forKey: normalizedThreadID(threadID))
+        nextSequenceByThreadID.removeValue(forKey: normalizedID)
+        invalidateSavedConversationThreadSummariesCache()
     }
 
     func deleteEventLog(threadID: String) {
         guard let fileURL = eventLogFileURL(for: threadID) else { return }
         try? fileManager.removeItem(at: fileURL)
         nextSequenceByThreadID.removeValue(forKey: normalizedThreadID(threadID))
+        invalidateSavedConversationThreadSummariesCache()
     }
 
     func appendTranscriptResetEvent(threadID: String) throws {
@@ -993,6 +1265,26 @@ final class AssistantConversationStore {
             .appendingPathComponent(fileName, isDirectory: false)
     }
 
+    private func writeThreadNoteText(
+        threadID: String,
+        fileName: String,
+        text: String
+    ) throws {
+        guard let fileURL = threadNoteFileURL(threadID: threadID, fileName: fileName) else {
+            return
+        }
+        let normalizedText = text.replacingOccurrences(of: "\r\n", with: "\n")
+        if normalizedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            try? fileManager.removeItem(at: fileURL)
+            return
+        }
+        try fileManager.createDirectory(
+            at: fileURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try normalizedText.write(to: fileURL, atomically: true, encoding: .utf8)
+    }
+
     private func loadThreadNoteText(threadID: String, fileName: String) -> String {
         guard let fileURL = threadNoteFileURL(threadID: threadID, fileName: fileName),
               fileManager.fileExists(atPath: fileURL.path),
@@ -1039,6 +1331,7 @@ final class AssistantConversationStore {
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         let data = try encoder.encode(normalizedManifest)
         try data.write(to: manifestURL, options: .atomic)
+        invalidateSavedConversationThreadSummariesCache()
     }
 
     private func normalizedThreadNoteManifest(
@@ -1107,6 +1400,7 @@ final class AssistantConversationStore {
 
         guard !fileManager.fileExists(atPath: manifestURL.path) else {
             try? fileManager.removeItem(at: legacyURL)
+            invalidateSavedConversationThreadSummariesCache()
             return
         }
 
@@ -1118,6 +1412,7 @@ final class AssistantConversationStore {
         let trimmedLegacyText = legacyText.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmedLegacyText.isEmpty {
             try? fileManager.removeItem(at: legacyURL)
+            invalidateSavedConversationThreadSummariesCache()
             return
         }
 
@@ -1229,6 +1524,7 @@ final class AssistantConversationStore {
         }
 
         nextSequenceByThreadID[normalizedThreadID] = sequence + 1
+        invalidateSavedConversationThreadSummariesCache()
     }
 
     private func nextSequence(for threadID: String) -> Int {
@@ -1344,6 +1640,178 @@ final class AssistantConversationStore {
         }
 
         return snapshot
+    }
+
+    private func summarizeConversationThread(
+        at directoryURL: URL,
+        includeNotesOnly: Bool
+    ) -> AssistantConversationThreadSummary? {
+        let threadID = directoryURL.lastPathComponent
+        guard !threadID.isEmpty else { return nil }
+
+        let snapshotURL = snapshotFileURL(for: threadID)
+        let eventLogURL = eventLogFileURL(for: threadID)
+        let hasSnapshot = snapshotURL.map {
+            fileManager.fileExists(atPath: $0.path)
+        } ?? false
+        let hasEventLog = eventLogURL.map {
+            fileManager.fileExists(atPath: $0.path)
+        } ?? false
+        let snapshot = resolvedSnapshotForEnumeration(threadID: threadID)
+        let noteMetadata = readThreadNoteMetadata(threadID: threadID)
+        let hasNotes = noteMetadata?.hasNotes ?? false
+
+        guard hasSnapshot || hasEventLog || hasNotes else {
+            return nil
+        }
+
+        guard includeNotesOnly || hasSnapshot || hasEventLog else {
+            return nil
+        }
+
+        let latestUserMessage = snapshot?.transcript.reversed().first(where: { $0.role == .user })?
+            .text
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nonEmpty
+        let latestAssistantMessage = snapshot?.transcript.reversed().first(where: { $0.role == .assistant })?
+            .text
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nonEmpty
+        let lastUpdatedAt = [
+            hasSnapshot ? snapshot?.updatedAt : nil,
+            noteMetadata?.updatedAt,
+            fileModificationDate(for: snapshotURL),
+            fileModificationDate(for: eventLogURL),
+            fileModificationDate(for: threadNoteManifestFileURL(for: threadID)),
+            fileModificationDate(for: threadNoteFileURL(for: threadID))
+        ]
+        .compactMap { $0 }
+        .max() ?? Date.distantPast
+
+        return AssistantConversationThreadSummary(
+            threadID: threadID,
+            lastUpdatedAt: lastUpdatedAt,
+            hasSnapshot: hasSnapshot,
+            hasEventLog: hasEventLog,
+            hasNotes: hasNotes,
+            hasConversationContent: snapshot?.hasConversationContent == true,
+            latestUserMessage: latestUserMessage,
+            latestAssistantMessage: latestAssistantMessage,
+            noteTitle: noteMetadata?.title
+        )
+    }
+
+    private func resolvedSnapshotForEnumeration(threadID: String) -> AssistantConversationSnapshot? {
+        let normalizedThreadID = normalizedThreadID(threadID)
+        guard !normalizedThreadID.isEmpty else { return nil }
+
+        let storedSnapshot = readStoredSnapshot(threadID: normalizedThreadID)
+        let logExists = eventLogFileURL(for: normalizedThreadID).map {
+            fileManager.fileExists(atPath: $0.path)
+        } ?? false
+
+        if let storedSnapshot {
+            guard storedSnapshot.version == Self.hybridSnapshotVersion, logExists else {
+                return storedSnapshot
+            }
+            return replayEventLog(
+                threadID: normalizedThreadID,
+                onto: storedSnapshot,
+                rewriteSnapshot: false
+            )
+        }
+
+        guard logExists else { return nil }
+        return replayEventLog(
+            threadID: normalizedThreadID,
+            onto: nil,
+            rewriteSnapshot: false
+        )
+    }
+
+    private func readThreadNoteMetadata(threadID: String) -> (hasNotes: Bool, title: String?, updatedAt: Date?)? {
+        let normalizedThreadID = normalizedThreadID(threadID)
+        guard !normalizedThreadID.isEmpty else { return nil }
+
+        if let manifestMetadata = readManifestBackedThreadNoteMetadata(threadID: normalizedThreadID) {
+            return manifestMetadata
+        }
+
+        return readLegacyThreadNoteMetadata(threadID: normalizedThreadID)
+    }
+
+    private func readManifestBackedThreadNoteMetadata(
+        threadID: String
+    ) -> (hasNotes: Bool, title: String?, updatedAt: Date?)? {
+        guard let manifestURL = threadNoteManifestFileURL(for: threadID),
+              fileManager.fileExists(atPath: manifestURL.path),
+              let data = try? Data(contentsOf: manifestURL),
+              let decoded = try? JSONDecoder().decode(AssistantThreadNoteManifest.self, from: data) else {
+            return nil
+        }
+
+        let normalizedManifest = normalizedThreadNoteManifest(decoded)
+        guard !normalizedManifest.notes.isEmpty else { return nil }
+
+        let selectedNote = normalizedManifest.selectedNote
+        let noteDates = normalizedManifest.notes.compactMap { note -> Date? in
+            threadNoteFileURL(threadID: threadID, fileName: note.fileName)
+                .flatMap(fileModificationDate(for:))
+        }
+        let updatedAt = [
+            fileModificationDate(for: manifestURL),
+            selectedNote.flatMap { threadNoteFileURL(threadID: threadID, fileName: $0.fileName) }
+                .flatMap(fileModificationDate(for:)),
+            noteDates.max()
+        ]
+        .compactMap { $0 }
+        .max()
+
+        return (
+            hasNotes: true,
+            title: selectedNote?.title,
+            updatedAt: updatedAt
+        )
+    }
+
+    private func readLegacyThreadNoteMetadata(
+        threadID: String
+    ) -> (hasNotes: Bool, title: String?, updatedAt: Date?)? {
+        guard let legacyURL = threadNoteFileURL(for: threadID),
+              fileManager.fileExists(atPath: legacyURL.path),
+              let legacyText = try? String(contentsOf: legacyURL, encoding: .utf8)
+                .replacingOccurrences(of: "\r\n", with: "\n") else {
+            return nil
+        }
+
+        let trimmedLegacyText = legacyText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedLegacyText.isEmpty else { return nil }
+
+        return (
+            hasNotes: true,
+            title: inferredLegacyThreadNoteTitle(from: legacyText),
+            updatedAt: fileModificationDate(for: legacyURL)
+        )
+    }
+
+    private func isDirectory(at url: URL) -> Bool {
+        guard let values = try? url.resourceValues(forKeys: [.isDirectoryKey]) else {
+            return false
+        }
+        return values.isDirectory == true
+    }
+
+    private func fileModificationDate(for url: URL?) -> Date? {
+        guard let url,
+              let values = try? url.resourceValues(forKeys: [.contentModificationDateKey]) else {
+            return nil
+        }
+        return values.contentModificationDate
+    }
+
+    private func invalidateSavedConversationThreadSummariesCache() {
+        cachedSavedConversationThreadSummaries.removeAll(keepingCapacity: true)
+        cachedSavedConversationThreadSummariesStamp = nil
     }
 
     private func apply(

@@ -459,8 +459,8 @@ struct AppSplitChromeBackground: View {
                                     sidebarTint.opacity(leadingPaneTransparent ? 0.08 : 0.12),
                                     sidebarSurfaceBottom.opacity(leadingPaneTransparent ? 0.80 : 0.94)
                                 ],
-                                startPoint: .topLeading,
-                                endPoint: .bottomTrailing
+                                startPoint: .top,
+                                endPoint: .bottom
                             )
                         }
                     }

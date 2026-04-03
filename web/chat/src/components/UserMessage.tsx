@@ -38,7 +38,7 @@ function UserMessageInner({ message }: { message: ChatMessage }) {
               type="button"
               className="user-action-pill"
               onClick={handleUndo}
-              title="Undo this message and everything after it"
+              title="Undo the latest message"
             >
               Undo
             </button>

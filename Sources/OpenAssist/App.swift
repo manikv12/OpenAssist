@@ -755,6 +755,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
     private var hotkeyManager: HoldToTalkManager?
     private var continuousToggleHotkeyManager: OneShotHotkeyManager?
     private var assistantLiveVoiceHotkeyManager: HoldToTalkManager?
+    private var assistantCompactHotkeyManager: OneShotHotkeyManager?
     private var pasteLastTranscriptHotkeyManager: OneShotHotkeyManager?
     private let transcriptHistory = TranscriptHistoryStore.shared
     private var windowCoordinator: AppWindowCoordinator?
@@ -930,6 +931,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         let continuousToggleShortcutModifiers: UInt
         let assistantLiveVoiceShortcutKeyCode: UInt16
         let assistantLiveVoiceShortcutModifiers: UInt
+        let assistantCompactShortcutKeyCode: UInt16
+        let assistantCompactShortcutModifiers: UInt
         let muteSystemSoundsWhileHoldingShortcut: Bool
         let transcriptionEngineRawValue: String
         let cloudTranscriptionProviderRawValue: String
@@ -1075,7 +1078,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         }
 
         setupStatusBar()
-        assistantCompactHUD = AssistantCompactHUDManager(
+        assistantCompactHUD = AssistantCompactSurfaceCoordinator(
             controller: assistantController,
             settings: settings,
             style: settings.assistantCompactPresentationStyle
@@ -2061,6 +2064,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         }
     }
 
+    private func revealCompactAssistantFromShortcut() {
+        guard FeatureFlags.personalAssistantEnabled else { return }
+
+        guard settings.assistantBetaEnabled else {
+            setUIStatus(.message("Turn on Assistant in Settings first."))
+            windowCoordinator?.openSettingsWindow()
+            return
+        }
+
+        guard settings.assistantFloatingHUDEnabled else {
+            setUIStatus(.message("Turn on compact assistant in Settings first."))
+            windowCoordinator?.openSettingsWindow()
+            return
+        }
+
+        if !isAssistantWindowVisible,
+           settings.assistantCompactPresentationStyle == .sidebar,
+           assistantCompactHUD?.isExpandedSurfaceVisible == true {
+            assistantCompactHUD?.collapseExpandedSurface()
+            updateMenuState()
+            return
+        }
+
+        let revealCompactSurface = { [weak self] in
+            guard let self else { return }
+            self.syncAssistantCompactVisibility()
+            self.assistantCompactHUD?.prepareVoiceCaptureComposer()
+            self.updateMenuState()
+        }
+
+        if isAssistantWindowVisible {
+            minimizeAssistantToCompact()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.24, execute: revealCompactSurface)
+            return
+        }
+
+        revealCompactSurface()
+    }
+
     private func syncAssistantCompactVisibility() {
         assistantCompactHUD?.setPresentationStyle(settings.assistantCompactPresentationStyle)
 
@@ -2468,12 +2510,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         assistantVoiceBaselineSamples = []
         assistantVoiceBaselineCalibrated = false
         assistantCompactHUD?.setVoiceRecording(true)
+        assistantController.prepareForVoiceCapture()
         startRecording()
 
         if !isDictating {
             compactVoiceCaptureActive = false
             compactVoiceStopMode = .manualRelease
             assistantCompactHUD?.receiveVoiceTranscript("")
+            assistantController.cancelVoiceDraft("Could not start voice capture.")
         }
     }
 
@@ -2486,6 +2530,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         assistantVoiceBaselineSamples = []
         assistantVoiceBaselineCalibrated = false
         assistantCompactHUD?.setVoiceRecording(false)
+        assistantController.finalizingVoiceCapture()
         transcriber.stopRecording()
         isDictating = false
         currentAudioLevel = 0
@@ -2629,6 +2674,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             currentAudioLevel = 0
             assistantCompactHUD?.updateLevel(0)
             assistantCompactHUD?.receiveVoiceTranscript("")
+            assistantController.cancelVoiceDraft("Assistant listening stopped.")
             stopStatusIconAnimation()
             setUIStatus(.ready)
             updateMenuState()
@@ -2705,6 +2751,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             continuousToggleShortcutModifiers: settings.continuousToggleShortcutModifiers,
             assistantLiveVoiceShortcutKeyCode: settings.assistantLiveVoiceShortcutKeyCode,
             assistantLiveVoiceShortcutModifiers: settings.assistantLiveVoiceShortcutModifiers,
+            assistantCompactShortcutKeyCode: settings.assistantCompactShortcutKeyCode,
+            assistantCompactShortcutModifiers: settings.assistantCompactShortcutModifiers,
             muteSystemSoundsWhileHoldingShortcut: settings.muteSystemSoundsWhileHoldingShortcut,
             transcriptionEngineRawValue: settings.transcriptionEngineRawValue,
             cloudTranscriptionProviderRawValue: settings.cloudTranscriptionProviderRawValue,
@@ -2800,6 +2848,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             || previousSnapshot?.continuousToggleShortcutModifiers != snapshot.continuousToggleShortcutModifiers
             || previousSnapshot?.assistantLiveVoiceShortcutKeyCode != snapshot.assistantLiveVoiceShortcutKeyCode
             || previousSnapshot?.assistantLiveVoiceShortcutModifiers != snapshot.assistantLiveVoiceShortcutModifiers
+            || previousSnapshot?.assistantCompactShortcutKeyCode != snapshot.assistantCompactShortcutKeyCode
+            || previousSnapshot?.assistantCompactShortcutModifiers != snapshot.assistantCompactShortcutModifiers
             || previousSnapshot?.muteSystemSoundsWhileHoldingShortcut != snapshot.muteSystemSoundsWhileHoldingShortcut
         if hotkeysChanged {
             applyHotkeyMode()
@@ -2872,18 +2922,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         continuousToggleHotkeyManager = nil
         assistantLiveVoiceHotkeyManager?.stop()
         assistantLiveVoiceHotkeyManager = nil
+        assistantCompactHotkeyManager?.stop()
+        assistantCompactHotkeyManager = nil
         guard permissionsReady else { return }
 
-        hotkeyManager = HoldToTalkManager(
-            keyCode: settings.shortcutKeyCode,
-            modifiers: settings.shortcutModifierFlags,
-            suppressSystemShortcutSounds: settings.muteSystemSoundsWhileHoldingShortcut,
-            onStart: { [weak self] in self?.startHoldToTalkDictation() },
-            onStop: { [weak self] in self?.stopHoldToTalkDictation() }
-        )
-        hotkeyManager?.start()
+        if shortcutsConflict(
+            lhsKeyCode: settings.shortcutKeyCode,
+            lhsModifiers: settings.shortcutModifierFlags,
+            rhsKeyCode: settings.continuousToggleShortcutKeyCode,
+            rhsModifiers: settings.continuousToggleShortcutModifierFlags
+        ) || shortcutsConflict(
+            lhsKeyCode: settings.shortcutKeyCode,
+            lhsModifiers: settings.shortcutModifierFlags,
+            rhsKeyCode: settings.assistantLiveVoiceShortcutKeyCode,
+            rhsModifiers: settings.assistantLiveVoiceShortcutModifierFlags
+        ) || shortcutsConflict(
+            lhsKeyCode: settings.shortcutKeyCode,
+            lhsModifiers: settings.shortcutModifierFlags,
+            rhsKeyCode: settings.assistantCompactShortcutKeyCode,
+            rhsModifiers: settings.assistantCompactShortcutModifierFlags
+        ) || shortcutsConflict(
+            lhsKeyCode: settings.shortcutKeyCode,
+            lhsModifiers: settings.shortcutModifierFlags,
+            rhsKeyCode: PasteLastTranscriptShortcut.keyCode,
+            rhsModifiers: PasteLastTranscriptShortcut.modifiers
+        ) {
+            setUIStatus(.message("Fix shortcut conflicts in Settings to enable hold-to-talk"))
+        } else {
+            hotkeyManager = HoldToTalkManager(
+                keyCode: settings.shortcutKeyCode,
+                modifiers: settings.shortcutModifierFlags,
+                suppressSystemShortcutSounds: settings.muteSystemSoundsWhileHoldingShortcut,
+                onStart: { [weak self] in self?.startHoldToTalkDictation() },
+                onStop: { [weak self] in self?.stopHoldToTalkDictation() }
+            )
+            hotkeyManager?.start()
+        }
         configureContinuousToggleHotkey()
         configureAssistantLiveVoiceHotkey()
+        configureAssistantCompactHotkey()
         updateMenuState()
     }
 
@@ -2903,6 +2980,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             lhsModifiers: settings.continuousToggleShortcutModifierFlags,
             rhsKeyCode: settings.assistantLiveVoiceShortcutKeyCode,
             rhsModifiers: settings.assistantLiveVoiceShortcutModifierFlags
+        ) || shortcutsConflict(
+            lhsKeyCode: settings.continuousToggleShortcutKeyCode,
+            lhsModifiers: settings.continuousToggleShortcutModifierFlags,
+            rhsKeyCode: settings.assistantCompactShortcutKeyCode,
+            rhsModifiers: settings.assistantCompactShortcutModifierFlags
         ) {
             setUIStatus(.message("Fix shortcut conflicts in Settings to enable continuous toggle hotkey"))
             return
@@ -2933,6 +3015,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             lhsModifiers: settings.assistantLiveVoiceShortcutModifierFlags,
             rhsKeyCode: PasteLastTranscriptShortcut.keyCode,
             rhsModifiers: PasteLastTranscriptShortcut.modifiers
+        ) || shortcutsConflict(
+            lhsKeyCode: settings.assistantLiveVoiceShortcutKeyCode,
+            lhsModifiers: settings.assistantLiveVoiceShortcutModifierFlags,
+            rhsKeyCode: settings.assistantCompactShortcutKeyCode,
+            rhsModifiers: settings.assistantCompactShortcutModifierFlags
         ) {
             setUIStatus(.message("Fix shortcut conflicts in Settings to enable the agent shortcut"))
             return
@@ -2946,6 +3033,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             onStop: { [weak self] in self?.stopAssistantShortcutCapture() }
         )
         assistantLiveVoiceHotkeyManager?.start()
+    }
+
+    private func configureAssistantCompactHotkey() {
+        if shortcutsConflict(
+            lhsKeyCode: settings.assistantCompactShortcutKeyCode,
+            lhsModifiers: settings.assistantCompactShortcutModifierFlags,
+            rhsKeyCode: settings.shortcutKeyCode,
+            rhsModifiers: settings.shortcutModifierFlags
+        ) || shortcutsConflict(
+            lhsKeyCode: settings.assistantCompactShortcutKeyCode,
+            lhsModifiers: settings.assistantCompactShortcutModifierFlags,
+            rhsKeyCode: settings.continuousToggleShortcutKeyCode,
+            rhsModifiers: settings.continuousToggleShortcutModifierFlags
+        ) || shortcutsConflict(
+            lhsKeyCode: settings.assistantCompactShortcutKeyCode,
+            lhsModifiers: settings.assistantCompactShortcutModifierFlags,
+            rhsKeyCode: settings.assistantLiveVoiceShortcutKeyCode,
+            rhsModifiers: settings.assistantLiveVoiceShortcutModifierFlags
+        ) || shortcutsConflict(
+            lhsKeyCode: settings.assistantCompactShortcutKeyCode,
+            lhsModifiers: settings.assistantCompactShortcutModifierFlags,
+            rhsKeyCode: PasteLastTranscriptShortcut.keyCode,
+            rhsModifiers: PasteLastTranscriptShortcut.modifiers
+        ) {
+            setUIStatus(.message("Fix shortcut conflicts in Settings to enable the compact assistant shortcut"))
+            return
+        }
+
+        assistantCompactHotkeyManager = OneShotHotkeyManager(
+            keyCode: settings.assistantCompactShortcutKeyCode,
+            modifiers: settings.assistantCompactShortcutModifierFlags
+        ) { [weak self] in
+            self?.revealCompactAssistantFromShortcut()
+        }
+        assistantCompactHotkeyManager?.start()
     }
 
     private func shortcutsConflict(
@@ -3093,6 +3215,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
                 compactVoiceCaptureActive = false
                 compactVoiceStopMode = .manualRelease
                 assistantCompactHUD?.receiveVoiceTranscript("")
+                assistantController.cancelVoiceDraft("Microphone permission required.")
             }
             return
         }
@@ -3131,6 +3254,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
                 compactVoiceCaptureActive = false
                 compactVoiceStopMode = .manualRelease
                 assistantCompactHUD?.receiveVoiceTranscript("")
+                assistantController.cancelVoiceDraft("Could not start voice capture.")
             }
             waveform.hide()
             stopStatusIconAnimation()
@@ -4570,6 +4694,7 @@ struct SettingsView: View {
         case holdToTalk
         case continuousToggle
         case assistantLiveVoice
+        case assistantCompactSurface
     }
 
     private struct ShortcutBinding: Equatable {
@@ -4616,6 +4741,7 @@ struct SettingsView: View {
     @StateObject private var updateCheckStatusStore = UpdateCheckStatusStore.shared
     @StateObject private var automationAPICoordinator = AutomationAPICoordinator.shared
     @StateObject private var telegramRemoteCoordinator = TelegramRemoteCoordinator.shared
+    @StateObject private var notesBackupController = AssistantNotesBackupController.shared
     @State private var selectedSection: SettingsSection = .gettingStarted
     @State private var selectedIntegrationsPage: SettingsAdvancedPage = .overview
     @State private var searchQuery = ""
@@ -4629,6 +4755,7 @@ struct SettingsView: View {
     @State private var showHoldManualMap = false
     @State private var showContinuousManualMap = false
     @State private var showAssistantLiveVoiceManualMap = false
+    @State private var showAssistantCompactManualMap = false
     @State private var showDictationOutputSettings = false
     @State private var showDictationSoundSettings = false
     @State private var showWaveformAppearanceSettings = false
@@ -4678,6 +4805,7 @@ struct SettingsView: View {
     @State private var correctionsSearchQuery = ""
     @State private var automationActionMessage: String?
     @State private var telegramActionMessage: String?
+    @State private var notesBackupActionMessage: String?
     @State private var telegramBotTokenDraft = ""
 
     init(initialRoute: SettingsRoute? = nil) {
@@ -5551,7 +5679,7 @@ struct SettingsView: View {
                 tint: SettingsSection.gettingStarted.tint,
                 tasks: [
                     ("AI and assistant basics", "See your current provider, response style, and everyday AI controls.", SettingsRoute(section: .dailyUse, cardID: "daily.assistant")),
-                    ("Try voice dictation", "Check microphone, shortcuts, and speech controls.", SettingsRoute(section: .voiceDictation, cardID: "voice.tasks")),
+                    ("Open voice & shortcuts", "Check microphone, dictation, shortcuts, and speech controls.", SettingsRoute(section: .voiceDictation, cardID: "voice.tasks")),
                     ("Set up automation", "Review browser reuse, app actions, and Computer Use.", SettingsRoute(section: .browserAppControl, cardID: "browser.tasks")),
                     ("Open advanced AI settings", SettingsNavigationModel.aiStudioDescription, SettingsRoute(section: .advanced, cardID: "advanced.aiStudio", opensAIStudio: true))
                 ]
@@ -5573,7 +5701,8 @@ struct SettingsView: View {
                 tasks: [
                     ("Review AI basics", "See your current provider, model, and everyday AI behavior.", SettingsRoute(section: .dailyUse, cardID: "daily.assistant")),
                     ("Use the agent shortcut", "Jump straight to the voice shortcut that sends speech into Open Assist.", SettingsRoute(section: .voiceDictation, cardID: "shortcuts.agentShortcut")),
-                    ("Use voice dictation", "Open microphone, engine, and shortcut settings.", SettingsRoute(section: .voiceDictation, cardID: "voice.tasks")),
+                    ("Use the sidebar shortcut", "Jump straight to the compact assistant shortcut for Orb, Notch, or Sidebar mode.", SettingsRoute(section: .voiceDictation, cardID: "shortcuts.compactAssistantShortcut")),
+                    ("Use voice & shortcuts", "Open microphone, dictation, engine, and shortcut settings.", SettingsRoute(section: .voiceDictation, cardID: "voice.tasks")),
                     ("Use automation", "Open browser profile, permissions, and Computer Use controls.", SettingsRoute(section: .browserAppControl, cardID: "browser.tasks")),
                     ("Advanced AI settings", SettingsNavigationModel.aiStudioDescription, SettingsRoute(section: .advanced, cardID: "advanced.aiStudio", opensAIStudio: true))
                 ]
@@ -5591,14 +5720,15 @@ struct SettingsView: View {
 
             taskCardGroup(
                 id: "voice.tasks",
-                title: "Voice & Dictation Tasks",
-                subtitle: "Use this page to test the microphone, pick the engine, and set the shortcuts you actually use.",
+                title: "Voice & Shortcut Tasks",
+                subtitle: "Use this page to test the microphone, pick the engine, and set the dictation and assistant shortcuts you actually use.",
                 symbol: "waveform.and.mic",
                 tint: SettingsSection.voiceDictation.tint,
                 tasks: [
                     ("Test microphone", "Check the input device and auto-detect behavior.", SettingsRoute(section: .voiceDictation, cardID: "speech.inputDevice")),
                     ("Pick transcription engine", "Switch Apple Speech, whisper.cpp, or a cloud provider.", SettingsRoute(section: .voiceDictation, cardID: "speech.transcriptionEngine")),
                     ("Change agent shortcut", "Set the shortcut that records directly into Open Assist.", SettingsRoute(section: .voiceDictation, cardID: "shortcuts.agentShortcut")),
+                    ("Change sidebar shortcut", "Set the shortcut that opens the compact assistant or sidebar quickly.", SettingsRoute(section: .voiceDictation, cardID: "shortcuts.compactAssistantShortcut")),
                     ("Manage corrections", "Review learned corrections and add your own replacements.", SettingsRoute(section: .voiceDictation, cardID: "corrections.adaptive"))
                 ]
             )
@@ -5760,8 +5890,183 @@ struct SettingsView: View {
             }
 
             aiProviderStatusCard
+            notesBackupCard
             integrationsSection
             aboutSection
+        }
+    }
+
+    @ViewBuilder
+    private var notesBackupCard: some View {
+        settingsCollapsibleCard(
+            id: "advanced.notesBackup",
+            title: "Notes Backup",
+            subtitle: "Keep note history in the app and a second local backup in a separate folder.",
+            symbol: "externaldrive.badge.timemachine",
+            tint: SettingsSection.advanced.tint
+        ) {
+            let backupStatus = notesBackupController.status
+
+            Text("Your note history stays inside Open Assist, and this folder stores extra local backups in case the app data gets damaged.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Backup folder")
+                    .font(.callout.weight(.medium))
+
+                Text(backupStatus.resolvedFolderURL.path)
+                    .font(.system(size: 12, weight: .medium, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+
+                if backupStatus.usesCustomFolder && !backupStatus.folderExists {
+                    Text("The custom backup folder is missing right now. Pick another folder or create this one before relying on it.")
+                        .font(.caption)
+                        .foregroundStyle(Color.orange.opacity(0.92))
+                        .fixedSize(horizontal: false, vertical: true)
+                } else if !backupStatus.folderExists {
+                    Text("The default backup folder will be created the first time you run a backup.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                if let lastBackup = backupStatus.lastSuccessfulBackupAt {
+                    Text("Last successful backup: \(notesBackupTimestamp(lastBackup))")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text("No local notes backup has finished yet.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            HStack(spacing: 10) {
+                Button("Choose Folder") {
+                    chooseNotesBackupFolder()
+                }
+                .buttonStyle(.bordered)
+
+                Button("Use Default Folder") {
+                    settings.assistantNotesBackupFolderPath = ""
+                    notesBackupController.refreshStatus()
+                    notesBackupActionMessage = "Open Assist switched back to the default notes backup folder."
+                }
+                .buttonStyle(.bordered)
+
+                Button("Back Up Now") {
+                    runNotesBackupNow()
+                }
+                .buttonStyle(.borderedProminent)
+            }
+
+            if let notesBackupActionMessage,
+               !notesBackupActionMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                Text(notesBackupActionMessage)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Divider()
+                .padding(.vertical, 4)
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Recent backup sets")
+                    .font(.callout.weight(.medium))
+
+                if backupStatus.backupSets.isEmpty {
+                    Text("No backup sets yet. Run Back Up Now once so you have a full local restore point.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else {
+                    ForEach(Array(backupStatus.backupSets.prefix(6))) { backupSet in
+                        HStack(alignment: .top, spacing: 12) {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(notesBackupTimestamp(backupSet.createdAt))
+                                    .font(.callout.weight(.medium))
+                                Text(backupSet.id)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .textSelection(.enabled)
+                            }
+
+                            Spacer(minLength: 12)
+
+                            Button("Restore") {
+                                restoreNotesBackupSet(backupSet)
+                            }
+                            .buttonStyle(.bordered)
+                        }
+                        .padding(.vertical, 2)
+                    }
+
+                    Text("Restore first creates one safety backup of your current notes, then replaces the live notes data. Reopen the notes view or restart Open Assist if the old content is still on screen.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+        .onAppear {
+            notesBackupController.refreshStatus()
+        }
+    }
+
+    private func notesBackupTimestamp(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .short
+        return formatter.string(from: date)
+    }
+
+    private func chooseNotesBackupFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = true
+        panel.prompt = "Choose Backup Folder"
+        panel.title = "Choose a local notes backup folder"
+        panel.message = "Open Assist will keep extra notes backups in this folder."
+        if !settings.assistantNotesBackupFolderPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            panel.directoryURL = URL(
+                fileURLWithPath: settings.assistantNotesBackupFolderPath,
+                isDirectory: true
+            )
+        }
+
+        guard panel.runModal() == .OK, let selectedURL = panel.url else {
+            return
+        }
+
+        settings.assistantNotesBackupFolderPath = selectedURL.standardizedFileURL.path
+        notesBackupController.refreshStatus()
+        notesBackupActionMessage = "Open Assist will use the selected folder for future notes backups."
+    }
+
+    private func runNotesBackupNow() {
+        do {
+            if let backupSet = try notesBackupController.runManualBackup() {
+                notesBackupActionMessage = "Created a notes backup for \(notesBackupTimestamp(backupSet.createdAt))."
+            } else {
+                notesBackupActionMessage = "No note changes were detected since the newest backup, so Open Assist kept the latest backup set."
+            }
+        } catch {
+            notesBackupActionMessage = error.localizedDescription
+        }
+    }
+
+    private func restoreNotesBackupSet(_ backupSet: AssistantNotesBackupSetSummary) {
+        do {
+            let restored = try notesBackupController.restoreBackupSet(id: backupSet.id)
+            notesBackupActionMessage = "Restored notes backup from \(notesBackupTimestamp(restored.createdAt)). Reopen the notes view or restart Open Assist if you still see older data."
+        } catch {
+            notesBackupActionMessage = error.localizedDescription
         }
     }
 
@@ -6124,6 +6429,66 @@ struct SettingsView: View {
 
                 if !isAssistantLiveVoiceShortcutValid {
                     Text("Agent shortcut must include 2 to 4 keys.")
+                        .font(.callout)
+                        .foregroundStyle(AppVisualTheme.accentTint)
+                }
+            }
+
+            settingsCollapsibleCard(
+                id: "shortcuts.compactAssistantShortcut",
+                title: "Compact Assistant Shortcut",
+                subtitle: "Open the compact assistant quickly. In Sidebar mode, this opens the sidebar.",
+                symbol: "sidebar.left",
+                tint: AppVisualTheme.accentTint
+            ) {
+                shortcutSegmentRow(assistantCompactShortcutSegments)
+
+                HStack(alignment: .center, spacing: 10) {
+                    Button(action: {
+                        beginShortcutCapture(for: .assistantCompactSurface)
+                    }) {
+                        Text(isCapturingShortcut && shortcutCaptureTarget == .assistantCompactSurface ? "Listening..." : "Choose Shortcut")
+                    }
+                    .buttonStyle(.borderedProminent)
+
+                    Text("This shortcut opens the compact assistant surface without starting voice capture.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Text("Use this when you want the sidebar or compact assistant to appear quickly, then type or speak after it opens.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                VStack(alignment: .leading, spacing: 0) {
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.2)) { showAssistantCompactManualMap.toggle() }
+                    } label: {
+                        HStack {
+                            Text("Manual map (advanced)")
+                            Spacer()
+                            Image(systemName: "chevron.right")
+                                .rotationEffect(.degrees(showAssistantCompactManualMap ? 90 : 0))
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.secondary)
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    if showAssistantCompactManualMap {
+                        manualShortcutBuilder(for: .assistantCompactSurface)
+                            .padding(.top, 6)
+                    }
+                }
+
+                if isCapturingShortcut && shortcutCaptureTarget == .assistantCompactSurface {
+                    Text("Press the compact assistant shortcut now. Press Esc to cancel.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+
+                if !isAssistantCompactShortcutValid {
+                    Text("Compact assistant shortcut must include 2 to 4 keys.")
                         .font(.callout)
                         .foregroundStyle(AppVisualTheme.accentTint)
                 }
@@ -9457,6 +9822,13 @@ struct SettingsView: View {
         )
     }
 
+    private var assistantCompactShortcutSegments: [String] {
+        ShortcutValidation.displaySegments(
+            keyCode: settings.assistantCompactShortcutKeyCode,
+            modifiersRaw: settings.assistantCompactShortcutModifiers
+        )
+    }
+
     private var isHoldToTalkShortcutValid: Bool {
         ShortcutValidation.isValid(keyCode: settings.shortcutKeyCode, modifiersRaw: settings.shortcutModifiers)
     }
@@ -9475,6 +9847,13 @@ struct SettingsView: View {
         )
     }
 
+    private var isAssistantCompactShortcutValid: Bool {
+        ShortcutValidation.isValid(
+            keyCode: settings.assistantCompactShortcutKeyCode,
+            modifiersRaw: settings.assistantCompactShortcutModifiers
+        )
+    }
+
     private func shortcutKeyCode(for target: ShortcutCaptureTarget) -> UInt16 {
         switch target {
         case .holdToTalk:
@@ -9483,6 +9862,8 @@ struct SettingsView: View {
             settings.continuousToggleShortcutKeyCode
         case .assistantLiveVoice:
             settings.assistantLiveVoiceShortcutKeyCode
+        case .assistantCompactSurface:
+            settings.assistantCompactShortcutKeyCode
         }
     }
 
@@ -9494,6 +9875,8 @@ struct SettingsView: View {
             settings.continuousToggleShortcutModifiers
         case .assistantLiveVoice:
             settings.assistantLiveVoiceShortcutModifiers
+        case .assistantCompactSurface:
+            settings.assistantCompactShortcutModifiers
         }
     }
 
@@ -9529,6 +9912,9 @@ struct SettingsView: View {
         case .assistantLiveVoice:
             settings.assistantLiveVoiceShortcutKeyCode = keyCode
             settings.assistantLiveVoiceShortcutModifiers = filteredModifiers
+        case .assistantCompactSurface:
+            settings.assistantCompactShortcutKeyCode = keyCode
+            settings.assistantCompactShortcutModifiers = filteredModifiers
         }
 
         shortcutCaptureMessage = nil
@@ -9568,6 +9954,10 @@ struct SettingsView: View {
             keyCode: settings.assistantLiveVoiceShortcutKeyCode,
             modifiersRaw: ShortcutValidation.filteredModifierRawValue(from: settings.assistantLiveVoiceShortcutModifiers)
         )
+        let assistantCompactSurface = ShortcutBinding(
+            keyCode: settings.assistantCompactShortcutKeyCode,
+            modifiersRaw: ShortcutValidation.filteredModifierRawValue(from: settings.assistantCompactShortcutModifiers)
+        )
         let pasteLast = ShortcutBinding(
             keyCode: ReservedShortcut.pasteLastKeyCode,
             modifiersRaw: ReservedShortcut.pasteLastModifiersRaw
@@ -9581,6 +9971,9 @@ struct SettingsView: View {
             if candidate == assistantLiveVoice {
                 return "Hold-to-talk shortcut cannot match the agent shortcut."
             }
+            if candidate == assistantCompactSurface {
+                return "Hold-to-talk shortcut cannot match the compact assistant shortcut."
+            }
         case .continuousToggle:
             if candidate == holdToTalk {
                 return "Continuous toggle shortcut cannot match hold-to-talk shortcut."
@@ -9588,12 +9981,28 @@ struct SettingsView: View {
             if candidate == assistantLiveVoice {
                 return "Continuous toggle shortcut cannot match the agent shortcut."
             }
+            if candidate == assistantCompactSurface {
+                return "Continuous toggle shortcut cannot match the compact assistant shortcut."
+            }
         case .assistantLiveVoice:
             if candidate == holdToTalk {
                 return "Agent shortcut cannot match hold-to-talk shortcut."
             }
             if candidate == continuousToggle {
                 return "Agent shortcut cannot match continuous toggle shortcut."
+            }
+            if candidate == assistantCompactSurface {
+                return "Agent shortcut cannot match the compact assistant shortcut."
+            }
+        case .assistantCompactSurface:
+            if candidate == holdToTalk {
+                return "Compact assistant shortcut cannot match hold-to-talk shortcut."
+            }
+            if candidate == continuousToggle {
+                return "Compact assistant shortcut cannot match continuous toggle shortcut."
+            }
+            if candidate == assistantLiveVoice {
+                return "Compact assistant shortcut cannot match the agent shortcut."
             }
         }
 

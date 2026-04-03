@@ -9,8 +9,8 @@ final class AssistantSelectionActionHUDManager {
         static let actionSize = NSSize(width: 332, height: 52)
         static let composerSize = NSSize(width: 442, height: 308)
         static let loadingSize = NSSize(width: 352, height: 214)
-        static let resultSize = NSSize(width: 438, height: 336)
-        static let compactResultSize = NSSize(width: 392, height: 236)
+        static let resultSize = NSSize(width: 462, height: 388)
+        static let compactResultSize = NSSize(width: 404, height: 252)
         static let screenMargin: CGFloat = 10
         static let anchorGap: CGFloat = 10
         static let cornerRadius: CGFloat = 18
@@ -316,12 +316,12 @@ final class AssistantSelectionActionHUDManager {
             )
         case .result:
             size = NSSize(
-                width: min(widthLimit, 446),
+                width: min(widthLimit, viewModel.isError ? 412 : 470),
                 height: min(
                     heightLimit,
                     viewModel.isError
-                        ? (viewModel.conversationTurns.isEmpty ? 246 : 352)
-                        : (viewModel.conversationTurns.isEmpty ? 348 : 448)
+                        ? (viewModel.conversationTurns.isEmpty ? 264 : 364)
+                        : (viewModel.conversationTurns.isEmpty ? 392 : 500)
                 )
             )
         }
@@ -374,6 +374,7 @@ final class AssistantSelectionActionHUDManager {
 private struct AssistantSelectionActionHUDRootView: View {
     @ObservedObject var viewModel: AssistantSelectionActionHUDManager.ViewModel
     @FocusState private var questionFieldFocused: Bool
+    @State private var isSelectedPreviewExpanded = false
 
     private var isCompactActionsMode: Bool {
         viewModel.mode == .actions
@@ -508,18 +509,9 @@ private struct AssistantSelectionActionHUDRootView: View {
                 runtimeControlsRow
             }
 
-            sectionCard(
-                title: "Selected Text",
-                symbol: "text.quote",
-                tint: AppVisualTheme.accentTint
-            ) {
-                Text(viewModel.selectedPreview)
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(AppVisualTheme.foreground(0.80))
-                    .lineSpacing(2.5)
-                    .lineLimit(viewModel.conversationTurns.isEmpty ? 4 : 2)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
+            selectionPreviewDisclosure(
+                lineLimit: viewModel.conversationTurns.isEmpty ? 4 : 2
+            )
 
             if !viewModel.conversationTurns.isEmpty {
                 conversationHistoryCard(maxHeight: 132)
@@ -627,6 +619,7 @@ private struct AssistantSelectionActionHUDRootView: View {
             alignment: .topLeading
         )
         .onAppear {
+            isSelectedPreviewExpanded = false
             DispatchQueue.main.async {
                 questionFieldFocused = true
             }
@@ -644,18 +637,9 @@ private struct AssistantSelectionActionHUDRootView: View {
         VStack(alignment: .leading, spacing: 12) {
             header(title: viewModel.title, showsClose: false)
 
-            sectionCard(
-                title: "Selected Text",
-                symbol: "text.quote",
-                tint: AppVisualTheme.accentTint
-            ) {
-                Text(viewModel.selectedPreview)
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(AppVisualTheme.foreground(0.80))
-                    .lineSpacing(2.5)
-                    .lineLimit(viewModel.conversationTurns.isEmpty ? 4 : 2)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
+            selectionPreviewDisclosure(
+                lineLimit: viewModel.conversationTurns.isEmpty ? 4 : 2
+            )
 
             if !viewModel.conversationTurns.isEmpty {
                 conversationHistoryCard(maxHeight: 118)
@@ -664,7 +648,8 @@ private struct AssistantSelectionActionHUDRootView: View {
             sectionCard(
                 title: "Side Assistant",
                 symbol: "sparkles",
-                tint: AppVisualTheme.baseTint
+                tint: AppVisualTheme.baseTint,
+                tone: .dark
             ) {
                 HStack(spacing: 10) {
                     ProgressView()
@@ -683,24 +668,18 @@ private struct AssistantSelectionActionHUDRootView: View {
             height: viewModel.panelSize.height,
             alignment: .topLeading
         )
+        .onAppear {
+            isSelectedPreviewExpanded = false
+        }
     }
 
     private var resultView: some View {
         VStack(alignment: .leading, spacing: 12) {
             header(title: viewModel.title, showsClose: true)
 
-            sectionCard(
-                title: "Selected Text",
-                symbol: "text.quote",
-                tint: AppVisualTheme.accentTint
-            ) {
-                Text(viewModel.selectedPreview)
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(AppVisualTheme.foreground(0.80))
-                    .lineSpacing(2.5)
-                    .lineLimit(viewModel.conversationTurns.isEmpty ? (viewModel.isError ? 3 : 4) : 2)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
+            selectionPreviewDisclosure(
+                lineLimit: viewModel.conversationTurns.isEmpty ? (viewModel.isError ? 3 : 4) : 2
+            )
 
             if !viewModel.conversationTurns.isEmpty {
                 conversationHistoryCard(maxHeight: viewModel.isError ? 132 : 214)
@@ -710,19 +689,21 @@ private struct AssistantSelectionActionHUDRootView: View {
                 sectionCard(
                     title: viewModel.isError ? "Problem" : "Side Assistant",
                     symbol: viewModel.isError ? "exclamationmark.triangle.fill" : "bubble.left.and.text.bubble.right.fill",
-                    tint: viewModel.isError ? .orange : AppVisualTheme.baseTint
+                    tint: viewModel.isError ? .orange : AppVisualTheme.baseTint,
+                    tone: .dark
                 ) {
                     ScrollView {
                         Text(viewModel.bodyText)
-                            .font(.system(size: 13, weight: .regular))
+                            .font(.system(size: 14.5, weight: .regular))
                             .foregroundStyle(AppVisualTheme.foreground(viewModel.isError ? 0.86 : 0.92))
-                            .lineSpacing(4)
+                            .lineSpacing(5)
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .textSelection(.enabled)
                     }
                     .frame(
                         maxWidth: .infinity,
-                        maxHeight: viewModel.isError ? 88 : .infinity,
+                        minHeight: viewModel.isError ? 88 : 188,
+                        maxHeight: viewModel.isError ? 112 : .infinity,
                         alignment: .topLeading
                     )
                 }
@@ -777,6 +758,67 @@ private struct AssistantSelectionActionHUDRootView: View {
             width: viewModel.panelSize.width,
             height: viewModel.panelSize.height,
             alignment: .topLeading
+        )
+        .onAppear {
+            isSelectedPreviewExpanded = false
+        }
+    }
+
+    private func selectionPreviewDisclosure(lineLimit: Int) -> some View {
+        VStack(alignment: .leading, spacing: isSelectedPreviewExpanded ? 10 : 0) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.16)) {
+                    isSelectedPreviewExpanded.toggle()
+                }
+            } label: {
+                HStack(spacing: 10) {
+                    HStack(spacing: 8) {
+                        Image(systemName: "text.quote")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(AppVisualTheme.accentTint.opacity(0.96))
+
+                        Text(isSelectedPreviewExpanded ? "Hide Selection" : "Show Selection")
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(AppVisualTheme.foreground(0.86))
+                    }
+
+                    Spacer()
+
+                    Image(systemName: isSelectedPreviewExpanded ? "chevron.up" : "chevron.down")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(AppVisualTheme.foreground(0.58))
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if isSelectedPreviewExpanded {
+                Text(viewModel.selectedPreview)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(AppVisualTheme.foreground(0.80))
+                    .lineSpacing(2.5)
+                    .lineLimit(lineLimit)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+            }
+        }
+        .padding(12)
+        .background(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(
+                    LinearGradient(
+                        colors: [
+                            AppVisualTheme.surfaceFill(0.05),
+                            AppVisualTheme.surfaceFill(0.025)
+                        ],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .stroke(AppVisualTheme.foreground(0.08), lineWidth: 0.8)
+                )
         )
     }
 
@@ -1061,10 +1103,16 @@ private struct AssistantSelectionActionHUDRootView: View {
         }
     }
 
+    private enum SectionCardTone {
+        case standard
+        case dark
+    }
+
     private func sectionCard<Content: View>(
         title: String,
         symbol: String,
         tint: Color,
+        tone: SectionCardTone = .standard,
         @ViewBuilder content: () -> Content
     ) -> some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -1075,19 +1123,49 @@ private struct AssistantSelectionActionHUDRootView: View {
         .background(
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .fill(
-                    LinearGradient(
-                        colors: [
-                            tint.opacity(0.06),
-                            AppVisualTheme.surfaceFill(0.035)
-                        ],
-                        startPoint: .top,
-                        endPoint: .bottom
-                    )
+                    tone == .dark
+                        ? LinearGradient(
+                            colors: [
+                                Color(red: 0.11, green: 0.12, blue: 0.15).opacity(0.98),
+                                Color(red: 0.08, green: 0.09, blue: 0.11).opacity(0.98)
+                            ],
+                            startPoint: .top,
+                            endPoint: .bottom
+                        )
+                        : LinearGradient(
+                            colors: [
+                                tint.opacity(0.06),
+                                AppVisualTheme.surfaceFill(0.035)
+                            ],
+                            startPoint: .top,
+                            endPoint: .bottom
+                        )
                 )
                 .overlay(
                     RoundedRectangle(cornerRadius: 14, style: .continuous)
-                        .stroke(AppVisualTheme.foreground(0.08), lineWidth: 0.8)
+                        .stroke(
+                            tone == .dark
+                                ? AppVisualTheme.foreground(0.11)
+                                : AppVisualTheme.foreground(0.08),
+                            lineWidth: 0.8
+                        )
                 )
+                .overlay(alignment: .top) {
+                    if tone == .dark {
+                        RoundedRectangle(cornerRadius: 14, style: .continuous)
+                            .fill(
+                                LinearGradient(
+                                    colors: [
+                                        Color.white.opacity(0.032),
+                                        Color.clear
+                                    ],
+                                    startPoint: .top,
+                                    endPoint: .bottom
+                                )
+                            )
+                            .frame(height: 34)
+                    }
+                }
         )
     }
 

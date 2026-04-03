@@ -211,11 +211,13 @@ struct AssistantProjectDeletionResult: Sendable {
 final class AssistantProjectStore {
     private static let currentSnapshotVersion = 5
     private static let projectNotesRootDirectoryName = "ProjectNotes"
+    private static let projectNotesRecoveryDirectoryName = "ProjectNotesRecovery"
     private static let projectNotesDirectoryName = "notes"
     private static let projectNoteManifestFilename = "manifest.json"
     private static let defaultProjectNoteTitle = "Untitled note"
     private let fileManager: FileManager
     private let fileURL: URL
+    private let noteRecoveryStore: AssistantNoteRecoveryStore
     private var cachedSnapshot: AssistantProjectStoreSnapshot?
 
     init(
@@ -223,22 +225,34 @@ final class AssistantProjectStore {
         baseDirectoryURL: URL? = nil
     ) {
         self.fileManager = fileManager
+        let storageRootURL: URL
         if let baseDirectoryURL {
+            storageRootURL = baseDirectoryURL
             self.fileURL = baseDirectoryURL
                 .appendingPathComponent("projects.json", isDirectory: false)
         } else {
             let applicationSupport = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
                 ?? URL(fileURLWithPath: NSHomeDirectory())
                     .appendingPathComponent("Library/Application Support", isDirectory: true)
-            self.fileURL = applicationSupport
+            storageRootURL = applicationSupport
                 .appendingPathComponent("OpenAssist", isDirectory: true)
                 .appendingPathComponent("AssistantProjects", isDirectory: true)
+            self.fileURL = storageRootURL
                 .appendingPathComponent("projects.json", isDirectory: false)
         }
+        self.noteRecoveryStore = AssistantNoteRecoveryStore(
+            fileManager: fileManager,
+            recoveryRootURL: storageRootURL
+                .appendingPathComponent(Self.projectNotesRecoveryDirectoryName, isDirectory: true)
+        )
     }
 
     var storageURL: URL {
         fileURL
+    }
+
+    var storageRootURL: URL {
+        fileURL.deletingLastPathComponent()
     }
 
     func projects() -> [AssistantProject] {
@@ -338,6 +352,22 @@ final class AssistantProjectStore {
         )
     }
 
+    func loadProjectStoredNotes(projectID: String) throws -> [AssistantStoredNote] {
+        let normalizedProjectID = try requiredLeafProjectID(projectID)
+        let manifest = resolvedProjectNoteManifest(projectID: normalizedProjectID)
+        return manifest.orderedNotes.map { note in
+            AssistantStoredNote(
+                ownerKind: .project,
+                ownerID: normalizedProjectID,
+                noteID: note.id,
+                title: note.title,
+                fileName: note.fileName,
+                updatedAt: note.updatedAt,
+                text: loadProjectNoteText(projectID: normalizedProjectID, fileName: note.fileName)
+            )
+        }
+    }
+
     func createProjectNote(
         projectID: String,
         title: String? = nil,
@@ -420,7 +450,9 @@ final class AssistantProjectStore {
     func saveProjectNote(
         projectID: String,
         noteID: String?,
-        text: String
+        text: String,
+        forceHistorySnapshot: Bool = false,
+        now: Date = Date()
     ) throws -> AssistantNotesWorkspace {
         let normalizedProjectID = try requiredLeafProjectID(projectID)
         var manifest = resolvedProjectNoteManifest(projectID: normalizedProjectID)
@@ -451,6 +483,18 @@ final class AssistantProjectStore {
             return try loadProjectNotesWorkspace(projectID: normalizedProjectID)
         }
 
+        let previousText = loadProjectNoteText(projectID: normalizedProjectID, fileName: note.fileName)
+        if previousText != normalizedText {
+            noteRecoveryStore.captureHistorySnapshot(
+                note: note,
+                ownerKind: .project,
+                ownerID: normalizedProjectID,
+                text: previousText,
+                at: now,
+                force: forceHistorySnapshot || normalizedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            )
+        }
+
         if normalizedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             try? fileManager.removeItem(at: fileURL)
         } else {
@@ -462,7 +506,7 @@ final class AssistantProjectStore {
         }
 
         manifest.selectedNoteID = resolvedNoteID
-        manifest.notes[index].updatedAt = Date()
+        manifest.notes[index].updatedAt = now
         manifest.notes = normalizedProjectNoteItems(manifest.notes)
         try storeProjectNoteManifest(manifest, projectID: normalizedProjectID)
 
@@ -475,7 +519,8 @@ final class AssistantProjectStore {
 
     func deleteProjectNote(
         projectID: String,
-        noteID: String
+        noteID: String,
+        now: Date = Date()
     ) throws -> AssistantNotesWorkspace {
         let normalizedProjectID = try requiredLeafProjectID(projectID)
         var manifest = resolvedProjectNoteManifest(projectID: normalizedProjectID)
@@ -484,6 +529,14 @@ final class AssistantProjectStore {
         }
 
         let removed = manifest.notes.remove(at: existingIndex)
+        let removedText = loadProjectNoteText(projectID: normalizedProjectID, fileName: removed.fileName)
+        noteRecoveryStore.captureDeletedNote(
+            note: removed,
+            ownerKind: .project,
+            ownerID: normalizedProjectID,
+            text: removedText,
+            at: now
+        )
         if let fileURL = projectNoteFileURL(projectID: normalizedProjectID, fileName: removed.fileName) {
             try? fileManager.removeItem(at: fileURL)
         }
@@ -527,6 +580,152 @@ final class AssistantProjectStore {
             projectID: normalizedProjectID,
             noteID: workspace.selectedNote?.id,
             text: mergedText
+        )
+    }
+
+    func projectNoteHistoryVersions(
+        projectID: String,
+        noteID: String
+    ) throws -> [AssistantNoteHistoryVersion] {
+        let normalizedProjectID = try requiredLeafProjectID(projectID)
+        return noteRecoveryStore.historyVersions(
+            ownerKind: .project,
+            ownerID: normalizedProjectID,
+            noteID: noteID
+        )
+    }
+
+    func restoreProjectNoteHistoryVersion(
+        projectID: String,
+        noteID: String,
+        versionID: String,
+        now: Date = Date()
+    ) throws -> AssistantNotesWorkspace {
+        let normalizedProjectID = try requiredLeafProjectID(projectID)
+        var manifest = resolvedProjectNoteManifest(projectID: normalizedProjectID)
+        guard let noteIndex = manifest.notes.firstIndex(where: { $0.id == noteID }),
+              let payload = noteRecoveryStore.restoreHistoryVersion(
+                ownerKind: .project,
+                ownerID: normalizedProjectID,
+                noteID: noteID,
+                versionID: versionID
+              ) else {
+            return try loadProjectNotesWorkspace(projectID: normalizedProjectID)
+        }
+
+        let currentNote = manifest.notes[noteIndex]
+        let currentText = loadProjectNoteText(projectID: normalizedProjectID, fileName: currentNote.fileName)
+        if currentText != payload.text || currentNote.title != payload.note.title {
+            noteRecoveryStore.captureHistorySnapshot(
+                note: currentNote,
+                ownerKind: .project,
+                ownerID: normalizedProjectID,
+                text: currentText,
+                at: now,
+                force: true
+            )
+        }
+
+        manifest.notes[noteIndex].title = normalizedProjectNoteTitle(payload.note.title)
+        manifest.notes[noteIndex].updatedAt = now
+        manifest.selectedNoteID = noteID
+        try writeProjectNoteText(
+            projectID: normalizedProjectID,
+            fileName: currentNote.fileName,
+            text: payload.text
+        )
+        manifest.notes = normalizedProjectNoteItems(manifest.notes)
+        try storeProjectNoteManifest(manifest, projectID: normalizedProjectID)
+        return AssistantNotesWorkspace(
+            projectID: normalizedProjectID,
+            manifest: manifest,
+            selectedNoteText: payload.text
+        )
+    }
+
+    func deleteProjectNoteHistoryVersion(
+        projectID: String,
+        noteID: String,
+        versionID: String
+    ) throws -> AssistantNotesWorkspace {
+        let normalizedProjectID = try requiredLeafProjectID(projectID)
+        noteRecoveryStore.deleteHistoryVersion(
+            ownerKind: .project,
+            ownerID: normalizedProjectID,
+            noteID: noteID,
+            versionID: versionID
+        )
+        return try loadProjectNotesWorkspace(projectID: normalizedProjectID)
+    }
+
+    func recentlyDeletedProjectNotes(
+        projectID: String,
+        referenceDate: Date = Date()
+    ) throws -> [AssistantDeletedNoteSnapshot] {
+        let normalizedProjectID = try requiredLeafProjectID(projectID)
+        return noteRecoveryStore.recentlyDeletedNotes(
+            ownerKind: .project,
+            ownerID: normalizedProjectID,
+            referenceDate: referenceDate
+        )
+    }
+
+    func restoreDeletedProjectNote(
+        projectID: String,
+        deletedNoteID: String,
+        now: Date = Date()
+    ) throws -> AssistantNotesWorkspace {
+        let normalizedProjectID = try requiredLeafProjectID(projectID)
+        guard let payload = noteRecoveryStore.restoreDeletedNote(
+            ownerKind: .project,
+            ownerID: normalizedProjectID,
+            deletedID: deletedNoteID,
+            referenceDate: now
+        ) else {
+            return try loadProjectNotesWorkspace(projectID: normalizedProjectID)
+        }
+
+        var manifest = resolvedProjectNoteManifest(projectID: normalizedProjectID)
+        let restoredNoteID = manifest.notes.contains(where: {
+            $0.id.caseInsensitiveCompare(payload.note.id) == .orderedSame
+        }) ? UUID().uuidString.lowercased() : payload.note.id
+        let restoredFileName = manifest.notes.contains(where: {
+            $0.fileName.caseInsensitiveCompare(payload.note.fileName) == .orderedSame
+        }) ? "\(safePathComponent(restoredNoteID)).md" : payload.note.fileName
+
+        let restoredNote = AssistantNoteSummary(
+            id: restoredNoteID,
+            title: normalizedProjectNoteTitle(payload.note.title),
+            fileName: restoredFileName,
+            order: manifest.orderedNotes.count,
+            createdAt: payload.note.createdAt,
+            updatedAt: now
+        )
+        manifest.notes.append(restoredNote)
+        manifest.selectedNoteID = restoredNote.id
+        manifest.notes = normalizedProjectNoteItems(manifest.notes)
+        try writeProjectNoteText(
+            projectID: normalizedProjectID,
+            fileName: restoredNote.fileName,
+            text: payload.text
+        )
+        try storeProjectNoteManifest(manifest, projectID: normalizedProjectID)
+        return AssistantNotesWorkspace(
+            projectID: normalizedProjectID,
+            manifest: manifest,
+            selectedNoteText: payload.text
+        )
+    }
+
+    func permanentlyDeleteDeletedProjectNote(
+        projectID: String,
+        deletedNoteID: String
+    ) throws {
+        let normalizedProjectID = try requiredLeafProjectID(projectID)
+        noteRecoveryStore.permanentlyDeleteDeletedNote(
+            ownerKind: .project,
+            ownerID: normalizedProjectID,
+            deletedID: deletedNoteID
         )
     }
 
@@ -966,6 +1165,26 @@ final class AssistantProjectStore {
             .appendingPathComponent(fileName, isDirectory: false)
     }
 
+    private func writeProjectNoteText(
+        projectID: String,
+        fileName: String,
+        text: String
+    ) throws {
+        guard let fileURL = projectNoteFileURL(projectID: projectID, fileName: fileName) else {
+            return
+        }
+        let normalizedText = text.replacingOccurrences(of: "\r\n", with: "\n")
+        if normalizedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            try? fileManager.removeItem(at: fileURL)
+            return
+        }
+        try fileManager.createDirectory(
+            at: fileURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try normalizedText.write(to: fileURL, atomically: true, encoding: .utf8)
+    }
+
     private func loadProjectNoteText(projectID: String, fileName: String) -> String {
         guard let fileURL = projectNoteFileURL(projectID: projectID, fileName: fileName),
               fileManager.fileExists(atPath: fileURL.path),
@@ -1076,6 +1295,7 @@ final class AssistantProjectStore {
         let projectDirectoryURL = notesDirectoryURL.deletingLastPathComponent()
         let projectNotesRoot = projectDirectoryURL.deletingLastPathComponent()
         try? fileManager.removeItem(at: projectDirectoryURL)
+        noteRecoveryStore.removeAllRecoveryData(ownerKind: .project, ownerID: projectID)
         try? removeDirectoryIfEmpty(projectNotesRoot)
     }
 

@@ -873,6 +873,93 @@ final class CodexSessionCatalogTests: XCTestCase {
         XCTAssertEqual(transcript[4].text, "Task stopped.")
     }
 
+    func testLoadTranscriptCollapsesInlineAttachmentPayloadsToFilenameOnly() async throws {
+        let homeDirectory = try makeTemporaryHomeDirectory()
+        defer { try? FileManager.default.removeItem(at: homeDirectory) }
+
+        let responseItem = try jsonLine([
+            "timestamp": "2026-03-07T12:30:00Z",
+            "type": "response_item",
+            "payload": [
+                "type": "message",
+                "role": "user",
+                "content": [
+                    [
+                        "type": "input_text",
+                        "text": "[RES Internal Charter 3.26.26.docx]\n" + String(repeating: "UEsDBBQAAAAIA", count: 40)
+                    ],
+                    [
+                        "type": "input_text",
+                        "text": "Please summarize the charter."
+                    ]
+                ]
+            ]
+        ])
+
+        try writeSession(
+            id: "attachment-collapse",
+            dayPath: "2026/03/07",
+            in: homeDirectory,
+            lines: [
+                try sessionMetaLine(
+                    id: "attachment-collapse",
+                    timestamp: "2026-03-07T12:29:59Z",
+                    cwd: "/Users/test/App",
+                    source: "exec"
+                ),
+                responseItem
+            ]
+        )
+
+        let catalog = CodexSessionCatalog(homeDirectory: homeDirectory)
+        let transcript = await catalog.loadTranscript(sessionID: "attachment-collapse")
+
+        XCTAssertEqual(transcript.map(\.role), [.system, .user])
+        XCTAssertEqual(
+            transcript[1].text,
+            "[RES Internal Charter 3.26.26.docx]\n\nPlease summarize the charter."
+        )
+    }
+
+    func testSessionIndexIgnoresSyntheticSessionMemoryTitle() async throws {
+        let homeDirectory = try makeTemporaryHomeDirectory()
+        defer { try? FileManager.default.removeItem(at: homeDirectory) }
+
+        try writeSession(
+            id: "memory-title",
+            dayPath: "2026/03/07",
+            in: homeDirectory,
+            lines: [
+                try sessionMetaLine(
+                    id: "memory-title",
+                    timestamp: "2026-03-07T10:00:00Z",
+                    cwd: "/Users/test/App",
+                    source: "exec"
+                ),
+                try responseMessageLine(
+                    timestamp: "2026-03-07T10:00:01Z",
+                    role: "user",
+                    text: "## My request for Codex:\nFix the title"
+                )
+            ]
+        )
+
+        let sessionIndexDirectory = homeDirectory.appendingPathComponent(".codex", isDirectory: true)
+        try FileManager.default.createDirectory(at: sessionIndexDirectory, withIntermediateDirectories: true)
+        let sessionIndexURL = sessionIndexDirectory.appendingPathComponent("session-index.jsonl", isDirectory: false)
+        let badIndexLine = try jsonLine([
+            "id": "memory-title",
+            "thread_name": "# Session Memory Use this as context for the next reply.",
+            "updated_at": "2026-03-07T10:00:02Z"
+        ])
+        try (badIndexLine + "\n").write(to: sessionIndexURL, atomically: true, encoding: .utf8)
+
+        let catalog = CodexSessionCatalog(homeDirectory: homeDirectory)
+        let sessions = try await catalog.loadSessions(limit: 5)
+
+        XCTAssertEqual(sessions.first(where: { $0.id == "memory-title" })?.title, "Fix the title")
+    }
+
     func testLoadMergedTimelineClassifiesSavedToolRecordsAndCache() async throws {
         let homeDirectory = try makeTemporaryHomeDirectory()
         defer { try? FileManager.default.removeItem(at: homeDirectory) }

@@ -1,5 +1,19 @@
 import type { MermaidTemplateType } from "./threadNoteMermaidTemplates";
 
+export type MermaidRenderMode = "default-pretty" | "respect-authored-style";
+
+export interface MermaidSourceAnalysis {
+  type: MermaidTemplateType | null;
+  isFlowchart: boolean;
+  flowDirection: FlowchartDirection | null;
+  hasAuthorStyling: boolean;
+  hasFrontmatterConfig: boolean;
+  hasInitDirective: boolean;
+  renderMode: MermaidRenderMode;
+}
+
+type FlowchartDirection = "TB" | "TD" | "BT" | "LR" | "RL";
+
 const MERMAID_VARIANT_HEADERS: Record<string, string> = {
   flowchart: "flowchart",
   graph: "graph",
@@ -32,6 +46,32 @@ export function normalizeMermaidSource(language: string, code: string): string {
   return sanitizeMermaidSource(sourceWithNormalizedHeader);
 }
 
+export function inspectMermaidSource(source: string): MermaidSourceAnalysis {
+  const normalized = source.replace(/\r\n/g, "\n");
+  const firstDirective = firstMeaningfulMermaidDirective(normalized);
+  const type = detectTemplateTypeFromDirective(firstDirective);
+  const hasFrontmatterConfig = hasLeadingFrontmatter(normalized);
+  const hasInitDirective = /%%\{\s*init\s*:/i.test(normalized);
+  const hasAuthorStyling =
+    hasFrontmatterConfig ||
+    hasInitDirective ||
+    /^\s*classDef\b/m.test(normalized) ||
+    /^\s*style\b/m.test(normalized) ||
+    /^\s*linkStyle\b/m.test(normalized);
+
+  return {
+    type,
+    isFlowchart: type === "flowchart",
+    flowDirection: parseFlowchartDirection(firstDirective),
+    hasAuthorStyling,
+    hasFrontmatterConfig,
+    hasInitDirective,
+    renderMode: hasAuthorStyling
+      ? "respect-authored-style"
+      : "default-pretty",
+  };
+}
+
 function normalizeMermaidHeader(language: string, code: string): string {
   if (language === "mermaid") {
     return code;
@@ -61,11 +101,7 @@ function normalizeMermaidHeader(language: string, code: string): string {
 
 function sanitizeMermaidSource(source: string): string {
   const normalized = source.replace(/\r\n/g, "\n");
-  const firstDirective = normalized
-    .split("\n")
-    .map((line) => line.trim())
-    .find(Boolean)
-    ?.toLowerCase();
+  const firstDirective = firstMeaningfulMermaidDirective(normalized);
 
   if (!firstDirective) {
     return normalized;
@@ -113,66 +149,124 @@ function quoteMermaidLabel(label: string): string {
 export function detectMermaidTemplateType(
   source: string
 ): MermaidTemplateType | null {
-  const firstLine = source
-    .replace(/\r\n/g, "\n")
-    .split("\n")
-    .map((line) => line.trim())
-    .find(Boolean)
-    ?.toLowerCase();
+  return detectTemplateTypeFromDirective(firstMeaningfulMermaidDirective(source));
+}
 
-  if (!firstLine) {
+function mermaidVariantHeader(variant: string): string | null {
+  return MERMAID_VARIANT_HEADERS[variant] || null;
+}
+
+function detectTemplateTypeFromDirective(
+  firstDirective?: string | null
+): MermaidTemplateType | null {
+  if (!firstDirective) {
     return null;
   }
 
-  if (firstLine.startsWith("flowchart") || firstLine.startsWith("graph")) {
+  if (firstDirective.startsWith("flowchart") || firstDirective.startsWith("graph")) {
     return "flowchart";
   }
-  if (firstLine.startsWith("sequencediagram")) {
+  if (firstDirective.startsWith("sequencediagram")) {
     return "sequence";
   }
-  if (firstLine.startsWith("classdiagram")) {
+  if (firstDirective.startsWith("classdiagram")) {
     return "class";
   }
   if (
-    firstLine.startsWith("statediagram-v2") ||
-    firstLine.startsWith("statediagram")
+    firstDirective.startsWith("statediagram-v2") ||
+    firstDirective.startsWith("statediagram")
   ) {
     return "state";
   }
-  if (firstLine.startsWith("erdiagram")) {
+  if (firstDirective.startsWith("erdiagram")) {
     return "er";
   }
-  if (firstLine.startsWith("journey")) {
+  if (firstDirective.startsWith("journey")) {
     return "journey";
   }
-  if (firstLine.startsWith("gantt")) {
+  if (firstDirective.startsWith("gantt")) {
     return "gantt";
   }
-  if (firstLine.startsWith("pie")) {
+  if (firstDirective.startsWith("pie")) {
     return "pie";
   }
-  if (firstLine.startsWith("gitgraph")) {
+  if (firstDirective.startsWith("gitgraph")) {
     return "gitgraph";
   }
-  if (firstLine.startsWith("mindmap")) {
+  if (firstDirective.startsWith("mindmap")) {
     return "mindmap";
   }
-  if (firstLine.startsWith("timeline")) {
+  if (firstDirective.startsWith("timeline")) {
     return "timeline";
   }
-  if (firstLine.startsWith("quadrantchart")) {
+  if (firstDirective.startsWith("quadrantchart")) {
     return "quadrant";
   }
-  if (firstLine.startsWith("architecture-beta")) {
+  if (firstDirective.startsWith("architecture-beta")) {
     return "architecture";
   }
-  if (firstLine.startsWith("block-beta")) {
+  if (firstDirective.startsWith("block-beta")) {
     return "block";
   }
 
   return null;
 }
 
-function mermaidVariantHeader(variant: string): string | null {
-  return MERMAID_VARIANT_HEADERS[variant] || null;
+function parseFlowchartDirection(
+  firstDirective?: string | null
+): FlowchartDirection | null {
+  if (!firstDirective) {
+    return null;
+  }
+
+  const match = firstDirective.match(/^(?:flowchart|graph)\s+([a-z][a-z0-9-]*)/i);
+  if (!match) {
+    return null;
+  }
+
+  const direction = match[1].toUpperCase();
+  switch (direction) {
+    case "TB":
+    case "TD":
+    case "BT":
+    case "LR":
+    case "RL":
+      return direction;
+    default:
+      return null;
+  }
+}
+
+function firstMeaningfulMermaidDirective(source: string): string | undefined {
+  const normalized = stripLeadingConfigBlocks(source.replace(/\r\n/g, "\n"));
+  return normalized
+    .split("\n")
+    .map((line) => line.trim())
+    .find(Boolean)
+    ?.toLowerCase();
+}
+
+function stripLeadingConfigBlocks(source: string): string {
+  let remaining = source.trimStart();
+
+  if (remaining.startsWith("---")) {
+    const frontmatterMatch = remaining.match(/^---\s*\n[\s\S]*?\n---\s*(?:\n|$)/);
+    if (frontmatterMatch) {
+      remaining = remaining.slice(frontmatterMatch[0].length);
+    }
+  }
+
+  while (remaining.startsWith("%%{")) {
+    const directiveMatch = remaining.match(/^%%\{[\s\S]*?\}%%\s*(?:\n|$)/);
+    if (!directiveMatch) {
+      break;
+    }
+    remaining = remaining.slice(directiveMatch[0].length).trimStart();
+  }
+
+  return remaining;
+}
+
+function hasLeadingFrontmatter(source: string): boolean {
+  return /^(\s*)---\s*\n[\s\S]*?\n---\s*(?:\n|$)/.test(source);
 }

@@ -20,6 +20,8 @@ struct AssistantCompactHUDView: View {
                 AssistantOrbHUDView(model: model)
             case .notch:
                 AssistantNotchHUDView(model: model)
+            case .sidebar:
+                EmptyView()
             }
         }
     }
@@ -518,7 +520,7 @@ struct AssistantOrbHUDView: View {
                         .font(.system(size: 10, weight: .semibold))
                         .foregroundStyle(tint.opacity(0.85))
                     Text(
-                        "Typing here interrupts the current turn and applies your new instruction."
+                        "Typing here queues your next message without stopping the current turn."
                     )
                     .font(.system(size: 10.5, weight: .medium))
                     .foregroundStyle(AppVisualTheme.foreground(0.58))

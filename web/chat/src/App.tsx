@@ -498,6 +498,32 @@ export function App() {
     };
 
     const bridge = {
+      updateMessage: (
+        messageID: string,
+        text: string,
+        isStreaming: boolean
+      ) => {
+        clearPendingMessageTransitions();
+        startTransition(() => {
+          setMessages((prev) => {
+            const stablePrevious = stableMessages(prev);
+            const targetIndex = stablePrevious.findIndex((message) => message.id === messageID);
+            if (targetIndex < 0) {
+              return stablePrevious;
+            }
+
+            const targetMessage = stablePrevious[targetIndex];
+            if (targetMessage.text === text && targetMessage.isStreaming === isStreaming) {
+              return stablePrevious;
+            }
+
+            const updated = [...stablePrevious];
+            updated[targetIndex] = { ...targetMessage, text, isStreaming };
+            return updated;
+          });
+        });
+      },
+
       setMessages: (msgs: ChatMessage[]) => {
         const deduped = dedupeMessages(msgs);
         const applyUpdate = () =>
@@ -509,9 +535,10 @@ export function App() {
               stablePrevious,
               deduped
             );
-            const enteringTransition =
-              buildExpansionTransition(stablePrevious, deduped) ??
-              buildSessionSwapTransition(stablePrevious, deduped);
+            const enteringTransition = buildSessionSwapTransition(
+              stablePrevious,
+              deduped
+            );
 
             if (truncationTransition) {
               pendingTruncationTimeoutRef.current = window.setTimeout(() => {
@@ -540,23 +567,7 @@ export function App() {
         text: string,
         isStreaming: boolean
       ) => {
-        clearPendingMessageTransitions();
-        startTransition(() => {
-          setMessages((prev) => {
-            const stablePrevious = stableMessages(prev);
-            if (stablePrevious.length === 0) return stablePrevious;
-            const last = stablePrevious[stablePrevious.length - 1];
-            if (last.id !== messageID) {
-              return stablePrevious;
-            }
-            if (last.text === text && last.isStreaming === isStreaming) {
-              return stablePrevious;
-            }
-            const updated = [...stablePrevious];
-            updated[updated.length - 1] = { ...last, text, isStreaming };
-            return updated;
-          });
-        });
+        bridge.updateMessage(messageID, text, isStreaming);
       },
 
       appendMessage: (msg: ChatMessage) => {
@@ -669,6 +680,8 @@ export function App() {
   }
 
   const isProjectNotesMode = threadNoteState?.presentation === "projectFullScreen";
+  const isNotesWorkspaceMode = threadNoteState?.presentation === "notesWorkspace";
+  const isDedicatedNotesMode = isProjectNotesMode || isNotesWorkspaceMode;
 
   return (
     <>
@@ -676,13 +689,14 @@ export function App() {
       <div
         className={[
           "chat-stage",
-          isProjectNotesMode ? "is-project-notes-mode" : "",
+          isDedicatedNotesMode ? "is-project-notes-mode" : "",
+          isNotesWorkspaceMode ? "is-notes-workspace-mode" : "",
           threadNoteState?.isOpen ? "has-thread-note-open" : "",
         ]
           .filter(Boolean)
           .join(" ")}
       >
-        {!isProjectNotesMode ? (
+        {!isDedicatedNotesMode ? (
           <ChatView
             ref={chatViewRef}
             messages={visibleMessages}
@@ -715,6 +729,11 @@ declare global {
     __OPENASSIST_INITIAL_VIEW_MODE?: AppViewMode;
     chatBridge?: {
       setActiveWorkState?: (next: ActiveWorkState | null) => void;
+      updateMessage?: (
+        messageID: string,
+        text: string,
+        isStreaming: boolean
+      ) => void;
     };
     webkit?: {
       messageHandlers?: {
