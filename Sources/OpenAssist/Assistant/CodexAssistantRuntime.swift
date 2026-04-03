@@ -7363,7 +7363,7 @@ final class CodexAssistantRuntime {
         case .plan:
             return "plan"
         case .agentic, .conversational:
-            return "bypassPermissions"
+            return "default"
         }
     }
 

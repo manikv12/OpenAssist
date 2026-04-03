@@ -230,6 +230,7 @@ final class ClaudeCodeRuntimeParsingTests: XCTestCase {
 
     func testClaudeCodePlanModeUsesNativePermissionMode() {
         XCTAssertEqual(CodexAssistantRuntime.claudeCodePermissionMode(for: .plan), "plan")
-        XCTAssertEqual(CodexAssistantRuntime.claudeCodePermissionMode(for: .agentic), "bypassPermissions")
+        XCTAssertEqual(CodexAssistantRuntime.claudeCodePermissionMode(for: .agentic), "default")
+        XCTAssertEqual(CodexAssistantRuntime.claudeCodePermissionMode(for: .conversational), "default")
     }
 }
