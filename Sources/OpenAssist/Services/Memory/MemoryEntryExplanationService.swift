@@ -271,7 +271,7 @@ enum ThreadNoteChartPromptBuilder {
         """
 
         let systemPrompt = """
-        You turn selected chat content into a Mermaid chart for a non-technical user.
+        You turn selected note or chat content into a Mermaid chart for a non-technical user.
         Output markdown only.
         Return exactly:
         1. a short markdown heading
@@ -280,6 +280,15 @@ enum ThreadNoteChartPromptBuilder {
         Do not output more than one Mermaid block.
         Keep node labels short, clear, and easy to scan.
         Prefer simple structure over dense detail.
+        Prefer a presentation-ready diagram with a clear reading order.
+        For flowcharts, default to a top-to-bottom layout unless another direction is clearly better.
+        Use subgraphs or grouped stages when that makes the chart easier to scan.
+        If the content is sequential, prefer a small number of main steps instead of many tiny nodes.
+        Keep each node focused on one idea.
+        If a node needs one short detail line, you may use <br/> for a second line.
+        When color helps clarity, choose a small Mermaid color palette in the chart itself.
+        For flowcharts, you may use classDef, class, style, or linkStyle to separate stages or systems.
+        Keep the palette restrained, usually 2 to 4 colors.
         Use only supported Mermaid types.
         For hierarchy or stack breakdowns, prefer mindmap, block-beta, architecture-beta, or a grouped flowchart.
         For step-by-step processes, prefer flowchart or sequenceDiagram.
@@ -304,7 +313,7 @@ enum ThreadNoteChartPromptBuilder {
             } ?? ""
 
             userPrompt = """
-            Regenerate the chart from this selected chat content.
+            Regenerate the chart from this selected content.
 
             Selected text:
             \(snippet(normalizedSelection, limit: 10_000))
@@ -317,7 +326,7 @@ enum ThreadNoteChartPromptBuilder {
             """
         } else {
             userPrompt = """
-            Create the best Mermaid chart for this selected chat content.
+            Create the best Mermaid chart for this selected content.
 
             Selected text:
             \(snippet(normalizedSelection, limit: 10_000))

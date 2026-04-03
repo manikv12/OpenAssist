@@ -553,12 +553,136 @@ final class AssistantProjectStoreTests: XCTestCase {
         _ = try store.saveProjectNote(projectID: project.id, noteID: note.id, text: "   ")
         XCTAssertFalse(FileManager.default.fileExists(atPath: noteFileURL.path))
 
+        let historyVersions = try store.projectNoteHistoryVersions(
+            projectID: project.id,
+            noteID: note.id
+        )
+        XCTAssertEqual(historyVersions.map(\.preview), ["Temporary text"])
+
+        let restoredWorkspace = try store.restoreProjectNoteHistoryVersion(
+            projectID: project.id,
+            noteID: note.id,
+            versionID: try XCTUnwrap(historyVersions.first?.id)
+        )
+        XCTAssertEqual(restoredWorkspace.selectedNoteText, "Temporary text")
+
         _ = try store.deleteProjectResult(id: project.id)
 
         let projectNoteOwnerDirectory = directory
             .appendingPathComponent("ProjectNotes", isDirectory: true)
             .appendingPathComponent(project.id.lowercased(), isDirectory: true)
         XCTAssertFalse(FileManager.default.fileExists(atPath: projectNoteOwnerDirectory.path))
+
+        let projectRecoveryOwnerDirectory = directory
+            .appendingPathComponent("ProjectNotesRecovery", isDirectory: true)
+            .appendingPathComponent("history", isDirectory: true)
+            .appendingPathComponent("project", isDirectory: true)
+            .appendingPathComponent(project.id.lowercased(), isDirectory: true)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: projectRecoveryOwnerDirectory.path))
+    }
+
+    func testProjectNoteHistorySkipsRapidSnapshotsAndPrunesToFourVersions() throws {
+        let directory = try makeTemporaryDirectory(named: "assistant-project-note-history")
+        let store = AssistantProjectStore(baseDirectoryURL: directory)
+        let project = try store.createProject(name: "Recovery Project")
+        let createdWorkspace = try store.createProjectNote(projectID: project.id, title: "Architecture")
+        let note = try XCTUnwrap(createdWorkspace.selectedNote)
+        let baseDate = Date(timeIntervalSince1970: 1_000)
+
+        _ = try store.saveProjectNote(
+            projectID: project.id,
+            noteID: note.id,
+            text: "v1",
+            now: baseDate
+        )
+        _ = try store.saveProjectNote(
+            projectID: project.id,
+            noteID: note.id,
+            text: "v2",
+            now: baseDate.addingTimeInterval(60)
+        )
+        _ = try store.saveProjectNote(
+            projectID: project.id,
+            noteID: note.id,
+            text: "v3",
+            now: baseDate.addingTimeInterval(120)
+        )
+        _ = try store.saveProjectNote(
+            projectID: project.id,
+            noteID: note.id,
+            text: "v4",
+            now: baseDate.addingTimeInterval(420)
+        )
+        _ = try store.saveProjectNote(
+            projectID: project.id,
+            noteID: note.id,
+            text: "v5",
+            now: baseDate.addingTimeInterval(780)
+        )
+        _ = try store.saveProjectNote(
+            projectID: project.id,
+            noteID: note.id,
+            text: "v6",
+            now: baseDate.addingTimeInterval(1_140)
+        )
+        _ = try store.saveProjectNote(
+            projectID: project.id,
+            noteID: note.id,
+            text: "v7",
+            now: baseDate.addingTimeInterval(1_500)
+        )
+
+        let historyVersions = try store.projectNoteHistoryVersions(
+            projectID: project.id,
+            noteID: note.id
+        )
+
+        XCTAssertEqual(historyVersions.count, 4)
+        XCTAssertEqual(historyVersions.map(\.preview), ["v6", "v5", "v4", "v3"])
+    }
+
+    func testDeletingProjectNoteMovesItToRecentlyDeletedAndRestoreWorks() throws {
+        let directory = try makeTemporaryDirectory(named: "assistant-project-note-delete-restore")
+        let store = AssistantProjectStore(baseDirectoryURL: directory)
+        let project = try store.createProject(name: "Restore Project")
+        let createdWorkspace = try store.createProjectNote(projectID: project.id, title: "Runbook")
+        let note = try XCTUnwrap(createdWorkspace.selectedNote)
+        let baseDate = Date(timeIntervalSince1970: 5_000)
+
+        _ = try store.saveProjectNote(
+            projectID: project.id,
+            noteID: note.id,
+            text: "Recovery text",
+            now: baseDate
+        )
+
+        let deletedWorkspace = try store.deleteProjectNote(
+            projectID: project.id,
+            noteID: note.id,
+            now: baseDate.addingTimeInterval(60)
+        )
+        XCTAssertTrue(deletedWorkspace.notes.isEmpty)
+
+        let deletedNotes = try store.recentlyDeletedProjectNotes(
+            projectID: project.id,
+            referenceDate: baseDate.addingTimeInterval(120)
+        )
+        XCTAssertEqual(deletedNotes.count, 1)
+        XCTAssertEqual(deletedNotes.first?.preview, "Recovery text")
+
+        let restoredWorkspace = try store.restoreDeletedProjectNote(
+            projectID: project.id,
+            deletedNoteID: try XCTUnwrap(deletedNotes.first?.id),
+            now: baseDate.addingTimeInterval(180)
+        )
+        XCTAssertEqual(restoredWorkspace.notes.count, 1)
+        XCTAssertEqual(restoredWorkspace.selectedNoteText, "Recovery text")
+        XCTAssertTrue(
+            try store.recentlyDeletedProjectNotes(
+                projectID: project.id,
+                referenceDate: baseDate.addingTimeInterval(240)
+            ).isEmpty
+        )
     }
 
     func testProjectNamesAreCaseInsensitiveUnique() throws {

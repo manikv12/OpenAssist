@@ -135,6 +135,16 @@ final class SettingsStoreCrossIDEBootstrapTests: XCTestCase {
         )
     }
 
+    func testAssistantCompactPresentationStyleRestoresStoredSidebarValue() {
+        let defaults = makeIsolatedDefaults()
+        defaults.set("sidebar", forKey: "OpenAssist.assistantCompactPresentationStyle")
+
+        XCTAssertEqual(
+            SettingsStore.restoredAssistantCompactPresentationStyle(defaults: defaults),
+            .sidebar
+        )
+    }
+
     func testAssistantCompactPresentationStyleFallsBackToOrbForInvalidValue() {
         let defaults = makeIsolatedDefaults()
         defaults.set("floating-pill", forKey: "OpenAssist.assistantCompactPresentationStyle")
@@ -142,6 +152,42 @@ final class SettingsStoreCrossIDEBootstrapTests: XCTestCase {
         XCTAssertEqual(
             SettingsStore.restoredAssistantCompactPresentationStyle(defaults: defaults),
             .orb
+        )
+    }
+
+    func testAssistantCompactSidebarEdgeDefaultsToLeftWhenMissing() {
+        let defaults = makeIsolatedDefaults()
+
+        XCTAssertEqual(
+            SettingsStore.restoredAssistantCompactSidebarEdge(defaults: defaults),
+            .left
+        )
+    }
+
+    func testAssistantCompactSidebarEdgeRestoresStoredRightValue() {
+        let defaults = makeIsolatedDefaults()
+        defaults.set("right", forKey: "OpenAssist.assistantCompactSidebarEdge")
+
+        XCTAssertEqual(
+            SettingsStore.restoredAssistantCompactSidebarEdge(defaults: defaults),
+            .right
+        )
+    }
+
+    func testAssistantCompactSidebarPinnedDefaultsToFalseWhenMissing() {
+        let defaults = makeIsolatedDefaults()
+
+        XCTAssertFalse(
+            SettingsStore.restoredAssistantCompactSidebarPinned(defaults: defaults)
+        )
+    }
+
+    func testAssistantCompactSidebarPinnedRestoresStoredTrueValue() {
+        let defaults = makeIsolatedDefaults()
+        defaults.set(true, forKey: "OpenAssist.assistantCompactSidebarPinned")
+
+        XCTAssertTrue(
+            SettingsStore.restoredAssistantCompactSidebarPinned(defaults: defaults)
         )
     }
 

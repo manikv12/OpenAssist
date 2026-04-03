@@ -148,6 +148,57 @@ final class CodexThreadRewriteServiceTests: XCTestCase {
         XCTAssertEqual(userTexts, ["Turn one"])
     }
 
+    func testEditableTurnsCollapseInlineAttachmentPayloadsToFilenameOnly() throws {
+        let homeDirectory = try makeTemporaryHomeDirectory()
+        let attachmentPayload = "[RES Internal Charter 3.26.26.docx]\n" + String(repeating: "UEsDBBQAAAAIA", count: 40)
+        try writeSession(
+            id: "rewrite-attachment",
+            dayPath: "2026/03/18",
+            in: homeDirectory,
+            lines: [
+                try sessionMetaLine(
+                    id: "rewrite-attachment",
+                    timestamp: "2026-03-18T10:00:00Z",
+                    cwd: "/Users/test/OpenAssist",
+                    source: "exec"
+                ),
+                try jsonLine([
+                    "timestamp": "2026-03-18T10:00:01Z",
+                    "type": "response_item",
+                    "payload": [
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            [
+                                "type": "input_text",
+                                "text": attachmentPayload
+                            ],
+                            [
+                                "type": "input_text",
+                                "text": "Summarize the charter."
+                            ]
+                        ]
+                    ]
+                ]),
+                try responseMessageLine(
+                    timestamp: "2026-03-18T10:00:02Z",
+                    role: "assistant",
+                    text: "Done."
+                )
+            ]
+        )
+
+        let catalog = CodexSessionCatalog(homeDirectory: homeDirectory)
+        let service = CodexThreadRewriteService(sessionCatalog: catalog)
+        let turns = try service.editableTurns(sessionID: "rewrite-attachment")
+
+        XCTAssertEqual(turns.count, 1)
+        XCTAssertEqual(
+            turns[0].text,
+            "[RES Internal Charter 3.26.26.docx]\n\nSummarize the charter."
+        )
+    }
+
     func testBeginEditLastTurnCanBeCanceledAndRestoresOriginalSession() throws {
         let homeDirectory = try makeTemporaryHomeDirectory()
         try writeSession(

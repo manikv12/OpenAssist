@@ -1,0 +1,1329 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Open Assist Sidebar Compact Mockup</title>
+    <style>
+      :root {
+        --bg: #080b11;
+        --bg-2: #0d1118;
+        --panel: rgba(17, 22, 31, 0.94);
+        --panel-strong: rgba(11, 15, 22, 0.98);
+        --surface: rgba(255, 255, 255, 0.038);
+        --surface-2: rgba(255, 255, 255, 0.056);
+        --stroke: rgba(255, 255, 255, 0.085);
+        --stroke-soft: rgba(255, 255, 255, 0.05);
+        --text: rgba(255, 255, 255, 0.96);
+        --muted: rgba(255, 255, 255, 0.58);
+        --muted-soft: rgba(255, 255, 255, 0.38);
+        --accent: #d3a35d;
+        --accent-soft: rgba(211, 163, 93, 0.16);
+        --accent-glow: rgba(211, 163, 93, 0.34);
+        --success: #68d391;
+        --danger: #f58d88;
+        --panel-width: min(540px, 38vw);
+        --edge-gap: 12px;
+        --side-sign: -1;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html,
+      body {
+        height: 100%;
+      }
+
+      body {
+        margin: 0;
+        overflow: hidden;
+        font-family:
+          "SF Pro Display",
+          "Neue Haas Grotesk Display Pro",
+          "Helvetica Neue",
+          sans-serif;
+        color: var(--text);
+        background:
+          radial-gradient(circle at 14% 20%, rgba(211, 163, 93, 0.08), transparent 24%),
+          radial-gradient(circle at 82% 12%, rgba(64, 94, 154, 0.14), transparent 30%),
+          linear-gradient(180deg, #0b1017 0%, #07090e 100%);
+      }
+
+      body.side-right {
+        --side-sign: 1;
+      }
+
+      .scene {
+        position: relative;
+        width: 100%;
+        height: 100%;
+        isolation: isolate;
+      }
+
+      .wallpaper {
+        position: absolute;
+        inset: 0;
+        background:
+          linear-gradient(180deg, rgba(255, 255, 255, 0.02), transparent 18%),
+          linear-gradient(90deg, rgba(255, 255, 255, 0.015) 1px, transparent 1px),
+          linear-gradient(rgba(255, 255, 255, 0.012) 1px, transparent 1px);
+        background-size: 100% 100%, 56px 56px, 56px 56px;
+        opacity: 0.42;
+        pointer-events: none;
+      }
+
+      .workspace-shadow {
+        position: absolute;
+        inset: 24px;
+        border-radius: 30px;
+        background:
+          radial-gradient(circle at center, rgba(255, 255, 255, 0.018), transparent 56%),
+          linear-gradient(180deg, rgba(255, 255, 255, 0.02), rgba(255, 255, 255, 0.008));
+        border: 1px solid rgba(255, 255, 255, 0.04);
+        box-shadow:
+          inset 0 1px 0 rgba(255, 255, 255, 0.04),
+          0 30px 120px rgba(0, 0, 0, 0.42);
+      }
+
+      .desktop-app {
+        position: absolute;
+        inset: 54px 70px 44px;
+        border-radius: 28px;
+        overflow: hidden;
+        background:
+          linear-gradient(180deg, rgba(255, 255, 255, 0.03), transparent 9%),
+          linear-gradient(180deg, #10141d 0%, #0a0d14 100%);
+        border: 1px solid rgba(255, 255, 255, 0.06);
+        box-shadow:
+          0 28px 80px rgba(0, 0, 0, 0.36),
+          inset 0 1px 0 rgba(255, 255, 255, 0.05);
+      }
+
+      .desktop-topbar {
+        height: 62px;
+        padding: 0 20px 0 18px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+        background: rgba(12, 16, 24, 0.88);
+      }
+
+      .desktop-brand {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+      }
+
+      .desktop-brand-mark {
+        width: 11px;
+        height: 11px;
+        border-radius: 999px;
+        background: linear-gradient(180deg, #e7ba79, #bb8743);
+        box-shadow: 0 0 18px var(--accent-glow);
+      }
+
+      .desktop-brand strong {
+        display: block;
+        font-size: 15px;
+        font-weight: 720;
+        letter-spacing: -0.02em;
+      }
+
+      .desktop-brand span {
+        display: block;
+        margin-top: 2px;
+        font-size: 11px;
+        color: var(--muted-soft);
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+
+      .desktop-search {
+        width: min(480px, 42vw);
+        height: 38px;
+        border-radius: 999px;
+        border: 1px solid rgba(255, 255, 255, 0.06);
+        background: rgba(255, 255, 255, 0.03);
+      }
+
+      .desktop-body {
+        display: grid;
+        grid-template-columns: 268px 1fr;
+        height: calc(100% - 62px);
+      }
+
+      .desktop-sidebar {
+        padding: 18px 16px;
+        background:
+          linear-gradient(180deg, rgba(255, 255, 255, 0.02), transparent 18%),
+          rgba(13, 17, 25, 0.76);
+        border-right: 1px solid rgba(255, 255, 255, 0.05);
+      }
+
+      .desktop-list-label {
+        font-size: 10px;
+        font-weight: 700;
+        letter-spacing: 0.16em;
+        text-transform: uppercase;
+        color: var(--muted-soft);
+        margin: 0 0 14px;
+      }
+
+      .desktop-list {
+        display: grid;
+        gap: 10px;
+      }
+
+      .desktop-row {
+        padding: 12px 13px;
+        border-radius: 16px;
+        background: rgba(255, 255, 255, 0.025);
+        border: 1px solid rgba(255, 255, 255, 0.04);
+      }
+
+      .desktop-row strong {
+        display: block;
+        font-size: 13px;
+        font-weight: 650;
+      }
+
+      .desktop-row span {
+        display: block;
+        margin-top: 5px;
+        font-size: 11px;
+        color: var(--muted);
+      }
+
+      .desktop-main {
+        position: relative;
+        padding: 24px 26px;
+      }
+
+      .desktop-main::after {
+        content: "";
+        position: absolute;
+        inset: auto 22px 22px;
+        height: 88px;
+        border-radius: 20px;
+        border: 1px solid rgba(255, 255, 255, 0.05);
+        background: rgba(255, 255, 255, 0.025);
+      }
+
+      .desktop-chat {
+        max-width: 720px;
+        display: grid;
+        gap: 18px;
+      }
+
+      .desktop-msg {
+        max-width: 86%;
+        padding: 18px 19px;
+        border-radius: 22px;
+        line-height: 1.55;
+        font-size: 14px;
+      }
+
+      .desktop-msg.user {
+        justify-self: end;
+        background: rgba(255, 255, 255, 0.05);
+        border: 1px solid rgba(255, 255, 255, 0.05);
+      }
+
+      .desktop-msg.assistant {
+        background: rgba(211, 163, 93, 0.08);
+        border: 1px solid rgba(211, 163, 93, 0.14);
+      }
+
+      .stage-copy {
+        position: absolute;
+        top: 30px;
+        left: 50%;
+        transform: translateX(-50%);
+        width: min(680px, calc(100vw - 180px));
+        text-align: center;
+        z-index: 3;
+        pointer-events: none;
+      }
+
+      .kicker {
+        margin: 0;
+        font-size: 10px;
+        letter-spacing: 0.22em;
+        text-transform: uppercase;
+        color: rgba(255, 255, 255, 0.5);
+        font-weight: 700;
+      }
+
+      .headline {
+        margin: 12px 0 0;
+        font-size: clamp(34px, 5vw, 62px);
+        line-height: 0.94;
+        letter-spacing: -0.055em;
+        font-weight: 760;
+      }
+
+      .subcopy {
+        margin: 16px auto 0;
+        max-width: 520px;
+        font-size: 15px;
+        line-height: 1.6;
+        color: var(--muted);
+      }
+
+      .demo-controls {
+        position: absolute;
+        top: 28px;
+        right: 30px;
+        display: flex;
+        gap: 10px;
+        z-index: 5;
+      }
+
+      .demo-button {
+        appearance: none;
+        border: 1px solid var(--stroke);
+        background: rgba(10, 14, 21, 0.72);
+        color: var(--text);
+        font: inherit;
+        font-size: 12px;
+        font-weight: 650;
+        border-radius: 999px;
+        padding: 10px 14px;
+        cursor: pointer;
+        transition:
+          transform 160ms ease,
+          border-color 160ms ease,
+          background 160ms ease;
+      }
+
+      .demo-button:hover {
+        transform: translateY(-1px);
+        border-color: rgba(255, 255, 255, 0.16);
+        background: rgba(15, 20, 29, 0.92);
+      }
+
+      .compact-shell {
+        position: absolute;
+        top: 50%;
+        height: min(84vh, 920px);
+        width: var(--panel-width);
+        transform: translateY(-50%);
+        z-index: 4;
+      }
+
+      .compact-shell.left {
+        left: var(--edge-gap);
+      }
+
+      .compact-shell.right {
+        right: var(--edge-gap);
+      }
+
+      .compact-panel {
+        position: absolute;
+        inset: 0;
+        border-radius: 28px;
+        overflow: hidden;
+        background:
+          radial-gradient(circle at 0% 0%, rgba(211, 163, 93, 0.08), transparent 22%),
+          linear-gradient(180deg, rgba(255, 255, 255, 0.045), rgba(255, 255, 255, 0.012)),
+          linear-gradient(180deg, rgba(18, 23, 31, 0.96), rgba(10, 14, 21, 0.985));
+        border: 1px solid rgba(255, 255, 255, 0.085);
+        box-shadow:
+          0 35px 90px rgba(0, 0, 0, 0.52),
+          0 8px 28px rgba(0, 0, 0, 0.26),
+          inset 0 1px 0 rgba(255, 255, 255, 0.05);
+        transition:
+          transform 240ms cubic-bezier(0.2, 0.8, 0.2, 1),
+          opacity 180ms ease,
+          filter 180ms ease;
+      }
+
+      body.side-left .compact-panel {
+        transform: translateX(calc(-100% - 26px));
+      }
+
+      body.side-right .compact-panel {
+        transform: translateX(calc(100% + 26px));
+      }
+
+      body.panel-open .compact-panel {
+        transform: translateX(0);
+      }
+
+      body:not(.panel-open) .compact-panel {
+        opacity: 0.92;
+        filter: saturate(0.9);
+      }
+
+      .edge-handle {
+        position: absolute;
+        top: 50%;
+        width: 19px;
+        height: 118px;
+        border-radius: 999px;
+        transform: translateY(-50%);
+        border: 1px solid rgba(255, 255, 255, 0.07);
+        background:
+          linear-gradient(180deg, rgba(255, 255, 255, 0.07), rgba(255, 255, 255, 0.03)),
+          rgba(24, 29, 38, 0.92);
+        box-shadow:
+          0 12px 24px rgba(0, 0, 0, 0.34),
+          0 0 0 1px rgba(255, 255, 255, 0.03),
+          0 0 24px rgba(211, 163, 93, 0.18);
+        display: grid;
+        place-items: center;
+        cursor: pointer;
+        transition:
+          transform 180ms ease,
+          box-shadow 180ms ease,
+          background 180ms ease;
+      }
+
+      .compact-shell.left .edge-handle {
+        left: -8px;
+      }
+
+      .compact-shell.right .edge-handle {
+        right: -8px;
+      }
+
+      .edge-handle:hover {
+        transform: translateY(-50%) scale(1.02);
+        box-shadow:
+          0 14px 28px rgba(0, 0, 0, 0.42),
+          0 0 30px rgba(211, 163, 93, 0.28);
+      }
+
+      .edge-core {
+        position: relative;
+        width: 7px;
+        height: 70px;
+        border-radius: 999px;
+        background: linear-gradient(180deg, rgba(255, 255, 255, 0.3), rgba(255, 255, 255, 0.08));
+      }
+
+      .edge-core::before,
+      .edge-core::after {
+        content: "";
+        position: absolute;
+        left: 50%;
+        width: 0;
+        height: 0;
+        transform: translateX(-50%);
+        border-top: 5px solid transparent;
+        border-bottom: 5px solid transparent;
+      }
+
+      .compact-shell.left .edge-core::before,
+      .compact-shell.left .edge-core::after {
+        border-left: 6px solid var(--accent);
+      }
+
+      .compact-shell.right .edge-core::before,
+      .compact-shell.right .edge-core::after {
+        border-right: 6px solid var(--accent);
+      }
+
+      .edge-core::before {
+        top: 18px;
+      }
+
+      .edge-core::after {
+        bottom: 18px;
+      }
+
+      .edge-status {
+        position: absolute;
+        bottom: 14px;
+        left: 50%;
+        transform: translateX(-50%);
+        width: 6px;
+        height: 6px;
+        border-radius: 999px;
+        background: var(--success);
+        box-shadow: 0 0 10px rgba(104, 211, 145, 0.45);
+      }
+
+      .compact-topbar {
+        height: 70px;
+        padding: 0 18px 0 20px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.055);
+        background: rgba(10, 14, 21, 0.6);
+        backdrop-filter: blur(18px);
+      }
+
+      .compact-title {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+      }
+
+      .compact-title-mark {
+        width: 10px;
+        height: 10px;
+        border-radius: 999px;
+        background: linear-gradient(180deg, #e5b874, #bf8b48);
+        box-shadow: 0 0 16px rgba(211, 163, 93, 0.38);
+      }
+
+      .compact-title-text strong {
+        display: block;
+        font-size: 16px;
+        font-weight: 730;
+        letter-spacing: -0.025em;
+      }
+
+      .compact-title-text span {
+        display: block;
+        margin-top: 2px;
+        font-size: 11px;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+        color: var(--muted-soft);
+      }
+
+      .compact-actions {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+
+      .dot-btn {
+        width: 30px;
+        height: 30px;
+        border-radius: 999px;
+        border: 1px solid rgba(255, 255, 255, 0.06);
+        background: rgba(255, 255, 255, 0.032);
+      }
+
+      .compact-grid {
+        display: grid;
+        grid-template-rows: auto 1fr auto;
+        height: calc(100% - 70px);
+      }
+
+      .mode-strip {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 14px 18px 12px;
+      }
+
+      .mode-pill {
+        padding: 8px 12px;
+        border-radius: 999px;
+        border: 1px solid rgba(255, 255, 255, 0.06);
+        background: rgba(255, 255, 255, 0.03);
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 0.09em;
+        text-transform: uppercase;
+        color: var(--muted);
+      }
+
+      .mode-pill.active {
+        color: #1f1408;
+        background: linear-gradient(180deg, #ddb374, #c89350);
+        border-color: rgba(219, 174, 111, 0.6);
+      }
+
+      .sidebar-chat-layout {
+        display: grid;
+        grid-template-columns: 182px 1fr;
+        min-height: 0;
+        overflow: hidden;
+        border-top: 1px solid rgba(255, 255, 255, 0.04);
+        border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+      }
+
+      .thread-rail {
+        min-height: 0;
+        padding: 16px 12px 16px 16px;
+        border-right: 1px solid rgba(255, 255, 255, 0.045);
+        background: rgba(255, 255, 255, 0.02);
+      }
+
+      .rail-label {
+        font-size: 10px;
+        letter-spacing: 0.16em;
+        text-transform: uppercase;
+        color: var(--muted-soft);
+        font-weight: 700;
+        margin-bottom: 12px;
+      }
+
+      .thread-list {
+        display: grid;
+        gap: 8px;
+      }
+
+      .thread-item {
+        padding: 11px 12px;
+        border-radius: 16px;
+        border: 1px solid transparent;
+        background: transparent;
+      }
+
+      .thread-item.active {
+        background: rgba(211, 163, 93, 0.08);
+        border-color: rgba(211, 163, 93, 0.14);
+      }
+
+      .thread-item strong {
+        display: block;
+        font-size: 12px;
+        font-weight: 650;
+        letter-spacing: -0.01em;
+      }
+
+      .thread-item span {
+        display: block;
+        margin-top: 4px;
+        font-size: 10px;
+        color: var(--muted);
+        line-height: 1.45;
+      }
+
+      .chat-pane {
+        min-height: 0;
+        background: linear-gradient(180deg, rgba(255, 255, 255, 0.012), transparent 18%);
+        overflow: hidden;
+      }
+
+      .panel-view {
+        height: 100%;
+        min-height: 0;
+      }
+
+      .chat-view {
+        display: grid;
+        grid-template-rows: 1fr auto;
+      }
+
+      .notes-view {
+        display: none;
+        grid-template-rows: auto 1fr auto;
+      }
+
+      body.notes-mode .chat-view {
+        display: none;
+      }
+
+      body.notes-mode .notes-view {
+        display: grid;
+      }
+
+      .chat-scroll {
+        overflow: auto;
+        padding: 18px 18px 14px;
+      }
+
+      .chat-scroll::-webkit-scrollbar {
+        width: 10px;
+      }
+
+      .chat-scroll::-webkit-scrollbar-thumb {
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.08);
+        border: 2px solid transparent;
+        background-clip: padding-box;
+      }
+
+      .chat-meta {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin-bottom: 16px;
+      }
+
+      .chat-meta h2 {
+        margin: 0;
+        font-size: 18px;
+        letter-spacing: -0.03em;
+      }
+
+      .chat-meta span {
+        font-size: 12px;
+        color: var(--muted);
+      }
+
+      .chat-stream {
+        display: grid;
+        gap: 14px;
+      }
+
+      .notes-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 18px 18px 10px;
+      }
+
+      .notes-header h2 {
+        margin: 0;
+        font-size: 18px;
+        letter-spacing: -0.03em;
+      }
+
+      .notes-header span {
+        font-size: 12px;
+        color: var(--muted);
+      }
+
+      .note-owner-strip {
+        display: flex;
+        gap: 8px;
+        padding: 0 18px 14px;
+      }
+
+      .note-owner-pill {
+        padding: 8px 12px;
+        border-radius: 999px;
+        border: 1px solid rgba(255, 255, 255, 0.06);
+        background: rgba(255, 255, 255, 0.03);
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        color: var(--muted);
+      }
+
+      .note-owner-pill.active {
+        color: #1f1408;
+        background: linear-gradient(180deg, #ddb374, #c89350);
+        border-color: rgba(219, 174, 111, 0.6);
+      }
+
+      .notes-scroll {
+        overflow: auto;
+        padding: 0 18px 16px;
+      }
+
+      .notes-scroll::-webkit-scrollbar {
+        width: 10px;
+      }
+
+      .notes-scroll::-webkit-scrollbar-thumb {
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.08);
+        border: 2px solid transparent;
+        background-clip: padding-box;
+      }
+
+      .note-canvas {
+        min-height: 100%;
+        border-radius: 24px;
+        border: 1px solid rgba(255, 255, 255, 0.055);
+        background:
+          linear-gradient(180deg, rgba(255, 255, 255, 0.04), rgba(255, 255, 255, 0.018)),
+          rgba(10, 14, 21, 0.55);
+        padding: 18px 18px 20px;
+      }
+
+      .note-meta-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        margin-bottom: 14px;
+      }
+
+      .note-meta-row strong {
+        font-size: 13px;
+        letter-spacing: -0.01em;
+      }
+
+      .note-meta-row span {
+        font-size: 11px;
+        color: var(--accent);
+      }
+
+      .note-section {
+        margin-top: 16px;
+      }
+
+      .note-section h3 {
+        margin: 0 0 8px;
+        font-size: 11px;
+        letter-spacing: 0.16em;
+        text-transform: uppercase;
+        color: var(--muted-soft);
+      }
+
+      .note-section p,
+      .note-section li {
+        font-size: 13px;
+        line-height: 1.65;
+        color: rgba(255, 255, 255, 0.86);
+      }
+
+      .note-section ul {
+        margin: 0;
+        padding-left: 18px;
+      }
+
+      .note-tools {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 0 18px 16px;
+      }
+
+      .note-tools .composer-tools {
+        flex-wrap: wrap;
+      }
+
+      .message {
+        max-width: 94%;
+        padding: 15px 16px;
+        border-radius: 20px;
+        font-size: 13px;
+        line-height: 1.6;
+        letter-spacing: -0.01em;
+      }
+
+      .message.assistant {
+        background: rgba(255, 255, 255, 0.04);
+        border: 1px solid rgba(255, 255, 255, 0.055);
+      }
+
+      .message.user {
+        justify-self: end;
+        background: rgba(211, 163, 93, 0.11);
+        border: 1px solid rgba(211, 163, 93, 0.18);
+      }
+
+      .activity-strip {
+        margin-top: 16px;
+        padding: 14px 15px;
+        border-radius: 18px;
+        background:
+          linear-gradient(180deg, rgba(255, 255, 255, 0.04), rgba(255, 255, 255, 0.025)),
+          rgba(8, 11, 18, 0.55);
+        border: 1px solid rgba(255, 255, 255, 0.055);
+      }
+
+      .activity-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin-bottom: 10px;
+      }
+
+      .activity-head strong {
+        font-size: 12px;
+        text-transform: uppercase;
+        letter-spacing: 0.12em;
+        color: rgba(255, 255, 255, 0.74);
+      }
+
+      .activity-head span {
+        font-size: 11px;
+        color: var(--accent);
+      }
+
+      .activity-list {
+        display: grid;
+        gap: 9px;
+      }
+
+      .activity-row {
+        display: grid;
+        grid-template-columns: 8px 1fr auto;
+        gap: 10px;
+        align-items: center;
+      }
+
+      .activity-dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 999px;
+        background: var(--accent);
+        box-shadow: 0 0 12px rgba(211, 163, 93, 0.26);
+      }
+
+      .activity-row strong {
+        display: block;
+        font-size: 12px;
+        font-weight: 620;
+      }
+
+      .activity-row span {
+        font-size: 11px;
+        color: var(--muted);
+      }
+
+      .composer {
+        padding: 14px 16px 16px;
+        background: rgba(10, 14, 21, 0.72);
+        backdrop-filter: blur(16px);
+      }
+
+      .composer-box {
+        border-radius: 22px;
+        border: 1px solid rgba(255, 255, 255, 0.06);
+        background: rgba(255, 255, 255, 0.03);
+        padding: 14px 14px 12px;
+      }
+
+      .composer-draft {
+        min-height: 62px;
+        font-size: 14px;
+        line-height: 1.55;
+        color: rgba(255, 255, 255, 0.88);
+      }
+
+      .composer-draft .ghost {
+        color: var(--muted);
+      }
+
+      .composer-bar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        margin-top: 12px;
+      }
+
+      .composer-tools {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+
+      .tiny-pill,
+      .send-btn {
+        border-radius: 999px;
+        border: 1px solid rgba(255, 255, 255, 0.06);
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+
+      .tiny-pill {
+        padding: 8px 10px;
+        color: var(--muted);
+        background: rgba(255, 255, 255, 0.03);
+      }
+
+      .send-btn {
+        padding: 10px 14px;
+        color: #1e1308;
+        background: linear-gradient(180deg, #e3b978, #c48f49);
+        border-color: rgba(227, 185, 120, 0.72);
+        box-shadow: 0 10px 20px rgba(196, 143, 73, 0.22);
+      }
+
+      .legend {
+        position: absolute;
+        left: 30px;
+        bottom: 26px;
+        z-index: 3;
+        display: flex;
+        gap: 10px;
+        flex-wrap: wrap;
+        max-width: min(760px, calc(100vw - 120px));
+      }
+
+      .legend-chip {
+        padding: 8px 12px;
+        border-radius: 999px;
+        background: rgba(9, 12, 18, 0.7);
+        border: 1px solid rgba(255, 255, 255, 0.06);
+        font-size: 12px;
+        color: var(--muted);
+      }
+
+      @media (max-width: 1200px) {
+        :root {
+          --panel-width: min(520px, 44vw);
+        }
+
+        .desktop-app {
+          inset: 92px 36px 30px;
+        }
+
+        .stage-copy {
+          top: 82px;
+        }
+      }
+
+      @media (max-width: 920px) {
+        :root {
+          --panel-width: min(540px, calc(100vw - 28px));
+        }
+
+        .desktop-app {
+          display: none;
+        }
+
+        .stage-copy {
+          top: 96px;
+          width: calc(100vw - 34px);
+        }
+
+        .headline {
+          font-size: 38px;
+        }
+
+        .compact-shell {
+          height: calc(100vh - 162px);
+          top: 138px;
+          transform: none;
+        }
+
+        .compact-shell.left {
+          left: 14px;
+        }
+
+        .compact-shell.right {
+          right: 14px;
+        }
+
+        body.side-left .compact-panel {
+          transform: translateX(calc(-100% - 18px));
+        }
+
+        body.side-right .compact-panel {
+          transform: translateX(calc(100% + 18px));
+        }
+
+        .sidebar-chat-layout {
+          grid-template-columns: 1fr;
+        }
+
+        .thread-rail {
+          display: none;
+        }
+
+        .legend {
+          left: 16px;
+          right: 16px;
+          bottom: 16px;
+          max-width: none;
+        }
+      }
+    </style>
+  </head>
+  <body class="side-left panel-open">
+    <div class="scene">
+      <div class="wallpaper"></div>
+      <div class="workspace-shadow"></div>
+
+      <div class="stage-copy">
+        <p class="kicker">Compact Assistant Concept</p>
+        <h1 class="headline">The chat window, pulled to the screen edge.</h1>
+        <p class="subcopy">
+          A thin arrow stays pinned to the Mac screen. Click it and the full assistant workspace
+          glides out, ready for threads, tools, approvals, chat, and note mode.
+        </p>
+      </div>
+
+      <div class="demo-controls">
+        <button class="demo-button" id="toggle-side">Move to right</button>
+        <button class="demo-button" id="toggle-notes">Show note mode</button>
+        <button class="demo-button" id="toggle-panel">Close panel</button>
+      </div>
+
+      <div class="desktop-app" aria-hidden="true">
+        <div class="desktop-topbar">
+          <div class="desktop-brand">
+            <div class="desktop-brand-mark"></div>
+            <div>
+              <strong>Open Assist</strong>
+              <span>Assistant window</span>
+            </div>
+          </div>
+          <div class="desktop-search"></div>
+        </div>
+        <div class="desktop-body">
+          <aside class="desktop-sidebar">
+            <p class="desktop-list-label">Projects</p>
+            <div class="desktop-list">
+              <div class="desktop-row">
+                <strong>Open Assist Core</strong>
+                <span>6 active threads</span>
+              </div>
+              <div class="desktop-row">
+                <strong>UI Notes</strong>
+                <span>Sidebar ideas and compact flows</span>
+              </div>
+              <div class="desktop-row">
+                <strong>Automation</strong>
+                <span>Recurring jobs and approvals</span>
+              </div>
+            </div>
+          </aside>
+          <main class="desktop-main">
+            <div class="desktop-chat">
+              <div class="desktop-msg user">
+                Can you make the compact assistant open as a sidebar from the edge instead of the
+                notch HUD?
+              </div>
+              <div class="desktop-msg assistant">
+                Yes. We can treat it as a third compact mode and reuse the same assistant chat
+                surfaces, but present them as a slide-out edge panel.
+              </div>
+            </div>
+          </main>
+        </div>
+      </div>
+
+      <section class="compact-shell left" id="compact-shell">
+        <button class="edge-handle" id="edge-handle" aria-label="Toggle sidebar assistant">
+          <div class="edge-core"></div>
+          <div class="edge-status"></div>
+        </button>
+
+        <div class="compact-panel">
+          <div class="compact-topbar">
+            <div class="compact-title">
+              <div class="compact-title-mark"></div>
+              <div class="compact-title-text">
+                <strong>Open Assist</strong>
+                <span>Sidebar compact mode</span>
+              </div>
+            </div>
+            <div class="compact-actions">
+              <div class="dot-btn"></div>
+              <div class="dot-btn"></div>
+              <div class="dot-btn"></div>
+            </div>
+          </div>
+
+          <div class="compact-grid">
+            <div class="mode-strip">
+              <div class="mode-pill active">Threads</div>
+              <div class="mode-pill">Skills</div>
+              <div class="mode-pill">Jobs</div>
+            </div>
+
+            <div class="sidebar-chat-layout">
+              <aside class="thread-rail">
+                <div class="rail-label">Today</div>
+                <div class="thread-list">
+                  <div class="thread-item active">
+                    <strong>Sidebar compact plan</strong>
+                    <span>Current thread · active work visible</span>
+                  </div>
+                  <div class="thread-item">
+                    <strong>Approval flow cleanup</strong>
+                    <span>2 hours ago · waiting review</span>
+                  </div>
+                  <div class="thread-item">
+                    <strong>Voice task dock</strong>
+                    <span>Yesterday · listening handoff</span>
+                  </div>
+                  <div class="thread-item">
+                    <strong>Window reuse audit</strong>
+                    <span>Archived pieces to reuse safely</span>
+                  </div>
+                </div>
+              </aside>
+
+              <div class="chat-pane">
+                <div class="panel-view chat-view">
+                  <div class="chat-scroll">
+                    <div class="chat-meta">
+                      <h2>Sidebar compact plan</h2>
+                      <span>Codex · Agent mode</span>
+                    </div>
+
+                    <div class="chat-stream">
+                      <div class="message user">
+                        Can we make the compact assistant live on the side, with an arrow handle and
+                        the chat sliding out from there?
+                      </div>
+
+                      <div class="message assistant">
+                        Yes. The clean version is to keep Orb and Notch, then add Sidebar as a third
+                        compact mode. The handle stays on the screen edge, and the assistant opens as
+                        a slim full-height workspace using the same chat surface.
+                      </div>
+
+                      <div class="message assistant">
+                        This lets users switch threads, review active tool work, answer approvals,
+                        and keep chatting without opening the large main window.
+                      </div>
+                    </div>
+
+                    <div class="activity-strip">
+                      <div class="activity-head">
+                        <strong>Active Work</strong>
+                        <span>Streaming live</span>
+                      </div>
+                      <div class="activity-list">
+                        <div class="activity-row">
+                          <div class="activity-dot"></div>
+                          <div>
+                            <strong>Updating compact presenter</strong>
+                            <span>adding sidebar as a new display style</span>
+                          </div>
+                          <span>running</span>
+                        </div>
+                        <div class="activity-row">
+                          <div class="activity-dot"></div>
+                          <div>
+                            <strong>Reusing assistant web views</strong>
+                            <span>same threads, same composer, same message timeline</span>
+                          </div>
+                          <span>ready</span>
+                        </div>
+                        <div class="activity-row">
+                          <div class="activity-dot"></div>
+                          <div>
+                            <strong>Keeping left or right placement</strong>
+                            <span>user chooses the edge and the app remembers it</span>
+                          </div>
+                          <span>queued</span>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div class="composer">
+                    <div class="composer-box">
+                      <div class="composer-draft">
+                        <span class="ghost">Ask Open Assist to refine the sidebar mode, explain a plan, or run a task…</span>
+                      </div>
+                      <div class="composer-bar">
+                        <div class="composer-tools">
+                          <div class="tiny-pill">Plan</div>
+                          <div class="tiny-pill">Attach</div>
+                          <div class="tiny-pill">Voice</div>
+                        </div>
+                        <button class="send-btn">Send</button>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="panel-view notes-view">
+                  <div class="notes-header">
+                    <h2>Thread notes</h2>
+                    <span>Autosaved 12s ago</span>
+                  </div>
+
+                  <div class="note-owner-strip">
+                    <div class="note-owner-pill active">Thread</div>
+                    <div class="note-owner-pill">Project</div>
+                  </div>
+
+                  <div class="notes-scroll">
+                    <div class="note-canvas">
+                      <div class="note-meta-row">
+                        <strong>Sidebar compact mode</strong>
+                        <span>AI draft available</span>
+                      </div>
+
+                      <div class="note-section">
+                        <h3>Goal</h3>
+                        <p>
+                          Add a third compact assistant style that lives on the screen edge and reuses
+                          the main assistant workspace instead of rebuilding a second chat UI.
+                        </p>
+                      </div>
+
+                      <div class="note-section">
+                        <h3>Decisions</h3>
+                        <ul>
+                          <li>Keep Orb and Notch as existing modes.</li>
+                          <li>Use a left or right edge handle that remembers the user preference.</li>
+                          <li>Reuse the same thread, chat, tool, approval, and note surfaces.</li>
+                        </ul>
+                      </div>
+
+                      <div class="note-section">
+                        <h3>Next Steps</h3>
+                        <ul>
+                          <li>Finish sidebar panel behavior and outside-click dismissal.</li>
+                          <li>Make the compact top bar open the full assistant window.</li>
+                          <li>Verify thread notes and project notes inside the sidebar view.</li>
+                        </ul>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div class="note-tools">
+                    <div class="composer-tools">
+                      <div class="tiny-pill">Save</div>
+                      <div class="tiny-pill">AI Draft</div>
+                      <div class="tiny-pill">Chart</div>
+                    </div>
+                    <button class="send-btn">Open Full</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="mode-strip" style="justify-content: space-between; padding-top: 10px;">
+              <span style="font-size: 12px; color: var(--muted);">Click the edge handle to collapse. Use the top buttons to move sides.</span>
+              <span style="font-size: 12px; color: var(--accent);">Open full assistant ↗</span>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <div class="legend">
+        <div class="legend-chip">Thin edge arrow stays visible</div>
+        <div class="legend-chip">Slide-out panel reuses assistant chat layout</div>
+        <div class="legend-chip">Active work and approvals stay inside the drawer</div>
+        <div class="legend-chip">Thread notes and project notes fit in the same drawer</div>
+        <div class="legend-chip">User can pin it left or right</div>
+      </div>
+    </div>
+
+    <script>
+      const body = document.body;
+      const shell = document.getElementById("compact-shell");
+      const toggleSide = document.getElementById("toggle-side");
+      const toggleNotes = document.getElementById("toggle-notes");
+      const togglePanel = document.getElementById("toggle-panel");
+      const edgeHandle = document.getElementById("edge-handle");
+
+      function syncButtons() {
+        const isRight = body.classList.contains("side-right");
+        const isOpen = body.classList.contains("panel-open");
+        const isNotesMode = body.classList.contains("notes-mode");
+
+        toggleSide.textContent = isRight ? "Move to left" : "Move to right";
+        toggleNotes.textContent = isNotesMode ? "Show chat mode" : "Show note mode";
+        togglePanel.textContent = isOpen ? "Close panel" : "Open panel";
+
+        shell.classList.toggle("left", !isRight);
+        shell.classList.toggle("right", isRight);
+      }
+
+      toggleSide.addEventListener("click", () => {
+        body.classList.toggle("side-right");
+        body.classList.toggle("side-left");
+        syncButtons();
+      });
+
+      toggleNotes.addEventListener("click", () => {
+        body.classList.toggle("notes-mode");
+        syncButtons();
+      });
+
+      function togglePanelState() {
+        body.classList.toggle("panel-open");
+        syncButtons();
+      }
+
+      togglePanel.addEventListener("click", togglePanelState);
+      edgeHandle.addEventListener("click", togglePanelState);
+
+      syncButtons();
+    </script>
+  </body>
+</html>

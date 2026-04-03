@@ -248,6 +248,7 @@ enum AppChromeStyle: String, CaseIterable, Identifiable {
 enum AssistantCompactPresentationStyle: String, CaseIterable, Identifiable, Codable {
     case orb = "orb"
     case notch = "notch"
+    case sidebar = "sidebar"
 
     var id: Self { self }
 
@@ -257,6 +258,24 @@ enum AssistantCompactPresentationStyle: String, CaseIterable, Identifiable, Coda
             return "Orb"
         case .notch:
             return "Notch"
+        case .sidebar:
+            return "Sidebar"
+        }
+    }
+}
+
+enum AssistantCompactSidebarEdge: String, CaseIterable, Identifiable, Codable {
+    case left = "left"
+    case right = "right"
+
+    var id: Self { self }
+
+    var displayName: String {
+        switch self {
+        case .left:
+            return "Left"
+        case .right:
+            return "Right"
         }
     }
 }
@@ -551,6 +570,8 @@ final class SettingsStore: ObservableObject {
         static let continuousToggleShortcutModifiers = "OpenAssist.continuousToggleShortcutModifiers"
         static let assistantLiveVoiceShortcutKeyCode = "OpenAssist.assistantLiveVoiceShortcutKeyCode"
         static let assistantLiveVoiceShortcutModifiers = "OpenAssist.assistantLiveVoiceShortcutModifiers"
+        static let assistantCompactShortcutKeyCode = "OpenAssist.assistantCompactShortcutKeyCode"
+        static let assistantCompactShortcutModifiers = "OpenAssist.assistantCompactShortcutModifiers"
         static let autoDetectMicrophone = "OpenAssist.autoDetectMicrophone"
         static let selectedMicrophoneUID = "OpenAssist.selectedMicrophoneUID"
         static let copyToClipboard = "OpenAssist.copyToClipboard"
@@ -635,6 +656,8 @@ final class SettingsStore: ObservableObject {
         static let assistantVoiceTaskEntryEnabled = "OpenAssist.assistantVoiceTaskEntryEnabled"
         static let assistantFloatingHUDEnabled = "OpenAssist.assistantFloatingHUDEnabled"
         static let assistantCompactPresentationStyle = "OpenAssist.assistantCompactPresentationStyle"
+        static let assistantCompactSidebarEdge = "OpenAssist.assistantCompactSidebarEdge"
+        static let assistantCompactSidebarPinned = "OpenAssist.assistantCompactSidebarPinned"
         static let assistantNotchHoverDelay = "OpenAssist.assistantNotchHoverDelay"
         static let assistantBetaWarningAcknowledged = "OpenAssist.assistantBetaWarningAcknowledged"
         static let assistantVoiceOutputEnabled = "OpenAssist.assistantVoiceOutputEnabled"
@@ -666,6 +689,8 @@ final class SettingsStore: ObservableObject {
         static let assistantMemoryEnabled = "OpenAssist.assistantMemoryEnabled"
         static let assistantMemoryReviewEnabled = "OpenAssist.assistantMemoryReviewEnabled"
         static let assistantMemorySummaryMaxChars = "OpenAssist.assistantMemorySummaryMaxChars"
+        static let assistantNotesBackupFolderPath = "OpenAssist.assistantNotesBackupFolderPath"
+        static let assistantNotesLastSuccessfulBackupEpoch = "OpenAssist.assistantNotesLastSuccessfulBackupEpoch"
     }
 
     private enum ContinuousToggleDefaults {
@@ -675,6 +700,11 @@ final class SettingsStore: ObservableObject {
 
     private enum AssistantLiveVoiceShortcutDefaults {
         static let keyCode: UInt16 = 37 // L
+        static let modifiers: UInt = NSEvent.ModifierFlags([.command, .option, .control]).rawValue
+    }
+
+    private enum AssistantCompactShortcutDefaults {
+        static let keyCode: UInt16 = 1 // S
         static let modifiers: UInt = NSEvent.ModifierFlags([.command, .option, .control]).rawValue
     }
 
@@ -736,6 +766,18 @@ final class SettingsStore: ObservableObject {
     }
 
     @Published var assistantLiveVoiceShortcutModifiers: UInt {
+        didSet {
+            save()
+        }
+    }
+
+    @Published var assistantCompactShortcutKeyCode: UInt16 {
+        didSet {
+            save()
+        }
+    }
+
+    @Published var assistantCompactShortcutModifiers: UInt {
         didSet {
             save()
         }
@@ -1408,6 +1450,18 @@ final class SettingsStore: ObservableObject {
         }
     }
 
+    @Published var assistantCompactSidebarEdgeRawValue: String {
+        didSet {
+            save()
+        }
+    }
+
+    @Published var assistantCompactSidebarPinned: Bool {
+        didSet {
+            save()
+        }
+    }
+
     @Published var assistantNotchHoverDelayRawValue: String {
         didSet {
             save()
@@ -1674,6 +1728,18 @@ final class SettingsStore: ObservableObject {
         }
     }
 
+    @Published var assistantNotesBackupFolderPath: String {
+        didSet {
+            save()
+        }
+    }
+
+    @Published var assistantNotesLastSuccessfulBackupEpoch: Double {
+        didSet {
+            save()
+        }
+    }
+
     @Published var availableMicrophones: [MicrophoneOption] = []
     @Published var accessibilityTrusted: Bool = AXIsProcessTrusted()
 
@@ -1798,6 +1864,33 @@ final class SettingsStore: ObservableObject {
         )
         assistantLiveVoiceShortcutKeyCode = resolvedAssistantLiveVoiceShortcut.keyCode
         assistantLiveVoiceShortcutModifiers = resolvedAssistantLiveVoiceShortcut.modifiersRaw
+
+        let storedAssistantCompactShortcutKeyCode: UInt16
+        if defaults.object(forKey: Keys.assistantCompactShortcutKeyCode) == nil {
+            storedAssistantCompactShortcutKeyCode = AssistantCompactShortcutDefaults.keyCode
+        } else {
+            storedAssistantCompactShortcutKeyCode = UInt16(defaults.integer(forKey: Keys.assistantCompactShortcutKeyCode))
+        }
+
+        let storedAssistantCompactShortcutModifiersRaw: UInt
+        if defaults.object(forKey: Keys.assistantCompactShortcutModifiers) == nil {
+            storedAssistantCompactShortcutModifiersRaw = AssistantCompactShortcutDefaults.modifiers
+        } else {
+            storedAssistantCompactShortcutModifiersRaw = UInt(defaults.integer(forKey: Keys.assistantCompactShortcutModifiers))
+        }
+
+        let resolvedAssistantCompactShortcut = Self.resolveAssistantCompactShortcut(
+            keyCode: storedAssistantCompactShortcutKeyCode,
+            modifiersRaw: storedAssistantCompactShortcutModifiersRaw,
+            holdToTalkKeyCode: initialShortcutKeyCode,
+            holdToTalkModifiersRaw: ShortcutValidation.filteredModifierRawValue(from: initialShortcutModifiers),
+            continuousToggleKeyCode: resolvedContinuousToggle.keyCode,
+            continuousToggleModifiersRaw: resolvedContinuousToggle.modifiersRaw,
+            assistantLiveVoiceKeyCode: resolvedAssistantLiveVoiceShortcut.keyCode,
+            assistantLiveVoiceModifiersRaw: resolvedAssistantLiveVoiceShortcut.modifiersRaw
+        )
+        assistantCompactShortcutKeyCode = resolvedAssistantCompactShortcut.keyCode
+        assistantCompactShortcutModifiers = resolvedAssistantCompactShortcut.modifiersRaw
 
         if defaults.object(forKey: Keys.muteSystemSoundsWhileHoldingShortcut) == nil {
             muteSystemSoundsWhileHoldingShortcut = false
@@ -2267,6 +2360,14 @@ final class SettingsStore: ObservableObject {
             defaults: defaults
         ).rawValue
 
+        assistantCompactSidebarEdgeRawValue = Self.restoredAssistantCompactSidebarEdge(
+            defaults: defaults
+        ).rawValue
+
+        assistantCompactSidebarPinned = Self.restoredAssistantCompactSidebarPinned(
+            defaults: defaults
+        )
+
         assistantNotchHoverDelayRawValue = (
             AssistantNotchHoverDelay(
                 rawValue: defaults.string(forKey: Keys.assistantNotchHoverDelay) ?? ""
@@ -2410,6 +2511,11 @@ final class SettingsStore: ObservableObject {
         assistantMemorySummaryMaxChars = storedMemorySummaryMaxChars > 0
             ? min(max(storedMemorySummaryMaxChars, 400), 6_000)
             : 1_800
+        assistantNotesBackupFolderPath = defaults.string(forKey: Keys.assistantNotesBackupFolderPath)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        assistantNotesLastSuccessfulBackupEpoch = defaults.object(forKey: Keys.assistantNotesLastSuccessfulBackupEpoch) == nil
+            ? 0
+            : defaults.double(forKey: Keys.assistantNotesLastSuccessfulBackupEpoch)
 
         selectedMicrophoneUID = defaults.string(forKey: Keys.selectedMicrophoneUID) ?? ""
 
@@ -2471,6 +2577,8 @@ final class SettingsStore: ObservableObject {
         defaults.set(Int(ShortcutValidation.filteredModifierRawValue(from: continuousToggleShortcutModifiers)), forKey: Keys.continuousToggleShortcutModifiers)
         defaults.set(Int(assistantLiveVoiceShortcutKeyCode), forKey: Keys.assistantLiveVoiceShortcutKeyCode)
         defaults.set(Int(ShortcutValidation.filteredModifierRawValue(from: assistantLiveVoiceShortcutModifiers)), forKey: Keys.assistantLiveVoiceShortcutModifiers)
+        defaults.set(Int(assistantCompactShortcutKeyCode), forKey: Keys.assistantCompactShortcutKeyCode)
+        defaults.set(Int(ShortcutValidation.filteredModifierRawValue(from: assistantCompactShortcutModifiers)), forKey: Keys.assistantCompactShortcutModifiers)
         defaults.set(muteSystemSoundsWhileHoldingShortcut, forKey: Keys.muteSystemSoundsWhileHoldingShortcut)
         defaults.set(autoDetectMicrophone, forKey: Keys.autoDetectMicrophone)
         defaults.set(selectedMicrophoneUID, forKey: Keys.selectedMicrophoneUID)
@@ -2567,6 +2675,8 @@ final class SettingsStore: ObservableObject {
         defaults.set(assistantVoiceTaskEntryEnabled, forKey: Keys.assistantVoiceTaskEntryEnabled)
         defaults.set(assistantFloatingHUDEnabled, forKey: Keys.assistantFloatingHUDEnabled)
         defaults.set(assistantCompactPresentationStyleRawValue, forKey: Keys.assistantCompactPresentationStyle)
+        defaults.set(assistantCompactSidebarEdgeRawValue, forKey: Keys.assistantCompactSidebarEdge)
+        defaults.set(assistantCompactSidebarPinned, forKey: Keys.assistantCompactSidebarPinned)
         defaults.set(assistantNotchHoverDelayRawValue, forKey: Keys.assistantNotchHoverDelay)
         defaults.set(assistantBetaWarningAcknowledged, forKey: Keys.assistantBetaWarningAcknowledged)
         defaults.set(assistantVoiceOutputEnabled, forKey: Keys.assistantVoiceOutputEnabled)
@@ -2609,6 +2719,14 @@ final class SettingsStore: ObservableObject {
         defaults.set(assistantMemoryEnabled, forKey: Keys.assistantMemoryEnabled)
         defaults.set(assistantMemoryReviewEnabled, forKey: Keys.assistantMemoryReviewEnabled)
         defaults.set(assistantMemorySummaryMaxChars, forKey: Keys.assistantMemorySummaryMaxChars)
+        defaults.set(
+            assistantNotesBackupFolderPath.trimmingCharacters(in: .whitespacesAndNewlines),
+            forKey: Keys.assistantNotesBackupFolderPath
+        )
+        defaults.set(
+            assistantNotesLastSuccessfulBackupEpoch,
+            forKey: Keys.assistantNotesLastSuccessfulBackupEpoch
+        )
 
         scheduleOnChangeNotificationIfNeeded()
     }
@@ -2640,6 +2758,25 @@ final class SettingsStore: ObservableObject {
             return .orb
         }
         return style
+    }
+
+    static func restoredAssistantCompactSidebarEdge(
+        defaults: UserDefaults = .standard
+    ) -> AssistantCompactSidebarEdge {
+        guard let storedValue = defaults.string(forKey: Keys.assistantCompactSidebarEdge),
+              let edge = AssistantCompactSidebarEdge(rawValue: storedValue) else {
+            return .left
+        }
+        return edge
+    }
+
+    static func restoredAssistantCompactSidebarPinned(
+        defaults: UserDefaults = .standard
+    ) -> Bool {
+        guard defaults.object(forKey: Keys.assistantCompactSidebarPinned) != nil else {
+            return false
+        }
+        return defaults.bool(forKey: Keys.assistantCompactSidebarPinned)
     }
 
     private func scheduleOnChangeNotificationIfNeeded() {
@@ -2683,6 +2820,10 @@ final class SettingsStore: ObservableObject {
         ShortcutValidation.filteredModifierFlags(from: assistantLiveVoiceShortcutModifiers)
     }
 
+    var assistantCompactShortcutModifierFlags: NSEvent.ModifierFlags {
+        ShortcutValidation.filteredModifierFlags(from: assistantCompactShortcutModifiers)
+    }
+
     var recognitionMode: RecognitionMode {
         get { RecognitionMode(rawValue: recognitionModeRawValue) ?? .localOnly }
         set { recognitionModeRawValue = newValue.rawValue }
@@ -2706,6 +2847,11 @@ final class SettingsStore: ObservableObject {
     var assistantCompactPresentationStyle: AssistantCompactPresentationStyle {
         get { AssistantCompactPresentationStyle(rawValue: assistantCompactPresentationStyleRawValue) ?? .orb }
         set { assistantCompactPresentationStyleRawValue = newValue.rawValue }
+    }
+
+    var assistantCompactSidebarEdge: AssistantCompactSidebarEdge {
+        get { AssistantCompactSidebarEdge(rawValue: assistantCompactSidebarEdgeRawValue) ?? .left }
+        set { assistantCompactSidebarEdgeRawValue = newValue.rawValue }
     }
 
     var assistantNotchHoverDelay: AssistantNotchHoverDelay {
@@ -4090,6 +4236,92 @@ final class SettingsStore: ObservableObject {
                 rhsModifiersRaw: PasteLastShortcut.modifiers
             )
             if !conflictsHold && !conflictsContinuous && !conflictsPasteLast {
+                return normalizedCandidate
+            }
+        }
+
+        return normalized
+    }
+
+    private static func resolveAssistantCompactShortcut(
+        keyCode: UInt16,
+        modifiersRaw: UInt,
+        holdToTalkKeyCode: UInt16,
+        holdToTalkModifiersRaw: UInt,
+        continuousToggleKeyCode: UInt16,
+        continuousToggleModifiersRaw: UInt,
+        assistantLiveVoiceKeyCode: UInt16,
+        assistantLiveVoiceModifiersRaw: UInt
+    ) -> (keyCode: UInt16, modifiersRaw: UInt) {
+        let normalized = normalizedShortcut(
+            keyCode: keyCode,
+            modifiersRaw: modifiersRaw,
+            defaultKeyCode: AssistantCompactShortcutDefaults.keyCode,
+            defaultModifiersRaw: AssistantCompactShortcutDefaults.modifiers
+        )
+
+        if !shortcutsConflict(
+            lhsKeyCode: normalized.keyCode,
+            lhsModifiersRaw: normalized.modifiersRaw,
+            rhsKeyCode: holdToTalkKeyCode,
+            rhsModifiersRaw: holdToTalkModifiersRaw
+        ) && !shortcutsConflict(
+            lhsKeyCode: normalized.keyCode,
+            lhsModifiersRaw: normalized.modifiersRaw,
+            rhsKeyCode: continuousToggleKeyCode,
+            rhsModifiersRaw: continuousToggleModifiersRaw
+        ) && !shortcutsConflict(
+            lhsKeyCode: normalized.keyCode,
+            lhsModifiersRaw: normalized.modifiersRaw,
+            rhsKeyCode: assistantLiveVoiceKeyCode,
+            rhsModifiersRaw: assistantLiveVoiceModifiersRaw
+        ) && !shortcutsConflict(
+            lhsKeyCode: normalized.keyCode,
+            lhsModifiersRaw: normalized.modifiersRaw,
+            rhsKeyCode: PasteLastShortcut.keyCode,
+            rhsModifiersRaw: PasteLastShortcut.modifiers
+        ) {
+            return normalized
+        }
+
+        let fallbacks: [(UInt16, UInt)] = [
+            (AssistantCompactShortcutDefaults.keyCode, AssistantCompactShortcutDefaults.modifiers),
+            (11, NSEvent.ModifierFlags([.command, .option, .control]).rawValue), // B
+            (40, NSEvent.ModifierFlags([.command, .option, .shift]).rawValue) // K
+        ]
+
+        for candidate in fallbacks {
+            let normalizedCandidate = normalizedShortcut(
+                keyCode: candidate.0,
+                modifiersRaw: candidate.1,
+                defaultKeyCode: AssistantCompactShortcutDefaults.keyCode,
+                defaultModifiersRaw: AssistantCompactShortcutDefaults.modifiers
+            )
+            let conflictsHold = shortcutsConflict(
+                lhsKeyCode: normalizedCandidate.keyCode,
+                lhsModifiersRaw: normalizedCandidate.modifiersRaw,
+                rhsKeyCode: holdToTalkKeyCode,
+                rhsModifiersRaw: holdToTalkModifiersRaw
+            )
+            let conflictsContinuous = shortcutsConflict(
+                lhsKeyCode: normalizedCandidate.keyCode,
+                lhsModifiersRaw: normalizedCandidate.modifiersRaw,
+                rhsKeyCode: continuousToggleKeyCode,
+                rhsModifiersRaw: continuousToggleModifiersRaw
+            )
+            let conflictsAssistantLiveVoice = shortcutsConflict(
+                lhsKeyCode: normalizedCandidate.keyCode,
+                lhsModifiersRaw: normalizedCandidate.modifiersRaw,
+                rhsKeyCode: assistantLiveVoiceKeyCode,
+                rhsModifiersRaw: assistantLiveVoiceModifiersRaw
+            )
+            let conflictsPasteLast = shortcutsConflict(
+                lhsKeyCode: normalizedCandidate.keyCode,
+                lhsModifiersRaw: normalizedCandidate.modifiersRaw,
+                rhsKeyCode: PasteLastShortcut.keyCode,
+                rhsModifiersRaw: PasteLastShortcut.modifiers
+            )
+            if !conflictsHold && !conflictsContinuous && !conflictsAssistantLiveVoice && !conflictsPasteLast {
                 return normalizedCandidate
             }
         }

@@ -173,12 +173,49 @@ export interface ThreadNoteAIDraftPreview {
   isError: boolean;
 }
 
+export interface ThreadNoteRelationshipItem {
+  ownerKind: "thread" | "project" | string;
+  ownerId: string;
+  noteId: string;
+  title: string;
+  sourceLabel: string;
+  isMissing: boolean;
+  occurrenceCount: number;
+}
+
+export interface ThreadNoteGraphState {
+  mermaidCode: string;
+  nodeCount: number;
+  edgeCount: number;
+}
+
+export interface ThreadNoteHistoryItem {
+  id: string;
+  title: string;
+  savedAtLabel: string;
+  preview: string;
+}
+
+export interface ThreadDeletedNoteItem {
+  id: string;
+  title: string;
+  deletedAtLabel: string;
+  preview: string;
+}
+
 export interface ThreadNoteState {
   threadId: string | null;
   ownerKind?: "thread" | "project" | string | null;
   ownerId?: string | null;
   ownerTitle: string;
   presentation: "drawer" | "projectFullScreen" | string;
+  notesScope?: "project" | "thread" | string | null;
+  workspaceProjectId?: string | null;
+  workspaceProjectTitle?: string | null;
+  workspaceOwnerSubtitle?: string | null;
+  canCreateNote?: boolean;
+  owningThreadId?: string | null;
+  owningThreadTitle?: string | null;
   availableSources: ThreadNoteSource[];
   notes: ThreadNoteItem[];
   selectedNoteId: string | null;
@@ -195,6 +232,13 @@ export interface ThreadNoteState {
   canEdit: boolean;
   placeholder: string;
   aiDraftPreview?: ThreadNoteAIDraftPreview | null;
+  outgoingLinks: ThreadNoteRelationshipItem[];
+  backlinks: ThreadNoteRelationshipItem[];
+  graph?: ThreadNoteGraphState | null;
+  canNavigateBack: boolean;
+  previousLinkedNoteTitle?: string | null;
+  historyVersions: ThreadNoteHistoryItem[];
+  recentlyDeletedNotes: ThreadDeletedNoteItem[];
 }
 
 export interface ScrollState {
@@ -203,7 +247,12 @@ export interface ScrollState {
   distanceFromTop: number;
 }
 
-export type AssistantSidebarPaneID = "threads" | "archived" | "automations" | "skills";
+export type AssistantSidebarPaneID =
+  | "threads"
+  | "notes"
+  | "archived"
+  | "automations"
+  | "skills";
 export type AssistantSidebarCollapsedPreviewPane =
   | AssistantSidebarPaneID
   | "projects";
@@ -247,6 +296,19 @@ export interface AssistantSidebarSessionItem {
   projectId?: string;
 }
 
+export interface AssistantSidebarNoteItem {
+  id: string;
+  noteId: string;
+  ownerKind: "thread" | "project" | string;
+  ownerId: string;
+  title: string;
+  subtitle: string;
+  sourceLabel: string;
+  isSelected: boolean;
+  isArchivedThread: boolean;
+  threadId?: string;
+}
+
 export interface AssistantSidebarState {
   projectFilterKind: "all" | "folder" | "project";
   projectFilterId?: string;
@@ -261,19 +323,26 @@ export interface AssistantSidebarState {
   threadsHelperText?: string;
   archivedTitle: string;
   archivedHelperText?: string;
+  notesTitle: string;
+  notesHelperText?: string;
   projectsExpanded: boolean;
   threadsExpanded: boolean;
   archivedExpanded: boolean;
+  notesExpanded: boolean;
   canLoadMoreThreads: boolean;
   canLoadMoreArchived: boolean;
   archivedCount: number;
   hiddenProjectCount: number;
+  selectedNotesProjectId?: string;
+  notesScope: "project" | "thread" | string;
+  canCreateProjectNote: boolean;
   navItems: AssistantSidebarNavItem[];
   allProjects: AssistantSidebarProjectItem[];
   hiddenProjects: AssistantSidebarHiddenProjectItem[];
   projects: AssistantSidebarProjectItem[];
   threads: AssistantSidebarSessionItem[];
   archived: AssistantSidebarSessionItem[];
+  notes: AssistantSidebarNoteItem[];
 }
 
 export interface AssistantComposerOption {

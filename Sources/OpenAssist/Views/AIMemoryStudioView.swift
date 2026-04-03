@@ -5813,17 +5813,20 @@ struct AIMemoryStudioView: View {
                     Toggle("Show compact assistant", isOn: $settings.assistantFloatingHUDEnabled)
 
                     if settings.assistantFloatingHUDEnabled {
-                        Toggle(
-                            "Use notch style",
-                            isOn: Binding(
-                                get: { settings.assistantCompactPresentationStyle == .notch },
-                                set: { wantsNotch in
-                                    settings.assistantCompactPresentationStyle = wantsNotch ? .notch : .orb
-                                }
+                        Picker(
+                            "Compact assistant style",
+                            selection: Binding(
+                                get: { settings.assistantCompactPresentationStyle },
+                                set: { settings.assistantCompactPresentationStyle = $0 }
                             )
-                        )
+                        ) {
+                            ForEach(AssistantCompactPresentationStyle.allCases) { style in
+                                Text(style.displayName).tag(style)
+                            }
+                        }
+                        .pickerStyle(.segmented)
 
-                        Text("Turn this on to show the compact assistant at the top notch area. Turn it off to use the floating orb instead.")
+                        Text("Choose how the compact assistant appears. Sidebar mode opens from the screen edge.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
@@ -5842,6 +5845,26 @@ struct AIMemoryStudioView: View {
                             }
 
                             Text("Choose how long the pointer should stay near the notch before the compact assistant appears.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+
+                        if settings.assistantCompactPresentationStyle == .sidebar {
+                            Picker(
+                                "Sidebar edge",
+                                selection: Binding(
+                                    get: { settings.assistantCompactSidebarEdge },
+                                    set: { settings.assistantCompactSidebarEdge = $0 }
+                                )
+                            ) {
+                                ForEach(AssistantCompactSidebarEdge.allCases) { edge in
+                                    Text(edge.displayName).tag(edge)
+                                }
+                            }
+                            .pickerStyle(.segmented)
+
+                            Text("Choose which screen edge the assistant handle stays on.")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                                 .fixedSize(horizontal: false, vertical: true)

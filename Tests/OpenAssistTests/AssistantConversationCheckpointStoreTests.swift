@@ -266,6 +266,74 @@ final class AssistantConversationCheckpointStoreTests: XCTestCase {
         XCTAssertEqual(restoredPreferences?.preferencesJSON, originalPreferences.preferencesJSON)
     }
 
+    func testHasSnapshotRequiresPayloadAndConversationArtifacts() async throws {
+        let homeDirectory = try makeTemporaryDirectory(named: "ConversationCheckpointHome")
+        let trackingDirectory = try makeTemporaryDirectory(named: "ConversationCheckpointTracking")
+        let memoryRoot = try makeTemporaryDirectory(named: "ConversationCheckpointMemory")
+        let databaseURL = try makeTemporaryDirectory(named: "ConversationCheckpointDB")
+            .appendingPathComponent("memory.sqlite3", isDirectory: false)
+        let sessionID = "thread-has-snapshot"
+        let checkpointID = "checkpoint-has-snapshot"
+
+        try writeSessionFile(
+            sessionID: sessionID,
+            dayPath: "2026/04/01",
+            homeDirectory: homeDirectory,
+            contents: """
+            {\"type\":\"session_meta\",\"payload\":{\"id\":\"thread-has-snapshot\"}}
+            """
+        )
+
+        let sessionCatalog = CodexSessionCatalog(homeDirectory: homeDirectory)
+        let threadMemoryService = AssistantThreadMemoryService(baseDirectoryURL: memoryRoot)
+        let memoryStore = try MemorySQLiteStore(databaseURL: databaseURL)
+        let suggestionService = AssistantMemorySuggestionService(
+            threadMemoryService: threadMemoryService,
+            store: memoryStore
+        )
+        let agentStateService = ConversationAgentStateService(storeFactory: { memoryStore })
+        let checkpointStore = AssistantConversationCheckpointStore(
+            sessionCatalog: sessionCatalog,
+            threadMemoryService: threadMemoryService,
+            memorySuggestionService: suggestionService,
+            memoryStore: memoryStore,
+            agentStateService: agentStateService,
+            baseDirectoryURL: trackingDirectory
+        )
+
+        XCTAssertFalse(
+            checkpointStore.hasSnapshot(
+                sessionID: sessionID,
+                checkpointID: checkpointID,
+                phase: .after
+            )
+        )
+
+        try await checkpointStore.captureSnapshot(
+            sessionID: sessionID,
+            checkpointID: checkpointID,
+            phase: .after
+        )
+
+        XCTAssertTrue(
+            checkpointStore.hasSnapshot(
+                sessionID: sessionID,
+                checkpointID: checkpointID,
+                phase: .after
+            )
+        )
+
+        checkpointStore.deleteCheckpoints(sessionID: sessionID, checkpointIDs: [checkpointID])
+
+        XCTAssertFalse(
+            checkpointStore.hasSnapshot(
+                sessionID: sessionID,
+                checkpointID: checkpointID,
+                phase: .after
+            )
+        )
+    }
+
     func testCaptureAndRestoreSnapshotRestoresHybridConversationEventLog() async throws {
         let trackingDirectory = try makeTemporaryDirectory(named: "ConversationCheckpointTracking")
         let conversationDirectory = try makeTemporaryDirectory(named: "ConversationCheckpointConversation")

@@ -97,6 +97,33 @@ final class AssistantConversationCheckpointStore {
         try? fileManager.removeItem(at: sessionDirectoryURL)
     }
 
+    func hasSnapshot(
+        sessionID: String,
+        checkpointID: String,
+        phase: AssistantCodeCheckpointPhase
+    ) -> Bool {
+        guard let checkpointDirectoryURL = checkpointDirectoryURL(for: sessionID, checkpointID: checkpointID) else {
+            return false
+        }
+
+        let sessionCopyURL = checkpointDirectoryURL.appendingPathComponent(
+            "\(phase.rawValue)-session.jsonl",
+            isDirectory: false
+        )
+        let conversationCopyURL = checkpointDirectoryURL.appendingPathComponent(
+            "\(phase.rawValue)-openassist-conversation.json",
+            isDirectory: false
+        )
+        let payloadURL = checkpointDirectoryURL.appendingPathComponent(
+            "\(phase.rawValue)-conversation.json",
+            isDirectory: false
+        )
+
+        let hasRestorableConversation = fileManager.fileExists(atPath: sessionCopyURL.path)
+            || fileManager.fileExists(atPath: conversationCopyURL.path)
+        return hasRestorableConversation && fileManager.fileExists(atPath: payloadURL.path)
+    }
+
     func captureSnapshot(
         sessionID: String,
         checkpointID: String,

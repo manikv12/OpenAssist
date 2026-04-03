@@ -98,6 +98,37 @@ struct AssistantSidebarWebSession: Equatable {
     }
 }
 
+struct AssistantSidebarWebNote: Equatable {
+    let id: String
+    let noteID: String
+    let ownerKind: String
+    let ownerID: String
+    let title: String
+    let subtitle: String
+    let sourceLabel: String
+    let isSelected: Bool
+    let isArchivedThread: Bool
+    let threadID: String?
+
+    func toJSON() -> [String: Any] {
+        var json: [String: Any] = [
+            "id": id,
+            "noteId": noteID,
+            "ownerKind": ownerKind,
+            "ownerId": ownerID,
+            "title": title,
+            "subtitle": subtitle,
+            "sourceLabel": sourceLabel,
+            "isSelected": isSelected,
+            "isArchivedThread": isArchivedThread,
+        ]
+        if let threadID, !threadID.isEmpty {
+            json["threadId"] = threadID
+        }
+        return json
+    }
+}
+
 struct AssistantSidebarWebState: Equatable {
     let projectFilterKind: String
     let projectFilterID: String?
@@ -112,19 +143,26 @@ struct AssistantSidebarWebState: Equatable {
     let threadsHelperText: String?
     let archivedTitle: String
     let archivedHelperText: String?
+    let notesTitle: String
+    let notesHelperText: String?
     let projectsExpanded: Bool
     let threadsExpanded: Bool
     let archivedExpanded: Bool
+    let notesExpanded: Bool
     let canLoadMoreThreads: Bool
     let canLoadMoreArchived: Bool
     let archivedCount: Int
     let hiddenProjectCount: Int
+    let selectedNotesProjectID: String?
+    let notesScope: String
+    let canCreateProjectNote: Bool
     let navItems: [AssistantSidebarWebNavItem]
     let allProjects: [AssistantSidebarWebProject]
     let hiddenProjects: [AssistantSidebarWebHiddenProject]
     let projects: [AssistantSidebarWebProject]
     let threads: [AssistantSidebarWebSession]
     let archived: [AssistantSidebarWebSession]
+    let notes: [AssistantSidebarWebNote]
 
     func toJSON() -> [String: Any] {
         var json: [String: Any] = [
@@ -136,19 +174,24 @@ struct AssistantSidebarWebState: Equatable {
             "projectsTitle": projectsTitle,
             "threadsTitle": threadsTitle,
             "archivedTitle": archivedTitle,
+            "notesTitle": notesTitle,
             "projectsExpanded": projectsExpanded,
             "threadsExpanded": threadsExpanded,
             "archivedExpanded": archivedExpanded,
+            "notesExpanded": notesExpanded,
             "canLoadMoreThreads": canLoadMoreThreads,
             "canLoadMoreArchived": canLoadMoreArchived,
             "archivedCount": archivedCount,
             "hiddenProjectCount": hiddenProjectCount,
+            "notesScope": notesScope,
+            "canCreateProjectNote": canCreateProjectNote,
             "navItems": navItems.map { $0.toJSON() },
             "allProjects": allProjects.map { $0.toJSON() },
             "hiddenProjects": hiddenProjects.map { $0.toJSON() },
             "projects": projects.map { $0.toJSON() },
             "threads": threads.map { $0.toJSON() },
             "archived": archived.map { $0.toJSON() },
+            "notes": notes.map { $0.toJSON() },
         ]
         if let projectFilterID, !projectFilterID.isEmpty {
             json["projectFilterId"] = projectFilterID
@@ -162,8 +205,14 @@ struct AssistantSidebarWebState: Equatable {
         if let archivedHelperText, !archivedHelperText.isEmpty {
             json["archivedHelperText"] = archivedHelperText
         }
+        if let notesHelperText, !notesHelperText.isEmpty {
+            json["notesHelperText"] = notesHelperText
+        }
         if let collapsedPreviewPane, !collapsedPreviewPane.isEmpty {
             json["collapsedPreviewPane"] = collapsedPreviewPane
+        }
+        if let selectedNotesProjectID, !selectedNotesProjectID.isEmpty {
+            json["selectedNotesProjectId"] = selectedNotesProjectID
         }
         return json
     }

@@ -4,10 +4,20 @@ import {
   useCallback,
   useEffect,
   useLayoutEffect,
+  useMemo,
   useRef,
   useState,
 } from "react";
 import mermaid from "mermaid";
+import {
+  inspectMermaidSource,
+  type MermaidRenderMode,
+} from "./mermaidUtils";
+
+interface MermaidThemeConfig {
+  themeCSS: string;
+  themeVariables: Record<string, boolean | string>;
+}
 
 function resolveThemeIsDark(styles: CSSStyleDeclaration): boolean {
   const bg = styles.getPropertyValue("--chat-bg").trim();
@@ -22,7 +32,7 @@ function resolveThemeIsDark(styles: CSSStyleDeclaration): boolean {
   return window.matchMedia?.("(prefers-color-scheme: dark)").matches ?? true;
 }
 
-function getThemeVars() {
+function getMermaidTheme(mode: MermaidRenderMode): MermaidThemeConfig {
   const styles = getComputedStyle(document.documentElement);
   const get = (name: string, fallback: string) =>
     styles.getPropertyValue(name).trim() || fallback;
@@ -67,8 +77,28 @@ function getThemeVars() {
     "--chat-accent",
     get("--chat-link", isDark ? "rgb(133,194,255)" : "rgb(37,99,235)")
   );
+  const textSoft = get(
+    "--chat-text-soft",
+    isDark ? "rgba(255,255,255,0.40)" : "rgba(15,23,42,0.42)"
+  );
+  const mermaidBackdrop = get(
+    "--mermaid-board-bg",
+    isDark ? "rgba(11, 13, 19, 0.94)" : "rgba(255,255,255,0.94)"
+  );
+  const clusterFill = get(
+    "--mermaid-cluster-fill",
+    isDark ? "rgba(255,255,255,0.03)" : "rgba(15,23,42,0.03)"
+  );
+  const clusterBorder = get(
+    "--mermaid-cluster-border",
+    isDark ? "rgba(255,255,255,0.14)" : "rgba(15,23,42,0.12)"
+  );
+  const clusterLabel = get(
+    "--mermaid-cluster-label",
+    isDark ? "rgba(255,255,255,0.60)" : "rgba(15,23,42,0.56)"
+  );
 
-  return {
+  const themeVariables = {
     darkMode: isDark,
     background: "transparent",
     primaryColor: surface,
@@ -79,16 +109,16 @@ function getThemeVars() {
     tertiaryTextColor: textMuted,
     lineColor: accent,
     edgeLabelBackground: codeBg,
-    clusterBkg: panelHover,
-    clusterBorder: border,
+    clusterBkg: clusterFill,
+    clusterBorder,
     noteBkgColor: panel,
     noteTextColor: text,
     noteBorderColor: border,
     fontFamily:
       '"SF Pro Text", -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif',
-    fontSize: "13px",
+    fontSize: "14px",
     nodeBorder: borderStrong,
-    mainBkg: panel,
+    mainBkg: mermaidBackdrop,
     nodeTextColor: text,
     titleColor: textStrong,
     actorBorder: border,
@@ -101,16 +131,113 @@ function getThemeVars() {
     labelTextColor: text,
     loopTextColor: textMuted,
   };
+
+  return {
+    themeVariables,
+    themeCSS:
+      mode === "default-pretty"
+        ? `
+          svg {
+            shape-rendering: geometricPrecision;
+            text-rendering: geometricPrecision;
+          }
+
+          .node rect,
+          .node polygon,
+          .node circle,
+          .node ellipse,
+          .node path {
+            stroke-width: 1.15px;
+            filter: drop-shadow(0 10px 24px rgba(0, 0, 0, 0.18));
+          }
+
+          .nodeLabel,
+          .node text,
+          .label text {
+            font-weight: 650;
+            letter-spacing: 0.01em;
+          }
+
+          .nodeLabel *,
+          .edgeLabel *,
+          .cluster-label *,
+          .cluster text {
+            font-family: "SF Pro Text", -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif;
+          }
+
+          .cluster rect {
+            fill: ${clusterFill};
+            stroke: ${clusterBorder};
+            stroke-width: 1px;
+            stroke-dasharray: 7 8;
+            rx: 20px;
+            ry: 20px;
+          }
+
+          .cluster-label text,
+          .cluster text {
+            fill: ${clusterLabel};
+            color: ${clusterLabel};
+            font-size: 12px;
+            font-weight: 700;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+          }
+
+          .flowchart-link,
+          .edgePath path {
+            stroke: ${accent};
+            stroke-width: 1.9px;
+            stroke-linecap: round;
+            stroke-linejoin: round;
+            opacity: 0.8;
+          }
+
+          marker path {
+            fill: ${accent};
+            stroke: ${accent};
+          }
+
+          .edgeLabel,
+          .edgeLabel rect,
+          .labelBkg {
+            fill: ${codeBg};
+            background: ${codeBg};
+            stroke: ${border};
+            opacity: 0.96;
+            rx: 999px;
+            ry: 999px;
+          }
+
+          .edgeLabel text,
+          .edgeLabel tspan,
+          .edgeLabel div,
+          .edgeLabel span {
+            fill: ${textSoft};
+            color: ${textSoft};
+            font-size: 11px;
+            font-weight: 600;
+          }
+        `
+        : `
+          svg {
+            shape-rendering: geometricPrecision;
+            text-rendering: geometricPrecision;
+          }
+        `,
+  };
 }
 
-function configureMermaidTheme() {
+function configureMermaidTheme(mode: MermaidRenderMode): MermaidThemeConfig {
+  const theme = getMermaidTheme(mode);
   mermaid.initialize({
     startOnLoad: false,
     theme: "base",
     securityLevel: "loose",
     htmlLabels: true,
     suppressErrorRendering: true,
-    themeVariables: getThemeVars(),
+    themeVariables: theme.themeVariables,
+    themeCSS: theme.themeCSS,
     flowchart: {
       defaultRenderer: "elk",
       curve: "monotoneX",
@@ -119,9 +246,9 @@ function configureMermaidTheme() {
       padding: 20,
     },
   });
-}
 
-configureMermaidTheme();
+  return theme;
+}
 
 let mermaidCounter = 0;
 const INLINE_PREVIEW_MAX_HEIGHT = 560;
@@ -135,11 +262,16 @@ function MermaidDiagramInner({
   code,
   showViewerHint = true,
   displayMode = "default",
+  clickAction = "viewer",
+  isStreaming = false,
 }: {
   code: string;
   showViewerHint?: boolean;
   displayMode?: "default" | "noteCompact";
+  clickAction?: "viewer" | "none";
+  isStreaming?: boolean;
 }) {
+  const sourceAnalysis = useMemo(() => inspectMermaidSource(code), [code]);
   const [svg, setSvg] = useState("");
   const [error, setError] = useState("");
   const [expanded, setExpanded] = useState(false);
@@ -166,12 +298,16 @@ function MermaidDiagramInner({
   }, []);
 
   useEffect(() => {
+    // Skip expensive mermaid rendering while the message is still streaming.
+    // The diagram will render once streaming completes with the final code.
+    if (isStreaming) return;
+
     let cancelled = false;
     const id = `mermaid-${++mermaidCounter}`;
 
     (async () => {
       try {
-        configureMermaidTheme();
+        const theme = configureMermaidTheme(sourceAnalysis.renderMode);
         const { svg: rendered } = await mermaid.render(id, code.trim());
         if (!cancelled) {
           setSvg(rendered);
@@ -189,7 +325,7 @@ function MermaidDiagramInner({
     return () => {
       cancelled = true;
     };
-  }, [code, themeVersion]);
+  }, [code, sourceAnalysis, themeVersion, isStreaming]);
 
   useLayoutEffect(() => {
     const preview = previewRef.current;
@@ -265,12 +401,29 @@ function MermaidDiagramInner({
 
   const isNoteCompact = displayMode === "noteCompact";
 
+  const previewContent = (
+    <div
+      ref={previewRef}
+      className={[
+        "mermaid-inline",
+        isInlineCollapsible && !isInlineExpanded ? "is-collapsed" : "",
+      ]
+        .filter(Boolean)
+        .join(" ")}
+    >
+      <div dangerouslySetInnerHTML={{ __html: svg }} />
+    </div>
+  );
+
   return (
     <>
       <div
         className={[
           "mermaid-inline-card",
           isNoteCompact ? "is-note-compact" : "",
+          sourceAnalysis.renderMode === "default-pretty"
+            ? "mermaid-render-mode-default-pretty"
+            : "mermaid-render-mode-respect-authored-style",
         ]
           .filter(Boolean)
           .join(" ")}
@@ -280,24 +433,20 @@ function MermaidDiagramInner({
             <span className="mermaid-inline-card-hint">Click to open viewer</span>
           </div>
         ) : null}
-        <button
-          type="button"
-          className="mermaid-inline-card-preview"
-          aria-label="Open diagram viewer"
-          onClick={() => setExpanded(true)}
-        >
-          <div
-            ref={previewRef}
-            className={[
-              "mermaid-inline",
-              isInlineCollapsible && !isInlineExpanded ? "is-collapsed" : "",
-            ]
-              .filter(Boolean)
-              .join(" ")}
+        {clickAction === "viewer" ? (
+          <button
+            type="button"
+            className="mermaid-inline-card-preview"
+            aria-label="Open diagram viewer"
+            onClick={() => setExpanded(true)}
           >
-            <div dangerouslySetInnerHTML={{ __html: svg }} />
+            {previewContent}
+          </button>
+        ) : (
+          <div className="mermaid-inline-card-preview is-inline-interactive">
+            {previewContent}
           </div>
-        </button>
+        )}
         {isInlineCollapsible ? (
           <div className="mermaid-inline-card-footer">
             <button
@@ -311,18 +460,24 @@ function MermaidDiagramInner({
         ) : null}
       </div>
 
-      {expanded && (
-        <MermaidInteractiveOverlay svg={svg} onClose={() => setExpanded(false)} />
-      )}
+      {clickAction === "viewer" && expanded ? (
+        <MermaidInteractiveOverlay
+          svg={svg}
+          renderMode={sourceAnalysis.renderMode}
+          onClose={() => setExpanded(false)}
+        />
+      ) : null}
     </>
   );
 }
 
 function MermaidInteractiveOverlay({
   svg,
+  renderMode,
   onClose,
 }: {
   svg: string;
+  renderMode: MermaidRenderMode;
   onClose: () => void;
 }) {
   const viewportRef = useRef<HTMLDivElement>(null);
@@ -502,7 +657,14 @@ function MermaidInteractiveOverlay({
   return (
     <div className="mermaid-overlay" onClick={onClose}>
       <div
-        className="mermaid-overlay-shell"
+        className={[
+          "mermaid-overlay-shell",
+          renderMode === "default-pretty"
+            ? "mermaid-render-mode-default-pretty"
+            : "mermaid-render-mode-respect-authored-style",
+        ]
+          .filter(Boolean)
+          .join(" ")}
         onClick={(event) => event.stopPropagation()}
       >
         <div className="mermaid-overlay-toolbar">

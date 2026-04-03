@@ -5,6 +5,7 @@ import type { Components } from "react-markdown";
 import { CodeBlock } from "./CodeBlock";
 import { MermaidDiagram } from "./MermaidDiagram";
 import { normalizeMermaidSource } from "./mermaidUtils";
+import { useIsStreaming } from "../StreamingContext";
 
 const codeTheme: Record<string, React.CSSProperties> = {
   'code[class*="language-"]': {
@@ -69,6 +70,7 @@ function MarkdownContentInner({
   markdown: string;
   mermaidDisplayMode?: "default" | "noteCompact";
 }) {
+  const isStreaming = useIsStreaming();
   const renderedMarkdown = useMemo(
     () => normalizeMarkdownStructure(markdown),
     [markdown]
@@ -106,6 +108,7 @@ function MarkdownContentInner({
             <MermaidDiagram
               code={normalizeMermaidSource(language, codeString)}
               displayMode={mermaidDisplayMode}
+              isStreaming={isStreaming}
             />
           );
         }

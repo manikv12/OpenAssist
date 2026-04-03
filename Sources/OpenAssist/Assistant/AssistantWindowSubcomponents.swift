@@ -1114,13 +1114,26 @@ struct AssistantParentWorkCard: View {
     let snapshot: AssistantSessionActiveWorkSnapshot
     let onOpenThread: (String) -> Void
     var onReviewChanges: (() -> Void)? = nil
+    @State private var isExpanded = true
+    @State private var agentChecklistVisibility: [String: Bool] = [:]
+
+    private var displayedSubagents: [SubagentState] {
+        if let selectedAgent = snapshot.selectedAgent {
+            return [selectedAgent]
+        }
+        return snapshot.subagents
+    }
+
+    private var showsExpandableContent: Bool {
+        snapshot.hasChecklist || snapshot.hasFileChanges || snapshot.hasBackgroundAgents
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            VStack(alignment: .leading, spacing: 14) {
+            VStack(alignment: .leading, spacing: isExpanded ? 14 : 0) {
                 headerRow
 
-                if snapshot.hasChecklist {
+                if isExpanded, snapshot.hasChecklist {
                     VStack(alignment: .leading, spacing: 10) {
                         ForEach(Array(snapshot.planEntries.enumerated()), id: \.element.id) { index, entry in
                             planEntryRow(entry, index: index + 1)
@@ -1131,7 +1144,7 @@ struct AssistantParentWorkCard: View {
             .padding(.horizontal, 14)
             .padding(.vertical, 14)
 
-            if snapshot.hasFileChanges {
+            if isExpanded, snapshot.hasFileChanges {
                 Divider()
                     .overlay(AppVisualTheme.surfaceStroke(0.12))
                 fileChangesRow
@@ -1139,7 +1152,7 @@ struct AssistantParentWorkCard: View {
                     .padding(.vertical, 12)
             }
 
-            if snapshot.hasBackgroundAgents {
+            if isExpanded, snapshot.hasBackgroundAgents {
                 Divider()
                     .overlay(AppVisualTheme.surfaceStroke(0.12))
                 agentsSection
@@ -1159,28 +1172,82 @@ struct AssistantParentWorkCard: View {
 
     private var headerRow: some View {
         HStack(alignment: .center, spacing: 10) {
-            Image(systemName: snapshot.hasChecklist ? "checklist" : "person.3.sequence.fill")
+            Image(systemName: snapshot.hasChecklist ? "checklist" : (snapshot.selectedAgent == nil ? "person.3.sequence.fill" : "sparkles.rectangle.stack"))
                 .font(.system(size: 13, weight: .semibold))
                 .foregroundStyle(AppVisualTheme.foreground(0.58))
 
-            Text(snapshot.hasChecklist
-                 ? "\(snapshot.completedTaskCount) out of \(snapshot.totalTaskCount) tasks completed"
-                 : "Working on current request")
-                .font(.system(size: 14, weight: .semibold))
-                .foregroundStyle(AppVisualTheme.foreground(0.92))
-                .lineLimit(2)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(headerTitle)
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(AppVisualTheme.foreground(0.92))
+                    .lineLimit(2)
+
+                if let headerSubtitle {
+                    Text(headerSubtitle)
+                        .font(.system(size: 11.5, weight: .medium))
+                        .foregroundStyle(AppVisualTheme.foreground(0.46))
+                        .lineLimit(1)
+                }
+            }
 
             Spacer(minLength: 8)
 
-            Text("\(snapshot.subagents.count) background agent\(snapshot.subagents.count == 1 ? "" : "s")")
-                .font(.system(size: 11.5, weight: .medium))
-                .foregroundStyle(AppVisualTheme.foreground(0.46))
-                .lineLimit(1)
+            if showsExpandableContent {
+                Button {
+                    withAnimation(.spring(response: 0.28, dampingFraction: 0.88)) {
+                        isExpanded.toggle()
+                    }
+                } label: {
+                    HStack(spacing: 6) {
+                        Text(isExpanded ? "Minimize" : "Expand")
+                            .font(.system(size: 11.5, weight: .semibold))
+                        Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
+                            .font(.system(size: 11, weight: .semibold))
+                    }
+                    .foregroundStyle(AppVisualTheme.foreground(0.62))
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(
+                        Capsule(style: .continuous)
+                            .fill(AppVisualTheme.foreground(0.05))
+                            .overlay(
+                                Capsule(style: .continuous)
+                                    .stroke(AppVisualTheme.surfaceStroke(0.08), lineWidth: 0.6)
+                            )
+                    )
+                }
+                .buttonStyle(.plain)
+            }
         }
+    }
+
+    private var headerTitle: String {
+        if snapshot.hasChecklist {
+            return "\(snapshot.completedTaskCount) out of \(snapshot.totalTaskCount) tasks completed"
+        }
+        if let selectedAgent = snapshot.selectedAgent {
+            return selectedAgent.displayName
+        }
+        return "Working on current request"
+    }
+
+    private var headerSubtitle: String? {
+        if let selectedAgent = snapshot.selectedAgent {
+            let pieces = [
+                selectedAgent.roleLabel,
+                selectedAgent.statusText
+            ]
+                .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty }
+            return pieces.isEmpty ? nil : pieces.joined(separator: " · ")
+        }
+
+        guard !displayedSubagents.isEmpty else { return nil }
+        return "\(displayedSubagents.count) background agent\(displayedSubagents.count == 1 ? "" : "s")"
     }
 
     @ViewBuilder
     private func planEntryRow(_ entry: AssistantPlanEntry, index: Int) -> some View {
+        let isCompleted = isCompletedPlanEntryStatus(entry.status)
         HStack(alignment: .top, spacing: 10) {
             HStack(alignment: .center, spacing: 8) {
                 Image(systemName: planStatusSymbol(for: entry.status))
@@ -1196,7 +1263,8 @@ struct AssistantParentWorkCard: View {
 
             Text(entry.content)
                 .font(.system(size: 13.5, weight: .medium))
-                .foregroundStyle(AppVisualTheme.foreground(0.88))
+                .foregroundStyle(isCompleted ? AppVisualTheme.foreground(0.46) : AppVisualTheme.foreground(0.88))
+                .strikethrough(isCompleted, color: AppVisualTheme.foreground(0.34))
                 .fixedSize(horizontal: false, vertical: true)
         }
     }
@@ -1228,7 +1296,7 @@ struct AssistantParentWorkCard: View {
                     .font(.system(size: 12, weight: .semibold))
                     .foregroundStyle(AppVisualTheme.foreground(0.56))
 
-                Text("\(snapshot.subagents.count) background agent\(snapshot.subagents.count == 1 ? "" : "s")")
+                Text("\(displayedSubagents.count) background agent\(displayedSubagents.count == 1 ? "" : "s")")
                     .font(.system(size: 12.5, weight: .semibold))
                     .foregroundStyle(AppVisualTheme.foreground(0.74))
 
@@ -1237,62 +1305,97 @@ struct AssistantParentWorkCard: View {
 
             TimelineView(.periodic(from: .now, by: 30)) { timeline in
                 VStack(alignment: .leading, spacing: 10) {
-                    ForEach(snapshot.subagents) { agent in
-                        HStack(alignment: .center, spacing: 12) {
-                            Circle()
-                                .fill(subagentStatusTint(agent.status))
-                                .frame(width: 8, height: 8)
+                    ForEach(displayedSubagents) { agent in
+                        VStack(alignment: .leading, spacing: 10) {
+                            HStack(alignment: .center, spacing: 12) {
+                                Circle()
+                                    .fill(subagentStatusTint(agent.status))
+                                    .frame(width: 8, height: 8)
 
-                            VStack(alignment: .leading, spacing: 4) {
-                                HStack(alignment: .firstTextBaseline, spacing: 6) {
-                                    Text(agent.displayName)
-                                        .font(.system(size: 13.5, weight: .semibold))
-                                        .foregroundStyle(agentNameTint(agent))
-                                        .lineLimit(1)
-
-                                    if let roleLabel = agent.roleLabel {
-                                        Text("(\(roleLabel.lowercased()))")
-                                            .font(.system(size: 12.5, weight: .medium))
-                                            .foregroundStyle(AppVisualTheme.foreground(0.50))
+                                VStack(alignment: .leading, spacing: 4) {
+                                    HStack(alignment: .firstTextBaseline, spacing: 6) {
+                                        Text(agent.displayName)
+                                            .font(.system(size: 13.5, weight: .semibold))
+                                            .foregroundStyle(agentNameTint(agent))
                                             .lineLimit(1)
+
+                                        if let roleLabel = agent.roleLabel {
+                                            Text("(\(roleLabel.lowercased()))")
+                                                .font(.system(size: 12.5, weight: .medium))
+                                                .foregroundStyle(AppVisualTheme.foreground(0.50))
+                                                .lineLimit(1)
+                                        }
+
+                                        Text("is \(agent.statusText.lowercased())")
+                                            .font(.system(size: 12.5, weight: .medium))
+                                            .foregroundStyle(AppVisualTheme.foreground(0.58))
+                                            .lineLimit(1)
+
+                                        Spacer(minLength: 4)
+
+                                        if let elapsedText = elapsedText(for: agent, now: timeline.date) {
+                                            Text(elapsedText)
+                                                .font(.system(size: 11.5, weight: .medium))
+                                                .foregroundStyle(AppVisualTheme.foreground(0.34))
+                                                .lineLimit(1)
+                                        }
                                     }
 
-                                    Text("is \(agent.statusText.lowercased())")
-                                        .font(.system(size: 12.5, weight: .medium))
-                                        .foregroundStyle(AppVisualTheme.foreground(0.58))
-                                        .lineLimit(1)
-
-                                    Spacer(minLength: 4)
-
-                                    if let elapsedText = elapsedText(for: agent, now: timeline.date) {
-                                        Text(elapsedText)
-                                            .font(.system(size: 11.5, weight: .medium))
-                                            .foregroundStyle(AppVisualTheme.foreground(0.34))
-                                            .lineLimit(1)
+                                    if let preview = agent.promptPreview {
+                                        Text(preview)
+                                            .font(.system(size: 11.5, weight: .regular))
+                                            .foregroundStyle(AppVisualTheme.foreground(0.42))
+                                            .lineLimit(2)
                                     }
                                 }
 
-                                if let preview = agent.promptPreview {
-                                    Text(preview)
-                                        .font(.system(size: 11.5, weight: .regular))
-                                        .foregroundStyle(AppVisualTheme.foreground(0.42))
-                                        .lineLimit(2)
+                                Spacer(minLength: 8)
+
+                                if let threadID = agent.threadID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
+                                    Button("Open") {
+                                        onOpenThread(threadID)
+                                    }
+                                    .buttonStyle(.plain)
+                                    .font(.system(size: 12.5, weight: .semibold))
+                                    .foregroundStyle(AppVisualTheme.accentTint.opacity(0.96))
+                                } else {
+                                    Text("Open")
+                                        .font(.system(size: 12.5, weight: .semibold))
+                                        .foregroundStyle(AppVisualTheme.foreground(0.26))
                                 }
                             }
 
-                            Spacer(minLength: 8)
+                            if !agent.planEntries.isEmpty {
+                                VStack(alignment: .leading, spacing: 8) {
+                                    Button {
+                                        withAnimation(.easeInOut(duration: 0.18)) {
+                                            toggleAgentChecklist(agent.id)
+                                        }
+                                    } label: {
+                                        HStack(spacing: 8) {
+                                            Image(systemName: isAgentChecklistExpanded(agent.id) ? "chevron.down" : "chevron.right")
+                                                .font(.system(size: 10, weight: .semibold))
+                                            Text("Todo list")
+                                                .font(.system(size: 11.5, weight: .semibold))
+                                            Text("\(completedPlanCount(for: agent.planEntries))/\(agent.planEntries.count)")
+                                                .font(.system(size: 11, weight: .semibold))
+                                                .foregroundStyle(AppVisualTheme.foreground(0.46))
+                                            Spacer(minLength: 8)
+                                        }
+                                        .foregroundStyle(AppVisualTheme.foreground(0.70))
+                                    }
+                                    .buttonStyle(.plain)
 
-                            if let threadID = agent.threadID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
-                                Button("Open") {
-                                    onOpenThread(threadID)
+                                    if isAgentChecklistExpanded(agent.id) {
+                                        VStack(alignment: .leading, spacing: 8) {
+                                            ForEach(Array(agent.planEntries.enumerated()), id: \.element.id) { index, entry in
+                                                planEntryRow(entry, index: index + 1)
+                                            }
+                                        }
+                                        .padding(.top, 2)
+                                    }
                                 }
-                                .buttonStyle(.plain)
-                                .font(.system(size: 12.5, weight: .semibold))
-                                .foregroundStyle(AppVisualTheme.accentTint.opacity(0.96))
-                            } else {
-                                Text("Open")
-                                    .font(.system(size: 12.5, weight: .semibold))
-                                    .foregroundStyle(AppVisualTheme.foreground(0.26))
+                                .padding(.leading, 20)
                             }
                         }
                         .padding(.horizontal, 12)
@@ -1309,6 +1412,25 @@ struct AssistantParentWorkCard: View {
                 }
             }
         }
+    }
+
+    private func toggleAgentChecklist(_ agentID: String) {
+        agentChecklistVisibility[agentID] = !isAgentChecklistExpanded(agentID)
+    }
+
+    private func isAgentChecklistExpanded(_ agentID: String) -> Bool {
+        agentChecklistVisibility[agentID] ?? (displayedSubagents.count == 1)
+    }
+
+    private func completedPlanCount(for entries: [AssistantPlanEntry]) -> Int {
+        entries.filter { isCompletedPlanEntryStatus($0.status) }.count
+    }
+
+    private func isCompletedPlanEntryStatus(_ status: String) -> Bool {
+        status
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "-", with: "_")
+            .lowercased() == "completed"
     }
 
     private func planStatusSymbol(for status: String) -> String {

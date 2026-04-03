@@ -102,6 +102,11 @@ struct GitCheckpointCaptureResult: Equatable, Sendable {
     let ignoredTouchedPaths: [String]
 }
 
+struct GitCheckpointCaptureResolution: Equatable, Sendable {
+    let capture: GitCheckpointCaptureResult
+    let usedUnfilteredFallback: Bool
+}
+
 struct GitStoredCheckpointRefState: Equatable, Sendable {
     let checkpointID: String
     let hasBeforeWorktreeRef: Bool
@@ -373,6 +378,46 @@ final class GitCheckpointService {
                 before: before.ignoredFingerprints,
                 after: after.ignoredFingerprints
             )
+        )
+    }
+
+    func buildCaptureResultWithFullDiffFallback(
+        repository: GitCheckpointRepositoryContext,
+        before: GitCheckpointSnapshot,
+        after: GitCheckpointSnapshot,
+        includedPaths: Set<String>?
+    ) async throws -> GitCheckpointCaptureResolution {
+        let filteredCapture = try await buildCaptureResult(
+            repository: repository,
+            before: before,
+            after: after,
+            includedPaths: includedPaths
+        )
+        guard let includedPaths,
+              !includedPaths.isEmpty,
+              filteredCapture.changedFiles.isEmpty else {
+            return GitCheckpointCaptureResolution(
+                capture: filteredCapture,
+                usedUnfilteredFallback: false
+            )
+        }
+
+        let unfilteredCapture = try await buildCaptureResult(
+            repository: repository,
+            before: before,
+            after: after,
+            includedPaths: nil
+        )
+        guard !unfilteredCapture.changedFiles.isEmpty else {
+            return GitCheckpointCaptureResolution(
+                capture: filteredCapture,
+                usedUnfilteredFallback: false
+            )
+        }
+
+        return GitCheckpointCaptureResolution(
+            capture: unfilteredCapture,
+            usedUnfilteredFallback: true
         )
     }
 

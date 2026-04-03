@@ -40,6 +40,13 @@ private struct CLIAttachmentMaterialization: Sendable {
     let promptContext: String
 }
 
+private struct ClaudeQueuedPromptContext: Sendable {
+    let attachments: [AssistantAttachment]
+    let includesImageAttachments: Bool
+    let modelSupportsImageInput: Bool
+    let allowsProposedPlan: Bool
+}
+
 private final class ClaudeCodeCommandCapture: @unchecked Sendable {
     private let lock = NSLock()
     private let newlineData = Data([UInt8(ascii: "\n")])
@@ -232,7 +239,7 @@ final class CodexAssistantRuntime {
     var onTranscriptMutation: (@Sendable (AssistantTranscriptMutation) -> Void)?
     var onTimelineMutation: (@Sendable (AssistantTimelineMutation) -> Void)?
     var onHUDUpdate: (@Sendable (AssistantHUDState) -> Void)?
-    var onPlanUpdate: (@Sendable ([AssistantPlanEntry]) -> Void)?
+    var onPlanUpdate: (@Sendable (_ sessionID: String?, _ entries: [AssistantPlanEntry]) -> Void)?
     var onToolCallUpdate: (@Sendable ([AssistantToolCallState]) -> Void)?
     var onPermissionRequest: (@Sendable (AssistantPermissionRequest?) -> Void)?
     var onSessionChange: (@Sendable (String?) -> Void)?
@@ -245,6 +252,7 @@ final class CodexAssistantRuntime {
     var onProposedPlan: (@Sendable (String?) -> Void)?
     var onModeRestriction: (@Sendable (AssistantModeRestrictionEvent) -> Void)?
     var onTurnCompletion: (@Sendable (AssistantTurnCompletionStatus) -> Void)?
+    var onExecutionStateUpdate: (@Sendable (_ hasActiveTurn: Bool, _ hasLiveClaudeProcess: Bool) -> Void)?
     /// Fired after the first successful turn of a new session with (sessionID, userPrompt, assistantResponse).
     var onTitleRequest: (@Sendable (_ sessionID: String, _ userPrompt: String, _ assistantResponse: String) -> Void)?
 
@@ -252,6 +260,15 @@ final class CodexAssistantRuntime {
     private var mcpToolBridge: AssistantMCPToolBridge?
     private var mcpConfigFilePath: String?
     private var activeClaudeProcess: Process?
+    private var activeClaudeStdinHandle: FileHandle?
+    private var activeClaudeProcessSessionID: String?
+    private var activeClaudeProcessWorkingDirectory: String?
+    private var activeClaudeProcessModelID: String?
+    private var activeClaudeProcessPermissionMode: String?
+    private var activeClaudeTurnContinuations: [CheckedContinuation<AssistantTurnCompletionStatus, Error>] = []
+    private var activeClaudeQueuedPromptContexts: [ClaudeQueuedPromptContext] = []
+    private var claudeCodeIdleTimeoutTask: Task<Void, Never>?
+    private var lastClaudeCodeActivityAt: Date?
     private var activeSessionID: String?
     private var activeSessionCWD: String?
     private var activeTurnID: String?
@@ -272,6 +289,8 @@ final class CodexAssistantRuntime {
     private var pendingPermissionContext: PendingPermissionContext?
     private var loginRefreshTask: Task<Void, Never>?
     private var metadataRefreshTask: Task<Void, Never>?
+    private var rateLimitRefreshTask: Task<Void, Never>?
+    private var rateLimitRefreshTaskID = UUID()
     private var transportStartupTask: Task<Void, Error>?
     private var turnToolCallCount = 0
     private var repeatedCommandTracker = AssistantRepeatedCommandTracker()
@@ -279,6 +298,10 @@ final class CodexAssistantRuntime {
     private var firstTurnUserPrompt: String?
     var maxToolCallsPerTurn: Int = 75
     var maxRepeatedCommandAttemptsPerTurn: Int = 3
+    private static let claudeCodeRateLimitRefreshIntervalNanoseconds: UInt64 = 20_000_000_000
+    private static let claudeCodeIdleRateLimitRefreshIntervalNanoseconds: UInt64 = 90_000_000_000
+    private var idleRateLimitRefreshTask: Task<Void, Never>?
+    private static let claudeCodeLiveProcessIdleTimeoutNanoseconds: UInt64 = 900_000_000_000
 
     // Title generation: ephemeral thread whose notifications are filtered from the main UI
     private var titleGenThreadID: String?
@@ -345,6 +368,12 @@ final class CodexAssistantRuntime {
         activeTurnID != nil
     }
 
+    var hasLiveClaudeProcess: Bool {
+        backend == .claudeCode
+            && activeClaudeProcess?.isRunning == true
+            && activeClaudeStdinHandle != nil
+    }
+
     init(
         preferredModelID: String? = nil,
         preferredSubagentModelID: String? = nil,
@@ -390,8 +419,8 @@ final class CodexAssistantRuntime {
         )
         onHealthUpdate?(health)
 
-        // Refresh rate limits for the new model (Spark has different limits)
-        if backend == .codex, changed, currentAccountSnapshot.isLoggedIn {
+        // Refresh rate limits when the selected model can change the visible bucket.
+        if (backend == .codex || backend == .claudeCode), changed, currentAccountSnapshot.isLoggedIn {
             Task { await refreshRateLimits() }
         }
     }
@@ -401,6 +430,10 @@ final class CodexAssistantRuntime {
     }
 
     func clearCachedEnvironmentState() {
+        cancelRateLimitRefreshLoop()
+        cancelIdleRateLimitRefresh()
+        resolveAllActiveClaudeTurnContinuations(status: .interrupted)
+        activeClaudeQueuedPromptContexts.removeAll()
         terminateActiveClaudeProcess()
         currentAccountSnapshot = .signedOut
         currentRateLimits = .empty
@@ -482,6 +515,7 @@ final class CodexAssistantRuntime {
 
     func logout() async throws {
         guard backend == .codex else {
+            cancelRateLimitRefreshLoop()
             currentAccountSnapshot = .signedOut
             currentRateLimits = .empty
             currentTokenUsageSnapshot = .empty
@@ -526,7 +560,7 @@ final class CodexAssistantRuntime {
         resetStreamingTimelineState()
         clearPersistedCLIAttachmentMaterialization()
         onToolCallUpdate?([])
-        onPlanUpdate?([])
+        onPlanUpdate?(activeSessionID, [])
         onSubagentUpdate?([])
         onTimelineMutation?(.reset(sessionID: nil))
         onPermissionRequest?(nil)
@@ -685,19 +719,21 @@ final class CodexAssistantRuntime {
         let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty || !attachments.isEmpty else { return }
 
-        // Reset plan buffer for the new turn
-        proposedPlanBuffer = ""
-        allowsProposedPlanForActiveTurn = interactionMode == .plan
-        blockedToolUseHandledForActiveTurn = false
-        blockedToolUseInterruptionMessage = nil
-        currentTurnAttachments = attachments
-        currentTurnIncludesImageAttachments = attachments.contains(where: \.isImage)
-        currentTurnModelSupportsImageInput = modelSupportsImageInput
-        currentTurnHadSuccessfulImageGeneration = false
-        redirectedImageToolCallForActiveTurn = false
+        if backend != .claudeCode {
+            // Reset plan buffer for the new turn
+            proposedPlanBuffer = ""
+            allowsProposedPlanForActiveTurn = interactionMode == .plan
+            blockedToolUseHandledForActiveTurn = false
+            blockedToolUseInterruptionMessage = nil
+            currentTurnAttachments = attachments
+            currentTurnIncludesImageAttachments = attachments.contains(where: \.isImage)
+            currentTurnModelSupportsImageInput = modelSupportsImageInput
+            currentTurnHadSuccessfulImageGeneration = false
+            redirectedImageToolCallForActiveTurn = false
+        }
 
         // Track the first user prompt for title generation
-        if sessionTurnCount == 0 {
+        if sessionTurnCount == 0, firstTurnUserPrompt == nil {
             firstTurnUserPrompt = trimmed
         }
 
@@ -726,6 +762,7 @@ final class CodexAssistantRuntime {
                 prompt: trimmed,
                 attachments: attachments,
                 preferredModelID: preferredModelID ?? self.preferredModelID,
+                modelSupportsImageInput: modelSupportsImageInput,
                 resumeContext: resumeContext,
                 memoryContext: memoryContext
             )
@@ -737,13 +774,19 @@ final class CodexAssistantRuntime {
         updateHUD(phase: .streaming, title: "Starting", detail: nil)
         let requestedModelID = preferredModelID ?? self.preferredModelID
         CrashReporter.logInfo("Assistant runtime requesting turn/start threadID=\(activeSessionID) model=\(requestedModelID ?? "server-default") promptChars=\(trimmed.count) attachments=\(attachments.count)")
+        let inlineAttachments = attachments.filter(\.isImage)
+        let attachmentContext = try resolvedCLIAttachmentContext(
+            sessionID: activeSessionID,
+            attachments: attachments.filter { !$0.isImage }
+        )
 
         let response = try await sendRequest(
             method: "turn/start",
             params: turnStartParams(
                 threadID: activeSessionID,
                 prompt: trimmed,
-                attachments: attachments,
+                attachments: inlineAttachments,
+                attachmentContext: attachmentContext,
                 modelID: requestedModelID,
                 resumeContext: resumeContext,
                 memoryContext: memoryContext
@@ -791,6 +834,7 @@ final class CodexAssistantRuntime {
         }
         if backend == .claudeCode {
             let hadActiveTurn = activeTurnID != nil
+            resolveAllActiveClaudeTurnContinuations(status: .interrupted)
             self.activeTurnID = nil
             terminateActiveClaudeProcess()
             allowsProposedPlanForActiveTurn = false
@@ -856,6 +900,11 @@ final class CodexAssistantRuntime {
         if activeTurnID != nil {
             onTurnCompletion?(.interrupted)
         }
+        if backend == .claudeCode {
+            resolveAllActiveClaudeTurnContinuations(status: .interrupted)
+            activeClaudeQueuedPromptContexts.removeAll()
+            terminateActiveClaudeProcess(expected: true)
+        }
         if let oldSessionID = activeSessionID {
             detachedSessionIDs.insert(oldSessionID)
         }
@@ -870,7 +919,7 @@ final class CodexAssistantRuntime {
         resetStreamingTimelineState()
         clearPersistedCLIAttachmentMaterialization()
         onToolCallUpdate?([])
-        onPlanUpdate?([])
+        onPlanUpdate?(activeSessionID, [])
         onSubagentUpdate?([])
         onTimelineMutation?(.reset(sessionID: nil))
     }
@@ -891,8 +940,10 @@ final class CodexAssistantRuntime {
         loginRefreshTask = nil
         metadataRefreshTask?.cancel()
         metadataRefreshTask = nil
+        cancelRateLimitRefreshLoop()
         transportStartupTask?.cancel()
         transportStartupTask = nil
+        resolveAllActiveClaudeTurnContinuations(status: .interrupted)
         terminateActiveClaudeProcess()
         await pendingPermissionContext?.cancel()
         pendingPermissionContext = nil
@@ -911,7 +962,7 @@ final class CodexAssistantRuntime {
         repeatedCommandTracker.reset()
         resetStreamingTimelineState()
         onToolCallUpdate?([])
-        onPlanUpdate?([])
+        onPlanUpdate?(activeSessionID, [])
         onSubagentUpdate?([])
         onTimelineMutation?(.reset(sessionID: nil))
         onSessionChange?(nil)
@@ -1457,12 +1508,13 @@ final class CodexAssistantRuntime {
                 activeTurnID = turnID
             }
             clearSubagents()
-            onPlanUpdate?([])
+            claudeStreamingToolUseInputs.removeAll()
+            onPlanUpdate?(firstNonEmptyString(params["threadId"] as? String, activeSessionID), [])
             resetStreamingTimelineState()
             updateHUD(phase: .thinking, title: "Thinking", detail: nil)
             onHealthUpdate?(makeHealth(availability: .active, summary: "Codex is working"))
         case "turn/plan/updated":
-            onPlanUpdate?(parsePlanEntries(from: params["plan"]))
+            onPlanUpdate?(firstNonEmptyString(params["threadId"] as? String, activeSessionID), parsePlanEntries(from: params["plan"]))
         case "item/agentMessage/delta":
             if let delta = params["delta"] as? String, delta.nonEmpty != nil {
                 let threadID = params["threadId"] as? String
@@ -1837,6 +1889,213 @@ final class CodexAssistantRuntime {
         guard let limits = AccountRateLimits.fromPayload(params, preserving: currentRateLimits) else { return }
         currentRateLimits = limits
         onRateLimitsUpdate?(limits)
+    }
+
+    private func startRateLimitRefreshLoopIfNeeded() {
+        cancelRateLimitRefreshLoop()
+        guard backend == .claudeCode,
+              activeTurnID != nil,
+              currentAccountSnapshot.isLoggedIn else {
+            return
+        }
+
+        let refreshTaskID = UUID()
+        rateLimitRefreshTaskID = refreshTaskID
+        rateLimitRefreshTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+
+            await self.refreshRateLimits()
+
+            while !Task.isCancelled {
+                do {
+                    try await Task.sleep(nanoseconds: Self.claudeCodeRateLimitRefreshIntervalNanoseconds)
+                } catch {
+                    break
+                }
+
+                guard !Task.isCancelled,
+                      self.backend == .claudeCode,
+                      self.activeTurnID != nil,
+                      self.currentAccountSnapshot.isLoggedIn else {
+                    break
+                }
+
+                await self.refreshRateLimits()
+            }
+
+            guard self.rateLimitRefreshTaskID == refreshTaskID else { return }
+            self.rateLimitRefreshTask = nil
+        }
+    }
+
+    private func cancelRateLimitRefreshLoop() {
+        rateLimitRefreshTaskID = UUID()
+        rateLimitRefreshTask?.cancel()
+        rateLimitRefreshTask = nil
+    }
+
+    /// Lightweight background refresh that keeps the usage display current even
+    /// when no turn is active. Runs every 90 seconds.
+    private func startIdleRateLimitRefreshIfNeeded() {
+        idleRateLimitRefreshTask?.cancel()
+        idleRateLimitRefreshTask = nil
+
+        guard backend == .claudeCode, currentAccountSnapshot.isLoggedIn else { return }
+
+        idleRateLimitRefreshTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                do {
+                    try await Task.sleep(nanoseconds: Self.claudeCodeIdleRateLimitRefreshIntervalNanoseconds)
+                } catch {
+                    break
+                }
+
+                guard let self,
+                      !Task.isCancelled,
+                      self.backend == .claudeCode,
+                      self.activeTurnID == nil,
+                      self.currentAccountSnapshot.isLoggedIn else {
+                    break
+                }
+
+                await self.refreshRateLimits()
+            }
+        }
+    }
+
+    private func cancelIdleRateLimitRefresh() {
+        idleRateLimitRefreshTask?.cancel()
+        idleRateLimitRefreshTask = nil
+    }
+
+    private func publishExecutionStateSnapshot() {
+        onExecutionStateUpdate?(hasActiveTurn, hasLiveClaudeProcess)
+    }
+
+    private func enqueueClaudeQueuedPromptContext(
+        attachments: [AssistantAttachment],
+        modelSupportsImageInput: Bool
+    ) {
+        activeClaudeQueuedPromptContexts.append(
+            ClaudeQueuedPromptContext(
+                attachments: attachments,
+                includesImageAttachments: attachments.contains(where: \.isImage),
+                modelSupportsImageInput: modelSupportsImageInput,
+                allowsProposedPlan: interactionMode == .plan
+            )
+        )
+    }
+
+    private func activateCurrentClaudeQueuedPromptContextIfNeeded() {
+        guard let context = activeClaudeQueuedPromptContexts.first else {
+            currentTurnAttachments = []
+            currentTurnIncludesImageAttachments = false
+            currentTurnModelSupportsImageInput = false
+            currentTurnHadSuccessfulImageGeneration = false
+            redirectedImageToolCallForActiveTurn = false
+            blockedToolUseHandledForActiveTurn = false
+            blockedToolUseInterruptionMessage = nil
+            proposedPlanBuffer = ""
+            allowsProposedPlanForActiveTurn = false
+            claudeStreamingToolUseInputs.removeAll()
+            return
+        }
+
+        currentTurnAttachments = context.attachments
+        currentTurnIncludesImageAttachments = context.includesImageAttachments
+        currentTurnModelSupportsImageInput = context.modelSupportsImageInput
+        currentTurnHadSuccessfulImageGeneration = false
+        redirectedImageToolCallForActiveTurn = false
+        blockedToolUseHandledForActiveTurn = false
+        blockedToolUseInterruptionMessage = nil
+        proposedPlanBuffer = ""
+        allowsProposedPlanForActiveTurn = context.allowsProposedPlan
+        claudeStreamingToolUseInputs.removeAll()
+        turnToolCallCount = 0
+        repeatedCommandTracker.reset()
+    }
+
+    @discardableResult
+    private func dequeueCurrentClaudeQueuedPromptContext() -> ClaudeQueuedPromptContext? {
+        guard !activeClaudeQueuedPromptContexts.isEmpty else { return nil }
+        return activeClaudeQueuedPromptContexts.removeFirst()
+    }
+
+    private func cancelClaudeCodeIdleTimeoutTask() {
+        claudeCodeIdleTimeoutTask?.cancel()
+        claudeCodeIdleTimeoutTask = nil
+    }
+
+    private func recordClaudeCodeActivity() {
+        lastClaudeCodeActivityAt = Date()
+        scheduleClaudeCodeIdleTimeoutIfNeeded()
+    }
+
+    private func scheduleClaudeCodeIdleTimeoutIfNeeded() {
+        cancelClaudeCodeIdleTimeoutTask()
+        guard hasLiveClaudeProcess,
+              activeTurnID == nil,
+              pendingPermissionContext == nil else {
+            return
+        }
+
+        claudeCodeIdleTimeoutTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                try await Task.sleep(nanoseconds: Self.claudeCodeLiveProcessIdleTimeoutNanoseconds)
+            } catch {
+                return
+            }
+
+            guard self.hasLiveClaudeProcess,
+                  self.activeTurnID == nil,
+                  self.pendingPermissionContext == nil else {
+                return
+            }
+
+            self.terminateActiveClaudeProcess(expected: true)
+            self.updateHUD(phase: .idle, title: "Session ready", detail: nil)
+            self.publishExecutionStateSnapshot()
+            self.onHealthUpdate?(self.makeHealth(
+                availability: .ready,
+                summary: self.backend.connectedSummary
+            ))
+        }
+    }
+
+    private func waitForActiveClaudeTurnCompletion() async throws -> AssistantTurnCompletionStatus {
+        return try await withCheckedThrowingContinuation { continuation in
+            activeClaudeTurnContinuations.append(continuation)
+        }
+    }
+
+    private func resolveNextActiveClaudeTurnContinuation(
+        status: AssistantTurnCompletionStatus,
+        error: Error? = nil
+    ) {
+        guard !activeClaudeTurnContinuations.isEmpty else { return }
+        let continuation = activeClaudeTurnContinuations.removeFirst()
+        if let error {
+            continuation.resume(throwing: error)
+        } else {
+            continuation.resume(returning: status)
+        }
+    }
+
+    private func resolveAllActiveClaudeTurnContinuations(
+        status: AssistantTurnCompletionStatus,
+        error: Error? = nil
+    ) {
+        guard !activeClaudeTurnContinuations.isEmpty else { return }
+        let continuations = activeClaudeTurnContinuations
+        activeClaudeTurnContinuations.removeAll()
+        for continuation in continuations {
+            if let error {
+                continuation.resume(throwing: error)
+            } else {
+                continuation.resume(returning: status)
+            }
+        }
     }
 
     private func scheduleLoginRefreshFallback() {
@@ -2918,15 +3177,21 @@ final class CodexAssistantRuntime {
         let responsePreview = completedTurnResponse.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
         flushStreamingBuffer()
         flushCommentaryBuffer()
+        cancelRateLimitRefreshLoop()
+        var completionStatus = AssistantTurnCompletionStatus.completed
         defer {
             allowsProposedPlanForActiveTurn = false
             activeTurnID = nil
             pendingCopilotFallbackReply = nil
+            activeClaudeQueuedPromptContexts.removeAll()
             currentTurnAttachments = []
             currentTurnHadSuccessfulImageGeneration = false
+            publishExecutionStateSnapshot()
+            scheduleClaudeCodeIdleTimeoutIfNeeded()
         }
 
         guard let turn = params["turn"] as? [String: Any] else {
+            resolveNextActiveClaudeTurnContinuation(status: completionStatus)
             updateHUD(phase: .success, title: "Finished", detail: responsePreview)
             return
         }
@@ -2934,6 +3199,7 @@ final class CodexAssistantRuntime {
         let status = turn["status"] as? String ?? "completed"
         switch status {
         case "completed":
+            completionStatus = .completed
             finalizeActiveActivities(with: .completed)
             onTurnCompletion?(.completed)
             // Turn completion is shown via HUD phase, no transcript status needed.
@@ -2950,6 +3216,7 @@ final class CodexAssistantRuntime {
             }
             sessionTurnCount += 1
         case "interrupted":
+            completionStatus = .interrupted
             finalizeActiveActivities(with: .interrupted)
             onTurnCompletion?(.interrupted)
             if blockedToolUseInterruptionMessage == nil {
@@ -2963,6 +3230,7 @@ final class CodexAssistantRuntime {
         case "failed":
             finalizeActiveActivities(with: .failed)
             let errorText = extractString((turn["error"] as? [String: Any])?["message"]) ?? "\(backend.displayName) could not finish this turn."
+            completionStatus = .failed(message: errorText)
             onTurnCompletion?(.failed(message: errorText))
             onTranscript?(AssistantTranscriptEntry(role: .error, text: errorText, emphasis: true))
             emitTimelineSystemMessage(errorText, emphasis: true)
@@ -2972,6 +3240,22 @@ final class CodexAssistantRuntime {
             onHealthUpdate?(makeHealth(availability: .ready, summary: backend.connectedSummary, detail: errorText))
         default:
             updateHUD(phase: .idle, title: "Assistant is ready", detail: nil)
+        }
+
+        switch completionStatus {
+        case .failed(let message):
+            resolveAllActiveClaudeTurnContinuations(
+                status: completionStatus,
+                error: CodexAssistantRuntimeError.requestFailed(message)
+            )
+        case .interrupted:
+            resolveAllActiveClaudeTurnContinuations(status: completionStatus)
+        default:
+            resolveNextActiveClaudeTurnContinuation(status: completionStatus)
+        }
+
+        if backend == .claudeCode, currentAccountSnapshot.isLoggedIn {
+            Task { await refreshRateLimits() }
         }
 
         blockedToolUseHandledForActiveTurn = false
@@ -3007,7 +3291,9 @@ final class CodexAssistantRuntime {
     }
 
     private func shouldForceStreamingDeltaFlush(for delta: String) -> Bool {
-        delta.contains("\n\n") || delta.contains("\r\n\r\n") || delta.contains("\n")
+        delta.contains("\n\n")
+            || delta.contains("\r\n\r\n")
+            || delta.contains("```")
     }
 
     private func assistantMessageTurnID(from params: [String: Any]) -> String? {
@@ -3078,7 +3364,7 @@ final class CodexAssistantRuntime {
             return
         }
 
-        let minimumInterval: CFAbsoluteTime = 0.14
+        let minimumInterval: CFAbsoluteTime = 0.22
         let emit = { [weak self] in
             guard let self,
                   let entryID = self.streamingEntryID,
@@ -3792,6 +4078,8 @@ final class CodexAssistantRuntime {
         mode: AssistantInteractionMode,
         threadID: String = "thread-1",
         prompt: String = "Hello",
+        attachments: [AssistantAttachment] = [],
+        attachmentContext: String? = nil,
         modelID: String? = "gpt-5.4"
     ) -> [String: Any] {
         let previousMode = interactionMode
@@ -3800,7 +4088,8 @@ final class CodexAssistantRuntime {
         return turnStartParams(
             threadID: threadID,
             prompt: prompt,
-            attachments: [],
+            attachments: attachments,
+            attachmentContext: attachmentContext,
             modelID: modelID
         )
     }
@@ -3929,6 +4218,20 @@ final class CodexAssistantRuntime {
     func processClaudeCodeOutputLineForTesting(_ line: String) {
         backend = .claudeCode
         handleClaudeCodeOutputLine(line)
+    }
+
+    func claudeCodeUserMessagePayloadForTesting(content: String) -> [String: Any] {
+        Self.claudeCodeUserMessagePayload(content: content, sessionID: activeSessionID)
+    }
+
+    func claudeCodeElicitationContentForTesting(
+        answers: [String: [String]],
+        requestedSchema: [String: Any]?
+    ) -> [String: Any] {
+        Self.buildClaudeCodeElicitationContent(
+            from: answers,
+            requestedSchema: requestedSchema
+        )
     }
 
     func blockedToolUseMessage(
@@ -4313,6 +4616,357 @@ final class CodexAssistantRuntime {
         }
     }
 
+    private nonisolated static func serializedClaudeToolInput(_ raw: Any?) -> String {
+        if let text = raw as? String {
+            return text
+        }
+        guard let raw else { return "" }
+        guard JSONSerialization.isValidJSONObject(raw),
+              let data = try? JSONSerialization.data(withJSONObject: raw),
+              let text = String(data: data, encoding: .utf8) else {
+            return ""
+        }
+        return text
+    }
+
+    private nonisolated static func parseClaudeCodePlanEntriesFromToolUse(
+        name: String?,
+        input: Any?
+    ) -> [AssistantPlanEntry]? {
+        guard let normalizedName = name?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() else {
+            return nil
+        }
+
+        func parseJSONObject(_ raw: Any?) -> [String: Any]? {
+            if let dictionary = raw as? [String: Any] {
+                return dictionary
+            }
+            guard let text = raw as? String,
+                  let data = text.data(using: .utf8),
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                return nil
+            }
+            return json
+        }
+
+        func parseRows(
+            _ rows: [[String: Any]],
+            contentKeys: [String],
+            statusKey: String = "status"
+        ) -> [AssistantPlanEntry] {
+            rows.compactMap { row in
+                let content = contentKeys
+                    .compactMap { key in row[key] as? String }
+                    .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                    .first { !$0.isEmpty } ?? "Plan step"
+                let status = (row[statusKey] as? String)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .nonEmpty ?? "pending"
+                return AssistantPlanEntry(content: content, status: status)
+            }
+        }
+
+        switch normalizedName {
+        case "update_plan":
+            if let rows = input as? [[String: Any]] {
+                return parseRows(rows, contentKeys: ["step", "content"])
+            }
+            guard let inputObject = parseJSONObject(input) else { return [] }
+            if let rows = inputObject["plan"] as? [[String: Any]] {
+                return parseRows(rows, contentKeys: ["step", "content"])
+            }
+            if let rows = inputObject["items"] as? [[String: Any]] {
+                return parseRows(rows, contentKeys: ["step", "content"])
+            }
+            return []
+        case "todowrite":
+            guard let inputObject = parseJSONObject(input),
+                  let rows = inputObject["todos"] as? [[String: Any]] else {
+                return []
+            }
+            return parseRows(rows, contentKeys: ["content", "activeForm"])
+        default:
+            return nil
+        }
+    }
+
+    private func publishToolCallsSnapshot() {
+        onToolCallUpdate?(toolCalls.values.sorted { lhs, rhs in
+            lhs.title.localizedCaseInsensitiveCompare(rhs.title) == .orderedAscending
+        })
+    }
+
+    private func parsedClaudeStreamingToolInput(_ inputJSON: String) -> [String: Any]? {
+        guard let data = inputJSON.data(using: .utf8),
+              let raw = try? JSONSerialization.jsonObject(with: data),
+              let object = raw as? [String: Any] else {
+            return nil
+        }
+        return object
+    }
+
+    private func humanizedClaudeStreamingToolFragment(_ value: String?) -> String? {
+        guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+            return nil
+        }
+
+        let spaced = trimmed
+            .replacingOccurrences(of: "__", with: " ")
+            .replacingOccurrences(of: "_", with: " ")
+            .replacingOccurrences(of: "-", with: " ")
+            .replacingOccurrences(
+                of: #"([a-z0-9])([A-Z])"#,
+                with: "$1 $2",
+                options: .regularExpression
+            )
+        return spaced
+            .split(whereSeparator: \.isWhitespace)
+            .map { $0.prefix(1).uppercased() + $0.dropFirst().lowercased() }
+            .joined(separator: " ")
+            .nonEmpty
+    }
+
+    private func claudeStreamingToolPathSummary(_ input: [String: Any]?) -> String? {
+        guard let input else { return nil }
+
+        if let path = firstNonEmptyString(
+            extractString(input["file_path"]),
+            extractString(input["path"]),
+            extractString(input["filepath"]),
+            extractString(input["target_file"]),
+            extractString(input["target_path"])
+        ) {
+            return compactDetail(path)
+        }
+
+        if let paths = input["paths"] as? [Any] {
+            let rendered = paths.compactMap { extractString($0) }
+            if let firstPath = rendered.first, rendered.count == 1 {
+                return compactDetail(firstPath)
+            }
+            if rendered.count > 1 {
+                return "\(rendered.count) paths"
+            }
+        }
+
+        return nil
+    }
+
+    private func claudeStreamingToolCallState(
+        id: String,
+        rawName: String,
+        inputJSON: String
+    ) -> AssistantToolCallState {
+        let normalizedName = rawName
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        let input = parsedClaudeStreamingToolInput(inputJSON)
+        let serializedDetail = compactDetail(inputJSON)
+
+        if normalizedName.hasPrefix("mcp__") {
+            let parts = rawName.split(separator: "__", omittingEmptySubsequences: false)
+            let serverName = parts.count > 1
+                ? humanizedClaudeStreamingToolFragment(String(parts[1])) ?? "MCP"
+                : "MCP"
+            let toolName = parts.count > 2
+                ? humanizedClaudeStreamingToolFragment(String(parts[2])) ?? "Tool"
+                : humanizedClaudeStreamingToolFragment(rawName) ?? "Tool"
+            return AssistantToolCallState(
+                id: id,
+                title: "\(serverName): \(toolName)",
+                kind: "mcpToolCall",
+                status: "inProgress",
+                detail: serializedDetail,
+                hudDetail: "Using \(toolName)"
+            )
+        }
+
+        switch normalizedName {
+        case "bash", "localbash", "powershell", "sandboxnetworkaccess":
+            let command = firstNonEmptyString(
+                extractString(input?["command"]),
+                extractString(input?["cmd"]),
+                extractString(input?["script"]),
+                serializedDetail
+            )
+            let hudDetail = command.map { friendlyCommandSummary($0) } ?? "Running command"
+            return AssistantToolCallState(
+                id: id,
+                title: "Command",
+                kind: "commandExecution",
+                status: "inProgress",
+                detail: compactDetail(command),
+                hudDetail: hudDetail
+            )
+        case "edit", "multiedit", "write":
+            let detail = firstNonEmptyString(
+                claudeStreamingToolPathSummary(input),
+                serializedDetail
+            )
+            let title = normalizedName == "write" ? "Write File" : "File Changes"
+            return AssistantToolCallState(
+                id: id,
+                title: title,
+                kind: "fileChange",
+                status: "inProgress",
+                detail: detail,
+                hudDetail: detail.map { "Editing \($0)" } ?? "Editing files"
+            )
+        case "read":
+            let detail = firstNonEmptyString(
+                claudeStreamingToolPathSummary(input),
+                serializedDetail
+            )
+            return AssistantToolCallState(
+                id: id,
+                title: "Read File",
+                kind: "tool",
+                status: "inProgress",
+                detail: detail,
+                hudDetail: detail.map { "Reading \($0)" } ?? "Reading file"
+            )
+        case "glob", "grep", "search", "find":
+            let detail = firstNonEmptyString(
+                extractString(input?["pattern"]),
+                extractString(input?["query"]),
+                claudeStreamingToolPathSummary(input),
+                serializedDetail
+            )
+            return AssistantToolCallState(
+                id: id,
+                title: humanizedClaudeStreamingToolFragment(rawName) ?? "Search Files",
+                kind: "tool",
+                status: "inProgress",
+                detail: detail,
+                hudDetail: detail.map { "Searching \($0)" } ?? "Searching files"
+            )
+        case "ls":
+            let detail = firstNonEmptyString(
+                claudeStreamingToolPathSummary(input),
+                serializedDetail
+            )
+            return AssistantToolCallState(
+                id: id,
+                title: "List Files",
+                kind: "tool",
+                status: "inProgress",
+                detail: detail,
+                hudDetail: detail.map { "Listing \($0)" } ?? "Listing files"
+            )
+        case "webfetch", "web_fetch":
+            let detail = firstNonEmptyString(
+                extractString(input?["url"]),
+                serializedDetail
+            )
+            return AssistantToolCallState(
+                id: id,
+                title: "Web Fetch",
+                kind: "webSearch",
+                status: "inProgress",
+                detail: detail,
+                hudDetail: detail.map { "Fetching \($0)" } ?? "Fetching web page"
+            )
+        case "websearch", "web_search":
+            let detail = firstNonEmptyString(
+                extractString(input?["query"]),
+                serializedDetail
+            )
+            return AssistantToolCallState(
+                id: id,
+                title: "Web Search",
+                kind: "webSearch",
+                status: "inProgress",
+                detail: detail,
+                hudDetail: detail.map { "Searching \($0)" } ?? "Searching the web"
+            )
+        case let value where value.contains("browser"):
+            return AssistantToolCallState(
+                id: id,
+                title: "Browser",
+                kind: "browserAutomation",
+                status: "inProgress",
+                detail: serializedDetail,
+                hudDetail: "Browsing"
+            )
+        case "task":
+            let detail = firstNonEmptyString(
+                extractString(input?["description"]),
+                extractString(input?["prompt"]),
+                extractString(input?["task"]),
+                serializedDetail
+            )
+            return AssistantToolCallState(
+                id: id,
+                title: "Subagent",
+                kind: "collabAgentToolCall",
+                status: "inProgress",
+                detail: detail,
+                hudDetail: "Delegating"
+            )
+        case "update_plan", "todowrite":
+            return AssistantToolCallState(
+                id: id,
+                title: normalizedName == "todowrite" ? "Todo Write" : "Plan Update",
+                kind: "tool",
+                status: "inProgress",
+                detail: serializedDetail,
+                hudDetail: "Updating plan"
+            )
+        default:
+            let displayName = humanizedClaudeStreamingToolFragment(rawName) ?? "Tool"
+            return AssistantToolCallState(
+                id: id,
+                title: displayName,
+                kind: "tool",
+                status: "inProgress",
+                detail: serializedDetail,
+                hudDetail: "Using \(displayName)"
+            )
+        }
+    }
+
+    private func upsertClaudeStreamingToolUse(
+        id: String,
+        name: String,
+        inputJSON: String
+    ) {
+        let state = claudeStreamingToolCallState(id: id, rawName: name, inputJSON: inputJSON)
+        toolCalls[id] = state
+        let activityKind = activityKind(from: state.kind)
+        let activity = AssistantActivityItem(
+            id: id,
+            sessionID: activeSessionID,
+            turnID: activeTurnID,
+            kind: activityKind,
+            title: state.title,
+            status: parsedActivityStatus(from: state.status, fallback: .running),
+            friendlySummary: activitySummary(kind: activityKind, title: state.title),
+            rawDetails: compactDetail(state.detail),
+            startedAt: liveActivities[id]?.startedAt ?? Date(),
+            updatedAt: Date(),
+            source: .runtime
+        )
+        liveActivities[id] = activity
+        emitActivityTimelineUpdate(activity)
+        publishToolCallsSnapshot()
+    }
+
+    private func removeClaudeStreamingToolUse(forIndex index: Int) -> (id: String, name: String, inputJSON: String)? {
+        guard let toolUse = claudeStreamingToolUseInputs.removeValue(forKey: index) else {
+            return nil
+        }
+        toolCalls.removeValue(forKey: toolUse.id)
+        if var activity = liveActivities.removeValue(forKey: toolUse.id) {
+            activity.status = .completed
+            activity.updatedAt = Date()
+            emitActivityTimelineUpdate(activity, force: true)
+        }
+        publishToolCallsSnapshot()
+        return toolUse
+    }
+
     private func parseToolCallState(from item: [String: Any]) -> AssistantToolCallState? {
         guard let id = item["id"] as? String else { return nil }
         let type = normalizedActivityType(item["type"] as? String ?? "work")
@@ -4479,6 +5133,7 @@ final class CodexAssistantRuntime {
     // Proposed plan streaming: accumulates item/plan/delta content
     private var proposedPlanBuffer: String = ""
     private var allowsProposedPlanForActiveTurn = false
+    private var claudeStreamingToolUseInputs: [Int: (id: String, name: String, inputJSON: String)] = [:]
 
     /// Session IDs that have been detached. Notifications from these sessions are dropped.
     private var detachedSessionIDs: Set<String> = []
@@ -4755,6 +5410,7 @@ final class CodexAssistantRuntime {
         threadID: String,
         prompt: String,
         attachments: [AssistantAttachment] = [],
+        attachmentContext: String? = nil,
         modelID: String?,
         resumeContext: String? = nil,
         memoryContext: String? = nil
@@ -4763,6 +5419,10 @@ final class CodexAssistantRuntime {
         // Add attachment items first so the model sees them before the prompt text
         for attachment in attachments {
             inputItems.append(attachment.toInputItem())
+        }
+        if let attachmentContext = attachmentContext?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !attachmentContext.isEmpty {
+            inputItems.append(["type": "text", "text": attachmentContext])
         }
         if let resumeContext = resumeContext?.trimmingCharacters(in: .whitespacesAndNewlines), !resumeContext.isEmpty {
             inputItems.append(["type": "text", "text": resumeContext])
@@ -5386,6 +6046,7 @@ final class CodexAssistantRuntime {
         let account = try await refreshAccountState()
         let models = try await refreshModels()
         await refreshRateLimits()
+        startIdleRateLimitRefreshIfNeeded()
 
         let health = makeHealth(
             availability: account.isLoggedIn
@@ -5442,7 +6103,7 @@ final class CodexAssistantRuntime {
                 id: "sonnet",
                 displayName: "Claude Sonnet",
                 description: "Balanced Claude Code model alias.",
-                isDefault: true,
+                isDefault: false,
                 hidden: false,
                 supportedReasoningEfforts: [],
                 defaultReasoningEffort: nil
@@ -5451,7 +6112,7 @@ final class CodexAssistantRuntime {
                 id: "opus",
                 displayName: "Claude Opus",
                 description: "Higher-capability Claude Code model alias.",
-                isDefault: false,
+                isDefault: true,
                 hidden: false,
                 supportedReasoningEfforts: [],
                 defaultReasoningEffort: nil
@@ -5476,7 +6137,7 @@ final class CodexAssistantRuntime {
             repeatedCommandTracker.reset()
             resetStreamingTimelineState()
             onToolCallUpdate?([])
-            onPlanUpdate?([])
+            onPlanUpdate?(activeSessionID, [])
             onSubagentUpdate?([])
             onTimelineMutation?(.reset(sessionID: nil))
             onPermissionRequest?(nil)
@@ -5484,6 +6145,7 @@ final class CodexAssistantRuntime {
             firstTurnUserPrompt = nil
         }
 
+        terminateActiveClaudeProcess(expected: true)
         let sessionID = UUID().uuidString.lowercased()
         activeSessionID = sessionID
         activeSessionCWD = resolvedCWD
@@ -5514,6 +6176,9 @@ final class CodexAssistantRuntime {
         }
 
         let resolvedCWD = resolvedClaudeCodeWorkingDirectory(cwd)
+        if activeClaudeProcessSessionID?.caseInsensitiveCompare(sessionID) != .orderedSame {
+            terminateActiveClaudeProcess(expected: true)
+        }
         activeSessionID = sessionID
         activeSessionCWD = resolvedCWD
         sessionTurnCount = 1
@@ -5542,8 +6207,21 @@ final class CodexAssistantRuntime {
 
         activeSessionID = sessionID
         activeSessionCWD = resolvedClaudeCodeWorkingDirectory(cwd)
-        if let requestedModelID = preferredModelID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
+        let requestedModelID = preferredModelID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+        if let requestedModelID {
             self.preferredModelID = requestedModelID
+        }
+        let resolvedPermissionMode = Self.claudeCodePermissionMode(for: interactionMode)
+        if hasLiveClaudeProcess,
+           activeTurnID == nil,
+           pendingPermissionContext == nil,
+           (
+                activeClaudeProcessSessionID?.caseInsensitiveCompare(sessionID) != .orderedSame
+                || activeClaudeProcessWorkingDirectory != activeSessionCWD
+                || activeClaudeProcessModelID != requestedModelID
+                || activeClaudeProcessPermissionMode != resolvedPermissionMode
+           ) {
+            terminateActiveClaudeProcess(expected: true)
         }
         onHealthUpdate?(makeHealth(
             availability: activeTurnID == nil ? .ready : .active,
@@ -5556,6 +6234,7 @@ final class CodexAssistantRuntime {
         prompt: String,
         attachments: [AssistantAttachment],
         preferredModelID: String?,
+        modelSupportsImageInput: Bool,
         resumeContext: String?,
         memoryContext: String?
     ) async throws {
@@ -5577,93 +6256,73 @@ final class CodexAssistantRuntime {
             preferredModelID: preferredModelID
         )
 
-        turnToolCallCount = 0
-        repeatedCommandTracker.reset()
-        activeTurnID = activeTurnID ?? "claude-turn-\(UUID().uuidString)"
-        updateHUD(phase: .streaming, title: "Starting", detail: nil)
-        onHealthUpdate?(makeHealth(availability: .active, summary: backend.activeSummary))
-
         let attachmentContext = try resolvedCLIAttachmentContext(
             sessionID: sessionID,
             attachments: attachments
         )
+        let fullPrompt = buildClaudeCodePrompt(
+            prompt: prompt,
+            resumeContext: resumeContext,
+            memoryContext: memoryContext,
+            attachmentContext: attachmentContext
+        )
 
-        var arguments = [
-            "-p",
-            buildClaudeCodePrompt(
-                prompt: prompt,
-                resumeContext: resumeContext,
-                memoryContext: memoryContext,
-                attachmentContext: attachmentContext
-            ),
-            "--output-format",
-            "stream-json",
-            "--verbose",
-            "--include-partial-messages",
-            "--permission-mode",
-            Self.claudeCodePermissionMode(for: interactionMode)
-        ]
-        if let modelID = preferredModelID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
-            arguments.append(contentsOf: ["--model", modelID])
-        }
-        if sessionTurnCount == 0 {
-            arguments.append(contentsOf: ["--session-id", sessionID])
+        let canInjectFollowUpIntoActiveClaudeProcess =
+            activeTurnID != nil
+            && hasLiveClaudeProcess
+            && pendingPermissionContext == nil
+            && attachments.isEmpty
+
+        enqueueClaudeQueuedPromptContext(
+            attachments: attachments,
+            modelSupportsImageInput: modelSupportsImageInput
+        )
+        if !canInjectFollowUpIntoActiveClaudeProcess {
+            activateCurrentClaudeQueuedPromptContextIfNeeded()
+            activeTurnID = activeTurnID ?? "claude-turn-\(UUID().uuidString)"
+            publishExecutionStateSnapshot()
+            updateHUD(phase: .streaming, title: "Starting", detail: nil)
+            onHealthUpdate?(makeHealth(availability: .active, summary: backend.activeSummary))
+            startRateLimitRefreshLoopIfNeeded()
         } else {
-            arguments.append(contentsOf: ["--resume", sessionID])
-        }
-
-        // MCP tool bridge for computer use
-        await ensureMCPToolBridge()
-        if let mcpConfigPath = await writeMCPConfigFile() {
-            arguments.append(contentsOf: ["--mcp-config", mcpConfigPath])
+            updateHUD(
+                phase: .thinking,
+                title: "Queued Follow-Up",
+                detail: "Claude will continue with your next message after this reply."
+            )
         }
 
         do {
-            let result = try await runClaudeCodeStreamingCommand(
+            try await ensureClaudeCodeLiveProcess(
                 executablePath: executablePath,
-                arguments: arguments,
-                workingDirectory: resolvedCWD
+                sessionID: sessionID,
+                workingDirectory: resolvedCWD,
+                preferredModelID: preferredModelID
             )
-            guard activeTurnID != nil else { return }
-            guard result.exitCode == 0 else {
-                throw CodexAssistantRuntimeError.requestFailed(
-                    Self.commandFailureMessage(
-                        stdout: result.stdout,
-                        stderr: result.stderr,
-                        fallback: "Claude Code could not finish this turn."
-                    )
-                )
-            }
 
-            let parsed = try Self.parseClaudeCodeInvocationResult(from: result.stdout)
-            if let resolvedSessionID = parsed.sessionID?.nonEmpty, resolvedSessionID != activeSessionID {
-                activeSessionID = resolvedSessionID
-                onSessionChange?(resolvedSessionID)
-            }
-            if !parsed.responseText.isEmpty {
-                ensureStreamingIdentifiers()
-                streamingBuffer = parsed.responseText
-                pendingStreamingDeltaBuffer = ""
-            }
-            if let usage = parsed.usage {
-                applyClaudeCodeTokenUsage(usage, modelContextWindow: parsed.modelContextWindow)
-            }
+            let payload = Self.claudeCodeUserMessagePayload(
+                content: fullPrompt,
+                sessionID: sessionID
+            )
+            recordClaudeCodeActivity()
+            try writeClaudeCodeInputMessage(payload)
 
-            let stopReason = parsed.stopReason?.lowercased()
-            switch stopReason {
-            case "cancelled", "canceled", "interrupted":
-                handleTurnCompleted(["turn": ["status": "interrupted"]])
-            default:
-                handleTurnCompleted(["turn": ["status": "completed"]])
+            let status = try await waitForActiveClaudeTurnCompletion()
+            switch status {
+            case .completed, .interrupted:
+                return
+            case .failed(let message):
+                throw CodexAssistantRuntimeError.requestFailed(message)
             }
         } catch {
-            guard activeTurnID != nil else { return }
-            handleTurnCompleted([
-                "turn": [
-                    "status": "failed",
-                    "error": ["message": error.localizedDescription]
-                ]
-            ])
+            if activeTurnID != nil {
+                handleTurnCompleted([
+                    "turn": [
+                        "status": "failed",
+                        "error": ["message": error.localizedDescription]
+                    ]
+                ])
+            }
             throw error
         }
     }
@@ -5707,14 +6366,12 @@ final class CodexAssistantRuntime {
     }
 
     private func handleClaudeCodeStreamPayload(_ payload: [String: Any]) {
-        if let resolvedSessionID = firstNonEmptyString(
+        recordClaudeCodeActivity()
+        let payloadSessionID = firstNonEmptyString(
             payload["session_id"] as? String,
-            payload["sessionId"] as? String
-        ), resolvedSessionID != activeSessionID {
-            activeSessionID = resolvedSessionID
-            onSessionChange?(resolvedSessionID)
-        }
-
+            payload["sessionId"] as? String,
+            activeSessionID
+        )
         switch (payload["type"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
         case "system":
             updateHUD(
@@ -5722,9 +6379,24 @@ final class CodexAssistantRuntime {
                 title: interactionMode.normalizedForActiveUse == .plan ? "Planning" : "Thinking",
                 detail: nil
             )
+        case "user":
+            updateHUD(
+                phase: .thinking,
+                title: interactionMode.normalizedForActiveUse == .plan ? "Planning" : "Thinking",
+                detail: nil
+            )
+        case "control_request":
+            handleClaudeCodeControlRequest(payload)
+        case "control_cancel_request":
+            handleClaudeCodeControlCancelRequest(payload)
         case "assistant":
+            guard let message = payload["message"] as? [String: Any] else {
+                return
+            }
+
+            applyClaudeCodePlanEntriesIfNeeded(from: message, sessionID: payloadSessionID)
+
             guard streamingBuffer.isEmpty,
-                  let message = payload["message"] as? [String: Any],
                   let text = Self.extractClaudeCodeMessageText(from: message) else {
                 return
             }
@@ -5746,13 +6418,539 @@ final class CodexAssistantRuntime {
             )
         case "stream_event":
             guard let event = payload["event"] as? [String: Any] else { return }
-            handleClaudeCodeStreamEvent(event)
+            handleClaudeCodeStreamEvent(event, sessionID: payloadSessionID)
+        case "rate_limit_event":
+            Task { await refreshRateLimits() }
+        case "result":
+            handleClaudeCodeResultPayload(payload)
         default:
             return
         }
     }
 
-    private func handleClaudeCodeStreamEvent(_ event: [String: Any]) {
+    private func applyClaudeCodePlanEntriesIfNeeded(
+        from message: [String: Any],
+        sessionID: String?
+    ) {
+        guard let content = message["content"] as? [[String: Any]] else { return }
+
+        for block in content {
+            guard (block["type"] as? String)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased() == "tool_use" else {
+                continue
+            }
+
+            guard let entries = Self.parseClaudeCodePlanEntriesFromToolUse(
+                name: firstNonEmptyString(
+                    block["name"] as? String,
+                    block["tool_name"] as? String
+                ),
+                input: block["input"]
+            ) else {
+                continue
+            }
+
+            onPlanUpdate?(sessionID, entries)
+        }
+    }
+
+    private func handleClaudeCodeControlRequest(_ payload: [String: Any]) {
+        guard let requestID = firstNonEmptyString(
+                payload["request_id"] as? String,
+                payload["requestId"] as? String
+              ),
+              let request = payload["request"] as? [String: Any],
+              let subtype = firstNonEmptyString(request["subtype"] as? String)?.lowercased() else {
+            return
+        }
+
+        guard !(activeClaudeProcess != nil && activeClaudeStdinHandle == nil) else {
+            presentClaudeCodeOneShotControlRequest(subtype: subtype, payload: request)
+            return
+        }
+
+        switch subtype {
+        case "can_use_tool":
+            presentClaudeCodePermissionRequest(requestID: requestID, payload: request)
+        case "elicitation":
+            presentClaudeCodeElicitationRequest(requestID: requestID, payload: request)
+        default:
+            sendClaudeCodeControlError(
+                requestID: requestID,
+                error: "Unsupported Claude Code control request subtype: \(subtype)"
+            )
+        }
+    }
+
+    private func presentClaudeCodeOneShotControlRequest(
+        subtype: String,
+        payload: [String: Any]
+    ) {
+        switch subtype {
+        case "elicitation":
+            let message = firstNonEmptyString(
+                payload["message"] as? String,
+                "Claude needs more information."
+            ) ?? "Claude needs more information."
+            let url = firstNonEmptyString(payload["url"] as? String)
+            let detail = [message, url, "Please answer in a new chat message to continue."]
+                .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty }
+                .joined(separator: "\n\n")
+            onTranscript?(AssistantTranscriptEntry(role: .assistant, text: detail, emphasis: true))
+            onStatusMessage?("Claude needs more information. Reply in a new message to continue.")
+            updateHUD(
+                phase: .streaming,
+                title: "Waiting for your reply",
+                detail: compactDetail(message)
+            )
+            completeClaudeOneShotTurnForFollowUpIfNeeded()
+        case "can_use_tool":
+            let toolName = firstNonEmptyString(
+                payload["display_name"] as? String,
+                payload["tool_name"] as? String,
+                "a tool"
+            ) ?? "a tool"
+            let detail = firstNonEmptyString(
+                payload["description"] as? String,
+                compactDetail(extractString(payload["input"]))
+            )
+            let message = [
+                "Claude asked to use \(toolName), but this turn is running in one-shot Claude mode for reliability.",
+                detail,
+                "Please try again or send a smaller follow-up if Claude still needs that action."
+            ]
+                .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty }
+                .joined(separator: "\n\n")
+            onTranscript?(AssistantTranscriptEntry(role: .assistant, text: message, emphasis: true))
+            onStatusMessage?("Claude requested interactive tool approval, which is not available for this one-shot turn.")
+            updateHUD(
+                phase: .acting,
+                title: "Action Needed",
+                detail: detail ?? toolName
+            )
+            completeClaudeOneShotTurnForFollowUpIfNeeded()
+        default:
+            onStatusMessage?("Claude asked for extra input, but this turn cannot accept live follow-up data.")
+            completeClaudeOneShotTurnForFollowUpIfNeeded()
+        }
+    }
+
+    private func completeClaudeOneShotTurnForFollowUpIfNeeded() {
+        guard activeTurnID != nil else { return }
+        terminateActiveClaudeProcess()
+        handleTurnCompleted(["turn": ["status": "completed"]])
+    }
+
+    private func handleClaudeCodeControlCancelRequest(_ payload: [String: Any]) {
+        guard let requestID = firstNonEmptyString(
+                payload["request_id"] as? String,
+                payload["requestId"] as? String
+              ),
+              pendingPermissionContext?.request.id == approvalRequestID(from: .string(requestID)) else {
+            return
+        }
+
+        pendingPermissionContext = nil
+        onPermissionRequest?(nil)
+        updateHUD(
+            phase: .thinking,
+            title: interactionMode.normalizedForActiveUse == .plan ? "Planning" : "Thinking",
+            detail: nil
+        )
+    }
+
+    private func presentClaudeCodePermissionRequest(
+        requestID: String,
+        payload: [String: Any]
+    ) {
+        let toolName = firstNonEmptyString(
+            payload["display_name"] as? String,
+            payload["title"] as? String,
+            payload["tool_name"] as? String,
+            "Approval Needed"
+        ) ?? "Approval Needed"
+        let toolUseID = firstNonEmptyString(payload["tool_use_id"] as? String)
+        let toolKind = claudeCodePermissionToolKind(for: payload["tool_name"] as? String)
+        let input = payload["input"] as? [String: Any] ?? [:]
+        let rationale = firstNonEmptyString(
+            payload["description"] as? String,
+            payload["decision_reason"] as? String,
+            payload["blocked_path"] as? String
+        )
+        let summary = firstNonEmptyString(
+            payload["description"] as? String,
+            compactDetail(extractString(input)),
+            payload["tool_name"] as? String
+        )
+        let options = [
+            AssistantPermissionOption(id: "accept", title: "Allow Once", kind: toolKind, isDefault: true),
+            AssistantPermissionOption(id: "decline", title: "Decline", kind: toolKind, isDefault: false),
+            AssistantPermissionOption(id: "cancel", title: "Cancel Turn", kind: toolKind, isDefault: false)
+        ]
+        let request = AssistantPermissionRequest(
+            id: approvalRequestID(from: .string(requestID)),
+            sessionID: activeSessionID ?? "",
+            toolTitle: toolName,
+            toolKind: toolKind,
+            rationale: rationale,
+            options: options,
+            rawPayloadSummary: summary
+        )
+
+        pendingPermissionContext = PendingPermissionContext(request: request) { [weak self] optionID in
+            guard let self else { return }
+
+            let response: [String: Any]
+            switch optionID {
+            case "accept":
+                var payload: [String: Any] = [
+                    "behavior": "allow",
+                    "updatedInput": input
+                ]
+                if let toolUseID {
+                    payload["toolUseID"] = toolUseID
+                }
+                response = payload
+            case "cancel":
+                var payload: [String: Any] = [
+                    "behavior": "deny",
+                    "message": "The user canceled this turn.",
+                    "interrupt": true
+                ]
+                if let toolUseID {
+                    payload["toolUseID"] = toolUseID
+                }
+                response = payload
+            default:
+                var payload: [String: Any] = [
+                    "behavior": "deny",
+                    "message": "The user declined this request."
+                ]
+                if let toolUseID {
+                    payload["toolUseID"] = toolUseID
+                }
+                response = payload
+            }
+            let finalizedResponse = response
+
+            await MainActor.run {
+                self.sendClaudeCodeControlSuccess(requestID: requestID, response: finalizedResponse)
+            }
+        } cancelHandler: { [weak self] in
+            guard let self else { return }
+            var response: [String: Any] = [
+                "behavior": "deny",
+                "message": "The user canceled this turn.",
+                "interrupt": true
+            ]
+            if let toolUseID {
+                response["toolUseID"] = toolUseID
+            }
+            let finalizedResponse = response
+            await MainActor.run {
+                self.sendClaudeCodeControlSuccess(requestID: requestID, response: finalizedResponse)
+            }
+        }
+
+        onPermissionRequest?(request)
+        let transcriptText = summary ?? toolName
+        onTranscript?(AssistantTranscriptEntry(
+            role: .permission,
+            text: "Claude needs approval for: \(transcriptText)",
+            emphasis: true
+        ))
+        onTimelineMutation?(
+            .upsert(
+                .permission(
+                    id: "permission-\(request.id)",
+                    sessionID: request.sessionID,
+                    turnID: activeTurnID,
+                    request: request,
+                    createdAt: Date(),
+                    source: .runtime
+                )
+            )
+        )
+        updateHUD(
+            phase: .waitingForPermission,
+            title: "Approve \(toolName)",
+            detail: summary ?? rationale
+        )
+    }
+
+    private func presentClaudeCodeElicitationRequest(
+        requestID: String,
+        payload: [String: Any]
+    ) {
+        let message = firstNonEmptyString(
+            payload["message"] as? String,
+            "Claude needs more information."
+        ) ?? "Claude needs more information."
+        let sessionID = activeSessionID ?? ""
+        let requestedSchema = payload["requested_schema"] as? [String: Any]
+        let mode = firstNonEmptyString(payload["mode"] as? String)?.lowercased()
+        let url = firstNonEmptyString(payload["url"] as? String)
+
+        if mode == "url", let url {
+            let options = [
+                AssistantPermissionOption(id: "accept", title: "I Opened It", kind: "userInput", isDefault: true),
+                AssistantPermissionOption(id: "decline", title: "Decline", kind: "userInput", isDefault: false),
+                AssistantPermissionOption(id: "cancel", title: "Cancel Request", kind: "userInput", isDefault: false)
+            ]
+            let request = AssistantPermissionRequest(
+                id: approvalRequestID(from: .string(requestID)),
+                sessionID: sessionID,
+                toolTitle: "Claude needs your input",
+                toolKind: "userInput",
+                rationale: "\(message)\n\(url)",
+                options: options,
+                rawPayloadSummary: url
+            )
+
+            pendingPermissionContext = PendingPermissionContext(request: request) { [weak self] optionID in
+                guard let self else { return }
+                let action: String
+                switch optionID {
+                case "accept":
+                    action = "accept"
+                case "decline":
+                    action = "decline"
+                default:
+                    action = "cancel"
+                }
+                await MainActor.run {
+                    self.sendClaudeCodeControlSuccess(
+                        requestID: requestID,
+                        response: ["action": action]
+                    )
+                }
+            } cancelHandler: { [weak self] in
+                guard let self else { return }
+                await MainActor.run {
+                    self.sendClaudeCodeControlSuccess(
+                        requestID: requestID,
+                        response: ["action": "cancel"]
+                    )
+                }
+            }
+
+            onPermissionRequest?(request)
+            onTranscript?(AssistantTranscriptEntry(role: .permission, text: message, emphasis: true))
+            onTimelineMutation?(
+                .upsert(
+                    .permission(
+                        id: "permission-\(request.id)",
+                        sessionID: request.sessionID,
+                        turnID: activeTurnID,
+                        request: request,
+                        createdAt: Date(),
+                        source: .runtime
+                    )
+                )
+            )
+            updateHUD(phase: .waitingForPermission, title: "Input Needed", detail: url)
+            return
+        }
+
+        let questions = Self.parseClaudeCodeElicitationQuestions(
+            message: message,
+            requestedSchema: requestedSchema
+        )
+        let request = AssistantPermissionRequest(
+            id: approvalRequestID(from: .string(requestID)),
+            sessionID: sessionID,
+            toolTitle: "Claude needs input",
+            toolKind: "userInput",
+            rationale: message,
+            options: [],
+            userInputQuestions: questions,
+            rawPayloadSummary: compactDetail(message)
+        )
+
+        pendingPermissionContext = PendingPermissionContext(request: request) { _ in
+        } submitAnswersHandler: { [weak self] answers in
+            guard let self else { return }
+            var response: [String: Any] = ["action": "accept"]
+            let content = Self.buildClaudeCodeElicitationContent(
+                from: answers,
+                requestedSchema: requestedSchema
+            )
+            if !content.isEmpty {
+                response["content"] = content
+            }
+            let finalizedResponse = response
+            await MainActor.run {
+                self.sendClaudeCodeControlSuccess(requestID: requestID, response: finalizedResponse)
+            }
+        } cancelHandler: { [weak self] in
+            guard let self else { return }
+            await MainActor.run {
+                self.sendClaudeCodeControlSuccess(
+                    requestID: requestID,
+                    response: ["action": "cancel"]
+                )
+            }
+        }
+
+        onPermissionRequest?(request)
+        onTranscript?(AssistantTranscriptEntry(
+            role: .permission,
+            text: "Claude needs your answer to continue.",
+            emphasis: true
+        ))
+        onTimelineMutation?(
+            .upsert(
+                .permission(
+                    id: "permission-\(request.id)",
+                    sessionID: request.sessionID,
+                    turnID: activeTurnID,
+                    request: request,
+                    createdAt: Date(),
+                    source: .runtime
+                )
+            )
+        )
+        updateHUD(phase: .waitingForPermission, title: "Input Needed", detail: compactDetail(message))
+    }
+
+    private func claudeCodePermissionToolKind(for toolName: String?) -> String? {
+        switch toolName?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "bash", "localbash", "powershell", "sandboxnetworkaccess":
+            return "commandExecution"
+        case "edit", "multiedit", "write":
+            return "fileChange"
+        case let value? where value.contains("browser"):
+            return "browserUse"
+        default:
+            return "tool"
+        }
+    }
+
+    private func sendClaudeCodeControlSuccess(
+        requestID: String,
+        response: [String: Any]
+    ) {
+        var payload: [String: Any] = [
+            "type": "control_response",
+            "response": [
+                "subtype": "success",
+                "request_id": requestID
+            ]
+        ]
+        if !response.isEmpty {
+            payload["response"] = [
+                "subtype": "success",
+                "request_id": requestID,
+                "response": response
+            ]
+        }
+
+        do {
+            try writeClaudeCodeInputMessage(payload)
+        } catch {
+            onStatusMessage?(error.localizedDescription)
+        }
+    }
+
+    private func sendClaudeCodeControlError(
+        requestID: String,
+        error: String
+    ) {
+        do {
+            try writeClaudeCodeInputMessage([
+                "type": "control_response",
+                "response": [
+                    "subtype": "error",
+                    "request_id": requestID,
+                    "error": error
+                ]
+            ])
+        } catch {
+            onStatusMessage?(error.localizedDescription)
+        }
+    }
+
+    private func handleClaudeCodeResultPayload(_ payload: [String: Any]) {
+        guard activeTurnID != nil else { return }
+
+        if payload["is_error"] as? Bool == true {
+            let message = Self.extractClaudeCodeResponseText(from: payload)
+                ?? Self.commandFailureMessage(
+                    stdout: nil,
+                    stderr: nil,
+                    fallback: "Claude Code reported an error."
+                )
+            handleTurnCompleted([
+                "turn": [
+                    "status": "failed",
+                    "error": ["message": message]
+                ]
+            ])
+            return
+        }
+
+        if let responseText = Self.extractClaudeCodeResponseText(from: payload)?.nonEmpty,
+           streamingBuffer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            ensureStreamingIdentifiers()
+            streamingBuffer = responseText
+            pendingStreamingDeltaBuffer = ""
+        }
+        let (usage, modelContextWindow) = Self.parseClaudeCodeUsage(from: payload)
+        if let usage {
+            applyClaudeCodeTokenUsage(usage, modelContextWindow: modelContextWindow)
+        }
+
+        let stopReason = firstNonEmptyString(
+            payload["stop_reason"] as? String,
+            payload["stopReason"] as? String
+        )?.lowercased()
+        let hasQueuedClaudeFollowUps = activeClaudeQueuedPromptContexts.count > 1
+        switch stopReason {
+        case "cancelled", "canceled", "interrupted":
+            handleTurnCompleted(["turn": ["status": "interrupted"]])
+        default:
+            if hasQueuedClaudeFollowUps {
+                handleClaudeCodeIntermediateCompletion()
+            } else {
+                handleTurnCompleted(["turn": ["status": "completed"]])
+            }
+        }
+    }
+
+    private func handleClaudeCodeIntermediateCompletion() {
+        let completedTurnResponse = correctedAssistantImageFailureFallbackIfNeeded(streamingBuffer)
+        let responsePreview = completedTurnResponse.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+        flushStreamingBuffer()
+        flushCommentaryBuffer()
+        finalizeActiveActivities(with: .completed)
+
+        if sessionTurnCount == 0,
+           let sessionID = activeSessionID,
+           let userPrompt = firstTurnUserPrompt,
+           completedTurnResponse.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty != nil {
+            onTitleRequest?(sessionID, userPrompt, completedTurnResponse)
+        }
+        sessionTurnCount += 1
+
+        _ = dequeueCurrentClaudeQueuedPromptContext()
+        activateCurrentClaudeQueuedPromptContextIfNeeded()
+        pendingCopilotFallbackReply = nil
+        currentTurnHadSuccessfulImageGeneration = false
+        resolveNextActiveClaudeTurnContinuation(status: .completed)
+        updateHUD(
+            phase: .thinking,
+            title: "Queued Follow-Up",
+            detail: responsePreview ?? "Claude is continuing with your next message."
+        )
+        publishExecutionStateSnapshot()
+
+        if backend == .claudeCode, currentAccountSnapshot.isLoggedIn {
+            Task { await refreshRateLimits() }
+        }
+    }
+
+    private func handleClaudeCodeStreamEvent(_ event: [String: Any], sessionID: String?) {
         switch (event["type"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
         case "message_start":
             updateHUD(
@@ -5767,6 +6965,22 @@ final class CodexAssistantRuntime {
                 .lowercased()
             if blockType == "tool_use" {
                 let title = firstNonEmptyString(block["name"] as? String, "Using tool") ?? "Using tool"
+                if let index = event["index"] as? Int {
+                    let toolID = firstNonEmptyString(
+                        block["id"] as? String,
+                        "claude-tool-\(index)"
+                    ) ?? "claude-tool-\(index)"
+                    let inputJSON = Self.serializedClaudeToolInput(block["input"])
+                    claudeStreamingToolUseInputs[index] = (
+                        id: toolID,
+                        name: title,
+                        inputJSON: inputJSON
+                    )
+                    upsertClaudeStreamingToolUse(id: toolID, name: title, inputJSON: inputJSON)
+                    if let entries = Self.parseClaudeCodePlanEntriesFromToolUse(name: title, input: inputJSON) {
+                        onPlanUpdate?(sessionID, entries)
+                    }
+                }
                 updateHUD(phase: .acting, title: title, detail: compactDetail(extractString(block["input"])))
             } else if blockType == "text" {
                 updateHUD(
@@ -5776,27 +6990,61 @@ final class CodexAssistantRuntime {
                 )
             }
         case "content_block_delta":
-            guard let delta = event["delta"] as? [String: Any],
-                  let text = delta["text"] as? String,
-                  !text.isEmpty else {
+            guard let delta = event["delta"] as? [String: Any] else { return }
+            switch (delta["type"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+            case "input_json_delta":
+                guard let index = event["index"] as? Int,
+                      var toolUse = claudeStreamingToolUseInputs[index] else {
+                    return
+                }
+                toolUse.inputJSON += delta["partial_json"] as? String ?? ""
+                claudeStreamingToolUseInputs[index] = toolUse
+                upsertClaudeStreamingToolUse(
+                    id: toolUse.id,
+                    name: toolUse.name,
+                    inputJSON: toolUse.inputJSON
+                )
+                if let entries = Self.parseClaudeCodePlanEntriesFromToolUse(
+                    name: toolUse.name,
+                    input: toolUse.inputJSON
+                ) {
+                    onPlanUpdate?(sessionID, entries)
+                }
+            case "text_delta":
+                guard let text = delta["text"] as? String,
+                      !text.isEmpty else {
+                    return
+                }
+                guard acceptAssistantMessageDelta(
+                    threadID: activeSessionID,
+                    turnID: nil,
+                    source: "claude.stream.content_block_delta"
+                ) else {
+                    return
+                }
+                ensureStreamingIdentifiers()
+                streamingBuffer += text
+                pendingStreamingDeltaBuffer += text
+                emitStreamingAssistantDelta(force: shouldForceStreamingDeltaFlush(for: text))
+                updateHUD(
+                    phase: .streaming,
+                    title: interactionMode.normalizedForActiveUse == .plan ? "Planning" : "Responding",
+                    detail: nil
+                )
+            default:
                 return
             }
-            guard acceptAssistantMessageDelta(
-                threadID: activeSessionID,
-                turnID: nil,
-                source: "claude.stream.content_block_delta"
-            ) else {
+        case "content_block_stop":
+            guard let index = event["index"] as? Int,
+                  let toolUse = removeClaudeStreamingToolUse(forIndex: index) else {
                 return
             }
-            ensureStreamingIdentifiers()
-            streamingBuffer += text
-            pendingStreamingDeltaBuffer += text
-            emitStreamingAssistantDelta(force: shouldForceStreamingDeltaFlush(for: text))
-            updateHUD(
-                phase: .streaming,
-                title: interactionMode.normalizedForActiveUse == .plan ? "Planning" : "Responding",
-                detail: nil
-            )
+            if let entries = Self.parseClaudeCodePlanEntriesFromToolUse(
+                name: toolUse.name,
+                input: toolUse.inputJSON
+            ) {
+                onPlanUpdate?(sessionID, entries)
+            }
         case "message_delta":
             if let delta = event["delta"] as? [String: Any],
                let stopReason = firstNonEmptyString(
@@ -5811,92 +7059,197 @@ final class CodexAssistantRuntime {
         }
     }
 
-    private func runClaudeCodeStreamingCommand(
+    private func ensureClaudeCodeLiveProcess(
         executablePath: String,
-        arguments: [String],
-        workingDirectory: String?
-    ) async throws -> CommandExecutionResult {
-        try await withCheckedThrowingContinuation { continuation in
-            let process = Process()
-            let stdout = Pipe()
-            let stderr = Pipe()
-            let capture = ClaudeCodeCommandCapture()
+        sessionID: String,
+        workingDirectory: String?,
+        preferredModelID: String?
+    ) async throws {
+        let normalizedModelID = preferredModelID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+        let permissionMode = Self.claudeCodePermissionMode(for: interactionMode)
+        let requiresRestart =
+            !hasLiveClaudeProcess
+            || activeClaudeProcessSessionID?.caseInsensitiveCompare(sessionID) != .orderedSame
+            || activeClaudeProcessWorkingDirectory != workingDirectory
+            || activeClaudeProcessModelID != normalizedModelID
+            || activeClaudeProcessPermissionMode != permissionMode
 
-            process.executableURL = URL(fileURLWithPath: executablePath)
-            process.arguments = arguments
-            process.environment = AssistantCommandEnvironment.mergedEnvironment()
-            if let workingDirectory {
-                process.currentDirectoryURL = URL(fileURLWithPath: workingDirectory, isDirectory: true)
+        guard requiresRestart else {
+            recordClaudeCodeActivity()
+            publishExecutionStateSnapshot()
+            return
+        }
+
+        terminateActiveClaudeProcess(expected: true)
+
+        var arguments = [
+            "-p",
+            "--output-format",
+            "stream-json",
+            "--input-format",
+            "stream-json",
+            "--verbose",
+            "--include-partial-messages",
+            "--replay-user-messages",
+            "--permission-mode",
+            permissionMode
+        ]
+        if let normalizedModelID {
+            arguments.append(contentsOf: ["--model", normalizedModelID])
+        }
+        if sessionTurnCount == 0 {
+            arguments.append(contentsOf: ["--session-id", sessionID])
+        } else {
+            arguments.append(contentsOf: ["--resume", sessionID])
+        }
+
+        await ensureMCPToolBridge()
+        if let mcpConfigPath = await writeMCPConfigFile() {
+            arguments.append(contentsOf: ["--mcp-config", mcpConfigPath])
+        }
+
+        let process = Process()
+        let stdin = Pipe()
+        let stdout = Pipe()
+        let stderr = Pipe()
+        let capture = ClaudeCodeCommandCapture()
+
+        process.executableURL = URL(fileURLWithPath: executablePath)
+        process.arguments = arguments
+        process.environment = AssistantCommandEnvironment.mergedEnvironment()
+        if let workingDirectory {
+            process.currentDirectoryURL = URL(fileURLWithPath: workingDirectory, isDirectory: true)
+        }
+        process.standardInput = stdin
+        process.standardOutput = stdout
+        process.standardError = stderr
+
+        stdout.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let data = handle.availableData
+            if data.isEmpty {
+                handle.readabilityHandler = nil
+                return
             }
-            process.standardOutput = stdout
-            process.standardError = stderr
-
-            stdout.fileHandleForReading.readabilityHandler = { [weak self] handle in
-                let data = handle.availableData
-                if data.isEmpty {
-                    handle.readabilityHandler = nil
-                    return
-                }
-                let lines = capture.appendStdout(data)
-                guard !lines.isEmpty else { return }
-                Task { @MainActor [weak self] in
-                    guard let self else { return }
-                    for line in lines {
-                        self.handleClaudeCodeOutputLine(line)
-                    }
+            let lines = capture.appendStdout(data)
+            guard !lines.isEmpty else { return }
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                for line in lines {
+                    self.handleClaudeCodeOutputLine(line)
                 }
             }
+        }
 
-            stderr.fileHandleForReading.readabilityHandler = { handle in
-                let data = handle.availableData
-                if data.isEmpty {
-                    handle.readabilityHandler = nil
-                    return
-                }
-                _ = capture.appendStderr(data)
+        stderr.fileHandleForReading.readabilityHandler = { handle in
+            let data = handle.availableData
+            if data.isEmpty {
+                handle.readabilityHandler = nil
+                return
             }
-
-            process.terminationHandler = { [weak self] completed in
-                stdout.fileHandleForReading.readabilityHandler = nil
-                stderr.fileHandleForReading.readabilityHandler = nil
-
-                let snapshot = capture.finalize(
-                    remainingStdout: stdout.fileHandleForReading.readDataToEndOfFile(),
-                    remainingStderr: stderr.fileHandleForReading.readDataToEndOfFile()
-                )
-
-                Task { @MainActor [weak self] in
-                    guard let self else { return }
-                    for line in snapshot.stdoutLines {
-                        self.handleClaudeCodeOutputLine(line)
-                    }
-                    if self.activeClaudeProcess === completed {
-                        self.activeClaudeProcess = nil
-                    }
-                    continuation.resume(
-                        returning: CommandExecutionResult(
-                            exitCode: completed.terminationStatus,
-                            stdout: snapshot.stdout,
-                            stderr: snapshot.stderr
-                        )
-                    )
+            let lines = capture.appendStderr(data)
+            guard !lines.isEmpty else { return }
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                for line in lines {
+                    self.onStatusMessage?(line)
                 }
             }
+        }
 
-            do {
-                activeClaudeProcess = process
-                try process.run()
-            } catch {
-                activeClaudeProcess = nil
-                stdout.fileHandleForReading.readabilityHandler = nil
-                stderr.fileHandleForReading.readabilityHandler = nil
-                continuation.resume(
-                    throwing: CodexAssistantRuntimeError.runtimeUnavailable(
-                        "Could not launch Claude Code: \(error.localizedDescription)"
-                    )
+        process.terminationHandler = { [weak self] completed in
+            stdout.fileHandleForReading.readabilityHandler = nil
+            stderr.fileHandleForReading.readabilityHandler = nil
+
+            let snapshot = capture.finalize(
+                remainingStdout: stdout.fileHandleForReading.readDataToEndOfFile(),
+                remainingStderr: stderr.fileHandleForReading.readDataToEndOfFile()
+            )
+
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                for line in snapshot.stdoutLines {
+                    self.handleClaudeCodeOutputLine(line)
+                }
+                self.handleClaudeCodeLiveProcessTermination(
+                    completed,
+                    snapshot: snapshot
                 )
             }
         }
+
+        do {
+            try process.run()
+        } catch {
+            stdout.fileHandleForReading.readabilityHandler = nil
+            stderr.fileHandleForReading.readabilityHandler = nil
+            stdin.fileHandleForWriting.closeFile()
+            throw CodexAssistantRuntimeError.runtimeUnavailable(
+                "Could not launch Claude Code: \(error.localizedDescription)"
+            )
+        }
+
+        activeClaudeProcess = process
+        activeClaudeStdinHandle = stdin.fileHandleForWriting
+        activeClaudeProcessSessionID = sessionID
+        activeClaudeProcessWorkingDirectory = workingDirectory
+        activeClaudeProcessModelID = normalizedModelID
+        activeClaudeProcessPermissionMode = permissionMode
+        recordClaudeCodeActivity()
+        publishExecutionStateSnapshot()
+    }
+
+    private func handleClaudeCodeLiveProcessTermination(
+        _ completed: Process,
+        snapshot: (stdout: String, stderr: String, stdoutLines: [String], stderrLines: [String])
+    ) {
+        let wasCurrentProcess = activeClaudeProcess === completed
+        let hadLiveProcess = hasLiveClaudeProcess
+        if wasCurrentProcess {
+            activeClaudeStdinHandle?.closeFile()
+            activeClaudeStdinHandle = nil
+            activeClaudeProcess = nil
+            activeClaudeProcessSessionID = nil
+            activeClaudeProcessWorkingDirectory = nil
+            activeClaudeProcessModelID = nil
+            activeClaudeProcessPermissionMode = nil
+        }
+        cancelClaudeCodeIdleTimeoutTask()
+        if wasCurrentProcess || hadLiveProcess {
+            publishExecutionStateSnapshot()
+        }
+
+        guard wasCurrentProcess else { return }
+
+        let exitCode = Int(completed.terminationStatus)
+        guard activeTurnID != nil else {
+            if exitCode != 0 {
+                let message = Self.commandFailureMessage(
+                    stdout: snapshot.stdout,
+                    stderr: snapshot.stderr,
+                    fallback: "Claude Code stopped unexpectedly."
+                )
+                onStatusMessage?(message)
+                updateHUD(phase: .idle, title: "Session ready", detail: nil)
+            }
+            return
+        }
+
+        if exitCode == 0 {
+            handleTurnCompleted(["turn": ["status": "interrupted"]])
+            return
+        }
+
+        let message = Self.commandFailureMessage(
+            stdout: snapshot.stdout,
+            stderr: snapshot.stderr,
+            fallback: "Claude Code stopped unexpectedly."
+        )
+        handleTurnCompleted([
+            "turn": [
+                "status": "failed",
+                "error": ["message": message]
+            ]
+        ])
     }
 
     private func runClaudeCodeCommand(
@@ -5953,12 +7306,34 @@ final class CodexAssistantRuntime {
         }
     }
 
-    private func terminateActiveClaudeProcess() {
-        guard let activeClaudeProcess else { return }
+    private func terminateActiveClaudeProcess(expected _: Bool = true) {
+        cancelClaudeCodeIdleTimeoutTask()
+        guard let activeClaudeProcess else {
+            publishExecutionStateSnapshot()
+            return
+        }
         if activeClaudeProcess.isRunning {
             activeClaudeProcess.terminate()
         }
+        activeClaudeStdinHandle?.closeFile()
+        activeClaudeStdinHandle = nil
         self.activeClaudeProcess = nil
+        activeClaudeProcessSessionID = nil
+        activeClaudeProcessWorkingDirectory = nil
+        activeClaudeProcessModelID = nil
+        activeClaudeProcessPermissionMode = nil
+        publishExecutionStateSnapshot()
+    }
+
+    private func writeClaudeCodeInputMessage(_ payload: [String: Any]) throws {
+        guard let activeClaudeStdinHandle else {
+            throw CodexAssistantRuntimeError.runtimeUnavailable(
+                "This Claude turn is not waiting for live input anymore. Please answer in a new chat message."
+            )
+        }
+        let data = try Self.serializeClaudeCodeJSONObjectLine(payload)
+        try activeClaudeStdinHandle.write(contentsOf: data)
+        recordClaudeCodeActivity()
     }
 
     nonisolated static func parseClaudeCodeAccountSnapshot(from output: String) throws -> AssistantAccountSnapshot {
@@ -5995,12 +7370,14 @@ final class CodexAssistantRuntime {
     nonisolated static func parseClaudeCodeInvocationResult(from output: String) throws -> ClaudeCodeInvocationResult {
         let payload = try parseClaudeCodeInvocationPayload(from: output)
         if payload["is_error"] as? Bool == true {
-            throw CodexAssistantRuntimeError.requestFailed(
-                commandFailureMessage(
+            let message = extractClaudeCodeResponseText(from: payload)
+                ?? commandFailureMessage(
                     stdout: output,
                     stderr: nil,
                     fallback: "Claude Code reported an error."
                 )
+            throw CodexAssistantRuntimeError.requestFailed(
+                message
             )
         }
 
@@ -6046,12 +7423,21 @@ final class CodexAssistantRuntime {
     }
 
     private nonisolated static func extractClaudeCodeResponseText(from payload: [String: Any]) -> String? {
+        if let errors = payload["errors"] as? [String] {
+            let joined = errors
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+                .joined(separator: "\n")
+            if let text = joined.nonEmpty {
+                return normalizedClaudeCodeDisplayText(text)
+            }
+        }
         if let text = (payload["result"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
-            return text
+            return normalizedClaudeCodeDisplayText(text)
         }
         if let result = payload["result"] as? [String: Any] {
             if let text = (result["text"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
-                return text
+                return normalizedClaudeCodeDisplayText(text)
             }
             if let content = result["content"] as? [[String: Any]] {
                 return extractClaudeCodeContentText(from: content)
@@ -6065,7 +7451,7 @@ final class CodexAssistantRuntime {
 
     private nonisolated static func extractClaudeCodeMessageText(from message: [String: Any]) -> String? {
         if let text = (message["text"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
-            return text
+            return normalizedClaudeCodeDisplayText(text)
         }
         if let content = message["content"] as? [[String: Any]] {
             return extractClaudeCodeContentText(from: content)
@@ -6079,7 +7465,7 @@ final class CodexAssistantRuntime {
                 return nil
             }
             if let text = (item["text"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
-                return text
+                return normalizedClaudeCodeDisplayText(text)
             }
             if let nested = item["content"] as? [String: Any] {
                 return extractClaudeCodeMessageText(from: nested)
@@ -6131,6 +7517,220 @@ final class CodexAssistantRuntime {
         return (breakdown, contextWindow > 0 ? contextWindow : nil)
     }
 
+    private nonisolated static func claudeCodeUserMessagePayload(
+        content: String,
+        sessionID: String?
+    ) -> [String: Any] {
+        [
+            "type": "user",
+            "session_id": sessionID ?? "",
+            "message": [
+                "role": "user",
+                "content": [[
+                    "type": "text",
+                    "text": content
+                ]]
+            ],
+            "parent_tool_use_id": NSNull()
+        ]
+    }
+
+    private nonisolated static func serializeClaudeCodeJSONObjectLine(
+        _ payload: [String: Any]
+    ) throws -> Data {
+        let data = try JSONSerialization.data(withJSONObject: payload, options: [])
+        var line = data
+        line.append(Data([UInt8(ascii: "\n")]))
+        return line
+    }
+
+    private nonisolated static func parseClaudeCodeElicitationQuestions(
+        message: String,
+        requestedSchema: [String: Any]?
+    ) -> [AssistantUserInputQuestion] {
+        guard let properties = requestedSchema?["properties"] as? [String: Any],
+              !properties.isEmpty else {
+            return [
+                AssistantUserInputQuestion(
+                    id: "response",
+                    header: "Response",
+                    prompt: message,
+                    options: [],
+                    allowsCustomAnswer: true
+                )
+            ]
+        }
+
+        let required = Set((requestedSchema?["required"] as? [String]) ?? [])
+        let orderedKeys: [String]
+        if !required.isEmpty {
+            orderedKeys = properties.keys
+                .filter { required.contains($0) }
+                .sorted()
+        } else {
+            orderedKeys = properties.keys.sorted()
+        }
+
+        return orderedKeys.map { key in
+            let schema = properties[key] as? [String: Any] ?? [:]
+            let title = firstNonEmptyClaudeString(schema["title"] as? String)
+            let description = firstNonEmptyClaudeString(schema["description"] as? String)
+            let header = firstNonEmptyClaudeString(
+                title,
+                prettifyClaudeCodeFieldName(key),
+                "Answer"
+            ) ?? "Answer"
+            let optionValues = claudeCodeElicitationOptionValues(for: schema)
+            let allowsCustomAnswer = claudeCodeElicitationAllowsCustomAnswer(
+                for: schema,
+                optionValues: optionValues
+            )
+            var prompt = firstNonEmptyClaudeString(description, title, header) ?? header
+            if let guidance = claudeCodeElicitationInputGuidance(for: schema) {
+                prompt = "\(prompt)\n\(guidance)"
+            }
+
+            return AssistantUserInputQuestion(
+                id: key,
+                header: header,
+                prompt: prompt,
+                options: optionValues.enumerated().map { index, value in
+                    AssistantUserInputQuestionOption(
+                        id: "\(key)-option-\(index)",
+                        label: value,
+                        detail: nil
+                    )
+                },
+                allowsCustomAnswer: allowsCustomAnswer
+            )
+        }
+    }
+
+    private nonisolated static func buildClaudeCodeElicitationContent(
+        from answers: [String: [String]],
+        requestedSchema: [String: Any]?
+    ) -> [String: Any] {
+        guard let properties = requestedSchema?["properties"] as? [String: Any],
+              !properties.isEmpty else {
+            guard let first = answers.first else { return [:] }
+            if first.value.count <= 1 {
+                return [first.key: first.value.first ?? ""]
+            }
+            return [first.key: first.value]
+        }
+
+        var content: [String: Any] = [:]
+        for (key, values) in answers {
+            let schema = properties[key] as? [String: Any] ?? [:]
+            content[key] = coerceClaudeCodeElicitationValue(values, schema: schema)
+        }
+        return content
+    }
+
+    private nonisolated static func coerceClaudeCodeElicitationValue(
+        _ values: [String],
+        schema: [String: Any]
+    ) -> Any {
+        let normalizedValues = values
+            .flatMap { value -> [String] in
+                let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmed.isEmpty else { return [] }
+                return [trimmed]
+            }
+        let type = firstNonEmptyClaudeString(schema["type"] as? String)?.lowercased()
+
+        if type == "array" {
+            let itemSchema = schema["items"] as? [String: Any] ?? [:]
+            let arrayValues = normalizedValues.flatMap { value in
+                value
+                    .split(separator: ",")
+                    .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                    .filter { !$0.isEmpty }
+            }
+            return arrayValues.map { coerceClaudeCodeScalarValue($0, schema: itemSchema) }
+        }
+
+        let scalar = normalizedValues.first ?? ""
+        return coerceClaudeCodeScalarValue(scalar, schema: schema)
+    }
+
+    private nonisolated static func coerceClaudeCodeScalarValue(
+        _ value: String,
+        schema: [String: Any]
+    ) -> Any {
+        switch firstNonEmptyClaudeString(schema["type"] as? String)?.lowercased() {
+        case "boolean":
+            let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if ["true", "yes", "y", "1", "on"].contains(normalized) {
+                return true
+            }
+            if ["false", "no", "n", "0", "off"].contains(normalized) {
+                return false
+            }
+            return value
+        case "integer":
+            return Int(value) ?? value
+        case "number":
+            return Double(value) ?? value
+        default:
+            return value
+        }
+    }
+
+    private nonisolated static func claudeCodeElicitationOptionValues(
+        for schema: [String: Any]
+    ) -> [String] {
+        if let options = schema["enum"] as? [String], !options.isEmpty {
+            return options
+        }
+        let type = firstNonEmptyClaudeString(schema["type"] as? String)?.lowercased()
+        if type == "boolean" {
+            return ["Yes", "No"]
+        }
+        if type == "array",
+           let items = schema["items"] as? [String: Any],
+           let options = items["enum"] as? [String],
+           !options.isEmpty {
+            return options
+        }
+        return []
+    }
+
+    private nonisolated static func claudeCodeElicitationAllowsCustomAnswer(
+        for schema: [String: Any],
+        optionValues: [String]
+    ) -> Bool {
+        let type = firstNonEmptyClaudeString(schema["type"] as? String)?.lowercased()
+        if optionValues.isEmpty {
+            return true
+        }
+        return type == "array"
+    }
+
+    private nonisolated static func claudeCodeElicitationInputGuidance(
+        for schema: [String: Any]
+    ) -> String? {
+        let type = firstNonEmptyClaudeString(schema["type"] as? String)?.lowercased()
+        if type == "array" {
+            return "If you want multiple values, type them separated by commas."
+        }
+        if type == "boolean" {
+            return "Choose Yes or No."
+        }
+        return nil
+    }
+
+    private nonisolated static func prettifyClaudeCodeFieldName(_ key: String) -> String {
+        key
+            .replacingOccurrences(of: "_", with: " ")
+            .replacingOccurrences(of: "-", with: " ")
+            .split(separator: " ")
+            .map { component in
+                component.prefix(1).uppercased() + component.dropFirst().lowercased()
+            }
+            .joined(separator: " ")
+    }
+
     private nonisolated static func addTokenUsageBreakdowns(
         _ lhs: TokenUsageBreakdown,
         _ rhs: TokenUsageBreakdown
@@ -6164,11 +7764,80 @@ final class CodexAssistantRuntime {
         stderr: String?,
         fallback: String
     ) -> String {
-        firstNonEmptyClaudeString(
+        let message = firstNonEmptyClaudeString(
             stderr?.trimmingCharacters(in: .whitespacesAndNewlines),
             stdout?.trimmingCharacters(in: .whitespacesAndNewlines),
             fallback
         ) ?? fallback
+        return normalizedClaudeCodeDisplayText(message)
+    }
+
+    private nonisolated static func normalizedClaudeCodeDisplayText(_ text: String) -> String {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let formatted = formattedClaudeCodeAPIError(from: trimmed) else {
+            return trimmed
+        }
+        return formatted
+    }
+
+    private nonisolated static func formattedClaudeCodeAPIError(from text: String) -> String? {
+        let normalized = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard normalized.localizedCaseInsensitiveContains("API Error:") else { return nil }
+
+        let statusCode = parseClaudeCodeAPIStatusCode(from: normalized)
+        let jsonPayload: [String: Any]? = {
+            guard let braceIndex = normalized.firstIndex(of: "{") else { return nil }
+            let jsonString = String(normalized[braceIndex...])
+            guard let data = jsonString.data(using: .utf8),
+                  let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                return nil
+            }
+            return payload
+        }()
+
+        let errorPayload = jsonPayload?["error"] as? [String: Any]
+        let requestID = firstNonEmptyClaudeString(jsonPayload?["request_id"] as? String)
+        let errorType = firstNonEmptyClaudeString(errorPayload?["type"] as? String)?.lowercased()
+        let apiMessage = firstNonEmptyClaudeString(errorPayload?["message"] as? String)
+
+        var lines: [String]
+        switch (statusCode, errorType) {
+        case (529, _), (_, "overloaded_error"):
+            lines = [
+                "Claude is overloaded right now.",
+                "Please wait a little and try again."
+            ]
+        case (500, _):
+            lines = [
+                "Claude had a temporary server error.",
+                "Please try again in a moment."
+            ]
+        default:
+            let fallback = apiMessage ?? normalized
+            lines = ["Claude returned an API error: \(fallback)"]
+        }
+
+        if let requestID {
+            lines.append("Request ID: \(requestID)")
+        }
+
+        return lines.joined(separator: "\n")
+    }
+
+    private nonisolated static func parseClaudeCodeAPIStatusCode(from text: String) -> Int? {
+        guard let range = text.range(
+            of: #"API Error:\s*(\d{3})"#,
+            options: .regularExpression
+        ) else {
+            return nil
+        }
+
+        let match = String(text[range])
+        return match
+            .components(separatedBy: CharacterSet.decimalDigits.inverted)
+            .joined()
+            .nonEmpty
+            .flatMap(Int.init)
     }
 
     private nonisolated static func firstNonEmptyClaudeString(_ candidates: String?...) -> String? {
@@ -6325,7 +7994,7 @@ final class CodexAssistantRuntime {
             repeatedCommandTracker.reset()
             resetStreamingTimelineState()
             onToolCallUpdate?([])
-            onPlanUpdate?([])
+            onPlanUpdate?(activeSessionID, [])
             onSubagentUpdate?([])
             onTimelineMutation?(.reset(sessionID: nil))
             onPermissionRequest?(nil)

@@ -6,6 +6,7 @@ import { MarkdownContent } from "./MarkdownContent";
 import { CollapsibleImageGallery } from "./CollapsibleImageGallery";
 import { MessageCheckpointCard } from "./MessageCheckpointCard";
 import { useSmoothTextStream } from "../hooks/useSmoothTextStream";
+import { StreamingContext } from "../StreamingContext";
 
 function providerTheme(label?: string): "codex" | "copilot" | "claude" | "default" {
   const normalized = (label || "").trim().toLowerCase();
@@ -55,7 +56,9 @@ function AssistantMessageInner({
         {copyText && (
           <div className="assistant-message-stage phase-settled">
             <div className="assistant-markdown-shell">
-              <MarkdownContent markdown={smoothText} />
+              <StreamingContext.Provider value={message.isStreaming || false}>
+                <MarkdownContent markdown={smoothText} />
+              </StreamingContext.Provider>
             </div>
             {message.providerLabel && (
               <div

@@ -19,7 +19,7 @@ enum SettingsSection: String, CaseIterable, Identifiable, Sendable {
         case .dailyUse:
             return "AI & Assistant"
         case .voiceDictation:
-            return "Voice"
+            return "Voice & Shortcuts"
         case .browserAppControl:
             return "Automation"
         case .permissionsPrivacy:
@@ -36,7 +36,7 @@ enum SettingsSection: String, CaseIterable, Identifiable, Sendable {
         case .dailyUse:
             return "The everyday AI controls most people care about."
         case .voiceDictation:
-            return "Microphone, dictation, shortcuts, and speech quality."
+            return "Microphone, dictation, assistant shortcuts, and speech quality."
         case .browserAppControl:
             return "Browser reuse, app control, computer use, and approvals."
         case .permissionsPrivacy:
@@ -87,7 +87,7 @@ enum SettingsSection: String, CaseIterable, Identifiable, Sendable {
         case .dailyUse:
             return ["assistant", "ai", "rewrite", "appearance", "sounds", "common tasks"]
         case .voiceDictation:
-            return ["voice", "dictation", "speech", "shortcut", "hold to talk", "microphone", "whisper", "cleanup", "correction"]
+            return ["voice", "dictation", "speech", "shortcut", "assistant shortcut", "sidebar shortcut", "compact assistant", "hold to talk", "microphone", "whisper", "cleanup", "correction"]
         case .browserAppControl:
             return ["browser", "automation", "computer use", "app action", "screen recording", "apple events", "profile", "finder", "terminal"]
         case .permissionsPrivacy:
@@ -223,9 +223,9 @@ enum SettingsNavigationModel {
         ),
         .init(
             destination: SettingsRoute(section: .voiceDictation, cardID: "voice.tasks"),
-            title: "Voice setup",
-            detail: "Open the voice and dictation quick-start area",
-            keywords: ["voice", "dictation", "test dictation", "microphone", "shortcut"]
+            title: "Voice and shortcuts",
+            detail: "Open the voice, dictation, and shortcut quick-start area",
+            keywords: ["voice", "dictation", "test dictation", "microphone", "shortcut", "assistant shortcut", "sidebar shortcut", "compact assistant"]
         ),
         .init(
             destination: SettingsRoute(section: .voiceDictation, cardID: "shortcuts.agentShortcut"),
@@ -322,6 +322,12 @@ enum SettingsNavigationModel {
             title: "Provider connection status",
             detail: "See which AI providers are ready",
             keywords: ["provider", "oauth", "api key", "openai", "anthropic", "google", "gemini", "connection"]
+        ),
+        .init(
+            destination: SettingsRoute(section: .advanced, cardID: "advanced.notesBackup"),
+            title: "Notes backup",
+            detail: "Choose the local notes backup folder, run a backup now, or restore an older notes backup",
+            keywords: ["notes", "backup", "history", "restore", "deleted notes", "local backup"]
         ),
         .init(
             destination: SettingsRoute(

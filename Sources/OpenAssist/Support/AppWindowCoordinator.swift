@@ -130,6 +130,10 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
     private var historyTargetApplication: NSRunningApplication?
     private var onboardingCompletion: (() -> Void)?
     private var activationPolicyObservers: [NSObjectProtocol] = []
+    private var pendingAssistantWindowFitWorkItem: DispatchWorkItem?
+    private var assistantWindowNeedsPostMoveFit = false
+
+    private let assistantWindowFitDebounceDelay: TimeInterval = 0.18
 
     private var standardWindowCollectionBehavior: NSWindow.CollectionBehavior {
         [.moveToActiveSpace, .fullScreenPrimary]
@@ -453,6 +457,7 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
     }
 
     func closeAllWindows() {
+        cancelPendingAssistantWindowFit()
         onboardingWindowController?.close()
         onboardingWindowController = nil
         settingsWindowController?.close()
@@ -475,6 +480,7 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
             } else if closingWindow === aiStudioWindowController?.window {
                 aiStudioWindowController = nil
             } else if closingWindow === assistantWindowController?.window {
+                cancelPendingAssistantWindowFit()
                 assistantWindowController = nil
                 assistantHostingController = nil
                 onAssistantWindowVisibilityChanged?(false)
@@ -493,7 +499,18 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
             return
         }
 
-        fitAssistantWindowToVisibleScreen(window)
+        assistantWindowNeedsPostMoveFit = true
+        scheduleAssistantWindowFit(window)
+    }
+
+    func windowDidMove(_ notification: Notification) {
+        guard let window = notification.object as? NSWindow,
+              window === assistantWindowController?.window,
+              assistantWindowNeedsPostMoveFit else {
+            return
+        }
+
+        scheduleAssistantWindowFit(window)
     }
 
     private func reinsertFromHistory(_ text: String) {
@@ -558,6 +575,38 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
         }
 
         window.setFrame(fittedFrame, display: false)
+    }
+
+    private func scheduleAssistantWindowFit(_ window: NSWindow) {
+        pendingAssistantWindowFitWorkItem?.cancel()
+
+        let workItem = DispatchWorkItem { [weak self, weak window] in
+            guard let self, let window,
+                  window === self.assistantWindowController?.window else {
+                return
+            }
+
+            if (NSEvent.pressedMouseButtons & 1) == 1 {
+                self.scheduleAssistantWindowFit(window)
+                return
+            }
+
+            self.pendingAssistantWindowFitWorkItem = nil
+            self.assistantWindowNeedsPostMoveFit = false
+            self.fitAssistantWindowToVisibleScreen(window)
+        }
+
+        pendingAssistantWindowFitWorkItem = workItem
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + assistantWindowFitDebounceDelay,
+            execute: workItem
+        )
+    }
+
+    private func cancelPendingAssistantWindowFit() {
+        pendingAssistantWindowFitWorkItem?.cancel()
+        pendingAssistantWindowFitWorkItem = nil
+        assistantWindowNeedsPostMoveFit = false
     }
 
     private func preferredVisibleFrame(for window: NSWindow) -> NSRect? {

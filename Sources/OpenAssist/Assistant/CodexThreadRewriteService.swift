@@ -1040,11 +1040,8 @@ final class CodexThreadRewriteService {
         var uniqueFragments: [String] = []
         var seen = Set<String>()
         for fragment in fragments {
-            let normalized = fragment.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !normalized.isEmpty, seen.insert(normalized).inserted else {
-                continue
-            }
-            if normalized.hasPrefix("# Session Memory") {
+            guard let normalized = normalizedVisibleFragment(from: fragment),
+                  seen.insert(normalized).inserted else {
                 continue
             }
             uniqueFragments.append(normalized)
@@ -1121,6 +1118,59 @@ final class CodexThreadRewriteService {
                 with: " ",
                 options: .regularExpression
             )
+    }
+
+    private func normalizedVisibleFragment(from fragment: String) -> String? {
+        let normalized = fragment.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else {
+            return nil
+        }
+        if normalized.hasPrefix("# Session Memory") {
+            return nil
+        }
+        if let attachmentHeader = collapsedAttachmentHeader(from: normalized) {
+            return attachmentHeader
+        }
+        return normalized
+    }
+
+    private func collapsedAttachmentHeader(from value: String) -> String? {
+        guard let newlineIndex = value.firstIndex(of: "\n") else {
+            return nil
+        }
+
+        let header = value[..<newlineIndex].trimmingCharacters(in: .whitespacesAndNewlines)
+        guard header.hasPrefix("["),
+              header.hasSuffix("]"),
+              header.count > 2 else {
+            return nil
+        }
+
+        let body = value[value.index(after: newlineIndex)...]
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard looksLikeMachineAttachmentPayload(body) else {
+            return nil
+        }
+
+        return header
+    }
+
+    private func looksLikeMachineAttachmentPayload(_ value: String) -> Bool {
+        let condensed = value
+            .replacingOccurrences(of: "\r", with: "")
+            .replacingOccurrences(of: "\n", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard condensed.count >= 256 else {
+            return false
+        }
+        if condensed.hasPrefix("UEsDB") || condensed.hasPrefix("JVBERi0") || condensed.hasPrefix("iVBORw0KGgo") {
+            return true
+        }
+
+        let validBase64Scalars = condensed.unicodeScalars.filter { scalar in
+            CharacterSet.alphanumerics.contains(scalar) || scalar == "+" || scalar == "/" || scalar == "="
+        }.count
+        return Double(validBase64Scalars) / Double(condensed.unicodeScalars.count) > 0.97
     }
 
     private func normalizedSessionID(_ sessionID: String) -> String {

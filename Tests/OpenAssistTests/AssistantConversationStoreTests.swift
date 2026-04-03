@@ -673,17 +673,30 @@ final class AssistantConversationStoreTests: XCTestCase {
         let snapshotURL = try XCTUnwrap(store.snapshotFileURL(for: threadID))
         let eventLogURL = try XCTUnwrap(store.eventLogFileURL(for: threadID))
         let workspace = store.loadThreadNotesWorkspace(threadID: threadID)
+        let noteID = try XCTUnwrap(workspace.selectedNote?.id)
         let noteFileName = try XCTUnwrap(workspace.selectedNote?.fileName)
         let noteDirectoryURL = directoryURL
             .appendingPathComponent(threadID, isDirectory: true)
             .appendingPathComponent("notes", isDirectory: true)
         let manifestURL = noteDirectoryURL.appendingPathComponent("manifest.json", isDirectory: false)
         let noteURL = noteDirectoryURL.appendingPathComponent(noteFileName, isDirectory: false)
+        _ = try store.saveThreadNote(
+            threadID: threadID,
+            noteID: noteID,
+            text: "Delete me again",
+            now: Date(timeIntervalSince1970: 900)
+        )
+        let historyOwnerDirectoryURL = directoryURL
+            .appendingPathComponent("Recovery", isDirectory: true)
+            .appendingPathComponent("history", isDirectory: true)
+            .appendingPathComponent("thread", isDirectory: true)
+            .appendingPathComponent(threadID, isDirectory: true)
 
         XCTAssertTrue(fileManager.fileExists(atPath: snapshotURL.path))
         XCTAssertTrue(fileManager.fileExists(atPath: eventLogURL.path))
         XCTAssertTrue(fileManager.fileExists(atPath: manifestURL.path))
         XCTAssertTrue(fileManager.fileExists(atPath: noteURL.path))
+        XCTAssertTrue(fileManager.fileExists(atPath: historyOwnerDirectoryURL.path))
 
         store.deleteThreadArtifacts(threadID: threadID)
 
@@ -691,6 +704,294 @@ final class AssistantConversationStoreTests: XCTestCase {
         XCTAssertFalse(fileManager.fileExists(atPath: eventLogURL.path))
         XCTAssertFalse(fileManager.fileExists(atPath: manifestURL.path))
         XCTAssertFalse(fileManager.fileExists(atPath: noteURL.path))
+        XCTAssertFalse(fileManager.fileExists(atPath: historyOwnerDirectoryURL.path))
         XCTAssertEqual(store.loadThreadNote(threadID: threadID), "")
+    }
+
+    func testRestoringThreadNoteHistoryKeepsCurrentStateRecoverable() throws {
+        let fileManager = FileManager.default
+        let directoryURL = fileManager.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? fileManager.removeItem(at: directoryURL) }
+
+        let store = AssistantConversationStore(
+            fileManager: fileManager,
+            baseDirectoryURL: directoryURL
+        )
+
+        let threadID = "history-thread"
+        let createdWorkspace = try store.createThreadNote(threadID: threadID, title: "Notes")
+        let noteID = try XCTUnwrap(createdWorkspace.selectedNote?.id)
+        let baseDate = Date(timeIntervalSince1970: 2_000)
+
+        _ = try store.saveThreadNote(
+            threadID: threadID,
+            noteID: noteID,
+            text: "Draft 1",
+            now: baseDate
+        )
+        _ = try store.saveThreadNote(
+            threadID: threadID,
+            noteID: noteID,
+            text: "Draft 2",
+            now: baseDate.addingTimeInterval(60)
+        )
+        _ = try store.saveThreadNote(
+            threadID: threadID,
+            noteID: noteID,
+            text: "Draft 3",
+            now: baseDate.addingTimeInterval(420)
+        )
+
+        let historyBeforeRestore = store.threadNoteHistoryVersions(threadID: threadID, noteID: noteID)
+        XCTAssertEqual(historyBeforeRestore.map(\.preview), ["Draft 2", "Draft 1"])
+
+        let restoredWorkspace = try store.restoreThreadNoteHistoryVersion(
+            threadID: threadID,
+            noteID: noteID,
+            versionID: try XCTUnwrap(historyBeforeRestore.last?.id),
+            now: baseDate.addingTimeInterval(480)
+        )
+        XCTAssertEqual(restoredWorkspace.selectedNoteText, "Draft 1")
+
+        let historyAfterRestore = store.threadNoteHistoryVersions(threadID: threadID, noteID: noteID)
+        XCTAssertEqual(historyAfterRestore.first?.preview, "Draft 3")
+    }
+
+    func testDeletingThreadNoteMovesItToRecentlyDeletedAndRestoreWorks() throws {
+        let fileManager = FileManager.default
+        let directoryURL = fileManager.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? fileManager.removeItem(at: directoryURL) }
+
+        let store = AssistantConversationStore(
+            fileManager: fileManager,
+            baseDirectoryURL: directoryURL
+        )
+
+        let threadID = "deleted-thread"
+        let createdWorkspace = try store.createThreadNote(threadID: threadID, title: "Scratch")
+        let noteID = try XCTUnwrap(createdWorkspace.selectedNote?.id)
+        let baseDate = Date(timeIntervalSince1970: 3_000)
+
+        _ = try store.saveThreadNote(
+            threadID: threadID,
+            noteID: noteID,
+            text: "Bring this back",
+            now: baseDate
+        )
+
+        let deletedWorkspace = try store.deleteThreadNote(
+            threadID: threadID,
+            noteID: noteID,
+            now: baseDate.addingTimeInterval(60)
+        )
+        XCTAssertTrue(deletedWorkspace.notes.isEmpty)
+
+        let deletedNotes = store.recentlyDeletedThreadNotes(
+            threadID: threadID,
+            referenceDate: baseDate.addingTimeInterval(120)
+        )
+        XCTAssertEqual(deletedNotes.count, 1)
+        XCTAssertEqual(deletedNotes.first?.preview, "Bring this back")
+
+        let restoredWorkspace = try store.restoreDeletedThreadNote(
+            threadID: threadID,
+            deletedNoteID: try XCTUnwrap(deletedNotes.first?.id),
+            now: baseDate.addingTimeInterval(180)
+        )
+        XCTAssertEqual(restoredWorkspace.notes.count, 1)
+        XCTAssertEqual(restoredWorkspace.selectedNoteText, "Bring this back")
+        XCTAssertTrue(
+            store.recentlyDeletedThreadNotes(
+                threadID: threadID,
+                referenceDate: baseDate.addingTimeInterval(240)
+            ).isEmpty
+        )
+    }
+
+    func testSavedConversationThreadsEnumeratesSnapshotEventLogAndLegacyNotes() throws {
+        let fileManager = FileManager.default
+        let directoryURL = fileManager.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? fileManager.removeItem(at: directoryURL) }
+
+        let store = AssistantConversationStore(
+            fileManager: fileManager,
+            baseDirectoryURL: directoryURL
+        )
+
+        let snapshotThreadID = "snapshot-thread"
+        let eventLogThreadID = "event-log-thread"
+        let notesThreadID = "legacy-notes-thread"
+
+        try store.storeSnapshot(
+            AssistantConversationSnapshot(
+                version: 2,
+                threadID: snapshotThreadID,
+                timeline: [
+                    .userMessage(
+                        id: "snapshot-user",
+                        sessionID: snapshotThreadID,
+                        text: "snapshot hello",
+                        createdAt: Date(timeIntervalSince1970: 10),
+                        source: .runtime
+                    ),
+                    .assistantFinal(
+                        id: "snapshot-assistant",
+                        sessionID: snapshotThreadID,
+                        turnID: "snapshot-turn",
+                        text: "snapshot reply",
+                        createdAt: Date(timeIntervalSince1970: 11),
+                        updatedAt: Date(timeIntervalSince1970: 11),
+                        isStreaming: false,
+                        source: .runtime
+                    )
+                ],
+                transcript: [
+                    AssistantTranscriptEntry(
+                        role: .user,
+                        text: "snapshot hello",
+                        createdAt: Date(timeIntervalSince1970: 10)
+                    ),
+                    AssistantTranscriptEntry(
+                        role: .assistant,
+                        text: "snapshot reply",
+                        createdAt: Date(timeIntervalSince1970: 11)
+                    )
+                ],
+                turns: [],
+                updatedAt: Date(timeIntervalSince1970: 10),
+                lastAppliedEventSequence: 0
+            )
+        )
+
+        try store.appendTranscriptUpsertEvent(
+            threadID: eventLogThreadID,
+            entry: AssistantTranscriptEntry(
+                id: UUID(uuidString: "00000000-0000-0000-0000-000000000501")!,
+                role: .user,
+                text: "event hello",
+                createdAt: Date(timeIntervalSince1970: 20)
+            )
+        )
+        try store.appendTranscriptUpsertEvent(
+            threadID: eventLogThreadID,
+            entry: AssistantTranscriptEntry(
+                id: UUID(uuidString: "00000000-0000-0000-0000-000000000502")!,
+                role: .assistant,
+                text: "event reply",
+                createdAt: Date(timeIntervalSince1970: 21)
+            )
+        )
+
+        let notesDirectoryURL = directoryURL
+            .appendingPathComponent(notesThreadID, isDirectory: true)
+        try fileManager.createDirectory(at: notesDirectoryURL, withIntermediateDirectories: true)
+        let legacyNotesURL = notesDirectoryURL.appendingPathComponent("notes.md", isDirectory: false)
+        let legacyNotesText = """
+        # Legacy recovery note
+        Some thread notes that should still be discoverable.
+        """
+        try legacyNotesText.write(to: legacyNotesURL, atomically: true, encoding: .utf8)
+
+        let junkDirectoryURL = directoryURL.appendingPathComponent("junk", isDirectory: true)
+        try fileManager.createDirectory(at: junkDirectoryURL, withIntermediateDirectories: true)
+
+        try setModificationDate(Date(timeIntervalSince1970: 10), for: try XCTUnwrap(store.snapshotFileURL(for: snapshotThreadID)))
+        try setModificationDate(Date(timeIntervalSince1970: 20), for: try XCTUnwrap(store.eventLogFileURL(for: eventLogThreadID)))
+        try setModificationDate(Date(timeIntervalSince1970: 30), for: legacyNotesURL)
+
+        let summaries = store.savedConversationThreads()
+
+        XCTAssertEqual(summaries.map(\.threadID), [
+            notesThreadID,
+            eventLogThreadID,
+            snapshotThreadID
+        ])
+
+        let snapshotSummary = try XCTUnwrap(summaries.first { $0.threadID == snapshotThreadID })
+        XCTAssertTrue(snapshotSummary.hasSnapshot)
+        XCTAssertFalse(snapshotSummary.hasEventLog)
+        XCTAssertTrue(snapshotSummary.hasConversationContent)
+        XCTAssertEqual(snapshotSummary.latestAssistantMessage, "snapshot reply")
+
+        let eventLogSummary = try XCTUnwrap(summaries.first { $0.threadID == eventLogThreadID })
+        XCTAssertFalse(eventLogSummary.hasSnapshot)
+        XCTAssertTrue(eventLogSummary.hasEventLog)
+        XCTAssertTrue(eventLogSummary.hasConversationContent)
+        XCTAssertEqual(eventLogSummary.latestUserMessage, "event hello")
+        XCTAssertEqual(eventLogSummary.latestAssistantMessage, "event reply")
+        XCTAssertFalse(fileManager.fileExists(atPath: try XCTUnwrap(store.snapshotFileURL(for: eventLogThreadID)).path))
+
+        let notesSummary = try XCTUnwrap(summaries.first { $0.threadID == notesThreadID })
+        XCTAssertTrue(notesSummary.hasNotes)
+        XCTAssertFalse(notesSummary.hasConversationContent)
+        XCTAssertEqual(notesSummary.noteTitle, "Legacy recovery note")
+    }
+
+    func testSavedConversationThreadsCanSkipNotesOnlyThreads() throws {
+        let fileManager = FileManager.default
+        let directoryURL = fileManager.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? fileManager.removeItem(at: directoryURL) }
+
+        let store = AssistantConversationStore(
+            fileManager: fileManager,
+            baseDirectoryURL: directoryURL
+        )
+
+        let notesThreadID = "notes-only-thread"
+        let notesDirectoryURL = directoryURL
+            .appendingPathComponent(notesThreadID, isDirectory: true)
+        try fileManager.createDirectory(at: notesDirectoryURL, withIntermediateDirectories: true)
+        let legacyNotesURL = notesDirectoryURL.appendingPathComponent("notes.md", isDirectory: false)
+        try "# Just notes".write(to: legacyNotesURL, atomically: true, encoding: .utf8)
+
+        let allSummaries = store.savedConversationThreads()
+        let conversationOnlySummaries = store.savedConversationThreads(includeNotesOnly: false)
+
+        XCTAssertTrue(allSummaries.contains(where: { $0.threadID == notesThreadID }))
+        XCTAssertFalse(conversationOnlySummaries.contains(where: { $0.threadID == notesThreadID }))
+    }
+
+    func testSavedConversationThreadsCacheInvalidatesAfterMutation() throws {
+        let fileManager = FileManager.default
+        let directoryURL = fileManager.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? fileManager.removeItem(at: directoryURL) }
+
+        let store = AssistantConversationStore(
+            fileManager: fileManager,
+            baseDirectoryURL: directoryURL
+        )
+
+        let threadID = "cached-thread"
+        try store.saveSnapshot(
+            threadID: threadID,
+            timeline: [],
+            transcript: [
+                AssistantTranscriptEntry(
+                    id: UUID(uuidString: "00000000-0000-0000-0000-000000000601")!,
+                    role: .assistant,
+                    text: "cached reply",
+                    createdAt: Date(timeIntervalSince1970: 1)
+                )
+            ],
+            session: nil
+        )
+
+        XCTAssertTrue(store.savedConversationThreads().contains { $0.threadID == threadID })
+
+        store.deleteSnapshot(threadID: threadID)
+
+        XCTAssertFalse(store.savedConversationThreads().contains { $0.threadID == threadID })
+    }
+
+    private func setModificationDate(_ date: Date, for fileURL: URL) throws {
+        try FileManager.default.setAttributes(
+            [.modificationDate: date],
+            ofItemAtPath: fileURL.path
+        )
     }
 }

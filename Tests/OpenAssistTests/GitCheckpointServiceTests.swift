@@ -183,6 +183,45 @@ final class GitCheckpointServiceTests: XCTestCase {
         XCTAssertFalse(capture.patch.contains("external.txt"))
     }
 
+    func testFilteredCaptureCanFallBackToFullDiffWhenTouchedPathsMissTrackedChanges() async throws {
+        let repositoryURL = try makeGitRepository()
+        let service = GitCheckpointService()
+        let resolvedContext = try await service.repositoryContext(for: repositoryURL.path)
+        let context = try XCTUnwrap(resolvedContext)
+
+        try write("real change\n", to: repositoryURL.appendingPathComponent("real-change.txt"))
+        try runGit(["add", "real-change.txt"], in: repositoryURL)
+        try runGit(["commit", "-m", "Add real change fixture"], in: repositoryURL)
+
+        let checkpointID = UUID().uuidString
+        let before = try await service.captureSnapshot(
+            repository: context,
+            sessionID: "thread-filter-fallback",
+            checkpointID: checkpointID,
+            phase: .before
+        )
+
+        try write("updated content\n", to: repositoryURL.appendingPathComponent("real-change.txt"))
+
+        let after = try await service.captureSnapshot(
+            repository: context,
+            sessionID: "thread-filter-fallback",
+            checkpointID: checkpointID,
+            phase: .after
+        )
+
+        let resolvedCapture = try await service.buildCaptureResultWithFullDiffFallback(
+            repository: context,
+            before: before,
+            after: after,
+            includedPaths: ["wrong-file.txt"]
+        )
+
+        XCTAssertTrue(resolvedCapture.usedUnfilteredFallback)
+        XCTAssertEqual(resolvedCapture.capture.changedFiles.map(\.path), ["real-change.txt"])
+        XCTAssertTrue(resolvedCapture.capture.patch.contains("real-change.txt"))
+    }
+
     func testStoredCheckpointRefsExposeIncompleteBeforeSnapshot() async throws {
         let repositoryURL = try makeGitRepository()
         let service = GitCheckpointService()

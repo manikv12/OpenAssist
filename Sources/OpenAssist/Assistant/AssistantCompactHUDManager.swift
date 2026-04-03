@@ -525,6 +525,10 @@ final class AssistantCompactHUDManager: AssistantCompactPresenter {
         rebuildPanelForCurrentStyle()
     }
 
+    var isExpandedSurfaceVisible: Bool {
+        model.isExpanded
+    }
+
     func setPreferredScreen(_ screen: NSScreen?) {
         preferredDisplayID = screen.flatMap(Self.displayID(for:))
         if panel?.isVisible == true {
@@ -539,6 +543,10 @@ final class AssistantCompactHUDManager: AssistantCompactPresenter {
         NSApp.activate(ignoringOtherApps: true)
         _ = model.presentCompactComposerIfAvailable()
         panel?.orderFrontRegardless()
+    }
+
+    func collapseExpandedSurface() {
+        hide()
     }
 
     func show(state: AssistantHUDState) {
@@ -694,6 +702,8 @@ final class AssistantCompactHUDManager: AssistantCompactPresenter {
                 width: model.notchDockRevealed ? Layout.notchCollapsedSize.width : hiddenWidth,
                 height: model.notchDockRevealed ? Layout.notchCollapsedSize.height : max(2, model.notchDockVisibleHeight) + activeGlowExt
             )
+        case .sidebar:
+            return Layout.orbCollapsedSize
         }
     }
 
@@ -761,6 +771,10 @@ final class AssistantCompactHUDManager: AssistantCompactPresenter {
             panel.isOrbAnchoredAtBottom = false
             frame = notchFrame(for: screen)
             persistedPanelSize = frame.size
+        case .sidebar:
+            panel.isOrbAnchoredAtBottom = false
+            frame = panel.frame
+            persistedPanelSize = panel.frame.size
         }
 
         let dockRevealChanged = lastAppliedNotchDockReveal != isNotchDockRevealed
@@ -1379,9 +1393,6 @@ final class AssistantCompactHUDManager: AssistantCompactPresenter {
                 }
             }
             controller.interactionMode = model.interactionMode
-            if controller.hasActiveTurn {
-                await controller.cancelActiveTurn()
-            }
             await controller.sendPrompt(message)
             await controller.refreshSessions()
             self.syncModelFromController()

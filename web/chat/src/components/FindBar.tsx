@@ -34,32 +34,48 @@ function FindBarInner({ visible, onClose }: Props) {
         return;
       }
 
-      const container = document.querySelector(".chat-messages");
-      if (!container) return;
-
-      const walker = document.createTreeWalker(
-        container,
-        NodeFilter.SHOW_TEXT,
-        null
-      );
-
       const matches: Range[] = [];
       const lowerQuery = searchQuery.toLowerCase();
 
-      let node: Text | null;
-      while ((node = walker.nextText())) {
-        const text = node.textContent || "";
-        const lower = text.toLowerCase();
-        let startIdx = 0;
-        let idx: number;
-        while ((idx = lower.indexOf(lowerQuery, startIdx)) !== -1) {
-          const range = document.createRange();
-          range.setStart(node, idx);
-          range.setEnd(node, idx + searchQuery.length);
-          matches.push(range);
-          startIdx = idx + 1;
-        }
+      const containers = Array.from(
+        document.querySelectorAll(
+          ".chat-messages, .thread-note-editor-body, .thread-note-rendered-markdown"
+        )
+      );
+      if (containers.length === 0) {
+        setMatchCount(0);
+        setCurrentMatch(0);
+        return;
       }
+
+      containers.forEach((container) => {
+        const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT, null);
+
+        let node: Text | null;
+        while ((node = walker.nextText())) {
+          const parentElement = node.parentElement;
+          if (
+            !parentElement ||
+            parentElement.closest(
+              "mark.find-highlight, .find-bar, button, input, textarea, select"
+            )
+          ) {
+            continue;
+          }
+
+          const text = node.textContent || "";
+          const lower = text.toLowerCase();
+          let startIdx = 0;
+          let idx: number;
+          while ((idx = lower.indexOf(lowerQuery, startIdx)) !== -1) {
+            const range = document.createRange();
+            range.setStart(node, idx);
+            range.setEnd(node, idx + searchQuery.length);
+            matches.push(range);
+            startIdx = idx + 1;
+          }
+        }
+      });
 
       // Highlight all matches using CSS Highlight API or mark elements
       matches.forEach((range, i) => {
@@ -132,7 +148,7 @@ function FindBarInner({ visible, onClose }: Props) {
         ref={inputRef}
         type="text"
         className="find-input"
-        placeholder="Find in chat…"
+        placeholder="Find in chat or notes…"
         value={query}
         onChange={handleChange}
         onKeyDown={handleKeyDown}

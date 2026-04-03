@@ -8,15 +8,29 @@ interface ComposerViewProps {
 }
 
 const MAX_TEXTAREA_HEIGHT = 132;
+const MAX_HISTORY_SIZE = 50;
+
+// Persistent prompt history shared across re-renders.
+const promptHistory: string[] = [];
 
 export function ComposerView({ state, onDispatchCommand }: ComposerViewProps) {
   const [draft, setDraft] = useState(state?.draftText ?? "");
   const [isDropTarget, setIsDropTarget] = useState(false);
+  const [isExternalDraftReveal, setIsExternalDraftReveal] = useState(false);
   const composerRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const lastReportedHeightRef = useRef(0);
+  // History navigation: -1 means "current draft" (not browsing history).
+  const historyIndexRef = useRef(-1);
+  const savedDraftRef = useRef("");
   const wasVoiceCapturingRef = useRef(Boolean(state?.isVoiceCapturing));
-  const pendingVoiceFocusRef = useRef(false);
+  const pendingVoiceFocusRef = useRef<boolean | "awaiting-draft">(false);
+  const selectionBeforeVoiceCaptureRef = useRef<{ start: number; end: number } | null>(null);
+  const hadFocusBeforeVoiceCaptureRef = useRef(false);
+  const hasLoadedInitialDraftRef = useRef(false);
+  const draftRef = useRef(state?.draftText ?? "");
+  const lastLocalDraftRef = useRef(state?.draftText ?? "");
+  const externalDraftRevealTimeoutRef = useRef<number | null>(null);
 
   const reportComposerHeight = () => {
     const composer = composerRef.current;
@@ -35,39 +49,122 @@ export function ComposerView({ state, onDispatchCommand }: ComposerViewProps) {
   };
 
   useEffect(() => {
-    setDraft(state?.draftText ?? "");
+    const nextDraft = state?.draftText ?? "";
+
+    if (!hasLoadedInitialDraftRef.current) {
+      hasLoadedInitialDraftRef.current = true;
+      draftRef.current = nextDraft;
+      lastLocalDraftRef.current = nextDraft;
+      setDraft(nextDraft);
+      return;
+    }
+
+    const previousDraft = draftRef.current;
+    const isExternalReplacement =
+      nextDraft !== previousDraft && nextDraft !== lastLocalDraftRef.current;
+    const shouldRevealExternalDraft = isExternalReplacement && nextDraft.length > 0;
+
+    draftRef.current = nextDraft;
+    setDraft(nextDraft);
+
+    if (!shouldRevealExternalDraft) {
+      if (externalDraftRevealTimeoutRef.current !== null) {
+        window.clearTimeout(externalDraftRevealTimeoutRef.current);
+        externalDraftRevealTimeoutRef.current = null;
+      }
+      setIsExternalDraftReveal(false);
+      return;
+    }
+
+    setIsExternalDraftReveal(false);
+    window.requestAnimationFrame(() => {
+      setIsExternalDraftReveal(true);
+    });
+
+    if (externalDraftRevealTimeoutRef.current !== null) {
+      window.clearTimeout(externalDraftRevealTimeoutRef.current);
+    }
+
+    externalDraftRevealTimeoutRef.current = window.setTimeout(() => {
+      setIsExternalDraftReveal(false);
+      externalDraftRevealTimeoutRef.current = null;
+    }, 560);
   }, [state?.draftText]);
+
+  useEffect(() => {
+    return () => {
+      if (externalDraftRevealTimeoutRef.current !== null) {
+        window.clearTimeout(externalDraftRevealTimeoutRef.current);
+      }
+    };
+  }, []);
 
   useEffect(() => {
     const wasVoiceCapturing = wasVoiceCapturingRef.current;
     const isVoiceCapturing = Boolean(state?.isVoiceCapturing);
     const hasDraftText = Boolean(state?.draftText?.trim());
+    const textarea = textareaRef.current;
 
-    if (wasVoiceCapturing && !isVoiceCapturing && hasDraftText) {
+    if (!wasVoiceCapturing && isVoiceCapturing && textarea) {
+      const hadFocus = document.activeElement === textarea;
+      hadFocusBeforeVoiceCaptureRef.current = hadFocus;
+      selectionBeforeVoiceCaptureRef.current = hadFocus
+        ? {
+            start: textarea.selectionStart ?? textarea.value.length,
+            end: textarea.selectionEnd ?? textarea.value.length,
+          }
+        : null;
+    }
+
+    if (wasVoiceCapturing && !isVoiceCapturing) {
+      // Voice capture just ended. If draft text is already present, schedule
+      // focus restoration immediately. Otherwise mark that voice recently
+      // ended so focus can be restored when the draft text arrives.
+      if (hasDraftText) {
+        pendingVoiceFocusRef.current = true;
+      } else {
+        pendingVoiceFocusRef.current = "awaiting-draft";
+      }
+    }
+
+    // Draft text arrived after voice capture ended — schedule focus now.
+    if (
+      !isVoiceCapturing &&
+      pendingVoiceFocusRef.current === "awaiting-draft" &&
+      hasDraftText
+    ) {
       pendingVoiceFocusRef.current = true;
     }
 
-    wasVoiceCapturingRef.current = isVoiceCapturing;
-  }, [state?.draftText, state?.isVoiceCapturing]);
+    // Perform focus restoration directly when the flag is ready, rather
+    // than deferring to a separate useLayoutEffect which would miss the
+    // "awaiting-draft" → true transition (no re-render to trigger it).
+    if (
+      pendingVoiceFocusRef.current === true &&
+      state?.isEnabled &&
+      !isVoiceCapturing &&
+      textarea
+    ) {
+      pendingVoiceFocusRef.current = false;
+      const previousSelection = selectionBeforeVoiceCaptureRef.current;
+      const restorePreviousFocus = hadFocusBeforeVoiceCaptureRef.current;
+      selectionBeforeVoiceCaptureRef.current = null;
+      hadFocusBeforeVoiceCaptureRef.current = false;
 
-  useEffect(() => {
-    if (!pendingVoiceFocusRef.current || !state?.isEnabled || state.isVoiceCapturing) {
-      return;
+      textarea.focus();
+      textarea.scrollIntoView({ block: "nearest", behavior: "smooth" });
+      const end = textarea.value.length;
+      if (!restorePreviousFocus || !previousSelection) {
+        textarea.setSelectionRange(end, end);
+      } else {
+        const start = Math.max(0, Math.min(previousSelection.start, end));
+        const selEnd = Math.max(start, Math.min(previousSelection.end, end));
+        textarea.setSelectionRange(start, selEnd);
+      }
     }
 
-    const textarea = textareaRef.current;
-    if (!textarea) return;
-
-    pendingVoiceFocusRef.current = false;
-
-    const frame = requestAnimationFrame(() => {
-      textarea.focus();
-      const end = textarea.value.length;
-      textarea.setSelectionRange(end, end);
-    });
-
-    return () => cancelAnimationFrame(frame);
-  }, [state?.draftText, state?.isEnabled, state?.isVoiceCapturing]);
+    wasVoiceCapturingRef.current = isVoiceCapturing;
+  }, [state?.draftText, state?.isVoiceCapturing, state?.isEnabled]);
 
   useLayoutEffect(() => {
     const textarea = textareaRef.current;
@@ -118,12 +215,26 @@ export function ComposerView({ state, onDispatchCommand }: ComposerViewProps) {
   }
 
   const updateDraft = (value: string) => {
+    draftRef.current = value;
+    lastLocalDraftRef.current = value;
     setDraft(value);
     onDispatchCommand("updatePromptDraft", { text: value });
   };
 
   const sendPrompt = () => {
     if (!state.canSend) return;
+    const text = draft.trim();
+    if (text) {
+      // Avoid consecutive duplicates in history.
+      if (!promptHistory.length || promptHistory[promptHistory.length - 1] !== text) {
+        promptHistory.push(text);
+        if (promptHistory.length > MAX_HISTORY_SIZE) {
+          promptHistory.shift();
+        }
+      }
+    }
+    historyIndexRef.current = -1;
+    savedDraftRef.current = "";
     onDispatchCommand("sendPrompt");
   };
 
@@ -232,7 +343,9 @@ export function ComposerView({ state, onDispatchCommand }: ComposerViewProps) {
       ) : null}
 
       <div
-        className={`oa-react-composer__surface${isDropTarget ? " is-drop-target" : ""}`}
+        className={`oa-react-composer__surface${isDropTarget ? " is-drop-target" : ""}${
+          isExternalDraftReveal ? " is-restored-draft" : ""
+        }`}
         onDragEnter={(event) => {
           if (!hasTransferFiles(event.dataTransfer?.types)) return;
           event.preventDefault();
@@ -259,11 +372,17 @@ export function ComposerView({ state, onDispatchCommand }: ComposerViewProps) {
           void attachFiles(event.dataTransfer.files);
         }}
       >
+        {isExternalDraftReveal ? (
+          <div className="oa-react-composer__restore-indicator">Restored draft</div>
+        ) : null}
+
         <textarea
           ref={textareaRef}
-          className={`oa-react-composer__textarea${state.isVoiceCapturing ? " is-voice-capturing" : ""}`}
+          className={`oa-react-composer__textarea${state.isVoiceCapturing ? " is-voice-capturing" : ""}${
+            isExternalDraftReveal ? " is-restored-draft" : ""
+          }`}
           value={draft}
-          disabled={!state.isEnabled}
+          disabled={!state.isEnabled && !state.isVoiceCapturing}
           readOnly={state.isVoiceCapturing}
           placeholder={state.placeholder}
           onChange={(event) => updateDraft(event.target.value)}
@@ -289,6 +408,45 @@ export function ComposerView({ state, onDispatchCommand }: ComposerViewProps) {
             if (event.key === "Enter" && !event.shiftKey) {
               event.preventDefault();
               sendPrompt();
+              return;
+            }
+
+            // Arrow-up / arrow-down prompt history (only when cursor is at
+            // the very start/end of a single-line value, or the field is empty).
+            const textarea = textareaRef.current;
+            if (textarea && (event.key === "ArrowUp" || event.key === "ArrowDown")) {
+              const value = textarea.value;
+              const isMultiline = value.includes("\n");
+              const cursorAtStart = textarea.selectionStart === 0 && textarea.selectionEnd === 0;
+              const cursorAtEnd =
+                textarea.selectionStart === value.length && textarea.selectionEnd === value.length;
+              const isEmpty = value.length === 0;
+
+              if (event.key === "ArrowUp" && !isMultiline && (cursorAtStart || isEmpty)) {
+                if (!promptHistory.length) return;
+                event.preventDefault();
+                if (historyIndexRef.current === -1) {
+                  // Entering history — save current draft.
+                  savedDraftRef.current = value;
+                  historyIndexRef.current = promptHistory.length - 1;
+                } else if (historyIndexRef.current > 0) {
+                  historyIndexRef.current -= 1;
+                } else {
+                  return; // Already at oldest entry.
+                }
+                updateDraft(promptHistory[historyIndexRef.current]);
+              } else if (event.key === "ArrowDown" && !isMultiline && (cursorAtEnd || isEmpty)) {
+                if (historyIndexRef.current === -1) return; // Not browsing history.
+                event.preventDefault();
+                if (historyIndexRef.current < promptHistory.length - 1) {
+                  historyIndexRef.current += 1;
+                  updateDraft(promptHistory[historyIndexRef.current]);
+                } else {
+                  // Past the newest entry — restore saved draft.
+                  historyIndexRef.current = -1;
+                  updateDraft(savedDraftRef.current);
+                }
+              }
             }
           }}
         />

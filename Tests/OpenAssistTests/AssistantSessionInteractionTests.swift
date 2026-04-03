@@ -12,7 +12,76 @@ private final class AssistantRuntimeEventRecorder: @unchecked Sendable {
     var proposedPlans: [String?] = []
 }
 
+private final class PermissionRequestCapture: @unchecked Sendable {
+    var request: AssistantPermissionRequest?
+}
+
+private final class PlanUpdateCapture: @unchecked Sendable {
+    var sessionID: String?
+    var entries: [AssistantPlanEntry] = []
+}
+
 final class AssistantSessionInteractionTests: XCTestCase {
+    @MainActor
+    func testUpdatedOwnedSessionIDsPreservesOlderThreadsWithoutCapping() {
+        let existing = (0..<105).map { "thread-\($0)" }
+
+        let updated = AssistantStore.updatedOwnedSessionIDs(
+            existing: existing,
+            adding: "thread-105"
+        )
+
+        XCTAssertEqual(updated.count, 106)
+        XCTAssertEqual(updated.first, "thread-105")
+        XCTAssertEqual(updated.last, "thread-104")
+    }
+
+    @MainActor
+    func testUpdatedOwnedSessionIDsDeduplicatesAndNormalizesWhitespace() {
+        let updated = AssistantStore.updatedOwnedSessionIDs(
+            existing: [" thread-a ", "thread-b", "THREAD-A", ""],
+            adding: "  thread-b  "
+        )
+
+        XCTAssertEqual(updated, ["thread-b", "thread-a"])
+    }
+
+    @MainActor
+    func testEffectiveSessionRefreshLimitTracksSidebarVisibility() {
+        XCTAssertEqual(
+            AssistantStore.effectiveSessionRefreshLimit(
+                requestedLimit: 40,
+                visibleLimit: 30
+            ),
+            200
+        )
+
+        XCTAssertEqual(
+            AssistantStore.effectiveSessionRefreshLimit(
+                requestedLimit: 220,
+                visibleLimit: 260
+            ),
+            300
+        )
+    }
+
+    @MainActor
+    func testShouldPrefetchMoreSessionsUsesBufferNearVisibleEdge() {
+        XCTAssertTrue(
+            AssistantStore.shouldPrefetchMoreSessions(
+                loadedCount: 60,
+                visibleLimit: 30
+            )
+        )
+
+        XCTAssertFalse(
+            AssistantStore.shouldPrefetchMoreSessions(
+                loadedCount: 120,
+                visibleLimit: 30
+            )
+        )
+    }
+
     @MainActor
     func testShouldBlockSessionSwitchOnlyWhenAnotherTurnIsActive() {
         XCTAssertTrue(
@@ -96,6 +165,42 @@ final class AssistantSessionInteractionTests: XCTestCase {
             AssistantStore.isRecoverableProviderSessionErrorMessage(
                 "Codex App Server closed.",
                 backend: .codex
+            )
+        )
+    }
+
+    @MainActor
+    func testRecoverableClaudeProviderSessionErrorRecognizesMissingConversation() {
+        XCTAssertTrue(
+            AssistantStore.isRecoverableProviderSessionErrorMessage(
+                """
+                {"type":"result","subtype":"error_during_execution","is_error":true,"errors":["No conversation found with session ID: 6a4b33a6-839f-4803-9043-af9d913e9516"]}
+                """,
+                backend: .claudeCode
+            )
+        )
+    }
+
+    @MainActor
+    func testSendingPromptQueuesBehindBusyTurnWhenSessionOrRuntimeIsStillActive() {
+        XCTAssertTrue(
+            assistantShouldQueuePromptBehindActiveTurn(
+                sessionHasActiveTurn: true,
+                runtimeHasActiveTurn: false
+            )
+        )
+
+        XCTAssertTrue(
+            assistantShouldQueuePromptBehindActiveTurn(
+                sessionHasActiveTurn: false,
+                runtimeHasActiveTurn: true
+            )
+        )
+
+        XCTAssertFalse(
+            assistantShouldQueuePromptBehindActiveTurn(
+                sessionHasActiveTurn: false,
+                runtimeHasActiveTurn: false
             )
         )
     }
@@ -851,9 +956,9 @@ final class AssistantSessionInteractionTests: XCTestCase {
     @MainActor
     func testToolUserInputRequestKeepsQuestionsStructured() async {
         let runtime = CodexAssistantRuntime()
-        var capturedRequest: AssistantPermissionRequest?
+        let capturedRequest = PermissionRequestCapture()
         runtime.onPermissionRequest = { request in
-            capturedRequest = request
+            capturedRequest.request = request
         }
 
         await runtime.processServerRequestForTesting(
@@ -895,17 +1000,57 @@ final class AssistantSessionInteractionTests: XCTestCase {
             ]
         )
 
-        XCTAssertEqual(capturedRequest?.toolKind, "userInput")
-        XCTAssertEqual(capturedRequest?.toolTitle, "Codex needs input")
-        XCTAssertNil(capturedRequest?.rationale)
-        XCTAssertTrue(capturedRequest?.options.isEmpty ?? false)
-        XCTAssertEqual(capturedRequest?.userInputQuestions.count, 2)
-        XCTAssertEqual(capturedRequest?.userInputQuestions.first?.header, "Runtime")
-        XCTAssertEqual(capturedRequest?.userInputQuestions.last?.header, "Streaming")
+        XCTAssertEqual(capturedRequest.request?.toolKind, "userInput")
+        XCTAssertEqual(capturedRequest.request?.toolTitle, "Codex needs input")
+        XCTAssertNil(capturedRequest.request?.rationale)
+        XCTAssertTrue(capturedRequest.request?.options.isEmpty ?? false)
+        XCTAssertEqual(capturedRequest.request?.userInputQuestions.count, 2)
+        XCTAssertEqual(capturedRequest.request?.userInputQuestions.first?.header, "Runtime")
+        XCTAssertEqual(capturedRequest.request?.userInputQuestions.last?.header, "Streaming")
         XCTAssertEqual(
-            capturedRequest?.userInputQuestions.first?.options.map(\.label),
+            capturedRequest.request?.userInputQuestions.first?.options.map(\.label),
             ["Sidecar (Recommended)", "Local CLI"]
         )
+    }
+
+    @MainActor
+    func testClaudeCodeControlPermissionRequestUsesExistingPermissionUI() {
+        let runtime = CodexAssistantRuntime()
+        let capturedRequest = PermissionRequestCapture()
+        runtime.onPermissionRequest = { request in
+            capturedRequest.request = request
+        }
+
+        runtime.processClaudeCodeOutputLineForTesting("""
+        {"type":"control_request","request_id":"req-1","request":{"subtype":"can_use_tool","tool_name":"Bash","display_name":"Terminal Command","description":"Run git status","tool_use_id":"tool-1","input":{"command":"git status"}}}
+        """)
+
+        XCTAssertEqual(capturedRequest.request?.toolTitle, "Terminal Command")
+        XCTAssertEqual(capturedRequest.request?.toolKind, "commandExecution")
+        XCTAssertEqual(capturedRequest.request?.rationale, "Run git status")
+        XCTAssertEqual(capturedRequest.request?.options.map(\.title), ["Allow Once", "Decline", "Cancel Turn"])
+    }
+
+    @MainActor
+    func testClaudeCodeElicitationRequestUsesStructuredQuestionUI() {
+        let runtime = CodexAssistantRuntime()
+        let capturedRequest = PermissionRequestCapture()
+        runtime.onPermissionRequest = { request in
+            capturedRequest.request = request
+        }
+
+        runtime.processClaudeCodeOutputLineForTesting("""
+        {"type":"control_request","request_id":"req-2","request":{"subtype":"elicitation","message":"Please confirm the deployment details.","requested_schema":{"type":"object","properties":{"confirm":{"type":"boolean","title":"Confirm deployment"},"environment":{"type":"string","title":"Environment","enum":["dev","prod"]}},"required":["confirm","environment"]}}}
+        """)
+
+        XCTAssertEqual(capturedRequest.request?.toolKind, "userInput")
+        XCTAssertEqual(capturedRequest.request?.toolTitle, "Claude needs input")
+        XCTAssertEqual(capturedRequest.request?.rationale, "Please confirm the deployment details.")
+        XCTAssertEqual(capturedRequest.request?.userInputQuestions.count, 2)
+
+        let questionsByID = Dictionary(uniqueKeysWithValues: (capturedRequest.request?.userInputQuestions ?? []).map { ($0.id, $0) })
+        XCTAssertEqual(questionsByID["confirm"]?.options.map(\.label), ["Yes", "No"])
+        XCTAssertEqual(questionsByID["environment"]?.options.map(\.label), ["dev", "prod"])
     }
 
     @MainActor
@@ -1173,6 +1318,20 @@ final class AssistantSessionInteractionTests: XCTestCase {
     }
 
     @MainActor
+    func testFileAttachmentUsesCompactPlaceholderInsteadOfInliningContents() {
+        let attachment = AssistantAttachment(
+            filename: "notes.txt",
+            data: Data("hello from attachment".utf8),
+            mimeType: "text/plain"
+        )
+
+        let item = attachment.toInputItem()
+
+        XCTAssertEqual(item["type"] as? String, "text")
+        XCTAssertEqual(item["text"] as? String, "[Attached file: notes.txt (text/plain)]")
+    }
+
+    @MainActor
     func testCLIAttachmentContextPersistsAcrossFollowUpTurnsInSameSession() throws {
         let runtime = CodexAssistantRuntime()
         let attachment = AssistantAttachment(
@@ -1227,6 +1386,34 @@ final class AssistantSessionInteractionTests: XCTestCase {
             )
         )
         XCTAssertFalse(FileManager.default.fileExists(atPath: attachmentPath))
+    }
+
+    @MainActor
+    func testTurnStartParamsKeepImagesInlineAndReferenceFilesByContext() throws {
+        let runtime = CodexAssistantRuntime()
+        let imageAttachment = AssistantAttachment(
+            filename: "screen.png",
+            data: Data([0x89, 0x50, 0x4E, 0x47]),
+            mimeType: "image/png"
+        )
+
+        let params = runtime.turnStartParamsForTesting(
+            mode: .agentic,
+            prompt: "Summarize the attachment",
+            attachments: [imageAttachment],
+            attachmentContext: """
+            Local attachment files are available on disk for this session.
+            - charter.docx [application/vnd.openxmlformats-officedocument.wordprocessingml.document]: /tmp/charter.docx
+            """
+        )
+
+        let inputItems = try XCTUnwrap(params["input"] as? [[String: Any]])
+        XCTAssertEqual(inputItems.count, 4)
+        XCTAssertEqual(inputItems[0]["type"] as? String, "image")
+        XCTAssertEqual(inputItems[1]["type"] as? String, "text")
+        XCTAssertTrue((inputItems[1]["text"] as? String)?.contains("charter.docx") == true)
+        XCTAssertEqual(inputItems[2]["text"] as? String, "Summarize the attachment")
+        XCTAssertTrue((inputItems[3]["text"] as? String)?.contains("analyze those attached images directly") == true)
     }
 
     @MainActor
@@ -2011,6 +2198,103 @@ final class AssistantSessionInteractionTests: XCTestCase {
 
         XCTAssertEqual(recorder.systemMessages.last, "Hello")
         XCTAssertEqual(recorder.activityTitles.last, "Hello")
+    }
+
+    @MainActor
+    func testClaudeCodeUpdatePlanToolUsePublishesChecklistEntries() {
+        let runtime = CodexAssistantRuntime()
+        let capture = PlanUpdateCapture()
+
+        runtime.onPlanUpdate = { sessionID, entries in
+            capture.sessionID = sessionID
+            capture.entries = entries
+        }
+
+        runtime.processClaudeCodeOutputLineForTesting(
+            #"{"type":"stream_event","session_id":"claude-thread","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"tool-1","name":"update_plan"}}}"#
+        )
+        runtime.processClaudeCodeOutputLineForTesting(
+            #"{"type":"stream_event","session_id":"claude-thread","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"plan\":[{\"step\":\"Inspect runtime\",\"status\":\"in_progress\"},{\"step\":\"Verify UI\",\"status\":\"pending\"}]}"}}}"#
+        )
+        runtime.processClaudeCodeOutputLineForTesting(
+            #"{"type":"stream_event","session_id":"claude-thread","event":{"type":"content_block_stop","index":0}}"#
+        )
+
+        XCTAssertEqual(capture.sessionID, "claude-thread")
+        XCTAssertEqual(capture.entries.map(\.content), ["Inspect runtime", "Verify UI"])
+        XCTAssertEqual(capture.entries.map(\.status), ["in_progress", "pending"])
+    }
+
+    @MainActor
+    func testClaudeCodeToolUsePublishesLiveToolCalls() {
+        let runtime = CodexAssistantRuntime()
+        let recorder = AssistantRuntimeEventRecorder()
+
+        runtime.onToolCallUpdate = { calls in
+            recorder.toolSnapshots.append(calls)
+        }
+
+        runtime.configureStreamingTurnForTesting(
+            sessionID: "claude-thread",
+            turnID: "claude-turn",
+            text: "",
+            mode: .agentic
+        )
+
+        runtime.processClaudeCodeOutputLineForTesting(
+            #"{"type":"stream_event","session_id":"claude-thread","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"tool-1","name":"Bash","input":{"command":"git status"}}}}"#
+        )
+
+        XCTAssertEqual(recorder.toolSnapshots.last?.count, 1)
+        XCTAssertEqual(recorder.toolSnapshots.last?.first?.id, "tool-1")
+        XCTAssertEqual(recorder.toolSnapshots.last?.first?.title, "Command")
+        XCTAssertEqual(recorder.toolSnapshots.last?.first?.kind, "commandExecution")
+        XCTAssertEqual(recorder.toolSnapshots.last?.first?.detail, "git status")
+
+        runtime.processClaudeCodeOutputLineForTesting(
+            #"{"type":"stream_event","session_id":"claude-thread","event":{"type":"content_block_stop","index":0}}"#
+        )
+
+        XCTAssertEqual(recorder.toolSnapshots.last, [])
+    }
+
+    @MainActor
+    func testClaudeCodeToolUsePublishesInlineActivityTimeline() {
+        let runtime = CodexAssistantRuntime()
+        let recorder = AssistantRuntimeEventRecorder()
+
+        runtime.onTimelineMutation = { mutation in
+            if case let .upsert(item) = mutation {
+                recorder.timelineItems.append(item)
+            }
+        }
+
+        runtime.configureStreamingTurnForTesting(
+            sessionID: "claude-thread",
+            turnID: "claude-turn",
+            text: "",
+            mode: .agentic
+        )
+
+        runtime.processClaudeCodeOutputLineForTesting(
+            #"{"type":"stream_event","session_id":"claude-thread","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"tool-1","name":"Bash","input":{"command":"git status"}}}}"#
+        )
+
+        let startedActivity = recorder.timelineItems.last?.activity
+        XCTAssertEqual(recorder.timelineItems.last?.kind, .activity)
+        XCTAssertEqual(startedActivity?.title, "Command")
+        XCTAssertEqual(startedActivity?.status, .running)
+        XCTAssertEqual(startedActivity?.rawDetails, "git status")
+
+        runtime.processClaudeCodeOutputLineForTesting(
+            #"{"type":"stream_event","session_id":"claude-thread","event":{"type":"content_block_stop","index":0}}"#
+        )
+
+        let completedActivity = recorder.timelineItems.last?.activity
+        XCTAssertEqual(recorder.timelineItems.last?.kind, .activity)
+        XCTAssertEqual(completedActivity?.title, "Command")
+        XCTAssertEqual(completedActivity?.status, .completed)
+        XCTAssertEqual(completedActivity?.rawDetails, "git status")
     }
 
     @MainActor
