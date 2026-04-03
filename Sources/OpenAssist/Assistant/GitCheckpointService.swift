@@ -963,8 +963,17 @@ final class GitCheckpointService {
     ) async throws -> CommandExecutionResult {
         try await withCheckedThrowingContinuation { continuation in
             let process = Process()
-            let stdout = Pipe()
-            let stderr = Pipe()
+            let captures: GitCommandOutputCapture
+            do {
+                captures = try makeGitCommandOutputCapture()
+            } catch {
+                continuation.resume(
+                    throwing: GitCheckpointServiceError.gitCommandFailed(
+                        "Open Assist could not prepare Git output capture: \(error.localizedDescription)"
+                    )
+                )
+                return
+            }
 
             process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
             process.arguments = ["git"] + arguments
@@ -975,36 +984,50 @@ final class GitCheckpointService {
                 mergedEnvironment[key] = value
             }
             process.environment = mergedEnvironment
-            process.standardOutput = stdout
-            process.standardError = stderr
+            process.standardOutput = captures.stdoutHandle
+            process.standardError = captures.stderrHandle
 
             process.terminationHandler = { completed in
-                let stdoutData = stdout.fileHandleForReading.readDataToEndOfFile()
-                let stderrData = stderr.fileHandleForReading.readDataToEndOfFile()
-                let result = CommandExecutionResult(
-                    exitCode: completed.terminationStatus,
-                    stdout: String(decoding: stdoutData, as: UTF8.self),
-                    stderr: String(decoding: stderrData, as: UTF8.self)
-                )
+                do {
+                    try? captures.stdoutHandle.close()
+                    try? captures.stderrHandle.close()
+                    let result = try self.readGitCommandOutput(
+                        captures,
+                        exitCode: completed.terminationStatus
+                    )
+                    self.cleanupGitCommandOutputCapture(captures)
 
-                if completed.terminationStatus != 0 && !allowNonZeroExit {
+                    if completed.terminationStatus != 0 && !allowNonZeroExit {
+                        continuation.resume(
+                            throwing: GitCheckpointServiceError.gitCommandFailed(
+                                result.stderr
+                                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                                    .nonEmpty
+                                    ?? result.stdout
+                                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                                        .nonEmpty
+                                    ?? "Git command failed: git \(arguments.joined(separator: " "))"
+                            )
+                        )
+                    } else {
+                        continuation.resume(returning: result)
+                    }
+                } catch {
+                    self.cleanupGitCommandOutputCapture(captures)
                     continuation.resume(
                         throwing: GitCheckpointServiceError.gitCommandFailed(
-                            result.stderr
-                                .trimmingCharacters(in: .whitespacesAndNewlines)
-                                .nonEmpty
-                                ?? result.stdout.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
-                                ?? "Git command failed: git \(arguments.joined(separator: " "))"
+                            "Open Assist could not read Git output: \(error.localizedDescription)"
                         )
                     )
-                } else {
-                    continuation.resume(returning: result)
                 }
             }
 
             do {
                 try process.run()
             } catch {
+                try? captures.stdoutHandle.close()
+                try? captures.stderrHandle.close()
+                cleanupGitCommandOutputCapture(captures)
                 continuation.resume(
                     throwing: GitCheckpointServiceError.gitCommandFailed(
                         "Open Assist could not run Git: \(error.localizedDescription)"
@@ -1019,15 +1042,19 @@ final class GitCheckpointService {
         arguments: [String]
     ) throws -> CommandExecutionResult {
         let process = Process()
-        let stdout = Pipe()
-        let stderr = Pipe()
+        let captures = try makeGitCommandOutputCapture()
+        defer {
+            try? captures.stdoutHandle.close()
+            try? captures.stderrHandle.close()
+            cleanupGitCommandOutputCapture(captures)
+        }
 
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
         process.arguments = ["git"] + arguments
         process.currentDirectoryURL = URL(fileURLWithPath: currentDirectoryPath, isDirectory: true)
         process.environment = AssistantCommandEnvironment.mergedEnvironment()
-        process.standardOutput = stdout
-        process.standardError = stderr
+        process.standardOutput = captures.stdoutHandle
+        process.standardError = captures.stderrHandle
 
         do {
             try process.run()
@@ -1038,11 +1065,9 @@ final class GitCheckpointService {
         }
 
         process.waitUntilExit()
-        let result = CommandExecutionResult(
-            exitCode: process.terminationStatus,
-            stdout: String(decoding: stdout.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self),
-            stderr: String(decoding: stderr.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-        )
+        try? captures.stdoutHandle.close()
+        try? captures.stderrHandle.close()
+        let result = try readGitCommandOutput(captures, exitCode: process.terminationStatus)
         guard result.exitCode == 0 else {
             throw GitCheckpointServiceError.gitCommandFailed(
                 result.stderr.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
@@ -1051,6 +1076,57 @@ final class GitCheckpointService {
             )
         }
         return result
+    }
+
+    private struct GitCommandOutputCapture {
+        let stdoutURL: URL
+        let stderrURL: URL
+        let stdoutHandle: FileHandle
+        let stderrHandle: FileHandle
+    }
+
+    private func makeGitCommandOutputCapture() throws -> GitCommandOutputCapture {
+        let directory = fileManager.temporaryDirectory
+        let stdoutURL = directory.appendingPathComponent(
+            "OpenAssist-Git-\(UUID().uuidString).stdout",
+            isDirectory: false
+        )
+        let stderrURL = directory.appendingPathComponent(
+            "OpenAssist-Git-\(UUID().uuidString).stderr",
+            isDirectory: false
+        )
+
+        guard fileManager.createFile(atPath: stdoutURL.path, contents: nil),
+            fileManager.createFile(atPath: stderrURL.path, contents: nil) else {
+            throw GitCheckpointServiceError.gitCommandFailed(
+                "Open Assist could not create temporary files for Git output."
+            )
+        }
+
+        return GitCommandOutputCapture(
+            stdoutURL: stdoutURL,
+            stderrURL: stderrURL,
+            stdoutHandle: try FileHandle(forWritingTo: stdoutURL),
+            stderrHandle: try FileHandle(forWritingTo: stderrURL)
+        )
+    }
+
+    private func readGitCommandOutput(
+        _ captures: GitCommandOutputCapture,
+        exitCode: Int32
+    ) throws -> CommandExecutionResult {
+        let stdoutData = try Data(contentsOf: captures.stdoutURL)
+        let stderrData = try Data(contentsOf: captures.stderrURL)
+        return CommandExecutionResult(
+            exitCode: exitCode,
+            stdout: String(decoding: stdoutData, as: UTF8.self),
+            stderr: String(decoding: stderrData, as: UTF8.self)
+        )
+    }
+
+    private func cleanupGitCommandOutputCapture(_ captures: GitCommandOutputCapture) {
+        try? fileManager.removeItem(at: captures.stdoutURL)
+        try? fileManager.removeItem(at: captures.stderrURL)
     }
 }
 

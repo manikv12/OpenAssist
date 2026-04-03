@@ -1054,6 +1054,37 @@ final class AssistantSessionInteractionTests: XCTestCase {
     }
 
     @MainActor
+    func testClaudeCodePermissionDenialSynthesizesApprovalCard() {
+        let runtime = CodexAssistantRuntime()
+        let capturedRequest = PermissionRequestCapture()
+        runtime.onPermissionRequest = { request in
+            capturedRequest.request = request
+        }
+
+        runtime.configureStreamingTurnForTesting(
+            sessionID: "claude-thread",
+            turnID: "claude-turn",
+            text: "",
+            mode: .agentic
+        )
+
+        runtime.processClaudeCodeOutputLineForTesting(
+            #"{"type":"result","subtype":"success","is_error":false,"result":"I need your permission to run the git push command.","stop_reason":"end_turn","session_id":"claude-thread","permission_denials":[{"tool_name":"Bash","tool_use_id":"tool-1","tool_input":{"command":"git push --dry-run origin HEAD","description":"Dry-run push current branch to origin"}}]}"#
+        )
+
+        XCTAssertEqual(capturedRequest.request?.toolTitle, "Bash")
+        XCTAssertEqual(capturedRequest.request?.toolKind, "commandExecution")
+        XCTAssertEqual(
+            capturedRequest.request?.options.map(\.title),
+            ["Allow for Session", "Decline", "Cancel"]
+        )
+        XCTAssertEqual(
+            capturedRequest.request?.rawPayloadSummary,
+            "git push --dry-run origin HEAD"
+        )
+    }
+
+    @MainActor
     func testSnakeCaseWebSearchUsesFriendlyTitleAndSummary() {
         let runtime = CodexAssistantRuntime()
 

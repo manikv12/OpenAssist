@@ -47,6 +47,15 @@ private struct ClaudeQueuedPromptContext: Sendable {
     let allowsProposedPlan: Bool
 }
 
+private struct ClaudeCodePermissionDenial: @unchecked Sendable {
+    let requestID: String
+    let sessionID: String
+    let toolName: String
+    let toolUseID: String?
+    let toolInput: [String: Any]
+    let summary: String?
+}
+
 private final class ClaudeCodeCommandCapture: @unchecked Sendable {
     private let lock = NSLock()
     private let newlineData = Data([UInt8(ascii: "\n")])
@@ -265,6 +274,7 @@ final class CodexAssistantRuntime {
     private var activeClaudeProcessWorkingDirectory: String?
     private var activeClaudeProcessModelID: String?
     private var activeClaudeProcessPermissionMode: String?
+    private var activeClaudeProcessAllowedTools: [String] = []
     private var activeClaudeTurnContinuations: [CheckedContinuation<AssistantTurnCompletionStatus, Error>] = []
     private var activeClaudeQueuedPromptContexts: [ClaudeQueuedPromptContext] = []
     private var claudeCodeIdleTimeoutTask: Task<Void, Never>?
@@ -351,6 +361,7 @@ final class CodexAssistantRuntime {
     private let accessibilityAutomationService: AssistantAccessibilityAutomationService
     private let toolExecutor: AssistantToolExecutor
     private var approvedDynamicToolKindsBySessionID: [String: Set<String>] = [:]
+    private var approvedClaudeToolNamesBySessionID: [String: Set<String>] = [:]
 
     var currentSessionID: String? {
         activeSessionID
@@ -6827,6 +6838,196 @@ final class CodexAssistantRuntime {
         }
     }
 
+    private func rememberClaudeToolApproval(toolName: String, for sessionID: String) {
+        let normalizedSessionID = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedToolName = toolName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedSessionID.isEmpty, !normalizedToolName.isEmpty else { return }
+        var approvals = approvedClaudeToolNamesBySessionID[normalizedSessionID] ?? []
+        approvals.insert(normalizedToolName)
+        approvedClaudeToolNamesBySessionID[normalizedSessionID] = approvals
+    }
+
+    private func approvedClaudeToolNames(for sessionID: String) -> [String] {
+        let normalizedSessionID = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedSessionID.isEmpty else { return [] }
+        return (approvedClaudeToolNamesBySessionID[normalizedSessionID] ?? [])
+            .sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+    }
+
+    private func parseClaudeCodePermissionDenial(
+        from payload: [String: Any],
+        sessionID: String?
+    ) -> ClaudeCodePermissionDenial? {
+        guard let denial = (payload["permission_denials"] as? [[String: Any]])?.first else {
+            return nil
+        }
+
+        let toolName = firstNonEmptyString(
+            denial["tool_name"] as? String,
+            denial["toolName"] as? String
+        )
+        guard let toolName, !toolName.isEmpty else { return nil }
+
+        let resolvedSessionID = firstNonEmptyString(
+            sessionID,
+            payload["session_id"] as? String,
+            payload["sessionId"] as? String,
+            activeSessionID
+        ) ?? ""
+        guard !resolvedSessionID.isEmpty else { return nil }
+
+        let toolUseID = firstNonEmptyString(
+            denial["tool_use_id"] as? String,
+            denial["toolUseId"] as? String
+        )
+        let toolInput = denial["tool_input"] as? [String: Any] ?? [:]
+        let requestSeed = toolUseID ?? "\(toolName)-\(UUID().uuidString)"
+        let summary = firstNonEmptyString(
+            compactDetail(
+                firstNonEmptyString(
+                    toolInput["command"] as? String,
+                    toolInput["cmd"] as? String,
+                    toolInput["script"] as? String
+                )
+            ),
+            compactDetail(toolInput["description"] as? String),
+            compactDetail(extractString(toolInput)),
+            compactDetail(extractString(payload["result"]))
+        )
+
+        return ClaudeCodePermissionDenial(
+            requestID: "claude-denied-\(requestSeed)",
+            sessionID: resolvedSessionID,
+            toolName: toolName,
+            toolUseID: toolUseID,
+            toolInput: toolInput,
+            summary: summary
+        )
+    }
+
+    private func presentSyntheticClaudePermissionRequest(
+        _ denial: ClaudeCodePermissionDenial
+    ) {
+        cancelClaudeCodeIdleTimeoutTask()
+        let toolKind = claudeCodePermissionToolKind(for: denial.toolName)
+        let request = AssistantPermissionRequest(
+            id: approvalRequestID(from: .string(denial.requestID)),
+            sessionID: denial.sessionID,
+            toolTitle: denial.toolName,
+            toolKind: toolKind,
+            rationale: "Claude tried to use \(denial.toolName), but Claude Code blocked it until you approve it.",
+            options: [
+                AssistantPermissionOption(
+                    id: "acceptForSession",
+                    title: "Allow for Session",
+                    kind: toolKind,
+                    isDefault: true
+                ),
+                AssistantPermissionOption(
+                    id: "decline",
+                    title: "Decline",
+                    kind: toolKind,
+                    isDefault: false
+                ),
+                AssistantPermissionOption(
+                    id: "cancel",
+                    title: "Cancel",
+                    kind: toolKind,
+                    isDefault: false
+                )
+            ],
+            rawPayloadSummary: denial.summary
+        )
+
+        pendingPermissionContext = PendingPermissionContext(request: request) { [weak self] optionID in
+            guard let self else { return }
+
+            switch optionID {
+            case "acceptForSession":
+                await self.continueClaudeAfterPermissionApproval(denial, persistForSession: true)
+            case "cancel":
+                await MainActor.run {
+                    self.onStatusMessage?("Canceled the blocked Claude action.")
+                    self.updateHUD(phase: .idle, title: "Cancelled", detail: nil)
+                }
+            default:
+                await MainActor.run {
+                    self.onStatusMessage?("Declined the blocked Claude action.")
+                    self.updateHUD(phase: .idle, title: "Permission declined", detail: nil)
+                }
+            }
+        } cancelHandler: { [weak self] in
+            guard let self else { return }
+            await MainActor.run {
+                self.onStatusMessage?("Canceled the blocked Claude action.")
+                self.updateHUD(phase: .idle, title: "Cancelled", detail: nil)
+            }
+        }
+
+        onPermissionRequest?(request)
+        onTranscript?(AssistantTranscriptEntry(
+            role: .permission,
+            text: "Claude needs approval for: \(denial.toolName).",
+            emphasis: true
+        ))
+        onTimelineMutation?(
+            .upsert(
+                .permission(
+                    id: "permission-\(request.id)",
+                    sessionID: request.sessionID,
+                    turnID: nil,
+                    request: request,
+                    createdAt: Date(),
+                    source: .runtime
+                )
+            )
+        )
+        updateHUD(
+            phase: .waitingForPermission,
+            title: "Approve \(denial.toolName)",
+            detail: denial.summary
+        )
+    }
+
+    private func continueClaudeAfterPermissionApproval(
+        _ denial: ClaudeCodePermissionDenial,
+        persistForSession: Bool
+    ) async {
+        if persistForSession {
+            rememberClaudeToolApproval(toolName: denial.toolName, for: denial.sessionID)
+        }
+
+        terminateActiveClaudeProcess(expected: true)
+
+        let serializedInput = Self.serializedClaudeToolInput(denial.toolInput)
+        let continuationPrompt = [
+            "The user approved using the Claude Code tool `\(denial.toolName)` for this thread.",
+            "Continue the previously blocked work.",
+            serializedInput.nonEmpty.map {
+                "If needed, re-run the blocked tool with this exact input:\n\($0)"
+            },
+            "Do not ask for approval again for this same tool unless a different action now needs approval."
+        ]
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty }
+            .joined(separator: "\n\n")
+
+        do {
+            try await sendClaudeCodePrompt(
+                sessionID: denial.sessionID,
+                prompt: continuationPrompt,
+                attachments: [],
+                preferredModelID: preferredModelID,
+                modelSupportsImageInput: false,
+                resumeContext: nil,
+                memoryContext: nil
+            )
+        } catch {
+            await MainActor.run {
+                self.onStatusMessage?(error.localizedDescription)
+            }
+        }
+    }
+
     private func sendClaudeCodeControlSuccess(
         requestID: String,
         response: [String: Any]
@@ -6873,6 +7074,10 @@ final class CodexAssistantRuntime {
 
     private func handleClaudeCodeResultPayload(_ payload: [String: Any]) {
         guard activeTurnID != nil else { return }
+        let permissionDenial = parseClaudeCodePermissionDenial(
+            from: payload,
+            sessionID: activeSessionID
+        )
 
         if payload["is_error"] as? Bool == true {
             let message = Self.extractClaudeCodeResponseText(from: payload)
@@ -6915,6 +7120,10 @@ final class CodexAssistantRuntime {
             } else {
                 handleTurnCompleted(["turn": ["status": "completed"]])
             }
+        }
+
+        if let permissionDenial, pendingPermissionContext == nil {
+            presentSyntheticClaudePermissionRequest(permissionDenial)
         }
     }
 
@@ -7067,12 +7276,14 @@ final class CodexAssistantRuntime {
     ) async throws {
         let normalizedModelID = preferredModelID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
         let permissionMode = Self.claudeCodePermissionMode(for: interactionMode)
+        let allowedTools = approvedClaudeToolNames(for: sessionID)
         let requiresRestart =
             !hasLiveClaudeProcess
             || activeClaudeProcessSessionID?.caseInsensitiveCompare(sessionID) != .orderedSame
             || activeClaudeProcessWorkingDirectory != workingDirectory
             || activeClaudeProcessModelID != normalizedModelID
             || activeClaudeProcessPermissionMode != permissionMode
+            || activeClaudeProcessAllowedTools != allowedTools
 
         guard requiresRestart else {
             recordClaudeCodeActivity()
@@ -7094,6 +7305,9 @@ final class CodexAssistantRuntime {
             "--permission-mode",
             permissionMode
         ]
+        if !allowedTools.isEmpty {
+            arguments.append(contentsOf: ["--allowedTools", allowedTools.joined(separator: ",")])
+        }
         if let normalizedModelID {
             arguments.append(contentsOf: ["--model", normalizedModelID])
         }
@@ -7194,6 +7408,7 @@ final class CodexAssistantRuntime {
         activeClaudeProcessWorkingDirectory = workingDirectory
         activeClaudeProcessModelID = normalizedModelID
         activeClaudeProcessPermissionMode = permissionMode
+        activeClaudeProcessAllowedTools = allowedTools
         recordClaudeCodeActivity()
         publishExecutionStateSnapshot()
     }
@@ -7212,6 +7427,7 @@ final class CodexAssistantRuntime {
             activeClaudeProcessWorkingDirectory = nil
             activeClaudeProcessModelID = nil
             activeClaudeProcessPermissionMode = nil
+            activeClaudeProcessAllowedTools = []
         }
         cancelClaudeCodeIdleTimeoutTask()
         if wasCurrentProcess || hadLiveProcess {
@@ -7322,6 +7538,7 @@ final class CodexAssistantRuntime {
         activeClaudeProcessWorkingDirectory = nil
         activeClaudeProcessModelID = nil
         activeClaudeProcessPermissionMode = nil
+        activeClaudeProcessAllowedTools = []
         publishExecutionStateSnapshot()
     }
 

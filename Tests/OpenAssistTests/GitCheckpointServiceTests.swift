@@ -222,6 +222,46 @@ final class GitCheckpointServiceTests: XCTestCase {
         XCTAssertTrue(resolvedCapture.capture.patch.contains("real-change.txt"))
     }
 
+    func testBuildCaptureResultHandlesLargeDiffOutput() async throws {
+        let repositoryURL = try makeGitRepository()
+        let service = GitCheckpointService()
+        let resolvedContext = try await service.repositoryContext(for: repositoryURL.path)
+        let context = try XCTUnwrap(resolvedContext)
+
+        let checkpointID = UUID().uuidString
+        let targetURL = repositoryURL.appendingPathComponent("large-diff.txt")
+        let beforeContent = Array(repeating: "before line", count: 10_000).joined(separator: "\n") + "\n"
+        let afterContent = Array(repeating: "after line", count: 10_000).joined(separator: "\n") + "\n"
+
+        try write(beforeContent, to: targetURL)
+        try runGit(["add", "large-diff.txt"], in: repositoryURL)
+        try runGit(["commit", "-m", "Add large diff fixture"], in: repositoryURL)
+
+        let before = try await service.captureSnapshot(
+            repository: context,
+            sessionID: "thread-large-diff",
+            checkpointID: checkpointID,
+            phase: .before
+        )
+
+        try write(afterContent, to: targetURL)
+
+        let after = try await service.captureSnapshot(
+            repository: context,
+            sessionID: "thread-large-diff",
+            checkpointID: checkpointID,
+            phase: .after
+        )
+        let capture = try await service.buildCaptureResult(
+            repository: context,
+            before: before,
+            after: after
+        )
+
+        XCTAssertEqual(capture.changedFiles.map(\.path), ["large-diff.txt"])
+        XCTAssertGreaterThan(capture.patch.utf8.count, 100_000)
+    }
+
     func testStoredCheckpointRefsExposeIncompleteBeforeSnapshot() async throws {
         let repositoryURL = try makeGitRepository()
         let service = GitCheckpointService()
