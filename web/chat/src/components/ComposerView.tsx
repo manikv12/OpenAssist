@@ -60,8 +60,21 @@ export function ComposerView({ state, onDispatchCommand }: ComposerViewProps) {
     }
 
     const previousDraft = draftRef.current;
+    const localDraft = lastLocalDraftRef.current;
+    const textareaHasFocus = document.activeElement === textareaRef.current;
+    const isLikelyLaggingLocalEcho =
+      textareaHasFocus &&
+      nextDraft.length > 0 &&
+      localDraft.length > 0 &&
+      nextDraft !== localDraft &&
+      (localDraft.startsWith(nextDraft) || nextDraft.startsWith(localDraft));
+
+    if (isLikelyLaggingLocalEcho) {
+      return;
+    }
+
     const isExternalReplacement =
-      nextDraft !== previousDraft && nextDraft !== lastLocalDraftRef.current;
+      nextDraft !== previousDraft && nextDraft !== localDraft;
     const shouldRevealExternalDraft = isExternalReplacement && nextDraft.length > 0;
 
     draftRef.current = nextDraft;
