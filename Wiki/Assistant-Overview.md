@@ -1,58 +1,55 @@
 # Assistant Overview
 
-Open Assist now centers on one assistant workspace.
+Open Assist is built around one assistant workspace.
 
-You can type a request, speak it, use the compact HUD, or let the assistant take approved actions on your Mac.
+You can type, speak, keep work inside projects and threads, and let the assistant take actions on your Mac when you approve them.
 
-## The main pieces
+## Main parts
 
-- Assistant window for everyday work
-- Compact HUD and orb for quick access
-- Projects and threads to keep work organized
-- Skills and attachments for reusable help
-- Memory and checkpoints for longer jobs
-- AI Studio for provider and model setup
-- Browser and app control for approved actions
-- Scheduled jobs for recurring work
-- Telegram remote control for phone-based access
+- assistant window for normal work
+- compact HUD for quick access
+- projects and threads for organization
+- notes, memory, and checkpoints for longer sessions
+- AI Studio for model and provider setup
+- automation for browser and app tasks
 
-## Ways to work
+## Main ways to use it
 
 ### Ask
 
-Use Open Assist like a normal assistant.
+Use the assistant like a normal chat workspace.
+
+Examples:
 
 - "Summarize these notes."
-- "Rewrite this message to sound more professional."
-- "Help me plan my day."
 - "Draft a reply to this email."
+- "Help me plan my day."
 
 ### Speak
 
 Use voice when talking is faster than typing.
 
-- Hold-to-talk for quick dictation
-- Continuous dictation for longer speech
-- Live voice conversations when you want the assistant to respond out loud
+- hold-to-talk for quick dictation
+- continuous dictation for longer speech
+- live voice when you want spoken back-and-forth
 
 ### Act
 
-Use Agentic mode when you want the assistant to do work on your Mac with your approval.
+Use `Agentic` mode when you want the assistant to do work on your Mac.
 
-- Browser tasks in your signed-in browser profile
-- Direct app actions in supported apps
-- File, window, and automation work when the right permissions are granted
+- browser actions in your signed-in profile
+- direct actions in supported apps
+- screenshot-based computer use when needed
 
-## Good things to know
+## Helpful modes
 
-- Plan mode helps when you want the assistant to think first.
-- Agentic mode helps when you want the assistant to do the work.
-- Memory and checkpoints are there for long or complex sessions.
-- The compact HUD is useful when you want the assistant nearby but not in the way.
+- `Plan` mode: think first, then act
+- `Agentic` mode: do the work with approval
 
-## Where to go next
+## Next pages
 
 - [Quick Start](Quick-Start)
+- [Automation](Automation)
 - [AI Rewrite and Context](AI-Rewrite-and-Context)
 - [Privacy First Design](Privacy-First-Design)
 - [Troubleshooting](Troubleshooting)

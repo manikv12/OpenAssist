@@ -1,13 +1,13 @@
 ## Open Assist Wiki
 
 - [Home](Home)
-- [Assistant Overview](Assistant-Overview)
 - [Quick Start](Quick-Start)
+- [Assistant Overview](Assistant-Overview)
 - [Automation](Automation)
+- [AI Rewrite and Context](AI-Rewrite-and-Context)
 - [Scheduled Jobs](Scheduled-Jobs)
 - [Telegram Remote Control](Telegram-Remote-Control)
 - [Why Open Assist](Why-OpenAssist)
-- [AI Rewrite and Context](AI-Rewrite-and-Context)
 - [Privacy First Design](Privacy-First-Design)
 - [Troubleshooting](Troubleshooting)
 

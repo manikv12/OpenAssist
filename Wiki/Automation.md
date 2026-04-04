@@ -2,14 +2,13 @@
 
 Open Assist can take approved actions on your Mac.
 
-This is useful when you want the assistant to do a browser task or a direct app task for you instead of only writing text.
+Use this when you want more than text output, for example opening something, controlling a browser, or working in a supported app.
 
-## What it can do
+## What it supports
 
-- Use your signed-in browser profile for supported browser tasks
-- Open files and folders
-- Work with supported apps directly
-- Use screenshot-based computer use when needed
+- browser actions with your real signed-in profile
+- direct app actions
+- screenshot-based computer use
 
 ## Supported browsers
 
@@ -17,7 +16,7 @@ This is useful when you want the assistant to do a browser task or a direct app 
 - Brave
 - Microsoft Edge
 
-## Supported app actions
+## Supported apps
 
 - Finder
 - Terminal
@@ -28,21 +27,21 @@ This is useful when you want the assistant to do a browser task or a direct app 
 - Notes
 - Messages
 
-## What you need
+## Permissions you may need
 
-- `Automation / Apple Events` permission for browser and direct app control
-- `Screen Recording` permission if you want screenshot-based computer use
-- `Accessibility` permission for some keyboard and text actions
+- `Automation / Apple Events` for browser and direct app control
+- `Screen Recording` for screenshot-based computer use
+- `Accessibility` for some keyboard and text actions
 
-## How to set it up
+## Setup
 
 1. Open `Settings -> Automation`.
-2. Allow `Automation / Apple Events` when macOS asks.
-3. Pick a browser profile if you want browser control.
+2. Allow `Automation / Apple Events`.
+3. Pick a browser profile if needed.
 4. Grant `Screen Recording` if you want computer use.
-5. Open the assistant in `Agentic` mode when you want it to act.
+5. Use the assistant in `Agentic` mode.
 
-## Simple examples
+## Example tasks
 
 - "Open my project board in Chrome."
 - "Reveal the Downloads folder."
@@ -52,5 +51,5 @@ This is useful when you want the assistant to do a browser task or a direct app 
 ## Good to know
 
 - Open Assist asks for approval before important actions.
-- You can use browser tasks, app tasks, or both.
-- If a task fails, check the permission settings first.
+- If something fails, check permissions first.
+- Some tasks may need both browser access and app permissions.
