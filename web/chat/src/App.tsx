@@ -7,9 +7,13 @@ import { ThreadNoteDrawer } from "./components/ThreadNoteDrawer";
 import { useTextSelection } from "./hooks/useTextSelection";
 import type {
   ActiveWorkState,
+  ActiveTurnState,
+  AssistantComposerActivityState,
+  AssistantComposerControlsState,
   AssistantComposerState,
   AssistantSidebarState,
   ChatMessage,
+  ChatStreamEvent,
   CodeReviewPanelState,
   MessageCheckpointInfo,
   ProviderTone,
@@ -68,6 +72,81 @@ function dedupeMessages(messages: ChatMessage[]): ChatMessage[] {
   }
 
   return deduped;
+}
+
+function upsertMessageInOrder(
+  messages: ChatMessage[],
+  message: ChatMessage,
+  afterMessageID?: string
+): ChatMessage[] {
+  const stable = stableMessages(messages);
+  const nextMessage = clearMessageTransitionState(message);
+  const withoutExisting = stable.filter((entry) => entry.id !== nextMessage.id);
+
+  if (!afterMessageID) {
+    return [...withoutExisting, nextMessage];
+  }
+
+  const anchorIndex = withoutExisting.findIndex((entry) => entry.id === afterMessageID);
+  if (anchorIndex < 0) {
+    return [...withoutExisting, nextMessage];
+  }
+
+  return [
+    ...withoutExisting.slice(0, anchorIndex + 1),
+    nextMessage,
+    ...withoutExisting.slice(anchorIndex + 1),
+  ];
+}
+
+function applyChatStreamEvents(
+  previousMessages: ChatMessage[],
+  previousActiveWork: ActiveWorkState | null,
+  previousTyping: TypingState,
+  previousActiveTurn: ActiveTurnState | null,
+  events: ChatStreamEvent[]
+): {
+  messages: ChatMessage[];
+  activeWork: ActiveWorkState | null;
+  typing: TypingState;
+  activeTurn: ActiveTurnState | null;
+} {
+  let messages = stableMessages(previousMessages);
+  let activeWork = previousActiveWork;
+  let typing = previousTyping;
+  let activeTurn = previousActiveTurn;
+
+  for (const event of events) {
+    switch (event.kind) {
+      case "replaceMessages":
+        messages = dedupeMessages(event.messages);
+        break;
+      case "responseTextDelta":
+        messages = messages.map((message) =>
+          message.id === event.messageID
+            ? { ...message, text: event.text, isStreaming: event.isStreaming }
+            : message
+        );
+        break;
+      case "upsertMessage":
+        messages = upsertMessageInOrder(messages, event.message, event.afterMessageID);
+        break;
+      case "removeMessage":
+        messages = messages.filter((message) => message.id !== event.messageID);
+        break;
+      case "setActiveWorkState":
+        activeWork = event.state;
+        break;
+      case "setTypingState":
+        typing = event.state;
+        break;
+      case "setActiveTurnState":
+        activeTurn = event.state;
+        break;
+    }
+  }
+
+  return { messages, activeWork, typing, activeTurn };
 }
 
 function buildTruncationTransition(
@@ -231,6 +310,10 @@ export function App() {
   const [viewMode, setViewMode] = useState<AppViewMode>(initialViewMode);
   const [sidebarState, setSidebarState] = useState<AssistantSidebarState | null>(null);
   const [composerState, setComposerState] = useState<AssistantComposerState | null>(null);
+  const [composerControlsState, setComposerControlsState] =
+    useState<AssistantComposerControlsState | null>(null);
+  const [composerActivityState, setComposerActivityState] =
+    useState<AssistantComposerActivityState | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [typing, setTyping] = useState<TypingState>({ visible: false });
   const [runtimePanel, setRuntimePanel] = useState<RuntimePanelState | null>(null);
@@ -240,16 +323,21 @@ export function App() {
   const [rewindState, setRewindState] = useState<RewindState | null>(null);
   const [threadNoteState, setThreadNoteState] = useState<ThreadNoteState | null>(null);
   const [activeWorkState, setActiveWorkState] = useState<ActiveWorkState | null>(null);
+  const [activeTurnState, setActiveTurnState] = useState<ActiveTurnState | null>(null);
   const [textScale, setTextScaleState] = useState(1.0);
   const [isPinnedToBottom, setIsPinnedToBottom] = useState(true);
   const [canLoadOlder, setCanLoadOlder] = useState(false);
   const activeProviderTone = useMemo<ProviderTone>(() => {
     const selectedBackendID = runtimePanel?.backends.find((backend) => backend.isSelected)?.id;
-    return providerTone(selectedBackendID);
-  }, [runtimePanel]);
+    return providerTone(activeTurnState?.providerLabel ?? selectedBackendID);
+  }, [activeTurnState, runtimePanel]);
   const [findVisible, setFindVisible] = useState(false);
   const pendingTruncationTimeoutRef = useRef<number | null>(null);
   const pendingEnterAnimationFrameRef = useRef<number | null>(null);
+  const messagesRef = useRef<ChatMessage[]>([]);
+  const typingRef = useRef<TypingState>({ visible: false });
+  const activeWorkRef = useRef<ActiveWorkState | null>(null);
+  const activeTurnRef = useRef<ActiveTurnState | null>(null);
   const chatViewRef = useRef<{
     scrollToBottom: (animated: boolean) => void;
     revealMessage: (
@@ -258,6 +346,22 @@ export function App() {
       expand: boolean
     ) => void;
   }>(null);
+
+  useEffect(() => {
+    messagesRef.current = messages;
+  }, [messages]);
+
+  useEffect(() => {
+    typingRef.current = typing;
+  }, [typing]);
+
+  useEffect(() => {
+    activeWorkRef.current = activeWorkState;
+  }, [activeWorkState]);
+
+  useEffect(() => {
+    activeTurnRef.current = activeTurnState;
+  }, [activeTurnState]);
 
   const handleScrollState = useCallback(
     (pinned: boolean, scrolledUp: boolean, distFromTop: number) => {
@@ -504,23 +608,23 @@ export function App() {
         isStreaming: boolean
       ) => {
         clearPendingMessageTransitions();
+        const stablePrevious = stableMessages(messagesRef.current);
+        const targetIndex = stablePrevious.findIndex((message) => message.id === messageID);
+        if (targetIndex < 0) {
+          return;
+        }
+
+        const targetMessage = stablePrevious[targetIndex];
+        if (targetMessage.text === text && targetMessage.isStreaming === isStreaming) {
+          return;
+        }
+
+        const updated = [...stablePrevious];
+        updated[targetIndex] = { ...targetMessage, text, isStreaming };
+        messagesRef.current = updated;
+
         startTransition(() => {
-          setMessages((prev) => {
-            const stablePrevious = stableMessages(prev);
-            const targetIndex = stablePrevious.findIndex((message) => message.id === messageID);
-            if (targetIndex < 0) {
-              return stablePrevious;
-            }
-
-            const targetMessage = stablePrevious[targetIndex];
-            if (targetMessage.text === text && targetMessage.isStreaming === isStreaming) {
-              return stablePrevious;
-            }
-
-            const updated = [...stablePrevious];
-            updated[targetIndex] = { ...targetMessage, text, isStreaming };
-            return updated;
-          });
+          setMessages(updated);
         });
       },
 
@@ -559,7 +663,36 @@ export function App() {
             return deduped;
           });
 
+        messagesRef.current = deduped;
         startTransition(applyUpdate);
+      },
+
+      applyStreamEvents: (events: ChatStreamEvent[]) => {
+        if (!events.length) {
+          return;
+        }
+
+        clearPendingMessageTransitions();
+
+        const next = applyChatStreamEvents(
+          messagesRef.current,
+          activeWorkRef.current,
+          typingRef.current,
+          activeTurnRef.current,
+          events
+        );
+
+        messagesRef.current = next.messages;
+        activeWorkRef.current = next.activeWork;
+        typingRef.current = next.typing;
+        activeTurnRef.current = next.activeTurn;
+
+        startTransition(() => {
+          setMessages(next.messages);
+          setActiveWorkState(next.activeWork);
+          setTyping(next.typing);
+          setActiveTurnState(next.activeTurn);
+        });
       },
 
       updateLastMessage: (
@@ -572,7 +705,12 @@ export function App() {
 
       appendMessage: (msg: ChatMessage) => {
         clearPendingMessageTransitions();
-        setMessages((prev) => [...stableMessages(prev), clearMessageTransitionState(msg)]);
+        const nextMessages = [
+          ...stableMessages(messagesRef.current),
+          clearMessageTransitionState(msg),
+        ];
+        messagesRef.current = nextMessages;
+        setMessages(nextMessages);
       },
 
       setTypingIndicator: (
@@ -580,16 +718,16 @@ export function App() {
         title?: string,
         detail?: string
       ) => {
-        setTyping((prev) => {
-          if (
-            prev.visible === visible &&
-            prev.title === title &&
-            prev.detail === detail
-          ) {
-            return prev;
-          }
-          return { visible, title, detail };
-        });
+        const nextTyping = { visible, title, detail };
+        if (
+          typingRef.current.visible === visible &&
+          typingRef.current.title === title &&
+          typingRef.current.detail === detail
+        ) {
+          return;
+        }
+        typingRef.current = nextTyping;
+        setTyping(nextTyping);
       },
 
       setRuntimePanel: (panel: RuntimePanelState | null) => {
@@ -605,11 +743,65 @@ export function App() {
       },
 
       setThreadNoteState: (next: ThreadNoteState | null) => {
-        setThreadNoteState(next);
+        startTransition(() => {
+          setThreadNoteState(next);
+        });
+      },
+
+      handleThreadNoteImageUploadResult: (result: {
+        requestId: string;
+        ok: boolean;
+        message?: string | null;
+        url?: string | null;
+        relativePath?: string | null;
+      }) => {
+        window.dispatchEvent(
+          new CustomEvent("openassist:thread-note-image-result", {
+            detail: result,
+          })
+        );
+      },
+
+      handleThreadNoteScreenshotCaptureResult: (result: {
+        requestId: string;
+        ok: boolean;
+        cancelled?: boolean;
+        message?: string | null;
+        filename?: string | null;
+        mimeType?: string | null;
+        dataUrl?: string | null;
+      }) => {
+        window.dispatchEvent(
+          new CustomEvent("openassist:thread-note-screenshot-capture-result", {
+            detail: result,
+          })
+        );
+      },
+
+      handleThreadNoteScreenshotProcessingResult: (result: {
+        requestId: string;
+        ok: boolean;
+        message?: string | null;
+        outputMode?: string | null;
+        markdown?: string | null;
+        rawText?: string | null;
+        usedVision?: boolean;
+      }) => {
+        window.dispatchEvent(
+          new CustomEvent("openassist:thread-note-screenshot-processing-result", {
+            detail: result,
+          })
+        );
       },
 
       setActiveWorkState: (next: ActiveWorkState | null) => {
+        activeWorkRef.current = next;
         setActiveWorkState(next);
+      },
+
+      setActiveTurnState: (next: ActiveTurnState | null) => {
+        activeTurnRef.current = next;
+        setActiveTurnState(next);
       },
 
       scrollToBottom: (animated: boolean) => {
@@ -647,6 +839,18 @@ export function App() {
 
       setComposerState: (nextState: AssistantComposerState | null) => {
         setComposerState(nextState);
+        if (!nextState) {
+          setComposerControlsState(null);
+          setComposerActivityState(null);
+        }
+      },
+
+      setComposerControls: (nextState: AssistantComposerControlsState | null) => {
+        setComposerControlsState(nextState);
+      },
+
+      setComposerActivity: (nextState: AssistantComposerActivityState | null) => {
+        setComposerActivityState(nextState);
       },
     };
 
@@ -675,7 +879,12 @@ export function App() {
 
   if (viewMode === "composer") {
     return (
-      <ComposerView state={composerState} onDispatchCommand={handleComposerCommand} />
+      <ComposerView
+        state={composerState}
+        controlsState={composerControlsState}
+        activityState={composerActivityState}
+        onDispatchCommand={handleComposerCommand}
+      />
     );
   }
 
@@ -729,6 +938,33 @@ declare global {
     __OPENASSIST_INITIAL_VIEW_MODE?: AppViewMode;
     chatBridge?: {
       setActiveWorkState?: (next: ActiveWorkState | null) => void;
+      setActiveTurnState?: (next: ActiveTurnState | null) => void;
+      applyStreamEvents?: (events: ChatStreamEvent[]) => void;
+      handleThreadNoteImageUploadResult?: (result: {
+        requestId: string;
+        ok: boolean;
+        message?: string | null;
+        url?: string | null;
+        relativePath?: string | null;
+      }) => void;
+      handleThreadNoteScreenshotCaptureResult?: (result: {
+        requestId: string;
+        ok: boolean;
+        cancelled?: boolean;
+        message?: string | null;
+        filename?: string | null;
+        mimeType?: string | null;
+        dataUrl?: string | null;
+      }) => void;
+      handleThreadNoteScreenshotProcessingResult?: (result: {
+        requestId: string;
+        ok: boolean;
+        message?: string | null;
+        outputMode?: string | null;
+        markdown?: string | null;
+        rawText?: string | null;
+        usedVision?: boolean;
+      }) => void;
       updateMessage?: (
         messageID: string,
         text: string,

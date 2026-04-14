@@ -873,7 +873,7 @@ final class TelegramRemoteCoordinator: ObservableObject {
 
         if provider.requiresAPIKey && apiKey.isEmpty {
             let guidance = provider == .gemini
-                ? "Open AI Studio and add a Google AI Studio API key before using Telegram audio transcription with Gemini."
+                ? "Open Settings > Models & Connections and add a Google AI Studio API key before using Telegram audio transcription with Gemini."
                 : "Open Settings > Recognition and add a \(provider.displayName) API key before using Telegram audio transcription."
             throw TelegramAudioRoutingError.missingCredentials(guidance)
         }

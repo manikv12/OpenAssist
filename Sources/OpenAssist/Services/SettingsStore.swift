@@ -346,178 +346,202 @@ enum ColorTheme: String, CaseIterable, Identifiable {
 
     var id: Self { self }
     var displayName: String { rawValue }
+    var summary: String {
+        switch self {
+        case .ocean:
+            return "Balanced navy with calm blue accents."
+        case .violet:
+            return "Smoky plum with crisp periwinkle highlights."
+        case .midnight:
+            return "Neutral graphite with classic cobalt highlights."
+        case .forest:
+            return "Deep spruce with soft emerald accents."
+        case .rose:
+            return "Muted berry with warm rose highlights."
+        case .sunset:
+            return "Espresso brown with restrained amber accents."
+        case .arctic:
+            return "Cool slate with icy cyan highlights."
+        case .slate:
+            return "Charcoal gray with understated silver-blue accents."
+        case .amethyst:
+            return "Ink purple with restrained lavender accents."
+        case .noirGold:
+            return "Near-black with antique gold accents."
+        }
+    }
 
     var palette: ColorPalette {
         switch self {
         case .ocean:
             return ColorPalette(
-                baseTint: Color(red: 0.08, green: 0.14, blue: 0.24),
-                accentTint: Color(red: 0.30, green: 0.62, blue: 0.70),
-                canvasBase: Color(red: 0.06, green: 0.10, blue: 0.18),
-                canvasDeep: Color(red: 0.03, green: 0.05, blue: 0.10),
-                sidebarTint: Color(red: 0.08, green: 0.13, blue: 0.22),
-                panelTint: Color(red: 0.07, green: 0.11, blue: 0.20),
-                rowSelection: Color(red: 0.16, green: 0.28, blue: 0.42),
-                historyTint: Color(red: 0.78, green: 0.64, blue: 0.22),
-                aiStudioTint: Color(red: 0.30, green: 0.62, blue: 0.70),
-                settingsTint: Color(red: 0.82, green: 0.68, blue: 0.28),
-                glowWarm: Color(red: 0.82, green: 0.68, blue: 0.28),
-                glowCool: Color(red: 0.25, green: 0.58, blue: 0.66),
-                surfaceTop: Color(red: 0.10, green: 0.16, blue: 0.28),
-                surfaceBottom: Color(red: 0.06, green: 0.10, blue: 0.18)
+                baseTint: Color(red: 0.09, green: 0.13, blue: 0.20),
+                accentTint: Color(red: 0.46, green: 0.59, blue: 0.86),
+                canvasBase: Color(red: 0.07, green: 0.09, blue: 0.14),
+                canvasDeep: Color(red: 0.04, green: 0.05, blue: 0.08),
+                sidebarTint: Color(red: 0.10, green: 0.13, blue: 0.19),
+                panelTint: Color(red: 0.09, green: 0.12, blue: 0.18),
+                rowSelection: Color(red: 0.17, green: 0.23, blue: 0.33),
+                historyTint: Color(red: 0.74, green: 0.64, blue: 0.44),
+                aiStudioTint: Color(red: 0.46, green: 0.59, blue: 0.86),
+                settingsTint: Color(red: 0.78, green: 0.67, blue: 0.46),
+                glowWarm: Color(red: 0.62, green: 0.54, blue: 0.38),
+                glowCool: Color(red: 0.34, green: 0.46, blue: 0.74),
+                surfaceTop: Color(red: 0.11, green: 0.15, blue: 0.22),
+                surfaceBottom: Color(red: 0.07, green: 0.10, blue: 0.15)
             )
         case .violet:
             return ColorPalette(
-                baseTint: Color(red: 0.24, green: 0.20, blue: 0.34),
-                accentTint: Color(red: 0.35, green: 0.58, blue: 0.95),
-                canvasBase: Color(red: 0.09, green: 0.08, blue: 0.15),
-                canvasDeep: Color(red: 0.04, green: 0.04, blue: 0.08),
-                sidebarTint: Color(red: 0.17, green: 0.14, blue: 0.23),
-                panelTint: Color(red: 0.13, green: 0.11, blue: 0.20),
-                rowSelection: Color(red: 0.29, green: 0.33, blue: 0.39),
-                historyTint: Color(red: 0.54, green: 0.61, blue: 0.57),
-                aiStudioTint: Color(red: 0.60, green: 0.64, blue: 0.71),
-                settingsTint: Color(red: 0.84, green: 0.47, blue: 0.40),
-                glowWarm: Color(red: 0.88, green: 0.30, blue: 0.37),
-                glowCool: Color(red: 0.19, green: 0.42, blue: 0.95),
-                surfaceTop: Color(red: 0.18, green: 0.15, blue: 0.27),
-                surfaceBottom: Color(red: 0.08, green: 0.08, blue: 0.16)
+                baseTint: Color(red: 0.14, green: 0.12, blue: 0.20),
+                accentTint: Color(red: 0.56, green: 0.60, blue: 0.88),
+                canvasBase: Color(red: 0.08, green: 0.07, blue: 0.12),
+                canvasDeep: Color(red: 0.04, green: 0.04, blue: 0.07),
+                sidebarTint: Color(red: 0.11, green: 0.10, blue: 0.16),
+                panelTint: Color(red: 0.10, green: 0.09, blue: 0.15),
+                rowSelection: Color(red: 0.19, green: 0.18, blue: 0.28),
+                historyTint: Color(red: 0.72, green: 0.64, blue: 0.80),
+                aiStudioTint: Color(red: 0.56, green: 0.60, blue: 0.88),
+                settingsTint: Color(red: 0.77, green: 0.62, blue: 0.58),
+                glowWarm: Color(red: 0.60, green: 0.42, blue: 0.50),
+                glowCool: Color(red: 0.40, green: 0.44, blue: 0.78),
+                surfaceTop: Color(red: 0.15, green: 0.13, blue: 0.22),
+                surfaceBottom: Color(red: 0.08, green: 0.07, blue: 0.13)
             )
         case .midnight:
             return ColorPalette(
-                baseTint: Color(red: 0.08, green: 0.08, blue: 0.16),
-                accentTint: Color(red: 0.30, green: 0.50, blue: 0.95),
-                canvasBase: Color(red: 0.06, green: 0.06, blue: 0.13),
-                canvasDeep: Color(red: 0.02, green: 0.02, blue: 0.06),
-                sidebarTint: Color(red: 0.08, green: 0.08, blue: 0.18),
-                panelTint: Color(red: 0.07, green: 0.07, blue: 0.16),
-                rowSelection: Color(red: 0.16, green: 0.20, blue: 0.40),
-                historyTint: Color(red: 0.45, green: 0.60, blue: 0.95),
-                aiStudioTint: Color(red: 0.30, green: 0.50, blue: 0.95),
-                settingsTint: Color(red: 0.55, green: 0.65, blue: 0.95),
-                glowWarm: Color(red: 0.40, green: 0.45, blue: 0.90),
-                glowCool: Color(red: 0.20, green: 0.30, blue: 0.80),
-                surfaceTop: Color(red: 0.10, green: 0.10, blue: 0.24),
-                surfaceBottom: Color(red: 0.05, green: 0.05, blue: 0.14)
+                baseTint: Color(red: 0.08, green: 0.10, blue: 0.15),
+                accentTint: Color(red: 0.43, green: 0.55, blue: 0.88),
+                canvasBase: Color(red: 0.05, green: 0.07, blue: 0.11),
+                canvasDeep: Color(red: 0.03, green: 0.04, blue: 0.07),
+                sidebarTint: Color(red: 0.08, green: 0.10, blue: 0.15),
+                panelTint: Color(red: 0.07, green: 0.09, blue: 0.14),
+                rowSelection: Color(red: 0.15, green: 0.20, blue: 0.31),
+                historyTint: Color(red: 0.59, green: 0.68, blue: 0.87),
+                aiStudioTint: Color(red: 0.43, green: 0.55, blue: 0.88),
+                settingsTint: Color(red: 0.66, green: 0.73, blue: 0.87),
+                glowWarm: Color(red: 0.34, green: 0.40, blue: 0.62),
+                glowCool: Color(red: 0.28, green: 0.38, blue: 0.72),
+                surfaceTop: Color(red: 0.10, green: 0.12, blue: 0.20),
+                surfaceBottom: Color(red: 0.05, green: 0.07, blue: 0.11)
             )
         case .forest:
             return ColorPalette(
-                baseTint: Color(red: 0.06, green: 0.14, blue: 0.10),
-                accentTint: Color(red: 0.28, green: 0.70, blue: 0.45),
-                canvasBase: Color(red: 0.05, green: 0.11, blue: 0.08),
-                canvasDeep: Color(red: 0.02, green: 0.06, blue: 0.04),
-                sidebarTint: Color(red: 0.07, green: 0.15, blue: 0.11),
-                panelTint: Color(red: 0.06, green: 0.13, blue: 0.09),
-                rowSelection: Color(red: 0.14, green: 0.30, blue: 0.22),
-                historyTint: Color(red: 0.82, green: 0.65, blue: 0.28),
-                aiStudioTint: Color(red: 0.28, green: 0.70, blue: 0.45),
-                settingsTint: Color(red: 0.82, green: 0.65, blue: 0.28),
-                glowWarm: Color(red: 0.78, green: 0.62, blue: 0.24),
-                glowCool: Color(red: 0.20, green: 0.58, blue: 0.38),
-                surfaceTop: Color(red: 0.08, green: 0.18, blue: 0.13),
-                surfaceBottom: Color(red: 0.04, green: 0.10, blue: 0.07)
+                baseTint: Color(red: 0.07, green: 0.12, blue: 0.10),
+                accentTint: Color(red: 0.41, green: 0.69, blue: 0.54),
+                canvasBase: Color(red: 0.05, green: 0.08, blue: 0.07),
+                canvasDeep: Color(red: 0.03, green: 0.05, blue: 0.04),
+                sidebarTint: Color(red: 0.07, green: 0.11, blue: 0.09),
+                panelTint: Color(red: 0.06, green: 0.10, blue: 0.08),
+                rowSelection: Color(red: 0.14, green: 0.24, blue: 0.20),
+                historyTint: Color(red: 0.72, green: 0.66, blue: 0.44),
+                aiStudioTint: Color(red: 0.41, green: 0.69, blue: 0.54),
+                settingsTint: Color(red: 0.74, green: 0.67, blue: 0.43),
+                glowWarm: Color(red: 0.56, green: 0.49, blue: 0.30),
+                glowCool: Color(red: 0.28, green: 0.54, blue: 0.41),
+                surfaceTop: Color(red: 0.09, green: 0.15, blue: 0.13),
+                surfaceBottom: Color(red: 0.05, green: 0.08, blue: 0.07)
             )
         case .rose:
             return ColorPalette(
-                baseTint: Color(red: 0.16, green: 0.06, blue: 0.12),
-                accentTint: Color(red: 0.85, green: 0.45, blue: 0.58),
-                canvasBase: Color(red: 0.12, green: 0.05, blue: 0.10),
-                canvasDeep: Color(red: 0.06, green: 0.02, blue: 0.05),
-                sidebarTint: Color(red: 0.18, green: 0.08, blue: 0.14),
-                panelTint: Color(red: 0.15, green: 0.06, blue: 0.12),
-                rowSelection: Color(red: 0.32, green: 0.14, blue: 0.24),
-                historyTint: Color(red: 0.90, green: 0.60, blue: 0.68),
-                aiStudioTint: Color(red: 0.85, green: 0.45, blue: 0.58),
-                settingsTint: Color(red: 0.90, green: 0.55, blue: 0.50),
-                glowWarm: Color(red: 0.85, green: 0.40, blue: 0.50),
-                glowCool: Color(red: 0.60, green: 0.30, blue: 0.55),
-                surfaceTop: Color(red: 0.20, green: 0.09, blue: 0.16),
-                surfaceBottom: Color(red: 0.12, green: 0.05, blue: 0.10)
+                baseTint: Color(red: 0.15, green: 0.08, blue: 0.11),
+                accentTint: Color(red: 0.79, green: 0.51, blue: 0.61),
+                canvasBase: Color(red: 0.10, green: 0.06, blue: 0.08),
+                canvasDeep: Color(red: 0.05, green: 0.03, blue: 0.05),
+                sidebarTint: Color(red: 0.14, green: 0.07, blue: 0.10),
+                panelTint: Color(red: 0.13, green: 0.07, blue: 0.09),
+                rowSelection: Color(red: 0.24, green: 0.13, blue: 0.18),
+                historyTint: Color(red: 0.87, green: 0.72, blue: 0.74),
+                aiStudioTint: Color(red: 0.79, green: 0.51, blue: 0.61),
+                settingsTint: Color(red: 0.86, green: 0.62, blue: 0.55),
+                glowWarm: Color(red: 0.72, green: 0.41, blue: 0.47),
+                glowCool: Color(red: 0.54, green: 0.32, blue: 0.48),
+                surfaceTop: Color(red: 0.18, green: 0.10, blue: 0.13),
+                surfaceBottom: Color(red: 0.10, green: 0.06, blue: 0.08)
             )
         case .sunset:
             return ColorPalette(
-                baseTint: Color(red: 0.16, green: 0.10, blue: 0.06),
-                accentTint: Color(red: 0.92, green: 0.55, blue: 0.25),
-                canvasBase: Color(red: 0.12, green: 0.08, blue: 0.05),
-                canvasDeep: Color(red: 0.06, green: 0.04, blue: 0.02),
-                sidebarTint: Color(red: 0.18, green: 0.12, blue: 0.08),
-                panelTint: Color(red: 0.15, green: 0.10, blue: 0.06),
-                rowSelection: Color(red: 0.30, green: 0.20, blue: 0.14),
-                historyTint: Color(red: 0.95, green: 0.70, blue: 0.30),
-                aiStudioTint: Color(red: 0.92, green: 0.55, blue: 0.25),
-                settingsTint: Color(red: 0.95, green: 0.65, blue: 0.25),
-                glowWarm: Color(red: 0.92, green: 0.50, blue: 0.20),
-                glowCool: Color(red: 0.70, green: 0.35, blue: 0.18),
-                surfaceTop: Color(red: 0.20, green: 0.14, blue: 0.09),
-                surfaceBottom: Color(red: 0.12, green: 0.08, blue: 0.05)
+                baseTint: Color(red: 0.16, green: 0.11, blue: 0.07),
+                accentTint: Color(red: 0.88, green: 0.58, blue: 0.31),
+                canvasBase: Color(red: 0.10, green: 0.07, blue: 0.04),
+                canvasDeep: Color(red: 0.05, green: 0.03, blue: 0.02),
+                sidebarTint: Color(red: 0.13, green: 0.09, blue: 0.06),
+                panelTint: Color(red: 0.12, green: 0.08, blue: 0.05),
+                rowSelection: Color(red: 0.25, green: 0.17, blue: 0.11),
+                historyTint: Color(red: 0.93, green: 0.76, blue: 0.44),
+                aiStudioTint: Color(red: 0.88, green: 0.58, blue: 0.31),
+                settingsTint: Color(red: 0.92, green: 0.67, blue: 0.34),
+                glowWarm: Color(red: 0.80, green: 0.47, blue: 0.24),
+                glowCool: Color(red: 0.63, green: 0.35, blue: 0.19),
+                surfaceTop: Color(red: 0.18, green: 0.13, blue: 0.08),
+                surfaceBottom: Color(red: 0.10, green: 0.07, blue: 0.04)
             )
         case .arctic:
             return ColorPalette(
-                baseTint: Color(red: 0.08, green: 0.12, blue: 0.16),
-                accentTint: Color(red: 0.40, green: 0.78, blue: 0.90),
-                canvasBase: Color(red: 0.07, green: 0.10, blue: 0.14),
+                baseTint: Color(red: 0.08, green: 0.12, blue: 0.15),
+                accentTint: Color(red: 0.48, green: 0.76, blue: 0.86),
+                canvasBase: Color(red: 0.06, green: 0.09, blue: 0.12),
                 canvasDeep: Color(red: 0.03, green: 0.05, blue: 0.07),
-                sidebarTint: Color(red: 0.09, green: 0.14, blue: 0.18),
-                panelTint: Color(red: 0.08, green: 0.12, blue: 0.16),
-                rowSelection: Color(red: 0.18, green: 0.28, blue: 0.36),
-                historyTint: Color(red: 0.50, green: 0.82, blue: 0.92),
-                aiStudioTint: Color(red: 0.40, green: 0.78, blue: 0.90),
-                settingsTint: Color(red: 0.55, green: 0.80, blue: 0.88),
-                glowWarm: Color(red: 0.50, green: 0.75, blue: 0.85),
-                glowCool: Color(red: 0.30, green: 0.60, blue: 0.78),
-                surfaceTop: Color(red: 0.11, green: 0.16, blue: 0.22),
-                surfaceBottom: Color(red: 0.06, green: 0.09, blue: 0.13)
+                sidebarTint: Color(red: 0.08, green: 0.12, blue: 0.15),
+                panelTint: Color(red: 0.07, green: 0.10, blue: 0.13),
+                rowSelection: Color(red: 0.15, green: 0.23, blue: 0.29),
+                historyTint: Color(red: 0.67, green: 0.81, blue: 0.87),
+                aiStudioTint: Color(red: 0.48, green: 0.76, blue: 0.86),
+                settingsTint: Color(red: 0.71, green: 0.82, blue: 0.84),
+                glowWarm: Color(red: 0.48, green: 0.67, blue: 0.73),
+                glowCool: Color(red: 0.34, green: 0.58, blue: 0.70),
+                surfaceTop: Color(red: 0.10, green: 0.15, blue: 0.19),
+                surfaceBottom: Color(red: 0.06, green: 0.09, blue: 0.12)
             )
         case .slate:
             return ColorPalette(
-                baseTint: Color(red: 0.12, green: 0.12, blue: 0.14),
-                accentTint: Color(red: 0.68, green: 0.70, blue: 0.74),
-                canvasBase: Color(red: 0.10, green: 0.10, blue: 0.12),
-                canvasDeep: Color(red: 0.05, green: 0.05, blue: 0.06),
-                sidebarTint: Color(red: 0.13, green: 0.13, blue: 0.16),
-                panelTint: Color(red: 0.11, green: 0.11, blue: 0.14),
-                rowSelection: Color(red: 0.24, green: 0.24, blue: 0.28),
-                historyTint: Color(red: 0.72, green: 0.74, blue: 0.78),
-                aiStudioTint: Color(red: 0.60, green: 0.62, blue: 0.68),
-                settingsTint: Color(red: 0.70, green: 0.72, blue: 0.76),
-                glowWarm: Color(red: 0.60, green: 0.58, blue: 0.55),
-                glowCool: Color(red: 0.45, green: 0.48, blue: 0.55),
-                surfaceTop: Color(red: 0.16, green: 0.16, blue: 0.20),
-                surfaceBottom: Color(red: 0.09, green: 0.09, blue: 0.12)
+                baseTint: Color(red: 0.11, green: 0.12, blue: 0.14),
+                accentTint: Color(red: 0.66, green: 0.71, blue: 0.78),
+                canvasBase: Color(red: 0.08, green: 0.09, blue: 0.11),
+                canvasDeep: Color(red: 0.04, green: 0.05, blue: 0.06),
+                sidebarTint: Color(red: 0.10, green: 0.11, blue: 0.13),
+                panelTint: Color(red: 0.09, green: 0.10, blue: 0.12),
+                rowSelection: Color(red: 0.19, green: 0.21, blue: 0.25),
+                historyTint: Color(red: 0.75, green: 0.76, blue: 0.78),
+                aiStudioTint: Color(red: 0.66, green: 0.71, blue: 0.78),
+                settingsTint: Color(red: 0.78, green: 0.79, blue: 0.81),
+                glowWarm: Color(red: 0.54, green: 0.55, blue: 0.52),
+                glowCool: Color(red: 0.44, green: 0.48, blue: 0.56),
+                surfaceTop: Color(red: 0.14, green: 0.15, blue: 0.18),
+                surfaceBottom: Color(red: 0.08, green: 0.09, blue: 0.11)
             )
         case .amethyst:
             return ColorPalette(
-                baseTint: Color(red: 0.14, green: 0.08, blue: 0.20),
-                accentTint: Color(red: 0.62, green: 0.42, blue: 0.85),
-                canvasBase: Color(red: 0.10, green: 0.06, blue: 0.16),
-                canvasDeep: Color(red: 0.05, green: 0.03, blue: 0.08),
-                sidebarTint: Color(red: 0.15, green: 0.09, blue: 0.22),
-                panelTint: Color(red: 0.13, green: 0.07, blue: 0.20),
-                rowSelection: Color(red: 0.26, green: 0.16, blue: 0.38),
-                historyTint: Color(red: 0.72, green: 0.55, blue: 0.90),
-                aiStudioTint: Color(red: 0.62, green: 0.42, blue: 0.85),
-                settingsTint: Color(red: 0.75, green: 0.50, blue: 0.85),
-                glowWarm: Color(red: 0.65, green: 0.40, blue: 0.80),
-                glowCool: Color(red: 0.45, green: 0.28, blue: 0.70),
-                surfaceTop: Color(red: 0.18, green: 0.10, blue: 0.28),
-                surfaceBottom: Color(red: 0.10, green: 0.06, blue: 0.16)
+                baseTint: Color(red: 0.12, green: 0.08, blue: 0.18),
+                accentTint: Color(red: 0.64, green: 0.50, blue: 0.84),
+                canvasBase: Color(red: 0.08, green: 0.05, blue: 0.13),
+                canvasDeep: Color(red: 0.04, green: 0.03, blue: 0.07),
+                sidebarTint: Color(red: 0.10, green: 0.07, blue: 0.16),
+                panelTint: Color(red: 0.09, green: 0.06, blue: 0.14),
+                rowSelection: Color(red: 0.18, green: 0.12, blue: 0.28),
+                historyTint: Color(red: 0.76, green: 0.64, blue: 0.88),
+                aiStudioTint: Color(red: 0.64, green: 0.50, blue: 0.84),
+                settingsTint: Color(red: 0.80, green: 0.60, blue: 0.82),
+                glowWarm: Color(red: 0.63, green: 0.44, blue: 0.74),
+                glowCool: Color(red: 0.46, green: 0.32, blue: 0.69),
+                surfaceTop: Color(red: 0.14, green: 0.09, blue: 0.22),
+                surfaceBottom: Color(red: 0.08, green: 0.05, blue: 0.13)
             )
         case .noirGold:
             return ColorPalette(
-                baseTint: Color(red: 0.10, green: 0.09, blue: 0.07),
-                accentTint: Color(red: 0.79, green: 0.66, blue: 0.30),
-                canvasBase: Color(red: 0.06, green: 0.06, blue: 0.05),
+                baseTint: Color(red: 0.09, green: 0.08, blue: 0.07),
+                accentTint: Color(red: 0.78, green: 0.65, blue: 0.38),
+                canvasBase: Color(red: 0.05, green: 0.05, blue: 0.04),
                 canvasDeep: Color(red: 0.03, green: 0.03, blue: 0.02),
-                sidebarTint: Color(red: 0.10, green: 0.09, blue: 0.07),
-                panelTint: Color(red: 0.08, green: 0.07, blue: 0.06),
-                rowSelection: Color(red: 0.22, green: 0.18, blue: 0.10),
-                historyTint: Color(red: 0.91, green: 0.83, blue: 0.55),
-                aiStudioTint: Color(red: 0.79, green: 0.66, blue: 0.30),
-                settingsTint: Color(red: 0.85, green: 0.72, blue: 0.35),
-                glowWarm: Color(red: 0.79, green: 0.66, blue: 0.30),
-                glowCool: Color(red: 0.55, green: 0.46, blue: 0.22),
-                surfaceTop: Color(red: 0.14, green: 0.12, blue: 0.09),
-                surfaceBottom: Color(red: 0.06, green: 0.05, blue: 0.04)
+                sidebarTint: Color(red: 0.09, green: 0.08, blue: 0.07),
+                panelTint: Color(red: 0.07, green: 0.06, blue: 0.05),
+                rowSelection: Color(red: 0.19, green: 0.16, blue: 0.10),
+                historyTint: Color(red: 0.88, green: 0.82, blue: 0.62),
+                aiStudioTint: Color(red: 0.78, green: 0.65, blue: 0.38),
+                settingsTint: Color(red: 0.84, green: 0.71, blue: 0.43),
+                glowWarm: Color(red: 0.72, green: 0.60, blue: 0.33),
+                glowCool: Color(red: 0.49, green: 0.42, blue: 0.25),
+                surfaceTop: Color(red: 0.12, green: 0.10, blue: 0.08),
+                surfaceBottom: Color(red: 0.05, green: 0.04, blue: 0.03)
             )
         }
     }
@@ -556,7 +580,7 @@ final class SettingsStore: ObservableObject {
     nonisolated static let crossIDEConversationSharingMigrationDefaultsKey =
         "OpenAssist.migration.crossIDEConversationSharingDefaultedV1"
 
-    private let defaults = UserDefaults.standard
+    private let defaults: UserDefaults
     private var isApplyingChanges = false
     private var pendingOnChangeWorkItem: DispatchWorkItem?
     private static let onChangeDebounceSeconds: TimeInterval = 0.14
@@ -673,6 +697,8 @@ final class SettingsStore: ObservableObject {
         static let assistantBackend = "OpenAssist.assistantBackend"
         static let assistantPreferredModelID = "OpenAssist.assistantPreferredModelID"
         static let assistantPreferredSubagentModelID = "OpenAssist.assistantPreferredSubagentModelID"
+        static let assistantPreferredModelIDByBackend = "OpenAssist.assistantPreferredModelIDByBackend"
+        static let assistantPreferredSubagentModelIDByBackend = "OpenAssist.assistantPreferredSubagentModelIDByBackend"
         static let assistantOwnedThreadIDs = "OpenAssist.assistantOwnedThreadIDs"
         static let assistantArchiveDefaultRetentionHours = "OpenAssist.assistantArchiveDefaultRetentionHours"
         static let browserAutomationEnabled = "OpenAssist.browserAutomationEnabled"
@@ -733,6 +759,8 @@ final class SettingsStore: ObservableObject {
 
     private var promptRewriteModelByProvider: [String: String] = [:]
     private var promptRewriteBaseURLByProvider: [String: String] = [:]
+    private var assistantPreferredModelIDByBackend: [String: String] = [:]
+    private var assistantPreferredSubagentModelIDByBackend: [String: String] = [:]
     private var saveSuppressionDepth = 0
 
     @Published var shortcutKeyCode: UInt16 {
@@ -1600,7 +1628,9 @@ final class SettingsStore: ObservableObject {
                 assistantBackendRawValue = normalized
                 return
             }
-            save()
+            performBatchedSave {
+                syncAssistantModelPreferences(for: assistantBackend)
+            }
         }
     }
 
@@ -1795,7 +1825,8 @@ final class SettingsStore: ObservableObject {
         )
     }
 
-    private init() {
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
         isApplyingChanges = true
 
         var initialShortcutKeyCode: UInt16
@@ -2434,17 +2465,38 @@ final class SettingsStore: ObservableObject {
             assistantInterruptCurrentSpeechOnNewReply = defaults.bool(forKey: Keys.assistantInterruptCurrentSpeechOnNewReply)
         }
 
-        assistantBackendRawValue = (
+        let selectedAssistantBackend = (
             AssistantRuntimeBackend(
                 rawValue: defaults.string(forKey: Keys.assistantBackend) ?? ""
             ) ?? .codex
-        ).rawValue
-        assistantPreferredModelID = defaults
+        )
+        assistantBackendRawValue = selectedAssistantBackend.rawValue
+        assistantPreferredModelIDByBackend = Self.normalizedBackendScopedStringDictionary(
+            defaults.dictionary(forKey: Keys.assistantPreferredModelIDByBackend)
+        )
+        assistantPreferredSubagentModelIDByBackend = Self.normalizedBackendScopedStringDictionary(
+            defaults.dictionary(forKey: Keys.assistantPreferredSubagentModelIDByBackend)
+        )
+
+        let storedAssistantPreferredModelID = defaults
             .string(forKey: Keys.assistantPreferredModelID)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        assistantPreferredSubagentModelID = defaults
+        if assistantPreferredModelIDByBackend[selectedAssistantBackend.rawValue] == nil,
+           assistantPreferredModelIDByBackend.isEmpty,
+           !storedAssistantPreferredModelID.isEmpty {
+            assistantPreferredModelIDByBackend[selectedAssistantBackend.rawValue] = storedAssistantPreferredModelID
+        }
+        assistantPreferredModelID = assistantPreferredModelIDByBackend[selectedAssistantBackend.rawValue] ?? ""
+
+        let storedAssistantPreferredSubagentModelID = defaults
             .string(forKey: Keys.assistantPreferredSubagentModelID)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if assistantPreferredSubagentModelIDByBackend[selectedAssistantBackend.rawValue] == nil,
+           assistantPreferredSubagentModelIDByBackend.isEmpty,
+           !storedAssistantPreferredSubagentModelID.isEmpty {
+            assistantPreferredSubagentModelIDByBackend[selectedAssistantBackend.rawValue] = storedAssistantPreferredSubagentModelID
+        }
+        assistantPreferredSubagentModelID = assistantPreferredSubagentModelIDByBackend[selectedAssistantBackend.rawValue] ?? ""
         assistantOwnedThreadIDs = Self.normalizedStringList(
             defaults.stringArray(forKey: Keys.assistantOwnedThreadIDs) ?? []
         )
@@ -2691,6 +2743,12 @@ final class SettingsStore: ObservableObject {
         defaults.set(
             assistantInterruptCurrentSpeechOnNewReply,
             forKey: Keys.assistantInterruptCurrentSpeechOnNewReply
+        )
+        updateAssistantModelPreferenceMaps()
+        defaults.set(assistantPreferredModelIDByBackend, forKey: Keys.assistantPreferredModelIDByBackend)
+        defaults.set(
+            assistantPreferredSubagentModelIDByBackend,
+            forKey: Keys.assistantPreferredSubagentModelIDByBackend
         )
         defaults.set(assistantBackendRawValue, forKey: Keys.assistantBackend)
         defaults.set(assistantPreferredModelID.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Keys.assistantPreferredModelID)
@@ -3333,6 +3391,47 @@ final class SettingsStore: ObservableObject {
         }
 
         return normalized
+    }
+
+    private static func normalizedBackendScopedStringDictionary(_ values: [String: Any]?) -> [String: String] {
+        guard let values else { return [:] }
+        let validBackendIDs = Set(AssistantRuntimeBackend.allCases.map(\.rawValue))
+        var normalized: [String: String] = [:]
+        normalized.reserveCapacity(values.count)
+
+        for (rawKey, rawValue) in values {
+            let backendID = normalizedIdentifier(rawKey)
+            guard validBackendIDs.contains(backendID) else { continue }
+            guard let rawString = rawValue as? String else { continue }
+            let value = normalizedIdentifier(rawString)
+            guard !value.isEmpty else { continue }
+            normalized[backendID] = value
+        }
+
+        return normalized
+    }
+
+    private func syncAssistantModelPreferences(for backend: AssistantRuntimeBackend) {
+        assistantPreferredModelID = assistantPreferredModelIDByBackend[backend.rawValue] ?? ""
+        assistantPreferredSubagentModelID = assistantPreferredSubagentModelIDByBackend[backend.rawValue] ?? ""
+    }
+
+    private func updateAssistantModelPreferenceMaps() {
+        let backendID = assistantBackend.rawValue
+
+        let normalizedPreferredModelID = Self.normalizedIdentifier(assistantPreferredModelID)
+        if normalizedPreferredModelID.isEmpty {
+            assistantPreferredModelIDByBackend.removeValue(forKey: backendID)
+        } else {
+            assistantPreferredModelIDByBackend[backendID] = normalizedPreferredModelID
+        }
+
+        let normalizedPreferredSubagentModelID = Self.normalizedIdentifier(assistantPreferredSubagentModelID)
+        if normalizedPreferredSubagentModelID.isEmpty {
+            assistantPreferredSubagentModelIDByBackend.removeValue(forKey: backendID)
+        } else {
+            assistantPreferredSubagentModelIDByBackend[backendID] = normalizedPreferredSubagentModelID
+        }
     }
 
     private static func sanitizedCloudTranscriptionConfiguration(

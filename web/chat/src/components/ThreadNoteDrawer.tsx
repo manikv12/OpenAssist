@@ -1,10 +1,12 @@
 import {
+  Component,
   useCallback,
   useEffect,
   useMemo,
   useRef,
   useState,
   type CSSProperties,
+  type ReactNode,
   type RefObject,
 } from "react";
 import { EditorContent, useEditor, type Editor } from "@tiptap/react";
@@ -14,15 +16,23 @@ import { TableKit } from "@tiptap/extension-table";
 import { TaskItem } from "@tiptap/extension-task-item";
 import { TaskList } from "@tiptap/extension-task-list";
 import { Markdown } from "@tiptap/markdown";
-import type { Node as ProseMirrorNode, ResolvedPos } from "@tiptap/pm/model";
-import { TextSelection } from "@tiptap/pm/state";
+import { Fragment } from "@tiptap/pm/model";
+import type { Node as ProseMirrorNode, ResolvedPos, Slice } from "@tiptap/pm/model";
+import { NodeSelection, Selection, TextSelection } from "@tiptap/pm/state";
+import type { EditorView } from "@tiptap/pm/view";
 import { all, createLowlight } from "lowlight";
 import { ThreadNoteCodeBlock } from "./ThreadNoteCodeBlock";
+import { ThreadNoteImage } from "./ThreadNoteImage";
 import {
   findCollapsedHeadingSectionAtSelection,
+  findContainingHeadingSectionAtSelection,
   findHeadingSectionAtPosition,
+  resolveHeadingAlignmentAtSelection,
   ThreadNoteCollapsibleHeading,
+  type ThreadNoteHeadingAlignment,
+  type ThreadNoteHeadingSection,
   uncollapseHeadingAtPosition,
+  updateHeadingAlignmentAtSelection,
   updateHeadingCollapsibleAtSelection,
 } from "./ThreadNoteCollapsibleHeading";
 import { MarkdownContent } from "./MarkdownContent";
@@ -30,6 +40,7 @@ import {
   detectMermaidTemplateType,
   isMermaidLanguage,
   normalizeMermaidSource,
+  sanitizeMermaidMarkdownBlocks,
 } from "./mermaidUtils";
 import {
   mermaidSnippetsForType,
@@ -41,7 +52,14 @@ import {
   type MermaidTemplateDefinition,
   type MermaidTemplateType,
 } from "./threadNoteMermaidTemplates";
-import type { ThreadNoteState } from "../types";
+import type {
+  BatchNotePlanPreview,
+  BatchNotePlanProposedLink,
+  BatchNotePlanProposedNote,
+  BatchNotePlanResolvedTarget,
+  BatchNotePlanSourceNote,
+  ThreadNoteState,
+} from "../types";
 import { MermaidDiagram } from "./MermaidDiagram";
 import {
   buildInternalNoteHref,
@@ -49,16 +67,107 @@ import {
   parseInternalNoteHref,
   type InternalNoteLinkTarget,
 } from "./noteLinkUtils";
+import {
+  buildThreadNoteMarkdownImage,
+  normalizeThreadNoteMarkdownForRichText,
+} from "./threadNoteImageMarkdown";
+import {
+  appendMarkdownToNote,
+  insertMarkdownAboveSelection,
+  insertMarkdownBelowSelection,
+  normalizeThreadNoteStoredMarkdown,
+  prependMarkdownToNote,
+  replaceMarkdownRange,
+  replaceSelectionInMarkdown,
+} from "./threadNoteMarkdownEditing";
+import { groupSlashCommands, matchesSlashCommand } from "./slashCommandUtils";
 
 interface Props {
   state: ThreadNoteState | null;
   onDispatchCommand: (type: string, payload?: Record<string, unknown>) => void;
 }
 
+interface ThreadNoteErrorBoundaryProps {
+  children: ReactNode;
+  resetKey: string;
+  state: ThreadNoteState | null;
+}
+
+interface ThreadNoteErrorBoundaryState {
+  hasError: boolean;
+}
+
+class ThreadNoteErrorBoundary extends Component<
+  ThreadNoteErrorBoundaryProps,
+  ThreadNoteErrorBoundaryState
+> {
+  state: ThreadNoteErrorBoundaryState = {
+    hasError: false,
+  };
+
+  static getDerivedStateFromError(): ThreadNoteErrorBoundaryState {
+    return { hasError: true };
+  }
+
+  componentDidCatch(error: unknown) {
+    console.error("Thread note view crashed", error);
+  }
+
+  componentDidUpdate(prevProps: ThreadNoteErrorBoundaryProps) {
+    if (prevProps.resetKey !== this.props.resetKey && this.state.hasError) {
+      this.setState({ hasError: false });
+    }
+  }
+
+  render() {
+    if (!this.state.hasError) {
+      return this.props.children;
+    }
+
+    return (
+      <div className="thread-note-fallback-shell">
+        <div className="thread-note-fallback-banner">
+          This note had a display problem. Showing the saved Markdown below so nothing is lost.
+        </div>
+        <div className="thread-note-fallback-title">
+          {this.props.state?.selectedNoteTitle?.trim() || "Untitled note"}
+        </div>
+        <textarea
+          className="thread-note-fallback-textarea"
+          value={this.props.state?.text ?? ""}
+          readOnly
+          spellCheck={false}
+        />
+      </div>
+    );
+  }
+}
+
 interface SlashQueryState {
   query: string;
   replaceFrom: number;
   replaceTo: number;
+}
+
+type ThreadNoteFindAction = "search" | "activate" | "clear";
+
+interface ThreadNoteFindResponse {
+  handled: boolean;
+  matchCount: number;
+  currentMatch: number;
+}
+
+interface ThreadNoteFindRequestDetail {
+  action: ThreadNoteFindAction;
+  query?: string;
+  index?: number;
+  respond: (result: ThreadNoteFindResponse) => void;
+}
+
+interface ThreadNoteSearchMatch {
+  from: number;
+  to: number;
+  collapsedHeadingPositions: number[];
 }
 
 type SlashCommandGroupTone =
@@ -113,6 +222,11 @@ interface ThreadNoteMenuPosition {
   maxHeight: number;
 }
 
+interface RawMarkdownSelectionOffsets {
+  startOffset: number;
+  endOffset?: number;
+}
+
 type MarkdownLineTag =
   | "paragraph"
   | "heading1"
@@ -124,7 +238,7 @@ type MarkdownLineTag =
   | "quote"
   | "code";
 
-type MarkdownInsertAction = "section" | "divider" | "table";
+type MarkdownInsertAction = "divider" | "table";
 
 type MarkdownTagGroupId = "structure" | "lists" | "blocks";
 
@@ -159,8 +273,10 @@ interface HeadingTagEditorState {
 
 interface NoteSelectionState {
   text: string;
-  from: number;
-  to: number;
+  from?: number;
+  to?: number;
+  selectedMarkdown?: string;
+  snapshotMarkdown?: string;
 }
 
 interface NoteContextMenuState {
@@ -179,6 +295,11 @@ interface NoteContextMenuState {
   lineMenuLeft?: number;
   lineMenuTop?: number;
   linkTarget?: InternalNoteLinkTarget | null;
+}
+
+interface RecoveryPreviewState {
+  kind: "history" | "deleted";
+  id: string;
 }
 
 type NoteContextMenuLayer = "root" | "format" | "links" | "ai";
@@ -217,6 +338,18 @@ interface ChartRequestComposerState {
   sourceKind: "selection" | "line" | "chatSelection" | "whole";
 }
 
+interface ProjectNoteTransferState {
+  selectedText: string;
+  selectedMarkdown: string;
+  from: number;
+  to: number;
+  targetProjectId: string;
+  targetNoteId: string | null;
+  transferMode: "copy" | "move";
+  step: "picker" | "preview";
+  isApplying: boolean;
+}
+
 interface ResolvedMarkdownLine {
   selectionPos: number;
   insertAt: number;
@@ -229,6 +362,15 @@ interface ResolvedMarkdownLine {
   headingCollapsible?: boolean;
 }
 
+interface SelectionCollapsibleSectionDraft {
+  replaceFrom: number;
+  replaceTo: number;
+  headingLevel: 1 | 2 | 3;
+  headingTitle: string;
+  bodyMarkdown: string;
+  emptyBodyMarker: string | null;
+}
+
 interface SelectedListItemRange {
   typeName: "listItem" | "taskItem";
   pos: number;
@@ -236,7 +378,19 @@ interface SelectedListItemRange {
   parentNode: ProseMirrorNode;
 }
 
+interface ThreadNoteInternalDragData {
+  from: number;
+  to: number;
+  move: boolean;
+}
+
 interface ThreadNoteSourceSection {
+  source: NonNullable<ThreadNoteState["availableSources"]>[number];
+  allNotes: ThreadNoteState["notes"];
+  visibleNotes: ThreadNoteState["notes"];
+}
+
+interface BatchOrganizerSection {
   source: NonNullable<ThreadNoteState["availableSources"]>[number];
   allNotes: ThreadNoteState["notes"];
   visibleNotes: ThreadNoteState["notes"];
@@ -248,6 +402,79 @@ interface ChartChoiceOption {
   description: string;
 }
 
+interface SelectedImageState {
+  alt: string;
+  title: string;
+  width: number | null;
+}
+
+interface PendingImagePickerInsert {
+  from: number;
+  to: number;
+}
+
+interface ThreadNoteImageUploadResult {
+  requestId: string;
+  ok: boolean;
+  message?: string;
+  url?: string;
+  relativePath?: string;
+}
+
+type ThreadNoteScreenshotImportMode = "rawOCR" | "cleanText" | "cleanTextAndImage";
+
+interface ThreadNoteScreenshotCaptureResult {
+  requestId: string;
+  ok: boolean;
+  cancelled?: boolean;
+  message?: string;
+  filename?: string;
+  mimeType?: string;
+  dataUrl?: string;
+}
+
+interface ThreadNoteScreenshotProcessingResult {
+  requestId: string;
+  ok: boolean;
+  message?: string;
+  outputMode?: ThreadNoteScreenshotImportMode;
+  markdown?: string;
+  rawText?: string;
+  usedVision?: boolean;
+}
+
+interface ThreadNoteScreenshotImportState {
+  capture: ThreadNoteScreenshotCaptureResult;
+  insertRange: PendingImagePickerInsert;
+  outputMode: ThreadNoteScreenshotImportMode;
+  customInstruction: string;
+  isProcessing: boolean;
+  processed: ThreadNoteScreenshotProcessingResult | null;
+  error: string | null;
+}
+
+const THREAD_NOTE_SCREENSHOT_MODE_OPTIONS: ReadonlyArray<{
+  value: ThreadNoteScreenshotImportMode;
+  label: string;
+  description: string;
+}> = [
+  {
+    value: "rawOCR",
+    label: "Raw OCR",
+    description: "Paste the text exactly as found.",
+  },
+  {
+    value: "cleanText",
+    label: "Clean",
+    description: "Use AI to make it easier to read.",
+  },
+  {
+    value: "cleanTextAndImage",
+    label: "Clean + image",
+    description: "Keep the screenshot and add the cleaned note.",
+  },
+];
+
 interface VisibleTopLevelBlock {
   pos: number;
   node: ProseMirrorNode;
@@ -255,6 +482,35 @@ interface VisibleTopLevelBlock {
 }
 
 const THREAD_NOTE_SAVE_DEBOUNCE_MS = 500;
+const DEFAULT_COLLAPSIBLE_SECTION_BODY = "Add notes here.";
+const THREAD_NOTE_HEADING_DROP_TARGET_CLASS = "is-drop-target";
+const THREAD_NOTE_INTERNAL_DRAG_MIME = "application/x-openassist-note-drag";
+const THREAD_NOTE_IMAGE_RESULT_EVENT = "openassist:thread-note-image-result";
+const THREAD_NOTE_SCREENSHOT_CAPTURE_RESULT_EVENT =
+  "openassist:thread-note-screenshot-capture-result";
+const THREAD_NOTE_SCREENSHOT_PROCESSING_RESULT_EVENT =
+  "openassist:thread-note-screenshot-processing-result";
+const THREAD_NOTE_FIND_REQUEST_EVENT = "openassist:thread-note-find-request";
+const THREAD_NOTE_IMAGE_UPLOAD_TIMEOUT_MS = 12000;
+const THREAD_NOTE_SCREENSHOT_CAPTURE_TIMEOUT_MS = 45000;
+const THREAD_NOTE_SCREENSHOT_PROCESSING_TIMEOUT_MS = 30000;
+const THREAD_NOTE_SUPPORTED_IMAGE_MIME_TYPES = new Set([
+  "image/png",
+  "image/jpeg",
+  "image/jpg",
+  "image/gif",
+  "image/webp",
+  "image/tiff",
+]);
+const THREAD_NOTE_SUPPORTED_IMAGE_EXTENSIONS = new Set([
+  "png",
+  "jpg",
+  "jpeg",
+  "gif",
+  "webp",
+  "tif",
+  "tiff",
+]);
 const DEFAULT_THREAD_NOTE_MENU_POSITION: ThreadNoteMenuPosition = {
   left: 16,
   top: 16,
@@ -298,6 +554,230 @@ function noteSourceKey(ownerKind: string, ownerId: string): string {
 
 function noteSourceLabelForOwner(ownerKind?: string | null): string {
   return ownerKind === "project" ? "Project notes" : "Thread notes";
+}
+
+function noteSourceSectionLabel(source: ThreadNoteSource): string {
+  if (source.ownerKind === "thread") {
+    return source.ownerTitle?.trim() || source.sourceLabel;
+  }
+  return source.sourceLabel;
+}
+
+function noteTypeLabel(noteType?: string | null): string {
+  switch ((noteType ?? "note").trim().toLowerCase()) {
+    case "master":
+      return "Master";
+    case "decision":
+      return "Decision";
+    case "task":
+      return "Task";
+    case "reference":
+      return "Reference";
+    case "question":
+      return "Question";
+    case "note":
+    default:
+      return "Note";
+  }
+}
+
+function batchSourceSelectionKeyFromParts(
+  ownerKind: string,
+  ownerId: string,
+  noteId: string
+): string {
+  return `${ownerKind}:${ownerId}:${noteId}`;
+}
+
+function batchSourceSelectionKeyForNote(note: {
+  ownerKind: string;
+  ownerId: string;
+  id: string;
+}): string {
+  return batchSourceSelectionKeyFromParts(note.ownerKind, note.ownerId, note.id);
+}
+
+function batchSourceSelectionKeyForSourceNote(note: BatchNotePlanSourceNote): string {
+  return batchSourceSelectionKeyFromParts(note.ownerKind, note.ownerId, note.noteId);
+}
+
+function batchSourceSelectionPayload(selectionKey: string) {
+  const [ownerKind, ownerId, noteId, ...rest] = selectionKey.split(":");
+  if (!ownerKind || !ownerId || !noteId || rest.length > 0) {
+    return null;
+  }
+  return { ownerKind, ownerId, noteId };
+}
+
+function batchResolvedTargetKey(target: BatchNotePlanResolvedTarget): string {
+  return [
+    target.kind,
+    target.tempId ?? "",
+    target.ownerKind ?? "",
+    target.ownerId ?? "",
+    target.noteId ?? "",
+  ]
+    .join("::")
+    .toLowerCase();
+}
+
+function batchPlanEditableLinkKey(link: BatchNotePlanProposedLink): string {
+  return `${link.fromTempId.toLowerCase()}::${batchResolvedTargetKey(link.toTarget)}`;
+}
+
+function batchResolvedTargetLabel(target: BatchNotePlanResolvedTarget): string {
+  return normalizeThreadNoteTitle(target.title);
+}
+
+function escapeBatchGraphLabel(value: string): string {
+  return value
+    .replaceAll("\\", "\\\\")
+    .replaceAll("\"", "\\\"");
+}
+
+function buildBatchNotePlanPreviewGraph(
+  sourceNotes: BatchNotePlanSourceNote[],
+  proposedNotes: BatchNotePlanProposedNote[],
+  proposedLinks: BatchNotePlanProposedLink[]
+) {
+  const acceptedNotes = proposedNotes.filter((note) => note.accepted);
+  if (!acceptedNotes.length) {
+    return null;
+  }
+
+  const acceptedTempIds = new Set(acceptedNotes.map((note) => note.tempId.toLowerCase()));
+  const sourceNodeIds = new Set(
+    sourceNotes.map((note) =>
+      batchSourceSelectionKeyFromParts(note.ownerKind, note.ownerId, note.noteId)
+    )
+  );
+
+  const nodes = [
+    ...sourceNotes.map((note) => ({
+      id: batchSourceSelectionKeyFromParts(note.ownerKind, note.ownerId, note.noteId),
+      title: normalizeThreadNoteTitle(note.title),
+      kind: "source" as const,
+      noteType: note.noteType,
+    })),
+    ...acceptedNotes.map((note) => ({
+      id: note.tempId,
+      title: normalizeThreadNoteTitle(note.title),
+      kind: "proposed" as const,
+      noteType: note.noteType,
+    })),
+  ];
+
+  const edges = proposedLinks.flatMap((link) => {
+    const fromKey = link.fromTempId.toLowerCase();
+    if (!link.accepted || !acceptedTempIds.has(fromKey)) {
+      return [];
+    }
+
+    if (link.toTarget.kind === "proposed") {
+      const targetTempId = link.toTarget.tempId?.trim();
+      if (!targetTempId || !acceptedTempIds.has(targetTempId.toLowerCase())) {
+        return [];
+      }
+      return [{ fromNodeId: link.fromTempId, toNodeId: targetTempId }];
+    }
+
+    const ownerKind = link.toTarget.ownerKind?.trim();
+    const ownerId = link.toTarget.ownerId?.trim();
+    const noteId = link.toTarget.noteId?.trim();
+    if (!ownerKind || !ownerId || !noteId) {
+      return [];
+    }
+    const sourceNodeId = batchSourceSelectionKeyFromParts(ownerKind, ownerId, noteId);
+    if (!sourceNodeIds.has(sourceNodeId)) {
+      return [];
+    }
+    return [{ fromNodeId: link.fromTempId, toNodeId: sourceNodeId }];
+  });
+
+  if (!edges.length) {
+    return {
+      mermaidCode: [
+        "flowchart LR",
+        ...nodes.map((node, index) => `  N${index}["${escapeBatchGraphLabel(node.title)}"]`),
+      ].join("\n"),
+      nodeCount: nodes.length,
+      edgeCount: 0,
+    };
+  }
+
+  const orderedNodes = [...nodes].sort((left, right) => {
+    if (left.kind !== right.kind) {
+      return left.kind === "proposed" ? -1 : 1;
+    }
+    if (left.noteType === "master" || right.noteType === "master") {
+      return left.noteType === "master" ? -1 : 1;
+    }
+    return left.title.localeCompare(right.title, undefined, { sensitivity: "base" });
+  });
+
+  const orderedEdges = [...edges].sort((left, right) => {
+    const fromCompare = left.fromNodeId.localeCompare(right.fromNodeId, undefined, {
+      sensitivity: "base",
+    });
+    if (fromCompare !== 0) {
+      return fromCompare;
+    }
+    return left.toNodeId.localeCompare(right.toNodeId, undefined, {
+      sensitivity: "base",
+    });
+  });
+
+  const nodeAliasById = new Map(orderedNodes.map((node, index) => [node.id, `N${index}`]));
+  const lines = ["flowchart LR"];
+
+  orderedNodes.forEach((node) => {
+    lines.push(
+      `  ${nodeAliasById.get(node.id)}["${escapeBatchGraphLabel(node.title)}"]`
+    );
+  });
+
+  orderedEdges.forEach((edge) => {
+    const fromAlias = nodeAliasById.get(edge.fromNodeId);
+    const toAlias = nodeAliasById.get(edge.toNodeId);
+    if (!fromAlias || !toAlias) {
+      return;
+    }
+    lines.push(`  ${fromAlias} --> ${toAlias}`);
+  });
+
+  lines.push("  classDef source fill:#7c87961c,stroke:#7c8796,stroke-width:1px;");
+  lines.push("  classDef proposed fill:#6aa6ff1f,stroke:#6aa6ff,stroke-width:1.4px;");
+  lines.push("  classDef master fill:#f59e0b22,stroke:#f59e0b,stroke-width:2px;");
+
+  const sourceAliases = orderedNodes
+    .filter((node) => node.kind === "source")
+    .map((node) => nodeAliasById.get(node.id))
+    .filter(Boolean);
+  if (sourceAliases.length) {
+    lines.push(`  class ${sourceAliases.join(",")} source;`);
+  }
+
+  const proposedAliases = orderedNodes
+    .filter((node) => node.kind === "proposed" && node.noteType !== "master")
+    .map((node) => nodeAliasById.get(node.id))
+    .filter(Boolean);
+  if (proposedAliases.length) {
+    lines.push(`  class ${proposedAliases.join(",")} proposed;`);
+  }
+
+  const masterAliases = orderedNodes
+    .filter((node) => node.noteType === "master")
+    .map((node) => nodeAliasById.get(node.id))
+    .filter(Boolean);
+  if (masterAliases.length) {
+    lines.push(`  class ${masterAliases.join(",")} master;`);
+  }
+
+  return {
+    mermaidCode: lines.join("\n"),
+    nodeCount: orderedNodes.length,
+    edgeCount: orderedEdges.length,
+  };
 }
 
 function chartChoiceLabel(type: ChartChoiceType): string {
@@ -539,7 +1019,7 @@ const MARKDOWN_LINE_TAG_OPTIONS: MarkdownLineTagOption[] = [
     id: "heading2",
     token: "##",
     label: "Section",
-    description: "Collapsible section heading",
+    description: "Regular section heading",
     groupId: "structure",
   },
   {
@@ -588,12 +1068,6 @@ const MARKDOWN_LINE_TAG_OPTIONS: MarkdownLineTagOption[] = [
 
 const MARKDOWN_INSERT_OPTIONS: MarkdownInsertOption[] = [
   {
-    id: "section",
-    token: "+ ##",
-    label: "New section",
-    description: "Insert a collapsible section below",
-  },
-  {
     id: "divider",
     token: "---",
     label: "Divider",
@@ -618,15 +1092,6 @@ threadNoteLowlight.registerAlias({
 });
 
 const BASE_SLASH_COMMANDS: SlashCommand[] = [
-  makeCommand(
-    "section",
-    "Collapsible Section",
-    "Insert a heading with notes underneath",
-    (editor, range) => {
-      insertCollapsibleSection(editor, range, 2);
-    },
-    HEADING_GROUP_META
-  ),
   makeCommand(
     "h1",
     "Heading 1",
@@ -800,6 +1265,28 @@ function buildMermaidSlashCommands(
   ];
 }
 
+function buildImageSlashCommands(
+  openImagePicker: (range?: PendingImagePickerInsert) => void
+): SlashCommand[] {
+  return [
+    makeCommand(
+      "image",
+      "Image",
+      "Upload an image from your Mac",
+      (editor, range) => {
+        editor
+          .chain()
+          .focus()
+          .deleteRange({ from: range.replaceFrom, to: range.replaceTo })
+          .run();
+        openImagePicker({ from: range.replaceFrom, to: range.replaceFrom });
+      },
+      BLOCK_GROUP_META,
+      ["photo", "picture", "upload"]
+    ),
+  ];
+}
+
 export function ThreadNoteDrawer({ state, onDispatchCommand }: Props) {
   const threadId = state?.threadId ?? null;
   const isNotesWorkspace = state?.presentation === "notesWorkspace";
@@ -869,19 +1356,24 @@ export function ThreadNoteDrawer({ state, onDispatchCommand }: Props) {
       ) : null}
 
       {isOpen && ownerKind ? (
-        <ThreadNoteDrawerOpenContent
-          key={`${ownerKind}:${ownerId ?? "no-owner"}:${threadId ?? "no-thread"}:${state?.presentation ?? "drawer"}`}
+        <ThreadNoteErrorBoundary
+          resetKey={`${ownerKind}:${ownerId ?? "no-owner"}:${threadId ?? "no-thread"}:${state?.presentation ?? "drawer"}:${state?.viewMode ?? "edit"}:${state?.notesScope ?? "notes"}:${state?.selectedNoteId ?? "no-note"}`}
           state={state}
-          threadId={threadId}
-          ownerKind={ownerKind}
-          ownerId={ownerId ?? ""}
-          isProjectFullScreen={isProjectFullScreen}
-          isNotesWorkspace={isNotesWorkspace}
-          layerRef={layerRef}
-          placeholderText={placeholderText}
-          statusLabel={statusLabel}
-          onDispatchCommand={onDispatchCommand}
-        />
+        >
+          <ThreadNoteDrawerOpenContent
+            key={`${ownerKind}:${ownerId ?? "no-owner"}:${threadId ?? "no-thread"}:${state?.presentation ?? "drawer"}:${state?.viewMode ?? "edit"}:${state?.notesScope ?? "notes"}:${state?.selectedNoteId ?? "no-note"}`}
+            state={state}
+            threadId={threadId}
+            ownerKind={ownerKind}
+            ownerId={ownerId ?? ""}
+            isProjectFullScreen={isProjectFullScreen}
+            isNotesWorkspace={isNotesWorkspace}
+            layerRef={layerRef}
+            placeholderText={placeholderText}
+            statusLabel={statusLabel}
+            onDispatchCommand={onDispatchCommand}
+          />
+        </ThreadNoteErrorBoundary>
       ) : null}
     </div>
   );
@@ -923,7 +1415,20 @@ function ThreadNoteDrawerOpenContent({
   const selectorSearchInputRef = useRef<HTMLInputElement | null>(null);
   const noteLinkSearchInputRef = useRef<HTMLInputElement | null>(null);
   const renameInputRef = useRef<HTMLInputElement | null>(null);
+  const imageInputRef = useRef<HTMLInputElement | null>(null);
+  const liveEditorRef = useRef<Editor | null>(null);
+  const rawMarkdownTextareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const threadNoteFindStateRef = useRef<{
+    query: string;
+    matches: ThreadNoteSearchMatch[];
+    currentIndex: number;
+  }>({
+    query: "",
+    matches: [],
+    currentIndex: -1,
+  });
   const isApplyingExternalContentRef = useRef(false);
+  const isRichEditorReadyForInputRef = useRef(false);
   const openRef = useRef(false);
   const previousNoteKeyRef = useRef<string | null>(null);
   const slashQueryRef = useRef<SlashQueryState | null>(null);
@@ -932,10 +1437,53 @@ function ThreadNoteDrawerOpenContent({
   const mermaidPickerStateRef = useRef<MermaidTemplatePickerState | null>(null);
   const selectedMermaidIndexRef = useRef(0);
   const summaryTargetRef = useRef<SummaryTarget | null>(null);
+  const pendingImagePickerInsertRef = useRef<PendingImagePickerInsert | null>(null);
+  const latestImageUploadContextRef = useRef<{
+    threadId: string | null;
+    ownerKind: string;
+    ownerId: string;
+    noteId: string | null;
+  }>({
+    threadId,
+    ownerKind,
+    ownerId,
+    noteId,
+  });
+  const pendingImageUploadsRef = useRef(
+    new Map<
+      string,
+      {
+        resolve: (result: ThreadNoteImageUploadResult) => void;
+      }
+    >()
+  );
+  const pendingScreenshotCapturesRef = useRef(
+    new Map<
+      string,
+      {
+        resolve: (result: ThreadNoteScreenshotCaptureResult) => void;
+      }
+    >()
+  );
+  const pendingScreenshotProcessingRef = useRef(
+    new Map<
+      string,
+      {
+        resolve: (result: ThreadNoteScreenshotProcessingResult) => void;
+      }
+    >()
+  );
+  const [noteEditorSurfaceMode, setNoteEditorSurfaceMode] = useState<"rich" | "markdown">("rich");
+  const [forcedNoteEditorSurfaceMode, setForcedNoteEditorSurfaceMode] = useState<
+    "markdown" | null
+  >(null);
   const [draftText, setDraftText] = useState(normalizeLineEndings(state?.text ?? ""));
   const [hasLocalDirtyChanges, setHasLocalDirtyChanges] = useState(false);
   const [isSelectorOpen, setIsSelectorOpen] = useState(false);
   const [selectorFilter, setSelectorFilter] = useState("");
+  const [isOverflowMenuOpen, setIsOverflowMenuOpen] = useState(false);
+  const overflowMenuRef = useRef<HTMLDivElement | null>(null);
+  const overflowMenuTriggerRef = useRef<HTMLButtonElement | null>(null);
   const [isRenamingTitle, setIsRenamingTitle] = useState(false);
   const [renameTitleDraft, setRenameTitleDraft] = useState(
     normalizeThreadNoteTitle(state?.selectedNoteTitle)
@@ -969,25 +1517,102 @@ function ThreadNoteDrawerOpenContent({
   const [isLinkedNotesOpen, setIsLinkedNotesOpen] = useState(false);
   const [isGraphOpen, setIsGraphOpen] = useState(false);
   const [linkNotice, setLinkNotice] = useState<string | null>(null);
+  const [editorLoadNotice, setEditorLoadNotice] = useState<string | null>(null);
+  const [imageNotice, setImageNotice] = useState<string | null>(null);
+  const [screenshotNotice, setScreenshotNotice] = useState<string | null>(null);
+  const [selectedImage, setSelectedImage] = useState<SelectedImageState | null>(null);
+  const [isImageInspectorOpen, setIsImageInspectorOpen] = useState(false);
+  const [isUploadingImage, setIsUploadingImage] = useState(false);
+  const [isCapturingScreenshot, setIsCapturingScreenshot] = useState(false);
+  const [screenshotImportState, setScreenshotImportState] =
+    useState<ThreadNoteScreenshotImportState | null>(null);
   const [chartRequestComposer, setChartRequestComposer] =
     useState<ChartRequestComposerState | null>(null);
+  const [projectNoteTransfer, setProjectNoteTransfer] =
+    useState<ProjectNoteTransferState | null>(null);
+  const [isBatchOrganizerOpen, setIsBatchOrganizerOpen] = useState(false);
+  const [batchOrganizerSearch, setBatchOrganizerSearch] = useState("");
+  const [batchOrganizerSelectedSourceKeys, setBatchOrganizerSelectedSourceKeys] = useState<
+    string[]
+  >([]);
+  const [batchOrganizerSourcePreviewKey, setBatchOrganizerSourcePreviewKey] =
+    useState<string | null>(null);
+  const [batchOrganizerActiveNoteTempId, setBatchOrganizerActiveNoteTempId] =
+    useState<string | null>(null);
+  const [batchOrganizerEditableNotes, setBatchOrganizerEditableNotes] = useState<
+    BatchNotePlanProposedNote[]
+  >([]);
+  const [batchOrganizerEditableLinks, setBatchOrganizerEditableLinks] = useState<
+    BatchNotePlanProposedLink[]
+  >([]);
+  const [batchOrganizerIsApplying, setBatchOrganizerIsApplying] = useState(false);
   const [selectedChartType, setSelectedChartType] = useState<ChartChoiceType>("auto");
   const [chartStyleInstruction, setChartStyleInstruction] = useState("");
+  const activeScreenshotModeOption = screenshotImportState
+    ? THREAD_NOTE_SCREENSHOT_MODE_OPTIONS.find(
+        (option) => option.value === screenshotImportState.outputMode
+      ) ?? THREAD_NOTE_SCREENSHOT_MODE_OPTIONS[0]
+    : null;
+  const [chartRenderError, setChartRenderError] = useState<string | null>(null);
   const [isChartDraftModalDismissed, setIsChartDraftModalDismissed] = useState(false);
   const [isHistoryPanelOpen, setIsHistoryPanelOpen] = useState(false);
+  const [recoveryPreview, setRecoveryPreview] = useState<RecoveryPreviewState | null>(null);
   const notes = state?.notes ?? [];
+  const normalizedBatchOrganizerSearch = batchOrganizerSearch.trim().toLowerCase();
+  const batchOrganizerSections = useMemo<BatchOrganizerSection[]>(
+    () =>
+      (state?.availableSources ?? []).map((source) => {
+        const sourceKey = noteSourceKey(source.ownerKind, source.ownerId);
+        const allSourceNotes = notes.filter(
+          (note) => noteSourceKey(note.ownerKind, note.ownerId) === sourceKey
+        );
+        const visibleSourceNotes = normalizedBatchOrganizerSearch
+          ? allSourceNotes.filter((note) => {
+              const titleMatch = normalizeThreadNoteTitle(note.title)
+                .toLowerCase()
+                .includes(normalizedBatchOrganizerSearch);
+              const typeMatch = noteTypeLabel(note.noteType)
+                .toLowerCase()
+                .includes(normalizedBatchOrganizerSearch);
+              return titleMatch || typeMatch;
+            })
+          : allSourceNotes;
+        return {
+          source,
+          allNotes: allSourceNotes,
+          visibleNotes: visibleSourceNotes,
+        };
+      }),
+    [batchOrganizerSearch, normalizedBatchOrganizerSearch, notes, state?.availableSources]
+  );
   const historyVersions = state?.historyVersions ?? [];
   const recentlyDeletedNotes = state?.recentlyDeletedNotes ?? [];
   const hasRecoveryItems = historyVersions.length > 0 || recentlyDeletedNotes.length > 0;
+  const currentProjectTransferProjectId =
+    state?.workspaceProjectId?.trim() ||
+    state?.availableSources?.find((source) => source.ownerKind === "project")?.ownerId ||
+    null;
 
   const isOpen = Boolean(state?.isOpen && state?.canEdit);
   const noteOwnerKey = `${ownerKind}:${ownerId}`;
   const noteKey = `${noteOwnerKey}:${noteId ?? "none"}`;
+  const isRawMarkdownMode =
+    noteEditorSurfaceMode === "markdown" || forcedNoteEditorSurfaceMode === "markdown";
+  const isRichEditorMode = !isRawMarkdownMode;
+  const isPreviewMode = state?.viewMode === "preview";
+  const isSplitMode = state?.viewMode === "split";
+  const showsEditorPane = !isPreviewMode;
+  const showsPreviewPane = isPreviewMode || isSplitMode;
   const canCloseDrawer = true;
   const isExpanded = Boolean(state?.isExpanded);
   const aiDraftPreview = state?.aiDraftPreview ?? null;
+  const projectNoteTransferPreview = state?.projectNoteTransferPreview ?? null;
+  const projectNoteTransferOutcome = state?.projectNoteTransferOutcome ?? null;
+  const batchNotePlanPreview = state?.batchNotePlanPreview ?? null;
   const aiDraftMode = state?.aiDraftMode ?? aiDraftPreview?.mode ?? null;
   const hasActiveAIDraft = Boolean(aiDraftPreview || (state?.isGeneratingAIDraft && aiDraftMode));
+  const isProjectTransferBusy = Boolean(state?.isGeneratingProjectTransferPreview);
+  const isBatchNotePlanBusy = Boolean(state?.isGeneratingBatchNotePlanPreview);
   const activeAIDraftMode = aiDraftPreview?.mode ?? aiDraftMode ?? "organize";
   const activeAIDraftSourceKind =
     aiDraftPreview?.sourceKind ??
@@ -995,6 +1620,7 @@ function ThreadNoteDrawerOpenContent({
   const isChartDraft = activeAIDraftMode === "chart";
   const isChartRequestComposerOpen = Boolean(chartRequestComposer);
   const hasActiveChartDraft = isChartDraft && hasActiveAIDraft;
+  const hasChartRenderError = Boolean(chartRenderError?.trim());
   const isAIDraftError = Boolean(aiDraftPreview?.isError);
   const showAIDraftModal = isChartRequestComposerOpen
     ? true
@@ -1004,7 +1630,10 @@ function ThreadNoteDrawerOpenContent({
   const showChartDraftStatusCard = hasActiveChartDraft && isChartDraftModalDismissed;
   const shouldBlockDrawerEscape =
     isChartRequestComposerOpen ||
-    (hasActiveAIDraft && activeAIDraftMode !== "chart");
+    Boolean(screenshotImportState) ||
+    (hasActiveAIDraft && activeAIDraftMode !== "chart") ||
+    Boolean(projectNoteTransfer) ||
+    isBatchOrganizerOpen;
   const chartDraftStatusTitle = !aiDraftPreview
     ? "Chart generation is running"
     : aiDraftPreview.isError
@@ -1017,12 +1646,570 @@ function ThreadNoteDrawerOpenContent({
       : "Open the chart panel to review it, regenerate it, or add it to the note.";
   const previousDrawerOpenRef = useRef(isOpen);
   const previousChartDraftActiveRef = useRef(hasActiveChartDraft);
+  const previousProjectTransferOutcomeIdRef = useRef<string | null>(null);
+  const latestDraftTextRef = useRef(draftText);
+  const hasLocalDirtyChangesRef = useRef(hasLocalDirtyChanges);
+  const showImageNotice = useCallback((message: string) => {
+    setImageNotice(message);
+  }, []);
+  const showScreenshotNotice = useCallback((message: string) => {
+    setScreenshotNotice(message);
+  }, []);
+
+  latestDraftTextRef.current = draftText;
+  hasLocalDirtyChangesRef.current = hasLocalDirtyChanges;
+
+  useEffect(() => {
+    latestImageUploadContextRef.current = {
+      threadId,
+      ownerKind,
+      ownerId,
+      noteId,
+    };
+  }, [noteId, ownerId, ownerKind, threadId]);
+
+  useEffect(() => {
+    const handleThreadNoteImageResult = (event: Event) => {
+      const detail = (event as CustomEvent<ThreadNoteImageUploadResult>).detail;
+      if (!detail?.requestId) {
+        return;
+      }
+
+      const pending = pendingImageUploadsRef.current.get(detail.requestId);
+      if (!pending) {
+        return;
+      }
+
+      pendingImageUploadsRef.current.delete(detail.requestId);
+      pending.resolve(detail);
+    };
+
+    window.addEventListener(
+      THREAD_NOTE_IMAGE_RESULT_EVENT,
+      handleThreadNoteImageResult as EventListener
+    );
+    return () => {
+      window.removeEventListener(
+        THREAD_NOTE_IMAGE_RESULT_EVENT,
+        handleThreadNoteImageResult as EventListener
+      );
+      pendingImageUploadsRef.current.clear();
+    };
+  }, []);
+
+  useEffect(() => {
+    const handleThreadNoteScreenshotCaptureResult = (event: Event) => {
+      const detail = (event as CustomEvent<ThreadNoteScreenshotCaptureResult>).detail;
+      if (!detail?.requestId) {
+        return;
+      }
+
+      const pending = pendingScreenshotCapturesRef.current.get(detail.requestId);
+      if (!pending) {
+        return;
+      }
+
+      pendingScreenshotCapturesRef.current.delete(detail.requestId);
+      pending.resolve(detail);
+    };
+
+    const handleThreadNoteScreenshotProcessingResult = (event: Event) => {
+      const detail = (event as CustomEvent<ThreadNoteScreenshotProcessingResult>).detail;
+      if (!detail?.requestId) {
+        return;
+      }
+
+      const pending = pendingScreenshotProcessingRef.current.get(detail.requestId);
+      if (!pending) {
+        return;
+      }
+
+      pendingScreenshotProcessingRef.current.delete(detail.requestId);
+      pending.resolve(detail);
+    };
+
+    window.addEventListener(
+      THREAD_NOTE_SCREENSHOT_CAPTURE_RESULT_EVENT,
+      handleThreadNoteScreenshotCaptureResult as EventListener
+    );
+    window.addEventListener(
+      THREAD_NOTE_SCREENSHOT_PROCESSING_RESULT_EVENT,
+      handleThreadNoteScreenshotProcessingResult as EventListener
+    );
+
+    return () => {
+      window.removeEventListener(
+        THREAD_NOTE_SCREENSHOT_CAPTURE_RESULT_EVENT,
+        handleThreadNoteScreenshotCaptureResult as EventListener
+      );
+      window.removeEventListener(
+        THREAD_NOTE_SCREENSHOT_PROCESSING_RESULT_EVENT,
+        handleThreadNoteScreenshotProcessingResult as EventListener
+      );
+      pendingScreenshotCapturesRef.current.clear();
+      pendingScreenshotProcessingRef.current.clear();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (isNotesWorkspace && state?.workspaceProjectId) {
+      return;
+    }
+
+    setIsBatchOrganizerOpen(false);
+    setBatchOrganizerSearch("");
+    setBatchOrganizerSelectedSourceKeys([]);
+    setBatchOrganizerSourcePreviewKey(null);
+    setBatchOrganizerActiveNoteTempId(null);
+    setBatchOrganizerEditableNotes([]);
+    setBatchOrganizerEditableLinks([]);
+    setBatchOrganizerIsApplying(false);
+  }, [isNotesWorkspace, state?.workspaceProjectId]);
+
+  useEffect(() => {
+    if (!batchNotePlanPreview) {
+      return;
+    }
+
+    setIsBatchOrganizerOpen(true);
+    setBatchOrganizerSelectedSourceKeys(
+      batchNotePlanPreview.sourceNotes.map((sourceNote) =>
+        batchSourceSelectionKeyForSourceNote(sourceNote)
+      )
+    );
+    setBatchOrganizerSourcePreviewKey((current) =>
+      current &&
+      batchNotePlanPreview.sourceNotes.some(
+        (sourceNote) => batchSourceSelectionKeyForSourceNote(sourceNote) === current
+      )
+        ? current
+        : batchNotePlanPreview.sourceNotes[0]
+          ? batchSourceSelectionKeyForSourceNote(batchNotePlanPreview.sourceNotes[0])
+          : null
+    );
+    setBatchOrganizerEditableNotes(batchNotePlanPreview.proposedNotes);
+    setBatchOrganizerEditableLinks(batchNotePlanPreview.proposedLinks);
+    setBatchOrganizerActiveNoteTempId((current) =>
+      current &&
+      batchNotePlanPreview.proposedNotes.some((note) => note.tempId === current)
+        ? current
+        : batchNotePlanPreview.proposedNotes[0]?.tempId ?? null
+    );
+  }, [batchNotePlanPreview]);
+
+  useEffect(() => {
+    if (batchNotePlanPreview) {
+      return;
+    }
+
+    if (
+      batchOrganizerSourcePreviewKey &&
+      batchOrganizerSelectedSourceKeys.includes(batchOrganizerSourcePreviewKey)
+    ) {
+      return;
+    }
+
+    setBatchOrganizerSourcePreviewKey(batchOrganizerSelectedSourceKeys[0] ?? null);
+  }, [
+    batchNotePlanPreview,
+    batchOrganizerSelectedSourceKeys,
+    batchOrganizerSourcePreviewKey,
+  ]);
+
+  useEffect(() => {
+    if (!batchOrganizerIsApplying) {
+      return;
+    }
+
+    if (batchNotePlanPreview) {
+      setBatchOrganizerIsApplying(false);
+      return;
+    }
+
+    if (!isBatchNotePlanBusy) {
+      setBatchOrganizerIsApplying(false);
+      setIsBatchOrganizerOpen(false);
+      setBatchOrganizerActiveNoteTempId(null);
+      setBatchOrganizerEditableNotes([]);
+      setBatchOrganizerEditableLinks([]);
+    }
+  }, [batchNotePlanPreview, batchOrganizerIsApplying, isBatchNotePlanBusy]);
+
+  const requestThreadNoteImageAsset = useCallback(
+    async (file: File): Promise<ThreadNoteImageUploadResult> => {
+      const {
+        threadId: activeThreadId,
+        ownerKind: activeOwnerKind,
+        ownerId: activeOwnerId,
+        noteId: activeNoteId,
+      } = latestImageUploadContextRef.current;
+
+      if (!activeOwnerKind || !activeOwnerId || !activeNoteId) {
+        return {
+          requestId: "",
+          ok: false,
+          message: "Open a note before adding an image.",
+        };
+      }
+
+      const dataUrl = await readFileAsDataURL(file);
+      if (!dataUrl) {
+        return {
+          requestId: "",
+          ok: false,
+          message: "I could not read that image file.",
+        };
+      }
+
+      const resolvedMimeType = resolveThreadNoteImageMimeType(file, dataUrl);
+      if (!isSupportedThreadNoteImageMimeType(resolvedMimeType)) {
+        return {
+          requestId: "",
+          ok: false,
+          message: "This image type is not supported yet. Use PNG, JPG, GIF, WebP, or TIFF.",
+        };
+      }
+
+      const requestId = createThreadNoteImageRequestID();
+      const threadNoteCommandHandler = window.webkit?.messageHandlers?.threadNoteCommand;
+
+      if (!threadNoteCommandHandler || typeof threadNoteCommandHandler.postMessage !== "function") {
+        return {
+          requestId,
+          ok: false,
+          message:
+            "Image paste in notes needs the desktop OpenAssist app bridge. The browser preview cannot save note images.",
+        };
+      }
+
+      return await new Promise<ThreadNoteImageUploadResult>((resolve) => {
+        const timeoutID = window.setTimeout(() => {
+          pendingImageUploadsRef.current.delete(requestId);
+          resolve({
+            requestId,
+            ok: false,
+            message:
+              "Saving the image took too long. Please try again.",
+          });
+        }, THREAD_NOTE_IMAGE_UPLOAD_TIMEOUT_MS);
+
+        pendingImageUploadsRef.current.set(requestId, {
+          resolve: (result) => {
+            window.clearTimeout(timeoutID);
+            resolve(result);
+          },
+        });
+
+        try {
+          threadNoteCommandHandler.postMessage({
+            type: "saveImageAsset",
+            ...(activeThreadId ? { threadId: activeThreadId } : {}),
+            ownerKind: activeOwnerKind,
+            ownerId: activeOwnerId,
+            noteId: activeNoteId,
+            requestId,
+            filename: file.name || undefined,
+            mimeType: resolvedMimeType || undefined,
+            dataUrl,
+          });
+        } catch (error) {
+          pendingImageUploadsRef.current.delete(requestId);
+          window.clearTimeout(timeoutID);
+          console.error("[thread-note image] saveImageAsset postMessage threw", error);
+          resolve({
+            requestId,
+            ok: false,
+            message:
+              error instanceof Error
+                ? `Open Assist could not send the image: ${error.message}`
+                : "Open Assist could not send the image to the desktop app.",
+          });
+        }
+      });
+    },
+    []
+  );
+
+  const requestThreadNoteClipboardImageAsset = useCallback(
+    async (): Promise<ThreadNoteImageUploadResult> => {
+      const {
+        threadId: activeThreadId,
+        ownerKind: activeOwnerKind,
+        ownerId: activeOwnerId,
+        noteId: activeNoteId,
+      } = latestImageUploadContextRef.current;
+
+      if (!activeOwnerKind || !activeOwnerId || !activeNoteId) {
+        return {
+          requestId: "",
+          ok: false,
+          message: "Open a note before adding an image.",
+        };
+      }
+
+      const requestId = createThreadNoteImageRequestID();
+      const threadNoteCommandHandler = window.webkit?.messageHandlers?.threadNoteCommand;
+
+      if (!threadNoteCommandHandler || typeof threadNoteCommandHandler.postMessage !== "function") {
+        return {
+          requestId,
+          ok: false,
+          message:
+            "Image paste in notes needs the desktop OpenAssist app bridge. The browser preview cannot save note images.",
+        };
+      }
+
+      return await new Promise<ThreadNoteImageUploadResult>((resolve) => {
+        const timeoutID = window.setTimeout(() => {
+          pendingImageUploadsRef.current.delete(requestId);
+          resolve({
+            requestId,
+            ok: false,
+            message: "Reading the pasted image took too long. Please try again.",
+          });
+        }, THREAD_NOTE_IMAGE_UPLOAD_TIMEOUT_MS);
+
+        pendingImageUploadsRef.current.set(requestId, {
+          resolve: (result) => {
+            window.clearTimeout(timeoutID);
+            resolve(result);
+          },
+        });
+
+        try {
+          threadNoteCommandHandler.postMessage({
+            type: "pasteImageFromClipboard",
+            ...(activeThreadId ? { threadId: activeThreadId } : {}),
+            ownerKind: activeOwnerKind,
+            ownerId: activeOwnerId,
+            noteId: activeNoteId,
+            requestId,
+          });
+        } catch (error) {
+          pendingImageUploadsRef.current.delete(requestId);
+          window.clearTimeout(timeoutID);
+          console.error("[thread-note image] pasteImageFromClipboard postMessage threw", error);
+          resolve({
+            requestId,
+            ok: false,
+            message:
+              error instanceof Error
+                ? `Open Assist could not read the clipboard image: ${error.message}`
+                : "Open Assist could not read the image from the clipboard.",
+          });
+        }
+      });
+    },
+    []
+  );
+
+  const requestThreadNoteScreenshotCapture = useCallback(
+    async (): Promise<ThreadNoteScreenshotCaptureResult> => {
+      const {
+        threadId: activeThreadId,
+        ownerKind: activeOwnerKind,
+        ownerId: activeOwnerId,
+        noteId: activeNoteId,
+      } = latestImageUploadContextRef.current;
+
+      if (!activeOwnerKind || !activeOwnerId || !activeNoteId) {
+        return {
+          requestId: "",
+          ok: false,
+          message: "Open a note before adding a screenshot.",
+        };
+      }
+
+      const requestId = createThreadNoteScreenshotRequestID();
+      const threadNoteCommandHandler = window.webkit?.messageHandlers?.threadNoteCommand;
+
+      if (!threadNoteCommandHandler || typeof threadNoteCommandHandler.postMessage !== "function") {
+        return {
+          requestId,
+          ok: false,
+          message:
+            "Screenshot import needs the desktop OpenAssist app bridge. The browser preview cannot capture screenshots.",
+        };
+      }
+
+      return await new Promise<ThreadNoteScreenshotCaptureResult>((resolve) => {
+        const timeoutID = window.setTimeout(() => {
+          pendingScreenshotCapturesRef.current.delete(requestId);
+          resolve({
+            requestId,
+            ok: false,
+            message: "Screenshot capture took too long. Please try again.",
+          });
+        }, THREAD_NOTE_SCREENSHOT_CAPTURE_TIMEOUT_MS);
+
+        pendingScreenshotCapturesRef.current.set(requestId, {
+          resolve: (result) => {
+            window.clearTimeout(timeoutID);
+            resolve(result);
+          },
+        });
+
+        try {
+          threadNoteCommandHandler.postMessage({
+            type: "captureScreenshotImport",
+            ...(activeThreadId ? { threadId: activeThreadId } : {}),
+            ownerKind: activeOwnerKind,
+            ownerId: activeOwnerId,
+            noteId: activeNoteId,
+            requestId,
+          });
+        } catch (error) {
+          pendingScreenshotCapturesRef.current.delete(requestId);
+          window.clearTimeout(timeoutID);
+          resolve({
+            requestId,
+            ok: false,
+            message:
+              error instanceof Error
+                ? `Open Assist could not start screenshot capture: ${error.message}`
+                : "Open Assist could not start screenshot capture.",
+          });
+        }
+      });
+    },
+    []
+  );
+
+  const requestThreadNoteScreenshotProcessingPreview = useCallback(
+    async (options: {
+      capture: ThreadNoteScreenshotCaptureResult;
+      outputMode: ThreadNoteScreenshotImportMode;
+      customInstruction?: string;
+    }): Promise<ThreadNoteScreenshotProcessingResult> => {
+      const {
+        threadId: activeThreadId,
+        ownerKind: activeOwnerKind,
+        ownerId: activeOwnerId,
+        noteId: activeNoteId,
+      } = latestImageUploadContextRef.current;
+
+      if (!activeOwnerKind || !activeOwnerId || !activeNoteId) {
+        return {
+          requestId: "",
+          ok: false,
+          message: "Open a note before adding a screenshot.",
+        };
+      }
+
+      if (!options.capture.dataUrl) {
+        return {
+          requestId: "",
+          ok: false,
+          message: "Open Assist could not find the captured screenshot data.",
+        };
+      }
+
+      const requestId = createThreadNoteScreenshotRequestID();
+      const threadNoteCommandHandler = window.webkit?.messageHandlers?.threadNoteCommand;
+
+      if (!threadNoteCommandHandler || typeof threadNoteCommandHandler.postMessage !== "function") {
+        return {
+          requestId,
+          ok: false,
+          message:
+            "Screenshot import needs the desktop OpenAssist app bridge. The browser preview cannot process screenshots.",
+        };
+      }
+
+      return await new Promise<ThreadNoteScreenshotProcessingResult>((resolve) => {
+        const timeoutID = window.setTimeout(() => {
+          pendingScreenshotProcessingRef.current.delete(requestId);
+          resolve({
+            requestId,
+            ok: false,
+            message: "Screenshot processing took too long. Please try again.",
+          });
+        }, THREAD_NOTE_SCREENSHOT_PROCESSING_TIMEOUT_MS);
+
+        pendingScreenshotProcessingRef.current.set(requestId, {
+          resolve: (result) => {
+            window.clearTimeout(timeoutID);
+            resolve(result);
+          },
+        });
+
+        try {
+          threadNoteCommandHandler.postMessage({
+            type: "processScreenshotImport",
+            ...(activeThreadId ? { threadId: activeThreadId } : {}),
+            ownerKind: activeOwnerKind,
+            ownerId: activeOwnerId,
+            noteId: activeNoteId,
+            requestId,
+            outputMode: options.outputMode,
+            filename: options.capture.filename,
+            mimeType: options.capture.mimeType,
+            dataUrl: options.capture.dataUrl,
+            styleInstruction: options.customInstruction?.trim() || undefined,
+          });
+        } catch (error) {
+          pendingScreenshotProcessingRef.current.delete(requestId);
+          window.clearTimeout(timeoutID);
+          resolve({
+            requestId,
+            ok: false,
+            message:
+              error instanceof Error
+                ? `Open Assist could not process the screenshot: ${error.message}`
+                : "Open Assist could not process the screenshot.",
+          });
+        }
+      });
+    },
+    []
+  );
+
+  const requestThreadNoteImageUploads = useCallback(
+    async (files: readonly File[]) => {
+      const imageFiles = files.filter((file) => file.size > 0 || file.type.length > 0);
+      if (!imageFiles.length) {
+        return [];
+      }
+
+      setIsUploadingImage(true);
+      try {
+        const uploaded: ThreadNoteImageUploadResult[] = [];
+        for (const file of imageFiles) {
+          const result = await requestThreadNoteImageAsset(file);
+          uploaded.push(result);
+        }
+        return uploaded;
+      } finally {
+        setIsUploadingImage(false);
+      }
+    },
+    [requestThreadNoteImageAsset]
+  );
+
+  const dispatchDraftUpdate = useCallback(
+    (nextText: string) => {
+      const normalized = normalizeLineEndings(nextText);
+      if (!ownerKind || !ownerId || !noteId) {
+        return;
+      }
+      onDispatchCommand("updateDraft", {
+        ...(threadId ? { threadId } : {}),
+        ownerKind,
+        ownerId,
+        noteId,
+        text: normalized,
+      });
+    },
+    [noteId, onDispatchCommand, ownerId, ownerKind, threadId]
+  );
 
   const editor = useEditor(
     {
       immediatelyRender: false,
       autofocus: false,
-      content: normalizeLineEndings(state?.text ?? ""),
+      content: normalizeThreadNoteMarkdownForRichText(
+        normalizeLineEndings(state?.text ?? "")
+      ),
       contentType: "markdown",
       extensions: [
         StarterKit.configure({
@@ -1035,6 +2222,7 @@ function ThreadNoteDrawerOpenContent({
         ThreadNoteCodeBlock.configure({
           lowlight: threadNoteLowlight,
         }),
+        ThreadNoteImage,
         Markdown,
         Placeholder.configure({
           placeholder: placeholderText,
@@ -1053,18 +2241,220 @@ function ThreadNoteDrawerOpenContent({
       editorProps: {
         attributes: {
           class: "thread-note-tiptap",
+          spellcheck: "true",
+        },
+        handlePaste: (_view, event) => {
+          const clipboardData = event.clipboardData;
+          const liveEditor = liveEditorRef.current;
+          console.info("[thread-note image] handlePaste", {
+            hasClipboardData: Boolean(clipboardData),
+            hasLiveEditor: Boolean(liveEditor),
+            types: clipboardData ? Array.from(clipboardData.types) : [],
+            itemKinds: clipboardData
+              ? Array.from(clipboardData.items).map((i) => `${i.kind}:${i.type}`)
+              : [],
+            fileCount: clipboardData?.files?.length ?? 0,
+          });
+          if (!clipboardData) {
+            return false;
+          }
+
+          const imageFiles = extractThreadNoteImageFiles(clipboardData.items, clipboardData.files);
+          console.info("[thread-note image] extracted imageFiles count", imageFiles.length);
+          if (!imageFiles.length) {
+            const shouldRouteToNative = shouldAttemptNativeThreadNoteClipboardImagePaste(clipboardData);
+            console.info("[thread-note image] native clipboard route?", shouldRouteToNative);
+            if (!shouldRouteToNative) {
+              return false;
+            }
+
+            event.preventDefault();
+            const selection = liveEditor?.state.selection ?? null;
+            void requestThreadNoteClipboardImageAsset().then((result) => {
+              console.info("[thread-note image] native clipboard result", result);
+              const currentEditor = liveEditorRef.current;
+              if (!currentEditor) {
+                showImageNotice("Rich editor not available; clipboard paste aborted.");
+                return;
+              }
+
+              if (!result.ok || !result.url) {
+                showImageNotice(
+                  result.message ??
+                    "Open Assist could not find an image on the clipboard."
+                );
+                return;
+              }
+
+              insertThreadNoteImages(currentEditor, {
+                from: selection?.from,
+                to: selection?.to,
+                images: [
+                  {
+                    src: result.url,
+                    alt: preferredThreadNoteImageAlt(),
+                    title: "",
+                  },
+                ],
+              });
+              const nextMarkdown = normalizeLineEndings(currentEditor.getMarkdown());
+              setDraftText(nextMarkdown);
+              setHasLocalDirtyChanges(true);
+              hasLocalDirtyChangesRef.current = true;
+              dispatchDraftUpdate(nextMarkdown);
+            });
+            return true;
+          }
+
+          event.preventDefault();
+          const selection = liveEditor?.state.selection ?? null;
+          console.info("[thread-note image] paste: routing imageFiles to upload", {
+            count: imageFiles.length,
+            selection: selection ? { from: selection.from, to: selection.to } : null,
+          });
+          void requestThreadNoteImageUploads(imageFiles).then((results) => {
+            console.info("[thread-note image] paste upload results", results);
+            const currentEditor = liveEditorRef.current;
+            if (!currentEditor) {
+              showImageNotice("Rich editor unavailable; paste aborted.");
+              console.error("[thread-note image] paste: editor null at result time");
+              return;
+            }
+
+            const successfulImages = results
+              .filter((result) => result.ok && result.url)
+              .map((result, index) => ({
+                src: result.url!,
+                alt: preferredThreadNoteImageAlt(imageFiles[index]?.name),
+                title: "",
+              }));
+
+            const failedResult = results.find((result) => !result.ok);
+            if (failedResult) {
+              showImageNotice(
+                failedResult.message ??
+                  "Image save returned failure with no message."
+              );
+              console.error("[thread-note image] paste failure", failedResult);
+            }
+            if (!successfulImages.length) {
+              return;
+            }
+
+            console.info("[thread-note image] paste: inserting into editor", successfulImages);
+            insertThreadNoteImages(currentEditor, {
+              from: selection?.from,
+              to: selection?.to,
+              images: successfulImages,
+            });
+            const nextMarkdown = normalizeLineEndings(currentEditor.getMarkdown());
+            setDraftText(nextMarkdown);
+            setHasLocalDirtyChanges(true);
+            hasLocalDirtyChangesRef.current = true;
+            dispatchDraftUpdate(nextMarkdown);
+          });
+          return true;
+        },
+        handleDrop: (view, event, slice, moved) => {
+          const imageFiles = extractThreadNoteImageFiles(
+            event.dataTransfer?.items,
+            event.dataTransfer?.files
+          );
+          if (imageFiles.length) {
+            event.preventDefault();
+            const dropPosition = view.posAtCoords({
+              left: event.clientX,
+              top: event.clientY,
+            })?.pos;
+
+            void requestThreadNoteImageUploads(imageFiles).then((results) => {
+              const successfulImages = results
+                .filter((result) => result.ok && result.url)
+                .map((result, index) => ({
+                  src: result.url!,
+                  alt: preferredThreadNoteImageAlt(imageFiles[index]?.name),
+                  title: "",
+                }));
+              const failedResult = results.find((result) => !result.ok);
+              if (failedResult?.message) {
+                showImageNotice(failedResult.message);
+              }
+              if (!successfulImages.length) {
+                return;
+              }
+
+              const currentEditor = liveEditorRef.current;
+              if (!currentEditor) {
+                return;
+              }
+
+              insertThreadNoteImages(currentEditor, {
+                from: dropPosition,
+                to: dropPosition,
+                images: successfulImages,
+              });
+              const nextMarkdown = normalizeLineEndings(currentEditor.getMarkdown());
+              setDraftText(nextMarkdown);
+              setHasLocalDirtyChanges(true);
+              hasLocalDirtyChangesRef.current = true;
+              dispatchDraftUpdate(nextMarkdown);
+            });
+            return true;
+          }
+
+          return handleThreadNoteSectionDrop(view, event, slice, moved);
         },
       },
     },
-    [placeholderText]
+    [
+      dispatchDraftUpdate,
+      placeholderText,
+      requestThreadNoteClipboardImageAsset,
+      requestThreadNoteImageUploads,
+      showImageNotice,
+    ]
   );
+
+  liveEditorRef.current = editor ?? null;
+
+  useEffect(() => {
+    const handleOpenInspector = () => {
+      setIsImageInspectorOpen(true);
+    };
+    window.addEventListener(
+      "openassist:thread-note-image-inspector-open",
+      handleOpenInspector as EventListener
+    );
+    return () => {
+      window.removeEventListener(
+        "openassist:thread-note-image-inspector-open",
+        handleOpenInspector as EventListener
+      );
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!selectedImage) {
+      setIsImageInspectorOpen(false);
+    }
+  }, [selectedImage]);
 
   const refreshSlashQuery = useCallback(
     (activeEditor: Editor | null = editor) => {
+      if (!isRichEditorMode) {
+        setSlashQuery(null);
+        setMermaidEditingContext(null);
+        setHeadingTagEditor(null);
+        setIsInTable(false);
+        setSelectedImage(null);
+        return;
+      }
+
       if (!activeEditor || !isOpen || !noteId) {
         setSlashQuery(null);
         setMermaidEditingContext(null);
         setNoteSelection(null);
+        setSelectedImage(null);
         return;
       }
 
@@ -1076,6 +2466,7 @@ function ThreadNoteDrawerOpenContent({
         setHeadingTagEditor(null);
       }
       setIsInTable(activeEditor.isActive("table"));
+      setSelectedImage(resolveSelectedThreadNoteImage(activeEditor));
 
       const { from, to, empty } = activeEditor.state.selection;
       if (!empty && to > from) {
@@ -1097,7 +2488,63 @@ function ThreadNoteDrawerOpenContent({
         );
       }
     },
-    [editor, isOpen, layerRef, noteId]
+    [editor, isOpen, isRichEditorMode, layerRef, noteId]
+  );
+
+  const fallbackToRawMarkdownEditor = useCallback((message: string) => {
+    isRichEditorReadyForInputRef.current = false;
+    setForcedNoteEditorSurfaceMode("markdown");
+    setEditorLoadNotice(message);
+    setSlashQuery(null);
+    setMermaidEditingContext(null);
+    setHeadingTagEditor(null);
+    setIsInTable(false);
+    setSelectedImage(null);
+    setNoteSelection(null);
+  }, []);
+
+  const syncRichEditorMarkdown = useCallback(
+    (
+      activeEditor: Editor,
+      markdown: string,
+      options?: {
+        fallbackMessage?: string;
+        refreshSelectionState?: boolean;
+      }
+    ): boolean => {
+      try {
+        isApplyingExternalContentRef.current = true;
+        activeEditor.commands.setContent(normalizeThreadNoteMarkdownForRichText(markdown), {
+          contentType: "markdown",
+        });
+        isApplyingExternalContentRef.current = false;
+        isRichEditorReadyForInputRef.current = true;
+        setForcedNoteEditorSurfaceMode(null);
+        setEditorLoadNotice(null);
+
+        if (options?.refreshSelectionState !== false) {
+          try {
+            refreshSlashQuery(activeEditor);
+          } catch (selectionRefreshError) {
+            console.error(
+              "Failed to refresh thread note rich editor selection state",
+              selectionRefreshError
+            );
+          }
+        }
+
+        return true;
+      } catch (error) {
+        isApplyingExternalContentRef.current = false;
+        console.error("Failed to load thread note into rich editor", error);
+        fallbackToRawMarkdownEditor(
+          options?.fallbackMessage ??
+            "This note opened in Markdown because rich view could not load it safely."
+        );
+        return false;
+      }
+    },
+    [fallbackToRawMarkdownEditor, refreshSlashQuery]
   );
 
   const openMermaidTemplatePicker = useCallback(
@@ -1127,9 +2574,40 @@ function ThreadNoteDrawerOpenContent({
     [layerRef, refreshSlashQuery]
   );
 
+  const handleOpenImagePicker = useCallback(
+    (range?: PendingImagePickerInsert) => {
+      if (!noteId || !ownerKind || !ownerId) {
+        showImageNotice("Open a note before adding an image.");
+        return;
+      }
+
+      pendingImagePickerInsertRef.current =
+        range ??
+        (isRichEditorMode && editor
+          ? {
+              from: editor.state.selection.from,
+              to: editor.state.selection.to,
+            }
+          : resolveCurrentRawMarkdownRange());
+      imageInputRef.current?.click();
+    },
+    [
+      editor,
+      isRichEditorMode,
+      noteId,
+      ownerId,
+      ownerKind,
+      showImageNotice,
+    ]
+  );
+
   const slashCommands = useMemo(
-    () => [...buildMermaidSlashCommands(openMermaidTemplatePicker), ...BASE_SLASH_COMMANDS],
-    [openMermaidTemplatePicker]
+    () => [
+      ...buildMermaidSlashCommands(openMermaidTemplatePicker),
+      ...buildImageSlashCommands(handleOpenImagePicker),
+      ...BASE_SLASH_COMMANDS,
+    ],
+    [handleOpenImagePicker, openMermaidTemplatePicker]
   );
 
   const mermaidSnippetCommands = useMemo(
@@ -1208,15 +2686,42 @@ function ThreadNoteDrawerOpenContent({
   mermaidPickerStateRef.current = mermaidPicker;
   selectedMermaidIndexRef.current = selectedMermaidIndex;
 
+  const updateDraftTextLocally = useCallback(
+    (nextText: string) => {
+      const normalized = normalizeLineEndings(nextText);
+      setDraftText(normalized);
+      setHasLocalDirtyChanges(true);
+      hasLocalDirtyChangesRef.current = true;
+      dispatchDraftUpdate(normalized);
+      return normalized;
+    },
+    [dispatchDraftUpdate]
+  );
+
+  const readCurrentThreadNoteMarkdown = useCallback(() => {
+    return normalizeLineEndings(
+      normalizeThreadNoteStoredMarkdown(latestDraftTextRef.current)
+    );
+  }, []);
+
   const commitSave = useCallback(
-    (nextText?: string) => {
+    (nextText?: string, options?: { force?: boolean }) => {
       const normalized = normalizeLineEndings(
-        nextText ?? editor?.getMarkdown() ?? draftText
+        nextText ?? readCurrentThreadNoteMarkdown()
       );
       if (!ownerKind || !ownerId || !noteId) {
         return;
       }
-      if (!hasLocalDirtyChanges && normalized === normalizeLineEndings(state?.text ?? "")) {
+      const savedText = normalizeLineEndings(state?.text ?? "");
+      const shouldForceSave = options?.force === true;
+      if (!shouldForceSave && !hasLocalDirtyChangesRef.current) {
+        return;
+      }
+      if (normalized === savedText) {
+        if (hasLocalDirtyChangesRef.current) {
+          setHasLocalDirtyChanges(false);
+          hasLocalDirtyChangesRef.current = false;
+        }
         return;
       }
       onDispatchCommand("save", {
@@ -1226,20 +2731,444 @@ function ThreadNoteDrawerOpenContent({
         noteId,
         text: normalized,
       });
-      setHasLocalDirtyChanges(false);
     },
     [
-      draftText,
-      editor,
-      hasLocalDirtyChanges,
       noteId,
       onDispatchCommand,
       ownerId,
       ownerKind,
+      readCurrentThreadNoteMarkdown,
+      setHasLocalDirtyChanges,
       state?.text,
       threadId,
     ]
   );
+
+  const commitEditorMarkdown = useCallback(
+    (nextMarkdown: string) => {
+      const normalized = updateDraftTextLocally(
+        normalizeThreadNoteStoredMarkdown(nextMarkdown)
+      );
+      commitSave(normalized, { force: true });
+    },
+    [commitSave, updateDraftTextLocally]
+  );
+
+  const focusRawMarkdownEditor = useCallback(
+    (selection?: { start: number; end: number }) => {
+      window.requestAnimationFrame(() => {
+        const textarea = rawMarkdownTextareaRef.current;
+        if (!textarea) {
+          return;
+        }
+
+        textarea.focus();
+        if (selection) {
+          textarea.setSelectionRange(selection.start, selection.end);
+        }
+      });
+    },
+    []
+  );
+
+  const updateRawMarkdownSelection = useCallback(
+    (
+      start: number,
+      end: number,
+      markdown: string = latestDraftTextRef.current
+    ) => {
+      const safeStart = Math.max(0, Math.min(markdown.length, start));
+      const safeEnd = Math.max(safeStart, Math.min(markdown.length, end));
+      if (safeEnd <= safeStart) {
+        setNoteSelection(null);
+        return;
+      }
+
+      const selectedMarkdown = markdown.slice(safeStart, safeEnd);
+      const selectedText = selectedMarkdown.trim();
+      if (!selectedText) {
+        setNoteSelection(null);
+        return;
+      }
+
+      setNoteSelection({
+        text: selectedText,
+        from: safeStart,
+        to: safeEnd,
+        selectedMarkdown,
+        snapshotMarkdown: markdown,
+      });
+    },
+    []
+  );
+
+  const refreshRawMarkdownSlashQuery = useCallback(
+    (
+      target: HTMLTextAreaElement | null = rawMarkdownTextareaRef.current,
+      markdown: string = latestDraftTextRef.current
+    ) => {
+      const normalizedMarkdown = normalizeLineEndings(markdown);
+      const selectionStart = target?.selectionStart ?? normalizedMarkdown.length;
+      const selectionEnd = target?.selectionEnd ?? selectionStart;
+
+      updateRawMarkdownSelection(selectionStart, selectionEnd, normalizedMarkdown);
+      setSelectedImage(null);
+      setIsInTable(false);
+      setMermaidEditingContext(null);
+
+      if (!isOpen || !noteId) {
+        setSlashQuery(null);
+        return;
+      }
+
+      const nextQuery = detectRawMarkdownSlashQuery(
+        normalizedMarkdown,
+        selectionStart,
+        selectionEnd
+      );
+      setSlashQuery(nextQuery);
+      if (nextQuery || mermaidPickerStateRef.current) {
+        setMenuPosition(DEFAULT_THREAD_NOTE_MENU_POSITION);
+      }
+    },
+    [isOpen, noteId, updateRawMarkdownSelection]
+  );
+
+  const resolveCurrentRawMarkdownRange = useCallback((): PendingImagePickerInsert => {
+    const textarea = rawMarkdownTextareaRef.current;
+    if (!textarea) {
+      const fallback = latestDraftTextRef.current.length;
+      return { from: fallback, to: fallback };
+    }
+
+    return {
+      from: textarea.selectionStart ?? 0,
+      to: textarea.selectionEnd ?? textarea.selectionStart ?? 0,
+    };
+  }, []);
+
+  const applyRawMarkdownReplacement = useCallback(
+    (
+      range: PendingImagePickerInsert,
+      replacement: string,
+      selectionOffsets?: RawMarkdownSelectionOffsets
+    ) => {
+      const nextMarkdown = replaceMarkdownRange(latestDraftTextRef.current, range, replacement);
+      const defaultOffset = replacement.length;
+      const start = Math.max(
+        0,
+        Math.min(
+          nextMarkdown.length,
+          range.from + (selectionOffsets?.startOffset ?? defaultOffset)
+        )
+      );
+      const end = Math.max(
+        start,
+        Math.min(
+          nextMarkdown.length,
+          range.from + (selectionOffsets?.endOffset ?? selectionOffsets?.startOffset ?? defaultOffset)
+        )
+      );
+
+      commitEditorMarkdown(nextMarkdown);
+      updateRawMarkdownSelection(start, end, nextMarkdown);
+      focusRawMarkdownEditor({ start, end });
+
+      return {
+        markdown: nextMarkdown,
+        start,
+        end,
+      };
+    },
+    [commitEditorMarkdown, focusRawMarkdownEditor, updateRawMarkdownSelection]
+  );
+
+  const replaceRawMarkdownSelection = useCallback(
+    (range: PendingImagePickerInsert, replacement: string) => {
+      applyRawMarkdownReplacement(range, replacement);
+    },
+    [applyRawMarkdownReplacement]
+  );
+
+  const insertThreadNoteMarkdownAtRange = useCallback(
+    (markdown: string, range?: PendingImagePickerInsert | null) => {
+      const normalized = normalizeLineEndings(markdown).trim();
+      if (!normalized) {
+        showScreenshotNotice("There is nothing to insert into the note yet.");
+        return false;
+      }
+
+      if (isRichEditorMode) {
+        if (!editor) {
+          showScreenshotNotice("The rich editor is not ready yet. Try again in a moment.");
+          return false;
+        }
+
+        editor.commands.insertContentAt(
+          {
+            from: range?.from ?? editor.state.selection.from,
+            to: range?.to ?? editor.state.selection.to,
+          },
+          normalized,
+          {
+            contentType: "markdown",
+          }
+        );
+        commitEditorMarkdown(normalizeLineEndings(editor.getMarkdown()));
+        refreshSlashQuery(editor);
+        return true;
+      }
+
+      const fallbackRange = range ?? resolveCurrentRawMarkdownRange();
+      const replacement =
+        fallbackRange.from === fallbackRange.to ? `\n\n${normalized}\n\n` : normalized;
+      replaceRawMarkdownSelection(fallbackRange, replacement);
+      return true;
+    },
+    [
+      commitEditorMarkdown,
+      editor,
+      isRichEditorMode,
+      refreshSlashQuery,
+      replaceRawMarkdownSelection,
+      resolveCurrentRawMarkdownRange,
+      showScreenshotNotice,
+    ]
+  );
+
+  const insertThreadNotePlainTextAtRange = useCallback(
+    (plainText: string, range?: PendingImagePickerInsert | null) => {
+      const normalized = normalizeLineEndings(plainText).trim();
+      if (!normalized) {
+        showScreenshotNotice("There is nothing to insert into the note yet.");
+        return false;
+      }
+
+      if (isRichEditorMode) {
+        if (!editor) {
+          showScreenshotNotice("The rich editor is not ready yet. Try again in a moment.");
+          return false;
+        }
+
+        editor
+          .chain()
+          .focus()
+          .insertContentAt(
+            {
+              from: range?.from ?? editor.state.selection.from,
+              to: range?.to ?? editor.state.selection.to,
+            },
+            buildThreadNotePlainTextContent(normalized)
+          )
+          .run();
+        commitEditorMarkdown(normalizeLineEndings(editor.getMarkdown()));
+        refreshSlashQuery(editor);
+        return true;
+      }
+
+      const fallbackRange = range ?? resolveCurrentRawMarkdownRange();
+      const replacement =
+        fallbackRange.from === fallbackRange.to ? `\n\n${normalized}\n\n` : normalized;
+      replaceRawMarkdownSelection(fallbackRange, replacement);
+      return true;
+    },
+    [
+      commitEditorMarkdown,
+      editor,
+      isRichEditorMode,
+      refreshSlashQuery,
+      replaceRawMarkdownSelection,
+      resolveCurrentRawMarkdownRange,
+      showScreenshotNotice,
+    ]
+  );
+
+  const handleOpenScreenshotImport = useCallback(async () => {
+    if (!noteId || !ownerKind || !ownerId) {
+      showScreenshotNotice("Open a note before adding a screenshot.");
+      return;
+    }
+
+    const insertRange =
+      isRichEditorMode && editor
+        ? {
+            from: editor.state.selection.from,
+            to: editor.state.selection.to,
+          }
+        : resolveCurrentRawMarkdownRange();
+
+    setScreenshotImportState(null);
+    setIsCapturingScreenshot(true);
+
+    try {
+      const capture = await requestThreadNoteScreenshotCapture();
+      if (capture.cancelled) {
+        return;
+      }
+
+      if (!capture.ok || !capture.dataUrl) {
+        showScreenshotNotice(
+          capture.message ?? "Open Assist could not capture a screenshot for this note."
+        );
+        return;
+      }
+
+      setScreenshotImportState({
+        capture,
+        insertRange,
+        outputMode: "cleanTextAndImage",
+        customInstruction: "",
+        isProcessing: false,
+        processed: null,
+        error: null,
+      });
+    } finally {
+      setIsCapturingScreenshot(false);
+    }
+  }, [
+    editor,
+    isRichEditorMode,
+    noteId,
+    ownerId,
+    ownerKind,
+    requestThreadNoteScreenshotCapture,
+    resolveCurrentRawMarkdownRange,
+    showScreenshotNotice,
+  ]);
+
+  const handleCloseScreenshotImport = useCallback(() => {
+    setScreenshotImportState(null);
+  }, []);
+
+  const handleGenerateScreenshotImportPreview = useCallback(async () => {
+    if (!screenshotImportState) {
+      return;
+    }
+
+    setScreenshotImportState((current) =>
+      current
+        ? {
+            ...current,
+            isProcessing: true,
+            error: null,
+          }
+        : current
+    );
+
+    const result = await requestThreadNoteScreenshotProcessingPreview({
+      capture: screenshotImportState.capture,
+      outputMode: screenshotImportState.outputMode,
+      customInstruction: screenshotImportState.customInstruction,
+    });
+
+    setScreenshotImportState((current) => {
+      if (!current || current.capture.requestId !== screenshotImportState.capture.requestId) {
+        return current;
+      }
+
+      return {
+        ...current,
+        isProcessing: false,
+        processed: result.ok ? result : null,
+        error: result.ok
+          ? null
+          : result.message ?? "Open Assist could not prepare that screenshot import preview.",
+      };
+    });
+  }, [requestThreadNoteScreenshotProcessingPreview, screenshotImportState]);
+
+  const handleApplyScreenshotImport = useCallback(async () => {
+    if (!screenshotImportState || !screenshotImportState.processed?.ok) {
+      showScreenshotNotice("Generate the screenshot preview first.");
+      return;
+    }
+
+    const processed = screenshotImportState.processed;
+    const insertRange = screenshotImportState.insertRange;
+    const outputMode = screenshotImportState.outputMode;
+    const cleanedMarkdown = normalizeLineEndings(processed.markdown ?? "").trim();
+    const rawText = normalizeLineEndings(processed.rawText ?? "").trim();
+
+    if (outputMode === "cleanTextAndImage") {
+      if (!screenshotImportState.capture.dataUrl) {
+        showScreenshotNotice("The captured screenshot is no longer available.");
+        return;
+      }
+
+      if (!cleanedMarkdown) {
+        showScreenshotNotice("The screenshot preview is empty. Generate it again and retry.");
+        return;
+      }
+
+      const screenshotFile = await fileFromThreadNoteDataURL(
+        screenshotImportState.capture.dataUrl,
+        screenshotImportState.capture.filename ?? "Screenshot.png",
+        screenshotImportState.capture.mimeType ?? "image/png"
+      );
+      if (!screenshotFile) {
+        showScreenshotNotice("Open Assist could not reopen the captured screenshot.");
+        return;
+      }
+
+      const upload = await requestThreadNoteImageAsset(screenshotFile);
+      if (!upload.ok || !upload.url) {
+        showScreenshotNotice(
+          upload.message ?? "Open Assist could not save the screenshot into this note."
+        );
+        return;
+      }
+
+      const combinedMarkdown = [
+        buildThreadNoteMarkdownImage({
+          src: upload.url,
+          alt: preferredThreadNoteImageAlt(screenshotImportState.capture.filename),
+          title: "",
+        }),
+        cleanedMarkdown,
+      ]
+        .filter(Boolean)
+        .join("\n\n");
+
+      if (!insertThreadNoteMarkdownAtRange(combinedMarkdown, insertRange)) {
+        return;
+      }
+
+      setScreenshotImportState(null);
+      return;
+    }
+
+    if (outputMode === "rawOCR") {
+      const textToInsert = rawText || cleanedMarkdown;
+      if (!textToInsert) {
+        showScreenshotNotice("The screenshot preview is empty. Generate it again and retry.");
+        return;
+      }
+
+      if (!insertThreadNotePlainTextAtRange(textToInsert, insertRange)) {
+        return;
+      }
+
+      setScreenshotImportState(null);
+      return;
+    }
+
+    if (!cleanedMarkdown) {
+      showScreenshotNotice("The screenshot preview is empty. Generate it again and retry.");
+      return;
+    }
+
+    if (!insertThreadNoteMarkdownAtRange(cleanedMarkdown, insertRange)) {
+      return;
+    }
+
+    setScreenshotImportState(null);
+  }, [
+    insertThreadNoteMarkdownAtRange,
+    insertThreadNotePlainTextAtRange,
+    requestThreadNoteImageAsset,
+    screenshotImportState,
+    showScreenshotNotice,
+  ]);
 
   const dispatchThreadNoteCommand = useCallback(
     (type: string, payload?: Record<string, unknown>) => {
@@ -1252,6 +3181,49 @@ function ThreadNoteDrawerOpenContent({
       });
     },
     [noteId, onDispatchCommand, ownerId, ownerKind, threadId]
+  );
+
+  const hideSelectionAssistantActions = useCallback(() => {
+    dispatchThreadNoteCommand("hideSelectionAssistantActions");
+  }, [dispatchThreadNoteCommand]);
+
+  const dispatchSelectionAssistantCommand = useCallback(
+    (
+      type: "showSelectionAssistantActions" | "openSelectionAssistantQuestionComposer",
+      options: {
+        selectedText: string;
+        from?: number;
+        to?: number;
+        anchorPoint?: { x: number; y: number };
+      }
+    ) => {
+      const selectedText = options.selectedText.trim();
+      if (!selectedText) {
+        hideSelectionAssistantActions();
+        return;
+      }
+
+      const rect =
+        resolveThreadNoteSelectionAssistantRect(editorBodyRef.current) ??
+        (options.anchorPoint
+          ? buildThreadNoteSelectionAnchorRect(options.anchorPoint.x, options.anchorPoint.y)
+          : null);
+
+      if (!rect) {
+        hideSelectionAssistantActions();
+        return;
+      }
+
+      dispatchThreadNoteCommand(type, {
+        selectedText,
+        rect,
+        ...(typeof options.from === "number"
+          ? { sourceSelectionFrom: options.from }
+          : {}),
+        ...(typeof options.to === "number" ? { sourceSelectionTo: options.to } : {}),
+      });
+    },
+    [dispatchThreadNoteCommand, hideSelectionAssistantActions]
   );
 
   const openHeadingTagEditor = useCallback(
@@ -1297,13 +3269,35 @@ function ThreadNoteDrawerOpenContent({
     [editor, headingTagEditor, refreshSlashQuery]
   );
 
+  const handleApplyHeadingAlignment = useCallback(
+    (alignment: ThreadNoteHeadingAlignment) => {
+      if (!editor || !headingTagEditor) {
+        return;
+      }
+
+      const view = resolveEditorView(editor);
+      if (!view) {
+        return;
+      }
+
+      updateHeadingAlignmentAtSelection(view, headingTagEditor.selectionPos, alignment);
+      refreshSlashQuery(editor);
+    },
+    [editor, headingTagEditor, refreshSlashQuery]
+  );
+
   const handleInsertMarkdownBlock = useCallback(
     (action: MarkdownInsertAction) => {
       if (!editor || !headingTagEditor) {
         return;
       }
 
-      applyMarkdownInsertAction(editor, headingTagEditor.insertAt, action);
+      applyMarkdownInsertAction(
+        editor,
+        headingTagEditor.selectionPos,
+        headingTagEditor.insertAt,
+        action
+      );
       setHeadingTagEditor(null);
       refreshSlashQuery(editor);
     },
@@ -1319,6 +3313,41 @@ function ThreadNoteDrawerOpenContent({
   const showLinkNotice = useCallback((message: string) => {
     setLinkNotice(message);
   }, []);
+
+  const serializeMarkdownForRange = useCallback(
+    (from: number, to: number) => {
+      if (!editor || from >= to) {
+        return "";
+      }
+
+      try {
+        const selectionDoc = editor.state.doc.cut(from, to);
+        const markdown = editor.markdown?.serialize(selectionDoc.toJSON()) ?? "";
+        return normalizeLineEndings(markdown).trim();
+      } catch {
+        return editor.state.doc.textBetween(from, to, "\n\n").trim();
+      }
+    },
+    [editor]
+  );
+
+  const buildMarkdownAfterDeletingRange = useCallback(
+    (from: number, to: number) => {
+      if (!editor || from >= to) {
+        return normalizeLineEndings(editor?.getMarkdown() ?? draftText);
+      }
+
+      try {
+        const transaction = editor.state.tr.deleteRange(from, to);
+        const nextState = editor.state.apply(transaction);
+        const markdown = editor.markdown?.serialize(nextState.doc.toJSON());
+        return normalizeLineEndings(markdown ?? editor.getMarkdown());
+      } catch {
+        return normalizeLineEndings(editor.getMarkdown());
+      }
+    },
+    [draftText, editor]
+  );
 
   const openInternalNoteTarget = useCallback(
     (target: InternalNoteLinkTarget | null | undefined) => {
@@ -1384,20 +3413,42 @@ function ThreadNoteDrawerOpenContent({
 
   const applyMermaidTemplate = useCallback(
     (template: MermaidTemplateDefinition) => {
-      if (!editor || !mermaidPicker) {
+      if (!mermaidPicker) {
         return;
       }
-      editor.commands.insertContentAt(mermaidPicker.insertAt, template.markdown, {
-        contentType: "markdown",
-      });
+
+      if (isRichEditorMode && editor) {
+        editor.commands.insertContentAt(mermaidPicker.insertAt, template.markdown, {
+          contentType: "markdown",
+        });
+      } else {
+        replaceRawMarkdownSelection(
+          { from: mermaidPicker.insertAt, to: mermaidPicker.insertAt },
+          `${template.markdown}\n`
+        );
+      }
+
       setMermaidPicker(null);
       setSelectedMermaidIndex(0);
-      window.requestAnimationFrame(() => {
-        editor.chain().focus().run();
-        refreshSlashQuery(editor);
-      });
+
+      if (isRichEditorMode && editor) {
+        window.requestAnimationFrame(() => {
+          editor.chain().focus().run();
+          refreshSlashQuery(editor);
+        });
+        return;
+      }
+
+      focusRawMarkdownEditor();
     },
-    [editor, mermaidPicker, refreshSlashQuery]
+    [
+      editor,
+      focusRawMarkdownEditor,
+      isRichEditorMode,
+      mermaidPicker,
+      refreshSlashQuery,
+      replaceRawMarkdownSelection,
+    ]
   );
 
   useEffect(() => {
@@ -1407,8 +3458,12 @@ function ThreadNoteDrawerOpenContent({
 
     if (noteChanged) {
       previousNoteKeyRef.current = noteKey;
+      isRichEditorReadyForInputRef.current = false;
       setDraftText(externalText);
       setHasLocalDirtyChanges(false);
+      hasLocalDirtyChangesRef.current = false;
+      setForcedNoteEditorSurfaceMode(null);
+      setEditorLoadNotice(null);
       setIsLinkedNotesOpen(false);
       setIsSelectorOpen(false);
       setSelectorFilter("");
@@ -1427,27 +3482,60 @@ function ThreadNoteDrawerOpenContent({
       setSelectedMermaidIndex(0);
       setIsInTable(false);
       setNoteSelection(null);
+      setSelectedImage(null);
       setIsHistoryPanelOpen(false);
+      setRecoveryPreview(null);
+      pendingImagePickerInsertRef.current = null;
       summaryTargetRef.current = null;
       setChartStyleInstruction("");
+    } else if (hasLocalDirtyChanges && draftText === externalText) {
+      setHasLocalDirtyChanges(false);
+      hasLocalDirtyChangesRef.current = false;
     } else if (!hasLocalDirtyChanges && draftText !== externalText) {
       setDraftText(externalText);
     }
 
-    if (editor && (noteChanged || (!hasLocalDirtyChanges && draftText !== externalText))) {
+    const isEditorFocusedSafely =
+      isRichEditorMode && editor && resolveEditorView(editor) ? editor.isFocused : false;
+    const shouldSyncEditorContent =
+      isRichEditorMode &&
+      (noteChanged ||
+        (!hasLocalDirtyChanges && draftText !== externalText && !isEditorFocusedSafely));
+
+    if (editor && shouldSyncEditorContent) {
       const syncEditorContent = () => {
         if (!resolveEditorView(editor)) {
           syncRAF = window.requestAnimationFrame(syncEditorContent);
           return;
         }
 
-        const currentMarkdown = normalizeLineEndings(editor.getMarkdown());
-        if (currentMarkdown !== externalText) {
-          isApplyingExternalContentRef.current = true;
-          editor.commands.setContent(externalText, { contentType: "markdown" });
-          isApplyingExternalContentRef.current = false;
+        let currentMarkdown = "";
+        try {
+          currentMarkdown = normalizeLineEndings(editor.getMarkdown());
+        } catch (error) {
+          console.error("Failed to read current thread note markdown before sync", error);
         }
-        refreshSlashQuery(editor);
+
+        if (currentMarkdown !== externalText) {
+          const synced = syncRichEditorMarkdown(editor, externalText, {
+            fallbackMessage:
+              "This note opened in Markdown because rich view could not load it safely.",
+            refreshSelectionState: false,
+          });
+          if (!synced) {
+            return;
+          }
+        } else {
+          isRichEditorReadyForInputRef.current = true;
+          setForcedNoteEditorSurfaceMode(null);
+          setEditorLoadNotice(null);
+        }
+
+        try {
+          refreshSlashQuery(editor);
+        } catch (refreshError) {
+          console.error("Failed to refresh thread note slash query after note switch", refreshError);
+        }
       };
 
       syncEditorContent();
@@ -1462,36 +3550,48 @@ function ThreadNoteDrawerOpenContent({
     draftText,
     editor,
     hasLocalDirtyChanges,
+    isRichEditorMode,
     isNotesWorkspace,
     noteKey,
     refreshSlashQuery,
+    syncRichEditorMarkdown,
     state?.text,
   ]);
 
   useEffect(() => {
-    if (!editor) {
+    if (!isRichEditorMode) {
+      isRichEditorReadyForInputRef.current = false;
+      return;
+    }
+
+    if (!isRichEditorMode || !editor) {
       return;
     }
 
     let editorDom: HTMLElement | null = null;
     let rafID: number | null = null;
+    let activeHeadingDropTarget: HTMLElement | null = null;
+
+    const clearHeadingDropTarget = () => {
+      if (!activeHeadingDropTarget) {
+        return;
+      }
+      activeHeadingDropTarget.classList.remove(THREAD_NOTE_HEADING_DROP_TARGET_CLASS);
+      activeHeadingDropTarget = null;
+    };
 
     const handleUpdate = () => {
       if (isApplyingExternalContentRef.current) {
         return;
       }
+      if (!isRichEditorReadyForInputRef.current) {
+        return;
+      }
       const nextText = normalizeLineEndings(editor.getMarkdown());
       setDraftText(nextText);
       setHasLocalDirtyChanges(true);
-      if (ownerKind && ownerId && noteId) {
-        onDispatchCommand("updateDraft", {
-          ...(threadId ? { threadId } : {}),
-          ownerKind,
-          ownerId,
-          noteId,
-          text: nextText,
-        });
-      }
+      hasLocalDirtyChangesRef.current = true;
+      dispatchDraftUpdate(nextText);
       setHeadingTagEditor(null);
       refreshSlashQuery(editor);
     };
@@ -1501,6 +3601,9 @@ function ThreadNoteDrawerOpenContent({
     };
 
     const handleBlur = () => {
+      if (!isRichEditorReadyForInputRef.current) {
+        return;
+      }
       commitSave(editor.getMarkdown());
       setIsInTable(editor.isActive("table"));
       window.requestAnimationFrame(() => {
@@ -1670,6 +3773,85 @@ function ThreadNoteDrawerOpenContent({
       return;
     };
 
+    const handleEditorDragStart = (event: DragEvent) => {
+      if (!event.altKey || !event.dataTransfer) {
+        return;
+      }
+
+      const editorView = resolveEditorView(editor);
+      if (!editorView || editorView.state.selection.empty) {
+        return;
+      }
+
+      const selectedText = editorView.state.doc
+        .textBetween(
+          editorView.state.selection.from,
+          editorView.state.selection.to,
+          "\n\n"
+        )
+        .trim();
+      if (!selectedText) {
+        return;
+      }
+
+      try {
+        event.dataTransfer.clearData();
+      } catch {
+        // Some browsers restrict clearing drag data; plain text is enough for our drop flow.
+      }
+
+      event.dataTransfer.effectAllowed = "move";
+      event.dataTransfer.setData("text/plain", selectedText);
+      event.dataTransfer.setData(
+        THREAD_NOTE_INTERNAL_DRAG_MIME,
+        JSON.stringify({
+          from: editorView.state.selection.from,
+          to: editorView.state.selection.to,
+          move: true,
+        } satisfies ThreadNoteInternalDragData)
+      );
+      editorView.dragging = {
+        slice: editorView.state.selection.content(),
+        move: true,
+      };
+    };
+
+    const handleEditorDragOver = (event: DragEvent) => {
+      const nextHeadingDropTarget = isNoteContentDragEvent(event)
+        ? resolveHeadingDropTargetElement(event.target)
+        : null;
+
+      if (activeHeadingDropTarget === nextHeadingDropTarget) {
+        if (nextHeadingDropTarget && event.dataTransfer) {
+          event.dataTransfer.dropEffect = "move";
+        }
+        return;
+      }
+
+      clearHeadingDropTarget();
+      if (!nextHeadingDropTarget) {
+        return;
+      }
+
+      activeHeadingDropTarget = nextHeadingDropTarget;
+      activeHeadingDropTarget.classList.add(THREAD_NOTE_HEADING_DROP_TARGET_CLASS);
+      if (event.dataTransfer) {
+        event.dataTransfer.dropEffect = "move";
+      }
+    };
+
+    const handleEditorDragLeave = (event: DragEvent) => {
+      const relatedTarget = event.relatedTarget;
+      if (relatedTarget instanceof Node && editorDom?.contains(relatedTarget)) {
+        return;
+      }
+      clearHeadingDropTarget();
+    };
+
+    const handleEditorDropCleanup = () => {
+      clearHeadingDropTarget();
+    };
+
     const handleCapturedKeyDown = (event: KeyboardEvent) => {
       const activeMermaidPicker = mermaidPickerStateRef.current;
       const activeMermaidItems = mermaidPickerItems;
@@ -1772,13 +3954,14 @@ function ThreadNoteDrawerOpenContent({
         event.key === "Tab" &&
         !event.altKey &&
         !event.ctrlKey &&
-        !event.metaKey &&
-        handleSelectedListIndent(editor, event.shiftKey ? "outdent" : "indent")
+        !event.metaKey
       ) {
-        event.preventDefault();
-        event.stopPropagation();
-        refreshSlashQuery(editor);
-        return;
+        if (handleSelectedListIndent(editor, event.shiftKey ? "outdent" : "indent")) {
+          event.preventDefault();
+          event.stopPropagation();
+          refreshSlashQuery(editor);
+          return;
+        }
       }
 
       if (
@@ -1787,15 +3970,34 @@ function ThreadNoteDrawerOpenContent({
         !event.ctrlKey &&
         !event.metaKey
       ) {
+        const sectionExitContext = event.shiftKey
+          ? resolveSectionLeaveContext(editor)
+          : null;
+        if (sectionExitContext) {
+          event.preventDefault();
+          event.stopPropagation();
+          if (exitSectionAtLastBlock(editor, sectionExitContext.section, sectionExitContext.block)) {
+            return;
+          }
+
+          editor.commands.focus("end");
+          return;
+        }
+
+        const headingSection = findHeadingSectionAtSelection(editor);
+        if (!event.shiftKey && headingSection?.isCollapsible) {
+          event.preventDefault();
+          event.stopPropagation();
+          insertParagraphAfterHeading(editor, headingSection);
+          return;
+        }
+
         const shouldInsertOutsideCollapsedSection = !event.shiftKey;
         const collapsedSection =
           shouldInsertOutsideCollapsedSection
             ? findCollapsedHeadingSectionAtSelection(editor.state)
             : null;
-        const headingSection = event.shiftKey
-          ? findHeadingSectionAtSelection(editor)
-          : null;
-        const sectionEnd = collapsedSection?.sectionEnd ?? headingSection?.sectionEnd;
+        const sectionEnd = collapsedSection?.sectionEnd;
 
         if (sectionEnd !== undefined) {
           event.preventDefault();
@@ -1828,6 +4030,11 @@ function ThreadNoteDrawerOpenContent({
       editorDom.addEventListener("click", handleEditorClick, true);
       editorDom.addEventListener("dblclick", handleLineDoubleClick);
       editorDom.addEventListener("contextmenu", handleEditorContextMenu);
+      editorDom.addEventListener("dragstart", handleEditorDragStart, true);
+      editorDom.addEventListener("dragover", handleEditorDragOver, true);
+      editorDom.addEventListener("dragleave", handleEditorDragLeave, true);
+      editorDom.addEventListener("drop", handleEditorDropCleanup, true);
+      editorDom.addEventListener("dragend", handleEditorDropCleanup, true);
     };
 
     attachDomListeners();
@@ -1840,17 +4047,24 @@ function ThreadNoteDrawerOpenContent({
       editor.off("selectionUpdate", handleSelectionChange);
       editor.off("blur", handleBlur);
       editor.off("focus", handleFocus);
+      clearHeadingDropTarget();
       editorDom?.removeEventListener("scroll", handleScroll);
       editorDom?.removeEventListener("keydown", handleCapturedKeyDown, true);
       editorDom?.removeEventListener("click", handleEditorClick, true);
       editorDom?.removeEventListener("dblclick", handleLineDoubleClick);
       editorDom?.removeEventListener("contextmenu", handleEditorContextMenu);
+      editorDom?.removeEventListener("dragstart", handleEditorDragStart, true);
+      editorDom?.removeEventListener("dragover", handleEditorDragOver, true);
+      editorDom?.removeEventListener("dragleave", handleEditorDragLeave, true);
+      editorDom?.removeEventListener("drop", handleEditorDropCleanup, true);
+      editorDom?.removeEventListener("dragend", handleEditorDropCleanup, true);
     };
   }, [
     applyMermaidTemplate,
     commitSave,
     closeNoteContextMenu,
     editor,
+    isRichEditorMode,
     isNotesWorkspace,
     openHeadingTagEditor,
     mermaidPickerItems,
@@ -1858,12 +4072,12 @@ function ThreadNoteDrawerOpenContent({
     noteSelection?.from,
     noteSelection?.text,
     noteSelection?.to,
-    onDispatchCommand,
     openMermaidTemplateType,
     openInternalNoteTarget,
     ownerId,
     ownerKind,
     refreshSlashQuery,
+    dispatchDraftUpdate,
     state?.viewMode,
     threadId,
   ]);
@@ -1890,7 +4104,25 @@ function ThreadNoteDrawerOpenContent({
       return;
     }
 
-    if (!editor || !noteId) {
+    if (!noteId) {
+      return;
+    }
+
+    if (!showsEditorPane) {
+      openRef.current = isOpen;
+      return;
+    }
+
+    if (isRawMarkdownMode) {
+      if (!openRef.current) {
+        focusRawMarkdownEditor();
+      }
+
+      openRef.current = isOpen;
+      return;
+    }
+
+    if (!editor) {
       return;
     }
 
@@ -1902,7 +4134,15 @@ function ThreadNoteDrawerOpenContent({
     }
 
     openRef.current = isOpen;
-  }, [editor, isOpen, noteId, refreshSlashQuery]);
+  }, [
+    editor,
+    focusRawMarkdownEditor,
+    isOpen,
+    isRawMarkdownMode,
+    noteId,
+    refreshSlashQuery,
+    showsEditorPane,
+  ]);
 
   useEffect(() => {
     if (isRenamingTitle) {
@@ -1934,6 +4174,229 @@ function ThreadNoteDrawerOpenContent({
 
     return () => window.clearTimeout(timeout);
   }, [linkNotice]);
+
+  useEffect(() => {
+    const outcomeId = projectNoteTransferOutcome?.id ?? null;
+    if (!outcomeId || outcomeId === previousProjectTransferOutcomeIdRef.current) {
+      return;
+    }
+
+    previousProjectTransferOutcomeIdRef.current = outcomeId;
+    showLinkNotice(projectNoteTransferOutcome?.message ?? "");
+    setProjectNoteTransfer(null);
+  }, [projectNoteTransferOutcome, showLinkNotice]);
+
+  useEffect(() => {
+    if (!projectNoteTransfer?.isApplying || !projectNoteTransferPreview?.isError) {
+      return;
+    }
+
+    setProjectNoteTransfer((current) =>
+      current
+        ? {
+            ...current,
+            isApplying: false,
+          }
+        : current
+    );
+  }, [projectNoteTransfer?.isApplying, projectNoteTransferPreview?.isError]);
+
+  useEffect(() => {
+    setProjectNoteTransfer(null);
+    setScreenshotImportState(null);
+  }, [noteKey]);
+
+  useEffect(() => {
+    if (!imageNotice) {
+      return;
+    }
+
+    const timeout = window.setTimeout(() => {
+      setImageNotice(null);
+    }, 3200);
+
+    return () => window.clearTimeout(timeout);
+  }, [imageNotice]);
+
+  useEffect(() => {
+    if (!screenshotNotice) {
+      return;
+    }
+
+    const timeout = window.setTimeout(() => {
+      setScreenshotNotice(null);
+    }, 3200);
+
+    return () => window.clearTimeout(timeout);
+  }, [screenshotNotice]);
+
+  useEffect(() => {
+    threadNoteFindStateRef.current = {
+      query: "",
+      matches: [],
+      currentIndex: -1,
+    };
+  }, [noteKey]);
+
+  const clearThreadNoteFind = useCallback((): ThreadNoteFindResponse => {
+    threadNoteFindStateRef.current = {
+      query: "",
+      matches: [],
+      currentIndex: -1,
+    };
+
+    return {
+      handled: true,
+      matchCount: 0,
+      currentMatch: 0,
+    };
+  }, []);
+
+  const activateThreadNoteFindMatch = useCallback(
+    (requestedIndex: number): ThreadNoteFindResponse => {
+      if (!editor || !noteId) {
+        return {
+          handled: false,
+          matchCount: 0,
+          currentMatch: 0,
+        };
+      }
+
+      const activeQuery = threadNoteFindStateRef.current.query.trim();
+      if (!activeQuery) {
+        return clearThreadNoteFind();
+      }
+
+      const matches = collectThreadNoteFindMatches(editor, activeQuery);
+      if (!matches.length) {
+        threadNoteFindStateRef.current = {
+          query: activeQuery,
+          matches: [],
+          currentIndex: -1,
+        };
+        return {
+          handled: true,
+          matchCount: 0,
+          currentMatch: 0,
+        };
+      }
+
+      const currentIndex = Math.max(0, Math.min(requestedIndex, matches.length - 1));
+      threadNoteFindStateRef.current = {
+        query: activeQuery,
+        matches,
+        currentIndex,
+      };
+      focusThreadNoteFindMatch(editor, matches[currentIndex]);
+
+      return {
+        handled: true,
+        matchCount: matches.length,
+        currentMatch: currentIndex + 1,
+      };
+    },
+    [clearThreadNoteFind, editor, noteId]
+  );
+
+  const searchThreadNoteText = useCallback(
+    (query: string): ThreadNoteFindResponse => {
+      if (!editor || !noteId) {
+        return {
+          handled: false,
+          matchCount: 0,
+          currentMatch: 0,
+        };
+      }
+
+      const trimmedQuery = query.trim();
+      if (!trimmedQuery) {
+        return clearThreadNoteFind();
+      }
+
+      const matches = collectThreadNoteFindMatches(editor, trimmedQuery);
+      threadNoteFindStateRef.current = {
+        query: trimmedQuery,
+        matches,
+        currentIndex: -1,
+      };
+
+      return {
+        handled: true,
+        matchCount: matches.length,
+        currentMatch: 0,
+      };
+    },
+    [clearThreadNoteFind, editor, noteId]
+  );
+
+  const shouldHandleThreadNoteFind = useCallback(() => {
+    if (!editor || !noteId) {
+      return false;
+    }
+
+    if (isFullScreenWorkspace) {
+      return true;
+    }
+
+    if (threadNoteFindStateRef.current.query) {
+      return true;
+    }
+
+    const activeElement = document.activeElement;
+    return Boolean(activeElement && editorBodyRef.current?.contains(activeElement));
+  }, [editor, isFullScreenWorkspace, noteId]);
+
+  useEffect(() => {
+    const handleThreadNoteFindRequest = (event: Event) => {
+      const detail = (event as CustomEvent<ThreadNoteFindRequestDetail>).detail;
+      if (!detail?.respond) {
+        return;
+      }
+
+      if (!shouldHandleThreadNoteFind()) {
+        detail.respond({
+          handled: false,
+          matchCount: 0,
+          currentMatch: 0,
+        });
+        return;
+      }
+
+      switch (detail.action) {
+        case "search":
+          detail.respond(searchThreadNoteText(detail.query ?? ""));
+          break;
+        case "activate":
+          detail.respond(activateThreadNoteFindMatch(detail.index ?? 0));
+          break;
+        case "clear":
+          detail.respond(clearThreadNoteFind());
+          break;
+        default:
+          detail.respond({
+            handled: false,
+            matchCount: 0,
+            currentMatch: 0,
+          });
+      }
+    };
+
+    window.addEventListener(
+      THREAD_NOTE_FIND_REQUEST_EVENT,
+      handleThreadNoteFindRequest as EventListener
+    );
+    return () => {
+      window.removeEventListener(
+        THREAD_NOTE_FIND_REQUEST_EVENT,
+        handleThreadNoteFindRequest as EventListener
+      );
+    };
+  }, [
+    activateThreadNoteFindMatch,
+    clearThreadNoteFind,
+    searchThreadNoteText,
+    shouldHandleThreadNoteFind,
+  ]);
 
   useEffect(() => {
     if (selectedSlashIndex >= visibleSlashCommands.length) {
@@ -1972,7 +4435,12 @@ function ThreadNoteDrawerOpenContent({
   }, [commitSave, hasLocalDirtyChanges, isOpen, noteId, ownerId, ownerKind]);
 
   useEffect(() => {
-    if ((!slashQuery && !mermaidPicker) || !editor) {
+    if (!slashQuery && !mermaidPicker) {
+      return;
+    }
+
+    if (!isRichEditorMode || !editor) {
+      setMenuPosition(DEFAULT_THREAD_NOTE_MENU_POSITION);
       return;
     }
 
@@ -1985,7 +4453,7 @@ function ThreadNoteDrawerOpenContent({
     return () => {
       window.removeEventListener("resize", refreshMenuPosition);
     };
-  }, [editor, layerRef, mermaidPicker, slashQuery]);
+  }, [editor, isRichEditorMode, layerRef, mermaidPicker, slashQuery]);
 
   useEffect(() => {
     if (!noteContextMenu || !noteContextMenuRef.current) {
@@ -2048,12 +4516,76 @@ function ThreadNoteDrawerOpenContent({
     };
   }, [closeNoteContextMenu, noteContextMenu]);
 
+  useEffect(() => {
+    const selectedText = noteSelection?.text?.trim() ?? "";
+    const shouldShowSelectionActions =
+      isOpen &&
+      isRichEditorMode &&
+      state?.viewMode === "edit" &&
+      !noteContextMenu &&
+      !headingTagEditor &&
+      !slashQuery &&
+      !mermaidPicker &&
+      !noteLinkPicker &&
+      !chartRequestComposer &&
+      !isRenamingTitle &&
+      Boolean(selectedText);
+
+    if (!shouldShowSelectionActions) {
+      hideSelectionAssistantActions();
+      return;
+    }
+
+    const syncSelectionAssistant = () => {
+      dispatchSelectionAssistantCommand("showSelectionAssistantActions", {
+        selectedText,
+        from: noteSelection?.from,
+        to: noteSelection?.to,
+      });
+    };
+
+    const frame = window.requestAnimationFrame(syncSelectionAssistant);
+    const handleResize = () => syncSelectionAssistant();
+    const handleViewportChange = () => hideSelectionAssistantActions();
+
+    window.addEventListener("resize", handleResize);
+    window.addEventListener("blur", handleViewportChange);
+    document.addEventListener("scroll", handleViewportChange, true);
+
+    return () => {
+      window.cancelAnimationFrame(frame);
+      window.removeEventListener("resize", handleResize);
+      window.removeEventListener("blur", handleViewportChange);
+      document.removeEventListener("scroll", handleViewportChange, true);
+    };
+  }, [
+    chartRequestComposer,
+    dispatchSelectionAssistantCommand,
+    headingTagEditor,
+    hideSelectionAssistantActions,
+    isOpen,
+    isRichEditorMode,
+    isRenamingTitle,
+    mermaidPicker,
+    noteContextMenu,
+    noteLinkPicker,
+    noteSelection?.from,
+    noteSelection?.text,
+    noteSelection?.to,
+    slashQuery,
+    state?.viewMode,
+  ]);
+
   const handleCloseDrawer = useCallback(() => {
     if (!canCloseDrawer) {
       return;
     }
     commitSave();
-    editor?.commands.blur();
+    if (isRichEditorMode && editor) {
+      editor.commands.blur();
+    } else {
+      rawMarkdownTextareaRef.current?.blur();
+    }
     setIsSelectorOpen(false);
     setSelectorFilter("");
     setIsRenamingTitle(false);
@@ -2063,7 +4595,14 @@ function ThreadNoteDrawerOpenContent({
     setMermaidPicker(null);
     closeNoteContextMenu();
     dispatchThreadNoteCommand("setOpen", { isOpen: false });
-  }, [canCloseDrawer, closeNoteContextMenu, commitSave, dispatchThreadNoteCommand, editor]);
+  }, [
+    canCloseDrawer,
+    closeNoteContextMenu,
+    commitSave,
+    dispatchThreadNoteCommand,
+    editor,
+    isRichEditorMode,
+  ]);
 
   useEffect(() => {
     if (!isOpen || !canCloseDrawer) {
@@ -2096,6 +4635,18 @@ function ThreadNoteDrawerOpenContent({
         setSelectorFilter("");
       }
 
+      const clickedOverflowMenu = Boolean(overflowMenuRef.current?.contains(target));
+      const clickedOverflowTrigger = Boolean(
+        overflowMenuTriggerRef.current?.contains(target)
+      );
+      if (
+        isOverflowMenuOpen &&
+        !clickedOverflowMenu &&
+        !clickedOverflowTrigger
+      ) {
+        setIsOverflowMenuOpen(false);
+      }
+
       if (
         headingTagEditor &&
         !clickedInsideFloatingLayer &&
@@ -2109,7 +4660,7 @@ function ThreadNoteDrawerOpenContent({
     return () => {
       window.removeEventListener("pointerdown", handlePointerDown, true);
     };
-  }, [canCloseDrawer, headingTagEditor, isOpen, isSelectorOpen]);
+  }, [canCloseDrawer, headingTagEditor, isOpen, isOverflowMenuOpen, isSelectorOpen]);
 
   useEffect(() => {
     if (!isOpen || !canCloseDrawer || shouldBlockDrawerEscape) {
@@ -2240,13 +4791,85 @@ function ThreadNoteDrawerOpenContent({
     setChartRequestComposer(null);
     setSelectedChartType("auto");
     setChartStyleInstruction("");
+    setChartRenderError(null);
   }, [noteKey]);
+
+  useEffect(() => {
+    setChartRenderError(null);
+  }, [aiDraftPreview?.isError, aiDraftPreview?.markdown, aiDraftPreview?.mode]);
+
+  const applyRawMarkdownSlashCommand = useCallback(
+    (command: SlashCommand, range: SlashQueryState) => {
+      const mermaidTypeOption =
+        MERMAID_TEMPLATE_TYPES.find((option) => option.commandId === command.id) ?? null;
+
+      setSlashQuery(null);
+      setSelectedSlashIndex(0);
+      setMermaidEditingContext(null);
+      setHeadingTagEditor(null);
+
+      if (command.id === "image") {
+        const nextMarkdown = replaceMarkdownRange(latestDraftTextRef.current, range, "");
+        commitEditorMarkdown(nextMarkdown);
+        updateRawMarkdownSelection(range.replaceFrom, range.replaceFrom, nextMarkdown);
+        handleOpenImagePicker({
+          from: range.replaceFrom,
+          to: range.replaceFrom,
+        });
+        return;
+      }
+
+      if (command.id === "mermaid" || mermaidTypeOption) {
+        const nextMarkdown = replaceMarkdownRange(latestDraftTextRef.current, range, "");
+        commitEditorMarkdown(nextMarkdown);
+        updateRawMarkdownSelection(range.replaceFrom, range.replaceFrom, nextMarkdown);
+        setMermaidPicker({
+          insertAt: range.replaceFrom,
+          step: mermaidTypeOption ? "template" : "type",
+          type: mermaidTypeOption?.type ?? null,
+          canGoBack: false,
+        });
+        setSelectedMermaidIndex(0);
+        setMenuPosition(DEFAULT_THREAD_NOTE_MENU_POSITION);
+        focusRawMarkdownEditor({
+          start: range.replaceFrom,
+          end: range.replaceFrom,
+        });
+        return;
+      }
+
+      const insert = buildRawMarkdownSlashInsert(command.id);
+      if (!insert) {
+        focusRawMarkdownEditor();
+        return;
+      }
+
+      applyRawMarkdownReplacement(range, insert.text, insert.selection);
+    },
+    [
+      applyRawMarkdownReplacement,
+      commitEditorMarkdown,
+      focusRawMarkdownEditor,
+      handleOpenImagePicker,
+      updateRawMarkdownSelection,
+    ]
+  );
 
   const applySlashCommand = useCallback(
     (command: SlashCommand) => {
-      if (!editor || !slashQuery) {
+      if (!slashQuery) {
         return;
       }
+
+      if (isRawMarkdownMode) {
+        applyRawMarkdownSlashCommand(command, slashQuery);
+        return;
+      }
+
+      if (!editor) {
+        return;
+      }
+
       command.run(editor, slashQuery);
       setSlashQuery(null);
       window.requestAnimationFrame(() => {
@@ -2254,7 +4877,7 @@ function ThreadNoteDrawerOpenContent({
         refreshSlashQuery(editor);
       });
     },
-    [editor, refreshSlashQuery, slashQuery]
+    [applyRawMarkdownSlashCommand, editor, isRawMarkdownMode, refreshSlashQuery, slashQuery]
   );
 
   const toggleSlashGroup = useCallback((groupId: string) => {
@@ -2301,6 +4924,279 @@ function ThreadNoteDrawerOpenContent({
     [commitSave, onDispatchCommand, threadId]
   );
 
+  const handleOpenBatchOrganizer = useCallback(() => {
+    if (!isNotesWorkspace || !state?.workspaceProjectId) {
+      return;
+    }
+
+    commitSave();
+    setIsSelectorOpen(false);
+    setSelectorFilter("");
+    setIsRenamingTitle(false);
+    setIsHistoryPanelOpen(false);
+    setIsBatchOrganizerOpen(true);
+
+    if (!batchOrganizerSelectedSourceKeys.length && noteId && ownerKind && ownerId) {
+      setBatchOrganizerSelectedSourceKeys([
+        batchSourceSelectionKeyFromParts(ownerKind, ownerId, noteId),
+      ]);
+    }
+  }, [
+    batchOrganizerSelectedSourceKeys.length,
+    commitSave,
+    isNotesWorkspace,
+    noteId,
+    ownerId,
+    ownerKind,
+    state?.workspaceProjectId,
+  ]);
+
+  const handleCloseBatchOrganizer = useCallback(() => {
+    const targetProjectId = state?.workspaceProjectId?.trim();
+    setIsBatchOrganizerOpen(false);
+    setBatchOrganizerSearch("");
+    setBatchOrganizerActiveNoteTempId(null);
+    setBatchOrganizerEditableNotes([]);
+    setBatchOrganizerEditableLinks([]);
+    setBatchOrganizerIsApplying(false);
+
+    if (targetProjectId && (batchNotePlanPreview || isBatchNotePlanBusy)) {
+      dispatchThreadNoteCommand("cancelBatchNotePlanPreview", {
+        targetProjectId,
+      });
+    }
+  }, [
+    batchNotePlanPreview,
+    dispatchThreadNoteCommand,
+    isBatchNotePlanBusy,
+    state?.workspaceProjectId,
+  ]);
+
+  const handleBackToBatchSourceSelection = useCallback(() => {
+    const targetProjectId = state?.workspaceProjectId?.trim();
+    setBatchOrganizerEditableNotes([]);
+    setBatchOrganizerEditableLinks([]);
+    setBatchOrganizerActiveNoteTempId(null);
+    setBatchOrganizerIsApplying(false);
+
+    if (targetProjectId && (batchNotePlanPreview || isBatchNotePlanBusy)) {
+      dispatchThreadNoteCommand("cancelBatchNotePlanPreview", {
+        targetProjectId,
+      });
+    }
+  }, [
+    batchNotePlanPreview,
+    dispatchThreadNoteCommand,
+    isBatchNotePlanBusy,
+    state?.workspaceProjectId,
+  ]);
+
+  const handleToggleBatchOrganizerSource = useCallback(
+    (note: NonNullable<ThreadNoteState["notes"]>[number]) => {
+      const selectionKey = batchSourceSelectionKeyForNote(note);
+      setBatchOrganizerSelectedSourceKeys((current) => {
+        const exists = current.includes(selectionKey);
+        if (exists) {
+          return current.filter((item) => item !== selectionKey);
+        }
+        return [...current, selectionKey];
+      });
+      setBatchOrganizerSourcePreviewKey(selectionKey);
+    },
+    []
+  );
+
+  const handleSelectAllVisibleBatchSources = useCallback(() => {
+    setBatchOrganizerSelectedSourceKeys((current) => {
+      const merged = new Set(current);
+      batchOrganizerSections.forEach((section) => {
+        section.visibleNotes.forEach((note) => {
+          merged.add(batchSourceSelectionKeyForNote(note));
+        });
+      });
+      return Array.from(merged);
+    });
+  }, [batchOrganizerSections]);
+
+  const handleClearBatchSourceSelection = useCallback(() => {
+    setBatchOrganizerSelectedSourceKeys([]);
+    setBatchOrganizerSourcePreviewKey(null);
+  }, []);
+
+  const handleRequestBatchPlanPreview = useCallback(() => {
+    const targetProjectId = state?.workspaceProjectId?.trim();
+    if (!targetProjectId) {
+      return;
+    }
+
+    const sourceNotes = batchOrganizerSelectedSourceKeys
+      .map((selectionKey) => batchSourceSelectionPayload(selectionKey))
+      .filter((selection): selection is NonNullable<typeof selection> => Boolean(selection));
+
+    if (!sourceNotes.length) {
+      return;
+    }
+
+    setBatchOrganizerEditableNotes([]);
+    setBatchOrganizerEditableLinks([]);
+    setBatchOrganizerActiveNoteTempId(null);
+    dispatchThreadNoteCommand("requestBatchNotePlanPreview", {
+      targetProjectId,
+      sourceNotes,
+    });
+  }, [
+    batchOrganizerSelectedSourceKeys,
+    dispatchThreadNoteCommand,
+    state?.workspaceProjectId,
+  ]);
+
+  const handleBatchOrganizerTitleChange = useCallback((tempId: string, title: string) => {
+    setBatchOrganizerEditableNotes((current) =>
+      current.map((note) =>
+        note.tempId === tempId
+          ? {
+              ...note,
+              title,
+            }
+          : note
+      )
+    );
+  }, []);
+
+  const handleBatchOrganizerTypeChange = useCallback((tempId: string, noteType: string) => {
+    setBatchOrganizerEditableNotes((current) => {
+      const existing = current.find((note) => note.tempId === tempId);
+      if (!existing) {
+        return current;
+      }
+
+      let updated = current.map((note) =>
+        note.tempId === tempId
+          ? {
+              ...note,
+              noteType,
+            }
+          : note
+      );
+
+      if (noteType === "master") {
+        updated = updated.map((note) =>
+          note.tempId !== tempId && note.noteType === "master"
+            ? {
+                ...note,
+                noteType: "note",
+              }
+            : note
+        );
+        return updated;
+      }
+
+      if (existing.noteType === "master") {
+        const replacementIndex = updated.findIndex(
+          (note) => note.tempId !== tempId && note.accepted
+        );
+        if (replacementIndex >= 0) {
+          updated[replacementIndex] = {
+            ...updated[replacementIndex],
+            noteType: "master",
+          };
+        } else {
+          return current;
+        }
+      }
+
+      return updated;
+    });
+  }, []);
+
+  const handleToggleBatchOrganizerNoteAccepted = useCallback((tempId: string) => {
+    setBatchOrganizerEditableNotes((current) => {
+      const existing = current.find((note) => note.tempId === tempId);
+      if (!existing) {
+        return current;
+      }
+
+      const nextAccepted = !existing.accepted;
+      if (!nextAccepted && existing.noteType === "master") {
+        const replacementIndex = current.findIndex(
+          (note) => note.tempId !== tempId && note.accepted
+        );
+        if (replacementIndex === -1) {
+          return current;
+        }
+      }
+
+      let updated = current.map((note) =>
+        note.tempId === tempId
+          ? {
+              ...note,
+              accepted: nextAccepted,
+            }
+          : note
+      );
+
+      if (existing.noteType === "master") {
+        if (nextAccepted) {
+          updated = updated.map((note) =>
+            note.tempId !== tempId && note.noteType === "master"
+              ? {
+                  ...note,
+                  noteType: "note",
+                }
+              : note
+          );
+        } else {
+          const replacementIndex = updated.findIndex(
+            (note) => note.tempId !== tempId && note.accepted
+          );
+          if (replacementIndex >= 0) {
+            updated[replacementIndex] = {
+              ...updated[replacementIndex],
+              noteType: "master",
+            };
+          }
+        }
+      }
+
+      return updated;
+    });
+  }, []);
+
+  const handleToggleBatchOrganizerLinkAccepted = useCallback((linkKey: string) => {
+    setBatchOrganizerEditableLinks((current) =>
+      current.map((link) =>
+        batchPlanEditableLinkKey(link) === linkKey
+          ? {
+              ...link,
+              accepted: !link.accepted,
+            }
+          : link
+      )
+    );
+  }, []);
+
+  const handleApplyBatchPlan = useCallback(() => {
+    const targetProjectId = state?.workspaceProjectId?.trim();
+    const previewId = batchNotePlanPreview?.previewId?.trim();
+    if (!targetProjectId || !previewId) {
+      return;
+    }
+
+    setBatchOrganizerIsApplying(true);
+    dispatchThreadNoteCommand("applyBatchNotePlanPreview", {
+      targetProjectId,
+      previewId,
+      proposedNotes: batchOrganizerEditableNotes,
+      proposedLinks: batchOrganizerEditableLinks,
+    });
+  }, [
+    batchNotePlanPreview?.previewId,
+    batchOrganizerEditableLinks,
+    batchOrganizerEditableNotes,
+    dispatchThreadNoteCommand,
+    state?.workspaceProjectId,
+  ]);
+
   const handleDeleteNote = useCallback(() => {
     if (!noteId) {
       return;
@@ -2327,8 +5223,26 @@ function ThreadNoteDrawerOpenContent({
     setIsSelectorOpen(false);
     setSelectorFilter("");
     setIsRenamingTitle(false);
-    setIsHistoryPanelOpen((current) => !current);
+    setIsHistoryPanelOpen((current) => {
+      const nextOpen = !current;
+      if (!nextOpen) {
+        setRecoveryPreview(null);
+      }
+      return nextOpen;
+    });
   }, [commitSave]);
+
+  const handleToggleRecoveryPreview = useCallback(
+    (kind: "history" | "deleted", id: string) => {
+      if (!id) {
+        return;
+      }
+      setRecoveryPreview((current) =>
+        current?.kind === kind && current.id === id ? null : { kind, id }
+      );
+    },
+    []
+  );
 
   const handleRestoreHistoryVersion = useCallback(
     (historyVersionId: string) => {
@@ -2338,6 +5252,7 @@ function ThreadNoteDrawerOpenContent({
       commitSave();
       dispatchThreadNoteCommand("restoreHistoryVersion", { historyVersionId });
       setIsHistoryPanelOpen(false);
+      setRecoveryPreview(null);
     },
     [commitSave, dispatchThreadNoteCommand]
   );
@@ -2360,6 +5275,7 @@ function ThreadNoteDrawerOpenContent({
       commitSave();
       dispatchThreadNoteCommand("restoreDeletedNote", { deletedNoteId });
       setIsHistoryPanelOpen(false);
+      setRecoveryPreview(null);
     },
     [commitSave, dispatchThreadNoteCommand]
   );
@@ -2469,13 +5385,19 @@ function ThreadNoteDrawerOpenContent({
         return;
       }
 
-      const currentMarkdown = normalizeLineEndings(editor?.getMarkdown() ?? draftText);
+      const currentMarkdown = readCurrentThreadNoteMarkdown();
       const normalizedSelectedText = options?.selectedText?.trim() || "";
       const hasSelectedRange =
         typeof options?.from === "number" &&
         typeof options?.to === "number" &&
         options.to > options.from;
-      const requestKind = normalizedSelectedText ? "selection" : "whole";
+      const serializedSelectedMarkdown =
+        draftMode === "organize" && hasSelectedRange
+          ? serializeEditorMarkdownRange(editor, options?.from, options?.to)
+          : "";
+      const resolvedSelectedText =
+        serializedSelectedMarkdown.trim() || normalizedSelectedText;
+      const requestKind = resolvedSelectedText ? "selection" : "whole";
       const selectionTarget =
         requestKind === "selection" && hasSelectedRange
           ? resolveSummaryTargetFromSelection(
@@ -2495,7 +5417,7 @@ function ThreadNoteDrawerOpenContent({
         noteId,
         draftMode,
         text: currentMarkdown,
-        selectedText: normalizedSelectedText || undefined,
+        selectedText: resolvedSelectedText || undefined,
         requestKind,
         styleInstruction: options?.styleInstruction?.trim() || undefined,
       });
@@ -2544,6 +5466,149 @@ function ThreadNoteDrawerOpenContent({
     });
   }, [closeNoteContextMenu, noteContextMenu, requestThreadNoteAIDraft]);
 
+  const handleAskAssistantAboutSelectionFromMenu = useCallback(() => {
+    if (!noteContextMenu || noteContextMenu.sourceKind !== "selection") {
+      return;
+    }
+
+    closeNoteContextMenu();
+    dispatchSelectionAssistantCommand("openSelectionAssistantQuestionComposer", {
+      selectedText: noteContextMenu.selectedText,
+      from: noteContextMenu.from,
+      to: noteContextMenu.to,
+      anchorPoint: {
+        x: noteContextMenu.x,
+        y: noteContextMenu.y,
+      },
+    });
+  }, [closeNoteContextMenu, dispatchSelectionAssistantCommand, noteContextMenu]);
+
+  const handleOpenProjectNoteTransfer = useCallback(() => {
+    if (
+      !noteContextMenu ||
+      noteContextMenu.sourceKind !== "selection" ||
+      ownerKind !== "thread" ||
+      !currentProjectTransferProjectId
+    ) {
+      return;
+    }
+
+    const selectedMarkdown = serializeMarkdownForRange(
+      noteContextMenu.from,
+      noteContextMenu.to
+    );
+    const selectedText = noteContextMenu.selectedText.trim();
+    if (!selectedMarkdown && !selectedText) {
+      return;
+    }
+
+    closeNoteContextMenu();
+    dispatchThreadNoteCommand("cancelProjectNoteTransferPreview");
+    setProjectNoteTransfer({
+      selectedText: selectedText || selectedMarkdown,
+      selectedMarkdown: selectedMarkdown || selectedText,
+      from: noteContextMenu.from,
+      to: noteContextMenu.to,
+      targetProjectId: currentProjectTransferProjectId,
+      targetNoteId: null,
+      transferMode: "copy",
+      step: "picker",
+      isApplying: false,
+    });
+  }, [
+    closeNoteContextMenu,
+    currentProjectTransferProjectId,
+    dispatchThreadNoteCommand,
+    noteContextMenu,
+    ownerKind,
+    serializeMarkdownForRange,
+  ]);
+
+  const handleCloseProjectNoteTransfer = useCallback(() => {
+    setProjectNoteTransfer(null);
+    dispatchThreadNoteCommand("cancelProjectNoteTransferPreview");
+  }, [dispatchThreadNoteCommand]);
+
+  const handleBackToProjectTransferPicker = useCallback(() => {
+    setProjectNoteTransfer((current) =>
+      current
+        ? {
+            ...current,
+            step: "picker",
+            isApplying: false,
+          }
+        : current
+    );
+  }, []);
+
+  const handleChooseProjectTransferTarget = useCallback(
+    (targetNoteId: string) => {
+      if (!projectNoteTransfer || !noteId) {
+        return;
+      }
+
+      const sourceMarkdown = readCurrentThreadNoteMarkdown();
+      const nextTransferState: ProjectNoteTransferState = {
+        ...projectNoteTransfer,
+        targetNoteId: targetNoteId,
+        step: "preview",
+        isApplying: false,
+      };
+      setProjectNoteTransfer(nextTransferState);
+      dispatchThreadNoteCommand("requestProjectNoteTransferPreview", {
+        noteId,
+        text: sourceMarkdown,
+        selectedText: nextTransferState.selectedMarkdown,
+        sourceSelectionFrom: nextTransferState.from,
+        sourceSelectionTo: nextTransferState.to,
+        targetProjectId: nextTransferState.targetProjectId,
+        targetNoteId: targetNoteId,
+        sourceNoteTitle: state?.selectedNoteTitle?.trim() || undefined,
+      });
+    },
+    [dispatchThreadNoteCommand, draftText, editor, noteId, projectNoteTransfer, state?.selectedNoteTitle]
+  );
+
+  const handleApplyProjectNoteTransfer = useCallback(
+    (placementChoice: "suggested" | "end") => {
+      if (!projectNoteTransfer || !projectNoteTransferPreview || !noteId) {
+        return;
+      }
+
+      const payload: Record<string, unknown> = {
+        noteId,
+        transferMode: projectNoteTransfer.transferMode,
+        placementChoice,
+        sourceFingerprint: projectNoteTransferPreview.sourceFingerprint,
+        targetFingerprint: projectNoteTransferPreview.targetFingerprint,
+      };
+
+      if (projectNoteTransfer.transferMode === "move") {
+        payload.sourceTextAfterMove = buildMarkdownAfterDeletingRange(
+          projectNoteTransfer.from,
+          projectNoteTransfer.to
+        );
+      }
+
+      setProjectNoteTransfer((current) =>
+        current
+          ? {
+              ...current,
+              isApplying: true,
+            }
+          : current
+      );
+      dispatchThreadNoteCommand("applyProjectNoteTransfer", payload);
+    },
+    [
+      buildMarkdownAfterDeletingRange,
+      dispatchThreadNoteCommand,
+      noteId,
+      projectNoteTransfer,
+      projectNoteTransferPreview,
+    ]
+  );
+
   const handleApplyInlineMarkFromMenu = useCallback(
     (markType: "bold" | "italic" | "code") => {
       if (!editor || !noteContextMenu || noteContextMenu.sourceKind !== "selection") {
@@ -2575,6 +5640,46 @@ function ThreadNoteDrawerOpenContent({
     [closeNoteContextMenu, editor, noteContextMenu, refreshSlashQuery]
   );
 
+  const handleIndentBlockFromMenu = useCallback(() => {
+    if (
+      !editor ||
+      !noteContextMenu ||
+      noteContextMenu.sourceKind !== "selection" ||
+      !canIndentSelectionAsIndentedBlock(editor, noteContextMenu.from, noteContextMenu.to)
+    ) {
+      return;
+    }
+
+    closeNoteContextMenu();
+    editor
+      .chain()
+      .focus()
+      .setTextSelection({ from: noteContextMenu.from, to: noteContextMenu.to })
+      .wrapIn("blockquote")
+      .run();
+    refreshSlashQuery(editor);
+  }, [closeNoteContextMenu, editor, noteContextMenu, refreshSlashQuery]);
+
+  const handleOutdentBlockFromMenu = useCallback(() => {
+    if (
+      !editor ||
+      !noteContextMenu ||
+      noteContextMenu.sourceKind !== "selection" ||
+      !selectionTouchesNodeType(editor.state, noteContextMenu.from, noteContextMenu.to, "blockquote")
+    ) {
+      return;
+    }
+
+    closeNoteContextMenu();
+    editor
+      .chain()
+      .focus()
+      .setTextSelection({ from: noteContextMenu.from, to: noteContextMenu.to })
+      .lift("blockquote")
+      .run();
+    refreshSlashQuery(editor);
+  }, [closeNoteContextMenu, editor, noteContextMenu, refreshSlashQuery]);
+
   const handleOpenLineFormatFromMenu = useCallback(() => {
     if (
       !noteContextMenu ||
@@ -2589,7 +5694,10 @@ function ThreadNoteDrawerOpenContent({
 
     closeNoteContextMenu();
     setHeadingTagEditor({
-      selectionPos: noteContextMenu.lineSelectionPos,
+      selectionPos:
+        noteContextMenu.sourceKind === "selection"
+          ? noteContextMenu.from
+          : noteContextMenu.lineSelectionPos,
       insertAt: noteContextMenu.lineInsertAt,
       tag: noteContextMenu.lineTag,
       headingCollapsible: noteContextMenu.lineHeadingCollapsible,
@@ -2598,21 +5706,119 @@ function ThreadNoteDrawerOpenContent({
     });
   }, [closeNoteContextMenu, noteContextMenu]);
 
+  const handleMakeSelectionCollapsibleFromMenu = useCallback(() => {
+    if (!editor || !noteContextMenu || noteContextMenu.sourceKind !== "selection") {
+      return;
+    }
+
+    const sectionDraft = resolveSelectionCollapsibleSectionDraft(
+      editor,
+      noteContextMenu.from,
+      noteContextMenu.to
+    );
+    if (!sectionDraft) {
+      return;
+    }
+
+    const nextMarkdown = buildMarkdownWithCollapsibleSectionReplacement(editor, sectionDraft);
+    closeNoteContextMenu();
+
+    const didSync = syncRichEditorMarkdown(editor, nextMarkdown, {
+      refreshSelectionState: false,
+    });
+    if (!didSync) {
+      return;
+    }
+
+    window.requestAnimationFrame(() => {
+      const editorView = resolveEditorView(editor);
+      if (!editorView) {
+        const normalized = updateDraftTextLocally(
+          normalizeThreadNoteStoredMarkdown(nextMarkdown)
+        );
+        commitSave(normalized, { force: true });
+        refreshSlashQuery(editor);
+        return;
+      }
+
+      if (sectionDraft.emptyBodyMarker) {
+        const markerRange = findTextRangeInDocument(
+          editorView.state.doc,
+          sectionDraft.emptyBodyMarker
+        );
+        if (markerRange) {
+          const tr = editorView.state.tr.deleteRange(markerRange.from, markerRange.to);
+          tr.setSelection(TextSelection.create(tr.doc, markerRange.from));
+          editorView.dispatch(tr.scrollIntoView());
+          editorView.focus();
+          const normalized = updateDraftTextLocally(
+            normalizeThreadNoteStoredMarkdown(editor.getMarkdown())
+          );
+          commitSave(normalized, { force: true });
+          refreshSlashQuery(editor);
+          return;
+        }
+      }
+
+      const targetSection = findClosestCollapsibleSectionByTitle(
+        editor,
+        sectionDraft.headingTitle,
+        sectionDraft.replaceFrom
+      );
+      if (targetSection) {
+        const firstBodyBlock = findFirstTopLevelBlockWithinSection(
+          editor,
+          targetSection.headingNodeEnd,
+          targetSection.sectionEnd
+        );
+        const targetPos = firstBodyBlock
+          ? Math.min(firstBodyBlock.pos + 1, editorView.state.doc.content.size)
+          : Math.min(targetSection.headingNodeEnd, editorView.state.doc.content.size);
+        const tr = editorView.state.tr.setSelection(
+          Selection.near(editorView.state.doc.resolve(targetPos), 1)
+        );
+        editorView.dispatch(tr.scrollIntoView());
+        editorView.focus();
+        const normalized = updateDraftTextLocally(
+          normalizeThreadNoteStoredMarkdown(editor.getMarkdown())
+        );
+        commitSave(normalized, { force: true });
+        refreshSlashQuery(editor);
+        return;
+      }
+
+      editor.commands.focus("end");
+      const normalized = updateDraftTextLocally(
+        normalizeThreadNoteStoredMarkdown(editor.getMarkdown())
+      );
+      commitSave(normalized, { force: true });
+      refreshSlashQuery(editor);
+    });
+  }, [
+    closeNoteContextMenu,
+    commitSave,
+    editor,
+    noteContextMenu,
+    refreshSlashQuery,
+    syncRichEditorMarkdown,
+    updateDraftTextLocally,
+  ]);
+
   const handleToggleHeadingCollapsibleFromMenu = useCallback(() => {
     if (
       !editor ||
       !noteContextMenu ||
       typeof noteContextMenu.lineSelectionPos !== "number" ||
-      !isHeadingLineTag(noteContextMenu.lineTag)
+      !isHeadingLineTag(noteContextMenu.lineTag) ||
+      noteContextMenu.lineHeadingCollapsible !== true
     ) {
       return;
     }
 
-    const nextCollapsible = noteContextMenu.lineHeadingCollapsible === false;
     const didUpdate = updateHeadingCollapsibleAtSelection(
       resolveEditorView(editor),
       noteContextMenu.lineSelectionPos,
-      nextCollapsible
+      false
     );
     if (!didUpdate) {
       return;
@@ -2682,110 +5888,498 @@ function ThreadNoteDrawerOpenContent({
     selectedChartType,
   ]);
 
-  const commitEditorMarkdown = useCallback(
-    (nextMarkdown: string) => {
-      const normalized = normalizeLineEndings(nextMarkdown);
-      setDraftText(normalized);
-      setHasLocalDirtyChanges(true);
-      if (ownerKind && ownerId && noteId) {
-        onDispatchCommand("updateDraft", {
-          ...(threadId ? { threadId } : {}),
-          ownerKind,
-          ownerId,
-          noteId,
-          text: normalized,
+  const handleSetNoteEditorSurfaceMode = useCallback(
+    (mode: "rich" | "markdown") => {
+      const activeSurfaceMode: "rich" | "markdown" = isRawMarkdownMode ? "markdown" : "rich";
+      if (mode === activeSurfaceMode) {
+        return;
+      }
+
+      const nextMarkdown = normalizeLineEndings(
+        isRichEditorMode && editor ? editor.getMarkdown() : latestDraftTextRef.current
+      );
+      setDraftText(nextMarkdown);
+      latestDraftTextRef.current = nextMarkdown;
+
+      setSelectedImage(null);
+      setIsInTable(false);
+      setSlashQuery(null);
+      setMermaidEditingContext(null);
+      setMermaidPicker(null);
+      setHeadingTagEditor(null);
+      setNoteLinkPicker(null);
+      setNoteLinkSearch("");
+      closeNoteContextMenu();
+      hideSelectionAssistantActions();
+      setNoteEditorSurfaceMode(mode);
+      if (mode === "rich") {
+        setForcedNoteEditorSurfaceMode(null);
+        setEditorLoadNotice(null);
+      }
+
+      if (mode === "markdown") {
+        const fallback = nextMarkdown.length;
+        setNoteSelection(null);
+        focusRawMarkdownEditor({ start: fallback, end: fallback });
+        return;
+      }
+
+      if (editor) {
+        const synced = syncRichEditorMarkdown(editor, nextMarkdown, {
+          fallbackMessage:
+            "This note stayed in Markdown because rich view could not load it safely.",
+        });
+        if (!synced) {
+          return;
+        }
+        window.requestAnimationFrame(() => {
+          editor.chain().focus("end").run();
+          refreshSlashQuery(editor);
         });
       }
-      commitSave(normalized);
     },
-    [commitSave, noteId, onDispatchCommand, ownerId, ownerKind, threadId]
+    [
+      closeNoteContextMenu,
+      editor,
+      focusRawMarkdownEditor,
+      hideSelectionAssistantActions,
+      isRawMarkdownMode,
+      isRichEditorMode,
+      refreshSlashQuery,
+      syncRichEditorMarkdown,
+    ]
+  );
+
+  const updateSelectedImageNode = useCallback(
+    (patch: Partial<SelectedImageState>) => {
+      if (!editor || !selectedImage) {
+        return;
+      }
+
+      const nextWidth = (() => {
+        if (patch.width === undefined) {
+          return selectedImage.width;
+        }
+        if (patch.width === null) {
+          return null;
+        }
+        if (!Number.isFinite(patch.width)) {
+          return selectedImage.width;
+        }
+        return Math.max(160, Math.round(patch.width));
+      })();
+      const nextImage: SelectedImageState = {
+        alt: patch.alt ?? selectedImage.alt,
+        title: patch.title ?? selectedImage.title,
+        width: nextWidth,
+      };
+
+      setSelectedImage(nextImage);
+      editor.commands.updateAttributes("threadNoteImage", nextImage);
+      commitEditorMarkdown(normalizeLineEndings(editor.getMarkdown()));
+    },
+    [commitEditorMarkdown, editor, selectedImage]
+  );
+
+  const handleRemoveSelectedImage = useCallback(() => {
+    if (!editor || !selectedImage) {
+      return;
+    }
+
+    editor.commands.deleteSelection();
+    setSelectedImage(null);
+    commitEditorMarkdown(normalizeLineEndings(editor.getMarkdown()));
+  }, [commitEditorMarkdown, editor, selectedImage]);
+
+  const insertUploadedImages = useCallback(
+    (
+      results: ThreadNoteImageUploadResult[],
+      files: readonly File[],
+      range?: PendingImagePickerInsert | null
+    ) => {
+      const successfulUploads = results
+        .map((result, index) => ({
+          result,
+          file: files[index] ?? null,
+        }))
+        .filter(
+          (item): item is { result: ThreadNoteImageUploadResult; file: File | null } =>
+            item.result.ok && Boolean(item.result.url)
+        );
+
+      console.info(
+        "[thread-note image] upload results",
+        results.map((r) => ({ ok: r.ok, url: r.url, message: r.message, relativePath: r.relativePath }))
+      );
+      const failedResult = results.find((result) => !result.ok);
+      if (failedResult) {
+        showImageNotice(
+          failedResult.message ??
+            "Open Assist could not save the image (no details were returned from the native bridge)."
+        );
+        console.error("[thread-note image] upload returned failure", failedResult);
+      }
+      if (!successfulUploads.length) {
+        if (!failedResult) {
+          showImageNotice("Upload finished but no image URL was returned.");
+          console.error("[thread-note image] all uploads ok but no urls", results);
+        }
+        return;
+      }
+
+      if (isRichEditorMode && !editor) {
+        showImageNotice("The rich editor is not ready yet. Try again in a moment.");
+        console.error("[thread-note image] rich editor unavailable at insert time");
+        return;
+      }
+
+      if (isRichEditorMode && editor) {
+        const imagesToInsert = successfulUploads.map(({ result, file }) => ({
+          src: result.url!,
+          alt: preferredThreadNoteImageAlt(file?.name),
+          title: "",
+        }));
+        console.info("[thread-note image] inserting into rich editor", {
+          from: range?.from ?? editor.state.selection.from,
+          to: range?.to ?? editor.state.selection.to,
+          images: imagesToInsert,
+        });
+        insertThreadNoteImages(editor, {
+          from: range?.from ?? editor.state.selection.from,
+          to: range?.to ?? editor.state.selection.to,
+          images: imagesToInsert,
+        });
+        const nextMarkdown = normalizeLineEndings(editor.getMarkdown());
+        console.info("[thread-note image] post-insert markdown length", nextMarkdown.length);
+        commitEditorMarkdown(nextMarkdown);
+        refreshSlashQuery(editor);
+        return;
+      }
+
+      const markdownImages = successfulUploads
+        .map(({ result, file }) =>
+          buildThreadNoteMarkdownImage({
+            src: result.url!,
+            alt: preferredThreadNoteImageAlt(file?.name),
+            title: "",
+          })
+        )
+        .join("\n\n");
+      const insertion = `\n\n${markdownImages}\n\n`;
+      replaceRawMarkdownSelection(range ?? resolveCurrentRawMarkdownRange(), insertion);
+    },
+    [
+      commitEditorMarkdown,
+      editor,
+      isRichEditorMode,
+      refreshSlashQuery,
+      replaceRawMarkdownSelection,
+      resolveCurrentRawMarkdownRange,
+      showImageNotice,
+    ]
+  );
+
+  const handleInsertImagesFromPicker = useCallback(
+    async (files: readonly File[]) => {
+      const targetRange = pendingImagePickerInsertRef.current;
+      pendingImagePickerInsertRef.current = null;
+
+      try {
+        const results = await requestThreadNoteImageUploads(files);
+        if (!results.length) {
+          showImageNotice("No images were returned from the picker.");
+          return;
+        }
+        insertUploadedImages(results, files, targetRange);
+      } catch (error) {
+        console.error("[thread-note image picker] upload failed", error);
+        showImageNotice(
+          error instanceof Error
+            ? `Image upload failed: ${error.message}`
+            : "Image upload failed. See the Web Inspector console for details."
+        );
+      }
+    },
+    [insertUploadedImages, requestThreadNoteImageUploads, showImageNotice]
+  );
+
+  const handleImageInputChange = useCallback(
+    (event: React.ChangeEvent<HTMLInputElement>) => {
+      const files = Array.from(event.currentTarget.files ?? []);
+      event.currentTarget.value = "";
+      if (!files.length) {
+        showImageNotice("No file was selected.");
+        return;
+      }
+
+      void handleInsertImagesFromPicker(files);
+    },
+    [handleInsertImagesFromPicker, showImageNotice]
+  );
+
+  const handleRawMarkdownChange = useCallback(
+    (event: React.ChangeEvent<HTMLTextAreaElement>) => {
+      const normalized = updateDraftTextLocally(event.target.value);
+      refreshRawMarkdownSlashQuery(event.currentTarget, normalized);
+    },
+    [refreshRawMarkdownSlashQuery, updateDraftTextLocally]
+  );
+
+  const handleRawMarkdownSelect = useCallback(
+    (event: React.SyntheticEvent<HTMLTextAreaElement>) => {
+      refreshRawMarkdownSlashQuery(event.currentTarget);
+    },
+    [refreshRawMarkdownSlashQuery]
+  );
+
+  const handleRawMarkdownPaste = useCallback(
+    (event: React.ClipboardEvent<HTMLTextAreaElement>) => {
+      const clipboardData = event.clipboardData;
+      if (!clipboardData) {
+        return;
+      }
+
+      const imageFiles = extractThreadNoteImageFiles(clipboardData.items, clipboardData.files);
+      if (!imageFiles.length) {
+        if (!shouldAttemptNativeThreadNoteClipboardImagePaste(clipboardData)) {
+          return;
+        }
+
+        event.preventDefault();
+        const range = {
+          from: event.currentTarget.selectionStart ?? 0,
+          to: event.currentTarget.selectionEnd ?? event.currentTarget.selectionStart ?? 0,
+        };
+        void requestThreadNoteClipboardImageAsset().then((result) => {
+          insertUploadedImages(result.ok ? [result] : [result], [], range);
+        });
+        return;
+      }
+
+      event.preventDefault();
+      const range = {
+        from: event.currentTarget.selectionStart ?? 0,
+        to: event.currentTarget.selectionEnd ?? event.currentTarget.selectionStart ?? 0,
+      };
+      void requestThreadNoteImageUploads(imageFiles).then((results) => {
+        insertUploadedImages(results, imageFiles, range);
+      });
+    },
+    [
+      insertUploadedImages,
+      requestThreadNoteClipboardImageAsset,
+      requestThreadNoteImageUploads,
+    ]
+  );
+
+  const handleRawMarkdownKeyDown = useCallback(
+    (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
+      const activeMermaidPicker = mermaidPickerStateRef.current;
+      const activeMermaidItems = mermaidPickerItems;
+      if (activeMermaidPicker && activeMermaidItems.length > 0) {
+        if (event.key === "ArrowDown") {
+          event.preventDefault();
+          setSelectedMermaidIndex((current) => (current + 1) % activeMermaidItems.length);
+          return;
+        }
+
+        if (event.key === "ArrowUp") {
+          event.preventDefault();
+          setSelectedMermaidIndex((current) =>
+            (current - 1 + activeMermaidItems.length) % activeMermaidItems.length
+          );
+          return;
+        }
+
+        if (event.key === "Enter") {
+          const selectedMermaidItem =
+            activeMermaidItems[selectedMermaidIndexRef.current] ?? activeMermaidItems[0];
+          if (!selectedMermaidItem) {
+            return;
+          }
+
+          event.preventDefault();
+          if ("template" in selectedMermaidItem) {
+            applyMermaidTemplate(selectedMermaidItem.template);
+          } else {
+            openMermaidTemplateType(selectedMermaidItem.type);
+          }
+          return;
+        }
+
+        if (event.key === "Escape") {
+          event.preventDefault();
+          if (activeMermaidPicker.step === "template" && activeMermaidPicker.canGoBack) {
+            setMermaidPicker({
+              ...activeMermaidPicker,
+              step: "type",
+              type: null,
+              canGoBack: false,
+            });
+            setSelectedMermaidIndex(0);
+            return;
+          }
+
+          setMermaidPicker(null);
+          focusRawMarkdownEditor();
+          return;
+        }
+      }
+
+      const activeSlashQuery = slashQueryRef.current;
+      const activeCommands = filteredCommandsRef.current;
+      if (activeSlashQuery && activeCommands.length > 0) {
+        if (event.key === "ArrowDown") {
+          event.preventDefault();
+          setSelectedSlashIndex((current) => (current + 1) % activeCommands.length);
+          return;
+        }
+
+        if (event.key === "ArrowUp") {
+          event.preventDefault();
+          setSelectedSlashIndex((current) =>
+            (current - 1 + activeCommands.length) % activeCommands.length
+          );
+          return;
+        }
+
+        if (event.key === "Enter") {
+          const selectedCommand =
+            activeCommands[selectedSlashIndexRef.current] ?? activeCommands[0];
+          if (!selectedCommand) {
+            return;
+          }
+
+          event.preventDefault();
+          applySlashCommand(selectedCommand);
+          return;
+        }
+      }
+
+      if (event.key === "Escape" && slashQueryRef.current) {
+        event.preventDefault();
+        setSlashQuery(null);
+      }
+    },
+    [
+      applyMermaidTemplate,
+      applySlashCommand,
+      focusRawMarkdownEditor,
+      mermaidPickerItems,
+      openMermaidTemplateType,
+    ]
+  );
+
+  const handleRawMarkdownBlur = useCallback(
+    (event: React.FocusEvent<HTMLTextAreaElement>) => {
+      refreshRawMarkdownSlashQuery(event.currentTarget);
+      commitSave(event.currentTarget.value);
+      window.requestAnimationFrame(() => {
+        const activeElement = document.activeElement;
+        const focusInsideFloatingLayer = Boolean(
+          activeElement && floatingLayerRef.current?.contains(activeElement)
+        );
+
+        if (focusInsideFloatingLayer) {
+          return;
+        }
+
+        setSlashQuery(null);
+        setMermaidPicker(null);
+      });
+    },
+    [commitSave, refreshRawMarkdownSlashQuery]
   );
 
   const handleApplyOrganizeAIDraft = useCallback(
     (applyMode: "replace" | "insertAbove" | "insertBelow" | "replaceNote" | "insertTop" | "insertBottom") => {
-      if (!editor || !aiDraftPreview || aiDraftPreview.isError || aiDraftPreview.mode !== "organize") {
+      if (!aiDraftPreview || aiDraftPreview.isError || aiDraftPreview.mode !== "organize") {
         closeAIDraftPreview();
         return;
       }
 
       const previewMarkdown = normalizeLineEndings(aiDraftPreview.markdown);
-      const currentMarkdown = normalizeLineEndings(editor.getMarkdown());
-      const summaryTarget = summaryTargetRef.current;
-
-      if (
-        summaryTarget?.kind === "selection" &&
-        typeof summaryTarget.from === "number" &&
-        typeof summaryTarget.to === "number"
-      ) {
-        if (applyMode === "replace") {
-          editor.commands.insertContentAt(
-            { from: summaryTarget.from, to: summaryTarget.to },
-            previewMarkdown,
-            { contentType: "markdown" }
-          );
-        } else if (applyMode === "insertAbove") {
-          editor.commands.insertContentAt(summaryTarget.from, `${previewMarkdown}\n\n`, {
-            contentType: "markdown",
-          });
-        } else if (applyMode === "insertBelow") {
-          editor.commands.insertContentAt(
-            summaryTarget.insertAt ?? summaryTarget.to,
-            `\n\n${previewMarkdown}`,
-            {
-              contentType: "markdown",
+      const currentMarkdown = readCurrentThreadNoteMarkdown();
+      const selectionSnapshot =
+        noteSelection?.selectedMarkdown && noteSelection?.snapshotMarkdown
+          ? {
+              selectedMarkdown: noteSelection.selectedMarkdown,
+              snapshotMarkdown: noteSelection.snapshotMarkdown,
             }
-          );
+          : null;
+
+      if (selectionSnapshot && applyMode === "replace") {
+        const replaced = replaceSelectionInMarkdown(currentMarkdown, selectionSnapshot, previewMarkdown);
+        if (replaced !== null) {
+          commitEditorMarkdown(replaced);
+          closeAIDraftPreview("applyAIDraftPreview");
+          return;
         }
-        const nextMarkdown = normalizeLineEndings(editor.getMarkdown());
-        commitEditorMarkdown(nextMarkdown);
-        closeAIDraftPreview("applyAIDraftPreview");
-        return;
+      }
+
+      if (selectionSnapshot && applyMode === "insertAbove") {
+        const inserted = insertMarkdownAboveSelection(currentMarkdown, selectionSnapshot, previewMarkdown);
+        if (inserted !== null) {
+          commitEditorMarkdown(inserted);
+          closeAIDraftPreview("applyAIDraftPreview");
+          return;
+        }
+      }
+
+      if (selectionSnapshot && applyMode === "insertBelow") {
+        const inserted = insertMarkdownBelowSelection(currentMarkdown, selectionSnapshot, previewMarkdown);
+        if (inserted !== null) {
+          commitEditorMarkdown(inserted);
+          closeAIDraftPreview("applyAIDraftPreview");
+          return;
+        }
       }
 
       const mergedMarkdown =
         applyMode === "replaceNote"
           ? previewMarkdown
           : applyMode === "insertTop"
-            ? [previewMarkdown.trim(), currentMarkdown.trim()].filter(Boolean).join("\n\n")
-            : [currentMarkdown.trim(), previewMarkdown.trim()].filter(Boolean).join("\n\n");
+            ? prependMarkdownToNote(currentMarkdown, previewMarkdown)
+            : appendMarkdownToNote(currentMarkdown, previewMarkdown);
 
-      editor.commands.setContent(mergedMarkdown, { contentType: "markdown" });
-      commitEditorMarkdown(normalizeLineEndings(editor.getMarkdown()));
+      commitEditorMarkdown(mergedMarkdown);
       closeAIDraftPreview("applyAIDraftPreview");
     },
-    [aiDraftPreview, closeAIDraftPreview, commitEditorMarkdown, editor]
+    [aiDraftPreview, closeAIDraftPreview, commitEditorMarkdown, noteSelection, readCurrentThreadNoteMarkdown]
   );
 
   const handleAddChartDraftToNote = useCallback(
     (applyMode: "appendBottom" | "insertBelowSelection" = "appendBottom") => {
-      if (!editor || !aiDraftPreview || aiDraftPreview.isError || aiDraftPreview.mode !== "chart") {
+      if (!aiDraftPreview || aiDraftPreview.isError || aiDraftPreview.mode !== "chart") {
         closeAIDraftPreview();
         return;
       }
 
-      const draftMarkdown = normalizeLineEndings(aiDraftPreview.markdown).trim();
-      const summaryTarget = summaryTargetRef.current;
+      const draftMarkdown = normalizeLineEndings(
+        sanitizeMermaidMarkdownBlocks(aiDraftPreview.markdown)
+      ).trim();
+      const currentMarkdown = readCurrentThreadNoteMarkdown();
+      const selectionSnapshot =
+        noteSelection?.selectedMarkdown && noteSelection?.snapshotMarkdown
+          ? {
+              selectedMarkdown: noteSelection.selectedMarkdown,
+              snapshotMarkdown: noteSelection.snapshotMarkdown,
+            }
+          : null;
 
-      if (
-        applyMode === "insertBelowSelection" &&
-        summaryTarget?.kind === "selection" &&
-        typeof (summaryTarget.insertAt ?? summaryTarget.to) === "number"
-      ) {
-        editor.commands.insertContentAt(summaryTarget.insertAt ?? summaryTarget.to!, `\n\n${draftMarkdown}`, {
-          contentType: "markdown",
-        });
-        commitEditorMarkdown(normalizeLineEndings(editor.getMarkdown()));
-        closeAIDraftPreview("applyAIDraftPreview");
-        return;
+      if (applyMode === "insertBelowSelection" && selectionSnapshot) {
+        const inserted = insertMarkdownBelowSelection(currentMarkdown, selectionSnapshot, draftMarkdown);
+        if (inserted !== null) {
+          commitEditorMarkdown(inserted);
+          closeAIDraftPreview("applyAIDraftPreview");
+          return;
+        }
       }
 
-      const currentMarkdown = normalizeLineEndings(editor.getMarkdown()).trim();
-      const mergedMarkdown = [currentMarkdown, draftMarkdown].filter(Boolean).join("\n\n");
-      editor.commands.setContent(mergedMarkdown, { contentType: "markdown" });
-      commitEditorMarkdown(normalizeLineEndings(editor.getMarkdown()));
+      commitEditorMarkdown(appendMarkdownToNote(currentMarkdown, draftMarkdown));
       closeAIDraftPreview("applyAIDraftPreview");
     },
-    [aiDraftPreview, closeAIDraftPreview, commitEditorMarkdown, editor]
+    [aiDraftPreview, closeAIDraftPreview, commitEditorMarkdown, noteSelection, readCurrentThreadNoteMarkdown]
   );
 
   const handleRegenerateChartDraft = useCallback(() => {
@@ -2793,8 +6387,32 @@ function ThreadNoteDrawerOpenContent({
       selectedChartType,
       chartStyleInstruction
     );
+    if (!aiDraftPreview || aiDraftPreview.mode !== "chart" || !noteId) {
+      return;
+    }
+
+    dispatchThreadNoteCommand("regenerateAIDraftPreview", {
+      noteId,
+      draftMode: "chart",
+      styleInstruction: normalizedInstruction,
+      currentDraftMarkdown:
+        sanitizeMermaidMarkdownBlocks(aiDraftPreview.markdown) || undefined,
+    });
+  }, [
+    aiDraftPreview,
+    chartStyleInstruction,
+    dispatchThreadNoteCommand,
+    noteId,
+    selectedChartType,
+  ]);
+
+  const handleRepairChartDraft = useCallback(() => {
+    const normalizedInstruction = buildChartStyleInstruction(
+      selectedChartType,
+      chartStyleInstruction
+    );
     if (
-      !normalizedInstruction ||
+      !chartRenderError ||
       !aiDraftPreview ||
       aiDraftPreview.mode !== "chart" ||
       !noteId
@@ -2806,10 +6424,13 @@ function ThreadNoteDrawerOpenContent({
       noteId,
       draftMode: "chart",
       styleInstruction: normalizedInstruction,
-      currentDraftMarkdown: aiDraftPreview.markdown || undefined,
+      currentDraftMarkdown:
+        sanitizeMermaidMarkdownBlocks(aiDraftPreview.markdown) || undefined,
+      renderError: chartRenderError,
     });
   }, [
     aiDraftPreview,
+    chartRenderError,
     chartStyleInstruction,
     dispatchThreadNoteCommand,
     noteId,
@@ -2857,6 +6478,110 @@ function ThreadNoteDrawerOpenContent({
       }),
     [normalizedSelectorFilter, notes, state?.availableSources]
   );
+  const batchOrganizerSelectedSourceNotes = useMemo(
+    () =>
+      batchOrganizerSelectedSourceKeys
+        .map((selectionKey) => {
+          const payload = batchSourceSelectionPayload(selectionKey);
+          if (!payload) {
+            return null;
+          }
+          return (
+            notes.find(
+              (note) =>
+                note.ownerKind === payload.ownerKind &&
+                note.ownerId === payload.ownerId &&
+                note.id === payload.noteId
+            ) ?? null
+          );
+        })
+        .filter((note): note is NonNullable<typeof note> => Boolean(note)),
+    [batchOrganizerSelectedSourceKeys, notes]
+  );
+  const batchOrganizerSourceNotes = batchNotePlanPreview?.sourceNotes ?? [];
+  const batchOrganizerSourcePreview = useMemo(
+    () =>
+      batchOrganizerSourcePreviewKey
+        ? batchOrganizerSourceNotes.find(
+            (sourceNote) =>
+              batchSourceSelectionKeyForSourceNote(sourceNote) === batchOrganizerSourcePreviewKey
+          ) ?? null
+        : batchOrganizerSourceNotes[0] ?? null,
+    [batchOrganizerSourceNotes, batchOrganizerSourcePreviewKey]
+  );
+  const batchOrganizerEditableNoteByTempId = useMemo(
+    () =>
+      new Map(
+        batchOrganizerEditableNotes.map((note) => [note.tempId.toLowerCase(), note] as const)
+      ),
+    [batchOrganizerEditableNotes]
+  );
+  const batchOrganizerActiveNote = useMemo(
+    () =>
+      batchOrganizerActiveNoteTempId
+        ? batchOrganizerEditableNotes.find((note) => note.tempId === batchOrganizerActiveNoteTempId) ??
+          batchOrganizerEditableNotes[0] ??
+          null
+        : batchOrganizerEditableNotes[0] ?? null,
+    [batchOrganizerActiveNoteTempId, batchOrganizerEditableNotes]
+  );
+  const batchOrganizerLinkRows = useMemo(
+    () =>
+      batchOrganizerEditableLinks.map((link) => {
+        const fromNote = batchOrganizerEditableNoteByTempId.get(link.fromTempId.toLowerCase()) ?? null;
+        const toNote =
+          link.toTarget.kind === "proposed" && link.toTarget.tempId
+            ? batchOrganizerEditableNoteByTempId.get(link.toTarget.tempId.toLowerCase()) ?? null
+            : null;
+        const toLabel = toNote ? normalizeThreadNoteTitle(toNote.title) : batchResolvedTargetLabel(link.toTarget);
+        const isVisible = Boolean(fromNote?.accepted) && (link.toTarget.kind !== "proposed" || Boolean(toNote?.accepted));
+        return {
+          ...link,
+          linkKey: batchPlanEditableLinkKey(link),
+          fromTitle: fromNote ? normalizeThreadNoteTitle(fromNote.title) : "Generated note",
+          toTitle: toLabel,
+          isVisible,
+        };
+      }),
+    [batchOrganizerEditableLinks, batchOrganizerEditableNoteByTempId]
+  );
+  const batchOrganizerGraph = useMemo(
+    () =>
+      buildBatchNotePlanPreviewGraph(
+        batchOrganizerSourceNotes,
+        batchOrganizerEditableNotes,
+        batchOrganizerEditableLinks
+      ),
+    [batchOrganizerEditableLinks, batchOrganizerEditableNotes, batchOrganizerSourceNotes]
+  );
+  const batchOrganizerAcceptedMasterCount = batchOrganizerEditableNotes.filter(
+    (note) => note.accepted && note.noteType === "master"
+  ).length;
+  const batchOrganizerWarnings = batchNotePlanPreview?.warnings ?? [];
+  const batchOrganizerStep =
+    batchNotePlanPreview || isBatchNotePlanBusy ? "preview" : "select";
+  const canRequestBatchPlanPreview =
+    Boolean(state?.workspaceProjectId) &&
+    batchOrganizerSelectedSourceKeys.length > 0 &&
+    !isBatchNotePlanBusy;
+  const canApplyBatchPlan =
+    Boolean(batchNotePlanPreview) &&
+    !batchNotePlanPreview?.isError &&
+    !isBatchNotePlanBusy &&
+    !batchOrganizerIsApplying &&
+    batchOrganizerEditableNotes.some((note) => note.accepted) &&
+    batchOrganizerAcceptedMasterCount === 1;
+  const projectNoteTransferTargets = useMemo(
+    () =>
+      currentProjectTransferProjectId
+        ? notes.filter(
+            (note) =>
+              note.ownerKind === "project" &&
+              note.ownerId === currentProjectTransferProjectId
+          )
+        : [],
+    [currentProjectTransferProjectId, notes]
+  );
   const linkableSourceSections = useMemo<ThreadNoteSourceSection[]>(
     () =>
       (state?.availableSources ?? []).map((source) => {
@@ -2892,10 +6617,6 @@ function ThreadNoteDrawerOpenContent({
   const selectedChartChoice =
     CHART_TYPE_CHOICES.find((option) => option.type === selectedChartType) ??
     CHART_TYPE_CHOICES[0];
-  const chartDraftInstruction = buildChartStyleInstruction(
-    selectedChartType,
-    chartStyleInstruction
-  );
   const currentChartDraftType =
     aiDraftPreview && aiDraftPreview.mode === "chart" && !aiDraftPreview.isError
       ? detectChartTypeFromDraftMarkdown(aiDraftPreview.markdown)
@@ -2933,9 +6654,62 @@ function ThreadNoteDrawerOpenContent({
   const workspaceOwnerSubtitle = state?.workspaceOwnerSubtitle?.trim() || "";
   const owningThreadId = state?.owningThreadId ?? null;
   const owningThreadTitle = state?.owningThreadTitle?.trim() || "Open thread";
+  const noteKindLabel =
+    currentSourceLabel === "Project notes" ? "Project note" : "Thread note";
+  const noteContextPrefix = isNotesWorkspace ? "Notes" : currentSourceLabel;
+  const noteContextLabel =
+    (isNotesWorkspace ? workspaceProjectTitle : state?.ownerTitle?.trim()) || currentSourceLabel;
+  const linkedNotesCount = outgoingLinks.length + backlinks.length;
+  const relatedNotePreviewLabels = Array.from(
+    new Set(
+      [...outgoingLinks, ...backlinks]
+        .map((item) => normalizeThreadNoteTitle(item.title).trim())
+        .filter(Boolean)
+    )
+  ).slice(0, 3);
+  const relatedNotePreviewText = relatedNotePreviewLabels.length
+    ? relatedNotePreviewLabels.join(" • ")
+    : graph
+      ? "View the local note graph"
+      : "No linked notes yet";
   const canRequestSummary = hasAnyNotes && Boolean(draftText.trim() || noteSelection?.text?.trim());
+  const selectedProjectTransferTarget =
+    projectNoteTransfer?.targetNoteId
+      ? projectNoteTransferTargets.find(
+          (note) => note.id === projectNoteTransfer.targetNoteId
+        ) ?? null
+      : null;
+  const projectTransferSuggestionLabel = projectNoteTransferPreview?.fallbackToEnd
+    ? "Add at end"
+    : projectNoteTransferPreview?.suggestedHeadingPath.length
+      ? projectNoteTransferPreview.suggestedHeadingPath.join(" / ")
+      : "Suggested section";
+  const canApplyProjectTransferSuggestion = Boolean(
+    projectNoteTransferPreview &&
+      !projectNoteTransferPreview.isError &&
+      !projectNoteTransferPreview.fallbackToEnd &&
+      projectNoteTransferPreview.suggestedHeadingPath.length > 0
+  );
   const handleOpenNoteLinkPicker = useCallback(() => {
     if (!noteContextMenu) {
+      const activeRange =
+        isRichEditorMode && editor
+          ? {
+              from: editor.state.selection.from,
+              to: editor.state.selection.to,
+            }
+          : resolveCurrentRawMarkdownRange();
+      const selectedLabel =
+        noteSelection?.text?.trim() ??
+        latestDraftTextRef.current.slice(activeRange.from, activeRange.to).trim();
+      setNoteLinkSearch("");
+      setNoteLinkPicker({
+        mode: selectedLabel ? "wrapSelection" : "insertInline",
+        selectedLabel,
+        from: selectedLabel ? activeRange.from : undefined,
+        to: selectedLabel ? activeRange.to : undefined,
+        insertAt: selectedLabel ? activeRange.from : activeRange.to,
+      });
       return;
     }
 
@@ -2952,10 +6726,17 @@ function ThreadNoteDrawerOpenContent({
         ? noteContextMenu.from
         : noteContextMenu.cursorPos ?? noteContextMenu.to,
     });
-  }, [closeNoteContextMenu, noteContextMenu]);
+  }, [
+    closeNoteContextMenu,
+    editor,
+    isRichEditorMode,
+    noteContextMenu,
+    noteSelection?.text,
+    resolveCurrentRawMarkdownRange,
+  ]);
   const handleInsertNoteLink = useCallback(
     (targetNote: (typeof notes)[number]) => {
-      if (!editor || !noteLinkPicker) {
+      if (!noteLinkPicker) {
         return;
       }
 
@@ -2970,35 +6751,74 @@ function ThreadNoteDrawerOpenContent({
         : fallbackLabel;
       const markdownLink = buildInternalNoteMarkdownLink(linkLabel, target);
 
-      if (
-        noteLinkPicker.mode === "wrapSelection" &&
-        typeof noteLinkPicker.from === "number" &&
-        typeof noteLinkPicker.to === "number" &&
-        noteLinkPicker.to > noteLinkPicker.from
-      ) {
-        editor
-          .chain()
-          .focus()
-          .deleteRange({ from: noteLinkPicker.from, to: noteLinkPicker.to })
-          .insertContentAt(noteLinkPicker.from, markdownLink, {
-            contentType: "markdown",
-          })
-          .run();
-      } else {
-        editor
-          .chain()
-          .focus()
-          .insertContentAt(noteLinkPicker.insertAt, `${markdownLink} `, {
-            contentType: "markdown",
-          })
-          .run();
+      if (isRichEditorMode) {
+        if (!editor) {
+          return;
+        }
+
+        if (
+          noteLinkPicker.mode === "wrapSelection" &&
+          typeof noteLinkPicker.from === "number" &&
+          typeof noteLinkPicker.to === "number" &&
+          noteLinkPicker.to > noteLinkPicker.from
+        ) {
+          editor
+            .chain()
+            .focus()
+            .deleteRange({ from: noteLinkPicker.from, to: noteLinkPicker.to })
+            .insertContentAt(noteLinkPicker.from, markdownLink, {
+              contentType: "markdown",
+            })
+            .run();
+        } else {
+          editor
+            .chain()
+            .focus()
+            .insertContentAt(noteLinkPicker.insertAt, `${markdownLink} `, {
+              contentType: "markdown",
+            })
+            .run();
+        }
+
+        setNoteLinkPicker(null);
+        setNoteLinkSearch("");
+        refreshSlashQuery(editor);
+        return;
       }
+
+      const nextMarkdown = replaceMarkdownRange(
+        readCurrentThreadNoteMarkdown(),
+        {
+          from:
+            noteLinkPicker.mode === "wrapSelection" &&
+            typeof noteLinkPicker.from === "number"
+              ? noteLinkPicker.from
+              : noteLinkPicker.insertAt,
+          to:
+            noteLinkPicker.mode === "wrapSelection" &&
+            typeof noteLinkPicker.to === "number"
+              ? noteLinkPicker.to
+              : noteLinkPicker.insertAt,
+        },
+        noteLinkPicker.mode === "wrapSelection" ? markdownLink : `${markdownLink} `
+      );
+      commitEditorMarkdown(nextMarkdown);
+      focusRawMarkdownEditor();
 
       setNoteLinkPicker(null);
       setNoteLinkSearch("");
-      refreshSlashQuery(editor);
     },
-    [editor, noteLinkPicker, notes, refreshSlashQuery]
+    [
+      commitEditorMarkdown,
+      editor,
+      focusRawMarkdownEditor,
+      isRichEditorMode,
+      noteLinkPicker,
+      notes,
+      readCurrentThreadNoteMarkdown,
+      resolveCurrentRawMarkdownRange,
+      refreshSlashQuery,
+    ]
   );
   const handleOpenLinkedNoteFromMenu = useCallback(() => {
     openInternalNoteTarget(noteContextMenu?.linkTarget);
@@ -3048,6 +6868,10 @@ function ThreadNoteDrawerOpenContent({
     ? MARKDOWN_LINE_TAG_OPTION_BY_ID.get(headingTagEditor.tag) ??
       MARKDOWN_LINE_TAG_OPTIONS[0]
     : null;
+  const currentHeadingAlignment =
+    headingTagEditor && editor && isHeadingLineTag(headingTagEditor.tag)
+      ? resolveHeadingAlignmentAtSelection(editor.state, headingTagEditor.selectionPos)
+      : "left";
   const mermaidPickerTitle =
     mermaidPicker?.step === "template"
       ? selectedMermaidType?.label ?? "Choose a template"
@@ -3061,6 +6885,21 @@ function ThreadNoteDrawerOpenContent({
     noteContextMenu &&
       (noteContextMenu.sourceKind === "selection" ||
         typeof noteContextMenu.lineSelectionPos === "number")
+  );
+  const canTransferSelectionToProjectNote = Boolean(
+    noteContextMenu?.sourceKind === "selection" &&
+      ownerKind === "thread" &&
+      currentProjectTransferProjectId
+  );
+  const canIndentBlockFromMenu = Boolean(
+    editor &&
+      noteContextMenu?.sourceKind === "selection" &&
+      canIndentSelectionAsIndentedBlock(editor, noteContextMenu.from, noteContextMenu.to)
+  );
+  const canOutdentBlockFromMenu = Boolean(
+    editor &&
+      noteContextMenu?.sourceKind === "selection" &&
+      selectionTouchesNodeType(editor.state, noteContextMenu.from, noteContextMenu.to, "blockquote")
   );
   const noteContextMenuHasLinkActions = Boolean(
     noteContextMenu &&
@@ -3166,17 +7005,20 @@ function ThreadNoteDrawerOpenContent({
     </div>
   );
   const utilityControls =
-    statusLabel || shouldShowSummaryAction || linkNotice ? (
+    shouldShowSummaryAction ||
+    linkNotice ||
+    imageNotice ||
+    screenshotNotice ||
+    isUploadingImage ||
+    isCapturingScreenshot ? (
       <div
         className={[
-          "thread-note-meta-row",
+          "thread-note-utility-actions",
           isFullScreenWorkspace ? "is-inline-utility" : "",
         ]
           .filter(Boolean)
           .join(" ")}
       >
-        {statusLabel ? <span className="thread-note-status">{statusLabel}</span> : null}
-        {linkNotice ? <span className="thread-note-link-notice">{linkNotice}</span> : null}
         {shouldShowSummaryAction ? (
           <button
             type="button"
@@ -3186,6 +7028,20 @@ function ThreadNoteDrawerOpenContent({
           >
             {state?.isGeneratingAIDraft ? "Working..." : aiButtonLabel}
           </button>
+        ) : null}
+        {linkNotice ? <span className="thread-note-link-notice">{linkNotice}</span> : null}
+        {editorLoadNotice ? (
+          <span className="thread-note-link-notice">{editorLoadNotice}</span>
+        ) : null}
+        {imageNotice ? <span className="thread-note-link-notice">{imageNotice}</span> : null}
+        {screenshotNotice ? (
+          <span className="thread-note-link-notice">{screenshotNotice}</span>
+        ) : null}
+        {isUploadingImage ? (
+          <span className="thread-note-link-notice">Saving image...</span>
+        ) : null}
+        {isCapturingScreenshot ? (
+          <span className="thread-note-link-notice">Waiting for screenshot selection...</span>
         ) : null}
       </div>
     ) : null;
@@ -3207,20 +7063,23 @@ function ThreadNoteDrawerOpenContent({
         >
           <span className="thread-note-links-toggle-main">
             <span className="thread-note-links-toggle-label">Linked Notes</span>
-            <span className="thread-note-links-toggle-meta">
-              {outgoingLinks.length} outgoing, {backlinks.length} backlinks
-            </span>
+            <span className="thread-note-links-toggle-meta">{relatedNotePreviewText}</span>
           </span>
-          <span
-            className={[
-              "thread-note-selector-chevron",
-              isLinkedNotesOpen ? "is-open" : "",
-            ]
-              .filter(Boolean)
-              .join(" ")}
-            aria-hidden="true"
-          >
-            ▾
+          <span className="thread-note-links-toggle-side">
+            {linkedNotesCount > 0 ? (
+              <span className="thread-note-links-toggle-count">{linkedNotesCount}</span>
+            ) : null}
+            <span
+              className={[
+                "thread-note-selector-chevron",
+                isLinkedNotesOpen ? "is-open" : "",
+              ]
+                .filter(Boolean)
+                .join(" ")}
+              aria-hidden="true"
+            >
+              ▾
+            </span>
           </span>
         </button>
         {isLinkedNotesOpen ? (
@@ -3328,8 +7187,32 @@ function ThreadNoteDrawerOpenContent({
                       <span>{item.savedAtLabel}</span>
                     </div>
                     <p>{item.preview}</p>
+                    {recoveryPreview?.kind === "history" && recoveryPreview.id === item.id ? (
+                      <div className="thread-note-recovery-preview">
+                        <div className="thread-note-recovery-preview-header">
+                          <span>Preview before restore</span>
+                          <span>{item.savedAtLabel}</span>
+                        </div>
+                        <div className="assistant-markdown-shell oa-markdown-surface thread-note-recovery-preview-surface">
+                          <MarkdownContent
+                            markdown={item.markdown || item.preview}
+                            mermaidDisplayMode="noteCompact"
+                            onMermaidRenderErrorChange={setChartRenderError}
+                          />
+                        </div>
+                      </div>
+                    ) : null}
                   </div>
                   <div className="thread-note-recovery-actions">
+                    <button
+                      type="button"
+                      className="thread-note-recovery-action"
+                      onClick={() => handleToggleRecoveryPreview("history", item.id)}
+                    >
+                      {recoveryPreview?.kind === "history" && recoveryPreview.id === item.id
+                        ? "Hide Preview"
+                        : "Preview"}
+                    </button>
                     <button
                       type="button"
                       className="thread-note-recovery-action is-primary"
@@ -3370,8 +7253,32 @@ function ThreadNoteDrawerOpenContent({
                       <span>{item.deletedAtLabel}</span>
                     </div>
                     <p>{item.preview}</p>
+                    {recoveryPreview?.kind === "deleted" && recoveryPreview.id === item.id ? (
+                      <div className="thread-note-recovery-preview">
+                        <div className="thread-note-recovery-preview-header">
+                          <span>Preview before restore</span>
+                          <span>{item.deletedAtLabel}</span>
+                        </div>
+                        <div className="assistant-markdown-shell oa-markdown-surface thread-note-recovery-preview-surface">
+                          <MarkdownContent
+                            markdown={item.markdown || item.preview}
+                            mermaidDisplayMode="noteCompact"
+                            onMermaidRenderErrorChange={setChartRenderError}
+                          />
+                        </div>
+                      </div>
+                    ) : null}
                   </div>
                   <div className="thread-note-recovery-actions">
+                    <button
+                      type="button"
+                      className="thread-note-recovery-action"
+                      onClick={() => handleToggleRecoveryPreview("deleted", item.id)}
+                    >
+                      {recoveryPreview?.kind === "deleted" && recoveryPreview.id === item.id
+                        ? "Hide Preview"
+                        : "Preview"}
+                    </button>
                     <button
                       type="button"
                       className="thread-note-recovery-action is-primary"
@@ -3422,11 +7329,30 @@ function ThreadNoteDrawerOpenContent({
             .filter(Boolean)
             .join(" ")}
         >
+          {isFullScreenWorkspace ? (
+            <div className="thread-note-document-meta-row">
+              <div className="thread-note-document-path">
+                <span>{noteContextPrefix}</span>
+                <span>{noteContextLabel}</span>
+              </div>
+              <div className="thread-note-document-meta-side">
+                {statusLabel ? (
+                  <span className="thread-note-document-status">{statusLabel}</span>
+                ) : null}
+                <button
+                  type="button"
+                  className="thread-note-document-meta-button"
+                  onClick={handleToggleHistoryPanel}
+                  disabled={!hasRecoveryItems}
+                >
+                  History
+                </button>
+              </div>
+            </div>
+          ) : null}
           <div className="thread-note-workspace-row">
             <div className="thread-note-header-copy">
-              <span className="thread-note-eyebrow">
-                {isNotesWorkspace ? workspaceProjectTitle : currentSourceLabel}
-              </span>
+              <span className="thread-note-eyebrow">{noteKindLabel}</span>
               {isRenamingTitle ? (
                 <div className="thread-note-title-editor">
                   <input
@@ -3473,8 +7399,7 @@ function ThreadNoteDrawerOpenContent({
                     ) : null}
                   </div>
                   <div className="thread-note-notes-subtitle">
-                    <span>{currentSourceLabel}</span>
-                    {workspaceOwnerSubtitle ? <span>{workspaceOwnerSubtitle}</span> : null}
+                    <span>{workspaceOwnerSubtitle || currentSourceLabel}</span>
                   </div>
                 </div>
               ) : (
@@ -3553,7 +7478,7 @@ function ThreadNoteDrawerOpenContent({
                     ) ? sourceSections.map((section) => (
                       <div key={noteSourceKey(section.source.ownerKind, section.source.ownerId)}>
                         <div className="thread-note-selector-section-header">
-                          <span>{section.source.sourceLabel}</span>
+                          <span>{noteSourceSectionLabel(section.source)}</span>
                           <span>{section.allNotes.length}</span>
                         </div>
                         {section.visibleNotes.map((note, index) => (
@@ -3670,38 +7595,52 @@ function ThreadNoteDrawerOpenContent({
                 ) : null}
                 <button
                   type="button"
-                  className="thread-note-icon-button"
-                  onClick={handleToggleHistoryPanel}
-                  disabled={!hasRecoveryItems}
-                  aria-label="Open note history"
-                  title="Open note history"
+                  className={[
+                    "thread-note-icon-button",
+                    screenshotImportState ? "is-active" : "",
+                  ]
+                    .filter(Boolean)
+                    .join(" ")}
+                  onClick={() => {
+                    void handleOpenScreenshotImport();
+                  }}
+                  disabled={isCapturingScreenshot || screenshotImportState?.isProcessing}
+                  aria-label="Import screenshot"
+                  title="Import screenshot"
                 >
-                  <HistoryIcon />
+                  <ScreenshotIcon />
                 </button>
-                <button
-                  className="thread-note-icon-button"
-                  type="button"
-                  onClick={handleCreateNote}
-                  disabled={!canCreateNote}
-                  aria-label={`New ${currentSourceLabel.toLowerCase().replace("notes", "note")}`}
-                  title={`New ${currentSourceLabel.toLowerCase().replace("notes", "note")}`}
-                >
-                  <PlusIcon />
-                </button>
-                {!isFullScreenWorkspace ? (
-                  <button
-                    className="thread-note-icon-button"
-                    type="button"
-                    onClick={() =>
-                      dispatchThreadNoteCommand("setExpanded", {
-                        isExpanded: !isExpanded,
-                      })
-                    }
-                    aria-label={isExpanded ? "Collapse note" : "Expand note"}
-                    title={isExpanded ? "Collapse note" : "Expand note"}
-                  >
-                    <ExpandIcon expanded={isExpanded} />
-                  </button>
+                {hasAnyNotes ? (
+                  <div className="thread-note-toolbar-switch" role="group" aria-label="Editor mode">
+                    <button
+                      type="button"
+                      className={[
+                        "thread-note-toolbar-switch-button",
+                        !isRawMarkdownMode ? "is-active" : "",
+                      ]
+                        .filter(Boolean)
+                        .join(" ")}
+                      onClick={() => handleSetNoteEditorSurfaceMode("rich")}
+                      disabled={!state?.canEdit}
+                      title="Use the normal rich editor"
+                    >
+                      Rich
+                    </button>
+                    <button
+                      type="button"
+                      className={[
+                        "thread-note-toolbar-switch-button",
+                        isRawMarkdownMode ? "is-active" : "",
+                      ]
+                        .filter(Boolean)
+                        .join(" ")}
+                      onClick={() => handleSetNoteEditorSurfaceMode("markdown")}
+                      disabled={!state?.canEdit}
+                      title="Edit the exact saved markdown"
+                    >
+                      Markdown
+                    </button>
+                  </div>
                 ) : null}
                 <button
                   className="thread-note-icon-button is-danger"
@@ -3713,14 +7652,129 @@ function ThreadNoteDrawerOpenContent({
                 >
                   <TrashIcon />
                 </button>
+                <div className="thread-note-overflow-wrap">
+                  <button
+                    ref={overflowMenuTriggerRef}
+                    type="button"
+                    className="thread-note-icon-button"
+                    onClick={() => setIsOverflowMenuOpen((value) => !value)}
+                    aria-label="More actions"
+                    aria-expanded={isOverflowMenuOpen}
+                    aria-haspopup="menu"
+                    title="More actions"
+                  >
+                    <MoreIcon />
+                  </button>
+                  {isOverflowMenuOpen ? (
+                    <div
+                      ref={overflowMenuRef}
+                      className="thread-note-overflow-menu"
+                      role="menu"
+                    >
+                      <button
+                        type="button"
+                        role="menuitem"
+                        className="thread-note-overflow-item"
+                        onClick={() => {
+                          setIsOverflowMenuOpen(false);
+                          handleOpenImagePicker();
+                        }}
+                        disabled={!hasAnyNotes || !state?.canEdit}
+                      >
+                        <ImageIcon />
+                        <span>Add image</span>
+                      </button>
+                      {hasAnyNotes ? (
+                        <button
+                          type="button"
+                          role="menuitem"
+                          className="thread-note-overflow-item"
+                          onClick={() => {
+                            setIsOverflowMenuOpen(false);
+                            handleOpenNoteLinkPicker();
+                          }}
+                          disabled={!state?.canEdit}
+                        >
+                          <span className="thread-note-overflow-item-glyph">↗</span>
+                          <span>
+                            {noteSelection?.text?.trim() ? "Link Selection" : "Insert Link"}
+                          </span>
+                        </button>
+                      ) : null}
+                      <button
+                        type="button"
+                        role="menuitem"
+                        className="thread-note-overflow-item"
+                        onClick={() => {
+                          setIsOverflowMenuOpen(false);
+                          handleCreateNote();
+                        }}
+                        disabled={!canCreateNote}
+                      >
+                        <PlusIcon />
+                        <span>
+                          New {currentSourceLabel.toLowerCase().replace("notes", "note")}
+                        </span>
+                      </button>
+                      {isNotesWorkspace && state?.workspaceProjectId ? (
+                        <button
+                          type="button"
+                          role="menuitem"
+                          className="thread-note-overflow-item"
+                          onClick={() => {
+                            setIsOverflowMenuOpen(false);
+                            handleOpenBatchOrganizer();
+                          }}
+                        >
+                          <span className="thread-note-overflow-item-glyph">✨</span>
+                          <span>Organize selected notes</span>
+                        </button>
+                      ) : null}
+                      {!isFullScreenWorkspace ? (
+                        <button
+                          type="button"
+                          role="menuitem"
+                          className="thread-note-overflow-item"
+                          onClick={() => {
+                            setIsOverflowMenuOpen(false);
+                            handleToggleHistoryPanel();
+                          }}
+                          disabled={!hasRecoveryItems}
+                        >
+                          <HistoryIcon />
+                          <span>History</span>
+                        </button>
+                      ) : null}
+                      {!isFullScreenWorkspace ? (
+                        <button
+                          type="button"
+                          role="menuitem"
+                          className="thread-note-overflow-item"
+                          onClick={() => {
+                            setIsOverflowMenuOpen(false);
+                            dispatchThreadNoteCommand("setExpanded", {
+                              isExpanded: !isExpanded,
+                            });
+                          }}
+                        >
+                          <ExpandIcon expanded={isExpanded} />
+                          <span>{isExpanded ? "Collapse note" : "Expand note"}</span>
+                        </button>
+                      ) : null}
+                    </div>
+                  ) : null}
+                </div>
               </div>
             </div>
           </div>
 
-          {!isFullScreenWorkspace ? utilityControls : null}
+          {!isFullScreenWorkspace ? (
+            <div className="thread-note-meta-row">
+              {statusLabel ? <span className="thread-note-status">{statusLabel}</span> : null}
+              {utilityControls}
+            </div>
+          ) : null}
         </div>
-
-        {!isNotesWorkspace ? linkedNotesPanel : null}
 
         <div
           className={[
@@ -3730,6 +7784,26 @@ function ThreadNoteDrawerOpenContent({
             .filter(Boolean)
             .join(" ")}
         >
+          <input
+            ref={imageInputRef}
+            type="file"
+            accept="image/png,image/jpeg,image/gif,image/webp,image/tiff,.tif,.tiff"
+            multiple
+            style={{
+              position: "absolute",
+              inset: "auto",
+              top: 0,
+              left: 0,
+              width: 0,
+              height: 0,
+              opacity: 0,
+              pointerEvents: "none",
+              overflow: "hidden",
+            }}
+            aria-hidden="true"
+            tabIndex={-1}
+            onChange={handleImageInputChange}
+          />
           {historyPanel}
           {!hasAnyNotes ? (
             <div className="thread-note-empty-shell">
@@ -3763,106 +7837,214 @@ function ThreadNoteDrawerOpenContent({
             <div
               className={[
                 "thread-note-workspace",
+                showsPreviewPane && showsEditorPane ? "is-split" : "",
                 isNotesWorkspace ? "is-notes-workspace" : "",
               ]
                 .filter(Boolean)
                 .join(" ")}
             >
-              <div className="thread-note-editor-shell">
-                {showChartDraftStatusCard ? (
-                  <div className="thread-note-ai-status-card">
-                    <div className="thread-note-ai-status-copy">
-                      <strong>{chartDraftStatusTitle}</strong>
-                      <span>{chartDraftStatusDetail}</span>
-                    </div>
-                    <div className="thread-note-ai-status-actions">
-                      <button
-                        type="button"
-                        className="oa-button"
-                        onClick={reopenChartDraftModal}
-                      >
-                        Open chart
-                      </button>
-                      {aiDraftPreview ? (
+              {showsEditorPane ? (
+                <div className="thread-note-editor-shell">
+                  {showChartDraftStatusCard ? (
+                    <div className="thread-note-ai-status-card">
+                      <div className="thread-note-ai-status-copy">
+                        <strong>{chartDraftStatusTitle}</strong>
+                        <span>{chartDraftStatusDetail}</span>
+                      </div>
+                      <div className="thread-note-ai-status-actions">
                         <button
                           type="button"
                           className="oa-button"
-                          onClick={discardChartDraft}
+                          onClick={reopenChartDraftModal}
                         >
-                          Discard
+                          Open chart
                         </button>
-                      ) : null}
+                        {aiDraftPreview ? (
+                          <button
+                            type="button"
+                            className="oa-button"
+                            onClick={discardChartDraft}
+                          >
+                            Discard
+                          </button>
+                        ) : null}
+                      </div>
                     </div>
-                  </div>
-                ) : null}
+                  ) : null}
 
-                {isInTable && editor ? (
-                  <div className="thread-note-table-toolbar">
-                    <button
-                      className="thread-note-table-action"
-                      type="button"
-                      disabled={!editor.can().addRowAfter()}
-                      onMouseDown={(event) => {
-                        event.preventDefault();
-                        runTableCommand((activeEditor) =>
-                          activeEditor.chain().focus().addRowAfter().run()
-                        );
-                      }}
-                    >
-                      + Row
-                    </button>
-                    <button
-                      className="thread-note-table-action"
-                      type="button"
-                      disabled={!editor.can().addColumnAfter()}
-                      onMouseDown={(event) => {
-                        event.preventDefault();
-                        runTableCommand((activeEditor) =>
-                          activeEditor.chain().focus().addColumnAfter().run()
-                        );
-                      }}
-                    >
-                      + Column
-                    </button>
-                    <button
-                      className="thread-note-table-action"
-                      type="button"
-                      disabled={!editor.can().deleteRow()}
-                      onMouseDown={(event) => {
-                        event.preventDefault();
-                        runTableCommand((activeEditor) =>
-                          activeEditor.chain().focus().deleteRow().run()
-                        );
-                      }}
-                    >
-                      Delete Row
-                    </button>
-                    <button
-                      className="thread-note-table-action"
-                      type="button"
-                      disabled={!editor.can().deleteColumn()}
-                      onMouseDown={(event) => {
-                        event.preventDefault();
-                        runTableCommand((activeEditor) =>
-                          activeEditor.chain().focus().deleteColumn().run()
-                        );
-                      }}
-                    >
-                      Delete Column
-                    </button>
-                  </div>
-                ) : null}
+                  {isRichEditorMode && selectedImage && isImageInspectorOpen ? (
+                    <div className="thread-note-image-toolbar">
+                      <button
+                        type="button"
+                        className="thread-note-image-toolbar-close"
+                        onClick={() => setIsImageInspectorOpen(false)}
+                        aria-label="Close image details"
+                        title="Close"
+                      >
+                        ×
+                      </button>
+                      <div className="thread-note-image-toolbar-copy">
+                        <strong>Image details</strong>
+                      </div>
+                      <label className="thread-note-image-field">
+                        <span>Caption</span>
+                        <input
+                          type="text"
+                          value={selectedImage.title}
+                          placeholder="Optional caption"
+                          onChange={(event) =>
+                            updateSelectedImageNode({ title: event.target.value })
+                          }
+                        />
+                      </label>
+                      <label className="thread-note-image-field">
+                        <span>Alt text</span>
+                        <input
+                          type="text"
+                          value={selectedImage.alt}
+                          placeholder="Describe this image"
+                          onChange={(event) =>
+                            updateSelectedImageNode({ alt: event.target.value })
+                          }
+                        />
+                      </label>
+                      <label className="thread-note-image-field thread-note-image-field--width">
+                        <span>Width</span>
+                        <input
+                          type="number"
+                          min={160}
+                          max={1280}
+                          step={10}
+                          value={selectedImage.width ?? ""}
+                          placeholder="Auto"
+                          onChange={(event) =>
+                            updateSelectedImageNode({
+                              width:
+                                event.target.value.trim().length > 0
+                                  ? Number.parseInt(event.target.value, 10)
+                                  : null,
+                            })
+                          }
+                        />
+                      </label>
+                      <button
+                        type="button"
+                        className="thread-note-image-remove-button"
+                        onClick={handleRemoveSelectedImage}
+                      >
+                        Remove image
+                      </button>
+                    </div>
+                  ) : null}
 
-                <div ref={editorBodyRef} className="thread-note-editor-body">
-                  {editor ? (
-                    <EditorContent editor={editor} className="thread-note-editor-content" />
-                  ) : (
-                    <div className="thread-note-editor-loading">{placeholderText}</div>
-                  )}
+                  {isRichEditorMode && isInTable && editor ? (
+                    <div className="thread-note-table-toolbar">
+                      <button
+                        className="thread-note-table-action"
+                        type="button"
+                        disabled={!editor.can().addRowAfter()}
+                        onMouseDown={(event) => {
+                          event.preventDefault();
+                          runTableCommand((activeEditor) =>
+                            activeEditor.chain().focus().addRowAfter().run()
+                          );
+                        }}
+                      >
+                        + Row
+                      </button>
+                      <button
+                        className="thread-note-table-action"
+                        type="button"
+                        disabled={!editor.can().addColumnAfter()}
+                        onMouseDown={(event) => {
+                          event.preventDefault();
+                          runTableCommand((activeEditor) =>
+                            activeEditor.chain().focus().addColumnAfter().run()
+                          );
+                        }}
+                      >
+                        + Column
+                      </button>
+                      <button
+                        className="thread-note-table-action"
+                        type="button"
+                        disabled={!editor.can().deleteRow()}
+                        onMouseDown={(event) => {
+                          event.preventDefault();
+                          runTableCommand((activeEditor) =>
+                            activeEditor.chain().focus().deleteRow().run()
+                          );
+                        }}
+                      >
+                        Delete Row
+                      </button>
+                      <button
+                        className="thread-note-table-action"
+                        type="button"
+                        disabled={!editor.can().deleteColumn()}
+                        onMouseDown={(event) => {
+                          event.preventDefault();
+                          runTableCommand((activeEditor) =>
+                            activeEditor.chain().focus().deleteColumn().run()
+                          );
+                        }}
+                      >
+                        Delete Column
+                      </button>
+                    </div>
+                  ) : null}
+
+                  <div ref={editorBodyRef} className="thread-note-editor-body">
+                    {isRichEditorMode ? (
+                      editor ? (
+                        <EditorContent editor={editor} className="thread-note-editor-content" />
+                      ) : (
+                        <div className="thread-note-editor-loading">{placeholderText}</div>
+                      )
+                    ) : (
+                      <textarea
+                        ref={rawMarkdownTextareaRef}
+                        className="thread-note-raw-markdown"
+                        value={draftText}
+                        placeholder={placeholderText}
+                        onChange={handleRawMarkdownChange}
+                        onSelect={handleRawMarkdownSelect}
+                        onClick={handleRawMarkdownSelect}
+                        onKeyDown={handleRawMarkdownKeyDown}
+                        onKeyUp={handleRawMarkdownSelect}
+                        onPaste={handleRawMarkdownPaste}
+                        onBlur={handleRawMarkdownBlur}
+                        spellCheck={false}
+                      />
+                    )}
+                  </div>
                 </div>
-              </div>
-              {isNotesWorkspace && linkedNotesPanel ? (
-                <aside className="thread-note-notes-float">{linkedNotesPanel}</aside>
+              ) : null}
+
+              {showsPreviewPane ? (
+                <div className="thread-note-preview-shell">
+                  <div className="thread-note-preview-header">
+                    <span>{isSplitMode ? "Live preview" : "Note preview"}</span>
+                    <span className="thread-note-preview-badge">
+                      {isSplitMode ? "Preview" : "Read"}
+                    </span>
+                  </div>
+                  <div className="thread-note-preview-surface">
+                    {draftText.trim() ? (
+                      <div className="assistant-markdown-shell oa-markdown-surface thread-note-summary-preview">
+                        <MarkdownContent
+                          markdown={draftText}
+                          mermaidDisplayMode="noteCompact"
+                          onMermaidRenderErrorChange={setChartRenderError}
+                        />
+                      </div>
+                    ) : (
+                      <div className="thread-note-preview-empty">
+                        This note is empty right now.
+                      </div>
+                    )}
+                  </div>
+                </div>
               ) : null}
             </div>
           )}
@@ -3951,6 +8133,9 @@ function ThreadNoteDrawerOpenContent({
                     <MarkdownContent
                       markdown={aiDraftPreview.markdown}
                       mermaidDisplayMode="noteCompact"
+                      onMermaidRenderErrorChange={
+                        isChartDraft ? setChartRenderError : undefined
+                      }
                     />
                   </div>
                 )}
@@ -4032,10 +8217,20 @@ function ThreadNoteDrawerOpenContent({
                       <button
                         type="button"
                         className="oa-button"
-                        disabled={isAIDraftBusy || !chartDraftInstruction}
+                        disabled={isAIDraftBusy}
                         onClick={handleRegenerateChartDraft}
                       >
                         {isAIDraftBusy ? "Working..." : chartRegenerateButtonLabel}
+                      </button>
+                    ) : null}
+                    {aiDraftPreview && hasChartRenderError ? (
+                      <button
+                        type="button"
+                        className="oa-button"
+                        disabled={isAIDraftBusy}
+                        onClick={handleRepairChartDraft}
+                      >
+                        {isAIDraftBusy ? "Working..." : "Fix Diagram Error"}
                       </button>
                     ) : null}
                     {aiDraftPreview ? (
@@ -4043,7 +8238,9 @@ function ThreadNoteDrawerOpenContent({
                         type="button"
                         className="oa-button"
                         disabled={
-                          isAIDraftBusy || activeAIDraftSourceKind !== "selection"
+                          isAIDraftBusy ||
+                          hasChartRenderError ||
+                          activeAIDraftSourceKind !== "selection"
                         }
                         onClick={() => handleAddChartDraftToNote("insertBelowSelection")}
                       >
@@ -4054,7 +8251,7 @@ function ThreadNoteDrawerOpenContent({
                       <button
                         type="button"
                         className="oa-button oa-button--primary"
-                        disabled={isAIDraftBusy}
+                        disabled={isAIDraftBusy || hasChartRenderError}
                         onClick={() => handleAddChartDraftToNote("appendBottom")}
                       >
                         Add to Note
@@ -4130,6 +8327,942 @@ function ThreadNoteDrawerOpenContent({
                     </button>
                   </>
                 )}
+              </div>
+            </div>
+          </div>
+        ) : null}
+
+        {projectNoteTransfer ? (
+          <div
+            className="thread-note-dialog-layer"
+            onClick={
+              projectNoteTransfer.isApplying ? undefined : handleCloseProjectNoteTransfer
+            }
+          >
+            <div
+              className="thread-note-dialog thread-note-project-transfer-modal"
+              onClick={(event) => event.stopPropagation()}
+            >
+              <div className="thread-note-dialog-header">
+                <div className="thread-note-dialog-copy">
+                  <h2>Send to project note</h2>
+                  <p>
+                    {projectNoteTransfer.step === "picker"
+                      ? "Pick which shared project note should receive this selected thread-note content."
+                      : "Review the AI placement suggestion before the app copies or moves the content."}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  className="thread-note-icon-button thread-note-dialog-close"
+                  onClick={handleCloseProjectNoteTransfer}
+                  disabled={projectNoteTransfer.isApplying}
+                  aria-label="Close project note transfer"
+                >
+                  ×
+                </button>
+              </div>
+              <div className="thread-note-dialog-body thread-note-project-transfer-body">
+                <div className="thread-note-project-transfer-mode-toggle">
+                  <button
+                    type="button"
+                    className={[
+                      "thread-note-project-transfer-mode-button",
+                      projectNoteTransfer.transferMode === "copy" ? "is-active" : "",
+                    ]
+                      .filter(Boolean)
+                      .join(" ")}
+                    disabled={projectNoteTransfer.isApplying}
+                    onClick={() =>
+                      setProjectNoteTransfer((current) =>
+                        current
+                          ? {
+                              ...current,
+                              transferMode: "copy",
+                            }
+                          : current
+                      )
+                    }
+                  >
+                    Copy
+                  </button>
+                  <button
+                    type="button"
+                    className={[
+                      "thread-note-project-transfer-mode-button",
+                      projectNoteTransfer.transferMode === "move" ? "is-active" : "",
+                    ]
+                      .filter(Boolean)
+                      .join(" ")}
+                    disabled={projectNoteTransfer.isApplying}
+                    onClick={() =>
+                      setProjectNoteTransfer((current) =>
+                        current
+                          ? {
+                              ...current,
+                              transferMode: "move",
+                            }
+                          : current
+                      )
+                    }
+                  >
+                    Move
+                  </button>
+                </div>
+                <div className="thread-note-project-transfer-selection">
+                  <span className="thread-note-project-transfer-selection-label">
+                    Selected content
+                  </span>
+                  <div className="thread-note-project-transfer-selection-preview">
+                    {truncateContextMenuPreview(projectNoteTransfer.selectedText)}
+                  </div>
+                </div>
+                {projectNoteTransfer.step === "picker" ? (
+                  projectNoteTransferTargets.length > 0 ? (
+                    <div className="thread-note-project-transfer-list">
+                      {projectNoteTransferTargets.map((targetNote) => (
+                        <button
+                          key={`${targetNote.ownerId}:${targetNote.id}`}
+                          type="button"
+                          className={[
+                            "thread-note-project-transfer-target",
+                            projectNoteTransfer.targetNoteId === targetNote.id
+                              ? "is-selected"
+                              : "",
+                          ]
+                            .filter(Boolean)
+                            .join(" ")}
+                          onClick={() => handleChooseProjectTransferTarget(targetNote.id)}
+                        >
+                          <span className="thread-note-project-transfer-target-copy">
+                            <strong>{normalizeThreadNoteTitle(targetNote.title)}</strong>
+                            <span>
+                              {targetNote.updatedAtLabel
+                                ? `Updated ${targetNote.updatedAtLabel}`
+                                : "No saved timestamp yet"}
+                            </span>
+                          </span>
+                          <span className="thread-note-project-transfer-target-action">
+                            Preview
+                          </span>
+                        </button>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="thread-note-project-transfer-empty">
+                      <strong>No project notes yet</strong>
+                      <p>
+                        Open this project&apos;s shared notes first, then create a project note
+                        there.
+                      </p>
+                      <button
+                        type="button"
+                        className="oa-button oa-button--primary"
+                        onClick={() => {
+                          dispatchThreadNoteCommand("openProjectNotes", {
+                            targetProjectId: projectNoteTransfer.targetProjectId,
+                            ownerKind: "project",
+                            ownerId: projectNoteTransfer.targetProjectId,
+                          });
+                          setProjectNoteTransfer(null);
+                        }}
+                      >
+                        Open project notes
+                      </button>
+                    </div>
+                  )
+                ) : !projectNoteTransferPreview || isProjectTransferBusy ? (
+                  <div className="thread-note-ai-loading">
+                    <div className="thread-note-ai-loading-spinner" aria-hidden="true" />
+                    <div className="thread-note-ai-loading-copy">
+                      AI is choosing the best section in the project note and preparing the
+                      inserted markdown.
+                    </div>
+                  </div>
+                ) : (
+                  <div className="thread-note-project-transfer-preview">
+                    <div className="thread-note-project-transfer-summary-card">
+                      <div className="thread-note-project-transfer-summary-row">
+                        <span>Target note</span>
+                        <strong>
+                          {projectNoteTransferPreview.targetNoteTitle ||
+                            selectedProjectTransferTarget?.title ||
+                            "Project note"}
+                        </strong>
+                      </div>
+                      <div className="thread-note-project-transfer-summary-row">
+                        <span>Suggested place</span>
+                        <strong>{projectTransferSuggestionLabel}</strong>
+                      </div>
+                      <div className="thread-note-project-transfer-summary-row">
+                        <span>Mode</span>
+                        <strong>
+                          {projectNoteTransfer.transferMode === "move"
+                            ? "Move from thread note"
+                            : "Copy from thread note"}
+                        </strong>
+                      </div>
+                    </div>
+                    {projectNoteTransferPreview.warningMessage ? (
+                      <div className="thread-note-project-transfer-warning">
+                        {projectNoteTransferPreview.warningMessage}
+                      </div>
+                    ) : null}
+                    {projectNoteTransferPreview.isError ? (
+                      <div className="thread-note-summary-error">
+                        {projectNoteTransferPreview.reason}
+                      </div>
+                    ) : (
+                      <>
+                        <div className="thread-note-project-transfer-reason">
+                          {projectNoteTransferPreview.reason}
+                        </div>
+                        <div className="assistant-markdown-shell oa-markdown-surface thread-note-summary-preview">
+                          <MarkdownContent
+                            markdown={projectNoteTransferPreview.insertedMarkdown}
+                            mermaidDisplayMode="noteCompact"
+                          />
+                        </div>
+                      </>
+                    )}
+                  </div>
+                )}
+              </div>
+              <div className="thread-note-dialog-footer">
+                {projectNoteTransfer.step === "picker" ? (
+                  <button
+                    type="button"
+                    className="oa-button"
+                    onClick={handleCloseProjectNoteTransfer}
+                  >
+                    Cancel
+                  </button>
+                ) : projectNoteTransferPreview?.isError ? (
+                  <>
+                    <button
+                      type="button"
+                      className="oa-button"
+                      disabled={projectNoteTransfer.isApplying}
+                      onClick={handleBackToProjectTransferPicker}
+                    >
+                      Back
+                    </button>
+                    <button
+                      type="button"
+                      className="oa-button"
+                      disabled={projectNoteTransfer.isApplying}
+                      onClick={handleCloseProjectNoteTransfer}
+                    >
+                      Close
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <button
+                      type="button"
+                      className="oa-button"
+                      disabled={projectNoteTransfer.isApplying}
+                      onClick={handleBackToProjectTransferPicker}
+                    >
+                      Change note
+                    </button>
+                    <button
+                      type="button"
+                      className="oa-button"
+                      disabled={projectNoteTransfer.isApplying}
+                      onClick={handleCloseProjectNoteTransfer}
+                    >
+                      Cancel
+                    </button>
+                    {canApplyProjectTransferSuggestion ? (
+                      <button
+                        type="button"
+                        className="oa-button"
+                        disabled={projectNoteTransfer.isApplying}
+                        onClick={() => handleApplyProjectNoteTransfer("suggested")}
+                      >
+                        {projectNoteTransfer.isApplying ? "Working..." : "Use suggestion"}
+                      </button>
+                    ) : null}
+                    <button
+                      type="button"
+                      className="oa-button oa-button--primary"
+                      disabled={projectNoteTransfer.isApplying}
+                      onClick={() => handleApplyProjectNoteTransfer("end")}
+                    >
+                      {projectNoteTransfer.isApplying
+                        ? "Working..."
+                        : canApplyProjectTransferSuggestion
+                        ? "Add at end instead"
+                        : "Add at end"}
+                    </button>
+                  </>
+                )}
+              </div>
+            </div>
+          </div>
+        ) : null}
+
+        {linkedNotesPanel}
+
+        {isBatchOrganizerOpen && isNotesWorkspace && state?.workspaceProjectId ? (
+          <div className="thread-note-dialog-layer" onClick={handleCloseBatchOrganizer}>
+            <div
+              className="thread-note-dialog thread-note-batch-organizer-modal"
+              onClick={(event) => event.stopPropagation()}
+            >
+              <div className="thread-note-dialog-header">
+                <div className="thread-note-dialog-copy">
+                  <h2>Batch AI note organizer</h2>
+                  <p>
+                    Pick project and thread notes, let AI propose a clean note set, then review
+                    every new note and link before anything is saved.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  className="thread-note-icon-button thread-note-dialog-close"
+                  onClick={handleCloseBatchOrganizer}
+                  aria-label="Close batch note organizer"
+                >
+                  ×
+                </button>
+              </div>
+              <div className="thread-note-dialog-body thread-note-batch-organizer-body">
+                {batchOrganizerWarnings.length > 0 ? (
+                  <div
+                    className={[
+                      "thread-note-batch-organizer-warning-list",
+                      batchNotePlanPreview?.isError ? "is-error" : "",
+                    ]
+                      .filter(Boolean)
+                      .join(" ")}
+                  >
+                    {batchOrganizerWarnings.map((warning, index) => (
+                      <div key={`${warning}-${index}`}>{warning}</div>
+                    ))}
+                  </div>
+                ) : null}
+
+                {batchOrganizerStep === "select" ? (
+                  <>
+                    <div className="thread-note-batch-organizer-toolbar">
+                      <div className="thread-note-selector-search-shell thread-note-batch-organizer-search-shell">
+                        <input
+                          type="text"
+                          className="thread-note-selector-search"
+                          value={batchOrganizerSearch}
+                          onChange={(event) => setBatchOrganizerSearch(event.target.value)}
+                          placeholder="Search project and thread notes"
+                          aria-label="Search selected note sources"
+                        />
+                      </div>
+                      <div className="thread-note-batch-organizer-toolbar-actions">
+                        <button
+                          type="button"
+                          className="oa-button"
+                          onClick={handleSelectAllVisibleBatchSources}
+                        >
+                          Pick visible
+                        </button>
+                        <button
+                          type="button"
+                          className="oa-button"
+                          disabled={!batchOrganizerSelectedSourceKeys.length}
+                          onClick={handleClearBatchSourceSelection}
+                        >
+                          Clear
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="thread-note-batch-organizer-selection-summary">
+                      <strong>
+                        {batchOrganizerSelectedSourceKeys.length} source
+                        {batchOrganizerSelectedSourceKeys.length === 1 ? "" : "s"} selected
+                      </strong>
+                      <div className="thread-note-batch-organizer-chip-row">
+                        {batchOrganizerSelectedSourceNotes.length > 0 ? (
+                          batchOrganizerSelectedSourceNotes.map((note) => (
+                            <button
+                              key={`selected-source-${batchSourceSelectionKeyForNote(note)}`}
+                              type="button"
+                              className="thread-note-batch-organizer-chip"
+                              onClick={() =>
+                                setBatchOrganizerSourcePreviewKey(
+                                  batchSourceSelectionKeyForNote(note)
+                                )
+                              }
+                            >
+                              <span>{normalizeThreadNoteTitle(note.title)}</span>
+                              <span>{note.sourceLabel}</span>
+                            </button>
+                          ))
+                        ) : (
+                          <span className="thread-note-batch-organizer-empty-inline">
+                            Pick at least one note to start.
+                          </span>
+                        )}
+                      </div>
+                    </div>
+
+                    <div className="thread-note-batch-organizer-selection-layout">
+                      <div className="thread-note-batch-organizer-source-panel">
+                        {batchOrganizerSections.some(
+                          (section) =>
+                            section.visibleNotes.length > 0 ||
+                            (!normalizedBatchOrganizerSearch && section.allNotes.length === 0)
+                        ) ? (
+                          batchOrganizerSections.map((section) => (
+                            <div
+                              key={`batch-source-${noteSourceKey(section.source.ownerKind, section.source.ownerId)}`}
+                              className="thread-note-batch-organizer-source-group"
+                            >
+                              <div className="thread-note-selector-section-header">
+                                <span>{noteSourceSectionLabel(section.source)}</span>
+                                <span>{section.allNotes.length}</span>
+                              </div>
+                              {section.visibleNotes.map((note) => {
+                                const selectionKey = batchSourceSelectionKeyForNote(note);
+                                const isSelected =
+                                  batchOrganizerSelectedSourceKeys.includes(selectionKey);
+                                return (
+                                  <label
+                                    key={`batch-source-note-${selectionKey}`}
+                                    className={[
+                                      "thread-note-batch-organizer-source-row",
+                                      isSelected ? "is-selected" : "",
+                                    ]
+                                      .filter(Boolean)
+                                      .join(" ")}
+                                  >
+                                    <input
+                                      type="checkbox"
+                                      checked={isSelected}
+                                      onChange={() => handleToggleBatchOrganizerSource(note)}
+                                    />
+                                    <span className="thread-note-batch-organizer-source-copy">
+                                      <strong>{normalizeThreadNoteTitle(note.title)}</strong>
+                                      <span>
+                                        {note.updatedAtLabel
+                                          ? `Updated ${note.updatedAtLabel}`
+                                          : note.sourceLabel}
+                                      </span>
+                                    </span>
+                                    <span className="thread-note-batch-organizer-type-pill">
+                                      {noteTypeLabel(note.noteType)}
+                                    </span>
+                                  </label>
+                                );
+                              })}
+                              {!normalizedBatchOrganizerSearch &&
+                              section.visibleNotes.length === 0 &&
+                              section.allNotes.length === 0 ? (
+                                <div className="thread-note-batch-organizer-empty-block">
+                                  No notes in this source yet.
+                                </div>
+                              ) : null}
+                            </div>
+                          ))
+                        ) : (
+                          <div className="thread-note-selector-empty">
+                            No notes match "{batchOrganizerSearch.trim()}".
+                          </div>
+                        )}
+                      </div>
+
+                      <aside className="thread-note-batch-organizer-selection-side">
+                        <div className="thread-note-batch-organizer-pane-header">
+                          <strong>Selected sources</strong>
+                          <span>{batchOrganizerSelectedSourceNotes.length}</span>
+                        </div>
+                        {batchOrganizerSelectedSourceNotes.length > 0 ? (
+                          <div className="thread-note-batch-organizer-selected-list">
+                            {batchOrganizerSelectedSourceNotes.map((note) => (
+                              <button
+                                key={`batch-selected-${batchSourceSelectionKeyForNote(note)}`}
+                                type="button"
+                                className={[
+                                  "thread-note-batch-organizer-selected-card",
+                                  batchOrganizerSourcePreviewKey ===
+                                  batchSourceSelectionKeyForNote(note)
+                                    ? "is-active"
+                                    : "",
+                                ]
+                                  .filter(Boolean)
+                                  .join(" ")}
+                                onClick={() =>
+                                  setBatchOrganizerSourcePreviewKey(
+                                    batchSourceSelectionKeyForNote(note)
+                                  )
+                                }
+                              >
+                                <strong>{normalizeThreadNoteTitle(note.title)}</strong>
+                                <span>{note.sourceLabel}</span>
+                                <span>{noteTypeLabel(note.noteType)}</span>
+                              </button>
+                            ))}
+                          </div>
+                        ) : (
+                          <div className="thread-note-batch-organizer-empty-block">
+                            Use the checkboxes on the left to build the AI source set.
+                          </div>
+                        )}
+                      </aside>
+                    </div>
+                  </>
+                ) : !batchNotePlanPreview ? (
+                  <div className="thread-note-ai-loading thread-note-batch-organizer-loading">
+                    <div className="thread-note-ai-loading-spinner" aria-hidden="true" />
+                    <div className="thread-note-ai-loading-copy">
+                      AI is organizing the selected notes into a master note, child notes, and
+                      links.
+                    </div>
+                  </div>
+                ) : (
+                  <div className="thread-note-batch-organizer-preview-layout">
+                    <section className="thread-note-batch-organizer-pane">
+                      <div className="thread-note-batch-organizer-pane-header">
+                        <strong>Selected sources</strong>
+                        <span>{batchOrganizerSourceNotes.length}</span>
+                      </div>
+                      <div className="thread-note-batch-organizer-source-preview-list">
+                        {batchOrganizerSourceNotes.map((sourceNote) => {
+                          const sourceKey = batchSourceSelectionKeyForSourceNote(sourceNote);
+                          return (
+                            <button
+                              key={`batch-preview-source-${sourceKey}`}
+                              type="button"
+                              className={[
+                                "thread-note-batch-organizer-selected-card",
+                                batchOrganizerSourcePreview?.noteId === sourceNote.noteId &&
+                                batchOrganizerSourcePreview?.ownerId === sourceNote.ownerId
+                                  ? "is-active"
+                                  : "",
+                              ]
+                                .filter(Boolean)
+                                .join(" ")}
+                              onClick={() => setBatchOrganizerSourcePreviewKey(sourceKey)}
+                            >
+                              <strong>{normalizeThreadNoteTitle(sourceNote.title)}</strong>
+                              <span>{sourceNote.sourceLabel}</span>
+                              <span>{noteTypeLabel(sourceNote.noteType)}</span>
+                            </button>
+                          );
+                        })}
+                      </div>
+                      {batchOrganizerSourcePreview ? (
+                        <div className="thread-note-batch-organizer-preview-card">
+                          <div className="thread-note-batch-organizer-preview-card-header">
+                            <strong>{normalizeThreadNoteTitle(batchOrganizerSourcePreview.title)}</strong>
+                            <span>{batchOrganizerSourcePreview.sourceLabel}</span>
+                          </div>
+                          <div className="assistant-markdown-shell oa-markdown-surface thread-note-batch-organizer-markdown">
+                            <MarkdownContent
+                              markdown={batchOrganizerSourcePreview.markdown}
+                              mermaidDisplayMode="noteCompact"
+                            />
+                          </div>
+                        </div>
+                      ) : null}
+                    </section>
+
+                    <section className="thread-note-batch-organizer-pane">
+                      <div className="thread-note-batch-organizer-pane-header">
+                        <strong>Proposed notes</strong>
+                        <span>
+                          {batchOrganizerEditableNotes.filter((note) => note.accepted).length} kept
+                        </span>
+                      </div>
+                      <div className="thread-note-batch-organizer-note-list">
+                        {batchOrganizerEditableNotes.map((note) => (
+                          <article
+                            key={`batch-proposed-note-${note.tempId}`}
+                            className={[
+                              "thread-note-batch-organizer-note-card",
+                              batchOrganizerActiveNote?.tempId === note.tempId ? "is-active" : "",
+                              note.accepted ? "" : "is-muted",
+                            ]
+                              .filter(Boolean)
+                              .join(" ")}
+                          >
+                            <div className="thread-note-batch-organizer-note-card-top">
+                              <button
+                                type="button"
+                                className="thread-note-batch-organizer-preview-toggle"
+                                onClick={() => setBatchOrganizerActiveNoteTempId(note.tempId)}
+                              >
+                                Preview
+                              </button>
+                              <label className="thread-note-batch-organizer-keep-toggle">
+                                <input
+                                  type="checkbox"
+                                  checked={note.accepted}
+                                  onChange={() =>
+                                    handleToggleBatchOrganizerNoteAccepted(note.tempId)
+                                  }
+                                />
+                                <span>Keep</span>
+                              </label>
+                            </div>
+                            <label className="thread-note-batch-organizer-field">
+                              <span>Title</span>
+                              <input
+                                type="text"
+                                value={note.title}
+                                onChange={(event) =>
+                                  handleBatchOrganizerTitleChange(
+                                    note.tempId,
+                                    event.target.value
+                                  )
+                                }
+                              />
+                            </label>
+                            <label className="thread-note-batch-organizer-field">
+                              <span>Type</span>
+                              <select
+                                value={note.noteType}
+                                onChange={(event) =>
+                                  handleBatchOrganizerTypeChange(
+                                    note.tempId,
+                                    event.target.value
+                                  )
+                                }
+                              >
+                                {[
+                                  "master",
+                                  "note",
+                                  "decision",
+                                  "task",
+                                  "reference",
+                                  "question",
+                                ].map((noteType) => (
+                                  <option key={noteType} value={noteType}>
+                                    {noteTypeLabel(noteType)}
+                                  </option>
+                                ))}
+                              </select>
+                            </label>
+                            <div className="thread-note-batch-organizer-chip-row">
+                              {note.sourceNoteTargets.map((sourceTarget) => (
+                                <span
+                                  key={`${note.tempId}-${batchResolvedTargetKey(sourceTarget)}`}
+                                  className="thread-note-batch-organizer-chip is-source"
+                                >
+                                  {batchResolvedTargetLabel(sourceTarget)}
+                                </span>
+                              ))}
+                            </div>
+                          </article>
+                        ))}
+                      </div>
+                      {batchOrganizerActiveNote ? (
+                        <div className="thread-note-batch-organizer-preview-card">
+                          <div className="thread-note-batch-organizer-preview-card-header">
+                            <strong>{normalizeThreadNoteTitle(batchOrganizerActiveNote.title)}</strong>
+                            <span>{noteTypeLabel(batchOrganizerActiveNote.noteType)}</span>
+                          </div>
+                          <div className="assistant-markdown-shell oa-markdown-surface thread-note-batch-organizer-markdown">
+                            <MarkdownContent
+                              markdown={batchOrganizerActiveNote.markdown}
+                              mermaidDisplayMode="noteCompact"
+                            />
+                          </div>
+                        </div>
+                      ) : (
+                        <div className="thread-note-batch-organizer-empty-block">
+                          AI has not proposed any notes yet.
+                        </div>
+                      )}
+                    </section>
+
+                    <section className="thread-note-batch-organizer-pane">
+                      <div className="thread-note-batch-organizer-pane-header">
+                        <strong>Links and graph</strong>
+                        <span>
+                          {batchOrganizerEditableLinks.filter((link) => link.accepted).length} kept
+                        </span>
+                      </div>
+                      <div className="thread-note-batch-organizer-link-list">
+                        {batchOrganizerLinkRows.length > 0 ? (
+                          batchOrganizerLinkRows.map((link) => (
+                            <label
+                              key={`batch-link-${link.linkKey}`}
+                              className={[
+                                "thread-note-batch-organizer-link-row",
+                                link.accepted ? "" : "is-muted",
+                                link.isVisible ? "" : "is-hidden-link",
+                              ]
+                                .filter(Boolean)
+                                .join(" ")}
+                            >
+                              <input
+                                type="checkbox"
+                                checked={link.accepted}
+                                onChange={() =>
+                                  handleToggleBatchOrganizerLinkAccepted(link.linkKey)
+                                }
+                              />
+                              <span className="thread-note-batch-organizer-link-copy">
+                                <strong>{link.fromTitle}</strong>
+                                <span>links to {link.toTitle}</span>
+                              </span>
+                            </label>
+                          ))
+                        ) : (
+                          <div className="thread-note-batch-organizer-empty-block">
+                            AI has not proposed any links yet.
+                          </div>
+                        )}
+                      </div>
+
+                      <div className="thread-note-batch-organizer-preview-card thread-note-batch-organizer-graph-card">
+                        <div className="thread-note-batch-organizer-preview-card-header">
+                          <strong>Preview graph</strong>
+                          <span>
+                            {batchOrganizerGraph?.nodeCount ?? 0} nodes •{" "}
+                            {batchOrganizerGraph?.edgeCount ?? 0} links
+                          </span>
+                        </div>
+                        {batchOrganizerGraph ? (
+                          <MermaidDiagram
+                            code={batchOrganizerGraph.mermaidCode}
+                            showViewerHint={false}
+                            clickAction="none"
+                          />
+                        ) : (
+                          <div className="thread-note-batch-organizer-empty-block">
+                            Keep at least one proposed note to see the preview graph.
+                          </div>
+                        )}
+                      </div>
+                    </section>
+                  </div>
+                )}
+              </div>
+              <div className="thread-note-dialog-footer">
+                {batchOrganizerStep === "select" ? (
+                  <>
+                    <button
+                      type="button"
+                      className="oa-button"
+                      onClick={handleCloseBatchOrganizer}
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      type="button"
+                      className="oa-button oa-button--primary"
+                      disabled={!canRequestBatchPlanPreview}
+                      onClick={handleRequestBatchPlanPreview}
+                    >
+                      Generate preview
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <button
+                      type="button"
+                      className="oa-button"
+                      disabled={isBatchNotePlanBusy || batchOrganizerIsApplying}
+                      onClick={handleBackToBatchSourceSelection}
+                    >
+                      Change sources
+                    </button>
+                    <button
+                      type="button"
+                      className="oa-button"
+                      disabled={batchOrganizerIsApplying}
+                      onClick={handleCloseBatchOrganizer}
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      type="button"
+                      className="oa-button oa-button--primary"
+                      disabled={!canApplyBatchPlan}
+                      onClick={handleApplyBatchPlan}
+                    >
+                      {batchOrganizerIsApplying ? "Applying..." : "Create notes"}
+                    </button>
+                  </>
+                )}
+              </div>
+            </div>
+          </div>
+        ) : null}
+
+        {screenshotImportState ? (
+          <div className="thread-note-dialog-layer" onClick={handleCloseScreenshotImport}>
+            <div
+              className="thread-note-dialog thread-note-screenshot-import-modal"
+              onClick={(event) => event.stopPropagation()}
+            >
+              <div className="thread-note-dialog-header">
+                <div className="thread-note-dialog-copy">
+                  <h2>Import screenshot</h2>
+                </div>
+                <button
+                  type="button"
+                  className="thread-note-icon-button thread-note-dialog-close"
+                  onClick={handleCloseScreenshotImport}
+                  aria-label="Close screenshot import"
+                >
+                  ×
+                </button>
+              </div>
+              <div className="thread-note-dialog-body thread-note-screenshot-import-body">
+                <div className="thread-note-screenshot-toolbar">
+                  {screenshotImportState.capture.dataUrl ? (
+                    <div className="thread-note-screenshot-capture-chip">
+                      <div className="thread-note-screenshot-capture-thumb">
+                        <img
+                          src={screenshotImportState.capture.dataUrl}
+                          alt="Captured screenshot preview"
+                          className="thread-note-screenshot-capture-thumb-image"
+                        />
+                      </div>
+                      <div className="thread-note-screenshot-capture-meta">
+                        <strong>Capture</strong>
+                        <span>
+                          {screenshotImportState.capture.filename?.trim() || "Selected area"}
+                        </span>
+                      </div>
+                    </div>
+                  ) : null}
+
+                  <div className="thread-note-screenshot-mode-stack">
+                    <div className="thread-note-screenshot-meta-row">
+                      <span className="thread-note-screenshot-mini-label">Mode</span>
+                      {activeScreenshotModeOption ? (
+                        <span className="thread-note-screenshot-mode-note">
+                          {activeScreenshotModeOption.description}
+                        </span>
+                      ) : null}
+                    </div>
+                    <div
+                      className="thread-note-screenshot-mode-grid"
+                      role="radiogroup"
+                      aria-label="Output mode"
+                    >
+                      {THREAD_NOTE_SCREENSHOT_MODE_OPTIONS.map((option) => (
+                        <button
+                          key={option.value}
+                          type="button"
+                          role="radio"
+                          aria-checked={screenshotImportState.outputMode === option.value}
+                          className={[
+                            "thread-note-screenshot-mode-card",
+                            screenshotImportState.outputMode === option.value ? "is-active" : "",
+                          ]
+                            .filter(Boolean)
+                            .join(" ")}
+                          onClick={() =>
+                            setScreenshotImportState((current) =>
+                              current
+                                ? {
+                                    ...current,
+                                    outputMode: option.value,
+                                    processed: null,
+                                    error: null,
+                                  }
+                                : current
+                            )
+                          }
+                        >
+                          <strong>{option.label}</strong>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+
+                {screenshotImportState.outputMode !== "rawOCR" ? (
+                  <label className="thread-note-screenshot-field">
+                    <span>Instruction</span>
+                    <textarea
+                      value={screenshotImportState.customInstruction}
+                      onChange={(event) =>
+                        setScreenshotImportState((current) =>
+                          current
+                            ? {
+                                ...current,
+                                customInstruction: event.target.value,
+                                processed: null,
+                                error: null,
+                              }
+                            : current
+                        )
+                      }
+                      placeholder="Optional: bullet points, checklist, meeting notes"
+                      rows={2}
+                    />
+                  </label>
+                ) : null}
+
+                {screenshotImportState.isProcessing ? (
+                  <div className="thread-note-screenshot-status-card">
+                    Preparing preview...
+                  </div>
+                ) : null}
+
+                {screenshotImportState.error ? (
+                  <div className="thread-note-screenshot-status-card is-error">
+                    {screenshotImportState.error}
+                  </div>
+                ) : null}
+
+                {screenshotImportState.processed?.ok ? (
+                  <div className="thread-note-screenshot-result-shell">
+                    <div className="thread-note-screenshot-result-meta">
+                      <strong>Preview</strong>
+                      <span>
+                        {screenshotImportState.processed.usedVision
+                          ? "Vision + OCR"
+                          : "OCR only"}
+                      </span>
+                    </div>
+                    {screenshotImportState.outputMode === "rawOCR" ? (
+                      <pre className="thread-note-screenshot-raw-preview">
+                        {screenshotImportState.processed.rawText ||
+                          screenshotImportState.processed.markdown ||
+                          ""}
+                      </pre>
+                    ) : (
+                      <div className="thread-note-screenshot-markdown-preview">
+                        <MarkdownContent
+                          markdown={screenshotImportState.processed.markdown ?? ""}
+                          mermaidDisplayMode="noteCompact"
+                        />
+                      </div>
+                    )}
+                  </div>
+                ) : null}
+              </div>
+              <div className="thread-note-dialog-footer">
+                <button type="button" className="oa-button" onClick={handleCloseScreenshotImport}>
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  className="oa-button"
+                  disabled={screenshotImportState.isProcessing}
+                  onClick={() => {
+                    void handleGenerateScreenshotImportPreview();
+                  }}
+                >
+                  {screenshotImportState.processed?.ok ? "Preview again" : "Preview"}
+                </button>
+                <button
+                  type="button"
+                  className="oa-button oa-button--primary"
+                  disabled={!screenshotImportState.processed?.ok || screenshotImportState.isProcessing}
+                  onClick={() => {
+                    void handleApplyScreenshotImport();
+                  }}
+                >
+                  Insert into note
+                </button>
               </div>
             </div>
           </div>
@@ -4288,7 +9421,7 @@ function ThreadNoteDrawerOpenContent({
                           key={`link-${noteSourceKey(section.source.ownerKind, section.source.ownerId)}`}
                         >
                           <div className="thread-note-selector-section-header">
-                            <span>{section.source.sourceLabel}</span>
+                            <span>{noteSourceSectionLabel(section.source)}</span>
                             <span>{section.allNotes.length}</span>
                           </div>
                           {section.visibleNotes.map((note) => (
@@ -4535,6 +9668,50 @@ function ThreadNoteDrawerOpenContent({
                     <span>Italic selected words</span>
                   </span>
                 </button>
+                {canIndentBlockFromMenu || canOutdentBlockFromMenu ? (
+                  <div className="oa-react-context-menu__separator" />
+                ) : null}
+                {canIndentBlockFromMenu ? (
+                  <button
+                    type="button"
+                    className="oa-react-context-menu__item"
+                    onClick={handleIndentBlockFromMenu}
+                  >
+                    <span className="oa-react-context-menu__item-main">
+                      <span className="oa-react-context-menu__item-icon" aria-hidden="true">
+                        <IndentIcon />
+                      </span>
+                      <span>Indent selected block</span>
+                    </span>
+                  </button>
+                ) : null}
+                {canOutdentBlockFromMenu ? (
+                  <button
+                    type="button"
+                    className="oa-react-context-menu__item"
+                    onClick={handleOutdentBlockFromMenu}
+                  >
+                    <span className="oa-react-context-menu__item-main">
+                      <span className="oa-react-context-menu__item-icon" aria-hidden="true">
+                        <OutdentIcon />
+                      </span>
+                      <span>Outdent selected block</span>
+                    </span>
+                  </button>
+                ) : null}
+                <div className="oa-react-context-menu__separator" />
+                <button
+                  type="button"
+                  className="oa-react-context-menu__item"
+                  onClick={handleMakeSelectionCollapsibleFromMenu}
+                >
+                  <span className="oa-react-context-menu__item-main">
+                    <span className="oa-react-context-menu__item-icon" aria-hidden="true">
+                      <SectionToggleIcon />
+                    </span>
+                    <span>Make collapsible section</span>
+                  </span>
+                </button>
               </>
             ) : null}
             {noteContextMenuLayer === "format" &&
@@ -4553,8 +9730,10 @@ function ThreadNoteDrawerOpenContent({
               </button>
             ) : null}
             {noteContextMenuLayer === "format" &&
+            noteContextMenu.sourceKind === "line" &&
             typeof noteContextMenu.lineSelectionPos === "number" &&
-            isHeadingLineTag(noteContextMenu.lineTag) ? (
+            isHeadingLineTag(noteContextMenu.lineTag) &&
+            noteContextMenu.lineHeadingCollapsible === true ? (
               <button
                 type="button"
                 className="oa-react-context-menu__item"
@@ -4564,11 +9743,7 @@ function ThreadNoteDrawerOpenContent({
                   <span className="oa-react-context-menu__item-icon" aria-hidden="true">
                     <SectionToggleIcon />
                   </span>
-                  <span>
-                    {noteContextMenu.lineHeadingCollapsible === false
-                      ? "Make collapsible section"
-                      : "Make regular heading"}
-                  </span>
+                  <span>Make regular heading</span>
                 </span>
               </button>
             ) : null}
@@ -4577,6 +9752,20 @@ function ThreadNoteDrawerOpenContent({
             ) : null}
             {noteContextMenuLayer === "ai" ? (
               <>
+                {noteContextMenu.sourceKind === "selection" ? (
+                  <button
+                    type="button"
+                    className="oa-react-context-menu__item"
+                    onClick={handleAskAssistantAboutSelectionFromMenu}
+                  >
+                    <span className="oa-react-context-menu__item-main">
+                      <span className="oa-react-context-menu__item-icon" aria-hidden="true">
+                        <SparklesIcon />
+                      </span>
+                      <span>Ask assistant about selection</span>
+                    </span>
+                  </button>
+                ) : null}
                 <button
                   type="button"
                   className="oa-react-context-menu__item"
@@ -4601,6 +9790,20 @@ function ThreadNoteDrawerOpenContent({
                     <span>Organize with AI</span>
                   </span>
                 </button>
+                {canTransferSelectionToProjectNote ? (
+                  <button
+                    type="button"
+                    className="oa-react-context-menu__item"
+                    onClick={handleOpenProjectNoteTransfer}
+                  >
+                    <span className="oa-react-context-menu__item-main">
+                      <span className="oa-react-context-menu__item-icon" aria-hidden="true">
+                        <ArrowJumpIcon />
+                      </span>
+                      <span>Send to project note</span>
+                    </span>
+                  </button>
+                ) : null}
                 <div className="oa-react-context-menu__separator" />
                 <div className="oa-react-context-menu__note">
                   {noteContextMenu.sourceKind === "selection"
@@ -4646,6 +9849,54 @@ function ThreadNoteDrawerOpenContent({
                   </span>
                 </div>
               </div>
+            ) : null}
+            {headingTagEditor && isHeadingLineTag(headingTagEditor.tag) ? (
+              <section className="thread-note-heading-tag-section">
+                <div className="thread-note-heading-tag-section-header">Heading alignment</div>
+                <div className="thread-note-heading-tag-actions">
+                  {[
+                    {
+                      alignment: "left" as ThreadNoteHeadingAlignment,
+                      token: "L",
+                      label: "Left",
+                      description: "Keep the heading aligned with the rest of the note.",
+                    },
+                    {
+                      alignment: "center" as ThreadNoteHeadingAlignment,
+                      token: "C",
+                      label: "Center",
+                      description: "Center this heading to make the section title stand out.",
+                    },
+                  ].map((option) => (
+                    <button
+                      key={option.alignment}
+                      type="button"
+                      className={[
+                        "thread-note-heading-tag-button",
+                        currentHeadingAlignment === option.alignment ? "is-selected" : "",
+                      ]
+                        .filter(Boolean)
+                        .join(" ")}
+                      onMouseDown={(event) => {
+                        event.preventDefault();
+                        handleApplyHeadingAlignment(option.alignment);
+                      }}
+                    >
+                      <span className="thread-note-heading-tag-button-token">
+                        {option.token}
+                      </span>
+                      <span className="thread-note-heading-tag-button-copy">
+                        <span className="thread-note-heading-tag-button-label">
+                          {option.label}
+                        </span>
+                        <span className="thread-note-heading-tag-button-description">
+                          {option.description}
+                        </span>
+                      </span>
+                    </button>
+                  ))}
+                </div>
+              </section>
             ) : null}
             <div className="thread-note-heading-tag-search-shell">
               <input
@@ -4973,6 +10224,16 @@ function makeCommand(
   };
 }
 
+function MoreIcon() {
+  return (
+    <svg viewBox="0 0 16 16" aria-hidden="true">
+      <circle cx="3.25" cy="8" r="1.1" fill="currentColor" stroke="none" />
+      <circle cx="8" cy="8" r="1.1" fill="currentColor" stroke="none" />
+      <circle cx="12.75" cy="8" r="1.1" fill="currentColor" stroke="none" />
+    </svg>
+  );
+}
+
 function PlusIcon() {
   return (
     <svg viewBox="0 0 16 16" aria-hidden="true">
@@ -4997,6 +10258,25 @@ function EditIcon() {
     <svg viewBox="0 0 16 16" aria-hidden="true">
       <path d="M11.9 2.9a1.4 1.4 0 0 1 2 2L6.2 12.6l-3 0.6 0.6-3 8.1-7.3Z" />
       <path d="M10.7 4.1l1.2 1.2" />
+    </svg>
+  );
+}
+
+function ImageIcon() {
+  return (
+    <svg viewBox="0 0 16 16" aria-hidden="true">
+      <path d="M3.75 3.25h8.5A1.5 1.5 0 0 1 13.75 4.75v6.5a1.5 1.5 0 0 1-1.5 1.5h-8.5a1.5 1.5 0 0 1-1.5-1.5v-6.5a1.5 1.5 0 0 1 1.5-1.5Z" />
+      <circle cx="5.35" cy="5.55" r="0.95" fill="currentColor" stroke="none" />
+      <path d="m3.2 10.9 2.45-2.45a.8.8 0 0 1 1.13 0l1.05 1.05 1.95-1.95a.8.8 0 0 1 1.13 0l1.87 1.87" />
+    </svg>
+  );
+}
+
+function ScreenshotIcon() {
+  return (
+    <svg viewBox="0 0 16 16" aria-hidden="true">
+      <path d="M5 3.35h1.35l.65-1.05h1.98l.65 1.05H11a1.5 1.5 0 0 1 1.5 1.5v6.3a1.5 1.5 0 0 1-1.5 1.5H5a1.5 1.5 0 0 1-1.5-1.5v-6.3A1.5 1.5 0 0 1 5 3.35Z" />
+      <rect x="5.45" y="5.35" width="5.1" height="3.8" rx="0.85" />
     </svg>
   );
 }
@@ -5068,6 +10348,34 @@ function ItalicIcon() {
       <path d="M6.8 3.25h5.2" />
       <path d="M4 12.75h5.2" />
       <path d="M9.3 3.25 6 12.75" />
+    </svg>
+  );
+}
+
+function IndentIcon() {
+  return (
+    <svg viewBox="0 0 16 16" aria-hidden="true">
+      <path d="M3 4.25h3.2" />
+      <path d="M3 8h3.2" />
+      <path d="M3 11.75h3.2" />
+      <path d="M8.15 4.25h4.85" />
+      <path d="M8.15 11.75h4.85" />
+      <path d="m8.35 8 2.1-2.1" />
+      <path d="m8.35 8 2.1 2.1" />
+    </svg>
+  );
+}
+
+function OutdentIcon() {
+  return (
+    <svg viewBox="0 0 16 16" aria-hidden="true">
+      <path d="M3 4.25h4.85" />
+      <path d="M3 11.75h4.85" />
+      <path d="M9.8 4.25H13" />
+      <path d="M9.8 8H13" />
+      <path d="M9.8 11.75H13" />
+      <path d="m7.65 8-2.1-2.1" />
+      <path d="m7.65 8-2.1 2.1" />
     </svg>
   );
 }
@@ -5382,42 +10690,6 @@ function mermaidSnippetGroupMeta(
   }
 }
 
-function matchesSlashCommand(command: SlashCommand, query: string): boolean {
-  const haystack = [
-    command.id,
-    command.label,
-    command.subtitle,
-    command.groupLabel,
-    ...(command.searchKeywords ?? []),
-  ]
-    .join(" ")
-    .toLowerCase();
-
-  return haystack.includes(query);
-}
-
-function groupSlashCommands(commands: SlashCommand[]): SlashCommandGroup[] {
-  const groups = new Map<string, SlashCommandGroup>();
-
-  commands.forEach((command) => {
-    const existingGroup = groups.get(command.groupId);
-    if (existingGroup) {
-      existingGroup.commands.push(command);
-      return;
-    }
-
-    groups.set(command.groupId, {
-      id: command.groupId,
-      label: command.groupLabel,
-      tone: command.groupTone,
-      order: command.groupOrder,
-      commands: [command],
-    });
-  });
-
-  return [...groups.values()].sort((left, right) => left.order - right.order);
-}
-
 function detectSlashQuery(editor: Editor): SlashQueryState | null {
   const { from, empty, $from } = editor.state.selection;
   if (!empty || !$from.parent.isTextblock) {
@@ -5444,6 +10716,125 @@ function detectSlashQuery(editor: Editor): SlashQueryState | null {
     replaceFrom: $from.start() + replaceStartInParent,
     replaceTo: from,
   };
+}
+
+function detectRawMarkdownSlashQuery(
+  markdown: string,
+  selectionStart: number,
+  selectionEnd: number
+): SlashQueryState | null {
+  if (selectionStart !== selectionEnd) {
+    return null;
+  }
+
+  const normalizedMarkdown = normalizeLineEndings(markdown);
+  const caret = Number.isFinite(selectionStart)
+    ? Math.max(0, Math.min(normalizedMarkdown.length, Math.round(selectionStart)))
+    : normalizedMarkdown.length;
+  const lineStart = normalizedMarkdown.lastIndexOf("\n", Math.max(0, caret - 1)) + 1;
+  const beforeCaret = normalizedMarkdown.slice(lineStart, caret);
+  const match = beforeCaret.match(/(?:^|\s)\/([a-z0-9-]*)$/i);
+  if (!match) {
+    return null;
+  }
+
+  const query = (match[1] ?? "").toLowerCase();
+  const slashWithQuery = `/${query}`;
+  const replaceStartInLine = beforeCaret.lastIndexOf(slashWithQuery);
+  if (replaceStartInLine < 0) {
+    return null;
+  }
+
+  return {
+    query,
+    replaceFrom: lineStart + replaceStartInLine,
+    replaceTo: caret,
+  };
+}
+
+function buildRawMarkdownSlashInsert(
+  commandId: string
+): { text: string; selection?: RawMarkdownSelectionOffsets } | null {
+  switch (commandId) {
+    case "h1":
+      return {
+        text: "# Heading",
+        selection: {
+          startOffset: 2,
+          endOffset: 9,
+        },
+      };
+    case "h2":
+      return {
+        text: "## Heading",
+        selection: {
+          startOffset: 3,
+          endOffset: 10,
+        },
+      };
+    case "h3":
+      return {
+        text: "### Heading",
+        selection: {
+          startOffset: 4,
+          endOffset: 11,
+        },
+      };
+    case "bullet":
+      return {
+        text: "- Item",
+        selection: {
+          startOffset: 2,
+          endOffset: 6,
+        },
+      };
+    case "numbered":
+      return {
+        text: "1. Item",
+        selection: {
+          startOffset: 3,
+          endOffset: 7,
+        },
+      };
+    case "todo":
+      return {
+        text: "- [ ] Task",
+        selection: {
+          startOffset: 6,
+          endOffset: 10,
+        },
+      };
+    case "quote":
+      return {
+        text: "> Quote",
+        selection: {
+          startOffset: 2,
+          endOffset: 7,
+        },
+      };
+    case "code":
+      return {
+        text: "```text\ncode\n```\n",
+        selection: {
+          startOffset: 8,
+          endOffset: 12,
+        },
+      };
+    case "divider":
+      return {
+        text: "---",
+      };
+    case "table":
+      return {
+        text: "| Column | Value |\n| --- | --- |\n| Item | Detail |\n",
+        selection: {
+          startOffset: 2,
+          endOffset: 8,
+        },
+      };
+    default:
+      return null;
+  }
 }
 
 function detectMermaidEditingContext(
@@ -5504,38 +10895,147 @@ function insertMermaidSnippet(
   editor.chain().focus().run();
 }
 
-function insertCollapsibleSection(
+function serializeEditorRangeToMarkdown(
   editor: Editor,
-  range: SlashQueryState,
-  level: 1 | 2 | 3
-) {
-  const title = level === 1 ? "New major section" : "New section";
-  const body = "Add notes here.";
-  const insertAt = range.replaceFrom;
+  from: number,
+  to: number
+): string {
+  if (from >= to) {
+    return "";
+  }
 
-  editor
-    .chain()
-    .focus()
-    .deleteRange({ from: range.replaceFrom, to: range.replaceTo })
-    .insertContentAt(insertAt, [
-      {
-        type: "heading",
-        attrs: { level, collapsible: true },
-        content: [{ type: "text", text: title }],
-      },
-      {
-        type: "paragraph",
-        content: [{ type: "text", text: body }],
-      },
-      {
-        type: "paragraph",
-      },
-    ])
-    .setTextSelection({
-      from: insertAt + 1,
-      to: insertAt + 1 + title.length,
-    })
-    .run();
+  try {
+    const selectionDoc = editor.state.doc.cut(from, to);
+    const markdown = editor.markdown?.serialize(selectionDoc.toJSON()) ?? "";
+    return normalizeLineEndings(markdown).trim();
+  } catch {
+    return editor.state.doc.textBetween(from, to, "\n\n").trim();
+  }
+}
+
+function resolveSelectionCollapsibleSectionDraft(
+  editor: Editor,
+  from: number,
+  to: number
+): SelectionCollapsibleSectionDraft | null {
+  if (from >= to) {
+    return null;
+  }
+
+  const effectiveTo = resolveCollapsibleSectionSelectionEnd(editor, from, to);
+
+  try {
+    const startPosition = editor.state.doc.resolve(from);
+    const headingDepth = findAncestorDepth(startPosition, "heading");
+
+    if (headingDepth !== null) {
+      const headingNode = startPosition.node(headingDepth);
+      const headingPos = startPosition.before(headingDepth);
+      const headingNodeEnd = startPosition.after(headingDepth);
+      const headingTitle = normalizeLineEndings(headingNode.textContent ?? "").trim();
+      const bodyMarkdown =
+        effectiveTo > headingNodeEnd
+          ? serializeEditorRangeToMarkdown(editor, headingNodeEnd, effectiveTo)
+          : "";
+      if (!headingTitle) {
+        return null;
+      }
+
+      return {
+        replaceFrom: headingPos,
+        replaceTo: Math.max(effectiveTo, headingNodeEnd),
+        headingLevel: clamp(Number(headingNode.attrs.level ?? 2), 1, 3) as 1 | 2 | 3,
+        headingTitle,
+        bodyMarkdown,
+        emptyBodyMarker: bodyMarkdown.trim().length > 0 ? null : createEmptySectionBodyMarker(),
+      };
+    }
+  } catch {
+    return null;
+  }
+
+  const selectedMarkdown = serializeEditorRangeToMarkdown(editor, from, effectiveTo);
+  const selectedPlainTextLines = normalizeLineEndings(
+    editor.state.doc.textBetween(from, effectiveTo, "\n")
+  ).split("\n");
+  const lines = normalizeLineEndings(selectedMarkdown).split("\n");
+  const firstContentIndex = lines.findIndex((line) => line.trim().length > 0);
+  const firstPlainTextIndex = selectedPlainTextLines.findIndex((line) => line.trim().length > 0);
+  if (firstContentIndex === -1) {
+    return null;
+  }
+
+  const headingTitle =
+    firstPlainTextIndex === -1
+      ? lines[firstContentIndex].trim()
+      : selectedPlainTextLines[firstPlainTextIndex].trim();
+  const bodyLines = lines.slice(firstContentIndex + 1);
+  while (bodyLines.length > 0 && bodyLines[0].trim().length === 0) {
+    bodyLines.shift();
+  }
+
+  const bodyMarkdown = bodyLines.join("\n").trim();
+  return {
+    replaceFrom: from,
+    replaceTo: effectiveTo,
+    headingLevel: 2,
+    headingTitle,
+    bodyMarkdown,
+    emptyBodyMarker: bodyMarkdown ? null : createEmptySectionBodyMarker(),
+  };
+}
+
+function buildCollapsibleSectionMarkdown(
+  draft: SelectionCollapsibleSectionDraft
+): string {
+  const headingPrefix = "#".repeat(draft.headingLevel);
+  const bodyMarkdown = draft.bodyMarkdown.trim() || draft.emptyBodyMarker || "";
+  return `${headingPrefix} ${draft.headingTitle} <!-- oa:collapsible -->\n\n${bodyMarkdown}`.trim();
+}
+
+function buildMarkdownWithCollapsibleSectionReplacement(
+  editor: Editor,
+  draft: SelectionCollapsibleSectionDraft
+): string {
+  const beforeMarkdown = serializeEditorRangeToMarkdown(editor, 0, draft.replaceFrom);
+  const afterMarkdown = serializeEditorRangeToMarkdown(
+    editor,
+    draft.replaceTo,
+    editor.state.doc.content.size
+  );
+  const sectionMarkdown = buildCollapsibleSectionMarkdown(draft);
+  return normalizeLineEndings(
+    [beforeMarkdown, sectionMarkdown, afterMarkdown]
+      .map((segment) => normalizeLineEndings(segment).trim())
+      .filter(Boolean)
+      .join("\n\n")
+  );
+}
+
+function createEmptySectionBodyMarker(): string {
+  return `oa-empty-collapsible-body-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function resolveCollapsibleSectionSelectionEnd(
+  editor: Editor,
+  from: number,
+  to: number
+): number {
+  if (to <= from) {
+    return to;
+  }
+
+  const startBlock = findTopLevelBlockAtSelection(editor, from);
+  const endBlock = findTopLevelBlockAtSelection(
+    editor,
+    Math.max(from, Math.min(editor.state.doc.content.size, to - 1))
+  );
+
+  if (!startBlock || !endBlock || startBlock.pos === endBlock.pos) {
+    return to;
+  }
+
+  return endBlock.insertAt;
 }
 
 function detectCurrentLineIndent(editor: Editor): string {
@@ -5627,6 +11127,51 @@ function measureMenuPosition(
   };
 }
 
+function resolveThreadNoteSelectionAssistantRect(
+  container: HTMLElement | null
+): { x: number; y: number; width: number; height: number } | null {
+  if (!container) {
+    return null;
+  }
+
+  const selection = window.getSelection();
+  if (!selection || selection.rangeCount === 0 || selection.isCollapsed) {
+    return null;
+  }
+
+  const range = selection.getRangeAt(0);
+  const commonAncestor = range.commonAncestorContainer;
+  const anchorNode =
+    commonAncestor instanceof Element ? commonAncestor : commonAncestor.parentElement;
+  if (!anchorNode || !container.contains(anchorNode)) {
+    return null;
+  }
+
+  const rect = range.getBoundingClientRect();
+  if (!rect.width && !rect.height) {
+    return null;
+  }
+
+  return {
+    x: rect.left,
+    y: rect.top,
+    width: rect.width,
+    height: rect.height,
+  };
+}
+
+function buildThreadNoteSelectionAnchorRect(
+  x: number,
+  y: number
+): { x: number; y: number; width: number; height: number } {
+  return {
+    x,
+    y,
+    width: 2,
+    height: 2,
+  };
+}
+
 function resolveMarkdownLineFromDOM(
   editor: Editor,
   lineElement: HTMLElement
@@ -5646,13 +11191,16 @@ function resolveMarkdownLineFromDOM(
       const headingSection = findHeadingSectionAtPosition(editor.state, headingPos);
       return buildResolvedMarkdownLine(editor, {
         selectionPos: resolvedPosition.start(headingDepth),
-        insertAt: headingSection?.sectionEnd ?? resolvedPosition.after(headingDepth),
+        insertAt:
+          headingSection?.isCollapsible === true
+            ? headingSection.sectionEnd
+            : resolvedPosition.after(headingDepth),
         tag: headingLevelToTag(Number(headingNode.attrs.level ?? 1)),
         replaceFrom: headingPos,
         replaceTo: resolvedPosition.after(headingDepth),
         previewFrom: resolvedPosition.start(headingDepth),
         previewTo: resolvedPosition.end(headingDepth),
-        headingCollapsible: headingSection?.isCollapsible ?? headingNode.attrs.collapsible !== false,
+        headingCollapsible: headingSection?.isCollapsible ?? headingNode.attrs.collapsible === true,
       });
     }
 
@@ -5767,9 +11315,27 @@ function applyMarkdownLineTag(
   headingCollapsible?: boolean
 ) {
   if (
+    currentTag === "paragraph" &&
+    nextTag !== "paragraph" &&
+    tryApplyMarkdownLineTagWithinParagraphLine(
+      editor,
+      selectionPos,
+      nextTag,
+      headingCollapsible
+    )
+  ) {
+    return;
+  }
+
+  if (
     isHeadingLineTag(nextTag) &&
     tryApplyHeadingWithinListItem(editor, selectionPos, nextTag, headingCollapsible)
   ) {
+    return;
+  }
+
+  if (isListLineTag(currentTag) && isListLineTag(nextTag)) {
+    applyListLineTag(editor, selectionPos, nextTag);
     return;
   }
 
@@ -5799,13 +11365,13 @@ function applyMarkdownLineTag(
       nextChain.setParagraph().run();
       return;
     case "heading1":
-      nextChain.setNode("heading", { level: 1, collapsible: headingCollapsible ?? true }).run();
+      nextChain.setNode("heading", { level: 1, collapsible: headingCollapsible ?? false }).run();
       return;
     case "heading2":
-      nextChain.setNode("heading", { level: 2, collapsible: headingCollapsible ?? true }).run();
+      nextChain.setNode("heading", { level: 2, collapsible: headingCollapsible ?? false }).run();
       return;
     case "heading3":
-      nextChain.setNode("heading", { level: 3, collapsible: headingCollapsible ?? true }).run();
+      nextChain.setNode("heading", { level: 3, collapsible: headingCollapsible ?? false }).run();
       return;
     case "bullet":
       nextChain.toggleBulletList().run();
@@ -5827,13 +11393,44 @@ function applyMarkdownLineTag(
   }
 }
 
+function applyListLineTag(
+  editor: Editor,
+  selectionPos: number,
+  nextTag: Extract<MarkdownLineTag, "bullet" | "numbered" | "todo">
+): void {
+  const chain = editor.chain().focus().setTextSelection(selectionPos);
+
+  switch (nextTag) {
+    case "bullet":
+      chain.toggleBulletList().run();
+      return;
+    case "numbered":
+      chain.toggleOrderedList().run();
+      return;
+    case "todo":
+      chain.toggleTaskList().run();
+      return;
+  }
+}
+
 function handleSelectedListIndent(
   editor: Editor,
   direction: "indent" | "outdent"
 ): boolean {
   const { state, view } = editor;
-  if (state.selection.empty || editor.isActive("table")) {
+  if (editor.isActive("table")) {
     return false;
+  }
+
+  if (state.selection.empty) {
+    const currentListItemType = findCurrentListItemType(state);
+    if (!currentListItemType) {
+      return false;
+    }
+
+    return direction === "indent"
+      ? editor.commands.sinkListItem(currentListItemType)
+      : editor.commands.liftListItem(currentListItemType);
   }
 
   const selectedItems = collectSelectedTopLevelListItems(state);
@@ -5863,6 +11460,20 @@ function handleSelectedListIndent(
     : editor.commands.liftListItem(firstItem.typeName);
 }
 
+function findCurrentListItemType(
+  state: Editor["state"]
+): "listItem" | "taskItem" | null {
+  const { $from } = state.selection;
+  for (let depth = $from.depth; depth > 0; depth -= 1) {
+    const nodeTypeName = $from.node(depth).type.name;
+    if (nodeTypeName === "listItem" || nodeTypeName === "taskItem") {
+      return nodeTypeName;
+    }
+  }
+
+  return null;
+}
+
 function collectSelectedTopLevelListItems(
   state: Editor["state"]
 ): SelectedListItemRange[] {
@@ -5888,6 +11499,54 @@ function collectSelectedTopLevelListItems(
   });
 
   return ranges;
+}
+
+function canIndentSelectionAsIndentedBlock(
+  editor: Editor,
+  from: number,
+  to: number
+): boolean {
+  if (from >= to || editor.isActive("table")) {
+    return false;
+  }
+
+  return Boolean(editor.state.doc.textBetween(from, to, "\n").trim());
+}
+
+function selectionTouchesNodeType(
+  state: Editor["state"],
+  from: number,
+  to: number,
+  nodeName: string
+): boolean {
+  let found = false;
+
+  state.doc.nodesBetween(from, to, (node) => {
+    if (node.type.name === nodeName) {
+      found = true;
+      return false;
+    }
+
+    return true;
+  });
+
+  if (found) {
+    return true;
+  }
+
+  try {
+    const startPos = Math.max(0, Math.min(from, state.doc.content.size));
+    const resolvedFrom = state.doc.resolve(startPos);
+    if (findAncestorDepth(resolvedFrom, nodeName) !== null) {
+      return true;
+    }
+
+    const endPos = Math.max(0, Math.min(Math.max(from, to - 1), state.doc.content.size));
+    const resolvedTo = state.doc.resolve(endPos);
+    return findAncestorDepth(resolvedTo, nodeName) !== null;
+  } catch {
+    return false;
+  }
 }
 
 function tryApplyHeadingWithinListItem(
@@ -5918,20 +11577,228 @@ function tryApplyHeadingWithinListItem(
   }
 }
 
+function tryApplyMarkdownLineTagWithinParagraphLine(
+  editor: Editor,
+  selectionPos: number,
+  nextTag: Exclude<MarkdownLineTag, "paragraph">,
+  headingCollapsible?: boolean
+): boolean {
+  const paragraphLine = resolveParagraphLineAtSelection(editor, selectionPos);
+  if (!paragraphLine) {
+    return false;
+  }
+
+  const { schema } = editor.state;
+  const replacementNodes: ProseMirrorNode[] = [];
+  let targetNodeStart = paragraphLine.paragraphPos;
+
+  paragraphLine.lines.forEach((lineContent, index) => {
+    const nodesForLine =
+      index === paragraphLine.targetLineIndex
+        ? buildNodesForMarkdownLineTag(schema, nextTag, lineContent, headingCollapsible)
+        : [createParagraphNodeFromLineFragment(schema, lineContent)];
+
+    if (index < paragraphLine.targetLineIndex) {
+      targetNodeStart += nodesForLine.reduce((total, node) => total + node.nodeSize, 0);
+    }
+
+    replacementNodes.push(...nodesForLine);
+  });
+
+  if (replacementNodes.length === 0) {
+    return false;
+  }
+
+  const tr = editor.state.tr.replaceWith(
+    paragraphLine.paragraphPos,
+    paragraphLine.paragraphPos + paragraphLine.paragraphNode.nodeSize,
+    replacementNodes
+  );
+  const focusPos = Math.min(Math.max(0, targetNodeStart + 1), tr.doc.content.size);
+  tr.setSelection(Selection.near(tr.doc.resolve(focusPos), 1));
+
+  const editorView = resolveEditorView(editor);
+  if (!editorView) {
+    return false;
+  }
+
+  editorView.dispatch(tr.scrollIntoView());
+  editorView.focus();
+  return true;
+}
+
+function resolveParagraphLineAtSelection(
+  editor: Editor,
+  selectionPos: number
+): {
+  paragraphPos: number;
+  paragraphNode: ProseMirrorNode;
+  targetLineIndex: number;
+  lines: Fragment[];
+} | null {
+  try {
+    const resolvedPosition = editor.state.doc.resolve(selectionPos);
+    const paragraphDepth = findAncestorDepth(resolvedPosition, "paragraph");
+    if (paragraphDepth === null) {
+      return null;
+    }
+
+    const paragraphNode = resolvedPosition.node(paragraphDepth);
+    const lines = splitParagraphNodeIntoLineFragments(paragraphNode);
+    if (lines.length <= 1) {
+      return null;
+    }
+
+    const paragraphPos = resolvedPosition.before(paragraphDepth);
+    const paragraphContentStart = resolvedPosition.start(paragraphDepth);
+    const relativeSelectionPos = clamp(
+      selectionPos - paragraphContentStart,
+      0,
+      paragraphNode.content.size
+    );
+
+    return {
+      paragraphPos,
+      paragraphNode,
+      targetLineIndex: resolveParagraphLineIndex(paragraphNode, relativeSelectionPos),
+      lines,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function splitParagraphNodeIntoLineFragments(paragraphNode: ProseMirrorNode): Fragment[] {
+  const lines: Fragment[] = [];
+  let currentLineChildren: ProseMirrorNode[] = [];
+
+  paragraphNode.forEach((child) => {
+    if (child.type.name === "hardBreak") {
+      lines.push(
+        currentLineChildren.length > 0
+          ? Fragment.fromArray(currentLineChildren)
+          : Fragment.empty
+      );
+      currentLineChildren = [];
+      return;
+    }
+
+    currentLineChildren.push(child);
+  });
+
+  lines.push(
+    currentLineChildren.length > 0 ? Fragment.fromArray(currentLineChildren) : Fragment.empty
+  );
+  return lines;
+}
+
+function resolveParagraphLineIndex(
+  paragraphNode: ProseMirrorNode,
+  relativeSelectionPos: number
+): number {
+  let lineIndex = 0;
+
+  paragraphNode.forEach((child, offset) => {
+    if (child.type.name === "hardBreak" && relativeSelectionPos > offset) {
+      lineIndex += 1;
+    }
+  });
+
+  return lineIndex;
+}
+
+function createParagraphNodeFromLineFragment(
+  schema: Editor["state"]["schema"],
+  lineContent: Fragment
+): ProseMirrorNode {
+  return schema.nodes.paragraph.create(null, lineContent.size > 0 ? lineContent : undefined);
+}
+
+function buildNodesForMarkdownLineTag(
+  schema: Editor["state"]["schema"],
+  nextTag: Exclude<MarkdownLineTag, "paragraph">,
+  lineContent: Fragment,
+  headingCollapsible?: boolean
+): ProseMirrorNode[] {
+  const paragraphNode = createParagraphNodeFromLineFragment(schema, lineContent);
+
+  switch (nextTag) {
+    case "heading1":
+      return [
+        schema.nodes.heading.create(
+          { level: 1, collapsible: headingCollapsible ?? false },
+          lineContent.size > 0 ? lineContent : undefined
+        ),
+      ];
+    case "heading2":
+      return [
+        schema.nodes.heading.create(
+          { level: 2, collapsible: headingCollapsible ?? false },
+          lineContent.size > 0 ? lineContent : undefined
+        ),
+      ];
+    case "heading3":
+      return [
+        schema.nodes.heading.create(
+          { level: 3, collapsible: headingCollapsible ?? false },
+          lineContent.size > 0 ? lineContent : undefined
+        ),
+      ];
+    case "bullet":
+      return [
+        schema.nodes.bulletList.create(
+          null,
+          schema.nodes.listItem.create(null, paragraphNode)
+        ),
+      ];
+    case "numbered":
+      return [
+        schema.nodes.orderedList.create(
+          null,
+          schema.nodes.listItem.create(null, paragraphNode)
+        ),
+      ];
+    case "todo":
+      return [
+        schema.nodes.taskList.create(
+          null,
+          schema.nodes.taskItem.create({ checked: false }, paragraphNode)
+        ),
+      ];
+    case "quote":
+      return [schema.nodes.blockquote.create(null, paragraphNode)];
+    case "code": {
+      const codeText = lineContent.textBetween(0, lineContent.size, "", "");
+      return [
+        schema.nodes.codeBlock.create(
+          null,
+          codeText ? schema.text(codeText) : undefined
+        ),
+      ];
+    }
+  }
+}
+
 function headingAttributesForTag(
   tag: MarkdownLineTag,
   headingCollapsible?: boolean
 ): { level: 1 | 2 | 3; collapsible: boolean } | null {
   switch (tag) {
     case "heading1":
-      return { level: 1, collapsible: headingCollapsible ?? true };
+      return { level: 1, collapsible: headingCollapsible ?? false };
     case "heading2":
-      return { level: 2, collapsible: headingCollapsible ?? true };
+      return { level: 2, collapsible: headingCollapsible ?? false };
     case "heading3":
-      return { level: 3, collapsible: headingCollapsible ?? true };
+      return { level: 3, collapsible: headingCollapsible ?? false };
     default:
       return null;
   }
+}
+
+function isListLineTag(
+  tag: MarkdownLineTag
+): tag is Extract<MarkdownLineTag, "bullet" | "numbered" | "todo"> {
+  return tag === "bullet" || tag === "numbered" || tag === "todo";
 }
 
 function resolveSummaryTargetFromSelection(
@@ -5979,7 +11846,10 @@ function resolveSummaryTargetFromSelection(
         kind: "selection",
         from: headingPos,
         to: startPosition.after(headingDepth),
-        insertAt: headingSection?.sectionEnd ?? insertAt ?? startPosition.after(headingDepth),
+        insertAt:
+          headingSection?.isCollapsible === true
+            ? headingSection.sectionEnd
+            : insertAt ?? startPosition.after(headingDepth),
       };
     }
   } catch {
@@ -6019,32 +11889,294 @@ function findHeadingSectionAtSelection(
   }
 }
 
-function insertParagraphAfterSection(editor: Editor, sectionEnd: number): boolean {
+function findClosestCollapsibleSectionByTitle(
+  editor: Editor,
+  title: string,
+  preferredPos: number
+): ThreadNoteHeadingSection | null {
+  const normalizedTitle = normalizeLineEndings(title).trim();
+  if (!normalizedTitle) {
+    return null;
+  }
+
+  const matchingSections: ThreadNoteHeadingSection[] = [];
+  editor.state.doc.forEach((node, offset) => {
+    if (node.type.name !== "heading" || normalizeLineEndings(node.textContent ?? "").trim() !== normalizedTitle) {
+      return;
+    }
+
+    const section = findHeadingSectionAtPosition(editor.state, offset);
+    if (section?.isCollapsible) {
+      matchingSections.push(section);
+    }
+  });
+
+  if (matchingSections.length === 0) {
+    return null;
+  }
+
+  return matchingSections.reduce((closest, section) => {
+    if (!closest) {
+      return section;
+    }
+
+    return Math.abs(section.headingPos - preferredPos) < Math.abs(closest.headingPos - preferredPos)
+      ? section
+      : closest;
+  }, null as ThreadNoteHeadingSection | null);
+}
+
+function findTextRangeInDocument(
+  doc: Editor["state"]["doc"],
+  text: string
+): { from: number; to: number } | null {
+  if (!text) {
+    return null;
+  }
+
+  let result: { from: number; to: number } | null = null;
+  doc.descendants((node, pos) => {
+    if (result || !node.isText || !node.text) {
+      return result === null;
+    }
+
+    const offset = node.text.indexOf(text);
+    if (offset === -1) {
+      return true;
+    }
+
+    result = {
+      from: pos + offset,
+      to: pos + offset + text.length,
+    };
+    return false;
+  });
+
+  return result;
+}
+
+function insertParagraphAfterSection(
+  editor: Editor,
+  sectionEnd: number,
+  replaceFrom?: number,
+  replaceTo?: number
+): boolean {
+  const editorView = resolveEditorView(editor);
+  if (!editorView) {
+    return false;
+  }
+
   const insertAt = Math.min(sectionEnd, editor.state.doc.content.size);
 
   // If the section extends to the document end, the new paragraph would also
   // become part of the section and get hidden. Uncollapse the section first
   // so the new content stays visible.
   if (insertAt >= editor.state.doc.content.size) {
-    const view = resolveEditorView(editor);
-    if (view) {
-      const section = findCollapsedHeadingSectionAtSelection(
-        editor.state,
-        Math.max(0, insertAt - 1)
-      );
-      if (section) {
-        uncollapseHeadingAtPosition(view, section.headingPos);
-      }
+    const section = findCollapsedHeadingSectionAtSelection(
+      editor.state,
+      Math.max(0, insertAt - 1)
+    );
+    if (section) {
+      uncollapseHeadingAtPosition(editorView, section.headingPos);
     }
   }
 
-  const newInsertAt = Math.min(sectionEnd, editor.state.doc.content.size);
+  const tr = editor.state.tr;
+  if (
+    typeof replaceFrom === "number" &&
+    typeof replaceTo === "number" &&
+    replaceTo > replaceFrom
+  ) {
+    tr.deleteRange(replaceFrom, replaceTo);
+  }
+
+  const newInsertAt = tr.mapping.map(
+    Math.min(sectionEnd, editor.state.doc.content.size)
+  );
+  tr.insert(newInsertAt, editor.state.schema.nodes.paragraph.create());
+  tr.setSelection(TextSelection.create(tr.doc, newInsertAt + 1));
+  editorView.dispatch(tr.scrollIntoView());
+  editorView.focus();
+  return true;
+}
+
+function insertParagraphAfterHeading(
+  editor: Editor,
+  headingSection: NonNullable<ReturnType<typeof findHeadingSectionAtSelection>>
+): boolean {
+  const nextBlock = findFirstTopLevelBlockWithinSection(
+    editor,
+    headingSection.headingNodeEnd,
+    headingSection.sectionEnd
+  );
+
+  if (nextBlock) {
+    const contentStart = nextBlock.pos + 1;
+    const contentEnd = nextBlock.pos + nextBlock.node.nodeSize - 1;
+
+    if (nextBlock.node.type.name === "paragraph" && contentEnd > contentStart) {
+      const paragraphText = nextBlock.node.textContent.trim();
+      if (paragraphText === DEFAULT_COLLAPSIBLE_SECTION_BODY) {
+        return editor
+          .chain()
+          .focus()
+          .setTextSelection({ from: contentStart, to: contentEnd })
+          .run();
+      }
+    }
+
+    return editor.chain().focus().setTextSelection(contentStart).run();
+  }
+
+  const insertAt = Math.min(headingSection.headingNodeEnd, editor.state.doc.content.size);
+  const view = resolveEditorView(editor);
+
+  if (headingSection.isCollapsed && view) {
+    uncollapseHeadingAtPosition(view, headingSection.headingPos);
+  }
+
   return editor
     .chain()
     .focus()
-    .insertContentAt(newInsertAt, [{ type: "paragraph" }])
-    .setTextSelection(newInsertAt + 1)
+    .insertContentAt(insertAt, [{ type: "paragraph" }])
+    .setTextSelection(insertAt + 1)
     .run();
+}
+
+function handleThreadNoteSectionDrop(
+  view: EditorView,
+  event: DragEvent,
+  slice: Slice,
+  moved: boolean
+): boolean {
+  const targetSection = resolveHeadingDropTargetSection(view.state, event.target);
+  if (!targetSection || slice.size === 0) {
+    return false;
+  }
+
+  const internalDrag = resolveThreadNoteInternalDragData(event);
+  const shouldMove = moved || internalDrag?.move === true;
+
+  if (targetSection.isCollapsed) {
+    uncollapseHeadingAtPosition(view, targetSection.headingPos);
+  }
+
+  const insertPos = Math.min(targetSection.headingNodeEnd, view.state.doc.content.size);
+  let tr = view.state.tr;
+  const dragging = view.dragging;
+
+  if (shouldMove) {
+    if (internalDrag) {
+      const safeFrom = Math.max(0, Math.min(internalDrag.from, internalDrag.to));
+      const safeTo = Math.min(
+        view.state.doc.content.size,
+        Math.max(internalDrag.from, internalDrag.to)
+      );
+      if (safeTo > safeFrom) {
+        tr.deleteRange(safeFrom, safeTo);
+      }
+    } else if (dragging?.node) {
+      dragging.node.replace(tr);
+    } else {
+      tr.deleteSelection();
+    }
+  }
+
+  const mappedInsertPos = tr.mapping.map(insertPos);
+  const beforeInsert = tr.doc;
+  const isSingleNodeSlice =
+    slice.openStart === 0 && slice.openEnd === 0 && slice.content.childCount === 1;
+
+  if (isSingleNodeSlice) {
+    const node = slice.content.firstChild;
+    if (!node) {
+      return false;
+    }
+    tr.replaceRangeWith(mappedInsertPos, mappedInsertPos, node);
+  } else {
+    tr.replaceRange(mappedInsertPos, mappedInsertPos, slice);
+  }
+
+  if (tr.doc.eq(beforeInsert)) {
+    return true;
+  }
+
+  let selectionEnd = tr.mapping.map(insertPos);
+  tr.mapping.maps[tr.mapping.maps.length - 1]?.forEach((_from, _to, _newFrom, newTo) => {
+    selectionEnd = newTo;
+  });
+  tr.setSelection(Selection.near(tr.doc.resolve(selectionEnd), -1));
+
+  view.focus();
+  view.dispatch(tr.setMeta("uiEvent", "drop").scrollIntoView());
+  return true;
+}
+
+function resolveHeadingDropTargetSection(
+  state: Editor["state"],
+  eventTarget: EventTarget | null
+): ThreadNoteHeadingSection | null {
+  const headingElement = resolveHeadingDropTargetElement(eventTarget);
+  const rawHeadingPos = headingElement?.getAttribute("data-thread-note-heading-pos");
+  if (!rawHeadingPos) {
+    return null;
+  }
+
+  const headingPos = Number.parseInt(rawHeadingPos, 10);
+  if (!Number.isFinite(headingPos)) {
+    return null;
+  }
+
+  return findHeadingSectionAtPosition(state, headingPos);
+}
+
+function resolveHeadingDropTargetElement(
+  eventTarget: EventTarget | null
+): HTMLElement | null {
+  if (!(eventTarget instanceof Node)) {
+    return null;
+  }
+
+  const eventElement = eventTarget instanceof Element ? eventTarget : eventTarget.parentElement;
+  return eventElement?.closest<HTMLElement>(".thread-note-heading-node") ?? null;
+}
+
+function isNoteContentDragEvent(event: DragEvent): boolean {
+  const dragTypes = event.dataTransfer?.types;
+  if (!dragTypes) {
+    return false;
+  }
+
+  return Array.from(dragTypes).some((type) => type === "text/plain" || type === "text/html");
+}
+
+function resolveThreadNoteInternalDragData(
+  event: DragEvent
+): ThreadNoteInternalDragData | null {
+  const rawValue = event.dataTransfer?.getData(THREAD_NOTE_INTERNAL_DRAG_MIME);
+  if (!rawValue) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(rawValue) as Partial<ThreadNoteInternalDragData>;
+    if (
+      typeof parsed.from !== "number" ||
+      typeof parsed.to !== "number" ||
+      !Number.isFinite(parsed.from) ||
+      !Number.isFinite(parsed.to)
+    ) {
+      return null;
+    }
+
+    return {
+      from: parsed.from,
+      to: parsed.to,
+      move: parsed.move !== false,
+    };
+  } catch {
+    return null;
+  }
 }
 
 function focusBlankEditorSpace(
@@ -6094,6 +12226,22 @@ function focusBlankEditorSpace(
   event.preventDefault();
   event.stopPropagation();
 
+  const containingSection = findContainingHeadingSectionAtSelection(
+    editor.state,
+    Math.min(lastVisibleBlock.insertAt - 1, editor.state.doc.content.size)
+  );
+  if (
+    containingSection &&
+    !containingSection.isCollapsed &&
+    lastVisibleBlock.insertAt === containingSection.sectionEnd
+  ) {
+    if (exitSectionAtLastBlock(editor, containingSection, lastVisibleBlock)) {
+      return true;
+    }
+
+    return editor.commands.focus("end");
+  }
+
   if (lastVisibleBlock.node.type.name === "paragraph") {
     return editor.commands.focus("end");
   }
@@ -6141,24 +12289,133 @@ function findLastVisibleTopLevelBlock(editor: Editor): VisibleTopLevelBlock | nu
   return lastVisibleBlock;
 }
 
+function findTopLevelBlockAtSelection(
+  editor: Editor,
+  selectionPos: number = editor.state.selection.from
+): VisibleTopLevelBlock | null {
+  try {
+    const resolvedPosition = editor.state.doc.resolve(
+      Math.min(selectionPos, editor.state.doc.content.size)
+    );
+
+    for (let depth = resolvedPosition.depth; depth > 0; depth -= 1) {
+      if (resolvedPosition.node(depth - 1).type.name !== "doc") {
+        continue;
+      }
+
+      const pos = resolvedPosition.before(depth);
+      const node = resolvedPosition.node(depth);
+      return {
+        pos,
+        node,
+        insertAt: pos + node.nodeSize,
+      };
+    }
+  } catch {
+    return null;
+  }
+
+  return null;
+}
+
+function resolveSectionLeaveContext(
+  editor: Editor,
+  selectionPos: number = editor.state.selection.from
+): {
+  section: ThreadNoteHeadingSection;
+  block: VisibleTopLevelBlock;
+} | null {
+  const { state } = editor;
+  if (!state.selection.empty) {
+    return null;
+  }
+
+  const containingSection = findContainingHeadingSectionAtSelection(state, selectionPos);
+  if (!containingSection || containingSection.isCollapsed) {
+    return null;
+  }
+
+  const topLevelBlock = findTopLevelBlockAtSelection(editor, selectionPos);
+  if (!topLevelBlock) {
+    return null;
+  }
+
+  if (topLevelBlock.insertAt !== containingSection.sectionEnd) {
+    return null;
+  }
+
+  return {
+    section: containingSection,
+    block: topLevelBlock,
+  };
+}
+
+function resolveBlockInsertTarget(
+  editor: Editor,
+  selectionPos: number,
+  fallbackInsertAt: number
+): number {
+  return resolveTopLevelBlockInsertAt(editor, selectionPos, fallbackInsertAt);
+}
+
+function findFirstTopLevelBlockWithinSection(
+  editor: Editor,
+  fromPos: number,
+  sectionEnd: number
+): VisibleTopLevelBlock | null {
+  let firstBlock: VisibleTopLevelBlock | null = null;
+
+  editor.state.doc.forEach((node, offset) => {
+    if (firstBlock || offset < fromPos || offset >= sectionEnd) {
+      return;
+    }
+
+    firstBlock = {
+      pos: offset,
+      node,
+      insertAt: offset + node.nodeSize,
+    };
+  });
+
+  return firstBlock;
+}
+
+function resolveTopLevelBlockInsertAt(
+  editor: Editor,
+  selectionPos: number,
+  fallbackInsertAt: number
+): number {
+  try {
+    const resolvedPosition = editor.state.doc.resolve(
+      Math.min(selectionPos, editor.state.doc.content.size)
+    );
+
+    for (let depth = resolvedPosition.depth; depth > 0; depth -= 1) {
+      if (resolvedPosition.node(depth - 1).type.name === "doc") {
+        return resolvedPosition.after(depth);
+      }
+    }
+  } catch {
+    return Math.min(fallbackInsertAt, editor.state.doc.content.size);
+  }
+
+  return Math.min(fallbackInsertAt, editor.state.doc.content.size);
+}
+
 function applyMarkdownInsertAction(
   editor: Editor,
+  selectionPos: number,
   insertAt: number,
   action: MarkdownInsertAction
 ) {
+  const targetInsertAt = resolveBlockInsertTarget(editor, selectionPos, insertAt);
+
   switch (action) {
-    case "section":
-      insertCollapsibleSection(editor, {
-        query: "",
-        replaceFrom: insertAt,
-        replaceTo: insertAt,
-      }, 2);
-      return;
     case "divider":
       editor
         .chain()
         .focus()
-        .setTextSelection(insertAt)
+        .setTextSelection(targetInsertAt)
         .setHorizontalRule()
         .createParagraphNear()
         .run();
@@ -6167,13 +12424,100 @@ function applyMarkdownInsertAction(
       editor
         .chain()
         .focus()
-        .setTextSelection(insertAt)
+        .setTextSelection(targetInsertAt)
         .insertTable({ rows: 3, cols: 2, withHeaderRow: true })
         .run();
       return;
     default:
       return;
   }
+}
+
+function exitSectionAtLastBlock(
+  editor: Editor,
+  section: ThreadNoteHeadingSection,
+  block: VisibleTopLevelBlock
+): boolean {
+  const shouldReplaceEmptyParagraph =
+    block.node.type.name === "paragraph" &&
+    (block.node.textContent ?? "").trim() === "";
+  const replaceFrom = shouldReplaceEmptyParagraph ? block.pos : undefined;
+  const replaceTo = shouldReplaceEmptyParagraph ? block.insertAt : undefined;
+
+  if (section.sectionEnd >= editor.state.doc.content.size) {
+    return insertDividerAndParagraphOutsideSection(editor, section, replaceFrom, replaceTo);
+  }
+
+  return insertParagraphOutsideSection(editor, section, replaceFrom, replaceTo);
+}
+
+function insertDividerAndParagraphOutsideSection(
+  editor: Editor,
+  section: ThreadNoteHeadingSection,
+  replaceFrom?: number,
+  replaceTo?: number
+): boolean {
+  const editorView = resolveEditorView(editor);
+  if (!editorView) {
+    return false;
+  }
+
+  const { schema } = editor.state;
+  const dividerNode = schema.nodes.horizontalRule.create();
+  const paragraphNode = schema.nodes.paragraph.create();
+  const tr = editor.state.tr;
+  if (
+    typeof replaceFrom === "number" &&
+    typeof replaceTo === "number" &&
+    replaceTo > replaceFrom
+  ) {
+    tr.deleteRange(replaceFrom, replaceTo);
+  }
+
+  // A divider creates a real persisted boundary so the paragraph stays outside
+  // the collapsible section after save/reload.
+  const insertAt = tr.mapping.map(
+    Math.min(section.sectionEnd, editor.state.doc.content.size)
+  );
+  tr.insert(insertAt, Fragment.fromArray([dividerNode, paragraphNode]));
+  tr.setSelection(TextSelection.create(tr.doc, insertAt + dividerNode.nodeSize + 1));
+  editorView.dispatch(tr.scrollIntoView());
+  editorView.focus();
+  return true;
+}
+
+function insertParagraphOutsideSection(
+  editor: Editor,
+  section: ThreadNoteHeadingSection,
+  replaceFrom?: number,
+  replaceTo?: number
+): boolean {
+  if (section.sectionEnd >= editor.state.doc.content.size) {
+    return false;
+  }
+
+  const editorView = resolveEditorView(editor);
+  if (!editorView) {
+    return false;
+  }
+
+  const tr = editor.state.tr;
+  if (
+    typeof replaceFrom === "number" &&
+    typeof replaceTo === "number" &&
+    replaceTo > replaceFrom
+  ) {
+    tr.deleteRange(replaceFrom, replaceTo);
+  }
+
+  const insertAt = tr.mapping.map(
+    Math.min(section.sectionEnd, editor.state.doc.content.size)
+  );
+  tr.insert(insertAt, editor.state.schema.nodes.paragraph.create());
+  tr.setSelection(TextSelection.create(tr.doc, insertAt + 1));
+  editorView.dispatch(tr.scrollIntoView());
+  editorView.focus();
+  return true;
 }
 
 function matchesMarkdownPickerOption(
@@ -6278,6 +12622,346 @@ function resolveEditorView(editor: Editor): Editor["view"] | null {
 
 function resolveEditorDOM(editor: Editor): HTMLElement | null {
   return resolveEditorView(editor)?.dom ?? null;
+}
+
+function serializeEditorMarkdownRange(
+  editor: Editor | null,
+  from?: number,
+  to?: number
+): string {
+  if (!editor || typeof from !== "number" || typeof to !== "number" || from >= to) {
+    return "";
+  }
+
+  try {
+    const selectionDoc = editor.state.doc.cut(from, to);
+    const markdown = editor.markdown?.serialize(selectionDoc.toJSON()) ?? "";
+    return normalizeLineEndings(markdown).trim();
+  } catch {
+    return editor.state.doc.textBetween(from, to, "\n\n").trim();
+  }
+}
+
+function createThreadNoteImageRequestID(): string {
+  if (typeof window !== "undefined" && window.crypto?.randomUUID) {
+    return window.crypto.randomUUID();
+  }
+
+  return `thread-note-image-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function createThreadNoteScreenshotRequestID(): string {
+  if (typeof window !== "undefined" && window.crypto?.randomUUID) {
+    return window.crypto.randomUUID();
+  }
+
+  return `thread-note-screenshot-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function readFileAsDataURL(file: File): Promise<string | null> {
+  return new Promise((resolve) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      resolve(typeof reader.result === "string" ? reader.result : null);
+    };
+    reader.onerror = () => resolve(null);
+    reader.readAsDataURL(file);
+  });
+}
+
+async function fileFromThreadNoteDataURL(
+  dataUrl: string,
+  filename: string,
+  fallbackMimeType: string
+): Promise<File | null> {
+  try {
+    const response = await fetch(dataUrl);
+    const blob = await response.blob();
+    const resolvedMimeType = blob.type || fallbackMimeType || "image/png";
+    return new File([blob], filename, { type: resolvedMimeType });
+  } catch {
+    return null;
+  }
+}
+
+function buildThreadNotePlainTextContent(value: string) {
+  const paragraphs = normalizeLineEndings(value)
+    .split(/\n{2,}/)
+    .map((paragraph) => paragraph.trim())
+    .filter(Boolean);
+
+  if (!paragraphs.length) {
+    return [{ type: "paragraph" }];
+  }
+
+  return paragraphs.map((paragraph) => {
+    const lines = paragraph.split("\n");
+    return {
+      type: "paragraph",
+      content: lines.flatMap((line, index) => {
+        const content: Array<{ type: "text"; text: string } | { type: "hardBreak" }> = [];
+        if (line.length) {
+          content.push({ type: "text", text: line });
+        }
+        if (index < lines.length - 1) {
+          content.push({ type: "hardBreak" });
+        }
+        return content;
+      }),
+    };
+  });
+}
+
+function extractThreadNoteImageFiles(
+  items?: DataTransferItemList | null,
+  files?: FileList | null
+): File[] {
+  const itemFiles = Array.from(items ?? [])
+    .filter((item) => item.kind === "file" && isPotentialThreadNoteImageType(item.type))
+    .map((item) => item.getAsFile())
+    .filter((file): file is File => file instanceof File && isPotentialThreadNoteImageFile(file));
+
+  if (itemFiles.length) {
+    return itemFiles;
+  }
+
+  return Array.from(files ?? []).filter((file) => isPotentialThreadNoteImageFile(file));
+}
+
+function shouldAttemptNativeThreadNoteClipboardImagePaste(
+  clipboardData?: DataTransfer | null
+): boolean {
+  const types = Array.from(clipboardData?.types ?? []).map((type) => type.trim().toLowerCase());
+  if (types.some((type) => type === "files" || isPotentialThreadNoteImageType(type))) {
+    return true;
+  }
+
+  if (
+    types.some((type) =>
+      ["png", "jpeg", "jpg", "gif", "webp", "tiff", "tif", "bmp", "heic"].some((token) =>
+        type.includes(token)
+      )
+    )
+  ) {
+    return true;
+  }
+
+  const html = clipboardData?.getData("text/html")?.trim() ?? "";
+  if (html && /<img[\s>]/i.test(html)) {
+    return true;
+  }
+
+  const items = Array.from(clipboardData?.items ?? []);
+  if (items.some((item) => item.kind === "file" || isPotentialThreadNoteImageType(item.type))) {
+    return true;
+  }
+
+  return types.length === 0 && items.length === 0;
+}
+
+function isSupportedThreadNoteImageMimeType(mimeType?: string | null): boolean {
+  if (!mimeType) {
+    return false;
+  }
+
+  return THREAD_NOTE_SUPPORTED_IMAGE_MIME_TYPES.has(mimeType.toLowerCase());
+}
+
+function isPotentialThreadNoteImageType(mimeType?: string | null): boolean {
+  const normalized = mimeType?.trim().toLowerCase() ?? "";
+  return !normalized || normalized.startsWith("image/");
+}
+
+function isPotentialThreadNoteImageFile(file: File): boolean {
+  if (isPotentialThreadNoteImageType(file.type)) {
+    return true;
+  }
+
+  const extension = file.name.split(".").pop()?.trim().toLowerCase() ?? "";
+  return THREAD_NOTE_SUPPORTED_IMAGE_EXTENSIONS.has(extension);
+}
+
+function resolveThreadNoteImageMimeType(file: File, dataUrl?: string | null): string {
+  const normalizedFileType = file.type.trim().toLowerCase();
+  if (isSupportedThreadNoteImageMimeType(normalizedFileType)) {
+    return normalizedFileType;
+  }
+
+  const dataUrlMimeType = extractThreadNoteDataUrlMimeType(dataUrl);
+  if (isSupportedThreadNoteImageMimeType(dataUrlMimeType)) {
+    return dataUrlMimeType!;
+  }
+
+  const extension = file.name.split(".").pop()?.trim().toLowerCase() ?? "";
+  switch (extension) {
+    case "png":
+      return "image/png";
+    case "jpg":
+    case "jpeg":
+      return "image/jpeg";
+    case "gif":
+      return "image/gif";
+    case "webp":
+      return "image/webp";
+    case "tif":
+    case "tiff":
+      return "image/tiff";
+    default:
+      return normalizedFileType;
+  }
+}
+
+function extractThreadNoteDataUrlMimeType(dataUrl?: string | null): string | null {
+  const trimmed = dataUrl?.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  const match = trimmed.match(/^data:([^;,]+)[;,]/i);
+  return match?.[1]?.trim().toLowerCase() ?? null;
+}
+
+function collectThreadNoteFindMatches(editor: Editor, query: string): ThreadNoteSearchMatch[] {
+  const normalizedQuery = query.trim().toLowerCase();
+  if (!normalizedQuery) {
+    return [];
+  }
+
+  const matches: ThreadNoteSearchMatch[] = [];
+  editor.state.doc.descendants((node, pos) => {
+    if (!node.isText) {
+      return true;
+    }
+
+    const text = node.text ?? "";
+    const normalizedText = text.toLowerCase();
+    let searchStart = 0;
+    let matchIndex = normalizedText.indexOf(normalizedQuery, searchStart);
+
+    while (matchIndex !== -1) {
+      const from = pos + matchIndex;
+      const to = from + normalizedQuery.length;
+      matches.push({
+        from,
+        to,
+        collapsedHeadingPositions: findCollapsedHeadingPositionsContainingSelection(
+          editor.state,
+          from
+        ),
+      });
+      searchStart = matchIndex + 1;
+      matchIndex = normalizedText.indexOf(normalizedQuery, searchStart);
+    }
+
+    return true;
+  });
+
+  return matches;
+}
+
+function findCollapsedHeadingPositionsContainingSelection(
+  state: Editor["state"],
+  selectionPos: number
+): number[] {
+  const collapsedHeadingPositions: number[] = [];
+
+  state.doc.forEach((node, offset) => {
+    if (node.type.name !== "heading") {
+      return;
+    }
+
+    const section = findHeadingSectionAtPosition(state, offset);
+    if (!section?.isCollapsed) {
+      return;
+    }
+
+    if (selectionPos >= section.headingNodeEnd && selectionPos < section.sectionEnd) {
+      collapsedHeadingPositions.push(section.headingPos);
+    }
+  });
+
+  return collapsedHeadingPositions.sort((left, right) => left - right);
+}
+
+function focusThreadNoteFindMatch(editor: Editor, match: ThreadNoteSearchMatch): boolean {
+  const editorView = resolveEditorView(editor);
+  if (!editorView) {
+    return false;
+  }
+
+  for (const headingPos of match.collapsedHeadingPositions) {
+    uncollapseHeadingAtPosition(editorView, headingPos);
+  }
+
+  try {
+    const selection = TextSelection.create(editorView.state.doc, match.from, match.to);
+    editorView.dispatch(editorView.state.tr.setSelection(selection).scrollIntoView());
+    editorView.focus();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function preferredThreadNoteImageAlt(filename?: string | null): string {
+  const trimmed = filename?.trim();
+  if (!trimmed) {
+    return "Image";
+  }
+
+  const baseName = trimmed.replace(/\.[^.]+$/, "");
+  const normalized = baseName.replace(/[-_]+/g, " ").replace(/\s+/g, " ").trim();
+  return normalized || "Image";
+}
+
+function resolveSelectedThreadNoteImage(editor: Editor): SelectedImageState | null {
+  const selection = editor.state.selection;
+  if (!(selection instanceof NodeSelection) || selection.node.type.name !== "threadNoteImage") {
+    return null;
+  }
+
+  const width =
+    typeof selection.node.attrs.width === "number" && Number.isFinite(selection.node.attrs.width)
+      ? Math.max(160, Math.round(selection.node.attrs.width))
+      : null;
+  return {
+    alt: `${selection.node.attrs.alt ?? ""}`,
+    title: `${selection.node.attrs.title ?? ""}`,
+    width,
+  };
+}
+
+function insertThreadNoteImages(
+  editor: Editor,
+  options: {
+    from?: number;
+    to?: number;
+    images: Array<{ src: string; alt: string; title: string }>;
+  }
+) {
+  if (!options.images.length) {
+    return;
+  }
+
+  const from = typeof options.from === "number" ? options.from : editor.state.selection.from;
+  const to = typeof options.to === "number" ? options.to : editor.state.selection.to;
+  const content = [
+    ...options.images.map((image) => ({
+      type: "threadNoteImage",
+      attrs: {
+        src: image.src,
+        alt: image.alt,
+        title: image.title,
+      },
+    })),
+    { type: "paragraph" },
+  ];
+
+  editor
+    .chain()
+    .focus()
+    .insertContentAt({ from, to }, content)
+    .run();
 }
 
 function truncateContextMenuPreview(text: string): string {

@@ -18,7 +18,7 @@ final class AssistantChatWebStreamingPlannerTests: XCTestCase {
         XCTAssertTrue(AssistantChatWebStreamingUpdatePlanner.hasStreamingMessages(messages))
     }
 
-    func testBuildsIncrementalTextUpdateForMiddleStreamingAssistantMessage() {
+    func testBuildsIncrementalEventsForMiddleStreamingAssistantMessage() {
         let previous = [
             makeMessage(id: "user-1", type: "user", text: "Hello", isStreaming: false),
             makeMessage(id: "assistant-1", type: "assistant", text: "Work", isStreaming: true),
@@ -46,16 +46,27 @@ final class AssistantChatWebStreamingPlannerTests: XCTestCase {
         ]
 
         XCTAssertEqual(
-            AssistantChatWebStreamingUpdatePlanner.incrementalTextUpdate(from: previous, to: next),
-            AssistantChatWebStreamingTextUpdate(
-                messageID: "assistant-1",
-                text: "Working",
-                isStreaming: true
-            )
+            AssistantChatWebStreamingUpdatePlanner.incrementalEvents(
+                from: previous,
+                to: next,
+                previousActiveWorkState: nil,
+                nextActiveWorkState: nil,
+                previousTyping: (false, "", ""),
+                nextTyping: (false, "", ""),
+                previousActiveTurnState: nil,
+                nextActiveTurnState: nil
+            ),
+            [
+                .responseTextDelta(
+                    messageID: "assistant-1",
+                    text: "Working",
+                    isStreaming: true
+                )
+            ]
         )
     }
 
-    func testFallsBackWhenNonTextFieldsChange() {
+    func testFallsBackToMessageUpsertWhenNonTextFieldsChange() {
         let previous = [
             makeMessage(id: "user-1", type: "user", text: "Hello", isStreaming: false),
             makeMessage(
@@ -80,8 +91,20 @@ final class AssistantChatWebStreamingPlannerTests: XCTestCase {
             ),
         ]
 
-        XCTAssertNil(
-            AssistantChatWebStreamingUpdatePlanner.incrementalTextUpdate(from: previous, to: next)
+        XCTAssertEqual(
+            AssistantChatWebStreamingUpdatePlanner.incrementalEvents(
+                from: previous,
+                to: next,
+                previousActiveWorkState: nil,
+                nextActiveWorkState: nil,
+                previousTyping: (false, "", ""),
+                nextTyping: (false, "", ""),
+                previousActiveTurnState: nil,
+                nextActiveTurnState: nil
+            ),
+            [
+                .upsertMessage(message: next[1], afterMessageID: "user-1")
+            ]
         )
     }
 

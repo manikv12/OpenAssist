@@ -81,6 +81,33 @@ enum AssistantRuntimeAvailability: String, Codable, Sendable {
     case failed
 }
 
+enum AssistantRuntimeControlsAvailability: String, Codable, Sendable {
+    case ready
+    case busy
+    case loadingModels
+    case switchingProvider
+    case unavailable
+
+    var isReady: Bool {
+        self == .ready
+    }
+
+    var fallbackStatusText: String {
+        switch self {
+        case .ready:
+            return ""
+        case .busy:
+            return "Responding..."
+        case .loadingModels:
+            return "Loading models..."
+        case .switchingProvider:
+            return "Starting provider..."
+        case .unavailable:
+            return "Runtime unavailable"
+        }
+    }
+}
+
 struct AssistantRuntimeHealth: Equatable, Sendable {
     var availability: AssistantRuntimeAvailability
     var summary: String
@@ -955,8 +982,13 @@ enum AssistantThreadArchitectureVersion: Int, Codable, Sendable {
 }
 
 enum AssistantConversationPersistenceKind: Int, Codable, Sendable {
+    case transient = 0
     case snapshotOnly = 1
     case hybridJSONL = 2
+
+    var persistsConversationHistory: Bool {
+        self != .transient
+    }
 }
 
 struct AssistantProviderBinding: Equatable, Codable, Sendable {
@@ -1005,6 +1037,7 @@ struct AssistantSessionSummary: Identifiable, Equatable, Codable, Sendable {
     var updatedAt: Date?
     var summary: String?
     var latestModel: String?
+    var latestTaskMode: AssistantTaskMode?
     var latestInteractionMode: AssistantInteractionMode?
     var latestReasoningEffort: AssistantReasoningEffort?
     var latestServiceTier: String?
@@ -1038,6 +1071,7 @@ struct AssistantSessionSummary: Identifiable, Equatable, Codable, Sendable {
         updatedAt: Date? = nil,
         summary: String? = nil,
         latestModel: String? = nil,
+        latestTaskMode: AssistantTaskMode? = nil,
         latestInteractionMode: AssistantInteractionMode? = nil,
         latestReasoningEffort: AssistantReasoningEffort? = nil,
         latestServiceTier: String? = nil,
@@ -1070,6 +1104,7 @@ struct AssistantSessionSummary: Identifiable, Equatable, Codable, Sendable {
         self.updatedAt = updatedAt
         self.summary = summary
         self.latestModel = latestModel
+        self.latestTaskMode = latestTaskMode
         self.latestInteractionMode = latestInteractionMode
         self.latestReasoningEffort = latestReasoningEffort
         self.latestServiceTier = latestServiceTier
@@ -1104,6 +1139,7 @@ struct AssistantSessionSummary: Identifiable, Equatable, Codable, Sendable {
         case updatedAt
         case summary
         case latestModel
+        case latestTaskMode
         case latestInteractionMode
         case latestReasoningEffort
         case latestServiceTier
@@ -1149,6 +1185,7 @@ struct AssistantSessionSummary: Identifiable, Equatable, Codable, Sendable {
             updatedAt: try container.decodeIfPresent(Date.self, forKey: .updatedAt),
             summary: try container.decodeIfPresent(String.self, forKey: .summary),
             latestModel: try container.decodeIfPresent(String.self, forKey: .latestModel),
+            latestTaskMode: try container.decodeIfPresent(AssistantTaskMode.self, forKey: .latestTaskMode),
             latestInteractionMode: try container.decodeIfPresent(AssistantInteractionMode.self, forKey: .latestInteractionMode),
             latestReasoningEffort: try container.decodeIfPresent(AssistantReasoningEffort.self, forKey: .latestReasoningEffort),
             latestServiceTier: try container.decodeIfPresent(String.self, forKey: .latestServiceTier),
@@ -1187,6 +1224,7 @@ struct AssistantSessionSummary: Identifiable, Equatable, Codable, Sendable {
         try container.encodeIfPresent(updatedAt, forKey: .updatedAt)
         try container.encodeIfPresent(summary, forKey: .summary)
         try container.encodeIfPresent(latestModel, forKey: .latestModel)
+        try container.encodeIfPresent(latestTaskMode, forKey: .latestTaskMode)
         try container.encodeIfPresent(latestInteractionMode, forKey: .latestInteractionMode)
         try container.encodeIfPresent(latestReasoningEffort, forKey: .latestReasoningEffort)
         try container.encodeIfPresent(latestServiceTier, forKey: .latestServiceTier)
@@ -1235,8 +1273,12 @@ struct AssistantSessionSummary: Identifiable, Equatable, Codable, Sendable {
         isCanonicalThread && threadArchitectureVersion == .providerIndependentV2
     }
 
+    var persistsConversationHistory: Bool {
+        isProviderIndependentThreadV2 && conversationPersistence.persistsConversationHistory
+    }
+
     var usesHybridConversationPersistence: Bool {
-        isProviderIndependentThreadV2 && conversationPersistence == .hybridJSONL
+        persistsConversationHistory && conversationPersistence == .hybridJSONL
     }
 
     var activeProviderBackend: AssistantRuntimeBackend? {
@@ -1745,6 +1787,7 @@ struct AssistantModelOption: Identifiable, Equatable, Sendable {
     var supportedReasoningEfforts: [String]
     var defaultReasoningEffort: String?
     var inputModalities: [String] = []
+    var isInstalled: Bool = true
 
     var supportsImageInput: Bool {
         inputModalities.contains { modality in
@@ -2243,6 +2286,7 @@ final class AssistantStore: ObservableObject {
             return await switchProvider(for: selectedSession.id, to: backend)
         }
         guard settings.assistantBackend != backend else { return false }
+        let previousBackend = settings.assistantBackend
         applyAssistantBackendSelectionState(backend)
         var runtimesByID: [ObjectIdentifier: CodexAssistantRuntime] = [:]
         for candidate in [rootRuntime] + Array(sessionRuntimesBySessionID.values) {
@@ -2255,6 +2299,9 @@ final class AssistantStore: ObservableObject {
         }
         await refreshEnvironment(permissions: permissions)
         await refreshSessions()
+        if previousBackend == .ollamaLocal, backend != .ollamaLocal {
+            await stopManagedLocalOllamaRuntimeIfIdle()
+        }
         return true
     }
 
@@ -2271,6 +2318,7 @@ final class AssistantStore: ObservableObject {
         runtime.backend = backend
         installGuidance = .placeholder(for: backend)
         accountSnapshot = .signedOut
+        visibleProviderSurfaceBackend = nil
         availableModels = []
         selectedModelID = nil
         runtimeHealth = .idle
@@ -2305,7 +2353,7 @@ final class AssistantStore: ObservableObject {
             guidanceByBackend[backend]?.codexDetected == true
         }
 
-        if detectedBackends.contains(preferred) {
+        if detectedBackends.contains(preferred) || preferred == .ollamaLocal {
             return preferred
         }
 
@@ -2325,13 +2373,20 @@ final class AssistantStore: ObservableObject {
         }
 
         if detectedBackends.isEmpty {
-            return [resolvedDefaultAssistantBackend(
+            let defaultBackend = resolvedDefaultAssistantBackend(
                 preferred: preferred,
                 guidanceByBackend: guidanceByBackend
-            )]
+            )
+            if defaultBackend == .ollamaLocal {
+                return [.ollamaLocal]
+            }
+            return [defaultBackend, .ollamaLocal]
         }
 
-        return detectedBackends
+        if detectedBackends.contains(.ollamaLocal) {
+            return detectedBackends
+        }
+        return detectedBackends + [.ollamaLocal]
     }
 
     @discardableResult
@@ -2374,8 +2429,7 @@ final class AssistantStore: ObservableObject {
         sessions[sessionIndex] = session
         persistManagedSessionsSnapshot()
 
-        restoreVisibleProviderSurface(threadID: threadID, backend: backend, session: session)
-        syncRuntimeContext()
+        restoreVisibleProviderState(for: session)
         let hasWarmModels = hasCachedModels(threadID: threadID, backend: backend)
         isLoadingModels = !hasWarmModels
         Task { @MainActor [weak self] in
@@ -2383,6 +2437,10 @@ final class AssistantStore: ObservableObject {
                 threadID: threadID,
                 backend: backend
             )
+        }
+
+        if previousBackend == .ollamaLocal, backend != .ollamaLocal {
+            await stopManagedLocalOllamaRuntimeIfIdle()
         }
 
         if previousBackend != backend {
@@ -2424,6 +2482,14 @@ final class AssistantStore: ObservableObject {
         }
 
         return true
+    }
+
+    static func shouldApplyVisibleRuntimeRefreshResult(
+        requestedBackend: AssistantRuntimeBackend,
+        currentVisibleBackend: AssistantRuntimeBackend,
+        runtimeBackend: AssistantRuntimeBackend
+    ) -> Bool {
+        requestedBackend == currentVisibleBackend && requestedBackend == runtimeBackend
     }
 
     private func refreshProviderSwitchSurfaceIfStillCurrent(
@@ -2587,6 +2653,36 @@ final class AssistantStore: ObservableObject {
             await waitForCachedModels(threadID: session.id, backend: backend)
             await warmRuntime.stop()
         case .claudeCode:
+            let warmRuntime = runtime ?? makeBackgroundWarmupRuntime(
+                preferredSessionID: session.id,
+                backend: backend
+            )
+            let shouldStopRuntime = runtime == nil
+            let guidance = await installSupport.inspect(backend: backend)
+            guard guidance.codexDetected else {
+                if shouldStopRuntime {
+                    await warmRuntime.stop()
+                }
+                return
+            }
+
+            await ensureRuntimeBackend(warmRuntime, matches: backend)
+            do {
+                _ = try await warmRuntime.refreshEnvironment(codexPath: guidance.codexPath)
+                if shouldStopRuntime {
+                    await waitForCachedModels(threadID: session.id, backend: backend)
+                }
+            } catch {
+                if shouldStopRuntime {
+                    await warmRuntime.stop()
+                }
+                return
+            }
+
+            if shouldStopRuntime {
+                await warmRuntime.stop()
+            }
+        case .ollamaLocal:
             let warmRuntime = runtime ?? makeBackgroundWarmupRuntime(
                 preferredSessionID: session.id,
                 backend: backend
@@ -2860,6 +2956,13 @@ final class AssistantStore: ObservableObject {
             }
         }
     }
+    @Published var taskMode: AssistantTaskMode = .chat {
+        didSet {
+            guard oldValue != taskMode else { return }
+            guard !isRestoringSessionConfiguration else { return }
+            syncRuntimeContext()
+        }
+    }
     @Published private(set) var proposedPlan: String?
     @Published var attachments: [AssistantAttachment] = [] {
         didSet {
@@ -2877,6 +2980,7 @@ final class AssistantStore: ObservableObject {
     @Published private(set) var selectedCodeTrackingState: AssistantCodeTrackingState?
     @Published private(set) var selectedCodeReviewPanelState: AssistantCodeReviewPanelState?
     @Published private(set) var memoryInspectorSnapshot: AssistantMemoryInspectorSnapshot?
+    @Published private(set) var lastAssistantNotesMutation: AssistantNotesMutationEvent?
     @Published private(set) var assistantVoiceHealth: AssistantSpeechHealth = .unknown
     @Published private(set) var assistantVoiceStatusMessage: String?
     @Published private(set) var isRefreshingAssistantVoiceHealth = false
@@ -2911,6 +3015,7 @@ final class AssistantStore: ObservableObject {
     private let automationMemoryService: AutomationMemoryService
     private let completionNotificationService: AssistantCompletionNotificationService
     private let conversationStore: AssistantConversationStore
+    private let assistantNotesToolService: AssistantNotesToolService
     private let threadRewriteService: CodexThreadRewriteService
     private let gitCheckpointService: GitCheckpointService
     private let conversationCheckpointStore: AssistantConversationCheckpointStore
@@ -2934,9 +3039,11 @@ final class AssistantStore: ObservableObject {
     private var selectedSessionWarmupTask: Task<Void, Never>?
     private var isSendingPrompt = false
     private var isRefreshingEnvironment = false
+    private var pendingEnvironmentRefreshPermissions: AssistantPermissionSnapshot?
     private var isRefreshingSessions = false
     private var isRestoringSessionConfiguration = false
     private var oneShotSessionInstructions: String?
+    private var notesWorkspaceRuntimeContext: AssistantNotesRuntimeContext?
     private var blockedModeSwitchSuggestion: AssistantModeSwitchSuggestion?
     private var proposedPlanSessionID: String?
     private var composerDraftBySessionID: [String: String] = [:]
@@ -2968,6 +3075,7 @@ final class AssistantStore: ObservableObject {
     private var sessionCatalogCWDCacheBySessionID: [String: SessionCatalogCWDCacheEntry] = [:]
     private var idleCodeCheckpointRecoveryAttemptedSessionIDs: Set<String> = []
     private var pendingConversationCheckpointCaptureTasksByKey: [String: Task<Void, Never>] = [:]
+    private var visibleProviderSurfaceBackend: AssistantRuntimeBackend?
     var onStartLiveVoiceSession: ((AssistantLiveVoiceSessionSurface) -> Void)?
     var onEndLiveVoiceSession: (() -> Void)?
     var onStopLiveVoiceSpeaking: (() -> Void)?
@@ -3021,30 +3129,37 @@ final class AssistantStore: ObservableObject {
         self.installGuidance = .placeholder(for: resolvedSettings.assistantBackend)
         self.selectedModelID = initialPreferredModelID
         self.selectedSubagentModelID = resolvedSettings.assistantPreferredSubagentModelID.nonEmpty
+        let resolvedProjectStore = projectStore ?? AssistantProjectStore()
+        let resolvedConversationStore = conversationStore ?? AssistantConversationStore()
+        let resolvedAssistantNotesToolService = AssistantNotesToolService(
+            projectStore: resolvedProjectStore,
+            conversationStore: resolvedConversationStore
+        )
         let initialRuntime = runtime ?? CodexAssistantRuntime(
             preferredModelID: initialPreferredModelID,
-            preferredSubagentModelID: resolvedSettings.assistantPreferredSubagentModelID.nonEmpty
+            preferredSubagentModelID: resolvedSettings.assistantPreferredSubagentModelID.nonEmpty,
+            assistantNotesService: resolvedAssistantNotesToolService
         )
         initialRuntime.backend = resolvedSettings.assistantBackend
         self.rootRuntime = initialRuntime
         let transcriptionRuntime = CodexAssistantRuntime()
         transcriptionRuntime.backend = .codex
         self.codexTranscriptionRuntime = transcriptionRuntime
-        self.runtimeFactory = { [settings = resolvedSettings] in
+        self.runtimeFactory = { [settings = resolvedSettings, assistantNotesToolService = resolvedAssistantNotesToolService] in
             let preferredModelID = Self.normalizedStartupPreferredModelID(
                 for: settings.assistantBackend,
                 storedModelID: settings.assistantPreferredModelID.nonEmpty
             )
             let runtime = CodexAssistantRuntime(
                 preferredModelID: preferredModelID,
-                preferredSubagentModelID: settings.assistantPreferredSubagentModelID.nonEmpty
+                preferredSubagentModelID: settings.assistantPreferredSubagentModelID.nonEmpty,
+                assistantNotesService: assistantNotesToolService
             )
             runtime.backend = settings.assistantBackend
             return runtime
         }
         let resolvedMemoryStore = memoryStore ?? (try? MemorySQLiteStore()) ?? MemorySQLiteStore.fallback()
         self.memoryStore = resolvedMemoryStore
-        let resolvedProjectStore = projectStore ?? AssistantProjectStore()
         self.projectStore = resolvedProjectStore
         self.temporarySessionStore = temporarySessionStore ?? AssistantTemporarySessionStore()
         self.sessionRegistry = sessionRegistry ?? AssistantSessionRegistry()
@@ -3067,7 +3182,8 @@ final class AssistantStore: ObservableObject {
             threadMemoryService: resolvedThreadMemoryService,
             store: resolvedMemoryStore
         )
-        self.conversationStore = conversationStore ?? AssistantConversationStore()
+        self.conversationStore = resolvedConversationStore
+        self.assistantNotesToolService = resolvedAssistantNotesToolService
         self.gitCheckpointService = GitCheckpointService()
         self.conversationCheckpointStore = AssistantConversationCheckpointStore(
             sessionCatalog: self.sessionCatalog,
@@ -3106,6 +3222,14 @@ final class AssistantStore: ObservableObject {
             tokenService: humeTokenService,
             configService: humeConversationConfigService
         )
+        resolvedAssistantNotesToolService.setSessionSummaryProvider { [weak self] sessionID in
+            self?.sessions.first {
+                $0.id.caseInsensitiveCompare(sessionID) == .orderedSame
+            }
+        }
+        resolvedAssistantNotesToolService.setMutationHandler { [weak self] event in
+            self?.lastAssistantNotesMutation = event
+        }
         bindRuntimeCallbacks(initialRuntime, preferredSessionID: nil)
         self.assistantSpeechPlaybackService.onPlaybackStateChange = { [weak self] isPlaying in
             Task { @MainActor in
@@ -3183,6 +3307,34 @@ final class AssistantStore: ObservableObject {
                 total += 1
             }
         }
+    }
+
+    private func hasActiveOllamaRuntimeUsage() -> Bool {
+        var candidateSessionIDs = Set(sessionExecutionStateBySessionID.keys)
+        candidateSessionIDs.formUnion(sessionRuntimesBySessionID.keys)
+        if let selectedSessionID = normalizedSessionID(selectedSessionID) {
+            candidateSessionIDs.insert(selectedSessionID)
+        }
+        if let rootSessionID = normalizedSessionID(rootRuntime.currentSessionID) {
+            candidateSessionIDs.insert(rootSessionID)
+        }
+
+        return candidateSessionIDs.contains { runtimeSessionID in
+            let state = sessionExecutionStateBySessionID[runtimeSessionID]
+            let runtime = runtime(for: runtimeSessionID)
+                ?? (sessionsMatch(rootRuntime.currentSessionID, runtimeSessionID) ? rootRuntime : nil)
+            let session = sessions.first(where: { sessionsMatch($0.id, runtimeSessionID) })
+            let runtimeBackend = runtime?.backend ?? session.map { self.backend(for: $0) }
+            guard runtimeBackend == .ollamaLocal else { return false }
+            return state?.hasActiveTurn == true
+                || state?.pendingPermissionRequest != nil
+                || runtime?.hasActiveTurn == true
+        }
+    }
+
+    private func stopManagedLocalOllamaRuntimeIfIdle() async {
+        guard !hasActiveOllamaRuntimeUsage() else { return }
+        await LocalAIRuntimeManager.shared.stop()
     }
 
     private func ensureLiveRuntimeCapacity(for sessionID: String?) throws {
@@ -3643,6 +3795,12 @@ final class AssistantStore: ObservableObject {
             return nil
         }
 
+        if activeAssistantNotesRuntimeContext() != nil {
+            currentMemoryFileURL = nil
+            updateMemoryStatus(base: "Using live project notes")
+            return nil
+        }
+
         let builtMemory: AssistantBuiltMemoryContext
         if let automationJob {
             builtMemory = try automationMemoryService.prepareAutomationTurnContext(
@@ -3790,6 +3948,7 @@ final class AssistantStore: ObservableObject {
                 surfaceModelID: snapshot.selectedModelID
             )
             accountSnapshot = snapshot.accountSnapshot
+            visibleProviderSurfaceBackend = backend
             availableModels = resolvedModels
             tokenUsage = snapshot.tokenUsage
             rateLimits = snapshot.rateLimits
@@ -3810,10 +3969,22 @@ final class AssistantStore: ObservableObject {
 
         tokenUsage = .empty
         rateLimits = .empty
+        visibleProviderSurfaceBackend = backend
         availableModels = cachedAvailableModels(threadID: threadID, backend: backend)
         selectedModelID = fallbackModelID
         runtime.setPreferredModelID(fallbackModelID)
         runtimeHealth.selectedModelID = fallbackModelID
+    }
+
+    private func restoreVisibleProviderState(for session: AssistantSessionSummary?) {
+        guard let session else { return }
+        let providerBackend = backend(for: session)
+        restoreVisibleProviderSurface(
+            threadID: session.id,
+            backend: providerBackend,
+            session: session
+        )
+        restoreSessionConfiguration(from: session)
     }
 
     private func recomputeAggregatedSubagents() {
@@ -3989,6 +4160,7 @@ final class AssistantStore: ObservableObject {
                         state.hasLiveClaudeProcess = runtime.hasLiveClaudeProcess
                         state.awaitingAssistantStart = false
                         state.pendingOutgoingMessage = nil
+                        self.finalizeToolCallsForTurn(state: &state, status: status)
                         if state.hudState?.phase == .waitingForPermission {
                             state.hudState = .idle
                         }
@@ -4263,6 +4435,7 @@ final class AssistantStore: ObservableObject {
                 let resolvedModels = models.isEmpty
                     ? self.cachedAvailableModels(threadID: resolvedSessionID, backend: runtime.backend)
                     : models
+                self.visibleProviderSurfaceBackend = runtime.backend
                 self.availableModels = resolvedModels
                 self.applyPreferredModelSelection(using: resolvedModels)
                 self.restoreSessionConfiguration(from: self.selectedSession)
@@ -4346,7 +4519,11 @@ final class AssistantStore: ObservableObject {
         case .failed, .unavailable:
             state = .failed
         default:
-            state = accountSnapshot.isLoggedIn ? .ready : (installGuidance.codexDetected ? .needsLogin : .missingCodex)
+            if visibleAssistantBackend.requiresLogin {
+                state = accountSnapshot.isLoggedIn ? .ready : (installGuidance.codexDetected ? .needsLogin : .missingCodex)
+            } else {
+                state = installGuidance.codexDetected ? .ready : .missingCodex
+            }
         }
         return AssistantEnvironmentSnapshot(
             state: state,
@@ -4370,6 +4547,76 @@ final class AssistantStore: ObservableObject {
         return "No models"
     }
 
+    var runtimeControlsAvailability: AssistantRuntimeControlsAvailability {
+        runtimeControlsState(
+            for: visibleAssistantBackend,
+            availableModels: visibleModels,
+            isLoadingModels: isLoadingModels,
+            isBusy: hasActiveTurn
+        ).availability
+    }
+
+    var runtimeControlsStatusText: String {
+        runtimeControlsState(
+            for: visibleAssistantBackend,
+            availableModels: visibleModels,
+            isLoadingModels: isLoadingModels,
+            isBusy: hasActiveTurn
+        ).statusText
+    }
+
+    func runtimeControlsState(
+        for backend: AssistantRuntimeBackend,
+        availableModels: [AssistantModelOption],
+        isLoadingModels: Bool,
+        isBusy: Bool
+    ) -> (availability: AssistantRuntimeControlsAvailability, statusText: String) {
+        if isBusy {
+            return (.busy, AssistantRuntimeControlsAvailability.busy.fallbackStatusText)
+        }
+
+        if backend == visibleAssistantBackend {
+            switch runtimeHealth.availability {
+            case .idle, .checking, .connecting:
+                return (
+                    .switchingProvider,
+                    AssistantRuntimeControlsAvailability.switchingProvider.fallbackStatusText
+                )
+            case .installRequired:
+                return (.unavailable, backend.missingInstallSummary)
+            case .loginRequired:
+                return (.unavailable, backend.loginRequiredSummary)
+            case .failed, .unavailable:
+                let summary =
+                    runtimeHealth.detail?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .nonEmpty
+                    ?? runtimeHealth.summary
+                return (.unavailable, summary)
+            case .ready, .active:
+                break
+            }
+        }
+
+        let installGuidance = guidance(for: backend)
+        if !installGuidance.codexDetected {
+            return (.unavailable, backend.missingInstallSummary)
+        }
+
+        if isLoadingModels {
+            return (
+                .loadingModels,
+                AssistantRuntimeControlsAvailability.loadingModels.fallbackStatusText
+            )
+        }
+
+        if availableModels.isEmpty {
+            return (.unavailable, "No models available")
+        }
+
+        return (.ready, "")
+    }
+
     var visibleToolActivity: [AssistantToolCallState] {
         toolCalls + recentToolCalls
     }
@@ -4379,7 +4626,7 @@ final class AssistantStore: ObservableObject {
     }
 
     var visibleModels: [AssistantModelOption] {
-        availableModels.filter { !$0.hidden }
+        Self.selectableModels(for: visibleAssistantBackend, from: availableModels)
     }
 
     var selectedModel: AssistantModelOption? {
@@ -4476,7 +4723,11 @@ final class AssistantStore: ObservableObject {
                 "codex app server closed",
                 "codex app server is not running",
                 "github copilot exited because of a signal",
-                "github copilot exited with code"
+                "github copilot exited with code",
+                "operation cancelled by user",
+                "operation canceled by user",
+                "operation was cancelled by the user",
+                "operation was canceled by the user"
             ]
         case .claudeCode:
             recoverableFragments = [
@@ -4486,9 +4737,23 @@ final class AssistantStore: ObservableObject {
             ]
         case .codex:
             recoverableFragments = []
+        case .ollamaLocal:
+            recoverableFragments = []
         }
 
         return recoverableFragments.contains { normalized.contains($0) }
+    }
+
+    static func shouldInvalidateProviderSessionAfterUserCancellation(
+        backend: AssistantRuntimeBackend,
+        session: AssistantSessionSummary?
+    ) -> Bool {
+        guard backend == .copilot,
+              let session else {
+            return false
+        }
+
+        return session.isCanonicalThread
     }
 
     var isRuntimeReadyForConversation: Bool {
@@ -4500,8 +4765,16 @@ final class AssistantStore: ObservableObject {
         }
     }
 
+    private var selectedModelIsReadyForConversation: Bool {
+        guard let selectedModel else { return false }
+        if visibleAssistantBackend == .ollamaLocal {
+            return selectedModel.isInstalled
+        }
+        return true
+    }
+
     var canStartConversation: Bool {
-        isRuntimeReadyForConversation && selectedModel != nil
+        isRuntimeReadyForConversation && selectedModelIsReadyForConversation
     }
 
     var canCreateThread: Bool {
@@ -4536,6 +4809,11 @@ final class AssistantStore: ObservableObject {
         }
         if selectedModel == nil {
             return "Choose a model before starting a conversation. Then confirm the reasoning level."
+        }
+        if visibleAssistantBackend == .ollamaLocal,
+           selectedModel?.isInstalled == false {
+            let modelName = selectedModel?.displayName ?? "The selected model"
+            return "\(modelName) is not installed yet. Open Setup to download it, or choose an installed local model."
         }
         if attachments.contains(where: \.isImage), !selectedModelSupportsImageInput {
             let modelName = selectedModel?.displayName ?? "The selected model"
@@ -4868,11 +5146,20 @@ final class AssistantStore: ObservableObject {
     func refreshEnvironment(permissions: AssistantPermissionSnapshot = .unknown) async {
         guard !isRefreshingEnvironment else {
             self.permissions = permissions
+            pendingEnvironmentRefreshPermissions = permissions
             return
         }
 
         isRefreshingEnvironment = true
-        defer { isRefreshingEnvironment = false }
+        defer {
+            isRefreshingEnvironment = false
+            if let pendingPermissions = pendingEnvironmentRefreshPermissions {
+                pendingEnvironmentRefreshPermissions = nil
+                Task { @MainActor [weak self] in
+                    await self?.refreshEnvironment(permissions: pendingPermissions)
+                }
+            }
+        }
 
         let guidanceByBackend = await refreshInstallGuidanceCatalog()
         if selectedSession == nil {
@@ -4885,26 +5172,34 @@ final class AssistantStore: ObservableObject {
             }
         }
 
-        let backend = visibleAssistantBackend
-        runtime.backend = backend
+        let requestedBackend = visibleAssistantBackend
+        runtime.backend = requestedBackend
         let guidance: AssistantInstallGuidance
-        if let cachedGuidance = guidanceByBackend[backend] {
+        if let cachedGuidance = guidanceByBackend[requestedBackend] {
             guidance = cachedGuidance
         } else {
-            guidance = await installSupport.inspect(backend: backend)
+            guidance = await installSupport.inspect(backend: requestedBackend)
+        }
+        guard Self.shouldApplyVisibleRuntimeRefreshResult(
+            requestedBackend: requestedBackend,
+            currentVisibleBackend: visibleAssistantBackend,
+            runtimeBackend: runtime.backend
+        ) else {
+            return
         }
         installGuidance = guidance
         self.permissions = permissions
 
         guard guidance.codexDetected else {
             accountSnapshot = .signedOut
+            visibleProviderSurfaceBackend = requestedBackend
             availableModels = []
             selectedModelID = nil
             isLoadingModels = false
             runtime.setPreferredModelID(nil)
             runtimeHealth = AssistantRuntimeHealth(
                 availability: .installRequired,
-                summary: backend.missingInstallSummary,
+                summary: requestedBackend.missingInstallSummary,
                 detail: guidance.primaryDetail,
                 runtimePath: guidance.codexPath,
                 selectedModelID: nil,
@@ -4917,24 +5212,32 @@ final class AssistantStore: ObservableObject {
         isLoadingModels = true
         do {
             let details = try await runtime.refreshEnvironment(codexPath: guidance.codexPath)
+            guard Self.shouldApplyVisibleRuntimeRefreshResult(
+                requestedBackend: requestedBackend,
+                currentVisibleBackend: visibleAssistantBackend,
+                runtimeBackend: runtime.backend
+            ) else {
+                return
+            }
             let resolvedModels = details.models.isEmpty
-                ? cachedAvailableModels(threadID: selectedSessionID, backend: backend)
+                ? cachedAvailableModels(threadID: selectedSessionID, backend: requestedBackend)
                 : details.models
             accountSnapshot = details.account
             if !details.models.isEmpty {
-                providerAvailableModelsByBackend[backend] = details.models
+                providerAvailableModelsByBackend[requestedBackend] = details.models
             }
+            visibleProviderSurfaceBackend = requestedBackend
             availableModels = resolvedModels
             applyPreferredModelSelection(using: resolvedModels)
             if let selectedSessionID {
                 let scopedModelID = scopedProviderSurfaceModelID(
                     threadID: selectedSessionID,
-                    backend: backend,
+                    backend: requestedBackend,
                     prefersVisibleSelection: true
                 )
                 updateProviderSurfaceSnapshot(
                     threadID: selectedSessionID,
-                    backend: backend
+                    backend: requestedBackend
                 ) { snapshot in
                     snapshot.accountSnapshot = details.account
                     if !details.models.isEmpty {
@@ -4944,17 +5247,27 @@ final class AssistantStore: ObservableObject {
                 }
             }
             runtimeHealth = details.health
-            if details.account.isLoggedIn && resolvedModels.isEmpty {
-                runtimeHealth.detail = backend.loadingModelsMessage
+            if (requestedBackend.requiresLogin ? details.account.isLoggedIn : guidance.codexDetected) && resolvedModels.isEmpty {
+                runtimeHealth.detail = requestedBackend.loadingModelsMessage
             }
             if !resolvedModels.isEmpty {
                 isLoadingModels = false
             }
         } catch {
+            guard Self.shouldApplyVisibleRuntimeRefreshResult(
+                requestedBackend: requestedBackend,
+                currentVisibleBackend: visibleAssistantBackend,
+                runtimeBackend: runtime.backend
+            ) else {
+                return
+            }
             isLoadingModels = false
+            let requiresLogin = requestedBackend.requiresLogin
             runtimeHealth = AssistantRuntimeHealth(
-                availability: accountSnapshot.isLoggedIn ? .failed : .loginRequired,
-                summary: accountSnapshot.isLoggedIn ? backend.needsAttentionSummary : backend.loginRequiredSummary,
+                availability: requiresLogin ? (accountSnapshot.isLoggedIn ? .failed : .loginRequired) : .failed,
+                summary: requiresLogin
+                    ? (accountSnapshot.isLoggedIn ? requestedBackend.needsAttentionSummary : requestedBackend.loginRequiredSummary)
+                    : requestedBackend.needsAttentionSummary,
                 detail: error.localizedDescription,
                 runtimePath: guidance.codexPath,
                 selectedModelID: selectedModelID,
@@ -5100,7 +5413,7 @@ final class AssistantStore: ObservableObject {
                 selectedSessionID = preferredSessionID()
             }
 
-            restoreSessionConfiguration(from: selectedSession)
+            restoreVisibleProviderState(for: selectedSession)
             refreshMemoryState(for: selectedSessionID)
             reloadMemoryInspectorSnapshot(closeIfMissing: true)
             scheduleSelectedSessionHistoryReload(force: transcript.isEmpty || timelineItems.isEmpty)
@@ -5119,10 +5432,14 @@ final class AssistantStore: ObservableObject {
         managedSessionIDs: Set<String>
     ) async -> [AssistantSessionSummary] {
         let filteredSessionIDs = managedSessionIDs.isEmpty ? nil : managedSessionIDs
-        return applyStoredSessionMetadata(to: sessionRegistry.sessions(
-            sources: Set([.openAssist]),
-            sessionIDs: filteredSessionIDs
-        ))
+        return filterRestorableSessions(
+            applyStoredSessionMetadata(
+                to: sessionRegistry.sessions(
+                    sources: Set([.openAssist]),
+                    sessionIDs: filteredSessionIDs
+                )
+            )
+        )
     }
 
     private func trackedSidebarSessionIDs() -> [String] {
@@ -5338,11 +5655,13 @@ final class AssistantStore: ObservableObject {
         let existingIDs = Set(byID.map { $0.id.lowercased() })
         for session in byOriginator where !existingIDs.contains(session.id.lowercased()) {
             merged.append(session)
-            if session.parentThreadID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty == nil {
-                recordOwnedSessionID(session.id)
-            }
         }
-        return applyStoredSessionMetadata(to: merged)
+        let filteredSessions = filterRestorableSessions(applyStoredSessionMetadata(to: merged))
+        for session in filteredSessions
+        where session.parentThreadID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty == nil {
+            recordOwnedSessionID(session.id)
+        }
+        return filteredSessions
     }
 
     private func loadManagedCopilotSessions(
@@ -5355,9 +5674,10 @@ final class AssistantStore: ObservableObject {
             sources: Set([.cli]),
             sessionIDs: managedSessionIDs
         ))
+        let filteredStoredSessions = filterRestorableSessions(storedSessions)
 
         guard assistantBackend == .copilot else {
-            return storedSessions
+            return filteredStoredSessions
         }
 
         let inspectionLimit = max(limit * 8, managedSessionIDs.count + temporarySessionIDs.count + 40)
@@ -5375,10 +5695,14 @@ final class AssistantStore: ObservableObject {
                 }
                 return managedSessionIDs.contains(normalizedSessionID)
             }
-            return deduplicateSessions(applyStoredSessionMetadata(to: liveSessions + storedSessions))
+            return deduplicateSessions(
+                filterRestorableSessions(
+                    applyStoredSessionMetadata(to: liveSessions + filteredStoredSessions)
+                )
+            )
         } catch {
             lastStatusMessage = error.localizedDescription
-            return storedSessions
+            return filteredStoredSessions
         }
     }
 
@@ -5390,6 +5714,7 @@ final class AssistantStore: ObservableObject {
             }
             return managedSessionIDs.contains(normalizedID)
                 && (session.source == .cli || session.source == .openAssist)
+                && session.conversationPersistence.persistsConversationHistory
         }
 
         do {
@@ -5750,6 +6075,16 @@ final class AssistantStore: ObservableObject {
         syncReasoningEffortWithSelectedModel(preferModelDefault: true)
         runtime.setPreferredModelID(trimmed)
         runtimeHealth.selectedModelID = trimmed
+        if visibleAssistantBackend == .ollamaLocal,
+           let selectedModel = visibleModels.first(where: { $0.id == trimmed }) {
+            runtimeHealth.availability = selectedModel.isInstalled ? .ready : .installRequired
+            runtimeHealth.summary = selectedModel.isInstalled
+                ? visibleAssistantBackend.connectedSummary
+                : visibleAssistantBackend.missingInstallSummary
+            runtimeHealth.detail = selectedModel.isInstalled
+                ? nil
+                : "\(selectedModel.displayName) is not installed yet. Open Setup to download it, or choose an installed local model."
+        }
         syncRuntimeContext()
     }
 
@@ -5770,8 +6105,10 @@ final class AssistantStore: ObservableObject {
     func selectionSideAssistantVisibleModels(
         for backend: AssistantRuntimeBackend
     ) -> [AssistantModelOption] {
-        cachedAvailableModels(threadID: selectedSessionID, backend: backend)
-            .filter { !$0.hidden }
+        Self.selectableModels(
+            for: backend,
+            from: cachedAvailableModels(threadID: selectedSessionID, backend: backend)
+        )
     }
 
     func selectionSideAssistantResolvedModelID(
@@ -5821,6 +6158,10 @@ final class AssistantStore: ObservableObject {
     func startAccountLogin() {
         Task { @MainActor in
             let backend = self.assistantBackend
+            guard backend.requiresLogin else {
+                self.runPreferredInstallCommand(for: backend)
+                return
+            }
             if accountSnapshot.isLoggedIn {
                 self.lastStatusMessage = backend.alreadySignedInMessage
                 self.runtimeHealth = AssistantRuntimeHealth(
@@ -5871,12 +6212,14 @@ final class AssistantStore: ObservableObject {
         recentToolCalls = []
         pendingPermissionRequest = nil
         lastSubmittedPrompt = nil
+        taskMode = .chat
         sessionInstructions = ""
         oneShotSessionInstructions = nil
         proposedPlan = nil
         proposedPlanSessionID = nil
         tokenUsage = .empty
         subagents = []
+        notesWorkspaceRuntimeContext = nil
         syncRuntimeContext()
     }
 
@@ -5892,7 +6235,7 @@ final class AssistantStore: ObservableObject {
             title: "New Assistant Session",
             source: .openAssist,
             threadArchitectureVersion: .providerIndependentV2,
-            conversationPersistence: .hybridJSONL,
+            conversationPersistence: isTemporary ? .transient : .hybridJSONL,
             providerBackend: nil,
             providerSessionID: nil,
             activeProvider: nil,
@@ -5904,6 +6247,7 @@ final class AssistantStore: ObservableObject {
             updatedAt: now,
             summary: nil,
             latestModel: selectedModelID,
+            latestTaskMode: taskMode,
             latestInteractionMode: interactionMode,
             latestReasoningEffort: reasoningEffort,
             latestServiceTier: fastModeEnabled ? "fast" : nil,
@@ -5915,12 +6259,14 @@ final class AssistantStore: ObservableObject {
             linkedProjectFolderPath: requestedCWD
         )
 
-        recordOwnedSessionID(sessionID)
+        if !isTemporary {
+            recordOwnedSessionID(sessionID)
+        }
         if let targetProjectID {
             try? updateSessionProjectAssignment(sessionID: sessionID, projectID: targetProjectID)
         }
         setTemporaryFlag(isTemporary, for: sessionID, reportErrors: true)
-        if settings.assistantMemoryEnabled {
+        if settings.assistantMemoryEnabled && !isTemporary {
             _ = try? threadMemoryService.ensureMemoryFile(for: sessionID)
         }
 
@@ -6076,11 +6422,6 @@ final class AssistantStore: ObservableObject {
         }
         let desiredBackend = backend(for: session)
         let sessionRuntime = ensureRuntime(for: normalizedSessionID)
-        if sessionRuntime.backend != desiredBackend {
-            await sessionRuntime.stop()
-            sessionRuntime.clearCachedEnvironmentState()
-            sessionRuntime.backend = desiredBackend
-        }
 
         let previousSelectedSessionID = selectedSessionID
         if !sessionsMatch(previousSelectedSessionID, normalizedSessionID) {
@@ -6103,10 +6444,11 @@ final class AssistantStore: ObservableObject {
            sessionsMatch(timelineSessionID, normalizedSessionID),
            !isTransitioningSession,
            (hasVisibleSelectedSessionHistory || hasUsableCachedHistory) {
-            restoreSessionConfiguration(from: session)
+            restoreVisibleProviderState(for: session)
             await refreshEnvironment(permissions: permissions)
             refreshMemoryState(for: normalizedSessionID)
             refreshEditableTurns(for: normalizedSessionID)
+            scheduleSelectedSessionHistoryReload(force: true)
             scheduleSelectedSessionWarmupIfNeeded()
             return
         }
@@ -6114,7 +6456,15 @@ final class AssistantStore: ObservableObject {
         let requestID = UUID()
         sessionLoadRequestID = requestID
         selectedSessionID = normalizedSessionID
-        restoreSessionConfiguration(from: session)
+        isTransitioningSession = true
+        restoreVisibleProviderState(for: session)
+        await Task.yield()
+
+        if sessionRuntime.backend != desiredBackend {
+            await sessionRuntime.stop()
+            sessionRuntime.clearCachedEnvironmentState()
+            sessionRuntime.backend = desiredBackend
+        }
 
         if session.isCanonicalThread {
             await openOpenAssistSession(
@@ -6136,21 +6486,26 @@ final class AssistantStore: ObservableObject {
             return
         }
 
-        await refreshEnvironment(permissions: permissions)
-        scheduleSelectedSessionWarmupIfNeeded()
         if hasUsableCachedHistory {
             setVisibleTimeline(cachedTimeline, for: normalizedSessionID)
             setVisibleTranscript(cachedTranscript, for: normalizedSessionID)
             refreshEditableTurns(for: normalizedSessionID)
+            refreshMemoryState(for: normalizedSessionID)
+        } else {
+            setVisibleHistoryLoadingState(for: normalizedSessionID)
+        }
+
+        await Task.yield()
+        await refreshEnvironment(permissions: permissions)
+        scheduleSelectedSessionWarmupIfNeeded()
+        if hasUsableCachedHistory {
             isTransitioningSession = false
             await cleanupTemporarySessionAfterLeaving(
                 previousSelectedSessionID,
                 nextSelectedSessionID: normalizedSessionID
             )
+            return
         } else {
-            setVisibleHistoryLoadingState(for: normalizedSessionID)
-            isTransitioningSession = true
-
             let recentChunk = await loadRecentHistoryChunk(
                 sessionID: normalizedSessionID,
                 timelineLimit: min(
@@ -6181,10 +6536,10 @@ final class AssistantStore: ObservableObject {
                 transcriptEntriesBySessionID[normalizedSessionID] = recentChunk.transcript
                 canLoadMoreHistoryBySessionID[normalizedSessionID] = recentChunk.hasMore
                 refreshEditableTurns(for: normalizedSessionID)
-                isTransitioningSession = false
                 scheduleSelectedSessionHistoryReload(force: true)
                 scheduleSelectedSessionWarmupIfNeeded()
                 refreshMemoryState(for: normalizedSessionID)
+                isTransitioningSession = false
                 await cleanupTemporarySessionAfterLeaving(
                     previousSelectedSessionID,
                     nextSelectedSessionID: normalizedSessionID
@@ -6223,8 +6578,8 @@ final class AssistantStore: ObservableObject {
         setVisibleTranscript(mergedTranscript, for: normalizedSessionID)
         refreshEditableTurns(for: normalizedSessionID)
         refreshMemoryState(for: normalizedSessionID)
-        isTransitioningSession = false
         scheduleSelectedSessionWarmupIfNeeded()
+        isTransitioningSession = false
         await cleanupTemporarySessionAfterLeaving(
             previousSelectedSessionID,
             nextSelectedSessionID: normalizedSessionID
@@ -6255,11 +6610,11 @@ final class AssistantStore: ObservableObject {
             setVisibleTranscript(cachedTranscript, for: normalizedSessionID)
             refreshEditableTurns(for: normalizedSessionID)
             refreshMemoryState(for: normalizedSessionID)
-            isTransitioningSession = false
         } else {
             setVisibleHistoryLoadingState(for: normalizedSessionID)
-            isTransitioningSession = true
         }
+        isTransitioningSession = true
+        await Task.yield()
 
         let recentChunk = await loadRecentHistoryChunk(
             sessionID: normalizedSessionID,
@@ -6284,12 +6639,7 @@ final class AssistantStore: ObservableObject {
         canLoadMoreHistoryBySessionID[normalizedSessionID] = recentChunk.hasMore
         refreshEditableTurns(for: normalizedSessionID)
         refreshMemoryState(for: normalizedSessionID)
-        isTransitioningSession = false
-        restoreVisibleProviderSurface(
-            threadID: session.id,
-            backend: backend(for: session),
-            session: session
-        )
+        restoreVisibleProviderState(for: session)
         let sessionRuntime = ensureRuntime(for: session.id)
         let desiredBackend = backend(for: session)
         _ = await silentlyResumeStoredProviderSession(
@@ -6300,7 +6650,9 @@ final class AssistantStore: ObservableObject {
         )
 
         await refreshEnvironment(permissions: permissions)
+        scheduleSelectedSessionHistoryReload(force: true)
         scheduleSelectedSessionWarmupIfNeeded()
+        isTransitioningSession = false
         await cleanupTemporarySessionAfterLeaving(
             previousSelectedSessionID,
             nextSelectedSessionID: normalizedSessionID
@@ -6331,11 +6683,11 @@ final class AssistantStore: ObservableObject {
             setVisibleTranscript(cachedTranscript, for: normalizedSessionID)
             refreshEditableTurns(for: normalizedSessionID)
             refreshMemoryState(for: normalizedSessionID)
-            isTransitioningSession = false
         } else {
             setVisibleHistoryLoadingState(for: normalizedSessionID)
-            isTransitioningSession = true
         }
+        isTransitioningSession = true
+        await Task.yield()
 
         let recentChunk = await loadRecentHistoryChunk(
             sessionID: normalizedSessionID,
@@ -6360,7 +6712,6 @@ final class AssistantStore: ObservableObject {
         canLoadMoreHistoryBySessionID[normalizedSessionID] = recentChunk.hasMore
         refreshEditableTurns(for: normalizedSessionID)
         refreshMemoryState(for: normalizedSessionID)
-        isTransitioningSession = false
         let sessionRuntime = ensureRuntime(for: session.id)
         _ = await silentlyResumeStoredProviderSession(
             using: sessionRuntime,
@@ -6370,7 +6721,9 @@ final class AssistantStore: ObservableObject {
         )
 
         await refreshEnvironment(permissions: permissions)
+        scheduleSelectedSessionHistoryReload(force: true)
         scheduleSelectedSessionWarmupIfNeeded()
+        isTransitioningSession = false
         await cleanupTemporarySessionAfterLeaving(
             previousSelectedSessionID,
             nextSelectedSessionID: normalizedSessionID
@@ -6399,6 +6752,11 @@ final class AssistantStore: ObservableObject {
             }
 
             loadedSession = applyStoredSessionMetadata(to: [loadedSession]).first ?? loadedSession
+            guard let restorableSession = filterRestorableSessions([loadedSession]).first else {
+                lastStatusMessage = "That thread is no longer available."
+                return
+            }
+            loadedSession = restorableSession
             if loadedSession.parentThreadID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty == nil {
                 recordOwnedSessionID(loadedSession.id)
             }
@@ -6642,6 +7000,8 @@ final class AssistantStore: ObservableObject {
                     return "Claude had a saved session problem. Open Assist repaired the Claude session. Use Try again."
                 case .codex:
                     return "The assistant session had an internal problem. Open Assist repaired it. Use Try again."
+                case .ollamaLocal:
+                    return "The local Ollama session had an internal problem. Open Assist repaired it. Use Try again."
                 }
             }()
 
@@ -6784,7 +7144,32 @@ final class AssistantStore: ObservableObject {
     }
 
     func cancelActiveTurn() async {
-        await runtime.cancelActiveTurn()
+        let cancellationSessionID = selectedSessionID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+        let cancellationRuntime = runtime(for: cancellationSessionID) ?? runtime
+        let cancellationBackend = cancellationRuntime.backend
+        let cancellationSession = cancellationSessionID.flatMap { sessionID in
+            sessions.first(where: { sessionsMatch($0.id, sessionID) })
+        }
+        let shouldInvalidateProviderSession = Self.shouldInvalidateProviderSessionAfterUserCancellation(
+            backend: cancellationBackend,
+            session: cancellationSession
+        )
+
+        await cancellationRuntime.cancelActiveTurn()
+
+        guard shouldInvalidateProviderSession,
+              let cancellationSessionID else {
+            return
+        }
+
+        cancellationRuntime.detachSession()
+        updateProviderLink(
+            forThreadID: cancellationSessionID,
+            backend: cancellationBackend,
+            providerSessionID: nil
+        )
+        markPendingResumeContext(for: cancellationSessionID)
+        lastStatusMessage = "Stopped the Copilot turn. Your next message will start a fresh Copilot session inside this same chat."
     }
 
     func undoUserMessage(anchorID: String) async {
@@ -7541,6 +7926,31 @@ final class AssistantStore: ObservableObject {
         return conversationStore.loadThreadStoredNotes(threadID: normalizedThreadID)
     }
 
+    /// On-disk URL for the given note's markdown file, or nil if the owner /
+    /// note cannot be resolved or the file isn't written yet.
+    func noteMarkdownFileURL(
+        ownerKind: AssistantNoteOwnerKind,
+        ownerID: String,
+        noteID: String
+    ) -> URL? {
+        let trimmedOwner = ownerID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedNoteID = noteID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedOwner.isEmpty, !trimmedNoteID.isEmpty else { return nil }
+        switch ownerKind {
+        case .thread:
+            guard let normalizedThreadID = normalizedSessionID(trimmedOwner) else { return nil }
+            return conversationStore.threadNoteOnDiskURL(
+                threadID: normalizedThreadID,
+                noteID: trimmedNoteID
+            )
+        case .project:
+            return projectStore.projectNoteOnDiskURL(
+                projectID: trimmedOwner,
+                noteID: trimmedNoteID
+            )
+        }
+    }
+
     func threadNoteLastSavedAt(threadID: String?) -> Date? {
         guard let normalizedThreadID = normalizedSessionID(threadID) else { return nil }
         return conversationStore.threadNoteModificationDate(threadID: normalizedThreadID)
@@ -7561,13 +7971,17 @@ final class AssistantStore: ObservableObject {
 
     func createThreadNote(
         threadID: String?,
-        title: String? = nil
+        title: String? = nil,
+        noteType: AssistantNoteType = .note,
+        selectNewNote: Bool = true
     ) -> AssistantThreadNotesWorkspace? {
         guard let normalizedThreadID = normalizedSessionID(threadID) else { return nil }
         do {
             return try conversationStore.createThreadNote(
                 threadID: normalizedThreadID,
-                title: title
+                title: title,
+                noteType: noteType,
+                selectNewNote: selectNewNote
             )
         } catch {
             lastStatusMessage = "Could not create the thread note."
@@ -7640,6 +8054,48 @@ final class AssistantStore: ObservableObject {
             CrashReporter.logError("Thread note save failed: \(error.localizedDescription)")
             return nil
         }
+    }
+
+    func saveThreadNoteImageAsset(
+        threadID: String?,
+        noteID: String?,
+        attachment: AssistantAttachment
+    ) -> AssistantSavedNoteAsset? {
+        guard let normalizedThreadID = normalizedSessionID(threadID),
+              let noteID = noteID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+            return nil
+        }
+
+        do {
+            let asset = try conversationStore.saveThreadNoteImageAsset(
+                threadID: normalizedThreadID,
+                noteID: noteID,
+                attachment: attachment
+            )
+            _ = try? AssistantNotesBackupController.shared.maybeRunAutomaticBackupIfNeeded()
+            return asset
+        } catch {
+            lastStatusMessage = "Could not save that image in the thread note."
+            CrashReporter.logError("Thread note image save failed: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    func resolveThreadNoteImageAssetURL(
+        threadID: String?,
+        noteID: String?,
+        relativePath: String
+    ) -> URL? {
+        guard let normalizedThreadID = normalizedSessionID(threadID),
+              let noteID = noteID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+            return nil
+        }
+
+        return conversationStore.resolveThreadNoteImageAssetURL(
+            threadID: normalizedThreadID,
+            noteID: noteID,
+            relativePath: relativePath
+        )
     }
 
     func deleteThreadNote(
@@ -7804,6 +8260,32 @@ final class AssistantStore: ObservableObject {
         }
     }
 
+    func projectNoteFolders(projectID: String?) -> [AssistantNoteFolderSummary] {
+        guard let normalizedProjectID = projectID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+            return []
+        }
+        do {
+            return try projectStore.projectNoteFolders(projectID: normalizedProjectID)
+        } catch {
+            lastStatusMessage = "Could not load the project note folders."
+            CrashReporter.logError("Project note folders failed: \(error.localizedDescription)")
+            return []
+        }
+    }
+
+    func projectNoteFolderPathMap(projectID: String?) -> [String: [String]] {
+        guard let normalizedProjectID = projectID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+            return [:]
+        }
+        do {
+            return try projectStore.projectNoteFolderPathMap(projectID: normalizedProjectID)
+        } catch {
+            lastStatusMessage = "Could not load the project note folders."
+            CrashReporter.logError("Project note folder paths failed: \(error.localizedDescription)")
+            return [:]
+        }
+    }
+
     func projectNoteLastSavedAt(projectID: String?) -> Date? {
         guard let normalizedProjectID = projectID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
             return nil
@@ -7813,7 +8295,10 @@ final class AssistantStore: ObservableObject {
 
     func createProjectNote(
         projectID: String?,
-        title: String? = nil
+        title: String? = nil,
+        noteType: AssistantNoteType = .note,
+        selectNewNote: Bool = true,
+        folderID: String? = nil
     ) -> AssistantNotesWorkspace? {
         guard let normalizedProjectID = projectID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
             return nil
@@ -7821,11 +8306,121 @@ final class AssistantStore: ObservableObject {
         do {
             return try projectStore.createProjectNote(
                 projectID: normalizedProjectID,
-                title: title
+                title: title,
+                noteType: noteType,
+                selectNewNote: selectNewNote,
+                folderID: folderID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
             )
         } catch {
             lastStatusMessage = "Could not create the project note."
             CrashReporter.logError("Project note create failed: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    func createProjectNoteFolder(
+        projectID: String?,
+        parentFolderID: String? = nil,
+        name: String
+    ) -> AssistantNotesWorkspace? {
+        guard let normalizedProjectID = projectID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+            return nil
+        }
+        do {
+            return try projectStore.createProjectNoteFolder(
+                projectID: normalizedProjectID,
+                parentFolderID: parentFolderID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty,
+                name: name
+            )
+        } catch {
+            lastStatusMessage = "Could not create the note folder."
+            CrashReporter.logError("Project note folder create failed: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    func renameProjectNoteFolder(
+        projectID: String?,
+        folderID: String?,
+        name: String
+    ) -> AssistantNotesWorkspace? {
+        guard let normalizedProjectID = projectID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty,
+              let normalizedFolderID = folderID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+            return nil
+        }
+        do {
+            return try projectStore.renameProjectNoteFolder(
+                projectID: normalizedProjectID,
+                folderID: normalizedFolderID,
+                name: name
+            )
+        } catch {
+            lastStatusMessage = "Could not rename the note folder."
+            CrashReporter.logError("Project note folder rename failed: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    func moveProjectNoteFolder(
+        projectID: String?,
+        folderID: String?,
+        parentFolderID: String?
+    ) -> AssistantNotesWorkspace? {
+        guard let normalizedProjectID = projectID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty,
+              let normalizedFolderID = folderID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+            return nil
+        }
+        do {
+            return try projectStore.moveProjectNoteFolder(
+                projectID: normalizedProjectID,
+                folderID: normalizedFolderID,
+                parentFolderID: parentFolderID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+            )
+        } catch {
+            lastStatusMessage = "Could not move the note folder."
+            CrashReporter.logError("Project note folder move failed: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    func deleteProjectNoteFolder(
+        projectID: String?,
+        folderID: String?
+    ) -> AssistantNotesWorkspace? {
+        guard let normalizedProjectID = projectID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty,
+              let normalizedFolderID = folderID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+            return nil
+        }
+        do {
+            return try projectStore.deleteProjectNoteFolder(
+                projectID: normalizedProjectID,
+                folderID: normalizedFolderID
+            )
+        } catch {
+            lastStatusMessage = "Could not delete the note folder."
+            CrashReporter.logError("Project note folder delete failed: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    func moveProjectNote(
+        projectID: String?,
+        noteID: String?,
+        folderID: String?
+    ) -> AssistantNotesWorkspace? {
+        guard let normalizedProjectID = projectID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty,
+              let normalizedNoteID = noteID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+            return nil
+        }
+        do {
+            return try projectStore.moveProjectNote(
+                projectID: normalizedProjectID,
+                noteID: normalizedNoteID,
+                folderID: folderID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+            )
+        } catch {
+            lastStatusMessage = "Could not move the project note."
+            CrashReporter.logError("Project note move failed: \(error.localizedDescription)")
             return nil
         }
     }
@@ -7894,6 +8489,53 @@ final class AssistantStore: ObservableObject {
         } catch {
             lastStatusMessage = "Could not save the project note."
             CrashReporter.logError("Project note save failed: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    func saveProjectNoteImageAsset(
+        projectID: String?,
+        noteID: String?,
+        attachment: AssistantAttachment
+    ) -> AssistantSavedNoteAsset? {
+        guard let normalizedProjectID = projectID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty,
+              let noteID = noteID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+            return nil
+        }
+
+        do {
+            let asset = try projectStore.saveProjectNoteImageAsset(
+                projectID: normalizedProjectID,
+                noteID: noteID,
+                attachment: attachment
+            )
+            _ = try? AssistantNotesBackupController.shared.maybeRunAutomaticBackupIfNeeded()
+            return asset
+        } catch {
+            lastStatusMessage = "Could not save that image in the project note."
+            CrashReporter.logError("Project note image save failed: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    func resolveProjectNoteImageAssetURL(
+        projectID: String?,
+        noteID: String?,
+        relativePath: String
+    ) -> URL? {
+        guard let normalizedProjectID = projectID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty,
+              let noteID = noteID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+            return nil
+        }
+
+        do {
+            return try projectStore.resolveProjectNoteImageAssetURL(
+                projectID: normalizedProjectID,
+                noteID: noteID,
+                relativePath: relativePath
+            )
+        } catch {
+            CrashReporter.logError("Project note image resolve failed: \(error.localizedDescription)")
             return nil
         }
     }
@@ -9115,13 +9757,29 @@ final class AssistantStore: ObservableObject {
     }
 
     func runPreferredInstallCommand() {
+        if visibleAssistantBackend == .ollamaLocal {
+            openLocalAISetup(preferredModelID: selectedModelID ?? AssistantGemma4ModelCatalog.recommendedModelID())
+            return
+        }
         guard let command = installGuidance.installCommands.first else { return }
         runInTerminal(command)
     }
 
     func runPreferredInstallCommand(for backend: AssistantRuntimeBackend) {
+        if backend == .ollamaLocal {
+            openLocalAISetup(preferredModelID: AssistantGemma4ModelCatalog.recommendedModelID())
+            return
+        }
         guard let command = guidance(for: backend).installCommands.first else { return }
         runInTerminal(command)
+    }
+
+    private func openLocalAISetup(preferredModelID: String?) {
+        AIStudioNavigationState.shared.requestOpen(
+            pageRawValue: "models",
+            preferredLocalModelID: preferredModelID
+        )
+        NotificationCenter.default.post(name: .openAssistOpenAIMemoryStudio, object: nil)
     }
 
     func runLoginCommand() {
@@ -9195,15 +9853,22 @@ final class AssistantStore: ObservableObject {
     func syncRuntimeContext() {
         runtime.activeSkills = resolvedActiveSkillDescriptors(for: selectedSessionID)
         runtime.browserProfileContext = currentBrowserProfileContext
+        let notesRuntimeContext = activeAssistantNotesRuntimeContext()
         // Combine global + per-session instructions
         let global = settings.assistantCustomInstructions.trimmingCharacters(in: .whitespacesAndNewlines)
         let session = sessionInstructions.trimmingCharacters(in: .whitespacesAndNewlines)
         let oneShot = oneShotSessionInstructions?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let contextualInstructions = notesRuntimeContext?.instructionText
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let mergedOneShot = [oneShot, contextualInstructions]
+            .compactMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty }
+            .joined(separator: "\n\n")
         runtime.customInstructions = Self.combinedRuntimeInstructions(
             global: global,
             session: session,
-            oneShot: oneShot
+            oneShot: mergedOneShot
         )
+        runtime.assistantNotesContext = notesRuntimeContext
         runtime.setPreferredSubagentModelID(selectedSubagentModelID)
         runtime.reasoningEffort = reasoningEffort.wireValue
         runtime.serviceTier = fastModeEnabled ? "fast" : nil
@@ -9213,6 +9878,49 @@ final class AssistantStore: ObservableObject {
         if !isRestoringSessionConfiguration {
             updateVisibleSessionConfiguration()
         }
+    }
+
+    func setNotesWorkspaceRuntimeContext(_ context: AssistantNotesRuntimeContext?) {
+        if notesWorkspaceRuntimeContext == context {
+            return
+        }
+        notesWorkspaceRuntimeContext = context
+        syncRuntimeContext()
+    }
+
+    private func activeAssistantNotesRuntimeContext() -> AssistantNotesRuntimeContext? {
+        if let notesWorkspaceRuntimeContext {
+            return notesWorkspaceRuntimeContext
+        }
+
+        guard taskMode == .note else {
+            return nil
+        }
+
+        if let sessionID = selectedSessionID,
+           let context = projectStore.context(forThreadID: sessionID) {
+            return AssistantNotesRuntimeContext(
+                source: .chatNoteMode,
+                projectID: context.project.id,
+                projectName: context.project.name,
+                selectedNoteTarget: nil,
+                selectedNoteTitle: nil,
+                defaultScopeDescription: "the whole current project (`\(context.project.name)`) including project notes and linked thread notes"
+            )
+        }
+
+        if let selectedProject {
+            return AssistantNotesRuntimeContext(
+                source: .chatNoteMode,
+                projectID: selectedProject.id,
+                projectName: selectedProject.name,
+                selectedNoteTarget: nil,
+                selectedNoteTitle: nil,
+                defaultScopeDescription: "the whole current project (`\(selectedProject.name)`) including project notes and linked thread notes"
+            )
+        }
+
+        return nil
     }
 
     private func refreshActiveThreadSkills(syncRuntime: Bool) {
@@ -9275,7 +9983,7 @@ final class AssistantStore: ObservableObject {
     }
 
     private func applyPreferredModelSelection(using models: [AssistantModelOption]) {
-        let visibleModels = models.filter { !$0.hidden }
+        let visibleModels = Self.selectableModels(for: visibleAssistantBackend, from: models)
         guard !visibleModels.isEmpty else {
             selectedModelID = nil
             selectedSubagentModelID = nil
@@ -9519,6 +10227,7 @@ final class AssistantStore: ObservableObject {
             // Keep sidebar recency tied to real message activity.
             // Simply selecting or resurfacing a thread should not make it look newly updated.
             sessions[existingIndex].latestModel = selectedModelID
+            sessions[existingIndex].latestTaskMode = taskMode
             sessions[existingIndex].latestInteractionMode = interactionMode
             sessions[existingIndex].latestReasoningEffort = reasoningEffort
             sessions[existingIndex].latestServiceTier = fastModeEnabled ? "fast" : nil
@@ -9550,6 +10259,7 @@ final class AssistantStore: ObservableObject {
             updatedAt: Date(),
             summary: lastSubmittedPrompt,
             latestModel: selectedModelID,
+            latestTaskMode: taskMode,
             latestInteractionMode: interactionMode,
             latestReasoningEffort: reasoningEffort,
             latestServiceTier: fastModeEnabled ? "fast" : nil,
@@ -9862,7 +10572,7 @@ final class AssistantStore: ObservableObject {
             appendTranscriptEntry(entry, sessionID: sessionID)
 
         case .appendDelta(let id, let sessionID, let role, let delta, let createdAt, let emphasis, let isStreaming):
-            guard let normalizedDelta = delta.nonEmpty else { return }
+            guard let normalizedDelta = delta.streamingDeltaPreservingWhitespace else { return }
             let targetSessionID = sessionID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty ?? selectedSessionID
 
             guard sessionsMatch(targetSessionID, selectedSessionID) || transcriptSessionID == nil else {
@@ -10107,7 +10817,7 @@ final class AssistantStore: ObservableObject {
             let emphasis,
             let source
         ):
-            guard let normalizedDelta = delta.nonEmpty else { return }
+            guard let normalizedDelta = delta.streamingDeltaPreservingWhitespace else { return }
             let targetSessionID = sessionID?.nonEmpty
                 ?? runtime.currentSessionID?.nonEmpty
                 ?? selectedSessionID?.nonEmpty
@@ -10361,6 +11071,40 @@ final class AssistantStore: ObservableObject {
         return archived
     }
 
+    private func finalizeToolCallsForTurn(
+        state: inout AssistantSessionExecutionState,
+        status: AssistantTurnCompletionStatus
+    ) {
+        guard !state.toolCalls.isEmpty else { return }
+
+        let finalizedCalls = state.toolCalls.map { call -> AssistantToolCallState in
+            var finalized = call
+            let normalizedStatus = finalized.status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard ["inprogress", "running", "working", "active", "started", "pending"].contains(normalizedStatus) else {
+                return finalized
+            }
+
+            switch status {
+            case .completed:
+                finalized.status = "completed"
+            case .interrupted:
+                finalized.status = "interrupted"
+            case .failed:
+                finalized.status = "failed"
+            }
+
+            return finalized
+        }
+
+        let finalizedIDs = Set(finalizedCalls.map(\.id))
+        state.recentToolCalls.removeAll { finalizedIDs.contains($0.id) }
+        state.recentToolCalls.insert(contentsOf: finalizedCalls, at: 0)
+        if state.recentToolCalls.count > 24 {
+            state.recentToolCalls = Array(state.recentToolCalls.prefix(24))
+        }
+        state.toolCalls = []
+    }
+
     private func updateVisibleSessionPreview(with entry: AssistantTranscriptEntry, sessionID: String? = nil) {
         guard let sessionID = sessionID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty ?? selectedSessionID,
               let sessionIndex = sessions.firstIndex(where: { sessionsMatch($0.id, sessionID) }),
@@ -10466,6 +11210,18 @@ final class AssistantStore: ObservableObject {
 
     private func reloadTemporarySessionsFromStore() {
         temporarySessionIDs = temporarySessionStore.temporarySessionIDs()
+    }
+
+    private func filterRestorableSessions(_ sessions: [AssistantSessionSummary]) -> [AssistantSessionSummary] {
+        sessions.filter { session in
+            guard let normalizedSessionID = normalizedSessionID(session.id) else {
+                return false
+            }
+            guard !deletedSessionIDs.contains(normalizedSessionID) else {
+                return false
+            }
+            return session.conversationPersistence != .transient
+        }
     }
 
     private func markSessionPendingDeletion(_ sessionID: String?) {
@@ -12884,6 +13640,7 @@ final class AssistantStore: ObservableObject {
 
     struct ResolvedSessionConfiguration: Equatable {
         let modelID: String?
+        let taskMode: AssistantTaskMode
         let interactionMode: AssistantInteractionMode
         let reasoningEffort: AssistantReasoningEffort
         let fastModeEnabled: Bool
@@ -12896,6 +13653,9 @@ final class AssistantStore: ObservableObject {
         let normalizedModelID = storedModelID?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .nonEmpty
+        if backend == .ollamaLocal {
+            return normalizedModelID ?? AssistantGemma4ModelCatalog.recommendedModelID()
+        }
         guard backend == .claudeCode else { return normalizedModelID }
 
         switch normalizedModelID?.lowercased() {
@@ -12913,7 +13673,7 @@ final class AssistantStore: ObservableObject {
         preferredModelID: String?,
         surfaceModelID: String? = nil
     ) -> String? {
-        let visibleModels = availableModels.filter { !$0.hidden }
+        let visibleModels = selectableModels(for: backend, from: availableModels)
         guard !visibleModels.isEmpty else { return nil }
 
         let visibleModelIDs = Set(visibleModels.map(\.id))
@@ -12962,17 +13722,31 @@ final class AssistantStore: ObservableObject {
         return nil
     }
 
+    static func selectableModels(
+        for backend: AssistantRuntimeBackend,
+        from availableModels: [AssistantModelOption]
+    ) -> [AssistantModelOption] {
+        let unhiddenModels = availableModels.filter { !$0.hidden }
+        guard backend == .ollamaLocal else {
+            return unhiddenModels
+        }
+
+        return unhiddenModels.filter(\.isInstalled)
+    }
+
     static func resolvedSessionConfiguration(
         from session: AssistantSessionSummary?,
         backend: AssistantRuntimeBackend,
         availableModels: [AssistantModelOption],
-        preferredModelID: String?
+        preferredModelID: String?,
+        surfaceModelID: String? = nil
     ) -> ResolvedSessionConfiguration {
         let resolvedModelID = resolvedModelSelection(
             from: session,
             backend: backend,
             availableModels: availableModels,
-            preferredModelID: preferredModelID
+            preferredModelID: preferredModelID,
+            surfaceModelID: surfaceModelID
         )
         let activeBinding = session.flatMap { summary -> AssistantProviderBinding? in
             guard summary.isProviderIndependentThreadV2,
@@ -12984,6 +13758,7 @@ final class AssistantStore: ObservableObject {
 
         return ResolvedSessionConfiguration(
             modelID: resolvedModelID,
+            taskMode: session?.latestTaskMode ?? .chat,
             interactionMode: (activeBinding?.latestInteractionMode
                 ?? session?.latestInteractionMode
                 ?? .agentic).normalizedForActiveUse,
@@ -12995,22 +13770,50 @@ final class AssistantStore: ObservableObject {
         )
     }
 
+    static func configurationModels(
+        for backend: AssistantRuntimeBackend,
+        visibleProviderSurfaceBackend: AssistantRuntimeBackend?,
+        visibleAvailableModels: [AssistantModelOption],
+        cachedProviderModels: [AssistantModelOption]
+    ) -> [AssistantModelOption] {
+        if visibleProviderSurfaceBackend == backend {
+            return visibleAvailableModels
+        }
+        return cachedProviderModels
+    }
+
     private func restoreSessionConfiguration(from session: AssistantSessionSummary?) {
         guard let session else { return }
 
         isRestoringSessionConfiguration = true
         defer { isRestoringSessionConfiguration = false }
 
+        let providerBackend = backend(for: session)
+        let configurationModels = Self.configurationModels(
+            for: providerBackend,
+            visibleProviderSurfaceBackend: visibleProviderSurfaceBackend,
+            visibleAvailableModels: availableModels,
+            cachedProviderModels: cachedAvailableModels(
+                threadID: session.id,
+                backend: providerBackend
+            )
+        )
+
         let resolvedConfiguration = Self.resolvedSessionConfiguration(
             from: session,
-            backend: backend(for: session),
-            availableModels: availableModels,
-            preferredModelID: settings.assistantPreferredModelID.nonEmpty
+            backend: providerBackend,
+            availableModels: configurationModels,
+            preferredModelID: settings.assistantPreferredModelID.nonEmpty,
+            surfaceModelID: providerSurfaceSnapshot(
+                threadID: session.id,
+                backend: providerBackend
+            )?.selectedModelID
         )
 
         selectedModelID = resolvedConfiguration.modelID
         runtime.setPreferredModelID(resolvedConfiguration.modelID)
         runtimeHealth.selectedModelID = resolvedConfiguration.modelID
+        taskMode = resolvedConfiguration.taskMode
         interactionMode = resolvedConfiguration.interactionMode
         reasoningEffort = resolvedConfiguration.reasoningEffort
         fastModeEnabled = resolvedConfiguration.fastModeEnabled
@@ -13025,6 +13828,7 @@ final class AssistantStore: ObservableObject {
         }
 
         sessions[sessionIndex].latestModel = selectedModelID
+        sessions[sessionIndex].latestTaskMode = taskMode
         sessions[sessionIndex].latestInteractionMode = interactionMode
         sessions[sessionIndex].latestReasoningEffort = reasoningEffort
         sessions[sessionIndex].latestServiceTier = fastModeEnabled ? "fast" : nil
@@ -13421,6 +14225,8 @@ final class AssistantStore: ObservableObject {
             return
         }
 
+        let previousCachedTimelineCount = timelineItemsBySessionID[selectedSessionID]?.count ?? 0
+        let previousCachedTranscriptCount = transcriptEntriesBySessionID[selectedSessionID]?.count ?? 0
         let requestID = UUID()
         sessionLoadRequestID = requestID
         let loadedHistory = await loadSessionHistorySlice(
@@ -13454,6 +14260,15 @@ final class AssistantStore: ObservableObject {
         if !mergedTranscript.isEmpty || transcript.isEmpty || transcriptSessionID != selectedSessionID {
             setVisibleTranscript(mergedTranscript, for: selectedSessionID)
         }
+
+        // If the merge didn't add any items beyond what was already cached
+        // in memory, the store has no additional history to offer. Clear the
+        // optimistic canLoadMore flag so the UI doesn't show a stale button.
+        if mergedTimeline.count <= previousCachedTimelineCount,
+           mergedTranscript.count <= previousCachedTranscriptCount {
+            canLoadMoreHistoryBySessionID[selectedSessionID] = false
+        }
+
         refreshEditableTurns(for: selectedSessionID)
         isTransitioningSession = false
     }
@@ -14299,6 +15114,14 @@ final class AssistantStore: ObservableObject {
         return session.conversationPersistence
     }
 
+    private func conversationPersistsHistory(for sessionID: String?) -> Bool {
+        guard let normalizedSessionID = normalizedSessionID(sessionID),
+              let session = sessions.first(where: { sessionsMatch($0.id, normalizedSessionID) }) else {
+            return false
+        }
+        return session.persistsConversationHistory
+    }
+
     private func shouldUseHybridConversationPersistence(sessionID: String?) -> Bool {
         guard let normalizedSessionID = normalizedSessionID(sessionID) else { return false }
         return isProviderIndependentThreadV2(sessionID: normalizedSessionID)
@@ -14312,7 +15135,8 @@ final class AssistantStore: ObservableObject {
 
     private func saveConversationSnapshotNow(sessionID: String) throws {
         let normalizedSessionID = normalizedSessionID(sessionID) ?? sessionID
-        guard isProviderIndependentThreadV2(sessionID: normalizedSessionID) else { return }
+        guard isProviderIndependentThreadV2(sessionID: normalizedSessionID),
+              conversationPersistsHistory(for: normalizedSessionID) else { return }
 
         let timeline = timelineItemsBySessionID[normalizedSessionID]
             ?? (sessionsMatch(timelineSessionID, normalizedSessionID) ? timelineItems : [])
@@ -14338,6 +15162,7 @@ final class AssistantStore: ObservableObject {
         eventAppender: (_ normalizedSessionID: String) throws -> Void
     ) {
         guard let normalizedSessionID = normalizedSessionID(sessionID),
+              conversationPersistsHistory(for: normalizedSessionID),
               Self.shouldPersistConversationMutation(
                 normalizedSessionID: normalizedSessionID,
                 isProviderIndependentThreadV2: isProviderIndependentThreadV2(sessionID: normalizedSessionID),
@@ -14381,6 +15206,7 @@ final class AssistantStore: ObservableObject {
 
     private func flushPersistedHistoryIfNeeded(sessionID: String?) {
         guard let normalizedSessionID = normalizedSessionID(sessionID) else { return }
+        guard conversationPersistsHistory(for: normalizedSessionID) else { return }
         if isProviderIndependentThreadV2(sessionID: normalizedSessionID) {
             persistConversationSnapshotIfNeeded(sessionID: normalizedSessionID, force: true)
         } else {
@@ -14390,7 +15216,8 @@ final class AssistantStore: ObservableObject {
 
     private func persistConversationSnapshotIfNeeded(sessionID: String?, force: Bool = false) {
         guard let normalizedSessionID = normalizedSessionID(sessionID),
-              isProviderIndependentThreadV2(sessionID: normalizedSessionID) else {
+              isProviderIndependentThreadV2(sessionID: normalizedSessionID),
+              conversationPersistsHistory(for: normalizedSessionID) else {
             return
         }
 
@@ -14437,6 +15264,9 @@ final class AssistantStore: ObservableObject {
         guard let session else { return nil }
 
         if let backend {
+            if backend == .ollamaLocal {
+                return session.id
+            }
             if session.isCanonicalThread {
                 return session.providerBinding(for: backend)?
                     .providerSessionID?
@@ -14446,6 +15276,9 @@ final class AssistantStore: ObservableObject {
             return self.backend(for: session) == backend ? session.id : nil
         }
 
+        if self.backend(for: session) == .ollamaLocal {
+            return session.id
+        }
         if let providerSessionID = session.activeProviderSessionID {
             return providerSessionID
         }
@@ -14704,6 +15537,7 @@ final class AssistantStore: ObservableObject {
                     updatedAt: Date(),
                     summary: nil,
                     latestModel: selectedModelID,
+                    latestTaskMode: taskMode,
                     latestInteractionMode: interactionMode,
                     latestReasoningEffort: reasoningEffort,
                     latestServiceTier: fastModeEnabled ? "fast" : nil,
@@ -14819,6 +15653,10 @@ extension String {
     var nonEmpty: String? {
         let trimmed = trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
+    }
+
+    var streamingDeltaPreservingWhitespace: String? {
+        isEmpty ? nil : self
     }
 
     var assistantNonEmpty: String? {

@@ -533,6 +533,25 @@ func assistantShouldShowPendingAssistantPlaceholder(
     }
 }
 
+func assistantTimelineHasVisibleStreamingAssistantContent(
+    _ renderItem: AssistantTimelineRenderItem?
+) -> Bool {
+    guard case .timeline(let item) = renderItem else { return false }
+
+    switch item.kind {
+    case .assistantProgress, .assistantFinal, .plan:
+        guard item.isStreaming else { return false }
+        let hasVisibleText = item.text
+            .flatMap { AssistantVisibleTextSanitizer.clean($0) }?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nonEmpty != nil
+        let hasVisibleImages = !(item.imageAttachments?.isEmpty ?? true)
+        return hasVisibleText || hasVisibleImages
+    default:
+        return false
+    }
+}
+
 func assistantSelectedSessionToolActivity(
     selectedSessionID: String?,
     activeRuntimeSessionID: String?,

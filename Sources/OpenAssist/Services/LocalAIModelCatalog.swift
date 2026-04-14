@@ -19,6 +19,7 @@ enum LocalAIModelCatalog {
             summary: "Best balance for rewrite quality and memory-lesson extraction on most Macs.",
             isRecommended: true
         ),
+    ] + AssistantGemma4ModelCatalog.catalog() + [
         LocalAIModelOption(
             id: "llama3.2:3b",
             displayName: "Llama 3.2 3B",

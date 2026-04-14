@@ -59,6 +59,31 @@ export interface TypingState {
   detail?: string;
 }
 
+export type ActiveTurnPhase =
+  | "idle"
+  | "thinking"
+  | "streaming"
+  | "acting"
+  | "needsInput"
+  | "cancelling";
+
+export interface ActiveTurnState {
+  phase: ActiveTurnPhase;
+  canCancel: boolean;
+  providerLabel?: string;
+  hasPendingToolApproval: boolean;
+  hasPendingInput: boolean;
+}
+
+export type ChatStreamEvent =
+  | { kind: "replaceMessages"; messages: ChatMessage[] }
+  | { kind: "responseTextDelta"; messageID: string; text: string; isStreaming: boolean }
+  | { kind: "upsertMessage"; message: ChatMessage; afterMessageID?: string }
+  | { kind: "removeMessage"; messageID: string }
+  | { kind: "setActiveWorkState"; state: ActiveWorkState | null }
+  | { kind: "setTypingState"; state: TypingState }
+  | { kind: "setActiveTurnState"; state: ActiveTurnState | null };
+
 export interface ActiveWorkItem {
   id: string;
   title: string;
@@ -153,6 +178,7 @@ export interface RewindState {
 export interface ThreadNoteItem {
   id: string;
   title: string;
+  noteType?: string;
   updatedAtLabel?: string | null;
   ownerKind: "thread" | "project" | string;
   ownerId: string;
@@ -170,6 +196,79 @@ export interface ThreadNoteAIDraftPreview {
   mode: "organize" | "chart" | string;
   sourceKind: "selection" | "whole" | "chatSelection" | string;
   markdown: string;
+  isError: boolean;
+}
+
+export interface ThreadNoteProjectTransferPreview {
+  targetProjectId: string;
+  targetNoteId: string;
+  targetNoteTitle: string;
+  suggestedHeadingPath: string[];
+  insertedMarkdown: string;
+  reason: string;
+  fallbackToEnd: boolean;
+  sourceFingerprint: string;
+  targetFingerprint: string;
+  isError: boolean;
+  warningMessage?: string | null;
+}
+
+export interface ThreadNoteProjectTransferOutcome {
+  id: string;
+  kind: "success" | "warning" | "error" | string;
+  message: string;
+}
+
+export interface BatchNotePlanSourceSelection {
+  ownerKind: "thread" | "project" | string;
+  ownerId: string;
+  noteId: string;
+}
+
+export interface BatchNotePlanSourceNote {
+  ownerKind: "thread" | "project" | string;
+  ownerId: string;
+  noteId: string;
+  title: string;
+  noteType: string;
+  sourceLabel: string;
+  markdown: string;
+}
+
+export interface BatchNotePlanResolvedTarget {
+  kind: "proposed" | "source" | string;
+  tempId?: string | null;
+  ownerKind?: "thread" | "project" | string | null;
+  ownerId?: string | null;
+  noteId?: string | null;
+  title: string;
+  sourceLabel?: string | null;
+}
+
+export interface BatchNotePlanProposedNote {
+  tempId: string;
+  title: string;
+  noteType: string;
+  markdown: string;
+  sourceNoteTargets: BatchNotePlanResolvedTarget[];
+  accepted: boolean;
+}
+
+export interface BatchNotePlanProposedLink {
+  fromTempId: string;
+  toTarget: BatchNotePlanResolvedTarget;
+  accepted: boolean;
+}
+
+export interface BatchNotePlanPreview {
+  previewId: string;
+  sourceNotes: BatchNotePlanSourceNote[];
+  proposedNotes: BatchNotePlanProposedNote[];
+  proposedLinks: BatchNotePlanProposedLink[];
+  graph?: ThreadNoteGraphState | null;
+  warnings: string[];
+  sourceFingerprint: string;
+  targetFingerprint: string;
   isError: boolean;
 }
 
@@ -194,6 +293,7 @@ export interface ThreadNoteHistoryItem {
   title: string;
   savedAtLabel: string;
   preview: string;
+  markdown: string;
 }
 
 export interface ThreadDeletedNoteItem {
@@ -201,6 +301,7 @@ export interface ThreadDeletedNoteItem {
   title: string;
   deletedAtLabel: string;
   preview: string;
+  markdown: string;
 }
 
 export interface ThreadNoteState {
@@ -227,11 +328,16 @@ export interface ThreadNoteState {
   hasAnyNotes: boolean;
   isSaving: boolean;
   isGeneratingAIDraft: boolean;
+  isGeneratingProjectTransferPreview?: boolean;
+  isGeneratingBatchNotePlanPreview?: boolean;
   aiDraftMode?: "organize" | "chart" | string | null;
   lastSavedAtLabel?: string | null;
   canEdit: boolean;
   placeholder: string;
   aiDraftPreview?: ThreadNoteAIDraftPreview | null;
+  projectNoteTransferPreview?: ThreadNoteProjectTransferPreview | null;
+  projectNoteTransferOutcome?: ThreadNoteProjectTransferOutcome | null;
+  batchNotePlanPreview?: BatchNotePlanPreview | null;
   outgoingLinks: ThreadNoteRelationshipItem[];
   backlinks: ThreadNoteRelationshipItem[];
   graph?: ThreadNoteGraphState | null;
@@ -304,9 +410,21 @@ export interface AssistantSidebarNoteItem {
   title: string;
   subtitle: string;
   sourceLabel: string;
+  folderId?: string;
+  folderPath: string[];
   isSelected: boolean;
   isArchivedThread: boolean;
   threadId?: string;
+}
+
+export interface AssistantSidebarNoteFolderItem {
+  id: string;
+  name: string;
+  parentId?: string;
+  path: string[];
+  isExpanded: boolean;
+  childFolderCount: number;
+  noteCount: number;
 }
 
 export interface AssistantSidebarState {
@@ -342,6 +460,7 @@ export interface AssistantSidebarState {
   projects: AssistantSidebarProjectItem[];
   threads: AssistantSidebarSessionItem[];
   archived: AssistantSidebarSessionItem[];
+  noteFolders: AssistantSidebarNoteFolderItem[];
   notes: AssistantSidebarNoteItem[];
 }
 
@@ -366,19 +485,50 @@ export interface AssistantComposerSkill {
 export interface AssistantComposerState {
   draftText: string;
   placeholder: string;
+  isCompactComposer?: boolean;
   isEnabled: boolean;
   canSend: boolean;
-  isBusy: boolean;
-  isVoiceCapturing: boolean;
-  canUseVoiceInput: boolean;
-  showStopVoicePlayback: boolean;
+  isNoteModeActive: boolean;
+  noteModeLabel?: string;
+  noteModeHelperText?: string;
+  showNoteModeButton: boolean;
   canOpenSkills: boolean;
+  preflightStatusMessage?: string;
+  activeSkills: AssistantComposerSkill[];
+  attachments: AssistantComposerAttachment[];
+}
+
+export type AssistantRuntimeControlsAvailability =
+  | "ready"
+  | "busy"
+  | "loadingModels"
+  | "switchingProvider"
+  | "unavailable";
+
+export interface AssistantComposerControlsState {
+  availability: AssistantRuntimeControlsAvailability;
+  availabilityStatusText?: string;
+  showsInteractionModeControl?: boolean;
+  showsModelControls?: boolean;
+  showsReasoningControls?: boolean;
   selectedInteractionMode: string;
   interactionModes: AssistantComposerOption[];
   selectedModelId?: string;
   modelOptions: AssistantComposerOption[];
+  modelPlaceholder: string;
+  opensModelSetupWhenUnavailable: boolean;
   selectedReasoningId: string;
   reasoningOptions: AssistantComposerOption[];
-  activeSkills: AssistantComposerSkill[];
-  attachments: AssistantComposerAttachment[];
+}
+
+export interface AssistantComposerActivityState {
+  isBusy: boolean;
+  activeTurnPhase?: ActiveTurnPhase;
+  canCancelActiveTurn?: boolean;
+  activeTurnProviderLabel?: string;
+  hasPendingToolApproval?: boolean;
+  hasPendingInput?: boolean;
+  isVoiceCapturing: boolean;
+  canUseVoiceInput: boolean;
+  showStopVoicePlayback: boolean;
 }

@@ -6,11 +6,69 @@ interface Props {
   onClose: () => void;
 }
 
+type ThreadNoteFindAction = "search" | "activate" | "clear";
+
+interface ThreadNoteFindResponse {
+  handled: boolean;
+  matchCount: number;
+  currentMatch: number;
+}
+
+interface ThreadNoteFindRequestDetail {
+  action: ThreadNoteFindAction;
+  query?: string;
+  index?: number;
+  respond: (result: ThreadNoteFindResponse) => void;
+}
+
+type FindTarget =
+  | { source: "note"; index: number }
+  | { source: "dom"; index: number };
+
+const THREAD_NOTE_FIND_REQUEST_EVENT = "openassist:thread-note-find-request";
+
 function FindBarInner({ visible, onClose }: Props) {
   const inputRef = useRef<HTMLInputElement>(null);
+  const targetsRef = useRef<FindTarget[]>([]);
   const [query, setQuery] = useState("");
   const [matchCount, setMatchCount] = useState(0);
   const [currentMatch, setCurrentMatch] = useState(0);
+
+  const requestThreadNoteFind = useCallback(
+    (action: ThreadNoteFindAction, options?: { query?: string; index?: number }) => {
+      let response: ThreadNoteFindResponse | null = null;
+      window.dispatchEvent(
+        new CustomEvent<ThreadNoteFindRequestDetail>(THREAD_NOTE_FIND_REQUEST_EVENT, {
+          detail: {
+            action,
+            query: options?.query,
+            index: options?.index,
+            respond: (result) => {
+              response = result;
+            },
+          },
+        })
+      );
+      return response;
+    },
+    []
+  );
+
+  const activateTarget = useCallback(
+    (target: FindTarget | undefined) => {
+      if (!target) {
+        return;
+      }
+
+      if (target.source === "note") {
+        requestThreadNoteFind("activate", { index: target.index });
+        return;
+      }
+
+      scrollToMatch(target.index);
+    },
+    [requestThreadNoteFind]
+  );
 
   // Focus input when shown
   useEffect(() => {
@@ -19,19 +77,31 @@ function FindBarInner({ visible, onClose }: Props) {
     } else {
       // Clear highlights when hiding
       clearHighlights();
+      targetsRef.current = [];
+      requestThreadNoteFind("clear");
       setQuery("");
       setMatchCount(0);
       setCurrentMatch(0);
     }
-  }, [visible]);
+  }, [requestThreadNoteFind, visible]);
 
   const doSearch = useCallback(
     (searchQuery: string) => {
       clearHighlights();
       if (!searchQuery.trim()) {
+        targetsRef.current = [];
+        requestThreadNoteFind("clear");
         setMatchCount(0);
         setCurrentMatch(0);
         return;
+      }
+
+      const noteResult = requestThreadNoteFind("search", { query: searchQuery });
+      const nextTargets: FindTarget[] = [];
+      if (noteResult?.handled) {
+        for (let index = 0; index < noteResult.matchCount; index += 1) {
+          nextTargets.push({ source: "note", index });
+        }
       }
 
       const matches: Range[] = [];
@@ -42,12 +112,6 @@ function FindBarInner({ visible, onClose }: Props) {
           ".chat-messages, .thread-note-rendered-markdown"
         )
       );
-      if (containers.length === 0) {
-        setMatchCount(0);
-        setCurrentMatch(0);
-        return;
-      }
-
       containers.forEach((container) => {
         const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT, null);
 
@@ -85,15 +149,20 @@ function FindBarInner({ visible, onClose }: Props) {
         range.surroundContents(mark);
       });
 
-      setMatchCount(matches.length);
-      if (matches.length > 0) {
+      for (let index = 0; index < matches.length; index += 1) {
+        nextTargets.push({ source: "dom", index });
+      }
+
+      targetsRef.current = nextTargets;
+      setMatchCount(nextTargets.length);
+      if (nextTargets.length > 0) {
         setCurrentMatch(1);
-        scrollToMatch(0);
+        activateTarget(nextTargets[0]);
       } else {
         setCurrentMatch(0);
       }
     },
-    []
+    [activateTarget, requestThreadNoteFind]
   );
 
   const handleChange = useCallback(
@@ -107,15 +176,15 @@ function FindBarInner({ visible, onClose }: Props) {
 
   const navigateMatch = useCallback(
     (direction: "next" | "prev") => {
-      if (matchCount === 0) return;
+      if (targetsRef.current.length === 0) return;
       let next =
         direction === "next" ? currentMatch + 1 : currentMatch - 1;
-      if (next > matchCount) next = 1;
-      if (next < 1) next = matchCount;
+      if (next > targetsRef.current.length) next = 1;
+      if (next < 1) next = targetsRef.current.length;
       setCurrentMatch(next);
-      scrollToMatch(next - 1);
+      activateTarget(targetsRef.current[next - 1]);
     },
-    [currentMatch, matchCount]
+    [activateTarget, currentMatch]
   );
 
   const handleKeyDown = useCallback(

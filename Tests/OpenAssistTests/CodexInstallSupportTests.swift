@@ -134,6 +134,65 @@ final class CodexInstallSupportTests: XCTestCase {
             "https://code.claude.com/docs/en/headless"
         )
     }
+
+    func testInspectShowsOllamaGuidanceWhenRuntimeIsMissing() async {
+        let support = CodexInstallSupport(
+            runner: WhichCommandRunner(locations: [:]),
+            searchPathsOverride: [],
+            allowShellLookup: false,
+            localRuntimeDetector: {
+                .unavailable
+            }
+        )
+
+        let guidance = await support.inspect(backend: .ollamaLocal)
+
+        XCTAssertEqual(guidance.backend, .ollamaLocal)
+        XCTAssertFalse(guidance.codexDetected)
+        XCTAssertNil(guidance.codexPath)
+        XCTAssertEqual(guidance.primaryTitle, "Set up Ollama (Local)")
+        XCTAssertEqual(
+            guidance.primaryDetail,
+            "Open Local AI Setup to install Ollama and download a Gemma 4 model for agent mode."
+        )
+        XCTAssertTrue(guidance.installCommands.isEmpty)
+        XCTAssertTrue(guidance.loginCommands.isEmpty)
+        XCTAssertEqual(
+            guidance.docsURL?.absoluteString,
+            "https://ollama.com/library/gemma4"
+        )
+    }
+
+    func testInspectShowsOllamaGuidanceWhenRuntimeIsHealthy() async {
+        let support = CodexInstallSupport(
+            runner: WhichCommandRunner(locations: [:]),
+            searchPathsOverride: [],
+            allowShellLookup: false,
+            localRuntimeDetector: {
+                LocalAIRuntimeDetection(
+                    installed: true,
+                    isManagedInstallation: true,
+                    isHealthy: true,
+                    appURL: URL(fileURLWithPath: "/Applications/Ollama.app"),
+                    executableURL: URL(fileURLWithPath: "/Applications/Ollama.app/Contents/MacOS/ollama"),
+                    version: "0.6.0"
+                )
+            }
+        )
+
+        let guidance = await support.inspect(backend: .ollamaLocal)
+
+        XCTAssertTrue(guidance.codexDetected)
+        XCTAssertEqual(
+            guidance.codexPath,
+            "/Applications/Ollama.app/Contents/MacOS/ollama"
+        )
+        XCTAssertEqual(guidance.primaryTitle, "Ollama (Local) is installed")
+        XCTAssertEqual(
+            guidance.primaryDetail,
+            "Ollama is ready on this Mac. Open Assist can run local Gemma 4 agent turns, stream replies, and use tools without a sign-in flow."
+        )
+    }
 }
 
 private struct WhichCommandRunner: CommandRunning {

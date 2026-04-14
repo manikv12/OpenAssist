@@ -1,11 +1,94 @@
 import AppKit
 import SwiftUI
 
+enum AIStudioScope: Sendable, Equatable {
+    case all
+    case assistantOnly
+    case modelsOnly
+
+    var showsAssistantPages: Bool {
+        switch self {
+        case .all, .assistantOnly:
+            return true
+        case .modelsOnly:
+            return false
+        }
+    }
+
+    var showsModelPages: Bool {
+        switch self {
+        case .all, .modelsOnly:
+            return true
+        case .assistantOnly:
+            return false
+        }
+    }
+
+    var sidebarTitle: String {
+        switch self {
+        case .all:
+            return "AI Studio (Advanced)"
+        case .assistantOnly:
+            return "Assistant Settings"
+        case .modelsOnly:
+            return "Models & Connections"
+        }
+    }
+
+    var sidebarSubtitle: String {
+        switch self {
+        case .all:
+            return "Deeper AI setup lives here. Everyday choices stay in Settings."
+        case .assistantOnly:
+            return "Global assistant defaults live here in one place."
+        case .modelsOnly:
+            return "Provider setup, local AI, and memory tools live here now."
+        }
+    }
+
+    var headerTitle: String {
+        switch self {
+        case .all:
+            return "AI Studio"
+        case .assistantOnly:
+            return "Assistant"
+        case .modelsOnly:
+            return "Models & Connections"
+        }
+    }
+
+    var headerHelpText: String {
+        switch self {
+        case .all:
+            return "These are the deeper AI controls. Most people only need the simpler Settings sections."
+        case .assistantOnly:
+            return "These are the global assistant defaults used across Open Assist."
+        case .modelsOnly:
+            return "These are the shared provider, model, local AI, and memory controls."
+        }
+    }
+}
+
 struct AIMemoryStudioView: View {
+    let scope: AIStudioScope
+    let showsStandaloneChrome: Bool
+    let showsSidebar: Bool
+
+    init(
+        scope: AIStudioScope = .all,
+        showsStandaloneChrome: Bool = true,
+        showsSidebar: Bool = true
+    ) {
+        self.scope = scope
+        self.showsStandaloneChrome = showsStandaloneChrome
+        self.showsSidebar = showsSidebar
+    }
+
     @EnvironmentObject private var settings: SettingsStore
     @ObservedObject private var assistant = AssistantStore.shared
     @StateObject private var promptRewriteConversationStore = PromptRewriteConversationStore.shared
     @StateObject private var localAISetupService = LocalAISetupService.shared
+    @ObservedObject private var aiStudioNavigationState = AIStudioNavigationState.shared
 
     @State private var detectedMemoryProviders: [MemoryIndexingSettingsService.Provider] = []
     @State private var detectedMemorySourceFolders: [MemoryIndexingSettingsService.SourceFolder] = []
@@ -383,126 +466,103 @@ struct AIMemoryStudioView: View {
     private let aiStudioWindowReference = WeakWindowReference()
 
     var body: some View {
-        ZStack {
-            studioBackground
-            HStack(spacing: 0) {
-                studioSidebar
-
-                Rectangle()
-                    .fill(AppVisualTheme.surfaceFill(0.12))
-                    .frame(width: 1)
-                    .frame(maxHeight: .infinity)
-
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 16) {
-                        studioPageHeader
-                        studioPageContent
-                    }
-                    .padding(18)
-                    .frame(maxWidth: .infinity, alignment: .topLeading)
+        rootBody
+            .appScrollbars()
+            .tint(AppVisualTheme.accentTint)
+            .sheet(isPresented: $showingProvidersSheet) {
+                providersSelectionSheet
+            }
+            .sheet(isPresented: $showingSourceFoldersSheet) {
+                sourceFoldersSelectionSheet
+            }
+            .sheet(isPresented: $showConversationContextInspectSheet) {
+                conversationContextInspectSheet
+            }
+            .sheet(isPresented: $showConversationContextMappingsSheet) {
+                conversationContextMappingsSheet
+            }
+            .sheet(isPresented: $showMemoryDetailSheet) {
+                memoryDetailSheet
+            }
+            .confirmationDialog(
+                "Delete Local Model?",
+                isPresented: $showLocalModelDeleteConfirmation,
+                titleVisibility: .visible
+            ) {
+                Button("Delete Model", role: .destructive) {
+                    localAISetupService.deleteSelectedModel()
                 }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("This removes the selected model from local runtime storage on this Mac.")
             }
-            .padding(10)
-
-            if showConversationContextInspectFullscreen {
-                conversationContextInspectFullscreenCover
-                    .transition(.opacity)
-                    .zIndex(10)
+            .onAppear {
+                sanitizeSelectedStudioPage()
+                prepare()
             }
-        }
-        .appScrollbars()
-        .tint(AppVisualTheme.accentTint)
-        .background(
-            AIMemoryStudioWindowAccessor(windowReference: aiStudioWindowReference)
-        )
-        .sheet(isPresented: $showingProvidersSheet) {
-            providersSelectionSheet
-        }
-        .sheet(isPresented: $showingSourceFoldersSheet) {
-            sourceFoldersSelectionSheet
-        }
-        .sheet(isPresented: $showConversationContextInspectSheet) {
-            conversationContextInspectSheet
-        }
-        .sheet(isPresented: $showConversationContextMappingsSheet) {
-            conversationContextMappingsSheet
-        }
-        .sheet(isPresented: $showMemoryDetailSheet) {
-            memoryDetailSheet
-        }
-        .confirmationDialog(
-            "Delete Local Model?",
-            isPresented: $showLocalModelDeleteConfirmation,
-            titleVisibility: .visible
-        ) {
-            Button("Delete Model", role: .destructive) {
-                localAISetupService.deleteSelectedModel()
-            }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text("This removes the selected model from local runtime storage on this Mac.")
-        }
-        .onAppear {
-            sanitizeSelectedStudioPage()
-            prepare()
-        }
-        .onChange(of: promptRewriteConversationStore.contextSummaries) { _ in
-            refreshConversationContextDetails()
-        }
-        .onChange(of: assistantSetupStage) { _ in
-            sanitizeSelectedStudioPage()
-        }
-        .onChange(of: selectedStudioPage) { newValue in
-            if newValue == .conversationMemory {
+            .onChange(of: promptRewriteConversationStore.contextSummaries) { _ in
                 refreshConversationContextDetails()
             }
-        }
-        .onChange(of: showConversationContextInspectSheet) { isPresented in
-            if !isPresented {
-                clearInspectedConversationContextIfNeeded()
+            .onChange(of: assistantSetupStage) { _ in
+                sanitizeSelectedStudioPage()
             }
-        }
-        .onChange(of: showConversationContextInspectFullscreen) { isPresented in
-            if !isPresented {
-                clearInspectedConversationContextIfNeeded()
+            .onChange(of: selectedStudioPage) { newValue in
+                if newValue == .conversationMemory {
+                    refreshConversationContextDetails()
+                }
             }
-        }
-        .onChange(of: showConversationContextMappingsSheet) { isPresented in
-            if isPresented {
-                syncContextOverrideSelections()
-                loadContextMappings(showStatusMessage: false)
+            .onChange(of: showConversationContextInspectSheet) { isPresented in
+                if !isPresented {
+                    clearInspectedConversationContextIfNeeded()
+                }
             }
-        }
-        .onChange(of: localAISetupService.setupState) { newValue in
-            if newValue == .ready {
-                refreshPromptRewriteModels(showMessage: true)
+            .onChange(of: showConversationContextInspectFullscreen) { isPresented in
+                if !isPresented {
+                    clearInspectedConversationContextIfNeeded()
+                }
             }
-        }
-        .onChange(of: settings.promptRewriteProviderModeRawValue) { _ in
-            handlePromptRewriteProviderChanged()
-        }
-        .onReceive(
-            NotificationCenter.default.publisher(
-                for: MemoryIndexingSettingsService.indexingDidProgressNotification
-            )
-        ) { notification in
-            handleMemoryIndexingProgress(notification)
-        }
-        .onReceive(
-            NotificationCenter.default.publisher(
-                for: MemoryIndexingSettingsService.indexingDidFinishNotification
-            )
-        ) { notification in
-            handleMemoryIndexingCompletion(notification)
-        }
-        .onChange(of: memoryDetailShowLowSignal) { _ in
-            guard let selectedMemoryBrowserEntry else { return }
-            refreshMemoryDetailContext(for: selectedMemoryBrowserEntry)
-        }
-        .onDisappear {
-            memoryBrowserRefreshWorkItem?.cancel()
-            memoryBrowserRefreshWorkItem = nil
-        }
+            .onChange(of: showConversationContextMappingsSheet) { isPresented in
+                if isPresented {
+                    syncContextOverrideSelections()
+                    loadContextMappings(showStatusMessage: false)
+                }
+            }
+            .onChange(of: localAISetupService.setupState) { newValue in
+                if newValue == .ready {
+                    refreshPromptRewriteModels(showMessage: true)
+                }
+            }
+            .onChange(of: settings.promptRewriteProviderModeRawValue) { _ in
+                handlePromptRewriteProviderChanged()
+            }
+            .onReceive(
+                NotificationCenter.default.publisher(
+                    for: MemoryIndexingSettingsService.indexingDidProgressNotification
+                )
+            ) { notification in
+                handleMemoryIndexingProgress(notification)
+            }
+            .onReceive(
+                NotificationCenter.default.publisher(
+                    for: MemoryIndexingSettingsService.indexingDidFinishNotification
+                )
+            ) { notification in
+                handleMemoryIndexingCompletion(notification)
+            }
+            .onChange(of: memoryDetailShowLowSignal) { _ in
+                guard let selectedMemoryBrowserEntry else { return }
+                refreshMemoryDetailContext(for: selectedMemoryBrowserEntry)
+            }
+            .onAppear {
+                applyPendingNavigationRequestIfNeeded()
+            }
+            .onChange(of: aiStudioNavigationState.pendingRequest?.id) { _ in
+                applyPendingNavigationRequestIfNeeded()
+            }
+            .onDisappear {
+                memoryBrowserRefreshWorkItem?.cancel()
+                memoryBrowserRefreshWorkItem = nil
+            }
     }
 
     private var studioBackground: some View {
@@ -517,83 +577,143 @@ struct AIMemoryStudioView: View {
         )
     }
 
+    @ViewBuilder
+    private var rootBody: some View {
+        if showsStandaloneChrome {
+            ZStack {
+                studioBackground
+                studioRootContent
+                    .padding(10)
+
+                if showConversationContextInspectFullscreen {
+                    conversationContextInspectFullscreenCover
+                        .transition(.opacity)
+                        .zIndex(10)
+                }
+            }
+            .background(
+                AIMemoryStudioWindowAccessor(windowReference: aiStudioWindowReference)
+            )
+        } else {
+            studioRootContent
+        }
+    }
+
+    private var studioRootContent: some View {
+        Group {
+            if showsSidebar {
+                HStack(spacing: 0) {
+                    studioSidebar
+
+                    Rectangle()
+                        .fill(AppVisualTheme.surfaceFill(0.12))
+                        .frame(width: 1)
+                        .frame(maxHeight: .infinity)
+
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 16) {
+                            if showsStandaloneChrome {
+                                studioPageHeader
+                            }
+                            studioPageContent
+                        }
+                        .padding(showsStandaloneChrome ? 18 : 16)
+                        .frame(maxWidth: .infinity, alignment: .topLeading)
+                    }
+                }
+            } else {
+                VStack(alignment: .leading, spacing: 16) {
+                    studioPageContent
+                }
+                .padding(0)
+                .frame(maxWidth: .infinity, alignment: .topLeading)
+            }
+        }
+    }
+
     private var studioSidebar: some View {
         VStack(alignment: .leading, spacing: 14) {
-            Button {
-                NotificationCenter.default.post(
-                    name: .openAssistOpenSettings,
-                    object: SettingsRoute(section: .advanced, cardID: "advanced.aiStudio")
-                )
-            } label: {
-                HStack(spacing: 4) {
-                    Image(systemName: "chevron.left")
-                        .font(.caption2.weight(.bold))
-                    Text("Back to Settings")
-                        .font(.caption.weight(.medium))
-                }
-                .foregroundStyle(AppVisualTheme.mutedText)
-                .padding(.vertical, 4)
-                .padding(.horizontal, 6)
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .padding(.bottom, 4)
-
-            VStack(alignment: .leading, spacing: 2) {
-                Text("AI Studio (Advanced)")
-                    .font(.system(size: 15, weight: .semibold))
-                    .foregroundStyle(AppVisualTheme.foreground(0.92))
-                Text("Deeper AI setup lives here. Everyday choices stay in Settings.")
-                    .font(.system(size: 11, weight: .regular))
-                    .foregroundStyle(AppVisualTheme.foreground(0.48))
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-
-            VStack(spacing: 6) {
-                ForEach(Array(studioSidebarStatusItems.enumerated()), id: \.offset) { _, item in
-                    sidebarMetricRow(
-                        label: item.label,
-                        value: item.value,
-                        tint: item.tint
+            if showsStandaloneChrome {
+                Button {
+                    NotificationCenter.default.post(
+                        name: .openAssistOpenSettings,
+                        object: SettingsRoute(section: .modelsConnections, subsection: .modelsConnections)
                     )
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "chevron.left")
+                            .font(.caption2.weight(.bold))
+                        Text("Back to Settings")
+                            .font(.caption.weight(.medium))
+                    }
+                    .foregroundStyle(AppVisualTheme.mutedText)
+                    .padding(.vertical, 4)
+                    .padding(.horizontal, 6)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .padding(.bottom, 4)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(scope.sidebarTitle)
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(AppVisualTheme.foreground(0.92))
+                    Text(scope.sidebarSubtitle)
+                        .font(.system(size: 11, weight: .regular))
+                        .foregroundStyle(AppVisualTheme.foreground(0.48))
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                VStack(spacing: 6) {
+                    ForEach(Array(studioSidebarStatusItems.enumerated()), id: \.offset) { _, item in
+                        sidebarMetricRow(
+                            label: item.label,
+                            value: item.value,
+                            tint: item.tint
+                        )
+                    }
                 }
             }
 
-            Divider()
-                .overlay(AppVisualTheme.surfaceStroke(0.08))
+            if !visibleCoreStudioPages.isEmpty {
+                Divider()
+                    .overlay(AppVisualTheme.surfaceStroke(0.08))
 
-            Text("Core AI")
-                .font(.subheadline.weight(.semibold))
-                .foregroundStyle(.secondary)
-                .padding(.leading, 2)
+                Text(scope == .assistantOnly ? "Overview" : "Models")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .padding(.leading, 2)
 
-            VStack(spacing: 3) {
-                ForEach(availableStudioPages) { page in
-                    Button {
-                        selectedStudioPage = page
-                    } label: {
-                        studioPageRow(for: page)
+                VStack(spacing: 3) {
+                    ForEach(visibleCoreStudioPages) { page in
+                        Button {
+                            selectedStudioPage = page
+                        } label: {
+                            studioPageRow(for: page)
+                        }
+                        .buttonStyle(.plain)
                     }
-                    .buttonStyle(.plain)
                 }
             }
 
-            Divider()
-                .overlay(AppVisualTheme.surfaceStroke(0.08))
+            if !visibleAssistantStudioPages.isEmpty {
+                Divider()
+                    .overlay(AppVisualTheme.surfaceStroke(0.08))
 
-            Text("Assistant")
-                .font(.subheadline.weight(.semibold))
-                .foregroundStyle(.secondary)
-                .padding(.leading, 2)
+                Text("Assistant")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .padding(.leading, 2)
 
-            VStack(spacing: 3) {
-                ForEach(assistantStudioPages) { page in
-                    Button {
-                        selectedStudioPage = page
-                    } label: {
-                        studioPageRow(for: page)
+                VStack(spacing: 3) {
+                    ForEach(visibleAssistantStudioPages) { page in
+                        Button {
+                            selectedStudioPage = page
+                        } label: {
+                            studioPageRow(for: page)
+                        }
+                        .buttonStyle(.plain)
                     }
-                    .buttonStyle(.plain)
                 }
             }
 
@@ -634,29 +754,35 @@ struct AIMemoryStudioView: View {
         let isSelected = selectedStudioPage == page
 
         HStack(spacing: 10) {
-            Image(systemName: page.iconName)
-                .font(.system(size: 11, weight: .medium))
-                .foregroundStyle(isSelected ? AppVisualTheme.accentTint.opacity(0.90) : AppVisualTheme.foreground(0.40))
-                .frame(width: 20, height: 20)
+            if showsStandaloneChrome {
+                Image(systemName: page.iconName)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(isSelected ? AppVisualTheme.accentTint.opacity(0.90) : AppVisualTheme.foreground(0.40))
+                    .frame(width: 20, height: 20)
+            } else {
+                Capsule(style: .continuous)
+                    .fill(isSelected ? AppVisualTheme.accentTint.opacity(0.92) : Color.clear)
+                    .frame(width: 3, height: 16)
+            }
 
             Text(page.title)
-                .font(.system(size: 13, weight: isSelected ? .semibold : .regular))
-                .foregroundStyle(isSelected ? AppVisualTheme.foreground(0.92) : AppVisualTheme.foreground(0.68))
+                .font(.system(size: 13, weight: isSelected ? .semibold : .medium))
+                .foregroundStyle(isSelected ? AppVisualTheme.foreground(0.92) : AppVisualTheme.foreground(0.70))
                 .lineLimit(1)
 
             Spacer(minLength: 0)
         }
         .padding(.horizontal, 8)
-        .padding(.vertical, 6)
+        .padding(.vertical, 7)
         .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(Rectangle())
         .background(
             RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(isSelected ? AppVisualTheme.surfaceFill(0.10) : Color.clear)
+                .fill(isSelected ? AppVisualTheme.surfaceFill(0.08) : Color.clear)
                 .overlay(
                     RoundedRectangle(cornerRadius: 10, style: .continuous)
                         .stroke(
-                            isSelected ? AppVisualTheme.accentTint.opacity(0.16) : Color.clear,
+                            isSelected ? AppVisualTheme.accentTint.opacity(0.12) : Color.clear,
                             lineWidth: 0.7
                         )
                 )
@@ -675,7 +801,7 @@ struct AIMemoryStudioView: View {
                 )
 
                 VStack(alignment: .leading, spacing: 6) {
-                    Text("AI Studio")
+                    Text(scope.headerTitle)
                         .font(.system(size: 11, weight: .semibold))
                         .foregroundStyle(AppVisualTheme.foreground(0.48))
                         .textCase(.uppercase)
@@ -690,7 +816,7 @@ struct AIMemoryStudioView: View {
                         .foregroundStyle(AppVisualTheme.foreground(0.62))
                         .fixedSize(horizontal: false, vertical: true)
 
-                    Text("These are the deeper AI controls. Most people only need the simpler Setup and AI & Assistant pages in Settings.")
+                    Text(scope.headerHelpText)
                         .font(.caption)
                         .foregroundStyle(AppVisualTheme.foreground(0.52))
                         .fixedSize(horizontal: false, vertical: true)
@@ -698,13 +824,15 @@ struct AIMemoryStudioView: View {
 
                 Spacer(minLength: 0)
 
-                Button("Back to Settings") {
-                    NotificationCenter.default.post(
-                        name: .openAssistOpenSettings,
-                        object: SettingsRoute(section: .advanced, cardID: "advanced.aiStudio")
-                    )
+                if showsStandaloneChrome {
+                    Button("Back to Settings") {
+                        NotificationCenter.default.post(
+                            name: .openAssistOpenSettings,
+                            object: SettingsRoute(section: .modelsConnections, subsection: .modelsConnections)
+                        )
+                    }
+                    .buttonStyle(.bordered)
                 }
-                .buttonStyle(.bordered)
             }
 
             LazyVGrid(
@@ -892,11 +1020,17 @@ struct AIMemoryStudioView: View {
         VStack(alignment: .leading, spacing: 14) {
             providerConnectionCard
             promptModelConfigCard
-            if settings.promptRewriteProviderMode == .ollama {
+            if shouldShowLocalAISetupCard {
                 localAISetupCard
             }
             googleAIStudioCard
         }
+    }
+
+    private var shouldShowLocalAISetupCard: Bool {
+        settings.promptRewriteProviderMode == .ollama
+            || assistant.visibleAssistantBackend == .ollamaLocal
+            || !localAISetupService.installedModelIDs.isEmpty
     }
 
     private var studioProvidersPage: some View {
@@ -1668,7 +1802,7 @@ struct AIMemoryStudioView: View {
                         memoryEntryBadge(detail.context.appName, tint: AppVisualTheme.accentTint)
                     }
 
-                    Button("Back to AI Studio") {
+                    Button("Back") {
                         closeConversationContextInspectorFullScreen()
                     }
                     .buttonStyle(.borderedProminent)
@@ -1687,7 +1821,7 @@ struct AIMemoryStudioView: View {
                     } else {
                         emptyStateRow(
                             title: "Context unavailable",
-                            message: "This context may have been cleared. Go back to AI Studio and inspect another context.",
+                            message: "This context may have been cleared. Go back and inspect another context.",
                             systemImage: "exclamationmark.triangle"
                         )
                         .padding(24)
@@ -2412,6 +2546,9 @@ struct AIMemoryStudioView: View {
     }
 
     private var availableStudioPages: [StudioPage] {
+        guard scope.showsModelPages else {
+            return []
+        }
         let base = isMemoryFeatureEnabled ? StudioPage.allCases : aiCorePages
         return base.filter { !$0.isAssistantPage }
     }
@@ -2521,11 +2658,22 @@ struct AIMemoryStudioView: View {
     }
 
     private var assistantStudioPages: [StudioPage] {
+        guard scope.showsAssistantPages else {
+            return []
+        }
         var pages: [StudioPage] = [.assistantSetup]
         if shouldShowAssistantAdvancedPages {
             pages.append(contentsOf: [.assistantVoice, .assistantMemory, .assistantInstructions, .assistantLimits, .assistantSessions])
         }
         return pages
+    }
+
+    private var visibleCoreStudioPages: [StudioPage] {
+        availableStudioPages
+    }
+
+    private var visibleAssistantStudioPages: [StudioPage] {
+        assistantStudioPages
     }
 
     private var enabledSourceProviderCount: Int {
@@ -4746,9 +4894,23 @@ struct AIMemoryStudioView: View {
     }
 
     private func sanitizeSelectedStudioPage() {
-        let allValid = availableStudioPages + assistantStudioPages
+        let allValid = visibleCoreStudioPages + visibleAssistantStudioPages
         if !allValid.contains(selectedStudioPage) {
-            selectedStudioPage = .dashboard
+            selectedStudioPage = allValid.first ?? .dashboard
+        }
+    }
+
+    private func applyPendingNavigationRequestIfNeeded() {
+        guard let request = aiStudioNavigationState.pendingRequest else { return }
+        defer { aiStudioNavigationState.clearPendingRequest(id: request.id) }
+
+        if let page = StudioPage(rawValue: request.pageRawValue),
+           (visibleCoreStudioPages + visibleAssistantStudioPages).contains(page) {
+            selectedStudioPage = page
+        }
+
+        if let preferredLocalModelID = request.preferredLocalModelID {
+            localAISetupService.selectModelForSetup(preferredLocalModelID)
         }
     }
 
@@ -5984,7 +6146,7 @@ struct AIMemoryStudioView: View {
                 }
             }
 
-            if shouldShowAssistantAdvancedPages {
+            if shouldShowAssistantAdvancedPages && scope == .all {
                 BrowserAutomationSettingsView(settings: settings)
             }
         }

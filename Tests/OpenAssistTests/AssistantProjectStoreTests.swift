@@ -685,6 +685,67 @@ final class AssistantProjectStoreTests: XCTestCase {
         )
     }
 
+    func testProjectNoteImageAssetsRestoreWithDeletedNote() throws {
+        let directory = try makeTemporaryDirectory(named: "assistant-project-note-images")
+        let fileManager = FileManager.default
+        let store = AssistantProjectStore(baseDirectoryURL: directory)
+        let project = try store.createProject(name: "Image Project")
+        let createdWorkspace = try store.createProjectNote(projectID: project.id, title: "Runbook")
+        let note = try XCTUnwrap(createdWorkspace.selectedNote)
+        let attachmentData = Data("fake-project-png".utf8)
+        let attachment = AssistantAttachment(
+            filename: "Architecture.webp",
+            data: attachmentData,
+            mimeType: "image/webp"
+        )
+
+        let savedAsset = try store.saveProjectNoteImageAsset(
+            projectID: project.id,
+            noteID: note.id,
+            attachment: attachment
+        )
+        let assetDirectoryName = "\(URL(fileURLWithPath: note.fileName).deletingPathExtension().lastPathComponent).assets"
+        XCTAssertTrue(savedAsset.relativePath.hasPrefix("./\(assetDirectoryName)/"))
+        XCTAssertTrue(fileManager.fileExists(atPath: savedAsset.fileURL.path))
+        XCTAssertEqual(
+            try store.resolveProjectNoteImageAssetURL(
+                projectID: project.id,
+                noteID: note.id,
+                relativePath: savedAsset.relativePath
+            )?.path,
+            savedAsset.fileURL.path
+        )
+
+        _ = try store.saveProjectNote(
+            projectID: project.id,
+            noteID: note.id,
+            text: "![Architecture](\(savedAsset.relativePath))"
+        )
+
+        _ = try store.deleteProjectNote(projectID: project.id, noteID: note.id)
+        XCTAssertFalse(fileManager.fileExists(atPath: savedAsset.fileURL.path))
+
+        let deletedSnapshot = try XCTUnwrap(
+            store.recentlyDeletedProjectNotes(projectID: project.id).first
+        )
+        let restoredWorkspace = try store.restoreDeletedProjectNote(
+            projectID: project.id,
+            deletedNoteID: deletedSnapshot.id
+        )
+        let restoredNote = try XCTUnwrap(restoredWorkspace.selectedNote)
+        let restoredAssetURL = try XCTUnwrap(
+            store.resolveProjectNoteImageAssetURL(
+                projectID: project.id,
+                noteID: restoredNote.id,
+                relativePath: savedAsset.relativePath
+            )
+        )
+
+        XCTAssertEqual(restoredWorkspace.selectedNoteText, "![Architecture](\(savedAsset.relativePath))")
+        XCTAssertTrue(fileManager.fileExists(atPath: restoredAssetURL.path))
+        XCTAssertEqual(try Data(contentsOf: restoredAssetURL), attachmentData)
+    }
+
     func testProjectNamesAreCaseInsensitiveUnique() throws {
         let directory = try makeTemporaryDirectory(named: "assistant-project-name")
         let store = AssistantProjectStore(baseDirectoryURL: directory)
@@ -711,6 +772,198 @@ final class AssistantProjectStoreTests: XCTestCase {
                 XCTFail("Expected invalidThreadID, got \(storeError)")
             }
             XCTAssertEqual(storeError.localizedDescription, "Enter a thread ID first.")
+        }
+    }
+
+    func testProjectNoteFoldersRoundTripAndMoveNotesBetweenFoldersAndRoot() throws {
+        let directory = try makeTemporaryDirectory(named: "assistant-project-note-folders")
+        let store = AssistantProjectStore(baseDirectoryURL: directory)
+        let project = try store.createProject(name: "Notes")
+
+        let planningWorkspace = try store.createProjectNoteFolder(
+            projectID: project.id,
+            name: "Planning"
+        )
+        let planningFolder = try XCTUnwrap(
+            planningWorkspace.manifest.folders.first(where: { $0.name == "Planning" })
+        )
+        let q2Workspace = try store.createProjectNoteFolder(
+            projectID: project.id,
+            parentFolderID: planningFolder.id,
+            name: "Q2"
+        )
+        let q2Folder = try XCTUnwrap(
+            q2Workspace.manifest.folders.first(where: { $0.name == "Q2" })
+        )
+
+        let noteWorkspace = try store.createProjectNote(
+            projectID: project.id,
+            title: "Roadmap",
+            folderID: q2Folder.id
+        )
+        let noteID = try XCTUnwrap(noteWorkspace.selectedNote?.id)
+
+        let reloadedStore = AssistantProjectStore(baseDirectoryURL: directory)
+        let reloadedFolders = try reloadedStore.projectNoteFolders(projectID: project.id)
+        XCTAssertEqual(reloadedFolders.map(\.name), ["Planning", "Q2"])
+        XCTAssertEqual(
+            try reloadedStore.projectNoteFolderPathMap(projectID: project.id)[q2Folder.id],
+            ["Planning", "Q2"]
+        )
+        XCTAssertEqual(
+            try reloadedStore.loadProjectStoredNotes(projectID: project.id).first(where: {
+                $0.noteID == noteID
+            })?.folderID,
+            q2Folder.id
+        )
+
+        _ = try reloadedStore.moveProjectNote(
+            projectID: project.id,
+            noteID: noteID,
+            folderID: planningFolder.id
+        )
+        XCTAssertEqual(
+            try reloadedStore.loadProjectStoredNotes(projectID: project.id).first(where: {
+                $0.noteID == noteID
+            })?.folderID,
+            planningFolder.id
+        )
+
+        _ = try reloadedStore.moveProjectNote(
+            projectID: project.id,
+            noteID: noteID,
+            folderID: nil
+        )
+        XCTAssertNil(
+            try reloadedStore.loadProjectStoredNotes(projectID: project.id).first(where: {
+                $0.noteID == noteID
+            })?.folderID
+        )
+    }
+
+    func testProjectNoteFolderPersistsEvenBeforeAnyNotesExist() throws {
+        let directory = try makeTemporaryDirectory(named: "assistant-project-note-folder-empty")
+        let store = AssistantProjectStore(baseDirectoryURL: directory)
+        let project = try store.createProject(name: "Notes")
+
+        _ = try store.createProjectNoteFolder(projectID: project.id, name: "Planning")
+
+        let reloadedStore = AssistantProjectStore(baseDirectoryURL: directory)
+        XCTAssertEqual(
+            try reloadedStore.projectNoteFolders(projectID: project.id).map(\.name),
+            ["Planning"]
+        )
+        XCTAssertTrue(try reloadedStore.loadProjectStoredNotes(projectID: project.id).isEmpty)
+    }
+
+    func testProjectNoteFolderDeleteRejectsNonEmptyFolder() throws {
+        let directory = try makeTemporaryDirectory(named: "assistant-project-note-folder-delete")
+        let store = AssistantProjectStore(baseDirectoryURL: directory)
+        let project = try store.createProject(name: "Notes")
+
+        let folderWorkspace = try store.createProjectNoteFolder(
+            projectID: project.id,
+            name: "Planning"
+        )
+        let folderID = try XCTUnwrap(folderWorkspace.manifest.folders.first?.id)
+        _ = try store.createProjectNote(
+            projectID: project.id,
+            title: "Roadmap",
+            folderID: folderID
+        )
+
+        XCTAssertThrowsError(
+            try store.deleteProjectNoteFolder(projectID: project.id, folderID: folderID)
+        ) { error in
+            guard let storeError = error as? AssistantProjectStoreError else {
+                return XCTFail("Unexpected error type: \(error)")
+            }
+            guard case .noteFolderNotEmpty = storeError else {
+                return XCTFail("Expected noteFolderNotEmpty, got \(storeError)")
+            }
+        }
+    }
+
+    func testLegacyProjectNoteManifestMigrationKeepsNotesAtRoot() throws {
+        let directory = try makeTemporaryDirectory(named: "assistant-project-note-manifest-legacy")
+        let store = AssistantProjectStore(baseDirectoryURL: directory)
+        let project = try store.createProject(name: "Notes")
+
+        let manifestDirectory = directory
+            .appendingPathComponent("ProjectNotes", isDirectory: true)
+            .appendingPathComponent(project.id, isDirectory: true)
+            .appendingPathComponent("notes", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: manifestDirectory,
+            withIntermediateDirectories: true
+        )
+
+        let createdAt = Date(timeIntervalSinceReferenceDate: 1_000)
+        let updatedAt = Date(timeIntervalSinceReferenceDate: 1_100)
+        let legacyManifest: [String: Any] = [
+            "version": 2,
+            "selectedNoteID": "note-1",
+            "notes": [[
+                "id": "note-1",
+                "title": "Legacy Note",
+                "fileName": "note-1.md",
+                "order": 0,
+                "createdAt": createdAt.timeIntervalSinceReferenceDate,
+                "updatedAt": updatedAt.timeIntervalSinceReferenceDate
+            ]]
+        ]
+        let manifestData = try JSONSerialization.data(
+            withJSONObject: legacyManifest,
+            options: [.sortedKeys, .prettyPrinted]
+        )
+        try manifestData.write(
+            to: manifestDirectory.appendingPathComponent("manifest.json", isDirectory: false)
+        )
+
+        let reloadedStore = AssistantProjectStore(baseDirectoryURL: directory)
+        let workspace = try reloadedStore.loadProjectNotesWorkspace(projectID: project.id)
+        XCTAssertTrue(workspace.manifest.folders.isEmpty)
+        XCTAssertNil(workspace.manifest.notes.first?.folderID)
+    }
+
+    func testProjectNoteFoldersRejectDuplicateSiblingNamesAndCycles() throws {
+        let directory = try makeTemporaryDirectory(named: "assistant-project-note-folder-validation")
+        let store = AssistantProjectStore(baseDirectoryURL: directory)
+        let project = try store.createProject(name: "Notes")
+
+        let parentWorkspace = try store.createProjectNoteFolder(
+            projectID: project.id,
+            name: "Planning"
+        )
+        let parentFolderID = try XCTUnwrap(parentWorkspace.manifest.folders.first?.id)
+        let childWorkspace = try store.createProjectNoteFolder(
+            projectID: project.id,
+            parentFolderID: parentFolderID,
+            name: "Q2"
+        )
+        let childFolderID = try XCTUnwrap(
+            childWorkspace.manifest.folders.first(where: { $0.name == "Q2" })?.id
+        )
+
+        XCTAssertThrowsError(
+            try store.createProjectNoteFolder(projectID: project.id, name: "planning")
+        ) { error in
+            XCTAssertTrue(error.localizedDescription.contains("already exists"))
+        }
+
+        XCTAssertThrowsError(
+            try store.moveProjectNoteFolder(
+                projectID: project.id,
+                folderID: parentFolderID,
+                parentFolderID: childFolderID
+            )
+        ) { error in
+            guard let storeError = error as? AssistantProjectStoreError else {
+                return XCTFail("Unexpected error type: \(error)")
+            }
+            guard case .cannotMoveNoteFolderIntoDescendant = storeError else {
+                return XCTFail("Expected cannotMoveNoteFolderIntoDescendant, got \(storeError)")
+            }
         }
     }
 

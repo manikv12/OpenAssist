@@ -3,6 +3,20 @@ import SwiftUI
 import WebKit
 
 final class AssistantInteractiveWebView: WKWebView {
+    override init(frame: CGRect, configuration: WKWebViewConfiguration) {
+        super.init(frame: frame, configuration: configuration)
+        if #available(macOS 13.3, *) {
+            self.isInspectable = true
+        }
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        if #available(macOS 13.3, *) {
+            self.isInspectable = true
+        }
+    }
+
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
         true
     }

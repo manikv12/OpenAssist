@@ -162,6 +162,14 @@ final class LocalAISetupService: ObservableObject {
         LocalAIModelCatalog.model(withID: modelID, in: modelOptions)
     }
 
+    func selectModelForSetup(_ modelID: String) {
+        let normalizedModelID = modelID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedModelID.isEmpty else { return }
+        ensureModelOptionExists(normalizedModelID)
+        selectedModelID = normalizedModelID
+        settings.localAISelectedModelID = normalizedModelID
+    }
+
     private func ensureModelOptionExists(_ modelID: String) {
         let normalizedModelID = modelID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !normalizedModelID.isEmpty else { return }

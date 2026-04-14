@@ -54,7 +54,7 @@ enum AssistantImageGenerationServiceError: LocalizedError {
         case .invalidBaseURL:
             return "Invalid Google AI Studio base URL."
         case .missingAPIKey:
-            return "Set a Google AI Studio API key in AI Studio to use Gemini image generation."
+            return "Set a Google AI Studio API key in Settings > Models & Connections to use Gemini image generation."
         case .providerError(let message):
             return message
         case .unsupportedResponse:

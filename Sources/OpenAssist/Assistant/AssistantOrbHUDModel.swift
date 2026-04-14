@@ -63,6 +63,8 @@ final class AssistantOrbHUDModel: ObservableObject {
     @Published var selectedSessionBackendHelpText: String?
     @Published var availableModels: [AssistantModelOption] = []
     @Published var selectedModelSummary: String = ""
+    @Published var runtimeControlsAvailability: AssistantRuntimeControlsAvailability = .ready
+    @Published var runtimeControlsStatusText: String = ""
     @Published var controllerModeSwitchSuggestion: AssistantModeSwitchSuggestion? {
         didSet { refreshCachedModeSwitchSuggestion() }
     }

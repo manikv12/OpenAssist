@@ -415,7 +415,7 @@ actor PromptRewriteModelCatalogService {
 
     private func localRuntimeCatalogFailureMessage(for error: Error?) -> String {
         guard let error else {
-            return "Could not load local models. AI Studio -> Prompt Models -> Local AI Setup and install or repair Local AI."
+            return "Could not load local models. Open Settings -> Models & Connections -> Local AI Setup, then install or repair Local AI."
         }
 
         let nsError = error as NSError
@@ -429,15 +429,15 @@ actor PromptRewriteModelCatalogService {
                 NSURLErrorTimedOut
             ]
             if localRuntimeCodes.contains(nsError.code) {
-                return "Local AI runtime is not reachable. AI Studio -> Prompt Models -> Local AI Setup and install or repair Local AI."
+                return "Local AI runtime is not reachable. Open Settings -> Models & Connections -> Local AI Setup, then install or repair Local AI."
             }
         }
 
         let detail = error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
         if detail.isEmpty {
-            return "Could not load local models. AI Studio -> Prompt Models -> Local AI Setup and repair Local AI."
+            return "Could not load local models. Open Settings -> Models & Connections -> Local AI Setup, then repair Local AI."
         }
-        return "Could not load local models: \(detail). AI Studio -> Prompt Models -> Local AI Setup."
+        return "Could not load local models: \(detail). Open Settings -> Models & Connections -> Local AI Setup."
     }
 
     private func cacheModels(_ models: [PromptRewriteModelOption], for providerMode: PromptRewriteProviderMode) {

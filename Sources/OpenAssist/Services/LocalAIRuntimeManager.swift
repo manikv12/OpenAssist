@@ -182,7 +182,7 @@ actor LocalAIRuntimeManager: LocalAIRuntimeManaging {
             process.terminate()
             self.runtimeProcess = nil
             throw LocalAIRuntimeError.runtimeStartFailed(
-                reason: "Local runtime started but did not become healthy. Try Repair Local AI in AI Studio."
+                reason: "Local runtime started but did not become healthy. Try Repair Local AI in Settings > Models & Connections."
             )
         }
 

@@ -274,53 +274,14 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
     }
 
     func openAIMemoryStudioWindow() {
-        onStatusUpdate(.openingSettings)
-        requestDockActivation()
-
-        if aiStudioWindowController == nil {
-            let hostingController = NSHostingController(rootView: AIMemoryStudioView().environmentObject(settings))
-            let window = AppHostWindow(
-                contentRect: NSRect(origin: .zero, size: aiStudioDefaultSize),
-                styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
-                backing: .buffered,
-                defer: false
-            )
-            window.title = "AI Studio"
-            window.titleVisibility = .hidden
-            window.titlebarAppearsTransparent = true
-            window.isOpaque = false
-            window.backgroundColor = AppVisualTheme.windowBackdropNSColor
-            window.toolbarStyle = .unifiedCompact
-            window.isMovableByWindowBackground = false
-            window.contentViewController = hostingController
-            window.hidesOnDeactivate = false
-            window.collectionBehavior = standardWindowCollectionBehavior
-            window.isReleasedWhenClosed = false
-            window.minSize = aiStudioMinimumSize
-            centerWindowOnActiveScreen(window)
-            window.delegate = self
-
-            aiStudioWindowController = NSWindowController(window: window)
+        let pendingPage = AIStudioNavigationState.shared.pendingRequest?.pageRawValue ?? "models"
+        let route: SettingsRoute
+        if pendingPage.lowercased().hasPrefix("assistant") {
+            route = SettingsRoute(section: .assistant, subsection: .assistantSetup)
+        } else {
+            route = SettingsRoute(section: .modelsConnections, subsection: .modelsConnections)
         }
-
-        guard let window = aiStudioWindowController?.window else {
-            onStatusUpdate(.message("Could not open AI Studio"))
-            return
-        }
-
-        NSApp.activate(ignoringOtherApps: true)
-        aiStudioWindowController?.showWindow(nil)
-        if window.isMiniaturized {
-            window.deminiaturize(nil)
-        }
-        if window.frame.width < aiStudioMinimumSize.width || window.frame.height < aiStudioMinimumSize.height {
-            window.setContentSize(aiStudioDefaultSize)
-        }
-        centerWindowOnActiveScreen(window)
-        window.orderFrontRegardless()
-        window.makeKeyAndOrderFront(nil)
-        settingsWindowController?.close()
-        onStatusUpdate(.ready)
+        openSettingsWindow(route: route)
     }
 
     func openAssistantWindow<Content: View>(rootView: Content) {

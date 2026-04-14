@@ -810,6 +810,74 @@ final class AssistantConversationStoreTests: XCTestCase {
         )
     }
 
+    func testThreadNoteImageAssetsRestoreWithDeletedNote() throws {
+        let fileManager = FileManager.default
+        let directoryURL = fileManager.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? fileManager.removeItem(at: directoryURL) }
+
+        let store = AssistantConversationStore(
+            fileManager: fileManager,
+            baseDirectoryURL: directoryURL
+        )
+
+        let threadID = "thread-images"
+        let createdWorkspace = try store.createThreadNote(threadID: threadID, title: "Images")
+        let note = try XCTUnwrap(createdWorkspace.selectedNote)
+        let attachmentData = Data("fake-png-data".utf8)
+        let attachment = AssistantAttachment(
+            filename: "Board Sketch.png",
+            data: attachmentData,
+            mimeType: "image/png"
+        )
+
+        let savedAsset = try store.saveThreadNoteImageAsset(
+            threadID: threadID,
+            noteID: note.id,
+            attachment: attachment
+        )
+        let assetDirectoryName = "\(URL(fileURLWithPath: note.fileName).deletingPathExtension().lastPathComponent).assets"
+        XCTAssertTrue(savedAsset.relativePath.hasPrefix("./\(assetDirectoryName)/"))
+        XCTAssertTrue(fileManager.fileExists(atPath: savedAsset.fileURL.path))
+        XCTAssertEqual(
+            store.resolveThreadNoteImageAssetURL(
+                threadID: threadID,
+                noteID: note.id,
+                relativePath: savedAsset.relativePath
+            )?.path,
+            savedAsset.fileURL.path
+        )
+
+        _ = try store.saveThreadNote(
+            threadID: threadID,
+            noteID: note.id,
+            text: "![Board](\(savedAsset.relativePath))"
+        )
+
+        _ = try store.deleteThreadNote(threadID: threadID, noteID: note.id)
+        XCTAssertFalse(fileManager.fileExists(atPath: savedAsset.fileURL.path))
+
+        let deletedSnapshot = try XCTUnwrap(
+            store.recentlyDeletedThreadNotes(threadID: threadID).first
+        )
+        let restoredWorkspace = try store.restoreDeletedThreadNote(
+            threadID: threadID,
+            deletedNoteID: deletedSnapshot.id
+        )
+        let restoredNote = try XCTUnwrap(restoredWorkspace.selectedNote)
+        let restoredAssetURL = try XCTUnwrap(
+            store.resolveThreadNoteImageAssetURL(
+                threadID: threadID,
+                noteID: restoredNote.id,
+                relativePath: savedAsset.relativePath
+            )
+        )
+
+        XCTAssertEqual(restoredWorkspace.selectedNoteText, "![Board](\(savedAsset.relativePath))")
+        XCTAssertTrue(fileManager.fileExists(atPath: restoredAssetURL.path))
+        XCTAssertEqual(try Data(contentsOf: restoredAssetURL), attachmentData)
+    }
+
     func testSavedConversationThreadsEnumeratesSnapshotEventLogAndLegacyNotes() throws {
         let fileManager = FileManager.default
         let directoryURL = fileManager.temporaryDirectory
@@ -986,6 +1054,32 @@ final class AssistantConversationStoreTests: XCTestCase {
         store.deleteSnapshot(threadID: threadID)
 
         XCTAssertFalse(store.savedConversationThreads().contains { $0.threadID == threadID })
+    }
+
+    func testThreadNotesStayFlatAndNeverPersistFolders() throws {
+        let fileManager = FileManager.default
+        let directoryURL = fileManager.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? fileManager.removeItem(at: directoryURL) }
+
+        let store = AssistantConversationStore(
+            fileManager: fileManager,
+            baseDirectoryURL: directoryURL
+        )
+
+        let workspace = try store.createThreadNote(threadID: "thread-notes-flat", title: "Quick note")
+        let noteID = try XCTUnwrap(workspace.selectedNote?.id)
+
+        XCTAssertTrue(workspace.manifest.folders.isEmpty)
+        XCTAssertNil(workspace.selectedNote?.folderID)
+
+        let storedNote = try XCTUnwrap(
+            store.loadThreadStoredNotes(threadID: "thread-notes-flat").first(where: {
+                $0.noteID == noteID
+            })
+        )
+        XCTAssertNil(storedNote.folderID)
+        XCTAssertTrue(store.loadThreadNotesWorkspace(threadID: "thread-notes-flat").manifest.folders.isEmpty)
     }
 
     private func setModificationDate(_ date: Date, for fileURL: URL) throws {

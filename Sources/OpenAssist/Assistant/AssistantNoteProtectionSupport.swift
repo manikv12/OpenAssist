@@ -18,6 +18,7 @@ struct AssistantNoteHistoryVersion: Codable, Equatable, Sendable, Identifiable {
     let ownerID: String
     let savedAt: Date
     let preview: String
+    let markdown: String
 }
 
 struct AssistantDeletedNoteSnapshot: Codable, Equatable, Sendable, Identifiable {
@@ -28,6 +29,7 @@ struct AssistantDeletedNoteSnapshot: Codable, Equatable, Sendable, Identifiable 
     let ownerID: String
     let deletedAt: Date
     let preview: String
+    let markdown: String
 }
 
 struct AssistantNotesBackupSetSummary: Codable, Equatable, Sendable, Identifiable {
@@ -63,6 +65,7 @@ enum AssistantNotesBackupError: LocalizedError {
 struct AssistantNoteRestorePayload: Sendable {
     let note: AssistantNoteSummary
     let text: String
+    let assetDirectoryURL: URL?
 }
 
 private struct AssistantNoteHistoryRecord: Codable, Equatable, Sendable {
@@ -93,6 +96,7 @@ private struct AssistantDeletedNoteRecord: Codable, Equatable, Sendable {
     let preview: String
     let contentHash: String
     let contentFileName: String
+    let assetDirectoryName: String?
 }
 
 private struct AssistantNotesBackupManifest: Codable, Equatable, Sendable {
@@ -223,7 +227,13 @@ final class AssistantNoteRecoveryStore {
                     ownerKind: $0.ownerKind,
                     ownerID: $0.ownerID,
                     savedAt: $0.savedAt,
-                    preview: $0.preview
+                    preview: $0.preview,
+                    markdown: loadHistoryContent(
+                        ownerKind: $0.ownerKind,
+                        ownerID: $0.ownerID,
+                        noteID: $0.noteID,
+                        contentFileName: $0.contentFileName
+                    ) ?? $0.preview
                 )
             }
     }
@@ -256,7 +266,8 @@ final class AssistantNoteRecoveryStore {
                 createdAt: record.createdAt,
                 updatedAt: record.updatedAt
             ),
-            text: Self.normalizedText(text)
+            text: Self.normalizedText(text),
+            assetDirectoryURL: nil
         )
     }
 
@@ -288,6 +299,7 @@ final class AssistantNoteRecoveryStore {
         ownerKind: AssistantNoteOwnerKind,
         ownerID: String,
         text: String,
+        assetDirectoryURL: URL? = nil,
         at date: Date = Date()
     ) {
         purgeExpiredDeletedNotes(referenceDate: date, ownerKind: ownerKind, ownerID: ownerID)
@@ -296,12 +308,22 @@ final class AssistantNoteRecoveryStore {
         let contentHash = Self.sha256(normalizedText)
         let deletedID = UUID().uuidString.lowercased()
         let contentFileName = "\(deletedID).md"
+        let assetDirectoryName = assetDirectoryURL == nil
+            ? nil
+            : AssistantNoteAssetSupport.deletedAssetDirectoryName(for: deletedID)
         guard let contentURL = deletedContentFileURL(
             ownerKind: ownerKind,
             ownerID: ownerID,
             contentFileName: contentFileName
         ) else {
             return
+        }
+        let deletedAssetURL = assetDirectoryName.flatMap {
+            deletedAssetDirectoryURL(
+                ownerKind: ownerKind,
+                ownerID: ownerID,
+                assetDirectoryName: $0
+            )
         }
 
         do {
@@ -317,6 +339,12 @@ final class AssistantNoteRecoveryStore {
                 withIntermediateDirectories: true
             )
             try normalizedText.write(to: contentURL, atomically: true, encoding: .utf8)
+            if let assetDirectoryURL,
+               fileManager.fileExists(atPath: assetDirectoryURL.path),
+               let deletedAssetURL {
+                try? fileManager.removeItem(at: deletedAssetURL)
+                try fileManager.copyItem(at: assetDirectoryURL, to: deletedAssetURL)
+            }
 
             let record = AssistantDeletedNoteRecord(
                 id: deletedID,
@@ -330,12 +358,16 @@ final class AssistantNoteRecoveryStore {
                 deletedAt: date,
                 preview: Self.preview(for: normalizedText, fallbackTitle: note.title),
                 contentHash: contentHash,
-                contentFileName: contentFileName
+                contentFileName: contentFileName,
+                assetDirectoryName: assetDirectoryName
             )
             records.insert(record, at: 0)
             try saveDeletedRecords(records, ownerKind: ownerKind, ownerID: ownerID)
         } catch {
             try? fileManager.removeItem(at: contentURL)
+            if let deletedAssetURL {
+                try? fileManager.removeItem(at: deletedAssetURL)
+            }
         }
     }
 
@@ -355,7 +387,12 @@ final class AssistantNoteRecoveryStore {
                     ownerKind: $0.ownerKind,
                     ownerID: $0.ownerID,
                     deletedAt: $0.deletedAt,
-                    preview: $0.preview
+                    preview: $0.preview,
+                    markdown: loadDeletedContent(
+                        ownerKind: $0.ownerKind,
+                        ownerID: $0.ownerID,
+                        contentFileName: $0.contentFileName
+                    ) ?? $0.preview
                 )
             }
     }
@@ -397,7 +434,14 @@ final class AssistantNoteRecoveryStore {
                 createdAt: record.createdAt,
                 updatedAt: record.updatedAt
             ),
-            text: Self.normalizedText(text)
+            text: Self.normalizedText(text),
+            assetDirectoryURL: record.assetDirectoryName.flatMap {
+                deletedAssetDirectoryURL(
+                    ownerKind: ownerKind,
+                    ownerID: ownerID,
+                    assetDirectoryName: $0
+                )
+            }
         )
     }
 
@@ -523,6 +567,44 @@ final class AssistantNoteRecoveryStore {
         return records
     }
 
+    private func loadHistoryContent(
+        ownerKind: AssistantNoteOwnerKind,
+        ownerID: String,
+        noteID: String,
+        contentFileName: String
+    ) -> String? {
+        guard let contentURL = historyContentFileURL(
+            ownerKind: ownerKind,
+            ownerID: ownerID,
+            noteID: noteID,
+            contentFileName: contentFileName
+        ),
+        fileManager.fileExists(atPath: contentURL.path),
+        let text = try? String(contentsOf: contentURL, encoding: .utf8) else {
+            return nil
+        }
+
+        return Self.normalizedText(text)
+    }
+
+    private func loadDeletedContent(
+        ownerKind: AssistantNoteOwnerKind,
+        ownerID: String,
+        contentFileName: String
+    ) -> String? {
+        guard let contentURL = deletedContentFileURL(
+            ownerKind: ownerKind,
+            ownerID: ownerID,
+            contentFileName: contentFileName
+        ),
+        fileManager.fileExists(atPath: contentURL.path),
+        let text = try? String(contentsOf: contentURL, encoding: .utf8) else {
+            return nil
+        }
+
+        return Self.normalizedText(text)
+    }
+
     private func saveDeletedRecords(
         _ records: [AssistantDeletedNoteRecord],
         ownerKind: AssistantNoteOwnerKind,
@@ -554,6 +636,14 @@ final class AssistantNoteRecoveryStore {
             contentFileName: record.contentFileName
         ) {
             try? fileManager.removeItem(at: contentURL)
+        }
+        if let assetDirectoryName = record.assetDirectoryName,
+           let assetDirectoryURL = deletedAssetDirectoryURL(
+            ownerKind: ownerKind,
+            ownerID: ownerID,
+            assetDirectoryName: assetDirectoryName
+           ) {
+            try? fileManager.removeItem(at: assetDirectoryURL)
         }
     }
 
@@ -591,6 +681,15 @@ final class AssistantNoteRecoveryStore {
     ) -> URL? {
         deletedOwnerDirectoryURL(ownerKind: ownerKind, ownerID: ownerID)?
             .appendingPathComponent(contentFileName, isDirectory: false)
+    }
+
+    private func deletedAssetDirectoryURL(
+        ownerKind: AssistantNoteOwnerKind,
+        ownerID: String,
+        assetDirectoryName: String
+    ) -> URL? {
+        deletedOwnerDirectoryURL(ownerKind: ownerKind, ownerID: ownerID)?
+            .appendingPathComponent(assetDirectoryName, isDirectory: true)
     }
 
     private func historyNoteDirectoryURL(

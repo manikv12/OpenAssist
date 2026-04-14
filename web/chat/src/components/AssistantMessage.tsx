@@ -5,7 +5,6 @@ import { AppIcon } from "./AppIcon";
 import { MarkdownContent } from "./MarkdownContent";
 import { CollapsibleImageGallery } from "./CollapsibleImageGallery";
 import { MessageCheckpointCard } from "./MessageCheckpointCard";
-import { useSmoothTextStream } from "../hooks/useSmoothTextStream";
 import { StreamingContext } from "../StreamingContext";
 
 function providerTheme(label?: string): "codex" | "copilot" | "claude" | "default" {
@@ -19,12 +18,20 @@ function providerTheme(label?: string): "codex" | "copilot" | "claude" | "defaul
 function AssistantMessageInner({
   message,
   checkpointInfo,
+  showProviderFooter = false,
 }: {
   message: ChatMessage;
   checkpointInfo?: MessageCheckpointInfo;
+  showProviderFooter?: boolean;
 }) {
   const text = message.text || "";
-  const smoothText = useSmoothTextStream(text, message.isStreaming || false);
+  const hasImages = Boolean(message.images?.length);
+  const hasVisibleBody = Boolean(text) || hasImages || Boolean(checkpointInfo);
+
+  if (!hasVisibleBody) {
+    return null;
+  }
+
   const transitionClass = message.transitionState
     ? ` is-${message.transitionState}`
     : "";
@@ -40,6 +47,7 @@ function AssistantMessageInner({
       className={`message-row assistant-row${message.isStreaming ? " streaming" : ""}${transitionClass}`}
       data-message-id={message.id}
       data-message-text={copyText}
+      data-provider={providerTone}
     >
       <div className="assistant-content">
         {copyText && (
@@ -57,10 +65,10 @@ function AssistantMessageInner({
           <div className="assistant-message-stage phase-settled">
             <div className="assistant-markdown-shell">
               <StreamingContext.Provider value={message.isStreaming || false}>
-                <MarkdownContent markdown={smoothText} />
+                <MarkdownContent markdown={text} />
               </StreamingContext.Provider>
             </div>
-            {message.providerLabel && (
+            {showProviderFooter && message.providerLabel && (
               <div
                 className="assistant-provider-footer"
                 data-provider={providerTone}
@@ -94,6 +102,7 @@ function AssistantMessageInner({
 export const AssistantMessage = memo(AssistantMessageInner, (prev, next) => {
   return (
     prev.message === next.message &&
+    prev.showProviderFooter === next.showProviderFooter &&
     prev.checkpointInfo?.checkpoint.id === next.checkpointInfo?.checkpoint.id &&
     prev.checkpointInfo?.currentCheckpointPosition === next.checkpointInfo?.currentCheckpointPosition &&
     prev.checkpointInfo?.hasActiveTurn === next.checkpointInfo?.hasActiveTurn &&

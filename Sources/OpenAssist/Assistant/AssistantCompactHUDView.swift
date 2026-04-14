@@ -2587,11 +2587,17 @@ struct AssistantNotchHUDView: View {
 
             HStack(alignment: .center, spacing: 8) {
                 notchAttachmentButton(tint: AppVisualTheme.accentTint)
-                notchProviderPicker(tint: AppVisualTheme.accentTint)
+                if shouldShowNotchRuntimeMenus {
+                    notchProviderPicker(tint: AppVisualTheme.accentTint)
+                } else {
+                    notchRuntimeStatusChip(tint: AppVisualTheme.accentTint)
+                }
                 AssistantModePicker(selection: model.interactionMode, style: .compact) { mode in
                     model.setInteractionMode(mode)
                 }
-                notchModelPicker(tint: AppVisualTheme.accentTint)
+                if shouldShowNotchRuntimeMenus {
+                    notchModelPicker(tint: AppVisualTheme.accentTint)
+                }
                 Spacer(minLength: 0)
             }
 
@@ -2775,6 +2781,57 @@ struct AssistantNotchHUDView: View {
                         .stroke(AppVisualTheme.surfaceStroke(0.06), lineWidth: 0.6)
                 )
         )
+    }
+
+    private var shouldShowNotchRuntimeMenus: Bool {
+        !model.state.phase.isActive && model.runtimeControlsAvailability.isReady
+    }
+
+    private func notchRuntimeStatusChip(tint: Color) -> some View {
+        let statusText =
+            model.runtimeControlsStatusText.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+            ?? model.runtimeControlsAvailability.fallbackStatusText
+
+        return HStack(spacing: 6) {
+            AssistantGlyphBadge(
+                symbol: "hourglass",
+                tint: runtimeStatusTint(defaultTint: tint),
+                side: 16,
+                fillOpacity: 0.14,
+                strokeOpacity: 0.22,
+                symbolScale: 0.46
+            )
+            Text(statusText)
+                .font(.system(size: 9.5, weight: .medium))
+                .foregroundStyle(AppVisualTheme.foreground(0.60))
+                .lineLimit(1)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 5)
+        .background(
+            Capsule(style: .continuous)
+                .fill(AppVisualTheme.surfaceFill(0.06))
+                .overlay(
+                    Capsule(style: .continuous)
+                        .stroke(
+                            runtimeStatusTint(defaultTint: tint).opacity(0.16),
+                            lineWidth: 0.5
+                        )
+                )
+        )
+    }
+
+    private func runtimeStatusTint(defaultTint: Color) -> Color {
+        switch model.runtimeControlsAvailability {
+        case .ready:
+            return defaultTint
+        case .busy:
+            return AppVisualTheme.baseTint
+        case .loadingModels, .switchingProvider:
+            return defaultTint
+        case .unavailable:
+            return .orange
+        }
     }
 
     private func notchProviderPicker(tint: Color) -> some View {

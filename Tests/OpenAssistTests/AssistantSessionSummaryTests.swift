@@ -281,4 +281,18 @@ final class AssistantSessionSummaryTests: XCTestCase {
         XCTAssertTrue(hybrid.usesHybridConversationPersistence)
         XCTAssertFalse(snapshotOnly.usesHybridConversationPersistence)
     }
+
+    func testTransientPersistenceDisablesSavedConversationHistory() {
+        let transient = AssistantSessionSummary(
+            id: "openassist-temp",
+            title: "Temporary",
+            source: .openAssist,
+            threadArchitectureVersion: .providerIndependentV2,
+            conversationPersistence: .transient,
+            status: .idle
+        )
+
+        XCTAssertFalse(transient.persistsConversationHistory)
+        XCTAssertFalse(transient.usesHybridConversationPersistence)
+    }
 }

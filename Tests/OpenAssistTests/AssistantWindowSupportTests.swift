@@ -2,6 +2,120 @@ import XCTest
 @testable import OpenAssist
 
 final class AssistantWindowSupportTests: XCTestCase {
+    func testAssistantNotesSessionRegistryMigratesLegacySingleSessionMap() {
+        let registries = assistantDecodeNotesAssistantSessionRegistries(
+            from: #"{"amwins":"session-a","ops":"session-b"}"#
+        )
+
+        XCTAssertEqual(
+            registries["amwins"],
+            AssistantNotesProjectSessionRegistry(
+                sessionIDs: ["session-a"],
+                lastUsedSessionID: "session-a"
+            )
+        )
+        XCTAssertEqual(
+            registries["ops"],
+            AssistantNotesProjectSessionRegistry(
+                sessionIDs: ["session-b"],
+                lastUsedSessionID: "session-b"
+            )
+        )
+    }
+
+    func testAssistantNotesSessionRegistryPrefersLastUsedThenNewestValidSession() {
+        let recentDate = Date(timeIntervalSince1970: 1_710_000_000)
+        let olderDate = Date(timeIntervalSince1970: 1_700_000_000)
+        let sessions = [
+            AssistantSessionSummary(
+                id: "session-a",
+                title: "Main",
+                source: .openAssist,
+                status: .idle,
+                createdAt: olderDate,
+                updatedAt: olderDate
+            ),
+            AssistantSessionSummary(
+                id: "session-b",
+                title: "Recent",
+                source: .openAssist,
+                status: .idle,
+                createdAt: recentDate,
+                updatedAt: recentDate
+            ),
+        ]
+
+        var registries = [
+            "amwins": AssistantNotesProjectSessionRegistry(
+                sessionIDs: ["session-a", "session-b"],
+                lastUsedSessionID: "session-a"
+            )
+        ]
+
+        XCTAssertEqual(
+            assistantResolvedNotesAssistantSessionID(
+                projectID: "amwins",
+                registries: registries,
+                sessions: sessions
+            ),
+            "session-a"
+        )
+
+        registries["amwins"] = AssistantNotesProjectSessionRegistry(
+            sessionIDs: ["session-a", "session-b"],
+            lastUsedSessionID: "missing"
+        )
+
+        XCTAssertEqual(
+            assistantResolvedNotesAssistantSessionID(
+                projectID: "amwins",
+                registries: registries,
+                sessions: sessions
+            ),
+            "session-b"
+        )
+    }
+
+    func testAssistantNotesSessionRegistryIgnoresArchivedSessionsWhenResolving() {
+        let archivedDate = Date(timeIntervalSince1970: 1_710_000_000)
+        let activeDate = Date(timeIntervalSince1970: 1_700_000_000)
+        let sessions = [
+            AssistantSessionSummary(
+                id: "archived-session",
+                title: "Archived",
+                source: .openAssist,
+                status: .idle,
+                createdAt: archivedDate,
+                updatedAt: archivedDate,
+                isArchived: true
+            ),
+            AssistantSessionSummary(
+                id: "active-session",
+                title: "Active",
+                source: .openAssist,
+                status: .idle,
+                createdAt: activeDate,
+                updatedAt: activeDate
+            ),
+        ]
+
+        let registries = [
+            "amwins": AssistantNotesProjectSessionRegistry(
+                sessionIDs: ["archived-session", "active-session"],
+                lastUsedSessionID: "archived-session"
+            )
+        ]
+
+        XCTAssertEqual(
+            assistantResolvedNotesAssistantSessionID(
+                projectID: "amwins",
+                registries: registries,
+                sessions: sessions
+            ),
+            "active-session"
+        )
+    }
+
     func testAssistantWindowViewUsesLargerHistoryAndSidebarDefaults() {
         XCTAssertEqual(AssistantWindowView.initialVisibleHistoryLimit, 24)
         XCTAssertEqual(AssistantWindowView.historyBatchSize, 24)
@@ -122,9 +236,11 @@ final class AssistantWindowSupportTests: XCTestCase {
     func testMessagesFirstRenderItemsKeepConversationAndHelpfulErrors() {
         let baseDate = Date(timeIntervalSince1970: 1_700_000_000)
         let sessionID = "thread-a"
+        let turnID = "turn-1"
         let userMessage = AssistantTimelineItem.userMessage(
             id: "user-1",
             sessionID: sessionID,
+            turnID: turnID,
             text: "Hello",
             createdAt: baseDate,
             source: .runtime
@@ -132,6 +248,7 @@ final class AssistantWindowSupportTests: XCTestCase {
         let assistantProgress = AssistantTimelineItem.assistantProgress(
             id: "assistant-progress-1",
             sessionID: sessionID,
+            turnID: turnID,
             text: "Working",
             createdAt: baseDate.addingTimeInterval(1),
             updatedAt: baseDate.addingTimeInterval(1),
@@ -141,6 +258,7 @@ final class AssistantWindowSupportTests: XCTestCase {
         let assistantFinal = AssistantTimelineItem.assistantFinal(
             id: "assistant-final-1",
             sessionID: sessionID,
+            turnID: turnID,
             text: "Hi there",
             createdAt: baseDate.addingTimeInterval(2),
             updatedAt: baseDate.addingTimeInterval(2),
@@ -150,6 +268,7 @@ final class AssistantWindowSupportTests: XCTestCase {
         let plan = AssistantTimelineItem.plan(
             id: "plan-1",
             sessionID: sessionID,
+            turnID: turnID,
             text: "1. Check history",
             entries: nil,
             createdAt: baseDate.addingTimeInterval(3),
@@ -160,7 +279,7 @@ final class AssistantWindowSupportTests: XCTestCase {
         let activity = AssistantActivityItem(
             id: "activity-1",
             sessionID: sessionID,
-            turnID: nil,
+            turnID: turnID,
             kind: .webSearch,
             title: "Search",
             status: .completed,
@@ -242,8 +361,67 @@ final class AssistantWindowSupportTests: XCTestCase {
                 "assistant-progress-1",
                 "assistant-final-1",
                 "plan-1",
+                activityGroup.id,
+                "activity-1",
                 "permission-match",
                 "system-2",
+            ]
+        )
+    }
+
+    func testMessagesFirstViewPrefersLiveActivityCardDuringActiveTurn() {
+        let sessionID = "thread-1"
+        let baseDate = Date(timeIntervalSince1970: 1_710_000_000)
+        let userMessage = AssistantTimelineItem.userMessage(
+            id: "user-1",
+            sessionID: sessionID,
+            turnID: "turn-1",
+            text: "Check telegram integration",
+            createdAt: baseDate,
+            source: .runtime
+        )
+        let activity = AssistantActivityItem(
+            id: "activity-1",
+            sessionID: sessionID,
+            turnID: "turn-1",
+            kind: .webSearch,
+            title: "Search workspace",
+            status: .running,
+            friendlySummary: "Looking for Telegram files",
+            rawDetails: nil,
+            startedAt: baseDate.addingTimeInterval(1),
+            updatedAt: baseDate.addingTimeInterval(1),
+            source: .runtime
+        )
+        let activityItem = AssistantTimelineItem.activity(activity)
+        let activityGroup = AssistantTimelineActivityGroup(items: [activityItem])
+        let assistantProgress = AssistantTimelineItem.assistantProgress(
+            id: "assistant-progress-1",
+            sessionID: sessionID,
+            turnID: "turn-1",
+            text: "Searching the project…",
+            createdAt: baseDate.addingTimeInterval(2),
+            updatedAt: baseDate.addingTimeInterval(2),
+            isStreaming: true,
+            source: .runtime
+        )
+
+        let filtered = assistantMessagesFirstVisibleRenderItems(
+            from: [
+                .timeline(userMessage),
+                .activityGroup(activityGroup),
+                .timeline(activityItem),
+                .timeline(assistantProgress),
+            ],
+            pendingPermissionSessionID: sessionID,
+            preferLiveActivityCard: true
+        )
+
+        XCTAssertEqual(
+            filtered.map(\.id),
+            [
+                "user-1",
+                "assistant-progress-1",
             ]
         )
     }
@@ -329,6 +507,36 @@ final class AssistantWindowSupportTests: XCTestCase {
                 hudPhase: .streaming
             )
         )
+    }
+
+    func testVisibleStreamingAssistantContentRequiresActualTextOrImage() {
+        let baseDate = Date(timeIntervalSince1970: 1_700_000_000)
+
+        let emptyStreamingAssistant = AssistantTimelineRenderItem.timeline(
+            AssistantTimelineItem.assistantProgress(
+                id: "assistant-progress-empty",
+                sessionID: "thread-a",
+                text: "",
+                createdAt: baseDate,
+                updatedAt: baseDate,
+                isStreaming: true,
+                source: .runtime
+            )
+        )
+        XCTAssertFalse(assistantTimelineHasVisibleStreamingAssistantContent(emptyStreamingAssistant))
+
+        let streamingAssistantWithText = AssistantTimelineRenderItem.timeline(
+            AssistantTimelineItem.assistantProgress(
+                id: "assistant-progress-text",
+                sessionID: "thread-a",
+                text: "Working on it",
+                createdAt: baseDate,
+                updatedAt: baseDate,
+                isStreaming: true,
+                source: .runtime
+            )
+        )
+        XCTAssertTrue(assistantTimelineHasVisibleStreamingAssistantContent(streamingAssistantWithText))
     }
 
     func testSelectedSessionToolActivityIsHiddenWhenAnotherThreadOwnsRuntime() {
@@ -576,6 +784,7 @@ final class AssistantWindowSupportTests: XCTestCase {
                 AssistantChatWebThreadNoteItem(
                     id: "note-1",
                     title: "Main note",
+                    noteType: AssistantNoteType.note.rawValue,
                     updatedAtLabel: "Saved now",
                     ownerKind: "project",
                     ownerID: "project-1",
@@ -591,6 +800,8 @@ final class AssistantWindowSupportTests: XCTestCase {
             hasAnyNotes: true,
             isSaving: false,
             isGeneratingAIDraft: true,
+            isGeneratingProjectTransferPreview: false,
+            isGeneratingBatchNotePlanPreview: false,
             aiDraftMode: "chart",
             lastSavedAtLabel: "Saved now",
             canEdit: true,
@@ -599,6 +810,42 @@ final class AssistantWindowSupportTests: XCTestCase {
                 mode: "chart",
                 sourceKind: "chatSelection",
                 markdown: "## Stack\n\n```mermaid\nmindmap\n  root((SaaS))\n```",
+                isError: false
+            ),
+            projectNoteTransferPreview: nil,
+            projectNoteTransferOutcome: nil,
+            batchNotePlanPreview: AssistantChatWebBatchNotePlanPreview(
+                previewID: "preview-1",
+                sourceNotes: [
+                    AssistantChatWebBatchNotePlanSourceNote(
+                        ownerKind: "project",
+                        ownerID: "project-1",
+                        noteID: "note-1",
+                        title: "Main note",
+                        noteType: AssistantNoteType.note.rawValue,
+                        sourceLabel: "Project notes",
+                        markdown: "Main note body"
+                    )
+                ],
+                proposedNotes: [
+                    AssistantChatWebBatchNotePlanProposedNote(
+                        tempID: "master-note",
+                        title: "Master note",
+                        noteType: AssistantNoteType.master.rawValue,
+                        markdown: "# Summary",
+                        sourceNoteTargets: [],
+                        accepted: true
+                    )
+                ],
+                proposedLinks: [],
+                graph: AssistantChatWebThreadNoteGraph(
+                    mermaidCode: "flowchart LR\n  N0[\"Master note\"]",
+                    nodeCount: 1,
+                    edgeCount: 0
+                ),
+                warnings: ["Titles were adjusted."],
+                sourceFingerprint: "source-fingerprint",
+                targetFingerprint: "target-fingerprint",
                 isError: false
             ),
             outgoingLinks: [],
@@ -639,6 +886,10 @@ final class AssistantWindowSupportTests: XCTestCase {
         XCTAssertEqual(preview["mode"] as? String, "chart")
         XCTAssertEqual(preview["sourceKind"] as? String, "chatSelection")
         XCTAssertEqual(preview["isError"] as? Bool, false)
+        let batchPreview = try XCTUnwrap(json["batchNotePlanPreview"] as? [String: Any])
+        XCTAssertEqual(batchPreview["previewId"] as? String, "preview-1")
+        XCTAssertEqual((batchPreview["sourceNotes"] as? [[String: Any]])?.count, 1)
+        XCTAssertEqual((batchPreview["proposedNotes"] as? [[String: Any]])?.count, 1)
     }
 
     func testMergedNoteDraftsOnlySeedsSelectedNoteAndPreservesEditedDrafts() {

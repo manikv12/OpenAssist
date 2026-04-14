@@ -143,6 +143,89 @@ final class AssistantProjectMemoryServiceTests: XCTestCase {
         XCTAssertFalse(block.contains("Refine sidebar"), block)
     }
 
+    func testTurnContextSkipsProjectDigestsForLowSignalPrompt() throws {
+        let projectDirectory = try makeTemporaryDirectory(named: "assistant-project-context-low-signal")
+        let memoryRoot = try makeTemporaryDirectory(named: "assistant-thread-memory")
+        let databaseURL = try makeDatabaseURL()
+
+        let projectStore = AssistantProjectStore(baseDirectoryURL: projectDirectory)
+        let memoryStore = try MemorySQLiteStore(databaseURL: databaseURL)
+        let suggestionService = AssistantMemorySuggestionService(
+            threadMemoryService: AssistantThreadMemoryService(baseDirectoryURL: memoryRoot),
+            store: memoryStore
+        )
+        let service = AssistantProjectMemoryService(
+            projectStore: projectStore,
+            memoryStore: memoryStore,
+            memorySuggestionService: suggestionService
+        )
+
+        let project = try projectStore.createProject(name: "Mac Client", linkedFolderPath: "/tmp/mac-client")
+        try projectStore.assignThread("thread-10", toProjectID: project.id)
+        try projectStore.updateThreadDigest(
+            projectID: project.id,
+            threadID: "thread-11",
+            threadTitle: "Release notes",
+            summary: "Assistant: Prepared the release notes and checked the GitHub release branch.",
+            fingerprint: "release-1"
+        )
+
+        let context = try XCTUnwrap(
+            service.turnContext(
+                forThreadID: "thread-10",
+                fallbackCWD: "/tmp/mac-client",
+                prompt: "Can you check why?"
+            )
+        )
+
+        let block = context.projectContextBlock ?? ""
+        XCTAssertTrue(block.contains("Project context:"), block)
+        XCTAssertTrue(block.contains("Mac Client"), block)
+        XCTAssertFalse(block.contains("Relevant project notes:"), block)
+        XCTAssertFalse(block.contains("Release notes"), block)
+    }
+
+    func testTurnContextRequiresMoreThanSingleStrongKeywordOverlap() throws {
+        let projectDirectory = try makeTemporaryDirectory(named: "assistant-project-context-overlap")
+        let memoryRoot = try makeTemporaryDirectory(named: "assistant-thread-memory")
+        let databaseURL = try makeDatabaseURL()
+
+        let projectStore = AssistantProjectStore(baseDirectoryURL: projectDirectory)
+        let memoryStore = try MemorySQLiteStore(databaseURL: databaseURL)
+        let suggestionService = AssistantMemorySuggestionService(
+            threadMemoryService: AssistantThreadMemoryService(baseDirectoryURL: memoryRoot),
+            store: memoryStore
+        )
+        let service = AssistantProjectMemoryService(
+            projectStore: projectStore,
+            memoryStore: memoryStore,
+            memorySuggestionService: suggestionService
+        )
+
+        let project = try projectStore.createProject(name: "Mac Client", linkedFolderPath: "/tmp/mac-client")
+        try projectStore.assignThread("thread-12", toProjectID: project.id)
+        try projectStore.updateThreadDigest(
+            projectID: project.id,
+            threadID: "thread-13",
+            threadTitle: "Voice mode bug",
+            summary: "Assistant: Fixed the voice mode issue in the sidebar and stopped the blocked state.",
+            fingerprint: "voice-1"
+        )
+
+        let context = try XCTUnwrap(
+            service.turnContext(
+                forThreadID: "thread-12",
+                fallbackCWD: "/tmp/mac-client",
+                prompt: "Why does gpt-5.4 xhigh mode appear late for this provider?"
+            )
+        )
+
+        let block = context.projectContextBlock ?? ""
+        XCTAssertTrue(block.contains("Project context:"), block)
+        XCTAssertFalse(block.contains("Relevant project notes:"), block)
+        XCTAssertFalse(block.contains("Voice mode bug"), block)
+    }
+
     private func makeTemporaryDirectory(named name: String) throws -> URL {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("\(name)-\(UUID().uuidString)", isDirectory: true)

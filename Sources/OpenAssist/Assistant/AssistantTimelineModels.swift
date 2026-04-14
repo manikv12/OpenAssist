@@ -732,7 +732,14 @@ struct AssistantTimelineItem: Identifiable, Equatable, Codable, Sendable {
     var source: AssistantTimelineSource
 
     var sortDate: Date {
-        activity?.startedAt ?? createdAt
+        switch kind {
+        case .activity:
+            return activity?.startedAt ?? createdAt
+        case .assistantFinal:
+            return updatedAt
+        case .userMessage, .assistantProgress, .permission, .plan, .system:
+            return createdAt
+        }
     }
 
     var lastUpdatedAt: Date {

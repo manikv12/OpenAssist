@@ -297,12 +297,12 @@ final class AssistantProjectMemoryService {
         prompt: String?
     ) -> [String] {
         let promptKeywords = Set(
-            MemoryTextNormalizer.keywords(from: prompt ?? "", limit: 18)
+            projectMemorySignalKeywords(from: prompt, limit: 18)
         )
-        guard !promptKeywords.isEmpty else {
+        guard promptKeywords.count >= 2 else {
             return []
         }
-        let minimumOverlap = promptKeywords.count <= 2 ? 1 : 2
+        let minimumOverlap = promptKeywords.count >= 4 ? 2 : 1
 
         let normalizedCurrentThreadID = currentThreadID
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -338,6 +338,18 @@ final class AssistantProjectMemoryService {
         return rankedDigests.prefix(3).map { item in
             "- \(item.digest.threadTitle): \(item.digest.summary)"
         }
+    }
+
+    private func projectMemorySignalKeywords(from prompt: String?, limit: Int) -> [String] {
+        guard let prompt = prompt?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+            return []
+        }
+
+        return MemoryTextNormalizer.keywords(from: prompt, limit: limit)
+            .filter { token in
+                token.count >= 4
+                    || token.rangeOfCharacter(from: .decimalDigits) != nil
+            }
     }
 
     private func buildThreadDigest(

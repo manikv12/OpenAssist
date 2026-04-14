@@ -1,4 +1,5 @@
 import AppKit
+import CryptoKit
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -60,6 +61,160 @@ func assistantProjectNotesRestoredSidebarCollapsed(
     restoreState ?? persistedSidebarCollapsed
 }
 
+struct AssistantNotesProjectSessionRegistry: Codable, Equatable, Sendable {
+    var sessionIDs: [String]
+    var lastUsedSessionID: String?
+
+    init(sessionIDs: [String] = [], lastUsedSessionID: String? = nil) {
+        let normalizedSessionIDs = Self.normalizedSessionIDs(from: sessionIDs)
+        let normalizedLastUsedSessionID = assistantNormalizedNotesSessionID(lastUsedSessionID)
+
+        self.sessionIDs = normalizedSessionIDs
+        self.lastUsedSessionID =
+            normalizedSessionIDs.contains(where: {
+                assistantTimelineSessionIDsMatch($0, normalizedLastUsedSessionID)
+            })
+            ? normalizedLastUsedSessionID
+            : nil
+    }
+
+    var isEmpty: Bool { sessionIDs.isEmpty }
+
+    private static func normalizedSessionIDs(from sessionIDs: [String]) -> [String] {
+        var normalized: [String] = []
+
+        for sessionID in sessionIDs {
+            guard let normalizedSessionID = assistantNormalizedNotesSessionID(sessionID),
+                !normalized.contains(where: {
+                    assistantTimelineSessionIDsMatch($0, normalizedSessionID)
+                })
+            else {
+                continue
+            }
+            normalized.append(normalizedSessionID)
+        }
+
+        return normalized
+    }
+}
+
+func assistantNormalizedNotesProjectID(_ projectID: String?) -> String? {
+    projectID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty?.lowercased()
+}
+
+func assistantNormalizedNotesSessionID(_ sessionID: String?) -> String? {
+    sessionID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+}
+
+func assistantDecodeNotesAssistantSessionRegistries(
+    from jsonString: String
+) -> [String: AssistantNotesProjectSessionRegistry] {
+    guard let data = jsonString.data(using: .utf8) else { return [:] }
+
+    if let decoded = try? JSONDecoder().decode(
+        [String: AssistantNotesProjectSessionRegistry].self,
+        from: data
+    ) {
+        return decoded.reduce(into: [:]) { result, pair in
+            guard let projectID = assistantNormalizedNotesProjectID(pair.key) else { return }
+            let normalizedRegistry = AssistantNotesProjectSessionRegistry(
+                sessionIDs: pair.value.sessionIDs,
+                lastUsedSessionID: pair.value.lastUsedSessionID
+            )
+            guard !normalizedRegistry.isEmpty else { return }
+            result[projectID] = normalizedRegistry
+        }
+    }
+
+    if let legacyDecoded = try? JSONDecoder().decode([String: String].self, from: data) {
+        return legacyDecoded.reduce(into: [:]) { result, pair in
+            guard let projectID = assistantNormalizedNotesProjectID(pair.key),
+                let sessionID = assistantNormalizedNotesSessionID(pair.value)
+            else {
+                return
+            }
+            result[projectID] = AssistantNotesProjectSessionRegistry(
+                sessionIDs: [sessionID],
+                lastUsedSessionID: sessionID
+            )
+        }
+    }
+
+    return [:]
+}
+
+func assistantEncodeNotesAssistantSessionRegistries(
+    _ registries: [String: AssistantNotesProjectSessionRegistry]
+) -> String? {
+    let normalized = registries.reduce(into: [String: AssistantNotesProjectSessionRegistry]()) {
+        result,
+        pair in
+        guard let projectID = assistantNormalizedNotesProjectID(pair.key) else { return }
+        let normalizedRegistry = AssistantNotesProjectSessionRegistry(
+            sessionIDs: pair.value.sessionIDs,
+            lastUsedSessionID: pair.value.lastUsedSessionID
+        )
+        guard !normalizedRegistry.isEmpty else { return }
+        result[projectID] = normalizedRegistry
+    }
+
+    guard !normalized.isEmpty,
+        let data = try? JSONEncoder().encode(normalized)
+    else {
+        return nil
+    }
+
+    return String(data: data, encoding: .utf8)
+}
+
+func assistantNotesSessionRecencyDate(_ session: AssistantSessionSummary) -> Date {
+    session.updatedAt ?? session.createdAt ?? .distantPast
+}
+
+func assistantResolvedNotesAssistantSessionID(
+    projectID: String?,
+    registries: [String: AssistantNotesProjectSessionRegistry],
+    sessions: [AssistantSessionSummary]
+) -> String? {
+    guard let normalizedProjectID = assistantNormalizedNotesProjectID(projectID),
+        let registry = registries[normalizedProjectID],
+        !registry.sessionIDs.isEmpty
+    else {
+        return nil
+    }
+
+    let validSessions = registry.sessionIDs.compactMap { registeredSessionID in
+        sessions.first(where: {
+            assistantTimelineSessionIDsMatch($0.id, registeredSessionID)
+        })
+    }
+    .filter { !$0.isArchived }
+
+    guard !validSessions.isEmpty else { return nil }
+
+    if let lastUsedSessionID = assistantNormalizedNotesSessionID(registry.lastUsedSessionID),
+        let matchedSession = validSessions.first(where: {
+            assistantTimelineSessionIDsMatch($0.id, lastUsedSessionID)
+        })
+    {
+        return matchedSession.id
+    }
+
+    return validSessions.max(by: {
+        assistantNotesSessionRecencyDate($0) < assistantNotesSessionRecencyDate($1)
+    })?.id
+}
+
+func assistantNotesAssistantSessionTitle(
+    projectName: String,
+    existingRegistry: AssistantNotesProjectSessionRegistry,
+    createdAt: Date
+) -> String {
+    let baseTitle = "Notes Assistant · \(projectName)"
+    guard !existingRegistry.sessionIDs.isEmpty else { return baseTitle }
+    return "\(baseTitle) · \(createdAt.formatted(date: .abbreviated, time: .shortened))"
+}
+
 enum AssistantWindowPresentationStyle {
     case window
     case compactSidebar
@@ -84,6 +239,17 @@ private struct AssistantNoteOwnerKey: Hashable {
     }
 }
 
+private struct ProjectNoteHeadingSection {
+    let title: String
+    let normalizedTitle: String
+    let level: Int
+    let lineStartUTF16: Int
+    let contentStartUTF16: Int
+    let sectionEndUTF16: Int
+    let path: [String]
+    let normalizedPath: [String]
+}
+
 private struct AssistantNoteNavigationEntry: Hashable {
     let owner: AssistantNoteOwnerKey
     let noteID: String
@@ -100,6 +266,8 @@ private struct AssistantNotesUniverse {
     let project: AssistantProject
     let projectOwner: AssistantNoteOwnerKey
     let projectNotes: [AssistantStoredNote]
+    let projectFolders: [AssistantNoteFolderSummary]
+    let projectFolderPathByID: [String: [String]]
     let threadSources: [AssistantNotesUniverseThreadSource]
 
     var threadNotes: [AssistantStoredNote] {
@@ -117,10 +285,22 @@ private struct AssistantSidebarNoteRowModel: Identifiable {
     let subtitle: String
     let sourceLabel: String
     let updatedAt: Date
+    let folderID: String?
+    let folderPath: [String]
     let isArchivedThread: Bool
     let threadID: String?
 
     var id: String { target.storageKey }
+}
+
+private struct AssistantSidebarNoteFolderRowModel: Identifiable {
+    let id: String
+    let name: String
+    let parentFolderID: String?
+    let path: [String]
+    let isExpanded: Bool
+    let childFolderCount: Int
+    let noteCount: Int
 }
 
 extension AssistantSidebarPane {
@@ -203,10 +383,11 @@ private struct AssistantWorkspaceLaunchTarget: Identifiable {
 
 func assistantTimelineItemLooksLikeVisibleError(_ item: AssistantTimelineItem) -> Bool {
     guard item.kind == .system,
-          let cleanedText = AssistantVisibleTextSanitizer.clean(item.text)?
+        let cleanedText = AssistantVisibleTextSanitizer.clean(item.text)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .nonEmpty?
-            .lowercased() else {
+            .lowercased()
+    else {
         return false
     }
 
@@ -218,28 +399,102 @@ func assistantTimelineItemLooksLikeVisibleError(_ item: AssistantTimelineItem) -
 
 func assistantMessagesFirstVisibleRenderItems(
     from renderItems: [AssistantTimelineRenderItem],
-    pendingPermissionSessionID: String? = nil
+    pendingPermissionSessionID: String? = nil,
+    preferLiveActivityCard: Bool = false
 ) -> [AssistantTimelineRenderItem] {
-    renderItems.filter { renderItem in
+    let latestConversationTurnID = renderItems.reversed().compactMap { renderItem -> String? in
+        switch renderItem {
+        case .timeline(let item):
+            switch item.kind {
+            case .assistantProgress, .assistantFinal, .plan, .activity:
+                return item.turnID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+                    ?? item.activity?.turnID?.trimmingCharacters(in: .whitespacesAndNewlines)
+                    .nonEmpty
+            case .userMessage, .permission, .system:
+                return nil
+            }
+        case .activityGroup(let group):
+            return group.items.reversed().compactMap { item in
+                item.turnID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+                    ?? item.activity?.turnID?.trimmingCharacters(in: .whitespacesAndNewlines)
+                    .nonEmpty
+            }.first
+        }
+    }.first
+
+    let latestUserIndex = renderItems.lastIndex { renderItem in
+        if case .timeline(let item) = renderItem {
+            return item.kind == .userMessage
+        }
+        return false
+    }
+
+    func shouldKeepLatestActivity(
+        _ renderItem: AssistantTimelineRenderItem,
+        index: Int
+    ) -> Bool {
+        let candidateTurnIDs: [String] = {
+            switch renderItem {
+            case .timeline(let item):
+                return [
+                    item.turnID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty,
+                    item.activity?.turnID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty,
+                ].compactMap { $0 }
+            case .activityGroup(let group):
+                return group.items.compactMap { item in
+                    item.turnID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+                        ?? item.activity?.turnID?.trimmingCharacters(in: .whitespacesAndNewlines)
+                        .nonEmpty
+                }
+            }
+        }()
+
+        if let latestConversationTurnID,
+            candidateTurnIDs.contains(where: {
+                $0.caseInsensitiveCompare(latestConversationTurnID) == .orderedSame
+            })
+        {
+            return true
+        }
+
+        if let latestUserIndex {
+            return index > latestUserIndex
+        }
+
+        switch renderItem {
+        case .timeline(let item):
+            return item.activity?.status.isActive == true
+        case .activityGroup(let group):
+            return group.activities.contains(where: \.status.isActive)
+        }
+    }
+
+    return renderItems.enumerated().compactMap { index, renderItem in
         switch renderItem {
         case .activityGroup:
-            return false
+            if preferLiveActivityCard {
+                return nil
+            }
+            return shouldKeepLatestActivity(renderItem, index: index) ? renderItem : nil
 
         case .timeline(let item):
             switch item.kind {
             case .userMessage, .assistantProgress, .assistantFinal, .plan:
-                return true
+                return renderItem
             case .permission:
                 guard let pendingPermissionSessionID = pendingPermissionSessionID?.nonEmpty else {
-                    return false
+                    return nil
                 }
                 return item.permissionRequest?.sessionID.caseInsensitiveCompare(
                     pendingPermissionSessionID
-                ) == .orderedSame
+                ) == .orderedSame ? renderItem : nil
             case .system:
-                return assistantTimelineItemLooksLikeVisibleError(item)
+                return assistantTimelineItemLooksLikeVisibleError(item) ? renderItem : nil
             case .activity:
-                return false
+                if preferLiveActivityCard {
+                    return nil
+                }
+                return shouldKeepLatestActivity(renderItem, index: index) ? renderItem : nil
             }
         }
     }
@@ -256,6 +511,29 @@ private final class AssistantThreadNoteMenuSelectionHandler: NSObject {
     @objc func handleSelect(_ sender: NSMenuItem) {
         guard let noteID = sender.representedObject as? String else { return }
         onSelect(noteID)
+    }
+}
+
+@MainActor
+private final class AssistantThreadNoteDraftStore {
+    private var draftsByOwnerKey: [String: [String: String]] = [:]
+
+    func draft(ownerKey: String, noteID: String) -> String? {
+        draftsByOwnerKey[ownerKey]?[noteID]
+    }
+
+    func drafts(ownerKey: String) -> [String: String] {
+        draftsByOwnerKey[ownerKey] ?? [:]
+    }
+
+    func setDraft(_ text: String, ownerKey: String, noteID: String) {
+        var drafts = draftsByOwnerKey[ownerKey] ?? [:]
+        drafts[noteID] = text
+        draftsByOwnerKey[ownerKey] = drafts
+    }
+
+    func replaceDrafts(_ drafts: [String: String], ownerKey: String) {
+        draftsByOwnerKey[ownerKey] = drafts
     }
 }
 
@@ -353,10 +631,12 @@ struct AssistantWindowView: View {
 
     private struct ChatLayoutMetrics {
         let windowWidth: CGFloat
+        let windowHeight: CGFloat
         let sidebarWidth: CGFloat
         let collapsedSidebarWidth: CGFloat
         let collapsedSidebarPreviewWidth: CGFloat
         let visibleSidebarWidth: CGFloat
+        let detailWidth: CGFloat
         let outerPadding: CGFloat
         let timelineHorizontalPadding: CGFloat
         let contentMaxWidth: CGFloat
@@ -408,6 +688,7 @@ struct AssistantWindowView: View {
     @State private var toolCallsExpanded = false
     @State private var expandedActivityIDs: Set<String> = []
     @State private var pendingPermanentDeleteSession: AssistantSessionSummary?
+    @State private var pendingDeleteNotesAssistantSession: AssistantSessionSummary?
     @State private var pendingDeleteProject: AssistantProject?
     @State private var showSessionInstructions = false
     @State private var showProviderPicker = false
@@ -416,6 +697,8 @@ struct AssistantWindowView: View {
     @State private var visibleHistoryLimit = Self.initialVisibleHistoryLimit
     @State private var chatViewportHeight: CGFloat = 0
     @State private var composerMeasuredHeight: CGFloat?
+    @State private var notesAssistantComposerMeasuredHeight: CGFloat?
+    @State private var isComposerQuickActionsMenuPresented = false
     @State private var isLoadingOlderHistory = false
     @State private var hoveredInlineCopyMessageID: String?
     @State private var inlineCopyHideWorkItem: DispatchWorkItem?
@@ -423,7 +706,8 @@ struct AssistantWindowView: View {
     @State private var expandedHistoricalActivityRenderItemIDs: Set<String> = []
     @State private var expandedHistoricalConversationBlockIDs: Set<String> = []
     @State private var chatScrollTracking = AssistantChatScrollTracking()
-    @AppStorage("assistantSelectedSidebarPane") private var selectedSidebarPaneRawValue = AssistantSidebarPane.threads.shellID
+    @AppStorage("assistantSelectedSidebarPane") private var selectedSidebarPaneRawValue =
+        AssistantSidebarPane.threads.shellID
 
     private var selectedSidebarPane: AssistantSidebarPane {
         get { AssistantSidebarPane(shellID: selectedSidebarPaneRawValue) ?? .threads }
@@ -442,7 +726,8 @@ struct AssistantWindowView: View {
     @State private var hoveredWorkspaceLaunchTargetID: String?
     @State private var showWorkspaceLaunchMenu = false
     @State private var cachedVisibleRenderItems: [AssistantTimelineRenderItem] = []
-    @State private var chatWebContainer: AssistantChatWebContainerView?
+    @State private var chatTimelineWebContainer: AssistantChatWebContainerView?
+    @State private var threadNoteWebContainer: AssistantChatWebContainerView?
     @State private var isThreadNoteOpen = false
     @State private var isThreadNoteExpanded = false
     @State private var threadNoteViewMode = "edit"
@@ -450,20 +735,40 @@ struct AssistantWindowView: View {
     @State private var selectedNoteOwnerByThreadID: [String: AssistantNoteOwnerKey] = [:]
     @State private var selectedNotesProjectID: String?
     @State private var selectedNotesScope: AssistantNotesScope = .project
+    @AppStorage("assistantNotesAssistantOverlayOpen") private var isNotesAssistantPanelOpen = false
+    @AppStorage("assistantNotesAssistantOverlayExpanded") private
+        var isNotesAssistantPanelExpanded =
+        false
+    @AppStorage("assistantNotesAssistantSessionMap") private var notesAssistantSessionMapJSON = ""
+    @State private var notesAssistantReturnSessionID: String?
+    @State private var notesAssistantSessionTask: Task<Void, Never>?
     @State private var selectedNotesTargetByContextKey: [String: AssistantNoteLinkTarget] = [:]
     @State private var threadsDetailMode: AssistantThreadsDetailMode = .chat
     @State private var noteManifestByOwnerKey: [String: AssistantNoteManifest] = [:]
-    @State private var noteDraftTextByOwnerKey: [String: [String: String]] = [:]
+    @State private var noteDraftStore = AssistantThreadNoteDraftStore()
     @State private var noteLastSavedAtByOwnerKey: [String: [String: Date]] = [:]
-    @State private var threadNoteNavigationStackByContextKey: [String: [AssistantNoteNavigationEntry]] = [:]
+    @State private var threadNoteNavigationStackByContextKey:
+        [String: [AssistantNoteNavigationEntry]] = [:]
     @State private var threadNoteSavingNoteKeys: Set<String> = []
-    @State private var threadNoteAIDraftPreviewByOwnerKey: [String: AssistantChatWebThreadNoteAIPreview] = [:]
+    @State private var threadNoteAIDraftPreviewByOwnerKey:
+        [String: AssistantChatWebThreadNoteAIPreview] = [:]
     @State private var threadNoteGeneratingAIDraftOwnerKeys: Set<String> = []
     @State private var threadNoteAIDraftModeByOwnerKey: [String: String] = [:]
     @State private var threadNoteAIDraftRequestIDByOwnerKey: [String: UUID] = [:]
     @State private var threadNoteChartContextByOwnerKey: [String: ThreadNoteChartContext] = [:]
+    @State private var threadNoteProjectTransferPreviewByOwnerKey:
+        [String: AssistantChatWebProjectNoteTransferPreview] = [:]
+    @State private var threadNoteGeneratingProjectTransferOwnerKeys: Set<String> = []
+    @State private var threadNoteProjectTransferRequestIDByOwnerKey: [String: UUID] = [:]
+    @State private var threadNoteProjectTransferOutcomeByOwnerKey:
+        [String: AssistantChatWebProjectNoteTransferOutcome] = [:]
+    @State private var batchNotePlanPreviewByProjectID:
+        [String: AssistantChatWebBatchNotePlanPreview] = [:]
+    @State private var batchNotePlanGeneratingProjectIDs: Set<String> = []
+    @State private var batchNotePlanRequestIDByProjectID: [String: UUID] = [:]
     @State private var projectNotesSidebarRestoreState: Bool?
-    @State private var selectionAskConversationsByKey: [SelectionAskConversationSession.Key: SelectionAskConversationSession] = [:]
+    @State private var selectionAskConversationsByKey:
+        [SelectionAskConversationSession.Key: SelectionAskConversationSession] = [:]
     @State private var historyBranchBannerPulse = false
     @State private var historyBranchBannerSettled = true
     @StateObject private var selectionTracker = AssistantTextSelectionTracker.shared
@@ -481,10 +786,14 @@ struct AssistantWindowView: View {
     }
     @AppStorage("assistantSidebarCollapsed") private var isSidebarCollapsed = false
     @AppStorage("assistantSidebarCustomWidth") private var sidebarCustomWidth: Double = 0
+    @AppStorage("assistantCompactSidebarInnerWidth") private var compactSidebarInnerWidth: Double =
+        0
     @State private var collapsedSidebarPreviewPane: String?
     @State private var sidebarDragStartWidth: CGFloat = 0
+    @State private var isSidebarResizeHandleHovered = false
     @AppStorage("assistantSidebarProjectsExpanded") private var areProjectsExpanded = true
     @AppStorage("assistantSidebarExpandedFolderIDs") private var expandedFolderIDsRaw = ""
+    @AppStorage("assistantSidebarExpandedNoteFolderIDs") private var expandedNoteFolderIDsRaw = ""
     @AppStorage("assistantSidebarThreadsExpanded") private var areThreadsExpanded = true
     @AppStorage("assistantSidebarArchivedExpanded") private var areArchivedExpanded = true
     @AppStorage("assistantSidebarNotesExpanded") private var areNotesExpanded = true
@@ -518,10 +827,16 @@ struct AssistantWindowView: View {
         let _ = assistant.historyActionsRevision
         let sessionActivity = selectedSessionActivitySnapshot
         let messagesFirstMode = chatHistoryDisplayMode == .messagesFirst
-        let renderItems = messagesFirstMode
+        let preferLiveActivityCard =
+            messagesFirstMode
+            && chatWebActiveWorkState != nil
+            && (sessionActivity.hasActiveTurn || sessionActivity.awaitingAssistantStart)
+        let renderItems =
+            messagesFirstMode
             ? assistantMessagesFirstVisibleRenderItems(
                 from: visibleRenderItems,
-                pendingPermissionSessionID: assistant.pendingPermissionRequest?.sessionID
+                pendingPermissionSessionID: assistant.pendingPermissionRequest?.sessionID,
+                preferLiveActivityCard: preferLiveActivityCard
             )
             : visibleRenderItems
         let historyActions = assistant.historyActionMetadata(for: renderItems)
@@ -532,11 +847,14 @@ struct AssistantWindowView: View {
             sessionStatusByNormalizedID: sessionStatusByNormalizedID,
             sessionWorkingDirectoryByNormalizedID: sessionWorkingDirectoryByNormalizedID
         )
-        let canCollapseHistoricalTurnSummaries = !messagesFirstMode && assistantCanCollapseHistoricalTurnSummaries(
-            hasActiveTurn: assistant.hasActiveTurn,
-            activeWorkSnapshot: selectedSessionActiveWorkSnapshot
-        )
-        let collapsedConversationGroups = canCollapseHistoricalTurnSummaries
+        let canCollapseHistoricalTurnSummaries =
+            !messagesFirstMode
+            && assistantCanCollapseHistoricalTurnSummaries(
+                hasActiveTurn: assistant.hasActiveTurn,
+                activeWorkSnapshot: selectedSessionActiveWorkSnapshot
+            )
+        let collapsedConversationGroups =
+            canCollapseHistoricalTurnSummaries
             ? collapsedHistoricalConversationGroups(in: renderItems)
             : []
         let collapsedConversationGroupByFirstHiddenIndex = Dictionary(
@@ -642,7 +960,8 @@ struct AssistantWindowView: View {
 
     private var chatWebRewindState: AssistantChatWebRewindState? {
         guard let branch = assistant.historyBranchState,
-              assistant.selectedSessionID?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            assistant.selectedSessionID?.trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
                 == branch.sessionID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         else {
             return nil
@@ -691,10 +1010,12 @@ struct AssistantWindowView: View {
         guard case .projectNotes(let projectID) = threadsDetailMode else {
             return nil
         }
-        guard let project = assistant.visibleLeafProjects.first(where: {
-            $0.id.trimmingCharacters(in: .whitespacesAndNewlines)
-                .caseInsensitiveCompare(projectID) == .orderedSame
-        }) else {
+        guard
+            let project = assistant.visibleLeafProjects.first(where: {
+                $0.id.trimmingCharacters(in: .whitespacesAndNewlines)
+                    .caseInsensitiveCompare(projectID) == .orderedSame
+            })
+        else {
             return nil
         }
         return project
@@ -721,6 +1042,281 @@ struct AssistantWindowView: View {
         return assistant.visibleLeafProjects.first
     }
 
+    private var notesAssistantSessionRegistriesByProjectID:
+        [String: AssistantNotesProjectSessionRegistry]
+    {
+        get {
+            assistantDecodeNotesAssistantSessionRegistries(from: notesAssistantSessionMapJSON)
+        }
+        nonmutating set {
+            guard let encoded = assistantEncodeNotesAssistantSessionRegistries(newValue) else {
+                notesAssistantSessionMapJSON = ""
+                return
+            }
+            notesAssistantSessionMapJSON = encoded
+        }
+    }
+
+    private var hiddenNotesAssistantSessionIDs: Set<String> {
+        Set(
+            notesAssistantSessionRegistriesByProjectID.values
+                .flatMap(\.sessionIDs)
+                .compactMap { assistantNormalizedNotesSessionID($0)?.lowercased() }
+        )
+    }
+
+    private func notesAssistantSessionRegistry(for projectID: String?)
+        -> AssistantNotesProjectSessionRegistry?
+    {
+        guard let normalizedProjectID = assistantNormalizedNotesProjectID(projectID) else {
+            return nil
+        }
+        return notesAssistantSessionRegistriesByProjectID[normalizedProjectID]
+    }
+
+    private func notesAssistantAllSessionSummaries(
+        for project: AssistantProject
+    ) -> [AssistantSessionSummary] {
+        guard let registry = notesAssistantSessionRegistry(for: project.id) else { return [] }
+
+        return registry.sessionIDs.compactMap { sessionID in
+            assistant.sessions.first(where: {
+                assistantTimelineSessionIDsMatch($0.id, sessionID)
+            })
+        }
+        .sorted {
+            assistantNotesSessionRecencyDate($0) > assistantNotesSessionRecencyDate($1)
+        }
+    }
+
+    private func notesAssistantSessionSummaries(
+        for project: AssistantProject
+    ) -> [AssistantSessionSummary] {
+        notesAssistantAllSessionSummaries(for: project).filter { !$0.isArchived }
+    }
+
+    private func archivedNotesAssistantSessionSummaries(
+        for project: AssistantProject
+    ) -> [AssistantSessionSummary] {
+        notesAssistantAllSessionSummaries(for: project).filter(\.isArchived)
+    }
+
+    private func notesAssistantResolvedSessionID(for project: AssistantProject) -> String? {
+        assistantResolvedNotesAssistantSessionID(
+            projectID: project.id,
+            registries: notesAssistantSessionRegistriesByProjectID,
+            sessions: assistant.sessions
+        )
+    }
+
+    private func setNotesAssistantSessionRegistry(
+        _ registry: AssistantNotesProjectSessionRegistry,
+        for projectID: String
+    ) {
+        guard let normalizedProjectID = assistantNormalizedNotesProjectID(projectID) else { return }
+
+        var mappings = notesAssistantSessionRegistriesByProjectID
+        if registry.isEmpty {
+            mappings.removeValue(forKey: normalizedProjectID)
+        } else {
+            mappings[normalizedProjectID] = AssistantNotesProjectSessionRegistry(
+                sessionIDs: registry.sessionIDs,
+                lastUsedSessionID: registry.lastUsedSessionID
+            )
+        }
+        notesAssistantSessionRegistriesByProjectID = mappings
+    }
+
+    private func rememberNotesAssistantSessionID(
+        _ sessionID: String,
+        for projectID: String,
+        makeLastUsed: Bool = true
+    ) {
+        guard let normalizedSessionID = assistantNormalizedNotesSessionID(sessionID),
+            let normalizedProjectID = assistantNormalizedNotesProjectID(projectID)
+        else {
+            return
+        }
+
+        var registry =
+            notesAssistantSessionRegistriesByProjectID[normalizedProjectID]
+            ?? AssistantNotesProjectSessionRegistry()
+
+        if !registry.sessionIDs.contains(where: {
+            assistantTimelineSessionIDsMatch($0, normalizedSessionID)
+        }) {
+            registry.sessionIDs.append(normalizedSessionID)
+        }
+        if makeLastUsed {
+            registry.lastUsedSessionID = normalizedSessionID
+        }
+
+        setNotesAssistantSessionRegistry(registry, for: normalizedProjectID)
+    }
+
+    private func pruneNotesAssistantSessionRegistry(
+        for project: AssistantProject
+    ) {
+        guard var registry = notesAssistantSessionRegistry(for: project.id) else { return }
+
+        registry = AssistantNotesProjectSessionRegistry(
+            sessionIDs: registry.sessionIDs.filter { registeredSessionID in
+                assistant.sessions.contains(where: {
+                    assistantTimelineSessionIDsMatch($0.id, registeredSessionID)
+                })
+            },
+            lastUsedSessionID: registry.lastUsedSessionID
+        )
+
+        setNotesAssistantSessionRegistry(registry, for: project.id)
+    }
+
+    private func forgetNotesAssistantSessionID(
+        _ sessionID: String,
+        for projectID: String
+    ) {
+        guard let normalizedSessionID = assistantNormalizedNotesSessionID(sessionID),
+            var registry = notesAssistantSessionRegistry(for: projectID)
+        else {
+            return
+        }
+
+        registry.sessionIDs.removeAll(where: {
+            assistantTimelineSessionIDsMatch($0, normalizedSessionID)
+        })
+        if assistantTimelineSessionIDsMatch(registry.lastUsedSessionID, normalizedSessionID) {
+            registry.lastUsedSessionID = nil
+        }
+
+        setNotesAssistantSessionRegistry(registry, for: projectID)
+    }
+
+    private func notesAssistantSessionID(for projectID: String?) -> String? {
+        guard let normalizedProjectID = assistantNormalizedNotesProjectID(projectID) else {
+            return nil
+        }
+
+        if let selectedNotesProject,
+            assistantNormalizedNotesProjectID(selectedNotesProject.id) == normalizedProjectID
+        {
+            return notesAssistantResolvedSessionID(for: selectedNotesProject)
+        }
+
+        return assistantResolvedNotesAssistantSessionID(
+            projectID: normalizedProjectID,
+            registries: notesAssistantSessionRegistriesByProjectID,
+            sessions: assistant.sessions
+        )
+    }
+
+    private func notesAssistantSessionTitle(
+        for project: AssistantProject,
+        existingRegistry: AssistantNotesProjectSessionRegistry
+    ) -> String {
+        assistantNotesAssistantSessionTitle(
+            projectName: project.name,
+            existingRegistry: existingRegistry,
+            createdAt: Date()
+        )
+    }
+
+    private func notesAssistantSessionDisplayTitle(
+        for session: AssistantSessionSummary,
+        project: AssistantProject
+    ) -> String {
+        session.title.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+            ?? assistantNotesAssistantSessionTitle(
+                projectName: project.name,
+                existingRegistry: AssistantNotesProjectSessionRegistry(),
+                createdAt: assistantNotesSessionRecencyDate(session)
+            )
+    }
+
+    private func notesAssistantSessionSwitcherLabel(
+        for session: AssistantSessionSummary?,
+        project: AssistantProject
+    ) -> String {
+        guard let session else { return "Chats" }
+        guard let registry = notesAssistantSessionRegistry(for: project.id) else {
+            return "Chats"
+        }
+
+        if let primarySessionID = registry.sessionIDs.first,
+            assistantTimelineSessionIDsMatch(primarySessionID, session.id)
+        {
+            return "Main chat"
+        }
+
+        if let timestamp = session.updatedAt ?? session.createdAt {
+            return timestamp.formatted(date: .abbreviated, time: .shortened)
+        }
+
+        return "Chat"
+    }
+
+    @MainActor
+    private func archiveNotesAssistantSession(
+        _ session: AssistantSessionSummary,
+        in project: AssistantProject
+    ) async {
+        await assistant.archiveSession(
+            session.id,
+            retentionHours: settings.assistantArchiveDefaultRetentionHours,
+            updateDefaultRetention: false
+        )
+        pruneNotesAssistantSessionRegistry(for: project)
+
+        if assistantTimelineSessionIDsMatch(assistant.selectedSessionID, session.id) {
+            await activateNotesAssistantSession(for: project)
+        }
+    }
+
+    @MainActor
+    private func unarchiveNotesAssistantSession(
+        _ session: AssistantSessionSummary,
+        in project: AssistantProject
+    ) async {
+        await assistant.unarchiveSession(session.id)
+        rememberNotesAssistantSessionID(session.id, for: project.id, makeLastUsed: true)
+        await activateNotesAssistantSession(for: project, preferredSessionID: session.id)
+    }
+
+    @MainActor
+    private func deleteNotesAssistantSession(
+        _ session: AssistantSessionSummary,
+        in project: AssistantProject
+    ) async {
+        await assistant.deleteSession(session.id)
+        forgetNotesAssistantSessionID(session.id, for: project.id)
+        pruneNotesAssistantSessionRegistry(for: project)
+        await activateNotesAssistantSession(for: project)
+    }
+
+    private func setNotesAssistantSessionID(_ sessionID: String, for projectID: String) {
+        let normalizedProjectID = projectID.trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        guard !normalizedProjectID.isEmpty else { return }
+
+        rememberNotesAssistantSessionID(sessionID, for: normalizedProjectID, makeLastUsed: true)
+    }
+
+    private func isNotesAssistantSession(_ sessionID: String?) -> Bool {
+        guard
+            let normalizedSessionID = sessionID?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .nonEmpty?
+                .lowercased()
+        else {
+            return false
+        }
+
+        return hiddenNotesAssistantSessionIDs.contains(normalizedSessionID)
+    }
+
+    private func notesAssistantSessionTitle(for project: AssistantProject) -> String {
+        "Notes Assistant · \(project.name)"
+    }
+
     private var isNotesPaneActive: Bool {
         selectedSidebarPane == .notes
     }
@@ -740,7 +1336,8 @@ struct AssistantWindowView: View {
         projectID: String,
         scope: AssistantNotesScope
     ) -> String {
-        let normalizedProjectID = projectID
+        let normalizedProjectID =
+            projectID
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
         return "\(normalizedProjectID)::\(scope.rawValue)"
@@ -781,6 +1378,8 @@ struct AssistantWindowView: View {
 
     private func notesUniverse(for project: AssistantProject) -> AssistantNotesUniverse {
         let projectOwner = AssistantNoteOwnerKey(kind: .project, id: project.id)
+        let projectFolders = assistant.projectNoteFolders(projectID: project.id)
+        let projectFolderPathByID = assistant.projectNoteFolderPathMap(projectID: project.id)
         let projectNotes = loadStoredNotes(for: projectOwner)
             .sorted { $0.updatedAt > $1.updatedAt }
 
@@ -804,6 +1403,8 @@ struct AssistantWindowView: View {
             project: project,
             projectOwner: projectOwner,
             projectNotes: projectNotes,
+            projectFolders: projectFolders,
+            projectFolderPathByID: projectFolderPathByID,
             threadSources: threadSources
         )
     }
@@ -824,6 +1425,8 @@ struct AssistantWindowView: View {
                     subtitle: updatedLabel,
                     sourceLabel: "Project notes",
                     updatedAt: note.updatedAt,
+                    folderID: note.folderID,
+                    folderPath: note.folderID.flatMap { universe.projectFolderPathByID[$0] } ?? [],
                     isArchivedThread: false,
                     threadID: nil
                 )
@@ -831,7 +1434,8 @@ struct AssistantWindowView: View {
 
         case .thread:
             return universe.threadSources.flatMap { source in
-                let sessionTitle = source.session.title.trimmingCharacters(in: .whitespacesAndNewlines)
+                let sessionTitle =
+                    source.session.title.trimmingCharacters(in: .whitespacesAndNewlines)
                     .nonEmpty ?? "Thread"
                 return source.notes.map { note in
                     let updatedLabel = threadNoteSavedLabel(for: note.updatedAt) ?? "Saved recently"
@@ -842,6 +1446,8 @@ struct AssistantWindowView: View {
                         subtitle: "\(sessionTitle)\(archivedLabel) · \(updatedLabel)",
                         sourceLabel: "Thread notes",
                         updatedAt: note.updatedAt,
+                        folderID: nil,
+                        folderPath: [],
                         isArchivedThread: source.session.isArchived,
                         threadID: source.session.id
                     )
@@ -851,6 +1457,55 @@ struct AssistantWindowView: View {
         }
     }
 
+    private func sidebarNoteFolderRows(
+        for project: AssistantProject,
+        scope: AssistantNotesScope
+    ) -> [AssistantSidebarNoteFolderRowModel] {
+        guard scope == .project else { return [] }
+        let universe = notesUniverse(for: project)
+        let expandedFolderIDs = storedExpandedNoteFolderIDs
+        let childFolderCountByParentID = Dictionary(
+            universe.projectFolders.map { ($0.parentFolderID?.lowercased() ?? "", 1) },
+            uniquingKeysWith: +
+        )
+        let noteCountByFolderID = universe.projectNotes.reduce(into: [String: Int]()) {
+            result, note in
+            guard let folderID = note.folderID?.lowercased() else { return }
+            result[folderID, default: 0] += 1
+        }
+        return universe.projectFolders.map { folder in
+            AssistantSidebarNoteFolderRowModel(
+                id: folder.id,
+                name: folder.name,
+                parentFolderID: folder.parentFolderID,
+                path: universe.projectFolderPathByID[folder.id] ?? [folder.name],
+                isExpanded: expandedFolderIDs.contains(folder.id.lowercased()),
+                childFolderCount: childFolderCountByParentID[folder.id.lowercased(), default: 0],
+                noteCount: noteCountByFolderID[folder.id.lowercased(), default: 0]
+            )
+        }
+    }
+
+    private func noteFolderDescendantIDs(
+        folderID: String,
+        folders: [AssistantNoteFolderSummary]
+    ) -> Set<String> {
+        let rootFolderID = folderID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !rootFolderID.isEmpty else { return [] }
+        let childrenByParentID = Dictionary(grouping: folders) { folder in
+            folder.parentFolderID?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                ?? ""
+        }
+        var descendants: Set<String> = []
+        var stack = childrenByParentID[rootFolderID, default: []]
+        while let folder = stack.popLast() {
+            let folderKey = folder.id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard descendants.insert(folderKey).inserted else { continue }
+            stack.append(contentsOf: childrenByParentID[folderKey, default: []])
+        }
+        return descendants
+    }
+
     private func currentNotesSelectionTarget(
         project: AssistantProject,
         scope: AssistantNotesScope
@@ -858,7 +1513,8 @@ struct AssistantWindowView: View {
         let rows = sidebarNoteRows(for: project, scope: scope)
         let key = notesSelectionContextKey(projectID: project.id, scope: scope)
         if let storedTarget = selectedNotesTargetByContextKey[key],
-           rows.contains(where: { $0.target == storedTarget }) {
+            rows.contains(where: { $0.target == storedTarget })
+        {
             return storedTarget
         }
         return rows.first?.target
@@ -875,21 +1531,34 @@ struct AssistantWindowView: View {
         ]
         if let project = projectForThreadNotes(threadID: threadID) {
             owners.append(.init(kind: .project, id: project.id))
+
+            let siblingThreadOwners = notesUniverse(for: project).threadSources.compactMap {
+                source -> AssistantNoteOwnerKey? in
+                guard !assistantTimelineSessionIDsMatch(source.owner.id, threadID),
+                    !source.notes.isEmpty
+                else {
+                    return nil
+                }
+                return source.owner
+            }
+            owners.append(contentsOf: siblingThreadOwners)
         }
         return owners
     }
 
     private var currentThreadNoteOwner: AssistantNoteOwnerKey? {
         if isNotesPaneActive,
-           let project = selectedNotesProject,
-           let currentTarget = currentNotesSelectionTarget(project: project, scope: selectedNotesScope)
+            let project = selectedNotesProject,
+            let currentTarget = currentNotesSelectionTarget(
+                project: project, scope: selectedNotesScope)
         {
             return .init(kind: currentTarget.ownerKind, id: currentTarget.ownerID)
         }
 
         if isNotesPaneActive,
-           selectedNotesScope == .project,
-           let project = selectedNotesProject {
+            selectedNotesScope == .project,
+            let project = selectedNotesProject
+        {
             return .init(kind: .project, id: project.id)
         }
 
@@ -900,7 +1569,8 @@ struct AssistantWindowView: View {
         guard let threadID = selectedThreadNoteID else { return nil }
         let availableOwners = availableNoteOwners(for: threadID)
         if let selectedOwner = selectedNoteOwnerByThreadID[threadID],
-           availableOwners.contains(selectedOwner) {
+            availableOwners.contains(selectedOwner)
+        {
             return selectedOwner
         }
         return availableOwners.first
@@ -921,26 +1591,33 @@ struct AssistantWindowView: View {
     private func notePlaceholder(for owner: AssistantNoteOwnerKey?) -> String {
         switch owner?.kind {
         case .project:
-            return "Write shared decisions, constraints, architecture notes, and next steps for this project. Type / for Markdown blocks."
+            return
+                "Write shared decisions, constraints, architecture notes, and next steps for this project. Type / for Markdown blocks."
         case .thread, .none:
-            return "Write decisions, next steps, constraints, and follow-ups for this thread. Type / for Markdown blocks."
+            return
+                "Write decisions, next steps, constraints, and follow-ups for this thread. Type / for Markdown blocks."
         }
     }
 
     private func noteNavigationContextKey(for threadID: String?) -> String? {
         if isNotesPaneActive,
-           let project = selectedNotesProject {
-            return "notes::\(project.id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())"
+            let project = selectedNotesProject
+        {
+            return
+                "notes::\(project.id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())"
         }
 
         if let project = currentProjectNotesProject {
-            return "project::\(project.id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())"
+            return
+                "project::\(project.id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())"
         }
 
-        guard let normalizedThreadID = threadID?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .nonEmpty?
-            .lowercased() else {
+        guard
+            let normalizedThreadID = threadID?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .nonEmpty?
+                .lowercased()
+        else {
             return nil
         }
         return "thread::\(normalizedThreadID)"
@@ -962,9 +1639,10 @@ struct AssistantWindowView: View {
 
     private func pushCurrentNoteOntoNavigationStack(for threadID: String?) {
         guard let contextKey = noteNavigationContextKey(for: threadID),
-              let currentTarget = currentDisplayedNoteTarget,
-              let owner = currentThreadNoteOwner,
-              let title = currentDisplayedNoteTitle else {
+            let currentTarget = currentDisplayedNoteTarget,
+            let owner = currentThreadNoteOwner,
+            let title = currentDisplayedNoteTitle
+        else {
             return
         }
 
@@ -981,7 +1659,9 @@ struct AssistantWindowView: View {
         threadNoteNavigationStackByContextKey[contextKey] = stack
     }
 
-    private func popThreadNoteNavigationEntry(for threadID: String?) -> AssistantNoteNavigationEntry? {
+    private func popThreadNoteNavigationEntry(for threadID: String?)
+        -> AssistantNoteNavigationEntry?
+    {
         guard let contextKey = noteNavigationContextKey(for: threadID) else {
             return nil
         }
@@ -1025,7 +1705,8 @@ struct AssistantWindowView: View {
 
         let storedNotes: [AssistantStoredNote]
         if isNotesPaneActive,
-           let project = selectedNotesProject {
+            let project = selectedNotesProject
+        {
             storedNotes = notesUniverse(for: project).allNotes
         } else {
             let availableOwners = availableNoteOwners(for: selectedThreadNoteID)
@@ -1060,7 +1741,8 @@ struct AssistantWindowView: View {
         noteID: String?
     ) -> [AssistantChatWebThreadNoteHistoryItem] {
         guard let owner,
-              let noteID = noteID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+            let noteID = noteID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+        else {
             return []
         }
 
@@ -1077,7 +1759,8 @@ struct AssistantWindowView: View {
                 id: $0.id,
                 title: $0.title,
                 savedAtLabel: threadNoteSavedLabel(for: $0.savedAt) ?? "Saved recently",
-                preview: $0.preview
+                preview: $0.preview,
+                markdown: $0.markdown
             )
         }
     }
@@ -1102,7 +1785,8 @@ struct AssistantWindowView: View {
                 deletedAtLabel: threadNoteSavedLabel(for: $0.deletedAt)?
                     .replacingOccurrences(of: "Saved", with: "Deleted")
                     ?? "Deleted recently",
-                preview: $0.preview
+                preview: $0.preview,
+                markdown: $0.markdown
             )
         }
     }
@@ -1123,19 +1807,78 @@ struct AssistantWindowView: View {
         return loadNotesWorkspace(for: owner)?.manifest ?? AssistantNoteManifest()
     }
 
+    private func noteMarkdownForDisplay(
+        owner: AssistantNoteOwnerKey,
+        noteID: String,
+        text: String
+    ) -> String {
+        AssistantNoteAssetSupport.rewriteMarkdownForDisplay(
+            text,
+            ownerKind: owner.kind,
+            ownerID: owner.id,
+            noteID: noteID
+        )
+    }
+
+    private func noteMarkdownForPersistence(
+        owner: AssistantNoteOwnerKey,
+        noteID: String,
+        text: String
+    ) -> String {
+        AssistantNoteAssetSupport.rewriteMarkdownForPersistence(
+            text,
+            ownerKind: owner.kind,
+            ownerID: owner.id,
+            noteID: noteID
+        )
+    }
+
+    private func resolveNoteAssetFileURL(
+        owner: AssistantNoteOwnerKey,
+        noteID: String,
+        relativePath: String
+    ) -> URL? {
+        switch owner.kind {
+        case .thread:
+            return assistant.resolveThreadNoteImageAssetURL(
+                threadID: owner.id,
+                noteID: noteID,
+                relativePath: relativePath
+            )
+        case .project:
+            return assistant.resolveProjectNoteImageAssetURL(
+                projectID: owner.id,
+                noteID: noteID,
+                relativePath: relativePath
+            )
+        }
+    }
+
+    private func resolveWebNoteAssetURL(
+        _ reference: AssistantResolvedNoteAssetReference
+    ) -> URL? {
+        resolveNoteAssetFileURL(
+            owner: AssistantNoteOwnerKey(kind: reference.ownerKind, id: reference.ownerID),
+            noteID: reference.noteID,
+            relativePath: reference.relativePath
+        )
+    }
+
     private func noteDraftText(for owner: AssistantNoteOwnerKey, noteID: String) -> String {
-        if let draft = noteDraftTextByOwnerKey[owner.storageKey]?[noteID] {
+        if let draft = noteDraftStore.draft(ownerKey: owner.storageKey, noteID: noteID) {
             return draft
         }
 
         if let workspace = loadNotesWorkspace(for: owner),
-           workspace.manifest.selectedNote?.id == noteID {
-            return workspace.selectedNoteText
+            workspace.manifest.selectedNote?.id == noteID
+        {
+            return noteMarkdownForDisplay(
+                owner: owner, noteID: noteID, text: workspace.selectedNoteText)
         }
 
         return loadStoredNotes(for: owner)
-            .first(where: { $0.noteID.caseInsensitiveCompare(noteID) == .orderedSame })?
-            .text ?? ""
+            .first(where: { $0.noteID.caseInsensitiveCompare(noteID) == .orderedSame })
+            .map { noteMarkdownForDisplay(owner: owner, noteID: noteID, text: $0.text) } ?? ""
     }
 
     private var currentThreadNoteManifest: AssistantNoteManifest {
@@ -1145,12 +1888,14 @@ struct AssistantWindowView: View {
 
     private var currentDisplayedNoteTarget: AssistantNoteLinkTarget? {
         if isNotesPaneActive,
-           let project = selectedNotesProject {
+            let project = selectedNotesProject
+        {
             return currentNotesSelectionTarget(project: project, scope: selectedNotesScope)
         }
 
         guard let owner = currentThreadNoteOwner,
-              let noteID = currentThreadNoteManifest.selectedNote?.id else {
+            let noteID = currentThreadNoteManifest.selectedNote?.id
+        else {
             return nil
         }
         return AssistantNoteLinkTarget(
@@ -1162,14 +1907,175 @@ struct AssistantWindowView: View {
 
     private var currentDisplayedNoteTitle: String? {
         if isNotesPaneActive,
-           let project = selectedNotesProject,
-           let currentTarget = currentNotesSelectionTarget(project: project, scope: selectedNotesScope) {
+            let project = selectedNotesProject,
+            let currentTarget = currentNotesSelectionTarget(
+                project: project, scope: selectedNotesScope)
+        {
             return sidebarNoteRows(for: project, scope: selectedNotesScope)
                 .first(where: { $0.target == currentTarget })?
                 .title
         }
 
         return currentThreadNoteManifest.selectedNote?.title
+    }
+
+    private func notesAssistantWorkspaceScopeLabel(for scope: AssistantNotesScope) -> String {
+        switch scope {
+        case .project:
+            return "the current project notes list"
+        case .thread:
+            return "the current thread notes list"
+        }
+    }
+
+    private func notesAssistantWorkspaceNoteReferences(
+        project: AssistantProject,
+        scope: AssistantNotesScope
+    ) -> [AssistantNotesRuntimeContext.WorkspaceNoteReference] {
+        let rows = sidebarNoteRows(for: project, scope: scope)
+        guard !rows.isEmpty else { return [] }
+
+        let notesByTarget = Dictionary(
+            uniqueKeysWithValues: notesUniverse(for: project).allNotes.map { ($0.target, $0) }
+        )
+        let selectedTarget = currentNotesSelectionTarget(project: project, scope: scope)
+        let references = rows.map { row in
+            AssistantNotesRuntimeContext.WorkspaceNoteReference(
+                target: row.target,
+                title: row.title,
+                sourceLabel: row.sourceLabel,
+                folderPath: row.folderPath,
+                fileName: notesByTarget[row.target]?.fileName,
+                isSelected: row.target == selectedTarget
+            )
+        }
+
+        return references.filter(\.isSelected) + references.filter { !$0.isSelected }
+    }
+
+    private var notesAssistantScopeLabel: String {
+        if let noteTitle = currentDisplayedNoteTitle?.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        )
+        .nonEmpty {
+            return "Open note: \(noteTitle)"
+        }
+
+        if let projectName = selectedNotesProject?.name.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        )
+        .nonEmpty {
+            return "Whole project: \(projectName)"
+        }
+
+        return "Whole project note scope"
+    }
+
+    private var notesAssistantRuntimeContext: AssistantNotesRuntimeContext? {
+        guard isNotesPaneActive,
+            isNotesAssistantPanelOpen,
+            let project = selectedNotesProject
+        else {
+            return nil
+        }
+
+        return AssistantNotesRuntimeContext(
+            source: .notesWorkspace,
+            projectID: project.id,
+            projectName: project.name,
+            selectedNoteTarget: currentDisplayedNoteTarget,
+            selectedNoteTitle: currentDisplayedNoteTitle,
+            defaultScopeDescription:
+                "the whole current project (`\(project.name)`) including project notes and linked thread notes",
+            workspaceScopeLabel: notesAssistantWorkspaceScopeLabel(for: selectedNotesScope),
+            workspaceNotes: notesAssistantWorkspaceNoteReferences(
+                project: project,
+                scope: selectedNotesScope
+            )
+        )
+    }
+
+    private var activeNotesAssistantSessionID: String? {
+        guard let project = selectedNotesProject else { return nil }
+
+        if let selectedSessionID = assistant.selectedSessionID,
+            notesAssistantAllSessionSummaries(for: project).contains(where: {
+                assistantTimelineSessionIDsMatch($0.id, selectedSessionID)
+            })
+        {
+            return selectedSessionID
+        }
+
+        return notesAssistantResolvedSessionID(for: project)
+    }
+
+    private var currentNotesAssistantSessionSummary: AssistantSessionSummary? {
+        guard let activeNotesAssistantSessionID else { return nil }
+        return assistant.sessions.first(where: {
+            assistantTimelineSessionIDsMatch($0.id, activeNotesAssistantSessionID)
+        })
+    }
+
+    private var isShowingNotesAssistantConversation: Bool {
+        guard isNotesPaneActive,
+            isNotesAssistantPanelOpen,
+            let activeNotesAssistantSessionID
+        else {
+            return false
+        }
+
+        return assistantTimelineSessionIDsMatch(
+            assistant.selectedSessionID,
+            activeNotesAssistantSessionID
+        )
+    }
+
+    private var notesAssistantChatMessages: [AssistantChatWebMessage] {
+        isShowingNotesAssistantConversation ? chatWebMessages : []
+    }
+
+    private var notesAssistantActiveWorkState: AssistantChatWebActiveWorkState? {
+        isShowingNotesAssistantConversation ? chatWebActiveWorkState : nil
+    }
+
+    private var notesAssistantActiveTurnState: AssistantChatWebActiveTurnState? {
+        isShowingNotesAssistantConversation ? chatWebActiveTurnState : nil
+    }
+
+    private var notesAssistantRuntimePanel: AssistantChatWebRuntimePanel? {
+        isShowingNotesAssistantConversation ? chatWebRuntimePanel : nil
+    }
+
+    private var notesAssistantRewindState: AssistantChatWebRewindState? {
+        isShowingNotesAssistantConversation ? chatWebRewindState : nil
+    }
+
+    private var notesAssistantReviewPanel: AssistantChatWebCodeReviewPanel? {
+        isShowingNotesAssistantConversation ? inlineTrackedCodePanel : nil
+    }
+
+    private var notesAssistantShouldShowPendingPlaceholder: Bool {
+        isShowingNotesAssistantConversation && shouldShowPendingAssistantPlaceholder
+    }
+
+    private var notesAssistantTypingIndicatorTitle: String {
+        isShowingNotesAssistantConversation ? typingIndicatorTitle : ""
+    }
+
+    private var notesAssistantTypingIndicatorDetail: String {
+        isShowingNotesAssistantConversation ? typingIndicatorDetail : ""
+    }
+
+    private var notesAssistantCanLoadOlderHistory: Bool {
+        isShowingNotesAssistantConversation && canLoadOlderHistory
+    }
+
+    private var notesAssistantHasVisibleConversationContent: Bool {
+        !notesAssistantChatMessages.isEmpty
+            || notesAssistantActiveWorkState != nil
+            || notesAssistantActiveTurnState != nil
+            || notesAssistantShouldShowPendingPlaceholder
+            || notesAssistantCanLoadOlderHistory
     }
 
     private var currentSelectedThreadNoteItem: AssistantNoteSummary? {
@@ -1182,7 +2088,8 @@ struct AssistantWindowView: View {
 
     private var currentThreadNoteDraftText: String {
         guard let owner = currentThreadNoteOwner,
-              let noteID = currentSelectedThreadNoteNoteID else { return "" }
+            let noteID = currentSelectedThreadNoteNoteID
+        else { return "" }
         return noteDraftText(for: owner, noteID: noteID)
     }
 
@@ -1203,16 +2110,19 @@ struct AssistantWindowView: View {
         let recentlyDeletedNotes = chatWebDeletedNoteItems(for: owner)
         let savedAt: Date?
         if let owner, let selectedNoteID {
-            savedAt = noteLastSavedAtByOwnerKey[owner.storageKey]?[selectedNoteID]
+            savedAt =
+                noteLastSavedAtByOwnerKey[owner.storageKey]?[selectedNoteID]
                 ?? selectedNote?.updatedAt
         } else {
             savedAt = nil
         }
-        let isSaving = owner.flatMap { owner in
-            selectedNoteID.map {
-                threadNoteSavingNoteKeys.contains(threadNoteStorageKey(owner: owner, noteID: $0))
-            }
-        } ?? false
+        let isSaving =
+            owner.flatMap { owner in
+                selectedNoteID.map {
+                    threadNoteSavingNoteKeys.contains(
+                        threadNoteStorageKey(owner: owner, noteID: $0))
+                }
+            } ?? false
         let availableOwners = availableNoteOwners(for: selectedThreadNoteID)
         let presentation = currentProjectNotesProject == nil ? "drawer" : "projectFullScreen"
 
@@ -1230,8 +2140,10 @@ struct AssistantWindowView: View {
                 AssistantChatWebThreadNoteItem(
                     id: note.id,
                     title: note.title,
+                    noteType: note.noteType.rawValue,
                     updatedAtLabel: threadNoteSavedLabel(
-                        for: noteLastSavedAtByOwnerKey[source.storageKey]?[note.id] ?? note.updatedAt
+                        for: noteLastSavedAtByOwnerKey[source.storageKey]?[note.id]
+                            ?? note.updatedAt
                     ),
                     ownerKind: source.kind.rawValue,
                     ownerID: source.id,
@@ -1258,17 +2170,31 @@ struct AssistantWindowView: View {
             selectedNoteID: selectedNoteID,
             selectedNoteTitle: selectedNote?.title ?? "Untitled note",
             text: text,
-            isOpen: owner == nil ? false : (presentation == "projectFullScreen" ? true : isThreadNoteOpen),
+            isOpen: owner == nil
+                ? false : (presentation == "projectFullScreen" ? true : isThreadNoteOpen),
             isExpanded: presentation == "projectFullScreen" ? true : isThreadNoteExpanded,
             viewMode: threadNoteViewMode,
             hasAnyNotes: !manifest.notes.isEmpty,
             isSaving: isSaving,
-            isGeneratingAIDraft: owner.map { threadNoteGeneratingAIDraftOwnerKeys.contains($0.storageKey) } ?? false,
+            isGeneratingAIDraft: owner.map {
+                threadNoteGeneratingAIDraftOwnerKeys.contains($0.storageKey)
+            } ?? false,
+            isGeneratingProjectTransferPreview: owner.map {
+                threadNoteGeneratingProjectTransferOwnerKeys.contains($0.storageKey)
+            } ?? false,
+            isGeneratingBatchNotePlanPreview: false,
             aiDraftMode: owner.flatMap { threadNoteAIDraftModeByOwnerKey[$0.storageKey] },
             lastSavedAtLabel: threadNoteSavedLabel(for: savedAt),
             canEdit: owner != nil,
             placeholder: notePlaceholder(for: owner),
             aiDraftPreview: owner.flatMap { threadNoteAIDraftPreviewByOwnerKey[$0.storageKey] },
+            projectNoteTransferPreview: owner.flatMap {
+                threadNoteProjectTransferPreviewByOwnerKey[$0.storageKey]
+            },
+            projectNoteTransferOutcome: owner.flatMap {
+                threadNoteProjectTransferOutcomeByOwnerKey[$0.storageKey]
+            },
+            batchNotePlanPreview: nil,
             outgoingLinks: chatWebRelationshipItems(from: relationships.outgoingLinks),
             backlinks: chatWebRelationshipItems(from: relationships.backlinks),
             graph: relationships.graph.map {
@@ -1305,7 +2231,8 @@ struct AssistantWindowView: View {
                 availableSources: [],
                 notes: [],
                 selectedNoteID: nil,
-                selectedNoteTitle: selectedNotesScope == .project ? "Project notes" : "Thread notes",
+                selectedNoteTitle: selectedNotesScope == .project
+                    ? "Project notes" : "Thread notes",
                 text: "",
                 isOpen: true,
                 isExpanded: true,
@@ -1313,11 +2240,16 @@ struct AssistantWindowView: View {
                 hasAnyNotes: false,
                 isSaving: false,
                 isGeneratingAIDraft: false,
+                isGeneratingProjectTransferPreview: false,
+                isGeneratingBatchNotePlanPreview: false,
                 aiDraftMode: nil,
                 lastSavedAtLabel: nil,
                 canEdit: true,
                 placeholder: notePlaceholder(for: nil),
                 aiDraftPreview: nil,
+                projectNoteTransferPreview: nil,
+                projectNoteTransferOutcome: nil,
+                batchNotePlanPreview: nil,
                 outgoingLinks: [],
                 backlinks: [],
                 graph: nil,
@@ -1329,12 +2261,15 @@ struct AssistantWindowView: View {
         }
 
         let universe = notesUniverse(for: project)
-        let selectedTarget = currentNotesSelectionTarget(project: project, scope: selectedNotesScope)
-        let selectedOwner = selectedTarget.map {
-            AssistantNoteOwnerKey(kind: $0.ownerKind, id: $0.ownerID)
-        } ?? (selectedNotesScope == .project
-            ? AssistantNoteOwnerKey(kind: .project, id: project.id)
-            : nil)
+        let selectedTarget = currentNotesSelectionTarget(
+            project: project, scope: selectedNotesScope)
+        let selectedOwner =
+            selectedTarget.map {
+                AssistantNoteOwnerKey(kind: $0.ownerKind, id: $0.ownerID)
+            }
+            ?? (selectedNotesScope == .project
+                ? AssistantNoteOwnerKey(kind: .project, id: project.id)
+                : nil)
         let scopeRows = sidebarNoteRows(for: project, scope: selectedNotesScope)
         let selectedRow = selectedTarget.flatMap { target in
             scopeRows.first(where: { $0.target == target })
@@ -1344,23 +2279,28 @@ struct AssistantWindowView: View {
         let navigationStack = currentThreadNoteNavigationStack()
         let historyVersions = chatWebHistoryItems(for: selectedOwner, noteID: selectedNoteID)
         let recentlyDeletedNotes = chatWebDeletedNoteItems(for: selectedOwner)
-        let text = selectedOwner.flatMap { owner in
-            selectedNoteID.map { noteDraftText(for: owner, noteID: $0) }
-        } ?? ""
-        let isSaving = selectedOwner.flatMap { owner in
-            selectedNoteID.map {
-                threadNoteSavingNoteKeys.contains(threadNoteStorageKey(owner: owner, noteID: $0))
-            }
-        } ?? false
+        let text =
+            selectedOwner.flatMap { owner in
+                selectedNoteID.map { noteDraftText(for: owner, noteID: $0) }
+            } ?? ""
+        let isSaving =
+            selectedOwner.flatMap { owner in
+                selectedNoteID.map {
+                    threadNoteSavingNoteKeys.contains(
+                        threadNoteStorageKey(owner: owner, noteID: $0))
+                }
+            } ?? false
 
-        let availableSources = [
-            AssistantChatWebThreadNoteSource(
-                ownerKind: universe.projectOwner.kind.rawValue,
-                ownerID: universe.projectOwner.id,
-                ownerTitle: project.name,
-                sourceLabel: universe.projectOwner.displaySourceLabel
-            )
-        ] + universe.threadSources
+        let availableSources =
+            [
+                AssistantChatWebThreadNoteSource(
+                    ownerKind: universe.projectOwner.kind.rawValue,
+                    ownerID: universe.projectOwner.id,
+                    ownerTitle: project.name,
+                    sourceLabel: universe.projectOwner.displaySourceLabel
+                )
+            ]
+            + universe.threadSources
             .filter { !$0.notes.isEmpty }
             .map { source in
                 AssistantChatWebThreadNoteSource(
@@ -1371,32 +2311,38 @@ struct AssistantWindowView: View {
                 )
             }
 
-        let notes = universe.projectNotes.map { note in
-            AssistantChatWebThreadNoteItem(
-                id: note.noteID,
-                title: note.title,
-                updatedAtLabel: threadNoteSavedLabel(for: note.updatedAt),
-                ownerKind: note.ownerKind.rawValue,
-                ownerID: note.ownerID,
-                sourceLabel: "Project notes"
-            )
-        } + universe.threadNotes.map { note in
-            AssistantChatWebThreadNoteItem(
-                id: note.noteID,
-                title: note.title,
-                updatedAtLabel: threadNoteSavedLabel(for: note.updatedAt),
-                ownerKind: note.ownerKind.rawValue,
-                ownerID: note.ownerID,
-                sourceLabel: "Thread notes"
-            )
-        }
+        let notes =
+            universe.projectNotes.map { note in
+                AssistantChatWebThreadNoteItem(
+                    id: note.noteID,
+                    title: note.title,
+                    noteType: note.noteType.rawValue,
+                    updatedAtLabel: threadNoteSavedLabel(for: note.updatedAt),
+                    ownerKind: note.ownerKind.rawValue,
+                    ownerID: note.ownerID,
+                    sourceLabel: "Project notes"
+                )
+            }
+            + universe.threadNotes.map { note in
+                AssistantChatWebThreadNoteItem(
+                    id: note.noteID,
+                    title: note.title,
+                    noteType: note.noteType.rawValue,
+                    updatedAtLabel: threadNoteSavedLabel(for: note.updatedAt),
+                    ownerKind: note.ownerKind.rawValue,
+                    ownerID: note.ownerID,
+                    sourceLabel: "Thread notes"
+                )
+            }
 
-        let owningThread = selectedOwner?.kind == .thread
+        let owningThread =
+            selectedOwner?.kind == .thread
             ? sessionSummary(forThreadID: selectedOwner?.id)
             : nil
         let ownerSubtitle: String?
         if let owningThread {
-            ownerSubtitle = owningThread.isArchived
+            ownerSubtitle =
+                owningThread.isArchived
                 ? "\(owningThread.title) • Archived chat"
                 : owningThread.title
         } else if selectedOwner?.kind == .project {
@@ -1405,9 +2351,10 @@ struct AssistantWindowView: View {
             ownerSubtitle = nil
         }
 
-        let savedAt = selectedOwner.flatMap { owner in
-            selectedNoteID.flatMap { noteLastSavedAtByOwnerKey[owner.storageKey]?[$0] }
-        } ?? selectedRow?.updatedAt
+        let savedAt =
+            selectedOwner.flatMap { owner in
+                selectedNoteID.flatMap { noteLastSavedAtByOwnerKey[owner.storageKey]?[$0] }
+            } ?? selectedRow?.updatedAt
 
         return AssistantChatWebThreadNoteState(
             threadID: nil,
@@ -1436,11 +2383,25 @@ struct AssistantWindowView: View {
             isGeneratingAIDraft: selectedOwner.map {
                 threadNoteGeneratingAIDraftOwnerKeys.contains($0.storageKey)
             } ?? false,
+            isGeneratingProjectTransferPreview: selectedOwner.map {
+                threadNoteGeneratingProjectTransferOwnerKeys.contains($0.storageKey)
+            } ?? false,
+            isGeneratingBatchNotePlanPreview: batchNotePlanGeneratingProjectIDs.contains(
+                project.id),
             aiDraftMode: selectedOwner.flatMap { threadNoteAIDraftModeByOwnerKey[$0.storageKey] },
             lastSavedAtLabel: threadNoteSavedLabel(for: savedAt),
             canEdit: true,
             placeholder: notePlaceholder(for: selectedOwner),
-            aiDraftPreview: selectedOwner.flatMap { threadNoteAIDraftPreviewByOwnerKey[$0.storageKey] },
+            aiDraftPreview: selectedOwner.flatMap {
+                threadNoteAIDraftPreviewByOwnerKey[$0.storageKey]
+            },
+            projectNoteTransferPreview: selectedOwner.flatMap {
+                threadNoteProjectTransferPreviewByOwnerKey[$0.storageKey]
+            },
+            projectNoteTransferOutcome: selectedOwner.flatMap {
+                threadNoteProjectTransferOutcomeByOwnerKey[$0.storageKey]
+            },
+            batchNotePlanPreview: batchNotePlanPreviewByProjectID[project.id],
             outgoingLinks: chatWebRelationshipItems(from: relationships.outgoingLinks),
             backlinks: chatWebRelationshipItems(from: relationships.backlinks),
             graph: relationships.graph.map {
@@ -1459,7 +2420,8 @@ struct AssistantWindowView: View {
 
     private func threadNoteSavedLabel(for date: Date?) -> String? {
         guard let date else { return nil }
-        let relative = Self.sidebarRelativeDateFormatter.localizedString(for: date, relativeTo: Date())
+        let relative = Self.sidebarRelativeDateFormatter.localizedString(
+            for: date, relativeTo: Date())
         return relative == "now" ? "Saved now" : "Saved \(relative)"
     }
 
@@ -1484,11 +2446,52 @@ struct AssistantWindowView: View {
         noteManifestByOwnerKey[owner.storageKey] = workspace.manifest
 
         let validNoteIDs = Set(workspace.notes.map(\.id))
-        let drafts = Self.mergedNoteDrafts(
-            existingDrafts: noteDraftTextByOwnerKey[owner.storageKey] ?? [:],
-            workspace: workspace
-        )
-        noteDraftTextByOwnerKey[owner.storageKey] = drafts
+        var drafts = noteDraftStore.drafts(ownerKey: owner.storageKey)
+            .filter { validNoteIDs.contains($0.key) }
+        if let selectedNote = workspace.selectedNote {
+            drafts[selectedNote.id] = noteMarkdownForDisplay(
+                owner: owner,
+                noteID: selectedNote.id,
+                text: workspace.selectedNoteText
+            )
+        }
+        noteDraftStore.replaceDrafts(drafts, ownerKey: owner.storageKey)
+
+        var savedAt = noteLastSavedAtByOwnerKey[owner.storageKey] ?? [:]
+        savedAt = savedAt.filter { validNoteIDs.contains($0.key) }
+        for note in workspace.notes {
+            savedAt[note.id] = note.updatedAt
+        }
+        noteLastSavedAtByOwnerKey[owner.storageKey] = savedAt
+    }
+
+    private func refreshNotesAfterAssistantMutation(_ mutation: AssistantNotesMutationEvent?) {
+        guard let mutation else { return }
+
+        let owner = AssistantNoteOwnerKey(kind: mutation.ownerKind, id: mutation.ownerID)
+        guard let workspace = loadNotesWorkspace(for: owner) else {
+            return
+        }
+
+        noteManifestByOwnerKey[owner.storageKey] = workspace.manifest
+
+        let validNoteIDs = Set(workspace.notes.map(\.id))
+        var drafts = noteDraftStore.drafts(ownerKey: owner.storageKey)
+            .filter { validNoteIDs.contains($0.key) }
+        let storedNotesByID = Dictionary(
+            uniqueKeysWithValues: loadStoredNotes(for: owner).map { note in
+                (note.noteID, note)
+            })
+        if let changedNote = storedNotesByID[mutation.noteID] {
+            drafts[changedNote.noteID] = noteMarkdownForDisplay(
+                owner: owner,
+                noteID: changedNote.noteID,
+                text: changedNote.text
+            )
+        } else {
+            drafts.removeValue(forKey: mutation.noteID)
+        }
+        noteDraftStore.replaceDrafts(drafts, ownerKey: owner.storageKey)
 
         var savedAt = noteLastSavedAtByOwnerKey[owner.storageKey] ?? [:]
         savedAt = savedAt.filter { validNoteIDs.contains($0.key) }
@@ -1505,6 +2508,1207 @@ struct AssistantWindowView: View {
         threadNoteAIDraftModeByOwnerKey.removeValue(forKey: storageKey)
         threadNoteAIDraftRequestIDByOwnerKey.removeValue(forKey: storageKey)
         threadNoteChartContextByOwnerKey.removeValue(forKey: storageKey)
+    }
+
+    private func clearThreadNoteProjectTransferState(for owner: AssistantNoteOwnerKey) {
+        let storageKey = owner.storageKey
+        threadNoteProjectTransferPreviewByOwnerKey.removeValue(forKey: storageKey)
+        threadNoteGeneratingProjectTransferOwnerKeys.remove(storageKey)
+        threadNoteProjectTransferRequestIDByOwnerKey.removeValue(forKey: storageKey)
+    }
+
+    private func clearThreadNoteProjectTransferOutcome(for owner: AssistantNoteOwnerKey) {
+        threadNoteProjectTransferOutcomeByOwnerKey.removeValue(forKey: owner.storageKey)
+    }
+
+    @discardableResult
+    private func beginThreadNoteProjectTransferRequest(
+        for owner: AssistantNoteOwnerKey
+    ) -> UUID {
+        let requestID = UUID()
+        let storageKey = owner.storageKey
+        threadNoteGeneratingProjectTransferOwnerKeys.insert(storageKey)
+        threadNoteProjectTransferRequestIDByOwnerKey[storageKey] = requestID
+        threadNoteProjectTransferPreviewByOwnerKey.removeValue(forKey: storageKey)
+        return requestID
+    }
+
+    private func finishThreadNoteProjectTransferRequest(
+        for owner: AssistantNoteOwnerKey,
+        requestID: UUID,
+        preview: AssistantChatWebProjectNoteTransferPreview
+    ) {
+        let storageKey = owner.storageKey
+        guard threadNoteProjectTransferRequestIDByOwnerKey[storageKey] == requestID else {
+            return
+        }
+        threadNoteProjectTransferPreviewByOwnerKey[storageKey] = preview
+        threadNoteGeneratingProjectTransferOwnerKeys.remove(storageKey)
+    }
+
+    private func failThreadNoteProjectTransferRequest(
+        for owner: AssistantNoteOwnerKey,
+        requestID: UUID,
+        preview: AssistantChatWebProjectNoteTransferPreview
+    ) {
+        let storageKey = owner.storageKey
+        guard threadNoteProjectTransferRequestIDByOwnerKey[storageKey] == requestID else {
+            return
+        }
+        threadNoteProjectTransferPreviewByOwnerKey[storageKey] = preview
+        threadNoteGeneratingProjectTransferOwnerKeys.remove(storageKey)
+    }
+
+    private func setThreadNoteProjectTransferOutcome(
+        for owner: AssistantNoteOwnerKey,
+        kind: String,
+        message: String
+    ) {
+        threadNoteProjectTransferOutcomeByOwnerKey[owner.storageKey] =
+            AssistantChatWebProjectNoteTransferOutcome(
+                id: UUID().uuidString.lowercased(),
+                kind: kind,
+                message: message
+            )
+    }
+
+    private func stableNoteFingerprint(_ text: String) -> String {
+        let normalized = text.replacingOccurrences(of: "\r\n", with: "\n")
+        return SHA256.hash(data: Data(normalized.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+    }
+
+    @discardableResult
+    private func beginBatchNotePlanRequest(for projectID: String) -> UUID {
+        let requestID = UUID()
+        batchNotePlanGeneratingProjectIDs.insert(projectID)
+        batchNotePlanRequestIDByProjectID[projectID] = requestID
+        return requestID
+    }
+
+    private func finishBatchNotePlanRequest(
+        for projectID: String,
+        requestID: UUID,
+        preview: AssistantChatWebBatchNotePlanPreview
+    ) {
+        guard batchNotePlanRequestIDByProjectID[projectID] == requestID else {
+            return
+        }
+        batchNotePlanPreviewByProjectID[projectID] = preview
+        batchNotePlanGeneratingProjectIDs.remove(projectID)
+        batchNotePlanRequestIDByProjectID.removeValue(forKey: projectID)
+    }
+
+    private func clearBatchNotePlanState(for projectID: String) {
+        batchNotePlanPreviewByProjectID.removeValue(forKey: projectID)
+        batchNotePlanGeneratingProjectIDs.remove(projectID)
+        batchNotePlanRequestIDByProjectID.removeValue(forKey: projectID)
+    }
+
+    private func stableBatchSourceFingerprint(
+        _ sourceNotes: [AssistantBatchNotePlanSourceContext]
+    ) -> String {
+        let fingerprintSource = sourceNotes.map { source in
+            [
+                source.target.storageKey,
+                source.title,
+                source.noteType.rawValue,
+                source.markdown.replacingOccurrences(of: "\r\n", with: "\n"),
+            ]
+            .joined(separator: "\n")
+        }
+        .joined(separator: "\n---\n")
+        return stableNoteFingerprint(fingerprintSource)
+    }
+
+    private func stableBatchTargetManifestFingerprint(projectID: String) -> String {
+        let owner = AssistantNoteOwnerKey(kind: .project, id: projectID)
+        let manifest = noteManifest(for: owner)
+        let payload = manifest.orderedNotes.map { note in
+            [
+                note.id,
+                note.title,
+                note.noteType.rawValue,
+                note.fileName,
+                String(note.order),
+                String(note.updatedAt.timeIntervalSince1970),
+            ]
+            .joined(separator: "|")
+        }
+        .joined(separator: "\n")
+        return stableNoteFingerprint(payload)
+    }
+
+    private func resolveBatchNotePlanSourceContexts(
+        projectID: String,
+        selections: [AssistantChatWebBatchSourceNoteSelection]
+    ) -> [AssistantBatchNotePlanSourceContext] {
+        guard let project = sidebarProject(for: projectID) else {
+            return []
+        }
+
+        let notesByStorageKey = Dictionary(
+            uniqueKeysWithValues: notesUniverse(for: project).allNotes.map {
+                ($0.target.storageKey, $0)
+            })
+        var resolved: [AssistantBatchNotePlanSourceContext] = []
+        var seen = Set<String>()
+
+        for selection in selections {
+            guard let ownerKind = AssistantNoteOwnerKind(rawValue: selection.ownerKind) else {
+                continue
+            }
+            let target = AssistantNoteLinkTarget(
+                ownerKind: ownerKind,
+                ownerID: selection.ownerID,
+                noteID: selection.noteID
+            )
+            guard seen.insert(target.storageKey).inserted,
+                let storedNote = notesByStorageKey[target.storageKey]
+            else {
+                continue
+            }
+
+            let owner = AssistantNoteOwnerKey(kind: storedNote.ownerKind, id: storedNote.ownerID)
+            resolved.append(
+                AssistantBatchNotePlanSourceContext(
+                    ref: "S\(resolved.count + 1)",
+                    target: target,
+                    title: storedNote.title,
+                    noteType: storedNote.noteType,
+                    sourceLabel: sourceLabel(
+                        for: storedNote.ownerKind, ownerID: storedNote.ownerID),
+                    markdown: noteDraftText(for: owner, noteID: storedNote.noteID)
+                )
+            )
+        }
+
+        return resolved
+    }
+
+    private func makeBatchSourceResolvedTarget(
+        from source: AssistantBatchNotePlanSourceContext
+    ) -> AssistantChatWebBatchNotePlanResolvedTarget {
+        AssistantChatWebBatchNotePlanResolvedTarget(
+            kind: AssistantBatchNotePlanLinkTargetKind.source.rawValue,
+            tempID: nil,
+            ownerKind: source.target.ownerKind.rawValue,
+            ownerID: source.target.ownerID,
+            noteID: source.target.noteID,
+            title: source.title,
+            sourceLabel: source.sourceLabel
+        )
+    }
+
+    private func makeBatchProposedResolvedTarget(
+        tempID: String,
+        title: String
+    ) -> AssistantChatWebBatchNotePlanResolvedTarget {
+        AssistantChatWebBatchNotePlanResolvedTarget(
+            kind: AssistantBatchNotePlanLinkTargetKind.proposed.rawValue,
+            tempID: tempID,
+            ownerKind: nil,
+            ownerID: nil,
+            noteID: nil,
+            title: title,
+            sourceLabel: nil
+        )
+    }
+
+    private func batchPlanLinkKey(
+        fromTempID: String,
+        toTarget: AssistantChatWebBatchNotePlanResolvedTarget
+    ) -> String {
+        [
+            fromTempID.lowercased(),
+            toTarget.kind.lowercased(),
+            (toTarget.tempID ?? "").lowercased(),
+            (toTarget.ownerKind ?? "").lowercased(),
+            (toTarget.ownerID ?? "").lowercased(),
+            (toTarget.noteID ?? "").lowercased(),
+        ]
+        .joined(separator: "::")
+    }
+
+    private func buildBatchNotePlanPreview(
+        projectID: String,
+        sourceNotes: [AssistantBatchNotePlanSourceContext],
+        draft: AssistantBatchNotePlanDraftOutput
+    ) -> AssistantChatWebBatchNotePlanPreview {
+        let reservedTitles = Set(
+            loadStoredNotes(for: AssistantNoteOwnerKey(kind: .project, id: projectID)).map(\.title)
+        )
+        let deduplicatedTitles = AssistantBatchNotePlanComposer.deduplicatedTitles(
+            draft.notes.map(\.title),
+            reservedTitles: reservedTitles
+        )
+
+        var warnings: [String] = []
+        if draft.notes.map(\.title) != deduplicatedTitles {
+            warnings.append("Some generated note titles were adjusted to keep them unique.")
+        }
+
+        let sourceTargetsByRef = Dictionary(uniqueKeysWithValues: sourceNotes.map { ($0.ref, $0) })
+        let proposedNotes = zip(draft.notes, deduplicatedTitles).map { draftNote, title in
+            let sourceTargets = draftNote.sourceNoteRefs.compactMap {
+                ref -> AssistantChatWebBatchNotePlanResolvedTarget? in
+                guard let source = sourceTargetsByRef[ref] else { return nil }
+                return makeBatchSourceResolvedTarget(from: source)
+            }
+            return AssistantChatWebBatchNotePlanProposedNote(
+                tempID: draftNote.tempID,
+                title: title,
+                noteType: draftNote.noteType.rawValue,
+                markdown: draftNote.markdown,
+                sourceNoteTargets: sourceTargets,
+                accepted: true
+            )
+        }
+
+        let proposedTargetsByTempID = Dictionary(
+            uniqueKeysWithValues: proposedNotes.map {
+                (
+                    $0.tempID.lowercased(),
+                    makeBatchProposedResolvedTarget(tempID: $0.tempID, title: $0.title)
+                )
+            })
+        let sourceNoteRows = sourceNotes.map { source in
+            AssistantChatWebBatchNotePlanSourceNote(
+                ownerKind: source.target.ownerKind.rawValue,
+                ownerID: source.target.ownerID,
+                noteID: source.target.noteID,
+                title: source.title,
+                noteType: source.noteType.rawValue,
+                sourceLabel: source.sourceLabel,
+                markdown: source.markdown
+            )
+        }
+
+        var proposedLinks: [AssistantChatWebBatchNotePlanProposedLink] = []
+        var seenLinkKeys = Set<String>()
+        func appendLink(from tempID: String, to target: AssistantChatWebBatchNotePlanResolvedTarget)
+        {
+            let key = batchPlanLinkKey(fromTempID: tempID, toTarget: target)
+            guard seenLinkKeys.insert(key).inserted else { return }
+            proposedLinks.append(
+                AssistantChatWebBatchNotePlanProposedLink(
+                    fromTempID: tempID,
+                    toTarget: target,
+                    accepted: true
+                )
+            )
+        }
+
+        for link in draft.links {
+            switch link.toTarget.kind {
+            case .proposed:
+                if let target = proposedTargetsByTempID[link.toTarget.ref.lowercased()] {
+                    appendLink(from: link.fromTempID, to: target)
+                }
+            case .source:
+                if let source = sourceTargetsByRef[link.toTarget.ref] {
+                    appendLink(
+                        from: link.fromTempID, to: makeBatchSourceResolvedTarget(from: source))
+                }
+            }
+        }
+
+        if let masterNote = proposedNotes.first(where: {
+            $0.noteType == AssistantNoteType.master.rawValue
+        }) {
+            for note in proposedNotes where note.tempID != masterNote.tempID {
+                appendLink(
+                    from: masterNote.tempID,
+                    to: makeBatchProposedResolvedTarget(tempID: note.tempID, title: note.title)
+                )
+            }
+        }
+
+        for note in proposedNotes {
+            for sourceTarget in note.sourceNoteTargets {
+                appendLink(from: note.tempID, to: sourceTarget)
+            }
+        }
+
+        let graph = AssistantBatchNotePlanComposer.buildPreviewGraph(
+            nodes: sourceNotes.map {
+                AssistantBatchNotePlanGraphNode(
+                    id: $0.target.storageKey,
+                    title: $0.title,
+                    kind: .source,
+                    noteType: $0.noteType
+                )
+            }
+                + proposedNotes.map {
+                    AssistantBatchNotePlanGraphNode(
+                        id: $0.tempID,
+                        title: $0.title,
+                        kind: .proposed,
+                        noteType: AssistantNoteType.normalized($0.noteType)
+                    )
+                },
+            edges: proposedLinks.compactMap { link in
+                let toNodeID: String
+                if link.toTarget.kind == AssistantBatchNotePlanLinkTargetKind.proposed.rawValue,
+                    let tempID = link.toTarget.tempID
+                {
+                    toNodeID = tempID
+                } else if let ownerKind = link.toTarget.ownerKind,
+                    let ownerID = link.toTarget.ownerID,
+                    let noteID = link.toTarget.noteID,
+                    let kind = AssistantNoteOwnerKind(rawValue: ownerKind)
+                {
+                    toNodeID =
+                        AssistantNoteLinkTarget(
+                            ownerKind: kind,
+                            ownerID: ownerID,
+                            noteID: noteID
+                        ).storageKey
+                } else {
+                    return nil
+                }
+                return AssistantBatchNotePlanGraphEdge(
+                    fromNodeID: link.fromTempID, toNodeID: toNodeID)
+            }
+        )
+
+        return AssistantChatWebBatchNotePlanPreview(
+            previewID: UUID().uuidString.lowercased(),
+            sourceNotes: sourceNoteRows,
+            proposedNotes: proposedNotes,
+            proposedLinks: proposedLinks,
+            graph: graph.map {
+                AssistantChatWebThreadNoteGraph(
+                    mermaidCode: $0.mermaidCode,
+                    nodeCount: $0.nodeCount,
+                    edgeCount: $0.edgeCount
+                )
+            },
+            warnings: warnings,
+            sourceFingerprint: stableBatchSourceFingerprint(sourceNotes),
+            targetFingerprint: stableBatchTargetManifestFingerprint(projectID: projectID),
+            isError: false
+        )
+    }
+
+    private func batchPreviewWithError(
+        _ preview: AssistantChatWebBatchNotePlanPreview,
+        message: String
+    ) -> AssistantChatWebBatchNotePlanPreview {
+        let normalizedMessage = message.trimmingCharacters(in: .whitespacesAndNewlines)
+        let mergedWarnings = Array(
+            Set((preview.warnings + [normalizedMessage]).filter { !$0.isEmpty })
+        )
+        return AssistantChatWebBatchNotePlanPreview(
+            previewID: preview.previewID,
+            sourceNotes: preview.sourceNotes,
+            proposedNotes: preview.proposedNotes,
+            proposedLinks: preview.proposedLinks,
+            graph: preview.graph,
+            warnings: mergedWarnings,
+            sourceFingerprint: preview.sourceFingerprint,
+            targetFingerprint: preview.targetFingerprint,
+            isError: true
+        )
+    }
+
+    private func requestBatchNotePlanPreview(
+        projectID: String,
+        sourceSelections: [AssistantChatWebBatchSourceNoteSelection]
+    ) {
+        let sourceNotes = resolveBatchNotePlanSourceContexts(
+            projectID: projectID,
+            selections: sourceSelections
+        )
+        guard !sourceNotes.isEmpty else {
+            batchNotePlanPreviewByProjectID[projectID] = AssistantChatWebBatchNotePlanPreview(
+                previewID: UUID().uuidString.lowercased(),
+                sourceNotes: [],
+                proposedNotes: [],
+                proposedLinks: [],
+                graph: nil,
+                warnings: ["Select at least one source note first."],
+                sourceFingerprint: "",
+                targetFingerprint: stableBatchTargetManifestFingerprint(projectID: projectID),
+                isError: true
+            )
+            return
+        }
+
+        let requestID = beginBatchNotePlanRequest(for: projectID)
+        batchNotePlanPreviewByProjectID.removeValue(forKey: projectID)
+
+        Task {
+            let result = await MemoryEntryExplanationService.shared.generateBatchNotePlan(
+                sourceNotes: sourceNotes
+            )
+
+            await MainActor.run {
+                switch result {
+                case .success(let draft):
+                    let preview = buildBatchNotePlanPreview(
+                        projectID: projectID,
+                        sourceNotes: sourceNotes,
+                        draft: draft
+                    )
+                    finishBatchNotePlanRequest(
+                        for: projectID,
+                        requestID: requestID,
+                        preview: preview
+                    )
+                case .failure(let message):
+                    finishBatchNotePlanRequest(
+                        for: projectID,
+                        requestID: requestID,
+                        preview: AssistantChatWebBatchNotePlanPreview(
+                            previewID: UUID().uuidString.lowercased(),
+                            sourceNotes: sourceNotes.map { source in
+                                AssistantChatWebBatchNotePlanSourceNote(
+                                    ownerKind: source.target.ownerKind.rawValue,
+                                    ownerID: source.target.ownerID,
+                                    noteID: source.target.noteID,
+                                    title: source.title,
+                                    noteType: source.noteType.rawValue,
+                                    sourceLabel: source.sourceLabel,
+                                    markdown: source.markdown
+                                )
+                            },
+                            proposedNotes: [],
+                            proposedLinks: [],
+                            graph: nil,
+                            warnings: [message],
+                            sourceFingerprint: stableBatchSourceFingerprint(sourceNotes),
+                            targetFingerprint: stableBatchTargetManifestFingerprint(
+                                projectID: projectID),
+                            isError: true
+                        )
+                    )
+                }
+            }
+        }
+    }
+
+    private func applyBatchNotePlanPreview(
+        projectID: String,
+        previewID: String,
+        proposedNotes: [AssistantChatWebBatchNotePlanProposedNote],
+        proposedLinks: [AssistantChatWebBatchNotePlanProposedLink]
+    ) {
+        guard let preview = batchNotePlanPreviewByProjectID[projectID],
+            preview.previewID == previewID
+        else {
+            return
+        }
+
+        let currentSourceSelections = preview.sourceNotes.map {
+            AssistantChatWebBatchSourceNoteSelection(
+                ownerKind: $0.ownerKind,
+                ownerID: $0.ownerID,
+                noteID: $0.noteID
+            )
+        }
+        let currentSourceNotes = resolveBatchNotePlanSourceContexts(
+            projectID: projectID,
+            selections: currentSourceSelections
+        )
+        guard stableBatchSourceFingerprint(currentSourceNotes) == preview.sourceFingerprint else {
+            batchNotePlanPreviewByProjectID[projectID] = batchPreviewWithError(
+                preview,
+                message:
+                    "One of the selected source notes changed after the preview. Refresh the preview and try again."
+            )
+            return
+        }
+
+        let currentTargetFingerprint = stableBatchTargetManifestFingerprint(projectID: projectID)
+        guard currentTargetFingerprint == preview.targetFingerprint else {
+            batchNotePlanPreviewByProjectID[projectID] = batchPreviewWithError(
+                preview,
+                message:
+                    "The target project notes changed after the preview. Refresh the preview and try again."
+            )
+            return
+        }
+
+        let payloadNotesByTempID = Dictionary(
+            uniqueKeysWithValues: proposedNotes.map {
+                ($0.tempID.lowercased(), $0)
+            })
+        let mergedNotes = preview.proposedNotes.map {
+            note -> AssistantChatWebBatchNotePlanProposedNote in
+            let payload = payloadNotesByTempID[note.tempID.lowercased()]
+            return AssistantChatWebBatchNotePlanProposedNote(
+                tempID: note.tempID,
+                title: payload?.title.trimmingCharacters(in: .whitespacesAndNewlines)
+                    .assistantNonEmpty ?? note.title,
+                noteType: payload?.noteType ?? note.noteType,
+                markdown: payload?.markdown ?? note.markdown,
+                sourceNoteTargets: note.sourceNoteTargets,
+                accepted: payload?.accepted ?? note.accepted
+            )
+        }
+
+        let acceptedMasters = mergedNotes.filter {
+            $0.accepted && $0.noteType == AssistantNoteType.master.rawValue
+        }
+        guard acceptedMasters.count == 1 else {
+            batchNotePlanPreviewByProjectID[projectID] = batchPreviewWithError(
+                preview,
+                message: "Keep exactly one accepted master note before applying this plan."
+            )
+            return
+        }
+
+        for note in mergedNotes where AssistantNoteType.normalized(note.noteType) == nil {
+            batchNotePlanPreviewByProjectID[projectID] = batchPreviewWithError(
+                preview,
+                message: "One of the proposed notes has an unsupported note type."
+            )
+            return
+        }
+
+        let payloadLinksByKey = Dictionary(
+            uniqueKeysWithValues: proposedLinks.map {
+                (batchPlanLinkKey(fromTempID: $0.fromTempID, toTarget: $0.toTarget), $0)
+            })
+        let mergedLinks = preview.proposedLinks.map {
+            link -> AssistantChatWebBatchNotePlanProposedLink in
+            let mergedTarget: AssistantChatWebBatchNotePlanResolvedTarget
+            if link.toTarget.kind == AssistantBatchNotePlanLinkTargetKind.proposed.rawValue,
+                let tempID = link.toTarget.tempID,
+                let updatedNote = mergedNotes.first(where: {
+                    $0.tempID.caseInsensitiveCompare(tempID) == .orderedSame
+                })
+            {
+                mergedTarget = makeBatchProposedResolvedTarget(
+                    tempID: updatedNote.tempID, title: updatedNote.title)
+            } else {
+                mergedTarget = link.toTarget
+            }
+
+            return AssistantChatWebBatchNotePlanProposedLink(
+                fromTempID: link.fromTempID,
+                toTarget: mergedTarget,
+                accepted: payloadLinksByKey[
+                    batchPlanLinkKey(fromTempID: link.fromTempID, toTarget: link.toTarget)]?
+                    .accepted
+                    ?? link.accepted
+            )
+        }
+
+        let acceptedNotes = mergedNotes.filter(\.accepted)
+        guard !acceptedNotes.isEmpty else {
+            batchNotePlanPreviewByProjectID[projectID] = batchPreviewWithError(
+                preview,
+                message: "Accept at least one generated note before applying the plan."
+            )
+            return
+        }
+
+        let reservedTitles = Set(
+            loadStoredNotes(for: AssistantNoteOwnerKey(kind: .project, id: projectID)).map(\.title)
+        )
+        let deduplicatedTitles = AssistantBatchNotePlanComposer.deduplicatedTitles(
+            acceptedNotes.map(\.title),
+            reservedTitles: reservedTitles
+        )
+
+        var finalTargetByTempID: [String: AssistantNoteLinkTarget] = [:]
+        var finalTitleByTempID: [String: String] = [:]
+
+        for (index, note) in acceptedNotes.enumerated() {
+            guard let noteType = AssistantNoteType.normalized(note.noteType),
+                let workspace = assistant.createProjectNote(
+                    projectID: projectID,
+                    title: deduplicatedTitles[index],
+                    noteType: noteType,
+                    selectNewNote: true
+                ),
+                let createdNote = workspace.selectedNote
+            else {
+                batchNotePlanPreviewByProjectID[projectID] = batchPreviewWithError(
+                    preview,
+                    message:
+                        "Could not create one of the generated project notes. Please try again."
+                )
+                return
+            }
+
+            finalTargetByTempID[note.tempID.lowercased()] = AssistantNoteLinkTarget(
+                ownerKind: .project,
+                ownerID: projectID,
+                noteID: createdNote.id
+            )
+            finalTitleByTempID[note.tempID.lowercased()] = deduplicatedTitles[index]
+        }
+
+        for note in acceptedNotes {
+            guard let noteTarget = finalTargetByTempID[note.tempID.lowercased()] else {
+                continue
+            }
+
+            let outgoingLinks = mergedLinks.filter {
+                $0.accepted && $0.fromTempID.caseInsensitiveCompare(note.tempID) == .orderedSame
+            }
+
+            let sourceLinks = outgoingLinks.compactMap {
+                link -> AssistantBatchNotePlanComposedLink? in
+                guard link.toTarget.kind == AssistantBatchNotePlanLinkTargetKind.source.rawValue,
+                    let ownerKindRaw = link.toTarget.ownerKind,
+                    let ownerKind = AssistantNoteOwnerKind(rawValue: ownerKindRaw),
+                    let ownerID = link.toTarget.ownerID,
+                    let noteID = link.toTarget.noteID
+                else {
+                    return nil
+                }
+                let target = AssistantNoteLinkTarget(
+                    ownerKind: ownerKind, ownerID: ownerID, noteID: noteID)
+                return AssistantBatchNotePlanComposedLink(
+                    title: link.toTarget.title,
+                    href: AssistantNoteLinkCodec.urlString(for: target)
+                )
+            }
+
+            let relatedLinks = outgoingLinks.compactMap {
+                link -> AssistantBatchNotePlanComposedLink? in
+                guard link.toTarget.kind == AssistantBatchNotePlanLinkTargetKind.proposed.rawValue,
+                    let tempID = link.toTarget.tempID,
+                    let target = finalTargetByTempID[tempID.lowercased()]
+                else {
+                    return nil
+                }
+                return AssistantBatchNotePlanComposedLink(
+                    title: finalTitleByTempID[tempID.lowercased()] ?? link.toTarget.title,
+                    href: AssistantNoteLinkCodec.urlString(for: target)
+                )
+            }
+
+            let finalMarkdown = AssistantBatchNotePlanComposer.composeMarkdown(
+                baseMarkdown: note.markdown,
+                sourceLinks: sourceLinks,
+                relatedLinks: relatedLinks
+            )
+
+            guard
+                assistant.saveProjectNote(
+                    projectID: projectID,
+                    noteID: noteTarget.noteID,
+                    text: finalMarkdown
+                ) != nil
+            else {
+                batchNotePlanPreviewByProjectID[projectID] = batchPreviewWithError(
+                    preview,
+                    message: "Could not save one of the generated project notes. Please try again."
+                )
+                return
+            }
+        }
+
+        let masterNote = acceptedMasters[0]
+        let finalWorkspace =
+            finalTargetByTempID[masterNote.tempID.lowercased()]
+            .flatMap { assistant.selectProjectNote(projectID: projectID, noteID: $0.noteID) }
+            ?? assistant.loadProjectNotesWorkspace(projectID: projectID)
+        if let finalWorkspace {
+            applyThreadNoteWorkspace(finalWorkspace)
+        }
+        clearBatchNotePlanState(for: projectID)
+    }
+
+    private func normalizeProjectNoteHeadingTitle(_ value: String) -> String {
+        value
+            .replacingOccurrences(
+                of: #"<!--[\s\S]*?-->"#,
+                with: "",
+                options: .regularExpression
+            )
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func normalizedProjectNoteHeadingKey(_ value: String) -> String {
+        normalizeProjectNoteHeadingTitle(value).lowercased()
+    }
+
+    private func projectNoteHeadingSections(in markdown: String) -> [ProjectNoteHeadingSection] {
+        let normalizedMarkdown = markdown.replacingOccurrences(of: "\r\n", with: "\n")
+        let lines = normalizedMarkdown.components(separatedBy: "\n")
+        let headingPattern = try? NSRegularExpression(pattern: #"^(#{1,6})[ \t]+(.+?)\s*$"#)
+        struct PendingHeading {
+            let title: String
+            let normalizedTitle: String
+            let level: Int
+            let lineStartUTF16: Int
+            let contentStartUTF16: Int
+            let path: [String]
+            let normalizedPath: [String]
+        }
+
+        var headings: [PendingHeading] = []
+        var utf16Offset = 0
+        var stack: [(level: Int, title: String, normalizedTitle: String)] = []
+
+        for (index, line) in lines.enumerated() {
+            let nsLine = line as NSString
+            if let headingPattern,
+                let match = headingPattern.firstMatch(
+                    in: line,
+                    range: NSRange(location: 0, length: nsLine.length)
+                )
+            {
+                let hashes = nsLine.substring(with: match.range(at: 1))
+                let rawTitle = nsLine.substring(with: match.range(at: 2))
+                let title = normalizeProjectNoteHeadingTitle(rawTitle)
+                if !title.isEmpty {
+                    let normalizedTitle = normalizedProjectNoteHeadingKey(title)
+                    while let last = stack.last, last.level >= hashes.count {
+                        stack.removeLast()
+                    }
+                    let path = stack.map { $0.title } + [title]
+                    let normalizedPath = stack.map { $0.normalizedTitle } + [normalizedTitle]
+                    let newlineLength = index < lines.count - 1 ? 1 : 0
+                    headings.append(
+                        PendingHeading(
+                            title: title,
+                            normalizedTitle: normalizedTitle,
+                            level: hashes.count,
+                            lineStartUTF16: utf16Offset,
+                            contentStartUTF16: utf16Offset + nsLine.length + newlineLength,
+                            path: path,
+                            normalizedPath: normalizedPath
+                        )
+                    )
+                    stack.append(
+                        (level: hashes.count, title: title, normalizedTitle: normalizedTitle))
+                }
+            }
+
+            utf16Offset += nsLine.length
+            if index < lines.count - 1 {
+                utf16Offset += 1
+            }
+        }
+
+        let textLength = (normalizedMarkdown as NSString).length
+        return headings.enumerated().map { index, heading in
+            let nextBoundary =
+                headings.dropFirst(index + 1)
+                .first(where: { $0.level <= heading.level })?
+                .lineStartUTF16
+                ?? textLength
+            return ProjectNoteHeadingSection(
+                title: heading.title,
+                normalizedTitle: heading.normalizedTitle,
+                level: heading.level,
+                lineStartUTF16: heading.lineStartUTF16,
+                contentStartUTF16: heading.contentStartUTF16,
+                sectionEndUTF16: nextBoundary,
+                path: heading.path,
+                normalizedPath: heading.normalizedPath
+            )
+        }
+    }
+
+    private func projectNoteHeadingOutline(from sections: [ProjectNoteHeadingSection]) -> String {
+        sections.map { section in
+            let indent = String(repeating: "  ", count: max(0, section.path.count - 1))
+            return "\(indent)- \(section.title)"
+        }
+        .joined(separator: "\n")
+    }
+
+    private func resolveProjectNoteHeadingSection(
+        matching path: [String]?,
+        in sections: [ProjectNoteHeadingSection]
+    ) -> ProjectNoteHeadingSection? {
+        let normalizedPath = path?
+            .map(normalizedProjectNoteHeadingKey(_:))
+            .filter { !$0.isEmpty }
+        guard let normalizedPath, !normalizedPath.isEmpty else {
+            return nil
+        }
+
+        let matches = sections.filter { $0.normalizedPath == normalizedPath }
+        return matches.count == 1 ? matches[0] : nil
+    }
+
+    private func insertMarkdownBlock(
+        into markdown: String,
+        block: String,
+        atUTF16Offset offset: Int
+    ) -> String {
+        let normalizedMarkdown = markdown.replacingOccurrences(of: "\r\n", with: "\n")
+        let trimmedBlock = block.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedBlock.isEmpty else {
+            return normalizedMarkdown
+        }
+
+        let nsMarkdown = normalizedMarkdown as NSString
+        let safeOffset = max(0, min(offset, nsMarkdown.length))
+        let prefix = nsMarkdown.substring(to: safeOffset)
+        let suffix = nsMarkdown.substring(from: safeOffset)
+
+        let leadingGap: String
+        if prefix.isEmpty {
+            leadingGap = ""
+        } else if prefix.hasSuffix("\n\n") {
+            leadingGap = ""
+        } else if prefix.hasSuffix("\n") {
+            leadingGap = "\n"
+        } else {
+            leadingGap = "\n\n"
+        }
+
+        let trailingGap: String
+        if suffix.isEmpty {
+            trailingGap = ""
+        } else if suffix.hasPrefix("\n\n") {
+            trailingGap = ""
+        } else if suffix.hasPrefix("\n") {
+            trailingGap = "\n"
+        } else {
+            trailingGap = "\n\n"
+        }
+
+        return prefix + leadingGap + trimmedBlock + trailingGap + suffix
+    }
+
+    private func mergedProjectNoteTransferText(
+        currentText: String,
+        preview: AssistantChatWebProjectNoteTransferPreview,
+        placementChoice: String
+    ) -> String {
+        let normalizedCurrentText = currentText.replacingOccurrences(of: "\r\n", with: "\n")
+        let sections = projectNoteHeadingSections(in: normalizedCurrentText)
+        let shouldUseSuggestedPlacement = placementChoice == "suggested" && !preview.fallbackToEnd
+        let targetSection =
+            shouldUseSuggestedPlacement
+            ? resolveProjectNoteHeadingSection(
+                matching: preview.suggestedHeadingPath,
+                in: sections
+            )
+            : nil
+        let insertionOffset =
+            targetSection?.sectionEndUTF16 ?? (normalizedCurrentText as NSString).length
+        return insertMarkdownBlock(
+            into: normalizedCurrentText,
+            block: preview.insertedMarkdown,
+            atUTF16Offset: insertionOffset
+        )
+    }
+
+    private func threadNoteProjectTransferDestinationLabel(
+        preview: AssistantChatWebProjectNoteTransferPreview,
+        placementChoice: String
+    ) -> String {
+        if placementChoice == "suggested",
+            !preview.fallbackToEnd,
+            !preview.suggestedHeadingPath.isEmpty
+        {
+            return
+                "\(preview.targetNoteTitle) → \(preview.suggestedHeadingPath.joined(separator: " / "))"
+        }
+
+        return "\(preview.targetNoteTitle) → end"
+    }
+
+    private func makeProjectNoteTransferPreview(
+        targetProjectID: String,
+        targetNote: AssistantStoredNote,
+        suggestion: ProjectNoteTransferSuggestion?,
+        selectedMarkdown: String,
+        sourceFingerprint: String,
+        targetFingerprint: String,
+        blockingMessage: String? = nil,
+        warningMessage: String? = nil
+    ) -> AssistantChatWebProjectNoteTransferPreview {
+        let insertedMarkdown =
+            suggestion?.insertedMarkdown.trimmingCharacters(in: .whitespacesAndNewlines)
+            .nonEmpty
+            ?? selectedMarkdown.trimmingCharacters(in: .whitespacesAndNewlines)
+        let headingPath = suggestion?.headingPath ?? []
+        let reason =
+            blockingMessage
+            ?? suggestion?.reason
+            ?? "This content will be added to the end of the project note."
+
+        return AssistantChatWebProjectNoteTransferPreview(
+            targetProjectID: targetProjectID,
+            targetNoteID: targetNote.noteID,
+            targetNoteTitle: targetNote.title,
+            suggestedHeadingPath: headingPath,
+            insertedMarkdown: insertedMarkdown,
+            reason: reason,
+            fallbackToEnd: headingPath.isEmpty,
+            sourceFingerprint: sourceFingerprint,
+            targetFingerprint: targetFingerprint,
+            isError: blockingMessage != nil,
+            warningMessage: warningMessage
+        )
+    }
+
+    private func requestProjectNoteTransferPreview(
+        owner: AssistantNoteOwnerKey,
+        sourceNoteID: String,
+        sourceNoteTitle: String?,
+        noteText: String,
+        selectedMarkdown: String,
+        targetProjectID: String,
+        targetNoteID: String
+    ) {
+        guard owner.kind == .thread else {
+            return
+        }
+
+        let normalizedSelectedMarkdown = selectedMarkdown.trimmingCharacters(
+            in: .whitespacesAndNewlines)
+        guard !normalizedSelectedMarkdown.isEmpty else {
+            let requestID = beginThreadNoteProjectTransferRequest(for: owner)
+            let preview = AssistantChatWebProjectNoteTransferPreview(
+                targetProjectID: targetProjectID,
+                targetNoteID: targetNoteID,
+                targetNoteTitle: "Project note",
+                suggestedHeadingPath: [],
+                insertedMarkdown: "",
+                reason: "Select some note content first.",
+                fallbackToEnd: true,
+                sourceFingerprint: "",
+                targetFingerprint: "",
+                isError: true,
+                warningMessage: nil
+            )
+            failThreadNoteProjectTransferRequest(for: owner, requestID: requestID, preview: preview)
+            return
+        }
+
+        clearThreadNoteProjectTransferOutcome(for: owner)
+        let requestID = beginThreadNoteProjectTransferRequest(for: owner)
+        let targetOwner = AssistantNoteOwnerKey(kind: .project, id: targetProjectID)
+        let targetNotes = assistant.loadProjectStoredNotes(projectID: targetProjectID)
+        guard let targetNote = targetNotes.first(where: { $0.noteID == targetNoteID }) else {
+            let preview = AssistantChatWebProjectNoteTransferPreview(
+                targetProjectID: targetProjectID,
+                targetNoteID: targetNoteID,
+                targetNoteTitle: "Project note",
+                suggestedHeadingPath: [],
+                insertedMarkdown: "",
+                reason: "That project note is no longer available.",
+                fallbackToEnd: true,
+                sourceFingerprint: "",
+                targetFingerprint: "",
+                isError: true,
+                warningMessage: nil
+            )
+            failThreadNoteProjectTransferRequest(for: owner, requestID: requestID, preview: preview)
+            return
+        }
+
+        let normalizedSourceText = noteText.replacingOccurrences(of: "\r\n", with: "\n")
+        let targetNoteText = noteDraftText(for: targetOwner, noteID: targetNoteID)
+        let sourceFingerprint = stableNoteFingerprint(normalizedSourceText)
+        let targetFingerprint = stableNoteFingerprint(targetNoteText)
+        let sections = projectNoteHeadingSections(in: targetNoteText)
+        let headingOutline = projectNoteHeadingOutline(from: sections)
+
+        Task {
+            let result = await MemoryEntryExplanationService.shared.suggestProjectNoteTransfer(
+                selectedMarkdown: normalizedSelectedMarkdown,
+                sourceNoteTitle: sourceNoteTitle ?? "Untitled note",
+                targetNoteTitle: targetNote.title,
+                targetHeadingOutline: headingOutline,
+                targetNoteText: targetNoteText
+            )
+
+            await MainActor.run {
+                switch result {
+                case .success(let suggestion):
+                    let matchedSection = resolveProjectNoteHeadingSection(
+                        matching: suggestion.headingPath,
+                        in: sections
+                    )
+                    let preview = makeProjectNoteTransferPreview(
+                        targetProjectID: targetProjectID,
+                        targetNote: targetNote,
+                        suggestion: ProjectNoteTransferSuggestion(
+                            headingPath: matchedSection?.path,
+                            insertedMarkdown: suggestion.insertedMarkdown,
+                            reason: suggestion.reason
+                        ),
+                        selectedMarkdown: normalizedSelectedMarkdown,
+                        sourceFingerprint: sourceFingerprint,
+                        targetFingerprint: targetFingerprint,
+                        warningMessage: matchedSection == nil
+                            ? "AI could not find a safe section, so this will be added at the end."
+                            : nil
+                    )
+                    finishThreadNoteProjectTransferRequest(
+                        for: owner,
+                        requestID: requestID,
+                        preview: preview
+                    )
+                case .failure(let message):
+                    let preview = makeProjectNoteTransferPreview(
+                        targetProjectID: targetProjectID,
+                        targetNote: targetNote,
+                        suggestion: nil,
+                        selectedMarkdown: normalizedSelectedMarkdown,
+                        sourceFingerprint: sourceFingerprint,
+                        targetFingerprint: targetFingerprint,
+                        warningMessage: message
+                    )
+                    finishThreadNoteProjectTransferRequest(
+                        for: owner,
+                        requestID: requestID,
+                        preview: preview
+                    )
+                }
+            }
+        }
+    }
+
+    private func applyProjectNoteTransfer(
+        owner: AssistantNoteOwnerKey,
+        sourceNoteID: String,
+        transferMode: String,
+        placementChoice: String,
+        sourceFingerprint: String,
+        targetFingerprint: String,
+        sourceTextAfterMove: String?
+    ) {
+        let storageKey = owner.storageKey
+        guard owner.kind == .thread,
+            let preview = threadNoteProjectTransferPreviewByOwnerKey[storageKey]
+        else {
+            return
+        }
+
+        let currentSourceText = noteDraftText(for: owner, noteID: sourceNoteID)
+        guard stableNoteFingerprint(currentSourceText) == sourceFingerprint,
+            preview.sourceFingerprint == sourceFingerprint
+        else {
+            threadNoteProjectTransferPreviewByOwnerKey[storageKey] =
+                AssistantChatWebProjectNoteTransferPreview(
+                    targetProjectID: preview.targetProjectID,
+                    targetNoteID: preview.targetNoteID,
+                    targetNoteTitle: preview.targetNoteTitle,
+                    suggestedHeadingPath: preview.suggestedHeadingPath,
+                    insertedMarkdown: preview.insertedMarkdown,
+                    reason:
+                        "This thread note changed after the preview. Refresh the preview and try again.",
+                    fallbackToEnd: preview.fallbackToEnd,
+                    sourceFingerprint: preview.sourceFingerprint,
+                    targetFingerprint: preview.targetFingerprint,
+                    isError: true,
+                    warningMessage: nil
+                )
+            return
+        }
+
+        let targetOwner = AssistantNoteOwnerKey(kind: .project, id: preview.targetProjectID)
+        let currentTargetText = noteDraftText(for: targetOwner, noteID: preview.targetNoteID)
+        guard stableNoteFingerprint(currentTargetText) == targetFingerprint,
+            preview.targetFingerprint == targetFingerprint
+        else {
+            threadNoteProjectTransferPreviewByOwnerKey[storageKey] =
+                AssistantChatWebProjectNoteTransferPreview(
+                    targetProjectID: preview.targetProjectID,
+                    targetNoteID: preview.targetNoteID,
+                    targetNoteTitle: preview.targetNoteTitle,
+                    suggestedHeadingPath: preview.suggestedHeadingPath,
+                    insertedMarkdown: preview.insertedMarkdown,
+                    reason:
+                        "That project note changed after the preview. Refresh the preview and try again.",
+                    fallbackToEnd: preview.fallbackToEnd,
+                    sourceFingerprint: preview.sourceFingerprint,
+                    targetFingerprint: preview.targetFingerprint,
+                    isError: true,
+                    warningMessage: nil
+                )
+            return
+        }
+
+        let mergedTargetText = mergedProjectNoteTransferText(
+            currentText: currentTargetText,
+            preview: preview,
+            placementChoice: placementChoice
+        )
+        let persistedTargetText = noteMarkdownForPersistence(
+            owner: targetOwner,
+            noteID: preview.targetNoteID,
+            text: mergedTargetText
+        )
+        guard
+            let targetWorkspace = assistant.saveProjectNote(
+                projectID: preview.targetProjectID,
+                noteID: preview.targetNoteID,
+                text: persistedTargetText
+            )
+        else {
+            threadNoteProjectTransferPreviewByOwnerKey[storageKey] =
+                AssistantChatWebProjectNoteTransferPreview(
+                    targetProjectID: preview.targetProjectID,
+                    targetNoteID: preview.targetNoteID,
+                    targetNoteTitle: preview.targetNoteTitle,
+                    suggestedHeadingPath: preview.suggestedHeadingPath,
+                    insertedMarkdown: preview.insertedMarkdown,
+                    reason: "Could not save the target project note. Please try again.",
+                    fallbackToEnd: preview.fallbackToEnd,
+                    sourceFingerprint: preview.sourceFingerprint,
+                    targetFingerprint: preview.targetFingerprint,
+                    isError: true,
+                    warningMessage: nil
+                )
+            return
+        }
+        applyThreadNoteWorkspace(targetWorkspace)
+
+        let destinationLabel = threadNoteProjectTransferDestinationLabel(
+            preview: preview,
+            placementChoice: placementChoice
+        )
+
+        if transferMode == "move" {
+            let nextSourceText = sourceTextAfterMove?
+                .replacingOccurrences(of: "\r\n", with: "\n")
+            let persistedSourceText = nextSourceText.map {
+                noteMarkdownForPersistence(
+                    owner: owner,
+                    noteID: sourceNoteID,
+                    text: $0
+                )
+            }
+            guard let persistedSourceText,
+                let sourceWorkspace = assistant.saveThreadNote(
+                    threadID: owner.id,
+                    noteID: sourceNoteID,
+                    text: persistedSourceText
+                )
+            else {
+                clearThreadNoteProjectTransferState(for: owner)
+                setThreadNoteProjectTransferOutcome(
+                    for: owner,
+                    kind: "warning",
+                    message:
+                        "Added this content to \(destinationLabel), but the original text is still in the thread note because saving the source note failed."
+                )
+                return
+            }
+            applyThreadNoteWorkspace(sourceWorkspace)
+            clearThreadNoteProjectTransferState(for: owner)
+            setThreadNoteProjectTransferOutcome(
+                for: owner,
+                kind: "success",
+                message: "Moved this note content to \(destinationLabel)."
+            )
+            return
+        }
+
+        clearThreadNoteProjectTransferState(for: owner)
+        setThreadNoteProjectTransferOutcome(
+            for: owner,
+            kind: "success",
+            message: "Copied this note content to \(destinationLabel)."
+        )
     }
 
     @discardableResult
@@ -1595,21 +3799,23 @@ struct AssistantWindowView: View {
         resolvedThreadID: String?
     ) -> AssistantNoteOwnerKey? {
         if let ownerKind = command.ownerKind.flatMap(AssistantNoteOwnerKind.init(rawValue:)),
-           let ownerID = command.ownerID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+            let ownerID = command.ownerID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
         {
             return AssistantNoteOwnerKey(kind: ownerKind, id: ownerID)
         }
 
         if isNotesPaneActive,
-           let project = selectedNotesProject,
-           let currentTarget = currentNotesSelectionTarget(project: project, scope: selectedNotesScope)
+            let project = selectedNotesProject,
+            let currentTarget = currentNotesSelectionTarget(
+                project: project, scope: selectedNotesScope)
         {
             return AssistantNoteOwnerKey(kind: currentTarget.ownerKind, id: currentTarget.ownerID)
         }
 
         if isNotesPaneActive,
-           selectedNotesScope == .project,
-           let project = selectedNotesProject {
+            selectedNotesScope == .project,
+            let project = selectedNotesProject
+        {
             return AssistantNoteOwnerKey(kind: .project, id: project.id)
         }
 
@@ -1623,7 +3829,7 @@ struct AssistantWindowView: View {
 
         let availableOwners = availableNoteOwners(for: resolvedThreadID)
         if let selectedOwner = selectedNoteOwnerByThreadID[resolvedThreadID],
-           availableOwners.contains(selectedOwner)
+            availableOwners.contains(selectedOwner)
         {
             return selectedOwner
         }
@@ -1639,7 +3845,7 @@ struct AssistantWindowView: View {
         }
 
         guard let threadID,
-              currentProjectNotesProject == nil
+            currentProjectNotesProject == nil
         else {
             return
         }
@@ -1665,7 +3871,7 @@ struct AssistantWindowView: View {
         let defaultOwner = AssistantNoteOwnerKey(kind: .thread, id: nextThreadID)
         let availableOwners = availableNoteOwners(for: nextThreadID)
         if let selectedOwner = selectedNoteOwnerByThreadID[nextThreadID],
-           availableOwners.contains(selectedOwner)
+            availableOwners.contains(selectedOwner)
         {
             // Keep the user's last note source for this thread.
         } else {
@@ -1673,7 +3879,8 @@ struct AssistantWindowView: View {
         }
 
         if noteManifestByOwnerKey[defaultOwner.storageKey] == nil,
-           let workspace = assistant.loadThreadNotesWorkspace(threadID: nextThreadID) {
+            let workspace = assistant.loadThreadNotesWorkspace(threadID: nextThreadID)
+        {
             applyThreadNoteWorkspace(workspace)
         }
     }
@@ -1690,10 +3897,16 @@ struct AssistantWindowView: View {
         let manifest = noteManifest(for: owner)
         let resolvedNoteID = noteID ?? currentSelectedThreadNoteNoteID ?? manifest.selectedNote?.id
         guard let resolvedNoteID,
-              let draftText = noteDraftTextByOwnerKey[owner.storageKey]?[resolvedNoteID]
+            let draftText = noteDraftStore.draft(ownerKey: owner.storageKey, noteID: resolvedNoteID)
         else {
             return
         }
+
+        let persistedDraftText = noteMarkdownForPersistence(
+            owner: owner,
+            noteID: resolvedNoteID,
+            text: draftText
+        )
 
         let storageKey = threadNoteStorageKey(owner: owner, noteID: resolvedNoteID)
         threadNoteSavingNoteKeys.insert(storageKey)
@@ -1704,14 +3917,14 @@ struct AssistantWindowView: View {
             workspace = assistant.saveThreadNote(
                 threadID: owner.id,
                 noteID: resolvedNoteID,
-                text: draftText,
+                text: persistedDraftText,
                 forceHistorySnapshot: forceHistorySnapshot
             )
         case .project:
             workspace = assistant.saveProjectNote(
                 projectID: owner.id,
                 noteID: resolvedNoteID,
-                text: draftText,
+                text: persistedDraftText,
                 forceHistorySnapshot: forceHistorySnapshot
             )
         }
@@ -1748,11 +3961,13 @@ struct AssistantWindowView: View {
         noteID: String,
         resolvedThreadID: String?
     ) {
-        if currentDisplayedNoteTarget == AssistantNoteLinkTarget(
-            ownerKind: owner.kind,
-            ownerID: owner.id,
-            noteID: noteID
-        ) {
+        if currentDisplayedNoteTarget
+            == AssistantNoteLinkTarget(
+                ownerKind: owner.kind,
+                ownerID: owner.id,
+                noteID: noteID
+            )
+        {
             return
         }
         persistThreadNoteIfNeeded(for: currentThreadNoteOwner)
@@ -1763,7 +3978,8 @@ struct AssistantWindowView: View {
         applyThreadNoteWorkspace(workspace)
         clearThreadNoteAIDraftState(for: owner)
         if isNotesPaneActive,
-           let project = notesProject(for: owner) {
+            let project = notesProject(for: owner)
+        {
             selectedNotesProjectID = project.id
             selectedNotesScope = owner.kind == .project ? .project : .thread
             rememberNotesSelectionTarget(
@@ -1780,13 +3996,15 @@ struct AssistantWindowView: View {
     private func navigateBackToLinkedNote(resolvedThreadID: String?) {
         persistThreadNoteIfNeeded(for: currentThreadNoteOwner)
         while let entry = popThreadNoteNavigationEntry(for: resolvedThreadID) {
-            guard let workspace = selectNotesWorkspace(for: entry.owner, noteID: entry.noteID) else {
+            guard let workspace = selectNotesWorkspace(for: entry.owner, noteID: entry.noteID)
+            else {
                 continue
             }
             applyThreadNoteWorkspace(workspace)
             clearThreadNoteAIDraftState(for: entry.owner)
             if isNotesPaneActive,
-               let project = notesProject(for: entry.owner) {
+                let project = notesProject(for: entry.owner)
+            {
                 selectedNotesProjectID = project.id
                 selectedNotesScope = entry.owner.kind == .project ? .project : .thread
                 rememberNotesSelectionTarget(
@@ -1816,13 +4034,70 @@ struct AssistantWindowView: View {
         isThreadNoteOpen.toggle()
     }
 
-    private func handleThreadNoteCommand(_ command: AssistantChatWebThreadNoteCommand) {
-        let resolvedThreadID = command.threadID?
+    private func sendThreadNoteImageUploadResult(
+        _ result: AssistantChatWebThreadNoteImageUploadResult,
+        sourceContainer: AssistantChatWebContainerView?
+    ) {
+        let candidateContainers = [
+            sourceContainer, threadNoteWebContainer, chatTimelineWebContainer,
+        ]
+        var delivered = Set<ObjectIdentifier>()
+
+        for container in candidateContainers {
+            guard let container else { continue }
+            let identity = ObjectIdentifier(container)
+            guard delivered.insert(identity).inserted else { continue }
+            container.applyThreadNoteImageUploadResult(result)
+        }
+    }
+
+    private func sendThreadNoteScreenshotCaptureResult(
+        _ result: AssistantChatWebThreadNoteScreenshotCaptureResult,
+        sourceContainer: AssistantChatWebContainerView?
+    ) {
+        let candidateContainers = [
+            sourceContainer, threadNoteWebContainer, chatTimelineWebContainer,
+        ]
+        var delivered = Set<ObjectIdentifier>()
+
+        for container in candidateContainers {
+            guard let container else { continue }
+            let identity = ObjectIdentifier(container)
+            guard delivered.insert(identity).inserted else { continue }
+            container.applyThreadNoteScreenshotCaptureResult(result)
+        }
+    }
+
+    private func sendThreadNoteScreenshotProcessingResult(
+        _ result: AssistantChatWebThreadNoteScreenshotProcessingResult,
+        sourceContainer: AssistantChatWebContainerView?
+    ) {
+        let candidateContainers = [
+            sourceContainer, threadNoteWebContainer, chatTimelineWebContainer,
+        ]
+        var delivered = Set<ObjectIdentifier>()
+
+        for container in candidateContainers {
+            guard let container else { continue }
+            let identity = ObjectIdentifier(container)
+            guard delivered.insert(identity).inserted else { continue }
+            container.applyThreadNoteScreenshotProcessingResult(result)
+        }
+    }
+
+    private func handleThreadNoteCommand(
+        _ command: AssistantChatWebThreadNoteCommand,
+        sourceContainer: AssistantChatWebContainerView? = nil
+    ) {
+        let resolvedThreadID =
+            command.threadID?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .nonEmpty?
             .lowercased() ?? selectedThreadNoteID
-        let resolvedOwner = resolvedThreadNoteOwner(from: command, resolvedThreadID: resolvedThreadID)
-        let resolvedNoteID = command.noteID?
+        let resolvedOwner = resolvedThreadNoteOwner(
+            from: command, resolvedThreadID: resolvedThreadID)
+        let resolvedNoteID =
+            command.noteID?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .nonEmpty
             ?? currentSelectedThreadNoteNoteID
@@ -1833,6 +4108,301 @@ struct AssistantWindowView: View {
         }
 
         switch command.type {
+        case "pasteImageFromClipboard":
+            let requestID = command.requestID ?? UUID().uuidString.lowercased()
+            let sendImageUploadResult = { (result: AssistantChatWebThreadNoteImageUploadResult) in
+                sendThreadNoteImageUploadResult(result, sourceContainer: sourceContainer)
+            }
+
+            guard let resolvedOwner,
+                let resolvedNoteID
+            else {
+                sendImageUploadResult(
+                    AssistantChatWebThreadNoteImageUploadResult(
+                        requestID: requestID,
+                        ok: false,
+                        message: "Open a note before adding an image.",
+                        url: nil,
+                        relativePath: nil
+                    )
+                )
+                return
+            }
+
+            guard let attachment = AssistantAttachmentSupport.attachment(
+                fromPasteboard: NSPasteboard.general
+            ) else {
+                sendImageUploadResult(
+                    AssistantChatWebThreadNoteImageUploadResult(
+                        requestID: requestID,
+                        ok: false,
+                        message: "I could not find an image on the clipboard.",
+                        url: nil,
+                        relativePath: nil
+                    )
+                )
+                return
+            }
+
+            let savedAsset: AssistantSavedNoteAsset?
+            switch resolvedOwner.kind {
+            case .thread:
+                savedAsset = assistant.saveThreadNoteImageAsset(
+                    threadID: resolvedOwner.id,
+                    noteID: resolvedNoteID,
+                    attachment: attachment
+                )
+            case .project:
+                savedAsset = assistant.saveProjectNoteImageAsset(
+                    projectID: resolvedOwner.id,
+                    noteID: resolvedNoteID,
+                    attachment: attachment
+                )
+            }
+
+            guard let savedAsset,
+                let displayURL = AssistantNoteAssetSupport.displayURL(
+                    ownerKind: resolvedOwner.kind,
+                    ownerID: resolvedOwner.id,
+                    noteID: resolvedNoteID,
+                    relativePath: savedAsset.relativePath
+                )?.absoluteString
+            else {
+                sendImageUploadResult(
+                    AssistantChatWebThreadNoteImageUploadResult(
+                        requestID: requestID,
+                        ok: false,
+                        message: "Open Assist could not save that clipboard image.",
+                        url: nil,
+                        relativePath: nil
+                    )
+                )
+                return
+            }
+
+            sendImageUploadResult(
+                AssistantChatWebThreadNoteImageUploadResult(
+                    requestID: requestID,
+                    ok: true,
+                    message: nil,
+                    url: displayURL,
+                    relativePath: savedAsset.relativePath
+                )
+            )
+        case "saveImageAsset":
+            let requestID = command.requestID ?? UUID().uuidString.lowercased()
+            let sendImageUploadResult = { (result: AssistantChatWebThreadNoteImageUploadResult) in
+                sendThreadNoteImageUploadResult(result, sourceContainer: sourceContainer)
+            }
+
+            guard let resolvedOwner,
+                let resolvedNoteID
+            else {
+                sendImageUploadResult(
+                    AssistantChatWebThreadNoteImageUploadResult(
+                        requestID: requestID,
+                        ok: false,
+                        message: "Open a note before adding an image.",
+                        url: nil,
+                        relativePath: nil
+                    )
+                )
+                return
+            }
+
+            guard let dataURL = command.dataURL,
+                let attachment = AssistantAttachmentSupport.attachment(
+                    fromDataURL: dataURL,
+                    suggestedFilename: command.filename
+                )
+            else {
+                sendImageUploadResult(
+                    AssistantChatWebThreadNoteImageUploadResult(
+                        requestID: requestID,
+                        ok: false,
+                        message: "Open Assist could not read that image file.",
+                        url: nil,
+                        relativePath: nil
+                    )
+                )
+                return
+            }
+
+            let resolvedMimeType = command.mimeType ?? attachment.mimeType
+            guard AssistantNoteAssetSupport.isSupportedImageMimeType(resolvedMimeType) else {
+                sendImageUploadResult(
+                    AssistantChatWebThreadNoteImageUploadResult(
+                        requestID: requestID,
+                        ok: false,
+                        message: "Use PNG, JPG, GIF, WebP, or TIFF images here.",
+                        url: nil,
+                        relativePath: nil
+                    )
+                )
+                return
+            }
+
+            let savedAsset: AssistantSavedNoteAsset?
+            switch resolvedOwner.kind {
+            case .thread:
+                savedAsset = assistant.saveThreadNoteImageAsset(
+                    threadID: resolvedOwner.id,
+                    noteID: resolvedNoteID,
+                    attachment: attachment
+                )
+            case .project:
+                savedAsset = assistant.saveProjectNoteImageAsset(
+                    projectID: resolvedOwner.id,
+                    noteID: resolvedNoteID,
+                    attachment: attachment
+                )
+            }
+
+            guard let savedAsset,
+                let displayURL = AssistantNoteAssetSupport.displayURL(
+                    ownerKind: resolvedOwner.kind,
+                    ownerID: resolvedOwner.id,
+                    noteID: resolvedNoteID,
+                    relativePath: savedAsset.relativePath
+                )?.absoluteString
+            else {
+                sendImageUploadResult(
+                    AssistantChatWebThreadNoteImageUploadResult(
+                        requestID: requestID,
+                        ok: false,
+                        message: "Open Assist could not save that note image.",
+                        url: nil,
+                        relativePath: nil
+                    )
+                )
+                return
+            }
+
+            sendImageUploadResult(
+                AssistantChatWebThreadNoteImageUploadResult(
+                    requestID: requestID,
+                    ok: true,
+                    message: nil,
+                    url: displayURL,
+                    relativePath: savedAsset.relativePath
+                )
+            )
+        case "captureScreenshotImport":
+            let requestID = command.requestID ?? UUID().uuidString.lowercased()
+            let sendCaptureResult = { (result: AssistantChatWebThreadNoteScreenshotCaptureResult) in
+                sendThreadNoteScreenshotCaptureResult(result, sourceContainer: sourceContainer)
+            }
+
+            guard resolvedOwner != nil, resolvedNoteID != nil else {
+                sendCaptureResult(
+                    AssistantChatWebThreadNoteScreenshotCaptureResult(
+                        requestID: requestID,
+                        ok: false,
+                        cancelled: false,
+                        message: "Open a note before adding a screenshot.",
+                        filename: nil,
+                        mimeType: nil,
+                        dataURL: nil
+                    )
+                )
+                return
+            }
+
+            Task { @MainActor in
+                let result = await captureThreadNoteScreenshotImport(requestID: requestID)
+                sendCaptureResult(result)
+            }
+        case "processScreenshotImport":
+            let requestID = command.requestID ?? UUID().uuidString.lowercased()
+            let sendProcessingResult = {
+                (result: AssistantChatWebThreadNoteScreenshotProcessingResult) in
+                sendThreadNoteScreenshotProcessingResult(result, sourceContainer: sourceContainer)
+            }
+
+            guard resolvedOwner != nil, resolvedNoteID != nil else {
+                sendProcessingResult(
+                    AssistantChatWebThreadNoteScreenshotProcessingResult(
+                        requestID: requestID,
+                        ok: false,
+                        message: "Open a note before adding a screenshot.",
+                        outputMode: command.outputMode,
+                        markdown: nil,
+                        rawText: nil,
+                        usedVision: false
+                    )
+                )
+                return
+            }
+
+            guard let dataURL = command.dataURL,
+                  let attachment = AssistantAttachmentSupport.attachment(
+                    fromDataURL: dataURL,
+                    suggestedFilename: command.filename
+                  ) else {
+                sendProcessingResult(
+                    AssistantChatWebThreadNoteScreenshotProcessingResult(
+                        requestID: requestID,
+                        ok: false,
+                        message: "Open Assist could not read the captured screenshot.",
+                        outputMode: command.outputMode,
+                        markdown: nil,
+                        rawText: nil,
+                        usedVision: false
+                    )
+                )
+                return
+            }
+
+            guard let outputModeRaw = command.outputMode,
+                  let outputMode = ThreadNoteScreenshotImportMode(rawValue: outputModeRaw) else {
+                sendProcessingResult(
+                    AssistantChatWebThreadNoteScreenshotProcessingResult(
+                        requestID: requestID,
+                        ok: false,
+                        message: "Choose how the screenshot should be imported first.",
+                        outputMode: command.outputMode,
+                        markdown: nil,
+                        rawText: nil,
+                        usedVision: false
+                    )
+                )
+                return
+            }
+
+            Task { @MainActor in
+                let result = await MemoryEntryExplanationService.shared.prepareThreadNoteScreenshotImport(
+                    attachment: attachment,
+                    outputMode: outputMode,
+                    styleInstruction: command.styleInstruction
+                )
+
+                switch result {
+                case .success(let preparation):
+                    sendProcessingResult(
+                        AssistantChatWebThreadNoteScreenshotProcessingResult(
+                            requestID: requestID,
+                            ok: true,
+                            message: nil,
+                            outputMode: outputMode.rawValue,
+                            markdown: preparation.markdown,
+                            rawText: preparation.rawText,
+                            usedVision: preparation.usedVision
+                        )
+                    )
+                case .failure(let message):
+                    sendProcessingResult(
+                        AssistantChatWebThreadNoteScreenshotProcessingResult(
+                            requestID: requestID,
+                            ok: false,
+                            message: message,
+                            outputMode: outputMode.rawValue,
+                            markdown: nil,
+                            rawText: nil,
+                            usedVision: false
+                        )
+                    )
+                }
+            }
         case "setOpen":
             if isNotesPaneActive {
                 return
@@ -1852,21 +4422,26 @@ struct AssistantWindowView: View {
             guard let isExpanded = command.isExpanded else { return }
             isThreadNoteExpanded = isExpanded
         case "setViewMode":
-            guard let viewMode = command.viewMode?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+            guard
+                let viewMode = command.viewMode?.trimmingCharacters(in: .whitespacesAndNewlines)
+                    .nonEmpty
             else { return }
             threadNoteViewMode = viewMode
         case "selectNote":
             persistThreadNoteIfNeeded(for: currentThreadNoteOwner)
             guard let resolvedOwner,
-                  let resolvedNoteID
+                let resolvedNoteID
             else { return }
             clearThreadNoteNavigationStack(for: resolvedThreadID)
             let workspace = selectNotesWorkspace(for: resolvedOwner, noteID: resolvedNoteID)
             guard let workspace else { return }
             applyThreadNoteWorkspace(workspace)
             clearThreadNoteAIDraftState(for: resolvedOwner)
+            clearThreadNoteProjectTransferState(for: resolvedOwner)
+            clearThreadNoteProjectTransferOutcome(for: resolvedOwner)
             if isNotesPaneActive,
-               let project = notesProject(for: resolvedOwner) {
+                let project = notesProject(for: resolvedOwner)
+            {
                 let scope: AssistantNotesScope = resolvedOwner.kind == .project ? .project : .thread
                 selectedNotesProjectID = project.id
                 selectedNotesScope = scope
@@ -1882,7 +4457,8 @@ struct AssistantWindowView: View {
             }
         case "openLinkedNote":
             guard let resolvedOwner,
-                  let resolvedNoteID else {
+                let resolvedNoteID
+            else {
                 return
             }
             openLinkedNote(
@@ -1890,19 +4466,22 @@ struct AssistantWindowView: View {
                 noteID: resolvedNoteID,
                 resolvedThreadID: resolvedThreadID
             )
+            clearThreadNoteProjectTransferState(for: resolvedOwner)
+            clearThreadNoteProjectTransferOutcome(for: resolvedOwner)
         case "goBackLinkedNote":
             navigateBackToLinkedNote(resolvedThreadID: resolvedThreadID)
         case "showNoteMenu":
             guard let resolvedThreadID,
-                  let anchorRect = command.viewportRect
+                let anchorRect = command.viewportRect
             else { return }
             presentThreadNoteMenu(threadID: resolvedThreadID, anchorRect: anchorRect)
         case "createNote":
             persistThreadNoteIfNeeded(for: currentThreadNoteOwner)
             guard let resolvedOwner else { return }
             if isNotesPaneActive,
-               selectedNotesScope == .thread,
-               resolvedOwner.kind == .thread {
+                selectedNotesScope == .thread,
+                resolvedOwner.kind == .thread
+            {
                 return
             }
             let workspace: AssistantNotesWorkspace?
@@ -1916,9 +4495,12 @@ struct AssistantWindowView: View {
             applyThreadNoteWorkspace(workspace)
             isThreadNoteOpen = true
             clearThreadNoteAIDraftState(for: resolvedOwner)
+            clearThreadNoteProjectTransferState(for: resolvedOwner)
+            clearThreadNoteProjectTransferOutcome(for: resolvedOwner)
             if isNotesPaneActive,
-               let project = notesProject(for: resolvedOwner),
-               let createdNoteID = workspace.selectedNote?.id {
+                let project = notesProject(for: resolvedOwner),
+                let createdNoteID = workspace.selectedNote?.id
+            {
                 rememberNotesSelectionTarget(
                     AssistantNoteLinkTarget(
                         ownerKind: resolvedOwner.kind,
@@ -1931,8 +4513,8 @@ struct AssistantWindowView: View {
             }
         case "renameNote":
             guard let resolvedOwner,
-                  let resolvedNoteID,
-                  let title = command.title
+                let resolvedNoteID,
+                let title = command.title
             else { return }
             let workspace: AssistantNotesWorkspace?
             switch resolvedOwner.kind {
@@ -1952,7 +4534,8 @@ struct AssistantWindowView: View {
             guard let workspace else { return }
             applyThreadNoteWorkspace(workspace)
             if isNotesPaneActive,
-               let project = notesProject(for: resolvedOwner) {
+                let project = notesProject(for: resolvedOwner)
+            {
                 rememberNotesSelectionTarget(
                     AssistantNoteLinkTarget(
                         ownerKind: resolvedOwner.kind,
@@ -1965,7 +4548,7 @@ struct AssistantWindowView: View {
             }
         case "deleteNote":
             guard let resolvedOwner,
-                  let resolvedNoteID
+                let resolvedNoteID
             else { return }
             let workspace: AssistantNotesWorkspace?
             switch resolvedOwner.kind {
@@ -1984,8 +4567,11 @@ struct AssistantWindowView: View {
             removeNoteFromNavigationStacks(owner: resolvedOwner, noteID: resolvedNoteID)
             applyThreadNoteWorkspace(workspace)
             clearThreadNoteAIDraftState(for: resolvedOwner)
+            clearThreadNoteProjectTransferState(for: resolvedOwner)
+            clearThreadNoteProjectTransferOutcome(for: resolvedOwner)
             if isNotesPaneActive,
-               let project = notesProject(for: resolvedOwner) {
+                let project = notesProject(for: resolvedOwner)
+            {
                 let scope: AssistantNotesScope = resolvedOwner.kind == .project ? .project : .thread
                 rememberNotesSelectionTarget(
                     currentNotesSelectionTarget(project: project, scope: scope),
@@ -1995,20 +4581,18 @@ struct AssistantWindowView: View {
             }
         case "updateDraft":
             guard let resolvedOwner,
-                  let resolvedNoteID,
-                  let text = command.text
+                let resolvedNoteID,
+                let text = command.text
             else { return }
-            var drafts = noteDraftTextByOwnerKey[resolvedOwner.storageKey] ?? [:]
-            drafts[resolvedNoteID] = text
-            noteDraftTextByOwnerKey[resolvedOwner.storageKey] = drafts
+            noteDraftStore.setDraft(
+                text, ownerKey: resolvedOwner.storageKey, noteID: resolvedNoteID)
         case "save":
             guard let resolvedOwner,
-                  let resolvedNoteID
+                let resolvedNoteID
             else { return }
             if let text = command.text {
-                var drafts = noteDraftTextByOwnerKey[resolvedOwner.storageKey] ?? [:]
-                drafts[resolvedNoteID] = text
-                noteDraftTextByOwnerKey[resolvedOwner.storageKey] = drafts
+                noteDraftStore.setDraft(
+                    text, ownerKey: resolvedOwner.storageKey, noteID: resolvedNoteID)
             }
             persistThreadNoteIfNeeded(
                 for: resolvedOwner,
@@ -2017,8 +4601,8 @@ struct AssistantWindowView: View {
             )
         case "restoreHistoryVersion":
             guard let resolvedOwner,
-                  let resolvedNoteID,
-                  let historyVersionID = command.historyVersionID
+                let resolvedNoteID,
+                let historyVersionID = command.historyVersionID
             else { return }
             let workspace: AssistantNotesWorkspace?
             switch resolvedOwner.kind {
@@ -2038,10 +4622,12 @@ struct AssistantWindowView: View {
             guard let workspace else { return }
             applyThreadNoteWorkspace(workspace)
             clearThreadNoteAIDraftState(for: resolvedOwner)
+            clearThreadNoteProjectTransferState(for: resolvedOwner)
+            clearThreadNoteProjectTransferOutcome(for: resolvedOwner)
         case "deleteHistoryVersion":
             guard let resolvedOwner,
-                  let resolvedNoteID,
-                  let historyVersionID = command.historyVersionID
+                let resolvedNoteID,
+                let historyVersionID = command.historyVersionID
             else { return }
             let workspace: AssistantNotesWorkspace?
             switch resolvedOwner.kind {
@@ -2062,7 +4648,7 @@ struct AssistantWindowView: View {
             applyThreadNoteWorkspace(workspace)
         case "restoreDeletedNote":
             guard let resolvedOwner,
-                  let deletedNoteID = command.deletedNoteID
+                let deletedNoteID = command.deletedNoteID
             else { return }
             let workspace: AssistantNotesWorkspace?
             switch resolvedOwner.kind {
@@ -2080,9 +4666,11 @@ struct AssistantWindowView: View {
             guard let workspace else { return }
             applyThreadNoteWorkspace(workspace)
             clearThreadNoteAIDraftState(for: resolvedOwner)
+            clearThreadNoteProjectTransferState(for: resolvedOwner)
+            clearThreadNoteProjectTransferOutcome(for: resolvedOwner)
         case "deleteDeletedNote":
             guard let resolvedOwner,
-                  let deletedNoteID = command.deletedNoteID
+                let deletedNoteID = command.deletedNoteID
             else { return }
             switch resolvedOwner.kind {
             case .thread:
@@ -2098,7 +4686,7 @@ struct AssistantWindowView: View {
             }
         case "appendSelection":
             guard let resolvedOwner,
-                  let text = command.text
+                let text = command.text
             else { return }
             let workspace: AssistantNotesWorkspace?
             switch resolvedOwner.kind {
@@ -2116,9 +4704,39 @@ struct AssistantWindowView: View {
             guard let workspace else { return }
             applyThreadNoteWorkspace(workspace)
             isThreadNoteOpen = true
+        case "showSelectionAssistantActions":
+            guard let resolvedOwner,
+                let resolvedNoteID
+            else {
+                hideThreadNoteSelectionAssistantActionsIfNeeded()
+                return
+            }
+            presentThreadNoteSelectionAssistantActions(
+                owner: resolvedOwner,
+                noteID: resolvedNoteID,
+                selectedText: command.selectedText,
+                anchorRect: command.viewportRect
+            )
+        case "openSelectionAssistantQuestionComposer":
+            guard let resolvedOwner,
+                let resolvedNoteID,
+                let selection = threadNoteSelectionContext(
+                    owner: resolvedOwner,
+                    noteID: resolvedNoteID,
+                    selectedText: command.selectedText,
+                    anchorRect: command.viewportRect
+                )
+            else {
+                hideThreadNoteSelectionAssistantActionsIfNeeded()
+                return
+            }
+            askQuestionAboutSelection(using: selection)
+        case "hideSelectionAssistantActions":
+            hideThreadNoteSelectionAssistantActionsIfNeeded()
         case "requestAIDraftPreview":
             guard let resolvedOwner,
-                  let noteText = command.text else { return }
+                let noteText = command.text
+            else { return }
             requestThreadNoteAIDraftPreview(
                 owner: resolvedOwner,
                 noteText: noteText,
@@ -2132,23 +4750,118 @@ struct AssistantWindowView: View {
             regenerateThreadNoteChartDraft(
                 owner: resolvedOwner,
                 currentDraftMarkdown: command.currentDraftMarkdown,
-                styleInstruction: command.styleInstruction
+                styleInstruction: command.styleInstruction,
+                renderError: command.renderError
             )
         case "applyAIDraftPreview", "cancelAIDraftPreview", "clearAIDraftPreview":
             guard let resolvedOwner else { return }
             clearThreadNoteAIDraftState(for: resolvedOwner)
-        case "openSettings":
-            NotificationCenter.default.post(
-                name: .openAssistOpenSettings,
-                object: SettingsRoute(section: .advanced, cardID: "advanced.notesBackup")
+        case "requestProjectNoteTransferPreview":
+            guard let resolvedOwner,
+                let resolvedNoteID,
+                let noteText = command.text,
+                let targetProjectID = command.targetProjectID,
+                let targetNoteID = command.targetNoteID,
+                let selectedText = command.selectedText
+            else {
+                return
+            }
+            requestProjectNoteTransferPreview(
+                owner: resolvedOwner,
+                sourceNoteID: resolvedNoteID,
+                sourceNoteTitle: command.sourceNoteTitle,
+                noteText: noteText,
+                selectedMarkdown: selectedText,
+                targetProjectID: targetProjectID,
+                targetNoteID: targetNoteID
             )
-        case "openOwningThread":
-            guard let threadID = command.threadID?
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-                .nonEmpty
+        case "applyProjectNoteTransfer":
+            guard let resolvedOwner,
+                let resolvedNoteID,
+                let placementChoice = command.placementChoice,
+                let transferMode = command.transferMode,
+                let sourceFingerprint = command.sourceFingerprint,
+                let targetFingerprint = command.targetFingerprint
+            else {
+                return
+            }
+            applyProjectNoteTransfer(
+                owner: resolvedOwner,
+                sourceNoteID: resolvedNoteID,
+                transferMode: transferMode,
+                placementChoice: placementChoice,
+                sourceFingerprint: sourceFingerprint,
+                targetFingerprint: targetFingerprint,
+                sourceTextAfterMove: command.sourceTextAfterMove
+            )
+        case "cancelProjectNoteTransferPreview":
+            guard let resolvedOwner else { return }
+            clearThreadNoteProjectTransferState(for: resolvedOwner)
+        case "requestBatchNotePlanPreview":
+            guard
+                let projectID = command.targetProjectID?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .nonEmpty,
+                !command.sourceNotes.isEmpty
+            else {
+                return
+            }
+            requestBatchNotePlanPreview(
+                projectID: projectID,
+                sourceSelections: command.sourceNotes
+            )
+        case "applyBatchNotePlanPreview":
+            guard
+                let projectID = command.targetProjectID?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .nonEmpty,
+                let previewID = command.previewID?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .nonEmpty
+            else {
+                return
+            }
+            applyBatchNotePlanPreview(
+                projectID: projectID,
+                previewID: previewID,
+                proposedNotes: command.proposedNotes,
+                proposedLinks: command.proposedLinks
+            )
+        case "cancelBatchNotePlanPreview":
+            guard
+                let projectID = command.targetProjectID?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .nonEmpty
+            else {
+                return
+            }
+            clearBatchNotePlanState(for: projectID)
+        case "openProjectNotes":
+            let projectID =
+                command.targetProjectID
+                ?? command.ownerID
                 ?? resolvedOwner?.id
-                ?? command.ownerID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty,
-                  resolvedOwner?.kind == .thread || command.ownerKind == AssistantNoteOwnerKind.thread.rawValue
+            guard let projectID,
+                let project = sidebarProject(for: projectID),
+                project.isProject
+            else {
+                return
+            }
+            openProjectNotes(for: project)
+        case "openSettings":
+                NotificationCenter.default.post(
+                    name: .openAssistOpenSettings,
+                    object: SettingsRoute(section: .general, subsection: .generalNotesBackup)
+                )
+        case "openOwningThread":
+            guard
+                let threadID = command.threadID?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .nonEmpty
+                    ?? resolvedOwner?.id
+                    ?? command.ownerID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty,
+                resolvedOwner?.kind == .thread
+                    || command.ownerKind == AssistantNoteOwnerKind.thread.rawValue
             else {
                 return
             }
@@ -2156,6 +4869,99 @@ struct AssistantWindowView: View {
             openThread(threadID)
         default:
             break
+        }
+    }
+
+    private func captureThreadNoteScreenshotImport(
+        requestID: String
+    ) async -> AssistantChatWebThreadNoteScreenshotCaptureResult {
+        guard CGPreflightScreenCaptureAccess() else {
+            return AssistantChatWebThreadNoteScreenshotCaptureResult(
+                requestID: requestID,
+                ok: false,
+                cancelled: false,
+                message: "Grant Screen Recording in macOS Settings so Open Assist can capture screenshots.",
+                filename: nil,
+                mimeType: nil,
+                dataURL: nil
+            )
+        }
+
+        let fileManager = FileManager.default
+        let temporaryURL = fileManager.temporaryDirectory
+            .appendingPathComponent("openassist-thread-note-screenshot-\(UUID().uuidString)")
+            .appendingPathExtension("png")
+
+        defer {
+            try? fileManager.removeItem(at: temporaryURL)
+        }
+
+        do {
+            let terminationStatus = try await runInteractiveScreenshot(to: temporaryURL)
+            guard fileManager.fileExists(atPath: temporaryURL.path) else {
+                return AssistantChatWebThreadNoteScreenshotCaptureResult(
+                    requestID: requestID,
+                    ok: false,
+                    cancelled: terminationStatus != 0,
+                    message: terminationStatus == 0
+                        ? "Open Assist could not find the captured screenshot."
+                        : nil,
+                    filename: nil,
+                    mimeType: nil,
+                    dataURL: nil
+                )
+            }
+
+            let data = try Data(contentsOf: temporaryURL)
+            guard !data.isEmpty else {
+                return AssistantChatWebThreadNoteScreenshotCaptureResult(
+                    requestID: requestID,
+                    ok: false,
+                    cancelled: false,
+                    message: "The captured screenshot was empty. Please try again.",
+                    filename: nil,
+                    mimeType: nil,
+                    dataURL: nil
+                )
+            }
+
+            return AssistantChatWebThreadNoteScreenshotCaptureResult(
+                requestID: requestID,
+                ok: true,
+                cancelled: false,
+                message: nil,
+                filename: "Screenshot-\(Date.now.formatted(.iso8601.year().month().day())).png",
+                mimeType: "image/png",
+                dataURL: "data:image/png;base64,\(data.base64EncodedString())"
+            )
+        } catch {
+            return AssistantChatWebThreadNoteScreenshotCaptureResult(
+                requestID: requestID,
+                ok: false,
+                cancelled: false,
+                message: "Open Assist could not capture the screenshot: \(error.localizedDescription)",
+                filename: nil,
+                mimeType: nil,
+                dataURL: nil
+            )
+        }
+    }
+
+    private func runInteractiveScreenshot(to fileURL: URL) async throws -> Int32 {
+        try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let process = Process()
+                process.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+                process.arguments = ["-i", "-x", fileURL.path]
+
+                do {
+                    try process.run()
+                    process.waitUntilExit()
+                    continuation.resume(returning: process.terminationStatus)
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
         }
     }
 
@@ -2178,20 +4984,23 @@ struct AssistantWindowView: View {
         let normalizedStyleInstruction = styleInstruction?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .nonEmpty
-        let resolvedSourceKind = (requestKind == "selection" && normalizedSelectedText != nil)
+        let resolvedSourceKind =
+            (requestKind == "selection" && normalizedSelectedText != nil)
             ? "selection"
             : "whole"
 
         if resolvedDraftMode == "chart" {
-            let chartSelection = normalizedSelectedText
+            let chartSelection =
+                normalizedSelectedText
                 ?? noteText.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
             guard let chartSelection else {
-                threadNoteAIDraftPreviewByOwnerKey[owner.storageKey] = AssistantChatWebThreadNoteAIPreview(
-                    mode: "chart",
-                    sourceKind: resolvedSourceKind,
-                    markdown: "Select or right-click some note text first.",
-                    isError: true
-                )
+                threadNoteAIDraftPreviewByOwnerKey[owner.storageKey] =
+                    AssistantChatWebThreadNoteAIPreview(
+                        mode: "chart",
+                        sourceKind: resolvedSourceKind,
+                        markdown: "Select or right-click some note text first.",
+                        isError: true
+                    )
                 threadNoteAIDraftModeByOwnerKey[owner.storageKey] = "chart"
                 threadNoteGeneratingAIDraftOwnerKeys.remove(owner.storageKey)
                 threadNoteAIDraftRequestIDByOwnerKey.removeValue(forKey: owner.storageKey)
@@ -2251,18 +5060,21 @@ struct AssistantWindowView: View {
             let result = await MemoryEntryExplanationService.shared.organizeThreadNote(
                 noteText: noteText,
                 selectedText: resolvedSourceKind == "selection" ? normalizedSelectedText : nil,
+                styleInstruction: normalizedStyleInstruction,
                 onPartialText: { partialText in
                     Task { @MainActor in
-                        guard self.threadNoteAIDraftRequestIDByOwnerKey[owner.storageKey] == requestID else {
+                        guard
+                            self.threadNoteAIDraftRequestIDByOwnerKey[owner.storageKey] == requestID
+                        else {
                             return
                         }
                         self.threadNoteAIDraftPreviewByOwnerKey[owner.storageKey] =
                             AssistantChatWebThreadNoteAIPreview(
-                            mode: "organize",
-                            sourceKind: resolvedSourceKind,
-                            markdown: partialText,
-                            isError: false
-                        )
+                                mode: "organize",
+                                sourceKind: resolvedSourceKind,
+                                markdown: partialText,
+                                isError: false
+                            )
                     }
                 }
             )
@@ -2295,19 +5107,22 @@ struct AssistantWindowView: View {
 
     private func presentThreadNoteMenu(threadID: String, anchorRect: CGRect) {
         let availableOwners = availableNoteOwners(for: threadID)
-        guard let owner = selectedNoteOwnerByThreadID[threadID].flatMap({ selectedOwner in
-            availableOwners.contains(selectedOwner) ? selectedOwner : nil
-        }) ?? availableOwners.first else { return }
+        guard
+            let owner = selectedNoteOwnerByThreadID[threadID].flatMap({ selectedOwner in
+                availableOwners.contains(selectedOwner) ? selectedOwner : nil
+            }) ?? availableOwners.first
+        else { return }
 
         persistThreadNoteIfNeeded(for: owner)
 
         let workspace = loadNotesWorkspace(for: owner)
-        let manifest = noteManifestByOwnerKey[owner.storageKey]
+        let manifest =
+            noteManifestByOwnerKey[owner.storageKey]
             ?? workspace?.manifest
             ?? AssistantNoteManifest()
         let notes = manifest.orderedNotes
 
-        guard let container = chatWebContainer else {
+        guard let container = threadNoteWebContainer else {
             return
         }
 
@@ -2392,14 +5207,7 @@ struct AssistantWindowView: View {
     }
 
     private var hasVisibleStreamingAssistantMessage: Bool {
-        guard let lastVisibleItem = visibleRenderItems.last else { return false }
-        guard case .timeline(let item) = lastVisibleItem else { return false }
-        switch item.kind {
-        case .assistantProgress, .assistantFinal:
-            return item.isStreaming
-        default:
-            return false
-        }
+        assistantTimelineHasVisibleStreamingAssistantContent(visibleRenderItems.last)
     }
 
     private var selectedSessionActivitySnapshot: AssistantSessionActivitySnapshot {
@@ -2442,8 +5250,9 @@ struct AssistantWindowView: View {
     private var typingIndicatorDetail: String {
         let hudState = selectedSessionActivitySnapshot.hudState ?? assistant.hudState
         if let detail = hudState.detail?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !detail.isEmpty,
-           hudState.phase.isActive {
+            !detail.isEmpty,
+            hudState.phase.isActive
+        {
             return detail
         }
 
@@ -2479,11 +5288,12 @@ struct AssistantWindowView: View {
                 dict[threadKey] = session.status
             }
 
-            let providerKeys = (
-                [session.providerSessionID, session.activeProviderSessionID]
-                + session.providerBindingsByBackend.map(\.providerSessionID)
-            )
-            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty?.lowercased() }
+            let providerKeys =
+                ([session.providerSessionID, session.activeProviderSessionID]
+                + session.providerBindingsByBackend.map(\.providerSessionID))
+                .compactMap {
+                    $0?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty?.lowercased()
+                }
 
             for providerKey in providerKeys where !providerKey.isEmpty {
                 dict[providerKey] = session.status
@@ -2504,11 +5314,12 @@ struct AssistantWindowView: View {
                 dict[threadKey] = cwd
             }
 
-            let providerKeys = (
-                [session.providerSessionID, session.activeProviderSessionID]
-                + session.providerBindingsByBackend.map(\.providerSessionID)
-            )
-            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty?.lowercased() }
+            let providerKeys =
+                ([session.providerSessionID, session.activeProviderSessionID]
+                + session.providerBindingsByBackend.map(\.providerSessionID))
+                .compactMap {
+                    $0?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty?.lowercased()
+                }
 
             for providerKey in providerKeys where !providerKey.isEmpty {
                 dict[providerKey] = cwd
@@ -2535,6 +5346,42 @@ struct AssistantWindowView: View {
     private var isAgentBusy: Bool {
         let phase = assistant.hudState.phase
         return phase == .acting || phase == .thinking || phase == .streaming
+    }
+
+    private var composerHasPendingInput: Bool {
+        selectedSessionActivitySnapshot.pendingPermissionRequest?.toolKind == "userInput"
+    }
+
+    private var composerHasPendingToolApproval: Bool {
+        selectedSessionActivitySnapshot.pendingPermissionRequest != nil && !composerHasPendingInput
+    }
+
+    private var composerCanCancelActiveTurn: Bool {
+        let snapshot = selectedSessionActivitySnapshot
+        return snapshot.hasActiveTurn
+            || snapshot.pendingPermissionRequest != nil
+            || snapshot.awaitingAssistantStart
+    }
+
+    private var composerActiveTurnPhase: String {
+        let snapshot = selectedSessionActivitySnapshot
+        if composerHasPendingInput || composerHasPendingToolApproval {
+            return "needsInput"
+        }
+
+        let phase = snapshot.hudState?.phase ?? assistant.hudState.phase
+        switch phase {
+        case .thinking:
+            return composerCanCancelActiveTurn ? "thinking" : "idle"
+        case .streaming:
+            return composerCanCancelActiveTurn ? "streaming" : "idle"
+        case .acting, .listening:
+            return composerCanCancelActiveTurn ? "acting" : "idle"
+        case .waitingForPermission:
+            return "needsInput"
+        case .idle, .success, .failed:
+            return composerCanCancelActiveTurn ? "acting" : "idle"
+        }
     }
 
     private var isVoiceCapturing: Bool {
@@ -2586,8 +5433,12 @@ struct AssistantWindowView: View {
     {
         let maxSidebarWidth = max(210.0, safeWindowWidth - (outerPadding * 2) - 320.0 - 0.5)
         if isCompactSidebarPresentation {
-            let compactSidebarWidth = min(190.0, max(160.0, safeWindowWidth * 0.20))
-            return min(compactSidebarWidth, maxSidebarWidth)
+            let compactMaxSidebarWidth = min(280.0, maxSidebarWidth)
+            if compactSidebarInnerWidth > 0 {
+                return min(max(200.0, CGFloat(compactSidebarInnerWidth)), compactMaxSidebarWidth)
+            }
+            let compactSidebarWidth = min(248.0, max(216.0, safeWindowWidth * 0.30))
+            return min(compactSidebarWidth, compactMaxSidebarWidth)
         }
         if sidebarCustomWidth > 0 {
             return min(max(180.0, CGFloat(sidebarCustomWidth)), maxSidebarWidth)
@@ -2599,13 +5450,14 @@ struct AssistantWindowView: View {
 
     private func sidebarResizeHandle(layout: ChatLayoutMetrics) -> some View {
         Color.clear
-            .frame(width: 8)
+            .frame(width: 10)
             .frame(maxHeight: .infinity)
             .contentShape(Rectangle())
             .overlay(
                 Rectangle()
-                    .fill(AppVisualTheme.surfaceFill(sidebarDragStartWidth > 0 ? 0.14 : 0.06))
-                    .frame(width: 0.5)
+                    .fill(AppVisualTheme.surfaceFill(sidebarDragStartWidth > 0 ? 0.14 : 0.10))
+                    .frame(width: 1)
+                    .opacity((isSidebarResizeHandleHovered || sidebarDragStartWidth > 0) ? 1 : 0)
             )
             .gesture(
                 DragGesture(minimumDistance: 2)
@@ -2615,8 +5467,15 @@ struct AssistantWindowView: View {
                             NSCursor.resizeLeftRight.push()
                         }
                         let newWidth = sidebarDragStartWidth + value.translation.width
-                        let maxWidth = max(210.0, layout.windowWidth - (layout.outerPadding * 2) - 320.0 - 0.5)
-                        sidebarCustomWidth = Double(min(max(180.0, newWidth), maxWidth))
+                        let maxWidth = max(
+                            210.0, layout.windowWidth - (layout.outerPadding * 2) - 320.0 - 0.5)
+                        let minWidth = isCompactSidebarPresentation ? 200.0 : 180.0
+                        let clampedWidth = Double(min(max(minWidth, newWidth), maxWidth))
+                        if isCompactSidebarPresentation {
+                            compactSidebarInnerWidth = clampedWidth
+                        } else {
+                            sidebarCustomWidth = clampedWidth
+                        }
                     }
                     .onEnded { _ in
                         sidebarDragStartWidth = 0
@@ -2624,6 +5483,7 @@ struct AssistantWindowView: View {
                     }
             )
             .onHover { hovering in
+                isSidebarResizeHandleHovered = hovering
                 if hovering && sidebarDragStartWidth == 0 {
                     NSCursor.resizeLeftRight.push()
                 } else if !hovering && sidebarDragStartWidth == 0 {
@@ -2662,7 +5522,7 @@ struct AssistantWindowView: View {
 
     private func ensureNotesProjectSelectionIfNeeded() {
         guard selectedNotesProject == nil,
-              let fallbackProject = assistant.selectedProject ?? assistant.visibleLeafProjects.first
+            let fallbackProject = assistant.selectedProject ?? assistant.visibleLeafProjects.first
         else {
             return
         }
@@ -2672,11 +5532,181 @@ struct AssistantWindowView: View {
         }
     }
 
+    private func syncAssistantNotesRuntimeContext() {
+        assistant.setNotesWorkspaceRuntimeContext(notesAssistantRuntimeContext)
+    }
+
+    private func syncNotesAssistantConversationBinding() {
+        notesAssistantSessionTask?.cancel()
+        notesAssistantSessionTask = Task { @MainActor in
+            if selectedSidebarPane == .notes,
+                isNotesAssistantPanelOpen,
+                let project = selectedNotesProject
+            {
+                await activateNotesAssistantSession(for: project)
+            } else {
+                await restorePrimaryAssistantSessionAfterNotesIfNeeded()
+            }
+        }
+    }
+
+    @MainActor
+    private func activateNotesAssistantSession(for project: AssistantProject) async {
+        await activateNotesAssistantSession(for: project, preferredSessionID: nil)
+    }
+
+    @MainActor
+    private func activateNotesAssistantSession(
+        for project: AssistantProject,
+        preferredSessionID: String?
+    ) async {
+        if notesAssistantReturnSessionID == nil,
+            !isNotesAssistantSession(assistant.selectedSessionID)
+        {
+            notesAssistantReturnSessionID = assistant.selectedSessionID
+        }
+
+        guard
+            let targetSessionID = await ensureNotesAssistantSession(
+                for: project,
+                preferredSessionID: preferredSessionID
+            )
+        else {
+            return
+        }
+
+        guard !assistantTimelineSessionIDsMatch(assistant.selectedSessionID, targetSessionID) else {
+            rememberNotesAssistantSessionID(targetSessionID, for: project.id, makeLastUsed: true)
+            syncAssistantNotesRuntimeContext()
+            return
+        }
+
+        if let session = assistant.sessions.first(where: {
+            assistantTimelineSessionIDsMatch($0.id, targetSessionID)
+        }) {
+            await assistant.openSession(session)
+        } else {
+            assistant.selectedSessionID = targetSessionID
+        }
+
+        rememberNotesAssistantSessionID(targetSessionID, for: project.id, makeLastUsed: true)
+        syncAssistantNotesRuntimeContext()
+    }
+
+    @MainActor
+    private func ensureNotesAssistantSession(
+        for project: AssistantProject,
+        preferredSessionID: String? = nil
+    ) async -> String? {
+        if let preferredSessionID = assistantNormalizedNotesSessionID(preferredSessionID),
+            let matchedPreferredSession = assistant.sessions.first(where: {
+                assistantTimelineSessionIDsMatch($0.id, preferredSessionID)
+            }),
+            !matchedPreferredSession.isArchived
+        {
+            assistant.assignSessionToProject(matchedPreferredSession.id, projectID: project.id)
+            rememberNotesAssistantSessionID(
+                matchedPreferredSession.id,
+                for: project.id,
+                makeLastUsed: true
+            )
+            return matchedPreferredSession.id
+        }
+
+        if let existingSessionID = notesAssistantResolvedSessionID(for: project),
+            let existingSession = assistant.sessions.first(where: {
+                assistantTimelineSessionIDsMatch($0.id, existingSessionID)
+            })
+        {
+            assistant.assignSessionToProject(existingSession.id, projectID: project.id)
+            rememberNotesAssistantSessionID(existingSession.id, for: project.id, makeLastUsed: true)
+            return existingSession.id
+        }
+
+        if notesAssistantSessionRegistry(for: project.id) != nil {
+            await assistant.refreshSessions(limit: max(200, assistant.visibleSessionsLimit + 20))
+            pruneNotesAssistantSessionRegistry(for: project)
+
+            if let recoveredSessionID = notesAssistantResolvedSessionID(for: project),
+                let recoveredSession = assistant.sessions.first(where: {
+                    assistantTimelineSessionIDsMatch($0.id, recoveredSessionID)
+                })
+            {
+                assistant.assignSessionToProject(recoveredSession.id, projectID: project.id)
+                rememberNotesAssistantSessionID(
+                    recoveredSession.id,
+                    for: project.id,
+                    makeLastUsed: true
+                )
+                return recoveredSession.id
+            }
+        }
+
+        return await createNotesAssistantSession(for: project)
+    }
+
+    @MainActor
+    private func createNotesAssistantSession(for project: AssistantProject) async -> String? {
+        let previousReturnSessionID = notesAssistantReturnSessionID
+        await assistant.startNewSession(cwd: project.linkedFolderPath)
+        guard
+            let createdSessionID = assistant.selectedSessionID?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .nonEmpty
+        else {
+            return nil
+        }
+
+        assistant.assignSessionToProject(createdSessionID, projectID: project.id)
+        let existingRegistry =
+            notesAssistantSessionRegistry(for: project.id)
+            ?? AssistantNotesProjectSessionRegistry()
+        await assistant.renameSession(
+            createdSessionID,
+            to: notesAssistantSessionTitle(for: project, existingRegistry: existingRegistry)
+        )
+        rememberNotesAssistantSessionID(createdSessionID, for: project.id, makeLastUsed: true)
+        notesAssistantReturnSessionID = previousReturnSessionID
+        syncAssistantNotesRuntimeContext()
+        return createdSessionID
+    }
+
+    @MainActor
+    private func restorePrimaryAssistantSessionAfterNotesIfNeeded() async {
+        guard isNotesAssistantSession(assistant.selectedSessionID) else { return }
+
+        let targetSessionID = notesAssistantReturnSessionID?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nonEmpty
+
+        defer {
+            notesAssistantReturnSessionID = nil
+            syncAssistantNotesRuntimeContext()
+        }
+
+        if let targetSessionID,
+            let session = assistant.sessions.first(where: {
+                assistantTimelineSessionIDsMatch($0.id, targetSessionID)
+            })
+        {
+            await assistant.openSession(session)
+            return
+        }
+
+        if let fallbackSession = sidebarVisibleSessions.first {
+            await assistant.openSession(fallbackSession)
+            return
+        }
+
+        assistant.selectedSessionID = nil
+    }
+
     private func selectNotesProject(_ project: AssistantProject?) {
         persistThreadNoteIfNeeded(for: currentThreadNoteOwner)
         selectedNotesProjectID = project?.id
         if let project,
-           let parentID = project.parentID {
+            let parentID = project.parentID
+        {
             setFolderExpanded(parentID, expanded: true)
         }
         selectedSidebarPane = .notes
@@ -2695,6 +5725,11 @@ struct AssistantWindowView: View {
     ) {
         guard let project = selectedNotesProject else { return }
         let scope: AssistantNotesScope = owner.kind == .project ? .project : .thread
+        let selectedRow = sidebarNoteRows(for: project, scope: scope).first(where: {
+            $0.target.ownerKind == owner.kind
+                && $0.target.ownerID.caseInsensitiveCompare(owner.id) == .orderedSame
+                && $0.target.noteID.caseInsensitiveCompare(noteID) == .orderedSame
+        })
         selectedSidebarPane = .notes
         selectedNotesScope = scope
         rememberNotesSelectionTarget(
@@ -2703,6 +5738,12 @@ struct AssistantWindowView: View {
             scope: scope
         )
         persistThreadNoteIfNeeded(for: currentThreadNoteOwner)
+        if scope == .project {
+            setNoteFolderPathExpanded(
+                folderID: selectedRow?.folderID,
+                folders: noteManifest(for: AssistantNoteOwnerKey(kind: .project, id: project.id)).folders
+            )
+        }
         clearThreadNoteNavigationStack(for: nil)
         if let workspace = selectNotesWorkspace(for: owner, noteID: noteID) {
             applyThreadNoteWorkspace(workspace)
@@ -2724,7 +5765,8 @@ struct AssistantWindowView: View {
 
     private func revealLatestFileChangeActivity() {
         guard let latestFileChangeMessageID else { return }
-        chatWebContainer?.revealMessage(id: latestFileChangeMessageID, animated: true, expand: true)
+        chatTimelineWebContainer?.revealMessage(
+            id: latestFileChangeMessageID, animated: true, expand: true)
     }
 
     private var shouldShowLiveVoicePanel: Bool {
@@ -2787,13 +5829,18 @@ struct AssistantWindowView: View {
         case .transcribing:
             return ("waveform", "Live voice is turning your speech into text.", .cyan)
         case .sending:
-            return ("paperplane.fill", "Live voice is sending your request.", AppVisualTheme.accentTint)
+            return (
+                "paperplane.fill", "Live voice is sending your request.", AppVisualTheme.accentTint
+            )
         case .waitingForPermission:
             return ("hand.raised.fill", "Live voice is waiting for approval.", .orange)
         case .speaking:
             return ("speaker.wave.2.fill", "Live voice is speaking back.", .purple)
         case .paused:
-            return ("pause.circle.fill", "Live voice is paused. Start again when you are ready.", .yellow)
+            return (
+                "pause.circle.fill", "Live voice is paused. Start again when you are ready.",
+                .yellow
+            )
         case .idle, .ended:
             break
         }
@@ -2813,7 +5860,10 @@ struct AssistantWindowView: View {
         return nil
     }
 
-    private var composerPlaceholder: String {
+    private func composerPlaceholder(
+        isNoteModeActive: Bool,
+        isNotesWorkspaceAssistant: Bool
+    ) -> String {
         if !settings.assistantBetaEnabled {
             return "Enable assistant in Settings to chat."
         }
@@ -2823,6 +5873,9 @@ struct AssistantWindowView: View {
         if let composerPendingPermissionHelperText {
             return composerPendingPermissionHelperText
         }
+        if isNotesWorkspaceAssistant && shouldDeferNotesAssistantSetupState {
+            return "Ask about this note."
+        }
         if assistant.isLoadingModels {
             return "Loading models..."
         }
@@ -2830,6 +5883,12 @@ struct AssistantWindowView: View {
             return assistant.visibleModels.isEmpty
                 ? "Models will appear here when \(assistant.visibleAssistantBackendName) is ready."
                 : "Select a model to start chatting..."
+        }
+        if isNotesWorkspaceAssistant {
+            return "Ask about this note."
+        }
+        if isNoteModeActive {
+            return "Ask about project notes, add to the best note, or organize a note."
         }
         return "What would you like to do?"
     }
@@ -2841,13 +5900,42 @@ struct AssistantWindowView: View {
         return "Answer or approve the card above to continue this turn."
     }
 
+    private var shouldDeferNotesAssistantSetupState: Bool {
+        isNotesPaneActive
+            && isNotesAssistantPanelOpen
+            && trimmedPromptDraft.isEmpty
+            && assistant.attachments.isEmpty
+            && assistant.pendingPermissionRequest == nil
+            && !assistant.hasActiveTurn
+    }
+
+    private var notesAssistantPreflightStatusMessage: String? {
+        guard isNotesPaneActive, isNotesAssistantPanelOpen else { return nil }
+        guard !trimmedPromptDraft.isEmpty || !assistant.attachments.isEmpty else { return nil }
+
+        if !settings.assistantBetaEnabled {
+            return "Enable the assistant in Settings before sending note requests."
+        }
+
+        if !canChat {
+            return
+                "Use the provider menu to connect \(assistant.visibleAssistantBackendName), then try again."
+        }
+
+        if let composerPendingPermissionHelperText {
+            return composerPendingPermissionHelperText
+        }
+
+        return assistant.conversationBlockedReason
+    }
+
     private var emptyStateMessage: String {
         if !settings.assistantBetaEnabled {
             return "Enable the assistant in Settings, then come back here."
         }
         if !canChat {
             return
-                "Open Setup to connect to \(assistant.visibleAssistantBackendName), then come back to chat."
+                "Use the provider menu to connect \(assistant.visibleAssistantBackendName), then come back to chat."
         }
         return assistant.conversationBlockedReason
             ?? "Send a message to start a conversation with the assistant."
@@ -2897,12 +5985,24 @@ struct AssistantWindowView: View {
 
     private var currentProjectWorkspaceURL: URL? {
         let notesProjectURL = existingDirectoryURL(for: selectedNotesProject?.linkedFolderPath)
-        let focusedProjectURL = existingDirectoryURL(for: currentProjectNotesProject?.linkedFolderPath)
+        let focusedProjectURL = existingDirectoryURL(
+            for: currentProjectNotesProject?.linkedFolderPath)
         return (isNotesPaneActive ? notesProjectURL : nil) ?? focusedProjectURL
     }
 
     private var currentWorkspaceURL: URL? {
         currentProjectWorkspaceURL ?? activeSessionWorkspaceURL
+    }
+
+    /// On-disk URL of the markdown file for the currently displayed note, if any.
+    /// Returns `nil` when no note is focused or the note has no saved file yet.
+    private var currentNoteMarkdownFileURL: URL? {
+        guard let target = currentDisplayedNoteTarget else { return nil }
+        return assistant.noteMarkdownFileURL(
+            ownerKind: target.ownerKind,
+            ownerID: target.ownerID,
+            noteID: target.noteID
+        )
     }
 
     private var currentWorkspaceSubjectLabel: String {
@@ -2962,12 +6062,30 @@ struct AssistantWindowView: View {
         return words.prefix(maxWords).joined(separator: " ") + "..."
     }
 
+    private var sidebarVisibleSessionsIgnoringProjectFilter: [AssistantSessionSummary] {
+        assistant.visibleSidebarSessionsIgnoringProjectFilter.filter { session in
+            !isNotesAssistantSession(session.id)
+        }
+    }
+
+    private var sidebarVisibleSessions: [AssistantSessionSummary] {
+        assistant.visibleSidebarSessions.filter { session in
+            !isNotesAssistantSession(session.id)
+        }
+    }
+
+    private var sidebarVisibleArchivedSessions: [AssistantSessionSummary] {
+        assistant.visibleArchivedSidebarSessions.filter { session in
+            !isNotesAssistantSession(session.id)
+        }
+    }
+
     private var visibleSidebarSessionCount: Int {
-        assistant.visibleSidebarSessions.count
+        sidebarVisibleSessions.count
     }
 
     private var visibleArchivedSessionCount: Int {
-        assistant.visibleArchivedSidebarSessions.count
+        sidebarVisibleArchivedSessions.count
     }
 
     private func syncSidebarVisibleSessionsLimitIfNeeded(newValue: Int? = nil) {
@@ -2985,35 +6103,66 @@ struct AssistantWindowView: View {
         }
     }
 
-    private func composerFallbackHeight(for layout: ChatLayoutMetrics) -> CGFloat {
+    private func composerFallbackHeight(
+        for layout: ChatLayoutMetrics,
+        compact: Bool
+    ) -> CGFloat {
         let accessoryRowCount =
             (assistant.activeThreadSkills.isEmpty ? 0 : 1)
             + (assistant.attachments.isEmpty ? 0 : 1)
 
-        return 182 + (CGFloat(accessoryRowCount) * 34)
+        if compact {
+            return 82 + (CGFloat(accessoryRowCount) * 18)
+        }
+
+        return 136 + (CGFloat(accessoryRowCount) * 28)
     }
 
-    private func composerWebHeight(for layout: ChatLayoutMetrics) -> CGFloat {
-        let minHeight: CGFloat = 170
-        let maxHeight: CGFloat = 300
-        let proposedHeight = composerMeasuredHeight ?? composerFallbackHeight(for: layout)
+    private func composerWebHeight(
+        for layout: ChatLayoutMetrics,
+        compact: Bool,
+        measuredHeight: CGFloat?
+    ) -> CGFloat {
+        let minHeight: CGFloat = compact ? 76 : 120
+        let maxHeight: CGFloat = compact ? 148 : 300
+        let proposedHeight =
+            measuredHeight
+            ?? composerFallbackHeight(for: layout, compact: compact)
         return min(max(proposedHeight, minHeight), maxHeight)
     }
 
-    private func updateComposerMeasuredHeight(_ height: CGFloat) {
+    private func updateComposerMeasuredHeight(_ height: CGFloat, compact: Bool = false) {
         guard height.isFinite else { return }
 
-        let boundedHeight = min(max(ceil(height), 140), 420)
-        guard composerMeasuredHeight == nil || abs((composerMeasuredHeight ?? 0) - boundedHeight) > 1
-        else {
-            return
-        }
+        let boundedHeight =
+            compact
+            ? min(max(ceil(height), 70), 180)
+            : min(max(ceil(height), 112), 420)
 
-        composerMeasuredHeight = boundedHeight
+        if compact {
+            guard
+                notesAssistantComposerMeasuredHeight == nil
+                    || abs((notesAssistantComposerMeasuredHeight ?? 0) - boundedHeight) > 1
+            else {
+                return
+            }
+
+            notesAssistantComposerMeasuredHeight = boundedHeight
+        } else {
+            guard
+                composerMeasuredHeight == nil
+                    || abs((composerMeasuredHeight ?? 0) - boundedHeight) > 1
+            else {
+                return
+            }
+
+            composerMeasuredHeight = boundedHeight
+        }
     }
 
     private var sidebarWebState: AssistantSidebarWebState {
         let notesRows = notesSidebarRows
+        let noteFolderRows = notesSidebarFolderRows
         return AssistantSidebarWebState(
             projectFilterKind: currentProjectFilterKind,
             projectFilterID: assistant.selectedProjectFilterID,
@@ -3023,7 +6172,8 @@ struct AssistantWindowView: View {
             canCreateThread: assistant.canCreateThread,
             canCollapse: true,
             projectsTitle: projectSectionTitle,
-            projectsHelperText: selectedSidebarPane == .notes ? "Choose which project's notes you want to browse." : nil,
+            projectsHelperText: selectedSidebarPane == .notes
+                ? "Choose which project's notes you want to browse." : nil,
             threadsTitle: "Threads",
             threadsHelperText: nil,
             archivedTitle: "Archived",
@@ -3054,7 +6204,9 @@ struct AssistantWindowView: View {
                     symbol: "clock"),
                 .init(id: AssistantSidebarPane.skills.shellID, label: "Skills", symbol: "sparkles"),
             ],
-            allProjects: assistant.visibleProjects.map { sidebarWebProject(for: $0, selectedProjectID: sidebarSelectedProjectID) },
+            allProjects: assistant.visibleProjects.map {
+                sidebarWebProject(for: $0, selectedProjectID: sidebarSelectedProjectID)
+            },
             hiddenProjects: assistant.hiddenProjects.map { project in
                 AssistantSidebarWebHiddenProject(
                     id: project.id,
@@ -3062,13 +6214,18 @@ struct AssistantWindowView: View {
                     symbol: project.displayIconSymbolName
                 )
             },
-            projects: displayedSidebarProjects.map { sidebarWebProject(for: $0, selectedProjectID: sidebarSelectedProjectID) },
-            threads: assistant.visibleSidebarSessions
+            projects: displayedSidebarProjects.map {
+                sidebarWebProject(for: $0, selectedProjectID: sidebarSelectedProjectID)
+            },
+            threads:
+                sidebarVisibleSessions
                 .prefix(assistant.visibleSessionsLimit)
                 .map { sidebarWebSession(for: $0) },
-            archived: assistant.visibleArchivedSidebarSessions
+            archived:
+                sidebarVisibleArchivedSessions
                 .prefix(assistant.visibleSessionsLimit)
                 .map { sidebarWebSession(for: $0) },
+            noteFolders: noteFolderRows.map(sidebarWebNoteFolder(for:)),
             notes: notesRows.map(sidebarWebNote(for:))
         )
     }
@@ -3085,6 +6242,11 @@ struct AssistantWindowView: View {
     private var notesSidebarRows: [AssistantSidebarNoteRowModel] {
         guard let project = selectedNotesProject else { return [] }
         return sidebarNoteRows(for: project, scope: selectedNotesScope)
+    }
+
+    private var notesSidebarFolderRows: [AssistantSidebarNoteFolderRowModel] {
+        guard let project = selectedNotesProject else { return [] }
+        return sidebarNoteFolderRows(for: project, scope: selectedNotesScope)
     }
 
     private var notesSidebarHelperText: String? {
@@ -3106,45 +6268,116 @@ struct AssistantWindowView: View {
         }
     }
 
-    private var composerWebState: AssistantComposerWebState {
-        AssistantComposerWebState(
-            draftText: assistant.promptDraft,
-            placeholder: composerPlaceholder,
-            isEnabled: settings.assistantBetaEnabled && !isVoiceCapturing,
-            canSend: canSendMessage && !isVoiceCapturing,
-            isBusy: isAgentBusy,
-            isVoiceCapturing: isVoiceCapturing,
-            canUseVoiceInput: settings.assistantVoiceTaskEntryEnabled,
-            showStopVoicePlayback: assistant.assistantVoicePlaybackActive && !isAgentBusy,
-            canOpenSkills: assistant.canAttachSkillsToSelectedThread,
-            selectedInteractionMode: assistant.interactionMode.normalizedForActiveUse.rawValue,
-            interactionModes: AssistantInteractionMode.allCases.map {
-                AssistantComposerWebOption(id: $0.rawValue, label: $0.label)
-            },
-            selectedModelID: assistant.selectedModelID,
-            modelOptions: assistant.visibleModels.map {
-                AssistantComposerWebOption(id: $0.id, label: $0.displayName)
-            },
-            selectedReasoningID: assistant.reasoningEffort.rawValue,
-            reasoningOptions: supportedEfforts.map {
-                AssistantComposerWebOption(id: $0.rawValue, label: $0.label)
-            },
-            activeSkills: assistant.activeThreadSkills.map {
-                AssistantComposerWebSkill(
-                    skillName: $0.skillName,
-                    displayName: $0.displayName,
-                    isMissing: $0.isMissing
-                )
-            },
-            attachments: assistant.attachments.map {
-                AssistantComposerWebAttachment(
-                    id: $0.id.uuidString,
-                    filename: $0.filename,
-                    kind: $0.isImage ? "image" : "file",
-                    previewDataURL: $0.previewDataURL
-                )
-            }
+    private func makeComposerWebState(
+        isNotesWorkspaceAssistant: Bool
+    ) -> AssistantComposerWebState {
+        let localBackendNeedsSetup =
+            assistant.visibleAssistantBackend == .ollamaLocal
+            && !assistant.isLoadingModels
+            && !assistant.visibleModels.contains(where: \.isInstalled)
+        let isCompactComposer = isNotesWorkspaceAssistant
+        let isNoteModeActive = isNotesWorkspaceAssistant || assistant.taskMode == .note
+        let runtimeControlsState = assistant.runtimeControlsState(
+            for: assistant.visibleAssistantBackend,
+            availableModels: assistant.visibleModels,
+            isLoadingModels: assistant.isLoadingModels,
+            isBusy: composerCanCancelActiveTurn
         )
+        let noteModeLabel: String?
+        let noteModeHelperText: String?
+
+        if isNotesWorkspaceAssistant {
+            noteModeLabel = nil
+            noteModeHelperText = nil
+        } else if assistant.taskMode == .note {
+            noteModeLabel = "Note Mode"
+            noteModeHelperText =
+                activeSessionProject.map {
+                    "Whole project scope: \($0.name)"
+                } ?? assistant.selectedProject.map {
+                    "Whole project scope: \($0.name)"
+                } ?? "The assistant will prefer project notes and thread notes."
+        } else {
+            noteModeLabel = nil
+            noteModeHelperText = nil
+        }
+
+        return AssistantComposerWebState(
+            base: AssistantComposerWebBaseState(
+                draftText: assistant.promptDraft,
+                placeholder: composerPlaceholder(
+                    isNoteModeActive: isNoteModeActive,
+                    isNotesWorkspaceAssistant: isNotesWorkspaceAssistant
+                ),
+                isCompactComposer: isCompactComposer,
+                isEnabled: settings.assistantBetaEnabled && !isVoiceCapturing,
+                canSend: canSendMessage && !isVoiceCapturing,
+                isNoteModeActive: isNoteModeActive,
+                noteModeLabel: noteModeLabel,
+                noteModeHelperText: noteModeHelperText,
+                showNoteModeButton: !isNotesWorkspaceAssistant,
+                canOpenSkills: isCompactComposer
+                    ? false : assistant.canAttachSkillsToSelectedThread,
+                preflightStatusMessage: isCompactComposer
+                    ? notesAssistantPreflightStatusMessage : nil,
+                activeSkills: assistant.activeThreadSkills.map {
+                    AssistantComposerWebSkill(
+                        skillName: $0.skillName,
+                        displayName: $0.displayName,
+                        isMissing: $0.isMissing
+                    )
+                },
+                attachments: assistant.attachments.map {
+                    AssistantComposerWebAttachment(
+                        id: $0.id.uuidString,
+                        filename: $0.filename,
+                        kind: $0.isImage ? "image" : "file",
+                        previewDataURL: $0.previewDataURL
+                    )
+                }
+            ),
+            controls: AssistantComposerWebControlsState(
+                availability: runtimeControlsState.availability,
+                availabilityStatusText: runtimeControlsState.statusText.nonEmpty,
+                showsInteractionModeControl: !isCompactComposer,
+                showsModelControls: !isCompactComposer,
+                showsReasoningControls: !isCompactComposer,
+                selectedInteractionMode: assistant.interactionMode.normalizedForActiveUse.rawValue,
+                interactionModes: AssistantInteractionMode.allCases.map {
+                    AssistantComposerWebOption(id: $0.rawValue, label: $0.label)
+                },
+                selectedModelID: assistant.selectedModelID,
+                modelOptions: assistant.visibleModels.map {
+                    AssistantComposerWebOption(id: $0.id, label: $0.displayName)
+                },
+                modelPlaceholder: localBackendNeedsSetup ? "Install model" : "Select model",
+                opensModelSetupWhenUnavailable: localBackendNeedsSetup,
+                selectedReasoningID: assistant.reasoningEffort.rawValue,
+                reasoningOptions: supportedEfforts.map {
+                    AssistantComposerWebOption(id: $0.rawValue, label: $0.label)
+                }
+            ),
+            activity: AssistantComposerWebActivityState(
+                isBusy: composerCanCancelActiveTurn,
+                activeTurnPhase: composerActiveTurnPhase,
+                canCancelActiveTurn: composerCanCancelActiveTurn,
+                activeTurnProviderLabel: assistant.visibleAssistantBackend.shortDisplayName,
+                hasPendingToolApproval: composerHasPendingToolApproval,
+                hasPendingInput: composerHasPendingInput,
+                isVoiceCapturing: isVoiceCapturing,
+                canUseVoiceInput: settings.assistantVoiceTaskEntryEnabled,
+                showStopVoicePlayback: assistant.assistantVoicePlaybackActive
+                    && !composerCanCancelActiveTurn
+            )
+        )
+    }
+
+    private var composerWebState: AssistantComposerWebState {
+        makeComposerWebState(isNotesWorkspaceAssistant: false)
+    }
+
+    private var notesAssistantComposerWebState: AssistantComposerWebState {
+        makeComposerWebState(isNotesWorkspaceAssistant: true)
     }
 
     private var sidebarSessionAnimationKey: String {
@@ -3162,7 +6395,7 @@ struct AssistantWindowView: View {
     }
 
     private var projectThreadCountByProjectID: [String: Int] {
-        assistant.visibleSidebarSessionsIgnoringProjectFilter.reduce(into: [:]) { result, session in
+        sidebarVisibleSessionsIgnoringProjectFilter.reduce(into: [:]) { result, session in
             guard
                 let projectID = session.projectID?.trimmingCharacters(in: .whitespacesAndNewlines)
                     .lowercased()
@@ -3201,12 +6434,58 @@ struct AssistantWindowView: View {
     }
 
     private var effectiveExpandedFolderIDs: Set<String> {
-        let visibleFolderIDs = Set(assistant.visibleFolders.compactMap { normalizedSidebarProjectID($0.id) })
+        let visibleFolderIDs = Set(
+            assistant.visibleFolders.compactMap { normalizedSidebarProjectID($0.id) })
         var folderIDs = storedExpandedFolderIDs.intersection(visibleFolderIDs)
-        if let selectedProjectParentID = normalizedSidebarProjectID(assistant.selectedProject?.parentID) {
+        if let selectedProjectParentID = normalizedSidebarProjectID(
+            assistant.selectedProject?.parentID)
+        {
             folderIDs.insert(selectedProjectParentID)
         }
         return folderIDs
+    }
+
+    private var storedExpandedNoteFolderIDs: Set<String> {
+        Set(
+            expandedNoteFolderIDsRaw
+                .split(separator: ",")
+                .compactMap { normalizedSidebarProjectID(String($0)) }
+        )
+    }
+
+    private func persistExpandedNoteFolderIDs(_ folderIDs: Set<String>) {
+        expandedNoteFolderIDsRaw = folderIDs.sorted().joined(separator: ",")
+    }
+
+    private func setNoteFolderExpanded(_ folderID: String, expanded: Bool) {
+        guard let normalizedFolderID = normalizedSidebarProjectID(folderID) else { return }
+        var folderIDs = storedExpandedNoteFolderIDs
+        if expanded {
+            folderIDs.insert(normalizedFolderID)
+        } else {
+            folderIDs.remove(normalizedFolderID)
+        }
+        persistExpandedNoteFolderIDs(folderIDs)
+    }
+
+    private func setNoteFolderPathExpanded(
+        folderID: String?,
+        folders: [AssistantNoteFolderSummary]
+    ) {
+        guard let normalizedFolderID = normalizedSidebarProjectID(folderID) else { return }
+        let foldersByID = Dictionary(
+            uniqueKeysWithValues: folders.compactMap { folder in
+                normalizedSidebarProjectID(folder.id).map { ($0, folder) }
+            }
+        )
+        var folderIDs = storedExpandedNoteFolderIDs
+        var cursor = normalizedFolderID
+        while let folder = foldersByID[cursor] {
+            folderIDs.insert(cursor)
+            guard let parentFolderID = normalizedSidebarProjectID(folder.parentFolderID) else { break }
+            cursor = parentFolderID
+        }
+        persistExpandedNoteFolderIDs(folderIDs)
     }
 
     private var visibleRootFolders: [AssistantProject] {
@@ -3262,7 +6541,8 @@ struct AssistantWindowView: View {
             if childCount == 0 {
                 return "Only chats from \(folderName) are shown. This group has no projects yet."
             }
-            return "Showing chats from all \(childCount) project\(childCount == 1 ? "" : "s") inside \(folderName). Click it again to go back."
+            return
+                "Showing chats from all \(childCount) project\(childCount == 1 ? "" : "s") inside \(folderName). Click it again to go back."
         case .project:
             return "Click the current project again to go back to all projects."
         case nil:
@@ -3280,7 +6560,8 @@ struct AssistantWindowView: View {
 
     private var threadsFilterHelperText: String? {
         if let folder = assistant.selectedFolder {
-            return "Only chats inside the group \(folder.name) are shown. New chats start ungrouped until you move them into a project."
+            return
+                "Only chats inside the group \(folder.name) are shown. New chats start ungrouped until you move them into a project."
         }
         guard let project = assistant.selectedProject else { return nil }
         return "Only \(project.name) chats are shown. New chats stay here."
@@ -3303,7 +6584,8 @@ struct AssistantWindowView: View {
             default:
                 threadLabel = "\(threadCount) chats"
             }
-            return focused ? "\(projectLabel) · \(threadLabel) here" : "\(projectLabel) · \(threadLabel)"
+            return focused
+                ? "\(projectLabel) · \(threadLabel) here" : "\(projectLabel) · \(threadLabel)"
         }
 
         let count = projectThreadCountByProjectID[project.id.lowercased(), default: 0]
@@ -3361,7 +6643,8 @@ struct AssistantWindowView: View {
             default:
                 notesLabel = "\(totalNotes) notes"
             }
-            return focused ? "\(projectLabel) · \(notesLabel) here" : "\(projectLabel) · \(notesLabel)"
+            return focused
+                ? "\(projectLabel) · \(notesLabel) here" : "\(projectLabel) · \(notesLabel)"
         }
 
         let count = noteCount(in: project, scope: scope)
@@ -3383,12 +6666,17 @@ struct AssistantWindowView: View {
 
     private func threadCount(inFolder folder: AssistantProject) -> Int {
         let projectIDs = Set(
-            visibleChildProjects(for: folder).map { $0.id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+            visibleChildProjects(for: folder).map {
+                $0.id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            }
         )
         guard !projectIDs.isEmpty else { return 0 }
-        return assistant.visibleSidebarSessionsIgnoringProjectFilter.reduce(into: 0) { count, session in
-            guard let projectID = session.projectID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty?.lowercased(),
-                  projectIDs.contains(projectID) else {
+        return sidebarVisibleSessionsIgnoringProjectFilter.reduce(into: 0) { count, session in
+            guard
+                let projectID = session.projectID?.trimmingCharacters(in: .whitespacesAndNewlines)
+                    .nonEmpty?.lowercased(),
+                projectIDs.contains(projectID)
+            else {
                 return
             }
             count += 1
@@ -3397,10 +6685,11 @@ struct AssistantWindowView: View {
 
     private func sidebarProjectMenuTitle(for project: AssistantProject) -> String {
         guard let parentID = project.parentID,
-              let parent = assistant.visibleFolders.first(where: {
-                  $0.id.trimmingCharacters(in: .whitespacesAndNewlines)
-                      .caseInsensitiveCompare(parentID) == .orderedSame
-              }) else {
+            let parent = assistant.visibleFolders.first(where: {
+                $0.id.trimmingCharacters(in: .whitespacesAndNewlines)
+                    .caseInsensitiveCompare(parentID) == .orderedSame
+            })
+        else {
             return project.name
         }
         return "\(parent.name) / \(project.name)"
@@ -3415,8 +6704,11 @@ struct AssistantWindowView: View {
         selectedProjectID: String?
     ) -> AssistantSidebarWebProject {
         let isSelected = selectedProjectID?.caseInsensitiveCompare(project.id) == .orderedSame
-        let linkedFolderPath = project.linkedFolderPath?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
-        let subtitle = selectedSidebarPane == .notes
+        let linkedFolderPath = project.linkedFolderPath?.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        ).nonEmpty
+        let subtitle =
+            selectedSidebarPane == .notes
             ? projectNotesSubtitle(for: project, focused: isSelected)
             : projectThreadSubtitle(for: project, focused: isSelected)
         return AssistantSidebarWebProject(
@@ -3427,11 +6719,13 @@ struct AssistantWindowView: View {
             kind: project.kind.rawValue,
             depth: sidebarProjectDepth(for: project),
             isSelected: isSelected,
-            isExpanded: project.isFolder && effectiveExpandedFolderIDs.contains(project.id.lowercased()),
+            isExpanded: project.isFolder
+                && effectiveExpandedFolderIDs.contains(project.id.lowercased()),
             parentID: project.parentID,
             menuTitle: sidebarProjectMenuTitle(for: project),
             hasLinkedFolder: linkedFolderPath != nil,
-            hasCustomIcon: project.iconSymbolName?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty != nil,
+            hasCustomIcon: project.iconSymbolName?.trimmingCharacters(in: .whitespacesAndNewlines)
+                .nonEmpty != nil,
             folderMissing: project.isProject && linkedFolderPath != nil
                 && assistant.sessions.contains(where: {
                     $0.projectID?.caseInsensitiveCompare(project.id) == .orderedSame
@@ -3479,9 +6773,25 @@ struct AssistantWindowView: View {
             title: row.title,
             subtitle: row.subtitle,
             sourceLabel: row.sourceLabel,
+            folderID: row.folderID,
+            folderPath: row.folderPath,
             isSelected: currentDisplayedNoteTarget == row.target,
             isArchivedThread: row.isArchivedThread,
             threadID: row.threadID
+        )
+    }
+
+    private func sidebarWebNoteFolder(
+        for row: AssistantSidebarNoteFolderRowModel
+    ) -> AssistantSidebarWebNoteFolder {
+        AssistantSidebarWebNoteFolder(
+            id: row.id,
+            name: row.name,
+            parentID: row.parentFolderID,
+            path: row.path,
+            isExpanded: row.isExpanded,
+            childFolderCount: row.childFolderCount,
+            noteCount: row.noteCount
         )
     }
 
@@ -3597,10 +6907,24 @@ struct AssistantWindowView: View {
         Task { await assistant.startNewSession() }
     }
 
+    private func startNewTemporaryThreadFromSidebar() {
+        selectedSidebarPane = .threads
+        closeProjectNotesIfNeeded()
+        threadsDetailMode = .chat
+        if !areThreadsExpanded {
+            withAnimation(sidebarDisclosureAnimation) {
+                areThreadsExpanded = true
+            }
+        }
+        Task { await assistant.startNewTemporarySession() }
+    }
+
     private func handleSidebarWebCommand(type: String, payload: [String: Any]?) {
         switch type {
         case "newThread":
             startNewThreadFromSidebar()
+        case "newTemporaryThread":
+            startNewTemporaryThreadFromSidebar()
         case "setSidebarCollapsed":
             guard let collapsed = payload?["collapsed"] as? Bool else { return }
             setSidebarCollapsed(collapsed)
@@ -3651,12 +6975,14 @@ struct AssistantWindowView: View {
                 .trimmingCharacters(in: .whitespacesAndNewlines)
                 .nonEmpty
             if let projectID,
-               let project = sidebarProject(for: projectID),
-               let parentID = project.parentID {
+                let project = sidebarProject(for: projectID),
+                let parentID = project.parentID
+            {
                 setFolderExpanded(parentID, expanded: true)
             }
             if let projectID,
-               let project = sidebarProject(for: projectID) {
+                let project = sidebarProject(for: projectID)
+            {
                 closeProjectNotesIfNeeded()
                 threadsDetailMode = .chat
                 Task { await assistant.selectProjectFilter(project.id) }
@@ -3670,7 +6996,8 @@ struct AssistantWindowView: View {
                 .trimmingCharacters(in: .whitespacesAndNewlines)
                 .nonEmpty
             if let projectID,
-               let project = sidebarProject(for: projectID) {
+                let project = sidebarProject(for: projectID)
+            {
                 guard project.isProject else { return }
                 selectNotesProject(project)
             } else {
@@ -3679,10 +7006,12 @@ struct AssistantWindowView: View {
                 selectedSidebarPane = .notes
             }
         case "setNotesScope":
-            guard let scopeRawValue = (payload?["scope"] as? String)?
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-                .nonEmpty,
-                  let scope = AssistantNotesScope(rawValue: scopeRawValue) else {
+            guard
+                let scopeRawValue = (payload?["scope"] as? String)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .nonEmpty,
+                let scope = AssistantNotesScope(rawValue: scopeRawValue)
+            else {
                 return
             }
             setNotesScope(scope)
@@ -3702,21 +7031,170 @@ struct AssistantWindowView: View {
                 return
             }
             selectSidebarNote(owner: .init(kind: ownerKind, id: ownerID), noteID: noteID)
+        case "toggleNoteFolderExpanded":
+            guard
+                let folderID = (payload?["folderId"] as? String)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .nonEmpty,
+                let expanded = payload?["expanded"] as? Bool
+            else {
+                return
+            }
+            setNoteFolderExpanded(folderID, expanded: expanded)
         case "createSidebarNote":
             guard let project = selectedNotesProject,
-                  selectedNotesScope == .project,
-                  let workspace = assistant.createProjectNote(projectID: project.id, title: nil),
-                  let noteID = workspace.selectedNote?.id else {
+                selectedNotesScope == .project
+            else {
+                return
+            }
+            let folderID = (payload?["folderId"] as? String)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .nonEmpty
+            guard let workspace = assistant.createProjectNote(
+                projectID: project.id,
+                title: nil,
+                folderID: folderID
+            ),
+                let noteID = workspace.selectedNote?.id
+            else {
                 return
             }
             applyThreadNoteWorkspace(workspace)
             clearThreadNoteAIDraftState(for: AssistantNoteOwnerKey(kind: .project, id: project.id))
+            if let folderID {
+                setNoteFolderPathExpanded(
+                    folderID: folderID,
+                    folders: workspace.manifest.folders
+                )
+            }
             rememberNotesSelectionTarget(
                 AssistantNoteLinkTarget(ownerKind: .project, ownerID: project.id, noteID: noteID),
                 projectID: project.id,
                 scope: .project
             )
             selectedSidebarPane = .notes
+        case "createNoteFolderPrompt":
+            guard let project = selectedNotesProject,
+                selectedNotesScope == .project
+            else {
+                return
+            }
+            let parentFolderID = (payload?["parentFolderId"] as? String)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .nonEmpty
+            presentCreateNoteFolderPrompt(for: project, parentFolderID: parentFolderID)
+        case "renameNoteFolderPrompt":
+            guard let project = selectedNotesProject,
+                selectedNotesScope == .project,
+                let folderID = (payload?["folderId"] as? String)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .nonEmpty
+            else {
+                return
+            }
+            presentRenameNoteFolderPrompt(for: project, folderID: folderID)
+        case "moveNoteFolderPrompt":
+            guard let project = selectedNotesProject,
+                selectedNotesScope == .project,
+                let folderID = (payload?["folderId"] as? String)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .nonEmpty
+            else {
+                return
+            }
+            presentMoveNoteFolderPrompt(for: project, folderID: folderID)
+        case "moveNoteFolder":
+            guard let project = selectedNotesProject,
+                selectedNotesScope == .project,
+                let folderID = (payload?["folderId"] as? String)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .nonEmpty
+            else {
+                return
+            }
+            let parentFolderID = (payload?["parentFolderId"] as? String)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .nonEmpty
+            guard let workspace = assistant.moveProjectNoteFolder(
+                projectID: project.id,
+                folderID: folderID,
+                parentFolderID: parentFolderID
+            ) else {
+                return
+            }
+            let targetFolderID = parentFolderID ?? folderID
+            setNoteFolderPathExpanded(
+                folderID: targetFolderID,
+                folders: workspace.manifest.folders
+            )
+            applyThreadNoteWorkspace(workspace)
+        case "deleteNoteFolder":
+            guard let project = selectedNotesProject,
+                selectedNotesScope == .project,
+                let folderID = (payload?["folderId"] as? String)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .nonEmpty,
+                let workspace = assistant.deleteProjectNoteFolder(
+                    projectID: project.id,
+                    folderID: folderID
+                )
+            else {
+                return
+            }
+            setNoteFolderExpanded(folderID, expanded: false)
+            applyThreadNoteWorkspace(workspace)
+        case "deleteSidebarProjectNote":
+            guard let project = selectedNotesProject,
+                selectedNotesScope == .project,
+                let noteID = (payload?["noteId"] as? String)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .nonEmpty
+            else {
+                return
+            }
+            let owner = AssistantNoteOwnerKey(kind: .project, id: project.id)
+            guard let workspace = assistant.deleteProjectNote(
+                projectID: project.id,
+                noteID: noteID
+            ) else {
+                return
+            }
+            removeNoteFromNavigationStacks(owner: owner, noteID: noteID)
+            applyThreadNoteWorkspace(workspace)
+            clearThreadNoteAIDraftState(for: owner)
+            clearThreadNoteProjectTransferState(for: owner)
+            clearThreadNoteProjectTransferOutcome(for: owner)
+        case "moveSidebarProjectNote":
+            guard let project = selectedNotesProject,
+                selectedNotesScope == .project,
+                let noteID = (payload?["noteId"] as? String)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .nonEmpty
+            else {
+                return
+            }
+            let folderID = (payload?["folderId"] as? String)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .nonEmpty
+            guard let workspace = assistant.moveProjectNote(
+                projectID: project.id,
+                noteID: noteID,
+                folderID: folderID
+            ) else {
+                return
+            }
+            if let folderID {
+                setNoteFolderPathExpanded(
+                    folderID: folderID,
+                    folders: workspace.manifest.folders
+                )
+            }
+            rememberNotesSelectionTarget(
+                AssistantNoteLinkTarget(ownerKind: .project, ownerID: project.id, noteID: noteID),
+                projectID: project.id,
+                scope: .project
+            )
+            applyThreadNoteWorkspace(workspace)
         case "toggleProjectExpanded":
             guard
                 let projectID = (payload?["projectId"] as? String)?
@@ -3727,7 +7205,8 @@ struct AssistantWindowView: View {
             else {
                 return
             }
-            let expanded = payload?["expanded"] as? Bool
+            let expanded =
+                payload?["expanded"] as? Bool
                 ?? !effectiveExpandedFolderIDs.contains(project.id.lowercased())
             setFolderExpanded(project.id, expanded: expanded)
         case "openSession":
@@ -3981,10 +7460,15 @@ struct AssistantWindowView: View {
             assistant.promptDraft = (payload?["text"] as? String) ?? ""
         case "sendPrompt":
             sendCurrentPrompt()
+            dismissComposerQuickActionsMenu()
         case "openFilePicker":
             openFilePicker()
+            dismissComposerQuickActionsMenu()
         case "openSkillsPane":
+            dismissComposerQuickActionsMenu()
             selectedSidebarPane = .skills
+        case "toggleQuickActionsMenu":
+            toggleComposerQuickActionsMenu()
         case "removeAttachment":
             guard
                 let attachmentID = (payload?["attachmentId"] as? String)?
@@ -4033,6 +7517,11 @@ struct AssistantWindowView: View {
                 return
             }
             assistant.interactionMode = mode
+        case "setNoteMode":
+            guard let isActive = payload?["active"] as? Bool else {
+                return
+            }
+            assistant.taskMode = isActive ? .note : .chat
         case "setModel":
             guard
                 let modelID = (payload?["modelId"] as? String)?
@@ -4042,6 +7531,8 @@ struct AssistantWindowView: View {
                 return
             }
             assistant.chooseModel(modelID)
+        case "openModelSetup":
+            assistant.runPreferredInstallCommand()
         case "setReasoningEffort":
             guard let effortID = payload?["effort"] as? String,
                 let effort = AssistantReasoningEffort(rawValue: effortID)
@@ -4072,8 +7563,12 @@ struct AssistantWindowView: View {
         }
     }
 
-    private func chatLayoutMetrics(for windowWidth: CGFloat) -> ChatLayoutMetrics {
+    private func chatLayoutMetrics(
+        for windowWidth: CGFloat,
+        windowHeight: CGFloat
+    ) -> ChatLayoutMetrics {
         let safeWindowWidth = max(windowWidth, 640)
+        let safeWindowHeight = max(windowHeight, 420)
         let outerPadding = safeWindowWidth < 900 ? 2.0 : 4.0
         let chromeState = projectNotesChromeState
         let sidebarWidth = scaledSidebarWidth(for: safeWindowWidth, outerPadding: outerPadding)
@@ -4118,10 +7613,12 @@ struct AssistantWindowView: View {
 
         return ChatLayoutMetrics(
             windowWidth: safeWindowWidth,
+            windowHeight: safeWindowHeight,
             sidebarWidth: sidebarWidth,
             collapsedSidebarWidth: collapsedSidebarWidth,
             collapsedSidebarPreviewWidth: collapsedSidebarPreviewWidth,
             visibleSidebarWidth: visibleSidebarWidth,
+            detailWidth: detailWidth,
             outerPadding: outerPadding,
             timelineHorizontalPadding: timelineHorizontalPadding,
             contentMaxWidth: contentMaxWidth,
@@ -4164,13 +7661,17 @@ struct AssistantWindowView: View {
             leadingTint: AppVisualTheme.sidebarTint,
             trailingTint: AppVisualTheme.windowBackground,
             accent: AppVisualTheme.accentTint,
-            leadingPaneTransparent: projectNotesChromeState.effectiveSidebarCollapsed
+            leadingPaneTransparent: projectNotesChromeState.effectiveSidebarCollapsed,
+            showsLeadingDivider: false
         )
     }
 
     var body: some View {
         GeometryReader { proxy in
-            let layout = chatLayoutMetrics(for: proxy.size.width)
+            let layout = chatLayoutMetrics(
+                for: proxy.size.width,
+                windowHeight: proxy.size.height
+            )
             let chromeState = projectNotesChromeState
             let collapsedOverlayWidth =
                 collapsedSidebarPreviewPane == nil
@@ -4183,13 +7684,16 @@ struct AssistantWindowView: View {
                 HStack(spacing: 0) {
                     if chromeState.showsExpandedSidebar {
                         sidebar(layout: layout, width: layout.sidebarWidth)
+                            .overlay(alignment: .trailing) {
+                                if chromeState.showsResizeHandle {
+                                    sidebarResizeHandle(layout: layout)
+                                        .offset(x: 5)
+                                        .zIndex(1)
+                                }
+                            }
                     } else if chromeState.showsCollapsedSidebarOverlay {
                         Color.clear
                             .frame(width: layout.collapsedSidebarWidth)
-                    }
-
-                    if !isCompactSidebarPresentation && chromeState.showsResizeHandle {
-                        sidebarResizeHandle(layout: layout)
                     }
 
                     detailPane(layout: layout)
@@ -4207,6 +7711,8 @@ struct AssistantWindowView: View {
         .onAppear {
             recomputeVisibleRenderItems()
             syncSidebarVisibleSessionsLimitIfNeeded()
+            syncAssistantNotesRuntimeContext()
+            syncNotesAssistantConversationBinding()
             Task { await refreshEverything(refreshPermissions: true) }
         }
         .onChange(of: allRenderItems) { _ in
@@ -4220,6 +7726,9 @@ struct AssistantWindowView: View {
         }
         .onChange(of: assistant.selectedSessionID) { _ in
             recomputeVisibleRenderItems()
+        }
+        .onChange(of: assistant.lastAssistantNotesMutation?.id) { _ in
+            refreshNotesAfterAssistantMutation(assistant.lastAssistantNotesMutation)
         }
         .alert(
             "Delete this archived chat forever?",
@@ -4248,6 +7757,47 @@ struct AssistantWindowView: View {
             }
         } message: { session in
             Text("This permanently removes the archived chat “\(session.title)”.")
+        }
+        .alert(
+            "Delete this notes chat forever?",
+            isPresented: Binding(
+                get: { pendingDeleteNotesAssistantSession != nil },
+                set: { isPresented in
+                    if !isPresented {
+                        pendingDeleteNotesAssistantSession = nil
+                    }
+                }
+            ),
+            presenting: pendingDeleteNotesAssistantSession
+        ) { session in
+            Button("Delete Forever", role: .destructive) {
+                let selectedProject = selectedNotesProject
+                pendingDeleteNotesAssistantSession = nil
+                Task {
+                    let resolvedProject =
+                        selectedProject.flatMap { project in
+                            assistantNormalizedNotesProjectID(project.id)
+                                == assistantNormalizedNotesProjectID(session.projectID)
+                                ? project : nil
+                        }
+                        ?? assistant.visibleLeafProjects.first(where: {
+                            assistantNormalizedNotesProjectID($0.id)
+                                == assistantNormalizedNotesProjectID(session.projectID)
+                        })
+
+                    guard let resolvedProject else {
+                        await assistant.deleteSession(session.id)
+                        return
+                    }
+
+                    await deleteNotesAssistantSession(session, in: resolvedProject)
+                }
+            }
+            Button("Cancel", role: .cancel) {
+                pendingDeleteNotesAssistantSession = nil
+            }
+        } message: { session in
+            Text("This permanently removes the saved notes chat “\(session.title)”.")
         }
         .alert(
             "Delete this item?",
@@ -4353,6 +7903,29 @@ struct AssistantWindowView: View {
             if pane == .notes {
                 ensureNotesProjectSelectionIfNeeded()
             }
+            syncAssistantNotesRuntimeContext()
+            syncNotesAssistantConversationBinding()
+        }
+        .onChange(of: selectedNotesProjectID) { _ in
+            syncAssistantNotesRuntimeContext()
+            syncNotesAssistantConversationBinding()
+        }
+        .onChange(of: selectedNotesProject?.id) { _ in
+            syncAssistantNotesRuntimeContext()
+            syncNotesAssistantConversationBinding()
+        }
+        .onChange(of: selectedNotesScope) { _ in
+            syncAssistantNotesRuntimeContext()
+        }
+        .onChange(of: isNotesAssistantPanelOpen) { _ in
+            syncAssistantNotesRuntimeContext()
+            syncNotesAssistantConversationBinding()
+        }
+        .onChange(of: currentDisplayedNoteTarget) { _ in
+            syncAssistantNotesRuntimeContext()
+        }
+        .onChange(of: currentDisplayedNoteTitle) { _ in
+            syncAssistantNotesRuntimeContext()
         }
         .onChange(of: currentProjectNotesProject?.id) { projectID in
             if projectID == nil, projectNotesSidebarRestoreState != nil {
@@ -4570,7 +8143,8 @@ struct AssistantWindowView: View {
                 Button {
                     assistant.assignSessionToProject(selectedSession.id, projectID: project.id)
                 } label: {
-                    Label("Move \"\(selectedSession.title)\" Here", systemImage: "arrow.down.circle")
+                    Label(
+                        "Move \"\(selectedSession.title)\" Here", systemImage: "arrow.down.circle")
                 }
             }
 
@@ -4704,7 +8278,9 @@ struct AssistantWindowView: View {
                         Button {
                             assistant.assignSessionToProject(session.id, projectID: project.id)
                         } label: {
-                            Label(sidebarProjectMenuTitle(for: project), systemImage: project.displayIconSymbolName)
+                            Label(
+                                sidebarProjectMenuTitle(for: project),
+                                systemImage: project.displayIconSymbolName)
                         }
                         .disabled(isCurrentProject)
                     }
@@ -4748,114 +8324,166 @@ struct AssistantWindowView: View {
     }
 
     private func chatDetail(layout: ChatLayoutMetrics) -> some View {
-        ZStack(alignment: .topLeading) {
+        let isTransitioningChat = assistant.isTransitioningSession
+        let webMessages = isTransitioningChat ? [] : chatWebMessages
+        let webRuntimePanel = isTransitioningChat ? nil : chatWebRuntimePanel
+        let webReviewPanel = isTransitioningChat ? nil : inlineTrackedCodePanel
+        let webRewindState = isTransitioningChat ? nil : chatWebRewindState
+        let webActiveWorkState = isTransitioningChat ? nil : chatWebActiveWorkState
+        let webActiveTurnState = isTransitioningChat ? nil : chatWebActiveTurnState
+        let webCanLoadOlderHistory = !isTransitioningChat && canLoadOlderHistory
+        let showsTransitionPlaceholder = isTransitioningChat && webMessages.isEmpty
+
+        return ZStack(alignment: .topLeading) {
             VStack(spacing: 0) {
                 chatTopBar(layout: layout)
                     .zIndex(showProviderPicker || showWorkspaceLaunchMenu ? 20 : 1)
 
                 ZStack {
                     VStack(spacing: 0) {
-                        AssistantChatWebView(
-                            messages: chatWebMessages,
-                            runtimePanel: chatWebRuntimePanel,
-                            reviewPanel: inlineTrackedCodePanel,
-                            rewindState: chatWebRewindState,
-                            threadNoteState: chatWebThreadNoteState,
-                            activeWorkState: chatWebActiveWorkState,
-                            showTypingIndicator: shouldShowPendingAssistantPlaceholder,
-                            typingTitle: typingIndicatorTitle,
-                            typingDetail: typingIndicatorDetail,
-                            textScale: CGFloat(chatTextScale),
-                            canLoadOlderHistory: canLoadOlderHistory,
-                            accentColor: AppVisualTheme.accentTint,
-                            onScrollStateChanged: { isPinned, isScrolledUp in
-                                autoScrollPinnedToBottom = isPinned
-                                userHasScrolledUp = isScrolledUp
-                            },
-                            onLoadOlderHistory: {
-                                guard canLoadOlderHistory, !isLoadingOlderHistory else { return }
-                                loadOlderHistoryBatchWeb()
-                            },
-                            onLoadActivityDetails: { renderItemID in
-                                if renderItemID.hasPrefix("collapsed-conversation-") {
-                                    expandedHistoricalConversationBlockIDs.insert(renderItemID)
-                                } else {
-                                    expandedHistoricalActivityRenderItemIDs.insert(renderItemID)
+                        ZStack(alignment: .top) {
+                            AssistantChatWebView(
+                                messages: webMessages,
+                                runtimePanel: webRuntimePanel,
+                                reviewPanel: webReviewPanel,
+                                rewindState: webRewindState,
+                                threadNoteState: chatWebThreadNoteState,
+                                activeWorkState: webActiveWorkState,
+                                activeTurnState: webActiveTurnState,
+                                showTypingIndicator: !isTransitioningChat
+                                    && shouldShowPendingAssistantPlaceholder,
+                                typingTitle: isTransitioningChat ? "" : typingIndicatorTitle,
+                                typingDetail: isTransitioningChat ? "" : typingIndicatorDetail,
+                                textScale: CGFloat(chatTextScale),
+                                canLoadOlderHistory: webCanLoadOlderHistory,
+                                accentColor: AppVisualTheme.accentTint,
+                                onScrollStateChanged: { isPinned, isScrolledUp in
+                                    autoScrollPinnedToBottom = isPinned
+                                    userHasScrolledUp = isScrolledUp
+                                },
+                                onLoadOlderHistory: {
+                                    guard webCanLoadOlderHistory, !isLoadingOlderHistory else {
+                                        return
+                                    }
+                                    loadOlderHistoryBatchWeb()
+                                },
+                                onLoadActivityDetails: { renderItemID in
+                                    if renderItemID.hasPrefix("collapsed-conversation-") {
+                                        expandedHistoricalConversationBlockIDs.insert(renderItemID)
+                                    } else {
+                                        expandedHistoricalActivityRenderItemIDs.insert(renderItemID)
+                                    }
+                                },
+                                onCollapseActivityDetails: { renderItemID in
+                                    if renderItemID.hasPrefix("collapsed-conversation-") {
+                                        expandedHistoricalConversationBlockIDs.remove(renderItemID)
+                                    } else {
+                                        expandedHistoricalActivityRenderItemIDs.remove(renderItemID)
+                                    }
+                                },
+                                onSelectRuntimeBackend: { backendID in
+                                    guard let backend = AssistantRuntimeBackend(rawValue: backendID)
+                                    else { return }
+                                    assistant.selectAssistantBackend(backend)
+                                },
+                                onOpenRuntimeSettings: {
+                                    NotificationCenter.default.post(
+                                        name: .openAssistOpenSettings,
+                                        object: SettingsRoute(section: .assistant, subsection: .assistantSetup))
+                                },
+                                onUndoMessage: { anchorID in
+                                    Task { await assistant.undoUserMessage(anchorID: anchorID) }
+                                },
+                                onEditMessage: { anchorID in
+                                    Task {
+                                        await assistant.beginEditLastUserMessage(anchorID: anchorID)
+                                    }
+                                },
+                                onUndoCodeCheckpoint: {
+                                    Task { await assistant.undoTrackedCodeCheckpoint() }
+                                },
+                                onRedoHistoryMutation: {
+                                    Task { await assistant.redoUndoneUserMessage() }
+                                },
+                                onRestoreCodeCheckpoint: { checkpointID in
+                                    Task {
+                                        await assistant.restoreTrackedCodeCheckpoint(
+                                            checkpointID: checkpointID)
+                                    }
+                                },
+                                onCloseCodeReviewPanel: {
+                                    // Inline tracked coding does not need a separate native close action.
+                                },
+                                onThreadNoteCommand: { command, sourceContainer in
+                                    handleThreadNoteCommand(
+                                        command, sourceContainer: sourceContainer)
+                                },
+                                noteAssetResolver: resolveWebNoteAssetURL,
+                                onTextSelected: { selectedText, messageID, parentText, screenRect in
+                                    handleWebViewTextSelection(
+                                        selectedText: selectedText,
+                                        messageID: messageID,
+                                        parentText: parentText,
+                                        screenRect: screenRect
+                                    )
+                                },
+                                onContainerReady: { container in
+                                    if chatTimelineWebContainer !== container {
+                                        chatTimelineWebContainer = container
+                                    }
+                                    if threadNoteWebContainer !== container {
+                                        threadNoteWebContainer = container
+                                    }
                                 }
-                            },
-                            onCollapseActivityDetails: { renderItemID in
-                                if renderItemID.hasPrefix("collapsed-conversation-") {
-                                    expandedHistoricalConversationBlockIDs.remove(renderItemID)
-                                } else {
-                                    expandedHistoricalActivityRenderItemIDs.remove(renderItemID)
-                                }
-                            },
-                            onSelectRuntimeBackend: { backendID in
-                                guard let backend = AssistantRuntimeBackend(rawValue: backendID) else { return }
-                                assistant.selectAssistantBackend(backend)
-                            },
-                            onOpenRuntimeSettings: {
-                                NotificationCenter.default.post(
-                                    name: .openAssistOpenSettings, object: SettingsRoute.gettingStartedHome)
-                            },
-                            onUndoMessage: { anchorID in
-                                Task { await assistant.undoUserMessage(anchorID: anchorID) }
-                            },
-                            onEditMessage: { anchorID in
-                                Task { await assistant.beginEditLastUserMessage(anchorID: anchorID) }
-                            },
-                            onUndoCodeCheckpoint: {
-                                Task { await assistant.undoTrackedCodeCheckpoint() }
-                            },
-                            onRedoHistoryMutation: {
-                                Task { await assistant.redoUndoneUserMessage() }
-                            },
-                            onRestoreCodeCheckpoint: { checkpointID in
-                                Task { await assistant.restoreTrackedCodeCheckpoint(checkpointID: checkpointID) }
-                            },
-                            onCloseCodeReviewPanel: {
-                                // Inline tracked coding does not need a separate native close action.
-                            },
-                            onThreadNoteCommand: handleThreadNoteCommand,
-                            onTextSelected: { selectedText, messageID, parentText, screenRect in
-                                handleWebViewTextSelection(
-                                    selectedText: selectedText,
-                                    messageID: messageID,
-                                    parentText: parentText,
-                                    screenRect: screenRect
-                                )
-                            },
-                            onContainerReady: { container in
-                                if chatWebContainer !== container {
-                                    chatWebContainer = container
-                                }
+                            )
+
+                            if showsTransitionPlaceholder {
+                                sessionTransitionPlaceholder
+                                    .background(
+                                        Color(red: 0.051, green: 0.067, blue: 0.090)
+                                            .opacity(0.96)
+                                    )
                             }
-                        )
+
+                            if isTransitioningChat {
+                                VStack(spacing: 0) {
+                                    sessionTransitionOverlay
+                                        .padding(.top, 16)
+                                    Spacer(minLength: 0)
+                                }
+                                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                            }
+                        }
                         .frame(maxHeight: .infinity)
                         .onAppear {
                             resetVisibleHistoryWindow()
-                            syncThreadNoteSelection(assistant.selectedSessionID, persistCurrent: false)
+                            syncThreadNoteSelection(
+                                assistant.selectedSessionID, persistCurrent: false)
+                            dismissComposerQuickActionsMenu(animated: false)
                         }
                         .onChange(of: assistant.selectedSessionID) { newSessionID in
                             syncThreadNoteSelection(newSessionID, persistCurrent: true)
-                            guard newSessionID?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+                            dismissComposerQuickActionsMenu(animated: false)
+                            guard
+                                newSessionID?.trimmingCharacters(in: .whitespacesAndNewlines)
+                                    .isEmpty == false
                             else {
                                 return
                             }
                             resetVisibleHistoryWindow()
                         }
                         .onChange(of: assistant.selectedCodeTrackingState) { _ in
-                            chatWebContainer?.applyReviewPanel(inlineTrackedCodePanel)
+                            chatTimelineWebContainer?.applyReviewPanel(inlineTrackedCodePanel)
                             // Auto-scroll so the checkpoint card is visible
                             DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-                                chatWebContainer?.scrollToBottom(animated: true)
+                                chatTimelineWebContainer?.scrollToBottom(animated: true)
                             }
                         }
                         .onChange(of: assistant.hasActiveTurn) { _ in
-                            chatWebContainer?.applyReviewPanel(inlineTrackedCodePanel)
+                            chatTimelineWebContainer?.applyReviewPanel(inlineTrackedCodePanel)
                         }
 
-                        chatBottomDock(layout: layout)
+                        chatBottomDock(layout: layout, composerState: composerWebState)
                     }
 
                     if showProviderPicker || showWorkspaceLaunchMenu {
@@ -4868,7 +8496,7 @@ struct AssistantWindowView: View {
                 }
                 .zIndex(0)
             }
-        } // end ZStack
+        }  // end ZStack
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(
             Color(red: 0.051, green: 0.067, blue: 0.090)
@@ -4891,6 +8519,7 @@ struct AssistantWindowView: View {
                 rewindState: nil,
                 threadNoteState: chatWebThreadNoteState,
                 activeWorkState: nil,
+                activeTurnState: nil,
                 showTypingIndicator: false,
                 typingTitle: "",
                 typingDetail: "",
@@ -4922,7 +8551,7 @@ struct AssistantWindowView: View {
                 },
                 onOpenRuntimeSettings: {
                     NotificationCenter.default.post(
-                        name: .openAssistOpenSettings, object: SettingsRoute.gettingStartedHome)
+                        name: .openAssistOpenSettings, object: SettingsRoute(section: .assistant, subsection: .assistantSetup))
                 },
                 onUndoMessage: { anchorID in
                     Task { await assistant.undoUserMessage(anchorID: anchorID) }
@@ -4937,10 +8566,15 @@ struct AssistantWindowView: View {
                     Task { await assistant.redoUndoneUserMessage() }
                 },
                 onRestoreCodeCheckpoint: { checkpointID in
-                    Task { await assistant.restoreTrackedCodeCheckpoint(checkpointID: checkpointID) }
+                    Task {
+                        await assistant.restoreTrackedCodeCheckpoint(checkpointID: checkpointID)
+                    }
                 },
                 onCloseCodeReviewPanel: {},
-                onThreadNoteCommand: handleThreadNoteCommand,
+                onThreadNoteCommand: { command, sourceContainer in
+                    handleThreadNoteCommand(command, sourceContainer: sourceContainer)
+                },
+                noteAssetResolver: resolveWebNoteAssetURL,
                 onTextSelected: { selectedText, messageID, parentText, screenRect in
                     handleWebViewTextSelection(
                         selectedText: selectedText,
@@ -4950,8 +8584,8 @@ struct AssistantWindowView: View {
                     )
                 },
                 onContainerReady: { container in
-                    if chatWebContainer !== container {
-                        chatWebContainer = container
+                    if threadNoteWebContainer !== container {
+                        threadNoteWebContainer = container
                     }
                 }
             )
@@ -4972,71 +8606,25 @@ struct AssistantWindowView: View {
     }
 
     private func notesWorkspaceDetail(layout: ChatLayoutMetrics) -> some View {
-        ZStack(alignment: .topLeading) {
-            VStack(spacing: 0) {
-                notesTopBar(layout: layout)
-                    .zIndex(showWorkspaceLaunchMenu ? 20 : 1)
+        let usesDockedRail = notesAssistantUsesDockedRail(for: layout)
 
+        return VStack(spacing: 0) {
+            notesTopBar(layout: layout)
+                .zIndex(showWorkspaceLaunchMenu ? 20 : 1)
+
+            if usesDockedRail {
+                HStack(spacing: 18) {
+                    notesWorkspaceEditorCanvas()
+
+                    notesAssistantDockedRail(layout: layout)
+                }
+                .padding(.horizontal, 18)
+                .padding(.top, 10)
+                .padding(.bottom, 16)
+            } else {
                 ZStack {
-                    AssistantChatWebView(
-                        messages: [],
-                        runtimePanel: nil,
-                        reviewPanel: nil,
-                        rewindState: nil,
-                        threadNoteState: chatWebThreadNoteState,
-                        activeWorkState: nil,
-                        showTypingIndicator: false,
-                        typingTitle: "",
-                        typingDetail: "",
-                        textScale: CGFloat(chatTextScale),
-                        canLoadOlderHistory: false,
-                        accentColor: AppVisualTheme.accentTint,
-                        onScrollStateChanged: { isPinned, isScrolledUp in
-                            autoScrollPinnedToBottom = isPinned
-                            userHasScrolledUp = isScrolledUp
-                        },
-                        onLoadOlderHistory: {},
-                        onLoadActivityDetails: { _ in },
-                        onCollapseActivityDetails: { _ in },
-                        onSelectRuntimeBackend: { backendID in
-                            guard let backend = AssistantRuntimeBackend(rawValue: backendID) else { return }
-                            assistant.selectAssistantBackend(backend)
-                        },
-                        onOpenRuntimeSettings: {
-                            NotificationCenter.default.post(
-                                name: .openAssistOpenSettings, object: SettingsRoute.gettingStartedHome)
-                        },
-                        onUndoMessage: { _ in },
-                        onEditMessage: { _ in },
-                        onUndoCodeCheckpoint: {},
-                        onRedoHistoryMutation: {},
-                        onRestoreCodeCheckpoint: { _ in },
-                        onCloseCodeReviewPanel: {},
-                        onThreadNoteCommand: handleThreadNoteCommand,
-                        onTextSelected: { selectedText, messageID, parentText, screenRect in
-                            handleWebViewTextSelection(
-                                selectedText: selectedText,
-                                messageID: messageID,
-                                parentText: parentText,
-                                screenRect: screenRect
-                            )
-                        },
-                        onContainerReady: { container in
-                            if chatWebContainer !== container {
-                                chatWebContainer = container
-                            }
-                        }
-                    )
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-                    .clipped()
-
-                    if showWorkspaceLaunchMenu {
-                        Color.black.opacity(0.001)
-                            .contentShape(Rectangle())
-                            .onTapGesture {
-                                dismissTopBarDropdowns()
-                            }
-                    }
+                    notesWorkspaceEditorCanvas()
+                    notesAssistantOverlayLayer(layout: layout)
                 }
             }
         }
@@ -5047,6 +8635,864 @@ struct AssistantWindowView: View {
         .ignoresSafeArea(edges: .top)
     }
 
+    private func notesWorkspaceEditorCanvas() -> some View {
+        ZStack {
+            AssistantChatWebView(
+                messages: [],
+                runtimePanel: nil,
+                reviewPanel: nil,
+                rewindState: nil,
+                threadNoteState: chatWebThreadNoteState,
+                activeWorkState: nil,
+                activeTurnState: nil,
+                showTypingIndicator: false,
+                typingTitle: "",
+                typingDetail: "",
+                textScale: CGFloat(chatTextScale),
+                canLoadOlderHistory: false,
+                accentColor: AppVisualTheme.accentTint,
+                onScrollStateChanged: { isPinned, isScrolledUp in
+                    autoScrollPinnedToBottom = isPinned
+                    userHasScrolledUp = isScrolledUp
+                },
+                onLoadOlderHistory: {},
+                onLoadActivityDetails: { _ in },
+                onCollapseActivityDetails: { _ in },
+                onSelectRuntimeBackend: { backendID in
+                    guard let backend = AssistantRuntimeBackend(rawValue: backendID) else { return }
+                    assistant.selectAssistantBackend(backend)
+                },
+                onOpenRuntimeSettings: {
+                    NotificationCenter.default.post(
+                        name: .openAssistOpenSettings, object: SettingsRoute(section: .assistant, subsection: .assistantSetup))
+                },
+                onUndoMessage: { _ in },
+                onEditMessage: { _ in },
+                onUndoCodeCheckpoint: {},
+                onRedoHistoryMutation: {},
+                onRestoreCodeCheckpoint: { _ in },
+                onCloseCodeReviewPanel: {},
+                onThreadNoteCommand: { command, sourceContainer in
+                    handleThreadNoteCommand(command, sourceContainer: sourceContainer)
+                },
+                noteAssetResolver: resolveWebNoteAssetURL,
+                onTextSelected: { selectedText, messageID, parentText, screenRect in
+                    handleWebViewTextSelection(
+                        selectedText: selectedText,
+                        messageID: messageID,
+                        parentText: parentText,
+                        screenRect: screenRect
+                    )
+                },
+                onContainerReady: { container in
+                    if threadNoteWebContainer !== container {
+                        threadNoteWebContainer = container
+                    }
+                }
+            )
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .clipped()
+
+            if showWorkspaceLaunchMenu {
+                Color.black.opacity(0.001)
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        dismissTopBarDropdowns()
+                    }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func notesAssistantDockedRail(layout: ChatLayoutMetrics) -> some View {
+        if isNotesAssistantPanelOpen {
+            notesAssistantOverlayCard(layout: layout, docked: true)
+                .frame(maxHeight: .infinity, alignment: .top)
+                .transition(.move(edge: .trailing).combined(with: .opacity))
+        } else {
+            VStack {
+                Spacer(minLength: 0)
+                notesAssistantOverlayHandle
+                Spacer(minLength: 0)
+            }
+            .frame(minWidth: 30, idealWidth: 30, maxWidth: 30)
+            .frame(maxHeight: .infinity, alignment: .center)
+            .transition(.move(edge: .trailing).combined(with: .opacity))
+        }
+    }
+
+    @ViewBuilder
+    private func notesAssistantOverlayLayer(layout: ChatLayoutMetrics) -> some View {
+        if isNotesAssistantPanelOpen {
+            notesAssistantOverlayCard(layout: layout)
+                .padding(.trailing, layout.isNarrow ? 12 : 16)
+                .padding(.bottom, layout.isNarrow ? 12 : 16)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
+                .transition(.move(edge: .trailing).combined(with: .opacity))
+        } else {
+            notesAssistantOverlayHandle
+                .padding(.trailing, 8)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .trailing)
+                .transition(.move(edge: .trailing).combined(with: .opacity))
+        }
+    }
+
+    private func notesAssistantOverlayCard(
+        layout: ChatLayoutMetrics,
+        docked: Bool = false
+    ) -> some View {
+        let overlayWidth =
+            docked
+            ? notesAssistantDockedRailWidth(for: layout)
+            : notesAssistantOverlayWidth(for: layout)
+        let overlayHeight = docked ? nil : notesAssistantOverlayHeight(for: layout)
+        let usesCondensedLayout =
+            docked ? false : notesAssistantOverlayUsesCondensedLayout(for: layout)
+        let panelCornerRadius: CGFloat = docked ? 26 : 22
+
+        return VStack(spacing: 0) {
+            HStack(alignment: .top, spacing: 8) {
+                VStack(alignment: .leading, spacing: usesCondensedLayout ? 5 : 7) {
+                    HStack(spacing: 8) {
+                        Circle()
+                            .fill(AppVisualTheme.accentTint.opacity(0.92))
+                            .frame(width: 6, height: 6)
+
+                        Text("NOTES ASSISTANT")
+                            .font(.system(size: 9.5, weight: .bold))
+                            .tracking(0.9)
+                            .foregroundStyle(AppVisualTheme.foreground(0.48))
+                    }
+
+                    Text(notesAssistantScopeLabel)
+                        .font(.system(size: usesCondensedLayout ? 12.5 : 13.5, weight: .semibold))
+                        .foregroundStyle(AppVisualTheme.foreground(0.92))
+                        .lineLimit(1)
+                }
+
+                Spacer(minLength: 0)
+
+                HStack(spacing: 6) {
+                    notesAssistantSessionSwitcherMenu
+
+                    Button {
+                        withAnimation(.spring(response: 0.24, dampingFraction: 0.86)) {
+                            isNotesAssistantPanelExpanded.toggle()
+                        }
+                    } label: {
+                        notesAssistantOverlayIconButton(
+                            symbol: isNotesAssistantPanelExpanded
+                                ? "arrow.down.right.and.arrow.up.left"
+                                : "arrow.up.left.and.arrow.down.right"
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .help(
+                        isNotesAssistantPanelExpanded
+                            ? "Restore compact notes assistant"
+                            : "Maximize notes assistant"
+                    )
+
+                    notesAssistantOverlayMenu
+
+                    Button {
+                        withAnimation(.spring(response: 0.24, dampingFraction: 0.86)) {
+                            isNotesAssistantPanelOpen = false
+                        }
+                        syncAssistantNotesRuntimeContext()
+                    } label: {
+                        notesAssistantOverlayIconButton(symbol: "sidebar.right", emphasized: true)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Collapse notes assistant")
+                }
+                .padding(3)
+                .background(
+                    Capsule(style: .continuous)
+                        .fill(AppVisualTheme.surfaceFill(0.05))
+                        .overlay(
+                            Capsule(style: .continuous)
+                                .stroke(AppVisualTheme.surfaceStroke(0.08), lineWidth: 0.7)
+                        )
+                )
+            }
+            .padding(.horizontal, 14)
+            .padding(.top, usesCondensedLayout ? 11 : 13)
+            .padding(.bottom, usesCondensedLayout ? 9 : 11)
+
+            Rectangle()
+                .fill(
+                    LinearGradient(
+                        colors: [
+                            AppVisualTheme.surfaceFill(0.0),
+                            AppVisualTheme.surfaceFill(0.12),
+                            AppVisualTheme.surfaceFill(0.0),
+                        ],
+                        startPoint: .leading,
+                        endPoint: .trailing
+                    )
+                )
+                .frame(height: 1)
+
+            ZStack {
+                RoundedRectangle(cornerRadius: docked ? 20 : 18, style: .continuous)
+                    .fill(Color(red: 0.045, green: 0.055, blue: 0.075))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: docked ? 20 : 18, style: .continuous)
+                            .stroke(Color.white.opacity(0.05), lineWidth: 0.7)
+                    )
+
+                Group {
+                    if notesAssistantHasVisibleConversationContent {
+                        AssistantChatWebView(
+                            messages: notesAssistantChatMessages,
+                            runtimePanel: nil,
+                            reviewPanel: nil,
+                            rewindState: nil,
+                            threadNoteState: nil,
+                            activeWorkState: notesAssistantActiveWorkState,
+                            activeTurnState: notesAssistantActiveTurnState,
+                            showTypingIndicator: notesAssistantShouldShowPendingPlaceholder,
+                            typingTitle: notesAssistantTypingIndicatorTitle,
+                            typingDetail: notesAssistantTypingIndicatorDetail,
+                            textScale: CGFloat(chatTextScale),
+                            canLoadOlderHistory: notesAssistantCanLoadOlderHistory,
+                            accentColor: AppVisualTheme.accentTint,
+                            onScrollStateChanged: { isPinned, isScrolledUp in
+                                autoScrollPinnedToBottom = isPinned
+                                userHasScrolledUp = isScrolledUp
+                            },
+                            onLoadOlderHistory: {
+                                guard notesAssistantCanLoadOlderHistory, !isLoadingOlderHistory
+                                else {
+                                    return
+                                }
+                                loadOlderHistoryBatchWeb()
+                            },
+                            onLoadActivityDetails: { renderItemID in
+                                if renderItemID.hasPrefix("collapsed-conversation-") {
+                                    expandedHistoricalConversationBlockIDs.insert(renderItemID)
+                                } else {
+                                    expandedHistoricalActivityRenderItemIDs.insert(renderItemID)
+                                }
+                            },
+                            onCollapseActivityDetails: { renderItemID in
+                                if renderItemID.hasPrefix("collapsed-conversation-") {
+                                    expandedHistoricalConversationBlockIDs.remove(renderItemID)
+                                } else {
+                                    expandedHistoricalActivityRenderItemIDs.remove(renderItemID)
+                                }
+                            },
+                            onSelectRuntimeBackend: { backendID in
+                                guard let backend = AssistantRuntimeBackend(rawValue: backendID)
+                                else {
+                                    return
+                                }
+                                assistant.selectAssistantBackend(backend)
+                            },
+                            onOpenRuntimeSettings: {
+                                NotificationCenter.default.post(
+                                    name: .openAssistOpenSettings,
+                                    object: SettingsRoute(section: .assistant, subsection: .assistantSetup)
+                                )
+                            },
+                            onUndoMessage: { anchorID in
+                                Task { await assistant.undoUserMessage(anchorID: anchorID) }
+                            },
+                            onEditMessage: { anchorID in
+                                Task {
+                                    await assistant.beginEditLastUserMessage(anchorID: anchorID)
+                                }
+                            },
+                            onUndoCodeCheckpoint: {
+                                Task { await assistant.undoTrackedCodeCheckpoint() }
+                            },
+                            onRedoHistoryMutation: {
+                                Task { await assistant.redoUndoneUserMessage() }
+                            },
+                            onRestoreCodeCheckpoint: { checkpointID in
+                                Task {
+                                    await assistant.restoreTrackedCodeCheckpoint(
+                                        checkpointID: checkpointID
+                                    )
+                                }
+                            },
+                            onCloseCodeReviewPanel: {},
+                            onThreadNoteCommand: { command, sourceContainer in
+                                handleThreadNoteCommand(command, sourceContainer: sourceContainer)
+                            },
+                            noteAssetResolver: resolveWebNoteAssetURL,
+                            onTextSelected: { selectedText, messageID, parentText, screenRect in
+                                handleWebViewTextSelection(
+                                    selectedText: selectedText,
+                                    messageID: messageID,
+                                    parentText: parentText,
+                                    screenRect: screenRect
+                                )
+                            },
+                            onContainerReady: { container in
+                                if chatTimelineWebContainer !== container {
+                                    chatTimelineWebContainer = container
+                                }
+                            }
+                        )
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                        .clipped()
+                    } else {
+                        notesAssistantOverlayEmptyState
+                    }
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .layoutPriority(0)
+            .padding(.horizontal, 10)
+            .padding(.top, 10)
+            .padding(.bottom, 2)
+
+            chatBottomDock(
+                layout: layout,
+                composerState: notesAssistantComposerWebState,
+                maxWidth: overlayWidth - 28,
+                showsStatusBar: false,
+                isCompact: true
+            )
+            .fixedSize(horizontal: false, vertical: true)
+            .layoutPriority(1)
+            .padding(.horizontal, 10)
+            .padding(.top, 4)
+            .padding(.bottom, 10)
+        }
+        .frame(width: overlayWidth, height: overlayHeight, alignment: .top)
+        .frame(maxHeight: docked ? .infinity : nil, alignment: .top)
+        .background(
+            RoundedRectangle(cornerRadius: panelCornerRadius, style: .continuous)
+                .fill(
+                    LinearGradient(
+                        colors: [
+                            Color(red: 0.084, green: 0.097, blue: 0.125),
+                            Color(red: 0.067, green: 0.079, blue: 0.103),
+                        ],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                )
+                .overlay(
+                    LinearGradient(
+                        colors: [
+                            Color.white.opacity(0.035),
+                            Color.clear,
+                            AppVisualTheme.accentTint.opacity(0.03),
+                        ],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                    .clipShape(
+                        RoundedRectangle(cornerRadius: panelCornerRadius, style: .continuous))
+                )
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: panelCornerRadius, style: .continuous)
+                .stroke(
+                    LinearGradient(
+                        colors: [
+                            Color.white.opacity(0.11),
+                            AppVisualTheme.surfaceStroke(0.10),
+                            Color.black.opacity(0.05),
+                        ],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    ),
+                    lineWidth: 0.9
+                )
+        )
+        .overlay(alignment: .topLeading) {
+            RoundedRectangle(cornerRadius: panelCornerRadius, style: .continuous)
+                .stroke(Color.white.opacity(0.04), lineWidth: 0.7)
+                .blur(radius: 0.4)
+                .padding(1)
+        }
+        .shadow(color: Color.black.opacity(0.24), radius: docked ? 18 : 22, x: 0, y: docked ? 6 : 9)
+    }
+
+    private var notesAssistantOverlayEmptyState: some View {
+        ScrollView(.vertical, showsIndicators: false) {
+            VStack(alignment: .leading, spacing: 12) {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("START HERE")
+                        .font(.system(size: 9.5, weight: .bold))
+                        .tracking(0.8)
+                        .foregroundStyle(AppVisualTheme.foreground(0.40))
+
+                    Text("Ask about this note")
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(AppVisualTheme.foreground(0.92))
+
+                    Text("Search the project or focus on the open note.")
+                        .font(.system(size: 11.5, weight: .medium))
+                        .foregroundStyle(AppVisualTheme.foreground(0.54))
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                VStack(spacing: 0) {
+                    notesAssistantQuickPromptButton(
+                        title: "What is already covered here?",
+                        prompt: currentDisplayedNoteTitle.map {
+                            "What is already covered in the note '\($0)'?"
+                        } ?? "What is already covered in these project notes?"
+                    )
+
+                    Rectangle()
+                        .fill(AppVisualTheme.surfaceFill(0.06))
+                        .frame(height: 0.5)
+
+                    notesAssistantQuickPromptButton(
+                        title: "Summarize the open note",
+                        prompt: currentDisplayedNoteTitle.map {
+                            "Summarize the note '\($0)' and call out the key decisions."
+                        } ?? "Summarize the key decisions in these project notes."
+                    )
+
+                    Rectangle()
+                        .fill(AppVisualTheme.surfaceFill(0.06))
+                        .frame(height: 0.5)
+
+                    notesAssistantQuickPromptButton(
+                        title: "Find the best note to update",
+                        prompt: "Which note should I update for this work, and why?"
+                    )
+                }
+                .background(
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .fill(AppVisualTheme.surfaceFill(0.04))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                .stroke(AppVisualTheme.surfaceStroke(0.07), lineWidth: 0.7)
+                        )
+                )
+            }
+            .frame(maxWidth: .infinity, alignment: .topLeading)
+            .padding(.horizontal, 14)
+            .padding(.top, 14)
+            .padding(.bottom, 10)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+
+    private var notesAssistantOverlayHandle: some View {
+        Button {
+            withAnimation(.spring(response: 0.24, dampingFraction: 0.86)) {
+                isNotesAssistantPanelOpen = true
+            }
+            syncAssistantNotesRuntimeContext()
+        } label: {
+            VStack(spacing: 8) {
+                RoundedRectangle(cornerRadius: 999, style: .continuous)
+                    .fill(AppVisualTheme.accentTint.opacity(0.92))
+                    .frame(width: 4, height: 22)
+
+                Image(systemName: "sparkles")
+                    .font(.system(size: 10.5, weight: .semibold))
+                Image(systemName: "chevron.left")
+                    .font(.system(size: 9.5, weight: .bold))
+            }
+            .foregroundStyle(AppVisualTheme.foreground(0.82))
+            .frame(width: 28, height: 96)
+            .background(
+                RoundedRectangle(cornerRadius: 15, style: .continuous)
+                    .fill(
+                        LinearGradient(
+                            colors: [
+                                Color(red: 0.090, green: 0.110, blue: 0.144).opacity(0.98),
+                                Color(red: 0.060, green: 0.073, blue: 0.097).opacity(0.96),
+                            ],
+                            startPoint: .top,
+                            endPoint: .bottom
+                        )
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 15, style: .continuous)
+                            .stroke(AppVisualTheme.surfaceStroke(0.12), lineWidth: 0.8)
+                    )
+            )
+            .shadow(color: Color.black.opacity(0.20), radius: 16, x: 0, y: 7)
+        }
+        .buttonStyle(.plain)
+        .help("Open notes assistant")
+    }
+
+    private func notesAssistantOverlayIconButton(
+        symbol: String,
+        emphasized: Bool = false
+    ) -> some View {
+        Image(systemName: symbol)
+            .font(.system(size: 11, weight: .semibold))
+            .foregroundStyle(
+                emphasized ? AppVisualTheme.accentTint : AppVisualTheme.foreground(0.60)
+            )
+            .frame(width: 27, height: 27)
+            .background(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(AppVisualTheme.surfaceFill(emphasized ? 0.10 : 0.05))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .stroke(
+                                emphasized
+                                    ? AppVisualTheme.accentTint.opacity(0.20)
+                                    : AppVisualTheme.surfaceStroke(0.08),
+                                lineWidth: 0.7
+                            )
+                    )
+            )
+            .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+
+    private var notesAssistantOverlayMenu: some View {
+        Menu {
+            Section("View") {
+                Button {
+                    withAnimation(.spring(response: 0.24, dampingFraction: 0.86)) {
+                        isNotesAssistantPanelExpanded.toggle()
+                    }
+                } label: {
+                    Label(
+                        isNotesAssistantPanelExpanded
+                            ? "Restore Compact Size"
+                            : "Maximize Assistant",
+                        systemImage: isNotesAssistantPanelExpanded
+                            ? "arrow.down.right.and.arrow.up.left"
+                            : "arrow.up.left.and.arrow.down.right"
+                    )
+                }
+            }
+
+            Section("Interaction Mode") {
+                ForEach(AssistantInteractionMode.allCases, id: \.rawValue) { mode in
+                    Button {
+                        assistant.interactionMode = mode
+                    } label: {
+                        notesAssistantMenuRowLabel(
+                            title: mode.label,
+                            isSelected: assistant.interactionMode.normalizedForActiveUse == mode
+                        )
+                    }
+                }
+            }
+
+            Section("Backend") {
+                ForEach(AssistantRuntimeBackend.allCases, id: \.rawValue) { backend in
+                    Button {
+                        assistant.selectAssistantBackend(backend)
+                    } label: {
+                        notesAssistantMenuRowLabel(
+                            title: backend.shortDisplayName,
+                            isSelected: assistant.visibleAssistantBackend == backend
+                        )
+                    }
+                }
+            }
+
+            Section("Model") {
+                if assistant.visibleModels.isEmpty {
+                    Text("No models available")
+                } else {
+                    ForEach(assistant.visibleModels, id: \.id) { model in
+                        Button {
+                            assistant.chooseModel(model.id)
+                        } label: {
+                            notesAssistantMenuRowLabel(
+                                title: model.displayName,
+                                isSelected: assistant.selectedModelID == model.id
+                            )
+                        }
+                    }
+                }
+            }
+
+            Section("Reasoning") {
+                ForEach(supportedEfforts, id: \.rawValue) { effort in
+                    Button {
+                        assistant.reasoningEffort = effort
+                    } label: {
+                        notesAssistantMenuRowLabel(
+                            title: effort.label,
+                            isSelected: assistant.reasoningEffort == effort
+                        )
+                    }
+                }
+            }
+
+            Divider()
+
+            Button {
+                NotificationCenter.default.post(
+                    name: .openAssistOpenSettings,
+                    object: SettingsRoute(section: .modelsConnections, subsection: .modelsConnections)
+                )
+            } label: {
+                Label("Open Assistant Setup", systemImage: "gearshape")
+            }
+        } label: {
+            notesAssistantOverlayIconButton(symbol: "ellipsis")
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .help("Notes assistant options")
+    }
+
+    @ViewBuilder
+    private var notesAssistantSessionSwitcherMenu: some View {
+        if let project = selectedNotesProject {
+            let sessionSummaries = notesAssistantSessionSummaries(for: project)
+            let archivedSessionSummaries = archivedNotesAssistantSessionSummaries(for: project)
+            let currentLabel = notesAssistantSessionSwitcherLabel(
+                for: currentNotesAssistantSessionSummary,
+                project: project
+            )
+
+            Menu {
+                if sessionSummaries.isEmpty && archivedSessionSummaries.isEmpty {
+                    Text("No saved chats yet")
+                }
+
+                if !sessionSummaries.isEmpty {
+                    Section("Saved notes chats") {
+                        ForEach(sessionSummaries) { session in
+                            Button {
+                                Task { @MainActor in
+                                    await activateNotesAssistantSession(
+                                        for: project,
+                                        preferredSessionID: session.id
+                                    )
+                                }
+                            } label: {
+                                notesAssistantMenuRowLabel(
+                                    title: notesAssistantSessionDisplayTitle(
+                                        for: session,
+                                        project: project
+                                    ),
+                                    isSelected: assistantTimelineSessionIDsMatch(
+                                        currentNotesAssistantSessionSummary?.id,
+                                        session.id
+                                    )
+                                )
+                            }
+                        }
+                    }
+                }
+
+                if !archivedSessionSummaries.isEmpty {
+                    Section("Archived notes chats") {
+                        ForEach(archivedSessionSummaries) { session in
+                            Button {
+                                Task { @MainActor in
+                                    await activateNotesAssistantSession(
+                                        for: project,
+                                        preferredSessionID: session.id
+                                    )
+                                }
+                            } label: {
+                                notesAssistantMenuRowLabel(
+                                    title: notesAssistantSessionDisplayTitle(
+                                        for: session,
+                                        project: project
+                                    ),
+                                    isSelected: assistantTimelineSessionIDsMatch(
+                                        currentNotesAssistantSessionSummary?.id,
+                                        session.id
+                                    )
+                                )
+                            }
+                        }
+                    }
+                }
+
+                Divider()
+
+                Button {
+                    Task { @MainActor in
+                        _ = await createNotesAssistantSession(for: project)
+                    }
+                } label: {
+                    Label("New Chat", systemImage: "plus")
+                }
+
+                if let currentSession = currentNotesAssistantSessionSummary {
+                    Divider()
+
+                    Menu("Current Chat") {
+                        Button {
+                            presentRenameSessionPrompt(for: currentSession)
+                        } label: {
+                            Label("Rename Chat", systemImage: "pencil")
+                        }
+
+                        if currentSession.isArchived {
+                            Button {
+                                Task { @MainActor in
+                                    await unarchiveNotesAssistantSession(
+                                        currentSession, in: project)
+                                }
+                            } label: {
+                                Label("Unarchive Chat", systemImage: "tray.and.arrow.up")
+                            }
+                        } else {
+                            Button {
+                                Task { @MainActor in
+                                    await archiveNotesAssistantSession(currentSession, in: project)
+                                }
+                            } label: {
+                                Label("Archive Chat", systemImage: "archivebox")
+                            }
+                        }
+
+                        Divider()
+
+                        Button(role: .destructive) {
+                            pendingDeleteNotesAssistantSession = currentSession
+                        } label: {
+                            Label("Delete Chat", systemImage: "trash")
+                        }
+                    }
+                }
+            } label: {
+                HStack(spacing: 6) {
+                    Text(currentLabel)
+                        .font(.system(size: 11.5, weight: .semibold))
+                        .foregroundStyle(AppVisualTheme.foreground(0.74))
+                        .lineLimit(1)
+
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 9, weight: .bold))
+                        .foregroundStyle(AppVisualTheme.foreground(0.42))
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 7)
+                .background(
+                    Capsule(style: .continuous)
+                        .fill(AppVisualTheme.surfaceFill(0.05))
+                        .overlay(
+                            Capsule(style: .continuous)
+                                .stroke(AppVisualTheme.surfaceStroke(0.08), lineWidth: 0.7)
+                        )
+                )
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .help("Switch saved notes chats")
+        }
+    }
+
+    private func notesAssistantMenuRowLabel(
+        title: String,
+        isSelected: Bool
+    ) -> some View {
+        HStack(spacing: 8) {
+            Text(title)
+            Spacer(minLength: 8)
+            if isSelected {
+                Image(systemName: "checkmark")
+            }
+        }
+    }
+
+    private func notesAssistantQuickPromptButton(
+        title: String,
+        prompt: String
+    ) -> some View {
+        Button {
+            assistant.promptDraft = prompt
+        } label: {
+            HStack(spacing: 10) {
+                Text(title)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(AppVisualTheme.foreground(0.84))
+
+                Spacer(minLength: 0)
+
+                Image(systemName: "arrow.up.right")
+                    .font(.system(size: 10.5, weight: .semibold))
+                    .foregroundStyle(AppVisualTheme.foreground(0.34))
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func notesAssistantOverlayUsesCondensedLayout(
+        for layout: ChatLayoutMetrics
+    ) -> Bool {
+        layout.detailWidth < 760 || layout.windowHeight < 720
+    }
+
+    private func notesAssistantUsesDockedRail(for layout: ChatLayoutMetrics) -> Bool {
+        !layout.isNarrow && layout.detailWidth >= 1100 && layout.windowHeight >= 720
+    }
+
+    private func notesAssistantDockedRailWidth(for layout: ChatLayoutMetrics) -> CGFloat {
+        let minimumWidth: CGFloat = isNotesAssistantPanelExpanded ? 360 : 282
+        let maximumWidth: CGFloat = min(
+            isNotesAssistantPanelExpanded ? 560 : 332,
+            layout.detailWidth * (isNotesAssistantPanelExpanded ? 0.46 : 0.34)
+        )
+        let preferredWidth =
+            isNotesAssistantPanelExpanded
+            ? layout.detailWidth * 0.40
+            : layout.detailWidth * 0.24
+        return min(max(preferredWidth, minimumWidth), maximumWidth)
+    }
+
+    private func notesAssistantOverlayWidth(for layout: ChatLayoutMetrics) -> CGFloat {
+        if notesAssistantOverlayUsesCondensedLayout(for: layout) {
+            let minimumWidth: CGFloat = isNotesAssistantPanelExpanded ? 300 : 220
+            let maximumWidth: CGFloat = min(
+                isNotesAssistantPanelExpanded ? layout.detailWidth - 20 : 286,
+                layout.detailWidth - 18
+            )
+            let preferredWidth =
+                isNotesAssistantPanelExpanded
+                ? layout.detailWidth * 0.78
+                : layout.detailWidth * 0.36
+            return min(max(preferredWidth, minimumWidth), maximumWidth)
+        }
+
+        let minimumWidth: CGFloat = isNotesAssistantPanelExpanded ? 420 : 248
+        let maximumWidth: CGFloat = min(
+            isNotesAssistantPanelExpanded ? 640 : 292,
+            layout.detailWidth - 28
+        )
+        let preferredWidth =
+            isNotesAssistantPanelExpanded
+            ? layout.detailWidth * 0.52
+            : layout.detailWidth * 0.22
+        return min(max(preferredWidth, minimumWidth), maximumWidth)
+    }
+
+    private func notesAssistantOverlayHeight(for layout: ChatLayoutMetrics) -> CGFloat {
+        let availableHeight = max(220, layout.windowHeight - 168)
+
+        if notesAssistantOverlayUsesCondensedLayout(for: layout) {
+            let minimumHeight: CGFloat = isNotesAssistantPanelExpanded ? 316 : 272
+            let maximumHeight: CGFloat = min(
+                isNotesAssistantPanelExpanded ? availableHeight : 332,
+                availableHeight
+            )
+            let preferredHeight: CGFloat = min(
+                isNotesAssistantPanelExpanded ? availableHeight * 0.88 : 304,
+                availableHeight
+            )
+            return min(max(preferredHeight, minimumHeight), maximumHeight)
+        }
+
+        let minimumHeight: CGFloat = isNotesAssistantPanelExpanded ? 404 : 298
+        let maximumHeight: CGFloat = min(
+            isNotesAssistantPanelExpanded ? availableHeight : 352, availableHeight)
+        let preferredHeight: CGFloat = isNotesAssistantPanelExpanded ? availableHeight * 0.86 : 316
+        return min(max(preferredHeight, minimumHeight), maximumHeight)
+    }
+
     private func notesTopBarTitleCluster(layout: ChatLayoutMetrics) -> some View {
         HStack(spacing: 10) {
             Text("Notes")
@@ -5054,18 +9500,21 @@ struct AssistantWindowView: View {
                 .foregroundStyle(AppVisualTheme.foreground(0.88))
 
             if let project = selectedNotesProject {
-                AssistantStatusBadge(
-                    title: project.name,
-                    tint: AppVisualTheme.accentTint,
-                    symbol: project.displayIconSymbolName
-                )
+                HStack(spacing: 6) {
+                    Image(systemName: project.displayIconSymbolName)
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(AppVisualTheme.accentTint)
+                    Text(project.name)
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(AppVisualTheme.foreground(0.72))
+                        .lineLimit(1)
+                }
                 .help(project.linkedFolderPath ?? project.name)
 
-                AssistantStatusBadge(
-                    title: selectedNotesScope == .project ? "Project notes" : "Thread notes",
-                    tint: AppVisualTheme.foreground(0.76),
-                    symbol: selectedNotesScope == .project ? "folder.text" : "bubble.left.and.text.bubble.right"
-                )
+                Text(selectedNotesScope == .project ? "Project notes" : "Thread notes")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(AppVisualTheme.foreground(0.42))
+                    .lineLimit(1)
             } else {
                 Text("Choose a project from the sidebar")
                     .font(.system(size: 12, weight: .medium))
@@ -5095,6 +9544,24 @@ struct AssistantWindowView: View {
             Spacer(minLength: 0)
 
             HStack(spacing: 6) {
+                Button {
+                    withAnimation(.spring(response: 0.24, dampingFraction: 0.86)) {
+                        isNotesAssistantPanelOpen.toggle()
+                    }
+                    syncAssistantNotesRuntimeContext()
+                } label: {
+                    topBarIconButton(
+                        symbol: isNotesAssistantPanelOpen ? "sidebar.right" : "sparkles",
+                        emphasized: isNotesAssistantPanelOpen
+                    )
+                }
+                .buttonStyle(.plain)
+                .help(
+                    isNotesAssistantPanelOpen
+                        ? "Collapse notes assistant"
+                        : "Open notes assistant"
+                )
+
                 if presentationStyle == .compactSidebar {
                     Button {
                         settings.assistantCompactSidebarPinned.toggle()
@@ -5151,7 +9618,8 @@ struct AssistantWindowView: View {
         layout: ChatLayoutMetrics
     ) -> some View {
         let outerHorizontalPadding: CGFloat = layout.isNarrow ? 14 : 18
-        let headerContentMaxWidth = min(1180, max(320, layout.windowWidth - (outerHorizontalPadding * 2)))
+        let headerContentMaxWidth = min(
+            1180, max(320, layout.windowWidth - (outerHorizontalPadding * 2)))
         let centeredInset = max((layout.windowWidth - headerContentMaxWidth) / 2, 0)
         let backButtonLeadingInset = max(0, layout.leadingReserve - centeredInset)
 
@@ -5210,8 +9678,11 @@ struct AssistantWindowView: View {
                     openCurrentWorkspace(in: primaryWorkspaceLaunchTarget)
                 } label: {
                     HStack(spacing: 7) {
-                        Image(systemName: currentWorkspaceURL == nil ? "folder.badge.questionmark" : "folder")
-                            .font(.system(size: 11.5, weight: .semibold))
+                        Image(
+                            systemName: currentWorkspaceURL == nil
+                                ? "folder.badge.questionmark" : "folder"
+                        )
+                        .font(.system(size: 11.5, weight: .semibold))
                         if !layout.isNarrow {
                             Text("Open Folder")
                                 .font(.system(size: 12, weight: .semibold))
@@ -5378,16 +9849,20 @@ struct AssistantWindowView: View {
     }
 
     private var chatWebActiveWorkState: AssistantChatWebActiveWorkState? {
-        guard let selectedSessionID = assistant.selectedSessionID?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .nonEmpty,
-            assistantSessionOwnsLiveRuntimeState(
-                sessionID: selectedSessionID,
-                activeRuntimeSessionID: assistant.activeRuntimeSessionID
-            ),
-            assistant.pendingPermissionRequest == nil,
-            !hasVisibleStreamingAssistantMessage,
-            assistant.hasActiveTurn else {
+        guard
+            let selectedSessionID = assistant.selectedSessionID?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .nonEmpty
+        else {
+            return nil
+        }
+
+        let snapshot = selectedSessionActivitySnapshot
+        let ownsLiveRuntime = assistantSessionOwnsLiveRuntimeState(
+            sessionID: selectedSessionID,
+            activeRuntimeSessionID: assistant.activeRuntimeSessionID
+        )
+        guard snapshot.pendingPermissionRequest == nil else {
             return nil
         }
 
@@ -5405,14 +9880,28 @@ struct AssistantWindowView: View {
                 .prefix(3)
                 .map(AssistantChatWebActiveWorkSubagent.init(subagent:))
         )
-        guard !subagents.isEmpty else {
+        let hasStructuredActivity =
+            !activeCalls.isEmpty || !recentCalls.isEmpty || !subagents.isEmpty
+        guard hasStructuredActivity else {
             return nil
         }
 
-        let title = assistant.hudState.title
+        let shouldShowStructuredActivity =
+            ownsLiveRuntime
+            || snapshot.hasActiveTurn
+            || snapshot.awaitingAssistantStart
+            || selectedSessionToolActivity.hasActivity
+            || activeWorkSnapshot != nil
+        guard shouldShowStructuredActivity else {
+            return nil
+        }
+
+        let effectiveHUD = snapshot.hudState ?? assistant.hudState
+        let title =
+            effectiveHUD.title
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .nonEmpty ?? "Working"
-        let detail = assistant.hudState.detail?
+        let detail = effectiveHUD.detail?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .nonEmpty
 
@@ -5422,6 +9911,60 @@ struct AssistantWindowView: View {
             activeCalls: activeCalls,
             recentCalls: recentCalls,
             subagents: subagents
+        )
+    }
+
+    private var chatWebActiveTurnState: AssistantChatWebActiveTurnState? {
+        guard
+            let selectedSessionID = assistant.selectedSessionID?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .nonEmpty
+        else {
+            return nil
+        }
+
+        let snapshot = selectedSessionActivitySnapshot
+        let hasPendingInput = snapshot.pendingPermissionRequest?.toolKind == "userInput"
+        let hasPendingToolApproval = snapshot.pendingPermissionRequest != nil && !hasPendingInput
+        let ownsLiveRuntime = assistantSessionOwnsLiveRuntimeState(
+            sessionID: selectedSessionID,
+            activeRuntimeSessionID: assistant.activeRuntimeSessionID
+        )
+        let isActive =
+            snapshot.hasActiveTurn
+            || snapshot.awaitingAssistantStart
+            || hasPendingToolApproval
+            || hasPendingInput
+
+        guard ownsLiveRuntime || isActive else {
+            return nil
+        }
+
+        let hudPhase = snapshot.hudState?.phase ?? assistant.hudState.phase
+        let phase: String
+        if hasPendingInput || hasPendingToolApproval {
+            phase = "needsInput"
+        } else {
+            switch hudPhase {
+            case .thinking:
+                phase = "thinking"
+            case .streaming:
+                phase = "streaming"
+            case .acting, .listening:
+                phase = "acting"
+            case .waitingForPermission:
+                phase = "needsInput"
+            case .idle, .success, .failed:
+                phase = isActive ? "acting" : "idle"
+            }
+        }
+
+        return AssistantChatWebActiveTurnState(
+            phase: phase,
+            canCancel: isActive,
+            providerLabel: assistant.visibleAssistantBackend.shortDisplayName,
+            hasPendingToolApproval: hasPendingToolApproval,
+            hasPendingInput: hasPendingInput
         )
     }
 
@@ -5463,8 +10006,15 @@ struct AssistantWindowView: View {
         )
     }
 
-    private func chatBottomDock(layout: ChatLayoutMetrics) -> some View {
-        VStack(alignment: .center, spacing: 6) {
+    private func chatBottomDock(
+        layout: ChatLayoutMetrics,
+        composerState: AssistantComposerWebState,
+        maxWidth: CGFloat? = nil,
+        showsStatusBar: Bool = true,
+        isCompact: Bool = false
+    ) -> some View {
+        let resolvedMaxWidth = maxWidth ?? layout.composerMaxWidth
+        return VStack(alignment: .center, spacing: 6) {
             VStack(alignment: .leading, spacing: 0) {
                 if let request = assistant.pendingPermissionRequest {
                     HStack(alignment: .top, spacing: 0) {
@@ -5508,33 +10058,49 @@ struct AssistantWindowView: View {
                     .padding(.bottom, 8)
                 }
 
-                chatComposer(layout: layout)
+                chatComposer(layout: layout, state: composerState)
             }
-            .frame(maxWidth: layout.composerMaxWidth, alignment: .leading)
-
-            // Integrated status bar
-            HStack(spacing: 6) {
-                if !assistant.rateLimits.isEmpty {
-                    statusBarRateLimits
+            .frame(maxWidth: resolvedMaxWidth, alignment: .leading)
+            .overlay(alignment: .bottomLeading) {
+                if isComposerQuickActionsMenuPresented && !composerState.base.isCompactComposer {
+                    composerQuickActionsMenu(state: composerState)
+                        .padding(.leading, 18)
+                        .padding(.bottom, 60)
+                        .transition(
+                            .asymmetric(
+                                insertion: .opacity.combined(with: .move(edge: .bottom)),
+                                removal: .opacity
+                            )
+                        )
                 }
-
-                Spacer(minLength: 4)
-
-                if assistant.accountSnapshot.isLoggedIn {
-                    AccountBadgeCircle(snapshot: assistant.accountSnapshot)
-                }
-
-                ContextUsageCircle(usage: assistant.tokenUsage)
             }
-            .padding(.horizontal, 14)
-            .frame(maxWidth: layout.composerMaxWidth)
+
+            if showsStatusBar {
+                // Integrated status bar
+                HStack(spacing: 6) {
+                    if !assistant.rateLimits.isEmpty {
+                        statusBarRateLimits
+                    }
+
+                    Spacer(minLength: 4)
+
+                    if assistant.accountSnapshot.isLoggedIn {
+                        AccountBadgeCircle(snapshot: assistant.accountSnapshot)
+                    }
+
+                    ContextUsageCircle(usage: assistant.tokenUsage)
+                }
+                .padding(.horizontal, 14)
+                .frame(maxWidth: resolvedMaxWidth)
+            }
         }
         .animation(.easeInOut(duration: 0.25), value: hasToolActivity)
         .animation(.easeInOut(duration: 0.25), value: hasSelectedSessionActiveWork)
         .frame(maxWidth: .infinity, alignment: .center)
-        .padding(.horizontal, layout.timelineHorizontalPadding)
-        .padding(.top, 4)
-        .padding(.bottom, 4)
+        .padding(.horizontal, isCompact ? 0 : layout.timelineHorizontalPadding)
+        .padding(.top, isCompact ? 0 : 4)
+        .padding(.bottom, isCompact ? 0 : 4)
+        .zIndex(isComposerQuickActionsMenuPresented ? 60 : 0)
     }
 
     private func chatTopBarTitleCluster(layout: ChatLayoutMetrics) -> some View {
@@ -5855,11 +10421,13 @@ struct AssistantWindowView: View {
     private var workspaceLaunchDropdownOverlay: some View {
         VStack(alignment: .leading, spacing: 2) {
             if currentWorkspaceURL == nil {
-                Text("Choose a default editor now. Open a project with a folder link to launch it there.")
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(AppVisualTheme.foreground(0.45))
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 6)
+                Text(
+                    "Choose a default editor now. Open a project with a folder link to launch it there."
+                )
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(AppVisualTheme.foreground(0.45))
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
 
                 Divider().padding(.horizontal, 6)
             }
@@ -5922,9 +10490,11 @@ struct AssistantWindowView: View {
                 .buttonStyle(.plain)
                 .disabled(!isEnabled)
                 .onHover { hovering in
-                    hoveredWorkspaceLaunchTargetID = hovering ? target.id : (
-                        hoveredWorkspaceLaunchTargetID == target.id ? nil : hoveredWorkspaceLaunchTargetID
-                    )
+                    hoveredWorkspaceLaunchTargetID =
+                        hovering
+                        ? target.id
+                        : (hoveredWorkspaceLaunchTargetID == target.id
+                            ? nil : hoveredWorkspaceLaunchTargetID)
                 }
             }
         }
@@ -5990,8 +10560,18 @@ struct AssistantWindowView: View {
             configuration.activates = true
             configuration.promptsUserIfNeeded = false
 
+            // When the user is viewing a note, also pass the note's markdown
+            // file so the editor opens the folder as the workspace AND a loose
+            // tab for the note. Folder must come first so the editor uses it
+            // as the workspace root.
+            let noteURL = currentNoteMarkdownFileURL
+            var urlsToOpen: [URL] = [workspaceURL]
+            if let noteURL {
+                urlsToOpen.append(noteURL)
+            }
+
             NSWorkspace.shared.open(
-                [workspaceURL],
+                urlsToOpen,
                 withApplicationAt: applicationURL,
                 configuration: configuration
             ) { _, error in
@@ -6002,6 +10582,9 @@ struct AssistantWindowView: View {
                         )
                         assistant.lastStatusMessage =
                             "Could not open this folder in \(target.title)."
+                    } else if noteURL != nil {
+                        assistant.lastStatusMessage =
+                            "Opened this folder and note in \(target.title)."
                     } else {
                         assistant.lastStatusMessage = "Opened this folder in \(target.title)."
                     }
@@ -6351,6 +10934,133 @@ struct AssistantWindowView: View {
         }
     }
 
+    private func presentCreateNoteFolderPrompt(
+        for project: AssistantProject,
+        parentFolderID: String?
+    ) {
+        let folderRows = sidebarNoteFolderRows(for: project, scope: .project)
+        let parentFolder = folderRows.first(where: {
+            $0.id.caseInsensitiveCompare(parentFolderID ?? "") == .orderedSame
+        })
+        let folderSuffix = parentFolder.map { " inside \($0.path.joined(separator: " / "))" } ?? ""
+        let existingFolderIDs = Set(folderRows.map { $0.id.lowercased() })
+        presentProjectNamePrompt(
+            title: "Create Note Folder",
+            message: "Give this note folder a simple name\(folderSuffix).",
+            confirmTitle: "Create",
+            initialValue: ""
+        ) { proposedName in
+            guard let workspace = assistant.createProjectNoteFolder(
+                projectID: project.id,
+                parentFolderID: parentFolderID,
+                name: proposedName
+            ) else {
+                return
+            }
+            if let newFolder = workspace.manifest.folders.first(where: {
+                !existingFolderIDs.contains($0.id.lowercased())
+            }) {
+                setNoteFolderPathExpanded(
+                    folderID: newFolder.id,
+                    folders: workspace.manifest.folders
+                )
+            } else if let parentFolderID {
+                setNoteFolderPathExpanded(
+                    folderID: parentFolderID,
+                    folders: workspace.manifest.folders
+                )
+            }
+            applyThreadNoteWorkspace(workspace)
+        }
+    }
+
+    private func presentRenameNoteFolderPrompt(
+        for project: AssistantProject,
+        folderID: String
+    ) {
+        let folderRows = sidebarNoteFolderRows(for: project, scope: .project)
+        guard let folder = folderRows.first(where: {
+            $0.id.caseInsensitiveCompare(folderID) == .orderedSame
+        }) else {
+            return
+        }
+        presentProjectNamePrompt(
+            title: "Rename Note Folder",
+            message: "Choose the new name for this note folder. Notes inside it will stay attached.",
+            confirmTitle: "Rename",
+            initialValue: folder.name
+        ) { proposedName in
+            guard let workspace = assistant.renameProjectNoteFolder(
+                projectID: project.id,
+                folderID: folderID,
+                name: proposedName
+            ) else {
+                return
+            }
+            setNoteFolderPathExpanded(folderID: folderID, folders: workspace.manifest.folders)
+            applyThreadNoteWorkspace(workspace)
+        }
+    }
+
+    private func presentMoveNoteFolderPrompt(
+        for project: AssistantProject,
+        folderID: String
+    ) {
+        let folderRows = sidebarNoteFolderRows(for: project, scope: .project)
+        guard let folder = folderRows.first(where: {
+            $0.id.caseInsensitiveCompare(folderID) == .orderedSame
+        }) else {
+            return
+        }
+
+        let allFolders = assistant.projectNoteFolders(projectID: project.id)
+        let descendantIDs = noteFolderDescendantIDs(folderID: folderID, folders: allFolders)
+        let availableFolders = folderRows.filter {
+            $0.id.caseInsensitiveCompare(folderID) != .orderedSame
+                && !descendantIDs.contains($0.id.lowercased())
+        }
+
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = "Move Note Folder"
+        alert.informativeText =
+            availableFolders.isEmpty
+            ? "There are no other note folders yet. You can still move this folder to the top level."
+            : "Choose where to place \(folder.path.joined(separator: " / "))."
+
+        let popup = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 320, height: 28))
+        popup.addItem(withTitle: "Top level")
+        availableFolders.forEach { popup.addItem(withTitle: $0.path.joined(separator: " / ")) }
+        if let currentParentID = folder.parentFolderID,
+            let currentIndex = availableFolders.firstIndex(where: {
+                $0.id.caseInsensitiveCompare(currentParentID) == .orderedSame
+            })
+        {
+            popup.selectItem(at: currentIndex + 1)
+        } else {
+            popup.selectItem(at: 0)
+        }
+        alert.accessoryView = popup
+        alert.addButton(withTitle: "Move")
+        alert.addButton(withTitle: "Cancel")
+
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let targetFolderID =
+            popup.indexOfSelectedItem <= 0 ? nil : availableFolders[popup.indexOfSelectedItem - 1].id
+        guard let workspace = assistant.moveProjectNoteFolder(
+            projectID: project.id,
+            folderID: folderID,
+            parentFolderID: targetFolderID
+        ) else {
+            return
+        }
+        setNoteFolderPathExpanded(
+            folderID: targetFolderID ?? folderID,
+            folders: workspace.manifest.folders
+        )
+        applyThreadNoteWorkspace(workspace)
+    }
+
     private func presentNamedProjectPrompt(parentFolder: AssistantProject?) {
         let folderSuffix = parentFolder.map { " inside the group \($0.name)" } ?? ""
         presentProjectNamePrompt(
@@ -6366,7 +11076,8 @@ struct AssistantWindowView: View {
 
     private func presentCreateProjectFromFolderPrompt(parentFolder: AssistantProject?) {
         let panel = NSOpenPanel()
-        panel.message = parentFolder == nil
+        panel.message =
+            parentFolder == nil
             ? "Choose the local folder to add as a project."
             : "Choose the local folder to add as a project inside the group \(parentFolder?.name ?? "this group")."
         panel.prompt = "Open Folder"
@@ -6402,8 +11113,8 @@ struct AssistantWindowView: View {
             title: project.isFolder ? "Rename Group" : "Rename Project",
             message:
                 project.isFolder
-                    ? "Choose the new name for this group. The projects inside it will stay attached."
-                    : "Choose the new name for this project. Its chats and memory will stay attached.",
+                ? "Choose the new name for this group. The projects inside it will stay attached."
+                : "Choose the new name for this project. Its chats and memory will stay attached.",
             confirmTitle: "Rename",
             initialValue: project.name
         ) { proposedName in
@@ -6422,16 +11133,17 @@ struct AssistantWindowView: View {
         alert.messageText = "Move Project to Group"
         alert.informativeText =
             folders.isEmpty
-                ? "There are no groups yet. Create a group first, or move this project back to the top level."
-                : "Choose where to place \(project.name)."
+            ? "There are no groups yet. Create a group first, or move this project back to the top level."
+            : "Choose where to place \(project.name)."
 
         let popup = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 320, height: 28))
         popup.addItem(withTitle: "Top level")
         folders.forEach { popup.addItem(withTitle: $0.name) }
         if let currentParentID = project.parentID,
-           let currentIndex = folders.firstIndex(where: {
-               $0.id.caseInsensitiveCompare(currentParentID) == .orderedSame
-           }) {
+            let currentIndex = folders.firstIndex(where: {
+                $0.id.caseInsensitiveCompare(currentParentID) == .orderedSame
+            })
+        {
             popup.selectItem(at: currentIndex + 1)
         } else {
             popup.selectItem(at: 0)
@@ -6441,7 +11153,8 @@ struct AssistantWindowView: View {
         alert.addButton(withTitle: "Cancel")
 
         guard alert.runModal() == .alertFirstButtonReturn else { return }
-        let targetFolder = popup.indexOfSelectedItem <= 0 ? nil : folders[popup.indexOfSelectedItem - 1]
+        let targetFolder =
+            popup.indexOfSelectedItem <= 0 ? nil : folders[popup.indexOfSelectedItem - 1]
         assistant.moveProject(project.id, toFolderID: targetFolder?.id)
     }
 
@@ -6581,7 +11294,9 @@ struct AssistantWindowView: View {
         return laterItems.contains(where: { activityItems(for: $0).isEmpty })
     }
 
-    private func activityItems(for renderItem: AssistantTimelineRenderItem) -> [AssistantActivityItem] {
+    private func activityItems(for renderItem: AssistantTimelineRenderItem)
+        -> [AssistantActivityItem]
+    {
         assistantTimelineActivityItems(for: renderItem)
     }
 
@@ -6610,9 +11325,11 @@ struct AssistantWindowView: View {
             guard segmentStart < endExclusive else { return }
 
             let indices = Array(segmentStart..<endExclusive)
-            guard let lastAssistantIndex = indices.last(where: {
-                assistantTimelineIsCollapsibleAssistantResponseRenderItem(renderItems[$0])
-            }) else {
+            guard
+                let lastAssistantIndex = indices.last(where: {
+                    assistantTimelineIsCollapsibleAssistantResponseRenderItem(renderItems[$0])
+                })
+            else {
                 return
             }
 
@@ -6799,7 +11516,7 @@ struct AssistantWindowView: View {
                 if !canChat {
                     Button("Open Settings") {
                         NotificationCenter.default.post(
-                            name: .openAssistOpenSettings, object: SettingsRoute.gettingStartedHome)
+                            name: .openAssistOpenSettings, object: SettingsRoute(section: .modelsConnections, subsection: .modelsConnections))
                     }
                     .buttonStyle(.borderedProminent)
                 }
@@ -6826,7 +11543,7 @@ struct AssistantWindowView: View {
             ProgressView()
                 .controlSize(.small)
                 .tint(AppVisualTheme.foreground(0.5))
-            Text("Loading session")
+            Text("Loading chat…")
                 .font(.system(size: 13, weight: .medium))
                 .foregroundStyle(AppVisualTheme.foreground(0.4))
             Spacer()
@@ -7272,6 +11989,80 @@ struct AssistantWindowView: View {
             || text.hasPrefix("### Selection Q&A")
     }
 
+    private func threadNoteSelectionContext(
+        owner: AssistantNoteOwnerKey,
+        noteID: String,
+        selectedText: String?,
+        anchorRect: CGRect?
+    ) -> AssistantTextSelectionTracker.SelectionContext? {
+        guard
+            let selectedText = selectedText?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .nonEmpty,
+            let anchorRect,
+            let screenRect = threadNoteSelectionScreenRect(from: anchorRect)
+        else {
+            return nil
+        }
+
+        let noteText = noteDraftText(for: owner, noteID: noteID)
+        return AssistantTextSelectionTracker.SelectionContext(
+            messageID: "note-selection-\(owner.storageKey)-\(noteID.lowercased())",
+            selectedText: selectedText,
+            parentMessageText: noteText,
+            anchorRectOnScreen: screenRect
+        )
+    }
+
+    private func threadNoteSelectionScreenRect(from anchorRect: CGRect) -> CGRect? {
+        guard let container = threadNoteWebContainer,
+            let window = container.window
+        else {
+            return nil
+        }
+
+        let localRect = CGRect(
+            x: max(0, anchorRect.origin.x),
+            y: max(0, anchorRect.origin.y),
+            width: max(anchorRect.width, 2),
+            height: max(anchorRect.height, 2)
+        )
+        let windowRect = container.convert(localRect, to: nil)
+        return window.convertToScreen(windowRect)
+    }
+
+    private func presentThreadNoteSelectionAssistantActions(
+        owner: AssistantNoteOwnerKey,
+        noteID: String,
+        selectedText: String?,
+        anchorRect: CGRect?
+    ) {
+        guard !AssistantSelectionActionHUDManager.shared.retainsPresentationWithoutSelection else {
+            return
+        }
+
+        guard
+            let selection = threadNoteSelectionContext(
+                owner: owner,
+                noteID: noteID,
+                selectedText: selectedText,
+                anchorRect: anchorRect
+            )
+        else {
+            hideThreadNoteSelectionAssistantActionsIfNeeded()
+            return
+        }
+
+        presentSelectionActions(for: selection, allowsNoteActions: false)
+    }
+
+    private func hideThreadNoteSelectionAssistantActionsIfNeeded() {
+        guard !AssistantSelectionActionHUDManager.shared.retainsPresentationWithoutSelection else {
+            return
+        }
+        AssistantSelectionActionHUDManager.shared.hide()
+    }
+
     private func handleWebViewTextSelection(
         selectedText: String,
         messageID: String,
@@ -7295,7 +12086,8 @@ struct AssistantWindowView: View {
     }
 
     private func presentSelectionActions(
-        for selection: AssistantTextSelectionTracker.SelectionContext
+        for selection: AssistantTextSelectionTracker.SelectionContext,
+        allowsNoteActions: Bool = true
     ) {
         AssistantSelectionActionHUDManager.shared.show(
             anchorRect: selection.anchorRectOnScreen,
@@ -7305,12 +12097,14 @@ struct AssistantWindowView: View {
             onAsk: {
                 askQuestionAboutSelection(using: selection)
             },
-            onAddToNote: {
-                addSelectionToCurrentThreadNote(using: selection)
-            },
-            onGenerateChart: {
-                generateChartForSelection(using: selection)
-            }
+            onAddToNote: allowsNoteActions
+                ? {
+                    addSelectionToCurrentThreadNote(using: selection)
+                } : nil,
+            onGenerateChart: allowsNoteActions
+                ? {
+                    generateChartForSelection(using: selection)
+                } : nil
         )
     }
 
@@ -7320,9 +12114,10 @@ struct AssistantWindowView: View {
         let textToAppend = selection.selectedText
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !textToAppend.isEmpty,
-              let owner = currentThreadNoteOwner ?? selectedThreadNoteID.map({
-                  AssistantNoteOwnerKey(kind: .thread, id: $0)
-              })
+            let owner = currentThreadNoteOwner
+                ?? selectedThreadNoteID.map({
+                    AssistantNoteOwnerKey(kind: .thread, id: $0)
+                })
         else { return }
 
         _ = ensureSelectedNotesWorkspace(for: owner)
@@ -7355,10 +12150,11 @@ struct AssistantWindowView: View {
         let normalizedParentMessageText = selection.parentMessageText
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !normalizedSelectedText.isEmpty,
-              !normalizedParentMessageText.isEmpty,
-              let owner = currentThreadNoteOwner ?? selectedThreadNoteID.map({
-                  AssistantNoteOwnerKey(kind: .thread, id: $0)
-              })
+            !normalizedParentMessageText.isEmpty,
+            let owner = currentThreadNoteOwner
+                ?? selectedThreadNoteID.map({
+                    AssistantNoteOwnerKey(kind: .thread, id: $0)
+                })
         else {
             return
         }
@@ -7409,15 +12205,18 @@ struct AssistantWindowView: View {
     private func regenerateThreadNoteChartDraft(
         owner: AssistantNoteOwnerKey,
         currentDraftMarkdown: String?,
-        styleInstruction: String?
+        styleInstruction: String?,
+        renderError: String?
     ) {
         guard let context = threadNoteChartContextByOwnerKey[owner.storageKey] else {
-            threadNoteAIDraftPreviewByOwnerKey[owner.storageKey] = AssistantChatWebThreadNoteAIPreview(
-                mode: "chart",
-                sourceKind: "chatSelection",
-                markdown: "The original chart context is no longer available. Select the source text again and choose Generate Chart one more time.",
-                isError: true
-            )
+            threadNoteAIDraftPreviewByOwnerKey[owner.storageKey] =
+                AssistantChatWebThreadNoteAIPreview(
+                    mode: "chart",
+                    sourceKind: "chatSelection",
+                    markdown:
+                        "The original chart context is no longer available. Select the source text again and choose Generate Chart one more time.",
+                    isError: true
+                )
             threadNoteAIDraftModeByOwnerKey[owner.storageKey] = "chart"
             threadNoteGeneratingAIDraftOwnerKeys.remove(owner.storageKey)
             return
@@ -7426,7 +12225,15 @@ struct AssistantWindowView: View {
         let normalizedStyleInstruction = styleInstruction?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .nonEmpty
-        guard let normalizedStyleInstruction else {
+        let normalizedRenderError = renderError?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nonEmpty
+        let hasCurrentDraft =
+            currentDraftMarkdown?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .isEmpty == false
+        guard hasCurrentDraft || normalizedStyleInstruction != nil || normalizedRenderError != nil
+        else {
             return
         }
 
@@ -7437,7 +12244,8 @@ struct AssistantWindowView: View {
                 selectedText: context.selectedText,
                 parentMessageText: context.parentMessageText,
                 currentDraft: currentDraftMarkdown,
-                styleInstruction: normalizedStyleInstruction
+                styleInstruction: normalizedStyleInstruction,
+                validationError: normalizedRenderError
             )
 
             await MainActor.run {
@@ -7656,13 +12464,11 @@ struct AssistantWindowView: View {
     private func selectionAskConversationKey(
         for selection: AssistantTextSelectionTracker.SelectionContext
     ) -> SelectionAskConversationSession.Key {
-        let sessionID = (
-            assistant.selectedSessionID ??
-            assistant.activeRuntimeSessionID ??
-            "selection-message-\(selection.messageID)"
-        )
-        .trimmingCharacters(in: .whitespacesAndNewlines)
-        .nonEmpty
+        let sessionID =
+            (assistant.selectedSessionID ?? assistant.activeRuntimeSessionID
+            ?? "selection-message-\(selection.messageID)")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nonEmpty
             ?? "selection-message-\(selection.messageID)"
 
         return SelectionAskConversationSession.Key(
@@ -7700,9 +12506,10 @@ struct AssistantWindowView: View {
     ) -> String? {
         let visibleModels = assistant.selectionSideAssistantVisibleModels(for: backend)
         if backend == .codex,
-           let miniModel = visibleModels.first(where: { model in
-               model.id.lowercased().contains("mini")
-           }) {
+            let miniModel = visibleModels.first(where: { model in
+                model.id.lowercased().contains("mini")
+            })
+        {
             return miniModel.id
         }
         return assistant.selectionSideAssistantResolvedModelID(
@@ -7772,7 +12579,8 @@ struct AssistantWindowView: View {
     private func selectionAssistantPreferredBackend(
         for selection: AssistantTextSelectionTracker.SelectionContext
     ) -> AssistantRuntimeBackend {
-        selectionAskConversation(for: selection)?.preferredBackend ?? assistant.visibleAssistantBackend
+        selectionAskConversation(for: selection)?.preferredBackend
+            ?? assistant.visibleAssistantBackend
     }
 
     private func selectionAssistantPreferredModelID(
@@ -7831,8 +12639,9 @@ struct AssistantWindowView: View {
         }
 
         if let conversation = selectionAskConversation(for: selection),
-           conversation.mainChatSummaryFingerprint == latestSnapshot.fingerprint,
-           conversation.mainChatSummary == latestSnapshot.summary {
+            conversation.mainChatSummaryFingerprint == latestSnapshot.fingerprint,
+            conversation.mainChatSummary == latestSnapshot.summary
+        {
             return conversation.mainChatSummary
         }
 
@@ -7848,7 +12657,8 @@ struct AssistantWindowView: View {
         for selection: AssistantTextSelectionTracker.SelectionContext
     ) async {
         let currentBackend = selectionAssistantPreferredBackend(for: selection)
-        let currentModelID = currentBackend == backend
+        let currentModelID =
+            currentBackend == backend
             ? selectionAssistantPreferredModelID(for: selection)
             : nil
         setSelectionAssistantRuntimeState(
@@ -7860,20 +12670,22 @@ struct AssistantWindowView: View {
         refreshSelectionAssistantRuntimeControls(for: selection)
 
         let loadedModels = await assistant.loadSelectionSideAssistantVisibleModels(for: backend)
-        let resolvedModelID = AssistantStore.resolvedModelSelection(
-            from: nil,
-            backend: backend,
-            availableModels: loadedModels,
-            preferredModelID: currentModelID
-        ) ?? {
-            if let currentModelID {
-                return assistant.selectionSideAssistantResolvedModelID(
-                    for: backend,
-                    preferredModelID: currentModelID
-                )
-            }
-            return defaultSelectionAssistantModelID(for: backend)
-        }()
+        let resolvedModelID =
+            AssistantStore.resolvedModelSelection(
+                from: nil,
+                backend: backend,
+                availableModels: loadedModels,
+                preferredModelID: currentModelID
+            )
+            ?? {
+                if let currentModelID {
+                    return assistant.selectionSideAssistantResolvedModelID(
+                        for: backend,
+                        preferredModelID: currentModelID
+                    )
+                }
+                return defaultSelectionAssistantModelID(for: backend)
+            }()
 
         setSelectionAssistantRuntimeState(
             for: selection,
@@ -7900,7 +12712,8 @@ struct AssistantWindowView: View {
 
     private func selectionPreview(for selectedText: String) -> String {
         let normalized = selectedText.replacingOccurrences(of: "\r\n", with: "\n")
-        let cleanedLines = normalized
+        let cleanedLines =
+            normalized
             .components(separatedBy: "\n")
             .map {
                 $0.replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
@@ -7938,7 +12751,7 @@ struct AssistantWindowView: View {
         {
             openSettingsAction = {
                 NotificationCenter.default.post(
-                    name: .openAssistOpenSettings, object: SettingsRoute.gettingStartedHome)
+                    name: .openAssistOpenSettings, object: SettingsRoute(section: .assistant, subsection: .assistantSetup))
             }
         } else {
             openSettingsAction = nil
@@ -7985,16 +12798,28 @@ struct AssistantWindowView: View {
     {
         let backend = selectionAssistantPreferredBackend(for: selection)
         let modelOptions = assistant.selectionSideAssistantVisibleModels(for: backend)
-        let inheritedModelID = backend == assistant.visibleAssistantBackend ? assistant.selectedModelID : nil
-        let selectedModelID = selectionAskConversation(for: selection)?.preferredModelID
+        let isLoadingModels = selectionAskConversation(for: selection)?.isLoadingModels ?? false
+        let isBusy = selectionAskConversation(for: selection)?.isRequestInFlight ?? false
+        let runtimeState = assistant.runtimeControlsState(
+            for: backend,
+            availableModels: modelOptions,
+            isLoadingModels: isLoadingModels,
+            isBusy: isBusy
+        )
+        let inheritedModelID =
+            backend == assistant.visibleAssistantBackend ? assistant.selectedModelID : nil
+        let selectedModelID =
+            selectionAskConversation(for: selection)?.preferredModelID
             ?? assistant.selectionSideAssistantResolvedModelID(
                 for: backend,
                 preferredModelID: inheritedModelID
             )
         return AssistantSelectionActionHUDManager.RuntimeControls(
+            availability: runtimeState.availability,
+            statusText: runtimeState.statusText.nonEmpty,
             providerOptions: assistant.selectableAssistantBackends,
             selectedProvider: backend,
-            isProviderSelectionDisabled: false,
+            isProviderSelectionDisabled: !runtimeState.availability.isReady,
             modelOptions: modelOptions,
             selectedModelID: selectedModelID,
             selectedModelSummary: selectionAssistantModelSummary(
@@ -8002,7 +12827,7 @@ struct AssistantWindowView: View {
                 selectedModelID: selectedModelID,
                 for: selection
             ),
-            isModelLoading: selectionAskConversation(for: selection)?.isLoadingModels ?? false
+            isModelLoading: isLoadingModels
         )
     }
 
@@ -8021,8 +12846,20 @@ struct AssistantWindowView: View {
         for selection: AssistantTextSelectionTracker.SelectionContext
     ) -> String {
         let visibleModels = assistant.selectionSideAssistantVisibleModels(for: backend)
+        let isLoadingModels = selectionAskConversation(for: selection)?.isLoadingModels ?? false
+        let isBusy = selectionAskConversation(for: selection)?.isRequestInFlight ?? false
+        let runtimeState = assistant.runtimeControlsState(
+            for: backend,
+            availableModels: visibleModels,
+            isLoadingModels: isLoadingModels,
+            isBusy: isBusy
+        )
+        if !runtimeState.availability.isReady {
+            return runtimeState.statusText
+        }
+
         if let selectedModelID,
-           let selectedModel = visibleModels.first(where: { $0.id == selectedModelID })
+            let selectedModel = visibleModels.first(where: { $0.id == selectedModelID })
         {
             return selectedModel.displayName
         }
@@ -8032,13 +12869,9 @@ struct AssistantWindowView: View {
             preferredModelID: selectedModelID ?? assistant.selectedModelID
         )
         if let fallbackModelID,
-           let fallbackModel = visibleModels.first(where: { $0.id == fallbackModelID })
+            let fallbackModel = visibleModels.first(where: { $0.id == fallbackModelID })
         {
             return fallbackModel.displayName
-        }
-
-        if selectionAskConversation(for: selection)?.isLoadingModels == true {
-            return "Loading models..."
         }
 
         return visibleModels.isEmpty ? "No models" : "Select model"
@@ -9102,33 +13935,56 @@ struct AssistantWindowView: View {
         }
 
         if let branch = assistant.historyBranchState,
-           let bannerText = branch.bannerText {
+            let bannerText = branch.bannerText
+        {
             historyBranchBanner(branch: branch, bannerText: bannerText)
                 .padding(.bottom, 6)
         }
     }
 
-    private func chatComposer(layout: ChatLayoutMetrics) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            chatComposerBanners
+    private func chatComposer(
+        layout: ChatLayoutMetrics,
+        state: AssistantComposerWebState
+    ) -> some View {
+        let isCompactComposer = state.base.isCompactComposer
+        let measuredHeight =
+            isCompactComposer
+            ? notesAssistantComposerMeasuredHeight
+            : composerMeasuredHeight
+
+        return VStack(alignment: .leading, spacing: isCompactComposer ? 6 : 8) {
+            if isCompactComposer {
+                if let preflightStatusMessage = state.base.preflightStatusMessage {
+                    composerStatusBanner(
+                        symbol: assistant.isLoadingModels
+                            ? "hourglass"
+                            : "exclamationmark.circle",
+                        text: preflightStatusMessage,
+                        tint: assistant.isLoadingModels
+                            ? AppVisualTheme.foreground(0.50)
+                            : .orange
+                    )
+                    .padding(.bottom, 4)
+                }
+            } else {
+                chatComposerBanners
+            }
 
             AssistantComposerWebView(
-                state: composerWebState,
+                state: state,
                 accentColor: AppVisualTheme.accentTint,
-                onHeightChange: updateComposerMeasuredHeight,
+                onHeightChange: { height in
+                    updateComposerMeasuredHeight(height, compact: isCompactComposer)
+                },
                 onCommand: handleComposerWebCommand
             )
-            .frame(height: composerWebHeight(for: layout))
-            .background(
-                RoundedRectangle(cornerRadius: 24, style: .continuous)
-                    .fill(AppVisualTheme.surfaceFill(0.18))
+            .frame(
+                height: composerWebHeight(
+                    for: layout,
+                    compact: isCompactComposer,
+                    measuredHeight: measuredHeight
+                )
             )
-            .overlay(
-                RoundedRectangle(cornerRadius: 24, style: .continuous)
-                    .stroke(AppVisualTheme.surfaceStroke(0.18), lineWidth: 0.8)
-            )
-            .shadow(color: Color.black.opacity(0.10), radius: 14, x: 0, y: 4)
-            .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
             .onDrop(of: [.fileURL, .image, .png, .jpeg], isTargeted: nil) { providers in
                 handleDrop(providers)
                 return true
@@ -9161,6 +14017,138 @@ struct AssistantWindowView: View {
 
     private var sessionMemoryStatusLabel: String {
         sessionMemoryIsActive ? "Session memory on" : "Session memory off"
+    }
+
+    private func toggleComposerQuickActionsMenu() {
+        withAnimation(.spring(response: 0.24, dampingFraction: 0.86)) {
+            isComposerQuickActionsMenuPresented.toggle()
+        }
+    }
+
+    private func dismissComposerQuickActionsMenu(animated: Bool = true) {
+        guard isComposerQuickActionsMenuPresented else { return }
+        if animated {
+            withAnimation(.easeOut(duration: 0.16)) {
+                isComposerQuickActionsMenuPresented = false
+            }
+        } else {
+            isComposerQuickActionsMenuPresented = false
+        }
+    }
+
+    @ViewBuilder
+    private func composerQuickActionsMenu(state: AssistantComposerWebState) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            ComposerQuickActionItemView(
+                title: "Upload image or file",
+                subtitle: "Add a picture, file, or folder.",
+                symbol: "plus"
+            ) {
+                dismissComposerQuickActionsMenu()
+                openFilePicker()
+            }
+
+            if state.base.canOpenSkills {
+                ComposerQuickActionItemView(
+                    title: "Use skills",
+                    subtitle: state.base.activeSkills.isEmpty
+                        ? "Browse skills and attach one to this thread."
+                        : "\(state.base.activeSkills.count) skill\(state.base.activeSkills.count == 1 ? "" : "s") attached to this thread.",
+                    symbol: "sparkles"
+                ) {
+                    dismissComposerQuickActionsMenu()
+                    selectedSidebarPane = .skills
+                }
+            }
+
+            if state.base.showNoteModeButton {
+                ComposerQuickActionItemView(
+                    title: state.base.isNoteModeActive ? "Turn off Note Mode" : "Turn on Note Mode",
+                    subtitle: state.base.isNoteModeActive
+                        ? "Go back to normal chat."
+                        : "Keep this chat focused on notes.",
+                    symbol: "note.text",
+                    isActive: state.base.isNoteModeActive
+                ) {
+                    dismissComposerQuickActionsMenu()
+                    assistant.taskMode = state.base.isNoteModeActive ? .chat : .note
+                }
+            }
+        }
+        .padding(6)
+        .frame(width: 260, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(Color(nsColor: .windowBackgroundColor))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .stroke(AppVisualTheme.surfaceStroke(0.12), lineWidth: 0.5)
+                )
+        )
+        .shadow(color: Color.black.opacity(0.12), radius: 10, x: 0, y: 4)
+        .shadow(color: Color.black.opacity(0.18), radius: 3, x: 0, y: 1)
+    }
+
+    private struct ComposerQuickActionItemView: View {
+        let title: String
+        let subtitle: String
+        let symbol: String
+        var isActive: Bool = false
+        let action: () -> Void
+
+        @State private var isHovered = false
+
+        var body: some View {
+            Button(action: action) {
+                HStack(alignment: .center, spacing: 10) {
+                    Image(systemName: symbol)
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(
+                            isActive
+                                ? AppVisualTheme.accentTint
+                                : AppVisualTheme.foreground(0.7)
+                        )
+                        .frame(width: 24, height: 24)
+                        .background(
+                            Circle()
+                                .fill(
+                                    isActive
+                                        ? AppVisualTheme.accentTint.opacity(0.15)
+                                        : AppVisualTheme.surfaceFill(0.06)
+                                )
+                        )
+
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(title)
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(AppVisualTheme.foreground(0.9))
+
+                        Text(subtitle)
+                            .font(.system(size: 11, weight: .regular))
+                            .foregroundStyle(AppVisualTheme.foreground(0.55))
+                            .lineLimit(2)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+
+                    Spacer(minLength: 0)
+                }
+                .contentShape(Rectangle())
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
+                .background(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .fill(
+                            isActive
+                                ? AppVisualTheme.accentTint.opacity(isHovered ? 0.12 : 0.05)
+                                : AppVisualTheme.surfaceFill(isHovered ? 0.06 : 0.0)
+                        )
+                )
+            }
+            .buttonStyle(.plain)
+            .onHover { hovering in
+                isHovered = hovering
+            }
+        }
     }
 
     private var liveVoicePanel: some View {
@@ -9357,7 +14345,8 @@ struct AssistantWindowView: View {
                         .fill(
                             LinearGradient(
                                 colors: [
-                                    AppVisualTheme.accentTint.opacity(historyBranchBannerPulse ? 0.06 : 0.02),
+                                    AppVisualTheme.accentTint.opacity(
+                                        historyBranchBannerPulse ? 0.06 : 0.02),
                                     Color.clear,
                                 ],
                                 startPoint: .leading,
@@ -9532,6 +14521,136 @@ struct AssistantWindowView: View {
         Color(red: backend.brandHue.red, green: backend.brandHue.green, blue: backend.brandHue.blue)
     }
 
+    private func providerPickerStatus(
+        for backend: AssistantRuntimeBackend
+    ) -> (
+        title: String,
+        color: Color,
+        detail: String?,
+        requiresSetup: Bool,
+        canSelect: Bool
+    ) {
+        let guidance = assistant.guidance(for: backend)
+        let canSelect = assistant.selectableAssistantBackends.contains(backend)
+        let isSelected = backend == assistant.visibleAssistantBackend
+        let availableModels =
+            isSelected
+            ? assistant.visibleModels
+            : assistant.selectionSideAssistantVisibleModels(for: backend)
+        let runtimeState = assistant.runtimeControlsState(
+            for: backend,
+            availableModels: availableModels,
+            isLoadingModels: isSelected ? assistant.isLoadingModels : false,
+            isBusy: isSelected ? assistant.hasActiveTurn : false
+        )
+
+        let readyColor = Color.green.opacity(0.92)
+        let workingColor = Color.orange.opacity(0.92)
+        let actionColor = providerBrandColor(for: backend).opacity(0.92)
+        let guidanceDetail = guidance.primaryDetail
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .assistantNonEmpty
+
+        if isSelected {
+            switch runtimeState.availability {
+            case .ready:
+                return ("Ready", readyColor, nil, false, true)
+            case .busy:
+                return (
+                    "Working",
+                    workingColor,
+                    assistant.runtimeHealth.summary
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                        .assistantNonEmpty,
+                    false,
+                    true
+                )
+            case .switchingProvider, .loadingModels:
+                return (
+                    "Loading",
+                    workingColor,
+                    runtimeState.statusText
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                        .assistantNonEmpty,
+                    false,
+                    false
+                )
+            case .unavailable:
+                if !guidance.codexDetected {
+                    return ("Install", actionColor, guidanceDetail, true, false)
+                }
+                if backend == .ollamaLocal {
+                    return (
+                        "Choose Model",
+                        actionColor,
+                        assistant.runtimeHealth.detail?
+                            .trimmingCharacters(in: .whitespacesAndNewlines)
+                            .assistantNonEmpty
+                            ?? guidanceDetail,
+                        true,
+                        canSelect
+                    )
+                }
+                return (
+                    "Sign In",
+                    actionColor,
+                    assistant.runtimeHealth.detail?
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                        .assistantNonEmpty
+                        ?? backend.signInPromptSummary,
+                    true,
+                    canSelect
+                )
+            }
+        }
+
+        if !guidance.codexDetected {
+            return ("Install", actionColor, guidanceDetail, true, false)
+        }
+
+        if backend == .ollamaLocal && availableModels.isEmpty {
+            return ("Choose Model", actionColor, guidanceDetail, true, canSelect)
+        }
+
+        if backend.requiresLogin && availableModels.isEmpty {
+            return ("Sign In", actionColor, backend.signInPromptSummary, true, canSelect)
+        }
+
+        return ("Ready", readyColor, nil, false, canSelect)
+    }
+
+    private func openSetupForProvider(_ backend: AssistantRuntimeBackend) {
+        let guidance = assistant.guidance(for: backend)
+        if !guidance.codexDetected || backend == .ollamaLocal {
+            assistant.runPreferredInstallCommand(for: backend)
+            return
+        }
+
+        Task { @MainActor in
+            if assistant.visibleAssistantBackend != backend {
+                _ = await assistant.switchAssistantBackend(backend)
+            }
+            assistant.runLoginCommand()
+        }
+    }
+
+    private func handleProviderPickerSelection(_ backend: AssistantRuntimeBackend) {
+        let status = providerPickerStatus(for: backend)
+        let isSelected = backend == assistant.visibleAssistantBackend
+
+        dismissTopBarDropdowns()
+
+        if status.requiresSetup {
+            openSetupForProvider(backend)
+            return
+        }
+
+        guard !isSelected else { return }
+        guard status.canSelect else { return }
+        guard !assistant.isSelectedSessionBackendPinned else { return }
+        assistant.selectAssistantBackend(backend)
+    }
+
     private func dismissTopBarDropdowns() {
         withAnimation(.none) {
             showProviderPicker = false
@@ -9558,14 +14677,17 @@ struct AssistantWindowView: View {
 
     private func topBarDropdownPanelBackground(cornerRadius: CGFloat = 12) -> some View {
         let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-        let topGlow = AppVisualTheme.isDarkAppearance
+        let topGlow =
+            AppVisualTheme.isDarkAppearance
             ? Color.white.opacity(0.045)
             : Color.white.opacity(0.18)
-        let bottomShade = AppVisualTheme.isDarkAppearance
+        let bottomShade =
+            AppVisualTheme.isDarkAppearance
             ? Color.black.opacity(0.14)
             : Color.black.opacity(0.05)
 
-        return shape
+        return
+            shape
             .fill(AssistantWindowChrome.elevatedPanel.opacity(0.985))
             .overlay {
                 shape
@@ -9574,7 +14696,7 @@ struct AssistantWindowView: View {
                             colors: [
                                 topGlow,
                                 Color.clear,
-                                bottomShade
+                                bottomShade,
                             ],
                             startPoint: .top,
                             endPoint: .bottom
@@ -9626,7 +14748,9 @@ struct AssistantWindowView: View {
                         Capsule(style: .continuous)
                             .stroke(brandColor.opacity(isHighlighted ? 0.34 : 0.24), lineWidth: 0.7)
                     )
-                    .shadow(color: Color.black.opacity(isHighlighted ? 0.18 : 0.12), radius: isHighlighted ? 10 : 8, x: 0, y: 4)
+                    .shadow(
+                        color: Color.black.opacity(isHighlighted ? 0.18 : 0.12),
+                        radius: isHighlighted ? 10 : 8, x: 0, y: 4)
             )
             .contentShape(Capsule(style: .continuous))
         }
@@ -9635,8 +14759,11 @@ struct AssistantWindowView: View {
         .onHover { hovering in
             isProviderSelectorHovered = hovering
         }
-        .disabled(isPinned)
-        .opacity(isPinned ? 0.6 : 1)
+        .help(
+            isPinned
+                ? "This thread is locked to \(selected.shortDisplayName). You can still open this menu to set up other providers."
+                : "Switch providers or finish provider setup here."
+        )
         .overlay(alignment: .topLeading) {
             if showProviderPicker {
                 providerPickerDropdownOverlay
@@ -9651,33 +14778,58 @@ struct AssistantWindowView: View {
     private var providerPickerDropdownOverlay: some View {
         let selected = assistant.visibleAssistantBackend
 
-        return VStack(alignment: .leading, spacing: 2) {
-            ForEach(assistant.selectableAssistantBackends, id: \.self) { backend in
+        return VStack(alignment: .leading, spacing: 4) {
+            ForEach(AssistantRuntimeBackend.allCases, id: \.self) { backend in
                 let backendColor = providerBrandColor(for: backend)
+                let status = providerPickerStatus(for: backend)
                 let isActive = backend == selected
                 let isHovered = hoveredProviderOptionID == backend.rawValue
                 let isHighlighted = isActive || isHovered
+                let isTemporarilyLocked =
+                    assistant.isSelectedSessionBackendPinned
+                    && backend != selected
+                    && !status.requiresSetup
                 Button {
-                    assistant.selectAssistantBackend(backend)
-                    dismissTopBarDropdowns()
+                    handleProviderPickerSelection(backend)
                 } label: {
-                    HStack(spacing: 6) {
-                        Circle()
-                            .fill(backendColor.opacity(0.9))
-                            .frame(width: 5, height: 5)
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack(spacing: 8) {
+                            Circle()
+                                .fill(backendColor.opacity(0.9))
+                                .frame(width: 5, height: 5)
 
-                        Text(backend.shortDisplayName)
-                            .font(.system(size: 11.5, weight: isActive ? .semibold : .medium))
-                            .foregroundStyle(
-                                AppVisualTheme.foreground(isHighlighted ? 0.95 : 0.84)
-                            )
+                            Text(backend.shortDisplayName)
+                                .font(.system(size: 11.5, weight: isActive ? .semibold : .medium))
+                                .foregroundStyle(
+                                    AppVisualTheme.foreground(isHighlighted ? 0.95 : 0.84)
+                                )
 
-                        Spacer(minLength: 0)
+                            Spacer(minLength: 0)
 
-                        if isActive {
-                            Image(systemName: "checkmark")
-                                .font(.system(size: 9, weight: .bold))
-                                .foregroundStyle(backendColor.opacity(0.8))
+                            Text(status.title)
+                                .font(.system(size: 10, weight: .semibold))
+                                .foregroundStyle(status.color)
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 4)
+                                .background(
+                                    Capsule(style: .continuous)
+                                        .fill(status.color.opacity(isActive ? 0.18 : 0.12))
+                                )
+
+                            if isActive {
+                                Image(systemName: "checkmark")
+                                    .font(.system(size: 9, weight: .bold))
+                                    .foregroundStyle(backendColor.opacity(0.8))
+                            }
+                        }
+
+                        if let detail = status.detail {
+                            Text(detail)
+                                .font(.system(size: 10.5, weight: .regular))
+                                .foregroundStyle(AppVisualTheme.foreground(0.60))
+                                .lineLimit(2)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .padding(.leading, 13)
                         }
                     }
                     .padding(.horizontal, 12)
@@ -9702,15 +14854,33 @@ struct AssistantWindowView: View {
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
+                .opacity(isTemporarilyLocked ? 0.58 : 1)
                 .onHover { hovering in
-                    hoveredProviderOptionID = hovering ? backend.rawValue : (
-                        hoveredProviderOptionID == backend.rawValue ? nil : hoveredProviderOptionID
-                    )
+                    hoveredProviderOptionID =
+                        hovering
+                        ? backend.rawValue
+                        : (hoveredProviderOptionID == backend.rawValue
+                            ? nil : hoveredProviderOptionID)
                 }
             }
+
+            Divider()
+                .overlay(AppVisualTheme.surfaceStroke(0.08))
+                .padding(.horizontal, 8)
+                .padding(.vertical, 2)
+
+            Text(
+                assistant.isSelectedSessionBackendPinned
+                    ? "This thread is locked to \(selected.shortDisplayName). Install and sign-in actions still work here, but switching providers requires a new thread."
+                    : "Click a provider to switch. Install, sign in, and local model setup all happen from this menu."
+            )
+            .font(.system(size: 10.5, weight: .medium))
+            .foregroundStyle(AppVisualTheme.foreground(0.58))
+            .padding(.horizontal, 12)
+            .padding(.bottom, 6)
         }
         .padding(6)
-        .frame(width: 170)
+        .frame(width: 280)
         .background(
             topBarDropdownPanelBackground(cornerRadius: 10)
         )

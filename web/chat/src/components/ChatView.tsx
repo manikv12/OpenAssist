@@ -5,6 +5,7 @@ import {
   useEffect,
   useImperativeHandle,
   useLayoutEffect,
+  useMemo,
   useRef,
   useState,
 } from "react";
@@ -43,6 +44,33 @@ interface Props {
   ) => void;
   onLoadOlder: () => void;
   onJumpToLatest: () => void;
+}
+
+function resolveAssistantProviderFooterMessageIDs(messages: ChatMessage[]): Set<string> {
+  let responseGroupIndex = 0;
+  const latestMessageIDByGroup = new Map<string, string>();
+
+  for (const message of messages) {
+    if (message.type === "user") {
+      responseGroupIndex += 1;
+      continue;
+    }
+
+    if (message.type !== "assistant") {
+      continue;
+    }
+
+    const providerLabel = message.providerLabel?.trim();
+    if (!providerLabel) {
+      continue;
+    }
+
+    const groupKey = `response:${responseGroupIndex}|provider:${providerLabel.toLowerCase()}`;
+
+    latestMessageIDByGroup.set(groupKey, message.id);
+  }
+
+  return new Set(latestMessageIDByGroup.values());
 }
 
 export const ChatView = forwardRef<
@@ -93,6 +121,10 @@ export const ChatView = forwardRef<
 
     return undefined;
   })();
+  const providerFooterMessageIDs = useMemo(
+    () => resolveAssistantProviderFooterMessageIDs(messages),
+    [messages]
+  );
 
   const containerRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -232,6 +264,7 @@ export const ChatView = forwardRef<
               checkpointsByMessageID={checkpointsByMessageID}
               latestRunningMessageID={latestRunningMessageID}
               rewindState={rewindState}
+              showProviderFooter={providerFooterMessageIDs.has(msg.id)}
             />
           ))}
 
@@ -275,17 +308,25 @@ const MessageRow = memo(function MessageRow({
   checkpointsByMessageID,
   latestRunningMessageID,
   rewindState: _rewindState,
+  showProviderFooter = false,
 }: {
   message: ChatMessage;
   checkpointsByMessageID: Map<string, MessageCheckpointInfo>;
   latestRunningMessageID?: string;
   rewindState: RewindState | null;
+  showProviderFooter?: boolean;
 }) {
   switch (message.type) {
     case "user":
       return <UserMessage message={message} />;
     case "assistant":
-      return <AssistantMessage message={message} checkpointInfo={checkpointsByMessageID.get(message.id)} />;
+      return (
+        <AssistantMessage
+          message={message}
+          checkpointInfo={checkpointsByMessageID.get(message.id)}
+          showProviderFooter={showProviderFooter}
+        />
+      );
     case "activity":
       return (
         <ActivityRow

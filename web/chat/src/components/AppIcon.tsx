@@ -1,5 +1,6 @@
 import {
   Archive,
+  ArchiveRestore,
   ArrowDown,
   ArrowUp,
   Bot,
@@ -8,26 +9,33 @@ import {
   BookOpen,
   Check,
   CircleArrowDown,
-  CircleArrowUp,
   CircleMinus,
   ChevronDown,
   ChevronLeft,
   ChevronRight,
   ChevronUp,
   Circle,
+  ClockCheck,
   Clock3,
   Copy,
   EyeOff,
   FileText,
   Folder,
+  FolderClosed,
   FolderMinus,
   FolderPlus,
+  FolderTree,
   Globe,
   Layers3,
   Lock,
-  MessageSquare,
+  MessageSquareText,
+  MessagesSquare,
   Mic,
-  PanelLeft,
+  MoreHorizontal,
+  NotebookText,
+  Outdent,
+  PanelLeftClose,
+  PanelLeftOpen,
   Pencil,
   Pin,
   Play,
@@ -36,15 +44,18 @@ import {
   RotateCcw,
   Search,
   Settings,
+  Sparkles,
+  SquarePlus,
   Star,
   Terminal,
-  Timer,
   Trash2,
   Undo2,
   VolumeX,
+  WandSparkles,
+  Workflow,
   Wrench,
   X,
-  Zap,
+  ToyBrick,
   type LucideIcon,
 } from "lucide-react";
 
@@ -56,30 +67,36 @@ interface AppIconProps {
 }
 
 const symbolIconMap: Record<string, LucideIcon> = {
-  "bubble.left.and.bubble.right": MessageSquare,
+  "bubble.left.and.bubble.right": MessagesSquare,
   "doc.text": FileText,
+  "note.text": NotebookText,
+  "text.bubble": MessageSquareText,
   "folder.badge.plus": FolderPlus,
   folder: Folder,
-  "folder.fill": Folder,
+  "folder.fill": FolderClosed,
+  "folder.tree": FolderTree,
   "square.stack.3d.up.fill": Layers3,
+  "square.grid.2x2": FolderTree,
   "briefcase.fill": BriefcaseBusiness,
   "book.closed.fill": BookOpen,
   "terminal.fill": Terminal,
-  sparkles: Zap,
+  sparkles: Sparkles,
+  workflow: Workflow,
+  "wand.sparkles": WandSparkles,
   "star.fill": Star,
   brain: BrainCircuit,
-  "clock.badge.checkmark.fill": Clock3,
-  clock: Timer,
+  "clock.badge.checkmark.fill": ClockCheck,
+  clock: Clock3,
   archivebox: Archive,
   gearshape: Settings,
-  "sidebar.left": PanelLeft,
-  "sidebar.right": PanelLeft,
+  "sidebar.left": PanelLeftClose,
+  "sidebar.right": PanelLeftOpen,
   "chevron.down": ChevronDown,
   "chevron.left": ChevronLeft,
   "chevron.up": ChevronUp,
   "chevron.right": ChevronRight,
   plus: Plus,
-  "plus.square.on.square": Plus,
+  "plus.square.on.square": SquarePlus,
   "mic.fill": Mic,
   "speaker.slash.fill": VolumeX,
   "arrow.up": ArrowUp,
@@ -100,10 +117,14 @@ const symbolIconMap: Record<string, LucideIcon> = {
   trash: Trash2,
   pin: Pin,
   "minus.circle": CircleMinus,
-  "tray.and.arrow.up": CircleArrowUp,
+  "tray.and.arrow.up": ArchiveRestore,
   "arrow.counterclockwise": RotateCcw,
   "arrow.down.circle": CircleArrowDown,
+  "arrow.up.left.and.arrow.down.right": Outdent,
   plug: Plug,
+  skills: ToyBrick,
+  ellipsis: MoreHorizontal,
+  "ellipsis.circle": MoreHorizontal,
 };
 
 function resolveIcon(symbol: string): LucideIcon {
@@ -114,16 +135,19 @@ function resolveIcon(symbol: string): LucideIcon {
 
   if (symbol.includes("folder")) return Folder;
   if (symbol.includes("archive")) return Archive;
+  if (symbol.includes("note")) return NotebookText;
+  if (symbol.includes("workflow")) return Workflow;
+  if (symbol.includes("wand")) return WandSparkles;
   if (symbol.includes("clock")) return Clock3;
   if (symbol.includes("trash")) return Trash2;
   if (symbol.includes("pencil")) return Pencil;
   if (symbol.includes("pin")) return Pin;
-  if (symbol.includes("sparkle")) return Zap;
+  if (symbol.includes("sparkle")) return Sparkles;
   if (symbol.includes("brain")) return BrainCircuit;
   if (symbol.includes("book")) return BookOpen;
   if (symbol.includes("briefcase")) return BriefcaseBusiness;
   if (symbol.includes("terminal")) return Terminal;
-  if (symbol.includes("bubble") || symbol.includes("message")) return MessageSquare;
+  if (symbol.includes("bubble") || symbol.includes("message")) return MessageSquareText;
   if (symbol.includes("gear") || symbol.includes("slider")) return Settings;
   if (symbol.includes("globe") || symbol.includes("browser")) return Globe;
   if (symbol.includes("lock") || symbol.includes("permission")) return Lock;
@@ -143,6 +167,7 @@ function resolveIcon(symbol: string): LucideIcon {
   }
   if (symbol.includes("counterclockwise")) return RotateCcw;
   if (symbol.includes("minus")) return CircleMinus;
+  if (symbol.includes("square.grid") || symbol.includes("grid")) return FolderTree;
   if (symbol.includes("arrow.up")) return ArrowUp;
   if (symbol.includes("arrow.down")) return ArrowDown;
   if (symbol.includes("mic")) return Mic;

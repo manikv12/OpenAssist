@@ -7,6 +7,7 @@ final class AssistantSelectionActionHUDManager {
 
     private enum Layout {
         static let actionSize = NSSize(width: 332, height: 52)
+        static let compactActionSize = NSSize(width: 218, height: 52)
         static let composerSize = NSSize(width: 442, height: 308)
         static let loadingSize = NSSize(width: 352, height: 214)
         static let resultSize = NSSize(width: 462, height: 388)
@@ -24,6 +25,8 @@ final class AssistantSelectionActionHUDManager {
     }
 
     struct RuntimeControls {
+        let availability: AssistantRuntimeControlsAvailability
+        let statusText: String?
         let providerOptions: [AssistantRuntimeBackend]
         let selectedProvider: AssistantRuntimeBackend
         let isProviderSelectionDisabled: Bool
@@ -115,8 +118,8 @@ final class AssistantSelectionActionHUDManager {
         anchorRect: NSRect,
         onExplain: @escaping () -> Void,
         onAsk: @escaping () -> Void,
-        onAddToNote: @escaping () -> Void,
-        onGenerateChart: @escaping () -> Void
+        onAddToNote: (() -> Void)? = nil,
+        onGenerateChart: (() -> Void)? = nil
     ) {
         self.anchorRect = anchorRect
         viewModel.mode = .actions
@@ -139,7 +142,12 @@ final class AssistantSelectionActionHUDManager {
         viewModel.onOpenSettings = nil
         viewModel.onChooseProvider = nil
         viewModel.onChooseModel = nil
-        render(size: Layout.actionSize, makeKey: false)
+        render(
+            size: (onAddToNote != nil || onGenerateChart != nil)
+                ? Layout.actionSize
+                : Layout.compactActionSize,
+            makeKey: false
+        )
     }
 
     func showQuestionComposer(
@@ -471,19 +479,22 @@ private struct AssistantSelectionActionHUDRootView: View {
                 viewModel.onAsk?()
             }
 
-            actionMenu(
-                title: "Add to Note",
-                symbol: "note.text.badge.plus",
-                tint: Color(red: 0.40, green: 0.72, blue: 0.58)
-            ) {
-                if let onAddToNote = viewModel.onAddToNote {
-                    Button("Add Selection") {
-                        onAddToNote()
+            if viewModel.onAddToNote != nil || viewModel.onGenerateChart != nil {
+                actionMenu(
+                    title: "Add to Note",
+                    symbol: "note.text.badge.plus",
+                    tint: Color(red: 0.40, green: 0.72, blue: 0.58)
+                ) {
+                    if let onAddToNote = viewModel.onAddToNote {
+                        Button("Add Selection") {
+                            onAddToNote()
+                        }
                     }
-                }
-                if let onGenerateChart = viewModel.onGenerateChart {
-                    Button("Generate Chart") {
-                        onGenerateChart()
+
+                    if let onGenerateChart = viewModel.onGenerateChart {
+                        Button("Generate Chart") {
+                            onGenerateChart()
+                        }
                     }
                 }
             }
@@ -925,6 +936,22 @@ private struct AssistantSelectionActionHUDRootView: View {
             return AnyView(EmptyView())
         }
 
+        if !runtimeControls.availability.isReady {
+            let statusText = runtimeControls.statusText?.trimmingCharacters(
+                in: .whitespacesAndNewlines
+            ).nonEmpty ?? runtimeControls.availability.fallbackStatusText
+
+            return AnyView(
+                HStack(spacing: 8) {
+                    runtimeStatusBadge(
+                        text: statusText,
+                        tint: runtimeStatusTint(for: runtimeControls)
+                    )
+                    Spacer(minLength: 0)
+                }
+            )
+        }
+
         let providerTitle = runtimeControls.selectedProvider.shortDisplayName
         let modelTitle = runtimeSelectedModelSummary(runtimeControls)
 
@@ -940,9 +967,12 @@ private struct AssistantSelectionActionHUDRootView: View {
                         Button {
                             var updatedControls = runtimeControls
                             updatedControls = AssistantSelectionActionHUDManager.RuntimeControls(
+                                availability: .loadingModels,
+                                statusText: AssistantRuntimeControlsAvailability.loadingModels
+                                    .fallbackStatusText,
                                 providerOptions: runtimeControls.providerOptions,
                                 selectedProvider: backend,
-                                isProviderSelectionDisabled: runtimeControls.isProviderSelectionDisabled,
+                                isProviderSelectionDisabled: true,
                                 modelOptions: [],
                                 selectedModelID: nil,
                                 selectedModelSummary: "Loading models...",
@@ -969,6 +999,8 @@ private struct AssistantSelectionActionHUDRootView: View {
                     ForEach(runtimeControls.modelOptions.filter { !$0.hidden }) { model in
                         Button {
                             viewModel.runtimeControls = AssistantSelectionActionHUDManager.RuntimeControls(
+                                availability: runtimeControls.availability,
+                                statusText: runtimeControls.statusText,
                                 providerOptions: runtimeControls.providerOptions,
                                 selectedProvider: runtimeControls.selectedProvider,
                                 isProviderSelectionDisabled: runtimeControls.isProviderSelectionDisabled,
@@ -990,6 +1022,29 @@ private struct AssistantSelectionActionHUDRootView: View {
 
                 Spacer(minLength: 0)
             }
+        )
+    }
+
+    private func runtimeStatusBadge(text: String, tint: Color) -> some View {
+        HStack(spacing: 8) {
+            Circle()
+                .fill(tint.opacity(0.84))
+                .frame(width: 6, height: 6)
+
+            Text(text)
+                .font(.system(size: 11.5, weight: .semibold))
+                .foregroundStyle(AppVisualTheme.foreground(0.86))
+                .lineLimit(1)
+        }
+        .padding(.horizontal, 11)
+        .padding(.vertical, 8)
+        .background(
+            Capsule(style: .continuous)
+                .fill(AppVisualTheme.surfaceFill(0.05))
+                .overlay(
+                    Capsule(style: .continuous)
+                        .stroke(tint.opacity(0.18), lineWidth: 0.8)
+                )
         )
     }
 
@@ -1051,6 +1106,21 @@ private struct AssistantSelectionActionHUDRootView: View {
             return summary
         }
         return runtimeControls.isModelLoading ? "Loading models..." : "Select model"
+    }
+
+    private func runtimeStatusTint(
+        for runtimeControls: AssistantSelectionActionHUDManager.RuntimeControls
+    ) -> Color {
+        switch runtimeControls.availability {
+        case .ready:
+            return providerTint(for: runtimeControls.selectedProvider)
+        case .busy:
+            return AppVisualTheme.baseTint
+        case .loadingModels, .switchingProvider:
+            return providerTint(for: runtimeControls.selectedProvider)
+        case .unavailable:
+            return .orange
+        }
     }
 
     private func providerTint(for backend: AssistantRuntimeBackend) -> Color {

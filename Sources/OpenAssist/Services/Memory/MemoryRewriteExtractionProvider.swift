@@ -389,7 +389,7 @@ private actor MemoryAILessonSynthesisProvider {
             let reachable = await isOllamaReachable(baseURL: configuration.baseURL)
             if !reachable {
                 CrashReporter.logWarning(
-                    "Memory lesson AI check failed: local runtime unavailable. AI Studio > Prompt Models > Local AI Setup."
+                    "Memory lesson AI check failed: local runtime unavailable. Open Settings > Models & Connections > Local AI Setup."
                 )
                 return false
             }
@@ -472,7 +472,7 @@ private actor MemoryAILessonSynthesisProvider {
         } catch {
             if configuration.providerMode == .ollama {
                 CrashReporter.logWarning(
-                    "Memory lesson synthesis skipped because local runtime is unavailable. AI Studio > Prompt Models > Local AI Setup."
+                    "Memory lesson synthesis skipped because local runtime is unavailable. Open Settings > Models & Connections > Local AI Setup."
                 )
             }
             return nil
@@ -482,7 +482,7 @@ private actor MemoryAILessonSynthesisProvider {
         guard (200...299).contains(http.statusCode) else {
             if configuration.providerMode == .ollama {
                 CrashReporter.logWarning(
-                    "Memory lesson synthesis request failed for local runtime (HTTP \(http.statusCode)). Repair Local AI in AI Studio."
+                    "Memory lesson synthesis request failed for local runtime (HTTP \(http.statusCode)). Repair Local AI in Settings > Models & Connections."
                 )
             }
             return nil

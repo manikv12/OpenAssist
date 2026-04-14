@@ -8,6 +8,9 @@ import { FileChangeSummary } from "./FileChangeSummary";
 import {
   buildActivityActionDetail,
   buildActivityActionLabel,
+  compactActivityTargetLabel,
+  resolveActivityPrimaryTarget,
+  splitActivityLabelLead,
 } from "./activityPresentation";
 
 function ActivityRowInner({
@@ -42,6 +45,18 @@ function ActivityRowInner({
     message.activityTargets,
     message.activityDetail
   );
+  const primaryTarget = resolveActivityPrimaryTarget(message.activityTargets, actionDetail);
+  const targetPillLabel = compactActivityTargetLabel(primaryTarget);
+  const titleLead =
+    splitActivityLabelLead(actionTitle, primaryTarget?.label) ||
+    splitActivityLabelLead(actionTitle, targetPillLabel) ||
+    actionTitle;
+  const detailLine =
+    actionDetail && actionDetail !== primaryTarget?.detail && actionDetail !== primaryTarget?.label
+      ? actionDetail
+      : primaryTarget?.detail && primaryTarget.detail !== targetPillLabel
+        ? primaryTarget.detail
+        : undefined;
 
   const cardContent = (
     <>
@@ -52,8 +67,15 @@ function ActivityRowInner({
         />
       </div>
       <div className="activity-body">
-        <span className="activity-title">{actionTitle}</span>
-        {actionDetail && <span className="activity-detail">{actionDetail}</span>}
+        <span className="activity-title-line">
+          {titleLead ? <span className="activity-title">{titleLead}</span> : null}
+          {targetPillLabel ? (
+            <span className="activity-target-pill" title={primaryTarget?.detail || primaryTarget?.label}>
+              {targetPillLabel}
+            </span>
+          ) : null}
+        </span>
+        {detailLine && <span className="activity-detail">{detailLine}</span>}
       </div>
       <div className="activity-meta">
         {message.activityStatusLabel && (

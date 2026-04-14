@@ -23,9 +23,33 @@ struct AssistantStoredNote: Equatable, Sendable, Identifiable {
     let ownerID: String
     let noteID: String
     let title: String
+    let noteType: AssistantNoteType
     let fileName: String
+    let folderID: String?
     let updatedAt: Date
     let text: String
+
+    init(
+        ownerKind: AssistantNoteOwnerKind,
+        ownerID: String,
+        noteID: String,
+        title: String,
+        noteType: AssistantNoteType,
+        fileName: String,
+        folderID: String? = nil,
+        updatedAt: Date,
+        text: String
+    ) {
+        self.ownerKind = ownerKind
+        self.ownerID = ownerID
+        self.noteID = noteID
+        self.title = title
+        self.noteType = noteType
+        self.fileName = fileName
+        self.folderID = folderID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+        self.updatedAt = updatedAt
+        self.text = text
+    }
 
     var id: String { target.storageKey }
 

@@ -2,25 +2,25 @@ import XCTest
 @testable import OpenAssist
 
 final class SettingsNavigationModelTests: XCTestCase {
-    func testGettingStartedSearchRoutesToGettingStartedHome() throws {
-        let entry = try XCTUnwrap(searchEntry(matchingTitle: "Getting started", query: "getting started"))
+    func testGettingStartedSearchRoutesToAssistantChecklist() throws {
+        let entry = try XCTUnwrap(searchEntry(matchingTitle: "Setup checklist", query: "getting started"))
 
-        XCTAssertEqual(entry.destination.section, .gettingStarted)
+        XCTAssertEqual(entry.destination.section, .assistant)
         XCTAssertEqual(entry.destination.cardID, "gettingStarted.checklist")
     }
 
-    func testTelegramSearchRoutesToAdvancedTelegramPage() throws {
+    func testTelegramSearchRoutesToIntegrationsTelegramPage() throws {
         let entry = try XCTUnwrap(searchEntry(matchingTitle: "Telegram remote", query: "telegram"))
 
-        XCTAssertEqual(entry.destination.section, .advanced)
+        XCTAssertEqual(entry.destination.section, .integrations)
         XCTAssertEqual(entry.destination.cardID, "integrations.telegram.setup")
         XCTAssertEqual(entry.destination.advancedPage, .telegramRemote)
     }
 
-    func testBrowserProfileSearchRoutesToBrowserAndAppControlPage() throws {
+    func testBrowserProfileSearchRoutesToAutomationPage() throws {
         let entry = try XCTUnwrap(searchEntry(matchingTitle: "Browser profile", query: "browser profile"))
 
-        XCTAssertEqual(entry.destination.section, .browserAppControl)
+        XCTAssertEqual(entry.destination.section, .automation)
         XCTAssertEqual(entry.destination.cardID, "automation.browserProfile")
     }
 
@@ -31,17 +31,17 @@ final class SettingsNavigationModelTests: XCTestCase {
         XCTAssertEqual(entry.destination.cardID, "speech.modelLibrary")
     }
 
-    func testAIStudioSearchRoutesToAdvancedSection() throws {
-        let entry = try XCTUnwrap(searchEntry(matchingTitle: "AI Studio", query: "AI Studio"))
+    func testAIStudioSearchRoutesToModelsAndConnections() throws {
+        let entry = try XCTUnwrap(searchEntry(matchingTitle: "Models and connections", query: "AI Studio"))
 
-        XCTAssertEqual(entry.destination.section, .advanced)
-        XCTAssertEqual(entry.destination.cardID, "advanced.aiStudio")
+        XCTAssertEqual(entry.destination.section, .modelsConnections)
+        XCTAssertEqual(entry.destination.cardID, "models.connections")
     }
 
-    func testPermissionsSearchRoutesToPermissionsPrivacySection() throws {
+    func testPermissionsSearchRoutesToPrivacyPermissionsSection() throws {
         let entry = try XCTUnwrap(searchEntry(matchingTitle: "Permission overview", query: "permissions"))
 
-        XCTAssertEqual(entry.destination.section, .permissionsPrivacy)
+        XCTAssertEqual(entry.destination.section, .privacyPermissions)
         XCTAssertEqual(entry.destination.cardID, "permissions.overview")
     }
 
@@ -58,10 +58,31 @@ final class SettingsNavigationModelTests: XCTestCase {
         XCTAssertTrue(sections.contains(.voiceDictation))
     }
 
-    func testBrowserSectionFilterIncludesBrowserAndAppControl() {
+    func testBrowserSectionFilterIncludesAutomation() {
         let sections = SettingsNavigationModel.filteredSections(for: "browser profile")
 
-        XCTAssertTrue(sections.contains(.browserAppControl))
+        XCTAssertTrue(sections.contains(.automation))
+    }
+
+    func testAssistantMemorySearchRoutesToAssistantSection() throws {
+        let entry = try XCTUnwrap(searchEntry(matchingTitle: "Assistant memory", query: "assistant memory"))
+
+        XCTAssertEqual(entry.destination.section, .assistant)
+        XCTAssertEqual(entry.destination.cardID, "assistant.memory")
+    }
+
+    func testToolLimitsSearchRoutesToAssistantAdvanced() throws {
+        let entry = try XCTUnwrap(searchEntry(matchingTitle: "Assistant advanced", query: "tool limits"))
+
+        XCTAssertEqual(entry.destination.section, .assistant)
+        XCTAssertEqual(entry.destination.cardID, "assistant.advanced")
+    }
+
+    func testLocalAPISearchRoutesToAutomationLocalAPI() throws {
+        let entry = try XCTUnwrap(searchEntry(matchingTitle: "Automation local API", query: "local api"))
+
+        XCTAssertEqual(entry.destination.section, .automation)
+        XCTAssertEqual(entry.destination.cardID, "automation.localAPI")
     }
 
     private func searchEntry(matchingTitle title: String, query: String) -> SettingSearchEntry? {

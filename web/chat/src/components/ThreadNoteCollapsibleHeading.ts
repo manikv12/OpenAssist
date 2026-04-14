@@ -17,6 +17,8 @@ type TopLevelBlock = {
   node: EditorState["doc"]["content"]["content"][number];
 };
 
+export type ThreadNoteHeadingAlignment = "left" | "center";
+
 export interface CollapsedHeadingSection {
   headingPos: number;
   sectionEnd: number;
@@ -29,7 +31,9 @@ export interface ThreadNoteHeadingSection extends CollapsedHeadingSection {
   isCollapsible: boolean;
 }
 
+const COLLAPSIBLE_HEADING_COMMENT = "<!-- oa:collapsible -->";
 const NON_COLLAPSIBLE_HEADING_COMMENT = "<!-- oa:non-collapsible -->";
+const CENTER_ALIGNED_HEADING_COMMENT = "<!-- oa:center -->";
 
 const headingCollapsePluginKey = new PluginKey<HeadingCollapsePluginState>(
   "threadNoteHeadingCollapse"
@@ -40,12 +44,26 @@ export const ThreadNoteCollapsibleHeading = Heading.extend({
     return {
       ...this.parent?.(),
       collapsible: {
-        default: true,
+        default: false,
         parseHTML: (element: HTMLElement) =>
-          element.getAttribute("data-heading-collapsible") !== "false",
+          element.getAttribute("data-heading-collapsible") === "true",
         renderHTML: (attributes: Record<string, unknown>) =>
-          attributes.collapsible === false
-            ? { "data-heading-collapsible": "false" }
+          attributes.collapsible === true ? { "data-heading-collapsible": "true" } : {},
+      },
+      alignment: {
+        default: "left",
+        parseHTML: (element: HTMLElement) =>
+          normalizeHeadingAlignment(
+            element.getAttribute("data-heading-align") ??
+              element.style.textAlign ??
+              undefined
+          ),
+        renderHTML: (attributes: Record<string, unknown>) =>
+          normalizeHeadingAlignment(attributes.alignment) === "center"
+            ? {
+                "data-heading-align": "center",
+                style: "text-align: center;",
+              }
             : {},
       },
     };
@@ -53,16 +71,22 @@ export const ThreadNoteCollapsibleHeading = Heading.extend({
 
   parseMarkdown(token: MarkdownToken, helpers: MarkdownParseHelpers) {
     const inlineTokens = Array.isArray(token.tokens) ? token.tokens : [];
+    const isCollapsible = inlineTokens.some(isCollapsibleHeadingToken);
     const isNonCollapsible = inlineTokens.some(isNonCollapsibleHeadingToken);
+    const alignment = inlineTokens.some(isCenterAlignedHeadingToken) ? "center" : "left";
     const contentTokens = inlineTokens.filter(
-      (inlineToken) => !isNonCollapsibleHeadingToken(inlineToken)
+      (inlineToken) =>
+        !isCollapsibleHeadingToken(inlineToken) &&
+        !isNonCollapsibleHeadingToken(inlineToken) &&
+        !isCenterAlignedHeadingToken(inlineToken)
     );
 
     return helpers.createNode(
       "heading",
       {
         level: token.depth || 1,
-        collapsible: !isNonCollapsible,
+        collapsible: isCollapsible && !isNonCollapsible,
+        alignment,
       },
       helpers.parseInline(contentTokens)
     );
@@ -77,8 +101,15 @@ export const ThreadNoteCollapsibleHeading = Heading.extend({
     }
 
     const content = helpers.renderChildren(node.content);
-    const comment =
-      node.attrs?.collapsible === false ? ` ${NON_COLLAPSIBLE_HEADING_COMMENT}` : "";
+    const comments = [
+      normalizeHeadingAlignment(node.attrs?.alignment) === "center"
+        ? CENTER_ALIGNED_HEADING_COMMENT
+        : null,
+      node.attrs?.collapsible === true ? COLLAPSIBLE_HEADING_COMMENT : null,
+    ]
+      .filter(Boolean)
+      .join(" ");
+    const comment = comments ? ` ${comments}` : "";
 
     return `${headingChars} ${content}${comment}`;
   },
@@ -215,6 +246,27 @@ export function findHeadingSectionAtPosition(
   return buildHeadingSection(state, topLevelBlocks, headingIndex);
 }
 
+export function findContainingHeadingSectionAtSelection(
+  state: EditorState,
+  selectionPos: number = state.selection.from
+): ThreadNoteHeadingSection | null {
+  const topLevelBlocks = getTopLevelBlocks(state);
+  let containingSection: ThreadNoteHeadingSection | null = null;
+
+  for (let index = 0; index < topLevelBlocks.length; index += 1) {
+    const section = buildHeadingSection(state, topLevelBlocks, index);
+    if (!section?.isCollapsible) {
+      continue;
+    }
+
+    if (selectionPos >= section.headingPos && selectionPos < section.sectionEnd) {
+      containingSection = section;
+    }
+  }
+
+  return containingSection;
+}
+
 export function updateHeadingCollapsibleAtSelection(
   view: EditorView | null,
   selectionPos: number,
@@ -246,6 +298,67 @@ export function updateHeadingCollapsibleAtSelection(
         type: "setCollapsible",
         pos: nodePos,
         collapsible,
+      });
+      view.dispatch(transaction);
+      view.focus();
+      return true;
+    }
+  } catch {
+    return false;
+  }
+
+  return false;
+}
+
+export function resolveHeadingAlignmentAtSelection(
+  state: EditorState,
+  selectionPos: number = state.selection.from
+): ThreadNoteHeadingAlignment {
+  try {
+    const resolvedPosition = state.doc.resolve(selectionPos);
+
+    for (let depth = resolvedPosition.depth; depth > 0; depth -= 1) {
+      const node = resolvedPosition.node(depth);
+      if (node.type.name !== "heading") {
+        continue;
+      }
+
+      return normalizeHeadingAlignment(node.attrs?.alignment);
+    }
+  } catch {
+    return "left";
+  }
+
+  return "left";
+}
+
+export function updateHeadingAlignmentAtSelection(
+  view: EditorView | null,
+  selectionPos: number,
+  alignment: ThreadNoteHeadingAlignment
+): boolean {
+  if (!view) {
+    return false;
+  }
+
+  try {
+    const resolvedPosition = view.state.doc.resolve(selectionPos);
+
+    for (let depth = resolvedPosition.depth; depth > 0; depth -= 1) {
+      const node = resolvedPosition.node(depth);
+      if (node.type.name !== "heading") {
+        continue;
+      }
+
+      const nodePos = resolvedPosition.before(depth);
+      const currentAlignment = normalizeHeadingAlignment(node.attrs?.alignment);
+      if (currentAlignment === alignment) {
+        return true;
+      }
+
+      const transaction = view.state.tr.setNodeMarkup(nodePos, undefined, {
+        ...node.attrs,
+        alignment,
       });
       view.dispatch(transaction);
       view.focus();
@@ -316,6 +429,21 @@ function buildHeadingDecorations(
       );
     }
 
+    if (isCollapsible && !isCollapsed) {
+      const lastBlockInSection = findLastBlockInSection(topLevelBlocks, index, sectionEnd);
+      if (lastBlockInSection) {
+        decorations.push(
+          Decoration.node(
+            lastBlockInSection.pos,
+            lastBlockInSection.pos + lastBlockInSection.node.nodeSize,
+            {
+              class: "thread-note-section-end-boundary",
+            }
+          )
+        );
+      }
+    }
+
     if (!isCollapsed) {
       return;
     }
@@ -365,6 +493,10 @@ function findSectionEnd(
 ): number {
   for (let index = currentIndex + 1; index < blocks.length; index += 1) {
     const block = blocks[index];
+    if (block.node.type.name === "horizontalRule") {
+      return block.pos;
+    }
+
     if (block.node.type.name !== "heading") {
       continue;
     }
@@ -390,17 +522,39 @@ function buildHeadingSection(
 
   const pluginState = headingCollapsePluginKey.getState(state);
   const collapsedPositions = new Set(pluginState?.collapsedHeadingPositions ?? []);
+  const isCollapsible = isHeadingNodeCollapsible(block.node);
   const headingLevel = Number(block.node.attrs.level ?? 1);
-  const sectionEnd = findSectionEnd(blocks, headingIndex, headingLevel, state.doc.content.size);
+  const headingNodeEnd = block.pos + block.node.nodeSize;
+  const sectionEnd = isCollapsible
+    ? findSectionEnd(blocks, headingIndex, headingLevel, state.doc.content.size)
+    : headingNodeEnd;
 
   return {
     headingPos: block.pos,
-    headingNodeEnd: block.pos + block.node.nodeSize,
+    headingNodeEnd,
     sectionEnd,
     headingLevel,
-    isCollapsed: collapsedPositions.has(block.pos) && isHeadingNodeCollapsible(block.node),
-    isCollapsible: isHeadingNodeCollapsible(block.node),
+    isCollapsed: collapsedPositions.has(block.pos) && isCollapsible,
+    isCollapsible,
   };
+}
+
+function findLastBlockInSection(
+  blocks: TopLevelBlock[],
+  headingIndex: number,
+  sectionEnd: number
+): TopLevelBlock | null {
+  let lastBlock: TopLevelBlock | null = blocks[headingIndex] ?? null;
+
+  for (let index = headingIndex + 1; index < blocks.length; index += 1) {
+    const block = blocks[index];
+    if (block.pos >= sectionEnd) {
+      break;
+    }
+    lastBlock = block;
+  }
+
+  return lastBlock;
 }
 
 function createHeadingToggle(
@@ -502,11 +656,29 @@ function toggleHeadingPosition(positions: number[], pos: number): number[] {
 }
 
 function isHeadingNodeCollapsible(node: TopLevelBlock["node"]): boolean {
-  return node.attrs?.collapsible !== false;
+  return node.attrs?.collapsible === true;
+}
+
+function normalizeHeadingAlignment(
+  value: unknown
+): ThreadNoteHeadingAlignment {
+  return value === "center" ? "center" : "left";
+}
+
+function isCollapsibleHeadingToken(token: MarkdownToken): boolean {
+  return token.type === "html" && typeof token.text === "string"
+    ? token.text.includes("oa:collapsible")
+    : false;
 }
 
 function isNonCollapsibleHeadingToken(token: MarkdownToken): boolean {
   return token.type === "html" && typeof token.text === "string"
     ? token.text.includes("oa:non-collapsible")
+    : false;
+}
+
+function isCenterAlignedHeadingToken(token: MarkdownToken): boolean {
+  return token.type === "html" && typeof token.text === "string"
+    ? token.text.includes("oa:center")
     : false;
 }

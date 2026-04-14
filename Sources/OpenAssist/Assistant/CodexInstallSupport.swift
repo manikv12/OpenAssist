@@ -101,22 +101,57 @@ struct CodexInstallSupport {
     let homeDirectory: URL
     let searchPathsOverride: [String]?
     let allowShellLookup: Bool
+    let localRuntimeDetector: @Sendable () async -> LocalAIRuntimeDetection
 
     init(
         runner: CommandRunning = ProcessCommandRunner(),
         fileManager: FileManager = .default,
         homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser,
         searchPathsOverride: [String]? = nil,
-        allowShellLookup: Bool = true
+        allowShellLookup: Bool = true,
+        localRuntimeDetector: (@Sendable () async -> LocalAIRuntimeDetection)? = nil
     ) {
         self.runner = runner
         self.fileManager = fileManager
         self.homeDirectory = homeDirectory
         self.searchPathsOverride = searchPathsOverride
         self.allowShellLookup = allowShellLookup
+        self.localRuntimeDetector = localRuntimeDetector ?? { await LocalAIRuntimeManager.shared.detect() }
     }
 
     func inspect(backend: AssistantRuntimeBackend = .codex) async -> AssistantInstallGuidance {
+        if backend == .ollamaLocal {
+            let detection = await localRuntimeDetector()
+            let primaryTitle: String
+            let primaryDetail: String
+
+            if !detection.installed {
+                primaryTitle = "Set up Ollama (Local)"
+                primaryDetail = "Open Local AI Setup to install Ollama and download a Gemma 4 model for agent mode."
+            } else if detection.isHealthy {
+                primaryTitle = "Ollama (Local) is installed"
+                primaryDetail = "Ollama is ready on this Mac. Open Assist can run local Gemma 4 agent turns, stream replies, and use tools without a sign-in flow."
+            } else {
+                primaryTitle = "Ollama (Local) needs attention"
+                primaryDetail = "Ollama is installed, but the local runtime is not healthy yet. Open Local AI Setup to repair the runtime or download Gemma 4."
+            }
+
+            return AssistantInstallGuidance(
+                backend: backend,
+                codexDetected: detection.installed,
+                brewDetected: false,
+                npmDetected: false,
+                codexPath: detection.executableURL?.path,
+                brewPath: nil,
+                npmPath: nil,
+                primaryTitle: primaryTitle,
+                primaryDetail: primaryDetail,
+                installCommands: [],
+                loginCommands: [],
+                docsURL: backend.docsURL
+            )
+        }
+
         async let runtimePath = which(backend.executableName)
         async let brewPath = which("brew")
         async let npmPath = which("npm")
@@ -153,6 +188,9 @@ struct CodexInstallSupport {
                 primaryTitle = "Install Claude Code"
                 primaryDetail = "Open Assist needs Claude Code CLI before the assistant can use Claude Code."
             }
+        case .ollamaLocal:
+            primaryTitle = "Set up Ollama (Local)"
+            primaryDetail = "Open Local AI Setup to install Ollama and Gemma 4."
         }
 
         return AssistantInstallGuidance(

@@ -23,6 +23,86 @@ function firstFileTarget(targets?: ActivityTarget[]): ActivityTarget | undefined
   return targets?.find((target) => target.kind === "file");
 }
 
+function looksLikeFilePath(value: string): boolean {
+  return /[\\/]/.test(value) || /\.[a-z0-9]{1,8}$/i.test(value);
+}
+
+function lastPathComponent(path: string): string {
+  const normalized = path.replace(/\\/g, "/");
+  const parts = normalized.split("/");
+  return parts[parts.length - 1] || path;
+}
+
+export function resolveActivityPrimaryTarget(
+  targets?: ActivityTarget[],
+  fallbackDetail?: string
+): ActivityTarget | undefined {
+  const explicitTarget = firstRelevantTarget(targets);
+  if (explicitTarget) {
+    return explicitTarget;
+  }
+
+  const trimmedDetail = fallbackDetail?.trim();
+  if (!trimmedDetail) {
+    return undefined;
+  }
+
+  if (/^https?:\/\//i.test(trimmedDetail)) {
+    return {
+      kind: "url",
+      label: trimmedDetail,
+    };
+  }
+
+  if (looksLikeFilePath(trimmedDetail)) {
+    return {
+      kind: "file",
+      label: lastPathComponent(trimmedDetail),
+      detail: trimmedDetail,
+    };
+  }
+
+  return undefined;
+}
+
+export function compactActivityTargetLabel(target?: ActivityTarget): string | undefined {
+  if (!target) {
+    return undefined;
+  }
+
+  if (target.kind === "file") {
+    return lastPathComponent(target.label);
+  }
+
+  return target.label;
+}
+
+export function splitActivityLabelLead(
+  label?: string,
+  targetLabel?: string
+): string | undefined {
+  const trimmedLabel = label?.trim();
+  const trimmedTarget = targetLabel?.trim();
+
+  if (!trimmedLabel) {
+    return undefined;
+  }
+
+  if (!trimmedTarget) {
+    return trimmedLabel;
+  }
+
+  if (trimmedLabel === trimmedTarget) {
+    return undefined;
+  }
+
+  if (trimmedLabel.endsWith(` ${trimmedTarget}`)) {
+    return trimmedLabel.slice(0, -trimmedTarget.length).trim();
+  }
+
+  return trimmedLabel;
+}
+
 export function buildActivityActionLabel(
   icon?: string,
   targets?: ActivityTarget[],

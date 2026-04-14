@@ -1410,6 +1410,8 @@ final class AssistantCompactHUDManager: AssistantCompactPresenter {
         setModelValue(\.busySessionID, to: activeSessionIDForOrb())
         setModelValue(\.availableModels, to: controller.visibleModels)
         setModelValue(\.selectedModelSummary, to: controller.selectedModelSummary)
+        setModelValue(\.runtimeControlsAvailability, to: controller.runtimeControlsAvailability)
+        setModelValue(\.runtimeControlsStatusText, to: controller.runtimeControlsStatusText)
         setModelValue(\.attachments, to: controller.attachments)
         setModelValue(\.controllerModeSwitchSuggestion, to: controller.modeSwitchSuggestion)
         setModelValue(\.workingToolActivity, to: Array(controller.visibleToolActivity.prefix(6)))

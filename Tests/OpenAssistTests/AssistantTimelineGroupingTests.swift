@@ -604,4 +604,48 @@ final class AssistantTimelineGroupingTests: XCTestCase {
             36
         )
     }
+
+    func testCompletedAssistantReplySortsAfterEarlierToolActivity() {
+        let sessionID = "session-inline-tools"
+        let baseDate = Date(timeIntervalSince1970: 1_750_000_000)
+
+        let finalReply = AssistantTimelineItem.assistantFinal(
+            id: "assistant-final",
+            sessionID: sessionID,
+            turnID: "turn-1",
+            text: "I found the fix.",
+            createdAt: baseDate,
+            updatedAt: baseDate.addingTimeInterval(5),
+            isStreaming: false,
+            source: .runtime
+        )
+        let toolActivity = AssistantTimelineItem.activity(
+            AssistantActivityItem(
+                id: "tool-1",
+                sessionID: sessionID,
+                turnID: "turn-1",
+                kind: .commandExecution,
+                title: "Read File",
+                status: .completed,
+                friendlySummary: "Opened AssistantModels.swift.",
+                rawDetails: nil,
+                startedAt: baseDate.addingTimeInterval(2),
+                updatedAt: baseDate.addingTimeInterval(2.5),
+                source: .runtime
+            )
+        )
+
+        let sorted = [finalReply, toolActivity].sorted {
+            if $0.sortDate != $1.sortDate {
+                return $0.sortDate < $1.sortDate
+            }
+            if $0.lastUpdatedAt != $1.lastUpdatedAt {
+                return $0.lastUpdatedAt < $1.lastUpdatedAt
+            }
+            return $0.id < $1.id
+        }
+
+        XCTAssertEqual(finalReply.sortDate, baseDate.addingTimeInterval(5))
+        XCTAssertEqual(sorted.map(\.id), ["tool-1", "assistant-final"])
+    }
 }

@@ -130,6 +130,7 @@ enum AssistantAttachmentSupport {
         case "jpg", "jpeg": return "image/jpeg"
         case "gif": return "image/gif"
         case "webp": return "image/webp"
+        case "tif", "tiff": return "image/tiff"
         case "svg": return "image/svg+xml"
         case "pdf": return "application/pdf"
         case "json": return "application/json"

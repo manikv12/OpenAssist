@@ -413,6 +413,7 @@ struct AppSplitChromeBackground: View {
     var trailingTint: Color = AppVisualTheme.windowBackground
     var accent: Color = AppVisualTheme.accentTint
     var leadingPaneTransparent = false
+    var showsLeadingDivider = true
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
     var body: some View {
@@ -466,9 +467,14 @@ struct AppSplitChromeBackground: View {
                     }
                     .frame(width: leadingWidth)
                     .overlay(alignment: .trailing) {
-                        Rectangle()
-                            .fill(AppVisualTheme.surfaceStroke(leadingPaneTransparent ? 0.24 : 0.32))
-                            .frame(width: 0.5)
+                        if showsLeadingDivider {
+                            Rectangle()
+                                .fill(
+                                    AppVisualTheme.surfaceStroke(
+                                        leadingPaneTransparent ? 0.24 : 0.32)
+                                )
+                                .frame(width: 0.5)
+                        }
                     }
 
                     ZStack {

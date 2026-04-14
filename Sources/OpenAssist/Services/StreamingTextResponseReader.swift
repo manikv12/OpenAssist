@@ -83,46 +83,83 @@ enum StreamingTextResponseReader {
             return nil
         }
 
+        let eventType = (event["type"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() ?? ""
+
         if let delta = event["delta"] as? String,
-           delta.nonEmpty != nil {
-            return currentText + delta
+           let normalizedDelta = delta.nonEmpty {
+            return mergeEventText(currentText: currentText, incomingText: normalizedDelta)
         }
 
-        if let delta = event["delta"] as? [String: Any],
-           let text = delta["text"] as? String,
-           text.nonEmpty != nil {
-            return currentText + text
+        if let delta = event["delta"],
+           let extractedDelta = extractText(fromEventPayload: delta) {
+            return mergeEventText(currentText: currentText, incomingText: extractedDelta)
         }
 
-        if let outputText = event["output_text"] as? String,
-           outputText.nonEmpty != nil {
-            return outputText
+        guard let extractedText = extractText(fromEventPayload: event) else {
+            return nil
         }
 
-        if let output = event["output"] as? [[String: Any]] {
-            let joined = output.compactMap { item -> String? in
-                if let content = item["content"] as? [[String: Any]] {
-                    let text = content.compactMap { block -> String? in
-                        if let value = block["text"] as? String,
-                           value.nonEmpty != nil {
-                            return value
-                        }
-                        if let value = block["output_text"] as? String,
-                           value.nonEmpty != nil {
-                            return value
-                        }
-                        return nil
-                    }.joined()
-                    return text.nonEmpty
-                }
-                return nil
-            }.joined(separator: "\n")
+        if eventType == "response.completed" || eventType.hasSuffix(".done") {
+            return extractedText
+        }
 
-            if joined.nonEmpty != nil {
-                return joined
+        return mergeEventText(currentText: currentText, incomingText: extractedText)
+    }
+
+    static func extractText(fromEventPayload payload: Any) -> String? {
+        if let string = payload as? String {
+            return string.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+        }
+
+        if let array = payload as? [Any] {
+            let joined = array.compactMap(extractText(fromEventPayload:))
+                .joined(separator: "\n")
+            return joined.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+        }
+
+        guard let dictionary = payload as? [String: Any] else {
+            return nil
+        }
+
+        for key in ["output_text", "text", "content"] {
+            if let string = dictionary[key] as? String,
+               let normalized = string.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
+                return normalized
+            }
+        }
+
+        for key in ["delta", "part", "item", "response", "message"] {
+            if let nested = dictionary[key],
+               let extracted = extractText(fromEventPayload: nested) {
+                return extracted
+            }
+        }
+
+        for key in ["content", "output"] {
+            if let nested = dictionary[key],
+               let extracted = extractText(fromEventPayload: nested) {
+                return extracted
             }
         }
 
         return nil
+    }
+
+    private static func mergeEventText(
+        currentText: String,
+        incomingText: String
+    ) -> String {
+        guard !currentText.isEmpty else {
+            return incomingText
+        }
+        if incomingText.hasPrefix(currentText) {
+            return incomingText
+        }
+        if currentText.hasSuffix(incomingText) {
+            return currentText
+        }
+        return currentText + incomingText
     }
 }

@@ -101,29 +101,134 @@ enum AssistantNoteOwnerKind: String, Codable, Equatable, Hashable, Sendable {
 struct AssistantNoteSummary: Codable, Equatable, Sendable, Identifiable {
     var id: String
     var title: String
+    var noteType: AssistantNoteType
     var fileName: String
+    var folderID: String?
     var order: Int
     var createdAt: Date
     var updatedAt: Date
+
+    init(
+        id: String,
+        title: String,
+        noteType: AssistantNoteType = .note,
+        fileName: String,
+        folderID: String? = nil,
+        order: Int,
+        createdAt: Date,
+        updatedAt: Date
+    ) {
+        self.id = id
+        self.title = title
+        self.noteType = noteType
+        self.fileName = fileName
+        self.folderID = folderID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+        self.order = order
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case title
+        case noteType
+        case fileName
+        case folderID
+        case order
+        case createdAt
+        case updatedAt
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        title = try container.decode(String.self, forKey: .title)
+        noteType = try container.decodeIfPresent(AssistantNoteType.self, forKey: .noteType) ?? .note
+        fileName = try container.decode(String.self, forKey: .fileName)
+        folderID = try container.decodeIfPresent(String.self, forKey: .folderID)?
+            .trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+        order = try container.decode(Int.self, forKey: .order)
+        createdAt = try container.decode(Date.self, forKey: .createdAt)
+        updatedAt = try container.decode(Date.self, forKey: .updatedAt)
+    }
 }
 
 typealias AssistantThreadNoteSummary = AssistantNoteSummary
 
+struct AssistantNoteFolderSummary: Codable, Equatable, Sendable, Identifiable {
+    var id: String
+    var name: String
+    var parentFolderID: String?
+    var createdAt: Date
+    var updatedAt: Date
+
+    init(
+        id: String,
+        name: String,
+        parentFolderID: String? = nil,
+        createdAt: Date,
+        updatedAt: Date
+    ) {
+        self.id = id
+        self.name = name
+        self.parentFolderID = parentFolderID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case name
+        case parentFolderID
+        case createdAt
+        case updatedAt
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        name = try container.decode(String.self, forKey: .name)
+        parentFolderID = try container.decodeIfPresent(String.self, forKey: .parentFolderID)?
+            .trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+        createdAt = try container.decode(Date.self, forKey: .createdAt)
+        updatedAt = try container.decode(Date.self, forKey: .updatedAt)
+    }
+}
+
 struct AssistantNoteManifest: Codable, Equatable, Sendable {
-    static let currentVersion = 1
+    static let currentVersion = 3
 
     var version: Int
     var selectedNoteID: String?
     var notes: [AssistantNoteSummary]
+    var folders: [AssistantNoteFolderSummary]
 
     init(
         version: Int = AssistantNoteManifest.currentVersion,
         selectedNoteID: String? = nil,
-        notes: [AssistantNoteSummary] = []
+        notes: [AssistantNoteSummary] = [],
+        folders: [AssistantNoteFolderSummary] = []
     ) {
         self.version = version
         self.selectedNoteID = selectedNoteID
         self.notes = notes
+        self.folders = folders
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case version
+        case selectedNoteID
+        case notes
+        case folders
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        version = try container.decodeIfPresent(Int.self, forKey: .version) ?? 1
+        selectedNoteID = try container.decodeIfPresent(String.self, forKey: .selectedNoteID)?
+            .trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+        notes = try container.decodeIfPresent([AssistantNoteSummary].self, forKey: .notes) ?? []
+        folders = try container.decodeIfPresent([AssistantNoteFolderSummary].self, forKey: .folders) ?? []
     }
 
     var orderedNotes: [AssistantNoteSummary] {
@@ -132,6 +237,29 @@ struct AssistantNoteManifest: Codable, Equatable, Sendable {
                 return $0.createdAt < $1.createdAt
             }
             return $0.order < $1.order
+        }
+    }
+
+    var orderedFolders: [AssistantNoteFolderSummary] {
+        folders.sorted { lhs, rhs in
+            switch (lhs.parentFolderID, rhs.parentFolderID) {
+            case let (.some(left), .some(right)):
+                let parentCompare = left.localizedCaseInsensitiveCompare(right)
+                if parentCompare != .orderedSame {
+                    return parentCompare == .orderedAscending
+                }
+            case (nil, .some):
+                return true
+            case (.some, nil):
+                return false
+            case (nil, nil):
+                break
+            }
+            let nameCompare = lhs.name.localizedCaseInsensitiveCompare(rhs.name)
+            if nameCompare != .orderedSame {
+                return nameCompare == .orderedAscending
+            }
+            return lhs.createdAt < rhs.createdAt
         }
     }
 
@@ -603,6 +731,25 @@ final class AssistantConversationStore {
             .appendingPathComponent(Self.legacyThreadNoteFilename, isDirectory: false)
     }
 
+    /// Returns the on-disk URL for the given thread note if it resolves and the
+    /// underlying `.md` file currently exists.
+    func threadNoteOnDiskURL(threadID: String, noteID: String) -> URL? {
+        let manifest = resolvedThreadNoteManifest(threadID: threadID)
+        guard
+            let note = manifest.notes.first(where: {
+                $0.id.caseInsensitiveCompare(noteID) == .orderedSame
+            }),
+            let fileURL = threadNoteFileURL(
+                threadID: threadID,
+                fileName: note.fileName
+            ),
+            fileManager.fileExists(atPath: fileURL.path)
+        else {
+            return nil
+        }
+        return fileURL
+    }
+
     func loadThreadNote(threadID: String) -> String {
         loadThreadNotesWorkspace(threadID: threadID).selectedNoteText
     }
@@ -652,7 +799,9 @@ final class AssistantConversationStore {
                 ownerID: normalizedThreadID,
                 noteID: note.id,
                 title: note.title,
+                noteType: note.noteType,
                 fileName: note.fileName,
+                folderID: nil,
                 updatedAt: note.updatedAt,
                 text: loadThreadNoteText(threadID: normalizedThreadID, fileName: note.fileName)
             )
@@ -662,6 +811,7 @@ final class AssistantConversationStore {
     func createThreadNote(
         threadID: String,
         title: String? = nil,
+        noteType: AssistantNoteType = .note,
         selectNewNote: Bool = true
     ) throws -> AssistantThreadNotesWorkspace {
         let normalizedThreadID = normalizedThreadID(threadID)
@@ -679,7 +829,9 @@ final class AssistantConversationStore {
         let note = AssistantThreadNoteSummary(
             id: noteID,
             title: normalizedThreadNoteTitle(title),
+            noteType: noteType,
             fileName: "\(safePathComponent(noteID)).md",
+            folderID: nil,
             order: manifest.orderedNotes.count,
             createdAt: now,
             updatedAt: now
@@ -741,6 +893,53 @@ final class AssistantConversationStore {
             threadID: normalizedThreadID,
             manifest: manifest,
             selectedNoteText: selectedText
+        )
+    }
+
+    func saveThreadNoteImageAsset(
+        threadID: String,
+        noteID: String,
+        attachment: AssistantAttachment
+    ) throws -> AssistantSavedNoteAsset {
+        let normalizedThreadID = normalizedThreadID(threadID)
+        guard !normalizedThreadID.isEmpty else {
+            throw AssistantNoteAssetError.noteNotFound
+        }
+
+        let manifest = resolvedThreadNoteManifest(threadID: normalizedThreadID)
+        guard let note = manifest.notes.first(where: { $0.id.caseInsensitiveCompare(noteID) == .orderedSame }),
+              let notesDirectoryURL = threadNotesDirectoryURL(for: normalizedThreadID) else {
+            throw AssistantNoteAssetError.noteNotFound
+        }
+
+        return try AssistantNoteAssetSupport.saveImageAsset(
+            attachment: attachment,
+            notesDirectoryURL: notesDirectoryURL,
+            noteFileName: note.fileName,
+            fileManager: fileManager
+        )
+    }
+
+    func resolveThreadNoteImageAssetURL(
+        threadID: String,
+        noteID: String,
+        relativePath: String
+    ) -> URL? {
+        let normalizedThreadID = normalizedThreadID(threadID)
+        guard !normalizedThreadID.isEmpty else {
+            return nil
+        }
+
+        let manifest = resolvedThreadNoteManifest(threadID: normalizedThreadID)
+        guard let note = manifest.notes.first(where: { $0.id.caseInsensitiveCompare(noteID) == .orderedSame }),
+              let notesDirectoryURL = threadNotesDirectoryURL(for: normalizedThreadID) else {
+            return nil
+        }
+
+        return AssistantNoteAssetSupport.resolveAssetFileURL(
+            notesDirectoryURL: notesDirectoryURL,
+            noteFileName: note.fileName,
+            relativePath: relativePath
         )
     }
 
@@ -836,15 +1035,23 @@ final class AssistantConversationStore {
 
         let removed = manifest.notes.remove(at: existingIndex)
         let removedText = loadThreadNoteText(threadID: normalizedThreadID, fileName: removed.fileName)
+        let removedAssetDirectoryURL = threadNoteAssetDirectoryURL(
+            threadID: normalizedThreadID,
+            fileName: removed.fileName
+        )
         noteRecoveryStore.captureDeletedNote(
             note: removed,
             ownerKind: .thread,
             ownerID: normalizedThreadID,
             text: removedText,
+            assetDirectoryURL: removedAssetDirectoryURL,
             at: now
         )
         if let fileURL = threadNoteFileURL(threadID: normalizedThreadID, fileName: removed.fileName) {
             try? fileManager.removeItem(at: fileURL)
+        }
+        if let removedAssetDirectoryURL {
+            try? fileManager.removeItem(at: removedAssetDirectoryURL)
         }
 
         manifest.notes = normalizedThreadNoteItems(manifest.notes)
@@ -1008,6 +1215,7 @@ final class AssistantConversationStore {
             id: restoredNoteID,
             title: normalizedThreadNoteTitle(payload.note.title),
             fileName: restoredFileName,
+            folderID: nil,
             order: manifest.orderedNotes.count,
             createdAt: payload.note.createdAt,
             updatedAt: now
@@ -1020,6 +1228,18 @@ final class AssistantConversationStore {
             fileName: restoredNote.fileName,
             text: payload.text
         )
+        if let assetDirectoryURL = payload.assetDirectoryURL,
+           fileManager.fileExists(atPath: assetDirectoryURL.path),
+           let restoredAssetDirectoryURL = threadNoteAssetDirectoryURL(
+            threadID: normalizedThreadID,
+            fileName: restoredNote.fileName
+           ) {
+            try? fileManager.removeItem(at: restoredAssetDirectoryURL)
+            do {
+                try fileManager.copyItem(at: assetDirectoryURL, to: restoredAssetDirectoryURL)
+                try? fileManager.removeItem(at: assetDirectoryURL)
+            } catch {}
+        }
         try storeThreadNoteManifest(manifest, threadID: normalizedThreadID)
         return AssistantThreadNotesWorkspace(
             threadID: normalizedThreadID,
@@ -1265,6 +1485,17 @@ final class AssistantConversationStore {
             .appendingPathComponent(fileName, isDirectory: false)
     }
 
+    private func threadNoteAssetDirectoryURL(threadID: String, fileName: String) -> URL? {
+        guard let notesDirectoryURL = threadNotesDirectoryURL(for: threadID) else {
+            return nil
+        }
+
+        return AssistantNoteAssetSupport.noteAssetDirectoryURL(
+            notesDirectoryURL: notesDirectoryURL,
+            noteFileName: fileName
+        )
+    }
+
     private func writeThreadNoteText(
         threadID: String,
         fileName: String,
@@ -1344,7 +1575,8 @@ final class AssistantConversationStore {
         return AssistantThreadNoteManifest(
             version: max(manifest.version, AssistantThreadNoteManifest.currentVersion),
             selectedNoteID: selectedNoteID,
-            notes: normalizedNotes
+            notes: normalizedNotes,
+            folders: []
         )
     }
 
@@ -1362,6 +1594,7 @@ final class AssistantConversationStore {
             .map { index, note in
                 var updated = note
                 updated.title = normalizedThreadNoteTitle(note.title)
+                updated.folderID = nil
                 updated.order = index
                 return updated
             }
@@ -1377,11 +1610,13 @@ final class AssistantConversationStore {
     private func createThreadNoteAndSave(
         threadID: String,
         title: String,
-        text: String
+        text: String,
+        noteType: AssistantNoteType = .note
     ) throws -> AssistantThreadNotesWorkspace {
         let createdWorkspace = try createThreadNote(
             threadID: threadID,
             title: title,
+            noteType: noteType,
             selectNewNote: true
         )
         return try saveThreadNote(

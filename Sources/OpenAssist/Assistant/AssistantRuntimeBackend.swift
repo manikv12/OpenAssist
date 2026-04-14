@@ -4,6 +4,7 @@ enum AssistantRuntimeBackend: String, CaseIterable, Identifiable, Codable, Senda
     case codex
     case copilot
     case claudeCode
+    case ollamaLocal
 
     var id: String { rawValue }
 
@@ -15,6 +16,8 @@ enum AssistantRuntimeBackend: String, CaseIterable, Identifiable, Codable, Senda
             return (0.784, 0.596, 0.992)   // #c898fd
         case .claudeCode:
             return (1.0, 0.702, 0.420)     // #ffb36b
+        case .ollamaLocal:
+            return (0.380, 0.749, 0.451)   // #61bf73
         }
     }
 
@@ -26,6 +29,8 @@ enum AssistantRuntimeBackend: String, CaseIterable, Identifiable, Codable, Senda
             return "GitHub Copilot"
         case .claudeCode:
             return "Claude Code"
+        case .ollamaLocal:
+            return "Ollama (Local)"
         }
     }
 
@@ -37,6 +42,8 @@ enum AssistantRuntimeBackend: String, CaseIterable, Identifiable, Codable, Senda
             return "Copilot"
         case .claudeCode:
             return "Claude"
+        case .ollamaLocal:
+            return "Ollama"
         }
     }
 
@@ -48,6 +55,8 @@ enum AssistantRuntimeBackend: String, CaseIterable, Identifiable, Codable, Senda
             return "copilot"
         case .claudeCode:
             return "claude"
+        case .ollamaLocal:
+            return "ollama"
         }
     }
 
@@ -59,6 +68,8 @@ enum AssistantRuntimeBackend: String, CaseIterable, Identifiable, Codable, Senda
             return ["npm install -g @github/copilot"]
         case .claudeCode:
             return ["npm install -g @anthropic-ai/claude-code"]
+        case .ollamaLocal:
+            return []
         }
     }
 
@@ -70,6 +81,8 @@ enum AssistantRuntimeBackend: String, CaseIterable, Identifiable, Codable, Senda
             return ["copilot login"]
         case .claudeCode:
             return ["claude auth login"]
+        case .ollamaLocal:
+            return []
         }
     }
 
@@ -81,6 +94,8 @@ enum AssistantRuntimeBackend: String, CaseIterable, Identifiable, Codable, Senda
             return URL(string: "https://docs.github.com/copilot/concepts/agents/about-copilot-cli")
         case .claudeCode:
             return URL(string: "https://code.claude.com/docs/en/headless")
+        case .ollamaLocal:
+            return URL(string: "https://ollama.com/library/gemma4")
         }
     }
 
@@ -92,6 +107,8 @@ enum AssistantRuntimeBackend: String, CaseIterable, Identifiable, Codable, Senda
             return .cli
         case .claudeCode:
             return .cli
+        case .ollamaLocal:
+            return .openAssist
         }
     }
 
@@ -103,6 +120,8 @@ enum AssistantRuntimeBackend: String, CaseIterable, Identifiable, Codable, Senda
             return "Install Copilot CLI"
         case .claudeCode:
             return "Install Claude Code"
+        case .ollamaLocal:
+            return "Open Local AI Setup"
         }
     }
 
@@ -114,6 +133,8 @@ enum AssistantRuntimeBackend: String, CaseIterable, Identifiable, Codable, Senda
             return "Copilot Docs"
         case .claudeCode:
             return "Claude Docs"
+        case .ollamaLocal:
+            return "Gemma 4 Guide"
         }
     }
 
@@ -125,6 +146,17 @@ enum AssistantRuntimeBackend: String, CaseIterable, Identifiable, Codable, Senda
             return "Sign In to GitHub Copilot"
         case .claudeCode:
             return "Sign In to Claude Code"
+        case .ollamaLocal:
+            return "Open Local AI Setup"
+        }
+    }
+
+    var requiresLogin: Bool {
+        switch self {
+        case .codex, .copilot, .claudeCode:
+            return true
+        case .ollamaLocal:
+            return false
         }
     }
 
@@ -148,6 +180,8 @@ enum AssistantRuntimeBackend: String, CaseIterable, Identifiable, Codable, Senda
             return "Sign in to GitHub Copilot"
         case .claudeCode:
             return "Sign in to Claude Code"
+        case .ollamaLocal:
+            return "Open Local AI Setup"
         }
     }
 
@@ -159,11 +193,18 @@ enum AssistantRuntimeBackend: String, CaseIterable, Identifiable, Codable, Senda
             return "Sign in to GitHub Copilot to use the assistant"
         case .claudeCode:
             return "Sign in to Claude Code to use the assistant"
+        case .ollamaLocal:
+            return "Open Local AI Setup to use Ollama and Gemma 4"
         }
     }
 
     var missingInstallSummary: String {
-        "\(installActionTitle) to start the assistant"
+        switch self {
+        case .ollamaLocal:
+            return "Open Local AI Setup to install Ollama or download Gemma 4"
+        case .codex, .copilot, .claudeCode:
+            return "\(installActionTitle) to start the assistant"
+        }
     }
 
     var startupSummary: String {
@@ -174,6 +215,8 @@ enum AssistantRuntimeBackend: String, CaseIterable, Identifiable, Codable, Senda
             return "Connecting to GitHub Copilot"
         case .claudeCode:
             return "Preparing Claude Code"
+        case .ollamaLocal:
+            return "Preparing Ollama (Local)"
         }
     }
 
@@ -185,6 +228,8 @@ enum AssistantRuntimeBackend: String, CaseIterable, Identifiable, Codable, Senda
             return "Could not start GitHub Copilot"
         case .claudeCode:
             return "Could not start Claude Code"
+        case .ollamaLocal:
+            return "Could not start Ollama (Local)"
         }
     }
 
@@ -220,6 +265,8 @@ enum AssistantRuntimeBackend: String, CaseIterable, Identifiable, Codable, Senda
             return "Signed out of GitHub Copilot"
         case .claudeCode:
             return "Signed out of Claude Code"
+        case .ollamaLocal:
+            return "Ollama (Local) does not use sign-in"
         }
     }
 
@@ -231,6 +278,8 @@ enum AssistantRuntimeBackend: String, CaseIterable, Identifiable, Codable, Senda
             return "Started a new GitHub Copilot session."
         case .claudeCode:
             return "Started a new Claude Code session."
+        case .ollamaLocal:
+            return "Started a new local Ollama thread."
         }
     }
 
@@ -242,6 +291,8 @@ enum AssistantRuntimeBackend: String, CaseIterable, Identifiable, Codable, Senda
             return "Loaded GitHub Copilot session \(sessionID)."
         case .claudeCode:
             return "Loaded Claude Code session \(sessionID)."
+        case .ollamaLocal:
+            return "Loaded local Ollama thread \(sessionID)."
         }
     }
 }

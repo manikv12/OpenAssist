@@ -8,6 +8,7 @@ import {
   useRef,
   useState,
 } from "react";
+import { createPortal } from "react-dom";
 import mermaid from "mermaid";
 import {
   inspectMermaidSource,
@@ -277,12 +278,14 @@ function MermaidDiagramInner({
   displayMode = "default",
   clickAction = "viewer",
   isStreaming = false,
+  onRenderErrorChange,
 }: {
   code: string;
   showViewerHint?: boolean;
   displayMode?: "default" | "noteCompact";
   clickAction?: "viewer" | "none";
   isStreaming?: boolean;
+  onRenderErrorChange?: (error: string | null) => void;
 }) {
   const sourceAnalysis = useMemo(() => inspectMermaidSource(code), [code]);
   const [svg, setSvg] = useState("");
@@ -347,6 +350,14 @@ function MermaidDiagramInner({
     };
   }, [code, sourceAnalysis, themeVersion, isStreaming]);
 
+  useEffect(() => {
+    onRenderErrorChange?.(error || null);
+  }, [error, onRenderErrorChange]);
+
+  useEffect(() => {
+    return () => onRenderErrorChange?.(null);
+  }, [onRenderErrorChange]);
+
   useLayoutEffect(() => {
     const preview = previewRef.current;
     if (!preview || !svg) {
@@ -407,6 +418,7 @@ function MermaidDiagramInner({
       <div className="mermaid-error">
         <div className="mermaid-error-header">
           <span className="mermaid-error-label">Diagram error</span>
+          <span className="mermaid-error-message">{error}</span>
         </div>
         <pre className="mermaid-error-code">
           <code>{code}</code>
@@ -674,7 +686,7 @@ function MermaidInteractiveOverlay({
     requestAnimationFrame(syncScale);
   };
 
-  return (
+  const overlay = (
     <div className="mermaid-overlay" onClick={onClose}>
       <div
         className={[
@@ -728,6 +740,8 @@ function MermaidInteractiveOverlay({
       </div>
     </div>
   );
+
+  return createPortal(overlay, document.body);
 }
 
 function measureSvg(svgEl: SVGSVGElement) {

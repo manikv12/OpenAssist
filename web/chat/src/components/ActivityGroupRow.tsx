@@ -8,6 +8,9 @@ import {
   buildActivityActionDetail,
   buildActivityActionLabel,
   buildActivityTrailModel,
+  compactActivityTargetLabel,
+  resolveActivityPrimaryTarget,
+  splitActivityLabelLead,
 } from "./activityPresentation";
 
 function ActivityGroupItemRow({
@@ -32,13 +35,32 @@ function ActivityGroupItemRow({
     buildActivityActionLabel(item.icon, item.activityTargets, item.title) ||
     item.title;
   const actionDetail = buildActivityActionDetail(item.activityTargets, item.detail);
+  const primaryTarget = resolveActivityPrimaryTarget(item.activityTargets, actionDetail);
+  const targetPillLabel = compactActivityTargetLabel(primaryTarget);
+  const titleLead =
+    splitActivityLabelLead(actionTitle, primaryTarget?.label) ||
+    splitActivityLabelLead(actionTitle, targetPillLabel) ||
+    actionTitle;
+  const detailLine =
+    actionDetail && actionDetail !== primaryTarget?.detail && actionDetail !== primaryTarget?.label
+      ? actionDetail
+      : primaryTarget?.detail && primaryTarget.detail !== targetPillLabel
+        ? primaryTarget.detail
+        : undefined;
 
   const summaryContent = (
     <>
       <ActivityIcon kind={item.icon} status={item.status} />
       <div className="activity-group-item-copy">
-        <span className="activity-title">{actionTitle}</span>
-        {actionDetail && <span className="activity-detail">{actionDetail}</span>}
+        <span className="activity-title-line">
+          {titleLead ? <span className="activity-title">{titleLead}</span> : null}
+          {targetPillLabel ? (
+            <span className="activity-target-pill" title={primaryTarget?.detail || primaryTarget?.label}>
+              {targetPillLabel}
+            </span>
+          ) : null}
+        </span>
+        {detailLine && <span className="activity-detail">{detailLine}</span>}
       </div>
       {item.statusLabel && (
         <span className={`activity-status-label ${statusClass}`}>
@@ -157,8 +179,6 @@ function ActivityGroupRowInner({
     ? ` is-${message.transitionState}`
     : "";
   const title = trail?.title || buildActivityGroupTitle(items);
-  const summary = buildActivityGroupSummary(items, runningCount, completedCount);
-  const groupIcon = buildActivityGroupIcon(items);
   const shouldAnimateRunning = isRunning && isLatestRunningActivity;
 
   useEffect(() => {
@@ -174,30 +194,17 @@ function ActivityGroupRowInner({
     >
       <button
         type="button"
-        className={`activity-card activity-card-button activity-card-compact activity-group-toggle${shouldAnimateRunning ? " activity-card-running" : ""}`}
+        className={`activity-group-toggle active-work-summary-toggle${shouldAnimateRunning ? " activity-card-running" : ""}`}
         onClick={() => setExpanded((current) => !current)}
         aria-expanded={expanded}
         data-activity-toggle="true"
       >
-        <div className="activity-icon-wrap">
-          {groupIcon ? (
-            <ActivityIcon
-              kind={groupIcon}
-              status={runningCount > 0 ? "running" : "completed"}
-            />
-          ) : (
-            <span className="activity-dot status-completed" />
-          )}
-        </div>
-        <div className="activity-body">
-          <span className="activity-title">{title}</span>
-          {!trail && <span className="activity-detail">{summary}</span>}
-        </div>
-        <div className="activity-meta">
-          <span className="activity-toggle-button" aria-hidden="true">
-            <ChevronIcon expanded={expanded} className="expand-icon" />
-          </span>
-        </div>
+        <ChevronIcon expanded={expanded} className="active-work-summary-chevron" />
+        <span
+          className={`active-work-summary-text${shouldAnimateRunning ? " active-work-summary-text--live" : " active-work-summary-text--static"}`}
+        >
+          {title}
+        </span>
       </button>
 
       {expanded && (
@@ -247,47 +254,6 @@ function buildActivityGroupTitle(items: ActivityGroupItem[]): string {
 
   const joined = fragments.slice(0, 2).join(", ");
   return joined.charAt(0).toUpperCase() + joined.slice(1);
-}
-
-function buildActivityGroupSummary(
-  items: ActivityGroupItem[],
-  runningCount: number,
-  completedCount: number
-): string {
-  const counts = countKinds(items);
-  const fragments: string[] = [];
-
-  if (counts.commandExecution) {
-    fragments.push(
-      `${counts.commandExecution} command${counts.commandExecution === 1 ? "" : "s"}`
-    );
-  }
-  if (counts.fileChange) {
-    fragments.push(
-      `${counts.fileChange} file change${counts.fileChange === 1 ? "" : "s"}`
-    );
-  }
-  if (counts.webSearch) {
-    fragments.push(
-      `${counts.webSearch} search${counts.webSearch === 1 ? "" : "es"}`
-    );
-  }
-
-  const statusSummary =
-    runningCount > 0
-      ? `${runningCount} running, ${completedCount} completed`
-      : `${completedCount} completed`;
-
-  if (fragments.length === 0) {
-    return statusSummary;
-  }
-
-  return `${fragments.slice(0, 3).join(", ")} • ${statusSummary}`;
-}
-
-function buildActivityGroupIcon(items: ActivityGroupItem[]): string | undefined {
-  const icons = Array.from(new Set(items.map((item) => item.icon).filter(Boolean)));
-  return icons.length === 1 ? icons[0] : undefined;
 }
 
 function countKinds(items: ActivityGroupItem[]): Record<string, number> {

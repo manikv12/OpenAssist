@@ -149,6 +149,7 @@ final class SelectionAskPromptBuilderTests: XCTestCase {
         XCTAssertTrue(prompt.systemPrompt.contains("For hierarchy or stack breakdowns, prefer mindmap"))
         XCTAssertTrue(prompt.systemPrompt.contains("subgraph Core[\"RAPID Core (shared)\"]"))
         XCTAssertTrue(prompt.systemPrompt.contains("Do not write flowchart subgraph titles like subgraph Core[RAPID Core (shared)]."))
+        XCTAssertTrue(prompt.systemPrompt.contains("Never write flowchart labels with raw parentheses inside square brackets"))
         XCTAssertTrue(prompt.userPrompt.contains("Create the best Mermaid chart"))
         XCTAssertTrue(prompt.userPrompt.contains("Selected text:"))
         XCTAssertTrue(prompt.userPrompt.contains("Full message context:"))
@@ -173,5 +174,67 @@ final class SelectionAskPromptBuilderTests: XCTestCase {
         XCTAssertTrue(prompt.userPrompt.contains("Current chart draft:"))
         XCTAssertTrue(prompt.userPrompt.contains("Change request:"))
         XCTAssertTrue(prompt.userPrompt.contains("Use sequence style and keep it simpler."))
+    }
+
+    func testThreadNoteChartPromptRepairIncludesRenderErrorAndCurrentDraft() {
+        let prompt = ThreadNoteChartPromptBuilder.makePrompt(
+            selectedText: "Show the deployment workflow from request to production.",
+            parentMessageText: "We want a clear deployment flow chart for non-technical teammates.",
+            currentDraft: """
+            ## Deployment Workflow
+
+            ```mermaid
+            flowchart TD
+              A[Request] --> B[Build]
+              B --> C[Deploy(prod)]
+            ```
+            """,
+            validationError: "Parse error on line 3: unexpected token '(' in node label"
+        )
+
+        XCTAssertTrue(prompt.systemPrompt.contains("Prefer valid Mermaid syntax and compatibility over decorative extras."))
+        XCTAssertTrue(prompt.userPrompt.contains("Repair the Mermaid chart so it renders correctly."))
+        XCTAssertTrue(prompt.userPrompt.contains("Current chart draft:"))
+        XCTAssertTrue(prompt.userPrompt.contains("Mermaid render error:"))
+        XCTAssertTrue(prompt.userPrompt.contains("unexpected token '('"))
+    }
+
+    func testThreadNoteOrganizePromptPreservesDetailInstructionsForSelection() {
+        let prompt = ThreadNoteOrganizePromptBuilder.makePrompt(
+            noteText: """
+            ## Stack File
+            - Lists services
+            - Lists resources
+            """,
+            selectedText: """
+            ## Stack File
+            - Lists services
+            - Lists resources
+            - Includes examples like `stacks/dev.yaml`
+            """
+        )
+
+        XCTAssertTrue(prompt.systemPrompt.contains("Keep the original detail level"))
+        XCTAssertTrue(prompt.systemPrompt.contains("Preserve important facts, decisions, action items, constraints, examples, filenames, config names, commands, and environment names."))
+        XCTAssertTrue(prompt.systemPrompt.contains("Do not compress many bullets or examples into one or two sentences."))
+        XCTAssertTrue(prompt.userPrompt.contains("Selected markdown to reorganize:"))
+        XCTAssertTrue(prompt.userPrompt.contains("Keep the amount of detail close to the source."))
+        XCTAssertTrue(prompt.userPrompt.contains("`stacks/dev.yaml`"))
+    }
+
+    func testThreadNoteOrganizePromptSkipsDuplicateFullContextWhenSelectionMatchesWholeNote() {
+        let note = """
+        ## Overview
+        - Detail one
+        - Detail two
+        """
+
+        let prompt = ThreadNoteOrganizePromptBuilder.makePrompt(
+            noteText: note,
+            selectedText: note
+        )
+
+        XCTAssertFalse(prompt.userPrompt.contains("Full note context (background only"))
+        XCTAssertTrue(prompt.userPrompt.contains("Selected markdown to reorganize:"))
     }
 }

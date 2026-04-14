@@ -21,6 +21,10 @@ private final class PlanUpdateCapture: @unchecked Sendable {
     var entries: [AssistantPlanEntry] = []
 }
 
+private final class TurnCompletionCapture: @unchecked Sendable {
+    var status: AssistantTurnCompletionStatus?
+}
+
 final class AssistantSessionInteractionTests: XCTestCase {
     @MainActor
     func testUpdatedOwnedSessionIDsPreservesOlderThreadsWithoutCapping() {
@@ -160,6 +164,16 @@ final class AssistantSessionInteractionTests: XCTestCase {
     }
 
     @MainActor
+    func testRecoverableCopilotProviderSessionErrorRecognizesCancelledOperation() {
+        XCTAssertTrue(
+            AssistantStore.isRecoverableProviderSessionErrorMessage(
+                "Info: Operation cancelled by user",
+                backend: .copilot
+            )
+        )
+    }
+
+    @MainActor
     func testRecoverableProviderSessionErrorDoesNotTriggerForCodex() {
         XCTAssertFalse(
             AssistantStore.isRecoverableProviderSessionErrorMessage(
@@ -255,6 +269,51 @@ final class AssistantSessionInteractionTests: XCTestCase {
                 for: session,
                 runtimeBackend: .copilot,
                 providerSessionID: nil
+            )
+        )
+    }
+
+    @MainActor
+    func testCancelledCopilotTurnInvalidatesOnlyCanonicalProviderSessions() {
+        let canonicalSession = AssistantSessionSummary(
+            id: "openassist-v2-thread",
+            title: "Merged",
+            source: .openAssist,
+            threadArchitectureVersion: .providerIndependentV2,
+            activeProvider: .copilot,
+            providerBindingsByBackend: [
+                AssistantProviderBinding(
+                    backend: .copilot,
+                    providerSessionID: "copilot-session"
+                )
+            ],
+            status: .idle
+        )
+        let providerSpecificSession = AssistantSessionSummary(
+            id: "copilot-session",
+            title: "Copilot",
+            source: .cli,
+            providerBackend: .copilot,
+            providerSessionID: "copilot-session",
+            status: .idle
+        )
+
+        XCTAssertTrue(
+            AssistantStore.shouldInvalidateProviderSessionAfterUserCancellation(
+                backend: .copilot,
+                session: canonicalSession
+            )
+        )
+        XCTAssertFalse(
+            AssistantStore.shouldInvalidateProviderSessionAfterUserCancellation(
+                backend: .copilot,
+                session: providerSpecificSession
+            )
+        )
+        XCTAssertFalse(
+            AssistantStore.shouldInvalidateProviderSessionAfterUserCancellation(
+                backend: .claudeCode,
+                session: canonicalSession
             )
         )
     }
@@ -1167,6 +1226,24 @@ final class AssistantSessionInteractionTests: XCTestCase {
                 ]
             )
         )
+        XCTAssertFalse(
+            runtime.dynamicToolRequiresExplicitConfirmationForTesting(
+                toolName: "assistant_notes",
+                arguments: [
+                    "action": "prepare_add",
+                    "content": "Add this summary to the best onboarding note."
+                ]
+            )
+        )
+        XCTAssertTrue(
+            runtime.dynamicToolRequiresExplicitConfirmationForTesting(
+                toolName: "assistant_notes",
+                arguments: [
+                    "action": "apply_preview",
+                    "previewId": "preview-123"
+                ]
+            )
+        )
     }
 
     @MainActor
@@ -1214,6 +1291,7 @@ final class AssistantSessionInteractionTests: XCTestCase {
             runtime.dynamicToolNamesForTesting(mode: .agentic),
             [
                 "generate_image",
+                "assistant_notes",
                 "app_action",
                 "browser_use",
                 "exec_command",
@@ -1284,6 +1362,137 @@ final class AssistantSessionInteractionTests: XCTestCase {
             inputModalities: ["text"]
         )
         XCTAssertFalse(textOnlyModel.supportsImageInput)
+    }
+
+    @MainActor
+    func testCopilotGroupedReasoningOptionsExposeExtraHigh() async {
+        let runtime = CodexAssistantRuntime()
+        let modelsExpectation = expectation(description: "Copilot models updated")
+        var capturedModels: [AssistantModelOption] = []
+        runtime.onModelsUpdate = { models in
+            Task { @MainActor in
+                capturedModels = models
+                modelsExpectation.fulfill()
+            }
+        }
+
+        await runtime.processCopilotSessionUpdateForTesting([
+            "sessionUpdate": "config_option_update",
+            "models": [
+                "currentModelId": "gpt-5.4",
+                "availableModels": [
+                    [
+                        "modelId": "gpt-5.4",
+                        "name": "GPT-5.4",
+                        "description": "Reasoning model"
+                    ]
+                ]
+            ],
+            "configOptions": [
+                [
+                    "id": "reasoning_effort",
+                    "currentValue": "high",
+                    "options": [
+                        [
+                            "group": "standard",
+                            "name": "Standard",
+                            "options": [
+                                ["value": "low", "name": "Low"],
+                                ["value": "medium", "name": "Medium"]
+                            ]
+                        ],
+                        [
+                            "group": "advanced",
+                            "name": "Advanced",
+                            "options": [
+                                ["value": "high", "name": "High"],
+                                ["value": "xhigh", "name": "Extra High"]
+                            ]
+                        ]
+                    ]
+                ]
+            ]
+        ])
+        await fulfillment(of: [modelsExpectation], timeout: 1)
+
+        XCTAssertEqual(capturedModels.first?.id, "gpt-5.4")
+        XCTAssertEqual(
+            capturedModels.first?.supportedReasoningEfforts,
+            ["low", "medium", "high", "xhigh"]
+        )
+    }
+
+    @MainActor
+    func testResolvedCopilotRequestedModelIDMapsClaudeAliasToAvailableModel() async {
+        let runtime = CodexAssistantRuntime()
+
+        await runtime.processCopilotSessionUpdateForTesting([
+            "sessionUpdate": "config_option_update",
+            "models": [
+                "currentModelId": "gpt-5.4",
+                "availableModels": [
+                    [
+                        "modelId": "claude-opus-4.6",
+                        "name": "Claude Opus 4.6",
+                        "description": "Highest capability"
+                    ],
+                    [
+                        "modelId": "gpt-5.4",
+                        "name": "GPT-5.4",
+                        "description": "Reasoning model"
+                    ]
+                ]
+            ]
+        ])
+
+        XCTAssertEqual(
+            runtime.resolvedCopilotRequestedModelIDForTesting("opus"),
+            "claude-opus-4.6"
+        )
+    }
+
+    @MainActor
+    func testResolvedCopilotRequestedModelIDSkipsUnsafeClaudeAliasWithoutModels() {
+        let runtime = CodexAssistantRuntime()
+
+        XCTAssertNil(runtime.resolvedCopilotRequestedModelIDForTesting("opus"))
+        XCTAssertEqual(
+            runtime.resolvedCopilotRequestedModelIDForTesting("claude-opus-4.6"),
+            "claude-opus-4.6"
+        )
+    }
+
+    @MainActor
+    func testCopilotConfigUpdateIsIgnoredAfterBackendSwitch() async {
+        let runtime = CodexAssistantRuntime()
+        let staleModelsExpectation = expectation(description: "stale copilot models ignored")
+        staleModelsExpectation.isInverted = true
+
+        runtime.onModelsUpdate = { _ in
+            staleModelsExpectation.fulfill()
+        }
+
+        runtime.backend = .claudeCode
+        runtime.configureSessionForTesting(sessionID: "copilot-test-session")
+
+        await runtime.processCopilotSessionUpdateForTesting(
+            [
+                "sessionUpdate": "config_option_update",
+                "models": [
+                    "currentModelId": "gpt-5.4",
+                    "availableModels": [
+                        [
+                            "modelId": "gpt-5.4",
+                            "name": "GPT-5.4",
+                            "description": "Reasoning model"
+                        ]
+                    ]
+                ]
+            ],
+            forceBackend: false
+        )
+
+        await fulfillment(of: [staleModelsExpectation], timeout: 0.2)
     }
 
     @MainActor
@@ -1502,11 +1711,12 @@ final class AssistantSessionInteractionTests: XCTestCase {
         }
 
         XCTAssertEqual(runtime.dynamicToolNamesForTesting(mode: .conversational), ["generate_image"])
-        XCTAssertEqual(runtime.dynamicToolNamesForTesting(mode: .plan), ["generate_image"])
+        XCTAssertEqual(runtime.dynamicToolNamesForTesting(mode: .plan), ["generate_image", "assistant_notes"])
         XCTAssertEqual(
             runtime.dynamicToolNamesForTesting(mode: .agentic),
             [
                 "generate_image",
+                "assistant_notes",
                 "app_action",
                 "browser_use",
                 "exec_command",
@@ -1939,6 +2149,40 @@ final class AssistantSessionInteractionTests: XCTestCase {
     }
 
     @MainActor
+    func testResolvedSessionConfigurationRestoresStickyNoteMode() {
+        let session = AssistantSessionSummary(
+            id: "notes-thread",
+            title: "Notes",
+            source: .openAssist,
+            status: .idle,
+            latestTaskMode: .note,
+            latestInteractionMode: .plan,
+            latestReasoningEffort: .medium
+        )
+
+        let configuration = AssistantStore.resolvedSessionConfiguration(
+            from: session,
+            backend: .codex,
+            availableModels: [
+                AssistantModelOption(
+                    id: "gpt-5.4",
+                    displayName: "GPT-5.4",
+                    description: "Default",
+                    isDefault: true,
+                    hidden: false,
+                    supportedReasoningEfforts: ["medium", "high"],
+                    defaultReasoningEffort: "medium"
+                )
+            ],
+            preferredModelID: "gpt-5.4"
+        )
+
+        XCTAssertEqual(configuration.taskMode, AssistantTaskMode.note)
+        XCTAssertEqual(configuration.interactionMode, AssistantInteractionMode.plan)
+        XCTAssertEqual(configuration.reasoningEffort, AssistantReasoningEffort.medium)
+    }
+
+    @MainActor
     func testResolvedModelSelectionFallsBackToProviderDefaultForV2Threads() {
         let v2Session = AssistantSessionSummary(
             id: "openassist-thread",
@@ -2026,6 +2270,129 @@ final class AssistantSessionInteractionTests: XCTestCase {
         )
 
         XCTAssertEqual(resolved, "gpt-4.1")
+    }
+
+    @MainActor
+    func testConfigurationModelsPreferCachedModelsWhenVisibleSurfaceBelongsToAnotherProvider() {
+        let copilotModel = AssistantModelOption(
+            id: "gpt-5.4-mini",
+            displayName: "GPT-5.4 Mini",
+            description: "Copilot",
+            isDefault: true,
+            hidden: false,
+            supportedReasoningEfforts: ["high"],
+            defaultReasoningEffort: "high"
+        )
+        let claudeModel = AssistantModelOption(
+            id: "opus",
+            displayName: "Claude Opus",
+            description: "Claude",
+            isDefault: true,
+            hidden: false,
+            supportedReasoningEfforts: ["high"],
+            defaultReasoningEffort: "high"
+        )
+
+        let resolved = AssistantStore.configurationModels(
+            for: .copilot,
+            visibleProviderSurfaceBackend: .claudeCode,
+            visibleAvailableModels: [claudeModel],
+            cachedProviderModels: [copilotModel]
+        )
+
+        XCTAssertEqual(resolved.map(\.id), ["gpt-5.4-mini"])
+    }
+
+    @MainActor
+    func testConfigurationModelsUseVisibleModelsWhenSurfaceMatchesProvider() {
+        let copilotModel = AssistantModelOption(
+            id: "gpt-5.4",
+            displayName: "GPT-5.4",
+            description: "Copilot",
+            isDefault: true,
+            hidden: false,
+            supportedReasoningEfforts: ["high"],
+            defaultReasoningEffort: "high"
+        )
+
+        let resolved = AssistantStore.configurationModels(
+            for: .copilot,
+            visibleProviderSurfaceBackend: .copilot,
+            visibleAvailableModels: [copilotModel],
+            cachedProviderModels: []
+        )
+
+        XCTAssertEqual(resolved.map(\.id), ["gpt-5.4"])
+    }
+
+    @MainActor
+    func testVisibleRuntimeRefreshResultRequiresCurrentBackendToStillMatch() {
+        XCTAssertFalse(
+            AssistantStore.shouldApplyVisibleRuntimeRefreshResult(
+                requestedBackend: .copilot,
+                currentVisibleBackend: .claudeCode,
+                runtimeBackend: .claudeCode
+            )
+        )
+        XCTAssertFalse(
+            AssistantStore.shouldApplyVisibleRuntimeRefreshResult(
+                requestedBackend: .copilot,
+                currentVisibleBackend: .copilot,
+                runtimeBackend: .claudeCode
+            )
+        )
+        XCTAssertTrue(
+            AssistantStore.shouldApplyVisibleRuntimeRefreshResult(
+                requestedBackend: .claudeCode,
+                currentVisibleBackend: .claudeCode,
+                runtimeBackend: .claudeCode
+            )
+        )
+    }
+
+    @MainActor
+    func testResolvedSessionConfigurationUsesSurfaceModelForCurrentProviderThread() {
+        let v2Session = AssistantSessionSummary(
+            id: "openassist-thread",
+            title: "Merged",
+            source: .openAssist,
+            threadArchitectureVersion: .providerIndependentV2,
+            activeProvider: .copilot,
+            providerBindingsByBackend: [
+                AssistantProviderBinding(backend: .copilot)
+            ],
+            status: .idle,
+            latestModel: "gpt-5.4"
+        )
+
+        let configuration = AssistantStore.resolvedSessionConfiguration(
+            from: v2Session,
+            backend: .copilot,
+            availableModels: [
+                AssistantModelOption(
+                    id: "gpt-5.4",
+                    displayName: "GPT-5.4",
+                    description: "Default",
+                    isDefault: true,
+                    hidden: false,
+                    supportedReasoningEfforts: ["high"],
+                    defaultReasoningEffort: "high"
+                ),
+                AssistantModelOption(
+                    id: "gpt-5.4-mini",
+                    displayName: "GPT-5.4 Mini",
+                    description: "Fast",
+                    isDefault: false,
+                    hidden: false,
+                    supportedReasoningEfforts: ["high"],
+                    defaultReasoningEffort: "high"
+                )
+            ],
+            preferredModelID: "gpt-5.4",
+            surfaceModelID: "gpt-5.4-mini"
+        )
+
+        XCTAssertEqual(configuration.modelID, "gpt-5.4-mini")
     }
 
     @MainActor
@@ -2201,6 +2568,45 @@ final class AssistantSessionInteractionTests: XCTestCase {
     }
 
     @MainActor
+    func testCopilotSearchToolCallPublishesVisibleActivity() async {
+        let runtime = CodexAssistantRuntime()
+        let recorder = AssistantRuntimeEventRecorder()
+
+        runtime.onToolCallUpdate = { recorder.toolSnapshots.append($0) }
+        runtime.onTimelineMutation = { mutation in
+            if case let .upsert(item) = mutation {
+                recorder.timelineItems.append(item)
+            }
+        }
+
+        runtime.configureStreamingTurnForTesting(
+            sessionID: "copilot-thread",
+            turnID: "copilot-turn",
+            text: "",
+            mode: .agentic
+        )
+
+        await runtime.processCopilotSessionUpdateForTesting([
+            "sessionUpdate": "tool_call",
+            "toolCallId": "tool-search",
+            "status": "running",
+            "kind": "semantic_search",
+            "title": "Codebase Search",
+            "rawInput": [
+                "query": "what features are in OpenAssist?"
+            ]
+        ])
+
+        let latestToolSnapshot = recorder.toolSnapshots.last?.first
+        XCTAssertEqual(latestToolSnapshot?.title, "Web Search")
+        XCTAssertEqual(latestToolSnapshot?.detail, "what features are in OpenAssist?")
+
+        let latestActivity = recorder.timelineItems.last { $0.kind == .activity }?.activity
+        XCTAssertEqual(latestActivity?.kind, .webSearch)
+        XCTAssertEqual(latestActivity?.title, "Web Search")
+    }
+
+    @MainActor
     func testClaudeCodeStreamDeltaProducesVisibleAssistantText() {
         let runtime = CodexAssistantRuntime()
         let recorder = AssistantRuntimeEventRecorder()
@@ -2229,6 +2635,220 @@ final class AssistantSessionInteractionTests: XCTestCase {
 
         XCTAssertEqual(recorder.systemMessages.last, "Hello")
         XCTAssertEqual(recorder.activityTitles.last, "Hello")
+    }
+
+    @MainActor
+    func testClaudeMessageStopCompletesTurnWhenResultPacketNeverArrives() {
+        let runtime = CodexAssistantRuntime()
+        let recorder = AssistantRuntimeEventRecorder()
+        let completionCapture = TurnCompletionCapture()
+
+        runtime.onTimelineMutation = { mutation in
+            if case let .upsert(item) = mutation {
+                recorder.timelineItems.append(item)
+            }
+        }
+        runtime.onTurnCompletion = { status in
+            completionCapture.status = status
+        }
+
+        runtime.configureStreamingTurnForTesting(
+            sessionID: "claude-thread",
+            turnID: "claude-turn",
+            text: "",
+            mode: .agentic
+        )
+
+        runtime.processClaudeCodeOutputLineForTesting(
+            #"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"Done."}},"session_id":"claude-thread"}"#
+        )
+        runtime.processClaudeCodeOutputLineForTesting(
+            #"{"type":"stream_event","event":{"type":"message_stop"},"session_id":"claude-thread"}"#
+        )
+        runtime.flushPendingClaudeCompletionForTesting()
+
+        XCTAssertEqual(completionCapture.status, .completed)
+        XCTAssertNil(runtime.currentTurnID)
+
+        let finalAssistant = recorder.timelineItems.last {
+            $0.kind == .assistantFinal && $0.isStreaming == false
+        }
+        XCTAssertEqual(finalAssistant?.text, "Done.")
+    }
+
+    @MainActor
+    func testClaudeResultPayloadReplacesEarlyProvisionalStreamReply() {
+        let runtime = CodexAssistantRuntime()
+        let recorder = AssistantRuntimeEventRecorder()
+
+        runtime.onTimelineMutation = { mutation in
+            if case let .upsert(item) = mutation {
+                recorder.timelineItems.append(item)
+            }
+        }
+
+        runtime.configureStreamingTurnForTesting(
+            sessionID: "claude-thread",
+            turnID: "claude-turn",
+            text: "",
+            mode: .agentic
+        )
+
+        runtime.processClaudeCodeOutputLineForTesting(
+            #"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"Let me read a few stack files first."}},"session_id":"claude-thread"}"#
+        )
+        runtime.processClaudeCodeOutputLineForTesting(
+            #"{"type":"result","result":"Here is how the stacks work:\n\n- Shared modules handle reusable infrastructure\n- Environment tiers change size and protection","stop_reason":"end_turn","session_id":"claude-thread"}"#
+        )
+
+        let finalAssistant = recorder.timelineItems.last {
+            $0.kind == .assistantFinal && $0.isStreaming == false
+        }
+        XCTAssertEqual(
+            finalAssistant?.text,
+            """
+            Here is how the stacks work:
+
+            - Shared modules handle reusable infrastructure
+            - Environment tiers change size and protection
+            """
+        )
+    }
+
+    @MainActor
+    func testClaudeAssistantPayloadReplacesEarlyProvisionalStreamReply() {
+        let runtime = CodexAssistantRuntime()
+        let recorder = AssistantRuntimeEventRecorder()
+
+        runtime.onTimelineMutation = { mutation in
+            if case let .upsert(item) = mutation {
+                recorder.timelineItems.append(item)
+            }
+        }
+
+        runtime.configureStreamingTurnForTesting(
+            sessionID: "claude-thread",
+            turnID: "claude-turn",
+            text: "",
+            mode: .agentic
+        )
+
+        runtime.processClaudeCodeOutputLineForTesting(
+            #"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"Let me inspect the files first."}},"session_id":"claude-thread"}"#
+        )
+        runtime.processClaudeCodeOutputLineForTesting(
+            #"{"type":"assistant","message":{"content":[{"type":"text","text":"Here is how the stacks fit together:\n\n1. Shared modules define common building blocks.\n2. Each environment file picks sizes, networking, and protection."}]},"session_id":"claude-thread"}"#
+        )
+        runtime.processClaudeCodeOutputLineForTesting(
+            #"{"type":"stream_event","event":{"type":"message_stop"},"session_id":"claude-thread"}"#
+        )
+        runtime.flushPendingClaudeCompletionForTesting()
+
+        let finalAssistant = recorder.timelineItems.last {
+            $0.kind == .assistantFinal && $0.isStreaming == false
+        }
+        XCTAssertEqual(
+            finalAssistant?.text,
+            """
+            Here is how the stacks fit together:
+
+            1. Shared modules define common building blocks.
+            2. Each environment file picks sizes, networking, and protection.
+            """
+        )
+    }
+
+    @MainActor
+    func testClaudeWorseLaterPayloadDoesNotReplaceBetterStreamedReply() {
+        let runtime = CodexAssistantRuntime()
+        let recorder = AssistantRuntimeEventRecorder()
+
+        runtime.onTimelineMutation = { mutation in
+            if case let .upsert(item) = mutation {
+                recorder.timelineItems.append(item)
+            }
+        }
+
+        runtime.configureStreamingTurnForTesting(
+            sessionID: "claude-thread",
+            turnID: "claude-turn",
+            text: "",
+            mode: .agentic
+        )
+
+        runtime.processClaudeCodeOutputLineForTesting(
+            #"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"Here is how the stacks work:\n\n- Shared modules define common resources\n- Environment files choose the right sizing"}},"session_id":"claude-thread"}"#
+        )
+        runtime.processClaudeCodeOutputLineForTesting(
+            #"{"type":"assistant","message":{"content":[{"type":"text","text":"Short note."}]},"session_id":"claude-thread"}"#
+        )
+        runtime.processClaudeCodeOutputLineForTesting(
+            #"{"type":"stream_event","event":{"type":"message_stop"},"session_id":"claude-thread"}"#
+        )
+        runtime.flushPendingClaudeCompletionForTesting()
+
+        let finalAssistant = recorder.timelineItems.last {
+            $0.kind == .assistantFinal && $0.isStreaming == false
+        }
+        XCTAssertEqual(
+            finalAssistant?.text,
+            """
+            Here is how the stacks work:
+
+            - Shared modules define common resources
+            - Environment files choose the right sizing
+            """
+        )
+    }
+
+    @MainActor
+    func testClaudeToolTurnStillFinishesWithFinalAnswerAfterPreface() {
+        let runtime = CodexAssistantRuntime()
+        let recorder = AssistantRuntimeEventRecorder()
+
+        runtime.onTimelineMutation = { mutation in
+            if case let .upsert(item) = mutation {
+                recorder.timelineItems.append(item)
+            }
+        }
+
+        runtime.configureStreamingTurnForTesting(
+            sessionID: "claude-thread",
+            turnID: "claude-turn",
+            text: "",
+            mode: .agentic
+        )
+
+        runtime.processClaudeCodeOutputLineForTesting(
+            #"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"Let me read a few stack files to answer that."}},"session_id":"claude-thread"}"#
+        )
+        runtime.processClaudeCodeOutputLineForTesting(
+            #"{"type":"stream_event","session_id":"claude-thread","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"tool-1","name":"Bash","input":{"command":"rg -n stack pulumi"}}}}"#
+        )
+        runtime.processClaudeCodeOutputLineForTesting(
+            #"{"type":"stream_event","session_id":"claude-thread","event":{"type":"content_block_stop","index":0}}"#
+        )
+        runtime.processClaudeCodeOutputLineForTesting(
+            #"{"type":"result","result":"The stacks share common modules, then each environment file picks the values it needs.\n\nThat means your workflow diagram should show one shared base feeding into separate environment-specific configuration paths.","stop_reason":"end_turn","session_id":"claude-thread"}"#
+        )
+
+        let finalAssistant = recorder.timelineItems.last {
+            $0.kind == .assistantFinal && $0.isStreaming == false
+        }
+        let completedActivity = recorder.timelineItems.last {
+            $0.kind == .activity && $0.activity?.status == .completed
+        }?.activity
+
+        XCTAssertEqual(
+            finalAssistant?.text,
+            """
+            The stacks share common modules, then each environment file picks the values it needs.
+
+            That means your workflow diagram should show one shared base feeding into separate environment-specific configuration paths.
+            """
+        )
+        XCTAssertEqual(completedActivity?.title, "Command")
+        XCTAssertEqual(completedActivity?.status, .completed)
     }
 
     @MainActor
@@ -2365,6 +2985,129 @@ final class AssistantSessionInteractionTests: XCTestCase {
         }
 
         XCTAssertEqual(finalAssistant?.text, "GitHub Copilot replied successfully.")
+    }
+
+    @MainActor
+    func testCopilotLateMessageChunkStillFinalizesAfterPromptCompletion() async {
+        let runtime = CodexAssistantRuntime()
+        let recorder = AssistantRuntimeEventRecorder()
+
+        runtime.onTimelineMutation = { mutation in
+            if case let .upsert(item) = mutation {
+                recorder.timelineItems.append(item)
+            }
+        }
+
+        runtime.configureStreamingTurnForTesting(
+            sessionID: "copilot-thread",
+            turnID: "copilot-turn",
+            text: "",
+            mode: .agentic
+        )
+
+        runtime.processCopilotPromptCompletionForTesting(finalizePendingCompletion: false)
+
+        await runtime.processCopilotSessionUpdateForTesting([
+            "sessionUpdate": "agent_message_chunk",
+            "turnId": "copilot-turn",
+            "content": ["text": "Late answer"]
+        ])
+
+        await runtime.processCopilotSessionUpdateForTesting([
+            "sessionUpdate": "agent_message_chunk",
+            "turnId": "copilot-turn",
+            "content": ["text": " that kept streaming."]
+        ])
+
+        runtime.flushPendingCopilotPromptCompletionForTesting()
+
+        let finalAssistant = recorder.timelineItems.last {
+            $0.kind == .assistantFinal && $0.isStreaming == false
+        }
+
+        XCTAssertEqual(finalAssistant?.text, "Late answer that kept streaming.")
+    }
+
+    @MainActor
+    func testCopilotPromptCompletionDefersForFreshVisibleActivity() {
+        XCTAssertTrue(
+            CodexAssistantRuntime.shouldDeferCopilotPromptCompletion(
+                elapsedSinceLastUpdate: 3,
+                hasLiveActivity: true,
+                hasVisibleAssistantOutput: true,
+                hasPendingPermissionRequest: false
+            )
+        )
+    }
+
+    @MainActor
+    func testCopilotPromptCompletionFinishesForStaleVisibleActivity() {
+        XCTAssertFalse(
+            CodexAssistantRuntime.shouldDeferCopilotPromptCompletion(
+                elapsedSinceLastUpdate: 7,
+                hasLiveActivity: true,
+                hasVisibleAssistantOutput: true,
+                hasPendingPermissionRequest: false
+            )
+        )
+    }
+
+    @MainActor
+    func testCopilotPromptCompletionWaitsForPendingPermission() {
+        XCTAssertTrue(
+            CodexAssistantRuntime.shouldDeferCopilotPromptCompletion(
+                elapsedSinceLastUpdate: 20,
+                hasLiveActivity: true,
+                hasVisibleAssistantOutput: true,
+                hasPendingPermissionRequest: true
+            )
+        )
+    }
+
+    @MainActor
+    func testCopilotPromptCompletionEventuallyFinishesWithoutVisibleReply() {
+        XCTAssertFalse(
+            CodexAssistantRuntime.shouldDeferCopilotPromptCompletion(
+                elapsedSinceLastUpdate: 16,
+                hasLiveActivity: true,
+                hasVisibleAssistantOutput: false,
+                hasPendingPermissionRequest: false
+            )
+        )
+    }
+
+    @MainActor
+    func testCopilotLiveUpdatesAreIgnoredWithoutActiveTurn() {
+        XCTAssertFalse(
+            CodexAssistantRuntime.shouldAcceptCopilotLiveUpdate(
+                updateTurnID: nil,
+                activeTurnID: nil
+            )
+        )
+
+        XCTAssertFalse(
+            CodexAssistantRuntime.shouldAcceptCopilotLiveUpdate(
+                updateTurnID: "copilot-turn",
+                activeTurnID: nil
+            )
+        )
+    }
+
+    @MainActor
+    func testCopilotLiveUpdatesIgnoreMismatchedTurnIDs() {
+        XCTAssertFalse(
+            CodexAssistantRuntime.shouldAcceptCopilotLiveUpdate(
+                updateTurnID: "copilot-turn-2",
+                activeTurnID: "copilot-turn-1"
+            )
+        )
+
+        XCTAssertTrue(
+            CodexAssistantRuntime.shouldAcceptCopilotLiveUpdate(
+                updateTurnID: "copilot-turn-1",
+                activeTurnID: "copilot-turn-1"
+            )
+        )
     }
 
     @MainActor

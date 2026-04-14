@@ -55,6 +55,18 @@ struct ClaudeCodeBackendAdapter: AssistantBackendAdapter {
     )
 }
 
+struct OllamaLocalBackendAdapter: AssistantBackendAdapter {
+    let backend: AssistantRuntimeBackend = .ollamaLocal
+    let capabilities = AssistantBackendCapabilities(
+        supportsStructuredToolCalls: true,
+        supportsImageInput: true,
+        maxPracticalToolCount: nil,
+        supportsLongToolOutputs: true,
+        supportsContinuation: true,
+        preferredToolSurface: .granular
+    )
+}
+
 enum AssistantBackendAdapterRegistry {
     static func adapter(for backend: AssistantRuntimeBackend) -> any AssistantBackendAdapter {
         switch backend {
@@ -64,6 +76,8 @@ enum AssistantBackendAdapterRegistry {
             return CopilotBackendAdapter()
         case .claudeCode:
             return ClaudeCodeBackendAdapter()
+        case .ollamaLocal:
+            return OllamaLocalBackendAdapter()
         }
     }
 }
@@ -99,6 +113,7 @@ struct AssistantHostCapabilities: Equatable {
 }
 
 enum AssistantToolExecutionKind {
+    case assistantNotes
     case browserUse
     case appAction
     case computerUse
@@ -170,6 +185,25 @@ enum AssistantToolCatalog {
                     (try? AssistantImageGenerationService.parseRequest(from: arguments).summaryLine) ?? "Generate an image"
                 },
                 requiresExplicitConfirmation: { _ in false }
+            ),
+            AssistantToolDescriptor(
+                name: AssistantNotesToolDefinition.name,
+                aliases: [],
+                toolKind: AssistantNotesToolDefinition.toolKind,
+                displayName: "Assistant Notes",
+                description: AssistantNotesToolDefinition.description,
+                inputSchema: AssistantNotesToolDefinition.inputSchema,
+                modes: [.plan, .agentic],
+                surfaceStyles: [.compact, .granular],
+                permissionLeadText: "Assistant Notes reads Open Assist project and thread note files, prepares note changes as previews, and only saves when you confirm an apply action.",
+                executionKind: .assistantNotes,
+                availability: { true },
+                summaryProvider: { arguments in
+                    (try? AssistantNotesToolService.parseRequest(from: arguments).summaryLine) ?? "Use project notes"
+                },
+                requiresExplicitConfirmation: { arguments in
+                    (try? AssistantNotesToolService.parseRequest(from: arguments).action) == .applyPreview
+                }
             ),
             AssistantToolDescriptor(
                 name: AssistantAppActionToolDefinition.name,
@@ -608,12 +642,15 @@ struct AssistantToolExecutionContext {
     let arguments: Any
     let attachments: [AssistantAttachment]
     let sessionID: String?
+    let assistantNotesContext: AssistantNotesRuntimeContext?
     let preferredModelID: String?
     let browserLoginResume: Bool
+    let interactionMode: AssistantInteractionMode
 }
 
 @MainActor
 final class AssistantToolExecutor {
+    private let assistantNotesService: AssistantNotesToolService
     private let browserUseService: AssistantBrowserUseService
     private let appActionService: AssistantAppActionService
     private let computerUseService: AssistantComputerUseService
@@ -624,6 +661,7 @@ final class AssistantToolExecutor {
     private let surfaceCompiler: AssistantToolSurfaceCompiler
 
     init(
+        assistantNotesService: AssistantNotesToolService,
         browserUseService: AssistantBrowserUseService,
         appActionService: AssistantAppActionService,
         computerUseService: AssistantComputerUseService,
@@ -633,6 +671,7 @@ final class AssistantToolExecutor {
         accessibilityAutomationService: AssistantAccessibilityAutomationService,
         surfaceCompiler: AssistantToolSurfaceCompiler
     ) {
+        self.assistantNotesService = assistantNotesService
         self.browserUseService = browserUseService
         self.appActionService = appActionService
         self.computerUseService = computerUseService
@@ -669,6 +708,14 @@ final class AssistantToolExecutor {
         }
 
         switch descriptor.executionKind {
+        case .assistantNotes:
+            return await assistantNotesService.run(
+                arguments: context.arguments,
+                sessionID: context.sessionID,
+                runtimeContext: context.assistantNotesContext,
+                preferredModelID: context.preferredModelID,
+                interactionMode: context.interactionMode
+            )
         case .browserUse:
             return await (
                 context.browserLoginResume
@@ -764,6 +811,8 @@ final class AssistantToolExecutor {
             return "Unsupported dynamic tool"
         }
         switch descriptor.executionKind {
+        case .assistantNotes:
+            return "Reading project notes and preparing note changes"
         case .browserUse:
             return browserLoginResume ? "Checking the browser after sign-in" : "Using the selected browser profile"
         case .appAction:

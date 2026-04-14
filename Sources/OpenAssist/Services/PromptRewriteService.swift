@@ -224,7 +224,7 @@ final class PromptRewriteService {
         ]
 
         if localRuntimeNeedles.contains(where: { normalized.contains($0) }) {
-            return "Local AI runtime is unavailable. AI Studio -> Prompt Models -> Local AI Setup, then install or repair Local AI."
+            return "Local AI runtime is unavailable. Open Settings -> Models & Connections -> Local AI Setup, then install or repair Local AI."
         }
         return fallback
     }
@@ -861,7 +861,7 @@ final class BackendPromptRewriteService: PromptRewriteBackendServing {
         var detection = await runtime.detect()
         guard detection.installed else {
             throw PromptRewriteBackendError.providerFailure(
-                reason: "Local AI runtime is unavailable. AI Studio -> Prompt Models -> Local AI Setup, then install or repair Local AI."
+                reason: "Local AI runtime is unavailable. Open Settings -> Models & Connections -> Local AI Setup, then install or repair Local AI."
             )
         }
 
@@ -871,7 +871,7 @@ final class BackendPromptRewriteService: PromptRewriteBackendServing {
                 CrashReporter.logInfo("Local AI runtime auto-started on first local rewrite request.")
             } catch {
                 throw PromptRewriteBackendError.providerFailure(
-                    reason: "Local AI runtime is unavailable. AI Studio -> Prompt Models -> Local AI Setup, then install or repair Local AI."
+                    reason: "Local AI runtime is unavailable. Open Settings -> Models & Connections -> Local AI Setup, then install or repair Local AI."
                 )
             }
         }
@@ -881,7 +881,7 @@ final class BackendPromptRewriteService: PromptRewriteBackendServing {
             let isInstalled = await runtime.isModelInstalled(modelID)
             if !isInstalled {
                 throw PromptRewriteBackendError.providerFailure(
-                    reason: "Local model \(modelID) is not installed. AI Studio -> Prompt Models -> Local AI Setup to install it."
+                    reason: "Local model \(modelID) is not installed. Open Settings -> Models & Connections -> Local AI Setup to install it."
                 )
             }
         }
@@ -1425,7 +1425,7 @@ private actor OpenAIPromptRewriteProvider {
 
         guard let endpoint else {
             throw PromptRewriteBackendError.providerFailure(
-                reason: "Invalid provider base URL. Update AI Studio > Prompt Models."
+                reason: "Invalid provider base URL. Update Settings > Models & Connections."
             )
         }
 
@@ -1512,7 +1512,7 @@ private actor OpenAIPromptRewriteProvider {
                 let message = error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
                 throw PromptRewriteBackendError.providerFailure(
                     reason: message.isEmpty
-                        ? "OAuth session expired. Reconnect the provider in AI Studio."
+                        ? "OAuth session expired. Reconnect the provider in Models & Connections."
                         : "OAuth session refresh failed: \(message)"
                 )
             }
@@ -1533,7 +1533,7 @@ private actor OpenAIPromptRewriteProvider {
                 let message = error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
                 throw PromptRewriteBackendError.providerFailure(
                     reason: message.isEmpty
-                        ? "OAuth session expired. Reconnect the provider in AI Studio."
+                        ? "OAuth session expired. Reconnect the provider in Models & Connections."
                         : "OAuth session refresh failed: \(message)"
                 )
             }

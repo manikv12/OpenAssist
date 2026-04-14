@@ -53,17 +53,17 @@ function ActivitySummaryRowInner({ message }: { message: ChatMessage }) {
         disabled={!message.loadActivityDetailsID && !message.collapseActivityDetailsID}
         aria-busy={isLoading}
       >
-        <span className="activity-summary-line" aria-hidden="true" />
-        <span className="activity-summary-center">
-          <span className="activity-summary-label">{title}</span>
+        <span className="activity-summary-center active-work-summary-toggle">
           <AppIcon
             symbol={isCollapse ? "chevron.left" : "chevron.right"}
-            className="activity-summary-icon"
+            className="activity-summary-icon active-work-summary-chevron"
             size={13}
             strokeWidth={2.2}
           />
+          <span className="activity-summary-label active-work-summary-text active-work-summary-text--static">
+            {title}
+          </span>
         </span>
-        <span className="activity-summary-line" aria-hidden="true" />
       </button>
     </div>
   );

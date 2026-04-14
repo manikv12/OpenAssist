@@ -114,7 +114,7 @@ struct StatusBarPopoverView: View {
 
                     PopoverMenuRow(
                         icon: "brain.head.profile",
-                        label: "AI Studio",
+                        label: "Models & Connections",
                         iconTint: AppVisualTheme.aiStudioTint
                     ) {
                         viewModel.onOpenAIMemoryStudio?()

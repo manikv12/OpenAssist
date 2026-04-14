@@ -106,6 +106,8 @@ struct AssistantSidebarWebNote: Equatable {
     let title: String
     let subtitle: String
     let sourceLabel: String
+    let folderID: String?
+    let folderPath: [String]
     let isSelected: Bool
     let isArchivedThread: Bool
     let threadID: String?
@@ -119,11 +121,40 @@ struct AssistantSidebarWebNote: Equatable {
             "title": title,
             "subtitle": subtitle,
             "sourceLabel": sourceLabel,
+            "folderPath": folderPath,
             "isSelected": isSelected,
             "isArchivedThread": isArchivedThread,
         ]
+        if let folderID, !folderID.isEmpty {
+            json["folderId"] = folderID
+        }
         if let threadID, !threadID.isEmpty {
             json["threadId"] = threadID
+        }
+        return json
+    }
+}
+
+struct AssistantSidebarWebNoteFolder: Equatable {
+    let id: String
+    let name: String
+    let parentID: String?
+    let path: [String]
+    let isExpanded: Bool
+    let childFolderCount: Int
+    let noteCount: Int
+
+    func toJSON() -> [String: Any] {
+        var json: [String: Any] = [
+            "id": id,
+            "name": name,
+            "path": path,
+            "isExpanded": isExpanded,
+            "childFolderCount": childFolderCount,
+            "noteCount": noteCount,
+        ]
+        if let parentID, !parentID.isEmpty {
+            json["parentId"] = parentID
         }
         return json
     }
@@ -162,6 +193,7 @@ struct AssistantSidebarWebState: Equatable {
     let projects: [AssistantSidebarWebProject]
     let threads: [AssistantSidebarWebSession]
     let archived: [AssistantSidebarWebSession]
+    let noteFolders: [AssistantSidebarWebNoteFolder]
     let notes: [AssistantSidebarWebNote]
 
     func toJSON() -> [String: Any] {
@@ -191,6 +223,7 @@ struct AssistantSidebarWebState: Equatable {
             "projects": projects.map { $0.toJSON() },
             "threads": threads.map { $0.toJSON() },
             "archived": archived.map { $0.toJSON() },
+            "noteFolders": noteFolders.map { $0.toJSON() },
             "notes": notes.map { $0.toJSON() },
         ]
         if let projectFilterID, !projectFilterID.isEmpty {

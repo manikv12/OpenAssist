@@ -46,6 +46,17 @@ export function normalizeMermaidSource(language: string, code: string): string {
   return sanitizeMermaidSource(sourceWithNormalizedHeader);
 }
 
+export function sanitizeMermaidMarkdownBlocks(markdown: string): string {
+  return markdown.replace(
+    /```(mermaid[^\n`]*)\n([\s\S]*?)```/gi,
+    (_match, rawLanguage: string, rawCode: string) => {
+      const language = `${rawLanguage ?? "mermaid"}`.trim() || "mermaid";
+      const sanitizedCode = normalizeMermaidSource(language, rawCode);
+      return `\`\`\`${language}\n${sanitizedCode}\n\`\`\``;
+    }
+  );
+}
+
 export function inspectMermaidSource(source: string): MermaidSourceAnalysis {
   const normalized = source.replace(/\r\n/g, "\n");
   const firstDirective = firstMeaningfulMermaidDirective(normalized);
@@ -113,7 +124,11 @@ function sanitizeMermaidSource(source: string): string {
   ) {
     return normalized
       .split("\n")
-      .map((line) => sanitizeFlowchartSubgraphLine(line))
+      .map((line) =>
+        sanitizeFlowchartNodeLine(
+          sanitizeFlowchartSubgraphLine(repairIncompleteFlowchartNodeLine(line))
+        )
+      )
       .join("\n");
   }
 
@@ -133,6 +148,64 @@ function sanitizeFlowchartSubgraphLine(line: string): string {
   }
 
   return `${keyword} ${identifier}[${quoteMermaidLabel(label)}]`;
+}
+
+function sanitizeFlowchartNodeLine(line: string): string {
+  if (!line.includes("[") || /^\s*subgraph\b/i.test(line)) {
+    return line;
+  }
+
+  return line.replace(
+    /\[(?!\s*")(.*?)(?<!\\)\]/g,
+    (fullMatch: string, rawLabel: string) => {
+      const label = rawLabel.trim();
+      if (!label) {
+        return fullMatch;
+      }
+
+      if (/^"(?:[^"\\]|\\.)*"$/.test(label)) {
+        return fullMatch;
+      }
+
+      // Quote labels that include punctuation Mermaid often mis-parses when
+      // prose is copied directly into flowchart square-bracket labels.
+      if (!/[^A-Za-z0-9 _-]/.test(label)) {
+        return fullMatch;
+      }
+
+      return `[${quoteMermaidLabel(label)}]`;
+    }
+  );
+}
+
+function repairIncompleteFlowchartNodeLine(line: string): string {
+  const squareOpenCount = (line.match(/\[/g) ?? []).length;
+  const squareCloseCount = (line.match(/\]/g) ?? []).length;
+  if (squareOpenCount <= squareCloseCount) {
+    return line;
+  }
+
+  const repairedLine = line.replace(
+    /^(.*?\b[A-Za-z0-9_]+)\[([^\]]*)$/,
+    (_match: string, prefix: string, rawLabel: string) => {
+      const label = rawLabel.trim();
+      if (!label) {
+        return prefix;
+      }
+
+      if (/^"(?:[^"\\]|\\.)*"$/.test(label)) {
+        return `${prefix}[${label}]`;
+      }
+
+      if (/[^A-Za-z0-9 _-]/.test(label)) {
+        return `${prefix}[${quoteMermaidLabel(label)}]`;
+      }
+
+      return `${prefix}[${label}]`;
+    }
+  );
+
+  return repairedLine;
 }
 
 function quoteMermaidLabel(label: string): string {

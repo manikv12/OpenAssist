@@ -47,22 +47,18 @@ struct AssistantComposerWebSkill: Equatable {
     }
 }
 
-struct AssistantComposerWebState: Equatable {
+struct AssistantComposerWebBaseState: Equatable {
     let draftText: String
     let placeholder: String
+    let isCompactComposer: Bool
     let isEnabled: Bool
     let canSend: Bool
-    let isBusy: Bool
-    let isVoiceCapturing: Bool
-    let canUseVoiceInput: Bool
-    let showStopVoicePlayback: Bool
+    let isNoteModeActive: Bool
+    let noteModeLabel: String?
+    let noteModeHelperText: String?
+    let showNoteModeButton: Bool
     let canOpenSkills: Bool
-    let selectedInteractionMode: String
-    let interactionModes: [AssistantComposerWebOption]
-    let selectedModelID: String?
-    let modelOptions: [AssistantComposerWebOption]
-    let selectedReasoningID: String
-    let reasoningOptions: [AssistantComposerWebOption]
+    let preflightStatusMessage: String?
     let activeSkills: [AssistantComposerWebSkill]
     let attachments: [AssistantComposerWebAttachment]
 
@@ -70,26 +66,100 @@ struct AssistantComposerWebState: Equatable {
         var json: [String: Any] = [
             "draftText": draftText,
             "placeholder": placeholder,
+            "isCompactComposer": isCompactComposer,
             "isEnabled": isEnabled,
             "canSend": canSend,
-            "isBusy": isBusy,
-            "isVoiceCapturing": isVoiceCapturing,
-            "canUseVoiceInput": canUseVoiceInput,
-            "showStopVoicePlayback": showStopVoicePlayback,
+            "isNoteModeActive": isNoteModeActive,
+            "showNoteModeButton": showNoteModeButton,
             "canOpenSkills": canOpenSkills,
-            "selectedInteractionMode": selectedInteractionMode,
-            "interactionModes": interactionModes.map { $0.toJSON() },
-            "modelOptions": modelOptions.map { $0.toJSON() },
-            "selectedReasoningId": selectedReasoningID,
-            "reasoningOptions": reasoningOptions.map { $0.toJSON() },
             "activeSkills": activeSkills.map { $0.toJSON() },
             "attachments": attachments.map { $0.toJSON() },
         ]
+        if let noteModeLabel, !noteModeLabel.isEmpty {
+            json["noteModeLabel"] = noteModeLabel
+        }
+        if let noteModeHelperText, !noteModeHelperText.isEmpty {
+            json["noteModeHelperText"] = noteModeHelperText
+        }
+        if let preflightStatusMessage, !preflightStatusMessage.isEmpty {
+            json["preflightStatusMessage"] = preflightStatusMessage
+        }
+        return json
+    }
+}
+
+struct AssistantComposerWebControlsState: Equatable {
+    let availability: AssistantRuntimeControlsAvailability
+    let availabilityStatusText: String?
+    let showsInteractionModeControl: Bool
+    let showsModelControls: Bool
+    let showsReasoningControls: Bool
+    let selectedInteractionMode: String
+    let interactionModes: [AssistantComposerWebOption]
+    let selectedModelID: String?
+    let modelOptions: [AssistantComposerWebOption]
+    let modelPlaceholder: String
+    let opensModelSetupWhenUnavailable: Bool
+    let selectedReasoningID: String
+    let reasoningOptions: [AssistantComposerWebOption]
+
+    func toJSON() -> [String: Any] {
+        var json: [String: Any] = [
+            "availability": availability.rawValue,
+            "showsInteractionModeControl": showsInteractionModeControl,
+            "showsModelControls": showsModelControls,
+            "showsReasoningControls": showsReasoningControls,
+            "selectedInteractionMode": selectedInteractionMode,
+            "interactionModes": interactionModes.map { $0.toJSON() },
+            "modelOptions": modelOptions.map { $0.toJSON() },
+            "modelPlaceholder": modelPlaceholder,
+            "opensModelSetupWhenUnavailable": opensModelSetupWhenUnavailable,
+            "selectedReasoningId": selectedReasoningID,
+            "reasoningOptions": reasoningOptions.map { $0.toJSON() },
+        ]
+        if let availabilityStatusText, !availabilityStatusText.isEmpty {
+            json["availabilityStatusText"] = availabilityStatusText
+        }
         if let selectedModelID, !selectedModelID.isEmpty {
             json["selectedModelId"] = selectedModelID
         }
         return json
     }
+}
+
+struct AssistantComposerWebActivityState: Equatable {
+    let isBusy: Bool
+    let activeTurnPhase: String
+    let canCancelActiveTurn: Bool
+    let activeTurnProviderLabel: String?
+    let hasPendingToolApproval: Bool
+    let hasPendingInput: Bool
+    let isVoiceCapturing: Bool
+    let canUseVoiceInput: Bool
+    let showStopVoicePlayback: Bool
+
+    func toJSON() -> [String: Any] {
+        var json: [String: Any] = [
+            "isBusy": isBusy,
+            "activeTurnPhase": activeTurnPhase,
+            "canCancelActiveTurn": canCancelActiveTurn,
+            "hasPendingToolApproval": hasPendingToolApproval,
+            "hasPendingInput": hasPendingInput,
+            "isVoiceCapturing": isVoiceCapturing,
+            "canUseVoiceInput": canUseVoiceInput,
+            "showStopVoicePlayback": showStopVoicePlayback,
+        ]
+        if let activeTurnProviderLabel, !activeTurnProviderLabel.isEmpty {
+            json["activeTurnProviderLabel"] = activeTurnProviderLabel
+        }
+        return json
+    }
+}
+
+struct AssistantComposerWebState: Equatable {
+    let base: AssistantComposerWebBaseState
+    let controls: AssistantComposerWebControlsState
+    let activity: AssistantComposerWebActivityState
 }
 
 struct AssistantComposerWebView: NSViewRepresentable {
@@ -179,12 +249,19 @@ final class AssistantComposerWebContainerView: NSView {
     var coordinator: AssistantComposerWebCoordinator
 
     private static var cachedHTMLString: String?
+#if DEBUG
+    private static var composerControlsSendCount = 0
+#endif
 
     private let webView: WKWebView
     private var isReady = false
-    private var pendingState: AssistantComposerWebState?
+    private var pendingBaseState: AssistantComposerWebBaseState?
+    private var pendingControlsState: AssistantComposerWebControlsState?
+    private var pendingActivityState: AssistantComposerWebActivityState?
     private var pendingAccentCSS: String?
-    private var lastAppliedState: AssistantComposerWebState?
+    private var lastAppliedBaseState: AssistantComposerWebBaseState?
+    private var lastAppliedControlsState: AssistantComposerWebControlsState?
+    private var lastAppliedActivityState: AssistantComposerWebActivityState?
     private var lastAppliedAccentCSS: String?
 
     init(coordinator: AssistantComposerWebCoordinator) {
@@ -231,9 +308,18 @@ final class AssistantComposerWebContainerView: NSView {
     }
 
     func applyState(_ state: AssistantComposerWebState) {
-        guard lastAppliedState != state else { return }
-        lastAppliedState = state
-        sendState(state)
+        if lastAppliedBaseState != state.base {
+            lastAppliedBaseState = state.base
+            sendBaseState(state.base)
+        }
+        if lastAppliedControlsState != state.controls {
+            lastAppliedControlsState = state.controls
+            sendControlsState(state.controls)
+        }
+        if lastAppliedActivityState != state.activity {
+            lastAppliedActivityState = state.activity
+            sendActivityState(state.activity)
+        }
     }
 
     private func handleReady() {
@@ -243,9 +329,17 @@ final class AssistantComposerWebContainerView: NSView {
             webView.evaluateJavaScript(pendingAccentCSS, completionHandler: nil)
             self.pendingAccentCSS = nil
         }
-        if let pendingState {
-            sendState(pendingState)
-            self.pendingState = nil
+        if let pendingBaseState {
+            sendBaseState(pendingBaseState)
+            self.pendingBaseState = nil
+        }
+        if let pendingControlsState {
+            sendControlsState(pendingControlsState)
+            self.pendingControlsState = nil
+        }
+        if let pendingActivityState {
+            sendActivityState(pendingActivityState)
+            self.pendingActivityState = nil
         }
     }
 
@@ -279,9 +373,9 @@ final class AssistantComposerWebContainerView: NSView {
         webView.loadHTMLString(html, baseURL: nil)
     }
 
-    private func sendState(_ state: AssistantComposerWebState) {
+    private func sendBaseState(_ state: AssistantComposerWebBaseState) {
         guard isReady else {
-            pendingState = state
+            pendingBaseState = state
             return
         }
 
@@ -293,6 +387,53 @@ final class AssistantComposerWebContainerView: NSView {
 
         webView.evaluateJavaScript(
             "chatBridge.setViewMode('composer'); chatBridge.setComposerState(\(jsonString));",
+            completionHandler: nil
+        )
+    }
+
+    private func sendControlsState(_ state: AssistantComposerWebControlsState) {
+        guard isReady else {
+            pendingControlsState = state
+            return
+        }
+
+        guard let data = try? JSONSerialization.data(withJSONObject: state.toJSON()),
+            let jsonString = String(data: data, encoding: .utf8)
+        else {
+            return
+        }
+
+        webView.evaluateJavaScript(
+            "chatBridge.setComposerControls?.(\(jsonString));",
+            completionHandler: nil
+        )
+
+#if DEBUG
+        Self.composerControlsSendCount += 1
+        if ProcessInfo.processInfo.environment["OPENASSIST_DEBUG_COMPOSER_CONTROLS"] == "1" {
+            NSLog(
+                "AssistantComposerWebView controls update #%d availability=%@",
+                Self.composerControlsSendCount,
+                state.availability.rawValue
+            )
+        }
+#endif
+    }
+
+    private func sendActivityState(_ state: AssistantComposerWebActivityState) {
+        guard isReady else {
+            pendingActivityState = state
+            return
+        }
+
+        guard let data = try? JSONSerialization.data(withJSONObject: state.toJSON()),
+            let jsonString = String(data: data, encoding: .utf8)
+        else {
+            return
+        }
+
+        webView.evaluateJavaScript(
+            "chatBridge.setComposerActivity?.(\(jsonString));",
             completionHandler: nil
         )
     }
@@ -312,6 +453,9 @@ final class AssistantComposerWebContainerView: NSView {
 extension AssistantComposerWebContainerView: WKNavigationDelegate {
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
         isReady = false
+        pendingBaseState = lastAppliedBaseState
+        pendingControlsState = lastAppliedControlsState
+        pendingActivityState = lastAppliedActivityState
         loadTemplate()
     }
 }

@@ -312,6 +312,10 @@ final class CodexAssistantRuntime {
     private static let claudeCodeIdleRateLimitRefreshIntervalNanoseconds: UInt64 = 90_000_000_000
     private var idleRateLimitRefreshTask: Task<Void, Never>?
     private static let claudeCodeLiveProcessIdleTimeoutNanoseconds: UInt64 = 900_000_000_000
+    private static let claudeCodeDeferredCompletionGracePeriodNanoseconds: UInt64 = 1_200_000_000
+    private static let copilotCompletionQuietPeriodNanoseconds: UInt64 = 2_000_000_000
+    private static let copilotCompletionActivityGracePeriodNanoseconds: UInt64 = 6_000_000_000
+    private static let copilotCompletionHardTimeoutNanoseconds: UInt64 = 15_000_000_000
 
     // Title generation: ephemeral thread whose notifications are filtered from the main UI
     private var titleGenThreadID: String?
@@ -329,6 +333,10 @@ final class CodexAssistantRuntime {
     private var commentaryBuffer: String = ""
     private var pendingCommentaryDeltaBuffer: String = ""
     private var pendingCopilotFallbackReply: String?
+    private var pendingCopilotCompletionParams: [String: Any]?
+    private var pendingCopilotCompletionEmit: DispatchWorkItem?
+    private var pendingClaudeCompletionEmit: DispatchWorkItem?
+    private var lastCopilotSessionUpdateTime: CFAbsoluteTime = 0
     private var planTimelineID: String?
     private var planStartedAt: Date?
     private var persistedCLIAttachmentSessionID: String?
@@ -360,8 +368,13 @@ final class CodexAssistantRuntime {
     private let windowAutomationService: AssistantWindowAutomationService
     private let accessibilityAutomationService: AssistantAccessibilityAutomationService
     private let toolExecutor: AssistantToolExecutor
+    private let localRuntimeManager: LocalAIRuntimeManaging
+    private let ollamaChatService: AssistantOllamaChatServing
     private var approvedDynamicToolKindsBySessionID: [String: Set<String>] = [:]
     private var approvedClaudeToolNamesBySessionID: [String: Set<String>] = [:]
+    private var activeOllamaTurnTask: Task<Void, Never>?
+    private var ollamaMessageHistoryBySessionID: [String: [AssistantOllamaChatMessage]] = [:]
+    private var ollamaModelIDBySessionID: [String: String] = [:]
 
     var currentSessionID: String? {
         activeSessionID
@@ -388,6 +401,7 @@ final class CodexAssistantRuntime {
     init(
         preferredModelID: String? = nil,
         preferredSubagentModelID: String? = nil,
+        assistantNotesService: AssistantNotesToolService? = nil,
         browserUseService: AssistantBrowserUseService? = nil,
         appActionService: AssistantAppActionService? = nil,
         computerUseService: AssistantComputerUseService? = nil,
@@ -395,7 +409,9 @@ final class CodexAssistantRuntime {
         shellExecutionService: AssistantShellExecutionService? = nil,
         windowAutomationService: AssistantWindowAutomationService? = nil,
         accessibilityAutomationService: AssistantAccessibilityAutomationService? = nil,
-        installSupport: CodexInstallSupport = CodexInstallSupport()
+        installSupport: CodexInstallSupport = CodexInstallSupport(),
+        localRuntimeManager: LocalAIRuntimeManaging = LocalAIRuntimeManager.shared,
+        ollamaChatService: AssistantOllamaChatServing = AssistantOllamaChatService.shared
     ) {
         self.preferredModelID = preferredModelID?.nonEmpty
         self.preferredSubagentModelID = preferredSubagentModelID?.nonEmpty
@@ -408,7 +424,9 @@ final class CodexAssistantRuntime {
         self.shellExecutionService = shellExecutionService ?? AssistantShellExecutionService()
         self.windowAutomationService = windowAutomationService ?? AssistantWindowAutomationService()
         self.accessibilityAutomationService = accessibilityAutomationService ?? AssistantAccessibilityAutomationService()
+        let resolvedAssistantNotesService = assistantNotesService ?? AssistantNotesToolService()
         self.toolExecutor = AssistantToolExecutor(
+            assistantNotesService: resolvedAssistantNotesService,
             browserUseService: self.browserUseService,
             appActionService: self.appActionService,
             computerUseService: self.computerUseService,
@@ -419,14 +437,19 @@ final class CodexAssistantRuntime {
             surfaceCompiler: AssistantToolSurfaceCompiler()
         )
         self.installSupport = installSupport
+        self.localRuntimeManager = localRuntimeManager
+        self.ollamaChatService = ollamaChatService
     }
 
     func setPreferredModelID(_ modelID: String?) {
         let changed = preferredModelID != modelID?.nonEmpty
         preferredModelID = modelID?.nonEmpty
+        let healthSummary = backend.requiresLogin
+            ? (currentAccountSnapshot.isLoggedIn ? backend.connectedSummary : backend.signInPromptSummary)
+            : backend.connectedSummary
         let health = makeHealth(
             availability: activeTurnID == nil ? .ready : .active,
-            summary: currentAccountSnapshot.isLoggedIn ? backend.connectedSummary : backend.signInPromptSummary
+            summary: healthSummary
         )
         onHealthUpdate?(health)
 
@@ -446,6 +469,10 @@ final class CodexAssistantRuntime {
         resolveAllActiveClaudeTurnContinuations(status: .interrupted)
         activeClaudeQueuedPromptContexts.removeAll()
         terminateActiveClaudeProcess()
+        activeOllamaTurnTask?.cancel()
+        activeOllamaTurnTask = nil
+        ollamaMessageHistoryBySessionID.removeAll()
+        ollamaModelIDBySessionID.removeAll()
         currentAccountSnapshot = .signedOut
         currentRateLimits = .empty
         currentTokenUsageSnapshot = .empty
@@ -468,6 +495,8 @@ final class CodexAssistantRuntime {
             return try await refreshCopilotEnvironment(cwd: activeSessionCWD)
         case .claudeCode:
             return try await refreshClaudeCodeEnvironment(cwd: activeSessionCWD)
+        case .ollamaLocal:
+            return try await refreshOllamaEnvironment()
         }
     }
 
@@ -521,10 +550,21 @@ final class CodexAssistantRuntime {
             onStatusMessage?("Run `claude auth login` in Terminal, then return to Open Assist.")
             onHealthUpdate?(makeHealth(availability: .loginRequired, summary: backend.loginRequiredSummary))
             return .runCommand(backend.loginCommands.first ?? "claude auth login")
+        case .ollamaLocal:
+            onStatusMessage?("Ollama uses local setup instead of sign-in. Open Local AI Setup to install Ollama or download Gemma 4.")
+            return .none
         }
     }
 
     func logout() async throws {
+        if backend == .ollamaLocal {
+            currentAccountSnapshot = .signedOut
+            currentRateLimits = .empty
+            onAccountUpdate?(currentAccountSnapshot)
+            onRateLimitsUpdate?(currentRateLimits)
+            onHealthUpdate?(makeHealth(availability: .ready, summary: backend.connectedSummary))
+            return
+        }
         guard backend == .codex else {
             cancelRateLimitRefreshLoop()
             currentAccountSnapshot = .signedOut
@@ -549,6 +589,30 @@ final class CodexAssistantRuntime {
     }
 
     func startNewSession(cwd: String? = nil, preferredModelID: String? = nil) async throws -> String {
+        if backend == .ollamaLocal {
+            let sessionID = "ollama-\(UUID().uuidString.lowercased())"
+            toolCalls.removeAll()
+            liveActivities.removeAll()
+            clearSubagents(publish: false)
+            repeatedCommandTracker.reset()
+            resetStreamingTimelineState()
+            clearPersistedCLIAttachmentMaterialization()
+            onToolCallUpdate?([])
+            onPlanUpdate?(activeSessionID, [])
+            onSubagentUpdate?([])
+            onTimelineMutation?(.reset(sessionID: nil))
+            onPermissionRequest?(nil)
+            sessionTurnCount = 0
+            firstTurnUserPrompt = nil
+            activeSessionID = sessionID
+            activeSessionCWD = cwd?.nonEmpty
+            ollamaMessageHistoryBySessionID[sessionID] = []
+            onSessionChange?(sessionID)
+            onTranscript?(AssistantTranscriptEntry(role: .system, text: backend.startedSessionMessage, emphasis: true))
+            onHealthUpdate?(makeHealth(availability: .active, summary: backend.connectedSummary))
+            updateHUD(phase: .idle, title: "Assistant is ready", detail: nil)
+            return sessionID
+        }
         if backend == .copilot {
             return try await startCopilotSession(
                 cwd: cwd,
@@ -604,6 +668,19 @@ final class CodexAssistantRuntime {
     }
 
     func resumeSession(_ sessionID: String, cwd: String?, preferredModelID: String? = nil) async throws {
+        if backend == .ollamaLocal {
+            activeSessionID = sessionID
+            activeSessionCWD = cwd?.nonEmpty
+            sessionTurnCount = 1
+            if ollamaMessageHistoryBySessionID[sessionID] == nil {
+                ollamaMessageHistoryBySessionID[sessionID] = []
+            }
+            onSessionChange?(sessionID)
+            onTranscript?(AssistantTranscriptEntry(role: .system, text: backend.loadedSessionMessage(sessionID), emphasis: true))
+            onHealthUpdate?(makeHealth(availability: .active, summary: backend.connectedSummary))
+            updateHUD(phase: .idle, title: "Thread ready", detail: nil)
+            return
+        }
         if backend == .copilot {
             try await resumeCopilotSession(
                 sessionID,
@@ -646,6 +723,21 @@ final class CodexAssistantRuntime {
         cwd: String?,
         preferredModelID: String? = nil
     ) async throws {
+        if backend == .ollamaLocal {
+            activeSessionID = sessionID
+            activeSessionCWD = cwd?.nonEmpty
+            sessionTurnCount = 1
+            if ollamaMessageHistoryBySessionID[sessionID] == nil {
+                ollamaMessageHistoryBySessionID[sessionID] = []
+            }
+            onSessionChange?(sessionID)
+            onHealthUpdate?(makeHealth(
+                availability: activeTurnID == nil ? .ready : .active,
+                summary: backend.connectedSummary
+            ))
+            updateHUD(phase: .idle, title: "Thread ready", detail: nil)
+            return
+        }
         if backend == .copilot {
             try await resumeCopilotSession(
                 sessionID,
@@ -687,6 +779,15 @@ final class CodexAssistantRuntime {
 
     func refreshCurrentSessionConfiguration(cwd: String?, preferredModelID: String? = nil) async throws {
         guard let activeSessionID else { return }
+        if backend == .ollamaLocal {
+            activeSessionCWD = cwd?.nonEmpty
+            self.preferredModelID = preferredModelID ?? self.preferredModelID
+            onHealthUpdate?(makeHealth(
+                availability: activeTurnID == nil ? .ready : .active,
+                summary: backend.connectedSummary
+            ))
+            return
+        }
         if backend == .copilot {
             try await refreshCopilotCurrentSessionConfiguration(
                 sessionID: activeSessionID,
@@ -756,6 +857,18 @@ final class CodexAssistantRuntime {
             throw CodexAssistantRuntimeError.sessionUnavailable
         }
 
+        if backend == .ollamaLocal {
+            try await sendOllamaPrompt(
+                sessionID: activeSessionID,
+                prompt: trimmed,
+                attachments: attachments,
+                preferredModelID: preferredModelID ?? self.preferredModelID,
+                modelSupportsImageInput: modelSupportsImageInput,
+                resumeContext: resumeContext,
+                memoryContext: memoryContext
+            )
+            return
+        }
         if backend == .copilot {
             try await sendCopilotPrompt(
                 sessionID: activeSessionID,
@@ -818,6 +931,7 @@ final class CodexAssistantRuntime {
         await pendingPermissionContext?.cancel()
         pendingPermissionContext = nil
         onPermissionRequest?(nil)
+        cancelPendingCopilotPromptCompletion()
 
         guard let activeSessionID else {
             updateHUD(phase: .idle, title: "Cancelled", detail: nil)
@@ -834,6 +948,7 @@ final class CodexAssistantRuntime {
             } catch {
                 onStatusMessage?(error.localizedDescription)
             }
+            finalizeActiveActivities(with: .interrupted)
             self.activeTurnID = nil
             allowsProposedPlanForActiveTurn = false
             updateHUD(phase: .idle, title: "Cancelled", detail: nil)
@@ -846,8 +961,24 @@ final class CodexAssistantRuntime {
         if backend == .claudeCode {
             let hadActiveTurn = activeTurnID != nil
             resolveAllActiveClaudeTurnContinuations(status: .interrupted)
+            finalizeActiveActivities(with: .interrupted)
             self.activeTurnID = nil
             terminateActiveClaudeProcess()
+            allowsProposedPlanForActiveTurn = false
+            updateHUD(phase: .idle, title: "Cancelled", detail: nil)
+            if hadActiveTurn {
+                onTurnCompletion?(.interrupted)
+            }
+            onHealthUpdate?(makeHealth(availability: .ready, summary: backend.connectedSummary))
+            return
+        }
+        if backend == .ollamaLocal {
+            let hadActiveTurn = activeTurnID != nil
+            activeOllamaTurnTask?.cancel()
+            activeOllamaTurnTask = nil
+            await unloadTrackedOllamaModels()
+            finalizeActiveActivities(with: .interrupted)
+            self.activeTurnID = nil
             allowsProposedPlanForActiveTurn = false
             updateHUD(phase: .idle, title: "Cancelled", detail: nil)
             if hadActiveTurn {
@@ -874,6 +1005,7 @@ final class CodexAssistantRuntime {
             onStatusMessage?(error.localizedDescription)
         }
 
+        finalizeActiveActivities(with: .interrupted)
         self.activeTurnID = nil
         allowsProposedPlanForActiveTurn = false
         updateHUD(phase: .idle, title: "Cancelled", detail: nil)
@@ -916,6 +1048,10 @@ final class CodexAssistantRuntime {
             activeClaudeQueuedPromptContexts.removeAll()
             terminateActiveClaudeProcess(expected: true)
         }
+        if backend == .ollamaLocal {
+            activeOllamaTurnTask?.cancel()
+            activeOllamaTurnTask = nil
+        }
         if let oldSessionID = activeSessionID {
             detachedSessionIDs.insert(oldSessionID)
         }
@@ -943,6 +1079,8 @@ final class CodexAssistantRuntime {
             return try await listCopilotSessions(limit: limit)
         case .claudeCode:
             return []
+        case .ollamaLocal:
+            return []
         }
     }
 
@@ -956,6 +1094,11 @@ final class CodexAssistantRuntime {
         transportStartupTask = nil
         resolveAllActiveClaudeTurnContinuations(status: .interrupted)
         terminateActiveClaudeProcess()
+        activeOllamaTurnTask?.cancel()
+        activeOllamaTurnTask = nil
+        if backend == .ollamaLocal {
+            await unloadTrackedOllamaModels()
+        }
         await pendingPermissionContext?.cancel()
         pendingPermissionContext = nil
         if activeTurnID != nil {
@@ -979,6 +1122,8 @@ final class CodexAssistantRuntime {
         onSessionChange?(nil)
         currentTokenUsageSnapshot = .empty
         onTokenUsageUpdate?(currentTokenUsageSnapshot)
+        ollamaMessageHistoryBySessionID.removeAll()
+        ollamaModelIDBySessionID.removeAll()
         await transport?.stop()
         transport = nil
         onHealthUpdate?(makeHealth(availability: .idle, summary: "Assistant is idle"))
@@ -986,6 +1131,58 @@ final class CodexAssistantRuntime {
 
         // Clean up lingering AppleScript processes
         Self.cleanupAppleScriptProcesses()
+    }
+
+    private func rememberOllamaModelID(_ modelID: String?, for sessionID: String) {
+        guard let normalizedSessionID = sessionID.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+            return
+        }
+
+        guard let normalizedModelID = modelID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+            ollamaModelIDBySessionID.removeValue(forKey: normalizedSessionID)
+            return
+        }
+
+        ollamaModelIDBySessionID[normalizedSessionID] = normalizedModelID
+    }
+
+    private func trackedOllamaModelIDs() -> [String] {
+        var orderedModelIDs: [String] = []
+        var seenModelIDs = Set<String>()
+
+        if let activeSessionID = activeSessionID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty,
+           let activeModelID = ollamaModelIDBySessionID[activeSessionID],
+           seenModelIDs.insert(activeModelID.lowercased()).inserted {
+            orderedModelIDs.append(activeModelID)
+        }
+
+        for modelID in ollamaModelIDBySessionID.values {
+            let normalizedKey = modelID.lowercased()
+            guard seenModelIDs.insert(normalizedKey).inserted else { continue }
+            orderedModelIDs.append(modelID)
+        }
+
+        return orderedModelIDs
+    }
+
+    private func unloadTrackedOllamaModels() async {
+        for modelID in trackedOllamaModelIDs() {
+            await unloadOllamaModelIfNeeded(named: modelID)
+        }
+    }
+
+    private func unloadOllamaModelIfNeeded(named modelID: String?) async {
+        guard let normalizedModelID = modelID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+            return
+        }
+
+        do {
+            try await ollamaChatService.unloadModel(named: normalizedModelID)
+        } catch {
+            CrashReporter.logWarning(
+                "Assistant runtime could not unload Ollama model model=\(normalizedModelID) error=\(error.localizedDescription)"
+            )
+        }
     }
 
     static func inspectCopilotSessions(
@@ -1018,6 +1215,9 @@ final class CodexAssistantRuntime {
         if backend == .claudeCode {
             throw CodexAssistantRuntimeError.runtimeUnavailable("Claude Code uses the headless CLI flow, not the ACP transport.")
         }
+        if backend == .ollamaLocal {
+            throw CodexAssistantRuntimeError.runtimeUnavailable("Ollama (Local) uses the native local chat API, not the ACP transport.")
+        }
         let desiredWorkingDirectory = backend == .copilot
             ? resolvedCopilotWorkingDirectory(cwd ?? activeSessionCWD)
             : nil
@@ -1049,6 +1249,8 @@ final class CodexAssistantRuntime {
                 throw CodexAssistantRuntimeError.runtimeUnavailable("GitHub Copilot CLI is not installed on this Mac.")
             case .claudeCode:
                 throw CodexAssistantRuntimeError.runtimeUnavailable("Claude Code is not installed on this Mac.")
+            case .ollamaLocal:
+                throw CodexAssistantRuntimeError.runtimeUnavailable("Ollama is not installed on this Mac.")
             }
         }
 
@@ -1072,6 +1274,8 @@ final class CodexAssistantRuntime {
                     )
                 case .claudeCode:
                     throw CodexAssistantRuntimeError.runtimeUnavailable("Claude Code does not use the ACP transport.")
+                case .ollamaLocal:
+                    throw CodexAssistantRuntimeError.runtimeUnavailable("Ollama (Local) does not use the ACP transport.")
                 }
                 self.transport = transport
                 self.transportSessionID = nil
@@ -1117,6 +1321,11 @@ final class CodexAssistantRuntime {
             return account
         case .claudeCode:
             let account = try await refreshClaudeCodeAccountState()
+            currentAccountSnapshot = account
+            onAccountUpdate?(account)
+            return account
+        case .ollamaLocal:
+            let account = AssistantAccountSnapshot.signedOut
             currentAccountSnapshot = account
             onAccountUpdate?(account)
             return account
@@ -1224,10 +1433,19 @@ final class CodexAssistantRuntime {
             } catch {
                 CrashReporter.logInfo("Claude Code usage refresh failed: \(error.localizedDescription)")
             }
+        case .ollamaLocal:
+            currentRateLimits = .empty
+            onRateLimitsUpdate?(currentRateLimits)
         }
     }
 
     private func refreshModels() async throws -> [AssistantModelOption] {
+        if backend == .ollamaLocal {
+            let models = await ollamaModelOptions()
+            currentModels = models
+            onModelsUpdate?(models)
+            return models
+        }
         if backend == .copilot {
             let resolvedCWD = resolvedCopilotWorkingDirectory(activeSessionCWD)
             if let activeSessionID {
@@ -1260,6 +1478,143 @@ final class CodexAssistantRuntime {
         onModelsUpdate?(models)
         CrashReporter.logInfo("Assistant runtime model/list finished count=\(models.count)")
         return models
+    }
+
+    private func refreshOllamaEnvironment() async throws -> AssistantEnvironmentDetails {
+        var detection = await localRuntimeManager.detect()
+        currentCodexPath = (detection.executableURL?.path)?.nonEmpty ?? currentCodexPath
+
+        if detection.installed && !detection.isHealthy {
+            detection = try await localRuntimeManager.start()
+            currentCodexPath = (detection.executableURL?.path)?.nonEmpty ?? currentCodexPath
+        }
+
+        guard detection.installed else {
+            throw CodexAssistantRuntimeError.runtimeUnavailable("Ollama is not installed on this Mac.")
+        }
+
+        let models = await ollamaModelOptions()
+        currentModels = models
+        currentAccountSnapshot = .signedOut
+        currentRateLimits = .empty
+        onAccountUpdate?(currentAccountSnapshot)
+        onRateLimitsUpdate?(currentRateLimits)
+        onModelsUpdate?(models)
+
+        let selectedModel = resolvedOllamaSelectedModel(from: models)
+        let selectedModelInstalled = selectedModel?.isInstalled ?? false
+        let health = AssistantRuntimeHealth(
+            availability: selectedModelInstalled ? (activeTurnID == nil ? .ready : .active) : .installRequired,
+            summary: selectedModelInstalled ? backend.connectedSummary : backend.missingInstallSummary,
+            detail: selectedModelInstalled ? nil : ollamaMissingModelDetail(for: selectedModel),
+            runtimePath: currentCodexPath,
+            selectedModelID: selectedModel?.id ?? preferredModelID,
+            accountEmail: nil,
+            accountPlan: nil
+        )
+        onHealthUpdate?(health)
+        return AssistantEnvironmentDetails(
+            health: health,
+            account: currentAccountSnapshot,
+            models: models
+        )
+    }
+
+    private func ollamaModelOptions() async -> [AssistantModelOption] {
+        let installedModelIDs = await localRuntimeManager.installedModels()
+        let normalizedInstalledModelIDs = installedModelIDs
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        let reasoningEfforts = AssistantReasoningEffort.allCases.map(\.wireValue)
+        var options: [AssistantModelOption] = []
+        var seenModelIDs: [String] = []
+
+        for model in AssistantGemma4ModelCatalog.catalog() {
+            let isInstalled = normalizedInstalledModelIDs.contains { Self.ollamaModelIDsEquivalent($0, model.id) }
+            options.append(
+                AssistantModelOption(
+                    id: model.id,
+                    displayName: model.displayName,
+                    description: model.summary,
+                    isDefault: model.isRecommended,
+                    hidden: false,
+                    supportedReasoningEfforts: reasoningEfforts,
+                    defaultReasoningEffort: AssistantReasoningEffort.high.wireValue,
+                    inputModalities: ["text", "image"],
+                    isInstalled: isInstalled
+                )
+            )
+            seenModelIDs.append(model.id)
+        }
+
+        for installedModelID in normalizedInstalledModelIDs {
+            guard !seenModelIDs.contains(where: { Self.ollamaModelIDsEquivalent($0, installedModelID) }) else {
+                continue
+            }
+            let supportsImageInput = Self.ollamaModelSupportsImageInput(installedModelID)
+            options.append(
+                AssistantModelOption(
+                    id: installedModelID,
+                    displayName: installedModelID,
+                    description: "Installed local Ollama model.",
+                    isDefault: false,
+                    hidden: false,
+                    supportedReasoningEfforts: reasoningEfforts,
+                    defaultReasoningEffort: AssistantReasoningEffort.high.wireValue,
+                    inputModalities: supportsImageInput ? ["text", "image"] : ["text"],
+                    isInstalled: true
+                )
+            )
+            seenModelIDs.append(installedModelID)
+        }
+
+        return options
+    }
+
+    private func resolvedOllamaSelectedModel(
+        from models: [AssistantModelOption]
+    ) -> AssistantModelOption? {
+        if let preferredModelID = preferredModelID?.nonEmpty,
+           let preferredModel = models.first(where: { Self.ollamaModelIDsEquivalent($0.id, preferredModelID) }) {
+            return preferredModel
+        }
+
+        if let recommendedModel = models.first(where: \.isDefault) {
+            return recommendedModel
+        }
+
+        return models.first
+    }
+
+    private func ollamaMissingModelDetail(for model: AssistantModelOption?) -> String {
+        if let model {
+            return "\(model.displayName) is not installed yet. Open Local AI Setup to download it, or choose a model that is already installed."
+        }
+        return "Open Local AI Setup to download a Gemma 4 model for Ollama."
+    }
+
+    private static func ollamaModelIDsEquivalent(_ lhs: String, _ rhs: String) -> Bool {
+        let normalizedLHS = lhs.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let normalizedRHS = rhs.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !normalizedLHS.isEmpty, !normalizedRHS.isEmpty else { return false }
+        return normalizedLHS == normalizedRHS
+            || normalizedLHS.hasPrefix(normalizedRHS + ":")
+            || normalizedRHS.hasPrefix(normalizedLHS + ":")
+    }
+
+    private static func ollamaModelSupportsImageInput(_ modelID: String) -> Bool {
+        let normalized = modelID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let visionSignals = [
+            "gemma4",
+            "gemma3",
+            "llava",
+            "vision",
+            "minicpm-v",
+            "qwen2.5vl",
+            "qwen2-vl"
+        ]
+        return visionSignals.contains(where: normalized.contains)
     }
 
     private func requestWithTimeout(
@@ -1295,6 +1650,693 @@ final class CodexAssistantRuntime {
             }
             throw error
         }
+    }
+
+    private func sendOllamaPrompt(
+        sessionID: String,
+        prompt: String,
+        attachments: [AssistantAttachment],
+        preferredModelID: String?,
+        modelSupportsImageInput: Bool,
+        resumeContext: String?,
+        memoryContext: String?
+    ) async throws {
+        turnToolCallCount = 0
+        repeatedCommandTracker.reset()
+        updateHUD(phase: .streaming, title: "Starting", detail: nil)
+
+        let turnID = activeTurnID?.nonEmpty ?? "ollama-turn-\(UUID().uuidString)"
+        activeTurnID = turnID
+        let requestedModelID = preferredModelID?.nonEmpty
+            ?? self.preferredModelID?.nonEmpty
+            ?? AssistantGemma4ModelCatalog.recommendedModelID()
+        rememberOllamaModelID(requestedModelID, for: sessionID)
+
+        let turnTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                try await self.runOllamaTurn(
+                    sessionID: sessionID,
+                    modelID: requestedModelID,
+                    prompt: prompt,
+                    attachments: attachments,
+                    modelSupportsImageInput: modelSupportsImageInput,
+                    resumeContext: resumeContext,
+                    memoryContext: memoryContext
+                )
+            } catch is CancellationError {
+                // `cancelActiveTurn()` already updates HUD and completion state.
+            } catch {
+                guard self.activeTurnID == turnID else { return }
+                self.handleTurnCompleted([
+                    "turn": [
+                        "status": "failed",
+                        "error": [
+                            "message": error.localizedDescription
+                        ]
+                    ]
+                ])
+            }
+        }
+
+        activeOllamaTurnTask = turnTask
+        await turnTask.value
+        if activeOllamaTurnTask?.isCancelled != false || activeTurnID != turnID {
+            activeOllamaTurnTask = nil
+            return
+        }
+        activeOllamaTurnTask = nil
+    }
+
+    private func runOllamaTurn(
+        sessionID: String,
+        modelID: String,
+        prompt: String,
+        attachments: [AssistantAttachment],
+        modelSupportsImageInput: Bool,
+        resumeContext: String?,
+        memoryContext: String?
+    ) async throws {
+        var messages = ollamaMessageHistoryBySessionID[sessionID] ?? []
+        if messages.isEmpty {
+            let instructions = await buildInstructions()
+            if let instructions = instructions.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
+                messages.append(
+                    AssistantOllamaChatMessage(
+                        role: .system,
+                        content: instructions
+                    )
+                )
+            }
+        }
+
+        let userMessage = ollamaUserMessage(
+            prompt: prompt,
+            attachments: attachments,
+            modelSupportsImageInput: modelSupportsImageInput,
+            resumeContext: resumeContext,
+            memoryContext: memoryContext
+        )
+        if userMessage.content.nonEmpty != nil || !userMessage.images.isEmpty {
+            messages.append(userMessage)
+        }
+        ollamaMessageHistoryBySessionID[sessionID] = messages
+
+        do {
+            while true {
+                let response = try await ollamaChatService.streamChat(
+                    request: AssistantOllamaChatRequest(
+                        model: modelID,
+                        messages: messages,
+                        tools: ollamaToolSpecs(for: interactionMode)
+                    ),
+                    onEvent: { [weak self] event in
+                        guard let self else { return }
+                        await self.handleOllamaStreamEvent(event)
+                    }
+                )
+
+                if Task.isCancelled {
+                    throw CancellationError()
+                }
+
+                messages.append(response.message)
+                ollamaMessageHistoryBySessionID[sessionID] = messages
+
+                if response.message.toolCalls.isEmpty {
+                    await unloadOllamaModelIfNeeded(named: modelID)
+                    handleTurnCompleted(["turn": ["status": "completed"]])
+                    return
+                }
+
+                let toolMessages = try await executeOllamaToolCalls(
+                    response.message.toolCalls,
+                    sessionID: sessionID
+                )
+                messages.append(contentsOf: toolMessages)
+                ollamaMessageHistoryBySessionID[sessionID] = messages
+            }
+        } catch {
+            await unloadOllamaModelIfNeeded(named: modelID)
+            throw error
+        }
+    }
+
+    private func ollamaUserMessage(
+        prompt: String,
+        attachments: [AssistantAttachment],
+        modelSupportsImageInput: Bool,
+        resumeContext: String?,
+        memoryContext: String?
+    ) -> AssistantOllamaChatMessage {
+        var parts: [String] = []
+
+        if let resumeContext = resumeContext?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
+            parts.append(resumeContext)
+        }
+        if let memoryContext = memoryContext?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
+            parts.append(memoryContext)
+        }
+
+        let nonImageAttachments = attachments.filter { !$0.isImage }
+        if !nonImageAttachments.isEmpty {
+            let attachmentLines = nonImageAttachments.map { attachment in
+                "[Attached file: \(attachment.filename) (\(attachment.mimeType))]"
+            }
+            parts.append(attachmentLines.joined(separator: "\n"))
+        }
+
+        if let prompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
+            parts.append(prompt)
+        }
+
+        let imagePayloads = attachments.filter(\.isImage).compactMap { attachment in
+            Self.ollamaImagePayload(from: attachment)
+        }
+        if !imagePayloads.isEmpty && modelSupportsImageInput {
+            parts.append("If images are attached, analyze those images directly before using tools.")
+        }
+
+        return AssistantOllamaChatMessage(
+            role: .user,
+            content: parts.joined(separator: "\n\n"),
+            images: imagePayloads
+        )
+    }
+
+    private func handleOllamaStreamEvent(_ event: AssistantOllamaStreamEvent) {
+        switch event {
+        case .assistantTextDelta(let delta):
+            ensureStreamingIdentifiers()
+            streamingBuffer += delta
+            pendingStreamingDeltaBuffer += delta
+            emitStreamingAssistantDelta(force: shouldForceStreamingDeltaFlush(for: delta))
+        case .toolCalls:
+            updateHUD(phase: .acting, title: "Working", detail: "Ollama requested a tool.")
+        }
+    }
+
+    private func ollamaToolSpecs(for mode: AssistantInteractionMode) -> [[String: Any]] {
+        dynamicToolSpecs(for: mode).map { spec in
+            [
+                "type": "function",
+                "function": [
+                    "name": spec["name"] as? String ?? "",
+                    "description": spec["description"] as? String ?? "",
+                    "parameters": spec["inputSchema"] as? [String: Any] ?? [:]
+                ]
+            ]
+        }
+    }
+
+    private func executeOllamaToolCalls(
+        _ toolCalls: [AssistantOllamaToolCall],
+        sessionID: String
+    ) async throws -> [AssistantOllamaChatMessage] {
+        var toolMessages: [AssistantOllamaChatMessage] = []
+        for toolCall in toolCalls {
+            if Task.isCancelled {
+                throw CancellationError()
+            }
+            let toolMessage = try await executeOllamaToolCall(
+                toolCall,
+                sessionID: sessionID
+            )
+            toolMessages.append(toolMessage)
+        }
+        return toolMessages
+    }
+
+    private func executeOllamaToolCall(
+        _ toolCall: AssistantOllamaToolCall,
+        sessionID: String
+    ) async throws -> AssistantOllamaChatMessage {
+        let toolName = toolCall.name
+        let arguments = toolCall.arguments
+        let displayName = dynamicToolDisplayName(toolName)
+        let taskSummary = dynamicToolTaskSummary(for: toolName, arguments: arguments)
+        let activityID = toolCall.id
+
+        let state = AssistantToolCallState(
+            id: activityID,
+            title: displayName,
+            kind: "dynamicToolCall",
+            status: "inProgress",
+            detail: compactDetail(taskSummary),
+            hudDetail: compactDetail(taskSummary)
+        )
+        toolCalls[activityID] = state
+        publishToolCallsSnapshot()
+
+        let activity = AssistantActivityItem(
+            id: activityID,
+            sessionID: sessionID,
+            turnID: activeTurnID,
+            kind: .dynamicToolCall,
+            title: displayName,
+            status: .running,
+            friendlySummary: activitySummary(kind: .dynamicToolCall, title: displayName),
+            rawDetails: compactDetail(taskSummary),
+            startedAt: Date(),
+            updatedAt: Date(),
+            source: .runtime
+        )
+        liveActivities[activityID] = activity
+        emitActivityTimelineUpdate(activity, force: true)
+
+        turnToolCallCount += 1
+        if let repeatedCommandLimitHit = ollamaRepeatedCommandLimitHit(
+            toolName: toolName,
+            arguments: arguments
+        ) {
+            let repeatedCommand = compactDetail(repeatedCommandLimitHit.command) ?? "Command"
+            let message = "Stopped this turn because the same command repeated \(repeatedCommandLimitHit.attemptCount) times in a row: \(repeatedCommand)"
+            onTranscript?(AssistantTranscriptEntry(role: .system, text: message, emphasis: true))
+            emitTimelineSystemMessage(message, emphasis: true)
+            toolCalls.removeValue(forKey: activityID)
+            liveActivities.removeValue(forKey: activityID)
+            publishToolCallsSnapshot()
+            handleTurnCompleted(["turn": ["status": "interrupted"]])
+            throw CancellationError()
+        }
+
+        if maxToolCallsPerTurn > 0 && turnToolCallCount >= maxToolCallsPerTurn {
+            let message = "Reached the tool call limit (\(maxToolCallsPerTurn)). Turn was automatically stopped."
+            onTranscript?(AssistantTranscriptEntry(role: .system, text: message, emphasis: true))
+            emitTimelineSystemMessage(message, emphasis: true)
+            toolCalls.removeValue(forKey: activityID)
+            liveActivities.removeValue(forKey: activityID)
+            publishToolCallsSnapshot()
+            handleTurnCompleted(["turn": ["status": "interrupted"]])
+            throw CancellationError()
+        }
+
+        let result = try await resolveOllamaToolResult(
+            toolName: toolName,
+            arguments: arguments,
+            sessionID: sessionID,
+            taskSummary: taskSummary
+        )
+
+        applyToolResultToLiveActivity(activityID: activityID, result: result)
+        toolCalls.removeValue(forKey: activityID)
+        publishToolCallsSnapshot()
+
+        if var completedActivity = liveActivities.removeValue(forKey: activityID) {
+            completedActivity.status = result.success ? .completed : .failed
+            completedActivity.updatedAt = Date()
+            emitActivityTimelineUpdate(completedActivity, force: true)
+            if !result.success {
+                emitActivityImageTimelineUpdateIfNeeded(for: completedActivity)
+            }
+        }
+
+        let screenshotDataItems = Self.imageDataItems(in: result.contentItems)
+        if !screenshotDataItems.isEmpty {
+            let imageTitle = result.success
+                ? "Screenshot from \(displayName)"
+                : "Last screenshot before \(displayName) failed"
+            onTimelineMutation?(
+                .upsert(
+                    .system(
+                        id: "tool-screenshot-\(UUID().uuidString)",
+                        sessionID: activeSessionID,
+                        turnID: activeTurnID,
+                        text: imageTitle,
+                        createdAt: Date(),
+                        imageAttachments: screenshotDataItems,
+                        source: .runtime
+                    )
+                )
+            )
+        }
+
+        if !result.summary.isEmpty {
+            onStatusMessage?(result.summary)
+        }
+        updateHUD(
+            phase: result.success ? .acting : .failed,
+            title: result.success ? "\(displayName) finished" : "\(displayName) failed",
+            detail: result.summary
+        )
+
+        return AssistantOllamaChatMessage(
+            role: .tool,
+            content: ollamaToolMessageContent(from: result),
+            toolName: toolName
+        )
+    }
+
+    private func resolveOllamaToolResult(
+        toolName: String,
+        arguments: Any,
+        sessionID: String,
+        taskSummary: String
+    ) async throws -> AssistantToolExecutionResult {
+        guard let descriptor = toolExecutor.descriptor(for: toolName),
+              let toolKind = dynamicToolKind(for: toolName) else {
+            return AssistantToolExecutionResult(
+                contentItems: [.init(type: "inputText", text: "Open Assist does not support the dynamic tool `\(toolName)` yet.", imageURL: nil)],
+                success: false,
+                summary: "Unsupported dynamic tool."
+            )
+        }
+
+        let requiresExplicitConfirmation = descriptor.requiresExplicitConfirmation(arguments)
+        let approvalContextDisplayName: String?
+        let approvalKind: String
+        if toolName == AssistantComputerUseToolDefinition.name {
+            let appContext = await computerUseService.frontmostAppContext()
+            approvalContextDisplayName = appContext.displayName
+            approvalKind = requiresExplicitConfirmation
+                ? toolKind
+                : AssistantComputerUseService.sessionApprovalKey(for: appContext)
+        } else {
+            approvalContextDisplayName = nil
+            approvalKind = toolKind
+        }
+
+        if toolName == AssistantAppActionToolDefinition.name,
+           let parsed = try? AssistantAppActionService.parseRequest(from: arguments),
+           let app = parsed.app,
+           app.usesNativeAccess {
+            return try await runOllamaToolExecution(
+                toolName: toolName,
+                arguments: arguments,
+                sessionID: sessionID,
+                taskSummary: taskSummary
+            )
+        }
+
+        if toolName != AssistantImageGenerationToolDefinition.name {
+            if requiresExplicitConfirmation
+                || !isDynamicToolApproved(toolKind: approvalKind, for: sessionID) {
+                let decision = await presentOllamaToolPermissionRequest(
+                    toolName: toolName,
+                    arguments: arguments,
+                    sessionID: sessionID,
+                    taskSummary: taskSummary,
+                    approvalKind: approvalKind,
+                    requiresExplicitConfirmation: requiresExplicitConfirmation,
+                    approvalContextDisplayName: approvalContextDisplayName
+                )
+
+                switch decision {
+                case .allowForSession:
+                    rememberDynamicToolApproval(toolKind: approvalKind, for: sessionID)
+                case .allowOnce:
+                    break
+                case .decline(let message):
+                    return AssistantToolExecutionResult(
+                        contentItems: [.init(type: "inputText", text: message, imageURL: nil)],
+                        success: false,
+                        summary: message
+                    )
+                case .cancel(let message):
+                    onStatusMessage?(message)
+                    await cancelActiveTurn()
+                    throw CancellationError()
+                }
+            }
+        }
+
+        return try await runOllamaToolExecution(
+            toolName: toolName,
+            arguments: arguments,
+            sessionID: sessionID,
+            taskSummary: taskSummary
+        )
+    }
+
+    private enum OllamaToolPermissionDecision {
+        case allowForSession
+        case allowOnce
+        case decline(String)
+        case cancel(String)
+    }
+
+    private func presentOllamaToolPermissionRequest(
+        toolName: String,
+        arguments: Any,
+        sessionID: String,
+        taskSummary: String,
+        approvalKind: String,
+        requiresExplicitConfirmation: Bool,
+        approvalContextDisplayName: String?
+    ) async -> OllamaToolPermissionDecision {
+        let displayName = dynamicToolDisplayName(toolName)
+        var options: [AssistantPermissionOption] = []
+        if !requiresExplicitConfirmation {
+            options.append(
+                AssistantPermissionOption(
+                    id: "acceptForSession",
+                    title: "Allow for Session",
+                    kind: approvalKind,
+                    isDefault: true
+                )
+            )
+        }
+        options.append(
+            AssistantPermissionOption(
+                id: "accept",
+                title: requiresExplicitConfirmation ? "Approve Once" : "Allow Once",
+                kind: approvalKind,
+                isDefault: requiresExplicitConfirmation
+            )
+        )
+        options.append(AssistantPermissionOption(id: "decline", title: "Decline", kind: approvalKind, isDefault: false))
+        options.append(AssistantPermissionOption(id: "cancel", title: "Cancel Turn", kind: approvalKind, isDefault: false))
+
+        let request = AssistantPermissionRequest(
+            id: Int.random(in: 1...(Int.max / 4)),
+            sessionID: sessionID,
+            toolTitle: displayName,
+            toolKind: approvalKind,
+            rationale: dynamicToolPermissionRationale(
+                toolName: toolName,
+                taskSummary: taskSummary,
+                requiresExplicitConfirmation: requiresExplicitConfirmation,
+                targetDisplayName: approvalContextDisplayName
+            ),
+            options: options,
+            rawPayloadSummary: taskSummary
+        )
+
+        let decision = await withCheckedContinuation { (continuation: CheckedContinuation<OllamaToolPermissionDecision, Never>) in
+            pendingPermissionContext = PendingPermissionContext(
+                request: request,
+                selectHandler: { optionID in
+                    switch optionID {
+                    case "acceptForSession":
+                        continuation.resume(returning: .allowForSession)
+                    case "accept":
+                        continuation.resume(returning: .allowOnce)
+                    case "cancel":
+                        continuation.resume(returning: .cancel("\(displayName) was canceled for this turn."))
+                    default:
+                        continuation.resume(returning: .decline("\(displayName) was declined for this request."))
+                    }
+                },
+                cancelHandler: {
+                    continuation.resume(returning: .cancel("\(displayName) was canceled for this turn."))
+                }
+            )
+            onPermissionRequest?(request)
+            onTranscript?(AssistantTranscriptEntry(role: .permission, text: "Ollama wants to use \(displayName).", emphasis: true))
+            onTimelineMutation?(
+                .upsert(
+                    .permission(
+                        id: "permission-\(request.id)",
+                        sessionID: request.sessionID,
+                        turnID: activeTurnID,
+                        request: request,
+                        createdAt: Date(),
+                        source: .runtime
+                    )
+                )
+            )
+            updateHUD(phase: .waitingForPermission, title: "Approve Action", detail: taskSummary)
+        }
+
+        pendingPermissionContext = nil
+        onPermissionRequest?(nil)
+        return decision
+    }
+
+    private func runOllamaToolExecution(
+        toolName: String,
+        arguments: Any,
+        sessionID: String,
+        taskSummary: String
+    ) async throws -> AssistantToolExecutionResult {
+        var browserLoginResume = false
+
+        while true {
+            let verdict = await preflightPermissionCheck(toolName: toolName, arguments: arguments)
+            if !verdict.satisfied {
+                return AssistantToolExecutionResult(
+                    contentItems: [.init(type: "inputText", text: verdict.message, imageURL: nil)],
+                    success: false,
+                    summary: verdict.message
+                )
+            }
+
+            let workingDetail = toolExecutor.workingDetail(for: toolName, browserLoginResume: browserLoginResume)
+            updateHUD(phase: .acting, title: dynamicToolDisplayName(toolName), detail: workingDetail)
+
+            let result = await toolExecutor.execute(
+                AssistantToolExecutionContext(
+                    toolName: toolName,
+                    arguments: arguments,
+                    attachments: currentTurnAttachments,
+                    sessionID: sessionID,
+                    assistantNotesContext: assistantNotesContext,
+                    preferredModelID: preferredModelID,
+                    browserLoginResume: browserLoginResume,
+                    interactionMode: interactionMode
+                )
+            )
+
+            guard let loginPrompt = result.loginPrompt else {
+                return result
+            }
+
+            let loginDecision = await presentOllamaBrowserLoginRequest(
+                prompt: loginPrompt,
+                taskSummary: taskSummary
+            )
+            switch loginDecision {
+            case .proceed:
+                browserLoginResume = true
+                continue
+            case .cancel(let message):
+                return AssistantToolExecutionResult(
+                    contentItems: [.init(type: "inputText", text: message, imageURL: nil)],
+                    success: false,
+                    summary: message
+                )
+            }
+        }
+    }
+
+    private enum OllamaBrowserLoginDecision {
+        case proceed
+        case cancel(String)
+    }
+
+    private func presentOllamaBrowserLoginRequest(
+        prompt: AssistantBrowserLoginPrompt,
+        taskSummary: String
+    ) async -> OllamaBrowserLoginDecision {
+        let proceedOption = AssistantPermissionOption(
+            id: "proceed",
+            title: "Proceed",
+            kind: "browserLogin",
+            isDefault: true
+        )
+        let cancelOption = AssistantPermissionOption(
+            id: "cancel",
+            title: "Cancel Request",
+            kind: "browserLogin",
+            isDefault: false
+        )
+        let request = AssistantPermissionRequest(
+            id: Int.random(in: 1...(Int.max / 4)),
+            sessionID: activeSessionID ?? "",
+            toolTitle: prompt.requestTitle,
+            toolKind: "browserLogin",
+            rationale: prompt.requestRationale,
+            options: [proceedOption, cancelOption],
+            rawPayloadSummary: prompt.requestSummary
+        )
+
+        let decision = await withCheckedContinuation { (continuation: CheckedContinuation<OllamaBrowserLoginDecision, Never>) in
+            pendingPermissionContext = PendingPermissionContext(
+                request: request,
+                selectHandler: { optionID in
+                    if optionID == "proceed" {
+                        continuation.resume(returning: .proceed)
+                    } else {
+                        continuation.resume(returning: .cancel("Browser sign-in was canceled for this turn."))
+                    }
+                },
+                cancelHandler: {
+                    continuation.resume(returning: .cancel("Browser sign-in was canceled for this turn."))
+                }
+            )
+            onPermissionRequest?(request)
+            onTranscript?(AssistantTranscriptEntry(role: .permission, text: prompt.requestRationale, emphasis: true))
+            onTimelineMutation?(
+                .upsert(
+                    .permission(
+                        id: "permission-\(request.id)",
+                        sessionID: request.sessionID,
+                        turnID: activeTurnID,
+                        request: request,
+                        createdAt: Date(),
+                        source: .runtime
+                    )
+                )
+            )
+            onStatusMessage?(prompt.requestRationale)
+            updateHUD(
+                phase: .waitingForPermission,
+                title: "Login Required",
+                detail: prompt.pageTitle?.nonEmpty ?? taskSummary
+            )
+        }
+
+        pendingPermissionContext = nil
+        onPermissionRequest?(nil)
+        return decision
+    }
+
+    private func ollamaRepeatedCommandLimitHit(
+        toolName: String,
+        arguments: Any
+    ) -> AssistantRepeatedCommandLimitHit? {
+        guard toolName == AssistantExecCommandToolDefinition.name,
+              let request = try? AssistantShellExecutionService.parseExecCommandRequest(from: arguments) else {
+            return nil
+        }
+
+        return repeatedCommandTracker.record(
+            command: request.command,
+            maxAttempts: maxRepeatedCommandAttemptsPerTurn
+        )
+    }
+
+    private func ollamaToolMessageContent(from result: AssistantToolExecutionResult) -> String {
+        let parts = result.contentItems.compactMap { item -> String? in
+            if let text = item.text?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
+                return text
+            }
+            if item.type == "inputImage", item.imageURL != nil {
+                return "[Image output omitted]"
+            }
+            return nil
+        }
+
+        if !parts.isEmpty {
+            return parts.joined(separator: "\n")
+        }
+        if let summary = result.summary.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
+            return summary
+        }
+        return result.success ? "Tool completed successfully." : "Tool failed."
+    }
+
+    private static func ollamaImagePayload(from attachment: AssistantAttachment) -> String? {
+        guard attachment.isImage else { return nil }
+        let dataURL = attachment.dataURL
+        guard let commaIndex = dataURL.firstIndex(of: ",") else {
+            return attachment.data.base64EncodedString()
+        }
+        let metadata = dataURL[..<commaIndex]
+        guard metadata.localizedCaseInsensitiveContains("base64") else {
+            return attachment.data.base64EncodedString()
+        }
+        return String(dataURL[dataURL.index(after: commaIndex)...])
     }
 
     private func copilotRequestWithTimeout(
@@ -2751,8 +3793,10 @@ final class CodexAssistantRuntime {
                 arguments: arguments,
                 attachments: currentTurnAttachments,
                 sessionID: sessionID ?? activeSessionID ?? "",
+                assistantNotesContext: assistantNotesContext,
                 preferredModelID: preferredModelID,
-                browserLoginResume: browserLoginResume
+                browserLoginResume: browserLoginResume,
+                interactionMode: interactionMode
             )
         )
         applyToolResultToLiveActivity(activityID: activityID, result: result)
@@ -3183,6 +4227,8 @@ final class CodexAssistantRuntime {
     }
 
     private func handleTurnCompleted(_ params: [String: Any]) {
+        cancelPendingCopilotPromptCompletion()
+        cancelPendingClaudeCompletion()
         materializeCopilotFallbackReplyIfNeeded()
         let completedTurnResponse = correctedAssistantImageFailureFallbackIfNeeded(streamingBuffer)
         let responsePreview = completedTurnResponse.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
@@ -3365,7 +4411,7 @@ final class CodexAssistantRuntime {
     private func emitStreamingAssistantDelta(force: Bool = false) {
         guard streamingEntryID != nil,
               streamingTimelineID != nil,
-              pendingStreamingDeltaBuffer.nonEmpty != nil else {
+              !pendingStreamingDeltaBuffer.isEmpty else {
             if force {
                 pendingStreamingTranscriptEmit?.cancel()
                 pendingStreamingTranscriptEmit = nil
@@ -3375,12 +4421,15 @@ final class CodexAssistantRuntime {
             return
         }
 
-        let minimumInterval: CFAbsoluteTime = 0.22
+        // Keep a tiny coalescing window so streamed text feels live without
+        // flooding persistence and UI observers on every token-sized update.
+        let minimumInterval: CFAbsoluteTime = 1.0 / 60.0
         let emit = { [weak self] in
             guard let self,
                   let entryID = self.streamingEntryID,
                   let timelineID = self.streamingTimelineID,
-                  let delta = self.pendingStreamingDeltaBuffer.nonEmpty else { return }
+                  !self.pendingStreamingDeltaBuffer.isEmpty else { return }
+            let delta = self.pendingStreamingDeltaBuffer
             let createdAt = self.streamingStartedAt ?? Date()
             self.onTranscriptMutation?(
                 .appendDelta(
@@ -3461,7 +4510,7 @@ final class CodexAssistantRuntime {
             return
         }
 
-        let minimumInterval: CFAbsoluteTime = 0.16
+        let minimumInterval: CFAbsoluteTime = 1.0 / 30.0
         let emit = { [weak self] in
             guard let self,
                   let commentaryTimelineID = self.commentaryTimelineID,
@@ -3546,7 +4595,7 @@ final class CodexAssistantRuntime {
         force: Bool = false
     ) {
         let activityID = activity.id
-        let minimumInterval: CFAbsoluteTime = 0.10
+        let minimumInterval: CFAbsoluteTime = 1.0 / 30.0
 
         let emit = { [weak self] in
             guard let self else { return }
@@ -3697,6 +4746,8 @@ final class CodexAssistantRuntime {
     }
 
     private func resetStreamingTimelineState() {
+        cancelPendingCopilotPromptCompletion()
+        cancelPendingClaudeCompletion()
         pendingAssistantTimelineEmit?.cancel()
         pendingAssistantTimelineEmit = nil
         pendingStreamingTranscriptEmit?.cancel()
@@ -4199,8 +5250,13 @@ final class CodexAssistantRuntime {
         await handleServerRequest(id: .string("test-request"), method: method, params: params)
     }
 
-    func processCopilotSessionUpdateForTesting(_ update: [String: Any]) async {
-        backend = .copilot
+    func processCopilotSessionUpdateForTesting(
+        _ update: [String: Any],
+        forceBackend: Bool = true
+    ) async {
+        if forceBackend {
+            backend = .copilot
+        }
         let sessionID = firstNonEmptyString(
             update["sessionId"] as? String,
             activeSessionID
@@ -4216,7 +5272,8 @@ final class CodexAssistantRuntime {
 
     func processCopilotPromptCompletionForTesting(
         raw: [String: Any] = [:],
-        stopReason: String? = nil
+        stopReason: String? = nil,
+        finalizePendingCompletion: Bool = true
     ) {
         backend = .copilot
         var payload = raw
@@ -4224,11 +5281,85 @@ final class CodexAssistantRuntime {
             payload["stopReason"] = stopReason
         }
         handleCopilotPromptCompletion(from: payload)
+        if finalizePendingCompletion {
+            flushPendingCopilotPromptCompletionForTesting()
+        }
+    }
+
+    func flushPendingCopilotPromptCompletionForTesting() {
+        guard let pendingParams = pendingCopilotCompletionParams else { return }
+        pendingCopilotCompletionEmit?.cancel()
+        pendingCopilotCompletionEmit = nil
+        pendingCopilotCompletionParams = nil
+        handleTurnCompleted(pendingParams)
+    }
+
+    static func shouldDeferCopilotPromptCompletion(
+        elapsedSinceLastUpdate: Double,
+        hasLiveActivity: Bool,
+        hasVisibleAssistantOutput: Bool,
+        hasPendingPermissionRequest: Bool
+    ) -> Bool {
+        let quietPeriodSeconds = Double(copilotCompletionQuietPeriodNanoseconds) / 1_000_000_000
+        guard elapsedSinceLastUpdate >= quietPeriodSeconds else {
+            return true
+        }
+
+        if hasPendingPermissionRequest {
+            return true
+        }
+
+        guard hasLiveActivity else {
+            return false
+        }
+
+        if hasVisibleAssistantOutput {
+            let activityGraceSeconds = Double(copilotCompletionActivityGracePeriodNanoseconds) / 1_000_000_000
+            return elapsedSinceLastUpdate < activityGraceSeconds
+        }
+
+        let hardTimeoutSeconds = Double(copilotCompletionHardTimeoutNanoseconds) / 1_000_000_000
+        return elapsedSinceLastUpdate < hardTimeoutSeconds
+    }
+
+    static func shouldAcceptCopilotLiveUpdate(
+        updateTurnID: String?,
+        activeTurnID: String?
+    ) -> Bool {
+        guard let activeTurnID = activeTurnID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+            return false
+        }
+
+        guard let updateTurnID = updateTurnID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+            return true
+        }
+
+        return updateTurnID.caseInsensitiveCompare(activeTurnID) == .orderedSame
+    }
+
+    func resolvedCopilotRequestedModelIDForTesting(_ preferredModelID: String?) -> String? {
+        backend = .copilot
+        return resolvedCopilotRequestedModelID(preferredModelID)
     }
 
     func processClaudeCodeOutputLineForTesting(_ line: String) {
         backend = .claudeCode
         handleClaudeCodeOutputLine(line)
+    }
+
+    func flushPendingClaudeCompletionForTesting() {
+        guard let pendingClaudeCompletionEmit else { return }
+        pendingClaudeCompletionEmit.cancel()
+        self.pendingClaudeCompletionEmit = nil
+        if activeTurnID == nil || pendingPermissionContext != nil {
+            return
+        }
+
+        if activeClaudeQueuedPromptContexts.count > 1 {
+            handleClaudeCodeIntermediateCompletion()
+        } else {
+            handleTurnCompleted(["turn": ["status": "completed"]])
+        }
     }
 
     func claudeCodeUserMessagePayloadForTesting(content: String) -> [String: Any] {
@@ -5130,6 +6261,7 @@ final class CodexAssistantRuntime {
 
     var browserProfileContext: [String: String]?
     var customInstructions: String?
+    var assistantNotesContext: AssistantNotesRuntimeContext?
     var activeSkills: [AssistantSkillDescriptor] = []
     var reasoningEffort: String?
     var serviceTier: String?
@@ -6407,8 +7539,7 @@ final class CodexAssistantRuntime {
 
             applyClaudeCodePlanEntriesIfNeeded(from: message, sessionID: payloadSessionID)
 
-            guard streamingBuffer.isEmpty,
-                  let text = Self.extractClaudeCodeMessageText(from: message) else {
+            guard let text = Self.extractClaudeCodeMessageText(from: message) else {
                 return
             }
             guard acceptAssistantMessageDelta(
@@ -6418,10 +7549,17 @@ final class CodexAssistantRuntime {
             ) else {
                 return
             }
-            ensureStreamingIdentifiers()
-            streamingBuffer = text
-            pendingStreamingDeltaBuffer = text
-            emitStreamingAssistantDelta(force: true)
+            switch applyClaudeSettledReplyCandidate(
+                text,
+                emitLiveDeltaWhenInstallingInitial: true
+            ) {
+            case .ignored:
+                return
+            case .installedAsInitial:
+                emitStreamingAssistantDelta(force: true)
+            case .replacedExisting:
+                break
+            }
             updateHUD(
                 phase: .streaming,
                 title: interactionMode.normalizedForActiveUse == .plan ? "Planning" : "Responding",
@@ -7074,6 +8212,7 @@ final class CodexAssistantRuntime {
 
     private func handleClaudeCodeResultPayload(_ payload: [String: Any]) {
         guard activeTurnID != nil else { return }
+        cancelPendingClaudeCompletion()
         let permissionDenial = parseClaudeCodePermissionDenial(
             from: payload,
             sessionID: activeSessionID
@@ -7095,11 +8234,11 @@ final class CodexAssistantRuntime {
             return
         }
 
-        if let responseText = Self.extractClaudeCodeResponseText(from: payload)?.nonEmpty,
-           streamingBuffer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            ensureStreamingIdentifiers()
-            streamingBuffer = responseText
-            pendingStreamingDeltaBuffer = ""
+        if let responseText = Self.extractClaudeCodeResponseText(from: payload)?.nonEmpty {
+            _ = applyClaudeSettledReplyCandidate(
+                responseText,
+                emitLiveDeltaWhenInstallingInitial: false
+            )
         }
         let (usage, modelContextWindow) = Self.parseClaudeCodeUsage(from: payload)
         if let usage {
@@ -7157,6 +8296,39 @@ final class CodexAssistantRuntime {
         if backend == .claudeCode, currentAccountSnapshot.isLoggedIn {
             Task { await refreshRateLimits() }
         }
+    }
+
+    private enum ClaudeReplySettlement {
+        case ignored
+        case installedAsInitial
+        case replacedExisting
+    }
+
+    @discardableResult
+    private func applyClaudeSettledReplyCandidate(
+        _ text: String,
+        emitLiveDeltaWhenInstallingInitial: Bool
+    ) -> ClaudeReplySettlement {
+        guard let candidate = text.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+            return .ignored
+        }
+
+        let current = streamingBuffer.trimmingCharacters(in: .whitespacesAndNewlines)
+        if current.isEmpty {
+            ensureStreamingIdentifiers()
+            streamingBuffer = candidate
+            pendingStreamingDeltaBuffer = emitLiveDeltaWhenInstallingInitial ? candidate : ""
+            return .installedAsInitial
+        }
+
+        guard Self.shouldPreferClaudeSettledReply(candidate, over: current) else {
+            return .ignored
+        }
+
+        ensureStreamingIdentifiers()
+        streamingBuffer = candidate
+        pendingStreamingDeltaBuffer = ""
+        return .replacedExisting
     }
 
     private func handleClaudeCodeStreamEvent(_ event: [String: Any], sessionID: String?) {
@@ -7220,8 +8392,11 @@ final class CodexAssistantRuntime {
                     onPlanUpdate?(sessionID, entries)
                 }
             case "text_delta":
-                guard let text = delta["text"] as? String,
-                      !text.isEmpty else {
+                guard let rawText = delta["text"] as? String else {
+                    return
+                }
+                let text = normalizedClaudeStreamingTextDelta(rawText)
+                guard !text.isEmpty else {
                     return
                 }
                 guard acceptAssistantMessageDelta(
@@ -7259,10 +8434,15 @@ final class CodexAssistantRuntime {
                let stopReason = firstNonEmptyString(
                     delta["stop_reason"] as? String,
                     delta["stopReason"] as? String
-               )?.lowercased(),
-               stopReason == "tool_use" {
-                updateHUD(phase: .acting, title: "Using tools", detail: nil)
+               )?.lowercased() {
+                if stopReason == "tool_use" {
+                    updateHUD(phase: .acting, title: "Using tools", detail: nil)
+                } else if ["end_turn", "stop_sequence", "max_tokens"].contains(stopReason) {
+                    scheduleClaudeDeferredCompletion()
+                }
             }
+        case "message_stop":
+            scheduleClaudeDeferredCompletion()
         default:
             return
         }
@@ -7691,6 +8871,132 @@ final class CodexAssistantRuntime {
         }
         .joined(separator: "\n")
         return joined.nonEmpty
+    }
+
+    private nonisolated static func shouldPreferClaudeSettledReply(
+        _ candidate: String,
+        over current: String
+    ) -> Bool {
+        let normalizedCandidate = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedCurrent = current.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard !normalizedCandidate.isEmpty else { return false }
+        guard !normalizedCurrent.isEmpty else { return true }
+        guard normalizedCandidate != normalizedCurrent else { return false }
+
+        let candidateWords = normalizedCandidate.split(whereSeparator: \.isWhitespace).count
+        let currentWords = normalizedCurrent.split(whereSeparator: \.isWhitespace).count
+        let candidateRichness = claudeReplyRichnessScore(normalizedCandidate)
+        let currentRichness = claudeReplyRichnessScore(normalizedCurrent)
+
+        if looksLikeClaudeProvisionalReply(normalizedCurrent) {
+            if candidateRichness > currentRichness {
+                return true
+            }
+            if candidateWords >= max(currentWords + 6, currentWords * 2) {
+                return true
+            }
+            if normalizedCandidate.count >= normalizedCurrent.count + 80 {
+                return true
+            }
+        }
+
+        if candidateRichness >= currentRichness + 2,
+           normalizedCandidate.count >= normalizedCurrent.count {
+            return true
+        }
+
+        if candidateRichness > currentRichness,
+           candidateWords > currentWords,
+           normalizedCandidate.count >= normalizedCurrent.count + 24 {
+            return true
+        }
+
+        if normalizedCandidate.count >= max(normalizedCurrent.count + 120, Int(Double(normalizedCurrent.count) * 1.6)),
+           candidateWords >= currentWords + 10 {
+            return true
+        }
+
+        return false
+    }
+
+    private nonisolated static func claudeReplyRichnessScore(_ text: String) -> Int {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return 0 }
+
+        let lines = trimmed.split(whereSeparator: \.isNewline).map(String.init)
+        let bulletLines = lines.filter { line in
+            let normalized = line.trimmingCharacters(in: .whitespaces)
+            return normalized.hasPrefix("- ")
+                || normalized.hasPrefix("* ")
+                || normalized.hasPrefix("• ")
+                || normalized.range(of: #"^\d+\.\s"#, options: .regularExpression) != nil
+        }.count
+        let headingLines = lines.filter { line in
+            line.trimmingCharacters(in: .whitespaces).hasPrefix("#")
+        }.count
+        let paragraphBreaks = trimmed.components(separatedBy: "\n\n").count - 1
+        let sentenceEndings = trimmed.filter { ".!?".contains($0) }.count
+
+        var score = 0
+        score += min(paragraphBreaks, 3) * 2
+        score += min(bulletLines, 4) * 2
+        score += min(headingLines, 2) * 2
+        if trimmed.contains("```") {
+            score += 3
+        }
+        if trimmed.contains("](") {
+            score += 1
+        }
+        if sentenceEndings >= 2 {
+            score += 1
+        }
+        return score
+    }
+
+    private nonisolated static func looksLikeClaudeProvisionalReply(_ text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+
+        let lowered = trimmed.lowercased()
+        let wordCount = lowered.split(whereSeparator: \.isWhitespace).count
+        guard wordCount <= 24 else { return false }
+
+        let provisionalPrefixes = [
+            "let me ",
+            "i'll ",
+            "i will ",
+            "i’m ",
+            "i'm ",
+            "give me a moment",
+            "one moment",
+            "let's ",
+            "first, i'll ",
+            "first, i’ll ",
+            "i need to "
+        ]
+        if provisionalPrefixes.contains(where: { lowered.hasPrefix($0) }) {
+            return true
+        }
+
+        let actionWords = [
+            "read",
+            "check",
+            "look",
+            "find",
+            "review",
+            "inspect",
+            "explore",
+            "scan",
+            "search",
+            "analyze"
+        ]
+        let hasIntentLeadIn = lowered.contains("let me")
+            || lowered.contains("i'll")
+            || lowered.contains("i will")
+            || lowered.contains("i'm going to")
+            || lowered.contains("i’m going to")
+        return hasIntentLeadIn && actionWords.contains(where: { lowered.contains($0) })
     }
 
     private nonisolated static func parseClaudeCodeUsage(from payload: [String: Any]) -> (TokenUsageBreakdown?, Int?) {
@@ -8376,7 +9682,7 @@ final class CodexAssistantRuntime {
             timeoutNanoseconds: 12_000_000_000
         )
 
-        if let requestedModelID = preferredModelID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty,
+        if let requestedModelID = resolvedCopilotRequestedModelID(preferredModelID),
            currentCopilotModelID() != requestedModelID {
             let response = try await copilotRequestWithTimeout(
                 method: "session/set_config_option",
@@ -8596,12 +9902,104 @@ final class CodexAssistantRuntime {
 
         switch stopReason {
         case "cancelled", "canceled", "interrupted":
+            cancelPendingCopilotPromptCompletion()
             handleTurnCompleted(["turn": ["status": "interrupted"]])
         default:
-            handleTurnCompleted(["turn": ["status": "completed"]])
+            scheduleCopilotPromptCompletion(["turn": ["status": "completed"]])
         }
 
         Task { await refreshRateLimits() }
+    }
+
+    private func scheduleCopilotPromptCompletion(_ params: [String: Any]) {
+        guard backend == .copilot, activeTurnID != nil else {
+            cancelPendingCopilotPromptCompletion()
+            handleTurnCompleted(params)
+            return
+        }
+
+        pendingCopilotCompletionParams = params
+        pendingCopilotCompletionEmit?.cancel()
+
+        let item = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.pendingCopilotCompletionEmit = nil
+
+            guard let pendingParams = self.pendingCopilotCompletionParams else { return }
+
+            let elapsed = CFAbsoluteTimeGetCurrent() - self.lastCopilotSessionUpdateTime
+            let hasLiveCopilotActivity = !self.liveActivities.isEmpty || !self.toolCalls.isEmpty
+            let hasVisibleAssistantOutput =
+                self.streamingBuffer.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty != nil
+                || self.pendingCopilotFallbackReply?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty != nil
+            if Self.shouldDeferCopilotPromptCompletion(
+                elapsedSinceLastUpdate: elapsed,
+                hasLiveActivity: hasLiveCopilotActivity,
+                hasVisibleAssistantOutput: hasVisibleAssistantOutput,
+                hasPendingPermissionRequest: self.pendingPermissionContext != nil
+            ) {
+                self.scheduleCopilotPromptCompletion(pendingParams)
+                return
+            }
+
+            if hasLiveCopilotActivity {
+                let detail = hasVisibleAssistantOutput ? "reply already visible" : "no fresh assistant output"
+                CrashReporter.logWarning(
+                    "Forcing Copilot turn completion after stale live activity elapsed=\(elapsed)s (\(detail))."
+                )
+            }
+
+            self.pendingCopilotCompletionParams = nil
+            self.handleTurnCompleted(pendingParams)
+        }
+
+        pendingCopilotCompletionEmit = item
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + .nanoseconds(Int(Self.copilotCompletionQuietPeriodNanoseconds)),
+            execute: item
+        )
+    }
+
+    private func cancelPendingCopilotPromptCompletion() {
+        pendingCopilotCompletionEmit?.cancel()
+        pendingCopilotCompletionEmit = nil
+        pendingCopilotCompletionParams = nil
+    }
+
+    private func scheduleClaudeDeferredCompletion() {
+        guard backend == .claudeCode, activeTurnID != nil else {
+            cancelPendingClaudeCompletion()
+            return
+        }
+
+        pendingClaudeCompletionEmit?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.pendingClaudeCompletionEmit = nil
+
+            guard self.backend == .claudeCode,
+                  self.activeTurnID != nil,
+                  self.pendingPermissionContext == nil else {
+                return
+            }
+
+            if self.activeClaudeQueuedPromptContexts.count > 1 {
+                self.handleClaudeCodeIntermediateCompletion()
+            } else {
+                self.handleTurnCompleted(["turn": ["status": "completed"]])
+            }
+        }
+
+        pendingClaudeCompletionEmit = item
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + .nanoseconds(Int(Self.claudeCodeDeferredCompletionGracePeriodNanoseconds)),
+            execute: item
+        )
+    }
+
+    private func cancelPendingClaudeCompletion() {
+        pendingClaudeCompletionEmit?.cancel()
+        pendingClaudeCompletionEmit = nil
     }
 
     private func waitForCopilotResponseMaterializationIfNeeded(
@@ -8686,7 +10084,26 @@ final class CodexAssistantRuntime {
         return formatter.date(from: rawValue)
     }
 
+    private func shouldAcceptBackendScopedUpdate(
+        expectedBackend: AssistantRuntimeBackend,
+        source: String
+    ) -> Bool {
+        guard backend == expectedBackend else {
+            CrashReporter.logInfo(
+                "Ignoring \(source) because runtime backend is \(backend.rawValue), expected \(expectedBackend.rawValue)"
+            )
+            return false
+        }
+        return true
+    }
+
     private func applyCopilotConfiguration(from raw: Any) {
+        guard shouldAcceptBackendScopedUpdate(
+            expectedBackend: .copilot,
+            source: "copilot.configuration"
+        ) else {
+            return
+        }
         currentAccountSnapshot = signedInCopilotAccountSnapshot()
         onAccountUpdate?(currentAccountSnapshot)
         let models = parseCopilotModels(from: raw)
@@ -8708,15 +10125,18 @@ final class CodexAssistantRuntime {
         )
 
         let rows: [[String: Any]]
-        if let availableRows = (payload["models"] as? [String: Any])?["availableModels"] as? [[String: Any]] {
+        let availableRows = flattenedCopilotConfigOptions(
+            from: (payload["models"] as? [String: Any])?["availableModels"]
+        )
+        if !availableRows.isEmpty {
             rows = availableRows
         } else {
-            rows = modelConfig?["options"] as? [[String: Any]] ?? []
+            rows = flattenedCopilotConfigOptions(from: modelConfig?["options"])
         }
 
         guard !rows.isEmpty else { return currentModels }
 
-        let supportedEfforts = (reasoningConfig?["options"] as? [[String: Any]] ?? [])
+        let supportedEfforts = flattenedCopilotConfigOptions(from: reasoningConfig?["options"])
             .compactMap { $0["value"] as? String }
         let currentReasoningEffort = reasoningConfig?["currentValue"] as? String
 
@@ -8755,8 +10175,121 @@ final class CodexAssistantRuntime {
         }
     }
 
+    private func flattenedCopilotConfigOptions(from rawOptions: Any?) -> [[String: Any]] {
+        guard let rawItems = rawOptions as? [Any] else { return [] }
+
+        var flattened: [[String: Any]] = []
+        for item in rawItems {
+            guard let dictionary = item as? [String: Any] else { continue }
+
+            if dictionary["value"] != nil || dictionary["modelId"] != nil {
+                flattened.append(dictionary)
+                continue
+            }
+
+            if dictionary["group"] != nil || dictionary["options"] != nil {
+                flattened.append(contentsOf: flattenedCopilotConfigOptions(from: dictionary["options"]))
+            }
+        }
+
+        return flattened
+    }
+
+    private func normalizedCopilotModelSearchKey(_ rawValue: String?) -> String? {
+        guard let rawValue = rawValue?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .nonEmpty else {
+            return nil
+        }
+
+        let tokens = rawValue
+            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .filter { !$0.isEmpty }
+        guard !tokens.isEmpty else { return nil }
+        return tokens.joined()
+    }
+
+    private func copilotModelSearchTokens(_ rawValue: String?) -> [String] {
+        guard let rawValue = rawValue?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .nonEmpty else {
+            return []
+        }
+
+        return rawValue
+            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .filter { !$0.isEmpty }
+    }
+
+    private func looksLikeSpecificCopilotModelID(_ rawValue: String) -> Bool {
+        rawValue.rangeOfCharacter(from: .decimalDigits) != nil
+            || rawValue.contains("-")
+            || rawValue.contains(".")
+            || rawValue.contains("/")
+    }
+
+    private func resolvedCopilotRequestedModelID(_ preferredModelID: String?) -> String? {
+        guard let requestedModelID = preferredModelID?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nonEmpty else {
+            return nil
+        }
+
+        if let exactMatch = currentModels.first(where: {
+            $0.id.caseInsensitiveCompare(requestedModelID) == .orderedSame
+        }) {
+            return exactMatch.id
+        }
+
+        let normalizedRequested = normalizedCopilotModelSearchKey(requestedModelID)
+        if let normalizedRequested,
+           let displayMatch = currentModels.first(where: { model in
+               normalizedCopilotModelSearchKey(model.id) == normalizedRequested
+                   || normalizedCopilotModelSearchKey(model.displayName) == normalizedRequested
+           }) {
+            return displayMatch.id
+        }
+
+        let requestedTokens = copilotModelSearchTokens(requestedModelID)
+        if !requestedTokens.isEmpty,
+           let partialMatch = currentModels.first(where: { model in
+               let haystacks = [
+                   model.id.lowercased(),
+                   model.displayName.lowercased(),
+                   model.description.lowercased()
+               ]
+               return requestedTokens.allSatisfy { token in
+                   haystacks.contains(where: { $0.contains(token) })
+               }
+           }) {
+            return partialMatch.id
+        }
+
+        if currentModels.isEmpty {
+            return looksLikeSpecificCopilotModelID(requestedModelID) ? requestedModelID : nil
+        }
+
+        return nil
+    }
+
     private func currentCopilotModelID() -> String? {
         currentModels.first(where: \.isDefault)?.id
+    }
+
+    private func normalizedClaudeStreamingTextDelta(_ text: String) -> String {
+        guard text.count > 1,
+              text.hasSuffix("\n") else {
+            return text
+        }
+
+        let body = text.dropLast()
+        guard !body.contains(where: \.isNewline) else {
+            return text
+        }
+
+        return String(body)
     }
 
     private func copilotModeID(for interactionMode: AssistantInteractionMode) -> String {
@@ -8778,6 +10311,12 @@ final class CodexAssistantRuntime {
 
     private func handleCopilotNotification(method: String, params: [String: Any]) async {
         guard method == "session/update" else { return }
+        guard shouldAcceptBackendScopedUpdate(
+            expectedBackend: .copilot,
+            source: "copilot.notification.\(method)"
+        ) else {
+            return
+        }
         guard let sessionID = params["sessionId"] as? String else { return }
         if detachedSessionIDs.contains(sessionID) {
             return
@@ -8785,6 +10324,7 @@ final class CodexAssistantRuntime {
         if let currentActive = activeSessionID, sessionID != currentActive {
             return
         }
+        lastCopilotSessionUpdateTime = CFAbsoluteTimeGetCurrent()
         handleCopilotSessionUpdate(params)
     }
 
@@ -8793,6 +10333,12 @@ final class CodexAssistantRuntime {
         method: String,
         params: [String: Any]
     ) async {
+        guard shouldAcceptBackendScopedUpdate(
+            expectedBackend: .copilot,
+            source: "copilot.serverRequest.\(method)"
+        ) else {
+            return
+        }
         switch method {
         case "session/request_permission":
             await presentCopilotPermissionRequest(id: id, params: params)
@@ -8829,14 +10375,28 @@ final class CodexAssistantRuntime {
                   delta.nonEmpty != nil else {
                 return
             }
+            guard Self.shouldAcceptCopilotLiveUpdate(
+                updateTurnID: assistantMessageTurnID(from: ["update": update]),
+                activeTurnID: activeTurnID
+            ) else {
+                return
+            }
             if shouldSurfaceCopilotThought(delta) {
                 appendCommentaryDelta(delta)
             }
             updateHUD(phase: .thinking, title: "Reasoning", detail: nil)
         case "tool_call":
-            handleCopilotToolCallUpdate(update, isInitial: true)
+            handleCopilotToolCallUpdate(
+                update,
+                sessionID: params["sessionId"] as? String,
+                isInitial: true
+            )
         case "tool_call_update":
-            handleCopilotToolCallUpdate(update, isInitial: false)
+            handleCopilotToolCallUpdate(
+                update,
+                sessionID: params["sessionId"] as? String,
+                isInitial: false
+            )
         case "config_option_update":
             applyCopilotConfiguration(from: update)
             onHealthUpdate?(connectedHealthForCurrentState())
@@ -8845,13 +10405,33 @@ final class CodexAssistantRuntime {
         }
     }
 
-    private func handleCopilotToolCallUpdate(_ update: [String: Any], isInitial: Bool) {
+    private func handleCopilotToolCallUpdate(
+        _ update: [String: Any],
+        sessionID: String?,
+        isInitial: Bool
+    ) {
+        let updateTurnID = assistantMessageTurnID(
+            from: [
+                "sessionId": sessionID as Any,
+                "update": update
+            ]
+        )
+        guard Self.shouldAcceptCopilotLiveUpdate(
+            updateTurnID: updateTurnID,
+            activeTurnID: activeTurnID
+        ) else {
+            CrashReporter.logInfo(
+                "Ignoring late Copilot tool update session=\(sessionID ?? activeSessionID ?? "unknown") turn=\(updateTurnID ?? "missing") activeTurn=\(activeTurnID ?? "none")"
+            )
+            return
+        }
+
         guard let item = copilotSyntheticItem(from: update) else { return }
         let status = (item["status"] as? String)?.lowercased() ?? "running"
         let isCompleted = !["pending", "running", "waiting", "inprogress", "in_progress"].contains(status)
         let toolOutput = copilotOutputText(from: update)
 
-        if shouldHideCopilotToolActivity(item: item) {
+        if shouldHideCopilotToolActivity(update: update, item: item) {
             if isCompleted,
                let reply = toolOutput.flatMap(copilotFallbackReplyCandidate(from:)) {
                 storeCopilotFallbackReply(reply)
@@ -8894,6 +10474,22 @@ final class CodexAssistantRuntime {
             )
         case "fileChange":
             item["changes"] = rawInput["files"] as? [[String: Any]] ?? []
+        case "webSearch":
+            item["tool"] = title
+            item["query"] = firstNonEmptyString(
+                rawInput["query"] as? String,
+                rawInput["search"] as? String,
+                rawInput["text"] as? String
+            )
+            item["arguments"] = rawInput
+        case "browserAutomation":
+            item["tool"] = title
+            item["action"] = firstNonEmptyString(
+                rawInput["action"] as? String,
+                rawInput["url"] as? String,
+                title
+            )
+            item["arguments"] = rawInput
         case "mcpToolCall":
             item["server"] = "MCP"
             item["tool"] = title
@@ -8937,14 +10533,33 @@ final class CodexAssistantRuntime {
         rawInput: [String: Any],
         title: String?
     ) -> String {
+        let normalizedKind = kind?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let normalizedTitle = title?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+
         if rawInput["command"] != nil || rawInput["commands"] != nil || kind == "execute" {
             return "commandExecution"
         }
         if rawInput["files"] != nil || kind == "edit" || title?.localizedCaseInsensitiveContains("edit") == true {
             return "fileChange"
         }
-        if kind?.localizedCaseInsensitiveContains("mcp") == true {
+        if rawInput["query"] != nil
+            || normalizedKind?.contains("search") == true
+            || normalizedTitle?.contains("search") == true {
+            return "webSearch"
+        }
+        if rawInput["url"] != nil
+            || normalizedKind?.contains("browser") == true
+            || normalizedTitle?.contains("browser") == true {
+            return "browserAutomation"
+        }
+        if normalizedKind?.contains("mcp") == true {
             return "mcpToolCall"
+        }
+        if normalizedKind == "internal" {
+            return "other"
+        }
+        if normalizedKind != nil || !(rawInput.isEmpty) || title?.nonEmpty != nil {
+            return "dynamicToolCall"
         }
         return "other"
     }
@@ -8962,8 +10577,24 @@ final class CodexAssistantRuntime {
         }
     }
 
-    private func shouldHideCopilotToolActivity(item: [String: Any]) -> Bool {
-        normalizedActivityType(item["type"] as? String ?? "other") == "other"
+    private func shouldHideCopilotToolActivity(update: [String: Any], item: [String: Any]) -> Bool {
+        let normalizedKind = (update["kind"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        if normalizedKind == "internal" {
+            return true
+        }
+
+        let normalizedTitle = firstNonEmptyString(
+            update["title"] as? String,
+            item["tool"] as? String
+        )?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+
+        if normalizedTitle?.contains("internal completion") == true {
+            return true
+        }
+
+        return false
     }
 
     private func shouldSurfaceCopilotThought(_ delta: String) -> Bool {
@@ -9755,13 +11386,21 @@ extension CodexAssistantRuntime: AssistantMCPToolBridgeDelegate {
         let resolvedModelID: String? = await MainActor.run {
             self.preferredModelID
         }
+        let resolvedInteractionMode: AssistantInteractionMode = await MainActor.run {
+            self.interactionMode
+        }
+        let resolvedAssistantNotesContext: AssistantNotesRuntimeContext? = await MainActor.run {
+            self.assistantNotesContext
+        }
         let context = AssistantToolExecutionContext(
             toolName: toolName,
             arguments: arguments,
             attachments: [],
             sessionID: resolvedSessionID,
+            assistantNotesContext: resolvedAssistantNotesContext,
             preferredModelID: resolvedModelID,
-            browserLoginResume: false
+            browserLoginResume: false,
+            interactionMode: resolvedInteractionMode
         )
         return await self.toolExecutor.execute(context)
     }

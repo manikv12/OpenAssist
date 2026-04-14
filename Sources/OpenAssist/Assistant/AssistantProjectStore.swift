@@ -5,6 +5,13 @@ enum AssistantProjectStoreError: LocalizedError {
     case invalidProjectName
     case invalidProjectIconName
     case duplicateProjectName(String)
+    case invalidNoteFolderName
+    case duplicateNoteFolderName(String)
+    case noteFolderNotFound
+    case invalidParentNoteFolder
+    case noteFolderNotEmpty
+    case cannotMoveNoteFolderIntoItself
+    case cannotMoveNoteFolderIntoDescendant
     case projectNotFound
     case invalidParentFolder
     case cannotNestFolders
@@ -21,6 +28,20 @@ enum AssistantProjectStoreError: LocalizedError {
             return "Enter a valid SF Symbol name."
         case .duplicateProjectName(let name):
             return "An item named “\(name)” already exists here."
+        case .invalidNoteFolderName:
+            return "Enter a folder name first."
+        case .duplicateNoteFolderName(let name):
+            return "A note folder named “\(name)” already exists here."
+        case .noteFolderNotFound:
+            return "That note folder could not be found."
+        case .invalidParentNoteFolder:
+            return "Choose a valid parent note folder first."
+        case .noteFolderNotEmpty:
+            return "This note folder must be empty before you delete it."
+        case .cannotMoveNoteFolderIntoItself:
+            return "A note folder cannot move into itself."
+        case .cannotMoveNoteFolderIntoDescendant:
+            return "A note folder cannot move into one of its subfolders."
         case .projectNotFound:
             return "That group or project could not be found."
         case .invalidParentFolder:
@@ -215,6 +236,7 @@ final class AssistantProjectStore {
     private static let projectNotesDirectoryName = "notes"
     private static let projectNoteManifestFilename = "manifest.json"
     private static let defaultProjectNoteTitle = "Untitled note"
+    private static let defaultProjectNoteFolderName = "Untitled folder"
     private let fileManager: FileManager
     private let fileURL: URL
     private let noteRecoveryStore: AssistantNoteRecoveryStore
@@ -338,6 +360,28 @@ final class AssistantProjectStore {
         try loadProjectNotesWorkspace(projectID: projectID).selectedNote?.updatedAt
     }
 
+    /// Returns the on-disk URL for the given project note if it resolves and the
+    /// underlying `.md` file currently exists.
+    func projectNoteOnDiskURL(projectID: String, noteID: String) -> URL? {
+        guard let normalizedProjectID = try? requiredLeafProjectID(projectID) else {
+            return nil
+        }
+        let manifest = resolvedProjectNoteManifest(projectID: normalizedProjectID)
+        guard
+            let note = manifest.notes.first(where: {
+                $0.id.caseInsensitiveCompare(noteID) == .orderedSame
+            }),
+            let fileURL = projectNoteFileURL(
+                projectID: normalizedProjectID,
+                fileName: note.fileName
+            ),
+            fileManager.fileExists(atPath: fileURL.path)
+        else {
+            return nil
+        }
+        return fileURL
+    }
+
     func loadProjectNotesWorkspace(projectID: String) throws -> AssistantNotesWorkspace {
         let normalizedProjectID = try requiredLeafProjectID(projectID)
         let manifest = resolvedProjectNoteManifest(projectID: normalizedProjectID)
@@ -361,32 +405,201 @@ final class AssistantProjectStore {
                 ownerID: normalizedProjectID,
                 noteID: note.id,
                 title: note.title,
+                noteType: note.noteType,
                 fileName: note.fileName,
+                folderID: note.folderID,
                 updatedAt: note.updatedAt,
                 text: loadProjectNoteText(projectID: normalizedProjectID, fileName: note.fileName)
             )
         }
     }
 
-    func createProjectNote(
+    func projectNoteFolders(projectID: String) throws -> [AssistantNoteFolderSummary] {
+        let normalizedProjectID = try requiredLeafProjectID(projectID)
+        return resolvedProjectNoteManifest(projectID: normalizedProjectID).orderedFolders
+    }
+
+    func projectNoteFolderPathMap(projectID: String) throws -> [String: [String]] {
+        let normalizedProjectID = try requiredLeafProjectID(projectID)
+        let manifest = resolvedProjectNoteManifest(projectID: normalizedProjectID)
+        return noteFolderPathMap(for: manifest.folders)
+    }
+
+    func createProjectNoteFolder(
         projectID: String,
-        title: String? = nil,
-        selectNewNote: Bool = true
+        parentFolderID: String? = nil,
+        name: String
     ) throws -> AssistantNotesWorkspace {
         let normalizedProjectID = try requiredLeafProjectID(projectID)
         var manifest = resolvedProjectNoteManifest(projectID: normalizedProjectID)
+        let normalizedParentFolderID = try validatedNoteParentFolderID(
+            parentFolderID,
+            folders: manifest.folders
+        )
+        let normalizedName = try validatedUniqueNoteFolderName(
+            name,
+            parentFolderID: normalizedParentFolderID,
+            excludingFolderID: nil,
+            folders: manifest.folders
+        )
+        let now = Date()
+        manifest.folders.append(
+            AssistantNoteFolderSummary(
+                id: UUID().uuidString.lowercased(),
+                name: normalizedName,
+                parentFolderID: normalizedParentFolderID,
+                createdAt: now,
+                updatedAt: now
+            )
+        )
+        try storeProjectNoteManifest(manifest, projectID: normalizedProjectID)
+        return try loadProjectNotesWorkspace(projectID: normalizedProjectID)
+    }
+
+    func renameProjectNoteFolder(
+        projectID: String,
+        folderID: String,
+        name: String
+    ) throws -> AssistantNotesWorkspace {
+        let normalizedProjectID = try requiredLeafProjectID(projectID)
+        var manifest = resolvedProjectNoteManifest(projectID: normalizedProjectID)
+        let normalizedFolderID = normalizedFolderID(folderID)
+        guard let folderIndex = manifest.folders.firstIndex(where: {
+            $0.id.caseInsensitiveCompare(normalizedFolderID) == .orderedSame
+        }) else {
+            throw AssistantProjectStoreError.noteFolderNotFound
+        }
+        let normalizedName = try validatedUniqueNoteFolderName(
+            name,
+            parentFolderID: manifest.folders[folderIndex].parentFolderID,
+            excludingFolderID: normalizedFolderID,
+            folders: manifest.folders
+        )
+        manifest.folders[folderIndex].name = normalizedName
+        manifest.folders[folderIndex].updatedAt = Date()
+        try storeProjectNoteManifest(manifest, projectID: normalizedProjectID)
+        return try loadProjectNotesWorkspace(projectID: normalizedProjectID)
+    }
+
+    func moveProjectNoteFolder(
+        projectID: String,
+        folderID: String,
+        parentFolderID: String?
+    ) throws -> AssistantNotesWorkspace {
+        let normalizedProjectID = try requiredLeafProjectID(projectID)
+        var manifest = resolvedProjectNoteManifest(projectID: normalizedProjectID)
+        let normalizedFolderID = normalizedFolderID(folderID)
+        guard let folderIndex = manifest.folders.firstIndex(where: {
+            $0.id.caseInsensitiveCompare(normalizedFolderID) == .orderedSame
+        }) else {
+            throw AssistantProjectStoreError.noteFolderNotFound
+        }
+        let normalizedParentFolderID = try validatedNoteParentFolderID(
+            parentFolderID,
+            folders: manifest.folders
+        )
+        if normalizedParentFolderID?.caseInsensitiveCompare(normalizedFolderID) == .orderedSame {
+            throw AssistantProjectStoreError.cannotMoveNoteFolderIntoItself
+        }
+        if let normalizedParentFolderID,
+           noteFolderDescendantIDs(folderID: normalizedFolderID, folders: manifest.folders)
+            .contains(where: { $0.caseInsensitiveCompare(normalizedParentFolderID) == .orderedSame }) {
+            throw AssistantProjectStoreError.cannotMoveNoteFolderIntoDescendant
+        }
+        let normalizedName = try validatedUniqueNoteFolderName(
+            manifest.folders[folderIndex].name,
+            parentFolderID: normalizedParentFolderID,
+            excludingFolderID: normalizedFolderID,
+            folders: manifest.folders
+        )
+        manifest.folders[folderIndex].name = normalizedName
+        manifest.folders[folderIndex].parentFolderID = normalizedParentFolderID
+        manifest.folders[folderIndex].updatedAt = Date()
+        try storeProjectNoteManifest(manifest, projectID: normalizedProjectID)
+        return try loadProjectNotesWorkspace(projectID: normalizedProjectID)
+    }
+
+    func deleteProjectNoteFolder(
+        projectID: String,
+        folderID: String
+    ) throws -> AssistantNotesWorkspace {
+        let normalizedProjectID = try requiredLeafProjectID(projectID)
+        var manifest = resolvedProjectNoteManifest(projectID: normalizedProjectID)
+        let normalizedFolderID = normalizedFolderID(folderID)
+        guard let folderIndex = manifest.folders.firstIndex(where: {
+            $0.id.caseInsensitiveCompare(normalizedFolderID) == .orderedSame
+        }) else {
+            throw AssistantProjectStoreError.noteFolderNotFound
+        }
+        let hasChildFolders = manifest.folders.contains {
+            $0.parentFolderID?.caseInsensitiveCompare(normalizedFolderID) == .orderedSame
+        }
+        let hasNotes = manifest.notes.contains {
+            $0.folderID?.caseInsensitiveCompare(normalizedFolderID) == .orderedSame
+        }
+        guard !hasChildFolders && !hasNotes else {
+            throw AssistantProjectStoreError.noteFolderNotEmpty
+        }
+        manifest.folders.remove(at: folderIndex)
+        try storeProjectNoteManifest(manifest, projectID: normalizedProjectID)
+        return try loadProjectNotesWorkspace(projectID: normalizedProjectID)
+    }
+
+    func moveProjectNote(
+        projectID: String,
+        noteID: String,
+        folderID: String?
+    ) throws -> AssistantNotesWorkspace {
+        let normalizedProjectID = try requiredLeafProjectID(projectID)
+        var manifest = resolvedProjectNoteManifest(projectID: normalizedProjectID)
+        let normalizedNoteID = noteID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let noteIndex = manifest.notes.firstIndex(where: {
+            $0.id.caseInsensitiveCompare(normalizedNoteID) == .orderedSame
+        }) else {
+            return try loadProjectNotesWorkspace(projectID: normalizedProjectID)
+        }
+        let normalizedFolderID = try validatedNoteParentFolderID(
+            folderID,
+            folders: manifest.folders
+        )
+        manifest.notes[noteIndex].folderID = normalizedFolderID
+        manifest.notes[noteIndex].updatedAt = Date()
+        manifest.notes = normalizedProjectNoteItems(manifest.notes, folders: manifest.folders)
+        try storeProjectNoteManifest(manifest, projectID: normalizedProjectID)
+        let selectedText = manifest.selectedNote.map {
+            loadProjectNoteText(projectID: normalizedProjectID, fileName: $0.fileName)
+        } ?? ""
+        return AssistantNotesWorkspace(
+            projectID: normalizedProjectID,
+            manifest: manifest,
+            selectedNoteText: selectedText
+        )
+    }
+
+    func createProjectNote(
+        projectID: String,
+        title: String? = nil,
+        noteType: AssistantNoteType = .note,
+        selectNewNote: Bool = true,
+        folderID: String? = nil
+    ) throws -> AssistantNotesWorkspace {
+        let normalizedProjectID = try requiredLeafProjectID(projectID)
+        var manifest = resolvedProjectNoteManifest(projectID: normalizedProjectID)
+        let normalizedFolderID = try validatedNoteParentFolderID(folderID, folders: manifest.folders)
         let noteID = UUID().uuidString.lowercased()
         let now = Date()
         let note = AssistantNoteSummary(
             id: noteID,
             title: normalizedProjectNoteTitle(title),
+            noteType: noteType,
             fileName: "\(safePathComponent(noteID)).md",
+            folderID: normalizedFolderID,
             order: manifest.orderedNotes.count,
             createdAt: now,
             updatedAt: now
         )
         manifest.notes.append(note)
-        manifest.notes = normalizedProjectNoteItems(manifest.notes)
+        manifest.notes = normalizedProjectNoteItems(manifest.notes, folders: manifest.folders)
         if selectNewNote || manifest.selectedNoteID == nil {
             manifest.selectedNoteID = note.id
         }
@@ -412,7 +625,7 @@ final class AssistantProjectStore {
 
         manifest.notes[index].title = normalizedProjectNoteTitle(title)
         manifest.notes[index].updatedAt = Date()
-        manifest.notes = normalizedProjectNoteItems(manifest.notes)
+        manifest.notes = normalizedProjectNoteItems(manifest.notes, folders: manifest.folders)
         try storeProjectNoteManifest(manifest, projectID: normalizedProjectID)
 
         let selectedText = manifest.selectedNote.map {
@@ -443,6 +656,45 @@ final class AssistantProjectStore {
             projectID: normalizedProjectID,
             manifest: manifest,
             selectedNoteText: selectedText
+        )
+    }
+
+    func saveProjectNoteImageAsset(
+        projectID: String,
+        noteID: String,
+        attachment: AssistantAttachment
+    ) throws -> AssistantSavedNoteAsset {
+        let normalizedProjectID = try requiredLeafProjectID(projectID)
+        let manifest = resolvedProjectNoteManifest(projectID: normalizedProjectID)
+        guard let note = manifest.notes.first(where: { $0.id.caseInsensitiveCompare(noteID) == .orderedSame }),
+              let notesDirectoryURL = projectNotesDirectoryURL(for: normalizedProjectID) else {
+            throw AssistantNoteAssetError.noteNotFound
+        }
+
+        return try AssistantNoteAssetSupport.saveImageAsset(
+            attachment: attachment,
+            notesDirectoryURL: notesDirectoryURL,
+            noteFileName: note.fileName,
+            fileManager: fileManager
+        )
+    }
+
+    func resolveProjectNoteImageAssetURL(
+        projectID: String,
+        noteID: String,
+        relativePath: String
+    ) throws -> URL? {
+        let normalizedProjectID = try requiredLeafProjectID(projectID)
+        let manifest = resolvedProjectNoteManifest(projectID: normalizedProjectID)
+        guard let note = manifest.notes.first(where: { $0.id.caseInsensitiveCompare(noteID) == .orderedSame }),
+              let notesDirectoryURL = projectNotesDirectoryURL(for: normalizedProjectID) else {
+            return nil
+        }
+
+        return AssistantNoteAssetSupport.resolveAssetFileURL(
+            notesDirectoryURL: notesDirectoryURL,
+            noteFileName: note.fileName,
+            relativePath: relativePath
         )
     }
 
@@ -507,7 +759,7 @@ final class AssistantProjectStore {
 
         manifest.selectedNoteID = resolvedNoteID
         manifest.notes[index].updatedAt = now
-        manifest.notes = normalizedProjectNoteItems(manifest.notes)
+        manifest.notes = normalizedProjectNoteItems(manifest.notes, folders: manifest.folders)
         try storeProjectNoteManifest(manifest, projectID: normalizedProjectID)
 
         return AssistantNotesWorkspace(
@@ -530,18 +782,26 @@ final class AssistantProjectStore {
 
         let removed = manifest.notes.remove(at: existingIndex)
         let removedText = loadProjectNoteText(projectID: normalizedProjectID, fileName: removed.fileName)
+        let removedAssetDirectoryURL = projectNoteAssetDirectoryURL(
+            projectID: normalizedProjectID,
+            fileName: removed.fileName
+        )
         noteRecoveryStore.captureDeletedNote(
             note: removed,
             ownerKind: .project,
             ownerID: normalizedProjectID,
             text: removedText,
+            assetDirectoryURL: removedAssetDirectoryURL,
             at: now
         )
         if let fileURL = projectNoteFileURL(projectID: normalizedProjectID, fileName: removed.fileName) {
             try? fileManager.removeItem(at: fileURL)
         }
+        if let removedAssetDirectoryURL {
+            try? fileManager.removeItem(at: removedAssetDirectoryURL)
+        }
 
-        manifest.notes = normalizedProjectNoteItems(manifest.notes)
+        manifest.notes = normalizedProjectNoteItems(manifest.notes, folders: manifest.folders)
         if manifest.selectedNoteID == noteID {
             let fallbackIndex = min(existingIndex, max(0, manifest.notes.count - 1))
             manifest.selectedNoteID = manifest.notes.indices.contains(fallbackIndex)
@@ -627,6 +887,7 @@ final class AssistantProjectStore {
         }
 
         manifest.notes[noteIndex].title = normalizedProjectNoteTitle(payload.note.title)
+        manifest.notes[noteIndex].folderID = payload.note.folderID
         manifest.notes[noteIndex].updatedAt = now
         manifest.selectedNoteID = noteID
         try writeProjectNoteText(
@@ -634,7 +895,7 @@ final class AssistantProjectStore {
             fileName: currentNote.fileName,
             text: payload.text
         )
-        manifest.notes = normalizedProjectNoteItems(manifest.notes)
+        manifest.notes = normalizedProjectNoteItems(manifest.notes, folders: manifest.folders)
         try storeProjectNoteManifest(manifest, projectID: normalizedProjectID)
         return AssistantNotesWorkspace(
             projectID: normalizedProjectID,
@@ -697,18 +958,31 @@ final class AssistantProjectStore {
             id: restoredNoteID,
             title: normalizedProjectNoteTitle(payload.note.title),
             fileName: restoredFileName,
+            folderID: payload.note.folderID,
             order: manifest.orderedNotes.count,
             createdAt: payload.note.createdAt,
             updatedAt: now
         )
         manifest.notes.append(restoredNote)
         manifest.selectedNoteID = restoredNote.id
-        manifest.notes = normalizedProjectNoteItems(manifest.notes)
+        manifest.notes = normalizedProjectNoteItems(manifest.notes, folders: manifest.folders)
         try writeProjectNoteText(
             projectID: normalizedProjectID,
             fileName: restoredNote.fileName,
             text: payload.text
         )
+        if let assetDirectoryURL = payload.assetDirectoryURL,
+           fileManager.fileExists(atPath: assetDirectoryURL.path),
+           let restoredAssetDirectoryURL = projectNoteAssetDirectoryURL(
+            projectID: normalizedProjectID,
+            fileName: restoredNote.fileName
+           ) {
+            try? fileManager.removeItem(at: restoredAssetDirectoryURL)
+            do {
+                try fileManager.copyItem(at: assetDirectoryURL, to: restoredAssetDirectoryURL)
+                try? fileManager.removeItem(at: assetDirectoryURL)
+            } catch {}
+        }
         try storeProjectNoteManifest(manifest, projectID: normalizedProjectID)
         return AssistantNotesWorkspace(
             projectID: normalizedProjectID,
@@ -1165,6 +1439,17 @@ final class AssistantProjectStore {
             .appendingPathComponent(fileName, isDirectory: false)
     }
 
+    private func projectNoteAssetDirectoryURL(projectID: String, fileName: String) -> URL? {
+        guard let notesDirectoryURL = projectNotesDirectoryURL(for: projectID) else {
+            return nil
+        }
+
+        return AssistantNoteAssetSupport.noteAssetDirectoryURL(
+            notesDirectoryURL: notesDirectoryURL,
+            noteFileName: fileName
+        )
+    }
+
     private func writeProjectNoteText(
         projectID: String,
         fileName: String,
@@ -1212,7 +1497,7 @@ final class AssistantProjectStore {
         let normalizedManifest = normalizedProjectNoteManifest(manifest)
         guard let manifestURL = projectNoteManifestFileURL(for: projectID) else { return }
 
-        if normalizedManifest.notes.isEmpty {
+        if normalizedManifest.notes.isEmpty && normalizedManifest.folders.isEmpty {
             try? fileManager.removeItem(at: manifestURL)
             if let notesDirectoryURL = projectNotesDirectoryURL(for: projectID) {
                 try? fileManager.removeItem(at: notesDirectoryURL)
@@ -1236,21 +1521,114 @@ final class AssistantProjectStore {
     private func normalizedProjectNoteManifest(
         _ manifest: AssistantNoteManifest
     ) -> AssistantNoteManifest {
-        let normalizedNotes = normalizedProjectNoteItems(manifest.notes)
+        let normalizedFolders = normalizedProjectNoteFolders(manifest.folders)
+        let normalizedNotes = normalizedProjectNoteItems(
+            manifest.notes,
+            folders: normalizedFolders
+        )
         let selectedNoteID = normalizedNotes.contains(where: { $0.id == manifest.selectedNoteID })
             ? manifest.selectedNoteID
             : normalizedNotes.first?.id
         return AssistantNoteManifest(
             version: max(manifest.version, AssistantNoteManifest.currentVersion),
             selectedNoteID: selectedNoteID,
-            notes: normalizedNotes
+            notes: normalizedNotes,
+            folders: normalizedFolders
         )
     }
 
+    private func normalizedProjectNoteFolders(
+        _ folders: [AssistantNoteFolderSummary]
+    ) -> [AssistantNoteFolderSummary] {
+        var seenFolderIDs = Set<String>()
+        var normalized = folders.compactMap { folder -> AssistantNoteFolderSummary? in
+            let normalizedID = normalizedFolderID(folder.id)
+            guard !normalizedID.isEmpty else { return nil }
+            let foldedID = normalizedID.lowercased()
+            guard seenFolderIDs.insert(foldedID).inserted else { return nil }
+            return AssistantNoteFolderSummary(
+                id: normalizedID,
+                name: normalizedProjectNoteFolderName(folder.name),
+                parentFolderID: folder.parentFolderID,
+                createdAt: folder.createdAt,
+                updatedAt: folder.updatedAt
+            )
+        }
+
+        guard !normalized.isEmpty else { return [] }
+
+        var folderIndexByID = Dictionary(
+            uniqueKeysWithValues: normalized.enumerated().map { index, folder in
+                (folder.id.lowercased(), index)
+            }
+        )
+
+        for index in normalized.indices {
+            if let parentFolderID = normalized[index].parentFolderID {
+                let normalizedParentFolderID = normalizedFolderID(parentFolderID).lowercased()
+                if normalizedParentFolderID.isEmpty
+                    || normalizedParentFolderID == normalized[index].id.lowercased()
+                    || folderIndexByID[normalizedParentFolderID] == nil
+                {
+                    normalized[index].parentFolderID = nil
+                } else {
+                    normalized[index].parentFolderID = normalized[folderIndexByID[normalizedParentFolderID]!].id
+                }
+            }
+        }
+
+        var changed = true
+        while changed {
+            changed = false
+            folderIndexByID = Dictionary(
+                uniqueKeysWithValues: normalized.enumerated().map { index, folder in
+                    (folder.id.lowercased(), index)
+                }
+            )
+            for index in normalized.indices {
+                guard let parentFolderID = normalized[index].parentFolderID else { continue }
+                var cursor = parentFolderID.lowercased()
+                var visited = Set([normalized[index].id.lowercased()])
+                while let parentIndex = folderIndexByID[cursor] {
+                    if !visited.insert(cursor).inserted {
+                        normalized[index].parentFolderID = nil
+                        changed = true
+                        break
+                    }
+                    guard let nextParentID = normalized[parentIndex].parentFolderID else { break }
+                    cursor = nextParentID.lowercased()
+                }
+            }
+        }
+
+        return normalized.sorted { lhs, rhs in
+            switch (lhs.parentFolderID, rhs.parentFolderID) {
+            case let (.some(leftParent), .some(rightParent)):
+                let parentCompare = leftParent.localizedCaseInsensitiveCompare(rightParent)
+                if parentCompare != .orderedSame {
+                    return parentCompare == .orderedAscending
+                }
+            case (nil, .some):
+                return true
+            case (.some, nil):
+                return false
+            case (nil, nil):
+                break
+            }
+            let nameCompare = lhs.name.localizedCaseInsensitiveCompare(rhs.name)
+            if nameCompare != .orderedSame {
+                return nameCompare == .orderedAscending
+            }
+            return lhs.createdAt < rhs.createdAt
+        }
+    }
+
     private func normalizedProjectNoteItems(
-        _ notes: [AssistantNoteSummary]
+        _ notes: [AssistantNoteSummary],
+        folders: [AssistantNoteFolderSummary]
     ) -> [AssistantNoteSummary] {
-        notes
+        let validFolderIDs = Set(folders.map { $0.id.lowercased() })
+        return notes
             .sorted {
                 if $0.order == $1.order {
                     return $0.createdAt < $1.createdAt
@@ -1261,6 +1639,8 @@ final class AssistantProjectStore {
             .map { index, note in
                 var updated = note
                 updated.title = normalizedProjectNoteTitle(note.title)
+                updated.folderID = updated.folderID?.trimmingCharacters(in: .whitespacesAndNewlines)
+                    .nonEmpty.flatMap { validFolderIDs.contains($0.lowercased()) ? $0 : nil }
                 updated.order = index
                 return updated
             }
@@ -1273,15 +1653,118 @@ final class AssistantProjectStore {
             ?? Self.defaultProjectNoteTitle
     }
 
+    private func normalizedProjectNoteFolderName(_ title: String?) -> String {
+        title?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nonEmpty
+            ?? Self.defaultProjectNoteFolderName
+    }
+
+    private func normalizedFolderID(_ folderID: String?) -> String {
+        folderID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    }
+
+    private func validatedUniqueNoteFolderName(
+        _ name: String,
+        parentFolderID: String?,
+        excludingFolderID: String?,
+        folders: [AssistantNoteFolderSummary]
+    ) throws -> String {
+        let normalizedName = MemoryTextNormalizer.collapsedWhitespace(name)
+        guard !normalizedName.isEmpty else {
+            throw AssistantProjectStoreError.invalidNoteFolderName
+        }
+        let normalizedParentFolderID = normalizedFolderID(parentFolderID).lowercased()
+        let excludedFolderID = normalizedFolderID(excludingFolderID).lowercased()
+        if folders.contains(where: { folder in
+            folder.name.caseInsensitiveCompare(normalizedName) == .orderedSame
+                && normalizedFolderID(folder.parentFolderID).lowercased() == normalizedParentFolderID
+                && folder.id.lowercased() != excludedFolderID
+        }) {
+            throw AssistantProjectStoreError.duplicateNoteFolderName(normalizedName)
+        }
+        return normalizedName
+    }
+
+    private func validatedNoteParentFolderID(
+        _ folderID: String?,
+        folders: [AssistantNoteFolderSummary]
+    ) throws -> String? {
+        let normalizedParentFolderID = normalizedFolderID(folderID)
+        guard !normalizedParentFolderID.isEmpty else { return nil }
+        guard let folder = folders.first(where: {
+            $0.id.caseInsensitiveCompare(normalizedParentFolderID) == .orderedSame
+        }) else {
+            throw AssistantProjectStoreError.invalidParentNoteFolder
+        }
+        return folder.id
+    }
+
+    private func noteFolderDescendantIDs(
+        folderID: String,
+        folders: [AssistantNoteFolderSummary]
+    ) -> Set<String> {
+        let rootFolderID = folderID.lowercased()
+        guard !rootFolderID.isEmpty else { return [] }
+        let childrenByParentID = Dictionary(grouping: folders) { folder in
+            normalizedFolderID(folder.parentFolderID).lowercased()
+        }
+        var descendants: Set<String> = []
+        var stack = childrenByParentID[rootFolderID, default: []]
+        while let folder = stack.popLast() {
+            let foldedID = folder.id.lowercased()
+            guard descendants.insert(foldedID).inserted else { continue }
+            stack.append(contentsOf: childrenByParentID[foldedID, default: []])
+        }
+        return descendants
+    }
+
+    private func noteFolderPathMap(
+        for folders: [AssistantNoteFolderSummary]
+    ) -> [String: [String]] {
+        let foldersByID = Dictionary(
+            uniqueKeysWithValues: folders.map { ($0.id.lowercased(), $0) }
+        )
+        var cache: [String: [String]] = [:]
+
+        func buildPath(for folder: AssistantNoteFolderSummary, visited: Set<String>) -> [String] {
+            let foldedID = folder.id.lowercased()
+            if let cached = cache[foldedID] {
+                return cached
+            }
+            if visited.contains(foldedID) {
+                return [folder.name]
+            }
+            let nextVisited = visited.union([foldedID])
+            let path: [String]
+            if let parentFolderID = folder.parentFolderID?.lowercased(),
+               let parent = foldersByID[parentFolderID] {
+                path = buildPath(for: parent, visited: nextVisited) + [folder.name]
+            } else {
+                path = [folder.name]
+            }
+            cache[foldedID] = path
+            return path
+        }
+
+        return folders.reduce(into: [:]) { result, folder in
+            result[folder.id] = buildPath(for: folder, visited: [])
+        }
+    }
+
     private func createProjectNoteAndSave(
         projectID: String,
         title: String,
-        text: String
+        text: String,
+        noteType: AssistantNoteType = .note,
+        folderID: String? = nil
     ) throws -> AssistantNotesWorkspace {
         let createdWorkspace = try createProjectNote(
             projectID: projectID,
             title: title,
-            selectNewNote: true
+            noteType: noteType,
+            selectNewNote: true,
+            folderID: folderID
         )
         return try saveProjectNote(
             projectID: projectID,

@@ -187,6 +187,7 @@ final class AssistantNoteLinkSupportTests: XCTestCase {
             ownerID: ownerID,
             noteID: noteID,
             title: title,
+            noteType: .note,
             fileName: "\(noteID).md",
             updatedAt: Date(timeIntervalSince1970: 1_700_000_000),
             text: text

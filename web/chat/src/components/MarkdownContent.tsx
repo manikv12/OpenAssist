@@ -1,13 +1,17 @@
-import { memo, useCallback, useMemo } from "react";
+import { memo, useCallback, useEffect, useMemo, type CSSProperties } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { Components } from "react-markdown";
 import { CodeBlock } from "./CodeBlock";
 import { MermaidDiagram } from "./MermaidDiagram";
 import { normalizeMermaidSource } from "./mermaidUtils";
+import {
+  normalizeThreadNoteMarkdownForRichText,
+  resolveRenderedThreadNoteImage,
+} from "./threadNoteImageMarkdown";
 import { useIsStreaming } from "../StreamingContext";
 
-const codeTheme: Record<string, React.CSSProperties> = {
+const codeTheme: Record<string, CSSProperties> = {
   'code[class*="language-"]': {
     color: "var(--chat-code-text)",
     fontFamily: '"SF Mono", SFMono-Regular, Menlo, Monaco, Consolas, monospace',
@@ -66,15 +70,29 @@ const remarkPlugins = [remarkGfm];
 function MarkdownContentInner({
   markdown,
   mermaidDisplayMode = "default",
+  onMermaidRenderErrorChange,
 }: {
   markdown: string;
   mermaidDisplayMode?: "default" | "noteCompact";
+  onMermaidRenderErrorChange?: (error: string | null) => void;
 }) {
   const isStreaming = useIsStreaming();
   const renderedMarkdown = useMemo(
-    () => normalizeMarkdownStructure(markdown),
-    [markdown]
+    () =>
+      normalizeThreadNoteMarkdownForRichText(
+        isStreaming ? markdown : normalizeMarkdownStructure(markdown)
+      ),
+    [isStreaming, markdown]
   );
+
+  useEffect(() => {
+    if (!onMermaidRenderErrorChange) {
+      return;
+    }
+    if (!/```mermaid/i.test(markdown)) {
+      onMermaidRenderErrorChange(null);
+    }
+  }, [markdown, onMermaidRenderErrorChange]);
 
   const handleLinkClick = useCallback(
     (e: React.MouseEvent<HTMLAnchorElement>) => {
@@ -104,11 +122,19 @@ function MarkdownContentInner({
       if (match) {
         const language = match[1].toLowerCase();
         if (language === "mermaid" || language.startsWith("mermaid")) {
+          if (isStreaming) {
+            return (
+              <pre className="streaming-mermaid-preview">
+                <code>{codeString}</code>
+              </pre>
+            );
+          }
           return (
             <MermaidDiagram
               code={normalizeMermaidSource(language, codeString)}
               displayMode={mermaidDisplayMode}
               isStreaming={isStreaming}
+              onRenderErrorChange={onMermaidRenderErrorChange}
             />
           );
         }
@@ -123,10 +149,53 @@ function MarkdownContentInner({
         </code>
       );
     },
+
+    img: ({ src, alt, title, ...props }) => {
+      const resolved = resolveRenderedThreadNoteImage(src ?? "");
+      const maxWidthStyle =
+        typeof resolved.width === "number"
+          ? ({
+              maxWidth: `${resolved.width}px`,
+              width: "100%",
+            } satisfies CSSProperties)
+          : undefined;
+      const normalizedTitle = title?.trim();
+
+      if (normalizedTitle) {
+        return (
+          <figure className="thread-note-rendered-image" style={maxWidthStyle}>
+            <img
+              {...props}
+              className="thread-note-rendered-image-media"
+              src={resolved.src}
+              alt={alt ?? ""}
+              title={normalizedTitle}
+            />
+            <figcaption className="thread-note-rendered-image-caption">
+              {normalizedTitle}
+            </figcaption>
+          </figure>
+        );
+      }
+
+      return (
+        <img
+          {...props}
+          className="thread-note-rendered-image-media"
+          src={resolved.src}
+          alt={alt ?? ""}
+          title={normalizedTitle}
+          style={maxWidthStyle}
+        />
+      );
+    },
   };
 
   return (
-    <ReactMarkdown remarkPlugins={remarkPlugins} components={components}>
+    <ReactMarkdown
+      remarkPlugins={isStreaming ? [] : remarkPlugins}
+      components={components}
+    >
       {renderedMarkdown}
     </ReactMarkdown>
   );

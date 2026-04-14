@@ -1,5 +1,6 @@
 import Foundation
 import Security
+import Vision
 
 enum MemoryEntryExplanationResult {
     case success(String)
@@ -38,6 +39,136 @@ struct SelectionAskPrompt: Equatable, Sendable {
 struct ThreadNoteChartPrompt: Equatable, Sendable {
     let systemPrompt: String
     let userPrompt: String
+}
+
+struct ThreadNoteOrganizePrompt: Equatable, Sendable {
+    let systemPrompt: String
+    let userPrompt: String
+}
+
+enum ThreadNoteScreenshotImportMode: String, Sendable {
+    case rawOCR
+    case cleanText
+    case cleanTextAndImage
+}
+
+struct ThreadNoteScreenshotImportPreparation: Equatable, Sendable {
+    let markdown: String
+    let rawText: String
+    let usedVision: Bool
+}
+
+enum ThreadNoteScreenshotImportPreparationResult {
+    case success(ThreadNoteScreenshotImportPreparation)
+    case failure(String)
+}
+
+struct BatchNotePlanPrompt: Equatable, Sendable {
+    let systemPrompt: String
+    let userPrompt: String
+}
+
+struct ProjectNoteTransferSuggestion: Equatable, Sendable {
+    let headingPath: [String]?
+    let insertedMarkdown: String
+    let reason: String
+}
+
+enum ProjectNoteTransferSuggestionResult {
+    case success(ProjectNoteTransferSuggestion)
+    case failure(String)
+}
+
+enum BatchNotePlanPromptBuilder {
+    static func makePrompt(
+        sourceNotes: [AssistantBatchNotePlanSourceContext]
+    ) -> BatchNotePlanPrompt {
+        let sourceBlock = sourceNotes.enumerated().map { index, source in
+            """
+            Source \(index + 1)
+            - ref: \(source.ref)
+            - title: \(snippet(source.title, limit: 180))
+            - type: \(source.noteType.rawValue)
+            - source_label: \(snippet(source.sourceLabel, limit: 80))
+            - markdown:
+            \(indented(snippet(source.markdown, limit: 10_000)))
+            """
+        }
+        .joined(separator: "\n\n")
+
+        let systemPrompt = """
+        You organize multiple notes into a clean note set for a non-technical user.
+        Output JSON only.
+        Do not wrap the JSON in markdown fences.
+        Keep important facts, decisions, tasks, examples, filenames, commands, and constraints.
+        Do not invent missing details.
+        Create exactly one note with noteType "master".
+        Allowed noteType values are: master, note, decision, task, reference, question.
+        Each note must keep a readable markdown body.
+        Do not include markdown links inside the note markdown. Return relationships through the links array instead.
+        Only use source note refs that were provided.
+        Only create links from a generated note to another generated note or to a provided source note.
+        Use this JSON shape exactly:
+        {
+          "notes": [
+            {
+              "tempId": "master-overview",
+              "title": "Project Master Note",
+              "noteType": "master",
+              "markdown": "# Summary\\n\\n...",
+              "sourceNoteRefs": ["S1", "S2"]
+            }
+          ],
+          "links": [
+            {
+              "fromTempId": "master-overview",
+              "toTarget": {
+                "kind": "proposed",
+                "ref": "decision-auth"
+              }
+            },
+            {
+              "fromTempId": "decision-auth",
+              "toTarget": {
+                "kind": "source",
+                "ref": "S2"
+              }
+            }
+          ]
+        }
+        """
+
+        let userPrompt = """
+        Reorganize these source notes into a clean shared project note set.
+
+        Goals:
+        - Create a master note plus supporting notes.
+        - Split content where it naturally belongs.
+        - Preserve detail without repeating the same information too many times.
+        - Use simple wording and clear headings.
+        - Keep the notes grounded in the provided source notes.
+
+        Source notes:
+        \(sourceBlock)
+        """
+
+        return BatchNotePlanPrompt(systemPrompt: systemPrompt, userPrompt: userPrompt)
+    }
+
+    private static func snippet(_ value: String, limit: Int) -> String {
+        let normalized = value
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard normalized.count > limit else { return normalized }
+        return String(normalized.prefix(max(0, limit - 3))) + "..."
+    }
+
+    private static func indented(_ value: String) -> String {
+        value
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map { "  \($0)" }
+            .joined(separator: "\n")
+    }
 }
 
 enum SelectionAskPromptBuilder {
@@ -241,7 +372,8 @@ enum ThreadNoteChartPromptBuilder {
         selectedText: String,
         parentMessageText: String,
         currentDraft: String? = nil,
-        styleInstruction: String? = nil
+        styleInstruction: String? = nil,
+        validationError: String? = nil
     ) -> ThreadNoteChartPrompt {
         let normalizedSelection = selectedText.trimmingCharacters(in: .whitespacesAndNewlines)
         let normalizedParentMessage = parentMessageText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -249,6 +381,9 @@ enum ThreadNoteChartPromptBuilder {
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .nonEmpty
         let normalizedStyleInstruction = styleInstruction?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nonEmpty
+        let normalizedValidationError = validationError?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .nonEmpty
 
@@ -297,18 +432,54 @@ enum ThreadNoteChartPromptBuilder {
         For flowcharts, if a subgraph label has spaces or punctuation, write it like subgraph Core["RAPID Core (shared)"].
         Do not write flowchart subgraph titles like subgraph Core[RAPID Core (shared)].
         Quote labels that contain punctuation such as parentheses, slashes, colons, or commas.
+        For flowchart node labels, always use quoted labels when punctuation appears, for example A["Check stacks (matching app)"].
+        Never write flowchart labels with raw parentheses inside square brackets, such as A[Check stacks (matching app)].
+        Prefer short labels over copying long parenthetical details from the source text.
         Use ASCII characters only.
+        If a current draft fails Mermaid rendering, fix the Mermaid syntax or unsupported constructs and return a corrected chart.
+        Prefer valid Mermaid syntax and compatibility over decorative extras.
 
         \(supportedTypes)
         """
 
+        let currentDraftSection = normalizedCurrentDraft.map {
+            """
+
+            Current chart draft:
+            \(snippet($0, limit: 14_000))
+            """
+        } ?? ""
+
         let userPrompt: String
-        if let normalizedStyleInstruction {
-            let currentDraftSection = normalizedCurrentDraft.map {
+        if let normalizedValidationError {
+            let styleSection = normalizedStyleInstruction.map {
                 """
 
-                Current chart draft:
-                \(snippet($0, limit: 14_000))
+                Requested style or chart preference:
+                \(snippet($0, limit: 1_200))
+                """
+            } ?? ""
+
+            userPrompt = """
+            Repair the Mermaid chart so it renders correctly.
+
+            Selected text:
+            \(snippet(normalizedSelection, limit: 10_000))
+
+            Full message context:
+            \(snippet(normalizedParentMessage, limit: 16_000))\(currentDraftSection)
+
+            Mermaid render error:
+            \(snippet(normalizedValidationError, limit: 1_600))\(styleSection)
+
+            Keep the chart faithful to the source content. Preserve the intended chart type when possible, but change the syntax or structure if needed to return valid Mermaid.
+            """
+        } else if normalizedCurrentDraft != nil {
+            let styleSection = normalizedStyleInstruction.map {
+                """
+
+                Change request:
+                \(snippet($0, limit: 1_200))
                 """
             } ?? ""
 
@@ -319,10 +490,9 @@ enum ThreadNoteChartPromptBuilder {
             \(snippet(normalizedSelection, limit: 10_000))
 
             Full message context:
-            \(snippet(normalizedParentMessage, limit: 16_000))\(currentDraftSection)
+            \(snippet(normalizedParentMessage, limit: 16_000))\(currentDraftSection)\(styleSection)
 
-            Change request:
-            \(snippet(normalizedStyleInstruction, limit: 1_200))
+            Return a fresh Mermaid version that stays true to the source content and renders correctly.
             """
         } else {
             userPrompt = """
@@ -339,6 +509,157 @@ enum ThreadNoteChartPromptBuilder {
         return ThreadNoteChartPrompt(
             systemPrompt: systemPrompt,
             userPrompt: userPrompt
+        )
+    }
+
+    private static func snippet(_ value: String, limit: Int) -> String {
+        let normalized = value
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard normalized.count > limit else { return normalized }
+        return String(normalized.prefix(max(0, limit - 3))) + "..."
+    }
+}
+
+enum ThreadNoteOrganizePromptBuilder {
+    static func makePrompt(
+        noteText: String,
+        selectedText: String? = nil,
+        styleInstruction: String? = nil
+    ) -> ThreadNoteOrganizePrompt {
+        let normalizedNoteText = noteText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedSelectedText = selectedText?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nonEmpty
+        let normalizedStyleInstruction = styleInstruction?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nonEmpty
+        let selectionMatchesWholeNote = normalizedSelectedText == normalizedNoteText
+
+        let systemPrompt = """
+        You organize thread notes for a non-technical user.
+        Output markdown only.
+        Use simple wording, clear headings, and readable bullet lists.
+        Keep the original detail level unless the source is clearly repetitive or noisy.
+        Preserve important facts, decisions, action items, constraints, examples, filenames, config names, commands, and environment names.
+        If the source already has useful bullets or sections, keep that structure or improve it instead of flattening it.
+        Do not compress many bullets or examples into one or two sentences.
+        Merge duplicates when helpful, but do not drop unique details.
+        Do not invent missing details.
+        Do not wrap the whole answer in a code fence.
+        """
+
+        let userPrompt: String
+        if let normalizedSelectedText {
+            let noteContextSection: String
+            if selectionMatchesWholeNote {
+                noteContextSection = ""
+            } else {
+                noteContextSection = """
+
+                Full note context (background only; use this to resolve references, but focus on organizing the selected content):
+                \(snippet(normalizedNoteText, limit: 14_000))
+                """
+            }
+
+            userPrompt = """
+            Reorganize this selected thread-note content into cleaner markdown without losing detail.
+
+            Selected markdown to reorganize:
+            \(snippet(normalizedSelectedText, limit: 24_000))\(noteContextSection)\(styleInstructionSection(normalizedStyleInstruction))
+
+            Keep the amount of detail close to the source. Preserve examples, lists, and step-by-step explanations when they carry useful information.
+            """
+        } else {
+            userPrompt = """
+            Reorganize this full thread note into cleaner markdown without losing detail.
+
+            Thread note markdown:
+            \(snippet(normalizedNoteText, limit: 24_000))\(styleInstructionSection(normalizedStyleInstruction))
+
+            Keep the amount of detail close to the source. Preserve examples, lists, and step-by-step explanations when they carry useful information.
+            """
+        }
+
+        return ThreadNoteOrganizePrompt(
+            systemPrompt: systemPrompt,
+            userPrompt: userPrompt
+        )
+    }
+
+    private static func snippet(_ value: String, limit: Int) -> String {
+        let normalized = value
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard normalized.count > limit else { return normalized }
+        return String(normalized.prefix(max(0, limit - 3))) + "..."
+    }
+
+    private static func styleInstructionSection(_ value: String?) -> String {
+        guard let value else { return "" }
+        return """
+
+        Requested formatting preference:
+        \(snippet(value, limit: 1_200))
+        """
+    }
+}
+
+enum ThreadNoteScreenshotImportPromptBuilder {
+    static func makePrompt(
+        recognizedText: String?,
+        styleInstruction: String? = nil
+    ) -> ThreadNoteOrganizePrompt {
+        let normalizedRecognizedText = recognizedText?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nonEmpty
+        let normalizedStyleInstruction = styleInstruction?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nonEmpty
+
+        let systemPrompt = """
+        You turn screenshot content into a clean note for a non-technical user.
+        Output markdown only.
+        Use simple wording, short headings, and readable bullets when they help.
+        Preserve concrete facts, names, numbers, commands, filenames, labels, and key wording from the screenshot.
+        If the screenshot looks like UI text, convert it into a useful note instead of copying visual layout details.
+        If the screenshot looks like a document, keep the important structure but remove obvious OCR noise.
+        Do not mention OCR unless the user asks.
+        Do not invent text that is not visible or strongly implied.
+        Do not wrap the whole answer in a code fence.
+        """
+
+        let recognizedTextSection = normalizedRecognizedText.map {
+            """
+
+            OCR text found in the screenshot:
+            \(snippet($0, limit: 14_000))
+            """
+        } ?? """
+
+        OCR text found in the screenshot:
+        (none)
+        """
+
+        let styleInstructionSection = normalizedStyleInstruction.map {
+            """
+
+            Requested formatting preference:
+            \(snippet($0, limit: 1_200))
+            """
+        } ?? ""
+
+        return ThreadNoteOrganizePrompt(
+            systemPrompt: systemPrompt,
+            userPrompt: """
+            Convert this screenshot into note-ready markdown.
+            \(recognizedTextSection)\(styleInstructionSection)
+
+            Focus on content that belongs in a note:
+            - the main text
+            - important labels or headings
+            - useful details the user will want to keep
+            """
         )
     }
 
@@ -511,6 +832,7 @@ actor MemoryEntryExplanationService {
     func organizeThreadNote(
         noteText: String,
         selectedText: String? = nil,
+        styleInstruction: String? = nil,
         onPartialText: (@Sendable (String) -> Void)? = nil
     ) async -> MemoryEntryExplanationResult {
         let normalizedNoteText = noteText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -526,42 +848,19 @@ actor MemoryEntryExplanationService {
             return .failure("Connect at least one provider first to organize notes with AI.")
         }
 
-        let systemPrompt = """
-        You organize thread notes for a non-technical user.
-        Output markdown only.
-        Use simple wording, short headings, and clear bullet points.
-        Keep important facts, decisions, action items, and constraints.
-        Do not invent missing details.
-        Do not wrap the whole answer in a code fence.
-        """
-
-        let userPrompt: String
-        if let normalizedSelectedText {
-            userPrompt = """
-            Organize this selected portion of a thread note into cleaner markdown.
-
-            Full note context:
-            \(snippet(normalizedNoteText, limit: 18_000))
-
-            Selected portion to organize:
-            \(snippet(normalizedSelectedText, limit: 12_000))
-            """
-        } else {
-            userPrompt = """
-            Organize this full thread note into cleaner markdown.
-
-            Note:
-            \(snippet(normalizedNoteText, limit: 18_000))
-            """
-        }
+        let prompt = ThreadNoteOrganizePromptBuilder.makePrompt(
+            noteText: normalizedNoteText,
+            selectedText: normalizedSelectedText,
+            styleInstruction: styleInstruction
+        )
 
         do {
             let request = try buildRequest(
                 configuration: resolved.configuration,
                 credential: resolved.credential,
-                systemPrompt: systemPrompt,
-                userPrompt: userPrompt,
-                maxOutputTokens: 520
+                systemPrompt: prompt.systemPrompt,
+                userPrompt: prompt.userPrompt,
+                maxOutputTokens: normalizedSelectedText == nil ? 2_200 : 1_800
             )
             return try await executeRequest(
                 request,
@@ -575,11 +874,161 @@ actor MemoryEntryExplanationService {
         }
     }
 
+    func prepareThreadNoteScreenshotImport(
+        attachment: AssistantAttachment,
+        outputMode: ThreadNoteScreenshotImportMode,
+        styleInstruction: String? = nil
+    ) async -> ThreadNoteScreenshotImportPreparationResult {
+        guard attachment.mimeType.lowercased().hasPrefix("image/") else {
+            return .failure("Use an image screenshot here.")
+        }
+
+        let recognizedText = recognizeScreenshotText(from: attachment.data)
+        let normalizedRecognizedText = recognizedText?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nonEmpty
+
+        if outputMode == .rawOCR {
+            guard let normalizedRecognizedText else {
+                return .failure(
+                    "I could not find readable text in that screenshot. Try a tighter selection or use Clean text with a vision-capable model."
+                )
+            }
+
+            return .success(
+                ThreadNoteScreenshotImportPreparation(
+                    markdown: normalizedRecognizedText,
+                    rawText: normalizedRecognizedText,
+                    usedVision: false
+                )
+            )
+        }
+
+        guard let resolved = await resolvedLiveConfiguration() else {
+            return .failure("Connect at least one provider first to clean screenshot text with AI.")
+        }
+
+        let normalizedStyleInstruction = styleInstruction?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nonEmpty
+        let prompt = ThreadNoteScreenshotImportPromptBuilder.makePrompt(
+            recognizedText: normalizedRecognizedText,
+            styleInstruction: normalizedStyleInstruction
+        )
+        let canUseVision = supportsVisionInput(configuration: resolved.configuration)
+
+        if !canUseVision, normalizedRecognizedText == nil {
+            return .failure(
+                "I could not find readable text in that screenshot, and the current model cannot read images directly. Try a tighter selection or choose a model with image input."
+            )
+        }
+
+        do {
+            let request: URLRequest
+            if canUseVision {
+                request = try buildRequest(
+                    configuration: resolved.configuration,
+                    credential: resolved.credential,
+                    systemPrompt: prompt.systemPrompt,
+                    userPrompt: prompt.userPrompt,
+                    maxOutputTokens: 1_400,
+                    imageData: attachment.data,
+                    imageMimeType: attachment.mimeType
+                )
+            } else {
+                request = try buildRequest(
+                    configuration: resolved.configuration,
+                    credential: resolved.credential,
+                    systemPrompt: prompt.systemPrompt,
+                    userPrompt: prompt.userPrompt,
+                    maxOutputTokens: 1_400
+                )
+            }
+
+            let result = try await executeRequest(
+                request,
+                configuration: resolved.configuration,
+                credential: resolved.credential,
+                emptyResultMessage: "Provider returned an empty screenshot note draft."
+            )
+
+            switch result {
+            case .success(let markdown):
+                let normalizedMarkdown = markdown
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !normalizedMarkdown.isEmpty else {
+                    return .failure("The screenshot preview came back empty. Please try again.")
+                }
+                return .success(
+                    ThreadNoteScreenshotImportPreparation(
+                        markdown: normalizedMarkdown,
+                        rawText: normalizedRecognizedText ?? "",
+                        usedVision: canUseVision
+                    )
+                )
+            case .failure(let message):
+                return .failure(message)
+            }
+        } catch {
+            return .failure("Could not build screenshot note request. Check provider base URL.")
+        }
+    }
+
+    func generateBatchNotePlan(
+        sourceNotes: [AssistantBatchNotePlanSourceContext]
+    ) async -> AssistantBatchNotePlanGenerationResult {
+        guard !sourceNotes.isEmpty else {
+            return .failure("Select at least one source note first.")
+        }
+
+        guard let resolved = await resolvedLiveConfiguration() else {
+            return .failure("Connect at least one provider first to organize notes with AI.")
+        }
+
+        let prompt = BatchNotePlanPromptBuilder.makePrompt(sourceNotes: sourceNotes)
+
+        do {
+            let request = try buildRequest(
+                configuration: resolved.configuration,
+                credential: resolved.credential,
+                systemPrompt: prompt.systemPrompt,
+                userPrompt: prompt.userPrompt,
+                maxOutputTokens: 3_000
+            )
+            let result = try await executeRequest(
+                request,
+                configuration: resolved.configuration,
+                credential: resolved.credential,
+                emptyResultMessage: "Provider returned an empty note plan."
+            )
+
+            switch result {
+            case .success(let response):
+                do {
+                    let parsed = try AssistantBatchNotePlanParser.parseResponse(
+                        response,
+                        allowedSourceRefs: Set(sourceNotes.map(\.ref))
+                    )
+                    return .success(parsed)
+                } catch {
+                    let message = (error as? LocalizedError)?.errorDescription
+                        ?? "AI returned a note plan in an unexpected format."
+                    return .failure(message)
+                }
+            case .failure(let message):
+                return .failure(message)
+            }
+        } catch {
+            return .failure("Could not build the batch note organization request. Check provider base URL.")
+        }
+    }
+
     func generateThreadNoteChart(
         selectedText: String,
         parentMessageText: String,
         currentDraft: String? = nil,
-        styleInstruction: String? = nil
+        styleInstruction: String? = nil,
+        validationError: String? = nil
     ) async -> MemoryEntryExplanationResult {
         let normalizedSelection = selectedText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !normalizedSelection.isEmpty else {
@@ -599,7 +1048,8 @@ actor MemoryEntryExplanationService {
             selectedText: normalizedSelection,
             parentMessageText: normalizedParentMessage,
             currentDraft: currentDraft,
-            styleInstruction: styleInstruction
+            styleInstruction: styleInstruction,
+            validationError: validationError
         )
 
         do {
@@ -618,6 +1068,93 @@ actor MemoryEntryExplanationService {
             )
         } catch {
             return .failure("Could not build chart generation request. Check provider base URL.")
+        }
+    }
+
+    func suggestProjectNoteTransfer(
+        selectedMarkdown: String,
+        sourceNoteTitle: String,
+        targetNoteTitle: String,
+        targetHeadingOutline: String,
+        targetNoteText: String
+    ) async -> ProjectNoteTransferSuggestionResult {
+        let normalizedSelection = selectedMarkdown.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedSelection.isEmpty else {
+            return .failure("Select some note content first.")
+        }
+
+        let normalizedTargetTitle = targetNoteTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedTargetTitle.isEmpty else {
+            return .failure("Choose a project note first.")
+        }
+
+        guard let resolved = await resolvedLiveConfiguration() else {
+            return .failure("Connect at least one provider first to place note content with AI.")
+        }
+
+        let normalizedSourceTitle = sourceNoteTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedOutline = targetHeadingOutline.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedTargetText = targetNoteText.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        let systemPrompt = """
+        You place selected thread-note content into an existing project note.
+        Output JSON only.
+        Do not wrap the JSON in markdown fences.
+        Do not invent facts.
+        You may lightly organize the selected markdown so it fits the target note better.
+        Keep the meaning, decisions, constraints, and action items intact.
+        Choose the single best heading path in the target note, or use "END" if no safe section fits.
+        Use this JSON shape exactly:
+        {
+          "headingPath": ["Heading", "Child Heading"] or "END",
+          "insertedMarkdown": "markdown to insert",
+          "reason": "short plain-language reason"
+        }
+        """
+
+        let userPrompt = """
+        Source thread note title:
+        \(snippet(normalizedSourceTitle.isEmpty ? "Untitled note" : normalizedSourceTitle, limit: 200))
+
+        Selected markdown to move or copy:
+        \(snippet(normalizedSelection, limit: 12_000))
+
+        Target project note title:
+        \(snippet(normalizedTargetTitle, limit: 200))
+
+        Target project note heading outline:
+        \(snippet(normalizedOutline.isEmpty ? "No headings yet." : normalizedOutline, limit: 5_000))
+
+        Target project note markdown:
+        \(snippet(normalizedTargetText, limit: 18_000))
+        """
+
+        do {
+            let request = try buildRequest(
+                configuration: resolved.configuration,
+                credential: resolved.credential,
+                systemPrompt: systemPrompt,
+                userPrompt: userPrompt,
+                maxOutputTokens: 720
+            )
+            let result = try await executeRequest(
+                request,
+                configuration: resolved.configuration,
+                credential: resolved.credential,
+                emptyResultMessage: "Provider returned an empty placement suggestion."
+            )
+
+            switch result {
+            case .success(let response):
+                guard let suggestion = parseProjectNoteTransferSuggestion(from: response) else {
+                    return .failure("AI returned a placement suggestion in an unexpected format.")
+                }
+                return .success(suggestion)
+            case .failure(let message):
+                return .failure(message)
+            }
+        } catch {
+            return .failure("Could not build project-note placement request. Check provider base URL.")
         }
     }
 
@@ -669,16 +1206,36 @@ actor MemoryEntryExplanationService {
         credential: ProviderCredential,
         systemPrompt: String,
         userPrompt: String,
-        maxOutputTokens: Int
+        maxOutputTokens: Int,
+        imageData: Data? = nil,
+        imageMimeType: String? = nil
     ) throws -> URLRequest {
         let trimmedSystemPrompt = systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
         let trimmedUserPrompt = userPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedImageMimeType = imageMimeType?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .nonEmpty ?? "image/png"
+        let imageDataURL = imageData.map {
+            "data:\(normalizedImageMimeType);base64,\($0.base64EncodedString())"
+        }
 
         let endpoint: URL?
         let payload: [String: Any]
         switch configuration.providerMode {
         case .openAI where isOAuth(credential):
             endpoint = URL(string: "https://chatgpt.com/backend-api/codex/responses")
+            let userContent: [[String: Any]]
+            if let imageDataURL {
+                userContent = [
+                    ["type": "input_text", "text": trimmedUserPrompt],
+                    ["type": "input_image", "image_url": imageDataURL]
+                ]
+            } else {
+                userContent = [
+                    ["type": "input_text", "text": trimmedUserPrompt]
+                ]
+            }
             payload = [
                 "model": configuration.model,
                 "store": false,
@@ -693,32 +1250,57 @@ actor MemoryEntryExplanationService {
                     ],
                     [
                         "role": "user",
-                        "content": [
-                            ["type": "input_text", "text": trimmedUserPrompt]
-                        ]
+                        "content": userContent
                     ]
                 ]
             ]
         case .anthropic:
             endpoint = anthropicMessagesEndpoint(from: configuration.baseURL)
+            let userContent: [[String: Any]]
+            if let imageData {
+                userContent = [
+                    [
+                        "type": "image",
+                        "source": [
+                            "type": "base64",
+                            "media_type": normalizedImageMimeType,
+                            "data": imageData.base64EncodedString()
+                        ]
+                    ],
+                    ["type": "text", "text": trimmedUserPrompt]
+                ]
+            } else {
+                userContent = [
+                    ["type": "text", "text": trimmedUserPrompt]
+                ]
+            }
             payload = [
                 "model": configuration.model,
                 "system": trimmedSystemPrompt,
                 "messages": [
-                    ["role": "user", "content": trimmedUserPrompt]
+                    ["role": "user", "content": userContent]
                 ],
                 "temperature": 0.2,
                 "max_tokens": maxOutputTokens
             ]
         case .openAI, .google, .openRouter, .groq, .ollama:
             endpoint = openAICompatibleEndpoint(from: configuration.baseURL)
+            let userContent: Any
+            if let imageDataURL {
+                userContent = [
+                    ["type": "text", "text": trimmedUserPrompt],
+                    ["type": "image_url", "image_url": ["url": imageDataURL]]
+                ]
+            } else {
+                userContent = trimmedUserPrompt
+            }
             payload = [
                 "model": configuration.model,
                 "temperature": 0.2,
                 "max_tokens": maxOutputTokens,
                 "messages": [
                     ["role": "system", "content": trimmedSystemPrompt],
-                    ["role": "user", "content": trimmedUserPrompt]
+                    ["role": "user", "content": userContent]
                 ]
             ]
         }
@@ -776,6 +1358,79 @@ actor MemoryEntryExplanationService {
         return request
     }
 
+    private func recognizeScreenshotText(from imageData: Data) -> String? {
+        let request = VNRecognizeTextRequest()
+        request.recognitionLevel = .accurate
+        request.usesLanguageCorrection = true
+
+        do {
+            let handler = VNImageRequestHandler(data: imageData, options: [:])
+            try handler.perform([request])
+        } catch {
+            return nil
+        }
+
+        let observations = (request.results ?? []).sorted { lhs, rhs in
+            let leftTop = lhs.boundingBox.maxY
+            let rightTop = rhs.boundingBox.maxY
+            if abs(leftTop - rightTop) < 0.03 {
+                return lhs.boundingBox.minX < rhs.boundingBox.minX
+            }
+            return leftTop > rightTop
+        }
+
+        let lines = observations.compactMap { observation in
+            observation.topCandidates(1).first?
+                .string
+                .replacingOccurrences(of: "\r\n", with: "\n")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .nonEmpty
+        }
+
+        let normalized = lines.joined(separator: "\n")
+            .replacingOccurrences(
+                of: #"\n{3,}"#,
+                with: "\n\n",
+                options: .regularExpression
+            )
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return normalized.nonEmpty
+    }
+
+    private func supportsVisionInput(configuration: LiveConfiguration) -> Bool {
+        let normalizedModel = configuration.model
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+
+        if normalizedModel.contains("vision")
+            || normalizedModel.contains("gpt-4o")
+            || normalizedModel.contains("gpt-4.1")
+            || normalizedModel.contains("gemini")
+            || normalizedModel.contains("claude-3")
+            || normalizedModel.contains("claude-4")
+            || normalizedModel.contains("sonnet-4")
+            || normalizedModel.contains("opus-4")
+            || normalizedModel.contains("haiku-3")
+            || normalizedModel.contains("llava")
+            || normalizedModel.contains("pixtral")
+            || normalizedModel.contains("gemma-3")
+            || normalizedModel.contains("gemma3")
+            || normalizedModel.contains("vl") {
+            return true
+        }
+
+        switch configuration.providerMode {
+        case .google:
+            return normalizedModel.contains("gemini")
+        case .anthropic:
+            return normalizedModel.contains("claude")
+        case .openAI:
+            return normalizedModel.contains("gpt")
+        case .openRouter, .groq, .ollama:
+            return false
+        }
+    }
+
     private func executeRequest(
         _ request: URLRequest,
         configuration: LiveConfiguration,
@@ -814,7 +1469,11 @@ actor MemoryEntryExplanationService {
 
         let content: String
         if isStreamingCodex {
-            content = decodeSSEContent(data: data)
+            content =
+                streamingResponse.streamedText?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .nonEmpty
+                ?? decodeSSEContent(data: data)
         } else if configuration.providerMode == .anthropic {
             content = decodeAnthropicContent(data: data)
         } else {
@@ -971,6 +1630,72 @@ actor MemoryEntryExplanationService {
         }
 
         return configurations
+    }
+
+    private func parseProjectNoteTransferSuggestion(
+        from response: String
+    ) -> ProjectNoteTransferSuggestion? {
+        let trimmed = response.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return nil
+        }
+
+        let candidates = [trimmed, extractJSONObject(from: trimmed)].compactMap { $0 }
+
+        for candidate in candidates {
+            guard let data = candidate.data(using: .utf8),
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                continue
+            }
+
+            let insertedMarkdown = (json["insertedMarkdown"] as? String)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let insertedMarkdown, !insertedMarkdown.isEmpty else {
+                continue
+            }
+
+            let reason = (json["reason"] as? String)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .nonEmpty
+                ?? "This location fits the target note structure."
+
+            let headingPath: [String]?
+            if let headingPathString = (json["headingPath"] as? String)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .nonEmpty {
+                headingPath = headingPathString.caseInsensitiveCompare("END") == .orderedSame
+                    ? nil
+                    : [headingPathString]
+            } else if let headingPathValues = json["headingPath"] as? [Any] {
+                let normalizedPath = headingPathValues.compactMap {
+                    ($0 as? String)?
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                        .nonEmpty
+                }
+                headingPath = normalizedPath.isEmpty ? nil : normalizedPath
+            } else {
+                headingPath = nil
+            }
+
+            return ProjectNoteTransferSuggestion(
+                headingPath: headingPath,
+                insertedMarkdown: insertedMarkdown,
+                reason: reason
+            )
+        }
+
+        return nil
+    }
+
+    private func extractJSONObject(from value: String) -> String? {
+        guard let start = value.firstIndex(of: "{"),
+              let end = value.lastIndex(of: "}") else {
+            return nil
+        }
+
+        let jsonSlice = value[start...end]
+        let normalized = jsonSlice.trimmingCharacters(in: .whitespacesAndNewlines)
+        return normalized.isEmpty ? nil : normalized
     }
 
     private func sanitizedConfiguration(
@@ -1211,34 +1936,14 @@ actor MemoryEntryExplanationService {
                   let event = (try? JSONSerialization.jsonObject(with: jsonData)) as? [String: Any] else {
                 continue
             }
-            // Responses API streaming: look for output_text.delta
-            if let delta = event["delta"] as? String {
-                textParts.append(delta)
-                continue
-            }
-            // Also check nested content delta
-            if let delta = event["delta"] as? [String: Any],
-               let text = delta["text"] as? String {
-                textParts.append(text)
-                continue
-            }
-            // Completed event with output_text
-            if let outputText = event["output_text"] as? String,
-               !outputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                return outputText
-            }
-            // Check for response.completed with full output
-            if let output = event["output"] as? [[String: Any]] {
-                let texts = output.compactMap { item -> String? in
-                    if let content = item["content"] as? [[String: Any]] {
-                        return content.compactMap { $0["text"] as? String }.joined()
-                    }
-                    return nil
+            if let extracted = StreamingTextResponseReader.extractText(fromEventPayload: event) {
+                let eventType = (event["type"] as? String)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .lowercased() ?? ""
+                if eventType == "response.completed" || eventType.hasSuffix(".done") {
+                    return extracted
                 }
-                let joined = texts.joined()
-                if !joined.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    return joined
-                }
+                textParts.append(extracted)
             }
         }
         return textParts.joined()

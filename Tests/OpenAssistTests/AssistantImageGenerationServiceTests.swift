@@ -180,7 +180,7 @@ final class AssistantImageGenerationServiceTests: XCTestCase {
         XCTAssertFalse(result.success)
         XCTAssertEqual(
             result.summary,
-            "Set a Google AI Studio API key in AI Studio to use Gemini image generation."
+            "Set a Google AI Studio API key in Settings > Models & Connections to use Gemini image generation."
         )
     }
 

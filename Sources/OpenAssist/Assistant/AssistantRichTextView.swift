@@ -361,7 +361,7 @@ final class AssistantRichTextContainerView: NSView, NSTextViewDelegate {
     }
 
     private func appendStreamingDelta(_ delta: String) {
-        guard let normalizedDelta = delta.nonEmpty else { return }
+        guard let normalizedDelta = delta.streamingDeltaPreservingWhitespace else { return }
         let attributedDelta = AssistantRichTextFormatter.attributedText(
             for: normalizedDelta,
             mode: .streamingPlain,

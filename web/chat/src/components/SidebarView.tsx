@@ -12,6 +12,7 @@ import {
 import type {
   AssistantSidebarCollapsedPreviewPane,
   AssistantSidebarNavItem,
+  AssistantSidebarNoteFolderItem,
   AssistantSidebarNoteItem,
   AssistantSidebarProjectItem,
   AssistantSidebarSessionItem,
@@ -73,8 +74,16 @@ const PROJECT_ICON_OPTIONS = [
   { label: "Use Brain Icon", symbol: "brain" },
 ];
 
+const SIDEBAR_ICON_ALIASES: Record<string, string> = {
+  clock: "workflow",
+};
+
 function sameSidebarID(left?: string | null, right?: string | null) {
-  return (left || "").trim().toLowerCase() === (right || "").trim().toLowerCase();
+  return normalizedSidebarKey(left) === normalizedSidebarKey(right);
+}
+
+function normalizedSidebarKey(value?: string | null) {
+  return (value || "").trim().toLowerCase();
 }
 
 function compactLabel(label: string, maxLength = 26) {
@@ -83,6 +92,234 @@ function compactLabel(label: string, maxLength = 26) {
     return trimmed;
   }
   return `${trimmed.slice(0, maxLength - 1).trimEnd()}…`;
+}
+
+function resolveSidebarIconSymbol(symbol: string) {
+  return SIDEBAR_ICON_ALIASES[symbol] ?? symbol;
+}
+
+type ProjectNoteTreeFolderRow = {
+  kind: "folder";
+  folder: AssistantSidebarNoteFolderItem;
+  depth: number;
+  isExpanded: boolean;
+};
+
+type ProjectNoteTreeNoteRow = {
+  kind: "note";
+  note: AssistantSidebarNoteItem;
+  depth: number;
+};
+
+type ProjectNoteTreeRow = ProjectNoteTreeFolderRow | ProjectNoteTreeNoteRow;
+
+function noteFolderPathLabel(path: string[]) {
+  return path.join(" / ");
+}
+
+function compareNoteFolders(
+  left: AssistantSidebarNoteFolderItem,
+  right: AssistantSidebarNoteFolderItem
+) {
+  const nameCompare = left.name.localeCompare(right.name, undefined, {
+    sensitivity: "base",
+  });
+  if (nameCompare !== 0) {
+    return nameCompare;
+  }
+  return left.id.localeCompare(right.id, undefined, { sensitivity: "base" });
+}
+
+function noteFolderSubtitle(folder: AssistantSidebarNoteFolderItem) {
+  const countParts = [];
+  if (folder.childFolderCount > 0) {
+    countParts.push(
+      `${folder.childFolderCount} ${folder.childFolderCount === 1 ? "folder" : "folders"}`
+    );
+  }
+  if (folder.noteCount > 0) {
+    countParts.push(`${folder.noteCount} ${folder.noteCount === 1 ? "note" : "notes"}`);
+  }
+  return (
+    countParts.join(" · ") ||
+    (folder.path.length > 1 ? folder.path.slice(0, -1).join(" / ") : "Empty folder")
+  );
+}
+
+function buildProjectNoteFolderPanel({
+  folders,
+  notes,
+  activeFolderId,
+}: {
+  folders: AssistantSidebarNoteFolderItem[];
+  notes: AssistantSidebarNoteItem[];
+  activeFolderId?: string | null;
+}) {
+  const folderById = new Map(
+    folders.map((folder) => [normalizedSidebarKey(folder.id), folder] as const)
+  );
+  const childFoldersByParent = new Map<string, AssistantSidebarNoteFolderItem[]>();
+  const notesByFolder = new Map<string, AssistantSidebarNoteItem[]>();
+
+  for (const folder of folders) {
+    const parentKey = normalizedSidebarKey(folder.parentId);
+    const siblings = childFoldersByParent.get(parentKey) ?? [];
+    siblings.push(folder);
+    childFoldersByParent.set(parentKey, siblings);
+  }
+
+  for (const siblings of childFoldersByParent.values()) {
+    siblings.sort(compareNoteFolders);
+  }
+
+  for (const note of notes) {
+    const folderKey = normalizedSidebarKey(note.folderId);
+    const siblings = notesByFolder.get(folderKey) ?? [];
+    siblings.push(note);
+    notesByFolder.set(folderKey, siblings);
+  }
+
+  const currentFolder = folderById.get(normalizedSidebarKey(activeFolderId)) ?? null;
+  const currentFolderKey = normalizedSidebarKey(currentFolder?.id);
+  const parentFolder = currentFolder?.parentId
+    ? folderById.get(normalizedSidebarKey(currentFolder.parentId)) ?? null
+    : null;
+
+  return {
+    currentFolder,
+    parentFolder,
+    childFolders: childFoldersByParent.get(currentFolderKey) ?? [],
+    notes: notesByFolder.get(currentFolderKey) ?? [],
+  };
+}
+
+function buildProjectNoteTree({
+  folders,
+  notes,
+  search,
+}: {
+  folders: AssistantSidebarNoteFolderItem[];
+  notes: AssistantSidebarNoteItem[];
+  search: string;
+}): ProjectNoteTreeRow[] {
+  const normalizedSearch = search.trim().toLowerCase();
+  const folderById = new Map(
+    folders.map((folder) => [normalizedSidebarKey(folder.id), folder] as const)
+  );
+  const childFoldersByParent = new Map<string, AssistantSidebarNoteFolderItem[]>();
+  const notesByFolder = new Map<string, AssistantSidebarNoteItem[]>();
+
+  const sortedFolders = [...folders].sort((left, right) => {
+    const leftLabel = noteFolderPathLabel(left.path);
+    const rightLabel = noteFolderPathLabel(right.path);
+    const pathCompare = leftLabel.localeCompare(rightLabel, undefined, {
+      sensitivity: "base",
+    });
+    if (pathCompare !== 0) {
+      return pathCompare;
+    }
+    return left.id.localeCompare(right.id, undefined, { sensitivity: "base" });
+  });
+
+  for (const folder of sortedFolders) {
+    const parentKey = normalizedSidebarKey(folder.parentId);
+    const siblings = childFoldersByParent.get(parentKey) ?? [];
+    siblings.push(folder);
+    childFoldersByParent.set(parentKey, siblings);
+  }
+
+  for (const note of notes) {
+    const folderKey = normalizedSidebarKey(note.folderId);
+    const siblings = notesByFolder.get(folderKey) ?? [];
+    siblings.push(note);
+    notesByFolder.set(folderKey, siblings);
+  }
+
+  const visibleFolderIds = new Set<string>();
+  const visibleNoteIds = new Set<string>();
+  const expandedFolderIds = new Set<string>();
+
+  if (normalizedSearch) {
+    for (const note of notes) {
+      const folder = folderById.get(normalizedSidebarKey(note.folderId));
+      const haystack = [
+        note.title,
+        note.subtitle,
+        note.sourceLabel,
+        folder?.name ?? "",
+        noteFolderPathLabel(note.folderPath),
+      ]
+        .join(" ")
+        .toLowerCase();
+      if (!haystack.includes(normalizedSearch)) {
+        continue;
+      }
+
+      visibleNoteIds.add(note.id);
+      let cursor = note.folderId;
+      while (cursor) {
+        const cursorKey = normalizedSidebarKey(cursor);
+        if (!cursorKey || visibleFolderIds.has(cursorKey)) {
+          break;
+        }
+        visibleFolderIds.add(cursorKey);
+        expandedFolderIds.add(cursorKey);
+        cursor = folderById.get(cursorKey)?.parentId;
+      }
+    }
+  } else {
+    for (const note of notes) {
+      visibleNoteIds.add(note.id);
+    }
+    for (const folder of folders) {
+      const folderKey = normalizedSidebarKey(folder.id);
+      visibleFolderIds.add(folderKey);
+      if (folder.isExpanded) {
+        expandedFolderIds.add(folderKey);
+      }
+    }
+  }
+
+  const rows: ProjectNoteTreeRow[] = [];
+
+  const visit = (parentId: string | undefined, depth: number) => {
+    const parentKey = normalizedSidebarKey(parentId);
+    const childFolders = childFoldersByParent.get(parentKey) ?? [];
+    const childNotes = notesByFolder.get(parentKey) ?? [];
+
+    for (const folder of childFolders) {
+      const folderKey = normalizedSidebarKey(folder.id);
+      if (normalizedSearch && !visibleFolderIds.has(folderKey)) {
+        continue;
+      }
+
+      const isExpanded = normalizedSearch ? true : expandedFolderIds.has(folderKey);
+      rows.push({
+        kind: "folder",
+        folder,
+        depth,
+        isExpanded,
+      });
+
+      if (isExpanded) {
+        visit(folder.id, depth + 1);
+      }
+    }
+
+    for (const note of childNotes) {
+      if (normalizedSearch && !visibleNoteIds.has(note.id)) {
+        continue;
+      }
+      rows.push({
+        kind: "note",
+        note,
+        depth,
+      });
+    }
+  };
+
+  visit(undefined, 0);
+  return rows;
 }
 
 export function SidebarView({
@@ -103,7 +340,16 @@ export function SidebarView({
   const [draggedProjectId, setDraggedProjectId] = useState<string | null>(null);
   const [dropTargetProjectId, setDropTargetProjectId] = useState<string | null>(null);
   const [rootDropActive, setRootDropActive] = useState(false);
+  const [draggedProjectNoteId, setDraggedProjectNoteId] = useState<string | null>(null);
+  const [draggedProjectNoteFolderId, setDraggedProjectNoteFolderId] = useState<string | null>(
+    null
+  );
+  const [dropTargetNoteFolderId, setDropTargetNoteFolderId] = useState<string | null>(null);
+  const [noteRootDropActive, setNoteRootDropActive] = useState(false);
   const [noteSearch, setNoteSearch] = useState("");
+  const [activeProjectNoteFolderId, setActiveProjectNoteFolderId] = useState<string | null>(
+    null
+  );
   const contextMenuRef = useRef<HTMLDivElement | null>(null);
   const collapsedPreviewCloseRef = useRef<number | null>(null);
   const sidebarScaleStyle = {
@@ -258,6 +504,22 @@ export function SidebarView({
     setNoteSearch("");
   }, [state?.selectedPane, state?.selectedNotesProjectId, state?.notesScope]);
 
+  useEffect(() => {
+    setActiveProjectNoteFolderId(null);
+  }, [state?.selectedNotesProjectId, state?.notesScope]);
+
+  useEffect(() => {
+    if (
+      !activeProjectNoteFolderId ||
+      (state?.noteFolders ?? []).some((folder) =>
+        sameSidebarID(folder.id, activeProjectNoteFolderId)
+      )
+    ) {
+      return;
+    }
+    setActiveProjectNoteFolderId(null);
+  }, [activeProjectNoteFolderId, state?.noteFolders]);
+
   if (!state) {
     return (
       <aside className="oa-react-sidebar" style={sidebarScaleStyle}>
@@ -287,6 +549,27 @@ export function SidebarView({
       x: event.clientX,
       y: event.clientY,
     });
+  };
+
+  const openAnchoredContextMenu = (
+    target: HTMLElement,
+    entries: SidebarContextMenuEntry[]
+  ) => {
+    if (!entries.length) {
+      closeContextMenu();
+      return;
+    }
+
+    const rect = target.getBoundingClientRect();
+    const x = rect.right - 4;
+    const y = rect.bottom + 6;
+
+    setContextMenu({
+      x,
+      y,
+      entries,
+    });
+    setContextMenuPosition({ x, y });
   };
 
   const dispatchContextMenuCommand = (entry: SidebarContextMenuAction) => {
@@ -331,14 +614,47 @@ export function SidebarView({
   );
   const isNotesPane = state.selectedPane === "notes";
   const notesSearch = noteSearch.trim().toLowerCase();
+  const isProjectNotesScope = state.notesScope === "project";
+  const projectNoteFolders = isProjectNotesScope ? state.noteFolders : [];
   const filteredNotes = notesSearch
     ? state.notes.filter((note) => {
-        const haystack = [note.title, note.subtitle, note.sourceLabel]
+        const haystack = [
+          note.title,
+          note.subtitle,
+          note.sourceLabel,
+          noteFolderPathLabel(note.folderPath),
+        ]
           .join(" ")
           .toLowerCase();
         return haystack.includes(notesSearch);
       })
     : state.notes;
+  const projectScopeNotes = filteredNotes.filter((note) => note.ownerKind === "project");
+  const visibleProjectNoteTreeRows =
+    isProjectNotesScope
+      ? buildProjectNoteTree({
+          folders: projectNoteFolders,
+          notes: projectScopeNotes,
+          search: noteSearch,
+        })
+      : [];
+  const activeProjectNoteFolderPanel = isProjectNotesScope
+    ? buildProjectNoteFolderPanel({
+        folders: projectNoteFolders,
+        notes: projectScopeNotes,
+        activeFolderId: activeProjectNoteFolderId,
+      })
+    : {
+        currentFolder: null,
+        parentFolder: null,
+        childFolders: [],
+        notes: [],
+      };
+  const activeProjectNoteFolder = activeProjectNoteFolderPanel.currentFolder;
+  const activeProjectNoteParentFolder = activeProjectNoteFolderPanel.parentFolder;
+  const visibleProjectNoteFolders = activeProjectNoteFolderPanel.childFolders;
+  const visibleProjectFolderNotes = activeProjectNoteFolderPanel.notes;
+  const isProjectNotesSearchActive = isProjectNotesScope && Boolean(notesSearch);
 
   const projectSectionContextMenuEntries = (): SidebarContextMenuEntry[] => {
     const entries: SidebarContextMenuEntry[] = [
@@ -685,10 +1001,202 @@ export function SidebarView({
     return entries;
   };
 
+  const threadSectionContextMenuEntries = (): SidebarContextMenuEntry[] => [
+    {
+      kind: "action",
+      id: "new-thread",
+      label: "New Thread",
+      symbol: "plus",
+      disabled: !state.canCreateThread,
+      command: "newThread",
+    },
+    {
+      kind: "action",
+      id: "new-temporary-thread",
+      label: "New Temporary Chat",
+      symbol: "eye.slash",
+      disabled: !state.canCreateThread,
+      command: "newTemporaryThread",
+    },
+  ];
+
+  const sortedNoteFolders = [...projectNoteFolders].sort((left, right) =>
+    noteFolderPathLabel(left.path).localeCompare(noteFolderPathLabel(right.path), undefined, {
+      sensitivity: "base",
+    })
+  );
+
+  const noteFolderMenuEntries = (
+    folder: AssistantSidebarNoteFolderItem
+  ): SidebarContextMenuEntry[] => [
+    {
+      kind: "action",
+      id: `folder-new-note-${folder.id}`,
+      label: "New Note Here",
+      symbol: "note.text.badge.plus",
+      command: "createSidebarNote",
+      payload: { folderId: folder.id },
+    },
+    {
+      kind: "action",
+      id: `folder-new-subfolder-${folder.id}`,
+      label: "New Subfolder",
+      symbol: "folder.badge.plus",
+      command: "createNoteFolderPrompt",
+      payload: { parentFolderId: folder.id },
+    },
+    { kind: "separator", id: `folder-edit-divider-${folder.id}` },
+    {
+      kind: "action",
+      id: `folder-rename-${folder.id}`,
+      label: "Rename Folder",
+      symbol: "pencil",
+      command: "renameNoteFolderPrompt",
+      payload: { folderId: folder.id },
+    },
+    {
+      kind: "action",
+      id: `folder-move-${folder.id}`,
+      label: "Move Folder",
+      symbol: "arrow.up.and.down.and.arrow.left.and.right",
+      command: "moveNoteFolderPrompt",
+      payload: { folderId: folder.id },
+    },
+    {
+      kind: "action",
+      id: `folder-delete-${folder.id}`,
+      label: "Delete Folder",
+      symbol: "trash",
+      destructive: true,
+      disabled: folder.childFolderCount > 0 || folder.noteCount > 0,
+      command: "deleteNoteFolder",
+      payload: { folderId: folder.id },
+    },
+  ];
+
+  const projectNoteContextMenuEntries = (
+    note: AssistantSidebarNoteItem
+  ): SidebarContextMenuEntry[] => {
+    const moveEntries: SidebarContextMenuEntry[] = sortedNoteFolders.length
+      ? sortedNoteFolders.map((folder) => ({
+          kind: "action" as const,
+          id: `move-note-${note.id}-${folder.id}`,
+          label: noteFolderPathLabel(folder.path),
+          symbol: "folder",
+          disabled: sameSidebarID(note.folderId, folder.id),
+          command: "moveSidebarProjectNote",
+          payload: { noteId: note.noteId, folderId: folder.id },
+        }))
+      : [
+          {
+            kind: "note",
+            id: `move-note-empty-${note.id}`,
+            label: "No note folders yet",
+          },
+        ];
+
+    return [
+      {
+        kind: "submenu",
+        id: `move-note-folder-submenu-${note.id}`,
+        label: "Move to Folder",
+        symbol: "folder",
+        entries: moveEntries,
+      },
+      {
+        kind: "action",
+        id: `move-note-root-${note.id}`,
+        label: "Move to Top Level",
+        symbol: "arrow.up.left.and.arrow.down.right",
+        disabled: !note.folderId,
+        command: "moveSidebarProjectNote",
+        payload: { noteId: note.noteId, folderId: "" },
+      },
+      { kind: "separator", id: `note-actions-divider-${note.id}` },
+      {
+        kind: "action",
+        id: `delete-note-${note.id}`,
+        label: "Delete Note",
+        symbol: "trash",
+        destructive: true,
+        command: "deleteSidebarProjectNote",
+        payload: {
+          ownerKind: note.ownerKind,
+          ownerId: note.ownerId,
+          noteId: note.noteId,
+        },
+      },
+    ];
+  };
+
+  const notesSectionContextMenuEntries = (): SidebarContextMenuEntry[] => {
+    const canOrganizeProjectNotes =
+      isProjectNotesScope && Boolean(state.selectedNotesProjectId);
+
+    if (activeProjectNoteFolder && !isProjectNotesSearchActive) {
+      return [
+        {
+          kind: "action",
+          id: "create-project-note-current-folder",
+          label: "New Note Here",
+          symbol: "note.text.badge.plus",
+          disabled: !canOrganizeProjectNotes,
+          command: "createSidebarNote",
+          payload: { folderId: activeProjectNoteFolder.id },
+        },
+        {
+          kind: "action",
+          id: "create-project-note-root",
+          label: "New Note at Top Level",
+          symbol: "arrow.up.left.and.arrow.down.right",
+          disabled: !canOrganizeProjectNotes,
+          command: "createSidebarNote",
+        },
+        {
+          kind: "action",
+          id: "create-project-note-folder-current",
+          label: "New Subfolder",
+          symbol: "folder.badge.plus",
+          disabled: !canOrganizeProjectNotes,
+          command: "createNoteFolderPrompt",
+          payload: { parentFolderId: activeProjectNoteFolder.id },
+        },
+        { kind: "separator", id: "current-folder-divider" },
+        ...noteFolderMenuEntries(activeProjectNoteFolder).slice(2),
+      ];
+    }
+
+    return [
+      {
+        kind: "action",
+        id: "create-project-note-root",
+        label: "New Note",
+        symbol: "note.text.badge.plus",
+        disabled: !canOrganizeProjectNotes,
+        command: "createSidebarNote",
+      },
+      {
+        kind: "action",
+        id: "create-project-note-folder-root",
+        label: "New Folder",
+        symbol: "folder.badge.plus",
+        disabled: !canOrganizeProjectNotes,
+        command: "createNoteFolderPrompt",
+      },
+    ];
+  };
+
   const resetProjectDragState = () => {
     setDraggedProjectId(null);
     setDropTargetProjectId(null);
     setRootDropActive(false);
+  };
+
+  const resetProjectNoteDragState = () => {
+    setDraggedProjectNoteId(null);
+    setDraggedProjectNoteFolderId(null);
+    setDropTargetNoteFolderId(null);
+    setNoteRootDropActive(false);
   };
 
   const handleProjectDragStart = (
@@ -739,6 +1247,51 @@ export function SidebarView({
     closeContextMenu();
     onDispatchCommand("moveProjectToRoot", { projectId });
     resetProjectDragState();
+  };
+
+  const handleProjectNoteDragStart = (
+    event: ReactDragEvent<HTMLElement>,
+    note: AssistantSidebarNoteItem
+  ) => {
+    event.dataTransfer.effectAllowed = "move";
+    event.dataTransfer.setData("text/plain", note.noteId);
+    setDraggedProjectNoteId(note.noteId);
+    setDraggedProjectNoteFolderId(note.folderId ?? null);
+    setDropTargetNoteFolderId(null);
+    setNoteRootDropActive(false);
+    closeContextMenu();
+  };
+
+  const handleProjectNoteDropIntoFolder = (
+    event: ReactDragEvent<HTMLElement>,
+    folder: AssistantSidebarNoteFolderItem
+  ) => {
+    const noteId = draggedProjectNoteId ?? event.dataTransfer.getData("text/plain");
+    if (!noteId || sameSidebarID(draggedProjectNoteFolderId, folder.id)) {
+      resetProjectNoteDragState();
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    onDispatchCommand("moveSidebarProjectNote", {
+      noteId,
+      folderId: folder.id,
+    });
+    resetProjectNoteDragState();
+  };
+
+  const handleProjectNoteDropToRoot = (event: ReactDragEvent<HTMLElement>) => {
+    const noteId = draggedProjectNoteId ?? event.dataTransfer.getData("text/plain");
+    if (!noteId) {
+      resetProjectNoteDragState();
+      return;
+    }
+    event.preventDefault();
+    onDispatchCommand("moveSidebarProjectNote", {
+      noteId,
+      folderId: "",
+    });
+    resetProjectNoteDragState();
   };
 
   if (state.isCollapsed) {
@@ -912,9 +1465,21 @@ export function SidebarView({
                   className="oa-react-sidebar__icon-button oa-react-sidebar__new-thread"
                   onClick={() => {
                     closeContextMenu();
-                    onDispatchCommand("createSidebarNote");
+                    onDispatchCommand(
+                      "createSidebarNote",
+                      activeProjectNoteFolder && !isProjectNotesSearchActive
+                        ? { folderId: activeProjectNoteFolder.id }
+                        : undefined
+                    );
                   }}
-                  title="New project note"
+                  onContextMenu={(event) =>
+                    openContextMenu(event, notesSectionContextMenuEntries())
+                  }
+                  title={
+                    activeProjectNoteFolder && !isProjectNotesSearchActive
+                      ? `New note in ${activeProjectNoteFolder.name}`
+                      : "New project note"
+                  }
                 >
                   <SidebarIcon symbol="plus" />
                 </button>
@@ -961,12 +1526,255 @@ export function SidebarView({
               />
             </div>
 
-            {filteredNotes.length ? (
+            {isProjectNotesScope && draggedProjectNoteId && draggedProjectNoteFolderId ? (
+              <div
+                className={`oa-react-sidebar__drop-target ${
+                  noteRootDropActive ? "is-active" : ""
+                }`}
+                onDragOver={(event) => {
+                  event.preventDefault();
+                  event.dataTransfer.dropEffect = "move";
+                  setNoteRootDropActive(true);
+                  setDropTargetNoteFolderId(null);
+                }}
+                onDragLeave={() => {
+                  setNoteRootDropActive(false);
+                }}
+                onDrop={handleProjectNoteDropToRoot}
+              >
+                Drop here to move this note to the top level
+              </div>
+            ) : null}
+
+            {isProjectNotesScope ? (
+              isProjectNotesSearchActive ? (
+                visibleProjectNoteTreeRows.length ? (
+                  <div className="oa-react-sidebar__list">
+                    {visibleProjectNoteTreeRows.map((row) =>
+                      row.kind === "folder" ? (
+                        <SidebarNoteFolderRow
+                          key={row.folder.id}
+                          folder={row.folder}
+                          depth={row.depth}
+                          chevronSymbol={row.isExpanded ? "chevron.down" : "chevron.right"}
+                          onClick={() => {
+                            closeContextMenu();
+                            setNoteSearch("");
+                            setActiveProjectNoteFolderId(row.folder.id);
+                          }}
+                          onContextMenu={(event) =>
+                            openContextMenu(event, noteFolderMenuEntries(row.folder))
+                          }
+                          onDragOver={(event) => {
+                            if (
+                              !draggedProjectNoteId ||
+                              sameSidebarID(draggedProjectNoteFolderId, row.folder.id)
+                            ) {
+                              return;
+                            }
+                            event.preventDefault();
+                            event.stopPropagation();
+                            event.dataTransfer.dropEffect = "move";
+                            setDropTargetNoteFolderId(row.folder.id);
+                            setNoteRootDropActive(false);
+                          }}
+                          onDragLeave={() => {
+                            if (sameSidebarID(dropTargetNoteFolderId, row.folder.id)) {
+                              setDropTargetNoteFolderId(null);
+                            }
+                          }}
+                          onDrop={(event) => handleProjectNoteDropIntoFolder(event, row.folder)}
+                          isDropTarget={sameSidebarID(dropTargetNoteFolderId, row.folder.id)}
+                        />
+                      ) : (
+                        <SidebarNoteRow
+                          key={row.note.id}
+                          note={row.note}
+                          depth={row.depth}
+                          draggable
+                          onClick={() => {
+                            closeContextMenu();
+                            onDispatchCommand("selectSidebarNote", {
+                              ownerKind: row.note.ownerKind,
+                              ownerId: row.note.ownerId,
+                              noteId: row.note.noteId,
+                            });
+                          }}
+                          onContextMenu={(event) =>
+                            openContextMenu(event, projectNoteContextMenuEntries(row.note))
+                          }
+                          onDragStart={(event) => handleProjectNoteDragStart(event, row.note)}
+                          onDragEnd={resetProjectNoteDragState}
+                        />
+                      )
+                    )}
+                  </div>
+                ) : (
+                  <div className="oa-react-sidebar__empty">
+                    {noteSearch.trim()
+                      ? `No notes match "${noteSearch.trim()}".`
+                      : "No project notes or folders yet."}
+                  </div>
+                )
+              ) : (
+                <div className="oa-react-sidebar__notes-folder-shell">
+                  {activeProjectNoteFolder ? (
+                    <div className="oa-react-sidebar__notes-folder-header">
+                      <div className="oa-react-sidebar__notes-folder-topbar">
+                        <button
+                          type="button"
+                          className="oa-react-sidebar__notes-folder-back"
+                          onClick={() => {
+                            closeContextMenu();
+                            setActiveProjectNoteFolderId(activeProjectNoteParentFolder?.id ?? null);
+                          }}
+                          title={
+                            activeProjectNoteParentFolder
+                              ? `Back to ${activeProjectNoteParentFolder.name}`
+                              : "Back to all project notes"
+                          }
+                        >
+                          <SidebarIcon symbol="chevron.left" />
+                          <span>
+                            {activeProjectNoteParentFolder
+                              ? activeProjectNoteParentFolder.name
+                              : "All notes"}
+                          </span>
+                        </button>
+
+                        <div className="oa-react-sidebar__notes-folder-actions">
+                          {state.canCreateProjectNote ? (
+                            <button
+                              type="button"
+                              className="oa-react-sidebar__icon-button oa-react-sidebar__notes-folder-action"
+                              onClick={() => {
+                                closeContextMenu();
+                                onDispatchCommand("createSidebarNote", {
+                                  folderId: activeProjectNoteFolder.id,
+                                });
+                              }}
+                              title={`New note in ${activeProjectNoteFolder.name}`}
+                            >
+                              <SidebarIcon symbol="plus" />
+                            </button>
+                          ) : null}
+
+                          <button
+                            type="button"
+                            className="oa-react-sidebar__icon-button oa-react-sidebar__notes-folder-action oa-react-sidebar__notes-folder-menu"
+                            onClick={(event) => {
+                              event.preventDefault();
+                              event.stopPropagation();
+                              openAnchoredContextMenu(
+                                event.currentTarget,
+                                noteFolderMenuEntries(activeProjectNoteFolder)
+                              );
+                            }}
+                            title={`Folder actions for ${activeProjectNoteFolder.name}`}
+                          >
+                            <SidebarIcon symbol="ellipsis" />
+                          </button>
+                        </div>
+                      </div>
+
+                      <div className="oa-react-sidebar__notes-folder-current">
+                        <span className="oa-react-sidebar__notes-folder-label">Folder</span>
+                        <span className="oa-react-sidebar__notes-folder-title-row">
+                          <span className="oa-react-sidebar__notes-folder-icon">
+                            <SidebarIcon symbol="folder" />
+                          </span>
+                          <span className="oa-react-sidebar__notes-folder-title">
+                            {activeProjectNoteFolder.name}
+                          </span>
+                        </span>
+                        <span className="oa-react-sidebar__notes-folder-path">
+                          {noteFolderSubtitle(activeProjectNoteFolder)}
+                        </span>
+                      </div>
+                    </div>
+                  ) : null}
+
+                  {visibleProjectNoteFolders.length || visibleProjectFolderNotes.length ? (
+                    <div
+                      key={activeProjectNoteFolder?.id ?? "project-note-root"}
+                      className="oa-react-sidebar__notes-folder-panel"
+                    >
+                      <div className="oa-react-sidebar__list">
+                        {visibleProjectNoteFolders.map((folder) => (
+                          <SidebarNoteFolderRow
+                            key={folder.id}
+                            folder={folder}
+                            depth={0}
+                            chevronSymbol="chevron.right"
+                            onClick={() => {
+                              closeContextMenu();
+                              setActiveProjectNoteFolderId(folder.id);
+                            }}
+                            onContextMenu={(event) =>
+                              openContextMenu(event, noteFolderMenuEntries(folder))
+                            }
+                            onDragOver={(event) => {
+                              if (
+                                !draggedProjectNoteId ||
+                                sameSidebarID(draggedProjectNoteFolderId, folder.id)
+                              ) {
+                                return;
+                              }
+                              event.preventDefault();
+                              event.stopPropagation();
+                              event.dataTransfer.dropEffect = "move";
+                              setDropTargetNoteFolderId(folder.id);
+                              setNoteRootDropActive(false);
+                            }}
+                            onDragLeave={() => {
+                              if (sameSidebarID(dropTargetNoteFolderId, folder.id)) {
+                                setDropTargetNoteFolderId(null);
+                              }
+                            }}
+                            onDrop={(event) => handleProjectNoteDropIntoFolder(event, folder)}
+                            isDropTarget={sameSidebarID(dropTargetNoteFolderId, folder.id)}
+                          />
+                        ))}
+
+                        {visibleProjectFolderNotes.map((note) => (
+                          <SidebarNoteRow
+                            key={note.id}
+                            note={note}
+                            depth={0}
+                            draggable
+                            onClick={() => {
+                              closeContextMenu();
+                              onDispatchCommand("selectSidebarNote", {
+                                ownerKind: note.ownerKind,
+                                ownerId: note.ownerId,
+                                noteId: note.noteId,
+                              });
+                            }}
+                            onContextMenu={(event) =>
+                              openContextMenu(event, projectNoteContextMenuEntries(note))
+                            }
+                            onDragStart={(event) => handleProjectNoteDragStart(event, note)}
+                            onDragEnd={resetProjectNoteDragState}
+                          />
+                        ))}
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="oa-react-sidebar__empty">
+                      {activeProjectNoteFolder
+                        ? "This folder is empty."
+                        : "No project notes or folders yet."}
+                    </div>
+                  )}
+                </div>
+              )
+            ) : filteredNotes.length ? (
               <div className="oa-react-sidebar__list">
                 {filteredNotes.map((note) => (
                   <SidebarNoteRow
                     key={note.id}
                     note={note}
+                    depth={0}
                     onClick={() => {
                       closeContextMenu();
                       onDispatchCommand("selectSidebarNote", {
@@ -1020,9 +1828,12 @@ export function SidebarView({
                     closeContextMenu();
                     onDispatchCommand("newThread");
                   }}
+                  onContextMenu={(event) =>
+                    openContextMenu(event, threadSectionContextMenuEntries())
+                  }
                   title={
                     state.canCreateThread
-                      ? "New thread"
+                      ? "New thread. Right-click for a temporary chat."
                       : "You can't start a new thread right now."
                   }
                 >
@@ -1093,7 +1904,9 @@ export function SidebarView({
             onDispatchCommand("openAssistantSetup");
           }}
         >
-          <SidebarIcon symbol="gearshape" />
+          <span className="oa-react-sidebar__footer-icon">
+            <SidebarIcon symbol="gearshape" />
+          </span>
           <span>Settings</span>
         </button>
 
@@ -1107,7 +1920,9 @@ export function SidebarView({
             onDispatchCommand("setSelectedPane", { pane: "archived" });
           }}
         >
-          <SidebarIcon symbol="archivebox" />
+          <span className="oa-react-sidebar__footer-icon">
+            <SidebarIcon symbol="archivebox" />
+          </span>
           <span>Archived</span>
           {state.archivedCount > 0 ? (
             <span className="oa-react-sidebar__count">{state.archivedCount}</span>
@@ -1142,7 +1957,9 @@ const NavButton = memo(function NavButton({
       className={`oa-react-sidebar__nav-button ${isSelected ? "is-selected" : ""}`}
       onClick={onClick}
     >
-      <SidebarIcon symbol={item.symbol} />
+      <span className="oa-react-sidebar__nav-icon">
+        <SidebarIcon symbol={item.symbol} />
+      </span>
       <span>{item.label}</span>
     </button>
   );
@@ -1316,15 +2133,85 @@ const SessionRow = memo(function SessionRow({
   );
 });
 
+const SidebarNoteFolderRow = memo(function SidebarNoteFolderRow({
+  folder,
+  depth,
+  chevronSymbol = "chevron.right",
+  onClick,
+  onContextMenu,
+  onDragOver,
+  onDragLeave,
+  onDrop,
+  isDropTarget,
+}: {
+  folder: AssistantSidebarNoteFolderItem;
+  depth: number;
+  chevronSymbol?: string;
+  onClick: () => void;
+  onContextMenu: (event: ReactMouseEvent<HTMLButtonElement>) => void;
+  onDragOver: (event: ReactDragEvent<HTMLButtonElement>) => void;
+  onDragLeave: () => void;
+  onDrop: (event: ReactDragEvent<HTMLButtonElement>) => void;
+  isDropTarget: boolean;
+}) {
+  const style = {
+    paddingLeft: `calc(${10 + depth * 18}px * var(--oa-sidebar-scale))`,
+  } as CSSProperties;
+
+  return (
+    <button
+      type="button"
+      className={`oa-react-sidebar__row oa-react-sidebar__row--note-folder ${
+        isDropTarget ? "is-drop-target" : ""
+      }`}
+      style={style}
+      onClick={onClick}
+      onContextMenu={onContextMenu}
+      onDragOver={onDragOver}
+      onDragLeave={onDragLeave}
+      onDrop={onDrop}
+    >
+      <span className="oa-react-sidebar__row-folder-chevron">
+        <SidebarIcon symbol={chevronSymbol} />
+      </span>
+      <span className="oa-react-sidebar__row-icon">
+        <SidebarIcon symbol="folder" />
+      </span>
+      <span className="oa-react-sidebar__row-copy">
+        <span className="oa-react-sidebar__row-title-line">
+          <span className="oa-react-sidebar__row-title-wrap">
+            <span className="oa-react-sidebar__row-title">{folder.name}</span>
+          </span>
+        </span>
+        <span className="oa-react-sidebar__row-subtitle">{noteFolderSubtitle(folder)}</span>
+      </span>
+    </button>
+  );
+});
+
 const SidebarNoteRow = memo(function SidebarNoteRow({
   note,
+  depth = 0,
+  draggable = false,
   onClick,
+  onContextMenu,
+  onDragStart,
+  onDragEnd,
   onOpenThread,
 }: {
   note: AssistantSidebarNoteItem;
+  depth?: number;
+  draggable?: boolean;
   onClick: () => void;
+  onContextMenu?: (event: ReactMouseEvent<HTMLDivElement>) => void;
+  onDragStart?: (event: ReactDragEvent<HTMLDivElement>) => void;
+  onDragEnd?: () => void;
   onOpenThread?: () => void;
 }) {
+  const style = {
+    paddingLeft: `calc(${10 + depth * 18}px * var(--oa-sidebar-scale))`,
+  } as CSSProperties;
+
   return (
     <div
       role="button"
@@ -1332,7 +2219,12 @@ const SidebarNoteRow = memo(function SidebarNoteRow({
       className={`oa-react-sidebar__row oa-react-sidebar__row--note ${
         note.isSelected ? "is-selected" : ""
       }`}
+      style={style}
       onClick={onClick}
+      onContextMenu={onContextMenu}
+      draggable={draggable}
+      onDragStart={onDragStart}
+      onDragEnd={() => onDragEnd?.()}
       onKeyDown={(event) => {
         if (event.key === "Enter" || event.key === " ") {
           event.preventDefault();
@@ -1449,7 +2341,7 @@ function CollapsedSidebarRail({
               onClick={() => onDispatchCommand("setSelectedPane", { pane: "automations" })}
             />
             <CollapsedRailButton
-              symbol="sparkles"
+              symbol="skills"
               label="Skills"
               isSelected={state.selectedPane === "skills"}
               onMouseEnter={(event) =>
@@ -1512,7 +2404,9 @@ function CollapsedRailButton({
       title={label}
       aria-label={label}
     >
-      <SidebarIcon symbol={symbol} />
+      <span className="oa-react-sidebar__rail-icon">
+        <SidebarIcon symbol={symbol} />
+      </span>
     </button>
   );
 }
@@ -1535,7 +2429,14 @@ function CollapsedSidebarPreview({
   } as CSSProperties;
 
   const projectItems = state.projects.slice(0, 4);
-  const noteItems = state.notes.slice(0, 4);
+  const noteItems =
+    state.notesScope === "project"
+      ? buildProjectNoteTree({
+          folders: state.noteFolders,
+          notes: state.notes.filter((note) => note.ownerKind === "project"),
+          search: "",
+        }).slice(0, 4)
+      : state.notes.slice(0, 4);
   const threadItems = state.threads.slice(0, 4);
   const archivedItems = state.archived.slice(0, 4);
 
@@ -1610,42 +2511,107 @@ function CollapsedSidebarPreview({
       {preview.pane === "notes" ? (
         noteItems.length ? (
           <div className="oa-react-sidebar__collapsed-preview-list">
-            {noteItems.map((note) => (
-              <button
-                key={note.id}
-                type="button"
-                className={`oa-react-sidebar__collapsed-preview-row ${
-                  note.isSelected ? "is-selected" : ""
-                }`}
-                onClick={() => {
-                  onDispatchCommand("setSelectedPane", { pane: "notes" });
-                  onDispatchCommand("selectSidebarNote", {
-                    ownerKind: note.ownerKind,
-                    ownerId: note.ownerId,
-                    noteId: note.noteId,
-                  });
-                }}
-              >
-                <span className="oa-react-sidebar__collapsed-preview-icon">
-                  <SidebarIcon
-                    symbol={note.ownerKind === "project" ? "note.text" : "text.bubble"}
-                  />
-                </span>
-                <span className="oa-react-sidebar__collapsed-preview-copy">
-                  <span className="oa-react-sidebar__collapsed-preview-name">
-                    {note.title}
-                  </span>
-                  <span className="oa-react-sidebar__collapsed-preview-meta">
-                    {note.subtitle}
-                  </span>
-                </span>
-              </button>
-            ))}
+            {state.notesScope === "project"
+              ? (noteItems as ProjectNoteTreeRow[]).map((row) =>
+                  row.kind === "folder" ? (
+                    <button
+                      key={row.folder.id}
+                      type="button"
+                      className="oa-react-sidebar__collapsed-preview-row"
+                      style={{
+                        paddingLeft: `${12 + row.depth * 14}px`,
+                      }}
+                      onClick={() => {
+                        onDispatchCommand("setSelectedPane", { pane: "notes" });
+                        onDispatchCommand("toggleNoteFolderExpanded", {
+                          folderId: row.folder.id,
+                          expanded: !row.isExpanded,
+                        });
+                      }}
+                    >
+                      <span className="oa-react-sidebar__collapsed-preview-icon">
+                        <SidebarIcon symbol="folder" />
+                      </span>
+                      <span className="oa-react-sidebar__collapsed-preview-copy">
+                        <span className="oa-react-sidebar__collapsed-preview-name">
+                          {row.folder.name}
+                        </span>
+                        <span className="oa-react-sidebar__collapsed-preview-meta">
+                          {row.folder.noteCount === 1
+                            ? "1 note"
+                            : `${row.folder.noteCount} notes`}
+                        </span>
+                      </span>
+                    </button>
+                  ) : (
+                    <button
+                      key={row.note.id}
+                      type="button"
+                      className={`oa-react-sidebar__collapsed-preview-row ${
+                        row.note.isSelected ? "is-selected" : ""
+                      }`}
+                      style={{
+                        paddingLeft: `${12 + row.depth * 14}px`,
+                      }}
+                      onClick={() => {
+                        onDispatchCommand("setSelectedPane", { pane: "notes" });
+                        onDispatchCommand("selectSidebarNote", {
+                          ownerKind: row.note.ownerKind,
+                          ownerId: row.note.ownerId,
+                          noteId: row.note.noteId,
+                        });
+                      }}
+                    >
+                      <span className="oa-react-sidebar__collapsed-preview-icon">
+                        <SidebarIcon symbol="note.text" />
+                      </span>
+                      <span className="oa-react-sidebar__collapsed-preview-copy">
+                        <span className="oa-react-sidebar__collapsed-preview-name">
+                          {row.note.title}
+                        </span>
+                        <span className="oa-react-sidebar__collapsed-preview-meta">
+                          {row.note.subtitle}
+                        </span>
+                      </span>
+                    </button>
+                  )
+                )
+              : (noteItems as AssistantSidebarNoteItem[]).map((note) => (
+                  <button
+                    key={note.id}
+                    type="button"
+                    className={`oa-react-sidebar__collapsed-preview-row ${
+                      note.isSelected ? "is-selected" : ""
+                    }`}
+                    onClick={() => {
+                      onDispatchCommand("setSelectedPane", { pane: "notes" });
+                      onDispatchCommand("selectSidebarNote", {
+                        ownerKind: note.ownerKind,
+                        ownerId: note.ownerId,
+                        noteId: note.noteId,
+                      });
+                    }}
+                  >
+                    <span className="oa-react-sidebar__collapsed-preview-icon">
+                      <SidebarIcon
+                        symbol={note.ownerKind === "project" ? "note.text" : "text.bubble"}
+                      />
+                    </span>
+                    <span className="oa-react-sidebar__collapsed-preview-copy">
+                      <span className="oa-react-sidebar__collapsed-preview-name">
+                        {note.title}
+                      </span>
+                      <span className="oa-react-sidebar__collapsed-preview-meta">
+                        {note.subtitle}
+                      </span>
+                    </span>
+                  </button>
+                ))}
           </div>
         ) : (
           <div className="oa-react-sidebar__collapsed-preview-note">
             {state.notesScope === "project"
-              ? "No project notes yet."
+              ? "No project notes or folders yet."
               : "No thread notes yet for this project."}
           </div>
         )
@@ -1697,7 +2663,7 @@ function CollapsedSidebarPreview({
 
       {preview.pane === "skills" ? (
         <div className="oa-react-sidebar__collapsed-preview-note">
-          Hover preview is not available here yet. Click the sparkles icon to open skills.
+          Hover preview is not available here yet. Click the skills icon to open skills.
         </div>
       ) : null}
     </div>
@@ -1741,7 +2707,7 @@ function CollapsedSessionPreviewRow({
 function SidebarIcon({ symbol }: { symbol: string }) {
   return (
     <AppIcon
-      symbol={symbol}
+      symbol={resolveSidebarIconSymbol(symbol)}
       className="oa-react-sidebar__icon-svg"
       strokeWidth={1.9}
     />
