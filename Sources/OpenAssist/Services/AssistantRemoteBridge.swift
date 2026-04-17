@@ -277,14 +277,19 @@ final class AssistantRemoteBridge {
     func sendPrompt(
         _ prompt: String,
         sessionID: String?,
-        selectedPluginIDs: [String] = []
+        selectedPluginIDs: [String] = [],
+        oneShotInstructions: String? = nil
     ) async -> AssistantRemoteSessionSnapshot? {
         if let sessionID = sessionID?.trimmingCharacters(in: .whitespacesAndNewlines),
            !sessionID.isEmpty {
             _ = await openSession(sessionID: sessionID)
         }
 
-        await assistant.sendPrompt(prompt, selectedPluginIDs: selectedPluginIDs)
+        await assistant.sendPrompt(
+            prompt,
+            selectedPluginIDs: selectedPluginIDs,
+            oneShotInstructions: oneShotInstructions
+        )
         guard let activeSessionID = assistant.selectedSessionID else { return nil }
         return await assistant.remoteSessionSnapshot(sessionID: activeSessionID)
     }

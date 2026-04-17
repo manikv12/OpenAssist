@@ -207,9 +207,20 @@ enum TelegramRemoteRenderer {
         let activeCalls = snapshot.toolCalls
         let recentCalls = snapshot.recentToolCalls
 
-        guard !activeCalls.isEmpty || !recentCalls.isEmpty else { return nil }
+        guard snapshot.hasActiveTurn || !activeCalls.isEmpty || !recentCalls.isEmpty else { return nil }
 
         var lines = ["Tool activity", ""]
+
+        if snapshot.pendingPermissionRequest != nil {
+            lines.append("Status: Waiting for your answer.")
+            lines.append("")
+        } else if snapshot.hasActiveTurn {
+            lines.append("Status: Working...")
+            if activeCalls.isEmpty && recentCalls.isEmpty {
+                lines.append("The assistant is still thinking.")
+            }
+            lines.append("")
+        }
 
         if !activeCalls.isEmpty {
             lines.append("Active:")
@@ -315,17 +326,51 @@ enum TelegramRemoteRenderer {
             let nextIndex = snapshot.transcriptEntries.index(after: lastUserIndex)
             currentTurnEntries = snapshot.transcriptEntries[nextIndex...]
         } else {
+            guard !snapshot.hasActiveTurn, snapshot.pendingPermissionRequest == nil else {
+                return nil
+            }
             currentTurnEntries = snapshot.transcriptEntries[...]
         }
 
-        if let latestAssistant = currentTurnEntries.last(where: { entry in
-            entry.role == .assistant && entry.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
-        }),
-           let cleanedText = AssistantVisibleTextSanitizer.clean(latestAssistant.text) {
+        let assistantCandidates = currentTurnEntries.compactMap { entry -> (entry: AssistantTranscriptEntry, cleanedText: String)? in
+            guard entry.role == .assistant,
+                  entry.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false,
+                  let cleanedText = AssistantVisibleTextSanitizer.clean(entry.text) else {
+                return nil
+            }
+            return (entry, cleanedText)
+        }
+
+        let preferredAssistant: (entry: AssistantTranscriptEntry, cleanedText: String)?
+        if snapshot.hasActiveTurn {
+            preferredAssistant = assistantCandidates.last
+        } else if !assistantCandidates.isEmpty {
+            let completedAssistants = assistantCandidates.filter { !$0.entry.isStreaming }
+            if let latestCompleted = completedAssistants.last {
+                if let longestCompleted = completedAssistants.max(by: { lhs, rhs in
+                    if lhs.cleanedText.count == rhs.cleanedText.count {
+                        return lhs.entry.createdAt < rhs.entry.createdAt
+                    }
+                    return lhs.cleanedText.count < rhs.cleanedText.count
+                }),
+                latestCompleted.cleanedText.count < 140,
+                longestCompleted.cleanedText.count >= max(latestCompleted.cleanedText.count * 2, 280) {
+                    preferredAssistant = longestCompleted
+                } else {
+                    preferredAssistant = latestCompleted
+                }
+            } else {
+                preferredAssistant = assistantCandidates.last
+            }
+        } else {
+            preferredAssistant = nil
+        }
+
+        if let preferredAssistant {
             return StreamPresentation(
-                text: cleanedText,
-                signaturePrefix: "assistant:\(latestAssistant.id.uuidString):\(latestAssistant.isStreaming)",
-                allowsOverflow: !latestAssistant.isStreaming && !snapshot.hasActiveTurn
+                text: preferredAssistant.cleanedText,
+                signaturePrefix: "assistant:\(preferredAssistant.entry.id.uuidString):\(preferredAssistant.entry.isStreaming)",
+                allowsOverflow: !preferredAssistant.entry.isStreaming && !snapshot.hasActiveTurn
             )
         }
 
@@ -340,10 +385,39 @@ enum TelegramRemoteRenderer {
             )
         }
 
+        if snapshot.hasActiveTurn || snapshot.pendingPermissionRequest != nil {
+            return nil
+        }
+
         return nil
     }
 
     static func permissionText(_ request: AssistantPermissionRequest) -> String {
+        if request.isStructuredApprovalPrompt {
+            var lines = [
+                "Approval needed:",
+                request.toolTitle
+            ]
+
+            if let rationale = request.rationale?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !rationale.isEmpty {
+                lines.append("")
+                lines.append(rationale)
+            } else if let prompt = request.userInputQuestions.first?.prompt.trimmingCharacters(in: .whitespacesAndNewlines),
+                      !prompt.isEmpty {
+                lines.append("")
+                lines.append(prompt)
+            }
+
+            if let summary = request.displayRawPayloadSummary?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !summary.isEmpty {
+                lines.append("")
+                lines.append(summary)
+            }
+
+            return lines.joined(separator: "\n")
+        }
+
         if request.hasStructuredUserInput {
             return """
             Open Assist needs your answer to continue.

@@ -1672,6 +1672,54 @@ struct AssistantPermissionRequest: Identifiable, Equatable, Codable, Sendable {
         return summary
     }
 
+    var requiresDesktopAppConfirmation: Bool {
+        let parts = (
+            [toolTitle, rationale, rawPayloadSummary]
+            + userInputQuestions.map(\.prompt)
+        )
+        .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty }
+        let normalized = Self.normalizedApprovalPromptText(parts.joined(separator: " "))
+        guard !normalized.isEmpty else { return false }
+
+        let strongSignals = [
+            "compose screen",
+            "draft ready",
+            "final click",
+            "ready to post",
+            "ready to publish",
+            "ready to send"
+        ]
+        if strongSignals.contains(where: normalized.contains) {
+            return true
+        }
+
+        let actionSignals = [
+            "send",
+            "post",
+            "publish",
+            "submit",
+            "share",
+            "tweet",
+            "comment",
+            "reply",
+            "message",
+            "email"
+        ]
+        let visualSignals = [
+            "compose",
+            "draft",
+            "preview",
+            "visible",
+            "screen",
+            "window",
+            "browser",
+            "app"
+        ]
+
+        guard actionSignals.contains(where: normalized.contains) else { return false }
+        return visualSignals.contains(where: normalized.contains)
+    }
+
     func structuredApprovalAnswers(approved: Bool) -> [String: [String]] {
         guard let question = userInputQuestions.first else { return [:] }
         if let matchingOption = Self.matchingStructuredApprovalOption(
@@ -6915,7 +6963,7 @@ final class AssistantStore: ObservableObject {
 
     func remoteSessionSnapshot(
         sessionID: String,
-        transcriptLimit: Int = 12
+        transcriptLimit: Int = 48
     ) async -> AssistantRemoteSessionSnapshot? {
         let normalizedSessionID = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !normalizedSessionID.isEmpty else { return nil }
@@ -6947,14 +6995,23 @@ final class AssistantStore: ObservableObject {
         let transcriptEntries: [AssistantTranscriptEntry]
         if sessionsMatch(transcriptSessionID, normalizedSessionID) {
             transcriptEntries = Array(transcript.suffix(transcriptLimit))
-        } else if let cachedEntries = transcriptEntriesBySessionID[normalizedSessionID],
-                  !cachedEntries.isEmpty {
-            transcriptEntries = Array(cachedEntries.suffix(transcriptLimit))
         } else {
-            transcriptEntries = await loadPersistedTranscript(
+            let cachedEntries = transcriptEntriesBySessionID[normalizedSessionID] ?? []
+            let persistedEntries = await loadPersistedTranscript(
                 sessionID: normalizedSessionID,
                 limit: transcriptLimit
             )
+
+            if cachedEntries.isEmpty {
+                transcriptEntries = persistedEntries
+            } else if persistedEntries.isEmpty {
+                transcriptEntries = Array(cachedEntries.suffix(transcriptLimit))
+            } else {
+                transcriptEntries = Array(
+                    mergeTranscriptHistory(cachedEntries, with: persistedEntries)
+                        .suffix(transcriptLimit)
+                )
+            }
         }
 
         let activitySnapshot = sessionActivitySnapshot(for: normalizedSessionID)
@@ -7856,7 +7913,8 @@ final class AssistantStore: ObservableObject {
     func sendPrompt(
         _ prompt: String,
         selectedPluginIDs: [String]? = nil,
-        automationJob: ScheduledJob? = nil
+        automationJob: ScheduledJob? = nil,
+        oneShotInstructions: String? = nil
     ) async {
         let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty || !attachments.isEmpty else { return }
@@ -7908,6 +7966,16 @@ final class AssistantStore: ObservableObject {
         }
         attachments = []
         promptDraft = ""
+        if let normalizedOneShotInstructions = oneShotInstructions?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nonEmpty {
+            oneShotSessionInstructions = [
+                oneShotSessionInstructions?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty,
+                normalizedOneShotInstructions
+            ]
+            .compactMap { $0 }
+            .joined(separator: "\n\n")
+        }
         let requestedPluginIDs = uniqueCodexPluginIDs(
             selectedPluginIDs ?? visibleSelectedComposerPlugins.map(\.pluginID)
         )
