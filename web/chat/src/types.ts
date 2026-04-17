@@ -11,6 +11,7 @@ export interface ChatMessage {
   canEdit?: boolean;
   rewriteAnchorID?: string;
   providerLabel?: string;
+  selectedPlugins?: AssistantComposerPlugin[];
   transitionState?: "removing" | "entering";
 
   // Activity-specific
@@ -482,6 +483,27 @@ export interface AssistantComposerSkill {
   isMissing: boolean;
 }
 
+export interface AssistantComposerPlugin {
+  pluginId: string;
+  displayName: string;
+  summary?: string;
+  needsSetup: boolean;
+}
+
+export interface AssistantComposerSlashCommand {
+  id: string;
+  label: string;
+  subtitle: string;
+  groupId: string;
+  groupLabel: string;
+  groupTone: string;
+  groupOrder: number;
+  searchKeywords?: string[];
+  insertText: string;
+  behavior: "insertText" | "localMode";
+  localMode?: "note" | "chat" | string;
+}
+
 export interface AssistantComposerState {
   draftText: string;
   placeholder: string;
@@ -493,9 +515,14 @@ export interface AssistantComposerState {
   noteModeHelperText?: string;
   showNoteModeButton: boolean;
   canOpenSkills: boolean;
+  canOpenPlugins: boolean;
   preflightStatusMessage?: string;
   activeSkills: AssistantComposerSkill[];
+  selectedPlugins: AssistantComposerPlugin[];
+  availablePlugins: AssistantComposerPlugin[];
   attachments: AssistantComposerAttachment[];
+  activeProviderId: string;
+  slashCommands: AssistantComposerSlashCommand[];
 }
 
 export type AssistantRuntimeControlsAvailability =
@@ -525,6 +552,7 @@ export interface AssistantComposerActivityState {
   isBusy: boolean;
   activeTurnPhase?: ActiveTurnPhase;
   canCancelActiveTurn?: boolean;
+  canSteerActiveTurn?: boolean;
   activeTurnProviderLabel?: string;
   hasPendingToolApproval?: boolean;
   hasPendingInput?: boolean;

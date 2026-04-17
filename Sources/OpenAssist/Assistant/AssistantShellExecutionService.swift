@@ -457,4 +457,39 @@ actor AssistantShellExecutionService {
         let prefix = trimmed.prefix(limit)
         return String(prefix) + "\n...[output truncated]"
     }
+
+    // MARK: - File Deletion Protection
+
+    /// Patterns that indicate destructive file operations requiring explicit user confirmation.
+    private static let destructiveFilePatterns: [String] = [
+        #"\brm\s"#,
+        #"\brm$"#,
+        #"\brmdir\s"#,
+        #"\bsrm\s"#,
+        #"\bunlink\s"#,
+        #"\bshred\s"#,
+        #"\btrash\s"#,
+        #"\bfind\b.*-delete\b"#,
+        #"\bfind\b.*-exec\s+rm\b"#,
+        #"\bgit\s+clean\s+-[a-zA-Z]*f"#,
+        #"\bgit\s+checkout\s+--\s"#,
+        #"\bgit\s+reset\s+--hard"#
+    ]
+
+    /// Returns `true` when the command appears to permanently delete or destroy files.
+    static func isDestructiveFileDeletion(command: String) -> Bool {
+        let normalized = command
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        guard !normalized.isEmpty else { return false }
+        return destructiveFilePatterns.contains { pattern in
+            normalized.range(of: pattern, options: .regularExpression) != nil
+        }
+    }
+
+    /// Human-readable warning shown in the permission dialog for destructive file commands.
+    static func fileDeletionWarning(for command: String) -> String? {
+        guard isDestructiveFileDeletion(command: command) else { return nil }
+        return "This command will permanently delete files. Open Assist requires your explicit permission before any file deletion."
+    }
 }

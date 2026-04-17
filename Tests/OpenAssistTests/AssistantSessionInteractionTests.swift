@@ -25,6 +25,99 @@ private final class TurnCompletionCapture: @unchecked Sendable {
     var status: AssistantTurnCompletionStatus?
 }
 
+private actor RecoveryRewriteCaptureStorage {
+    private(set) var lastStyle: ConversationHandoffSummaryStyle?
+    private(set) var lastTurns: [PromptRewriteConversationTurn] = []
+    private let result: (text: String, confidence: Double?, method: String)
+
+    init(result: (text: String, confidence: Double?, method: String)) {
+        self.result = result
+    }
+
+    func record(
+        style: ConversationHandoffSummaryStyle,
+        turns: [PromptRewriteConversationTurn]
+    ) {
+        lastStyle = style
+        lastTurns = turns
+    }
+
+    func nextResult() -> (text: String, confidence: Double?, method: String) {
+        result
+    }
+}
+
+private final class CapturingRecoveryRewriteProvider: MemoryRewriteExtractionProviding {
+    let storage: RecoveryRewriteCaptureStorage
+
+    init(result: (text: String, confidence: Double?, method: String)) {
+        self.storage = RecoveryRewriteCaptureStorage(result: result)
+    }
+
+    func summary(
+        for draft: MemoryEventDraft,
+        provider: MemoryProviderKind
+    ) async -> String? {
+        _ = draft
+        _ = provider
+        return nil
+    }
+
+    func rewriteSuggestion(
+        for draft: MemoryEventDraft,
+        card: MemoryCard,
+        provider: MemoryProviderKind
+    ) async -> RewriteSuggestion? {
+        _ = draft
+        _ = card
+        _ = provider
+        return nil
+    }
+
+    func lesson(
+        for draft: MemoryEventDraft,
+        card: MemoryCard,
+        provider: MemoryProviderKind
+    ) async -> MemoryLessonDraft? {
+        _ = draft
+        _ = card
+        _ = provider
+        return nil
+    }
+
+    func summarizeConversationHandoff(
+        summarySeed: String,
+        recentTurns: [PromptRewriteConversationTurn],
+        context: PromptRewriteConversationContext,
+        timeoutSeconds: Int
+    ) async -> (text: String, confidence: Double?, method: String) {
+        _ = summarySeed
+        _ = context
+        _ = timeoutSeconds
+        await storage.record(style: .memoryPromotion, turns: recentTurns)
+        return await storage.nextResult()
+    }
+
+    func summarizeConversationHandoff(
+        summarySeed: String,
+        recentTurns: [PromptRewriteConversationTurn],
+        context: PromptRewriteConversationContext,
+        timeoutSeconds: Int,
+        style: ConversationHandoffSummaryStyle
+    ) async -> (text: String, confidence: Double?, method: String) {
+        _ = summarySeed
+        _ = context
+        _ = timeoutSeconds
+        await storage.record(style: style, turns: recentTurns)
+        return await storage.nextResult()
+    }
+
+    func hasAIBackedIndexingAccess(for provider: MemoryProviderKind) async -> Bool {
+        _ = provider
+        return true
+    }
+}
+
 final class AssistantSessionInteractionTests: XCTestCase {
     @MainActor
     func testUpdatedOwnedSessionIDsPreservesOlderThreadsWithoutCapping() {
@@ -1112,6 +1205,63 @@ final class AssistantSessionInteractionTests: XCTestCase {
         XCTAssertEqual(questionsByID["environment"]?.options.map(\.label), ["dev", "prod"])
     }
 
+    func testToolExecutionContentItemDictionaryRepresentationUsesCodexWireFormat() {
+        let textItem = AssistantToolExecutionResult.ContentItem(
+            type: "inputText",
+            text: "Hello",
+            imageURL: nil
+        )
+        let imageItem = AssistantToolExecutionResult.ContentItem(
+            type: "inputImage",
+            text: nil,
+            imageURL: "data:image/png;base64,abc123"
+        )
+
+        let textDictionary = textItem.dictionaryRepresentation()
+        let imageDictionary = imageItem.dictionaryRepresentation()
+
+        XCTAssertEqual(textDictionary["type"] as? String, "input_text")
+        XCTAssertEqual(textDictionary["text"] as? String, "Hello")
+        XCTAssertEqual(imageDictionary["type"] as? String, "input_image")
+        XCTAssertEqual(imageDictionary["image_url"] as? String, "data:image/png;base64,abc123")
+    }
+
+    @MainActor
+    func testCodexComputerUsePluginSelectionHidesLocalDesktopAutomationTools() {
+        let runtime = CodexAssistantRuntime()
+
+        let baselineNames = Set(runtime.dynamicToolNamesForTesting(mode: .agentic))
+        runtime.setSelectedCodexPluginIDsForTesting(["computer-use@openai-bundled"])
+        let filteredNames = Set(runtime.dynamicToolNamesForTesting(mode: .agentic))
+
+        XCTAssertTrue(baselineNames.contains("app_action"))
+        XCTAssertFalse(filteredNames.contains("app_action"))
+        XCTAssertTrue(filteredNames.contains("exec_command"))
+    }
+
+    @MainActor
+    func testMCPElicitationConfirmationUsesApprovalOptions() async {
+        let runtime = CodexAssistantRuntime()
+        let capturedRequest = PermissionRequestCapture()
+        runtime.onPermissionRequest = { request in
+            capturedRequest.request = request
+        }
+
+        await runtime.processServerRequestForTesting(
+            method: "mcpServer/elicitation/request",
+            params: [
+                "threadId": "codex-thread",
+                "message": "Allow Codex to use Microsoft Teams?"
+            ]
+        )
+
+        XCTAssertEqual(capturedRequest.request?.toolKind, "userInput")
+        XCTAssertEqual(capturedRequest.request?.toolTitle, "Microsoft Teams")
+        XCTAssertEqual(capturedRequest.request?.rationale, "Allow Codex to use Microsoft Teams?")
+        XCTAssertEqual(capturedRequest.request?.options.map(\.title), ["Allow", "Decline", "Cancel"])
+        XCTAssertTrue(capturedRequest.request?.userInputQuestions.isEmpty ?? true)
+    }
+
     @MainActor
     func testClaudeCodePermissionDenialSynthesizesApprovalCard() {
         let runtime = CodexAssistantRuntime()
@@ -2004,6 +2154,24 @@ final class AssistantSessionInteractionTests: XCTestCase {
     @MainActor
     func testBuildInstructionsIncludesActiveSkillsBlock() async {
         let runtime = CodexAssistantRuntime()
+        let fileManager = FileManager.default
+        let skillDirectory = fileManager.temporaryDirectory
+            .appendingPathComponent("openassist-skill-\(UUID().uuidString)", isDirectory: true)
+        let skillFile = skillDirectory.appendingPathComponent("SKILL.md", isDirectory: false)
+        try? fileManager.createDirectory(at: skillDirectory, withIntermediateDirectories: true)
+        try? """
+        ---
+        name: obsidian-cli
+        description: Use the vault tools for note tasks.
+        ---
+
+        # Obsidian CLI
+
+        Use this skill for vault tasks.
+
+        ## Workflow
+        1. Read the requested note first.
+        """.write(to: skillFile, atomically: true, encoding: .utf8)
         runtime.activeSkills = [
             AssistantSkillDescriptor(
                 name: "obsidian-cli",
@@ -2012,8 +2180,8 @@ final class AssistantSessionInteractionTests: XCTestCase {
                 shortDescription: "Manage notes in Obsidian",
                 defaultPrompt: "Use $obsidian-cli for vault work.",
                 source: .imported,
-                skillDirectoryPath: "/tmp/obsidian-cli",
-                skillFilePath: "/tmp/obsidian-cli/SKILL.md",
+                skillDirectoryPath: skillDirectory.path,
+                skillFilePath: skillFile.path,
                 metadataFilePath: nil
             )
         ]
@@ -2021,9 +2189,16 @@ final class AssistantSessionInteractionTests: XCTestCase {
         let instructions = await runtime.buildInstructionsForTesting()
 
         XCTAssertTrue(instructions.contains("# Active Skills"))
+        XCTAssertTrue(instructions.contains("explicit user intent"))
         XCTAssertTrue(instructions.contains("`obsidian-cli`"))
         XCTAssertTrue(instructions.contains("Manage notes in Obsidian"))
-        XCTAssertTrue(instructions.contains("`/tmp/obsidian-cli/SKILL.md`"))
+        XCTAssertTrue(instructions.contains("`\(skillFile.path)`"))
+        XCTAssertTrue(instructions.contains("Use $obsidian-cli for vault work."))
+        XCTAssertTrue(instructions.contains("## Injected Skill Files"))
+        XCTAssertTrue(instructions.contains("<skill>"))
+        XCTAssertTrue(instructions.contains("Name: obsidian-cli"))
+        XCTAssertTrue(instructions.contains("# Obsidian CLI"))
+        XCTAssertTrue(instructions.contains("## Workflow"))
     }
 
     @MainActor
@@ -3302,6 +3477,144 @@ final class AssistantSessionInteractionTests: XCTestCase {
         XCTAssertTrue(
             context?.contains("Do not repeat work that these notes show is already completed") == true
         )
+    }
+
+    @MainActor
+    func testBuildProviderRecoveryHandoffRequestKeepsOlderImageDerivedAnswer() {
+        let oldListReply = "RJ Fidler's exclusion list included Flyway migration, infrastructure redesign, audit log streaming, and production go-live approval."
+        let laterReply = "Based on the session memory context, the GitHub licensing item was discussed later."
+        let oldImage = Data([0xAB, 0xCD, 0xEF])
+
+        var transcript: [AssistantTranscriptEntry] = [
+            AssistantTranscriptEntry(role: .user, text: "Explain RJ's screenshot and give me the list."),
+            AssistantTranscriptEntry(role: .assistant, text: oldListReply)
+        ]
+        for index in 1...15 {
+            transcript.append(
+                AssistantTranscriptEntry(role: .user, text: "Follow-up question \(index)?")
+            )
+            transcript.append(
+                AssistantTranscriptEntry(role: .assistant, text: "Follow-up answer \(index).")
+            )
+        }
+        transcript.append(AssistantTranscriptEntry(role: .user, text: "What was RJ asking later?"))
+        transcript.append(AssistantTranscriptEntry(role: .assistant, text: laterReply))
+
+        let timelineItems: [AssistantTimelineItem] = [
+            .userMessage(
+                sessionID: "thread-1",
+                turnID: "turn-old",
+                text: "Explain RJ's screenshot and give me the list.",
+                imageAttachments: [oldImage],
+                source: .runtime
+            ),
+            .assistantFinal(
+                id: "reply-old",
+                sessionID: "thread-1",
+                turnID: "turn-old",
+                text: oldListReply,
+                createdAt: Date(timeIntervalSince1970: 100),
+                isStreaming: false,
+                source: .runtime
+            ),
+            .userMessage(
+                sessionID: "thread-1",
+                turnID: "turn-new",
+                text: "What was RJ asking later?",
+                source: .runtime
+            ),
+            .assistantFinal(
+                id: "reply-new",
+                sessionID: "thread-1",
+                turnID: "turn-new",
+                text: laterReply,
+                createdAt: Date(timeIntervalSince1970: 200),
+                isStreaming: false,
+                source: .runtime
+            )
+        ]
+
+        let request = AssistantStore.buildProviderRecoveryHandoffRequest(
+            transcriptEntries: transcript,
+            timelineItems: timelineItems,
+            sessionSummary: AssistantSessionSummary(
+                id: "thread-1",
+                title: "RJ exclusion thread",
+                source: .openAssist,
+                status: .completed,
+                summary: "RJ had a numbered exclusion list from a screenshot."
+            )
+        )
+
+        XCTAssertNotNil(request)
+        XCTAssertFalse(request?.recentTurns.contains(where: { $0.assistantText.contains(oldListReply) }) == true)
+        XCTAssertTrue(request?.summarySeed.contains("Important Screenshot-Derived Answer") == true)
+        XCTAssertTrue(request?.summarySeed.contains(oldListReply) == true)
+        XCTAssertTrue(request?.summarySeed.contains("RJ had a numbered exclusion list") == true)
+        XCTAssertEqual(request?.metadata["recovery_included_image_answer"], "true")
+    }
+
+    @MainActor
+    func testBuildProviderRecoveryResumeContextUsesRecoveryStyleAndCapsAISummary() async {
+        let longSummary = Array(repeating: "Current task: keep the migration exclusions and screenshot facts together.", count: 80)
+            .joined(separator: "\n")
+        let provider = CapturingRecoveryRewriteProvider(
+            result: (longSummary, 0.92, "ai-test")
+        )
+
+        let result = await AssistantStore.buildProviderRecoveryResumeContext(
+            transcriptEntries: [
+                AssistantTranscriptEntry(role: .user, text: "Why did the chat lose the earlier list?"),
+                AssistantTranscriptEntry(role: .assistant, text: "I am checking the fallback behavior.")
+            ],
+            timelineItems: [],
+            sessionSummary: AssistantSessionSummary(
+                id: "thread-1",
+                title: "Provider fallback",
+                source: .openAssist,
+                status: .active
+            ),
+            rewriteProvider: provider,
+            timeoutSeconds: 6
+        )
+
+        let capturedStyle = await provider.storage.lastStyle
+        let capturedTurns = await provider.storage.lastTurns
+
+        XCTAssertEqual(capturedStyle, .providerRecovery)
+        XCTAssertEqual(capturedTurns.count, 1)
+        XCTAssertEqual(result.metadata["recovery_summary_method"], "ai-test")
+        XCTAssertEqual(result.metadata["recovery_used_deterministic_fallback"], "false")
+        XCTAssertNotNil(result.text)
+        XCTAssertLessThanOrEqual(result.text?.count ?? 0, 1_800)
+    }
+
+    @MainActor
+    func testBuildProviderRecoveryResumeContextRecordsDeterministicFallbackMetadata() async {
+        let provider = CapturingRecoveryRewriteProvider(
+            result: ("Recovered short fallback summary.", nil, "deterministic-timeout-fallback")
+        )
+
+        let result = await AssistantStore.buildProviderRecoveryResumeContext(
+            transcriptEntries: [
+                AssistantTranscriptEntry(role: .user, text: "Please continue the same chat."),
+                AssistantTranscriptEntry(role: .assistant, text: "I will rebuild the missing context.")
+            ],
+            timelineItems: [],
+            sessionSummary: AssistantSessionSummary(
+                id: "thread-1",
+                title: "Fallback thread",
+                source: .openAssist,
+                status: .completed
+            ),
+            rewriteProvider: provider,
+            timeoutSeconds: 6
+        )
+
+        XCTAssertEqual(result.text, "Recovered short fallback summary.")
+        XCTAssertEqual(result.metadata["recovery_summary_method"], "deterministic-timeout-fallback")
+        XCTAssertEqual(result.metadata["recovery_used_deterministic_fallback"], "true")
+        XCTAssertEqual(result.metadata["recovery_summary_timeout_seconds"], "6")
     }
 
     @MainActor

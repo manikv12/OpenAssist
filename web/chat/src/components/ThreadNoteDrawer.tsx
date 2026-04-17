@@ -6,6 +6,7 @@ import {
   useRef,
   useState,
   type CSSProperties,
+  type MouseEvent as ReactMouseEvent,
   type ReactNode,
   type RefObject,
 } from "react";
@@ -431,6 +432,8 @@ interface ThreadNoteScreenshotCaptureResult {
   filename?: string;
   mimeType?: string;
   dataUrl?: string;
+  captureMode?: ThreadNoteScreenshotCaptureMode;
+  segmentCount?: number;
 }
 
 interface ThreadNoteScreenshotProcessingResult {
@@ -444,6 +447,7 @@ interface ThreadNoteScreenshotProcessingResult {
 }
 
 interface ThreadNoteScreenshotImportState {
+  captures: ThreadNoteScreenshotCaptureResult[];
   capture: ThreadNoteScreenshotCaptureResult;
   insertRange: PendingImagePickerInsert;
   outputMode: ThreadNoteScreenshotImportMode;
@@ -452,6 +456,39 @@ interface ThreadNoteScreenshotImportState {
   processed: ThreadNoteScreenshotProcessingResult | null;
   error: string | null;
 }
+
+type ThreadNoteScreenshotCaptureMode = "area" | "scrolling" | "multiple";
+
+const THREAD_NOTE_SCREENSHOT_CAPTURE_MODE_STORAGE_KEY =
+  "openassist.thread-note-screenshot-capture-mode";
+
+const THREAD_NOTE_SCREENSHOT_CAPTURE_MODE_OPTIONS: ReadonlyArray<{
+  value: ThreadNoteScreenshotCaptureMode;
+  label: string;
+  chipLabel: string;
+  selectionNotice: string;
+}> = [
+  {
+    value: "area",
+    label: "Area screenshot",
+    chipLabel: "Area",
+    selectionNotice: "Screenshot mode set to Area.",
+  },
+  {
+    value: "scrolling",
+    label: "Scrolling capture",
+    chipLabel: "Scroll",
+    selectionNotice:
+      "Screenshot mode set to Scrolling. Capture one section, scroll that same content, then add the next section.",
+  },
+  {
+    value: "multiple",
+    label: "Multiple captures",
+    chipLabel: "Multiple",
+    selectionNotice:
+      "Screenshot mode set to Multiple. Use this when you want several screenshots. Open Assist will merge useful repeated info into one note when it can.",
+  },
+];
 
 const THREAD_NOTE_SCREENSHOT_MODE_OPTIONS: ReadonlyArray<{
   value: ThreadNoteScreenshotImportMode;
@@ -493,7 +530,8 @@ const THREAD_NOTE_SCREENSHOT_PROCESSING_RESULT_EVENT =
 const THREAD_NOTE_FIND_REQUEST_EVENT = "openassist:thread-note-find-request";
 const THREAD_NOTE_IMAGE_UPLOAD_TIMEOUT_MS = 12000;
 const THREAD_NOTE_SCREENSHOT_CAPTURE_TIMEOUT_MS = 45000;
-const THREAD_NOTE_SCREENSHOT_PROCESSING_TIMEOUT_MS = 30000;
+const THREAD_NOTE_SCREENSHOT_PROCESSING_TIMEOUT_MS = 45000;
+const THREAD_NOTE_SCREENSHOT_PROCESSING_TIMEOUT_MAX_MS = 150000;
 const THREAD_NOTE_SUPPORTED_IMAGE_MIME_TYPES = new Set([
   "image/png",
   "image/jpeg",
@@ -517,6 +555,27 @@ const DEFAULT_THREAD_NOTE_MENU_POSITION: ThreadNoteMenuPosition = {
   bottom: null,
   maxHeight: 320,
 };
+
+function readStoredThreadNoteScreenshotCaptureMode(): ThreadNoteScreenshotCaptureMode {
+  if (typeof window === "undefined") {
+    return "area";
+  }
+
+  try {
+    const value = window.localStorage.getItem(THREAD_NOTE_SCREENSHOT_CAPTURE_MODE_STORAGE_KEY);
+    if (
+      value === "area" ||
+      value === "scrolling" ||
+      value === "multiple"
+    ) {
+      return value;
+    }
+  } catch (error) {
+    console.warn("[thread-note screenshot] could not read capture mode", error);
+  }
+
+  return "area";
+}
 
 const CHART_TYPE_CHOICES: ChartChoiceOption[] = [
   {
@@ -1524,6 +1583,12 @@ function ThreadNoteDrawerOpenContent({
   const [isImageInspectorOpen, setIsImageInspectorOpen] = useState(false);
   const [isUploadingImage, setIsUploadingImage] = useState(false);
   const [isCapturingScreenshot, setIsCapturingScreenshot] = useState(false);
+  const [screenshotCaptureMode, setScreenshotCaptureMode] =
+    useState<ThreadNoteScreenshotCaptureMode>(readStoredThreadNoteScreenshotCaptureMode);
+  const [screenshotCaptureMenuPosition, setScreenshotCaptureMenuPosition] = useState<{
+    x: number;
+    y: number;
+  } | null>(null);
   const [screenshotImportState, setScreenshotImportState] =
     useState<ThreadNoteScreenshotImportState | null>(null);
   const [chartRequestComposer, setChartRequestComposer] =
@@ -1548,6 +1613,24 @@ function ThreadNoteDrawerOpenContent({
   const [batchOrganizerIsApplying, setBatchOrganizerIsApplying] = useState(false);
   const [selectedChartType, setSelectedChartType] = useState<ChartChoiceType>("auto");
   const [chartStyleInstruction, setChartStyleInstruction] = useState("");
+  const screenshotCaptureMenuRef = useRef<HTMLDivElement | null>(null);
+  const activeScreenshotCaptureModeOption =
+    THREAD_NOTE_SCREENSHOT_CAPTURE_MODE_OPTIONS.find(
+      (option) => option.value === screenshotCaptureMode
+    ) ?? THREAD_NOTE_SCREENSHOT_CAPTURE_MODE_OPTIONS[0];
+  const activeScreenshotImportCaptureMode =
+    screenshotImportState?.capture.captureMode ?? screenshotCaptureMode;
+  const canAppendScreenshotImportCaptures = activeScreenshotImportCaptureMode !== "area";
+  const screenshotImportAppendLabel =
+    activeScreenshotImportCaptureMode === "scrolling"
+      ? "Add next section"
+      : "Add screenshot";
+  const screenshotImportCaptureHint =
+    activeScreenshotImportCaptureMode === "scrolling"
+      ? "Scrolling keeps one long reading flow. Capture one section, scroll the same content, then add the next section."
+      : activeScreenshotImportCaptureMode === "multiple"
+        ? "Multiple can still be one topic. Open Assist will combine the useful parts and remove repeated info when that helps."
+        : null;
   const activeScreenshotModeOption = screenshotImportState
     ? THREAD_NOTE_SCREENSHOT_MODE_OPTIONS.find(
         (option) => option.value === screenshotImportState.outputMode
@@ -2004,7 +2087,9 @@ function ThreadNoteDrawerOpenContent({
   );
 
   const requestThreadNoteScreenshotCapture = useCallback(
-    async (): Promise<ThreadNoteScreenshotCaptureResult> => {
+    async (
+      captureMode: ThreadNoteScreenshotCaptureMode
+    ): Promise<ThreadNoteScreenshotCaptureResult> => {
       const {
         threadId: activeThreadId,
         ownerKind: activeOwnerKind,
@@ -2057,6 +2142,7 @@ function ThreadNoteDrawerOpenContent({
             ownerId: activeOwnerId,
             noteId: activeNoteId,
             requestId,
+            captureMode,
           });
         } catch (error) {
           pendingScreenshotCapturesRef.current.delete(requestId);
@@ -2117,14 +2203,19 @@ function ThreadNoteDrawerOpenContent({
       }
 
       return await new Promise<ThreadNoteScreenshotProcessingResult>((resolve) => {
+        const timeoutMs = threadNoteScreenshotProcessingTimeoutMs(
+          options.capture,
+          options.outputMode
+        );
         const timeoutID = window.setTimeout(() => {
           pendingScreenshotProcessingRef.current.delete(requestId);
           resolve({
             requestId,
             ok: false,
-            message: "Screenshot processing took too long. Please try again.",
+            message:
+              "Screenshot processing took too long. Try again, or use fewer screenshots if this batch is very large.",
           });
-        }, THREAD_NOTE_SCREENSHOT_PROCESSING_TIMEOUT_MS);
+        }, timeoutMs);
 
         pendingScreenshotProcessingRef.current.set(requestId, {
           resolve: (result) => {
@@ -2145,6 +2236,8 @@ function ThreadNoteDrawerOpenContent({
             filename: options.capture.filename,
             mimeType: options.capture.mimeType,
             dataUrl: options.capture.dataUrl,
+            captureMode: options.capture.captureMode,
+            captureSegmentCount: options.capture.segmentCount,
             styleInstruction: options.customInstruction?.trim() || undefined,
           });
         } catch (error) {
@@ -2712,18 +2805,20 @@ function ThreadNoteDrawerOpenContent({
       if (!ownerKind || !ownerId || !noteId) {
         return;
       }
-      const savedText = normalizeLineEndings(state?.text ?? "");
       const shouldForceSave = options?.force === true;
       if (!shouldForceSave && !hasLocalDirtyChangesRef.current) {
         return;
       }
-      if (normalized === savedText) {
-        if (hasLocalDirtyChangesRef.current) {
-          setHasLocalDirtyChanges(false);
-          hasLocalDirtyChangesRef.current = false;
-        }
+      const previousDraft = normalizeLineEndings(latestDraftTextRef.current ?? "");
+      if (
+        normalized.trim() === "" &&
+        previousDraft.trim() !== "" &&
+        !shouldForceSave
+      ) {
         return;
       }
+      setHasLocalDirtyChanges(false);
+      hasLocalDirtyChangesRef.current = false;
       onDispatchCommand("save", {
         ...(threadId ? { threadId } : {}),
         ownerKind,
@@ -2739,7 +2834,6 @@ function ThreadNoteDrawerOpenContent({
       ownerKind,
       readCurrentThreadNoteMarkdown,
       setHasLocalDirtyChanges,
-      state?.text,
       threadId,
     ]
   );
@@ -2904,16 +2998,24 @@ function ThreadNoteDrawerOpenContent({
           return false;
         }
 
-        editor.commands.insertContentAt(
+        const documentSize = editor.state.doc.content.size;
+        const from = Math.max(0, Math.min(range?.from ?? editor.state.selection.from, documentSize));
+        const to = Math.max(from, Math.min(range?.to ?? editor.state.selection.to, documentSize));
+        editor.commands.focus();
+        const inserted = editor.commands.insertContentAt(
           {
-            from: range?.from ?? editor.state.selection.from,
-            to: range?.to ?? editor.state.selection.to,
+            from,
+            to,
           },
           normalized,
           {
             contentType: "markdown",
           }
         );
+        if (!inserted) {
+          showScreenshotNotice("Open Assist could not insert that content into the note.");
+          return false;
+        }
         commitEditorMarkdown(normalizeLineEndings(editor.getMarkdown()));
         refreshSlashQuery(editor);
         return true;
@@ -2950,17 +3052,24 @@ function ThreadNoteDrawerOpenContent({
           return false;
         }
 
-        editor
+        const documentSize = editor.state.doc.content.size;
+        const from = Math.max(0, Math.min(range?.from ?? editor.state.selection.from, documentSize));
+        const to = Math.max(from, Math.min(range?.to ?? editor.state.selection.to, documentSize));
+        const inserted = editor
           .chain()
           .focus()
           .insertContentAt(
             {
-              from: range?.from ?? editor.state.selection.from,
-              to: range?.to ?? editor.state.selection.to,
+              from,
+              to,
             },
             buildThreadNotePlainTextContent(normalized)
           )
           .run();
+        if (!inserted) {
+          showScreenshotNotice("Open Assist could not insert that content into the note.");
+          return false;
+        }
         commitEditorMarkdown(normalizeLineEndings(editor.getMarkdown()));
         refreshSlashQuery(editor);
         return true;
@@ -2983,62 +3092,157 @@ function ThreadNoteDrawerOpenContent({
     ]
   );
 
-  const handleOpenScreenshotImport = useCallback(async () => {
-    if (!noteId || !ownerKind || !ownerId) {
-      showScreenshotNotice("Open a note before adding a screenshot.");
-      return;
-    }
-
-    const insertRange =
-      isRichEditorMode && editor
-        ? {
-            from: editor.state.selection.from,
-            to: editor.state.selection.to,
-          }
-        : resolveCurrentRawMarkdownRange();
-
-    setScreenshotImportState(null);
-    setIsCapturingScreenshot(true);
-
-    try {
-      const capture = await requestThreadNoteScreenshotCapture();
-      if (capture.cancelled) {
+  const handleOpenScreenshotImport = useCallback(
+    async (requestedCaptureMode?: ThreadNoteScreenshotCaptureMode) => {
+      if (!noteId || !ownerKind || !ownerId) {
+        showScreenshotNotice("Open a note before adding a screenshot.");
         return;
       }
 
-      if (!capture.ok || !capture.dataUrl) {
+      const captureMode = requestedCaptureMode ?? screenshotCaptureMode;
+      const insertRange =
+        isRichEditorMode && editor
+          ? {
+              from: editor.state.selection.from,
+              to: editor.state.selection.to,
+            }
+          : resolveCurrentRawMarkdownRange();
+
+      setScreenshotImportState(null);
+      setScreenshotCaptureMenuPosition(null);
+      setIsCapturingScreenshot(true);
+
+      try {
+        const capture = await requestThreadNoteScreenshotCapture(captureMode);
+        if (capture.cancelled) {
+          return;
+        }
+
+        if (!capture.ok || !capture.dataUrl) {
+          showScreenshotNotice(
+            capture.message ?? "Open Assist could not capture a screenshot for this note."
+          );
+          return;
+        }
+
+        setScreenshotImportState({
+          captures: [capture],
+          capture,
+          insertRange,
+          outputMode: "cleanTextAndImage",
+          customInstruction: "",
+          isProcessing: false,
+          processed: null,
+          error: null,
+        });
+      } finally {
+        setIsCapturingScreenshot(false);
+      }
+    },
+    [
+      editor,
+      isRichEditorMode,
+      noteId,
+      ownerId,
+      ownerKind,
+      requestThreadNoteScreenshotCapture,
+      resolveCurrentRawMarkdownRange,
+      screenshotCaptureMode,
+      showScreenshotNotice,
+    ]
+  );
+
+  const handleOpenScreenshotCaptureMenu = useCallback(
+    (event: ReactMouseEvent<HTMLButtonElement>) => {
+      event.preventDefault();
+      event.stopPropagation();
+
+      if (isCapturingScreenshot || screenshotImportState?.isProcessing) {
+        return;
+      }
+
+      const nextX = Math.max(12, Math.min(event.clientX, window.innerWidth - 228));
+      const nextY = Math.max(12, Math.min(event.clientY, window.innerHeight - 176));
+      setScreenshotCaptureMenuPosition({ x: nextX, y: nextY });
+    },
+    [isCapturingScreenshot, screenshotImportState?.isProcessing]
+  );
+
+  const handleSelectScreenshotCaptureMode = useCallback(
+    (nextMode: ThreadNoteScreenshotCaptureMode) => {
+      setScreenshotCaptureMode(nextMode);
+      setScreenshotCaptureMenuPosition(null);
+      const selectedOption =
+        THREAD_NOTE_SCREENSHOT_CAPTURE_MODE_OPTIONS.find((option) => option.value === nextMode) ??
+        THREAD_NOTE_SCREENSHOT_CAPTURE_MODE_OPTIONS[0];
+      showScreenshotNotice(selectedOption.selectionNotice);
+    },
+    [showScreenshotNotice]
+  );
+
+  const handleCloseScreenshotImport = useCallback(() => {
+    setScreenshotImportState(null);
+  }, []);
+
+  const handleAddScreenshotCapture = useCallback(async () => {
+    if (!screenshotImportState) {
+      return;
+    }
+
+    const captureMode = screenshotImportState.capture.captureMode ?? screenshotCaptureMode;
+    setScreenshotCaptureMenuPosition(null);
+    setIsCapturingScreenshot(true);
+
+    try {
+      const nextCapture = await requestThreadNoteScreenshotCapture(captureMode);
+      if (nextCapture.cancelled) {
+        return;
+      }
+
+      if (!nextCapture.ok || !nextCapture.dataUrl) {
         showScreenshotNotice(
-          capture.message ?? "Open Assist could not capture a screenshot for this note."
+          nextCapture.message ?? "Open Assist could not capture the next screenshot."
         );
         return;
       }
 
-      setScreenshotImportState({
-        capture,
-        insertRange,
-        outputMode: "cleanTextAndImage",
-        customInstruction: "",
-        isProcessing: false,
-        processed: null,
-        error: null,
+      const currentCaptures = screenshotImportState.captures.length
+        ? screenshotImportState.captures
+        : [screenshotImportState.capture];
+      const combinedCaptures = [...currentCaptures, nextCapture];
+      const combinedCapture = await composeThreadNoteScreenshotSessionCapture(
+        combinedCaptures,
+        captureMode
+      );
+
+      if (!combinedCapture) {
+        showScreenshotNotice("Open Assist could not combine those screenshots.");
+        return;
+      }
+
+      setScreenshotImportState((current) => {
+        if (!current) {
+          return current;
+        }
+
+        const baseCaptures = current.captures.length ? current.captures : [current.capture];
+        return {
+          ...current,
+          captures: [...baseCaptures, nextCapture],
+          capture: combinedCapture,
+          processed: null,
+          error: null,
+        };
       });
     } finally {
       setIsCapturingScreenshot(false);
     }
   }, [
-    editor,
-    isRichEditorMode,
-    noteId,
-    ownerId,
-    ownerKind,
     requestThreadNoteScreenshotCapture,
-    resolveCurrentRawMarkdownRange,
+    screenshotCaptureMode,
+    screenshotImportState,
     showScreenshotNotice,
   ]);
-
-  const handleCloseScreenshotImport = useCallback(() => {
-    setScreenshotImportState(null);
-  }, []);
 
   const handleGenerateScreenshotImportPreview = useCallback(async () => {
     if (!screenshotImportState) {
@@ -4204,6 +4408,7 @@ function ThreadNoteDrawerOpenContent({
   useEffect(() => {
     setProjectNoteTransfer(null);
     setScreenshotImportState(null);
+    setScreenshotCaptureMenuPosition(null);
   }, [noteKey]);
 
   useEffect(() => {
@@ -4229,6 +4434,53 @@ function ThreadNoteDrawerOpenContent({
 
     return () => window.clearTimeout(timeout);
   }, [screenshotNotice]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(
+        THREAD_NOTE_SCREENSHOT_CAPTURE_MODE_STORAGE_KEY,
+        screenshotCaptureMode
+      );
+    } catch (error) {
+      console.warn("[thread-note screenshot] could not store capture mode", error);
+    }
+  }, [screenshotCaptureMode]);
+
+  useEffect(() => {
+    if (!screenshotCaptureMenuPosition) {
+      return;
+    }
+
+    const handlePointerDown = (event: PointerEvent) => {
+      if (!screenshotCaptureMenuRef.current?.contains(event.target as Node)) {
+        setScreenshotCaptureMenuPosition(null);
+      }
+    };
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setScreenshotCaptureMenuPosition(null);
+      }
+    };
+
+    const handleViewportChange = () => {
+      setScreenshotCaptureMenuPosition(null);
+    };
+
+    document.addEventListener("pointerdown", handlePointerDown);
+    document.addEventListener("keydown", handleKeyDown);
+    document.addEventListener("scroll", handleViewportChange, true);
+    window.addEventListener("resize", handleViewportChange);
+    window.addEventListener("blur", handleViewportChange);
+
+    return () => {
+      document.removeEventListener("pointerdown", handlePointerDown);
+      document.removeEventListener("keydown", handleKeyDown);
+      document.removeEventListener("scroll", handleViewportChange, true);
+      window.removeEventListener("resize", handleViewportChange);
+      window.removeEventListener("blur", handleViewportChange);
+    };
+  }, [screenshotCaptureMenuPosition]);
 
   useEffect(() => {
     threadNoteFindStateRef.current = {
@@ -4433,6 +4685,28 @@ function ThreadNoteDrawerOpenContent({
 
     return () => window.clearTimeout(timeout);
   }, [commitSave, hasLocalDirtyChanges, isOpen, noteId, ownerId, ownerKind]);
+
+  useEffect(() => {
+    if (!isOpen || !ownerKind || !ownerId || !noteId) {
+      return;
+    }
+
+    const handleSaveShortcut = (event: KeyboardEvent) => {
+      const isSaveCombo =
+        (event.metaKey || event.ctrlKey) &&
+        !event.shiftKey &&
+        !event.altKey &&
+        (event.key === "s" || event.key === "S");
+      if (!isSaveCombo) {
+        return;
+      }
+      event.preventDefault();
+      commitSave(undefined, { force: true });
+    };
+
+    document.addEventListener("keydown", handleSaveShortcut);
+    return () => document.removeEventListener("keydown", handleSaveShortcut);
+  }, [commitSave, isOpen, noteId, ownerId, ownerKind]);
 
   useEffect(() => {
     if (!slashQuery && !mermaidPicker) {
@@ -6853,6 +7127,9 @@ function ThreadNoteDrawerOpenContent({
     setOrganizeConfirmation(null);
     handleRequestAIDraft();
   }, [handleRequestAIDraft]);
+  const handleManualSave = useCallback(() => {
+    commitSave(undefined, { force: true });
+  }, [commitSave]);
   const aiButtonLabel = noteSelection?.text ? "Organize Selection" : "Organize Note";
   const selectedMermaidType = mermaidPicker?.type
     ? MERMAID_TEMPLATE_TYPES.find((option) => option.type === mermaidPicker.type) ?? null
@@ -7598,18 +7875,57 @@ function ThreadNoteDrawerOpenContent({
                   className={[
                     "thread-note-icon-button",
                     screenshotImportState ? "is-active" : "",
+                    screenshotCaptureMode !== "area" ? "has-secondary-mode" : "",
                   ]
                     .filter(Boolean)
                     .join(" ")}
                   onClick={() => {
                     void handleOpenScreenshotImport();
                   }}
+                  onContextMenu={handleOpenScreenshotCaptureMenu}
                   disabled={isCapturingScreenshot || screenshotImportState?.isProcessing}
                   aria-label="Import screenshot"
-                  title="Import screenshot"
+                  title={`Import screenshot (${activeScreenshotCaptureModeOption.label}). Right-click to change mode.`}
                 >
                   <ScreenshotIcon />
                 </button>
+                {screenshotCaptureMenuPosition ? (
+                  <div
+                    ref={screenshotCaptureMenuRef}
+                    className="thread-note-screenshot-capture-menu"
+                    role="menu"
+                    aria-label="Screenshot capture mode"
+                    style={
+                      {
+                        "--thread-note-screenshot-menu-x": `${screenshotCaptureMenuPosition.x}px`,
+                        "--thread-note-screenshot-menu-y": `${screenshotCaptureMenuPosition.y}px`,
+                      } as CSSProperties
+                    }
+                  >
+                    {THREAD_NOTE_SCREENSHOT_CAPTURE_MODE_OPTIONS.map((option) => (
+                      <button
+                        key={option.value}
+                        type="button"
+                        role="menuitemradio"
+                        aria-checked={screenshotCaptureMode === option.value}
+                        className={[
+                          "thread-note-screenshot-capture-menu-item",
+                          screenshotCaptureMode === option.value ? "is-active" : "",
+                        ]
+                          .filter(Boolean)
+                          .join(" ")}
+                        onClick={() => {
+                          void handleSelectScreenshotCaptureMode(option.value);
+                        }}
+                      >
+                        <span>{option.label}</span>
+                        {screenshotCaptureMode === option.value ? (
+                          <span className="thread-note-screenshot-capture-menu-check">Current</span>
+                        ) : null}
+                      </button>
+                    ))}
+                  </div>
+                ) : null}
                 {hasAnyNotes ? (
                   <div className="thread-note-toolbar-switch" role="group" aria-label="Editor mode">
                     <button
@@ -7641,6 +7957,18 @@ function ThreadNoteDrawerOpenContent({
                       Markdown
                     </button>
                   </div>
+                ) : null}
+                {hasAnyNotes ? (
+                  <button
+                    type="button"
+                    className="thread-note-icon-button"
+                    onClick={handleManualSave}
+                    disabled={!state?.canEdit}
+                    aria-label="Save note"
+                    title="Save note (\u2318S)"
+                  >
+                    <SaveIcon />
+                  </button>
                 ) : null}
                 <button
                   className="thread-note-icon-button is-danger"
@@ -9125,25 +9453,44 @@ function ThreadNoteDrawerOpenContent({
                       <div className="thread-note-screenshot-capture-meta">
                         <strong>Capture</strong>
                         <span>
-                          {screenshotImportState.capture.filename?.trim() || "Selected area"}
+                          {[
+                            (
+                              THREAD_NOTE_SCREENSHOT_CAPTURE_MODE_OPTIONS.find(
+                                (option) =>
+                                  option.value ===
+                                  (screenshotImportState.capture.captureMode ?? "area")
+                              ) ?? THREAD_NOTE_SCREENSHOT_CAPTURE_MODE_OPTIONS[0]
+                            ).chipLabel,
+                            screenshotImportState.capture.segmentCount &&
+                            screenshotImportState.capture.segmentCount > 1
+                              ? `${screenshotImportState.capture.segmentCount} shots`
+                              : null,
+                          ]
+                            .filter(Boolean)
+                            .join(" · ") || screenshotImportState.capture.filename?.trim() || "Selected area"}
                         </span>
                       </div>
                     </div>
                   ) : null}
 
-                  <div className="thread-note-screenshot-mode-stack">
-                    <div className="thread-note-screenshot-meta-row">
-                      <span className="thread-note-screenshot-mini-label">Mode</span>
-                      {activeScreenshotModeOption ? (
-                        <span className="thread-note-screenshot-mode-note">
-                          {activeScreenshotModeOption.description}
-                        </span>
+                    <div className="thread-note-screenshot-mode-stack">
+                      <div className="thread-note-screenshot-meta-row">
+                        <span className="thread-note-screenshot-mini-label">Mode</span>
+                        {activeScreenshotModeOption ? (
+                          <span className="thread-note-screenshot-mode-note">
+                            {activeScreenshotModeOption.description}
+                          </span>
+                        ) : null}
+                      </div>
+                      {screenshotImportCaptureHint ? (
+                        <div className="thread-note-screenshot-mode-help">
+                          {screenshotImportCaptureHint}
+                        </div>
                       ) : null}
-                    </div>
-                    <div
-                      className="thread-note-screenshot-mode-grid"
-                      role="radiogroup"
-                      aria-label="Output mode"
+                      <div
+                        className="thread-note-screenshot-mode-grid"
+                        role="radiogroup"
+                        aria-label="Output mode"
                     >
                       {THREAD_NOTE_SCREENSHOT_MODE_OPTIONS.map((option) => (
                         <button
@@ -9200,6 +9547,14 @@ function ThreadNoteDrawerOpenContent({
                   </label>
                 ) : null}
 
+                {isCapturingScreenshot ? (
+                  <div className="thread-note-screenshot-status-card">
+                    {activeScreenshotImportCaptureMode === "scrolling"
+                      ? "Capture the next section after you scroll. Open Assist will keep building one long screenshot."
+                      : "Capture the next screenshot and Open Assist will add it to this draft."}
+                  </div>
+                ) : null}
+
                 {screenshotImportState.isProcessing ? (
                   <div className="thread-note-screenshot-status-card">
                     Preparing preview...
@@ -9243,10 +9598,22 @@ function ThreadNoteDrawerOpenContent({
                 <button type="button" className="oa-button" onClick={handleCloseScreenshotImport}>
                   Cancel
                 </button>
+                {canAppendScreenshotImportCaptures ? (
+                  <button
+                    type="button"
+                    className="oa-button"
+                    disabled={isCapturingScreenshot || screenshotImportState.isProcessing}
+                    onClick={() => {
+                      void handleAddScreenshotCapture();
+                    }}
+                  >
+                    {isCapturingScreenshot ? "Capturing..." : screenshotImportAppendLabel}
+                  </button>
+                ) : null}
                 <button
                   type="button"
                   className="oa-button"
-                  disabled={screenshotImportState.isProcessing}
+                  disabled={screenshotImportState.isProcessing || isCapturingScreenshot}
                   onClick={() => {
                     void handleGenerateScreenshotImportPreview();
                   }}
@@ -9256,7 +9623,11 @@ function ThreadNoteDrawerOpenContent({
                 <button
                   type="button"
                   className="oa-button oa-button--primary"
-                  disabled={!screenshotImportState.processed?.ok || screenshotImportState.isProcessing}
+                  disabled={
+                    !screenshotImportState.processed?.ok ||
+                    screenshotImportState.isProcessing ||
+                    isCapturingScreenshot
+                  }
                   onClick={() => {
                     void handleApplyScreenshotImport();
                   }}
@@ -10249,6 +10620,16 @@ function TrashIcon() {
       <path d="M3.5 4.75h9" />
       <path d="M6.1 4.75V3.4h3.8v1.35" />
       <path d="M4.9 4.75l.55 7.1h5.1l.55-7.1" />
+    </svg>
+  );
+}
+
+function SaveIcon() {
+  return (
+    <svg viewBox="0 0 16 16" aria-hidden="true">
+      <path d="M3.75 2.75h7.25l2.25 2.25v7.25a1.5 1.5 0 0 1-1.5 1.5h-8a1.5 1.5 0 0 1-1.5-1.5v-8a1.5 1.5 0 0 1 1.5-1.5Z" />
+      <path d="M5.5 2.75v3.25h4.5V2.75" />
+      <path d="M5.5 9.25h5v4h-5z" />
     </svg>
   );
 }
@@ -12667,6 +13048,171 @@ function readFileAsDataURL(file: File): Promise<string | null> {
     reader.onerror = () => resolve(null);
     reader.readAsDataURL(file);
   });
+}
+
+function loadThreadNoteScreenshotImage(dataUrl: string): Promise<HTMLImageElement | null> {
+  return new Promise((resolve) => {
+    const image = new Image();
+    image.onload = () => resolve(image);
+    image.onerror = () => resolve(null);
+    image.src = dataUrl;
+  });
+}
+
+function threadNoteScreenshotSessionFilename(
+  captureMode: ThreadNoteScreenshotCaptureMode,
+  segmentCount: number
+): string {
+  const dateStamp = new Date().toISOString().slice(0, 10);
+  switch (captureMode) {
+    case "scrolling":
+      return `Scrolling-Screenshot-${dateStamp}-${Math.max(1, segmentCount)}.png`;
+    case "multiple":
+      return `Screenshots-${dateStamp}-${Math.max(1, segmentCount)}.png`;
+    case "area":
+    default:
+      return `Screenshot-${dateStamp}.png`;
+  }
+}
+
+function threadNoteScreenshotProcessingTimeoutMs(
+  capture: ThreadNoteScreenshotCaptureResult,
+  outputMode: ThreadNoteScreenshotImportMode
+): number {
+  const segmentCount = Math.max(1, capture.segmentCount ?? 1);
+  if (outputMode === "rawOCR") {
+    return Math.min(
+      THREAD_NOTE_SCREENSHOT_PROCESSING_TIMEOUT_MAX_MS,
+      20000 + Math.max(0, segmentCount - 1) * 4000
+    );
+  }
+
+  const baseTimeout = outputMode === "cleanTextAndImage" ? 50000 : 45000;
+  const perExtraSegmentTimeout =
+    capture.captureMode === "multiple"
+      ? 14000
+      : capture.captureMode === "scrolling"
+        ? 10000
+        : 6000;
+
+  return Math.min(
+    THREAD_NOTE_SCREENSHOT_PROCESSING_TIMEOUT_MAX_MS,
+    baseTimeout + Math.max(0, segmentCount - 1) * perExtraSegmentTimeout
+  );
+}
+
+async function composeThreadNoteScreenshotSessionCapture(
+  captures: ThreadNoteScreenshotCaptureResult[],
+  captureMode: ThreadNoteScreenshotCaptureMode
+): Promise<ThreadNoteScreenshotCaptureResult | null> {
+  if (!captures.length) {
+    return null;
+  }
+
+  if (captures.length === 1) {
+    return {
+      ...captures[0],
+      captureMode,
+      segmentCount: 1,
+      filename: threadNoteScreenshotSessionFilename(captureMode, 1),
+    };
+  }
+
+  const validCaptures = captures.filter((capture) => capture.ok && capture.dataUrl);
+  if (!validCaptures.length) {
+    return null;
+  }
+
+  const images = await Promise.all(
+    validCaptures.map((capture) => loadThreadNoteScreenshotImage(capture.dataUrl ?? ""))
+  );
+  const loadedImages = images.filter(
+    (image): image is HTMLImageElement => image instanceof HTMLImageElement
+  );
+
+  if (!loadedImages.length) {
+    return null;
+  }
+
+  const maxSourceWidth = loadedImages.reduce(
+    (maxWidth, image) => Math.max(maxWidth, image.naturalWidth || image.width || 1),
+    1
+  );
+  const scale = Math.min(1, 1680 / maxSourceWidth);
+  const isScrolling = captureMode === "scrolling";
+  const padding = isScrolling ? 0 : 14;
+  const gap = isScrolling ? 0 : 18;
+  const drawSizes = loadedImages.map((image) => ({
+    width: Math.max(1, image.naturalWidth || image.width || 1) * scale,
+    height: Math.max(1, image.naturalHeight || image.height || 1) * scale,
+  }));
+  const contentWidth = drawSizes.reduce((maxWidth, size) => Math.max(maxWidth, size.width), 1);
+  const canvasWidth = Math.ceil(contentWidth + padding * 2);
+  const canvasHeight = Math.ceil(
+    drawSizes.reduce((sum, size) => sum + size.height, padding * 2 + gap * (drawSizes.length - 1))
+  );
+
+  const canvas = document.createElement("canvas");
+  canvas.width = canvasWidth;
+  canvas.height = canvasHeight;
+  const context = canvas.getContext("2d");
+  if (!context) {
+    return null;
+  }
+
+  if (!isScrolling) {
+    context.fillStyle = "#0d1016";
+    context.fillRect(0, 0, canvasWidth, canvasHeight);
+  }
+
+  let currentY = padding;
+  loadedImages.forEach((image, index) => {
+    const drawSize = drawSizes[index];
+    const drawX = padding + (contentWidth - drawSize.width) / 2;
+
+    if (!isScrolling) {
+      context.fillStyle = "#161922";
+      roundRect(context, drawX - 1, currentY - 1, drawSize.width + 2, drawSize.height + 2, 12);
+      context.fill();
+    }
+    context.drawImage(image, drawX, currentY, drawSize.width, drawSize.height);
+
+    currentY += drawSize.height + gap;
+  });
+
+  return {
+    requestId: createThreadNoteScreenshotRequestID(),
+    ok: true,
+    cancelled: false,
+    message: null,
+    captureMode,
+    segmentCount: validCaptures.length,
+    filename: threadNoteScreenshotSessionFilename(captureMode, validCaptures.length),
+    mimeType: "image/png",
+    dataUrl: canvas.toDataURL("image/png"),
+  };
+}
+
+function roundRect(
+  context: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  width: number,
+  height: number,
+  radius: number
+) {
+  const resolvedRadius = Math.max(0, Math.min(radius, width / 2, height / 2));
+  context.beginPath();
+  context.moveTo(x + resolvedRadius, y);
+  context.lineTo(x + width - resolvedRadius, y);
+  context.quadraticCurveTo(x + width, y, x + width, y + resolvedRadius);
+  context.lineTo(x + width, y + height - resolvedRadius);
+  context.quadraticCurveTo(x + width, y + height, x + width - resolvedRadius, y + height);
+  context.lineTo(x + resolvedRadius, y + height);
+  context.quadraticCurveTo(x, y + height, x, y + height - resolvedRadius);
+  context.lineTo(x, y + resolvedRadius);
+  context.quadraticCurveTo(x, y, x + resolvedRadius, y);
+  context.closePath();
 }
 
 async function fileFromThreadNoteDataURL(

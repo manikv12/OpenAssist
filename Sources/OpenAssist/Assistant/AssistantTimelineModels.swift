@@ -727,6 +727,7 @@ struct AssistantTimelineItem: Identifiable, Equatable, Codable, Sendable {
     var planText: String?
     var planEntries: [AssistantPlanEntry]?
     var imageAttachments: [Data]?
+    var selectedPlugins: [AssistantComposerPluginSelection]?
     var providerBackend: AssistantRuntimeBackend?
     var providerModelID: String?
     var source: AssistantTimelineSource
@@ -770,6 +771,7 @@ struct AssistantTimelineItem: Identifiable, Equatable, Codable, Sendable {
         planText: String?,
         planEntries: [AssistantPlanEntry]?,
         imageAttachments: [Data]? = nil,
+        selectedPlugins: [AssistantComposerPluginSelection]? = nil,
         providerBackend: AssistantRuntimeBackend? = nil,
         providerModelID: String? = nil,
         source: AssistantTimelineSource
@@ -788,6 +790,7 @@ struct AssistantTimelineItem: Identifiable, Equatable, Codable, Sendable {
         self.planText = planText
         self.planEntries = planEntries
         self.imageAttachments = imageAttachments
+        self.selectedPlugins = selectedPlugins?.isEmpty == false ? selectedPlugins : nil
         self.providerBackend = providerBackend
         self.providerModelID = providerModelID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
         self.source = source
@@ -800,6 +803,7 @@ struct AssistantTimelineItem: Identifiable, Equatable, Codable, Sendable {
         text: String,
         createdAt: Date = Date(),
         imageAttachments: [Data]? = nil,
+        selectedPlugins: [AssistantComposerPluginSelection]? = nil,
         providerBackend: AssistantRuntimeBackend? = nil,
         providerModelID: String? = nil,
         source: AssistantTimelineSource
@@ -819,6 +823,7 @@ struct AssistantTimelineItem: Identifiable, Equatable, Codable, Sendable {
             planText: nil,
             planEntries: nil,
             imageAttachments: imageAttachments,
+            selectedPlugins: selectedPlugins,
             providerBackend: providerBackend,
             providerModelID: providerModelID,
             source: source

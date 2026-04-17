@@ -736,6 +736,17 @@ final class AssistantProjectStore {
         }
 
         let previousText = loadProjectNoteText(projectID: normalizedProjectID, fileName: note.fileName)
+        let previousTrimmed = previousText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let nextTrimmed = normalizedText.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if nextTrimmed.isEmpty, !previousTrimmed.isEmpty, !forceHistorySnapshot {
+            return AssistantNotesWorkspace(
+                projectID: normalizedProjectID,
+                manifest: manifest,
+                selectedNoteText: previousText
+            )
+        }
+
         if previousText != normalizedText {
             noteRecoveryStore.captureHistorySnapshot(
                 note: note,
@@ -743,11 +754,11 @@ final class AssistantProjectStore {
                 ownerID: normalizedProjectID,
                 text: previousText,
                 at: now,
-                force: forceHistorySnapshot || normalizedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                force: forceHistorySnapshot || nextTrimmed.isEmpty
             )
         }
 
-        if normalizedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        if nextTrimmed.isEmpty {
             try? fileManager.removeItem(at: fileURL)
         } else {
             try fileManager.createDirectory(

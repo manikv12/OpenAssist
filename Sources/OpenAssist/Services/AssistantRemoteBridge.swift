@@ -274,15 +274,24 @@ final class AssistantRemoteBridge {
         return await assistant.remoteSessionSnapshot(sessionID: sessionID)
     }
 
-    func sendPrompt(_ prompt: String, sessionID: String?) async -> AssistantRemoteSessionSnapshot? {
+    func sendPrompt(
+        _ prompt: String,
+        sessionID: String?,
+        selectedPluginIDs: [String] = []
+    ) async -> AssistantRemoteSessionSnapshot? {
         if let sessionID = sessionID?.trimmingCharacters(in: .whitespacesAndNewlines),
            !sessionID.isEmpty {
             _ = await openSession(sessionID: sessionID)
         }
 
-        await assistant.sendPrompt(prompt)
+        await assistant.sendPrompt(prompt, selectedPluginIDs: selectedPluginIDs)
         guard let activeSessionID = assistant.selectedSessionID else { return nil }
         return await assistant.remoteSessionSnapshot(sessionID: activeSessionID)
+    }
+
+    func installedCodexPlugins() async -> [AssistantComposerPluginSelection] {
+        await assistant.refreshCodexPluginCatalogIfNeeded()
+        return assistant.installedCodexPluginSelections
     }
 
     private func reusableEmptyDraftSessionID(isTemporary: Bool) -> String? {
@@ -378,5 +387,11 @@ final class AssistantRemoteBridge {
 
     func cancelPendingPermissionRequest() async {
         await assistant.cancelPermissionRequest()
+    }
+
+    /// Strip heavy image data from delivered screenshot timeline items to prevent
+    /// screenshots from accumulating on disk in the session history.
+    func clearDeliveredScreenshotData() async {
+        assistant.clearDeliveredScreenshotAttachments()
     }
 }

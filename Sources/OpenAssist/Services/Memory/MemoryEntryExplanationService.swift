@@ -52,6 +52,12 @@ enum ThreadNoteScreenshotImportMode: String, Sendable {
     case cleanTextAndImage
 }
 
+enum ThreadNoteScreenshotCaptureMode: String, Sendable {
+    case area
+    case scrolling
+    case multiple
+}
+
 struct ThreadNoteScreenshotImportPreparation: Equatable, Sendable {
     let markdown: String
     let rawText: String
@@ -608,7 +614,9 @@ enum ThreadNoteOrganizePromptBuilder {
 enum ThreadNoteScreenshotImportPromptBuilder {
     static func makePrompt(
         recognizedText: String?,
-        styleInstruction: String? = nil
+        styleInstruction: String? = nil,
+        captureMode: ThreadNoteScreenshotCaptureMode = .area,
+        segmentCount: Int = 1
     ) -> ThreadNoteOrganizePrompt {
         let normalizedRecognizedText = recognizedText?
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -622,6 +630,7 @@ enum ThreadNoteScreenshotImportPromptBuilder {
         Output markdown only.
         Use simple wording, short headings, and readable bullets when they help.
         Preserve concrete facts, names, numbers, commands, filenames, labels, and key wording from the screenshot.
+        When several screenshots cover the same topic, merge them into one concise note and remove obvious repetition.
         If the screenshot looks like UI text, convert it into a useful note instead of copying visual layout details.
         If the screenshot looks like a document, keep the important structure but remove obvious OCR noise.
         Do not mention OCR unless the user asks.
@@ -649,11 +658,38 @@ enum ThreadNoteScreenshotImportPromptBuilder {
             """
         } ?? ""
 
+        let normalizedSegmentCount = max(1, segmentCount)
+        let captureContextSection: String = {
+            guard captureMode != .area || normalizedSegmentCount > 1 else { return "" }
+
+            switch captureMode {
+            case .scrolling:
+                return """
+
+                This image combines \(normalizedSegmentCount) screenshots in top-to-bottom scroll order.
+                Treat them as one continuous scrolling capture and preserve the reading order.
+                """
+            case .multiple:
+                return """
+
+                This image combines \(normalizedSegmentCount) separate screenshots arranged from top to bottom.
+                If they cover the same topic, merge them into one combined summary and remove repeated details.
+                Keep separate sections only when the screenshots are clearly about different subtopics.
+                """
+            case .area:
+                return """
+
+                This image combines \(normalizedSegmentCount) screenshots arranged from top to bottom.
+                Preserve the useful order when turning them into a note.
+                """
+            }
+        }()
+
         return ThreadNoteOrganizePrompt(
             systemPrompt: systemPrompt,
             userPrompt: """
             Convert this screenshot into note-ready markdown.
-            \(recognizedTextSection)\(styleInstructionSection)
+            \(recognizedTextSection)\(captureContextSection)\(styleInstructionSection)
 
             Focus on content that belongs in a note:
             - the main text
@@ -877,7 +913,9 @@ actor MemoryEntryExplanationService {
     func prepareThreadNoteScreenshotImport(
         attachment: AssistantAttachment,
         outputMode: ThreadNoteScreenshotImportMode,
-        styleInstruction: String? = nil
+        styleInstruction: String? = nil,
+        captureMode: ThreadNoteScreenshotCaptureMode = .area,
+        segmentCount: Int = 1
     ) async -> ThreadNoteScreenshotImportPreparationResult {
         guard attachment.mimeType.lowercased().hasPrefix("image/") else {
             return .failure("Use an image screenshot here.")
@@ -913,9 +951,18 @@ actor MemoryEntryExplanationService {
             .nonEmpty
         let prompt = ThreadNoteScreenshotImportPromptBuilder.makePrompt(
             recognizedText: normalizedRecognizedText,
-            styleInstruction: normalizedStyleInstruction
+            styleInstruction: normalizedStyleInstruction,
+            captureMode: captureMode,
+            segmentCount: segmentCount
         )
         let canUseVision = supportsVisionInput(configuration: resolved.configuration)
+        let shouldPreferTextOnly = shouldPreferTextOnlyScreenshotImport(
+            recognizedText: normalizedRecognizedText,
+            attachmentByteCount: attachment.data.count,
+            captureMode: captureMode,
+            segmentCount: segmentCount
+        )
+        let primaryUsesVision = canUseVision && !shouldPreferTextOnly
 
         if !canUseVision, normalizedRecognizedText == nil {
             return .failure(
@@ -924,29 +971,43 @@ actor MemoryEntryExplanationService {
         }
 
         do {
-            let request: URLRequest
-            if canUseVision {
-                request = try buildRequest(
+            let primaryRequest: URLRequest
+            if primaryUsesVision {
+                primaryRequest = try buildRequest(
                     configuration: resolved.configuration,
                     credential: resolved.credential,
                     systemPrompt: prompt.systemPrompt,
                     userPrompt: prompt.userPrompt,
                     maxOutputTokens: 1_400,
                     imageData: attachment.data,
-                    imageMimeType: attachment.mimeType
+                    imageMimeType: attachment.mimeType,
+                    timeoutInterval: screenshotImportRequestTimeout(
+                        outputMode: outputMode,
+                        captureMode: captureMode,
+                        segmentCount: segmentCount,
+                        attachmentByteCount: attachment.data.count,
+                        usingVision: true
+                    )
                 )
             } else {
-                request = try buildRequest(
+                primaryRequest = try buildRequest(
                     configuration: resolved.configuration,
                     credential: resolved.credential,
                     systemPrompt: prompt.systemPrompt,
                     userPrompt: prompt.userPrompt,
-                    maxOutputTokens: 1_400
+                    maxOutputTokens: 1_400,
+                    timeoutInterval: screenshotImportRequestTimeout(
+                        outputMode: outputMode,
+                        captureMode: captureMode,
+                        segmentCount: segmentCount,
+                        attachmentByteCount: attachment.data.count,
+                        usingVision: false
+                    )
                 )
             }
 
             let result = try await executeRequest(
-                request,
+                primaryRequest,
                 configuration: resolved.configuration,
                 credential: resolved.credential,
                 emptyResultMessage: "Provider returned an empty screenshot note draft."
@@ -963,15 +1024,134 @@ actor MemoryEntryExplanationService {
                     ThreadNoteScreenshotImportPreparation(
                         markdown: normalizedMarkdown,
                         rawText: normalizedRecognizedText ?? "",
-                        usedVision: canUseVision
+                        usedVision: primaryUsesVision
                     )
                 )
             case .failure(let message):
+                if primaryUsesVision,
+                    let normalizedRecognizedText,
+                    shouldRetryScreenshotImportWithoutVision(after: message)
+                {
+                    let fallbackRequest = try buildRequest(
+                        configuration: resolved.configuration,
+                        credential: resolved.credential,
+                        systemPrompt: prompt.systemPrompt,
+                        userPrompt: prompt.userPrompt,
+                        maxOutputTokens: 1_400,
+                        timeoutInterval: screenshotImportRequestTimeout(
+                            outputMode: outputMode,
+                            captureMode: captureMode,
+                            segmentCount: segmentCount,
+                            attachmentByteCount: attachment.data.count,
+                            usingVision: false
+                        )
+                    )
+
+                    let fallbackResult = try await executeRequest(
+                        fallbackRequest,
+                        configuration: resolved.configuration,
+                        credential: resolved.credential,
+                        emptyResultMessage: "Provider returned an empty screenshot note draft."
+                    )
+
+                    switch fallbackResult {
+                    case .success(let markdown):
+                        let normalizedMarkdown = markdown
+                            .trimmingCharacters(in: .whitespacesAndNewlines)
+                        guard !normalizedMarkdown.isEmpty else {
+                            return .failure("The screenshot preview came back empty. Please try again.")
+                        }
+                        return .success(
+                            ThreadNoteScreenshotImportPreparation(
+                                markdown: normalizedMarkdown,
+                                rawText: normalizedRecognizedText,
+                                usedVision: false
+                            )
+                        )
+                    case .failure(let fallbackMessage):
+                        return .failure(fallbackMessage)
+                    }
+                }
                 return .failure(message)
             }
         } catch {
             return .failure("Could not build screenshot note request. Check provider base URL.")
         }
+    }
+
+    private func shouldPreferTextOnlyScreenshotImport(
+        recognizedText: String?,
+        attachmentByteCount: Int,
+        captureMode: ThreadNoteScreenshotCaptureMode,
+        segmentCount: Int
+    ) -> Bool {
+        guard recognizedText != nil else { return false }
+
+        let normalizedSegmentCount = max(1, segmentCount)
+        if captureMode == .multiple && normalizedSegmentCount >= 4 {
+            return true
+        }
+
+        if captureMode == .scrolling && normalizedSegmentCount >= 5 {
+            return true
+        }
+
+        return attachmentByteCount >= 5_500_000
+    }
+
+    private func shouldRetryScreenshotImportWithoutVision(after message: String) -> Bool {
+        let normalized = message
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+
+        if normalized.isEmpty {
+            return false
+        }
+
+        let retryableFragments = [
+            "timed out",
+            "timeout",
+            "too large",
+            "413",
+            "body too large",
+            "context length",
+            "request entity too large"
+        ]
+        return retryableFragments.contains { normalized.contains($0) }
+    }
+
+    private func screenshotImportRequestTimeout(
+        outputMode: ThreadNoteScreenshotImportMode,
+        captureMode: ThreadNoteScreenshotCaptureMode,
+        segmentCount: Int,
+        attachmentByteCount: Int,
+        usingVision: Bool
+    ) -> TimeInterval {
+        let normalizedSegmentCount = max(1, segmentCount)
+        let megabytes = Double(max(0, attachmentByteCount)) / 1_000_000
+
+        if outputMode == .rawOCR {
+            return 20
+        }
+
+        var timeout: TimeInterval = usingVision ? 45 : 30
+
+        switch captureMode {
+        case .area:
+            timeout += Double(max(0, normalizedSegmentCount - 1)) * 4
+        case .scrolling:
+            timeout += Double(max(0, normalizedSegmentCount - 1)) * 8
+        case .multiple:
+            timeout += Double(max(0, normalizedSegmentCount - 1)) * 12
+        }
+
+        if usingVision {
+            timeout += min(30, megabytes * 3)
+        } else {
+            timeout += min(12, megabytes)
+        }
+
+        return min(150, max(20, timeout))
     }
 
     func generateBatchNotePlan(
@@ -1208,7 +1388,8 @@ actor MemoryEntryExplanationService {
         userPrompt: String,
         maxOutputTokens: Int,
         imageData: Data? = nil,
-        imageMimeType: String? = nil
+        imageMimeType: String? = nil,
+        timeoutInterval: TimeInterval = 25
     ) throws -> URLRequest {
         let trimmedSystemPrompt = systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
         let trimmedUserPrompt = userPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1315,7 +1496,7 @@ actor MemoryEntryExplanationService {
 
         var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"
-        request.timeoutInterval = 25
+        request.timeoutInterval = timeoutInterval
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = body
 

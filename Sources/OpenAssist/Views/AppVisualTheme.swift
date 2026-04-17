@@ -37,6 +37,33 @@ enum AppVisualTheme {
         }
     }
     static var panelTint: Color { palette.panelTint }
+    static var assistantWebAccentTint: Color {
+        accentTint
+    }
+    static var assistantWindowChromeAccent: Color {
+        if isDarkAppearance {
+            return Color(red: 0.17, green: 0.20, blue: 0.24)
+        }
+        return Color(red: 0.29, green: 0.43, blue: 0.70)
+    }
+    static var assistantWindowBackgroundTint: Color {
+        if isDarkAppearance {
+            return Color(red: 0.05, green: 0.07, blue: 0.09)
+        }
+        return Color(red: 0.98, green: 0.99, blue: 1.00)
+    }
+    static var assistantWindowGlowWarm: Color {
+        if isDarkAppearance {
+            return Color(red: 0.08, green: 0.10, blue: 0.12)
+        }
+        return Color(red: 0.97, green: 0.98, blue: 1.00)
+    }
+    static var assistantWindowGlowCool: Color {
+        if isDarkAppearance {
+            return Color(red: 0.05, green: 0.07, blue: 0.09)
+        }
+        return Color(red: 0.90, green: 0.94, blue: 1.00)
+    }
     static var rowSelection: Color { palette.rowSelection }
     static var historyTint: Color { palette.historyTint }
     static var aiStudioTint: Color { palette.aiStudioTint }
@@ -412,6 +439,12 @@ struct AppSplitChromeBackground: View {
     var leadingTint: Color = AppVisualTheme.sidebarTint
     var trailingTint: Color = AppVisualTheme.windowBackground
     var accent: Color = AppVisualTheme.accentTint
+    var glowWarm: Color? = nil
+    var glowCool: Color? = nil
+    var trailingMaterialOpacity: Double? = nil
+    var trailingTintOpacityWhenMaterial: Double? = nil
+    var trailingOverlayColor: Color? = nil
+    var trailingOverlayOpacity: Double = 0
     var leadingPaneTransparent = false
     var showsLeadingDivider = true
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
@@ -427,6 +460,10 @@ struct AppSplitChromeBackground: View {
         let sidebarTint = SettingsStore.shared.colorTheme == .noirGold
             ? AppVisualTheme.sidebarChromeTint
             : leadingTint
+        let resolvedGlowWarm = glowWarm ?? tokens.glowRed
+        let resolvedGlowCool = glowCool ?? tokens.glowBlue
+        let resolvedTrailingMaterialOpacity = trailingMaterialOpacity ?? 0.82
+        let resolvedTrailingTintOpacityWhenMaterial = trailingTintOpacityWhenMaterial ?? 0.18
 
         GeometryReader { proxy in
             let calculatedWidth = proxy.size.width * leadingPaneFraction
@@ -483,7 +520,7 @@ struct AppSplitChromeBackground: View {
                                 material: tokens.backgroundMaterial,
                                 blendingMode: tokens.backgroundBlendingMode
                             )
-                            .opacity(0.82)
+                            .opacity(resolvedTrailingMaterialOpacity)
                         }
 
                         LinearGradient(
@@ -496,11 +533,19 @@ struct AppSplitChromeBackground: View {
                             endPoint: .bottomTrailing
                         )
 
-                        trailingTint.opacity(tokens.useMaterial ? 0.18 : 0.14)
+                        trailingTint.opacity(
+                            tokens.useMaterial
+                                ? resolvedTrailingTintOpacityWhenMaterial
+                                : 0.14
+                        )
+
+                        if let trailingOverlayColor, trailingOverlayOpacity > 0 {
+                            trailingOverlayColor.opacity(trailingOverlayOpacity)
+                        }
 
                         RadialGradient(
                             colors: [
-                                tokens.glowRed.opacity(0.92),
+                                resolvedGlowWarm.opacity(0.92),
                                 Color.clear
                             ],
                             center: .bottomLeading,
@@ -510,7 +555,7 @@ struct AppSplitChromeBackground: View {
 
                         RadialGradient(
                             colors: [
-                                tokens.glowBlue.opacity(0.92),
+                                resolvedGlowCool.opacity(0.92),
                                 Color.clear
                             ],
                             center: .topTrailing,
@@ -520,8 +565,8 @@ struct AppSplitChromeBackground: View {
 
                         LinearGradient(
                             colors: [
-                                tokens.glowRed.opacity(0.24),
-                                tokens.glowBlue.opacity(0.20),
+                                resolvedGlowWarm.opacity(0.24),
+                                resolvedGlowCool.opacity(0.20),
                                 Color.clear
                             ],
                             startPoint: .leading,

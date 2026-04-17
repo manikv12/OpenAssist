@@ -27,6 +27,37 @@ enum AppWindowFrameFitter {
         )
     }
 
+    static func adaptedTargetSize(
+        preferredSize: NSSize,
+        minimumSize: NSSize,
+        visibleFrame: NSRect?,
+        fallbackMinimumSize: NSSize = NSSize(width: 420, height: 320),
+        screenPadding: NSSize = NSSize(width: 48, height: 56)
+    ) -> NSSize {
+        guard let visibleFrame else {
+            return preferredSize
+        }
+
+        let adaptedMinimumSize = adaptedMinimumSize(
+            preferredMinimumSize: minimumSize,
+            visibleFrame: visibleFrame,
+            fallbackMinimumSize: fallbackMinimumSize
+        )
+        let availableWidth = max(
+            adaptedMinimumSize.width,
+            visibleFrame.width - screenPadding.width
+        )
+        let availableHeight = max(
+            adaptedMinimumSize.height,
+            visibleFrame.height - screenPadding.height
+        )
+
+        return NSSize(
+            width: min(preferredSize.width, availableWidth),
+            height: min(preferredSize.height, availableHeight)
+        )
+    }
+
     static func centeredFrame(size: NSSize, in visibleFrame: NSRect) -> NSRect {
         NSRect(
             x: visibleFrame.midX - (size.width / 2),
@@ -104,8 +135,10 @@ private final class AppHostWindow: NSWindow {
 
 @MainActor
 final class AppWindowCoordinator: NSObject, NSWindowDelegate {
-    private let settingsDefaultSize = NSSize(width: 900, height: 680)
-    private let settingsMinimumSize = NSSize(width: 820, height: 560)
+    private let settingsDefaultSize = NSSize(width: 1120, height: 760)
+    private let settingsMinimumSize = NSSize(width: 920, height: 620)
+    private let settingsExpandedDefaultSize = NSSize(width: 1380, height: 860)
+    private let settingsExpandedMinimumSize = NSSize(width: 1080, height: 700)
     private let aiStudioDefaultSize = NSSize(width: 1120, height: 760)
     private let aiStudioMinimumSize = NSSize(width: 1000, height: 620)
     private let assistantDefaultSize = NSSize(width: 1180, height: 760)
@@ -114,6 +147,7 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
     private let historyMinimumSize = NSSize(width: 520, height: 360)
     private let onboardingDefaultSize = NSSize(width: 700, height: 620)
     private let onboardingMinimumSize = NSSize(width: 620, height: 540)
+    private let settingsWindowFrameAutosaveName = "OpenAssist.SettingsWindow"
 
     private let settings: SettingsStore
     private let transcriptHistory: TranscriptHistoryStore
@@ -171,8 +205,9 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
 
         let hostingController = NSHostingController(rootView: SettingsView(initialRoute: route).environmentObject(settings))
         if settingsWindowController == nil {
+            let targetSize = targetSettingsWindowSize(for: route, visibleFrame: preferredVisibleFrameForNewWindow)
             let window = AppHostWindow(
-                contentRect: NSRect(origin: .zero, size: settingsDefaultSize),
+                contentRect: NSRect(origin: .zero, size: targetSize),
                 styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
                 backing: .buffered,
                 defer: false
@@ -189,8 +224,11 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
             window.hidesOnDeactivate = false
             window.collectionBehavior = standardWindowCollectionBehavior
             window.isReleasedWhenClosed = false
-            window.minSize = settingsMinimumSize
-            centerWindowOnActiveScreen(window)
+            let restoredFrame = window.setFrameAutosaveName(settingsWindowFrameAutosaveName)
+            fitSettingsWindowToVisibleScreen(window, route: route, preferTargetSize: !restoredFrame)
+            if !restoredFrame {
+                centerWindowOnActiveScreen(window)
+            }
             window.delegate = self
 
             settingsWindowController = NSWindowController(window: window)
@@ -208,10 +246,7 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
         if window.isMiniaturized {
             window.deminiaturize(nil)
         }
-        if window.frame.width < settingsMinimumSize.width || window.frame.height < settingsMinimumSize.height {
-            window.setContentSize(settingsDefaultSize)
-        }
-        centerWindowOnActiveScreen(window)
+        fitSettingsWindowToVisibleScreen(window, route: route, preferTargetSize: false)
         window.orderFrontRegardless()
         window.makeKeyAndOrderFront(nil)
         aiStudioWindowController?.close()
@@ -495,21 +530,110 @@ final class AppWindowCoordinator: NSObject, NSWindowDelegate {
         fitAssistantWindowToVisibleScreen(window)
     }
 
-    private func targetAssistantWindowSize(for visibleFrame: NSRect?) -> NSSize {
-        guard let visibleFrame else { return assistantDefaultSize }
+    private var preferredVisibleFrameForNewWindow: NSRect? {
+        (NSScreen.main ?? NSScreen.screens.first)?.visibleFrame
+    }
 
-        let horizontalPadding: CGFloat = 48
-        let verticalPadding: CGFloat = 56
-        let adaptedMinimumSize = AppWindowFrameFitter.adaptedMinimumSize(
-            preferredMinimumSize: assistantMinimumSize,
+    private func canonicalSettingsSection(_ section: SettingsSection) -> SettingsSection {
+        switch section {
+        case .gettingStarted, .dailyUse:
+            return .assistant
+        case .browserAppControl:
+            return .automation
+        case .permissionsPrivacy:
+            return .privacyPermissions
+        case .advanced:
+            return .modelsConnections
+        case .assistant, .voiceDictation, .modelsConnections, .automation,
+             .privacyPermissions, .appearance, .integrations, .general:
+            return section
+        }
+    }
+
+    private func preferredSettingsSection(for route: SettingsRoute?) -> SettingsSection {
+        if let route {
+            return canonicalSettingsSection(route.section)
+        }
+
+        let storedRawValue = settings.settingsLastViewedSection
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let storedSection = SettingsSection(rawValue: storedRawValue) else {
+            return .assistant
+        }
+        return canonicalSettingsSection(storedSection)
+    }
+
+    private func preferredSettingsDefaultSize(for route: SettingsRoute?) -> NSSize {
+        switch preferredSettingsSection(for: route) {
+        case .assistant, .modelsConnections:
+            return settingsExpandedDefaultSize
+        default:
+            return settingsDefaultSize
+        }
+    }
+
+    private func preferredSettingsMinimumSize(for route: SettingsRoute?) -> NSSize {
+        switch preferredSettingsSection(for: route) {
+        case .assistant, .modelsConnections:
+            return settingsExpandedMinimumSize
+        default:
+            return settingsMinimumSize
+        }
+    }
+
+    private func targetSettingsWindowSize(for route: SettingsRoute?, visibleFrame: NSRect?) -> NSSize {
+        AppWindowFrameFitter.adaptedTargetSize(
+            preferredSize: preferredSettingsDefaultSize(for: route),
+            minimumSize: preferredSettingsMinimumSize(for: route),
             visibleFrame: visibleFrame
         )
-        let maxWidth = max(adaptedMinimumSize.width, visibleFrame.width - horizontalPadding)
-        let maxHeight = max(adaptedMinimumSize.height, visibleFrame.height - verticalPadding)
+    }
 
-        return NSSize(
-            width: min(assistantDefaultSize.width, maxWidth),
-            height: min(assistantDefaultSize.height, maxHeight)
+    private func fitSettingsWindowToVisibleScreen(
+        _ window: NSWindow,
+        route: SettingsRoute?,
+        preferTargetSize: Bool
+    ) {
+        guard let visibleFrame = preferredVisibleFrame(for: window) else {
+            return
+        }
+
+        let adaptedMinimumSize = AppWindowFrameFitter.adaptedMinimumSize(
+            preferredMinimumSize: preferredSettingsMinimumSize(for: route),
+            visibleFrame: visibleFrame
+        )
+        if window.minSize != adaptedMinimumSize {
+            window.minSize = adaptedMinimumSize
+        }
+
+        let targetSize = targetSettingsWindowSize(for: route, visibleFrame: visibleFrame)
+        let proposedSize: NSSize
+        if preferTargetSize {
+            proposedSize = NSSize(
+                width: max(window.frame.width, targetSize.width),
+                height: max(window.frame.height, targetSize.height)
+            )
+        } else {
+            proposedSize = window.frame.size
+        }
+
+        let fittedFrame = AppWindowFrameFitter.fittedFrame(
+            NSRect(origin: window.frame.origin, size: proposedSize),
+            within: visibleFrame,
+            minimumSize: adaptedMinimumSize
+        )
+        guard fittedFrame.integral != window.frame.integral else {
+            return
+        }
+
+        window.setFrame(fittedFrame, display: false)
+    }
+
+    private func targetAssistantWindowSize(for visibleFrame: NSRect?) -> NSSize {
+        AppWindowFrameFitter.adaptedTargetSize(
+            preferredSize: assistantDefaultSize,
+            minimumSize: assistantMinimumSize,
+            visibleFrame: visibleFrame
         )
     }
 

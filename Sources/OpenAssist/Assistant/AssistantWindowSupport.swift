@@ -13,19 +13,19 @@ enum AssistantWindowChrome {
     private static var isDarkAppearance: Bool { AppVisualTheme.isDarkAppearance }
 
     static var canvasTop: Color {
-        isDarkAppearance ? Color(red: 0.050, green: 0.052, blue: 0.062) : AppVisualTheme.windowBackground
+        isDarkAppearance ? Color(red: 0.05, green: 0.07, blue: 0.09) : AppVisualTheme.windowBackground
     }
 
     static var canvasBottom: Color {
-        isDarkAppearance ? Color(red: 0.028, green: 0.030, blue: 0.038) : Color(nsColor: .underPageBackgroundColor)
+        isDarkAppearance ? Color(red: 0.01, green: 0.02, blue: 0.03) : Color(nsColor: .underPageBackgroundColor)
     }
 
     static var shellTop: Color {
-        isDarkAppearance ? Color(red: 0.078, green: 0.082, blue: 0.098) : AppVisualTheme.surfaceFill(0.86)
+        isDarkAppearance ? Color(red: 0.05, green: 0.07, blue: 0.09) : AppVisualTheme.surfaceFill(0.86)
     }
 
     static var shellBottom: Color {
-        isDarkAppearance ? Color(red: 0.060, green: 0.064, blue: 0.078) : AppVisualTheme.surfaceFill(0.74)
+        isDarkAppearance ? Color(red: 0.05, green: 0.07, blue: 0.09) : AppVisualTheme.surfaceFill(0.74)
     }
 
     static var sidebarTop: Color {
@@ -37,43 +37,43 @@ enum AssistantWindowChrome {
     }
 
     static var contentTop: Color {
-        isDarkAppearance ? Color(red: 0.082, green: 0.086, blue: 0.102) : AppVisualTheme.textBackground
+        isDarkAppearance ? Color(red: 0.05, green: 0.07, blue: 0.09) : AppVisualTheme.textBackground
     }
 
     static var contentBottom: Color {
-        isDarkAppearance ? Color(red: 0.065, green: 0.068, blue: 0.082) : AppVisualTheme.controlBackground
+        isDarkAppearance ? Color(red: 0.05, green: 0.07, blue: 0.09) : AppVisualTheme.controlBackground
     }
 
     static var elevatedPanel: Color {
-        isDarkAppearance ? Color(red: 0.092, green: 0.096, blue: 0.114) : AppVisualTheme.surfaceFill(0.94)
+        isDarkAppearance ? Color(red: 0.09, green: 0.11, blue: 0.13) : AppVisualTheme.surfaceFill(0.94)
     }
 
     static var messagePanel: Color {
-        isDarkAppearance ? Color(red: 0.088, green: 0.092, blue: 0.108) : AppVisualTheme.surfaceFill(0.88)
+        isDarkAppearance ? Color(red: 0.09, green: 0.11, blue: 0.13) : AppVisualTheme.surfaceFill(0.88)
     }
 
     static var userBubble: Color {
-        isDarkAppearance ? Color(red: 0.110, green: 0.116, blue: 0.138) : AppVisualTheme.selectedContentBackground.opacity(0.88)
+        isDarkAppearance ? Color(red: 0.13, green: 0.15, blue: 0.18) : AppVisualTheme.selectedContentBackground.opacity(0.88)
     }
 
     static var userBubbleBorder: Color {
-        isDarkAppearance ? Color(red: 0.260, green: 0.340, blue: 0.480).opacity(0.50) : AppVisualTheme.surfaceStroke(0.55)
+        isDarkAppearance ? Color(red: 0.19, green: 0.21, blue: 0.24).opacity(0.82) : AppVisualTheme.surfaceStroke(0.55)
     }
 
     static var editorFill: Color {
-        isDarkAppearance ? Color(red: 0.065, green: 0.068, blue: 0.082) : AppVisualTheme.textBackground
+        isDarkAppearance ? Color(red: 0.05, green: 0.07, blue: 0.09) : AppVisualTheme.textBackground
     }
 
     static var toolbarFill: Color {
-        isDarkAppearance ? Color(red: 0.072, green: 0.076, blue: 0.092) : AppVisualTheme.surfaceFill(0.86)
+        isDarkAppearance ? Color(red: 0.05, green: 0.07, blue: 0.09) : AppVisualTheme.surfaceFill(0.86)
     }
 
     static var buttonFill: Color {
-        isDarkAppearance ? Color.white.opacity(0.050) : AppVisualTheme.surfaceFill(0.56)
+        isDarkAppearance ? Color(red: 0.13, green: 0.15, blue: 0.18).opacity(0.88) : AppVisualTheme.surfaceFill(0.56)
     }
 
     static var buttonEmphasis: Color {
-        isDarkAppearance ? Color(red: 0.130, green: 0.148, blue: 0.195) : AppVisualTheme.accentTint.opacity(0.16)
+        isDarkAppearance ? Color(red: 0.13, green: 0.16, blue: 0.20) : AppVisualTheme.accentTint.opacity(0.16)
     }
 
     static var border: Color { AppVisualTheme.surfaceStroke(0.58) }

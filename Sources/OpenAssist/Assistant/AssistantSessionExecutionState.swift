@@ -11,8 +11,10 @@ struct AssistantQueuedPrompt {
     var attachments: [AssistantAttachment]
     var preferredModelID: String?
     var modelSupportsImageInput: Bool
+    var selectedPluginIDs: [String]
     var automationJob: ScheduledJob?
     var createdAt: Date
+    var submittedSlashCommand: AssistantSubmittedSlashCommand?
 }
 
 struct AssistantSessionExecutionState {
@@ -35,6 +37,7 @@ struct AssistantSessionActivitySnapshot {
     let hudState: AssistantHUDState?
     let hasActiveTurn: Bool
     let hasLiveClaudeProcess: Bool
+    let canSteerActiveTurn: Bool
     let pendingPermissionRequest: AssistantPermissionRequest?
     let subagentCount: Int
     let pendingOutgoingMessage: AssistantPendingOutgoingMessage?
@@ -45,6 +48,7 @@ struct AssistantSessionActivitySnapshot {
         hudState: nil,
         hasActiveTurn: false,
         hasLiveClaudeProcess: false,
+        canSteerActiveTurn: false,
         pendingPermissionRequest: nil,
         subagentCount: 0,
         pendingOutgoingMessage: nil,

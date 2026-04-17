@@ -11,7 +11,7 @@ enum AssistantComputerUseToolDefinition {
     static let toolKind = "computerUse"
 
     static let description = """
-    Use the visible macOS desktop on this Mac by taking a screenshot, then using mouse and keyboard actions against the current screen. Prefer `browser_use` for opening or reusing a signed-in browser session, and prefer `app_action` for supported structured app actions. Use this tool only as a last resort when the task truly needs generic visual interaction such as observing the screen, clicking, dragging, scrolling, or typing in an unsupported app UI. When `app` or `window_id` is provided, the target app is automatically brought to focus and other apps are hidden for a clean, unobstructed interaction — you can skip the initial observe step and act directly.
+    Use the visible macOS desktop on this Mac by taking a screenshot, then using mouse and keyboard actions against the current screen. Prefer `browser_use` for opening or reusing a signed-in browser session, and prefer `app_action` for supported structured app actions. Use this tool only as a last resort when the task truly needs generic visual interaction such as observing the screen, clicking, dragging, scrolling, or typing in an unsupported app UI. When `app` or `window_id` is provided, the target app is automatically brought to focus and other apps are hidden for a clean, unobstructed interaction — you can skip the initial observe step and act directly. Supports: observe, click (left/right/middle with modifier keys), double_click, triple_click, right_click, middle_click, hover/move, mouse_down, mouse_up, drag, scroll, keypress, hold_key, type, open_application, clipboard_read, clipboard_write, cursor_position, switch_display, zoom (region inspect at full resolution), and wait.
     """
 
     static let inputSchema: [String: Any] = [
@@ -55,7 +55,7 @@ enum AssistantComputerUseToolDefinition {
                 "properties": [
                     "type": [
                         "type": "string",
-                        "description": "One of observe, click, double_click, move, drag, scroll, keypress, type, or wait."
+                        "description": "One of: observe, click, double_click, triple_click, right_click, middle_click, move, hover, mouse_down, mouse_up, drag, scroll, keypress, hold_key, type, open_application, clipboard_read, clipboard_write, cursor_position, switch_display, zoom, or wait."
                     ],
                     "x": [
                         "type": "number",
@@ -96,11 +96,27 @@ enum AssistantComputerUseToolDefinition {
                     ],
                     "button": [
                         "type": "string",
-                        "description": "Optional mouse button, usually left or right."
+                        "description": "Mouse button: left (default), right, or middle."
+                    ],
+                    "modifiers": [
+                        "type": "array",
+                        "description": "Modifier keys to hold during click (e.g. [\"cmd\"], [\"shift\", \"ctrl\"]).",
+                        "items": ["type": "string"]
+                    ],
+                    "name": [
+                        "type": "string",
+                        "description": "Application name for open_application action (e.g. Safari, Slack, Finder)."
                     ],
                     "duration_ms": [
                         "type": "integer",
-                        "description": "Optional wait duration in milliseconds."
+                        "description": "Duration in milliseconds for wait or hold_key actions."
+                    ],
+                    "region": [
+                        "type": "array",
+                        "description": "For zoom action: [x1, y1, x2, y2] defining top-left and bottom-right corners of the region to inspect at full resolution.",
+                        "items": ["type": "number"],
+                        "minItems": 4,
+                        "maxItems": 4
                     ]
                 ],
                 "required": ["type"]
@@ -117,6 +133,67 @@ enum AssistantComputerUseToolDefinition {
             "inputSchema": inputSchema
         ]
     }
+}
+
+enum AssistantComputerBatchToolDefinition {
+    static let name = "computer_batch"
+    static let toolKind = "computerBatch"
+
+    static let description = """
+    Execute multiple low-level computer actions in rapid sequence without per-action verification. \
+    Use this when you need to chain several actions quickly (e.g. click a field then type text, \
+    or press multiple keyboard shortcuts in sequence). Each action uses the same format as the \
+    computer_use tool's action object. A final screenshot is taken after all actions complete.
+    """
+
+    static let inputSchema: [String: Any] = [
+        "type": "object",
+        "properties": [
+            "actions": [
+                "type": "array",
+                "description": "An ordered list of actions to perform. Each uses the same schema as the computer_use action object.",
+                "items": [
+                    "type": "object",
+                    "properties": [
+                        "type": [
+                            "type": "string",
+                            "description": "One of: click, double_click, triple_click, right_click, middle_click, move, hover, mouse_down, mouse_up, drag, scroll, keypress, hold_key, type, open_application, clipboard_read, clipboard_write, cursor_position, switch_display, or wait."
+                        ],
+                        "x": ["type": "number"],
+                        "y": ["type": "number"],
+                        "path": [
+                            "type": "array",
+                            "items": [
+                                "type": "object",
+                                "properties": [
+                                    "x": ["type": "number"],
+                                    "y": ["type": "number"]
+                                ],
+                                "required": ["x", "y"]
+                            ]
+                        ],
+                        "scroll_x": ["type": "number"],
+                        "scroll_y": ["type": "number"],
+                        "keys": [
+                            "type": "array",
+                            "items": ["type": "string"]
+                        ],
+                        "text": ["type": "string"],
+                        "button": ["type": "string"],
+                        "modifiers": [
+                            "type": "array",
+                            "items": ["type": "string"]
+                        ],
+                        "name": ["type": "string"],
+                        "duration_ms": ["type": "integer"],
+                        "display_id": ["type": "integer"]
+                    ],
+                    "required": ["type"]
+                ]
+            ]
+        ],
+        "required": ["actions"]
+    ]
 }
 
 enum AssistantComputerUseServiceError: LocalizedError {
@@ -160,13 +237,25 @@ actor AssistantComputerUseService {
 
         enum Action: Equatable, Sendable {
             case observe
-            case click(Point, button: String?)
+            case click(Point, button: String?, modifiers: [String])
             case doubleClick(Point, button: String?)
+            case tripleClick(Point, button: String?)
+            case rightClick(Point)
+            case middleClick(Point)
             case move(Point)
+            case mouseDown(Point, button: String?)
+            case mouseUp(Point, button: String?)
             case drag([Point])
             case scroll(Point, deltaX: Double, deltaY: Double)
             case keypress([String])
+            case holdKey([String], durationMs: Int)
             case type(String)
+            case openApplication(String)
+            case clipboardRead
+            case clipboardWrite(String)
+            case cursorPosition
+            case switchDisplay(CGDirectDisplayID)
+            case zoom(x1: Double, y1: Double, x2: Double, y2: Double)
             case wait(milliseconds: Int)
 
             var typeName: String {
@@ -174,29 +263,43 @@ actor AssistantComputerUseService {
                 case .observe: return "observe"
                 case .click: return "click"
                 case .doubleClick: return "double_click"
+                case .tripleClick: return "triple_click"
+                case .rightClick: return "right_click"
+                case .middleClick: return "middle_click"
                 case .move: return "move"
+                case .mouseDown: return "mouse_down"
+                case .mouseUp: return "mouse_up"
                 case .drag: return "drag"
                 case .scroll: return "scroll"
                 case .keypress: return "keypress"
+                case .holdKey: return "hold_key"
                 case .type: return "type"
+                case .openApplication: return "open_application"
+                case .clipboardRead: return "clipboard_read"
+                case .clipboardWrite: return "clipboard_write"
+                case .cursorPosition: return "cursor_position"
+                case .switchDisplay: return "switch_display"
+                case .zoom: return "zoom"
                 case .wait: return "wait"
                 }
             }
 
             var requiresCurrentObservation: Bool {
                 switch self {
-                case .click, .doubleClick, .move, .drag, .scroll, .keypress:
+                case .click, .doubleClick, .tripleClick, .rightClick, .middleClick,
+                     .move, .mouseDown, .mouseUp, .drag, .scroll, .keypress:
                     return true
-                case .observe, .type, .wait:
+                case .observe, .holdKey, .type, .openApplication, .clipboardRead, .clipboardWrite, .cursorPosition, .switchDisplay, .zoom, .wait:
                     return false
                 }
             }
 
             var isCoordinateBased: Bool {
                 switch self {
-                case .click, .doubleClick, .move, .drag, .scroll:
+                case .click, .doubleClick, .tripleClick, .rightClick, .middleClick,
+                     .move, .mouseDown, .mouseUp, .drag, .scroll:
                     return true
-                case .observe, .keypress, .type, .wait:
+                case .observe, .keypress, .holdKey, .type, .openApplication, .clipboardRead, .clipboardWrite, .cursorPosition, .switchDisplay, .zoom, .wait:
                     return false
                 }
             }
@@ -205,13 +308,15 @@ actor AssistantComputerUseService {
                 switch self {
                 case .observe:
                     return ["type": "observe"]
-                case .click(let point, let button):
-                    return [
+                case .click(let point, let button, let modifiers):
+                    var payload: [String: Any] = [
                         "type": "click",
                         "x": point.x,
                         "y": point.y,
                         "button": button as Any
                     ]
+                    if !modifiers.isEmpty { payload["modifiers"] = modifiers }
+                    return payload
                 case .doubleClick(let point, let button):
                     return [
                         "type": "double_click",
@@ -219,11 +324,44 @@ actor AssistantComputerUseService {
                         "y": point.y,
                         "button": button as Any
                     ]
+                case .tripleClick(let point, let button):
+                    return [
+                        "type": "triple_click",
+                        "x": point.x,
+                        "y": point.y,
+                        "button": button as Any
+                    ]
+                case .rightClick(let point):
+                    return [
+                        "type": "right_click",
+                        "x": point.x,
+                        "y": point.y
+                    ]
+                case .middleClick(let point):
+                    return [
+                        "type": "middle_click",
+                        "x": point.x,
+                        "y": point.y
+                    ]
                 case .move(let point):
                     return [
                         "type": "move",
                         "x": point.x,
                         "y": point.y
+                    ]
+                case .mouseDown(let point, let button):
+                    return [
+                        "type": "mouse_down",
+                        "x": point.x,
+                        "y": point.y,
+                        "button": button as Any
+                    ]
+                case .mouseUp(let point, let button):
+                    return [
+                        "type": "mouse_up",
+                        "x": point.x,
+                        "y": point.y,
+                        "button": button as Any
                     ]
                 case .drag(let path):
                     return [
@@ -243,10 +381,40 @@ actor AssistantComputerUseService {
                         "type": "keypress",
                         "keys": keys
                     ]
+                case .holdKey(let keys, let durationMs):
+                    return [
+                        "type": "hold_key",
+                        "keys": keys,
+                        "duration_ms": durationMs
+                    ]
                 case .type(let text):
                     return [
                         "type": "type",
                         "text": text
+                    ]
+                case .openApplication(let name):
+                    return [
+                        "type": "open_application",
+                        "name": name
+                    ]
+                case .clipboardRead:
+                    return ["type": "clipboard_read"]
+                case .clipboardWrite(let text):
+                    return [
+                        "type": "clipboard_write",
+                        "text": text
+                    ]
+                case .cursorPosition:
+                    return ["type": "cursor_position"]
+                case .switchDisplay(let displayID):
+                    return [
+                        "type": "switch_display",
+                        "display_id": Int(displayID)
+                    ]
+                case .zoom(let x1, let y1, let x2, let y2):
+                    return [
+                        "type": "zoom",
+                        "region": [x1, y1, x2, y2]
                     ]
                 case .wait(let milliseconds):
                     return [
@@ -260,12 +428,22 @@ actor AssistantComputerUseService {
                 switch self {
                 case .observe:
                     return "Observed the current screen."
-                case .click(let point, _):
+                case .click(let point, _, _):
                     return "Clicked at \(point.compactDescription)."
                 case .doubleClick(let point, _):
                     return "Double-clicked at \(point.compactDescription)."
+                case .tripleClick(let point, _):
+                    return "Triple-clicked at \(point.compactDescription)."
+                case .rightClick(let point):
+                    return "Right-clicked at \(point.compactDescription)."
+                case .middleClick(let point):
+                    return "Middle-clicked at \(point.compactDescription)."
                 case .move(let point):
                     return "Moved the pointer to \(point.compactDescription)."
+                case .mouseDown(let point, _):
+                    return "Pressed mouse button at \(point.compactDescription)."
+                case .mouseUp(let point, _):
+                    return "Released mouse button at \(point.compactDescription)."
                 case .drag(let path):
                     let lead = path.first?.compactDescription ?? "the selected path"
                     let tail = path.last?.compactDescription ?? lead
@@ -274,8 +452,22 @@ actor AssistantComputerUseService {
                     return "Scrolled at \(point.compactDescription) by (\(Int(deltaX.rounded())), \(Int(deltaY.rounded())))."
                 case .keypress(let keys):
                     return "Pressed \(keys.joined(separator: " + "))."
+                case .holdKey(let keys, let durationMs):
+                    return "Held \(keys.joined(separator: " + ")) for \(durationMs) ms."
                 case .type:
                     return "Typed text into the target field."
+                case .openApplication(let name):
+                    return "Opened \(name)."
+                case .clipboardRead:
+                    return "Read clipboard."
+                case .clipboardWrite:
+                    return "Wrote to clipboard."
+                case .cursorPosition:
+                    return "Queried cursor position."
+                case .switchDisplay(let displayID):
+                    return "Switched to display \(displayID)."
+                case .zoom(let x1, let y1, let x2, let y2):
+                    return "Zoomed into region (\(Int(x1)), \(Int(y1))) to (\(Int(x2)), \(Int(y2)))."
                 case .wait(let milliseconds):
                     return "Waited \(milliseconds) ms."
                 }
@@ -317,14 +509,18 @@ actor AssistantComputerUseService {
             appName != nil || windowTitle != nil || windowID != nil || displayID != nil
         }
 
+        // computer_use always uses the pixel-click path (screenshot → LLM coordinates → CGEvent).
+        // Semantic AX clicks are reserved for the dedicated ui_click tool. This matches
+        // Claude Dispatch's behavior and avoids issues with Electron/web-view apps where
+        // AXPress does not propagate to the web layer.
         var canTrySemanticClick: Bool {
-            guard case .click = action else { return false }
-            return targetLabel?.nonEmpty != nil
+            return false
         }
 
+        // computer_use always uses the keyboard typing path (CGEvent keystrokes).
+        // Semantic AX typing is reserved for the dedicated ui_type tool.
         var canTrySemanticType: Bool {
-            guard case .type = action else { return false }
-            return targetLabel?.nonEmpty != nil || hasExplicitTargetHint
+            return false
         }
 
         private var normalizedContext: String {
@@ -440,6 +636,7 @@ actor AssistantComputerUseService {
         let targetBundleIdentifier: String?
         let targetPID: pid_t
         let hiddenAppPIDs: [pid_t]
+        let didHideOwnApp: Bool
     }
 
     private struct SessionState {
@@ -451,6 +648,7 @@ actor AssistantComputerUseService {
         var noProgressCounter = 0
         var staleReason: String?
         var focusState: FocusState?
+        var preferredDisplayID: CGDirectDisplayID?
     }
 
     private let helper: LocalAutomationHelper
@@ -509,7 +707,7 @@ actor AssistantComputerUseService {
     }
 
     private static func defaultFocusApp(bundleIdentifier: String?, appName: String, ownerPID: pid_t) async -> FocusState? {
-        await MainActor.run {
+        await MainActor.run { () -> FocusState? in
             let ownBundleID = Bundle.main.bundleIdentifier
             guard let targetApp = NSRunningApplication(processIdentifier: ownerPID),
                   !targetApp.isTerminated else {
@@ -518,20 +716,31 @@ actor AssistantComputerUseService {
             targetApp.activate(options: .activateIgnoringOtherApps)
 
             var hiddenPIDs: [pid_t] = []
+            var didHideOwn = false
+
             for app in NSWorkspace.shared.runningApplications {
                 guard app.activationPolicy == .regular,
                       app.processIdentifier != ownerPID,
-                      app.bundleIdentifier != ownBundleID,
                       !app.isHidden,
                       !app.isTerminated else { continue }
-                app.hide()
-                hiddenPIDs.append(app.processIdentifier)
+
+                if app.bundleIdentifier == ownBundleID {
+                    // Hide OpenAssist itself so its sidebar doesn't obstruct the
+                    // target app or appear in screenshots. The orb/notch HUD uses
+                    // a separate window level and will re-appear when we unhide.
+                    app.hide()
+                    didHideOwn = true
+                } else {
+                    app.hide()
+                    hiddenPIDs.append(app.processIdentifier)
+                }
             }
 
             return FocusState(
                 targetBundleIdentifier: bundleIdentifier,
                 targetPID: ownerPID,
-                hiddenAppPIDs: hiddenPIDs
+                hiddenAppPIDs: hiddenPIDs,
+                didHideOwnApp: didHideOwn
             )
         }
     }
@@ -540,6 +749,11 @@ actor AssistantComputerUseService {
         await MainActor.run {
             for pid in state.hiddenAppPIDs {
                 NSRunningApplication(processIdentifier: pid)?.unhide()
+            }
+
+            // Restore OpenAssist's own app visibility
+            if state.didHideOwnApp {
+                NSApp.unhide(nil)
             }
         }
     }
@@ -627,6 +841,77 @@ actor AssistantComputerUseService {
                 )
             }
 
+            // Non-visual actions that don't need a screen observation
+            if case .clipboardRead = request.action {
+                let content = await helper.readClipboard() ?? ""
+                sessionStateByID[normalizedSessionID] = state
+                let message = content.isEmpty ? "Clipboard is empty." : "Clipboard contents:\n\(content)"
+                return Self.result(summary: message, success: true, snapshot: nil, activityMetadata: nil)
+            }
+
+            if case .clipboardWrite(let text) = request.action {
+                await helper.writeClipboard(text)
+                sessionStateByID[normalizedSessionID] = state
+                return Self.result(summary: "Wrote \(text.count) characters to clipboard.", success: true, snapshot: nil, activityMetadata: nil)
+            }
+
+            if case .openApplication(let name) = request.action {
+                do {
+                    try await helper.openApplication(name: name)
+                    try await Task.sleep(nanoseconds: 500_000_000)
+                    sessionStateByID[normalizedSessionID] = state
+                    return Self.result(summary: "Opened \(name).", success: true, snapshot: nil, activityMetadata: nil)
+                } catch {
+                    sessionStateByID[normalizedSessionID] = state
+                    return Self.result(summary: error.localizedDescription, success: false, snapshot: nil, activityMetadata: nil)
+                }
+            }
+
+            if case .cursorPosition = request.action {
+                let pos = await helper.cursorPosition()
+                // NSEvent.mouseLocation uses bottom-left origin; convert to top-left for consistency
+                let screenHeight = NSScreen.main?.frame.height ?? 0
+                let x = Int(pos.x.rounded())
+                let y = Int((screenHeight - pos.y).rounded())
+                sessionStateByID[normalizedSessionID] = state
+                return Self.result(summary: "Cursor position: (\(x), \(y)).", success: true, snapshot: nil, activityMetadata: nil)
+            }
+
+            if case .switchDisplay(let displayID) = request.action {
+                // Validate the display ID exists
+                let validDisplays = AssistantWindowAutomationService.allDisplays()
+                guard validDisplays.contains(where: { $0.displayID == displayID }) else {
+                    let available = validDisplays.map { "  - \($0.displayID): \($0.resolutionDescription)\($0.isMain ? " (main)" : "")" }.joined(separator: "\n")
+                    sessionStateByID[normalizedSessionID] = state
+                    return Self.result(
+                        summary: "Display \(displayID) not found. Available displays:\n\(available)",
+                        success: false, snapshot: nil, activityMetadata: nil
+                    )
+                }
+                state.preferredDisplayID = CGDirectDisplayID(displayID)
+                sessionStateByID[normalizedSessionID] = state
+                return Self.result(summary: "Switched to display \(displayID). Future observations will capture from this display.", success: true, snapshot: nil, activityMetadata: nil)
+            }
+
+            if case .zoom(let x1, let y1, let x2, let y2) = request.action {
+                // Capture a fresh full screenshot, then crop the requested region at full resolution
+                let fullSnapshot: LocalAutomationDisplaySnapshot
+                if let existing = state.latestObservation?.snapshot {
+                    fullSnapshot = existing
+                } else {
+                    fullSnapshot = try await helper.capturePreferredSnapshot(
+                        previousSnapshot: state.latestObservation?.snapshot,
+                        windowID: request.windowID,
+                        displayID: state.preferredDisplayID ?? request.displayID.map { CGDirectDisplayID($0) }
+                    )
+                }
+                let croppedSnapshot = try Self.cropSnapshot(fullSnapshot, x1: x1, y1: y1, x2: x2, y2: y2)
+                sessionStateByID[normalizedSessionID] = state
+                let regionSize = "\(Int(x2 - x1))x\(Int(y2 - y1))"
+                let summary = "Zoomed into region (\(Int(x1)), \(Int(y1))) to (\(Int(x2)), \(Int(y2))). Cropped size: \(regionSize) pixels at full resolution."
+                return Self.result(summary: summary, success: true, snapshot: croppedSnapshot, activityMetadata: nil)
+            }
+
             if let staleReason = observationRefreshReason(
                 for: request,
                 state: state,
@@ -669,7 +954,7 @@ actor AssistantComputerUseService {
             )
 
             if request.canTrySemanticClick,
-               case .click(_, let button) = request.action,
+               case .click(_, let button, _) = request.action,
                let targetLabel = request.targetLabel?.nonEmpty {
                 do {
                     let semanticResult = try await accessibilityAutomationService.performSemanticClick(
@@ -703,6 +988,7 @@ actor AssistantComputerUseService {
                         frontmostAfterAction: frontmostAfterAction,
                         semanticVerificationText: semanticResult.verificationText
                     )
+
                     return await finishRun(
                         normalizedSessionID: normalizedSessionID,
                         state: state,
@@ -837,6 +1123,32 @@ actor AssistantComputerUseService {
                     confidence: 0,
                     verificationResult: "failed"
                 )
+            )
+        }
+    }
+
+    func runBatch(
+        arguments: Any,
+        preferredModelID _: String?
+    ) async -> AssistantToolExecutionResult {
+        guard let dictionary = arguments as? [String: Any],
+              let rawActions = dictionary["actions"] as? [[String: Any]],
+              !rawActions.isEmpty else {
+            return Self.result(
+                summary: "computer_batch needs a non-empty actions array.",
+                success: false, snapshot: nil, activityMetadata: nil
+            )
+        }
+
+        do {
+            let snapshot = try await executeActions(rawActions, nil)
+            let count = rawActions.count
+            let summary = "Executed \(count) action\(count == 1 ? "" : "s"). Here is the resulting screen."
+            return Self.result(summary: summary, success: true, snapshot: snapshot, activityMetadata: nil)
+        } catch {
+            return Self.result(
+                summary: error.localizedDescription,
+                success: false, snapshot: nil, activityMetadata: nil
             )
         }
     }
@@ -1253,19 +1565,28 @@ actor AssistantComputerUseService {
         case .click:
             return AutomationStepPlan(
                 stage: "Act",
-                actuator: request.canTrySemanticClick ? "ax-first" : "validated-pixel",
+                actuator: "validated-pixel",
                 target: target,
                 expectedResult: request.expectedChange ?? "The selected control should react.",
-                fallbackRule: "If Accessibility cannot find the control, use the locked screenshot and validate the click point before sending it.",
-                confidence: request.canTrySemanticClick ? 0.9 : (pointDescriptor == nil ? 0.46 : 0.62)
+                fallbackRule: "Validate the click point against the locked screenshot before sending it.",
+                confidence: pointDescriptor == nil ? 0.46 : 0.62
             )
-        case .doubleClick:
+        case .doubleClick, .tripleClick:
             return AutomationStepPlan(
                 stage: "Act",
                 actuator: "validated-pixel",
                 target: target,
                 expectedResult: request.expectedChange ?? "The item should open or activate.",
                 fallbackRule: "If the point looks unsafe, refresh the target instead of repeating the click blindly.",
+                confidence: pointDescriptor == nil ? 0.44 : 0.58
+            )
+        case .rightClick, .middleClick:
+            return AutomationStepPlan(
+                stage: "Act",
+                actuator: "validated-pixel",
+                target: target,
+                expectedResult: request.expectedChange ?? "A context menu or secondary action should appear.",
+                fallbackRule: "If nothing happens, refresh the target first.",
                 confidence: pointDescriptor == nil ? 0.44 : 0.58
             )
         case .move:
@@ -1276,6 +1597,15 @@ actor AssistantComputerUseService {
                 expectedResult: "The pointer should move to the planned location.",
                 fallbackRule: "Refresh the target if the current screenshot looks stale.",
                 confidence: 0.58
+            )
+        case .mouseDown, .mouseUp:
+            return AutomationStepPlan(
+                stage: "Act",
+                actuator: "pixel",
+                target: target,
+                expectedResult: request.expectedChange ?? "The mouse button state should change.",
+                fallbackRule: "Refresh the target if the UI does not respond.",
+                confidence: 0.54
             )
         case .drag:
             return AutomationStepPlan(
@@ -1307,11 +1637,11 @@ actor AssistantComputerUseService {
         case .type:
             return AutomationStepPlan(
                 stage: "Act",
-                actuator: request.canTrySemanticType ? "ax-first" : "keyboard",
+                actuator: "keyboard",
                 target: target,
                 expectedResult: request.expectedChange ?? "The target field should contain the typed text.",
                 fallbackRule: "If typing cannot be verified, refresh the target and stop instead of typing again blindly.",
-                confidence: request.canTrySemanticType ? 0.9 : 0.58
+                confidence: 0.58
             )
         case .wait:
             return AutomationStepPlan(
@@ -1321,6 +1651,69 @@ actor AssistantComputerUseService {
                 expectedResult: request.expectedChange ?? "The UI should finish changing.",
                 fallbackRule: "If the UI still looks stuck, refresh the target and plan the next step.",
                 confidence: 1
+            )
+        case .holdKey:
+            return AutomationStepPlan(
+                stage: "Act",
+                actuator: "keyboard",
+                target: target,
+                expectedResult: request.expectedChange ?? "The held keys should trigger the expected action.",
+                fallbackRule: "If no visible change occurs, refresh the target and verify focus.",
+                confidence: 0.62
+            )
+        case .openApplication:
+            return AutomationStepPlan(
+                stage: "Act",
+                actuator: "launch",
+                target: target,
+                expectedResult: request.expectedChange ?? "The application should launch and become frontmost.",
+                fallbackRule: "If the app does not appear, check the name and retry.",
+                confidence: 0.85
+            )
+        case .clipboardRead:
+            return AutomationStepPlan(
+                stage: "Act",
+                actuator: "clipboard",
+                target: "system clipboard",
+                expectedResult: "The current clipboard contents are returned.",
+                fallbackRule: "If the clipboard is empty, report that to the caller.",
+                confidence: 0.98
+            )
+        case .clipboardWrite:
+            return AutomationStepPlan(
+                stage: "Act",
+                actuator: "clipboard",
+                target: "system clipboard",
+                expectedResult: "The clipboard should contain the new text.",
+                fallbackRule: "If writing fails, report the error.",
+                confidence: 0.98
+            )
+        case .cursorPosition:
+            return AutomationStepPlan(
+                stage: "Act",
+                actuator: "query",
+                target: "mouse cursor",
+                expectedResult: "The current cursor coordinates are returned.",
+                fallbackRule: "This action always succeeds.",
+                confidence: 1.0
+            )
+        case .switchDisplay(let displayID):
+            return AutomationStepPlan(
+                stage: "Act",
+                actuator: "display",
+                target: "display \(displayID)",
+                expectedResult: "Future observations should capture from the specified display.",
+                fallbackRule: "If the display ID is invalid, report available displays.",
+                confidence: 0.9
+            )
+        case .zoom:
+            return AutomationStepPlan(
+                stage: "Observe",
+                actuator: "zoom-crop",
+                target: target,
+                expectedResult: "A full-resolution crop of the specified screen region is returned.",
+                fallbackRule: "If the region is invalid, fall back to a full screenshot.",
+                confidence: 0.95
             )
         }
     }
@@ -1333,14 +1726,19 @@ actor AssistantComputerUseService {
 
         let candidatePoint: ParsedRequest.Point?
         switch action {
-        case .click(let point, _),
+        case .click(let point, _, _),
              .doubleClick(let point, _),
+             .tripleClick(let point, _),
+             .rightClick(let point),
+             .middleClick(let point),
              .move(let point),
+             .mouseDown(let point, _),
+             .mouseUp(let point, _),
              .scroll(let point, _, _):
             candidatePoint = point
         case .drag(let path):
             candidatePoint = path.first
-        case .observe, .keypress, .type, .wait:
+        case .observe, .keypress, .holdKey, .type, .openApplication, .clipboardRead, .clipboardWrite, .cursorPosition, .switchDisplay, .zoom, .wait:
             candidatePoint = nil
         }
 
@@ -1429,17 +1827,33 @@ actor AssistantComputerUseService {
         case "observe", "screenshot":
             return .observe
         case "click":
+            let modifiers = (dictionary["modifiers"] as? [Any])?
+                .compactMap { ($0 as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased().nonEmpty } ?? []
             return .click(
                 try parsePoint(from: dictionary),
-                button: parseButton(from: dictionary)
+                button: parseButton(from: dictionary),
+                modifiers: modifiers
             )
         case "double_click", "doubleclick":
             return .doubleClick(
                 try parsePoint(from: dictionary),
                 button: parseButton(from: dictionary)
             )
-        case "move":
+        case "triple_click", "tripleclick":
+            return .tripleClick(
+                try parsePoint(from: dictionary),
+                button: parseButton(from: dictionary)
+            )
+        case "right_click", "rightclick":
+            return .rightClick(try parsePoint(from: dictionary))
+        case "middle_click", "middleclick":
+            return .middleClick(try parsePoint(from: dictionary))
+        case "move", "hover":
             return .move(try parsePoint(from: dictionary))
+        case "mouse_down", "mousedown":
+            return .mouseDown(try parsePoint(from: dictionary), button: parseButton(from: dictionary))
+        case "mouse_up", "mouseup":
+            return .mouseUp(try parsePoint(from: dictionary), button: parseButton(from: dictionary))
         case "drag":
             let rawPath = dictionary["path"] as? [[String: Any]] ?? []
             guard !rawPath.isEmpty else {
@@ -1467,6 +1881,16 @@ actor AssistantComputerUseService {
                 )
             }
             return .keypress(keys)
+        case "hold_key", "holdkey":
+            let keys = (dictionary["keys"] as? [Any])?
+                .compactMap { ($0 as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty } ?? []
+            guard !keys.isEmpty else {
+                throw AssistantComputerUseServiceError.invalidArguments(
+                    "Computer Use hold_key actions need a non-empty keys array."
+                )
+            }
+            let durationMs = Int((number(from: dictionary["duration_ms"]) ?? number(from: dictionary["durationMs"]) ?? 500).rounded())
+            return .holdKey(keys, durationMs: max(50, durationMs))
         case "type":
             let text = (dictionary["text"] as? String)?
                 .trimmingCharacters(in: .newlines)
@@ -1477,6 +1901,48 @@ actor AssistantComputerUseService {
                 )
             }
             return .type(text)
+        case "open_application", "open_app", "launch":
+            let name = firstNonEmptyString(
+                dictionary["name"] as? String,
+                dictionary["app"] as? String
+            )
+            guard let name else {
+                throw AssistantComputerUseServiceError.invalidArguments(
+                    "Computer Use open_application actions need a non-empty app name."
+                )
+            }
+            return .openApplication(name)
+        case "clipboard_read":
+            return .clipboardRead
+        case "clipboard_write", "write_clipboard":
+
+            let text = (dictionary["text"] as? String)
+            guard let text, !text.isEmpty else {
+                throw AssistantComputerUseServiceError.invalidArguments(
+                    "Computer Use clipboard_write actions need non-empty text."
+                )
+            }
+            return .clipboardWrite(text)
+        case "cursor_position":
+            return .cursorPosition
+        case "zoom":
+            if let region = dictionary["region"] as? [Any], region.count == 4,
+               let x1 = number(from: region[0]),
+               let y1 = number(from: region[1]),
+               let x2 = number(from: region[2]),
+               let y2 = number(from: region[3]) {
+                return .zoom(x1: x1, y1: y1, x2: x2, y2: y2)
+            }
+            throw AssistantComputerUseServiceError.invalidArguments(
+                "Computer Use zoom actions need a region array of [x1, y1, x2, y2] in screenshot pixels."
+            )
+        case "switch_display":
+            guard let rawDisplayID = integer(from: dictionary["display_id"]) else {
+                throw AssistantComputerUseServiceError.invalidArguments(
+                    "Computer Use switch_display actions need a display_id."
+                )
+            }
+            return .switchDisplay(CGDirectDisplayID(rawDisplayID))
         case "wait":
             let milliseconds = Int((number(from: dictionary["duration_ms"]) ?? 1000).rounded())
             return .wait(milliseconds: max(0, milliseconds))
@@ -1533,13 +1999,10 @@ actor AssistantComputerUseService {
         for point: ParsedRequest.Point,
         snapshot: LocalAutomationDisplaySnapshot
     ) -> CGPoint {
-        let scaleX = snapshot.imageSize.width / max(1, snapshot.screenFrame.width)
-        let scaleY = snapshot.imageSize.height / max(1, snapshot.screenFrame.height)
-        let screenX = snapshot.screenFrame.minX + CGFloat(point.x) / max(1, scaleX)
-        let screenY = snapshot.screenFrame.maxY - CGFloat(point.y) / max(1, scaleY)
-        return CGPoint(
-            x: min(max(screenX, snapshot.screenFrame.minX + 1), snapshot.screenFrame.maxX - 1),
-            y: min(max(screenY, snapshot.screenFrame.minY + 1), snapshot.screenFrame.maxY - 1)
+        LocalAutomationHelper.quartzScreenPoint(
+            imageX: CGFloat(point.x),
+            imageY: CGFloat(point.y),
+            snapshot: snapshot
         )
     }
 
@@ -1612,14 +2075,19 @@ actor AssistantComputerUseService {
 
         let points: [ParsedRequest.Point]
         switch action {
-        case .click(let point, _),
+        case .click(let point, _, _),
              .doubleClick(let point, _),
+             .tripleClick(let point, _),
+             .rightClick(let point),
+             .middleClick(let point),
              .move(let point),
+             .mouseDown(let point, _),
+             .mouseUp(let point, _),
              .scroll(let point, _, _):
             points = [point]
         case .drag(let path):
             points = path
-        case .observe, .keypress, .type, .wait:
+        case .observe, .keypress, .holdKey, .type, .openApplication, .clipboardRead, .clipboardWrite, .cursorPosition, .switchDisplay, .zoom, .wait:
             return nil
         }
 
@@ -1665,6 +2133,47 @@ actor AssistantComputerUseService {
             success: success,
             summary: summary,
             activityMetadata: activityMetadata
+        )
+    }
+
+    private static func cropSnapshot(
+        _ snapshot: LocalAutomationDisplaySnapshot,
+        x1: Double, y1: Double, x2: Double, y2: Double
+    ) throws -> LocalAutomationDisplaySnapshot {
+        let imgW = Double(snapshot.image.width)
+        let imgH = Double(snapshot.image.height)
+
+        // Clamp to image bounds
+        let cx1 = max(0, min(x1, imgW))
+        let cy1 = max(0, min(y1, imgH))
+        let cx2 = max(cx1 + 1, min(x2, imgW))
+        let cy2 = max(cy1 + 1, min(y2, imgH))
+
+        let cropRect = CGRect(x: cx1, y: cy1, width: cx2 - cx1, height: cy2 - cy1)
+        guard let cropped = snapshot.image.cropping(to: cropRect) else {
+            throw AssistantComputerUseServiceError.invalidArguments(
+                "Could not crop the screenshot to the requested region."
+            )
+        }
+
+        let rep = NSBitmapImageRep(cgImage: cropped)
+        guard let pngData = rep.representation(using: .png, properties: [:]) else {
+            throw AssistantComputerUseServiceError.invalidArguments(
+                "Could not encode the cropped region as PNG."
+            )
+        }
+        let dataURL = "data:image/png;base64,\(pngData.base64EncodedString())"
+
+        return LocalAutomationDisplaySnapshot(
+            image: cropped,
+            imageSize: CGSize(width: cropped.width, height: cropped.height),
+            screenFrame: snapshot.screenFrame,
+            imageDataURL: dataURL,
+            captureKind: "zoom",
+            windowID: snapshot.windowID,
+            displayID: snapshot.displayID,
+            targetAppName: snapshot.targetAppName,
+            windowTitle: snapshot.windowTitle
         )
     }
 

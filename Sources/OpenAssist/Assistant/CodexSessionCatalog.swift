@@ -1171,6 +1171,7 @@ struct CodexSessionCatalog {
                                 text: text ?? "",
                                 createdAt: lineTimestamp,
                                 imageAttachments: imageAttachments.isEmpty ? nil : imageAttachments,
+                                selectedPlugins: nil,
                                 source: .codexSession
                             ),
                             to: &items

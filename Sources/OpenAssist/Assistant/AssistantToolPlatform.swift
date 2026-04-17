@@ -60,7 +60,7 @@ struct OllamaLocalBackendAdapter: AssistantBackendAdapter {
     let capabilities = AssistantBackendCapabilities(
         supportsStructuredToolCalls: true,
         supportsImageInput: true,
-        maxPracticalToolCount: nil,
+        maxPracticalToolCount: 6,
         supportsLongToolOutputs: true,
         supportsContinuation: true,
         preferredToolSurface: .granular
@@ -129,6 +129,10 @@ enum AssistantToolExecutionKind {
     case uiClick
     case uiType
     case uiPressKey
+    case listDisplays
+    case listActivities
+    case computerBatch
+    case spawnSession
 }
 
 struct AssistantToolDescriptor {
@@ -169,23 +173,6 @@ struct AssistantToolDescriptor {
 enum AssistantToolCatalog {
     static func allDescriptors() -> [AssistantToolDescriptor] {
         [
-            AssistantToolDescriptor(
-                name: AssistantImageGenerationToolDefinition.name,
-                aliases: [],
-                toolKind: AssistantImageGenerationToolDefinition.toolKind,
-                displayName: "Image Generation",
-                description: AssistantImageGenerationToolDefinition.description,
-                inputSchema: AssistantImageGenerationToolDefinition.inputSchema,
-                modes: [.conversational, .plan, .agentic],
-                surfaceStyles: [.compact, .granular],
-                permissionLeadText: "Image Generation sends the request to Google Gemini using the shared Google AI Studio API key configured in Open Assist and returns the generated image back into the conversation.",
-                executionKind: .imageGeneration,
-                availability: { true },
-                summaryProvider: { arguments in
-                    (try? AssistantImageGenerationService.parseRequest(from: arguments).summaryLine) ?? "Generate an image"
-                },
-                requiresExplicitConfirmation: { _ in false }
-            ),
             AssistantToolDescriptor(
                 name: AssistantNotesToolDefinition.name,
                 aliases: [],
@@ -264,10 +251,20 @@ enum AssistantToolCatalog {
                 executionKind: .execCommand,
                 availability: { true },
                 summaryProvider: { arguments in
-                    (try? AssistantShellExecutionService.parseExecCommandRequest(from: arguments).summaryLine) ?? "Run a local command"
+                    guard let request = try? AssistantShellExecutionService.parseExecCommandRequest(from: arguments) else {
+                        return "Run a local command"
+                    }
+                    if let warning = AssistantShellExecutionService.fileDeletionWarning(for: request.command) {
+                        return "\(request.summaryLine)\n\u{26A0}\u{FE0F} \(warning)"
+                    }
+                    return request.summaryLine
                 },
                 requiresExplicitConfirmation: { arguments in
                     guard let request = try? AssistantShellExecutionService.parseExecCommandRequest(from: arguments) else {
+                        return true
+                    }
+                    // File deletions always require per-invocation confirmation (never session-approved)
+                    if AssistantShellExecutionService.isDestructiveFileDeletion(command: request.command) {
                         return true
                     }
                     return AssistantModePolicy.commandSafetyClass(for: request.command) != .readOnly
@@ -451,6 +448,36 @@ enum AssistantToolCatalog {
                 requiresExplicitConfirmation: { _ in false }
             ),
             AssistantToolDescriptor(
+                name: AssistantListActivitiesToolDefinition.name,
+                aliases: [],
+                toolKind: AssistantListActivitiesToolDefinition.toolKind,
+                displayName: "List Activities",
+                description: AssistantListActivitiesToolDefinition.description,
+                inputSchema: AssistantListActivitiesToolDefinition.inputSchema,
+                modes: [.agentic],
+                surfaceStyles: [.granular],
+                permissionLeadText: "List Activities returns a snapshot of tool calls, commands, and subagent steps across all active assistant sessions.",
+                executionKind: .listActivities,
+                availability: { true },
+                summaryProvider: { _ in "List recent activities" },
+                requiresExplicitConfirmation: { _ in false }
+            ),
+            AssistantToolDescriptor(
+                name: AssistantListDisplaysToolDefinition.name,
+                aliases: [],
+                toolKind: AssistantListDisplaysToolDefinition.toolKind,
+                displayName: "List Displays",
+                description: AssistantListDisplaysToolDefinition.description,
+                inputSchema: AssistantListDisplaysToolDefinition.inputSchema,
+                modes: [.agentic],
+                surfaceStyles: [.granular],
+                permissionLeadText: "List Displays enumerates the connected monitors on this Mac so the assistant can target a specific display by its ID.",
+                executionKind: .listDisplays,
+                availability: { true },
+                summaryProvider: { _ in "List connected displays" },
+                requiresExplicitConfirmation: { _ in false }
+            ),
+            AssistantToolDescriptor(
                 name: AssistantComputerUseToolDefinition.name,
                 aliases: [],
                 toolKind: AssistantComputerUseToolDefinition.toolKind,
@@ -468,6 +495,60 @@ enum AssistantToolCatalog {
                 requiresExplicitConfirmation: { arguments in
                     (try? AssistantComputerUseService.parseRequest(from: arguments).isHighRisk) ?? true
                 }
+            ),
+            AssistantToolDescriptor(
+                name: AssistantComputerBatchToolDefinition.name,
+                aliases: ["batch_actions"],
+                toolKind: AssistantComputerBatchToolDefinition.toolKind,
+                displayName: "Computer Batch",
+                description: AssistantComputerBatchToolDefinition.description,
+                inputSchema: AssistantComputerBatchToolDefinition.inputSchema,
+                modes: [.agentic],
+                surfaceStyles: [.compact, .granular],
+                permissionLeadText: "Computer Batch executes multiple mouse/keyboard actions in rapid sequence on this Mac's desktop and returns a final screenshot.",
+                executionKind: .computerBatch,
+                availability: { SettingsStore.shared.assistantComputerUseEnabled },
+                summaryProvider: { arguments in
+                    let count = ((arguments as? [String: Any])?["actions"] as? [Any])?.count ?? 0
+                    return "Execute \(count) batched desktop action\(count == 1 ? "" : "s")"
+                },
+                requiresExplicitConfirmation: { _ in true }
+            ),
+            AssistantToolDescriptor(
+                name: AssistantSpawnSessionToolDefinition.name,
+                aliases: ["dispatch", "delegate_task", "new_session"],
+                toolKind: AssistantSpawnSessionToolDefinition.toolKind,
+                displayName: "Spawn Session",
+                description: AssistantSpawnSessionToolDefinition.description,
+                inputSchema: AssistantSpawnSessionToolDefinition.inputSchema,
+                modes: [.agentic],
+                surfaceStyles: [.compact, .granular],
+                permissionLeadText: "Spawn Session creates a new independent assistant session on this Mac that runs in the background with its own tool access and execution context.",
+                executionKind: .spawnSession,
+                availability: { true },
+                summaryProvider: { arguments in
+                    (try? AssistantSpawnSessionService.parseRequest(from: arguments).summaryLine) ?? "Spawn a new session"
+                },
+                requiresExplicitConfirmation: { _ in true }
+            ),
+            // Image Generation is intentionally last so small models (e.g. Ollama) don't
+            // default to it when overwhelmed by tool definitions.
+            AssistantToolDescriptor(
+                name: AssistantImageGenerationToolDefinition.name,
+                aliases: [],
+                toolKind: AssistantImageGenerationToolDefinition.toolKind,
+                displayName: "Image Generation",
+                description: AssistantImageGenerationToolDefinition.description,
+                inputSchema: AssistantImageGenerationToolDefinition.inputSchema,
+                modes: [.conversational, .plan, .agentic],
+                surfaceStyles: [.compact, .granular],
+                permissionLeadText: "Image Generation sends the request to Google Gemini using the shared Google AI Studio API key configured in Open Assist and returns the generated image back into the conversation.",
+                executionKind: .imageGeneration,
+                availability: { true },
+                summaryProvider: { arguments in
+                    (try? AssistantImageGenerationService.parseRequest(from: arguments).summaryLine) ?? "Generate an image"
+                },
+                requiresExplicitConfirmation: { _ in false }
             )
         ]
     }
@@ -481,16 +562,56 @@ enum AssistantToolCatalog {
 final class AssistantToolSurfaceCompiler {
     init() {}
 
+    /// Priority order for tool selection when the backend has a `maxPracticalToolCount` limit.
+    /// Higher-priority tools (shell, computer use, notes) are kept; lower-priority tools
+    /// (image generation) are dropped first. This prevents small models from defaulting to
+    /// low-value tools like image generation when overwhelmed by too many tool definitions.
+    private static let toolPriorityOrder: [String] = [
+        "exec_command",
+        "computer_use",
+        "assistant_notes",
+        "browser_use",
+        "app_action",
+        "read_terminal",
+        "write_stdin",
+        "screen_capture",
+        "window_list",
+        "window_capture",
+        "list_displays",
+        "list_activities",
+        "computer_batch",
+        "spawn_session",
+        "ui_inspect",
+        "ui_click",
+        "ui_type",
+        "ui_press_key",
+        "view_image",
+        "image_generation",
+        "generate_image"
+    ]
+
     func descriptors(
         for mode: AssistantInteractionMode,
         backend: AssistantRuntimeBackend
     ) -> [AssistantToolDescriptor] {
         let adapter = AssistantBackendAdapterRegistry.adapter(for: backend)
-        return AssistantToolCatalog.allDescriptors().filter { descriptor in
+        var filtered = AssistantToolCatalog.allDescriptors().filter { descriptor in
             descriptor.modes.contains(mode)
                 && descriptor.surfaceStyles.contains(adapter.capabilities.preferredToolSurface)
                 && descriptor.availability()
         }
+
+        // Enforce tool count limit for backends that can't handle many tools (e.g. small Ollama models).
+        if let maxCount = adapter.capabilities.maxPracticalToolCount, filtered.count > maxCount {
+            filtered.sort { a, b in
+                let aIdx = Self.toolPriorityOrder.firstIndex(of: a.name) ?? Self.toolPriorityOrder.count
+                let bIdx = Self.toolPriorityOrder.firstIndex(of: b.name) ?? Self.toolPriorityOrder.count
+                return aIdx < bIdx
+            }
+            filtered = Array(filtered.prefix(maxCount))
+        }
+
+        return filtered
     }
 
     func dynamicToolSpecs(
@@ -658,6 +779,7 @@ final class AssistantToolExecutor {
     private let shellExecutionService: AssistantShellExecutionService
     private let windowAutomationService: AssistantWindowAutomationService
     private let accessibilityAutomationService: AssistantAccessibilityAutomationService
+    private let spawnSessionService: AssistantSpawnSessionService
     private let surfaceCompiler: AssistantToolSurfaceCompiler
 
     init(
@@ -669,6 +791,7 @@ final class AssistantToolExecutor {
         shellExecutionService: AssistantShellExecutionService,
         windowAutomationService: AssistantWindowAutomationService,
         accessibilityAutomationService: AssistantAccessibilityAutomationService,
+        spawnSessionService: AssistantSpawnSessionService = AssistantSpawnSessionService(),
         surfaceCompiler: AssistantToolSurfaceCompiler
     ) {
         self.assistantNotesService = assistantNotesService
@@ -679,6 +802,7 @@ final class AssistantToolExecutor {
         self.shellExecutionService = shellExecutionService
         self.windowAutomationService = windowAutomationService
         self.accessibilityAutomationService = accessibilityAutomationService
+        self.spawnSessionService = spawnSessionService
         self.surfaceCompiler = surfaceCompiler
     }
 
@@ -736,6 +860,11 @@ final class AssistantToolExecutor {
         case .computerUse:
             return await computerUseService.run(
                 sessionID: context.sessionID ?? "",
+                arguments: context.arguments,
+                preferredModelID: context.preferredModelID
+            )
+        case .computerBatch:
+            return await computerUseService.runBatch(
                 arguments: context.arguments,
                 preferredModelID: context.preferredModelID
             )
@@ -803,6 +932,18 @@ final class AssistantToolExecutor {
                 arguments: context.arguments,
                 preferredModelID: context.preferredModelID
             )
+        case .listDisplays:
+            return await windowAutomationService.listDisplays(
+                arguments: context.arguments,
+                preferredModelID: context.preferredModelID
+            )
+        case .listActivities:
+            return await AssistantListActivitiesService.run(arguments: context.arguments)
+        case .spawnSession:
+            return await spawnSessionService.run(
+                arguments: context.arguments,
+                parentSessionID: context.sessionID
+            )
         }
     }
 
@@ -819,6 +960,8 @@ final class AssistantToolExecutor {
             return "Using a supported Mac app"
         case .computerUse:
             return "Resolving the target, observing the UI, acting, and verifying the result"
+        case .computerBatch:
+            return "Executing batched desktop actions"
         case .imageGeneration:
             return "Generating an image with Google Gemini"
         case .execCommand:
@@ -843,6 +986,12 @@ final class AssistantToolExecutor {
             return "Typing into a macOS UI field"
         case .uiPressKey:
             return "Pressing macOS UI keys"
+        case .listDisplays:
+            return "Listing connected displays"
+        case .listActivities:
+            return "Reading current activity snapshot"
+        case .spawnSession:
+            return "Spawning a new background session"
         }
     }
 }

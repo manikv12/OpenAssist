@@ -2171,6 +2171,7 @@ struct AssistantThreadSkillChip: View {
 
 struct AssistantSkillsPane: View {
     @ObservedObject var assistant: AssistantStore
+    let onBack: () -> Void
     let onImportFolder: () -> Void
     let onImportGitHub: () -> Void
     let onCreateSkill: () -> Void
@@ -2213,6 +2214,13 @@ struct AssistantSkillsPane: View {
     private var header: some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(alignment: .center, spacing: 10) {
+                Button(action: onBack) {
+                    Label("Back", systemImage: "chevron.left")
+                        .font(.system(size: 11, weight: .semibold))
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+
                 ZStack {
                     RoundedRectangle(cornerRadius: 10, style: .continuous)
                         .fill(AppVisualTheme.accentTint.opacity(0.14))

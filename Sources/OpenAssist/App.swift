@@ -1,5 +1,5 @@
-import AppKit
 import AVFoundation
+import AppKit
 import Combine
 import Sparkle
 import Speech
@@ -10,21 +10,29 @@ extension Notification.Name {
     static let openAssistOpenSettings = Notification.Name("OpenAssist.openSettings")
     static let openAssistOpenAssistant = Notification.Name("OpenAssist.openAssistant")
     static let openAssistOpenAssistantSetup = Notification.Name("OpenAssist.openAssistantSetup")
-    static let openAssistStartAssistantVoiceCapture = Notification.Name("OpenAssist.startAssistantVoiceCapture")
-    static let openAssistStopAssistantVoiceCapture = Notification.Name("OpenAssist.stopAssistantVoiceCapture")
-    static let openAssistStartCompactVoiceCapture = Notification.Name("OpenAssist.startCompactVoiceCapture")
-    static let openAssistStopCompactVoiceCapture = Notification.Name("OpenAssist.stopCompactVoiceCapture")
-    static let openAssistMinimizeAssistantToCompact = Notification.Name("OpenAssist.minimizeAssistantToCompact")
+    static let openAssistStartAssistantVoiceCapture = Notification.Name(
+        "OpenAssist.startAssistantVoiceCapture")
+    static let openAssistStopAssistantVoiceCapture = Notification.Name(
+        "OpenAssist.stopAssistantVoiceCapture")
+    static let openAssistStartCompactVoiceCapture = Notification.Name(
+        "OpenAssist.startCompactVoiceCapture")
+    static let openAssistStopCompactVoiceCapture = Notification.Name(
+        "OpenAssist.stopCompactVoiceCapture")
+    static let openAssistMinimizeAssistantToCompact = Notification.Name(
+        "OpenAssist.minimizeAssistantToCompact")
     static let openAssistStartOrbVoiceCapture = Notification.Name("OpenAssist.startOrbVoiceCapture")
     static let openAssistStopOrbVoiceCapture = Notification.Name("OpenAssist.stopOrbVoiceCapture")
     static let openAssistAssistantZoomIn = Notification.Name("OpenAssist.assistantZoomIn")
     static let openAssistAssistantZoomOut = Notification.Name("OpenAssist.assistantZoomOut")
     static let openAssistAssistantZoomReset = Notification.Name("OpenAssist.assistantZoomReset")
-    static let openAssistMinimizeAssistantToOrb = Notification.Name("OpenAssist.minimizeAssistantToOrb")
+    static let openAssistMinimizeAssistantToOrb = Notification.Name(
+        "OpenAssist.minimizeAssistantToOrb")
     static let openAssistRunScheduledJob = Notification.Name("OpenAssist.runScheduledJob")
     static let openAssistSwitchToSession = Notification.Name("OpenAssist.switchToSession")
-    static let openAssistStartNewAssistantThread = Notification.Name("OpenAssist.startNewAssistantThread")
-    static let openAssistStartNewTemporaryAssistantThread = Notification.Name("OpenAssist.startNewTemporaryAssistantThread")
+    static let openAssistStartNewAssistantThread = Notification.Name(
+        "OpenAssist.startNewAssistantThread")
+    static let openAssistStartNewTemporaryAssistantThread = Notification.Name(
+        "OpenAssist.startNewTemporaryAssistantThread")
 }
 
 private struct ColorThemePreviewCard: View {
@@ -42,7 +50,7 @@ private struct ColorThemePreviewCard: View {
                                 colors: [
                                     palette.surfaceTop,
                                     palette.canvasBase,
-                                    palette.surfaceBottom
+                                    palette.surfaceBottom,
                                 ],
                                 startPoint: .topLeading,
                                 endPoint: .bottomTrailing
@@ -90,7 +98,8 @@ private struct ColorThemePreviewCard: View {
             }
         }
         .padding(12)
-        .appThemedSurface(cornerRadius: 14, tint: palette.accentTint, strokeOpacity: 0.12, tintOpacity: 0.04)
+        .appThemedSurface(
+            cornerRadius: 14, tint: palette.accentTint, strokeOpacity: 0.12, tintOpacity: 0.04)
     }
 }
 
@@ -259,33 +268,37 @@ private enum PromptRewriteAIMappingEvaluator {
 
         let currentIdentityType = normalizedClarificationIdentityType(inferredTags.identityType)
         if currentIdentityType == "person",
-           let prompt = clarificationPrompt(
-               axis: .person,
-               currentKey: inferredTags.identityKey,
-               currentLabel: inferredTags.identityLabel,
-               currentBundleIdentifier: normalizedCurrentBundle,
-               threads: crossAppThreads,
-               store: store
-           ) {
+            let prompt = clarificationPrompt(
+                axis: .person,
+                currentKey: inferredTags.identityKey,
+                currentLabel: inferredTags.identityLabel,
+                currentBundleIdentifier: normalizedCurrentBundle,
+                threads: crossAppThreads,
+                store: store
+            )
+        {
             return candidate(from: prompt)
         }
 
         if isMeaningfulProjectClarificationKey(inferredTags.projectKey),
-           let prompt = clarificationPrompt(
-               axis: .project,
-               currentKey: inferredTags.projectKey,
-               currentLabel: inferredTags.projectLabel,
-               currentBundleIdentifier: normalizedCurrentBundle,
-               threads: crossAppThreads,
-               store: store
-           ) {
+            let prompt = clarificationPrompt(
+                axis: .project,
+                currentKey: inferredTags.projectKey,
+                currentLabel: inferredTags.projectLabel,
+                currentBundleIdentifier: normalizedCurrentBundle,
+                threads: crossAppThreads,
+                store: store
+            )
+        {
             return candidate(from: prompt)
         }
 
         return nil
     }
 
-    private static func candidate(from prompt: ConversationClarificationPrompt) -> PromptRewriteAIMappingCandidate? {
+    private static func candidate(from prompt: ConversationClarificationPrompt)
+        -> PromptRewriteAIMappingCandidate?
+    {
         guard let primary = prompt.primaryCandidate else {
             return nil
         }
@@ -310,7 +323,8 @@ private enum PromptRewriteAIMappingEvaluator {
             aliasType: "project",
             aliasKey: normalizedProjectKey
         ),
-           !resolved.isEmpty {
+            !resolved.isEmpty
+        {
             canonicalProject = resolved
         }
 
@@ -319,7 +333,8 @@ private enum PromptRewriteAIMappingEvaluator {
             aliasType: "identity",
             aliasKey: normalizedIdentityKey
         ),
-           !resolved.isEmpty {
+            !resolved.isEmpty
+        {
             canonicalIdentity = resolved
         }
 
@@ -377,10 +392,12 @@ private enum PromptRewriteAIMappingEvaluator {
         var shouldSuppressPrompt = false
 
         for thread in threads {
-            guard let (candidateKey, candidateLabel) = clarificationCandidateParts(
-                for: axis,
-                thread: thread
-            ) else {
+            guard
+                let (candidateKey, candidateLabel) = clarificationCandidateParts(
+                    for: axis,
+                    thread: thread
+                )
+            else {
                 continue
             }
 
@@ -394,7 +411,8 @@ private enum PromptRewriteAIMappingEvaluator {
                 store: store
             )
             guard !canonicalCandidateKey.isEmpty,
-                  canonicalCandidateKey != normalizedCurrentKey else {
+                canonicalCandidateKey != normalizedCurrentKey
+            else {
                 continue
             }
 
@@ -410,8 +428,9 @@ private enum PromptRewriteAIMappingEvaluator {
                 switch existingRule {
                 case .keepSeparate:
                     continue
-                case let .link(canonicalKey):
-                    let resolvedCanonicalKey = normalizedClarificationKey(canonicalKey ?? canonicalCandidateKey)
+                case .link(let canonicalKey):
+                    let resolvedCanonicalKey = normalizedClarificationKey(
+                        canonicalKey ?? canonicalCandidateKey)
                     guard !resolvedCanonicalKey.isEmpty else {
                         continue
                     }
@@ -434,7 +453,8 @@ private enum PromptRewriteAIMappingEvaluator {
             }
 
             let isExact = normalizedCandidateLabel == normalizedCurrentLabel
-            let similarity = isExact
+            let similarity =
+                isExact
                 ? 1
                 : normalizedClarificationSimilarity(
                     normalizedCurrentLabel,
@@ -479,7 +499,8 @@ private enum PromptRewriteAIMappingEvaluator {
             if lhs.candidate.lastActivityAt != rhs.candidate.lastActivityAt {
                 return lhs.candidate.lastActivityAt > rhs.candidate.lastActivityAt
             }
-            return lhs.candidate.label.localizedCaseInsensitiveCompare(rhs.candidate.label) == .orderedAscending
+            return lhs.candidate.label.localizedCaseInsensitiveCompare(rhs.candidate.label)
+                == .orderedAscending
         }
         guard !ranked.isEmpty else {
             return nil
@@ -597,7 +618,8 @@ private enum PromptRewriteAIMappingEvaluator {
             aliasType: axis.aliasType,
             aliasKey: currentKey
         ),
-           normalizedClarificationKey(resolvedAlias) == candidateKey {
+            normalizedClarificationKey(resolvedAlias) == candidateKey
+        {
             return .link(canonicalKey: candidateKey)
         }
 
@@ -613,8 +635,10 @@ private enum PromptRewriteAIMappingEvaluator {
         guard !normalized.isEmpty else {
             return ""
         }
-        if let resolved = try? store.resolveConversationTagAlias(aliasType: aliasType, aliasKey: normalized),
-           !resolved.isEmpty {
+        if let resolved = try? store.resolveConversationTagAlias(
+            aliasType: aliasType, aliasKey: normalized),
+            !resolved.isEmpty
+        {
             return normalizedClarificationKey(resolved)
         }
         return normalized
@@ -656,7 +680,8 @@ private enum PromptRewriteAIMappingEvaluator {
     private static func readableClarificationLabel(from key: String) -> String {
         let split = key.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: true)
         let fallback = split.count == 2 ? String(split[1]) : key
-        let separated = fallback
+        let separated =
+            fallback
             .replacingOccurrences(of: "-", with: " ")
             .replacingOccurrences(of: "_", with: " ")
         let normalized = collapsedWhitespace(separated)
@@ -679,7 +704,7 @@ private enum PromptRewriteAIMappingEvaluator {
             "current-screen",
             "focused-input",
             "automation-folder",
-            "automation-folders"
+            "automation-folders",
         ]
         if blockedValues.contains(value) || value.hasPrefix("unknown-") {
             return false
@@ -725,7 +750,8 @@ private enum PromptRewriteAIMappingEvaluator {
         for lhsIndex in 1...lhsCharacters.count {
             current[0] = lhsIndex
             for rhsIndex in 1...rhsCharacters.count {
-                let substitutionCost = lhsCharacters[lhsIndex - 1] == rhsCharacters[rhsIndex - 1] ? 0 : 1
+                let substitutionCost =
+                    lhsCharacters[lhsIndex - 1] == rhsCharacters[rhsIndex - 1] ? 0 : 1
                 current[rhsIndex] = Swift.min(
                     previous[rhsIndex] + 1,
                     current[rhsIndex - 1] + 1,
@@ -774,12 +800,14 @@ struct OpenAssistApp: App {
         .commands {
             CommandGroup(after: .toolbar) {
                 Button("New Thread") {
-                    NotificationCenter.default.post(name: .openAssistStartNewAssistantThread, object: nil)
+                    NotificationCenter.default.post(
+                        name: .openAssistStartNewAssistantThread, object: nil)
                 }
                 .keyboardShortcut("n", modifiers: [.command, .control])
 
                 Button("New Temporary Chat") {
-                    NotificationCenter.default.post(name: .openAssistStartNewTemporaryAssistantThread, object: nil)
+                    NotificationCenter.default.post(
+                        name: .openAssistStartNewTemporaryAssistantThread, object: nil)
                 }
                 .keyboardShortcut("n", modifiers: [.command, .shift])
 
@@ -794,7 +822,8 @@ struct OpenAssistApp: App {
                 .keyboardShortcut("-", modifiers: .command)
 
                 Button("Actual Size") {
-                    NotificationCenter.default.post(name: .openAssistAssistantZoomReset, object: nil)
+                    NotificationCenter.default.post(
+                        name: .openAssistAssistantZoomReset, object: nil)
                 }
                 .keyboardShortcut("0", modifiers: .command)
             }
@@ -820,7 +849,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
     }
 
     private enum PasteLastTranscriptShortcut {
-        static let keyCode: UInt16 = 9 // V
+        static let keyCode: UInt16 = 9  // V
         static let modifiers: NSEvent.ModifierFlags = [.command, .option]
     }
 
@@ -872,6 +901,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
     private var assistantStopVoiceCaptureObserver: NSObjectProtocol?
     private var assistantMinimizeToCompactObserver: NSObjectProtocol?
     private var scheduledJobRequestObserver: NSObjectProtocol?
+    private var spawnSessionRequestObserver: NSObjectProtocol?
     private var scheduledJobInFlightID: String?
     private var scheduledJobWatchdogTask: Task<Void, Never>?
     private var scheduledJobWatchdogToken: String?
@@ -1086,15 +1116,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         @MainActor func resolvedSystemSoundName(settings: SettingsStore) -> String {
             switch self {
             case .startListening:
-                return Self.resolveSoundName(settings.dictationStartSoundName, fallback: Self.startingFallback)
+                return Self.resolveSoundName(
+                    settings.dictationStartSoundName, fallback: Self.startingFallback)
             case .stopListening:
-                return Self.resolveSoundName(settings.dictationStopSoundName, fallback: Self.stopFallback)
+                return Self.resolveSoundName(
+                    settings.dictationStopSoundName, fallback: Self.stopFallback)
             case .processing:
-                return Self.resolveSoundName(settings.dictationProcessingSoundName, fallback: Self.processingFallback)
+                return Self.resolveSoundName(
+                    settings.dictationProcessingSoundName, fallback: Self.processingFallback)
             case .pasted:
-                return Self.resolveSoundName(settings.dictationPastedSoundName, fallback: Self.pastedFallback)
+                return Self.resolveSoundName(
+                    settings.dictationPastedSoundName, fallback: Self.pastedFallback)
             case .correctionLearned:
-                return Self.resolveSoundName(settings.dictationCorrectionLearnedSoundName, fallback: Self.correctionLearnedFallback)
+                return Self.resolveSoundName(
+                    settings.dictationCorrectionLearnedSoundName,
+                    fallback: Self.correctionLearnedFallback)
             }
         }
 
@@ -1152,10 +1188,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
     func applicationDidFinishLaunching(_ notification: Notification) {
         // MCP server mode: run as a headless stdio MCP server and exit
         if let mcpIndex = CommandLine.arguments.firstIndex(of: "--mcp-server"),
-           let portIndex = CommandLine.arguments.firstIndex(of: "--port"),
-           portIndex + 1 < CommandLine.arguments.count,
-           let port = UInt16(CommandLine.arguments[portIndex + 1]) {
-            _ = mcpIndex // suppress unused warning
+            let portIndex = CommandLine.arguments.firstIndex(of: "--port"),
+            portIndex + 1 < CommandLine.arguments.count,
+            let port = UInt16(CommandLine.arguments[portIndex + 1])
+        {
+            _ = mcpIndex  // suppress unused warning
             AssistantMCPServerMain.run(bridgePort: port)
             // run(bridgePort:) calls exit() and never returns
         }
@@ -1167,7 +1204,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
 
         // Set app icon programmatically to bypass macOS automatic icon margin
         if let iconURL = Bundle.main.url(forResource: "AppIcon", withExtension: "png"),
-           let iconImage = NSImage(contentsOf: iconURL) {
+            let iconImage = NSImage(contentsOf: iconURL)
+        {
             NSApp.applicationIconImage = iconImage
         }
 
@@ -1230,7 +1268,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         settings.refreshMicrophones(notifyChange: false)
         syncWhisperModelSelectionIfNeeded()
         observeAdaptiveCorrectionChanges()
-        transcriber.applyMicrophoneSettings(autoDetect: settings.autoDetectMicrophone, microphoneUID: settings.selectedMicrophoneUID)
+        transcriber.applyMicrophoneSettings(
+            autoDetect: settings.autoDetectMicrophone, microphoneUID: settings.selectedMicrophoneUID
+        )
         applyRecognitionSettingsToTranscriber()
         transcriber.applyWhisperSettings(
             selectedModelID: settings.selectedWhisperModelID,
@@ -1310,7 +1350,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
                 case .micUnavailable:
                     let now = Date()
                     if let lastShown = self.lastAudioSetupHUDAlertAt,
-                       now.timeIntervalSince(lastShown) < 2.0 {
+                        now.timeIntervalSince(lastShown) < 2.0
+                    {
                         return
                     }
                     self.lastAudioSetupHUDAlertAt = now
@@ -1355,7 +1396,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
                     self?.currentAudioLevel = 0
                     self?.assistantController.updateVoiceCaptureLevel(0)
                     if let currentMode = self?.dictationInputMode {
-                        self?.dictationInputMode = DictationInputModeStateMachine.onRecordingEnded(currentMode)
+                        self?.dictationInputMode = DictationInputModeStateMachine.onRecordingEnded(
+                            currentMode)
                     }
                     self?.stopStatusIconAnimation()
                     self?.updateMenuState()
@@ -1399,7 +1441,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             queue: .main
         ) { [weak self] note in
             guard
-                let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+                let app = note.userInfo?[NSWorkspace.applicationUserInfoKey]
+                    as? NSRunningApplication,
                 app.processIdentifier != ProcessInfo.processInfo.processIdentifier
             else {
                 return
@@ -1410,7 +1453,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         }
 
         if let frontmost = NSWorkspace.shared.frontmostApplication,
-           frontmost.processIdentifier != ProcessInfo.processInfo.processIdentifier {
+            frontmost.processIdentifier != ProcessInfo.processInfo.processIdentifier
+        {
             lastExternalApplication = frontmost
         }
 
@@ -1421,7 +1465,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         ) { [weak self] _ in
             Task { @MainActor in
                 self?.schedulePermissionRestartIfNeeded()
-                self?.updatePermissionGate(openOnboardingIfNeeded: true, reconfigureHotkeysIfReady: true)
+                self?.updatePermissionGate(
+                    openOnboardingIfNeeded: true, reconfigureHotkeysIfReady: true)
             }
         }
 
@@ -1493,7 +1538,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             queue: .main
         ) { [weak self] notification in
             guard let jobID = notification.userInfo?["jobID"] as? String,
-                  let prompt = notification.userInfo?["prompt"] as? String else { return }
+                let prompt = notification.userInfo?["prompt"] as? String
+            else { return }
             let modelID = notification.userInfo?["preferredModelID"] as? String
             let effortRaw = notification.userInfo?["reasoningEffort"] as? String
             Task { @MainActor in
@@ -1502,6 +1548,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
                     prompt: prompt,
                     preferredModelID: modelID,
                     reasoningEffortRawValue: effortRaw
+                )
+            }
+        }
+
+        spawnSessionRequestObserver = NotificationCenter.default.addObserver(
+            forName: .openAssistSpawnSession,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            guard let task = notification.userInfo?["task"] as? String else { return }
+            let nickname = notification.userInfo?["nickname"] as? String
+            let role = notification.userInfo?["role"] as? String
+            let workingDirectory = notification.userInfo?["working_directory"] as? String
+            Task { @MainActor in
+                await self?.handleSpawnSessionRequest(
+                    task: task,
+                    nickname: nickname,
+                    role: role,
+                    workingDirectory: workingDirectory
                 )
             }
         }
@@ -1520,7 +1585,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
 
                 if let matchingSession = self.assistantController.sessions.first(where: {
                     $0.id.trimmingCharacters(in: .whitespacesAndNewlines)
-                        .caseInsensitiveCompare(sessionID.trimmingCharacters(in: .whitespacesAndNewlines)) == .orderedSame
+                        .caseInsensitiveCompare(
+                            sessionID.trimmingCharacters(in: .whitespacesAndNewlines))
+                        == .orderedSame
                 }) {
                     await self.assistantController.openSession(matchingSession)
                 } else {
@@ -1769,14 +1836,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
     }
 
     func checkForUpdatesFromSettings() {
-        let shortVersion = (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String)?
+        let shortVersion =
+            (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let buildVersion = (Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String)?
+        let buildVersion =
+            (Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
 
         guard let feedURLRaw = Bundle.main.object(forInfoDictionaryKey: "SUFeedURL") as? String,
-              !feedURLRaw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-              let feedURL = URL(string: feedURLRaw) else {
+            !feedURLRaw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+            let feedURL = URL(string: feedURLRaw)
+        else {
             let message = "Update feed URL is missing or invalid."
             updateCheckStatusStore.markFailed(message: message)
             setUIStatus(.message(message))
@@ -1790,7 +1860,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             let message = "An update check is already in progress."
             updateCheckStatusStore.markFailed(message: message)
             setUIStatus(.message(message))
-            waveform.flashEvent(message: message, symbolName: "arrow.triangle.2.circlepath.circle.fill")
+            waveform.flashEvent(
+                message: message, symbolName: "arrow.triangle.2.circlepath.circle.fill")
             CrashReporter.logWarning(
                 "Update check blocked: updater busy version=\(shortVersion) build=\(buildVersion)"
             )
@@ -1865,7 +1936,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         waveform.flashEvent(message: message, symbolName: "exclamationmark.triangle.fill")
     }
 
-    func updater(_ updater: SPUUpdater, didFinishUpdateCycleFor updateCheck: SPUUpdateCheck, error: (any Error)?) {
+    func updater(
+        _ updater: SPUUpdater, didFinishUpdateCycleFor updateCheck: SPUUpdateCheck,
+        error: (any Error)?
+    ) {
         cancelPendingUpdateCheckFallback()
 
         // Return to accessory mode only when no real work window is still open.
@@ -1875,7 +1949,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
 
         if let error {
             if isSparkleNoUpdateFoundError(error) {
-                CrashReporter.logInfo("Update check finished with no-update-found status (up to date)")
+                CrashReporter.logInfo(
+                    "Update check finished with no-update-found status (up to date)")
                 updateCheckStatusStore.markUpToDate()
             } else {
                 let message = readableUpdateErrorMessage(error)
@@ -1908,11 +1983,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
 
     private func readableUpdateErrorMessage(_ error: any Error) -> String {
         let nsError = error as NSError
-        if let failureReason = nsError.localizedFailureReason?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !failureReason.isEmpty {
+        if let failureReason = nsError.localizedFailureReason?.trimmingCharacters(
+            in: .whitespacesAndNewlines),
+            !failureReason.isEmpty
+        {
             return failureReason
         }
-        let description = nsError.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
+        let description = nsError.localizedDescription.trimmingCharacters(
+            in: .whitespacesAndNewlines)
         return description.isEmpty ? "Unknown update error." : description
     }
 
@@ -1920,7 +1998,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         PermissionCenter.snapshot(using: settings, includeExtendedPermissions: false)
     }
 
-    private func updatePermissionGate(openOnboardingIfNeeded: Bool, reconfigureHotkeysIfReady: Bool = false) {
+    private func updatePermissionGate(
+        openOnboardingIfNeeded: Bool, reconfigureHotkeysIfReady: Bool = false
+    ) {
         let hadAccessibilityPermission = settings.accessibilityTrusted
         let snapshot = currentPermissionSnapshot()
         let wasReady = permissionsReady
@@ -1945,7 +2025,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             if openOnboardingIfNeeded {
                 windowCoordinator?.openPermissionOnboardingWindow(onComplete: { [weak self] in
                     Task { @MainActor in
-                        self?.updatePermissionGate(openOnboardingIfNeeded: true, reconfigureHotkeysIfReady: true)
+                        self?.updatePermissionGate(
+                            openOnboardingIfNeeded: true, reconfigureHotkeysIfReady: true)
                         self?.windowCoordinator?.openSettingsWindow(route: .gettingStartedHome)
                     }
                 })
@@ -2129,7 +2210,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         syncAssistantCompactVisibility()
         windowCoordinator?.openAssistantWindow(
             rootView: AssistantWindowView(assistant: assistantController)
-            .environmentObject(settings)
+                .environmentObject(settings)
         )
     }
 
@@ -2169,7 +2250,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         // (triggered by onAssistantWindowVisibilityChanged). If there is a selected
         // session, show its follow-up preview in the compact view.
         if let sessionID = assistantController.selectedSessionID,
-           let session = assistantController.sessions.first(where: { $0.id == sessionID }) {
+            let session = assistantController.sessions.first(where: { $0.id == sessionID })
+        {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
                 self?.assistantCompactHUD?.showFollowUp(for: session)
             }
@@ -2192,8 +2274,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         }
 
         if !isAssistantWindowVisible,
-           settings.assistantCompactPresentationStyle == .sidebar,
-           assistantCompactHUD?.isExpandedSurfaceVisible == true {
+            settings.assistantCompactPresentationStyle == .sidebar,
+            assistantCompactHUD?.isExpandedSurfaceVisible == true
+        {
             assistantCompactHUD?.collapseExpandedSurface()
             updateMenuState()
             return
@@ -2291,7 +2374,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         liveVoiceCoordinator?.handleCaptureCancelled(message: message)
     }
 
-    private func beginAssistantVoiceTaskCapture(stopMode: AssistantVoiceStopMode = .silenceAutoStop) {
+    private func beginAssistantVoiceTaskCapture(stopMode: AssistantVoiceStopMode = .silenceAutoStop)
+    {
         guard FeatureFlags.personalAssistantEnabled else { return }
         guard settings.assistantBetaEnabled else {
             setUIStatus(.message("Turn on Assistant in Settings first."))
@@ -2299,7 +2383,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             return
         }
         guard settings.assistantVoiceTaskEntryEnabled else {
-            assistantController.failVoiceDraft("Voice task entry is turned off in Assistant settings.")
+            assistantController.failVoiceDraft(
+                "Voice task entry is turned off in Assistant settings.")
             openAssistantWindow()
             return
         }
@@ -2362,7 +2447,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         scheduledJobPreviousReasoningEffort = assistantController.reasoningEffort
         scheduledJobInFlightID = jobID
         _ = coordinator.beginRun(jobID: jobID, startedAt: Date())
-        let existingSessionID = coordinator.jobs.first(where: { $0.id == jobID })?.dedicatedSessionID
+        let existingSessionID = coordinator.jobs.first(where: { $0.id == jobID })?
+            .dedicatedSessionID
 
         // Set up the dedicated session for this job (resume existing or start fresh).
         guard !assistantController.hasActiveTurn else {
@@ -2377,11 +2463,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             assistantController.applyRuntimeModelSelection(preferredModelID)
         }
         if let reasoningEffortRawValue,
-           let reasoningEffort = AssistantReasoningEffort(rawValue: reasoningEffortRawValue) {
+            let reasoningEffort = AssistantReasoningEffort(rawValue: reasoningEffortRawValue)
+        {
             assistantController.reasoningEffort = reasoningEffort
         }
 
-        guard let sessionID = await assistantController.resumeOrStartScheduledJobSession(existingID: existingSessionID) else {
+        guard
+            let sessionID = await assistantController.resumeOrStartScheduledJobSession(
+                existingID: existingSessionID)
+        else {
             let note = "Failed — could not set up a session for this job."
             CrashReporter.logWarning("Scheduled job \(jobID): \(note)")
             coordinator.recordJobResult(id: jobID, note: note)
@@ -2393,7 +2483,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         openAssistantWindow()
         try? await Task.sleep(nanoseconds: 500_000_000)
 
-        coordinator.recordJobResult(id: jobID, note: "Prompt sent · session \(sessionID.prefix(8))…", sessionID: sessionID)
+        coordinator.recordJobResult(
+            id: jobID, note: "Prompt sent · session \(sessionID.prefix(8))…", sessionID: sessionID)
         await assistantController.sendPrompt(prompt, automationJob: job)
 
         if assistantController.hasActiveTurn {
@@ -2404,6 +2495,56 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             coordinator.recordJobResult(id: jobID, note: note, sessionID: sessionID)
             await finishScheduledJobIfNeeded(nil, forcedOutcome: .failed, fallbackNote: note)
         }
+    }
+
+    private func handleSpawnSessionRequest(
+        task: String,
+        nickname: String?,
+        role: String?,
+        workingDirectory: String?
+    ) async {
+        // Save the current session so the user's active conversation stays visible
+        let previousSessionID = assistantController.selectedSessionID
+        let previousModelID = assistantController.selectedModelID
+
+        // Create a new session using the same infrastructure as scheduled jobs
+        guard
+            let sessionID = await assistantController.resumeOrStartScheduledJobSession(
+                existingID: nil)
+        else {
+            CrashReporter.logWarning("Spawn session: could not create a new session.")
+            return
+        }
+
+        // Build a self-contained prompt with role and context
+        var prompt = ""
+        if let role = role?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
+            prompt += "You are acting as a \(role). "
+        }
+        if let workingDirectory = workingDirectory?.trimmingCharacters(in: .whitespacesAndNewlines)
+            .nonEmpty
+        {
+            prompt += "Working directory: \(workingDirectory)\n\n"
+        }
+        prompt += task
+
+        // Send the prompt to the spawned session (this starts the assistant turn)
+        await assistantController.sendPrompt(prompt)
+
+        // Immediately switch back to the original session so the parent conversation
+        // stays visible while the spawned session works in the background
+        if let previousSessionID,
+            let previousSession = assistantController.sessions.first(where: {
+                $0.id.trimmingCharacters(in: .whitespacesAndNewlines)
+                    .caseInsensitiveCompare(previousSessionID) == .orderedSame
+            })
+        {
+            await assistantController.openSession(previousSession)
+        }
+        assistantController.applyRuntimeModelSelection(previousModelID, force: true)
+
+        CrashReporter.logInfo(
+            "Spawn session: created \(nickname ?? "session") (\(sessionID.prefix(8))…)")
     }
 
     private func finishScheduledJobIfNeeded(
@@ -2422,28 +2563,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             return
         }
 
-        let outcome: ScheduledJobRunOutcome = forcedOutcome ?? {
-            switch completionStatus {
-            case .completed:
-                return .completed
-            case .interrupted:
-                return .interrupted
-            case .failed:
-                return .failed
-            case .none:
-                return .failed
-            }
-        }()
+        let outcome: ScheduledJobRunOutcome =
+            forcedOutcome
+            ?? {
+                switch completionStatus {
+                case .completed:
+                    return .completed
+                case .interrupted:
+                    return .interrupted
+                case .failed:
+                    return .failed
+                case .none:
+                    return .failed
+                }
+            }()
 
         let finishedAt = Date()
-        var run = coordinator.activeRun(jobID: jobID) ?? ScheduledJobRun.make(jobID: jobID, startedAt: finishedAt)
+        var run =
+            coordinator.activeRun(jobID: jobID)
+            ?? ScheduledJobRun.make(jobID: jobID, startedAt: finishedAt)
         run.finishedAt = finishedAt
         run.outcome = outcome
 
         let sessionID = run.sessionID ?? job.dedicatedSessionID
         let history: ([AssistantTimelineItem], [AssistantTranscriptEntry])
         if let sessionID {
-            history = await assistantController.loadSessionHistoryForAutomationSummary(sessionID: sessionID)
+            history = await assistantController.loadSessionHistoryForAutomationSummary(
+                sessionID: sessionID)
         } else {
             history = ([], [])
         }
@@ -2451,7 +2597,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         let sessionCWD = sessionID.flatMap { activeSessionID in
             assistantController.sessions.first(where: {
                 $0.id.trimmingCharacters(in: .whitespacesAndNewlines)
-                    .caseInsensitiveCompare(activeSessionID.trimmingCharacters(in: .whitespacesAndNewlines)) == .orderedSame
+                    .caseInsensitiveCompare(
+                        activeSessionID.trimmingCharacters(in: .whitespacesAndNewlines))
+                    == .orderedSame
             })?.cwd
         }
 
@@ -2464,10 +2612,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         )
 
         let resolvedNote: String
-        if let fallbackNote = fallbackNote?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
+        if let fallbackNote = fallbackNote?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+        {
             resolvedNote = fallbackNote
-        } else if case let .failed(message)? = completionStatus,
-                  let normalized = message.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
+        } else if case .failed(let message)? = completionStatus,
+            let normalized = message.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+        {
             resolvedNote = normalized
         } else {
             resolvedNote = processed.statusNote
@@ -2520,7 +2670,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         token: String
     ) async {
         guard scheduledJobInFlightID == jobID,
-              scheduledJobWatchdogToken == token else {
+            scheduledJobWatchdogToken == token
+        else {
             return
         }
 
@@ -2560,21 +2711,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         }
 
         guard let previousSessionID,
-              !assistantController.hasActiveTurn else {
+            !assistantController.hasActiveTurn
+        else {
             return
         }
 
         let currentlySelectedSessionID = assistantController.selectedSessionID?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .nonEmpty
-        guard currentlySelectedSessionID?.caseInsensitiveCompare(previousSessionID) != .orderedSame else {
+        guard currentlySelectedSessionID?.caseInsensitiveCompare(previousSessionID) != .orderedSame
+        else {
             return
         }
 
-        guard let previousSession = assistantController.sessions.first(where: {
-            $0.id.trimmingCharacters(in: .whitespacesAndNewlines)
-                .caseInsensitiveCompare(previousSessionID) == .orderedSame
-        }) else {
+        guard
+            let previousSession = assistantController.sessions.first(where: {
+                $0.id.trimmingCharacters(in: .whitespacesAndNewlines)
+                    .caseInsensitiveCompare(previousSessionID) == .orderedSame
+            })
+        else {
             return
         }
 
@@ -2667,7 +2822,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             return
         }
 
-        let speechThreshold = max(assistantVoiceBaselineNoise * speechMultiplier, minimumSpeechThreshold)
+        let speechThreshold = max(
+            assistantVoiceBaselineNoise * speechMultiplier, minimumSpeechThreshold)
 
         if level > speechThreshold {
             assistantVoiceHasSpoken = true
@@ -2682,7 +2838,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         }
 
         if let start = assistantVoiceSilenceStart,
-           Date().timeIntervalSince(start) >= silenceDuration {
+            Date().timeIntervalSince(start) >= silenceDuration
+        {
             stopLiveVoiceCapture()
         }
     }
@@ -2705,7 +2862,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             return
         }
 
-        let speechThreshold = max(assistantVoiceBaselineNoise * speechMultiplier, minimumSpeechThreshold)
+        let speechThreshold = max(
+            assistantVoiceBaselineNoise * speechMultiplier, minimumSpeechThreshold)
 
         if level > speechThreshold {
             assistantVoiceHasSpoken = true
@@ -2720,7 +2878,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         }
 
         if let start = assistantVoiceSilenceStart,
-           Date().timeIntervalSince(start) >= silenceDuration {
+            Date().timeIntervalSince(start) >= silenceDuration
+        {
             stopCompactVoiceCapture()
         }
     }
@@ -2745,7 +2904,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         }
 
         // Phase 2: Detect speech as significantly above ambient baseline
-        let speechThreshold = max(assistantVoiceBaselineNoise * speechMultiplier, minimumSpeechThreshold)
+        let speechThreshold = max(
+            assistantVoiceBaselineNoise * speechMultiplier, minimumSpeechThreshold)
 
         if level > speechThreshold {
             assistantVoiceHasSpoken = true
@@ -2761,7 +2921,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         }
 
         if let start = assistantVoiceSilenceStart,
-           Date().timeIntervalSince(start) >= silenceDuration {
+            Date().timeIntervalSince(start) >= silenceDuration
+        {
             stopAssistantVoiceCapture()
         }
     }
@@ -2870,7 +3031,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             cloudTranscriptionProviderRawValue: settings.cloudTranscriptionProviderRawValue,
             cloudTranscriptionModel: settings.cloudTranscriptionModel,
             cloudTranscriptionBaseURL: settings.cloudTranscriptionBaseURL,
-            cloudTranscriptionRequestTimeoutSeconds: settings.cloudTranscriptionRequestTimeoutSeconds,
+            cloudTranscriptionRequestTimeoutSeconds: settings
+                .cloudTranscriptionRequestTimeoutSeconds,
             cloudTranscriptionAPIKey: effectiveCloudTranscriptionAPIKey,
             selectedWhisperModelID: settings.selectedWhisperModelID,
             whisperUseCoreML: settings.whisperUseCoreML,
@@ -2891,7 +3053,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         let snapshot = currentSettingsApplySnapshot()
         let previousSnapshot = lastAppliedSettingsSnapshot
 
-        let microphoneChanged = previousSnapshot == nil
+        let microphoneChanged =
+            previousSnapshot == nil
             || previousSnapshot?.autoDetectMicrophone != snapshot.autoDetectMicrophone
             || previousSnapshot?.selectedMicrophoneUID != snapshot.selectedMicrophoneUID
         if microphoneChanged {
@@ -2902,7 +3065,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             )
         }
 
-        let recognitionChanged = previousSnapshot == nil
+        let recognitionChanged =
+            previousSnapshot == nil
             || previousSnapshot?.adaptiveCorrectionsEnabled != snapshot.adaptiveCorrectionsEnabled
             || previousSnapshot?.enableContextualBias != snapshot.enableContextualBias
             || previousSnapshot?.keepTextAcrossPauses != snapshot.keepTextAcrossPauses
@@ -2914,18 +3078,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             applyRecognitionSettingsToTranscriber()
         }
 
-        let engineChanged = previousSnapshot == nil
+        let engineChanged =
+            previousSnapshot == nil
             || previousSnapshot?.transcriptionEngineRawValue != snapshot.transcriptionEngineRawValue
-        let whisperRuntimeChanged = previousSnapshot == nil
+        let whisperRuntimeChanged =
+            previousSnapshot == nil
             || previousSnapshot?.selectedWhisperModelID != snapshot.selectedWhisperModelID
             || previousSnapshot?.whisperUseCoreML != snapshot.whisperUseCoreML
-            || previousSnapshot?.whisperAutoUnloadIdleContextEnabled != snapshot.whisperAutoUnloadIdleContextEnabled
-            || previousSnapshot?.whisperIdleContextUnloadSeconds != snapshot.whisperIdleContextUnloadSeconds
-        let cloudRuntimeChanged = previousSnapshot == nil
-            || previousSnapshot?.cloudTranscriptionProviderRawValue != snapshot.cloudTranscriptionProviderRawValue
+            || previousSnapshot?.whisperAutoUnloadIdleContextEnabled
+                != snapshot.whisperAutoUnloadIdleContextEnabled
+            || previousSnapshot?.whisperIdleContextUnloadSeconds
+                != snapshot.whisperIdleContextUnloadSeconds
+        let cloudRuntimeChanged =
+            previousSnapshot == nil
+            || previousSnapshot?.cloudTranscriptionProviderRawValue
+                != snapshot.cloudTranscriptionProviderRawValue
             || previousSnapshot?.cloudTranscriptionModel != snapshot.cloudTranscriptionModel
             || previousSnapshot?.cloudTranscriptionBaseURL != snapshot.cloudTranscriptionBaseURL
-            || previousSnapshot?.cloudTranscriptionRequestTimeoutSeconds != snapshot.cloudTranscriptionRequestTimeoutSeconds
+            || previousSnapshot?.cloudTranscriptionRequestTimeoutSeconds
+                != snapshot.cloudTranscriptionRequestTimeoutSeconds
             || previousSnapshot?.cloudTranscriptionAPIKey != snapshot.cloudTranscriptionAPIKey
         if engineChanged || whisperRuntimeChanged {
             syncWhisperModelSelectionIfNeeded()
@@ -2953,26 +3124,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             updatePermissionGate(openOnboardingIfNeeded: false)
         }
 
-        let hotkeysChanged = previousSnapshot == nil
+        let hotkeysChanged =
+            previousSnapshot == nil
             || previousSnapshot?.shortcutKeyCode != snapshot.shortcutKeyCode
             || previousSnapshot?.shortcutModifiers != snapshot.shortcutModifiers
-            || previousSnapshot?.continuousToggleShortcutKeyCode != snapshot.continuousToggleShortcutKeyCode
-            || previousSnapshot?.continuousToggleShortcutModifiers != snapshot.continuousToggleShortcutModifiers
-            || previousSnapshot?.assistantLiveVoiceShortcutKeyCode != snapshot.assistantLiveVoiceShortcutKeyCode
-            || previousSnapshot?.assistantLiveVoiceShortcutModifiers != snapshot.assistantLiveVoiceShortcutModifiers
-            || previousSnapshot?.assistantCompactShortcutKeyCode != snapshot.assistantCompactShortcutKeyCode
-            || previousSnapshot?.assistantCompactShortcutModifiers != snapshot.assistantCompactShortcutModifiers
-            || previousSnapshot?.muteSystemSoundsWhileHoldingShortcut != snapshot.muteSystemSoundsWhileHoldingShortcut
+            || previousSnapshot?.continuousToggleShortcutKeyCode
+                != snapshot.continuousToggleShortcutKeyCode
+            || previousSnapshot?.continuousToggleShortcutModifiers
+                != snapshot.continuousToggleShortcutModifiers
+            || previousSnapshot?.assistantLiveVoiceShortcutKeyCode
+                != snapshot.assistantLiveVoiceShortcutKeyCode
+            || previousSnapshot?.assistantLiveVoiceShortcutModifiers
+                != snapshot.assistantLiveVoiceShortcutModifiers
+            || previousSnapshot?.assistantCompactShortcutKeyCode
+                != snapshot.assistantCompactShortcutKeyCode
+            || previousSnapshot?.assistantCompactShortcutModifiers
+                != snapshot.assistantCompactShortcutModifiers
+            || previousSnapshot?.muteSystemSoundsWhileHoldingShortcut
+                != snapshot.muteSystemSoundsWhileHoldingShortcut
         if hotkeysChanged {
             applyHotkeyMode()
             configurePasteLastTranscriptHotkey()
         }
 
-        if (previousSnapshot?.adaptiveCorrectionsEnabled ?? true) && !settings.adaptiveCorrectionsEnabled {
+        if (previousSnapshot?.adaptiveCorrectionsEnabled ?? true)
+            && !settings.adaptiveCorrectionsEnabled
+        {
             postInsertCorrectionMonitor.stopMonitoring(commitSession: false)
         }
 
-        let assistantTurnedOff = (previousSnapshot?.assistantBetaEnabled ?? false) && !snapshot.assistantBetaEnabled
+        let assistantTurnedOff =
+            (previousSnapshot?.assistantBetaEnabled ?? false) && !snapshot.assistantBetaEnabled
         if assistantTurnedOff {
             stopAssistantExperience()
         }
@@ -3020,7 +3202,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             return
         }
 
-        if let fallbackModel = WhisperModelCatalog.curatedModels.first(where: { whisperModelManager.hasInstalledModel(id: $0.id) }) {
+        if let fallbackModel = WhisperModelCatalog.curatedModels.first(where: {
+            whisperModelManager.hasInstalledModel(id: $0.id)
+        }) {
             settings.selectedWhisperModelID = fallbackModel.id
         } else {
             settings.selectedWhisperModelID = ""
@@ -3043,22 +3227,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             lhsModifiers: settings.shortcutModifierFlags,
             rhsKeyCode: settings.continuousToggleShortcutKeyCode,
             rhsModifiers: settings.continuousToggleShortcutModifierFlags
-        ) || shortcutsConflict(
-            lhsKeyCode: settings.shortcutKeyCode,
-            lhsModifiers: settings.shortcutModifierFlags,
-            rhsKeyCode: settings.assistantLiveVoiceShortcutKeyCode,
-            rhsModifiers: settings.assistantLiveVoiceShortcutModifierFlags
-        ) || shortcutsConflict(
-            lhsKeyCode: settings.shortcutKeyCode,
-            lhsModifiers: settings.shortcutModifierFlags,
-            rhsKeyCode: settings.assistantCompactShortcutKeyCode,
-            rhsModifiers: settings.assistantCompactShortcutModifierFlags
-        ) || shortcutsConflict(
-            lhsKeyCode: settings.shortcutKeyCode,
-            lhsModifiers: settings.shortcutModifierFlags,
-            rhsKeyCode: PasteLastTranscriptShortcut.keyCode,
-            rhsModifiers: PasteLastTranscriptShortcut.modifiers
-        ) {
+        )
+            || shortcutsConflict(
+                lhsKeyCode: settings.shortcutKeyCode,
+                lhsModifiers: settings.shortcutModifierFlags,
+                rhsKeyCode: settings.assistantLiveVoiceShortcutKeyCode,
+                rhsModifiers: settings.assistantLiveVoiceShortcutModifierFlags
+            )
+            || shortcutsConflict(
+                lhsKeyCode: settings.shortcutKeyCode,
+                lhsModifiers: settings.shortcutModifierFlags,
+                rhsKeyCode: settings.assistantCompactShortcutKeyCode,
+                rhsModifiers: settings.assistantCompactShortcutModifierFlags
+            )
+            || shortcutsConflict(
+                lhsKeyCode: settings.shortcutKeyCode,
+                lhsModifiers: settings.shortcutModifierFlags,
+                rhsKeyCode: PasteLastTranscriptShortcut.keyCode,
+                rhsModifiers: PasteLastTranscriptShortcut.modifiers
+            )
+        {
             setUIStatus(.message("Fix shortcut conflicts in Settings to enable hold-to-talk"))
         } else {
             hotkeyManager = HoldToTalkManager(
@@ -3082,23 +3270,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             lhsModifiers: settings.continuousToggleShortcutModifierFlags,
             rhsKeyCode: settings.shortcutKeyCode,
             rhsModifiers: settings.shortcutModifierFlags
-        ) || shortcutsConflict(
-            lhsKeyCode: settings.continuousToggleShortcutKeyCode,
-            lhsModifiers: settings.continuousToggleShortcutModifierFlags,
-            rhsKeyCode: PasteLastTranscriptShortcut.keyCode,
-            rhsModifiers: PasteLastTranscriptShortcut.modifiers
-        ) || shortcutsConflict(
-            lhsKeyCode: settings.continuousToggleShortcutKeyCode,
-            lhsModifiers: settings.continuousToggleShortcutModifierFlags,
-            rhsKeyCode: settings.assistantLiveVoiceShortcutKeyCode,
-            rhsModifiers: settings.assistantLiveVoiceShortcutModifierFlags
-        ) || shortcutsConflict(
-            lhsKeyCode: settings.continuousToggleShortcutKeyCode,
-            lhsModifiers: settings.continuousToggleShortcutModifierFlags,
-            rhsKeyCode: settings.assistantCompactShortcutKeyCode,
-            rhsModifiers: settings.assistantCompactShortcutModifierFlags
-        ) {
-            setUIStatus(.message("Fix shortcut conflicts in Settings to enable continuous toggle hotkey"))
+        )
+            || shortcutsConflict(
+                lhsKeyCode: settings.continuousToggleShortcutKeyCode,
+                lhsModifiers: settings.continuousToggleShortcutModifierFlags,
+                rhsKeyCode: PasteLastTranscriptShortcut.keyCode,
+                rhsModifiers: PasteLastTranscriptShortcut.modifiers
+            )
+            || shortcutsConflict(
+                lhsKeyCode: settings.continuousToggleShortcutKeyCode,
+                lhsModifiers: settings.continuousToggleShortcutModifierFlags,
+                rhsKeyCode: settings.assistantLiveVoiceShortcutKeyCode,
+                rhsModifiers: settings.assistantLiveVoiceShortcutModifierFlags
+            )
+            || shortcutsConflict(
+                lhsKeyCode: settings.continuousToggleShortcutKeyCode,
+                lhsModifiers: settings.continuousToggleShortcutModifierFlags,
+                rhsKeyCode: settings.assistantCompactShortcutKeyCode,
+                rhsModifiers: settings.assistantCompactShortcutModifierFlags
+            )
+        {
+            setUIStatus(
+                .message("Fix shortcut conflicts in Settings to enable continuous toggle hotkey"))
             return
         }
 
@@ -3117,22 +3310,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             lhsModifiers: settings.assistantLiveVoiceShortcutModifierFlags,
             rhsKeyCode: settings.shortcutKeyCode,
             rhsModifiers: settings.shortcutModifierFlags
-        ) || shortcutsConflict(
-            lhsKeyCode: settings.assistantLiveVoiceShortcutKeyCode,
-            lhsModifiers: settings.assistantLiveVoiceShortcutModifierFlags,
-            rhsKeyCode: settings.continuousToggleShortcutKeyCode,
-            rhsModifiers: settings.continuousToggleShortcutModifierFlags
-        ) || shortcutsConflict(
-            lhsKeyCode: settings.assistantLiveVoiceShortcutKeyCode,
-            lhsModifiers: settings.assistantLiveVoiceShortcutModifierFlags,
-            rhsKeyCode: PasteLastTranscriptShortcut.keyCode,
-            rhsModifiers: PasteLastTranscriptShortcut.modifiers
-        ) || shortcutsConflict(
-            lhsKeyCode: settings.assistantLiveVoiceShortcutKeyCode,
-            lhsModifiers: settings.assistantLiveVoiceShortcutModifierFlags,
-            rhsKeyCode: settings.assistantCompactShortcutKeyCode,
-            rhsModifiers: settings.assistantCompactShortcutModifierFlags
-        ) {
+        )
+            || shortcutsConflict(
+                lhsKeyCode: settings.assistantLiveVoiceShortcutKeyCode,
+                lhsModifiers: settings.assistantLiveVoiceShortcutModifierFlags,
+                rhsKeyCode: settings.continuousToggleShortcutKeyCode,
+                rhsModifiers: settings.continuousToggleShortcutModifierFlags
+            )
+            || shortcutsConflict(
+                lhsKeyCode: settings.assistantLiveVoiceShortcutKeyCode,
+                lhsModifiers: settings.assistantLiveVoiceShortcutModifierFlags,
+                rhsKeyCode: PasteLastTranscriptShortcut.keyCode,
+                rhsModifiers: PasteLastTranscriptShortcut.modifiers
+            )
+            || shortcutsConflict(
+                lhsKeyCode: settings.assistantLiveVoiceShortcutKeyCode,
+                lhsModifiers: settings.assistantLiveVoiceShortcutModifierFlags,
+                rhsKeyCode: settings.assistantCompactShortcutKeyCode,
+                rhsModifiers: settings.assistantCompactShortcutModifierFlags
+            )
+        {
             setUIStatus(.message("Fix shortcut conflicts in Settings to enable the agent shortcut"))
             return
         }
@@ -3153,23 +3350,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             lhsModifiers: settings.assistantCompactShortcutModifierFlags,
             rhsKeyCode: settings.shortcutKeyCode,
             rhsModifiers: settings.shortcutModifierFlags
-        ) || shortcutsConflict(
-            lhsKeyCode: settings.assistantCompactShortcutKeyCode,
-            lhsModifiers: settings.assistantCompactShortcutModifierFlags,
-            rhsKeyCode: settings.continuousToggleShortcutKeyCode,
-            rhsModifiers: settings.continuousToggleShortcutModifierFlags
-        ) || shortcutsConflict(
-            lhsKeyCode: settings.assistantCompactShortcutKeyCode,
-            lhsModifiers: settings.assistantCompactShortcutModifierFlags,
-            rhsKeyCode: settings.assistantLiveVoiceShortcutKeyCode,
-            rhsModifiers: settings.assistantLiveVoiceShortcutModifierFlags
-        ) || shortcutsConflict(
-            lhsKeyCode: settings.assistantCompactShortcutKeyCode,
-            lhsModifiers: settings.assistantCompactShortcutModifierFlags,
-            rhsKeyCode: PasteLastTranscriptShortcut.keyCode,
-            rhsModifiers: PasteLastTranscriptShortcut.modifiers
-        ) {
-            setUIStatus(.message("Fix shortcut conflicts in Settings to enable the compact assistant shortcut"))
+        )
+            || shortcutsConflict(
+                lhsKeyCode: settings.assistantCompactShortcutKeyCode,
+                lhsModifiers: settings.assistantCompactShortcutModifierFlags,
+                rhsKeyCode: settings.continuousToggleShortcutKeyCode,
+                rhsModifiers: settings.continuousToggleShortcutModifierFlags
+            )
+            || shortcutsConflict(
+                lhsKeyCode: settings.assistantCompactShortcutKeyCode,
+                lhsModifiers: settings.assistantCompactShortcutModifierFlags,
+                rhsKeyCode: settings.assistantLiveVoiceShortcutKeyCode,
+                rhsModifiers: settings.assistantLiveVoiceShortcutModifierFlags
+            )
+            || shortcutsConflict(
+                lhsKeyCode: settings.assistantCompactShortcutKeyCode,
+                lhsModifiers: settings.assistantCompactShortcutModifierFlags,
+                rhsKeyCode: PasteLastTranscriptShortcut.keyCode,
+                rhsModifiers: PasteLastTranscriptShortcut.modifiers
+            )
+        {
+            setUIStatus(
+                .message(
+                    "Fix shortcut conflicts in Settings to enable the compact assistant shortcut"))
             return
         }
 
@@ -3227,7 +3430,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             return
         }
 
-        let shouldUseCompactSurface = settings.assistantFloatingHUDEnabled && !isAssistantWindowVisible
+        let shouldUseCompactSurface =
+            settings.assistantFloatingHUDEnabled && !isAssistantWindowVisible
         if shouldUseCompactSurface {
             syncAssistantCompactVisibility()
             assistantCompactHUD?.prepareVoiceCaptureComposer()
@@ -3249,16 +3453,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         }
     }
 
-
     private func startHoldToTalkDictation() {
         guard DictationInputModeStateMachine.onHoldStart(dictationInputMode) == .holdToTalk else {
             return
         }
         guard dictationInputMode == .idle else {
-            return
-        }
-
-        if shouldBlockDictationShortcutInsideAssistant() {
             return
         }
 
@@ -3286,9 +3485,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
 
         switch nextMode {
         case .continuous:
-            if shouldBlockDictationShortcutInsideAssistant() {
-                return
-            }
             startRecording()
             if isDictating {
                 dictationInputMode = nextMode
@@ -3300,12 +3496,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         case .holdToTalk:
             break
         }
-    }
-
-    private func shouldBlockDictationShortcutInsideAssistant() -> Bool {
-        guard AssistantComposerBridge.shared.activeCaptureTarget != nil else { return false }
-        setUIStatus(.message("Use the agent shortcut inside Open Assist."))
-        return true
     }
 
     private func startRecording() {
@@ -3321,7 +3511,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             if assistantVoiceCaptureActive {
                 assistantVoiceCaptureActive = false
                 assistantVoiceStopMode = .silenceAutoStop
-                assistantController.failVoiceDraft("Assistant voice capture needs microphone and accessibility permissions.")
+                assistantController.failVoiceDraft(
+                    "Assistant voice capture needs microphone and accessibility permissions.")
             }
             if compactVoiceCaptureActive {
                 compactVoiceCaptureActive = false
@@ -3334,7 +3525,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         postInsertCorrectionMonitor.stopMonitoring(commitSession: false)
 
         if let frontmost = NSWorkspace.shared.frontmostApplication,
-           frontmost.processIdentifier != ProcessInfo.processInfo.processIdentifier {
+            frontmost.processIdentifier != ProcessInfo.processInfo.processIdentifier
+        {
             lastExternalApplication = frontmost
             lastTargetApplication = frontmost
         } else if let fallback = lastExternalApplication, !fallback.isTerminated {
@@ -3348,14 +3540,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         if started {
             playDictationFeedbackSound(.startListening)
             setUIStatus(.listening)
-            if !liveVoiceCaptureActive && !assistantVoiceCaptureActive && !compactVoiceCaptureActive {
+            if !liveVoiceCaptureActive && !assistantVoiceCaptureActive && !compactVoiceCaptureActive
+            {
                 waveform.show()
             }
             startStatusIconAnimation()
         } else {
             if liveVoiceCaptureActive {
                 liveVoiceCaptureActive = false
-                liveVoiceCoordinator?.handleCaptureFailure("Open Assist could not start live voice listening.")
+                liveVoiceCoordinator?.handleCaptureFailure(
+                    "Open Assist could not start live voice listening.")
             }
             if assistantVoiceCaptureActive {
                 assistantVoiceCaptureActive = false
@@ -3372,13 +3566,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             stopStatusIconAnimation()
             updatePermissionGate(openOnboardingIfNeeded: true)
             if settings.transcriptionEngine == .whisperCpp,
-               !whisperModelManager.hasInstalledModel(id: settings.selectedWhisperModelID) {
-                setUIStatus(.message("Install a whisper model in Settings > Recognition to start dictation"))
+                !whisperModelManager.hasInstalledModel(id: settings.selectedWhisperModelID)
+            {
+                setUIStatus(
+                    .message("Install a whisper model in Settings > Recognition to start dictation")
+                )
                 windowCoordinator?.openSettingsWindow()
             } else if settings.transcriptionEngine == .cloudProviders,
-                      settings.cloudTranscriptionProvider.requiresAPIKey,
-                      effectiveCloudTranscriptionAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                setUIStatus(.message("Add a cloud provider API key in Settings > Recognition to start dictation"))
+                settings.cloudTranscriptionProvider.requiresAPIKey,
+                effectiveCloudTranscriptionAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
+                    .isEmpty
+            {
+                setUIStatus(
+                    .message(
+                        "Add a cloud provider API key in Settings > Recognition to start dictation")
+                )
                 windowCoordinator?.openSettingsWindow()
             }
         }
@@ -3425,11 +3627,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             assistantVoiceBaselineSamples = []
             assistantVoiceBaselineCalibrated = false
             if settings.promptRewriteEnabled {
-                assistantController.showTransientHUDState(AssistantHUDState(
-                    phase: .thinking,
-                    title: "Refining",
-                    detail: "Applying AI corrections to your message"
-                ))
+                assistantController.showTransientHUDState(
+                    AssistantHUDState(
+                        phase: .thinking,
+                        title: "Refining",
+                        detail: "Applying AI corrections to your message"
+                    ))
             }
             let refinedAssistantDraft = await refinedAssistantVoiceDraft(from: cleaned)
             assistantCompactHUD?.receiveVoiceTranscript(refinedAssistantDraft)
@@ -3445,11 +3648,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             assistantVoiceBaselineCalibrated = false
             openAssistantWindow()
             if settings.promptRewriteEnabled {
-                assistantController.showTransientHUDState(AssistantHUDState(
-                    phase: .thinking,
-                    title: "Refining",
-                    detail: "Applying AI corrections to your message"
-                ))
+                assistantController.showTransientHUDState(
+                    AssistantHUDState(
+                        phase: .thinking,
+                        title: "Refining",
+                        detail: "Applying AI corrections to your message"
+                    ))
             }
             let refinedAssistantDraft = await refinedAssistantVoiceDraft(from: cleaned)
             assistantController.receiveVoiceDraft(refinedAssistantDraft)
@@ -3476,10 +3680,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         let insertionSessionContext = capturePromptRewriteSessionContext()
         let rewriteResolution: PromptRewriteInsertionResolution
         if settings.promptRewriteEnabled {
-            guard let resolved = await resolvePromptRewriteInsertionText(
-                for: cleaned,
-                insertionSessionContext: insertionSessionContext
-            ) else {
+            guard
+                let resolved = await resolvePromptRewriteInsertionText(
+                    for: cleaned,
+                    insertionSessionContext: insertionSessionContext
+                )
+            else {
                 if !isDictating {
                     setUIStatus(.ready)
                 }
@@ -3501,7 +3707,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             readyForInsert = applyAdaptiveCorrectionsIfNeeded(to: rewriteResolution.insertionText)
         }
         if settings.promptRewriteEnabled,
-           let conversationContext = rewriteResolution.conversationContext {
+            let conversationContext = rewriteResolution.conversationContext
+        {
             promptRewriteConversationStore.recordTurn(
                 originalText: cleaned,
                 finalText: readyForInsert,
@@ -3532,11 +3739,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
     @MainActor
     private func insertTranscriptIntoAssistantComposerIfPossible(_ text: String) -> Bool {
         guard let frontmost = NSWorkspace.shared.frontmostApplication,
-              frontmost.processIdentifier == ProcessInfo.processInfo.processIdentifier,
-              AssistantComposerBridge.shared.canInsertIntoActiveComposer,
-              AssistantComposerBridge.shared.insert(text) else {
+            frontmost.processIdentifier == ProcessInfo.processInfo.processIdentifier
+        else {
             return false
         }
+
+        if AssistantComposerBridge.shared.insert(text) {
+            transcriptHistory.add(text)
+            playDictationFeedbackSound(.pasted)
+            return true
+        }
+
+        guard isAssistantWindowVisible else {
+            return false
+        }
+
+        assistantController.composerText = text
 
         transcriptHistory.add(text)
         playDictationFeedbackSound(.pasted)
@@ -3616,7 +3834,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
 
                 let rawSuggestion: PromptRewriteSuggestion?
                 switch retrievalOutcome {
-                case let .suggestion(suggestion):
+                case .suggestion(let suggestion):
                     rawSuggestion = suggestion
                 case .bypassed:
                     rawSuggestion = nil
@@ -3638,20 +3856,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
                 let autoInsertEnabled = settings.promptRewriteAutoInsertEnabled
                 let autoInsertThreshold = Self.promptRewriteAutoInsertMinimumConfidence
                 let suggestionConfidence = suggestion.confidence
-                let suggestionConfidenceString = suggestionConfidence.map { value in
-                    String(format: "%.3f", value)
-                } ?? "nil"
+                let suggestionConfidenceString =
+                    suggestionConfidence.map { value in
+                        String(format: "%.3f", value)
+                    } ?? "nil"
                 let thresholdString = String(format: "%.3f", autoInsertThreshold)
 
                 if autoInsertEnabled,
-                   let suggestionConfidence,
-                   suggestionConfidence >= autoInsertThreshold {
+                    let suggestionConfidence,
+                    suggestionConfidence >= autoInsertThreshold
+                {
                     CrashReporter.logInfo(
-                        "Prompt rewrite insertion decision=auto-insert " +
-                        "provider=\(settings.promptRewriteProviderModeRawValue) " +
-                        "confidence=\(suggestionConfidenceString) " +
-                        "threshold=\(thresholdString) " +
-                        "continuity=\(suggestion.continuityTrace ?? "none")"
+                        "Prompt rewrite insertion decision=auto-insert "
+                            + "provider=\(settings.promptRewriteProviderModeRawValue) "
+                            + "confidence=\(suggestionConfidenceString) "
+                            + "threshold=\(thresholdString) "
+                            + "continuity=\(suggestion.continuityTrace ?? "none")"
                     )
                     await recordPromptRewriteFeedback(
                         action: .autoInsertedSuggested,
@@ -3675,12 +3895,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
                     previewReason = "below-threshold"
                 }
                 CrashReporter.logInfo(
-                    "Prompt rewrite insertion decision=preview " +
-                    "provider=\(settings.promptRewriteProviderModeRawValue) " +
-                    "reason=\(previewReason) " +
-                    "confidence=\(suggestionConfidenceString) " +
-                    "threshold=\(thresholdString) " +
-                    "continuity=\(suggestion.continuityTrace ?? "none")"
+                    "Prompt rewrite insertion decision=preview "
+                        + "provider=\(settings.promptRewriteProviderModeRawValue) "
+                        + "reason=\(previewReason) " + "confidence=\(suggestionConfidenceString) "
+                        + "threshold=\(thresholdString) "
+                        + "continuity=\(suggestion.continuityTrace ?? "none")"
                 )
 
                 while true {
@@ -3702,13 +3921,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
                             insertionHUDContext: insertionSessionContext.insertionHUDContext
                         )
                     case .editThenInsert:
-                        guard let edited = presentPromptRewriteEditDialog(initialText: suggestion.suggestedText) else {
+                        guard
+                            let edited = presentPromptRewriteEditDialog(
+                                initialText: suggestion.suggestedText)
+                        else {
                             continue
                         }
-                        let normalizedEdited = PromptRewriteFormatting.prepareEditedTextForInsertion(
-                            edited,
-                            forceMarkdown: settings.promptRewriteAlwaysConvertToMarkdown
-                        )
+                        let normalizedEdited =
+                            PromptRewriteFormatting.prepareEditedTextForInsertion(
+                                edited,
+                                forceMarkdown: settings.promptRewriteAlwaysConvertToMarkdown
+                            )
                         let finalEdited = normalizedEdited.isEmpty ? edited : normalizedEdited
                         await recordPromptRewriteFeedback(
                             action: .editedThenInserted,
@@ -3790,32 +4013,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             return PromptRewriteLoadingNarrative(
                 transcript: transcript,
                 aiSuggestionsEnabled: false,
-                aiGenerationSummary: "AI suggestions are disabled. Open Assist will insert the cleaned transcription as-is.",
+                aiGenerationSummary:
+                    "AI suggestions are disabled. Open Assist will insert the cleaned transcription as-is.",
                 aiRuntimeSummary: nil
             )
         }
 
         let providerLabel = settings.promptRewriteProviderMode.displayName
-        let configuredModel = settings.promptRewriteOpenAIModel.trimmingCharacters(in: .whitespacesAndNewlines)
-        let modelLabel = configuredModel.isEmpty
+        let configuredModel = settings.promptRewriteOpenAIModel.trimmingCharacters(
+            in: .whitespacesAndNewlines)
+        let modelLabel =
+            configuredModel.isEmpty
             ? settings.promptRewriteProviderMode.defaultModel
             : configuredModel
         let styleLabel = settings.promptRewriteStylePreset.rawValue
             .replacingOccurrences(of: " (Default)", with: "")
-        let historyPhrase = conversationHistoryTurnCount > 0
+        let historyPhrase =
+            conversationHistoryTurnCount > 0
             ? "\(conversationHistoryTurnCount) prior turn(s)"
             : "current utterance only"
-        let insertionPath = settings.promptRewriteAutoInsertEnabled
+        let insertionPath =
+            settings.promptRewriteAutoInsertEnabled
             ? "auto-insert for high confidence"
             : "manual preview before insert"
-        let processNarrative = "Improving clarity, grammar, and tone from your transcript while preserving intent."
+        let processNarrative =
+            "Improving clarity, grammar, and tone from your transcript while preserving intent."
         let contextNarrative = "Context source: \(historyPhrase)."
         let decisionNarrative = "Decision path: \(insertionPath)."
 
         return PromptRewriteLoadingNarrative(
             transcript: transcript,
             aiSuggestionsEnabled: true,
-            aiGenerationSummary: "\(processNarrative) Style profile: \(styleLabel). \(contextNarrative) \(decisionNarrative)",
+            aiGenerationSummary:
+                "\(processNarrative) Style profile: \(styleLabel). \(contextNarrative) \(decisionNarrative)",
             aiRuntimeSummary: "\(providerLabel) · \(modelLabel)"
         )
     }
@@ -3841,7 +4071,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             group.addTask {
                 await PromptRewriteHUDManager.shared.updateLoadingIndicator(
                     insertionContext: insertionContext,
-                    displayState: loadingNarrative.displayState(step: "Sending transcript for rewrite suggestion")
+                    displayState: loadingNarrative.displayState(
+                        step: "Sending transcript for rewrite suggestion")
                 )
 
                 // Drip-feed progress while waiting for the API response
@@ -3851,19 +4082,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
                         guard !Task.isCancelled else { return }
                         await PromptRewriteHUDManager.shared.updateLoadingIndicator(
                             insertionContext: insertionContext,
-                            displayState: loadingNarrative.displayState(step: "Waiting for AI response")
+                            displayState: loadingNarrative.displayState(
+                                step: "Waiting for AI response")
                         )
                         try await Task.sleep(nanoseconds: 2_500_000_000)
                         guard !Task.isCancelled else { return }
                         await PromptRewriteHUDManager.shared.updateLoadingIndicator(
                             insertionContext: insertionContext,
-                            displayState: loadingNarrative.displayState(step: "Analyzing transcript context")
+                            displayState: loadingNarrative.displayState(
+                                step: "Analyzing transcript context")
                         )
                         try await Task.sleep(nanoseconds: 2_500_000_000)
                         guard !Task.isCancelled else { return }
                         await PromptRewriteHUDManager.shared.updateLoadingIndicator(
                             insertionContext: insertionContext,
-                            displayState: loadingNarrative.displayState(step: "Receiving and normalizing AI response")
+                            displayState: loadingNarrative.displayState(
+                                step: "Receiving and normalizing AI response")
                         )
                     } catch {
                         // Cancellation is expected when the suggestion returns quickly.
@@ -3899,7 +4133,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
                     ) {
                         await PromptRewriteHUDManager.shared.updateLoadingIndicator(
                             insertionContext: insertionContext,
-                            displayState: loadingNarrative.displayState(step: "Paused AI refinement. Restoring transcript")
+                            displayState: loadingNarrative.displayState(
+                                step: "Paused AI refinement. Restoring transcript")
                         )
                         return .bypassed
                     }
@@ -3932,13 +4167,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             return nil
         }
 
-        guard let requestContext = conversationContextResolverV2.resolve(
-            capturedContext: capturedContext,
-            userText: userText,
-            timeoutMinutes: settings.promptRewriteConversationTimeoutMinutes,
-            turnLimit: settings.promptRewriteConversationTurnLimit,
-            pinnedContextID: settings.promptRewriteConversationPinnedContextID
-        ) else {
+        guard
+            let requestContext = conversationContextResolverV2.resolve(
+                capturedContext: capturedContext,
+                userText: userText,
+                timeoutMinutes: settings.promptRewriteConversationTimeoutMinutes,
+                turnLimit: settings.promptRewriteConversationTurnLimit,
+                pinnedContextID: settings.promptRewriteConversationPinnedContextID
+            )
+        else {
             return nil
         }
 
@@ -3988,7 +4225,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             if let deterministicCandidate {
                 let matchType = deterministicCandidate.matchType.rawValue
                 if deterministicCandidate.matchType == .exact
-                    || deterministicCandidate.confidence >= Self.deterministicMappingHighConfidenceThreshold {
+                    || deterministicCandidate.confidence
+                        >= Self.deterministicMappingHighConfidenceThreshold
+                {
                     self.conversationContextResolverV2.persistMappingDecision(
                         .link,
                         prompt: deterministicCandidate.prompt,
@@ -4000,7 +4239,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
                         linkedContextCount: linkedContextCount,
                         mergeTurns: mergeTurns,
                         aiMatchTimeout: false,
-                        detail: "candidate_found=true auto_linked=true match_axis=\(deterministicCandidate.matchAxis.rawValue) match_type=\(matchType) confidence=\(String(format: "%.3f", deterministicCandidate.confidence))"
+                        detail:
+                            "candidate_found=true auto_linked=true match_axis=\(deterministicCandidate.matchAxis.rawValue) match_type=\(matchType) confidence=\(String(format: "%.3f", deterministicCandidate.confidence))"
                     )
                     return
                 }
@@ -4009,7 +4249,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
                     linkedContextCount: linkedContextCount,
                     mergeTurns: mergeTurns,
                     aiMatchTimeout: false,
-                    detail: "candidate_found=true auto_linked=false match_axis=\(deterministicCandidate.matchAxis.rawValue) match_type=\(matchType) confidence=\(String(format: "%.3f", deterministicCandidate.confidence)) below_threshold=true"
+                    detail:
+                        "candidate_found=true auto_linked=false match_axis=\(deterministicCandidate.matchAxis.rawValue) match_type=\(matchType) confidence=\(String(format: "%.3f", deterministicCandidate.confidence)) below_threshold=true"
                 )
             } else {
                 self.logPromptRewriteMappingTelemetry(
@@ -4057,7 +4298,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
                     linkedContextCount: linkedContextCount,
                     mergeTurns: mergeTurns,
                     aiMatchTimeout: false,
-                    detail: "candidate_found=true auto_linked=false confidence=\(String(format: "%.3f", aiCandidate.confidence)) below_threshold=true"
+                    detail:
+                        "candidate_found=true auto_linked=false confidence=\(String(format: "%.3f", aiCandidate.confidence)) below_threshold=true"
                 )
                 return
             }
@@ -4073,7 +4315,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
                 linkedContextCount: linkedContextCount,
                 mergeTurns: mergeTurns,
                 aiMatchTimeout: false,
-                detail: "candidate_found=true auto_linked=true confidence=\(String(format: "%.3f", aiCandidate.confidence)) fallback_from=deterministic"
+                detail:
+                    "candidate_found=true auto_linked=true confidence=\(String(format: "%.3f", aiCandidate.confidence)) fallback_from=deterministic"
             )
         }
     }
@@ -4118,7 +4361,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         message += " merge_turns=\(mergeTurns)"
         message += " ai_match_timeout=\(aiMatchTimeout)"
         if let detail,
-           !detail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            !detail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        {
             message += " \(detail)"
         }
         CrashReporter.logInfo(message)
@@ -4129,12 +4373,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         let insertionHUDContext = PromptRewriteHUDManager.shared.captureCurrentInsertionContext(
             fallbackApp: fallbackApp
         )
-        let conversationFallbackApp = insertionHUDContext.targetProcessIdentifier.flatMap { processID in
-            guard let app = NSRunningApplication(processIdentifier: processID), !app.isTerminated else {
-                return nil
-            }
-            return app
-        } ?? fallbackApp
+        let conversationFallbackApp =
+            insertionHUDContext.targetProcessIdentifier.flatMap { processID in
+                guard let app = NSRunningApplication(processIdentifier: processID),
+                    !app.isTerminated
+                else {
+                    return nil
+                }
+                return app
+            } ?? fallbackApp
         let conversationContext = PromptRewriteConversationContextResolver.captureCurrentContext(
             fallbackApp: conversationFallbackApp,
             screenLabel: nil
@@ -4225,13 +4472,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             let emptyAlert = NSAlert()
             emptyAlert.alertStyle = .warning
             emptyAlert.messageText = "Edited text is empty"
-            emptyAlert.informativeText = "Enter text before inserting, or go back and choose a different action."
+            emptyAlert.informativeText =
+                "Enter text before inserting, or go back and choose a different action."
             emptyAlert.addButton(withTitle: "Continue Editing")
             _ = emptyAlert.runModal()
         }
     }
 
-    private func presentPromptRewriteFailureDialog(failureDetail: String) -> PromptRewriteFailureChoice {
+    private func presentPromptRewriteFailureDialog(failureDetail: String)
+        -> PromptRewriteFailureChoice
+    {
         let alert = NSAlert()
         alert.alertStyle = .warning
         alert.messageText = "Rewrite Provider Unavailable"
@@ -4256,32 +4506,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
     ) -> String {
         let suggestedSnippet = promptRewriteSnippet(for: suggestion.suggestedText)
         let originalSnippet = promptRewriteSnippet(for: originalText)
-        if let memoryContext = suggestion.memoryContext?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !memoryContext.isEmpty {
+        if let memoryContext = suggestion.memoryContext?.trimmingCharacters(
+            in: .whitespacesAndNewlines),
+            !memoryContext.isEmpty
+        {
             let memorySnippet = promptRewriteSnippet(for: memoryContext, maxLength: 160)
             return """
-            Memory context:
-            \(memorySnippet)
+                Memory context:
+                \(memorySnippet)
 
+                Suggested:
+                \(suggestedSnippet)
+
+                Original:
+                \(originalSnippet)
+                """
+        }
+
+        return """
             Suggested:
             \(suggestedSnippet)
 
             Original:
             \(originalSnippet)
             """
-        }
-
-        return """
-        Suggested:
-        \(suggestedSnippet)
-
-        Original:
-        \(originalSnippet)
-        """
     }
 
     private func promptRewriteSnippet(for text: String, maxLength: Int = 320) -> String {
-        let normalized = text
+        let normalized =
+            text
             .replacingOccurrences(of: "\n", with: " ")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard normalized.count > maxLength else {
@@ -4294,12 +4547,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
     private func promptRewriteFailureDetail(for error: Error) -> String {
         if let serviceError = error as? PromptRewriteServiceError {
             switch serviceError {
-            case let .timedOut(timeoutSeconds):
+            case .timedOut(let timeoutSeconds):
                 if settings.promptRewriteProviderMode == .ollama {
-                    return "Local model timed out after \(String(format: "%.1f", timeoutSeconds))s. Increase Rewrite request timeout in Settings > Models & Connections."
+                    return
+                        "Local model timed out after \(String(format: "%.1f", timeoutSeconds))s. Increase Rewrite request timeout in Settings > Models & Connections."
                 }
                 return "Timed out after \(String(format: "%.1f", timeoutSeconds))s."
-            case let .providerUnavailable(reason):
+            case .providerUnavailable(let reason):
                 return reason
             }
         }
@@ -4328,7 +4582,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             confidence: suggestion.confidence,
             rewriteStrength: suggestion.rewriteStrength,
             continuityTrace: suggestion.continuityTrace,
-            refinementDurationSeconds: refinementDurationSeconds ?? suggestion.refinementDurationSeconds
+            refinementDurationSeconds: refinementDurationSeconds
+                ?? suggestion.refinementDurationSeconds
         )
     }
 
@@ -4359,10 +4614,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
     ) {
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         guard ensureAccessibilityReadyForInsertion() else { return }
-        let copyToClipboard = overrideCopyToClipboard ?? (settings.copyToClipboard || forceCopyToClipboard)
+        let copyToClipboard =
+            overrideCopyToClipboard ?? (settings.copyToClipboard || forceCopyToClipboard)
         if forceActivateTargetBeforeInsert,
-           let target = targetApplication(for: insertionContext),
-           !target.isTerminated {
+            let target = targetApplication(for: insertionContext),
+            !target.isTerminated
+        {
             lastTargetApplication = target
             _ = target.activate(options: [.activateIgnoringOtherApps])
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.10) { [weak self] in
@@ -4408,13 +4665,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         }
 
         guard let latest = transcriptHistory.entries.first?.text,
-              !latest.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            !latest.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else {
             setUIStatus(.message("No transcript in Open Assist History"))
             return
         }
 
         if let frontmost = NSWorkspace.shared.frontmostApplication,
-           frontmost.processIdentifier != ProcessInfo.processInfo.processIdentifier {
+            frontmost.processIdentifier != ProcessInfo.processInfo.processIdentifier
+        {
             lastExternalApplication = frontmost
             lastTargetApplication = frontmost
         } else if let fallback = lastExternalApplication, !fallback.isTerminated {
@@ -4435,11 +4694,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         return true
     }
 
-    private func targetApplication(for insertionContext: PromptRewriteInsertionHUDContext?) -> NSRunningApplication? {
+    private func targetApplication(for insertionContext: PromptRewriteInsertionHUDContext?)
+        -> NSRunningApplication?
+    {
         if let context = insertionContext,
-           let pid = context.targetProcessIdentifier,
-           let app = NSRunningApplication(processIdentifier: pid),
-           !app.isTerminated {
+            let pid = context.targetProcessIdentifier,
+            let app = NSRunningApplication(processIdentifier: pid),
+            !app.isTerminated
+        {
             return app
         }
         return nil
@@ -4467,14 +4729,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         if let explicitTarget = targetApplication(for: insertionContext) {
             lastTargetApplication = explicitTarget
         } else if lastTargetApplication == nil,
-                  let fallback = lastExternalApplication,
-                  !fallback.isTerminated {
+            let fallback = lastExternalApplication,
+            !fallback.isTerminated
+        {
             lastTargetApplication = fallback
         }
 
         if let target = lastTargetApplication,
-           !target.isTerminated,
-           !target.isActive {
+            !target.isTerminated,
+            !target.isActive
+        {
             _ = target.activate(options: [.activateIgnoringOtherApps])
             if attemptsRemaining > 1 {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.26) { [weak self] in
@@ -4493,7 +4757,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             lastTargetApplication = nil
         }
 
-        let result = TextInserter.insert(text, copyToClipboard: copyToClipboard)
+        let result = TextInserter.insert(
+            text,
+            copyToClipboard: copyToClipboard,
+            insertionContext: .dictation
+        )
         let retryPlan = InsertionRetryPolicy.plan(
             for: result,
             retriesRemaining: attemptsRemaining - 1,
@@ -4501,7 +4769,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         )
 
         switch retryPlan {
-        case let .retry(delay, nextRetriesRemaining):
+        case .retry(let delay, let nextRetriesRemaining):
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
                 self?.attemptInsertText(
                     text,
@@ -4512,7 +4780,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
                 )
             }
 
-        case let .complete(statusMessage):
+        case .complete(let statusMessage):
             let didInsert = result == .pasted
             if let statusMessage, statusMessage.hasPrefix("Paste unavailable") {
                 if copyToClipboard {
@@ -4537,14 +4805,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         }
     }
 
-    private func handleLearnedCorrection(from originalText: String, correctedText: String, insertedText: String) {
+    private func handleLearnedCorrection(
+        from originalText: String, correctedText: String, insertedText: String
+    ) {
         guard settings.adaptiveCorrectionsEnabled else { return }
 
-        guard let proposedEvent = adaptiveCorrectionStore.proposedLearningEvent(
-            from: originalText,
-            correctedText: correctedText,
-            insertionHint: insertedText
-        ) else { return }
+        guard
+            let proposedEvent = adaptiveCorrectionStore.proposedLearningEvent(
+                from: originalText,
+                correctedText: correctedText,
+                insertionHint: insertedText
+            )
+        else { return }
 
         let source = proposedEvent.source
         let replacement = proposedEvent.replacement
@@ -4561,10 +4833,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
     }
 
     private func acceptLearnedCorrection(source: String, replacement: String) {
-        guard let event = adaptiveCorrectionStore.acceptProposedLearning(
-            source: source,
-            replacement: replacement
-        ) else {
+        guard
+            let event = adaptiveCorrectionStore.acceptProposedLearning(
+                source: source,
+                replacement: replacement
+            )
+        else {
             return
         }
 
@@ -4663,12 +4937,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             value: FeatureFlags.personalAssistantEnabled && settings.assistantBetaEnabled
         )
 
-        let assistantBusy = liveVoiceCaptureActive
+        let assistantBusy =
+            liveVoiceCaptureActive
             || assistantController.isLiveVoiceSessionActive
             || assistantVoiceCaptureActive
             || compactVoiceCaptureActive
             || assistantController.pendingPermissionRequest != nil
-            || [.thinking, .acting, .waitingForPermission, .streaming].contains(assistantController.hudState.phase)
+            || [.thinking, .acting, .waitingForPermission, .streaming].contains(
+                assistantController.hudState.phase)
         updateStatusBarViewModel(
             \.assistantCanStopCurrentAction,
             value: statusBarViewModel.assistantEnabled && assistantBusy
@@ -4773,7 +5049,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
                 accessibilityDescription: "Open Assist"
             )
         } else {
-            symbol = NSImage(systemSymbolName: "waveform.circle", accessibilityDescription: "Open Assist")
+            symbol = NSImage(
+                systemSymbolName: "waveform.circle", accessibilityDescription: "Open Assist")
         }
 
         guard let symbol else {
@@ -4830,7 +5107,7 @@ struct SettingsView: View {
     }
 
     private enum ReservedShortcut {
-        static let pasteLastKeyCode: UInt16 = 9 // V
+        static let pasteLastKeyCode: UInt16 = 9  // V
         static let pasteLastModifiersRaw: UInt = NSEvent.ModifierFlags([.command, .option]).rawValue
     }
 
@@ -4840,7 +5117,7 @@ struct SettingsView: View {
         .init(id: "control", label: "⌃", flag: .control),
         .init(id: "option", label: "⌥", flag: .option),
         .init(id: "shift", label: "⇧", flag: .shift),
-        .init(id: "command", label: "⌘", flag: .command)
+        .init(id: "command", label: "⌘", flag: .command),
     ]
 
     private let initialRoute: SettingsRoute?
@@ -4892,7 +5169,8 @@ struct SettingsView: View {
     @State private var correctionEditingSource: String?
     @State private var correctionDialogMessage: String?
     @State private var detectedMemoryProviders: [MemoryIndexingSettingsService.Provider] = []
-    @State private var detectedMemorySourceFolders: [MemoryIndexingSettingsService.SourceFolder] = []
+    @State private var detectedMemorySourceFolders: [MemoryIndexingSettingsService.SourceFolder] =
+        []
     @State private var memoryProviderFilterQuery = ""
     @State private var memoryFolderFilterQuery = ""
     @State private var memoryShowSelectedProvidersOnly = false
@@ -4923,7 +5201,8 @@ struct SettingsView: View {
     init(initialRoute: SettingsRoute? = nil) {
         self.initialRoute = initialRoute
     }
-    @State private var computerPermissionSnapshot = PermissionCenter.snapshot(using: .shared, includeExtendedPermissions: false)
+    @State private var computerPermissionSnapshot = PermissionCenter.snapshot(
+        using: .shared, includeExtendedPermissions: false)
     @State private var computerControlStatus: HelperCapabilityStatus?
     @State private var computerControlRefreshTask: Task<Void, Never>?
     @State private var installClaudeNotificationHook = false
@@ -4932,12 +5211,14 @@ struct SettingsView: View {
     @State private var installedClaudeHookOptions: Set<ClaudeHookInstallOption> = []
     private let memoryIndexingSettingsService = MemoryIndexingSettingsService.shared
     private let settingsSidebarWidth: CGFloat = 304
-    private let manualShortcutKeyOptions: [ShortcutKeyOption] = ShortcutValidation.manualAssignableKeyCodes.map {
-        ShortcutKeyOption(keyCode: $0, label: ShortcutValidation.keyName(for: $0))
-    }
+    private let manualShortcutKeyOptions: [ShortcutKeyOption] = ShortcutValidation
+        .manualAssignableKeyCodes.map {
+            ShortcutKeyOption(keyCode: $0, label: ShortcutValidation.keyName(for: $0))
+        }
 
     private var appVersionDisplayText: String {
-        let shortVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+        let shortVersion =
+            Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
         let buildVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String
 
         let short = shortVersion?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -5150,7 +5431,7 @@ struct SettingsView: View {
         }
         .appScrollbars()
         .tint(AppVisualTheme.accentTint)
-        .frame(minWidth: 900, idealWidth: 980, minHeight: 640, idealHeight: 720)
+        .frame(minWidth: 1000, idealWidth: 1360, minHeight: 700, idealHeight: 860)
         .onChange(of: searchQuery) { _ in
             guard !trimmedSearchQuery.isEmpty else { return }
             if let firstMatch = filteredSearchEntries.first {
@@ -5190,7 +5471,9 @@ struct SettingsView: View {
             refreshComputerControlState()
             AssistantStore.shared.syncRuntimeContext()
         }
-        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+        .onReceive(
+            NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)
+        ) { _ in
             refreshComputerControlState()
         }
         .onReceive(NotificationCenter.default.publisher(for: .openAssistOpenAssistantSetup)) { _ in
@@ -5205,7 +5488,8 @@ struct SettingsView: View {
     }
 
     private var storedLastViewedSettingsSection: SettingsSection? {
-        let rawValue = settings.settingsLastViewedSection.trimmingCharacters(in: .whitespacesAndNewlines)
+        let rawValue = settings.settingsLastViewedSection.trimmingCharacters(
+            in: .whitespacesAndNewlines)
         guard !rawValue.isEmpty else { return nil }
         guard let section = SettingsSection(rawValue: rawValue) else { return nil }
         return canonicalSettingsSection(section)
@@ -5226,7 +5510,8 @@ struct SettingsView: View {
     }
 
     private var voiceSetupReady: Bool {
-        requiredVoicePermissionsReady && isHoldToTalkShortcutValid && isAssistantLiveVoiceShortcutValid
+        requiredVoicePermissionsReady && isHoldToTalkShortcutValid
+            && isAssistantLiveVoiceShortcutValid
     }
 
     private var browserAutomationSetupReady: Bool {
@@ -5244,7 +5529,8 @@ struct SettingsView: View {
     }
 
     private var selectedPromptModelLabel: String {
-        let model = settings.promptRewriteOpenAIModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        let model = settings.promptRewriteOpenAIModel.trimmingCharacters(
+            in: .whitespacesAndNewlines)
         return model.isEmpty ? settings.promptRewriteProviderMode.defaultModel : model
     }
 
@@ -5269,7 +5555,8 @@ struct SettingsView: View {
                 )
             },
             set: { newPreset in
-                settings.cloudTranscriptionRequestTimeoutSeconds = newPreset.cloudTranscriptionTimeoutSeconds
+                settings.cloudTranscriptionRequestTimeoutSeconds =
+                    newPreset.cloudTranscriptionTimeoutSeconds
             }
         )
     }
@@ -5288,10 +5575,13 @@ struct SettingsView: View {
             GettingStartedStep(
                 id: "permissions",
                 title: "Permissions",
-                detail: "Allow Accessibility, Microphone, and Speech Recognition if Apple Speech is selected.",
+                detail:
+                    "Allow Accessibility, Microphone, and Speech Recognition if Apple Speech is selected.",
                 status: requiredVoicePermissionsReady ? .ready : .needsAttention,
-                primaryActionTitle: requiredVoicePermissionsReady ? "Review permissions" : "Grant permissions",
-                destination: SettingsRoute(section: .privacyPermissions, subsection: .permissionsOverview)
+                primaryActionTitle: requiredVoicePermissionsReady
+                    ? "Review permissions" : "Grant permissions",
+                destination: SettingsRoute(
+                    section: .privacyPermissions, subsection: .permissionsOverview)
             ),
             GettingStartedStep(
                 id: "assistant",
@@ -5299,20 +5589,23 @@ struct SettingsView: View {
                 detail: "Pick your main provider and model in Models & Connections.",
                 status: assistantProviderReady ? .ready : .notStarted,
                 primaryActionTitle: "Open models",
-                destination: SettingsRoute(section: .modelsConnections, subsection: .modelsConnections)
+                destination: SettingsRoute(
+                    section: .modelsConnections, subsection: .modelsConnections)
             ),
             GettingStartedStep(
                 id: "voice",
                 title: "Try voice",
                 detail: "Check your microphone, transcription engine, and shortcuts in one place.",
-                status: voiceSetupReady ? .ready : (requiredVoicePermissionsReady ? .notStarted : .needsAttention),
+                status: voiceSetupReady
+                    ? .ready : (requiredVoicePermissionsReady ? .notStarted : .needsAttention),
                 primaryActionTitle: "Open voice setup",
                 destination: SettingsRoute(section: .voiceDictation, subsection: .voiceOverview)
             ),
             GettingStartedStep(
                 id: "automation",
                 title: "Set up automation",
-                detail: "Optional. Only do this if you want browser reuse, app actions, or Computer Use.",
+                detail:
+                    "Optional. Only do this if you want browser reuse, app actions, or Computer Use.",
                 status: browserAutomationSetupReady ? .ready : .notStarted,
                 primaryActionTitle: "Open automation",
                 destination: SettingsRoute(section: .automation, subsection: .automationOverview)
@@ -5321,10 +5614,12 @@ struct SettingsView: View {
                 id: "advanced",
                 title: "Memory & local AI",
                 detail: "Open shared memory tools, local AI setup, and maintenance.",
-                status: settings.localAISetupCompleted || settings.hasGoogleAIStudioAPIKey ? .ready : .notStarted,
+                status: settings.localAISetupCompleted || settings.hasGoogleAIStudioAPIKey
+                    ? .ready : .notStarted,
                 primaryActionTitle: "Open memory tools",
-                destination: SettingsRoute(section: .modelsConnections, subsection: .modelsMaintenance)
-            )
+                destination: SettingsRoute(
+                    section: .modelsConnections, subsection: .modelsMaintenance)
+            ),
         ]
     }
 
@@ -5345,7 +5640,7 @@ struct SettingsView: View {
         case .advanced:
             return .modelsConnections
         case .assistant, .voiceDictation, .modelsConnections, .automation,
-             .privacyPermissions, .appearance, .integrations, .general:
+            .privacyPermissions, .appearance, .integrations, .general:
             return section
         }
     }
@@ -5515,7 +5810,8 @@ struct SettingsView: View {
 
             Text(section.title)
                 .font(.system(size: 13.5, weight: isSelected ? .semibold : .medium))
-                .foregroundStyle(isSelected ? AppVisualTheme.foreground(0.97) : AppVisualTheme.foreground(0.80))
+                .foregroundStyle(
+                    isSelected ? AppVisualTheme.foreground(0.97) : AppVisualTheme.foreground(0.80))
 
             Spacer(minLength: 0)
 
@@ -5556,30 +5852,47 @@ struct SettingsView: View {
 
     @ViewBuilder
     private var settingsDetailPane: some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
-                    settingsHeroCard(for: selectedSection)
-
-                    if !trimmedSearchQuery.isEmpty {
-                        searchHighlightsCard
-                    }
-                    sectionContent(for: selectedSection)
-                }
-                .padding(.top, 34)
-                .padding(.horizontal, 18)
-                .padding(.bottom, 20)
-                .frame(maxWidth: .infinity, alignment: .topLeading)
+        if usesFullHeightEmbeddedStudioLayout {
+            VStack(alignment: .leading, spacing: 16) {
+                settingsHeroCard(for: selectedSection)
+                sectionContent(for: selectedSection)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             }
-            .onChange(of: focusedCardID) { target in
-                guard let target else { return }
-                DispatchQueue.main.async {
-                    withAnimation(.easeInOut(duration: 0.2)) {
-                        proxy.scrollTo(target, anchor: .top)
+            .padding(.top, 34)
+            .padding(.horizontal, 18)
+            .padding(.bottom, 20)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        } else {
+            ScrollViewReader { proxy in
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 16) {
+                        settingsHeroCard(for: selectedSection)
+
+                        if !trimmedSearchQuery.isEmpty {
+                            searchHighlightsCard
+                        }
+                        sectionContent(for: selectedSection)
+                    }
+                    .padding(.top, 34)
+                    .padding(.horizontal, 18)
+                    .padding(.bottom, 20)
+                    .frame(maxWidth: .infinity, alignment: .topLeading)
+                }
+                .onChange(of: focusedCardID) { target in
+                    guard let target else { return }
+                    DispatchQueue.main.async {
+                        withAnimation(.easeInOut(duration: 0.2)) {
+                            proxy.scrollTo(target, anchor: .top)
+                        }
                     }
                 }
             }
         }
+    }
+
+    private var usesFullHeightEmbeddedStudioLayout: Bool {
+        trimmedSearchQuery.isEmpty
+            && (selectedSection == .assistant || selectedSection == .modelsConnections)
     }
 
     @ViewBuilder
@@ -5591,7 +5904,8 @@ struct SettingsView: View {
     private var searchHighlightsCard: some View {
         settingsCard(
             title: "Search Results",
-            subtitle: "Matching controls for \"\(searchQuery.trimmingCharacters(in: .whitespacesAndNewlines))\"",
+            subtitle:
+                "Matching controls for \"\(searchQuery.trimmingCharacters(in: .whitespacesAndNewlines))\"",
             symbol: "magnifyingglass.circle.fill",
             tint: AppVisualTheme.accentTint
         ) {
@@ -5605,7 +5919,9 @@ struct SettingsView: View {
                         navigateToSearchEntry(entry)
                     } label: {
                         HStack(alignment: .center, spacing: 12) {
-                            settingsSymbolTile(entry.section.iconName, tint: entry.section.tint, size: 28, emphasized: true)
+                            settingsSymbolTile(
+                                entry.section.iconName, tint: entry.section.tint, size: 28,
+                                emphasized: true)
 
                             VStack(alignment: .leading, spacing: 3) {
                                 Text(entry.title)
@@ -5705,7 +6021,9 @@ struct SettingsView: View {
                     .disabled(!assistantProviderReady)
 
                     Button("Models & Connections") {
-                        applyRoute(SettingsRoute(section: .modelsConnections, subsection: .modelsConnections))
+                        applyRoute(
+                            SettingsRoute(
+                                section: .modelsConnections, subsection: .modelsConnections))
                     }
                     .buttonStyle(.bordered)
 
@@ -5757,10 +6075,25 @@ struct SettingsView: View {
                 symbol: "sparkles.rectangle.stack.fill",
                 tint: SettingsSection.gettingStarted.tint,
                 tasks: [
-                    ("AI and assistant basics", "See your current provider, response style, and everyday AI controls.", SettingsRoute(section: .dailyUse, cardID: "daily.assistant")),
-                    ("Open voice & shortcuts", "Check microphone, dictation, shortcuts, and speech controls.", SettingsRoute(section: .voiceDictation, cardID: "voice.tasks")),
-                    ("Set up automation", "Review browser reuse, app actions, and Computer Use.", SettingsRoute(section: .browserAppControl, cardID: "browser.tasks")),
-                    ("Open advanced AI settings", SettingsNavigationModel.aiStudioDescription, SettingsRoute(section: .advanced, cardID: "advanced.aiStudio", opensAIStudio: true))
+                    (
+                        "AI and assistant basics",
+                        "See your current provider, response style, and everyday AI controls.",
+                        SettingsRoute(section: .dailyUse, cardID: "daily.assistant")
+                    ),
+                    (
+                        "Open voice & shortcuts",
+                        "Check microphone, dictation, shortcuts, and speech controls.",
+                        SettingsRoute(section: .voiceDictation, cardID: "voice.tasks")
+                    ),
+                    (
+                        "Set up automation", "Review browser reuse, app actions, and Computer Use.",
+                        SettingsRoute(section: .browserAppControl, cardID: "browser.tasks")
+                    ),
+                    (
+                        "Open advanced AI settings", SettingsNavigationModel.aiStudioDescription,
+                        SettingsRoute(
+                            section: .advanced, cardID: "advanced.aiStudio", opensAIStudio: true)
+                    ),
                 ]
             )
         }
@@ -5778,12 +6111,37 @@ struct SettingsView: View {
                 symbol: "sparkles",
                 tint: SettingsSection.dailyUse.tint,
                 tasks: [
-                    ("Review AI basics", "See your current provider, model, and everyday AI behavior.", SettingsRoute(section: .dailyUse, cardID: "daily.assistant")),
-                    ("Use the agent shortcut", "Jump straight to the voice shortcut that sends speech into Open Assist.", SettingsRoute(section: .voiceDictation, cardID: "shortcuts.agentShortcut")),
-                    ("Use the sidebar shortcut", "Jump straight to the compact assistant shortcut for Orb, Notch, or Sidebar mode.", SettingsRoute(section: .voiceDictation, cardID: "shortcuts.compactAssistantShortcut")),
-                    ("Use voice & shortcuts", "Open microphone, dictation, engine, and shortcut settings.", SettingsRoute(section: .voiceDictation, cardID: "voice.tasks")),
-                    ("Use automation", "Open browser profile, permissions, and Computer Use controls.", SettingsRoute(section: .browserAppControl, cardID: "browser.tasks")),
-                    ("Advanced AI settings", SettingsNavigationModel.aiStudioDescription, SettingsRoute(section: .advanced, cardID: "advanced.aiStudio", opensAIStudio: true))
+                    (
+                        "Review AI basics",
+                        "See your current provider, model, and everyday AI behavior.",
+                        SettingsRoute(section: .dailyUse, cardID: "daily.assistant")
+                    ),
+                    (
+                        "Use the agent shortcut",
+                        "Jump straight to the voice shortcut that sends speech into Open Assist.",
+                        SettingsRoute(section: .voiceDictation, cardID: "shortcuts.agentShortcut")
+                    ),
+                    (
+                        "Use the sidebar shortcut",
+                        "Jump straight to the compact assistant shortcut for Orb, Notch, or Sidebar mode.",
+                        SettingsRoute(
+                            section: .voiceDictation, cardID: "shortcuts.compactAssistantShortcut")
+                    ),
+                    (
+                        "Use voice & shortcuts",
+                        "Open microphone, dictation, engine, and shortcut settings.",
+                        SettingsRoute(section: .voiceDictation, cardID: "voice.tasks")
+                    ),
+                    (
+                        "Use automation",
+                        "Open browser profile, permissions, and Computer Use controls.",
+                        SettingsRoute(section: .browserAppControl, cardID: "browser.tasks")
+                    ),
+                    (
+                        "Advanced AI settings", SettingsNavigationModel.aiStudioDescription,
+                        SettingsRoute(
+                            section: .advanced, cardID: "advanced.aiStudio", opensAIStudio: true)
+                    ),
                 ]
             )
 
@@ -5814,14 +6172,32 @@ struct SettingsView: View {
             taskCardGroup(
                 id: "browser.tasks",
                 title: "Browser & App Control Tasks",
-                subtitle: "This is where browser reuse, app actions, and Computer Use now live together.",
+                subtitle:
+                    "This is where browser reuse, app actions, and Computer Use now live together.",
                 symbol: "point.3.connected.trianglepath.dotted",
                 tint: SettingsSection.browserAppControl.tint,
                 tasks: [
-                    ("Review permissions", "Check Accessibility, Screen Recording, Apple Events, and Full Disk Access.", SettingsRoute(section: .browserAppControl, cardID: "automation.permissions")),
-                    ("Choose browser profile", "Pick the signed-in Chrome, Brave, or Edge profile to reuse.", SettingsRoute(section: .browserAppControl, cardID: "automation.browserProfile")),
-                    ("Turn on Computer Use", "Control the visible desktop with screenshots plus mouse and keyboard actions.", SettingsRoute(section: .browserAppControl, cardID: "automation.computerUse")),
-                    ("See helper status", "Check whether the local automation helper is ready.", SettingsRoute(section: .browserAppControl, cardID: "automation.helperStatus"))
+                    (
+                        "Review permissions",
+                        "Check Accessibility, Screen Recording, Apple Events, and Full Disk Access.",
+                        SettingsRoute(section: .browserAppControl, cardID: "automation.permissions")
+                    ),
+                    (
+                        "Choose browser profile",
+                        "Pick the signed-in Chrome, Brave, or Edge profile to reuse.",
+                        SettingsRoute(
+                            section: .browserAppControl, cardID: "automation.browserProfile")
+                    ),
+                    (
+                        "Turn on Computer Use",
+                        "Control the visible desktop with screenshots plus mouse and keyboard actions.",
+                        SettingsRoute(section: .browserAppControl, cardID: "automation.computerUse")
+                    ),
+                    (
+                        "See helper status", "Check whether the local automation helper is ready.",
+                        SettingsRoute(
+                            section: .browserAppControl, cardID: "automation.helperStatus")
+                    ),
                 ]
             )
 
@@ -5839,13 +6215,16 @@ struct SettingsView: View {
             settingsCard(
                 id: "permissions.overview",
                 title: "Permission Overview",
-                subtitle: "See the live status first, then jump to the exact Mac permission you need.",
+                subtitle:
+                    "See the live status first, then jump to the exact Mac permission you need.",
                 symbol: "hand.raised.fill",
                 tint: SettingsSection.privacyPermissions.tint
             ) {
                 VStack(alignment: .leading, spacing: 10) {
                     statusBadgeRow(
-                        title: requiredVoicePermissionsReady ? "Core permissions look ready" : "Core permissions still need attention",
+                        title: requiredVoicePermissionsReady
+                            ? "Core permissions look ready"
+                            : "Core permissions still need attention",
                         detail: requiredVoicePermissionsReady
                             ? "Accessibility, microphone, and the current speech engine permissions look good."
                             : "Open Assist needs Accessibility, Microphone, and sometimes Speech Recognition before voice features work well.",
@@ -5876,7 +6255,8 @@ struct SettingsView: View {
 
                     permissionRow(
                         name: "Speech Recognition",
-                        granted: settings.transcriptionEngine == .appleSpeech ? speechRecognitionAuthorized : true,
+                        granted: settings.transcriptionEngine == .appleSpeech
+                            ? speechRecognitionAuthorized : true,
                         hint: settings.transcriptionEngine == .appleSpeech
                             ? "Needed while Apple Speech is selected."
                             : "Optional while whisper.cpp or a cloud engine is selected.",
@@ -5890,7 +6270,8 @@ struct SettingsView: View {
                         granted: computerPermissionSnapshot.screenRecordingGranted,
                         hint: "Needed for Computer Use to capture the current screen.",
                         action: {
-                            PermissionCenter.requestScreenRecordingPermission(openSettingsIfDenied: true)
+                            PermissionCenter.requestScreenRecordingPermission(
+                                openSettingsIfDenied: true)
                             refreshComputerControlState()
                         }
                     )
@@ -5900,7 +6281,8 @@ struct SettingsView: View {
                         granted: computerPermissionSnapshot.appleEventsGranted,
                         hint: "Needed for direct browser and app scripting.",
                         action: {
-                            PermissionCenter.requestAppleEventsPermission(openSettingsIfDenied: true)
+                            PermissionCenter.requestAppleEventsPermission(
+                                openSettingsIfDenied: true)
                             refreshComputerControlState()
                         }
                     )
@@ -5944,9 +6326,11 @@ struct SettingsView: View {
                 symbol: "brain.head.profile",
                 tint: SettingsSection.advanced.tint
             ) {
-                Text("Use AI Studio when you want the deeper AI setup: provider sign-in, model choices, memory, and local AI.")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
+                Text(
+                    "Use AI Studio when you want the deeper AI setup: provider sign-in, model choices, memory, and local AI."
+                )
+                .font(.callout)
+                .foregroundStyle(.secondary)
 
                 HStack {
                     Button("Open AI Studio") {
@@ -5970,16 +6354,19 @@ struct SettingsView: View {
         settingsCollapsibleCard(
             id: "general.notesBackup",
             title: "Notes Backup",
-            subtitle: "Keep note history in the app and a second local backup in a separate folder.",
+            subtitle:
+                "Keep note history in the app and a second local backup in a separate folder.",
             symbol: "externaldrive.badge.timemachine",
             tint: SettingsSection.general.tint
         ) {
             let backupStatus = notesBackupController.status
 
-            Text("Your note history stays inside Open Assist, and this folder stores extra local backups in case the app data gets damaged.")
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
+            Text(
+                "Your note history stays inside Open Assist, and this folder stores extra local backups in case the app data gets damaged."
+            )
+            .font(.callout)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
 
             VStack(alignment: .leading, spacing: 8) {
                 Text("Backup folder")
@@ -5991,15 +6378,19 @@ struct SettingsView: View {
                     .textSelection(.enabled)
 
                 if backupStatus.usesCustomFolder && !backupStatus.folderExists {
-                    Text("The custom backup folder is missing right now. Pick another folder or create this one before relying on it.")
-                        .font(.caption)
-                        .foregroundStyle(Color.orange.opacity(0.92))
-                        .fixedSize(horizontal: false, vertical: true)
+                    Text(
+                        "The custom backup folder is missing right now. Pick another folder or create this one before relying on it."
+                    )
+                    .font(.caption)
+                    .foregroundStyle(Color.orange.opacity(0.92))
+                    .fixedSize(horizontal: false, vertical: true)
                 } else if !backupStatus.folderExists {
-                    Text("The default backup folder will be created the first time you run a backup.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
+                    Text(
+                        "The default backup folder will be created the first time you run a backup."
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
                 }
 
                 if let lastBackup = backupStatus.lastSuccessfulBackupAt {
@@ -6022,7 +6413,8 @@ struct SettingsView: View {
                 Button("Use Default Folder") {
                     settings.assistantNotesBackupFolderPath = ""
                     notesBackupController.refreshStatus()
-                    notesBackupActionMessage = "Open Assist switched back to the default notes backup folder."
+                    notesBackupActionMessage =
+                        "Open Assist switched back to the default notes backup folder."
                 }
                 .buttonStyle(.bordered)
 
@@ -6033,7 +6425,8 @@ struct SettingsView: View {
             }
 
             if let notesBackupActionMessage,
-               !notesBackupActionMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                !notesBackupActionMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            {
                 Text(notesBackupActionMessage)
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -6048,10 +6441,12 @@ struct SettingsView: View {
                     .font(.callout.weight(.medium))
 
                 if backupStatus.backupSets.isEmpty {
-                    Text("No backup sets yet. Run Back Up Now once so you have a full local restore point.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
+                    Text(
+                        "No backup sets yet. Run Back Up Now once so you have a full local restore point."
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
                 } else {
                     ForEach(Array(backupStatus.backupSets.prefix(6))) { backupSet in
                         HStack(alignment: .top, spacing: 12) {
@@ -6074,10 +6469,12 @@ struct SettingsView: View {
                         .padding(.vertical, 2)
                     }
 
-                    Text("Restore first creates one safety backup of your current notes, then replaces the live notes data. Reopen the notes view or restart Open Assist if the old content is still on screen.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
+                    Text(
+                        "Restore first creates one safety backup of your current notes, then replaces the live notes data. Reopen the notes view or restart Open Assist if the old content is still on screen."
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
                 }
             }
         }
@@ -6102,7 +6499,9 @@ struct SettingsView: View {
         panel.prompt = "Choose Backup Folder"
         panel.title = "Choose a local notes backup folder"
         panel.message = "Open Assist will keep extra notes backups in this folder."
-        if !settings.assistantNotesBackupFolderPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        if !settings.assistantNotesBackupFolderPath.trimmingCharacters(in: .whitespacesAndNewlines)
+            .isEmpty
+        {
             panel.directoryURL = URL(
                 fileURLWithPath: settings.assistantNotesBackupFolderPath,
                 isDirectory: true
@@ -6115,15 +6514,18 @@ struct SettingsView: View {
 
         settings.assistantNotesBackupFolderPath = selectedURL.standardizedFileURL.path
         notesBackupController.refreshStatus()
-        notesBackupActionMessage = "Open Assist will use the selected folder for future notes backups."
+        notesBackupActionMessage =
+            "Open Assist will use the selected folder for future notes backups."
     }
 
     private func runNotesBackupNow() {
         do {
             if let backupSet = try notesBackupController.runManualBackup() {
-                notesBackupActionMessage = "Created a notes backup for \(notesBackupTimestamp(backupSet.createdAt))."
+                notesBackupActionMessage =
+                    "Created a notes backup for \(notesBackupTimestamp(backupSet.createdAt))."
             } else {
-                notesBackupActionMessage = "No note changes were detected since the newest backup, so Open Assist kept the latest backup set."
+                notesBackupActionMessage =
+                    "No note changes were detected since the newest backup, so Open Assist kept the latest backup set."
             }
         } catch {
             notesBackupActionMessage = error.localizedDescription
@@ -6133,7 +6535,8 @@ struct SettingsView: View {
     private func restoreNotesBackupSet(_ backupSet: AssistantNotesBackupSetSummary) {
         do {
             let restored = try notesBackupController.restoreBackupSet(id: backupSet.id)
-            notesBackupActionMessage = "Restored notes backup from \(notesBackupTimestamp(restored.createdAt)). Reopen the notes view or restart Open Assist if you still see older data."
+            notesBackupActionMessage =
+                "Restored notes backup from \(notesBackupTimestamp(restored.createdAt)). Reopen the notes view or restart Open Assist if you still see older data."
         } catch {
             notesBackupActionMessage = error.localizedDescription
         }
@@ -6145,7 +6548,7 @@ struct SettingsView: View {
             settingsAnchors([
                 SettingsSubsection.onboardingChecklist.rawValue,
                 SettingsSubsection.onboardingOverview.rawValue,
-                SettingsSubsection.assistantOverview.rawValue
+                SettingsSubsection.assistantOverview.rawValue,
             ])
 
             if showsOnboardingChecklist {
@@ -6187,16 +6590,17 @@ struct SettingsView: View {
                     SettingsSubsection.assistantMemory.rawValue,
                     SettingsSubsection.assistantInstructions.rawValue,
                     SettingsSubsection.assistantAdvanced.rawValue,
-                    SettingsSubsection.assistantSessions.rawValue
+                    SettingsSubsection.assistantSessions.rawValue,
                 ],
                 title: nil,
                 subtitle: nil,
                 tint: SettingsSection.assistant.tint
             ) {
                 AIMemoryStudioView(scope: .assistantOnly, showsStandaloneChrome: false)
-                    .frame(minHeight: 840)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 
     @ViewBuilder
@@ -6214,16 +6618,17 @@ struct SettingsView: View {
                     SettingsSubsection.modelsMemorySources.rawValue,
                     SettingsSubsection.modelsSourceFolders.rawValue,
                     SettingsSubsection.modelsMemoryBrowser.rawValue,
-                    SettingsSubsection.modelsMaintenance.rawValue
+                    SettingsSubsection.modelsMaintenance.rawValue,
                 ],
                 title: nil,
                 subtitle: nil,
                 tint: SettingsSection.modelsConnections.tint
             ) {
                 AIMemoryStudioView(scope: .modelsOnly, showsStandaloneChrome: false)
-                    .frame(minHeight: 920)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .onAppear {
             localAISetupService.refreshStatus()
         }
@@ -6246,7 +6651,7 @@ struct SettingsView: View {
         VStack(alignment: .leading, spacing: 14) {
             settingsAnchors([
                 SettingsSubsection.appearanceSounds.rawValue,
-                SettingsSubsection.appearanceTheme.rawValue
+                SettingsSubsection.appearanceTheme.rawValue,
             ])
             dictationSoundsCard
             appearanceThemeCard
@@ -6271,7 +6676,7 @@ struct SettingsView: View {
                 SettingsSubsection.generalNotesBackup.rawValue,
                 SettingsSubsection.generalAppInfo.rawValue,
                 SettingsSubsection.generalDiagnostics.rawValue,
-                SettingsSubsection.generalUninstall.rawValue
+                SettingsSubsection.generalUninstall.rawValue,
             ])
 
             notesBackupCard
@@ -6323,6 +6728,7 @@ struct SettingsView: View {
         tint: Color,
         @ViewBuilder content: () -> Content
     ) -> some View {
+        let showsContainerChrome = title != nil || subtitle != nil
         VStack(alignment: .leading, spacing: 12) {
             if let title {
                 VStack(alignment: .leading, spacing: 4) {
@@ -6341,18 +6747,21 @@ struct SettingsView: View {
             settingsAnchors(anchorIDs)
             content()
         }
-        .padding(14)
-        .background(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .fill(AppVisualTheme.surfaceFill(0.05))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 16, style: .continuous)
-                        .stroke(
-                            focusedCardID == id ? tint.opacity(0.22) : AppVisualTheme.surfaceStroke(0.08),
-                            lineWidth: focusedCardID == id ? 0.9 : 0.7
-                        )
-                )
-        )
+        .padding(showsContainerChrome ? 14 : 0)
+        .background {
+            if showsContainerChrome {
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .fill(AppVisualTheme.surfaceFill(0.05))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 16, style: .continuous)
+                            .stroke(
+                                focusedCardID == id
+                                    ? tint.opacity(0.22) : AppVisualTheme.surfaceStroke(0.08),
+                                lineWidth: focusedCardID == id ? 0.9 : 0.7
+                            )
+                    )
+            }
+        }
         .id(id)
     }
 
@@ -6367,7 +6776,9 @@ struct SettingsView: View {
             isExpanded: $showDictationOutputSettings
         ) {
             Toggle("Also copy transcript to system clipboard", isOn: $settings.copyToClipboard)
-                .help("Turn this off to keep dictations out of clipboard history. Manual Copy actions still work.")
+                .help(
+                    "Turn this off to keep dictations out of clipboard history. Manual Copy actions still work."
+                )
         }
     }
 
@@ -6482,19 +6893,28 @@ struct SettingsView: View {
                 symbol: "switch.2",
                 tint: SettingsSection.automation.tint
             ) {
-                Toggle(AutomationAPISource.claudeCode.displayName, isOn: $settings.automationClaudeEnabled)
-                Toggle(AutomationAPISource.codexCLI.displayName, isOn: $settings.automationCodexCLIEnabled)
-                Toggle(AutomationAPISource.codexCloud.displayName, isOn: $settings.automationCodexCloudEnabled)
+                Toggle(
+                    AutomationAPISource.claudeCode.displayName,
+                    isOn: $settings.automationClaudeEnabled)
+                Toggle(
+                    AutomationAPISource.codexCLI.displayName,
+                    isOn: $settings.automationCodexCLIEnabled)
+                Toggle(
+                    AutomationAPISource.codexCloud.displayName,
+                    isOn: $settings.automationCodexCloudEnabled)
 
-                Text("Claude Code and Codex CLI use the local API. Codex Cloud beta watches your local codex tasks while Open Assist stays open.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                Text(
+                    "Claude Code and Codex CLI use the local API. Codex Cloud beta watches your local codex tasks while Open Assist stays open."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
             }
 
             settingsCollapsibleCard(
                 id: "automation.notifications.delivery",
                 title: "Automation Delivery",
-                subtitle: "Desktop notification, speech, and sound are shared across every automation source.",
+                subtitle:
+                    "Desktop notification, speech, and sound are shared across every automation source.",
                 symbol: "speaker.wave.3.fill",
                 tint: SettingsSection.automation.tint
             ) {
@@ -6516,7 +6936,9 @@ struct SettingsView: View {
                     Text("Default voice")
                         .font(.callout.weight(.medium))
                     Spacer()
-                    Picker("Default voice", selection: $settings.automationAPIDefaultVoiceIdentifier) {
+                    Picker(
+                        "Default voice", selection: $settings.automationAPIDefaultVoiceIdentifier
+                    ) {
                         ForEach(automationAPICoordinator.availableVoices) { voice in
                             Text(voice.displayLabel).tag(voice.id)
                         }
@@ -6529,7 +6951,8 @@ struct SettingsView: View {
                     Text("Default sound")
                         .font(.callout.weight(.medium))
                     Spacer()
-                    Picker("Default sound", selection: $settings.automationAPIDefaultSoundRawValue) {
+                    Picker("Default sound", selection: $settings.automationAPIDefaultSoundRawValue)
+                    {
                         ForEach(AutomationAPISound.allCases) { sound in
                             Text(sound.displayName).tag(sound.rawValue)
                         }
@@ -6541,7 +6964,10 @@ struct SettingsView: View {
                 HStack {
                     Button("Test Notification") {
                         Task {
-                            automationActionMessage = await automationAPICoordinator.sendTestAnnouncement(channels: [.notification])
+                            automationActionMessage =
+                                await automationAPICoordinator.sendTestAnnouncement(channels: [
+                                    .notification
+                                ])
                         }
                     }
                     .buttonStyle(.bordered)
@@ -6549,7 +6975,10 @@ struct SettingsView: View {
 
                     Button("Test Speech") {
                         Task {
-                            automationActionMessage = await automationAPICoordinator.sendTestAnnouncement(channels: [.speech])
+                            automationActionMessage =
+                                await automationAPICoordinator.sendTestAnnouncement(channels: [
+                                    .speech
+                                ])
                         }
                     }
                     .buttonStyle(.bordered)
@@ -6557,7 +6986,10 @@ struct SettingsView: View {
 
                     Button("Test Sound") {
                         Task {
-                            automationActionMessage = await automationAPICoordinator.sendTestAnnouncement(channels: [.sound])
+                            automationActionMessage =
+                                await automationAPICoordinator.sendTestAnnouncement(channels: [
+                                    .sound
+                                ])
                         }
                     }
                     .buttonStyle(.bordered)
@@ -6568,7 +7000,8 @@ struct SettingsView: View {
             settingsCollapsibleCard(
                 id: "automation.localAPI",
                 title: "Local API & Examples",
-                subtitle: "Set up Claude Code here, then copy the Codex CLI example if you need it.",
+                subtitle:
+                    "Set up Claude Code here, then copy the Codex CLI example if you need it.",
                 symbol: "terminal.fill",
                 tint: SettingsSection.automation.tint
             ) {
@@ -6610,7 +7043,9 @@ struct SettingsView: View {
                         automationActionMessage = "Token copied."
                     }
                     .buttonStyle(.bordered)
-                    .disabled(settings.automationAPIToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .disabled(
+                        settings.automationAPIToken.trimmingCharacters(in: .whitespacesAndNewlines)
+                            .isEmpty)
 
                     Button("Rotate") {
                         let token = settings.rotateAutomationAPIToken()
@@ -6625,9 +7060,11 @@ struct SettingsView: View {
                     Text("Claude Code")
                         .font(.callout.weight(.medium))
 
-                    Text("Select the Claude events you want, then Open Assist updates ~/.claude/settings.json for you.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    Text(
+                        "Select the Claude events you want, then Open Assist updates ~/.claude/settings.json for you."
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
 
                     Text(installedClaudeHooksSummary)
                         .font(.caption)
@@ -6700,14 +7137,16 @@ struct SettingsView: View {
                 automationStatusRow(
                     title: "Codex CLI",
                     badgeText: settings.automationCodexCLIEnabled ? "Enabled" : "Off",
-                    badgeColor: settings.automationCodexCLIEnabled ? AppVisualTheme.accentTint : Color.orange.opacity(0.92),
+                    badgeColor: settings.automationCodexCLIEnabled
+                        ? AppVisualTheme.accentTint : Color.orange.opacity(0.92),
                     detail: automationAPICoordinator.codexCLIStatusMessage
                 )
 
                 automationStatusRow(
                     title: "Codex Cloud (beta)",
                     badgeText: settings.automationCodexCloudEnabled ? "Enabled" : "Off",
-                    badgeColor: settings.automationCodexCloudEnabled ? AppVisualTheme.accentTint : Color.orange.opacity(0.92),
+                    badgeColor: settings.automationCodexCloudEnabled
+                        ? AppVisualTheme.accentTint : Color.orange.opacity(0.92),
                     detail: automationAPICoordinator.codexCloudStatusMessage
                 )
             }
@@ -6741,7 +7180,8 @@ struct SettingsView: View {
             settingsCollapsibleCard(
                 id: "integrations.telegram.setup",
                 title: "Telegram Remote",
-                subtitle: "Paste your bot token, approve your private DM, and control one Open Assist session at a time.",
+                subtitle:
+                    "Paste your bot token, approve your private DM, and control one Open Assist session at a time.",
                 symbol: "paperplane.fill",
                 tint: SettingsSection.integrations.tint
             ) {
@@ -6766,7 +7206,10 @@ struct SettingsView: View {
                             telegramActionMessage = "Saved Telegram bot token copied."
                         }
                         .buttonStyle(.bordered)
-                        .disabled(settings.telegramBotToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        .disabled(
+                            settings.telegramBotToken.trimmingCharacters(
+                                in: .whitespacesAndNewlines
+                            ).isEmpty)
 
                         Button("Clear Token") {
                             settings.telegramBotToken = ""
@@ -6804,13 +7247,15 @@ struct SettingsView: View {
                     .buttonStyle(.bordered)
                 }
 
-                Text("""
-                1. If you already made the bot, skip BotFather and use your existing token.
-                2. Paste the token here and save it.
-                3. Turn on Telegram Remote.
-                4. Open your bot in Telegram and send /start.
-                5. Approve the pairing request below.
-                """)
+                Text(
+                    """
+                    1. If you already made the bot, skip BotFather and use your existing token.
+                    2. Paste the token here and save it.
+                    3. Turn on Telegram Remote.
+                    4. Open your bot in Telegram and send /start.
+                    5. Approve the pairing request below.
+                    """
+                )
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -6825,7 +7270,8 @@ struct SettingsView: View {
             settingsCollapsibleCard(
                 id: "integrations.telegram.pairing",
                 title: "Pairing",
-                subtitle: "Only one approved private Telegram DM can control Open Assist in this first version.",
+                subtitle:
+                    "Only one approved private Telegram DM can control Open Assist in this first version.",
                 symbol: "person.crop.circle.badge.checkmark",
                 tint: SettingsSection.integrations.tint
             ) {
@@ -6848,21 +7294,28 @@ struct SettingsView: View {
                 if settings.hasTelegramPendingPairing {
                     Divider()
 
-                    let pendingDisplayName = settings.telegramPendingDisplayName.trimmingCharacters(in: .whitespacesAndNewlines)
-                    Text(pendingDisplayName.isEmpty ? "Pending pairing request." : "Pending pairing request from \(pendingDisplayName).")
-                        .font(.callout.weight(.medium))
+                    let pendingDisplayName = settings.telegramPendingDisplayName.trimmingCharacters(
+                        in: .whitespacesAndNewlines)
+                    Text(
+                        pendingDisplayName.isEmpty
+                            ? "Pending pairing request."
+                            : "Pending pairing request from \(pendingDisplayName)."
+                    )
+                    .font(.callout.weight(.medium))
 
                     HStack(spacing: 10) {
                         Button("Approve Pairing") {
                             Task {
-                                telegramActionMessage = await telegramRemoteCoordinator.approvePendingPairing()
+                                telegramActionMessage =
+                                    await telegramRemoteCoordinator.approvePendingPairing()
                             }
                         }
                         .buttonStyle(.borderedProminent)
 
                         Button("Decline") {
                             Task {
-                                telegramActionMessage = await telegramRemoteCoordinator.rejectPendingPairing()
+                                telegramActionMessage =
+                                    await telegramRemoteCoordinator.rejectPendingPairing()
                             }
                         }
                         .buttonStyle(.bordered)
@@ -6879,22 +7332,29 @@ struct SettingsView: View {
             ) {
                 automationStatusRow(
                     title: "Telegram Bot",
-                    badgeText: settings.telegramBotToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Missing token" : "Configured",
-                    badgeColor: settings.telegramBotToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? Color.orange.opacity(0.92) : AppVisualTheme.accentTint,
+                    badgeText: settings.telegramBotToken.trimmingCharacters(
+                        in: .whitespacesAndNewlines
+                    ).isEmpty ? "Missing token" : "Configured",
+                    badgeColor: settings.telegramBotToken.trimmingCharacters(
+                        in: .whitespacesAndNewlines
+                    ).isEmpty ? Color.orange.opacity(0.92) : AppVisualTheme.accentTint,
                     detail: telegramRemoteCoordinator.botIdentityLabel
                 )
 
                 automationStatusRow(
                     title: "Remote status",
                     badgeText: settings.telegramRemoteEnabled ? "Enabled" : "Off",
-                    badgeColor: settings.telegramRemoteEnabled ? AppVisualTheme.accentTint : Color.orange.opacity(0.92),
+                    badgeColor: settings.telegramRemoteEnabled
+                        ? AppVisualTheme.accentTint : Color.orange.opacity(0.92),
                     detail: telegramRemoteCoordinator.connectionStatusMessage
                 )
 
                 automationStatusRow(
                     title: "Pairing",
-                    badgeText: settings.hasTelegramRemoteOwner ? "Paired" : (settings.hasTelegramPendingPairing ? "Pending" : "Waiting"),
-                    badgeColor: settings.hasTelegramRemoteOwner ? Color.green.opacity(0.92) : Color.orange.opacity(0.92),
+                    badgeText: settings.hasTelegramRemoteOwner
+                        ? "Paired" : (settings.hasTelegramPendingPairing ? "Pending" : "Waiting"),
+                    badgeColor: settings.hasTelegramRemoteOwner
+                        ? Color.green.opacity(0.92) : Color.orange.opacity(0.92),
                     detail: telegramRemoteCoordinator.pairingStatusMessage
                 )
             }
@@ -6918,7 +7378,9 @@ struct SettingsView: View {
                 isExpanded: $showDictationOutputSettings
             ) {
                 Toggle("Also copy transcript to system clipboard", isOn: $settings.copyToClipboard)
-                    .help("Turn off to keep dictations out of clipboard history. Explicit Copy actions from History still copy as expected.")
+                    .help(
+                        "Turn off to keep dictations out of clipboard history. Explicit Copy actions from History still copy as expected."
+                    )
             }
 
             settingsDisclosureCard(
@@ -7030,8 +7492,12 @@ struct SettingsView: View {
                 VStack(alignment: .leading, spacing: 6) {
                     Text("Paste last transcript shortcut: ⌥⌘V")
                     Text("Hold-to-talk: hold your shortcut while speaking in normal dictation.")
-                    Text("Continuous mode: press your toggle shortcut to start/stop normal dictation.")
-                    Text("Agent shortcut: hold it while speaking, then release it to paste text into Open Assist.")
+                    Text(
+                        "Continuous mode: press your toggle shortcut to start/stop normal dictation."
+                    )
+                    Text(
+                        "Agent shortcut: hold it while speaking, then release it to paste text into Open Assist."
+                    )
                 }
                 .font(.callout)
                 .foregroundStyle(.secondary)
@@ -7059,9 +7525,10 @@ struct SettingsView: View {
             .pickerStyle(.menu)
             .frame(width: 200)
         }
-        .help(selection.wrappedValue == SettingsStore.noDictationSoundName
-            ? "No sound for this event."
-            : "Play this sound when: \(title.lowercased())")
+        .help(
+            selection.wrappedValue == SettingsStore.noDictationSoundName
+                ? "No sound for this event."
+                : "Play this sound when: \(title.lowercased())")
     }
 
     @ViewBuilder
@@ -7081,7 +7548,9 @@ struct SettingsView: View {
                     Button(action: {
                         beginShortcutCapture(for: .holdToTalk)
                     }) {
-                        Text(isCapturingShortcut && shortcutCaptureTarget == .holdToTalk ? "Listening..." : "Choose Shortcut")
+                        Text(
+                            isCapturingShortcut && shortcutCaptureTarget == .holdToTalk
+                                ? "Listening..." : "Choose Shortcut")
                     }
                     .buttonStyle(.borderedProminent)
 
@@ -7090,8 +7559,13 @@ struct SettingsView: View {
                         .foregroundStyle(.secondary)
                 }
 
-                Toggle("Mute system sounds while this shortcut is held", isOn: $settings.muteSystemSoundsWhileHoldingShortcut)
-                    .help("Suppresses this hold-to-talk key chord in other apps to avoid system alert beeps.")
+                Toggle(
+                    "Mute system sounds while this shortcut is held",
+                    isOn: $settings.muteSystemSoundsWhileHoldingShortcut
+                )
+                .help(
+                    "Suppresses this hold-to-talk key chord in other apps to avoid system alert beeps."
+                )
 
                 VStack(alignment: .leading, spacing: 0) {
                     Button {
@@ -7140,7 +7614,9 @@ struct SettingsView: View {
                     Button(action: {
                         beginShortcutCapture(for: .continuousToggle)
                     }) {
-                        Text(isCapturingShortcut && shortcutCaptureTarget == .continuousToggle ? "Listening..." : "Choose Shortcut")
+                        Text(
+                            isCapturingShortcut && shortcutCaptureTarget == .continuousToggle
+                                ? "Listening..." : "Choose Shortcut")
                     }
                     .buttonStyle(.borderedProminent)
 
@@ -7151,7 +7627,9 @@ struct SettingsView: View {
 
                 VStack(alignment: .leading, spacing: 0) {
                     Button {
-                        withAnimation(.easeInOut(duration: 0.2)) { showContinuousManualMap.toggle() }
+                        withAnimation(.easeInOut(duration: 0.2)) {
+                            showContinuousManualMap.toggle()
+                        }
                     } label: {
                         HStack {
                             Text("Manual map (advanced)")
@@ -7196,22 +7674,30 @@ struct SettingsView: View {
                     Button(action: {
                         beginShortcutCapture(for: .assistantLiveVoice)
                     }) {
-                        Text(isCapturingShortcut && shortcutCaptureTarget == .assistantLiveVoice ? "Listening..." : "Choose Shortcut")
+                        Text(
+                            isCapturingShortcut && shortcutCaptureTarget == .assistantLiveVoice
+                                ? "Listening..." : "Choose Shortcut")
                     }
                     .buttonStyle(.borderedProminent)
 
-                    Text("This shortcut records into Open Assist. It cannot match dictation shortcuts.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-
-                Text("Inside Open Assist, this shortcut records one voice draft into the agent box. Use Live Voice Start for the full listen, reply, and speak loop.")
+                    Text(
+                        "This shortcut records into Open Assist. It cannot match dictation shortcuts."
+                    )
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                }
+
+                Text(
+                    "Inside Open Assist, this shortcut records one voice draft into the agent box. Use Live Voice Start for the full listen, reply, and speak loop."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
 
                 VStack(alignment: .leading, spacing: 0) {
                     Button {
-                        withAnimation(.easeInOut(duration: 0.2)) { showAssistantLiveVoiceManualMap.toggle() }
+                        withAnimation(.easeInOut(duration: 0.2)) {
+                            showAssistantLiveVoiceManualMap.toggle()
+                        }
                     } label: {
                         HStack {
                             Text("Manual map (advanced)")
@@ -7246,7 +7732,8 @@ struct SettingsView: View {
             settingsCollapsibleCard(
                 id: "shortcuts.compactAssistantShortcut",
                 title: "Compact Assistant Shortcut",
-                subtitle: "Open the compact assistant quickly. In Sidebar mode, this opens the sidebar.",
+                subtitle:
+                    "Open the compact assistant quickly. In Sidebar mode, this opens the sidebar.",
                 symbol: "sidebar.left",
                 tint: AppVisualTheme.accentTint
             ) {
@@ -7256,22 +7743,30 @@ struct SettingsView: View {
                     Button(action: {
                         beginShortcutCapture(for: .assistantCompactSurface)
                     }) {
-                        Text(isCapturingShortcut && shortcutCaptureTarget == .assistantCompactSurface ? "Listening..." : "Choose Shortcut")
+                        Text(
+                            isCapturingShortcut && shortcutCaptureTarget == .assistantCompactSurface
+                                ? "Listening..." : "Choose Shortcut")
                     }
                     .buttonStyle(.borderedProminent)
 
-                    Text("This shortcut opens the compact assistant surface without starting voice capture.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-
-                Text("Use this when you want the sidebar or compact assistant to appear quickly, then type or speak after it opens.")
+                    Text(
+                        "This shortcut opens the compact assistant surface without starting voice capture."
+                    )
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                }
+
+                Text(
+                    "Use this when you want the sidebar or compact assistant to appear quickly, then type or speak after it opens."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
 
                 VStack(alignment: .leading, spacing: 0) {
                     Button {
-                        withAnimation(.easeInOut(duration: 0.2)) { showAssistantCompactManualMap.toggle() }
+                        withAnimation(.easeInOut(duration: 0.2)) {
+                            showAssistantCompactManualMap.toggle()
+                        }
                     } label: {
                         HStack {
                             Text("Manual map (advanced)")
@@ -7362,13 +7857,13 @@ struct SettingsView: View {
             settingsSectionHeader(for: .voiceDictation)
             microphoneInputCard
 
-                settingsCollapsibleCard(
-                    id: "speech.transcriptionEngine",
-                    title: "Transcription Engine",
-                    subtitle: "Pick Apple Speech, whisper.cpp, or a remote transcription provider.",
-                    symbol: "waveform",
-                    tint: AppVisualTheme.accentTint
-                ) {
+            settingsCollapsibleCard(
+                id: "speech.transcriptionEngine",
+                title: "Transcription Engine",
+                subtitle: "Pick Apple Speech, whisper.cpp, or a remote transcription provider.",
+                symbol: "waveform",
+                tint: AppVisualTheme.accentTint
+            ) {
                 HStack {
                     Text("Engine")
                         .font(.callout.weight(.medium))
@@ -7392,25 +7887,32 @@ struct SettingsView: View {
                 settingsCollapsibleCard(
                     id: "speech.appleSpeechBehavior",
                     title: "Apple Speech Behavior",
-                    subtitle: "Keep common recognition controls visible and tuck advanced tuning below.",
+                    subtitle:
+                        "Keep common recognition controls visible and tuck advanced tuning below.",
                     symbol: "apple.logo",
                     tint: AppVisualTheme.accentTint
                 ) {
                     Toggle("Use contextual language bias", isOn: $settings.enableContextualBias)
                         .help("Boost likely words/phrases for better recognition.")
 
-                    Toggle("Preserve words across short pauses", isOn: $settings.keepTextAcrossPauses)
-                        .help("Helps avoid dropping earlier words when you pause briefly mid-sentence.")
+                    Toggle(
+                        "Preserve words across short pauses", isOn: $settings.keepTextAcrossPauses
+                    )
+                    .help("Helps avoid dropping earlier words when you pause briefly mid-sentence.")
 
                     VStack(alignment: .leading, spacing: 0) {
                         Button {
-                            withAnimation(.easeInOut(duration: 0.2)) { showAppleSpeechAdvancedSettings.toggle() }
+                            withAnimation(.easeInOut(duration: 0.2)) {
+                                showAppleSpeechAdvancedSettings.toggle()
+                            }
                         } label: {
                             HStack {
                                 Text("Advanced Apple Speech options")
                                 Spacer()
                                 Image(systemName: "chevron.right")
-                                    .rotationEffect(.degrees(showAppleSpeechAdvancedSettings ? 90 : 0))
+                                    .rotationEffect(
+                                        .degrees(showAppleSpeechAdvancedSettings ? 90 : 0)
+                                    )
                                     .font(.caption.weight(.semibold))
                                     .foregroundStyle(.secondary)
                             }
@@ -7438,8 +7940,12 @@ struct SettingsView: View {
                                     .foregroundStyle(.secondary)
                                     .fixedSize(horizontal: false, vertical: true)
 
-                                Toggle("Enable Apple automatic punctuation", isOn: $settings.autoPunctuation)
-                                    .help("Uses Apple Speech punctuation generation during recognition.")
+                                Toggle(
+                                    "Enable Apple automatic punctuation",
+                                    isOn: $settings.autoPunctuation
+                                )
+                                .help(
+                                    "Uses Apple Speech punctuation generation during recognition.")
                             }
                             .padding(.top, 8)
                         }
@@ -7454,23 +7960,36 @@ struct SettingsView: View {
                     tint: AppVisualTheme.accentTint
                 ) {
                     Toggle("Use Core ML encoder when available", isOn: $settings.whisperUseCoreML)
-                        .help("If installed for the selected model, Core ML can improve whisper speed on Apple Silicon.")
+                        .help(
+                            "If installed for the selected model, Core ML can improve whisper speed on Apple Silicon."
+                        )
 
-                    Toggle("Release model after idle", isOn: $settings.whisperAutoUnloadIdleContextEnabled)
-                        .help("Frees whisper context memory when dictation is inactive.")
+                    Toggle(
+                        "Release model after idle",
+                        isOn: $settings.whisperAutoUnloadIdleContextEnabled
+                    )
+                    .help("Frees whisper context memory when dictation is inactive.")
 
                     if settings.whisperAutoUnloadIdleContextEnabled {
                         VStack(alignment: .leading, spacing: 8) {
-                            Text("Idle unload delay: \(Int(settings.whisperIdleContextUnloadSeconds.rounded())) sec")
-                                .font(.callout.weight(.medium))
-                            Slider(value: $settings.whisperIdleContextUnloadSeconds, in: 30...3600, step: 30)
-                            Text("Lower values free memory sooner; higher values keep whisper warm for faster restarts.")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+                            Text(
+                                "Idle unload delay: \(Int(settings.whisperIdleContextUnloadSeconds.rounded())) sec"
+                            )
+                            .font(.callout.weight(.medium))
+                            Slider(
+                                value: $settings.whisperIdleContextUnloadSeconds, in: 30...3600,
+                                step: 30)
+                            Text(
+                                "Lower values free memory sooner; higher values keep whisper warm for faster restarts."
+                            )
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                         }
                     }
 
-                    if settings.selectedWhisperModelID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    if settings.selectedWhisperModelID.trimmingCharacters(
+                        in: .whitespacesAndNewlines
+                    ).isEmpty {
                         Text("No model selected yet.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
@@ -7484,7 +8003,8 @@ struct SettingsView: View {
                 settingsCollapsibleCard(
                     id: "speech.modelLibrary",
                     title: "Model Library",
-                    subtitle: "Use focused controls first, then expand filters when you need to narrow down.",
+                    subtitle:
+                        "Use focused controls first, then expand filters when you need to narrow down.",
                     symbol: "shippingbox.fill",
                     tint: AppVisualTheme.accentTint
                 ) {
@@ -7496,13 +8016,17 @@ struct SettingsView: View {
                         VStack(alignment: .leading, spacing: 10) {
                             VStack(alignment: .leading, spacing: 0) {
                                 Button {
-                                    withAnimation(.easeInOut(duration: 0.2)) { showWhisperModelFilters.toggle() }
+                                    withAnimation(.easeInOut(duration: 0.2)) {
+                                        showWhisperModelFilters.toggle()
+                                    }
                                 } label: {
                                     HStack {
                                         Text("Find a model")
                                         Spacer()
                                         Image(systemName: "chevron.right")
-                                            .rotationEffect(.degrees(showWhisperModelFilters ? 90 : 0))
+                                            .rotationEffect(
+                                                .degrees(showWhisperModelFilters ? 90 : 0)
+                                            )
                                             .font(.caption.weight(.semibold))
                                             .foregroundStyle(.secondary)
                                     }
@@ -7512,19 +8036,28 @@ struct SettingsView: View {
                                 if showWhisperModelFilters {
                                     VStack(alignment: .leading, spacing: 10) {
                                         HStack(spacing: 10) {
-                                            TextField("Search model ID (e.g. medium, large-v3, q5)", text: $whisperModelSearchQuery)
-                                                .textFieldStyle(.roundedBorder)
+                                            TextField(
+                                                "Search model ID (e.g. medium, large-v3, q5)",
+                                                text: $whisperModelSearchQuery
+                                            )
+                                            .textFieldStyle(.roundedBorder)
 
-                                            Toggle("Installed only", isOn: $whisperShowInstalledOnly)
-                                                .toggleStyle(.switch)
-                                                .fixedSize()
+                                            Toggle(
+                                                "Installed only", isOn: $whisperShowInstalledOnly
+                                            )
+                                            .toggleStyle(.switch)
+                                            .fixedSize()
                                         }
 
                                         HStack(spacing: 10) {
                                             Picker("Family", selection: $whisperFamilyFilter) {
-                                                ForEach(whisperFamilyFilterOptions, id: \.self) { family in
-                                                    Text(family == "all" ? "All families" : family.capitalized)
-                                                        .tag(family)
+                                                ForEach(whisperFamilyFilterOptions, id: \.self) {
+                                                    family in
+                                                    Text(
+                                                        family == "all"
+                                                            ? "All families" : family.capitalized
+                                                    )
+                                                    .tag(family)
                                                 }
                                             }
                                             .pickerStyle(.menu)
@@ -7571,7 +8104,8 @@ struct SettingsView: View {
                 settingsCollapsibleCard(
                     id: "speech.cloudProvider",
                     title: "Cloud Provider",
-                    subtitle: "Use a provider API key or reuse the ChatGPT / Codex session already signed in on this Mac.",
+                    subtitle:
+                        "Use a provider API key or reuse the ChatGPT / Codex session already signed in on this Mac.",
                     symbol: "network",
                     tint: AppVisualTheme.accentTint
                 ) {
@@ -7588,126 +8122,139 @@ struct SettingsView: View {
                         .frame(width: 260)
                     }
 
-	                    Text(settings.cloudTranscriptionProvider.helpText)
-	                        .font(.caption)
-	                        .foregroundStyle(.secondary)
-	                        .fixedSize(horizontal: false, vertical: true)
+                    Text(settings.cloudTranscriptionProvider.helpText)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
 
-	                    VStack(alignment: .leading, spacing: 8) {
-	                        HStack {
-	                            Text("Connection style")
-	                                .font(.callout.weight(.semibold))
-	                            Spacer()
-	                            Text(cloudTranscriptionResponseStyleBinding.wrappedValue.displayName)
-	                                .font(.caption.weight(.semibold))
-	                                .foregroundStyle(AppVisualTheme.accentTint.opacity(0.92))
-	                        }
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Text("Connection style")
+                                .font(.callout.weight(.semibold))
+                            Spacer()
+                            Text(cloudTranscriptionResponseStyleBinding.wrappedValue.displayName)
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(AppVisualTheme.accentTint.opacity(0.92))
+                        }
 
-	                        Picker("Connection style", selection: cloudTranscriptionResponseStyleBinding) {
-	                            ForEach(OpenAssistResponseStylePreset.allCases) { preset in
-	                                Text(preset.displayName).tag(preset)
-	                            }
-	                        }
-	                        .pickerStyle(.segmented)
+                        Picker(
+                            "Connection style", selection: cloudTranscriptionResponseStyleBinding
+                        ) {
+                            ForEach(OpenAssistResponseStylePreset.allCases) { preset in
+                                Text(preset.displayName).tag(preset)
+                            }
+                        }
+                        .pickerStyle(.segmented)
 
-	                        Text(cloudTranscriptionResponseStyleBinding.wrappedValue.detail)
-	                            .font(.caption)
-	                            .foregroundStyle(.secondary)
-	                    }
+                        Text(cloudTranscriptionResponseStyleBinding.wrappedValue.detail)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
 
-	                    DisclosureGroup(
-	                        "Advanced provider options",
-	                        isExpanded: $showCloudProviderAdvancedOptions
-	                    ) {
-	                        VStack(alignment: .leading, spacing: 10) {
-	                            VStack(alignment: .leading, spacing: 8) {
-	                                HStack {
-	                                    Text("Model")
-	                                        .font(.callout.weight(.medium))
-	                                    Spacer()
-	                                    TextField("Model ID", text: $settings.cloudTranscriptionModel)
-	                                        .textFieldStyle(.roundedBorder)
-	                                        .frame(width: 260)
-	                                        .autocorrectionDisabled()
-	                                }
+                    DisclosureGroup(
+                        "Advanced provider options",
+                        isExpanded: $showCloudProviderAdvancedOptions
+                    ) {
+                        VStack(alignment: .leading, spacing: 10) {
+                            VStack(alignment: .leading, spacing: 8) {
+                                HStack {
+                                    Text("Model")
+                                        .font(.callout.weight(.medium))
+                                    Spacer()
+                                    TextField("Model ID", text: $settings.cloudTranscriptionModel)
+                                        .textFieldStyle(.roundedBorder)
+                                        .frame(width: 260)
+                                        .autocorrectionDisabled()
+                                }
 
-	                                HStack(spacing: 8) {
-	                                    Button {
-	                                        refreshCloudTranscriptionModels(showMessage: true)
-	                                    } label: {
-	                                        if cloudTranscriptionModelsLoading {
-	                                            ProgressView()
-	                                                .controlSize(.small)
-	                                        } else {
-	                                            Label("Load Models", systemImage: "arrow.clockwise")
-	                                        }
-	                                    }
-	                                    .buttonStyle(.bordered)
-	                                    .disabled(cloudTranscriptionModelsLoading)
+                                HStack(spacing: 8) {
+                                    Button {
+                                        refreshCloudTranscriptionModels(showMessage: true)
+                                    } label: {
+                                        if cloudTranscriptionModelsLoading {
+                                            ProgressView()
+                                                .controlSize(.small)
+                                        } else {
+                                            Label("Load Models", systemImage: "arrow.clockwise")
+                                        }
+                                    }
+                                    .buttonStyle(.bordered)
+                                    .disabled(cloudTranscriptionModelsLoading)
 
-	                                    if !cloudTranscriptionAvailableModels.isEmpty {
-	                                        Menu("Use Fetched Model") {
-	                                            ForEach(cloudTranscriptionAvailableModels.prefix(80)) { option in
-	                                                Button(option.displayName) {
-	                                                    settings.cloudTranscriptionModel = option.id
-	                                                }
-	                                            }
-	                                        }
-	                                        .menuStyle(.borderlessButton)
-	                                    }
+                                    if !cloudTranscriptionAvailableModels.isEmpty {
+                                        Menu("Use Fetched Model") {
+                                            ForEach(cloudTranscriptionAvailableModels.prefix(80)) {
+                                                option in
+                                                Button(option.displayName) {
+                                                    settings.cloudTranscriptionModel = option.id
+                                                }
+                                            }
+                                        }
+                                        .menuStyle(.borderlessButton)
+                                    }
 
-	                                    Spacer()
+                                    Spacer()
 
-	                                    if !cloudTranscriptionAvailableModels.isEmpty {
-	                                        Text("\(cloudTranscriptionAvailableModels.count) models")
-	                                            .font(.caption)
-	                                            .foregroundStyle(.secondary)
-	                                    }
-	                                }
+                                    if !cloudTranscriptionAvailableModels.isEmpty {
+                                        Text("\(cloudTranscriptionAvailableModels.count) models")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                }
 
-	                                if let cloudTranscriptionModelStatusMessage {
-	                                    Text(cloudTranscriptionModelStatusMessage)
-	                                        .font(.caption)
-	                                        .foregroundStyle(.secondary)
-	                                        .fixedSize(horizontal: false, vertical: true)
-	                                }
-	                            }
+                                if let cloudTranscriptionModelStatusMessage {
+                                    Text(cloudTranscriptionModelStatusMessage)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                }
+                            }
 
-	                            if settings.cloudTranscriptionProvider != .codexSession {
-	                                HStack {
-	                                    Text("Base URL")
-	                                        .font(.callout.weight(.medium))
-	                                    Spacer()
-	                                    TextField("Base URL", text: $settings.cloudTranscriptionBaseURL)
-	                                        .textFieldStyle(.roundedBorder)
-	                                        .frame(width: 260)
-	                                        .autocorrectionDisabled()
-	                                }
-	                            }
+                            if settings.cloudTranscriptionProvider != .codexSession {
+                                HStack {
+                                    Text("Base URL")
+                                        .font(.callout.weight(.medium))
+                                    Spacer()
+                                    TextField("Base URL", text: $settings.cloudTranscriptionBaseURL)
+                                        .textFieldStyle(.roundedBorder)
+                                        .frame(width: 260)
+                                        .autocorrectionDisabled()
+                                }
+                            }
 
-	                            HStack {
-	                                Text("Request timeout")
-	                                    .font(.callout.weight(.medium))
-	                                Spacer()
-	                                Text("\(Int(settings.cloudTranscriptionRequestTimeoutSeconds.rounded())) sec")
-	                                    .font(.caption)
-	                                    .foregroundStyle(.secondary)
-	                            }
-	                            Slider(value: $settings.cloudTranscriptionRequestTimeoutSeconds, in: 5...180, step: 1)
-	                        }
-	                        .padding(.top, 8)
-	                    }
+                            HStack {
+                                Text("Request timeout")
+                                    .font(.callout.weight(.medium))
+                                Spacer()
+                                Text(
+                                    "\(Int(settings.cloudTranscriptionRequestTimeoutSeconds.rounded())) sec"
+                                )
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            }
+                            Slider(
+                                value: $settings.cloudTranscriptionRequestTimeoutSeconds,
+                                in: 5...180, step: 1)
+                        }
+                        .padding(.top, 8)
+                    }
 
-	                    if settings.cloudTranscriptionProvider.requiresAPIKey {
+                    if settings.cloudTranscriptionProvider.requiresAPIKey {
                         HStack(spacing: 8) {
                             let apiKeyBinding = cloudTranscriptionAPIKeyBinding
                             if cloudTranscriptionAPIKeyVisible {
-                                TextField("\(settings.cloudTranscriptionProvider.displayName) API key", text: apiKeyBinding)
-                                    .textFieldStyle(.roundedBorder)
-                                    .autocorrectionDisabled()
+                                TextField(
+                                    "\(settings.cloudTranscriptionProvider.displayName) API key",
+                                    text: apiKeyBinding
+                                )
+                                .textFieldStyle(.roundedBorder)
+                                .autocorrectionDisabled()
                             } else {
-                                SecureField("\(settings.cloudTranscriptionProvider.displayName) API key", text: apiKeyBinding)
-                                    .textFieldStyle(.roundedBorder)
+                                SecureField(
+                                    "\(settings.cloudTranscriptionProvider.displayName) API key",
+                                    text: apiKeyBinding
+                                )
+                                .textFieldStyle(.roundedBorder)
                             }
 
                             Toggle("Show", isOn: $cloudTranscriptionAPIKeyVisible)
@@ -7717,25 +8264,33 @@ struct SettingsView: View {
                             Button {
                                 let pasteboard = NSPasteboard.general
                                 pasteboard.clearContents()
-                                _ = pasteboard.setString(effectiveCloudTranscriptionAPIKey, forType: .string)
+                                _ = pasteboard.setString(
+                                    effectiveCloudTranscriptionAPIKey, forType: .string)
                             } label: {
                                 Image(systemName: "doc.on.doc")
                             }
                             .buttonStyle(.bordered)
                             .controlSize(.small)
                             .help("Copy API key to clipboard")
-                            .disabled(effectiveCloudTranscriptionAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                            .disabled(
+                                effectiveCloudTranscriptionAPIKey.trimmingCharacters(
+                                    in: .whitespacesAndNewlines
+                                ).isEmpty)
                         }
 
-                        Text(settings.cloudTranscriptionProvider == .gemini
-                             ? "This Gemini credential is shared across Models & Connections, prompt rewrite, and assistant image generation."
-                             : "Credentials are stored in macOS Keychain.")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
+                        Text(
+                            settings.cloudTranscriptionProvider == .gemini
+                                ? "This Gemini credential is shared across Models & Connections, prompt rewrite, and assistant image generation."
+                                : "Credentials are stored in macOS Keychain."
+                        )
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
                     } else {
-                        Text("No separate API key is required. Open Assist uses the ChatGPT or Codex session already active on this Mac.")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
+                        Text(
+                            "No separate API key is required. Open Assist uses the ChatGPT or Codex session already active on this Mac."
+                        )
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
                     }
 
                     HStack {
@@ -7752,7 +8307,8 @@ struct SettingsView: View {
             settingsCollapsibleCard(
                 id: "speech.textQuality",
                 title: "Text Quality & Timing",
-                subtitle: "Keep finalize timing visible and place deep text processing in advanced controls.",
+                subtitle:
+                    "Keep finalize timing visible and place deep text processing in advanced controls.",
                 symbol: "text.badge.checkmark",
                 tint: AppVisualTheme.accentTint
             ) {
@@ -7766,13 +8322,17 @@ struct SettingsView: View {
 
                     VStack(alignment: .leading, spacing: 0) {
                         Button {
-                            withAnimation(.easeInOut(duration: 0.2)) { showRecognitionAdvancedSettings.toggle() }
+                            withAnimation(.easeInOut(duration: 0.2)) {
+                                showRecognitionAdvancedSettings.toggle()
+                            }
                         } label: {
                             HStack {
                                 Text("Advanced text processing")
                                 Spacer()
                                 Image(systemName: "chevron.right")
-                                    .rotationEffect(.degrees(showRecognitionAdvancedSettings ? 90 : 0))
+                                    .rotationEffect(
+                                        .degrees(showRecognitionAdvancedSettings ? 90 : 0)
+                                    )
                                     .font(.caption.weight(.semibold))
                                     .foregroundStyle(.secondary)
                             }
@@ -7793,7 +8353,9 @@ struct SettingsView: View {
                                     .pickerStyle(.menu)
                                     .frame(width: 170)
                                 }
-                                .help("Light keeps original phrasing; Aggressive normalizes punctuation/casing more strongly.")
+                                .help(
+                                    "Light keeps original phrasing; Aggressive normalizes punctuation/casing more strongly."
+                                )
 
                                 VStack(alignment: .leading, spacing: 8) {
                                     Text("Custom phrases (comma or new line separated)")
@@ -7819,17 +8381,21 @@ struct SettingsView: View {
             settingsCollapsibleCard(
                 id: "speech.adaptiveCorrectionsLink",
                 title: "Adaptive Corrections",
-                subtitle: "Learning controls and correction management moved to a dedicated section.",
+                subtitle:
+                    "Learning controls and correction management moved to a dedicated section.",
                 symbol: "wand.and.rays",
                 tint: AppVisualTheme.accentTint
             ) {
-                Text("Open Corrections to review learned fixes, add custom replacements, and tune correction sound.")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
+                Text(
+                    "Open Corrections to review learned fixes, add custom replacements, and tune correction sound."
+                )
+                .font(.callout)
+                .foregroundStyle(.secondary)
 
                 HStack {
                     Button("Open Corrections") {
-                        applyRoute(SettingsRoute(section: .voiceDictation, cardID: "corrections.adaptive"))
+                        applyRoute(
+                            SettingsRoute(section: .voiceDictation, cardID: "corrections.adaptive"))
                     }
                     .buttonStyle(.borderedProminent)
 
@@ -7906,7 +8472,8 @@ struct SettingsView: View {
             symbol: "brain.head.profile",
             tint: SettingsSection.dailyUse.tint
         ) {
-            settingsSummaryRow(label: "Current provider", value: settings.promptRewriteProviderMode.displayName)
+            settingsSummaryRow(
+                label: "Current provider", value: settings.promptRewriteProviderMode.displayName)
             settingsSummaryRow(label: "Current model", value: selectedPromptModelLabel)
 
             Divider()
@@ -7940,10 +8507,16 @@ struct SettingsView: View {
             if FeatureFlags.aiMemoryEnabled {
                 Toggle("Enable AI memory assistant", isOn: $settings.memoryIndexingEnabled)
             }
-            Toggle("Auto-insert high-confidence AI suggestions", isOn: $settings.promptRewriteAutoInsertEnabled)
-                .disabled(!settings.promptRewriteEnabled)
-            Toggle("Always convert AI suggestion to Markdown", isOn: $settings.promptRewriteAlwaysConvertToMarkdown)
-                .disabled(!settings.promptRewriteEnabled)
+            Toggle(
+                "Auto-insert high-confidence AI suggestions",
+                isOn: $settings.promptRewriteAutoInsertEnabled
+            )
+            .disabled(!settings.promptRewriteEnabled)
+            Toggle(
+                "Always convert AI suggestion to Markdown",
+                isOn: $settings.promptRewriteAlwaysConvertToMarkdown
+            )
+            .disabled(!settings.promptRewriteEnabled)
 
             Divider()
 
@@ -7971,7 +8544,8 @@ struct SettingsView: View {
             tint: SettingsSection.advanced.tint
         ) {
             VStack(alignment: .leading, spacing: 8) {
-                settingsSummaryRow(label: "Active provider", value: settings.promptRewriteProviderMode.displayName)
+                settingsSummaryRow(
+                    label: "Active provider", value: settings.promptRewriteProviderMode.displayName)
                 settingsSummaryRow(label: "Active model", value: selectedPromptModelLabel)
                 settingsSummaryRow(
                     label: "Response style",
@@ -7980,12 +8554,15 @@ struct SettingsView: View {
                 settingsSummaryRow(
                     label: "Local AI",
                     value: localAISetupStatusLabel,
-                    tint: localAISetupService.isReady ? AppVisualTheme.accentTint : AppVisualTheme.foreground(0.72)
+                    tint: localAISetupService.isReady
+                        ? AppVisualTheme.accentTint : AppVisualTheme.foreground(0.72)
                 )
                 if settings.localAISetupCompleted {
-                    Text("Installed local model: \(settings.localAISelectedModelID.isEmpty ? "(not selected)" : settings.localAISelectedModelID)")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    Text(
+                        "Installed local model: \(settings.localAISelectedModelID.isEmpty ? "(not selected)" : settings.localAISelectedModelID)"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 }
                 Text(readyProviderFootnote)
                     .font(.caption2)
@@ -8017,7 +8594,8 @@ struct SettingsView: View {
             return "Select model"
         case .idle:
             if localAISetupService.runtimeDetection.installed {
-                return localAISetupService.runtimeDetection.isHealthy ? "Runtime installed" : "Runtime unavailable"
+                return localAISetupService.runtimeDetection.isHealthy
+                    ? "Runtime installed" : "Runtime unavailable"
             }
             return "Not installed"
         }
@@ -8125,7 +8703,9 @@ struct SettingsView: View {
     }
 
     private var installedClaudeHooksSummary: String {
-        let installedOptions = ClaudeHookInstallOption.allCases.filter { installedClaudeHookOptions.contains($0) }
+        let installedOptions = ClaudeHookInstallOption.allCases.filter {
+            installedClaudeHookOptions.contains($0)
+        }
         guard !installedOptions.isEmpty else {
             return "No Open Assist Claude hooks are installed yet."
         }
@@ -8164,35 +8744,42 @@ struct SettingsView: View {
         let enabledSources = [
             settings.automationClaudeEnabled ? AutomationAPISource.claudeCode.displayName : nil,
             settings.automationCodexCLIEnabled ? AutomationAPISource.codexCLI.displayName : nil,
-            settings.automationCodexCloudEnabled ? AutomationAPISource.codexCloud.displayName : nil
+            settings.automationCodexCloudEnabled ? AutomationAPISource.codexCloud.displayName : nil,
         ].compactMap { $0 }
 
         if enabledSources.isEmpty {
-            return "No notification sources are enabled yet. Open Automation & Notifications to turn on Claude Code, Codex CLI, or Codex Cloud alerts."
+            return
+                "No notification sources are enabled yet. Open Automation & Notifications to turn on Claude Code, Codex CLI, or Codex Cloud alerts."
         }
 
-        return "Enabled sources: \(enabledSources.joined(separator: ", ")). Delivery settings are shared so users only configure sound, speech, and desktop alerts once."
+        return
+            "Enabled sources: \(enabledSources.joined(separator: ", ")). Delivery settings are shared so users only configure sound, speech, and desktop alerts once."
     }
 
     private var telegramOverviewSummary: String {
         if settings.hasTelegramRemoteOwner {
-            return "Telegram remote is paired and ready. The bot shows one active session view at a time, so chats do not get mixed together."
+            return
+                "Telegram remote is paired and ready. The bot shows one active session view at a time, so chats do not get mixed together."
         }
         if settings.hasTelegramPendingPairing {
-            let displayName = settings.telegramPendingDisplayName.trimmingCharacters(in: .whitespacesAndNewlines)
+            let displayName = settings.telegramPendingDisplayName.trimmingCharacters(
+                in: .whitespacesAndNewlines)
             if !displayName.isEmpty {
                 return "A Telegram pairing request from \(displayName) is waiting for approval."
             }
             return "A Telegram pairing request is waiting for approval."
         }
         if settings.telegramRemoteEnabled {
-            return "Telegram remote is on, but it still needs pairing. Open the focused page to paste your bot token, send /start from Telegram, and approve the pairing."
+            return
+                "Telegram remote is on, but it still needs pairing. Open the focused page to paste your bot token, send /start from Telegram, and approve the pairing."
         }
-        return "Telegram remote is off. Open the focused page to add a bot token, pair your Telegram DM, and control Open Assist while you are away from the Mac."
+        return
+            "Telegram remote is off. Open the focused page to add a bot token, pair your Telegram DM, and control Open Assist while you are away from the Mac."
     }
 
     private var telegramBotChatURL: URL? {
-        let label = telegramRemoteCoordinator.botIdentityLabel.trimmingCharacters(in: .whitespacesAndNewlines)
+        let label = telegramRemoteCoordinator.botIdentityLabel.trimmingCharacters(
+            in: .whitespacesAndNewlines)
         guard label.hasPrefix("@") else { return nil }
         let username = label.dropFirst().trimmingCharacters(in: .whitespacesAndNewlines)
         guard !username.isEmpty else { return nil }
@@ -8215,9 +8802,11 @@ struct SettingsView: View {
                 Text("Automation & Notifications")
                     .font(.title3.bold())
                     .foregroundStyle(AppVisualTheme.foreground(0.97))
-                Text("Manage sources, shared delivery settings, local API access, and Codex status in one place.")
-                    .font(.callout)
-                    .foregroundStyle(AppVisualTheme.mutedText)
+                Text(
+                    "Manage sources, shared delivery settings, local API access, and Codex status in one place."
+                )
+                .font(.callout)
+                .foregroundStyle(AppVisualTheme.mutedText)
             }
         }
     }
@@ -8238,9 +8827,11 @@ struct SettingsView: View {
                 Text("Telegram Remote")
                     .font(.title3.bold())
                     .foregroundStyle(AppVisualTheme.foreground(0.97))
-                Text("Set up a Telegram bot, approve your private DM, and control one Open Assist session at a time without mixing chats.")
-                    .font(.callout)
-                    .foregroundStyle(AppVisualTheme.mutedText)
+                Text(
+                    "Set up a Telegram bot, approve your private DM, and control one Open Assist session at a time without mixing chats."
+                )
+                .font(.callout)
+                .foregroundStyle(AppVisualTheme.mutedText)
             }
         }
     }
@@ -8256,7 +8847,8 @@ struct SettingsView: View {
                     settingsCollapsibleCard(
                         id: "integrations.overview.automationNotifications",
                         title: "Automation & Notifications",
-                        subtitle: "Keep integrations simple here, then open the focused page when you need the details.",
+                        subtitle:
+                            "Keep integrations simple here, then open the focused page when you need the details.",
                         symbol: "point.3.connected.trianglepath.dotted",
                         tint: AppVisualTheme.accentTint
                     ) {
@@ -8265,9 +8857,12 @@ struct SettingsView: View {
                             .foregroundStyle(.secondary)
 
                         HStack {
-                            Text(settings.automationAPIEnabled ? "Local API is on." : "Local API is off.")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+                            Text(
+                                settings.automationAPIEnabled
+                                    ? "Local API is on." : "Local API is off."
+                            )
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                             Spacer()
                             Button("Open Automation & Notifications") {
                                 selectedIntegrationsPage = .automationNotifications
@@ -8279,7 +8874,8 @@ struct SettingsView: View {
                     settingsCollapsibleCard(
                         id: "integrations.overview.telegramRemote",
                         title: "Telegram Remote",
-                        subtitle: "Control one Open Assist session at a time from your private Telegram chat.",
+                        subtitle:
+                            "Control one Open Assist session at a time from your private Telegram chat.",
                         symbol: "paperplane.fill",
                         tint: AppVisualTheme.accentTint
                     ) {
@@ -8288,9 +8884,12 @@ struct SettingsView: View {
                             .foregroundStyle(.secondary)
 
                         HStack {
-                            Text(settings.telegramRemoteEnabled ? "Telegram remote is on." : "Telegram remote is off.")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+                            Text(
+                                settings.telegramRemoteEnabled
+                                    ? "Telegram remote is on." : "Telegram remote is off."
+                            )
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                             Spacer()
                             Button("Open Telegram Remote") {
                                 selectedIntegrationsPage = .telegramRemote
@@ -8317,19 +8916,28 @@ struct SettingsView: View {
                         symbol: "switch.2",
                         tint: AppVisualTheme.accentTint
                     ) {
-                        Toggle(AutomationAPISource.claudeCode.displayName, isOn: $settings.automationClaudeEnabled)
-                        Toggle(AutomationAPISource.codexCLI.displayName, isOn: $settings.automationCodexCLIEnabled)
-                        Toggle(AutomationAPISource.codexCloud.displayName, isOn: $settings.automationCodexCloudEnabled)
+                        Toggle(
+                            AutomationAPISource.claudeCode.displayName,
+                            isOn: $settings.automationClaudeEnabled)
+                        Toggle(
+                            AutomationAPISource.codexCLI.displayName,
+                            isOn: $settings.automationCodexCLIEnabled)
+                        Toggle(
+                            AutomationAPISource.codexCloud.displayName,
+                            isOn: $settings.automationCodexCloudEnabled)
 
-                        Text("Claude Code and Codex CLI use the local API. Codex Cloud beta watches your local codex tasks while Open Assist stays open.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                        Text(
+                            "Claude Code and Codex CLI use the local API. Codex Cloud beta watches your local codex tasks while Open Assist stays open."
+                        )
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                     }
 
                     settingsCollapsibleCard(
                         id: "integrations.notifications.delivery",
                         title: "Delivery",
-                        subtitle: "These sound, speech, and desktop alert choices are shared across every source.",
+                        subtitle:
+                            "These sound, speech, and desktop alert choices are shared across every source.",
                         symbol: "speaker.wave.3.fill",
                         tint: AppVisualTheme.accentTint
                     ) {
@@ -8343,7 +8951,9 @@ struct SettingsView: View {
                             }
                         }
 
-                        Toggle("Desktop notification", isOn: $settings.automationAPINotificationsEnabled)
+                        Toggle(
+                            "Desktop notification",
+                            isOn: $settings.automationAPINotificationsEnabled)
                         Toggle("Speak message", isOn: $settings.automationAPISpeechEnabled)
                         Toggle("Play sound", isOn: $settings.automationAPISoundEnabled)
 
@@ -8351,7 +8961,10 @@ struct SettingsView: View {
                             Text("Default voice")
                                 .font(.callout.weight(.medium))
                             Spacer()
-                            Picker("Default voice", selection: $settings.automationAPIDefaultVoiceIdentifier) {
+                            Picker(
+                                "Default voice",
+                                selection: $settings.automationAPIDefaultVoiceIdentifier
+                            ) {
                                 ForEach(automationAPICoordinator.availableVoices) { voice in
                                     Text(voice.displayLabel).tag(voice.id)
                                 }
@@ -8364,7 +8977,10 @@ struct SettingsView: View {
                             Text("Default sound")
                                 .font(.callout.weight(.medium))
                             Spacer()
-                            Picker("Default sound", selection: $settings.automationAPIDefaultSoundRawValue) {
+                            Picker(
+                                "Default sound",
+                                selection: $settings.automationAPIDefaultSoundRawValue
+                            ) {
                                 ForEach(AutomationAPISound.allCases) { sound in
                                     Text(sound.displayName).tag(sound.rawValue)
                                 }
@@ -8376,7 +8992,9 @@ struct SettingsView: View {
                         HStack {
                             Button("Test Notification") {
                                 Task {
-                                    automationActionMessage = await automationAPICoordinator.sendTestAnnouncement(channels: [.notification])
+                                    automationActionMessage =
+                                        await automationAPICoordinator.sendTestAnnouncement(
+                                            channels: [.notification])
                                 }
                             }
                             .buttonStyle(.bordered)
@@ -8384,7 +9002,9 @@ struct SettingsView: View {
 
                             Button("Test Speech") {
                                 Task {
-                                    automationActionMessage = await automationAPICoordinator.sendTestAnnouncement(channels: [.speech])
+                                    automationActionMessage =
+                                        await automationAPICoordinator.sendTestAnnouncement(
+                                            channels: [.speech])
                                 }
                             }
                             .buttonStyle(.bordered)
@@ -8392,7 +9012,9 @@ struct SettingsView: View {
 
                             Button("Test Sound") {
                                 Task {
-                                    automationActionMessage = await automationAPICoordinator.sendTestAnnouncement(channels: [.sound])
+                                    automationActionMessage =
+                                        await automationAPICoordinator.sendTestAnnouncement(
+                                            channels: [.sound])
                                 }
                             }
                             .buttonStyle(.bordered)
@@ -8403,7 +9025,8 @@ struct SettingsView: View {
                     settingsCollapsibleCard(
                         id: "integrations.notifications.localAPI",
                         title: "Local API & Examples",
-                        subtitle: "Set up Claude Code from this page, then copy the Codex CLI example if you need it.",
+                        subtitle:
+                            "Set up Claude Code from this page, then copy the Codex CLI example if you need it.",
                         symbol: "terminal.fill",
                         tint: AppVisualTheme.accentTint
                     ) {
@@ -8445,7 +9068,10 @@ struct SettingsView: View {
                                 automationActionMessage = "Token copied."
                             }
                             .buttonStyle(.bordered)
-                            .disabled(settings.automationAPIToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                            .disabled(
+                                settings.automationAPIToken.trimmingCharacters(
+                                    in: .whitespacesAndNewlines
+                                ).isEmpty)
 
                             Button("Rotate") {
                                 let token = settings.rotateAutomationAPIToken()
@@ -8460,9 +9086,11 @@ struct SettingsView: View {
                             Text("Claude Code")
                                 .font(.callout.weight(.medium))
 
-                            Text("Select the Claude events you want, then Open Assist updates ~/.claude/settings.json for you.")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+                            Text(
+                                "Select the Claude events you want, then Open Assist updates ~/.claude/settings.json for you."
+                            )
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
 
                             Text(installedClaudeHooksSummary)
                                 .font(.caption)
@@ -8521,7 +9149,8 @@ struct SettingsView: View {
                     settingsCollapsibleCard(
                         id: "integrations.notifications.status",
                         title: "Status",
-                        subtitle: "Quick status for the local API, Codex CLI, and Codex Cloud beta.",
+                        subtitle:
+                            "Quick status for the local API, Codex CLI, and Codex Cloud beta.",
                         symbol: "info.circle.fill",
                         tint: AppVisualTheme.accentTint
                     ) {
@@ -8535,14 +9164,16 @@ struct SettingsView: View {
                         automationStatusRow(
                             title: "Codex CLI",
                             badgeText: settings.automationCodexCLIEnabled ? "Enabled" : "Off",
-                            badgeColor: settings.automationCodexCLIEnabled ? AppVisualTheme.accentTint : Color.orange.opacity(0.92),
+                            badgeColor: settings.automationCodexCLIEnabled
+                                ? AppVisualTheme.accentTint : Color.orange.opacity(0.92),
                             detail: automationAPICoordinator.codexCLIStatusMessage
                         )
 
                         automationStatusRow(
                             title: "Codex Cloud (beta)",
                             badgeText: settings.automationCodexCloudEnabled ? "Enabled" : "Off",
-                            badgeColor: settings.automationCodexCloudEnabled ? AppVisualTheme.accentTint : Color.orange.opacity(0.92),
+                            badgeColor: settings.automationCodexCloudEnabled
+                                ? AppVisualTheme.accentTint : Color.orange.opacity(0.92),
                             detail: automationAPICoordinator.codexCloudStatusMessage
                         )
                     }
@@ -8592,8 +9223,10 @@ struct SettingsView: View {
                             Text("Bot token")
                                 .font(.callout.weight(.medium))
 
-                            SecureField("Paste your Telegram bot token", text: $telegramBotTokenDraft)
-                                .textFieldStyle(.roundedBorder)
+                            SecureField(
+                                "Paste your Telegram bot token", text: $telegramBotTokenDraft
+                            )
+                            .textFieldStyle(.roundedBorder)
 
                             HStack(spacing: 10) {
                                 Button("Save Token") {
@@ -8607,7 +9240,10 @@ struct SettingsView: View {
                                     telegramActionMessage = "Saved Telegram bot token copied."
                                 }
                                 .buttonStyle(.bordered)
-                                .disabled(settings.telegramBotToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                                .disabled(
+                                    settings.telegramBotToken.trimmingCharacters(
+                                        in: .whitespacesAndNewlines
+                                    ).isEmpty)
 
                                 Button("Clear Token") {
                                     settings.telegramBotToken = ""
@@ -8639,21 +9275,24 @@ struct SettingsView: View {
 
                             Button("Test Bot Connection") {
                                 Task {
-                                    telegramActionMessage = await telegramRemoteCoordinator.testConnection()
+                                    telegramActionMessage =
+                                        await telegramRemoteCoordinator.testConnection()
                                 }
                             }
                             .buttonStyle(.bordered)
                         }
 
-                        Text("""
-                        1. If you already made the bot, skip BotFather and just use your existing token.
-                        2. Paste the bot token here and save it.
-                        3. Turn on Telegram Remote.
-                        4. Open your bot in Telegram and send /start.
-                        5. If /start was sent before, send it one more time now.
-                        6. Come back here and approve the pairing request.
-                        7. After pairing, use /sessions, /new, or normal messages in Telegram.
-                        """)
+                        Text(
+                            """
+                            1. If you already made the bot, skip BotFather and just use your existing token.
+                            2. Paste the bot token here and save it.
+                            3. Turn on Telegram Remote.
+                            4. Open your bot in Telegram and send /start.
+                            5. If /start was sent before, send it one more time now.
+                            6. Come back here and approve the pairing request.
+                            7. After pairing, use /sessions, /new, or normal messages in Telegram.
+                            """
+                        )
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -8662,7 +9301,8 @@ struct SettingsView: View {
                     settingsCollapsibleCard(
                         id: "integrations.telegram.pairing",
                         title: "Pairing",
-                        subtitle: "Only one approved private Telegram DM can control Open Assist in this first version.",
+                        subtitle:
+                            "Only one approved private Telegram DM can control Open Assist in this first version.",
                         symbol: "person.crop.circle.badge.checkmark",
                         tint: AppVisualTheme.accentTint
                     ) {
@@ -8681,35 +9321,46 @@ struct SettingsView: View {
                                 .font(.callout)
                                 .foregroundStyle(.secondary)
 
-                            Text("The bot connection already works. The next step is to open the bot in Telegram and send /start. If you changed the token, send /start again.")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                                .fixedSize(horizontal: false, vertical: true)
+                            Text(
+                                "The bot connection already works. The next step is to open the bot in Telegram and send /start. If you changed the token, send /start again."
+                            )
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
                         }
 
                         if settings.hasTelegramPendingPairing {
                             Divider()
 
-                            let pendingDisplayName = settings.telegramPendingDisplayName.trimmingCharacters(in: .whitespacesAndNewlines)
-                            Text(pendingDisplayName.isEmpty ? "Pending pairing request." : "Pending pairing request from \(pendingDisplayName).")
-                                .font(.callout.weight(.medium))
+                            let pendingDisplayName = settings.telegramPendingDisplayName
+                                .trimmingCharacters(in: .whitespacesAndNewlines)
+                            Text(
+                                pendingDisplayName.isEmpty
+                                    ? "Pending pairing request."
+                                    : "Pending pairing request from \(pendingDisplayName)."
+                            )
+                            .font(.callout.weight(.medium))
 
-                            Text("Approve this request to let that private Telegram chat control one Open Assist session view at a time.")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                                .fixedSize(horizontal: false, vertical: true)
+                            Text(
+                                "Approve this request to let that private Telegram chat control one Open Assist session view at a time."
+                            )
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
 
                             HStack(spacing: 10) {
                                 Button("Approve Pairing") {
                                     Task {
-                                        telegramActionMessage = await telegramRemoteCoordinator.approvePendingPairing()
+                                        telegramActionMessage =
+                                            await telegramRemoteCoordinator.approvePendingPairing()
                                     }
                                 }
                                 .buttonStyle(.borderedProminent)
 
                                 Button("Decline") {
                                     Task {
-                                        telegramActionMessage = await telegramRemoteCoordinator.rejectPendingPairing()
+                                        telegramActionMessage =
+                                            await telegramRemoteCoordinator.rejectPendingPairing()
                                     }
                                 }
                                 .buttonStyle(.bordered)
@@ -8720,13 +9371,16 @@ struct SettingsView: View {
                     settingsCollapsibleCard(
                         id: "integrations.telegram.behavior",
                         title: "Behavior",
-                        subtitle: "Telegram shows one active session view so different Open Assist sessions do not get mixed together.",
+                        subtitle:
+                            "Telegram shows one active session view so different Open Assist sessions do not get mixed together.",
                         symbol: "rectangle.3.group.bubble.left.fill",
                         tint: AppVisualTheme.accentTint
                     ) {
-                        Text("""
-                        When you switch sessions in Telegram, Open Assist removes the temporary view for the old session and loads the new session instead. The real history stays safe inside Open Assist on your Mac.
-                        """)
+                        Text(
+                            """
+                            When you switch sessions in Telegram, Open Assist removes the temporary view for the old session and loads the new session instead. The real history stays safe inside Open Assist on your Mac.
+                            """
+                        )
                         .font(.callout)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -8741,27 +9395,37 @@ struct SettingsView: View {
                     ) {
                         automationStatusRow(
                             title: "Telegram Bot",
-                            badgeText: settings.telegramBotToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Missing token" : "Configured",
-                            badgeColor: settings.telegramBotToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? Color.orange.opacity(0.92) : AppVisualTheme.accentTint,
+                            badgeText: settings.telegramBotToken.trimmingCharacters(
+                                in: .whitespacesAndNewlines
+                            ).isEmpty ? "Missing token" : "Configured",
+                            badgeColor: settings.telegramBotToken.trimmingCharacters(
+                                in: .whitespacesAndNewlines
+                            ).isEmpty ? Color.orange.opacity(0.92) : AppVisualTheme.accentTint,
                             detail: telegramRemoteCoordinator.botIdentityLabel
                         )
 
                         automationStatusRow(
                             title: "Remote status",
                             badgeText: settings.telegramRemoteEnabled ? "Enabled" : "Off",
-                            badgeColor: settings.telegramRemoteEnabled ? AppVisualTheme.accentTint : Color.orange.opacity(0.92),
+                            badgeColor: settings.telegramRemoteEnabled
+                                ? AppVisualTheme.accentTint : Color.orange.opacity(0.92),
                             detail: telegramRemoteCoordinator.connectionStatusMessage
                         )
 
                         automationStatusRow(
                             title: "Pairing",
-                            badgeText: settings.hasTelegramRemoteOwner ? "Paired" : (settings.hasTelegramPendingPairing ? "Pending" : "Waiting"),
-                            badgeColor: settings.hasTelegramRemoteOwner ? Color.green.opacity(0.92) : Color.orange.opacity(0.92),
+                            badgeText: settings.hasTelegramRemoteOwner
+                                ? "Paired"
+                                : (settings.hasTelegramPendingPairing ? "Pending" : "Waiting"),
+                            badgeColor: settings.hasTelegramRemoteOwner
+                                ? Color.green.opacity(0.92) : Color.orange.opacity(0.92),
                             detail: telegramRemoteCoordinator.pairingStatusMessage
                         )
 
                         if let lastErrorMessage = telegramRemoteCoordinator.lastErrorMessage,
-                           !lastErrorMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                            !lastErrorMessage.trimmingCharacters(in: .whitespacesAndNewlines)
+                                .isEmpty
+                        {
                             Text(lastErrorMessage)
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
@@ -8789,21 +9453,28 @@ struct SettingsView: View {
                 symbol: "text.badge.checkmark",
                 tint: AppVisualTheme.accentTint
             ) {
-                Text("Learned corrections are used as recognition hints for Apple Speech and whisper.cpp.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                Text(
+                    "Learned corrections are used as recognition hints for Apple Speech and whisper.cpp."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
 
-                Toggle("Learn from quick post-insert corrections", isOn: $settings.adaptiveCorrectionsEnabled)
+                Toggle(
+                    "Learn from quick post-insert corrections",
+                    isOn: $settings.adaptiveCorrectionsEnabled)
 
-                Toggle("Play sound when a correction is learned", isOn: $settings.playCorrectionLearnedSound)
-                    .disabled(!settings.adaptiveCorrectionsEnabled)
+                Toggle(
+                    "Play sound when a correction is learned",
+                    isOn: $settings.playCorrectionLearnedSound
+                )
+                .disabled(!settings.adaptiveCorrectionsEnabled)
 
                 if settings.playCorrectionLearnedSound {
                     dictationSoundRow(
                         title: "Learned correction sound",
                         selection: $settings.dictationCorrectionLearnedSoundName
                     )
-                        .disabled(!settings.adaptiveCorrectionsEnabled)
+                    .disabled(!settings.adaptiveCorrectionsEnabled)
                 } else {
                     Text("Enable this option to play a custom sound when a correction is learned.")
                         .font(.caption)
@@ -8820,12 +9491,16 @@ struct SettingsView: View {
                 }
 
                 if adaptiveCorrectionStore.learnedCorrections.isEmpty {
-                    Text("No learned corrections yet. Fix a mistaken word once and Open Assist can learn it.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    Text(
+                        "No learned corrections yet. Fix a mistaken word once and Open Assist can learn it."
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 } else {
                     VStack(alignment: .leading, spacing: 8) {
-                        ForEach(Array(adaptiveCorrectionStore.learnedCorrections.prefix(12)), id: \.id) { correction in
+                        ForEach(
+                            Array(adaptiveCorrectionStore.learnedCorrections.prefix(12)), id: \.id
+                        ) { correction in
                             HStack(alignment: .firstTextBaseline, spacing: 8) {
                                 Text(correction.source)
                                     .font(.callout.monospaced())
@@ -8841,7 +9516,8 @@ struct SettingsView: View {
                                 .buttonStyle(.bordered)
                                 .controlSize(.small)
                                 Button("Remove") {
-                                    adaptiveCorrectionStore.removeCorrection(source: correction.source)
+                                    adaptiveCorrectionStore.removeCorrection(
+                                        source: correction.source)
                                 }
                                 .buttonStyle(.bordered)
                                 .controlSize(.small)
@@ -8850,7 +9526,9 @@ struct SettingsView: View {
 
                         if adaptiveCorrectionStore.learnedCorrections.count > 12 {
                             HStack {
-                                Button("View All \\(adaptiveCorrectionStore.learnedCorrections.count) Corrections...") {
+                                Button(
+                                    "View All \\(adaptiveCorrectionStore.learnedCorrections.count) Corrections..."
+                                ) {
                                     showingCorrectionsListSheet = true
                                 }
                                 .buttonStyle(.bordered)
@@ -8873,7 +9551,8 @@ struct SettingsView: View {
 
     private var filteredCorrections: [AdaptiveCorrectionStore.LearnedCorrection] {
         let all = adaptiveCorrectionStore.learnedCorrections
-        let query = correctionsSearchQuery.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let query = correctionsSearchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
         if query.isEmpty { return all }
         return all.filter {
             $0.source.lowercased().contains(query) || $0.replacement.lowercased().contains(query)
@@ -8899,9 +9578,11 @@ struct SettingsView: View {
 
                 VStack(alignment: .leading, spacing: 14) {
                     if adaptiveCorrectionStore.learnedCorrections.isEmpty {
-                        Text("No learned corrections yet. Fix a mistaken word once and Open Assist can learn it.")
-                            .font(.callout)
-                            .foregroundStyle(.secondary)
+                        Text(
+                            "No learned corrections yet. Fix a mistaken word once and Open Assist can learn it."
+                        )
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
                         Spacer()
                     } else {
                         TextField("Search corrections", text: $correctionsSearchQuery)
@@ -8931,7 +9612,8 @@ struct SettingsView: View {
                                             .buttonStyle(.bordered)
                                             .controlSize(.small)
                                             Button("Remove") {
-                                                adaptiveCorrectionStore.removeCorrection(source: correction.source)
+                                                adaptiveCorrectionStore.removeCorrection(
+                                                    source: correction.source)
                                             }
                                             .buttonStyle(.bordered)
                                             .controlSize(.small)
@@ -8989,13 +9671,15 @@ struct SettingsView: View {
                                 setMemoryProvidersEnabled(filteredMemoryProviders, enabled: true)
                             }
                             .buttonStyle(.bordered)
-                            .disabled(!settings.memoryIndexingEnabled || filteredMemoryProviders.isEmpty)
+                            .disabled(
+                                !settings.memoryIndexingEnabled || filteredMemoryProviders.isEmpty)
 
                             Button("Clear Visible") {
                                 setMemoryProvidersEnabled(filteredMemoryProviders, enabled: false)
                             }
                             .buttonStyle(.bordered)
-                            .disabled(!settings.memoryIndexingEnabled || filteredMemoryProviders.isEmpty)
+                            .disabled(
+                                !settings.memoryIndexingEnabled || filteredMemoryProviders.isEmpty)
                         }
 
                         if filteredMemoryProviders.isEmpty {
@@ -9007,12 +9691,17 @@ struct SettingsView: View {
                             ScrollView {
                                 VStack(alignment: .leading, spacing: 10) {
                                     ForEach(filteredMemoryProviders) { provider in
-                                        Toggle(isOn: Binding(
-                                            get: { settings.isMemoryProviderEnabled(provider.id) },
-                                            set: { isEnabled in
-                                                settings.setMemoryProviderEnabled(provider.id, enabled: isEnabled)
-                                            }
-                                        )) {
+                                        Toggle(
+                                            isOn: Binding(
+                                                get: {
+                                                    settings.isMemoryProviderEnabled(provider.id)
+                                                },
+                                                set: { isEnabled in
+                                                    settings.setMemoryProviderEnabled(
+                                                        provider.id, enabled: isEnabled)
+                                                }
+                                            )
+                                        ) {
                                             VStack(alignment: .leading, spacing: 2) {
                                                 Text(provider.name)
                                                     .font(.callout.weight(.medium))
@@ -9076,16 +9765,22 @@ struct SettingsView: View {
 
                         HStack(spacing: 8) {
                             Button("Select All Visible") {
-                                setMemorySourceFoldersEnabled(filteredMemorySourceFolders, enabled: true)
+                                setMemorySourceFoldersEnabled(
+                                    filteredMemorySourceFolders, enabled: true)
                             }
                             .buttonStyle(.bordered)
-                            .disabled(!settings.memoryIndexingEnabled || filteredMemorySourceFolders.isEmpty)
+                            .disabled(
+                                !settings.memoryIndexingEnabled
+                                    || filteredMemorySourceFolders.isEmpty)
 
                             Button("Clear Visible") {
-                                setMemorySourceFoldersEnabled(filteredMemorySourceFolders, enabled: false)
+                                setMemorySourceFoldersEnabled(
+                                    filteredMemorySourceFolders, enabled: false)
                             }
                             .buttonStyle(.bordered)
-                            .disabled(!settings.memoryIndexingEnabled || filteredMemorySourceFolders.isEmpty)
+                            .disabled(
+                                !settings.memoryIndexingEnabled
+                                    || filteredMemorySourceFolders.isEmpty)
                         }
 
                         if filteredMemorySourceFolders.isEmpty {
@@ -9097,12 +9792,17 @@ struct SettingsView: View {
                             ScrollView {
                                 VStack(alignment: .leading, spacing: 10) {
                                     ForEach(filteredMemorySourceFolders) { folder in
-                                        Toggle(isOn: Binding(
-                                            get: { settings.isMemorySourceFolderEnabled(folder.id) },
-                                            set: { isEnabled in
-                                                settings.setMemorySourceFolderEnabled(folder.id, enabled: isEnabled)
-                                            }
-                                        )) {
+                                        Toggle(
+                                            isOn: Binding(
+                                                get: {
+                                                    settings.isMemorySourceFolderEnabled(folder.id)
+                                                },
+                                                set: { isEnabled in
+                                                    settings.setMemorySourceFolderEnabled(
+                                                        folder.id, enabled: isEnabled)
+                                                }
+                                            )
+                                        ) {
                                             VStack(alignment: .leading, spacing: 2) {
                                                 Text(folder.name)
                                                     .font(.callout.weight(.medium))
@@ -9136,7 +9836,9 @@ struct SettingsView: View {
             return
         }
 
-        if settings.memoryDetectedProviderIDs.isEmpty && settings.memoryDetectedSourceFolderIDs.isEmpty {
+        if settings.memoryDetectedProviderIDs.isEmpty
+            && settings.memoryDetectedSourceFolderIDs.isEmpty
+        {
             rescanMemorySources(showMessage: false)
             return
         }
@@ -9148,20 +9850,24 @@ struct SettingsView: View {
 
     private func hydrateMemorySourcesFromSavedSettings() {
         let providerLookup = Dictionary(
-            uniqueKeysWithValues: memoryIndexingSettingsService.detectedProviders().map { ($0.id, $0) }
+            uniqueKeysWithValues: memoryIndexingSettingsService.detectedProviders().map {
+                ($0.id, $0)
+            }
         )
         detectedMemoryProviders = settings.memoryDetectedProviderIDs.map { providerID in
-            providerLookup[providerID] ?? MemoryIndexingSettingsService.Provider(
-                id: providerID,
-                name: providerDisplayName(from: providerID),
-                detail: "Previously detected provider.",
-                sourceCount: 0
-            )
+            providerLookup[providerID]
+                ?? MemoryIndexingSettingsService.Provider(
+                    id: providerID,
+                    name: providerDisplayName(from: providerID),
+                    detail: "Previously detected provider.",
+                    sourceCount: 0
+                )
         }
 
         detectedMemorySourceFolders = settings.memoryDetectedSourceFolderIDs.map { folderPath in
             let folderURL = URL(fileURLWithPath: folderPath, isDirectory: true)
-            let fallbackName = folderURL.lastPathComponent.isEmpty ? folderPath : folderURL.lastPathComponent
+            let fallbackName =
+                folderURL.lastPathComponent.isEmpty ? folderPath : folderURL.lastPathComponent
             return MemoryIndexingSettingsService.SourceFolder(
                 id: folderPath,
                 name: fallbackName,
@@ -9176,9 +9882,9 @@ struct SettingsView: View {
         let candidates = Array(
             Set(settings.memoryDetectedProviderIDs + detectedMemoryProviders.map(\.id))
         )
-            .map { $0.lowercased() }
-            .filter { !$0.isEmpty }
-            .sorted()
+        .map { $0.lowercased() }
+        .filter { !$0.isEmpty }
+        .sorted()
 
         if let directMatch = candidates.first(where: { normalizedPath.contains($0) }) {
             return directMatch
@@ -9186,11 +9892,15 @@ struct SettingsView: View {
 
         if normalizedPath.contains("codex") { return MemoryProviderKind.codex.rawValue }
         if normalizedPath.contains("opencode") { return MemoryProviderKind.opencode.rawValue }
-        if normalizedPath.contains("claude") || normalizedPath.contains("claw") { return MemoryProviderKind.claude.rawValue }
+        if normalizedPath.contains("claude") || normalizedPath.contains("claw") {
+            return MemoryProviderKind.claude.rawValue
+        }
         if normalizedPath.contains("copilot") { return MemoryProviderKind.copilot.rawValue }
         if normalizedPath.contains("cursor") { return MemoryProviderKind.cursor.rawValue }
         if normalizedPath.contains("kimi") { return MemoryProviderKind.kimi.rawValue }
-        if normalizedPath.contains("gemini") || normalizedPath.contains("gmini") { return MemoryProviderKind.gemini.rawValue }
+        if normalizedPath.contains("gemini") || normalizedPath.contains("gmini") {
+            return MemoryProviderKind.gemini.rawValue
+        }
         if normalizedPath.contains("windsurf") { return MemoryProviderKind.windsurf.rawValue }
         if normalizedPath.contains("codeium") { return MemoryProviderKind.codeium.rawValue }
 
@@ -9262,14 +9972,16 @@ struct SettingsView: View {
 
     private var memoryBrowserFolderOptions: [MemoryIndexingSettingsService.SourceFolder] {
         let providerID = normalizedMemoryBrowserProviderID
-        return detectedMemorySourceFolders
+        return
+            detectedMemorySourceFolders
             .filter { folder in
                 guard let providerID else { return true }
                 return folder.providerID == providerID
             }
             .sorted { lhs, rhs in
                 if lhs.providerID != rhs.providerID {
-                    return lhs.providerID.localizedCaseInsensitiveCompare(rhs.providerID) == .orderedAscending
+                    return lhs.providerID.localizedCaseInsensitiveCompare(rhs.providerID)
+                        == .orderedAscending
                 }
                 if lhs.name != rhs.name {
                     return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
@@ -9279,7 +9991,8 @@ struct SettingsView: View {
     }
 
     private var normalizedMemoryBrowserProviderID: String? {
-        let trimmedProviderID = memoryBrowserSelectedProviderID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedProviderID = memoryBrowserSelectedProviderID.trimmingCharacters(
+            in: .whitespacesAndNewlines)
         guard !trimmedProviderID.isEmpty, trimmedProviderID != "all" else {
             return nil
         }
@@ -9287,7 +10000,8 @@ struct SettingsView: View {
     }
 
     private var normalizedMemoryBrowserFolderID: String? {
-        let trimmedFolderID = memoryBrowserSelectedFolderID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedFolderID = memoryBrowserSelectedFolderID.trimmingCharacters(
+            in: .whitespacesAndNewlines)
         guard !trimmedFolderID.isEmpty, trimmedFolderID != "all" else {
             return nil
         }
@@ -9296,13 +10010,15 @@ struct SettingsView: View {
 
     private func normalizeMemoryBrowserSelections() {
         let providerIDs = Set(memoryBrowserProviderOptions.map(\.id))
-        let selectedProviderID = memoryBrowserSelectedProviderID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let selectedProviderID = memoryBrowserSelectedProviderID.trimmingCharacters(
+            in: .whitespacesAndNewlines)
         if selectedProviderID != "all", !providerIDs.contains(selectedProviderID) {
             memoryBrowserSelectedProviderID = "all"
         }
 
         let folderIDs = Set(memoryBrowserFolderOptions.map(\.id))
-        let selectedFolderID = memoryBrowserSelectedFolderID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let selectedFolderID = memoryBrowserSelectedFolderID.trimmingCharacters(
+            in: .whitespacesAndNewlines)
         if selectedFolderID != "all", !folderIDs.contains(selectedFolderID) {
             memoryBrowserSelectedFolderID = "all"
         }
@@ -9332,9 +10048,10 @@ struct SettingsView: View {
         let detail = entry.detail.trimmingCharacters(in: .whitespacesAndNewlines)
         if detail.hasPrefix("{") && detail.hasSuffix("}") {
             if !detail.contains("->"),
-               !detail.localizedCaseInsensitiveContains("prompt"),
-               !detail.localizedCaseInsensitiveContains("rewrite"),
-               !detail.localizedCaseInsensitiveContains("response") {
+                !detail.localizedCaseInsensitiveContains("prompt"),
+                !detail.localizedCaseInsensitiveContains("rewrite"),
+                !detail.localizedCaseInsensitiveContains("response")
+            {
                 return false
             }
         }
@@ -9388,39 +10105,58 @@ struct SettingsView: View {
 
         guard showMessage else { return }
         if result.indexQueued {
-            memoryActionMessage = "Rescan finished. Detected \(result.providers.count) source providers and \(result.sourceFolders.count) source folders. Queued \(result.queuedSourceCount) selected source(s) for indexing in the background."
+            memoryActionMessage =
+                "Rescan finished. Detected \(result.providers.count) source providers and \(result.sourceFolders.count) source folders. Queued \(result.queuedSourceCount) selected source(s) for indexing in the background."
         } else if !FeatureFlags.aiMemoryEnabled {
-            memoryActionMessage = "Rescan finished. Detected \(result.providers.count) source providers and \(result.sourceFolders.count) source folders. AI memory feature flag is disabled, so no sources were queued."
+            memoryActionMessage =
+                "Rescan finished. Detected \(result.providers.count) source providers and \(result.sourceFolders.count) source folders. AI memory feature flag is disabled, so no sources were queued."
         } else {
-            memoryActionMessage = "Rescan finished. Detected \(result.providers.count) source providers and \(result.sourceFolders.count) source folders. Queued 0 selected sources for indexing."
+            memoryActionMessage =
+                "Rescan finished. Detected \(result.providers.count) source providers and \(result.sourceFolders.count) source folders. Queued 0 selected sources for indexing."
         }
     }
 
     private func handleMemoryIndexingCompletion(_ notification: Notification) {
         let userInfo = notification.userInfo ?? [:]
-        let isRebuild = userInfo[MemoryIndexingSettingsService.IndexingNotificationUserInfoKey.rebuild] as? Bool ?? false
-        let indexedFiles = userInfo[MemoryIndexingSettingsService.IndexingNotificationUserInfoKey.indexedFiles] as? Int ?? 0
-        let skippedFiles = userInfo[MemoryIndexingSettingsService.IndexingNotificationUserInfoKey.skippedFiles] as? Int ?? 0
-        let indexedCards = userInfo[MemoryIndexingSettingsService.IndexingNotificationUserInfoKey.indexedCards] as? Int ?? 0
-        let indexedRewrites = userInfo[MemoryIndexingSettingsService.IndexingNotificationUserInfoKey.indexedRewriteSuggestions] as? Int ?? 0
-        let failureCount = userInfo[MemoryIndexingSettingsService.IndexingNotificationUserInfoKey.failureCount] as? Int ?? 0
-        let firstFailure = (
-            userInfo[MemoryIndexingSettingsService.IndexingNotificationUserInfoKey.firstFailure] as? String
-        )?
+        let isRebuild =
+            userInfo[MemoryIndexingSettingsService.IndexingNotificationUserInfoKey.rebuild] as? Bool
+            ?? false
+        let indexedFiles =
+            userInfo[MemoryIndexingSettingsService.IndexingNotificationUserInfoKey.indexedFiles]
+            as? Int ?? 0
+        let skippedFiles =
+            userInfo[MemoryIndexingSettingsService.IndexingNotificationUserInfoKey.skippedFiles]
+            as? Int ?? 0
+        let indexedCards =
+            userInfo[MemoryIndexingSettingsService.IndexingNotificationUserInfoKey.indexedCards]
+            as? Int ?? 0
+        let indexedRewrites =
+            userInfo[
+                MemoryIndexingSettingsService.IndexingNotificationUserInfoKey
+                    .indexedRewriteSuggestions] as? Int ?? 0
+        let failureCount =
+            userInfo[MemoryIndexingSettingsService.IndexingNotificationUserInfoKey.failureCount]
+            as? Int ?? 0
+        let firstFailure =
+            (userInfo[MemoryIndexingSettingsService.IndexingNotificationUserInfoKey.firstFailure]
+            as? String)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
 
         let actionLabel = isRebuild ? "Rebuild" : "Indexing"
         if failureCount > 0 {
             if let firstFailure, !firstFailure.isEmpty {
-                memoryActionMessage = "\(actionLabel) finished with \(failureCount) issue(s). Indexed \(indexedFiles) files, skipped \(skippedFiles), and produced \(indexedCards) cards. First issue: \(firstFailure)"
+                memoryActionMessage =
+                    "\(actionLabel) finished with \(failureCount) issue(s). Indexed \(indexedFiles) files, skipped \(skippedFiles), and produced \(indexedCards) cards. First issue: \(firstFailure)"
             } else {
-                memoryActionMessage = "\(actionLabel) finished with \(failureCount) issue(s). Indexed \(indexedFiles) files, skipped \(skippedFiles), and produced \(indexedCards) cards."
+                memoryActionMessage =
+                    "\(actionLabel) finished with \(failureCount) issue(s). Indexed \(indexedFiles) files, skipped \(skippedFiles), and produced \(indexedCards) cards."
             }
             refreshMemoryBrowser()
             return
         }
 
-        memoryActionMessage = "\(actionLabel) finished. Indexed \(indexedFiles) files, skipped \(skippedFiles), produced \(indexedCards) cards, and generated \(indexedRewrites) rewrite suggestion(s)."
+        memoryActionMessage =
+            "\(actionLabel) finished. Indexed \(indexedFiles) files, skipped \(skippedFiles), produced \(indexedCards) cards, and generated \(indexedRewrites) rewrite suggestion(s)."
         refreshMemoryBrowser()
     }
 
@@ -9611,11 +10347,12 @@ struct SettingsView: View {
             models = models.filter { whisperModelManager.hasInstalledModel(id: $0.id) }
         }
 
-        let query = whisperModelSearchQuery.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let query = whisperModelSearchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
         if !query.isEmpty {
             models = models.filter { model in
-                model.id.lowercased().contains(query) ||
-                    model.useCaseDescription.lowercased().contains(query)
+                model.id.lowercased().contains(query)
+                    || model.useCaseDescription.lowercased().contains(query)
             }
         }
 
@@ -9625,7 +10362,7 @@ struct SettingsView: View {
                 "base": 1,
                 "small": 2,
                 "medium": 3,
-                "large": 4
+                "large": 4,
             ]
             let lhsRank = rankByFamily[lhs.family] ?? 99
             let rhsRank = rankByFamily[rhs.family] ?? 99
@@ -9656,9 +10393,11 @@ struct SettingsView: View {
             return
         }
 
-        let preferredID = settings.selectedWhisperModelID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let preferredID = settings.selectedWhisperModelID.trimmingCharacters(
+            in: .whitespacesAndNewlines)
         if !preferredID.isEmpty,
-           filteredWhisperModels.contains(where: { $0.id == preferredID }) {
+            filteredWhisperModels.contains(where: { $0.id == preferredID })
+        {
             whisperBrowserModelID = preferredID
             return
         }
@@ -9675,7 +10414,9 @@ struct SettingsView: View {
             return
         }
 
-        if let firstInstalled = WhisperModelCatalog.curatedModels.first(where: { whisperModelManager.hasInstalledModel(id: $0.id) }) {
+        if let firstInstalled = WhisperModelCatalog.curatedModels.first(where: {
+            whisperModelManager.hasInstalledModel(id: $0.id)
+        }) {
             settings.selectedWhisperModelID = firstInstalled.id
         } else {
             settings.selectedWhisperModelID = ""
@@ -9732,7 +10473,8 @@ struct SettingsView: View {
                 if showMessage || result.source == .fallback {
                     cloudTranscriptionModelStatusMessage = result.message
                 } else if let resultMessage = result.message,
-                          resultMessage.localizedCaseInsensitiveContains("loaded") {
+                    resultMessage.localizedCaseInsensitiveContains("loaded")
+                {
                     cloudTranscriptionModelStatusMessage = resultMessage
                 }
             }
@@ -10070,12 +10812,16 @@ struct SettingsView: View {
 
             HStack(spacing: 8) {
                 ForEach(Self.shortcutModifierOptions) { option in
-                    Toggle(option.label, isOn: Binding(
-                        get: { manualShortcutHasModifier(option.flag, for: target) },
-                        set: { isEnabled in
-                            setManualShortcutModifier(option.flag, enabled: isEnabled, for: target)
-                        }
-                    ))
+                    Toggle(
+                        option.label,
+                        isOn: Binding(
+                            get: { manualShortcutHasModifier(option.flag, for: target) },
+                            set: { isEnabled in
+                                setManualShortcutModifier(
+                                    option.flag, enabled: isEnabled, for: target)
+                            }
+                        )
+                    )
                     .toggleStyle(.button)
                 }
             }
@@ -10096,14 +10842,19 @@ struct SettingsView: View {
                 .labelsHidden()
             }
 
-            Text("For modifier-only shortcuts, choose 2 to 4 modifiers and select \"Modifier only\".")
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
+            Text(
+                "For modifier-only shortcuts, choose 2 to 4 modifiers and select \"Modifier only\"."
+            )
+            .font(.caption2)
+            .foregroundStyle(.tertiary)
         }
     }
 
-    private func manualShortcutHasModifier(_ modifier: NSEvent.ModifierFlags, for target: ShortcutCaptureTarget) -> Bool {
-        ShortcutValidation.filteredModifierFlags(from: shortcutModifiersRaw(for: target)).contains(modifier)
+    private func manualShortcutHasModifier(
+        _ modifier: NSEvent.ModifierFlags, for target: ShortcutCaptureTarget
+    ) -> Bool {
+        ShortcutValidation.filteredModifierFlags(from: shortcutModifiersRaw(for: target)).contains(
+            modifier)
     }
 
     private func setManualShortcutModifier(
@@ -10111,7 +10862,8 @@ struct SettingsView: View {
         enabled: Bool,
         for target: ShortcutCaptureTarget
     ) {
-        var flags = ShortcutValidation.filteredModifierFlags(from: shortcutModifiersRaw(for: target))
+        var flags = ShortcutValidation.filteredModifierFlags(
+            from: shortcutModifiersRaw(for: target))
         if enabled {
             flags.insert(modifier)
         } else {
@@ -10122,7 +10874,8 @@ struct SettingsView: View {
             for: target,
             keyCode: shortcutKeyCode(for: target),
             modifiersRaw: flags.rawValue,
-            validationMessage: "Shortcut must use 2 to 4 keys. Use 1-3 modifiers with a key, or 2-4 modifiers with \"Modifier only\"."
+            validationMessage:
+                "Shortcut must use 2 to 4 keys. Use 1-3 modifiers with a key, or 2-4 modifiers with \"Modifier only\"."
         )
     }
 
@@ -10134,7 +10887,8 @@ struct SettingsView: View {
                     for: target,
                     keyCode: newKeyCode,
                     modifiersRaw: shortcutModifiersRaw(for: target),
-                    validationMessage: "Shortcut must use 2 to 4 keys. Use 1-3 modifiers with a key, or 2-4 modifiers with \"Modifier only\"."
+                    validationMessage:
+                        "Shortcut must use 2 to 4 keys. Use 1-3 modifiers with a key, or 2-4 modifiers with \"Modifier only\"."
                 )
             }
         )
@@ -10170,8 +10924,8 @@ struct SettingsView: View {
     }
 
     private var canSubmitCorrectionDraft: Bool {
-        !correctionSourceDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
-            !correctionReplacementDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        !correctionSourceDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !correctionReplacementDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     private func openCreateCorrectionDialog() {
@@ -10200,10 +10954,12 @@ struct SettingsView: View {
 
     private func submitCorrectionDraft() {
         let originalEditingSource = correctionEditingSource
-        guard let saved = adaptiveCorrectionStore.upsertManualCorrection(
-            source: correctionSourceDraft,
-            replacement: correctionReplacementDraft
-        ) else {
+        guard
+            let saved = adaptiveCorrectionStore.upsertManualCorrection(
+                source: correctionSourceDraft,
+                replacement: correctionReplacementDraft
+            )
+        else {
             correctionDialogMessage = "Enter both fields with real words."
             return
         }
@@ -10270,12 +11026,15 @@ struct SettingsView: View {
     @ViewBuilder
     private var accessibilityCard: some View {
         settingsCard(
-            title: settings.accessibilityTrusted ? "Accessibility access granted" : "Accessibility access required",
+            title: settings.accessibilityTrusted
+                ? "Accessibility access granted" : "Accessibility access required",
             subtitle: settings.accessibilityTrusted
                 ? "Open Assist can control paste and insertion reliably."
                 : "Enable Open Assist in Privacy & Security -> Accessibility so paste and text insertion works across apps.",
-            symbol: settings.accessibilityTrusted ? "checkmark.shield.fill" : "exclamationmark.triangle.fill",
-            tint: settings.accessibilityTrusted ? AppVisualTheme.accentTint : AppVisualTheme.baseTint
+            symbol: settings.accessibilityTrusted
+                ? "checkmark.shield.fill" : "exclamationmark.triangle.fill",
+            tint: settings.accessibilityTrusted
+                ? AppVisualTheme.accentTint : AppVisualTheme.baseTint
         ) {
             HStack(spacing: 8) {
                 Button("Check again") {
@@ -10306,7 +11065,8 @@ struct SettingsView: View {
             settingsCollapsibleCard(
                 id: "automation.permissions",
                 title: "Automation Permissions",
-                subtitle: "Grant only the Mac permissions needed for browser reuse, direct app actions, and Computer Use.",
+                subtitle:
+                    "Grant only the Mac permissions needed for browser reuse, direct app actions, and Computer Use.",
                 symbol: "hand.raised.fill",
                 tint: SettingsSection.automation.tint
             ) {
@@ -10330,7 +11090,8 @@ struct SettingsView: View {
                         granted: computerPermissionSnapshot.screenRecordingGranted,
                         hint: "Needed for Computer Use to capture the current screen.",
                         action: {
-                            PermissionCenter.requestScreenRecordingPermission(openSettingsIfDenied: true)
+                            PermissionCenter.requestScreenRecordingPermission(
+                                openSettingsIfDenied: true)
                             refreshComputerControlState()
                         }
                     )
@@ -10342,7 +11103,8 @@ struct SettingsView: View {
                             ? "Needed for direct browser and app scripting. Click Grant to ask for each installed target app one by one."
                             : "Click Grant to ask for each installed target app one by one.",
                         action: {
-                            PermissionCenter.requestAppleEventsPermission(openSettingsIfDenied: true)
+                            PermissionCenter.requestAppleEventsPermission(
+                                openSettingsIfDenied: true)
                             refreshComputerControlState()
                         }
                     )
@@ -10376,7 +11138,8 @@ struct SettingsView: View {
             settingsCollapsibleCard(
                 id: "automation.appAccess",
                 title: "Automation App Access",
-                subtitle: "Ask macOS for the same per-app Automation entries that older builds may already have.",
+                subtitle:
+                    "Ask macOS for the same per-app Automation entries that older builds may already have.",
                 symbol: "switch.2",
                 tint: SettingsSection.automation.tint
             ) {
@@ -10388,7 +11151,8 @@ struct SettingsView: View {
             settingsCollapsibleCard(
                 id: "automation.helperStatus",
                 title: "Local Helper Status",
-                subtitle: "See whether the local automation layer is ready to run browser, app, and Computer Use actions.",
+                subtitle:
+                    "See whether the local automation layer is ready to run browser, app, and Computer Use actions.",
                 symbol: "desktopcomputer",
                 tint: SettingsSection.automation.tint
             ) {
@@ -10396,11 +11160,14 @@ struct SettingsView: View {
                     if let computerControlStatus {
                         statusBadgeRow(
                             title: computerControlStatus.helperName,
-                            detail: "\(computerControlStatus.executionMode) • \(computerControlStatus.available ? "Available" : "Unavailable")",
+                            detail:
+                                "\(computerControlStatus.executionMode) • \(computerControlStatus.available ? "Available" : "Unavailable")",
                             color: computerControlStatus.available ? .green : .orange
                         )
 
-                        if let selectedProfile = computerControlStatus.selectedBrowserProfileLabel?.nonEmpty {
+                        if let selectedProfile = computerControlStatus.selectedBrowserProfileLabel?
+                            .nonEmpty
+                        {
                             statusBadgeRow(
                                 title: "Selected Browser Profile",
                                 detail: selectedProfile,
@@ -10409,9 +11176,11 @@ struct SettingsView: View {
                         }
 
                         if computerControlStatus.issues.isEmpty {
-                            Text("Everything needed for local browser, app, and Computer Use actions looks ready.")
-                                .font(.callout)
-                                .foregroundStyle(.secondary)
+                            Text(
+                                "Everything needed for local browser, app, and Computer Use actions looks ready."
+                            )
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
                         } else {
                             VStack(alignment: .leading, spacing: 6) {
                                 ForEach(computerControlStatus.issues, id: \.self) { issue in
@@ -10440,7 +11209,8 @@ struct SettingsView: View {
             settingsCollapsibleCard(
                 id: "automation.computerUse",
                 title: "Computer Use",
-                subtitle: "Control the visible desktop with screenshots plus mouse and keyboard actions in Agentic mode.",
+                subtitle:
+                    "Control the visible desktop with screenshots plus mouse and keyboard actions in Agentic mode.",
                 symbol: "cursorarrow.motionlines",
                 tint: SettingsSection.automation.tint
             ) {
@@ -10448,7 +11218,8 @@ struct SettingsView: View {
                     Toggle("Enable Computer Use", isOn: $settings.assistantComputerUseEnabled)
 
                     statusBadgeRow(
-                        title: settings.assistantComputerUseEnabled ? "Computer Use is On" : "Computer Use is Off",
+                        title: settings.assistantComputerUseEnabled
+                            ? "Computer Use is On" : "Computer Use is Off",
                         detail: settings.assistantComputerUseEnabled
                             ? "Agentic mode can use the `computer_use` tool when the task needs screenshot-based desktop interaction."
                             : "Turn this on to allow screenshot-based desktop interaction in Agentic mode.",
@@ -10461,10 +11232,12 @@ struct SettingsView: View {
                         color: computerUseReady ? .green : .orange
                     )
 
-                    Text("Use `browser_use` for signed-in browser reuse, `app_action` for structured supported apps, and `computer_use` only when the task needs generic visual interaction.")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
+                    Text(
+                        "Use `browser_use` for signed-in browser reuse, `app_action` for structured supported apps, and `computer_use` only when the task needs generic visual interaction."
+                    )
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
                 }
             }
 
@@ -10517,23 +11290,32 @@ struct SettingsView: View {
             settingsCollapsibleCard(
                 id: "automation.approvalBehavior",
                 title: "Approval Behavior",
-                subtitle: "Open Assist explains what each browser, app, or Computer Use approval means.",
+                subtitle:
+                    "Open Assist explains what each browser, app, or Computer Use approval means.",
                 symbol: "checkmark.shield.fill",
                 tint: SettingsSection.automation.tint
             ) {
                 VStack(alignment: .leading, spacing: 8) {
-                    Text("`app_action`, `browser_use`, and `computer_use` only run in Agentic mode.")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                    Text("“Allow for Session” remembers approval only for the current conversation. For Computer Use, it is tracked per visible app.")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                    Text("High-risk actions like send, post, submit, purchase, confirm, transfer, and delete always ask again.")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                    Text("Computer Use will not type passwords, OTPs, API keys, or other secrets. Sign in manually when a page or app asks for them.")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
+                    Text(
+                        "`app_action`, `browser_use`, and `computer_use` only run in Agentic mode."
+                    )
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    Text(
+                        "“Allow for Session” remembers approval only for the current conversation. For Computer Use, it is tracked per visible app."
+                    )
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    Text(
+                        "High-risk actions like send, post, submit, purchase, confirm, transfer, and delete always ask again."
+                    )
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    Text(
+                        "Computer Use will not type passwords, OTPs, API keys, or other secrets. Sign in manually when a page or app asks for them."
+                    )
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
                 }
             }
         }
@@ -10582,7 +11364,9 @@ struct SettingsView: View {
         if !settings.assistantComputerUseEnabled {
             return "Computer Use is disabled in settings."
         }
-        if !computerPermissionSnapshot.accessibilityGranted && !computerPermissionSnapshot.screenRecordingGranted {
+        if !computerPermissionSnapshot.accessibilityGranted
+            && !computerPermissionSnapshot.screenRecordingGranted
+        {
             return "Grant Accessibility and Screen Recording first."
         }
         if !computerPermissionSnapshot.accessibilityGranted {
@@ -10623,7 +11407,8 @@ struct SettingsView: View {
     }
 
     private var isHoldToTalkShortcutValid: Bool {
-        ShortcutValidation.isValid(keyCode: settings.shortcutKeyCode, modifiersRaw: settings.shortcutModifiers)
+        ShortcutValidation.isValid(
+            keyCode: settings.shortcutKeyCode, modifiersRaw: settings.shortcutModifiers)
     }
 
     private var isContinuousToggleShortcutValid: Bool {
@@ -10737,19 +11522,23 @@ struct SettingsView: View {
         )
         let holdToTalk = ShortcutBinding(
             keyCode: settings.shortcutKeyCode,
-            modifiersRaw: ShortcutValidation.filteredModifierRawValue(from: settings.shortcutModifiers)
+            modifiersRaw: ShortcutValidation.filteredModifierRawValue(
+                from: settings.shortcutModifiers)
         )
         let continuousToggle = ShortcutBinding(
             keyCode: settings.continuousToggleShortcutKeyCode,
-            modifiersRaw: ShortcutValidation.filteredModifierRawValue(from: settings.continuousToggleShortcutModifiers)
+            modifiersRaw: ShortcutValidation.filteredModifierRawValue(
+                from: settings.continuousToggleShortcutModifiers)
         )
         let assistantLiveVoice = ShortcutBinding(
             keyCode: settings.assistantLiveVoiceShortcutKeyCode,
-            modifiersRaw: ShortcutValidation.filteredModifierRawValue(from: settings.assistantLiveVoiceShortcutModifiers)
+            modifiersRaw: ShortcutValidation.filteredModifierRawValue(
+                from: settings.assistantLiveVoiceShortcutModifiers)
         )
         let assistantCompactSurface = ShortcutBinding(
             keyCode: settings.assistantCompactShortcutKeyCode,
-            modifiersRaw: ShortcutValidation.filteredModifierRawValue(from: settings.assistantCompactShortcutModifiers)
+            modifiersRaw: ShortcutValidation.filteredModifierRawValue(
+                from: settings.assistantCompactShortcutModifiers)
         )
         let pasteLast = ShortcutBinding(
             keyCode: ReservedShortcut.pasteLastKeyCode,
@@ -10878,13 +11667,16 @@ struct SettingsView: View {
                 symbol: "trash.fill",
                 tint: .red
             ) {
-                Button(role: .destructive, action: {
-                    uninstallDeleteDownloadedModels = false
-                    uninstallDeleteLearnedCorrections = false
-                    uninstallDeleteMemories = false
-                    uninstallDeleteProviderCredentials = false
-                    showUninstallSheet = true
-                }) {
+                Button(
+                    role: .destructive,
+                    action: {
+                        uninstallDeleteDownloadedModels = false
+                        uninstallDeleteLearnedCorrections = false
+                        uninstallDeleteMemories = false
+                        uninstallDeleteProviderCredentials = false
+                        showUninstallSheet = true
+                    }
+                ) {
                     Label("Uninstall Open Assist…", systemImage: "trash")
                 }
                 .buttonStyle(.bordered)
@@ -10896,21 +11688,32 @@ struct SettingsView: View {
                             Text("Uninstall Open Assist")
                                 .font(.title2.bold())
 
-                            Text("This will reset permissions, remove settings, and uninstall the app. Enable any options below to also remove additional data.")
-                                .font(.callout)
-                                .foregroundStyle(.secondary)
+                            Text(
+                                "This will reset permissions, remove settings, and uninstall the app. Enable any options below to also remove additional data."
+                            )
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
 
                             Divider()
 
                             VStack(alignment: .leading, spacing: 10) {
-                                Toggle("Delete downloaded whisper models", isOn: $uninstallDeleteDownloadedModels)
-                                    .toggleStyle(.switch)
-                                Toggle("Delete learned corrections", isOn: $uninstallDeleteLearnedCorrections)
-                                    .toggleStyle(.switch)
+                                Toggle(
+                                    "Delete downloaded whisper models",
+                                    isOn: $uninstallDeleteDownloadedModels
+                                )
+                                .toggleStyle(.switch)
+                                Toggle(
+                                    "Delete learned corrections",
+                                    isOn: $uninstallDeleteLearnedCorrections
+                                )
+                                .toggleStyle(.switch)
                                 Toggle("Delete indexed memories", isOn: $uninstallDeleteMemories)
                                     .toggleStyle(.switch)
-                                Toggle("Delete provider credentials (API keys & OAuth sessions)", isOn: $uninstallDeleteProviderCredentials)
-                                    .toggleStyle(.switch)
+                                Toggle(
+                                    "Delete provider credentials (API keys & OAuth sessions)",
+                                    isOn: $uninstallDeleteProviderCredentials
+                                )
+                                .toggleStyle(.switch)
                             }
 
                             Divider()
@@ -10932,7 +11735,8 @@ struct SettingsView: View {
                                         deleteDownloadedModels: uninstallDeleteDownloadedModels,
                                         deleteLearnedCorrections: uninstallDeleteLearnedCorrections,
                                         deleteMemories: uninstallDeleteMemories,
-                                        deleteProviderCredentials: uninstallDeleteProviderCredentials
+                                        deleteProviderCredentials:
+                                            uninstallDeleteProviderCredentials
                                     )
                                 }
                                 .keyboardShortcut(.defaultAction)
@@ -10997,16 +11801,20 @@ struct SettingsView: View {
 
             if result.changedCount > 0 {
                 if result.unchangedCount > 0 {
-                    automationActionMessage = "Added or updated \(result.changedCount) Claude hook(s). \(result.unchangedCount) selected hook(s) were already ready."
+                    automationActionMessage =
+                        "Added or updated \(result.changedCount) Claude hook(s). \(result.unchangedCount) selected hook(s) were already ready."
                 } else {
-                    automationActionMessage = "Added or updated \(result.changedCount) Claude hook(s) in ~/.claude/settings.json."
+                    automationActionMessage =
+                        "Added or updated \(result.changedCount) Claude hook(s) in ~/.claude/settings.json."
                 }
             } else {
-                automationActionMessage = "The selected Claude hooks are already in ~/.claude/settings.json."
+                automationActionMessage =
+                    "The selected Claude hooks are already in ~/.claude/settings.json."
             }
             syncInstalledClaudeHooksFromDisk()
         } catch {
-            automationActionMessage = "Could not update ~/.claude/settings.json. \(error.localizedDescription)"
+            automationActionMessage =
+                "Could not update ~/.claude/settings.json. \(error.localizedDescription)"
         }
     }
 
@@ -11019,7 +11827,8 @@ struct SettingsView: View {
             installClaudeNotificationHook = installedOptions.contains(.notification)
         } catch {
             installedClaudeHookOptions = []
-            automationActionMessage = "Could not read ~/.claude/settings.json. \(error.localizedDescription)"
+            automationActionMessage =
+                "Could not read ~/.claude/settings.json. \(error.localizedDescription)"
         }
     }
 
@@ -11061,12 +11870,20 @@ struct SettingsView: View {
     }
 
     private var uninstallSummaryText: String {
-        let modelText = uninstallDeleteDownloadedModels ? "delete downloaded whisper models" : "keep downloaded whisper models"
-        let correctionText = uninstallDeleteLearnedCorrections ? "delete learned corrections" : "keep learned corrections"
-        let memoryText = uninstallDeleteMemories ? "delete indexed memories" : "keep indexed memories"
-        let credentialText = uninstallDeleteProviderCredentials ? "delete provider credentials" : "keep provider credentials"
+        let modelText =
+            uninstallDeleteDownloadedModels
+            ? "delete downloaded whisper models" : "keep downloaded whisper models"
+        let correctionText =
+            uninstallDeleteLearnedCorrections
+            ? "delete learned corrections" : "keep learned corrections"
+        let memoryText =
+            uninstallDeleteMemories ? "delete indexed memories" : "keep indexed memories"
+        let credentialText =
+            uninstallDeleteProviderCredentials
+            ? "delete provider credentials" : "keep provider credentials"
 
-        return "This will reset permissions, remove settings, \(modelText), \(correctionText), \(memoryText), \(credentialText), and uninstall the app."
+        return
+            "This will reset permissions, remove settings, \(modelText), \(correctionText), \(memoryText), \(credentialText), and uninstall the app."
     }
 
     @ViewBuilder
@@ -11122,7 +11939,9 @@ struct SettingsView: View {
     }
 
     @ViewBuilder
-    private func permissionRow(name: String, granted: Bool, hint: String, action: @escaping () -> Void) -> some View {
+    private func permissionRow(
+        name: String, granted: Bool, hint: String, action: @escaping () -> Void
+    ) -> some View {
         HStack(spacing: 10) {
             AppIconBadge(
                 symbol: granted ? "checkmark.shield.fill" : "hand.raised.slash.fill",
@@ -11177,8 +11996,8 @@ struct SettingsView: View {
 
 }
 
-private extension WhisperModelManager.InstallState {
-    var installButtonTitle: String {
+extension WhisperModelManager.InstallState {
+    fileprivate var installButtonTitle: String {
         switch self {
         case .failed:
             return "Retry Install"
@@ -11187,7 +12006,6 @@ private extension WhisperModelManager.InstallState {
         }
     }
 }
-
 
 struct TranscriptHistoryView: View {
     @EnvironmentObject private var history: TranscriptHistoryStore
@@ -11224,9 +12042,11 @@ struct TranscriptHistoryView: View {
                     VStack(alignment: .leading, spacing: 3) {
                         Text("Transcript History")
                             .font(.title3.weight(.semibold))
-                        Text("Re-use recent voice capture or assistant drafting without recording again.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                        Text(
+                            "Re-use recent voice capture or assistant drafting without recording again."
+                        )
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                     }
                     Spacer()
                     Text("\(filteredEntries.count) of \(history.entries.count)")
@@ -11262,11 +12082,13 @@ struct TranscriptHistoryView: View {
                 } else {
                     ScrollView {
                         LazyVStack(spacing: 0) {
-                            ForEach(Array(filteredEntries.enumerated()), id: \.element.id) { index, entry in
+                            ForEach(Array(filteredEntries.enumerated()), id: \.element.id) {
+                                index, entry in
                                 TranscriptHistoryEntryCard(
                                     entry: entry,
                                     timestampText: timestampFormatter.string(from: entry.createdAt),
-                                    relativeText: relativeFormatter.localizedString(for: entry.createdAt, relativeTo: Date()),
+                                    relativeText: relativeFormatter.localizedString(
+                                        for: entry.createdAt, relativeTo: Date()),
                                     showsDivider: index < (filteredEntries.count - 1),
                                     onCopy: { onCopy(entry.text) },
                                     onReinsert: {
@@ -11436,26 +12258,32 @@ struct ShortcutCaptureMonitor: NSViewRepresentable {
         }
 
         func start() {
-            guard globalKeyMonitor == nil, localKeyMonitor == nil, globalFlagsMonitor == nil, localFlagsMonitor == nil else { return }
+            guard globalKeyMonitor == nil, localKeyMonitor == nil, globalFlagsMonitor == nil,
+                localFlagsMonitor == nil
+            else { return }
             didCapture = false
 
             let mask = ShortcutValidation.supportedModifierFlags
 
-            globalKeyMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            globalKeyMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) {
+                [weak self] event in
                 _ = self?.handleKeyDown(event, mask: mask)
             }
 
-            localKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            localKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) {
+                [weak self] event in
                 guard let self else { return event }
                 let handled = self.handleKeyDown(event, mask: mask)
                 return handled ? nil : event
             }
 
-            globalFlagsMonitor = NSEvent.addGlobalMonitorForEvents(matching: .flagsChanged) { [weak self] event in
+            globalFlagsMonitor = NSEvent.addGlobalMonitorForEvents(matching: .flagsChanged) {
+                [weak self] event in
                 _ = self?.handleFlagsChanged(event, mask: mask)
             }
 
-            localFlagsMonitor = NSEvent.addLocalMonitorForEvents(matching: .flagsChanged) { [weak self] event in
+            localFlagsMonitor = NSEvent.addLocalMonitorForEvents(matching: .flagsChanged) {
+                [weak self] event in
                 guard let self else { return event }
                 let handled = self.handleFlagsChanged(event, mask: mask)
                 return handled ? nil : event
@@ -11466,7 +12294,7 @@ struct ShortcutCaptureMonitor: NSViewRepresentable {
         private func handleKeyDown(_ event: NSEvent, mask: NSEvent.ModifierFlags) -> Bool {
             guard !didCapture else { return true }
 
-            if event.keyCode == 53 { // Escape
+            if event.keyCode == 53 {  // Escape
                 didCapture = true
                 DispatchQueue.main.async {
                     self.parent.isCapturing = false
@@ -11481,7 +12309,8 @@ struct ShortcutCaptureMonitor: NSViewRepresentable {
                 return false
             }
 
-            let capturedMods = ShortcutValidation.filteredModifierRawValue(from: event.modifierFlags.intersection(mask).rawValue)
+            let capturedMods = ShortcutValidation.filteredModifierRawValue(
+                from: event.modifierFlags.intersection(mask).rawValue)
             guard capturedMods != 0 else { return false }
             let didCaptureShortcut = parent.onCapture(capturedCode, capturedMods)
             guard didCaptureShortcut else { return false }

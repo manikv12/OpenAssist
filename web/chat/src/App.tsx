@@ -767,6 +767,8 @@ export function App() {
         ok: boolean;
         cancelled?: boolean;
         message?: string | null;
+        captureMode?: string | null;
+        segmentCount?: number | null;
         filename?: string | null;
         mimeType?: string | null;
         dataUrl?: string | null;

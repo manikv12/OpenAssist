@@ -154,3 +154,41 @@ struct AssistantStructuredUserInputView: View {
             .nonEmpty
     }
 }
+
+struct AssistantStructuredApprovalView: View {
+    let accent: Color
+    let secondaryText: Color
+    let approveTitle: String
+    let rejectTitle: String
+    let cancelTitle: String
+    let onApprove: () -> Void
+    let onReject: () -> Void
+    let onCancel: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Approve or reject to continue.")
+                .font(.caption)
+                .foregroundStyle(secondaryText)
+
+            HStack(spacing: 10) {
+                Button(approveTitle) {
+                    onApprove()
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(accent)
+
+                Button(rejectTitle) {
+                    onReject()
+                }
+                .buttonStyle(.bordered)
+            }
+
+            Button(cancelTitle) {
+                onCancel()
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(secondaryText)
+        }
+    }
+}

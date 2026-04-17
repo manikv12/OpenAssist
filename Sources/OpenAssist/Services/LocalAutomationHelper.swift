@@ -174,13 +174,30 @@ actor LocalAutomationHelper {
                 )
             case "click":
                 let point = try screenPoint(from: action, snapshot: coordinateSnapshot)
-                try await click(at: point, button: button(from: action["button"] as? String), clickCount: 1)
+                let modifiers = parseModifierFlags(from: action)
+                try await click(at: point, button: button(from: action["button"] as? String), clickCount: 1, modifiers: modifiers)
             case "double_click":
                 let point = try screenPoint(from: action, snapshot: coordinateSnapshot)
-                try await click(at: point, button: button(from: action["button"] as? String), clickCount: 2)
-            case "move":
+                let modifiers = parseModifierFlags(from: action)
+                try await click(at: point, button: button(from: action["button"] as? String), clickCount: 2, modifiers: modifiers)
+            case "triple_click":
+                let point = try screenPoint(from: action, snapshot: coordinateSnapshot)
+                try await click(at: point, button: button(from: action["button"] as? String), clickCount: 3)
+            case "right_click":
+                let point = try screenPoint(from: action, snapshot: coordinateSnapshot)
+                try await click(at: point, button: .right, clickCount: 1)
+            case "middle_click":
+                let point = try screenPoint(from: action, snapshot: coordinateSnapshot)
+                try await click(at: point, button: .center, clickCount: 1)
+            case "move", "hover":
                 let point = try screenPoint(from: action, snapshot: coordinateSnapshot)
                 try moveMouse(to: point)
+            case "mouse_down":
+                let point = try screenPoint(from: action, snapshot: coordinateSnapshot)
+                try await mouseDown(at: point, buttonName: action["button"] as? String)
+            case "mouse_up":
+                let point = try screenPoint(from: action, snapshot: coordinateSnapshot)
+                try await mouseUp(at: point, buttonName: action["button"] as? String)
             case "drag":
                 let path = try dragPath(from: action, snapshot: coordinateSnapshot)
                 try await drag(along: path)
@@ -194,8 +211,31 @@ actor LocalAutomationHelper {
                     (value as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
                 } ?? []
                 try await keypress(keys)
+            case "hold_key":
+                let keys = (action["keys"] as? [Any])?.compactMap { value -> String? in
+                    (value as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+                } ?? []
+                let durationMs = number(from: action["duration_ms"])
+                    ?? number(from: action["durationMs"])
+                    ?? 500
+                try await holdKey(keys, durationMs: durationMs)
             case "type":
                 try await typeText((action["text"] as? String) ?? "")
+            case "open_application", "open_app", "launch":
+                if let appName = (action["name"] as? String ?? action["app"] as? String)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
+                    try await openApplication(name: appName)
+                }
+            case "cursor_position":
+                // Handled at the service layer, not here
+                break
+            case "clipboard_read":
+                // Handled at the service layer, not here
+                break
+            case "clipboard_write":
+                if let text = (action["text"] as? String) {
+                    writeClipboard(text)
+                }
             case "wait":
                 let durationMilliseconds = number(from: action["duration_ms"])
                     ?? number(from: action["durationMs"])
@@ -301,6 +341,131 @@ actor LocalAutomationHelper {
             throw LocalAutomationError.accessibilityRequired
         }
         try await keypress(keys)
+    }
+
+    func mouseDown(at point: CGPoint, buttonName: String? = nil) async throws {
+        guard AXIsProcessTrusted() else {
+            throw LocalAutomationError.accessibilityRequired
+        }
+        let btn = button(from: buttonName)
+        let source = try eventSource()
+        let moved = mouseEvent(source: source, type: .mouseMoved, point: point, button: .left)
+        moved.post(tap: .cgSessionEventTap)
+        let downType: CGEventType = btn == .right ? .rightMouseDown : .leftMouseDown
+        let down = mouseEvent(source: source, type: downType, point: point, button: btn)
+        down.post(tap: .cgSessionEventTap)
+    }
+
+    func mouseUp(at point: CGPoint, buttonName: String? = nil) async throws {
+        guard AXIsProcessTrusted() else {
+            throw LocalAutomationError.accessibilityRequired
+        }
+        let btn = button(from: buttonName)
+        let source = try eventSource()
+        let upType: CGEventType = btn == .right ? .rightMouseUp : .leftMouseUp
+        let up = mouseEvent(source: source, type: upType, point: point, button: btn)
+        up.post(tap: .cgSessionEventTap)
+    }
+
+    func holdKey(_ keys: [String], durationMs: Double) async throws {
+        guard AXIsProcessTrusted() else {
+            throw LocalAutomationError.accessibilityRequired
+        }
+        let source = try eventSource()
+        var modifiers: CGEventFlags = []
+        var primaryKeys: [String] = []
+
+        for rawKey in keys {
+            let key = rawKey.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            switch key {
+            case "cmd", "command", "meta", "super":
+                modifiers.insert(.maskCommand)
+            case "ctrl", "control":
+                modifiers.insert(.maskControl)
+            case "alt", "option":
+                modifiers.insert(.maskAlternate)
+            case "shift":
+                modifiers.insert(.maskShift)
+            default:
+                primaryKeys.append(key)
+            }
+        }
+
+        // Press down all keys
+        for key in primaryKeys {
+            if let keyCode = Self.keyCodeMap[key] {
+                guard let down = CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: true) else {
+                    throw LocalAutomationError.commandFailed("Computer control could not create a hold key event.")
+                }
+                down.flags = modifiers
+                down.post(tap: .cgSessionEventTap)
+            }
+        }
+
+        // Hold for the specified duration
+        try await pause(for: max(0.05, durationMs / 1000))
+
+        // Release all keys in reverse order
+        for key in primaryKeys.reversed() {
+            if let keyCode = Self.keyCodeMap[key] {
+                guard let up = CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: false) else {
+                    throw LocalAutomationError.commandFailed("Computer control could not create a key release event.")
+                }
+                up.flags = modifiers
+                up.post(tap: .cgSessionEventTap)
+            }
+        }
+    }
+
+    func cursorPosition() -> CGPoint {
+        NSEvent.mouseLocation
+    }
+
+    func readClipboard() -> String? {
+        NSPasteboard.general.string(forType: .string)
+    }
+
+    func writeClipboard(_ text: String) {
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(text, forType: .string)
+    }
+
+    func openApplication(name: String) async throws {
+        let workspace = NSWorkspace.shared
+        // Try to find by exact name or bundle ID
+        let nameNormalized = name.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // Try opening by bundle identifier first
+        if let appURL = workspace.urlForApplication(withBundleIdentifier: nameNormalized) {
+            try await workspace.openApplication(at: appURL, configuration: .init())
+            return
+        }
+
+        // Try by app name via /Applications paths
+        let candidates = [
+            "/Applications/\(nameNormalized).app",
+            "/Applications/Utilities/\(nameNormalized).app",
+            "/System/Applications/\(nameNormalized).app",
+            "/System/Applications/Utilities/\(nameNormalized).app"
+        ]
+        for candidate in candidates {
+            let url = URL(fileURLWithPath: candidate)
+            if FileManager.default.fileExists(atPath: url.path) {
+                try await workspace.openApplication(at: url, configuration: .init())
+                return
+            }
+        }
+
+        // Fallback: try `open -a` which searches Launch Services
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        process.arguments = ["-a", nameNormalized]
+        try process.run()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else {
+            throw LocalAutomationError.commandFailed("Could not find or open application: \(nameNormalized)")
+        }
     }
 
     func typeTextDirect(_ text: String) async throws {
@@ -561,13 +726,42 @@ actor LocalAutomationHelper {
             throw LocalAutomationError.invalidArguments("Computer control needs screen coordinates.")
         }
 
+        return Self.quartzScreenPoint(
+            imageX: CGFloat(x), imageY: CGFloat(y), snapshot: snapshot
+        )
+    }
+
+    /// Convert screenshot pixel coordinates to Quartz global display coordinates (top-left origin)
+    /// used by CGEvent. Handles both window captures (CG bounds, top-left origin) and display
+    /// captures (NSScreen.frame, bottom-left Cocoa origin).
+    static func quartzScreenPoint(
+        imageX: CGFloat, imageY: CGFloat, snapshot: LocalAutomationDisplaySnapshot
+    ) -> CGPoint {
         let scaleX = snapshot.imageSize.width / max(1, snapshot.screenFrame.width)
         let scaleY = snapshot.imageSize.height / max(1, snapshot.screenFrame.height)
-        let screenX = snapshot.screenFrame.minX + CGFloat(x) / max(1, scaleX)
-        let screenY = snapshot.screenFrame.maxY - CGFloat(y) / max(1, scaleY)
+        let offsetX = imageX / max(1, scaleX)
+        let offsetY = imageY / max(1, scaleY)
+
+        let screenX: CGFloat
+        let screenY: CGFloat
+
+        if snapshot.captureKind == "window" {
+            // Window bounds from CGWindowListCopyWindowInfo are in Quartz coords (top-left origin).
+            // Screenshot (0,0) = window top-left, so just add the offset directly.
+            screenX = snapshot.screenFrame.minX + offsetX
+            screenY = snapshot.screenFrame.minY + offsetY
+        } else {
+            // Display/screen frames from NSScreen.frame use Cocoa coords (bottom-left origin).
+            // Convert to Quartz (top-left) by flipping Y relative to the main screen height.
+            let mainHeight = NSScreen.screens.first?.frame.height ?? snapshot.screenFrame.height
+            let quartzOriginY = mainHeight - snapshot.screenFrame.maxY
+            screenX = snapshot.screenFrame.minX + offsetX
+            screenY = quartzOriginY + offsetY
+        }
+
         return CGPoint(
             x: min(max(screenX, snapshot.screenFrame.minX + 1), snapshot.screenFrame.maxX - 1),
-            y: min(max(screenY, snapshot.screenFrame.minY + 1), snapshot.screenFrame.maxY - 1)
+            y: max(screenY, 0)
         )
     }
 
@@ -583,28 +777,72 @@ actor LocalAutomationHelper {
         }
     }
 
+    private func parseModifierFlags(from action: [String: Any]) -> CGEventFlags {
+        var flags: CGEventFlags = []
+        if let modifiers = action["modifiers"] as? [Any] {
+            for raw in modifiers {
+                guard let mod = (raw as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() else { continue }
+                switch mod {
+                case "cmd", "command", "meta", "super":
+                    flags.insert(.maskCommand)
+                case "ctrl", "control":
+                    flags.insert(.maskControl)
+                case "alt", "option":
+                    flags.insert(.maskAlternate)
+                case "shift":
+                    flags.insert(.maskShift)
+                default:
+                    break
+                }
+            }
+        }
+        return flags
+    }
+
     private func button(from rawValue: String?) -> CGMouseButton {
         switch rawValue?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
         case "right":
             return .right
+        case "middle", "center":
+            return .center
         default:
             return .left
         }
     }
 
-    private func click(at point: CGPoint, button: CGMouseButton, clickCount: Int) async throws {
+    private func click(
+        at point: CGPoint,
+        button: CGMouseButton,
+        clickCount: Int,
+        modifiers: CGEventFlags = []
+    ) async throws {
         let source = try eventSource()
         let moved = mouseEvent(source: source, type: .mouseMoved, point: point, button: .left)
         moved.post(tap: .cgSessionEventTap)
 
-        let downType: CGEventType = button == .right ? .rightMouseDown : .leftMouseDown
-        let upType: CGEventType = button == .right ? .rightMouseUp : .leftMouseUp
+        let downType: CGEventType
+        let upType: CGEventType
+        switch button {
+        case .right:
+            downType = .rightMouseDown
+            upType = .rightMouseUp
+        case .center:
+            downType = .otherMouseDown
+            upType = .otherMouseUp
+        default:
+            downType = .leftMouseDown
+            upType = .leftMouseUp
+        }
 
         for index in 1...clickCount {
             let down = mouseEvent(source: source, type: downType, point: point, button: button)
             let up = mouseEvent(source: source, type: upType, point: point, button: button)
             down.setIntegerValueField(.mouseEventClickState, value: Int64(index))
             up.setIntegerValueField(.mouseEventClickState, value: Int64(index))
+            if !modifiers.isEmpty {
+                down.flags = modifiers
+                up.flags = modifiers
+            }
             down.post(tap: .cgSessionEventTap)
             up.post(tap: .cgSessionEventTap)
             try await pause(for: 0.05)

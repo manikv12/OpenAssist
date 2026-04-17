@@ -31,6 +31,7 @@ final class TelegramRemoteCoordinator: ObservableObject {
         .init(command: "sessions", description: "Switch to another Open Assist session"),
         .init(command: "backend", description: "Switch between Codex and GitHub Copilot"),
         .init(command: "models", description: "Change the active session model"),
+        .init(command: "plugins", description: "Choose installed Codex plugins for this chat"),
         .init(command: "mode", description: "Switch between Plan and Agentic"),
         .init(command: "effort", description: "Change the model thinking level"),
         .init(command: "usage", description: "Show context and token usage"),
@@ -49,6 +50,7 @@ final class TelegramRemoteCoordinator: ObservableObject {
         case sessions
         case backend
         case models
+        case plugins
         case mode
         case effort
     }
@@ -56,6 +58,7 @@ final class TelegramRemoteCoordinator: ObservableObject {
     private enum ViewSlot {
         case header
         case transcript
+        case toolActivity
         case stream
         case permission
     }
@@ -82,8 +85,11 @@ final class TelegramRemoteCoordinator: ObservableObject {
         var projectMenuProjectIDs: [String] = []
         var sessionMenuSessionIDs: [String] = []
         var modelMenuModelIDs: [String] = []
+        var pluginMenuPluginIDs: [String] = []
+        var selectedPluginIDs: [String] = []
         var headerSlot = MessageSlot()
         var transcriptSlot = MessageSlot()
+        var toolActivitySlot = MessageSlot()
         var streamSlot = MessageSlot()
         var permissionSlot = MessageSlot()
         var replyOverflowMessageIDs: [Int] = []
@@ -118,6 +124,7 @@ final class TelegramRemoteCoordinator: ObservableObject {
             shouldShowTranscriptPreview = true
             headerSlot.reset()
             transcriptSlot.reset()
+            toolActivitySlot.reset()
             streamSlot.reset()
             permissionSlot.reset()
             replyOverflowMessageIDs = []
@@ -131,6 +138,12 @@ final class TelegramRemoteCoordinator: ObservableObject {
             to sessionID: String?,
             showTranscriptPreview: Bool = true
         ) {
+            let previousSessionID = selectedSessionID?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            let nextSessionID = sessionID?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if previousSessionID != nil, previousSessionID != nextSessionID {
+                selectedPluginIDs = []
+                pluginMenuPluginIDs = []
+            }
             viewGeneration += 1
             selectedSessionID = sessionID
             shouldShowTranscriptPreview = showTranscriptPreview
@@ -148,6 +161,7 @@ final class TelegramRemoteCoordinator: ObservableObject {
             controllerSignature = nil
             headerSlot.reset()
             transcriptSlot.reset()
+            toolActivitySlot.reset()
             streamSlot.reset()
             permissionSlot.reset()
             replyOverflowMessageIDs = []
@@ -556,6 +570,8 @@ final class TelegramRemoteCoordinator: ObservableObject {
                 await renderBackendMenu(chatID: chat.id)
             case "menu:models":
                 await renderModelMenu(chatID: chat.id)
+            case "menu:plugins":
+                await renderPluginMenu(chatID: chat.id)
             case "menu:mode":
                 await renderModeMenu(chatID: chat.id)
             case "menu:effort":
@@ -583,6 +599,12 @@ final class TelegramRemoteCoordinator: ObservableObject {
             case "act:provider":
                 await renderHomeMenu(chatID: chat.id, notice: await providerUsageSummaryText())
                 await refreshSelectedSessionView(chatID: chat.id, force: true)
+            case "act:plugins-apply":
+                await renderHomeMenu(chatID: chat.id, notice: "Updated plugin selection for this chat.")
+                await refreshSelectedSessionView(chatID: chat.id, force: true)
+            case "act:plugins-clear":
+                chatState.selectedPluginIDs = []
+                await renderPluginMenu(chatID: chat.id)
             case "act:stop":
                 await bridge.cancelActiveTurn()
                 await renderHomeMenu(chatID: chat.id, notice: "Stopped the current turn.")
@@ -600,6 +622,8 @@ final class TelegramRemoteCoordinator: ObservableObject {
                 try await handleBackendSelection(data: data, chatID: chat.id)
             case let data where data.hasPrefix("sel:m:"):
                 try await handleModelSelection(data: data, chatID: chat.id)
+            case let data where data.hasPrefix("sel:plugin:"):
+                try await handlePluginSelection(data: data, chatID: chat.id)
             case let data where data.hasPrefix("sel:mode:"):
                 try await handleModeSelection(data: data, chatID: chat.id)
             case let data where data.hasPrefix("sel:eff:"):
@@ -658,6 +682,9 @@ final class TelegramRemoteCoordinator: ObservableObject {
         case "/models":
             await moveControllerMessageToBottom(chatID: chatID)
             await renderModelMenu(chatID: chatID)
+        case "/plugins":
+            await moveControllerMessageToBottom(chatID: chatID)
+            await renderPluginMenu(chatID: chatID)
         case "/mode":
             await moveControllerMessageToBottom(chatID: chatID)
             await renderModeMenu(chatID: chatID)
@@ -745,6 +772,7 @@ final class TelegramRemoteCoordinator: ObservableObject {
         } else {
             snapshot = await bridge.startNewSession()
         }
+        chatState.selectedPluginIDs = []
         chatState.switchSessionView(to: snapshot?.session.id ?? bridge.statusSnapshot().selectedSessionID)
         await clearTrackedChatHistory(chatID: chatID)
         if moveControllerToBottom {
@@ -793,13 +821,41 @@ final class TelegramRemoteCoordinator: ObservableObject {
     ) async {
         await applySelectedProjectFilter()
 
+        let status = await telegramSessionContext()
+        if !chatState.selectedPluginIDs.isEmpty && status.assistantBackend != .codex {
+            await renderHomeMenu(
+                chatID: chatID,
+                notice: "Plugin selection only works with the Codex backend in Telegram."
+            )
+            await refreshSelectedSessionView(chatID: chatID, force: true)
+            return
+        }
+
+        let pluginsNeedingSetup = await selectedPluginsNeedingSetup()
+        if !pluginsNeedingSetup.isEmpty {
+            let names = pluginsNeedingSetup.map(\.displayName).joined(separator: ", ")
+            await renderHomeMenu(
+                chatID: chatID,
+                notice: "\(names) still needs setup. Finish it from the desktop Plugins page first."
+            )
+            await refreshSelectedSessionView(chatID: chatID, force: true)
+            return
+        }
+
         if slot(for: .transcript).messageID != nil {
             await clearSlot(chatID: chatID, kind: .transcript)
+        }
+        if slot(for: .toolActivity).messageID != nil {
+            await clearSlot(chatID: chatID, kind: .toolActivity)
         }
         detachSlot(.stream)
 
         let selectedSessionID = chatState.selectedSessionID
-        let snapshot = await bridge.sendPrompt(text, sessionID: selectedSessionID)
+        let snapshot = await bridge.sendPrompt(
+            text,
+            sessionID: selectedSessionID,
+            selectedPluginIDs: chatState.selectedPluginIDs
+        )
         chatState.switchSessionView(
             to: snapshot?.session.id ?? bridge.statusSnapshot().selectedSessionID,
             showTranscriptPreview: false
@@ -997,6 +1053,13 @@ final class TelegramRemoteCoordinator: ObservableObject {
             "Backend: \(status.assistantBackendName)"
         ]
 
+        if !chatState.selectedPluginIDs.isEmpty {
+            let selectedPluginNames = await selectedPluginNames()
+            if !selectedPluginNames.isEmpty {
+                lines.append("Plugins: \(selectedPluginNames.joined(separator: ", "))")
+            }
+        }
+
         if status.selectedSessionIsTemporary {
             lines.append("Type: Temporary chat")
         }
@@ -1024,6 +1087,9 @@ final class TelegramRemoteCoordinator: ObservableObject {
             [
                 .init(text: "Backend", callbackData: "menu:backend"),
                 .init(text: "Models", callbackData: "menu:models")
+            ],
+            [
+                .init(text: "Plugins", callbackData: "menu:plugins")
             ],
             [
                 .init(text: "Mode", callbackData: "menu:mode"),
@@ -1225,6 +1291,65 @@ final class TelegramRemoteCoordinator: ObservableObject {
         )
     }
 
+    private func renderPluginMenu(chatID: Int64) async {
+        chatState.controllerMenu = .plugins
+        let status = await telegramSessionContext()
+        guard status.assistantBackend == .codex else {
+            await upsertControllerMessage(
+                chatID: chatID,
+                text: "Plugins are only available when Telegram is using the Codex backend.",
+                signature: "plugins:unavailable:\(status.assistantBackend.rawValue)",
+                markup: TelegramInlineKeyboardMarkup(inlineKeyboard: [[
+                    .init(text: "Back", callbackData: "nav:home")
+                ]])
+            )
+            return
+        }
+
+        let plugins = await bridge.installedCodexPlugins()
+        chatState.pluginMenuPluginIDs = plugins.map(\.pluginID)
+
+        var rows = plugins.enumerated().map { index, plugin in
+            let isSelected = chatState.selectedPluginIDs.contains {
+                $0.caseInsensitiveCompare(plugin.pluginID) == .orderedSame
+            }
+            let suffix = plugin.needsSetup ? " (setup)" : ""
+            return [TelegramInlineKeyboardButton(
+                text: isSelected ? "• \(plugin.displayName)\(suffix)" : "\(plugin.displayName)\(suffix)",
+                callbackData: "sel:plugin:\(index)"
+            )]
+        }
+
+        rows.append([
+            .init(text: "Apply", callbackData: "act:plugins-apply"),
+            .init(text: "Clear", callbackData: "act:plugins-clear")
+        ])
+        rows.append([.init(text: "Back", callbackData: "nav:home")])
+
+        let text: String
+        if plugins.isEmpty {
+            text = "No installed Codex plugins were found. Install plugins from the Open Assist desktop app first."
+        } else if chatState.selectedPluginIDs.isEmpty {
+            text = "Choose installed plugins for this chat. These selections are sent with your next Telegram prompt."
+        } else {
+            let selectedNames = plugins
+                .filter { plugin in
+                    chatState.selectedPluginIDs.contains {
+                        $0.caseInsensitiveCompare(plugin.pluginID) == .orderedSame
+                    }
+                }
+                .map(\.displayName)
+            text = "Selected plugins: \(selectedNames.joined(separator: ", "))"
+        }
+
+        await upsertControllerMessage(
+            chatID: chatID,
+            text: text,
+            signature: "plugins:\(plugins.map(\.pluginID).joined(separator: ",")):\(chatState.selectedPluginIDs.joined(separator: ","))",
+            markup: TelegramInlineKeyboardMarkup(inlineKeyboard: rows)
+        )
+    }
+
     private func renderModeMenu(chatID: Int64) async {
         chatState.controllerMenu = .mode
         let selectedMode = await telegramSessionContext().interactionMode
@@ -1302,10 +1427,15 @@ final class TelegramRemoteCoordinator: ObservableObject {
             return snapshot
         }
 
+        let selectedPluginNames = await selectedPluginNames()
+
         await upsertViewSlot(
             chatID: chatID,
             kind: .header,
-            text: TelegramRemoteRenderer.sessionHeaderText(snapshot: snapshot),
+            text: TelegramRemoteRenderer.sessionHeaderText(
+                snapshot: snapshot,
+                selectedPluginNames: selectedPluginNames
+            ),
             signaturePrefix: "header",
             markup: snapshot.session.isTemporary
                 ? TelegramInlineKeyboardMarkup(inlineKeyboard: [[
@@ -1326,6 +1456,18 @@ final class TelegramRemoteCoordinator: ObservableObject {
             )
         } else if slot(for: .transcript).messageID != nil, !chatState.shouldShowTranscriptPreview {
             await clearSlot(chatID: chatID, kind: .transcript)
+        }
+
+        if let toolActivityText = TelegramRemoteRenderer.toolActivityText(snapshot: snapshot) {
+            await upsertViewSlot(
+                chatID: chatID,
+                kind: .toolActivity,
+                text: toolActivityText,
+                signaturePrefix: "tools",
+                expectedGeneration: expectedGeneration
+            )
+        } else if slot(for: .toolActivity).messageID != nil {
+            await clearSlot(chatID: chatID, kind: .toolActivity)
         }
 
         if let streamPresentation = TelegramRemoteRenderer.streamPresentation(snapshot: snapshot) {
@@ -1522,6 +1664,35 @@ final class TelegramRemoteCoordinator: ObservableObject {
         await refreshSelectedSessionView(chatID: chatID, force: true)
     }
 
+    private func handlePluginSelection(data: String, chatID: Int64) async throws {
+        let rawIndex = data.replacingOccurrences(of: "sel:plugin:", with: "")
+        guard let index = Int(rawIndex), chatState.pluginMenuPluginIDs.indices.contains(index) else {
+            throw TelegramBotClientError.server(message: "That plugin button expired. Open /plugins again.")
+        }
+
+        let plugins = await bridge.installedCodexPlugins()
+        guard index < plugins.count else {
+            throw TelegramBotClientError.server(message: "That plugin is no longer available.")
+        }
+
+        let plugin = plugins[index]
+        if plugin.needsSetup {
+            throw TelegramBotClientError.server(
+                message: "\(plugin.displayName) still needs setup. Finish it from the desktop Plugins page first."
+            )
+        }
+
+        if let existingIndex = chatState.selectedPluginIDs.firstIndex(where: {
+            $0.caseInsensitiveCompare(plugin.pluginID) == .orderedSame
+        }) {
+            chatState.selectedPluginIDs.remove(at: existingIndex)
+        } else {
+            chatState.selectedPluginIDs.append(plugin.pluginID)
+        }
+
+        await renderPluginMenu(chatID: chatID)
+    }
+
     private func handleBackendSelection(data: String, chatID: Int64) async throws {
         let rawValue = data.replacingOccurrences(of: "sel:backend:", with: "")
         guard let backend = AssistantRuntimeBackend(rawValue: rawValue) else {
@@ -1529,6 +1700,9 @@ final class TelegramRemoteCoordinator: ObservableObject {
         }
 
         let changed = await bridge.selectBackend(backend)
+        if backend != .codex {
+            chatState.selectedPluginIDs = []
+        }
         chatState.switchSessionView(to: bridge.statusSnapshot().selectedSessionID)
         await clearTrackedChatHistory(chatID: chatID)
         await renderHomeMenu(
@@ -1849,6 +2023,8 @@ final class TelegramRemoteCoordinator: ObservableObject {
             return chatState.headerSlot
         case .transcript:
             return chatState.transcriptSlot
+        case .toolActivity:
+            return chatState.toolActivitySlot
         case .stream:
             return chatState.streamSlot
         case .permission:
@@ -1868,6 +2044,8 @@ final class TelegramRemoteCoordinator: ObservableObject {
             chatState.headerSlot = slot
         case .transcript:
             chatState.transcriptSlot = slot
+        case .toolActivity:
+            chatState.toolActivitySlot = slot
         case .stream:
             chatState.streamSlot = slot
         case .permission:
@@ -1991,6 +2169,10 @@ final class TelegramRemoteCoordinator: ObservableObject {
         if !sentMessageIDs.isEmpty {
             chatState.imageMessageIDs.append(contentsOf: sentMessageIDs)
             chatState.lastDeliveredImageSignature = delivery.signature
+
+            // Notify the bridge to strip heavy image data from delivered timeline items.
+            // This prevents screenshots from accumulating on disk in the session history.
+            await bridge.clearDeliveredScreenshotData()
         }
     }
 
@@ -2058,19 +2240,53 @@ final class TelegramRemoteCoordinator: ObservableObject {
         })?.name
     }
 
+    private func selectedPluginNames() async -> [String] {
+        let plugins = await bridge.installedCodexPlugins()
+        return plugins.compactMap { plugin in
+            chatState.selectedPluginIDs.contains {
+                $0.caseInsensitiveCompare(plugin.pluginID) == .orderedSame
+            } ? plugin.displayName : nil
+        }
+    }
+
+    private func selectedPluginsNeedingSetup() async -> [AssistantComposerPluginSelection] {
+        let plugins = await bridge.installedCodexPlugins()
+        return plugins.filter { plugin in
+            plugin.needsSetup && chatState.selectedPluginIDs.contains {
+                $0.caseInsensitiveCompare(plugin.pluginID) == .orderedSame
+            }
+        }
+    }
+
     private func applySelectedProjectFilter() async {
         await bridge.selectProject(chatState.selectedProjectID)
     }
+
+    private var turnJustFinished = false
 
     private func refreshIntervalSeconds(snapshot: AssistantRemoteSessionSnapshot?) -> Double {
         guard let snapshot else {
             return 20
         }
         if snapshot.hasActiveTurn {
+            turnJustFinished = true
             return 1.5
         }
         if snapshot.pendingPermissionRequest != nil {
             return 4
+        }
+        // When a turn just ended, do one quick refresh cycle to deliver the final
+        // screenshot and tool result before switching to slow polling. Without this,
+        // the user never sees what happened because the interval jumps from 1.5s to 20s
+        // right as the screenshot timeline item is created.
+        if turnJustFinished {
+            turnJustFinished = false
+            return 2
+        }
+        // Check if there are undelivered images from the latest turn
+        if let delivery = snapshot.imageDelivery,
+           delivery.signature != chatState.lastDeliveredImageSignature {
+            return 2
         }
         return 20
     }
@@ -2132,7 +2348,7 @@ final class TelegramRemoteCoordinator: ObservableObject {
         """
         Send a normal message to continue the selected session.
 
-        Commands: /new, /clear, /temp, /projects, /sessions, /backend, /models, /mode, /effort, /usage, /status, /stop
+        Commands: /new, /clear, /temp, /projects, /sessions, /backend, /models, /plugins, /mode, /effort, /usage, /status, /stop
         """
     }
 

@@ -645,7 +645,7 @@ private struct AssistantCompactSidebarRootView: View {
                 .fill(handleBackground)
                 .overlay(
                     RoundedRectangle(cornerRadius: 9, style: .continuous)
-                        .stroke(Color.white.opacity(0.08), lineWidth: 1)
+                        .stroke(handleStroke, lineWidth: 1)
                 )
                 .overlay {
                     Image(systemName: handleSymbol)
@@ -653,7 +653,7 @@ private struct AssistantCompactSidebarRootView: View {
                         .foregroundStyle(handleTint)
                 }
                 .frame(width: 18, height: 84)
-                .shadow(color: handleTint.opacity(0.16), radius: 12, x: 0, y: 0)
+                .shadow(color: handleGlow, radius: 14, x: 0, y: 0)
         }
         .buttonStyle(.plain)
         .frame(width: handleWidth)
@@ -735,11 +735,20 @@ private struct AssistantCompactSidebarRootView: View {
     private var handleBackground: LinearGradient {
         LinearGradient(
             colors: [
-                AppVisualTheme.sidebarTint.opacity(viewModel.isOpen ? 0.82 : 0.72),
-                AppVisualTheme.accentTint.opacity(viewModel.isOpen ? 0.34 : 0.22)
+                AppVisualTheme.sidebarTint.opacity(viewModel.isOpen ? 0.82 : 0.76),
+                AppVisualTheme.accentTint.opacity(viewModel.isOpen ? 0.22 : 0.18),
+                AppVisualTheme.accentTint.opacity(viewModel.isOpen ? 0.52 : 0.42)
             ],
             startPoint: .top,
             endPoint: .bottom
         )
+    }
+
+    private var handleStroke: Color {
+        AppVisualTheme.accentTint.opacity(viewModel.isOpen ? 0.28 : 0.22)
+    }
+
+    private var handleGlow: Color {
+        AppVisualTheme.accentTint.opacity(viewModel.isOpen ? 0.24 : 0.18)
     }
 }

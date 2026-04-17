@@ -9,6 +9,8 @@ import {
 import type {
   AssistantComposerActivityState,
   AssistantComposerControlsState,
+  AssistantComposerPlugin,
+  AssistantComposerSlashCommand,
   AssistantComposerState,
   AssistantRuntimeControlsAvailability,
 } from "../types";
@@ -25,7 +27,7 @@ interface ComposerViewProps {
 const MAX_TEXTAREA_HEIGHT = 132;
 const MAX_HISTORY_SIZE = 50;
 
-type ComposerSlashGroupTone = "mode";
+type ComposerSlashGroupTone = "mode" | "copilot";
 
 interface ComposerSlashQueryState {
   query: string;
@@ -33,11 +35,18 @@ interface ComposerSlashQueryState {
   replaceTo: number;
 }
 
-interface ComposerSlashCommand extends SlashCommandLike<ComposerSlashGroupTone> {
-  mode: "note" | "chat";
+interface ComposerPluginQueryState {
+  query: string;
+  replaceFrom: number;
+  replaceTo: number;
 }
 
-type ComposerQuickActionID = "upload" | "skills" | "note-mode";
+interface ComposerPluginLinkResolution {
+  text: string;
+  pluginIds: string[];
+}
+
+type ComposerQuickActionID = "upload" | "screenshot" | "skills" | "plugins" | "note-mode";
 
 interface ComposerQuickAction {
   id: ComposerQuickActionID;
@@ -67,6 +76,7 @@ const DEFAULT_COMPOSER_ACTIVITY_STATE: AssistantComposerActivityState = {
   isBusy: false,
   activeTurnPhase: "idle",
   canCancelActiveTurn: false,
+  canSteerActiveTurn: false,
   activeTurnProviderLabel: undefined,
   hasPendingToolApproval: false,
   hasPendingInput: false,
@@ -75,30 +85,11 @@ const DEFAULT_COMPOSER_ACTIVITY_STATE: AssistantComposerActivityState = {
   showStopVoicePlayback: false,
 };
 
-const COMPOSER_SLASH_COMMANDS: ComposerSlashCommand[] = [
-  {
-    id: "note",
-    label: "/note",
-    subtitle: "Turn on sticky Note Mode for this chat.",
-    groupId: "mode",
-    groupLabel: "Modes",
-    groupTone: "mode",
-    groupOrder: 0,
-    searchKeywords: ["notes", "project notes", "thread notes", "assistant notes"],
-    mode: "note",
-  },
-  {
-    id: "chat",
-    label: "/chat",
-    subtitle: "Turn Note Mode off and go back to normal chat.",
-    groupId: "mode",
-    groupLabel: "Modes",
-    groupTone: "mode",
-    groupOrder: 0,
-    searchKeywords: ["normal chat", "default mode", "general"],
-    mode: "chat",
-  },
-];
+interface ComposerSlashCommand extends SlashCommandLike<ComposerSlashGroupTone> {
+  insertText: string;
+  behavior: AssistantComposerSlashCommand["behavior"];
+  localMode?: AssistantComposerSlashCommand["localMode"];
+}
 
 // Persistent prompt history shared across re-renders.
 const promptHistory: string[] = [];
@@ -127,6 +118,82 @@ function detectComposerSlashQuery(
     query: (match[1] ?? "").toLowerCase(),
     replaceFrom: slashOffset,
     replaceTo: selectionStart,
+  };
+}
+
+function detectComposerPluginQuery(
+  text: string,
+  selectionStart: number,
+  selectionEnd: number
+): ComposerPluginQueryState | null {
+  if (selectionStart !== selectionEnd) {
+    return null;
+  }
+
+  const beforeCaret = text.slice(0, selectionStart);
+  const match = beforeCaret.match(/(?:^|\s)@([a-z0-9-]*)$/i);
+  if (!match) {
+    return null;
+  }
+
+  const atOffset = beforeCaret.lastIndexOf("@");
+  if (atOffset < 0) {
+    return null;
+  }
+
+  return {
+    query: (match[1] ?? "").toLowerCase(),
+    replaceFrom: atOffset,
+    replaceTo: selectionStart,
+  };
+}
+
+function resolveComposerPluginLinks(
+  text: string,
+  plugins: AssistantComposerPlugin[]
+): ComposerPluginLinkResolution {
+  if (!text || !plugins.length) {
+    return { text, pluginIds: [] };
+  }
+
+  const pluginsById = new Map(
+    plugins.map((plugin) => [plugin.pluginId.toLowerCase(), plugin] as const)
+  );
+  const pluginIds: string[] = [];
+  let nextText = text;
+
+  nextText = nextText.replace(
+    /\[([^\]]+)\]\(plugin:\/\/([^)]+)\)/gi,
+    (fullMatch, rawLabel, rawPluginId) => {
+      const plugin = pluginsById.get(String(rawPluginId).trim().toLowerCase());
+      if (!plugin) {
+        return fullMatch;
+      }
+      pluginIds.push(plugin.pluginId);
+      const label = String(rawLabel).trim();
+      return label.length ? label : `@${plugin.displayName}`;
+    }
+  );
+
+  nextText = nextText.replace(
+    /plugin:\/\/([A-Za-z0-9._-]+@[A-Za-z0-9._-]+)/gi,
+    (fullMatch, rawPluginId) => {
+      const plugin = pluginsById.get(String(rawPluginId).trim().toLowerCase());
+      if (!plugin) {
+        return fullMatch;
+      }
+      pluginIds.push(plugin.pluginId);
+      return `@${plugin.displayName}`;
+    }
+  );
+
+  return {
+    text: nextText,
+    pluginIds: Array.from(new Set(pluginIds.map((value) => value.toLowerCase()))).map(
+      (normalizedId) =>
+        plugins.find((plugin) => plugin.pluginId.toLowerCase() === normalizedId)?.pluginId ??
+        normalizedId
+    ),
   };
 }
 
@@ -160,27 +227,50 @@ export function ComposerView({
   activityState,
   onDispatchCommand,
 }: ComposerViewProps) {
-  const layoutMeasurementSignature = [
-    state?.isCompactComposer ? "compact" : "regular",
-    state?.isNoteModeActive ? "note" : "chat",
-    state?.noteModeLabel ?? "",
-    state?.noteModeHelperText ?? "",
-    state?.preflightStatusMessage ?? "",
-    String(state?.activeSkills.length ?? 0),
-    String(state?.attachments.length ?? 0),
-    controlsState?.availability ?? "unavailable",
-    controlsState?.selectedInteractionMode ?? "",
-    controlsState?.selectedModelId ?? "",
-    controlsState?.selectedReasoningId ?? "",
-    String(controlsState?.showsInteractionModeControl !== false),
-    String(controlsState?.showsModelControls !== false),
-    String(controlsState?.showsReasoningControls !== false),
-  ].join("|");
+  const layoutMeasurementSignature = useMemo(
+    () =>
+      [
+        state?.isCompactComposer ? "compact" : "regular",
+        state?.isNoteModeActive ? "note" : "chat",
+        state?.noteModeLabel ?? "",
+        state?.noteModeHelperText ?? "",
+        state?.preflightStatusMessage ?? "",
+        String(state?.activeSkills.length ?? 0),
+        String(state?.selectedPlugins.length ?? 0),
+        String(state?.attachments.length ?? 0),
+        controlsState?.availability ?? "unavailable",
+        controlsState?.selectedInteractionMode ?? "",
+        controlsState?.selectedModelId ?? "",
+        controlsState?.selectedReasoningId ?? "",
+        String(controlsState?.showsInteractionModeControl !== false),
+        String(controlsState?.showsModelControls !== false),
+        String(controlsState?.showsReasoningControls !== false),
+      ].join("|"),
+    [
+      state?.isCompactComposer,
+      state?.isNoteModeActive,
+      state?.noteModeLabel,
+      state?.noteModeHelperText,
+      state?.preflightStatusMessage,
+      state?.activeSkills.length,
+      state?.selectedPlugins.length,
+      state?.attachments.length,
+      controlsState?.availability,
+      controlsState?.selectedInteractionMode,
+      controlsState?.selectedModelId,
+      controlsState?.selectedReasoningId,
+      controlsState?.showsInteractionModeControl,
+      controlsState?.showsModelControls,
+      controlsState?.showsReasoningControls,
+    ]
+  );
 
   const [draft, setDraft] = useState(state?.draftText ?? "");
   const [isDropTarget, setIsDropTarget] = useState(false);
   const [isExternalDraftReveal, setIsExternalDraftReveal] = useState(false);
   const composerRef = useRef<HTMLDivElement>(null);
+  const composerContentRef = useRef<HTMLDivElement>(null);
+  const slashMenuRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const lastReportedHeightRef = useRef(0);
   // History navigation: -1 means "current draft" (not browsing history).
@@ -194,14 +284,50 @@ export function ComposerView({
   const draftRef = useRef(state?.draftText ?? "");
   const lastLocalDraftRef = useRef(state?.draftText ?? "");
   const externalDraftRevealTimeoutRef = useRef<number | null>(null);
+  const draftSyncTimerRef = useRef(0);
   const [slashQuery, setSlashQuery] = useState<ComposerSlashQueryState | null>(null);
   const [selectedSlashIndex, setSelectedSlashIndex] = useState(0);
+  const [pluginQuery, setPluginQuery] = useState<ComposerPluginQueryState | null>(null);
+  const [selectedPluginIndex, setSelectedPluginIndex] = useState(0);
+
+  const slashCommands = useMemo<ComposerSlashCommand[]>(
+    () =>
+      (state?.slashCommands ?? []).map((command) => ({
+        id: command.id,
+        label: command.label,
+        subtitle: command.subtitle,
+        groupId: command.groupId,
+        groupLabel: command.groupLabel,
+        groupTone: (command.groupTone as ComposerSlashGroupTone) || "mode",
+        groupOrder: command.groupOrder,
+        searchKeywords: command.searchKeywords,
+        insertText: command.insertText,
+        behavior: command.behavior,
+        localMode: command.localMode,
+      })),
+    [state?.slashCommands]
+  );
 
   const reportComposerHeight = () => {
     const composer = composerRef.current;
-    if (!composer) return;
+    const composerContent = composerContentRef.current ?? composer;
+    if (!composer || !composerContent) return;
 
-    const nextHeight = Math.ceil(composer.getBoundingClientRect().height);
+    const contentRect = composerContent.getBoundingClientRect();
+    const computedStyle = window.getComputedStyle(composer);
+    const paddingTop = parseFloat(computedStyle.paddingTop) || 0;
+    const paddingBottom = parseFloat(computedStyle.paddingBottom) || 0;
+    const slashMenuRect = slashMenuRef.current?.getBoundingClientRect() ?? null;
+    const menuOverflow = slashMenuRect
+      ? Math.min(Math.max(0, contentRect.top - slashMenuRect.top), 250)
+      : 0;
+    const nextHeight = Math.ceil(
+      contentRect.height + paddingTop + paddingBottom + menuOverflow
+    );
+
+    if (nextHeight <= 0 || !Number.isFinite(nextHeight)) {
+      return;
+    }
     if (Math.abs(nextHeight - lastReportedHeightRef.current) < 1) {
       return;
     }
@@ -275,31 +401,46 @@ export function ComposerView({
       if (externalDraftRevealTimeoutRef.current !== null) {
         window.clearTimeout(externalDraftRevealTimeoutRef.current);
       }
+      if (draftSyncTimerRef.current) {
+        // Flush pending draft to native before unmount.
+        onDispatchCommand("updatePromptDraft", { text: draftRef.current });
+        window.clearTimeout(draftSyncTimerRef.current);
+      }
     };
   }, []);
 
-  const refreshSlashQuery = (nextDraft?: string) => {
+  const refreshAutocompleteQuery = (nextDraft?: string) => {
     const textarea = textareaRef.current;
     const text = nextDraft ?? draftRef.current;
     const selectionStart = textarea?.selectionStart ?? text.length;
     const selectionEnd = textarea?.selectionEnd ?? text.length;
-    const nextQuery = detectComposerSlashQuery(text, selectionStart, selectionEnd);
-    setSlashQuery(nextQuery);
-    if (!nextQuery) {
+    const nextSlashQuery = detectComposerSlashQuery(text, selectionStart, selectionEnd);
+    const nextPluginQuery =
+      state?.activeProviderId === "codex" && (state.availablePlugins?.length ?? 0) > 0
+        ? detectComposerPluginQuery(text, selectionStart, selectionEnd)
+        : null;
+
+    setSlashQuery(nextPluginQuery ? null : nextSlashQuery);
+    setPluginQuery(nextPluginQuery);
+
+    if (!nextSlashQuery) {
       setSelectedSlashIndex(0);
+    }
+    if (!nextPluginQuery) {
+      setSelectedPluginIndex(0);
     }
   };
 
   const matchingSlashCommands = useMemo(() => {
     if (!slashQuery) {
-      return COMPOSER_SLASH_COMMANDS;
+      return slashCommands;
     }
     const query = slashQuery.query.trim().toLowerCase();
     if (!query) {
-      return COMPOSER_SLASH_COMMANDS;
+      return slashCommands;
     }
-    return COMPOSER_SLASH_COMMANDS.filter((command) => matchesSlashCommand(command, query));
-  }, [slashQuery]);
+    return slashCommands.filter((command) => matchesSlashCommand(command, query));
+  }, [slashCommands, slashQuery]);
 
   const groupedSlashCommands = useMemo(
     () => groupSlashCommands(matchingSlashCommands),
@@ -311,15 +452,43 @@ export function ComposerView({
     [groupedSlashCommands]
   );
 
-  useEffect(() => {
-    refreshSlashQuery();
-  }, [draft]);
+  const availablePlugins = useMemo<AssistantComposerPlugin[]>(
+    () =>
+      (state?.availablePlugins ?? []).filter(
+        (plugin) =>
+          !(state?.selectedPlugins ?? []).some(
+            (selected) => selected.pluginId === plugin.pluginId
+          )
+      ),
+    [state?.availablePlugins, state?.selectedPlugins]
+  );
+
+  const matchingPlugins = useMemo(() => {
+    const query = pluginQuery?.query?.trim().toLowerCase() ?? "";
+    if (!query) {
+      return availablePlugins;
+    }
+    return availablePlugins.filter((plugin) => {
+      const haystack = `${plugin.displayName} ${plugin.summary ?? ""}`.toLowerCase();
+      return haystack.includes(query);
+    });
+  }, [availablePlugins, pluginQuery]);
 
   useEffect(() => {
     if (selectedSlashIndex >= visibleSlashCommands.length) {
       setSelectedSlashIndex(visibleSlashCommands.length > 0 ? visibleSlashCommands.length - 1 : 0);
     }
   }, [selectedSlashIndex, visibleSlashCommands.length]);
+
+  useEffect(() => {
+    if (selectedPluginIndex >= matchingPlugins.length) {
+      setSelectedPluginIndex(matchingPlugins.length > 0 ? matchingPlugins.length - 1 : 0);
+    }
+  }, [matchingPlugins.length, selectedPluginIndex]);
+
+  useEffect(() => {
+    refreshAutocompleteQuery();
+  }, [state?.activeProviderId, state?.availablePlugins, state?.selectedPlugins]);
 
   useEffect(() => {
     const wasVoiceCapturing = wasVoiceCapturingRef.current;
@@ -397,11 +566,13 @@ export function ComposerView({
 
   useLayoutEffect(() => {
     reportComposerHeight();
-  }, [layoutMeasurementSignature, draft]);
+  }, [layoutMeasurementSignature, draft, slashQuery, pluginQuery, visibleSlashCommands.length, matchingPlugins.length]);
 
   useEffect(() => {
     const composer = composerRef.current;
-    if (!composer) return;
+    const composerContent = composerContentRef.current;
+    const slashMenu = slashMenuRef.current;
+    if (!composer && !composerContent && !slashMenu) return;
 
     if (typeof ResizeObserver === "undefined") {
       reportComposerHeight();
@@ -416,7 +587,15 @@ export function ComposerView({
       });
     });
 
-    observer.observe(composer);
+    if (composer) {
+      observer.observe(composer);
+    }
+    if (composerContent) {
+      observer.observe(composerContent);
+    }
+    if (slashMenu) {
+      observer.observe(slashMenu);
+    }
     const textarea = textareaRef.current;
     if (textarea) {
       observer.observe(textarea);
@@ -426,7 +605,7 @@ export function ComposerView({
       cancelAnimationFrame(frame);
       observer.disconnect();
     };
-  }, []);
+  }, [slashQuery, pluginQuery, visibleSlashCommands.length, matchingPlugins.length]);
 
   if (!state) {
     return (
@@ -456,6 +635,12 @@ export function ComposerView({
     controls.availability !== "ready" &&
     controls.availability !== "busy";
 
+  const flushDraftSync = () => {
+    window.clearTimeout(draftSyncTimerRef.current);
+    draftSyncTimerRef.current = 0;
+    onDispatchCommand("updatePromptDraft", { text: draftRef.current });
+  };
+
   const updateDraft = (value: string, { fromHistory = false }: { fromHistory?: boolean } = {}) => {
     if (!fromHistory && historyIndexRef.current !== -1) {
       // User edited recalled text — leave history browsing mode.
@@ -465,7 +650,13 @@ export function ComposerView({
     draftRef.current = value;
     lastLocalDraftRef.current = value;
     setDraft(value);
-    onDispatchCommand("updatePromptDraft", { text: value });
+    // Debounce the native bridge sync so rapid keystrokes don't cause
+    // a round-trip re-render storm (native echoes state back on each call).
+    window.clearTimeout(draftSyncTimerRef.current);
+    draftSyncTimerRef.current = window.setTimeout(() => {
+      onDispatchCommand("updatePromptDraft", { text: draftRef.current });
+      draftSyncTimerRef.current = 0;
+    }, 120);
   };
 
   const setNoteMode = (active: boolean) => {
@@ -479,6 +670,16 @@ export function ComposerView({
       detail: "Add a picture, file, or folder.",
       symbol: "plus",
     },
+    ...(!state.isCompactComposer
+      ? [
+          {
+            id: "screenshot" as const,
+            label: "Snipping tool",
+            detail: "Take a screenshot and attach it to this chat.",
+            symbol: "viewfinder",
+          },
+        ]
+      : []),
     ...(state.canOpenSkills
       ? [
           {
@@ -491,6 +692,22 @@ export function ComposerView({
                   } already attached.`
                 : "Browse skills and attach one to this thread.",
             symbol: "sparkles",
+          },
+        ]
+      : []),
+    ...(state.canOpenPlugins
+      ? [
+          {
+            id: "plugins" as const,
+            label: "Use plugins",
+            detail:
+              state.selectedPlugins.length > 0
+                ? `${state.selectedPlugins.length} plugin${
+                    state.selectedPlugins.length === 1 ? "" : "s"
+                  } selected for this message.`
+                : "Browse plugins and use installed ones with @.",
+            symbol: "shippingbox",
+            isActive: state.selectedPlugins.length > 0,
           },
         ]
       : []),
@@ -510,7 +727,7 @@ export function ComposerView({
   ];
 
   const hasHighlightedQuickAction =
-    state.isNoteModeActive || state.activeSkills.length > 0;
+    state.isNoteModeActive || state.activeSkills.length > 0 || state.selectedPlugins.length > 0;
 
   const quickActionsTriggerTitle =
     quickActions.length > 1
@@ -524,26 +741,79 @@ export function ComposerView({
     const current = draftRef.current;
     const before = current.slice(0, range.replaceFrom);
     const after = current.slice(range.replaceTo);
-    const nextDraft = before.endsWith(" ") && after.startsWith(" ")
-      ? before + after.slice(1)
-      : before + after;
+    let nextDraft = current;
+    let nextCursor = range.replaceFrom;
 
-    setNoteMode(command.mode === "note");
-    updateDraft(nextDraft);
+    if (command.behavior === "localMode") {
+      const trimmedAfter = after.startsWith(" ") ? after.slice(1) : after;
+      nextDraft = before.endsWith(" ") && trimmedAfter.startsWith(" ")
+        ? before + trimmedAfter.slice(1)
+        : before + trimmedAfter;
+      if (command.localMode === "note" || command.localMode === "chat") {
+        setNoteMode(command.localMode === "note");
+      }
+      updateDraft(nextDraft);
+    } else {
+      const insertedText = `${command.insertText} `;
+      const trimmedAfter = after.startsWith(" ") ? after.slice(1) : after;
+      nextDraft = before + insertedText + trimmedAfter;
+      nextCursor = before.length + insertedText.length;
+      updateDraft(nextDraft);
+    }
+
     setSlashQuery(null);
+    setPluginQuery(null);
     setSelectedSlashIndex(0);
+    setSelectedPluginIndex(0);
 
     requestAnimationFrame(() => {
       const textarea = textareaRef.current;
       if (!textarea) return;
-      const nextCursor = Math.min(range.replaceFrom, nextDraft.length);
+      const clampedCursor = Math.min(nextCursor, nextDraft.length);
+      textarea.focus();
+      textarea.setSelectionRange(clampedCursor, clampedCursor);
+      refreshAutocompleteQuery(nextDraft);
+    });
+  };
+
+  const applyPluginSelection = (plugin: AssistantComposerPlugin) => {
+    const range = pluginQuery;
+    if (!range) return;
+
+    const current = draftRef.current;
+    const before = current.slice(0, range.replaceFrom);
+    const after = current.slice(range.replaceTo);
+    const trimmedAfter = after.startsWith(" ") ? after.slice(1) : after;
+    const nextDraft = before.endsWith(" ") && trimmedAfter.startsWith(" ")
+      ? before + trimmedAfter.slice(1)
+      : before + trimmedAfter;
+    const nextCursor = Math.min(before.length, nextDraft.length);
+
+    updateDraft(nextDraft);
+    setSlashQuery(null);
+    setPluginQuery(null);
+    setSelectedSlashIndex(0);
+    setSelectedPluginIndex(0);
+    onDispatchCommand("selectComposerPlugin", {
+      pluginId: plugin.pluginId,
+      draftText: nextDraft,
+    });
+
+    requestAnimationFrame(() => {
+      const textarea = textareaRef.current;
+      if (!textarea) return;
       textarea.focus();
       textarea.setSelectionRange(nextCursor, nextCursor);
-      refreshSlashQuery(nextDraft);
+      refreshAutocompleteQuery(nextDraft);
     });
   };
 
   const sendPrompt = () => {
+    // Flush any pending debounced draft sync so native has the latest text.
+    if (draftSyncTimerRef.current) {
+      flushDraftSync();
+    }
+
     const { nextText, mode } = consumeLeadingSlashModeCommand(draftRef.current);
     if (mode) {
       setNoteMode(mode === "note");
@@ -561,7 +831,9 @@ export function ComposerView({
       historyIndexRef.current = -1;
       savedDraftRef.current = "";
       setSlashQuery(null);
+      setPluginQuery(null);
       setSelectedSlashIndex(0);
+      setSelectedPluginIndex(0);
       return;
     }
 
@@ -578,7 +850,9 @@ export function ComposerView({
     historyIndexRef.current = -1;
     savedDraftRef.current = "";
     setSlashQuery(null);
+    setPluginQuery(null);
     setSelectedSlashIndex(0);
+    setSelectedPluginIndex(0);
     onDispatchCommand("sendPrompt");
   };
 
@@ -633,6 +907,7 @@ export function ComposerView({
       className={`oa-react-composer${state.isCompactComposer ? " is-compact" : ""}`}
       ref={composerRef}
     >
+      <div className="oa-react-composer__content" ref={composerContentRef}>
       {state.activeSkills.length ? (
         <div className="oa-react-composer__chip-row">
           {state.activeSkills.map((skill) => (
@@ -650,6 +925,26 @@ export function ComposerView({
               <span>{skill.displayName}</span>
               <span className="oa-react-composer__chip-meta">
                 {skill.isMissing ? "Repair" : "Remove"}
+              </span>
+            </button>
+          ))}
+        </div>
+      ) : null}
+
+      {state.selectedPlugins.length ? (
+        <div className="oa-react-composer__chip-row">
+          {state.selectedPlugins.map((plugin) => (
+            <button
+              key={plugin.pluginId}
+              type="button"
+              className={`oa-react-composer__chip ${plugin.needsSetup ? "is-warning" : ""}`}
+              onClick={() =>
+                onDispatchCommand("removeComposerPlugin", { pluginId: plugin.pluginId })
+              }
+            >
+              <span>{`@${plugin.displayName}`}</span>
+              <span className="oa-react-composer__chip-meta">
+                {plugin.needsSetup ? "Needs setup" : "Remove"}
               </span>
             </button>
           ))}
@@ -689,36 +984,123 @@ export function ComposerView({
         </div>
       ) : null}
 
-      <div
-        className={`oa-react-composer__surface${isDropTarget ? " is-drop-target" : ""}${
-          isExternalDraftReveal ? " is-restored-draft" : ""
-        }`}
-        onDragEnter={(event) => {
-          if (!hasTransferFiles(event.dataTransfer?.types)) return;
-          event.preventDefault();
-          setIsDropTarget(true);
-        }}
-        onDragOver={(event) => {
-          if (!hasTransferFiles(event.dataTransfer?.types)) return;
-          event.preventDefault();
-          event.dataTransfer.dropEffect = "copy";
-          if (!isDropTarget) {
+      <div className="oa-react-composer__surface-stack">
+        {pluginQuery ? (
+          <div
+            ref={slashMenuRef}
+            className="oa-react-composer__slash-menu"
+            role="listbox"
+            aria-label="Composer plugins"
+          >
+            {matchingPlugins.length ? (
+              <div className="oa-react-composer__slash-group">
+                <div className="oa-react-composer__slash-group-title">Installed plugins</div>
+                {matchingPlugins.map((plugin, index) => {
+                  const isSelected = index === selectedPluginIndex;
+                  return (
+                    <button
+                      key={plugin.pluginId}
+                      type="button"
+                      className={`oa-react-composer__slash-item ${isSelected ? "is-selected" : ""}`}
+                      onMouseEnter={() => setSelectedPluginIndex(index)}
+                      onMouseDown={(event) => {
+                        event.preventDefault();
+                        applyPluginSelection(plugin);
+                      }}
+                    >
+                      <span className="oa-react-composer__slash-item-header">
+                        <span className="oa-react-composer__slash-item-title">
+                          @{plugin.displayName}
+                        </span>
+                      </span>
+                      <span className="oa-react-composer__slash-item-subtitle">
+                        {plugin.summary ||
+                          (plugin.needsSetup
+                            ? "Installed but setup is still needed."
+                            : "Installed plugin")}
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+            ) : (
+              <div className="oa-react-composer__slash-empty">
+                No installed plugins match that search.
+              </div>
+            )}
+          </div>
+        ) : slashQuery ? (
+          <div
+            ref={slashMenuRef}
+            className="oa-react-composer__slash-menu"
+            role="listbox"
+            aria-label="Composer commands"
+          >
+            {groupedSlashCommands.length ? (
+              groupedSlashCommands.map((group) => (
+                <div key={group.id} className="oa-react-composer__slash-group">
+                  <div className="oa-react-composer__slash-group-title">{group.label}</div>
+                  {group.commands.map((command) => {
+                    const index = visibleSlashCommands.findIndex((item) => item.id === command.id);
+                    const isSelected = index === selectedSlashIndex;
+                    return (
+                      <button
+                        key={command.id}
+                        type="button"
+                        className={`oa-react-composer__slash-item ${isSelected ? "is-selected" : ""}`}
+                        onMouseEnter={() => setSelectedSlashIndex(index)}
+                        onMouseDown={(event) => {
+                          event.preventDefault();
+                          applySlashCommand(command);
+                        }}
+                      >
+                        <span className="oa-react-composer__slash-item-header">
+                          <span className="oa-react-composer__slash-item-title">{command.label}</span>
+                        </span>
+                        <span className="oa-react-composer__slash-item-subtitle">
+                          {command.subtitle}
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+              ))
+            ) : (
+              <div className="oa-react-composer__slash-empty">No commands match that search.</div>
+            )}
+          </div>
+        ) : null}
+
+        <div
+          className={`oa-react-composer__surface${isDropTarget ? " is-drop-target" : ""}${
+            isExternalDraftReveal ? " is-restored-draft" : ""
+          }`}
+          onDragEnter={(event) => {
+            if (!hasTransferFiles(event.dataTransfer?.types)) return;
+            event.preventDefault();
             setIsDropTarget(true);
-          }
-        }}
-        onDragLeave={(event) => {
-          if (event.currentTarget.contains(event.relatedTarget as Node | null)) {
-            return;
-          }
-          setIsDropTarget(false);
-        }}
-        onDrop={(event) => {
-          if (!event.dataTransfer?.files?.length) return;
-          event.preventDefault();
-          setIsDropTarget(false);
-          void attachFiles(event.dataTransfer.files);
-        }}
-      >
+          }}
+          onDragOver={(event) => {
+            if (!hasTransferFiles(event.dataTransfer?.types)) return;
+            event.preventDefault();
+            event.dataTransfer.dropEffect = "copy";
+            if (!isDropTarget) {
+              setIsDropTarget(true);
+            }
+          }}
+          onDragLeave={(event) => {
+            if (event.currentTarget.contains(event.relatedTarget as Node | null)) {
+              return;
+            }
+            setIsDropTarget(false);
+          }}
+          onDrop={(event) => {
+            if (!event.dataTransfer?.files?.length) return;
+            event.preventDefault();
+            setIsDropTarget(false);
+            void attachFiles(event.dataTransfer.files);
+          }}
+        >
         {isExternalDraftReveal ? (
           <div className="oa-react-composer__restore-indicator">Restored draft</div>
         ) : null}
@@ -754,9 +1136,17 @@ export function ComposerView({
           placeholder={state.placeholder}
           onChange={(event) => {
             const value = event.target.value;
-            updateDraft(value);
-            requestAnimationFrame(() => {
-              refreshSlashQuery(value);
+            const resolvedLinks = resolveComposerPluginLinks(
+              value,
+              [...(state.availablePlugins ?? []), ...(state.selectedPlugins ?? [])]
+            );
+            updateDraft(resolvedLinks.text);
+            refreshAutocompleteQuery(resolvedLinks.text);
+            resolvedLinks.pluginIds.forEach((pluginId) => {
+              onDispatchCommand("selectComposerPlugin", {
+                pluginId,
+                draftText: resolvedLinks.text,
+              });
             });
           }}
           onPaste={(event) => {
@@ -778,6 +1168,40 @@ export function ComposerView({
             void attachFiles(attachmentFiles);
           }}
           onKeyDown={(event) => {
+            if (pluginQuery && event.key === "Escape") {
+              event.preventDefault();
+              setPluginQuery(null);
+              setSelectedPluginIndex(0);
+              return;
+            }
+
+            if (pluginQuery && matchingPlugins.length > 0) {
+              if (event.key === "ArrowDown") {
+                event.preventDefault();
+                setSelectedPluginIndex((current) =>
+                  current >= matchingPlugins.length - 1 ? 0 : current + 1
+                );
+                return;
+              }
+
+              if (event.key === "ArrowUp") {
+                event.preventDefault();
+                setSelectedPluginIndex((current) =>
+                  current <= 0 ? matchingPlugins.length - 1 : current - 1
+                );
+                return;
+              }
+
+              if (event.key === "Enter" || event.key === "Tab") {
+                event.preventDefault();
+                applyPluginSelection(
+                  matchingPlugins[selectedPluginIndex] ?? matchingPlugins[0]
+                );
+                return;
+              }
+
+            }
+
             if (slashQuery && visibleSlashCommands.length > 0) {
               if (event.key === "ArrowDown") {
                 event.preventDefault();
@@ -859,45 +1283,8 @@ export function ComposerView({
               }
             }
           }}
-          onClick={() => refreshSlashQuery()}
-          onKeyUp={() => refreshSlashQuery()}
-          onSelect={() => refreshSlashQuery()}
+          onSelect={() => refreshAutocompleteQuery()}
         />
-
-        {slashQuery ? (
-          <div className="oa-react-composer__slash-menu" role="listbox" aria-label="Composer commands">
-            {groupedSlashCommands.length ? (
-              groupedSlashCommands.map((group) => (
-                <div key={group.id} className="oa-react-composer__slash-group">
-                  <div className="oa-react-composer__slash-group-title">{group.label}</div>
-                  {group.commands.map((command) => {
-                    const index = visibleSlashCommands.findIndex((item) => item.id === command.id);
-                    const isSelected = index === selectedSlashIndex;
-                    return (
-                      <button
-                        key={command.id}
-                        type="button"
-                        className={`oa-react-composer__slash-item ${isSelected ? "is-selected" : ""}`}
-                        onMouseEnter={() => setSelectedSlashIndex(index)}
-                        onMouseDown={(event) => {
-                          event.preventDefault();
-                          applySlashCommand(command);
-                        }}
-                      >
-                        <span className="oa-react-composer__slash-item-title">{command.label}</span>
-                        <span className="oa-react-composer__slash-item-subtitle">
-                          {command.subtitle}
-                        </span>
-                      </button>
-                    );
-                  })}
-                </div>
-              ))
-            ) : (
-              <div className="oa-react-composer__slash-empty">No commands match that search.</div>
-            )}
-          </div>
-        ) : null}
 
         <div className="oa-react-composer__toolbar">
           <div className="oa-react-composer__toolbar-left">
@@ -991,14 +1378,27 @@ export function ComposerView({
 
           <div className="oa-react-composer__toolbar-right">
             {showStopButton ? (
-              <button
-                type="button"
-                className="oa-react-composer__action oa-react-composer__action--danger"
-                disabled={!canCancelActiveTurn}
-                onClick={() => onDispatchCommand("cancelActiveTurn")}
-              >
-                {stopButtonLabel}
-              </button>
+              <>
+                {activity.canSteerActiveTurn ? (
+                  <button
+                    type="button"
+                    className={`oa-react-composer__send ${state.canSend ? "is-enabled" : ""}`}
+                    onClick={sendPrompt}
+                    disabled={!state.canSend}
+                    title="Steer active turn"
+                  >
+                    <ComposerIcon symbol="arrow.up" />
+                  </button>
+                ) : null}
+                <button
+                  type="button"
+                  className="oa-react-composer__action oa-react-composer__action--danger"
+                  disabled={!canCancelActiveTurn}
+                  onClick={() => onDispatchCommand("cancelActiveTurn")}
+                >
+                  {stopButtonLabel}
+                </button>
+              </>
             ) : (
               <>
                 {activity.showStopVoicePlayback ? (
@@ -1041,6 +1441,8 @@ export function ComposerView({
               </>
             )}
           </div>
+          </div>
+        </div>
         </div>
       </div>
     </div>

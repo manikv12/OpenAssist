@@ -19,6 +19,8 @@ struct CoreLogicSmokeTests {
         testRecognitionTuningDeterminism()
         testInsertionRetryPolicyBounds()
         testTextInserterClipboardPaths()
+        testWindowsAppDictationRouting()
+        testTextInserterTypingFirstPolicy()
 
         print("✅ Core logic smoke tests passed")
     }
@@ -333,5 +335,191 @@ struct CoreLogicSmokeTests {
         let transientTypingRetryOutcome = TextInserter.insertForSmokeTests("hello", copyToClipboard: false, runtime: transientTypingRetryRuntime)
         check(transientTypingRetryOutcome.result == .pasted, "Typing fallback should run when transient clipboard paste fails")
         check(transientTypingRetryCalls == 1, "Typing fallback should execute exactly once after transient clipboard failure")
+    }
+
+    private static func testTextInserterTypingFirstPolicy() {
+        var mirroredClipboardWrites = 0
+        var typingFirstCallOrder: [String] = []
+        let typingFirstRuntime = TextInserter.Runtime(
+            insertDirect: { _ in
+                typingFirstCallOrder.append("direct")
+                return false
+            },
+            insertTyping: { _ in
+                typingFirstCallOrder.append("typing")
+                return true
+            },
+            writeClipboard: { _ in
+                typingFirstCallOrder.append("write")
+                mirroredClipboardWrites += 1
+                return .success(changeCount: 71)
+            },
+            sendSpecialPaste: {
+                typingFirstCallOrder.append("paste")
+                return true
+            },
+            log: { _ in },
+            pasteRetryBackoff: [0]
+        )
+
+        let typingFirstOutcome = TextInserter.insertForSmokeTests(
+            "hello",
+            copyToClipboard: true,
+            insertionPolicy: .preferTypingFirst,
+            runtime: typingFirstRuntime
+        )
+        check(typingFirstOutcome.result == .pasted, "Typing-first policy should succeed when typing succeeds")
+        check(
+            typingFirstCallOrder == ["typing", "write"],
+            "Typing-first policy should type before clipboard mirroring and skip paste entirely"
+        )
+        check(mirroredClipboardWrites == 1, "Typing-first success should mirror clipboard exactly once when enabled")
+
+        var nonClipboardCallOrder: [String] = []
+        let nonClipboardTypingRuntime = TextInserter.Runtime(
+            insertDirect: { _ in
+                nonClipboardCallOrder.append("direct")
+                return false
+            },
+            insertTyping: { _ in
+                nonClipboardCallOrder.append("typing")
+                return true
+            },
+            writeClipboard: { _ in
+                nonClipboardCallOrder.append("write")
+                return .success(changeCount: 72)
+            },
+            sendSpecialPaste: {
+                nonClipboardCallOrder.append("paste")
+                return true
+            },
+            log: { _ in },
+            pasteRetryBackoff: [0]
+        )
+
+        let nonClipboardTypingOutcome = TextInserter.insertForSmokeTests(
+            "hello",
+            copyToClipboard: false,
+            insertionPolicy: .preferTypingFirst,
+            runtime: nonClipboardTypingRuntime
+        )
+        check(
+            nonClipboardTypingOutcome.result == .pasted,
+            "Typing-first policy should not depend on clipboard mode when typing succeeds"
+        )
+        check(
+            nonClipboardCallOrder == ["typing"],
+            "Typing-first policy without clipboard mirroring should avoid clipboard and paste work"
+        )
+
+        var failureCallOrder: [String] = []
+        let failureRuntime = TextInserter.Runtime(
+            insertDirect: { _ in
+                failureCallOrder.append("direct")
+                return false
+            },
+            insertTyping: { _ in
+                failureCallOrder.append("typing")
+                return false
+            },
+            writeClipboard: { _ in
+                failureCallOrder.append("write")
+                return .success(changeCount: 73)
+            },
+            sendSpecialPaste: {
+                failureCallOrder.append("paste")
+                return true
+            },
+            log: { _ in },
+            pasteRetryBackoff: [0]
+        )
+
+        let failureOutcome = TextInserter.insertForSmokeTests(
+            "hello",
+            copyToClipboard: true,
+            insertionPolicy: .preferTypingFirst,
+            runtime: failureRuntime
+        )
+        check(
+            failureOutcome.result == .notInserted,
+            "Typing-first policy should report not-inserted when typing fails"
+        )
+        check(
+            failureCallOrder == ["typing"],
+            "Typing-first failure should stop after typing and leave final fallback to the app layer"
+        )
+
+        let failureStatusMessage = statusMessage(for: failureOutcome, retriesRemaining: 0)
+        check(
+            presentedFailureStatusMessage(failureStatusMessage, copyToClipboard: true) == "Paste unavailable — copied to clipboard [typing-unavailable]",
+            "Typing-first failure should keep clipboard-enabled final status wording"
+        )
+        check(
+            presentedFailureStatusMessage(failureStatusMessage, copyToClipboard: false) == "Paste unavailable — transcript is in Open Assist History [typing-unavailable]",
+            "Typing-first failure should keep history final status wording when clipboard mirroring is off"
+        )
+    }
+
+    private static func testWindowsAppDictationRouting() {
+        check(
+            TextInserter.insertionPolicy(
+                forFrontmostBundleIdentifier: "com.microsoft.rdc.macos",
+                insertionContext: .dictation
+            ) == .preferTypingFirst,
+            "Windows App dictation should prefer typing-first insertion"
+        )
+        check(
+            TextInserter.typingStrategy(
+                forFrontmostBundleIdentifier: "com.microsoft.rdc.macos",
+                insertionContext: .dictation
+            ) == .appleScriptKeystrokePreferred,
+            "Windows App dictation should use the Windows-safe typing strategy"
+        )
+        check(
+            TextInserter.insertionPolicy(
+                forFrontmostBundleIdentifier: "com.microsoft.rdc.macos",
+                insertionContext: .standard
+            ) == .standard,
+            "Non-dictation insertion should keep standard policy for Windows App"
+        )
+        check(
+            TextInserter.typingStrategy(
+                forFrontmostBundleIdentifier: "com.microsoft.rdc.macos",
+                insertionContext: .standard
+            ) == .unicodeEvents,
+            "Non-dictation insertion should keep the standard typing path"
+        )
+    }
+
+    private static func statusMessage(for outcome: TextInserter.InsertOutcome, retriesRemaining: Int) -> String? {
+        switch InsertionRetryPolicy.plan(
+            for: outcome.result,
+            retriesRemaining: retriesRemaining,
+            debugStatus: outcome.debugStatus
+        ) {
+        case .retry:
+            return nil
+        case let .complete(statusMessage):
+            return statusMessage
+        }
+    }
+
+    private static func presentedFailureStatusMessage(_ statusMessage: String?, copyToClipboard: Bool) -> String? {
+        guard let statusMessage else { return nil }
+        guard statusMessage.hasPrefix("Paste unavailable") else {
+            return statusMessage
+        }
+
+        if copyToClipboard {
+            return statusMessage.replacingOccurrences(
+                of: "Paste unavailable",
+                with: "Paste unavailable — copied to clipboard"
+            )
+        }
+
+        return statusMessage.replacingOccurrences(
+            of: "Paste unavailable",
+            with: "Paste unavailable — transcript is in Open Assist History"
+        )
     }
 }

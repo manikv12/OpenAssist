@@ -7,6 +7,7 @@ import { CollapsibleImageGallery } from "./CollapsibleImageGallery";
 function UserMessageInner({ message }: { message: ChatMessage }) {
   const text = message.text || "";
   const showText = text.trim().length > 0;
+  const selectedPlugins = message.selectedPlugins || [];
   const transitionClass = message.transitionState
     ? ` is-${message.transitionState}`
     : "";
@@ -71,7 +72,26 @@ function UserMessageInner({ message }: { message: ChatMessage }) {
           inline
         />
 
-        {showText && <div className="user-bubble">{text}</div>}
+        {(showText || selectedPlugins.length > 0) && (
+          <div className="user-bubble">
+            <div className="user-bubble-body">
+              {showText ? <span className="user-bubble-text">{text}</span> : null}
+              {selectedPlugins.length ? (
+                <span className="user-plugin-chip-row">
+                  {selectedPlugins.map((plugin) => (
+                    <span
+                      key={plugin.pluginId}
+                      className={`user-plugin-chip${plugin.needsSetup ? " is-warning" : ""}`}
+                    >
+                      <AppIcon symbol="plug" size={12} strokeWidth={2.1} />
+                      <span>{plugin.displayName}</span>
+                    </span>
+                  ))}
+                </span>
+              ) : null}
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );

@@ -23,7 +23,7 @@ enum CodexAssistantRuntimeError: Error, LocalizedError {
     }
 }
 
-private struct CodexResponsePayload: @unchecked Sendable {
+struct CodexResponsePayload: @unchecked Sendable {
     let raw: Any
 }
 
@@ -38,6 +38,72 @@ struct ClaudeCodeInvocationResult: Equatable, Sendable {
 private struct CLIAttachmentMaterialization: Sendable {
     let directoryURL: URL
     let promptContext: String
+}
+
+private enum CopilotBackgroundTaskTool: String, Sendable {
+    case task
+    case readAgent = "read_agent"
+    case writeAgent = "write_agent"
+    case listAgents = "list_agents"
+}
+
+private struct CopilotBackgroundTaskRecord: Equatable, Sendable {
+    let id: String
+    var sessionID: String?
+    var toolCallID: String?
+    var description: String
+    var statusLabel: String
+    var agentType: String?
+    var prompt: String?
+    var latestIntent: String?
+    var recentActivity: [String]
+    var result: String?
+    var error: String?
+    var startedAt: Date
+    var updatedAt: Date
+    var completedAt: Date?
+    var sourceSlashCommand: String?
+
+    var detailText: String? {
+        Self.firstNonEmpty(
+            latestIntent,
+            recentActivity.first,
+            prompt,
+            result,
+            error
+        )
+    }
+
+    var subagentStatus: SubagentStatus {
+        switch Self.normalizedTaskStatus(statusLabel) {
+        case "completed", "success", "succeeded":
+            return .completed
+        case "failed", "error", "errored", "cancelled", "canceled", "killed":
+            return .errored
+        case "waiting", "pending":
+            return .waiting
+        default:
+            return .running
+        }
+    }
+
+    private static func normalizedTaskStatus(_ rawValue: String) -> String {
+        rawValue
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "-", with: "_")
+            .replacingOccurrences(of: " ", with: "_")
+            .lowercased()
+    }
+
+    private static func firstNonEmpty(_ candidates: String?...) -> String? {
+        for candidate in candidates {
+            if let trimmed = candidate?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !trimmed.isEmpty {
+                return trimmed
+            }
+        }
+        return nil
+    }
 }
 
 private struct ClaudeQueuedPromptContext: Sendable {
@@ -247,6 +313,7 @@ final class CodexAssistantRuntime {
     var onTranscript: (@Sendable (AssistantTranscriptEntry) -> Void)?
     var onTranscriptMutation: (@Sendable (AssistantTranscriptMutation) -> Void)?
     var onTimelineMutation: (@Sendable (AssistantTimelineMutation) -> Void)?
+    var onActivityItemUpdate: (@Sendable (AssistantActivityItem) -> Void)?
     var onHUDUpdate: (@Sendable (AssistantHUDState) -> Void)?
     var onPlanUpdate: (@Sendable (_ sessionID: String?, _ entries: [AssistantPlanEntry]) -> Void)?
     var onToolCallUpdate: (@Sendable ([AssistantToolCallState]) -> Void)?
@@ -283,6 +350,7 @@ final class CodexAssistantRuntime {
     private var activeSessionCWD: String?
     private var activeTurnID: String?
     private var currentTurnAttachments: [AssistantAttachment] = []
+    private var selectedCodexPluginIDs: Set<String> = []
     private var preferredModelID: String?
     private var preferredSubagentModelID: String?
     private var currentCodexPath: String?
@@ -335,6 +403,9 @@ final class CodexAssistantRuntime {
     private var pendingCopilotFallbackReply: String?
     private var pendingCopilotCompletionParams: [String: Any]?
     private var pendingCopilotCompletionEmit: DispatchWorkItem?
+    private var pendingCopilotSlashCommand: AssistantSubmittedSlashCommand?
+    private var pendingCopilotSlashCommandActivityID: String?
+    private var pendingCopilotSessionTransitionCommand: AssistantSubmittedSlashCommand?
     private var pendingClaudeCompletionEmit: DispatchWorkItem?
     private var lastCopilotSessionUpdateTime: CFAbsoluteTime = 0
     private var planTimelineID: String?
@@ -360,6 +431,8 @@ final class CodexAssistantRuntime {
 
     // Subagent tracking
     private var activeSubagents: [String: SubagentState] = [:]
+    private var copilotBackgroundTasksByID: [String: CopilotBackgroundTaskRecord] = [:]
+    private var copilotBackgroundTaskIDByToolCallID: [String: String] = [:]
     private let browserUseService: AssistantBrowserUseService
     private let appActionService: AssistantAppActionService
     private let computerUseService: AssistantComputerUseService
@@ -396,6 +469,13 @@ final class CodexAssistantRuntime {
         backend == .claudeCode
             && activeClaudeProcess?.isRunning == true
             && activeClaudeStdinHandle != nil
+    }
+
+    var canSteerActiveTurn: Bool {
+        backend != .claudeCode
+            && backend != .copilot
+            && backend != .ollamaLocal
+            && activeTurnID != nil
     }
 
     init(
@@ -644,11 +724,15 @@ final class CodexAssistantRuntime {
 
         let requestedModelID = preferredModelID ?? self.preferredModelID
         let loggedCWD = cwd?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty ?? "none"
-        CrashReporter.logInfo("Assistant runtime requesting thread/start model=\(requestedModelID ?? "server-default") cwd=\(loggedCWD)")
+        let threadStartParameters = await threadStartParams(cwd: cwd, modelID: requestedModelID)
+        let instructionChars = (threadStartParameters["instructions"] as? String)?.count ?? 0
+        CrashReporter.logInfo(
+            "Assistant runtime requesting thread/start model=\(requestedModelID ?? "server-default") cwd=\(loggedCWD) instructionChars=\(instructionChars) activeSkills=\(activeSkills.count)"
+        )
 
         let response = try await sendRequest(
             method: "thread/start",
-            params: await threadStartParams(cwd: cwd, modelID: requestedModelID)
+            params: threadStartParameters
         )
 
         guard let payload = response.raw as? [String: Any],
@@ -805,13 +889,20 @@ final class CodexAssistantRuntime {
             return
         }
         try await ensureTransport()
+        let requestedModelID = preferredModelID ?? self.preferredModelID
+        let loggedCWD = cwd?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty ?? "none"
+        let threadResumeParameters = await threadResumeParams(
+            threadID: activeSessionID,
+            cwd: cwd,
+            modelID: requestedModelID
+        )
+        let instructionChars = (threadResumeParameters["instructions"] as? String)?.count ?? 0
+        CrashReporter.logInfo(
+            "Assistant runtime requesting thread/resume threadID=\(activeSessionID) model=\(requestedModelID ?? "server-default") cwd=\(loggedCWD) instructionChars=\(instructionChars) activeSkills=\(activeSkills.count)"
+        )
         _ = try await sendRequest(
             method: "thread/resume",
-            params: await threadResumeParams(
-                threadID: activeSessionID,
-                cwd: cwd,
-                modelID: preferredModelID ?? self.preferredModelID
-            )
+            params: threadResumeParameters
         )
         activeSessionCWD = cwd?.nonEmpty
         onHealthUpdate?(makeHealth(
@@ -826,7 +917,9 @@ final class CodexAssistantRuntime {
         preferredModelID: String? = nil,
         modelSupportsImageInput: Bool = true,
         resumeContext: String? = nil,
-        memoryContext: String? = nil
+        memoryContext: String? = nil,
+        submittedSlashCommand: AssistantSubmittedSlashCommand? = nil,
+        structuredInputItems: [AssistantCodexPromptInputItem] = []
     ) async throws {
         let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty || !attachments.isEmpty else { return }
@@ -876,7 +969,8 @@ final class CodexAssistantRuntime {
                 attachments: attachments,
                 preferredModelID: preferredModelID ?? self.preferredModelID,
                 resumeContext: resumeContext,
-                memoryContext: memoryContext
+                memoryContext: memoryContext,
+                submittedSlashCommand: submittedSlashCommand
             )
             return
         }
@@ -913,7 +1007,8 @@ final class CodexAssistantRuntime {
                 attachmentContext: attachmentContext,
                 modelID: requestedModelID,
                 resumeContext: resumeContext,
-                memoryContext: memoryContext
+                memoryContext: memoryContext,
+                structuredInputItems: structuredInputItems
             )
         )
 
@@ -1010,6 +1105,36 @@ final class CodexAssistantRuntime {
         allowsProposedPlanForActiveTurn = false
         updateHUD(phase: .idle, title: "Cancelled", detail: nil)
         onTurnCompletion?(.interrupted)
+    }
+
+    func steerActiveTurn(
+        prompt: String,
+        attachments: [AssistantAttachment] = []
+    ) async throws {
+        guard let activeSessionID, let activeTurnID else {
+            throw CodexAssistantRuntimeError.sessionUnavailable
+        }
+
+        var inputItems: [[String: Any]] = []
+        for attachment in attachments.filter(\.isImage) {
+            inputItems.append(attachment.toInputItem())
+        }
+        if !prompt.isEmpty {
+            inputItems.append(["type": "text", "text": prompt])
+        }
+
+        CrashReporter.logInfo("Assistant runtime requesting turn/steer threadID=\(activeSessionID) turnID=\(activeTurnID) promptChars=\(prompt.count)")
+
+        _ = try await sendRequest(
+            method: "turn/steer",
+            params: [
+                "threadId": activeSessionID,
+                "input": inputItems,
+                "expectedTurnId": activeTurnID
+            ]
+        )
+
+        CrashReporter.logInfo("Assistant runtime turn/steer accepted turnID=\(activeTurnID)")
     }
 
     func respondToPermissionRequest(optionID: String) async {
@@ -1211,7 +1336,7 @@ final class CodexAssistantRuntime {
         }
     }
 
-    private func ensureTransport(cwd: String? = nil) async throws {
+    func ensureTransport(cwd: String? = nil) async throws {
         if backend == .claudeCode {
             throw CodexAssistantRuntimeError.runtimeUnavailable("Claude Code uses the headless CLI flow, not the ACP transport.")
         }
@@ -1956,10 +2081,13 @@ final class CodexAssistantRuntime {
             let imageTitle = result.success
                 ? "Screenshot from \(displayName)"
                 : "Last screenshot before \(displayName) failed"
+            // Use the activityID as a stable identifier so re-emitting for the same
+            // tool call upserts (replaces) the existing timeline item instead of
+            // creating duplicates.
             onTimelineMutation?(
                 .upsert(
                     .system(
-                        id: "tool-screenshot-\(UUID().uuidString)",
+                        id: "tool-screenshot-\(activityID)",
                         sessionID: activeSessionID,
                         turnID: activeTurnID,
                         text: imageTitle,
@@ -2434,7 +2562,7 @@ final class CodexAssistantRuntime {
         }
     }
 
-    private func sendRequest(method: String, params: [String: Any]) async throws -> CodexResponsePayload {
+    func sendRequest(method: String, params: [String: Any]) async throws -> CodexResponsePayload {
         guard let transport else {
             throw CodexAssistantRuntimeError.runtimeUnavailable("\(backend.displayName) is not running yet.")
         }
@@ -2562,6 +2690,7 @@ final class CodexAssistantRuntime {
             }
             clearSubagents()
             claudeStreamingToolUseInputs.removeAll()
+            claudeStreamingAwaitingToolExecution = false
             onPlanUpdate?(firstNonEmptyString(params["threadId"] as? String, activeSessionID), [])
             resetStreamingTimelineState()
             updateHUD(phase: .thinking, title: "Thinking", detail: nil)
@@ -2914,7 +3043,8 @@ final class CodexAssistantRuntime {
     }
 
     private func clearSubagents(publish: Bool = true) {
-        guard !activeSubagents.isEmpty else {
+        let hadPublishedAgents = !activeSubagents.isEmpty || !copilotBackgroundTasksByID.isEmpty
+        guard hadPublishedAgents else {
             if publish {
                 onSubagentUpdate?([])
             }
@@ -2922,13 +3052,18 @@ final class CodexAssistantRuntime {
         }
 
         activeSubagents.removeAll()
+        copilotBackgroundTasksByID.removeAll()
+        copilotBackgroundTaskIDByToolCallID.removeAll()
         if publish {
             onSubagentUpdate?([])
         }
     }
 
     private func publishSubagents() {
-        let sorted = activeSubagents.values.sorted { a, b in
+        let publishedBackgroundTasks = copilotBackgroundTasksByID.values.map {
+            subagentState(from: $0)
+        }
+        let sorted = (Array(activeSubagents.values) + publishedBackgroundTasks).sorted { a, b in
             if a.status.isActive != b.status.isActive { return a.status.isActive }
             let lhsDate = a.lastEventAt ?? .distantPast
             let rhsDate = b.lastEventAt ?? .distantPast
@@ -2936,6 +3071,22 @@ final class CodexAssistantRuntime {
             return a.id < b.id
         }
         onSubagentUpdate?(Array(sorted))
+    }
+
+    private func subagentState(from task: CopilotBackgroundTaskRecord) -> SubagentState {
+        let detail = task.detailText
+        return SubagentState(
+            id: "copilot-task-\(task.id)",
+            parentThreadID: task.sessionID ?? activeSessionID,
+            threadID: nil,
+            nickname: task.description,
+            role: task.agentType,
+            status: task.subagentStatus,
+            prompt: detail,
+            startedAt: task.startedAt,
+            updatedAt: task.updatedAt,
+            endedAt: task.completedAt
+        )
     }
 
     private func handleRateLimitsUpdated(_ params: [String: Any]) {
@@ -3051,6 +3202,7 @@ final class CodexAssistantRuntime {
             proposedPlanBuffer = ""
             allowsProposedPlanForActiveTurn = false
             claudeStreamingToolUseInputs.removeAll()
+            claudeStreamingAwaitingToolExecution = false
             return
         }
 
@@ -3064,6 +3216,7 @@ final class CodexAssistantRuntime {
         proposedPlanBuffer = ""
         allowsProposedPlanForActiveTurn = context.allowsProposedPlan
         claudeStreamingToolUseInputs.removeAll()
+        claudeStreamingAwaitingToolExecution = false
         turnToolCallCount = 0
         repeatedCommandTracker.reset()
     }
@@ -3243,34 +3396,7 @@ final class CodexAssistantRuntime {
         case "item/tool/call":
             await handleDynamicToolCall(id: id, params: params)
         case "mcpServer/elicitation/request":
-            let message = firstNonEmptyString(
-                params["message"] as? String,
-                params["prompt"] as? String,
-                "Codex needs more information."
-            ) ?? "Codex needs more information."
-            onTranscript?(AssistantTranscriptEntry(role: .permission, text: message, emphasis: true))
-            let request = AssistantPermissionRequest(
-                id: approvalRequestID(from: id),
-                sessionID: params["threadId"] as? String ?? activeSessionID ?? "",
-                toolTitle: "Need more information",
-                toolKind: "userInput",
-                rationale: message,
-                options: [],
-                rawPayloadSummary: nil
-            )
-            onTimelineMutation?(
-                .upsert(
-                    .permission(
-                        id: "permission-\(approvalRequestID(from: id))",
-                        sessionID: request.sessionID,
-                        turnID: activeTurnID,
-                        request: request,
-                        createdAt: Date(),
-                        source: .runtime
-                    )
-                )
-            )
-            onStatusMessage?(message)
+            await presentMCPElicitationRequest(id: id, params: params)
         default:
             onStatusMessage?("Codex requested an unsupported action: \(method)")
         }
@@ -3540,6 +3666,230 @@ final class CodexAssistantRuntime {
         updateHUD(phase: .waitingForPermission, title: "Input Needed", detail: request.toolTitle)
     }
 
+    private func presentMCPElicitationRequest(
+        id: JSONRPCRequestID,
+        params: [String: Any]
+    ) async {
+        let requestID = approvalRequestID(from: id)
+        if pendingPermissionContext?.request.id == requestID {
+            return
+        }
+
+        let rawMessage = firstNonEmptyString(
+            params["message"] as? String,
+            params["prompt"] as? String,
+            "Codex needs more information."
+        ) ?? "Codex needs more information."
+        let message = Self.sanitizedMCPElicitationText(rawMessage)
+        let sessionID = params["threadId"] as? String ?? activeSessionID ?? ""
+        let requestedSchema = (params["requestedSchema"] as? [String: Any])
+            ?? (params["requested_schema"] as? [String: Any])
+        let mode = firstNonEmptyString(params["mode"] as? String)?.lowercased()
+        let url = firstNonEmptyString(params["url"] as? String)
+        let title = Self.mcpElicitationTitle(for: message)
+
+        if mode == "url", let url {
+            let options = [
+                AssistantPermissionOption(id: "accept", title: "I Opened It", kind: "userInput", isDefault: true),
+                AssistantPermissionOption(id: "decline", title: "Decline", kind: "userInput", isDefault: false),
+                AssistantPermissionOption(id: "cancel", title: "Cancel Request", kind: "userInput", isDefault: false)
+            ]
+            let request = AssistantPermissionRequest(
+                id: requestID,
+                sessionID: sessionID,
+                toolTitle: title,
+                toolKind: "userInput",
+                rationale: "\(message)\n\(url)",
+                options: options,
+                rawPayloadSummary: url
+            )
+
+            pendingPermissionContext = PendingPermissionContext(request: request) { [weak self] optionID in
+                guard let self else { return }
+                let action: String
+                switch optionID {
+                case "accept":
+                    action = "accept"
+                case "decline":
+                    action = "decline"
+                default:
+                    action = "cancel"
+                }
+
+                do {
+                    try await self.transport?.sendResponse(
+                        id: id,
+                        result: Self.simpleMCPElicitationConfirmationResponse(
+                            action: action,
+                            requestedSchema: requestedSchema
+                        )
+                    )
+                } catch {
+                    await MainActor.run {
+                        self.onStatusMessage?(error.localizedDescription)
+                    }
+                }
+            } cancelHandler: { [weak self] in
+                guard let self else { return }
+                do {
+                    try await self.transport?.sendResponse(id: id, result: ["action": "cancel"])
+                } catch {
+                    await MainActor.run {
+                        self.onStatusMessage?(error.localizedDescription)
+                    }
+                }
+            }
+
+            onPermissionRequest?(request)
+            onTranscript?(AssistantTranscriptEntry(role: .permission, text: message, emphasis: true))
+            onTimelineMutation?(
+                .upsert(
+                    .permission(
+                        id: "permission-\(request.id)",
+                        sessionID: request.sessionID,
+                        turnID: activeTurnID,
+                        request: request,
+                        createdAt: Date(),
+                        source: .runtime
+                    )
+                )
+            )
+            onStatusMessage?(message)
+            updateHUD(phase: .waitingForPermission, title: "Input Needed", detail: url)
+            return
+        }
+
+        if Self.isSimpleMCPElicitationConfirmation(
+            message: message,
+            requestedSchema: requestedSchema
+        ) {
+            let options = [
+                AssistantPermissionOption(id: "accept", title: "Allow", kind: "userInput", isDefault: true),
+                AssistantPermissionOption(id: "decline", title: "Decline", kind: "userInput", isDefault: false),
+                AssistantPermissionOption(id: "cancel", title: "Cancel", kind: "userInput", isDefault: false)
+            ]
+            let request = AssistantPermissionRequest(
+                id: requestID,
+                sessionID: sessionID,
+                toolTitle: title,
+                toolKind: "userInput",
+                rationale: message,
+                options: options,
+                rawPayloadSummary: compactDetail(message)
+            )
+
+            pendingPermissionContext = PendingPermissionContext(request: request) { [weak self] optionID in
+                guard let self else { return }
+                let action: String
+                switch optionID {
+                case "accept":
+                    action = "accept"
+                case "decline":
+                    action = "decline"
+                default:
+                    action = "cancel"
+                }
+
+                do {
+                    try await self.transport?.sendResponse(id: id, result: ["action": action])
+                } catch {
+                    await MainActor.run {
+                        self.onStatusMessage?(error.localizedDescription)
+                    }
+                }
+            } cancelHandler: { [weak self] in
+                guard let self else { return }
+                do {
+                    try await self.transport?.sendResponse(id: id, result: ["action": "cancel"])
+                } catch {
+                    await MainActor.run {
+                        self.onStatusMessage?(error.localizedDescription)
+                    }
+                }
+            }
+
+            onPermissionRequest?(request)
+            onTranscript?(AssistantTranscriptEntry(role: .permission, text: message, emphasis: true))
+            onTimelineMutation?(
+                .upsert(
+                    .permission(
+                        id: "permission-\(request.id)",
+                        sessionID: request.sessionID,
+                        turnID: activeTurnID,
+                        request: request,
+                        createdAt: Date(),
+                        source: .runtime
+                    )
+                )
+            )
+            onStatusMessage?(message)
+            updateHUD(phase: .waitingForPermission, title: "Approve Access", detail: title)
+            return
+        }
+
+        let questions = Self.parseClaudeCodeElicitationQuestions(
+            message: message,
+            requestedSchema: requestedSchema
+        )
+        let request = AssistantPermissionRequest(
+            id: requestID,
+            sessionID: sessionID,
+            toolTitle: title,
+            toolKind: "userInput",
+            rationale: message,
+            options: [],
+            userInputQuestions: questions,
+            rawPayloadSummary: compactDetail(message)
+        )
+
+        pendingPermissionContext = PendingPermissionContext(request: request) { _ in
+        } submitAnswersHandler: { [weak self] answers in
+            guard let self else { return }
+            var response: [String: Any] = ["action": "accept"]
+            let content = Self.buildClaudeCodeElicitationContent(
+                from: answers,
+                requestedSchema: requestedSchema
+            )
+            if !content.isEmpty {
+                response["content"] = content
+            }
+
+            do {
+                try await self.transport?.sendResponse(id: id, result: response)
+            } catch {
+                await MainActor.run {
+                    self.onStatusMessage?(error.localizedDescription)
+                }
+            }
+        } cancelHandler: { [weak self] in
+            guard let self else { return }
+            do {
+                try await self.transport?.sendResponse(id: id, result: ["action": "cancel"])
+            } catch {
+                await MainActor.run {
+                    self.onStatusMessage?(error.localizedDescription)
+                }
+            }
+        }
+
+        onPermissionRequest?(request)
+        onTranscript?(AssistantTranscriptEntry(role: .permission, text: message, emphasis: true))
+        onTimelineMutation?(
+            .upsert(
+                .permission(
+                    id: "permission-\(request.id)",
+                    sessionID: request.sessionID,
+                    turnID: activeTurnID,
+                    request: request,
+                    createdAt: Date(),
+                    source: .runtime
+                )
+            )
+        )
+        onStatusMessage?(message)
+        updateHUD(phase: .waitingForPermission, title: "Input Needed", detail: title)
+    }
+
     private func handleDynamicToolCall(id: JSONRPCRequestID, params: [String: Any]) async {
         let tool = dynamicToolName(from: params) ?? "Tool"
         let activityID = dynamicToolRequestActivityID(from: params)
@@ -3551,7 +3901,7 @@ final class CodexAssistantRuntime {
                     id: id,
                     result: dynamicToolResponseResult(
                         contentItems: [[
-                            "type": "inputText",
+                            "type": "input_text",
                             "text": "Open Assist does not support the dynamic tool `\(tool)` yet."
                         ]],
                         success: false
@@ -3688,7 +4038,7 @@ final class CodexAssistantRuntime {
                     try await self.transport?.sendResponse(
                         id: id,
                         result: self.dynamicToolResponseResult(
-                            contentItems: [["type": "inputText", "text": message]],
+                            contentItems: [["type": "input_text", "text": message]],
                             success: false
                         )
                     )
@@ -3704,7 +4054,7 @@ final class CodexAssistantRuntime {
                     try await self.transport?.sendResponse(
                         id: id,
                         result: self.dynamicToolResponseResult(
-                            contentItems: [["type": "inputText", "text": message]],
+                            contentItems: [["type": "input_text", "text": message]],
                             success: false
                         )
                     )
@@ -3721,7 +4071,7 @@ final class CodexAssistantRuntime {
                 try await self.transport?.sendResponse(
                     id: id,
                     result: self.dynamicToolResponseResult(
-                        contentItems: [["type": "inputText", "text": message]],
+                        contentItems: [["type": "input_text", "text": message]],
                         success: false
                     )
                 )
@@ -3891,9 +4241,17 @@ final class CodexAssistantRuntime {
         case "active":
             let flags = status["activeFlags"] as? [String] ?? []
             if flags.contains("waitingOnApproval") {
-                updateHUD(phase: .waitingForPermission, title: "Waiting for approval", detail: nil)
+                if pendingPermissionContext != nil {
+                    updateHUD(phase: .waitingForPermission, title: "Waiting for approval", detail: nil)
+                } else {
+                    updateHUD(phase: .acting, title: "Working", detail: nil)
+                }
             } else if flags.contains("waitingOnUserInput") {
-                updateHUD(phase: .waitingForPermission, title: "Waiting for input", detail: nil)
+                if pendingPermissionContext?.request.toolKind == "userInput" {
+                    updateHUD(phase: .waitingForPermission, title: "Waiting for input", detail: nil)
+                } else {
+                    updateHUD(phase: .acting, title: "Working", detail: nil)
+                }
             } else {
                 updateHUD(phase: .thinking, title: "Working", detail: nil)
             }
@@ -3991,7 +4349,7 @@ final class CodexAssistantRuntime {
             try await transport?.sendResponse(
                 id: id,
                 result: dynamicToolResponseResult(
-                    contentItems: [["type": "inputText", "text": message]],
+                    contentItems: [["type": "input_text", "text": message]],
                     success: false
                 )
             )
@@ -4240,6 +4598,9 @@ final class CodexAssistantRuntime {
             allowsProposedPlanForActiveTurn = false
             activeTurnID = nil
             pendingCopilotFallbackReply = nil
+            pendingCopilotSlashCommand = nil
+            pendingCopilotSlashCommandActivityID = nil
+            pendingCopilotSessionTransitionCommand = nil
             activeClaudeQueuedPromptContexts.removeAll()
             currentTurnAttachments = []
             currentTurnHadSuccessfulImageGeneration = false
@@ -4601,6 +4962,8 @@ final class CodexAssistantRuntime {
             guard let self else { return }
             let latestActivity = force ? activity : (self.liveActivities[activityID] ?? activity)
             self.onTimelineMutation?(.upsert(.activity(latestActivity)))
+            self.onActivityItemUpdate?(latestActivity)
+            Task { await AssistantTaskProgressStore.shared.upsert(latestActivity) }
             self.lastActivityTimelineEmitTimeByID[activityID] = CFAbsoluteTimeGetCurrent()
             self.pendingActivityTimelineEmitByID[activityID] = nil
         }
@@ -4709,13 +5072,18 @@ final class CodexAssistantRuntime {
         )
     }
 
-    private func emitTimelineSystemMessage(_ text: String, emphasis: Bool = false) {
+    private func emitTimelineSystemMessage(
+        _ text: String,
+        sessionID: String? = nil,
+        turnID: String? = nil,
+        emphasis: Bool = false
+    ) {
         guard let text = text.nonEmpty else { return }
         onTimelineMutation?(
             .upsert(
                 .system(
-                    sessionID: activeSessionID,
-                    turnID: activeTurnID,
+                    sessionID: sessionID ?? activeSessionID,
+                    turnID: turnID ?? activeTurnID,
                     text: text,
                     createdAt: Date(),
                     emphasis: emphasis,
@@ -4770,6 +5138,9 @@ final class CodexAssistantRuntime {
         commentaryBuffer = ""
         pendingCommentaryDeltaBuffer = ""
         pendingCopilotFallbackReply = nil
+        pendingCopilotSlashCommand = nil
+        pendingCopilotSlashCommandActivityID = nil
+        pendingCopilotSessionTransitionCommand = nil
         planTimelineID = nil
         planStartedAt = nil
         proposedPlanBuffer = ""
@@ -4963,7 +5334,7 @@ final class CodexAssistantRuntime {
         case .browserAutomation:
             return "Used the browser."
         case .mcpToolCall:
-            return "Used an MCP tool."
+            return "Used \(title)."
         case .dynamicToolCall:
             switch title {
             case "Browser Use":
@@ -5126,7 +5497,13 @@ final class CodexAssistantRuntime {
     }
 
     func dynamicToolNamesForTesting(mode: AssistantInteractionMode) -> [String] {
-        toolExecutor.dynamicToolNames(for: mode, backend: backend)
+        dynamicToolSpecs(for: mode).compactMap { spec in
+            spec["name"] as? String
+        }
+    }
+
+    func setSelectedCodexPluginIDsForTesting(_ pluginIDs: [String]) {
+        setSelectedCodexPluginIDs(pluginIDs)
     }
 
     func dynamicToolRequiresExplicitConfirmationForTesting(
@@ -5466,7 +5843,7 @@ final class CodexAssistantRuntime {
             try await transport?.sendResponse(
                 id: id,
                 result: dynamicToolResponseResult(
-                    contentItems: [["type": "inputText", "text": message]],
+                    contentItems: [["type": "input_text", "text": message]],
                     success: false
                 )
             )
@@ -5577,7 +5954,11 @@ final class CodexAssistantRuntime {
         case .mcpToolCall:
             let server = item["server"] as? String ?? "MCP"
             let tool = item["tool"] as? String ?? "tool"
-            return "\(server): \(tool)"
+            return mcpToolCallPresentation(
+                server: server,
+                tool: tool,
+                arguments: item["arguments"]
+            ).title
         case .dynamicToolCall:
             return dynamicToolDisplayName(dynamicToolName(from: item))
         case .subagent:
@@ -5587,6 +5968,90 @@ final class CodexAssistantRuntime {
         case .other:
             return "Tool"
         }
+    }
+
+    private func mcpToolCallPresentation(
+        server rawServer: String,
+        tool rawTool: String,
+        arguments: Any?
+    ) -> (title: String, detail: String?, hudDetail: String?) {
+        let server = rawServer.trimmingCharacters(in: .whitespacesAndNewlines)
+        let tool = rawTool.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedServer = server.lowercased()
+            .replacingOccurrences(of: "_", with: "-")
+            .replacingOccurrences(of: " ", with: "-")
+        let normalizedTool = tool.lowercased()
+            .replacingOccurrences(of: "-", with: "_")
+            .replacingOccurrences(of: " ", with: "_")
+
+        if normalizedServer.contains("computer-use") {
+            let appName = mcpToolArgumentString(arguments, key: "app")
+            switch normalizedTool {
+            case "list_apps":
+                return (
+                    title: "Computer Use",
+                    detail: "Checking which Mac apps are available",
+                    hudDetail: "Checking your apps"
+                )
+            case "get_app_state":
+                if let appName {
+                    return (
+                        title: appName,
+                        detail: "Checking \(appName)",
+                        hudDetail: "Looking at \(appName)"
+                    )
+                }
+                return (
+                    title: "Computer Use",
+                    detail: "Checking the current app",
+                    hudDetail: "Looking at the app"
+                )
+            default:
+                if let appName {
+                    return (
+                        title: appName,
+                        detail: "Using Computer Use in \(appName)",
+                        hudDetail: "Working in \(appName)"
+                    )
+                }
+                return (
+                    title: "Computer Use",
+                    detail: humanizedClaudeStreamingToolFragment(tool) ?? tool,
+                    hudDetail: "Using Computer Use"
+                )
+            }
+        }
+
+        let serverDisplay = humanizedClaudeStreamingToolFragment(server)
+            ?? assistantDisplayPluginName(pluginName: server)
+        let toolDisplay = humanizedClaudeStreamingToolFragment(tool)
+            ?? assistantDisplayPluginName(pluginName: tool)
+        return (
+            title: "\(serverDisplay): \(toolDisplay)",
+            detail: compactDetail(extractString(arguments)),
+            hudDetail: "Using \(toolDisplay)"
+        )
+    }
+
+    private func mcpToolArgumentString(
+        _ arguments: Any?,
+        key: String
+    ) -> String? {
+        if let dictionary = arguments as? [String: Any] {
+            return extractString(dictionary[key])?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .nonEmpty
+        }
+
+        if let rawString = arguments as? String,
+           let data = rawString.data(using: .utf8),
+           let dictionary = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
+            return extractString(dictionary[key])?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .nonEmpty
+        }
+
+        return nil
     }
 
     private func dynamicToolDisplayName(_ rawTool: String?) -> String {
@@ -5723,7 +6188,7 @@ final class CodexAssistantRuntime {
                 try await transport?.sendResponse(
                     id: id,
                     result: dynamicToolResponseResult(
-                        contentItems: [["type": "inputText", "text": message]],
+                        contentItems: [["type": "input_text", "text": message]],
                         success: false
                     )
                 )
@@ -5915,13 +6380,18 @@ final class CodexAssistantRuntime {
             let toolName = parts.count > 2
                 ? humanizedClaudeStreamingToolFragment(String(parts[2])) ?? "Tool"
                 : humanizedClaudeStreamingToolFragment(rawName) ?? "Tool"
+            let presentation = mcpToolCallPresentation(
+                server: serverName,
+                tool: toolName,
+                arguments: input ?? [:]
+            )
             return AssistantToolCallState(
                 id: id,
-                title: "\(serverName): \(toolName)",
+                title: presentation.title,
                 kind: "mcpToolCall",
                 status: "inProgress",
-                detail: serializedDetail,
-                hudDetail: "Using \(toolName)"
+                detail: presentation.detail ?? serializedDetail,
+                hudDetail: presentation.hudDetail ?? "Using \(toolName)"
             )
         }
 
@@ -6137,15 +6607,18 @@ final class CodexAssistantRuntime {
                 detail: detail
             )
         case "mcpToolCall":
-            let server = item["server"] as? String ?? "MCP"
-            let tool = item["tool"] as? String ?? "tool"
+            let presentation = mcpToolCallPresentation(
+                server: item["server"] as? String ?? "MCP",
+                tool: item["tool"] as? String ?? "tool",
+                arguments: item["arguments"]
+            )
             return AssistantToolCallState(
                 id: id,
-                title: "\(server): \(tool)",
+                title: presentation.title,
                 kind: type,
                 status: status,
-                detail: compactDetail(extractString(item["arguments"])),
-                hudDetail: "Using \(tool)"
+                detail: presentation.detail ?? compactDetail(extractString(item["arguments"])),
+                hudDetail: presentation.hudDetail ?? "Using \(presentation.title)"
             )
         case "dynamicToolCall":
             let rawTool = dynamicToolName(from: item) ?? "Tool"
@@ -6277,12 +6750,68 @@ final class CodexAssistantRuntime {
     private var proposedPlanBuffer: String = ""
     private var allowsProposedPlanForActiveTurn = false
     private var claudeStreamingToolUseInputs: [Int: (id: String, name: String, inputJSON: String)] = [:]
+    /// When true, the most recent message_delta had stop_reason "tool_use",
+    /// meaning the CLI will execute tools before producing the next assistant
+    /// message.  While this flag is set, message_stop must NOT schedule a
+    /// deferred completion because the turn is still in progress.
+    private var claudeStreamingAwaitingToolExecution = false
 
     /// Session IDs that have been detached. Notifications from these sessions are dropped.
     private var detachedSessionIDs: Set<String> = []
 
+    private static let codexComputerUsePluginIDs: Set<String> = [
+        "computer-use@openai-bundled",
+        "computer-use@openai-curated"
+    ]
+
+    private static let localDesktopAutomationToolNames: Set<String> = [
+        AssistantAppActionToolDefinition.name,
+        AssistantBrowserUseToolDefinition.name,
+        AssistantComputerUseToolDefinition.name,
+        AssistantComputerBatchToolDefinition.name,
+        "screen_capture",
+        "window_list",
+        "window_capture",
+        "list_displays",
+        "ui_inspect",
+        "ui_click",
+        "ui_type",
+        "ui_press_key"
+    ]
+
+    func setSelectedCodexPluginIDs(_ pluginIDs: [String]) {
+        selectedCodexPluginIDs = Set(
+            pluginIDs.compactMap(Self.normalizedCodexPluginID)
+        )
+    }
+
+    private static func normalizedCodexPluginID(_ rawValue: String?) -> String? {
+        rawValue?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .nonEmpty
+    }
+
+    private var shouldPreferCodexComputerUsePlugin: Bool {
+        backend == .codex
+            && !selectedCodexPluginIDs.isDisjoint(with: Self.codexComputerUsePluginIDs)
+    }
+
     private func dynamicToolSpecs(for mode: AssistantInteractionMode) -> [[String: Any]] {
-        toolExecutor.dynamicToolSpecs(for: mode, backend: backend)
+        var specs = toolExecutor.dynamicToolSpecs(for: mode, backend: backend)
+        guard shouldPreferCodexComputerUsePlugin else {
+            return specs
+        }
+
+        specs.removeAll { spec in
+            guard let name = (spec["name"] as? String)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .nonEmpty else {
+                return false
+            }
+            return Self.localDesktopAutomationToolNames.contains(name)
+        }
+        return specs
     }
 
     private func dynamicToolName(from payload: [String: Any]) -> String? {
@@ -6463,7 +6992,20 @@ final class CodexAssistantRuntime {
 
         guard !resolvedSkills.isEmpty else { return nil }
 
-        let lines = resolvedSkills.map { skill in
+        struct ActiveSkillInstructionEntry {
+            let skill: AssistantSkillDescriptor
+            let fullMarkdown: String
+        }
+
+        let entries = resolvedSkills.map { skill in
+            ActiveSkillInstructionEntry(
+                skill: skill,
+                fullMarkdown: (try? String(contentsOf: skill.skillFileURL, encoding: .utf8)) ?? ""
+            )
+        }
+
+        let lines = entries.map { entry in
+            let skill = entry.skill
             let summary = skill.summaryText
                 .replacingOccurrences(
                     of: #"\s+"#,
@@ -6471,18 +7013,54 @@ final class CodexAssistantRuntime {
                     options: .regularExpression
                 )
                 .trimmingCharacters(in: .whitespacesAndNewlines)
+            let suggestedPrompt = skill.defaultPrompt?
+                .replacingOccurrences(
+                    of: #"\s+"#,
+                    with: " ",
+                    options: .regularExpression
+                )
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .nonEmpty
+            let promptLine = suggestedPrompt.map { prompt in
+                "\n  Suggested prompt: \(prompt)"
+            } ?? ""
             return """
             - `\(skill.name)`: \(summary)
-              Skill file: `\(skill.skillFilePath)`
+              Skill file: `\(skill.skillFilePath)`\(promptLine)
+            """
+        }
+
+        let skillBlocks = entries.map { entry in
+            let loadedMarkdown = entry.fullMarkdown
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .nonEmpty
+                ?? "SKILL.md could not be loaded from disk for this attached skill."
+            return """
+            <skill>
+            Name: \(entry.skill.name)
+            Path: \(entry.skill.skillFilePath)
+
+            \(loadedMarkdown)
+            </skill>
             """
         }
 
         return """
         # Active Skills
 
-        These skills are attached to the current thread. Use them when they fit the user's request, and read the local `SKILL.md` file before using a skill in depth.
+        These skills are attached to the current thread. Treat a thread-attached skill as explicit user intent, not a weak hint.
+        If the user asks to use "this skill" or clearly points at an attached skill, open that local `SKILL.md` file before answering in depth.
+        If exactly one skill is attached and the request could reasonably match it, prefer that skill before taking a generic path.
+        If an attached skill looks unrelated, say that plainly and ask a short clarifying question instead of silently ignoring it.
+        The full attached skill files are injected below in `<skill>` blocks. Follow those injected instructions the same way you would follow an explicitly selected skill.
+
+        ## Attached Skill List
 
         \(lines.joined(separator: "\n"))
+
+        ## Injected Skill Files
+
+        \(skillBlocks.joined(separator: "\n\n"))
         """
     }
 
@@ -6556,7 +7134,8 @@ final class CodexAssistantRuntime {
         attachmentContext: String? = nil,
         modelID: String?,
         resumeContext: String? = nil,
-        memoryContext: String? = nil
+        memoryContext: String? = nil,
+        structuredInputItems: [AssistantCodexPromptInputItem] = []
     ) -> [String: Any] {
         var inputItems: [[String: Any]] = []
         // Add attachment items first so the model sees them before the prompt text
@@ -6573,6 +7152,7 @@ final class CodexAssistantRuntime {
         if let memoryContext = memoryContext?.trimmingCharacters(in: .whitespacesAndNewlines), !memoryContext.isEmpty {
             inputItems.append(["type": "text", "text": memoryContext])
         }
+        inputItems.append(contentsOf: structuredInputItems.map { $0.toJSON() })
         if !prompt.isEmpty {
             inputItems.append(["type": "text", "text": prompt])
         }
@@ -7515,7 +8095,18 @@ final class CodexAssistantRuntime {
             payload["sessionId"] as? String,
             activeSessionID
         )
-        switch (payload["type"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        let payloadType = (payload["type"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+
+        // Any incoming payload except "result" (which handles its own
+        // completion flow) means the CLI is still producing output and a
+        // previously scheduled deferred completion must be invalidated.
+        if payloadType != "result" {
+            cancelPendingClaudeCompletion()
+        }
+
+        switch payloadType {
         case "system":
             updateHUD(
                 phase: .thinking,
@@ -8334,6 +8925,7 @@ final class CodexAssistantRuntime {
     private func handleClaudeCodeStreamEvent(_ event: [String: Any], sessionID: String?) {
         switch (event["type"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
         case "message_start":
+            claudeStreamingAwaitingToolExecution = false
             updateHUD(
                 phase: .thinking,
                 title: interactionMode.normalizedForActiveUse == .plan ? "Planning" : "Thinking",
@@ -8436,13 +9028,22 @@ final class CodexAssistantRuntime {
                     delta["stopReason"] as? String
                )?.lowercased() {
                 if stopReason == "tool_use" {
+                    claudeStreamingAwaitingToolExecution = true
                     updateHUD(phase: .acting, title: "Using tools", detail: nil)
                 } else if ["end_turn", "stop_sequence", "max_tokens"].contains(stopReason) {
+                    claudeStreamingAwaitingToolExecution = false
                     scheduleClaudeDeferredCompletion()
                 }
             }
         case "message_stop":
-            scheduleClaudeDeferredCompletion()
+            // Only schedule deferred completion when the message ended
+            // naturally (end_turn / max_tokens).  When the CLI is about to
+            // execute tools (stop_reason was "tool_use"), more events will
+            // follow — scheduling a completion here would kill the turn
+            // before the tool results and follow-up response arrive.
+            if !claudeStreamingAwaitingToolExecution {
+                scheduleClaudeDeferredCompletion()
+            }
         default:
             return
         }
@@ -9067,6 +9668,167 @@ final class CodexAssistantRuntime {
         return line
     }
 
+    private nonisolated static func mcpElicitationTitle(for message: String) -> String {
+        let trimmed = sanitizedMCPElicitationText(message)
+        guard !trimmed.isEmpty else { return "Codex needs input" }
+
+        if let match = trimmed.range(
+            of: #"(?i)^allow codex to use (.+?)\?$"#,
+            options: .regularExpression
+        ) {
+            let matched = String(trimmed[match])
+            if let prefixRange = matched.range(
+                of: #"(?i)^allow codex to use "#,
+                options: .regularExpression
+            ) {
+                let remainder = matched[prefixRange.upperBound...]
+                    .trimmingCharacters(in: CharacterSet(charactersIn: "?").union(.whitespacesAndNewlines))
+                if !remainder.isEmpty {
+                    return sanitizedMCPElicitationText(remainder)
+                }
+            }
+        }
+
+        return "Codex needs input"
+    }
+
+    private nonisolated static func isSimpleMCPElicitationConfirmation(
+        message: String,
+        requestedSchema: [String: Any]?
+    ) -> Bool {
+        let normalized = sanitizedMCPElicitationText(message)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        guard normalized.hasSuffix("?") else { return false }
+        guard requestedSchema == nil || isTrivialMCPElicitationConfirmationSchema(requestedSchema) else {
+            return false
+        }
+
+        return normalized.hasPrefix("allow ")
+            || normalized.hasPrefix("do you want ")
+            || normalized.hasPrefix("would you like ")
+            || normalized.hasPrefix("can i ")
+            || normalized.hasPrefix("can codex ")
+            || normalized.hasPrefix("should i ")
+    }
+
+    private nonisolated static func isTrivialMCPElicitationConfirmationSchema(
+        _ requestedSchema: [String: Any]?
+    ) -> Bool {
+        guard let requestedSchema else { return true }
+
+        if let properties = requestedSchema["properties"] as? [String: Any], !properties.isEmpty {
+            guard properties.count == 1, let (key, rawSchema) = properties.first else {
+                return false
+            }
+            let schema = rawSchema as? [String: Any] ?? [:]
+            let normalizedKey = key
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .replacingOccurrences(of: "_", with: "")
+                .replacingOccurrences(of: "-", with: "")
+                .lowercased()
+            let optionValues = claudeCodeElicitationOptionValues(for: schema)
+            let type = firstNonEmptyClaudeString(schema["type"] as? String)?.lowercased()
+
+            if type == "boolean" {
+                return true
+            }
+            if !optionValues.isEmpty {
+                return optionValues.count <= 2
+            }
+
+            return [
+                "response",
+                "answer",
+                "approval",
+                "approve",
+                "confirmation",
+                "confirm",
+                "decision",
+                "choice",
+                "action"
+            ].contains(normalizedKey)
+        }
+
+        let type = firstNonEmptyClaudeString(requestedSchema["type"] as? String)?.lowercased()
+        return type == nil || type == "object" || type == "boolean" || type == "string"
+    }
+
+    private nonisolated static func simpleMCPElicitationConfirmationResponse(
+        action: String,
+        requestedSchema: [String: Any]?
+    ) -> [String: Any] {
+        var response: [String: Any] = ["action": action]
+        guard action != "cancel" else { return response }
+        if let content = simpleMCPElicitationConfirmationContent(
+            action: action,
+            requestedSchema: requestedSchema
+        ), !content.isEmpty {
+            response["content"] = content
+        }
+        return response
+    }
+
+    private nonisolated static func simpleMCPElicitationConfirmationContent(
+        action: String,
+        requestedSchema: [String: Any]?
+    ) -> [String: Any]? {
+        guard let requestedSchema else { return nil }
+
+        let fallbackValue = action == "accept" ? "Allow" : "Decline"
+        guard let properties = requestedSchema["properties"] as? [String: Any], !properties.isEmpty else {
+            return ["response": fallbackValue]
+        }
+        guard properties.count == 1, let (key, rawSchema) = properties.first else {
+            return nil
+        }
+
+        let schema = rawSchema as? [String: Any] ?? [:]
+        let answerValue = simpleMCPElicitationConfirmationAnswerValue(
+            action: action,
+            schema: schema,
+            fallback: fallbackValue
+        )
+        return [key: coerceClaudeCodeScalarValue(answerValue, schema: schema)]
+    }
+
+    private nonisolated static func simpleMCPElicitationConfirmationAnswerValue(
+        action: String,
+        schema: [String: Any],
+        fallback: String
+    ) -> String {
+        let optionValues = claudeCodeElicitationOptionValues(for: schema)
+        guard !optionValues.isEmpty else { return fallback }
+
+        let positiveTerms = ["allow", "accept", "approved", "approve", "yes", "true", "ok"]
+        let negativeTerms = ["decline", "deny", "denied", "reject", "rejected", "no", "false", "cancel"]
+        let preferredTerms = action == "accept" ? positiveTerms : negativeTerms
+
+        for option in optionValues {
+            let normalized = option
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+            if preferredTerms.contains(where: { normalized == $0 || normalized.contains($0) }) {
+                return option
+            }
+        }
+
+        if optionValues.count == 2 {
+            return action == "accept" ? optionValues[0] : optionValues[1]
+        }
+
+        return fallback
+    }
+
+    private nonisolated static func sanitizedMCPElicitationText(_ text: String) -> String {
+        let directionalMarks = CharacterSet(charactersIn:
+            "\u{061C}\u{200E}\u{200F}\u{202A}\u{202B}\u{202C}\u{202D}\u{202E}\u{2066}\u{2067}\u{2068}\u{2069}"
+        )
+        let filteredScalars = text.unicodeScalars.filter { !directionalMarks.contains($0) }
+        return String(String.UnicodeScalarView(filteredScalars))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     private nonisolated static func parseClaudeCodeElicitationQuestions(
         message: String,
         requestedSchema: [String: Any]?
@@ -9555,6 +10317,7 @@ final class CodexAssistantRuntime {
             bootstrapSessionID = nil
             onSessionChange?(sessionID)
             onTranscript?(AssistantTranscriptEntry(role: .system, text: backend.startedSessionMessage, emphasis: true))
+            emitPendingCopilotSessionTransitionLandingIfNeeded(sessionID: sessionID)
         } else {
             bootstrapSessionID = sessionID
         }
@@ -9600,6 +10363,7 @@ final class CodexAssistantRuntime {
                     onSessionChange?(sessionID)
                     if announce {
                         onTranscript?(AssistantTranscriptEntry(role: .system, text: backend.loadedSessionMessage(sessionID), emphasis: true))
+                        emitPendingCopilotSessionTransitionLandingIfNeeded(sessionID: sessionID)
                     }
                     onHealthUpdate?(makeHealth(availability: .ready, summary: backend.connectedSummary))
                     updateHUD(phase: .idle, title: "Session ready", detail: nil)
@@ -9623,6 +10387,7 @@ final class CodexAssistantRuntime {
         onSessionChange?(sessionID)
         if announce {
             onTranscript?(AssistantTranscriptEntry(role: .system, text: backend.loadedSessionMessage(sessionID), emphasis: true))
+            emitPendingCopilotSessionTransitionLandingIfNeeded(sessionID: sessionID)
         }
         onHealthUpdate?(makeHealth(availability: .ready, summary: backend.connectedSummary))
         updateHUD(phase: .idle, title: "Session ready", detail: nil)
@@ -9720,7 +10485,8 @@ final class CodexAssistantRuntime {
         attachments: [AssistantAttachment],
         preferredModelID: String?,
         resumeContext: String?,
-        memoryContext: String?
+        memoryContext: String?,
+        submittedSlashCommand: AssistantSubmittedSlashCommand?
     ) async throws {
         let resolvedCWD = resolvedCopilotWorkingDirectory(activeSessionCWD)
         try await refreshCopilotCurrentSessionConfiguration(
@@ -9736,6 +10502,10 @@ final class CodexAssistantRuntime {
         turnToolCallCount = 0
         repeatedCommandTracker.reset()
         activeTurnID = activeTurnID ?? "copilot-turn-\(UUID().uuidString)"
+        prepareCopilotSlashCommandTracking(
+            submittedSlashCommand,
+            sessionID: sessionID
+        )
         updateHUD(phase: .streaming, title: "Starting", detail: nil)
         onHealthUpdate?(makeHealth(availability: .active, summary: backend.activeSummary))
 
@@ -9783,6 +10553,601 @@ final class CodexAssistantRuntime {
             .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty }
             .joined(separator: "\n\n")
         return [["type": "text", "text": combined]]
+    }
+
+    private func prepareCopilotSlashCommandTracking(
+        _ submission: AssistantSubmittedSlashCommand?,
+        sessionID: String
+    ) {
+        pendingCopilotSlashCommand = submission
+        pendingCopilotSlashCommandActivityID = nil
+        pendingCopilotSessionTransitionCommand = nil
+
+        guard let submission, submission.isTrackable else { return }
+
+        switch submission.trackingMode {
+        case .state:
+            emitTimelineSystemMessage(
+                "Submitted `\(submission.submittedText)`.",
+                sessionID: sessionID
+            )
+            if copilotCommandMayChangeSession(submission.id) {
+                pendingCopilotSessionTransitionCommand = submission
+            }
+
+        case .work:
+            emitTimelineSystemMessage(
+                "Started `\(submission.submittedText)`.",
+                sessionID: sessionID
+            )
+            startCopilotSlashCommandActivity(
+                submission,
+                sessionID: sessionID
+            )
+
+        case .localMode, .ignored:
+            break
+        }
+    }
+
+    private func startCopilotSlashCommandActivity(
+        _ submission: AssistantSubmittedSlashCommand,
+        sessionID: String
+    ) {
+        let activityID = "copilot-slash-\(UUID().uuidString)"
+        pendingCopilotSlashCommandActivityID = activityID
+        let detail = compactDetail(
+            firstNonEmptyString(
+                submission.remainderText,
+                submission.descriptor.subtitle
+            )
+        )
+        let title = "Copilot \(submission.label)"
+
+        toolCalls[activityID] = AssistantToolCallState(
+            id: activityID,
+            title: title,
+            kind: "dynamicToolCall",
+            status: "running",
+            detail: detail,
+            hudDetail: "Running \(submission.label)"
+        )
+        publishToolCallsSnapshot()
+
+        let activity = AssistantActivityItem(
+            id: activityID,
+            sessionID: sessionID,
+            turnID: activeTurnID,
+            kind: .dynamicToolCall,
+            title: title,
+            status: .running,
+            friendlySummary: "Started \(submission.label).",
+            rawDetails: detail,
+            startedAt: Date(),
+            updatedAt: Date(),
+            source: .runtime
+        )
+        liveActivities[activityID] = activity
+        emitActivityTimelineUpdate(activity, force: true)
+    }
+
+    private func copilotCommandMayChangeSession(_ commandID: String) -> Bool {
+        switch commandID {
+        case "new", "clear", "restart", "resume":
+            return true
+        default:
+            return false
+        }
+    }
+
+    private func emitPendingCopilotSessionTransitionLandingIfNeeded(
+        sessionID: String
+    ) {
+        guard let submission = pendingCopilotSessionTransitionCommand else { return }
+        emitTimelineSystemMessage(
+            "Copilot continued `\(submission.commandOnlyText)` in this session.",
+            sessionID: sessionID
+        )
+        pendingCopilotSessionTransitionCommand = nil
+    }
+
+    private func updatePendingCopilotSlashCommandActivityDetail(
+        _ detail: String?
+    ) {
+        guard let activityID = pendingCopilotSlashCommandActivityID else { return }
+        let compacted = compactDetail(detail)
+
+        if var state = toolCalls[activityID] {
+            state.detail = compacted ?? state.detail
+            if let compacted {
+                state.hudDetail = compacted
+            }
+            toolCalls[activityID] = state
+            publishToolCallsSnapshot()
+        }
+
+        if var activity = liveActivities[activityID] {
+            activity.rawDetails = compacted ?? activity.rawDetails
+            activity.updatedAt = Date()
+            liveActivities[activityID] = activity
+            emitActivityTimelineUpdate(activity, force: true)
+        }
+    }
+
+    private func copilotBackgroundTaskTool(
+        from update: [String: Any]
+    ) -> CopilotBackgroundTaskTool? {
+        let rawInput = update["rawInput"] as? [String: Any] ?? [:]
+        let candidates = [
+            update["title"] as? String,
+            rawInput["tool"] as? String,
+            rawInput["name"] as? String,
+            rawInput["agentTool"] as? String,
+            rawInput["taskTool"] as? String
+        ]
+
+        for candidate in candidates {
+            switch normalizedCopilotTaskToolName(candidate) {
+            case CopilotBackgroundTaskTool.task.rawValue:
+                return .task
+            case CopilotBackgroundTaskTool.readAgent.rawValue:
+                return .readAgent
+            case CopilotBackgroundTaskTool.writeAgent.rawValue:
+                return .writeAgent
+            case CopilotBackgroundTaskTool.listAgents.rawValue:
+                return .listAgents
+            default:
+                continue
+            }
+        }
+
+        return nil
+    }
+
+    private func normalizedCopilotTaskToolName(_ rawValue: String?) -> String? {
+        rawValue?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "-", with: "_")
+            .replacingOccurrences(of: " ", with: "_")
+            .lowercased()
+            .nonEmpty
+    }
+
+    private func handleCopilotBackgroundTaskToolUpdate(
+        _ update: [String: Any],
+        sessionID: String?,
+        isInitial _: Bool
+    ) -> Bool {
+        guard let tool = copilotBackgroundTaskTool(from: update) else { return false }
+
+        let records = copilotBackgroundTaskRecords(
+            from: update,
+            tool: tool,
+            sessionID: sessionID
+        )
+
+        if records.isEmpty {
+            updatePendingCopilotSlashCommandActivityDetail(
+                firstNonEmptyString(
+                    copilotOutputText(from: update),
+                    extractString((update["rawInput"] as? [String: Any])?["description"]),
+                    extractString(update["rawInput"])
+                )
+            )
+            return true
+        }
+
+        for record in records {
+            upsertCopilotBackgroundTask(
+                record,
+                sourceTool: tool
+            )
+        }
+
+        if let summary = copilotBackgroundTaskSummary() {
+            updatePendingCopilotSlashCommandActivityDetail(summary)
+        }
+        publishSubagents()
+        return true
+    }
+
+    private func upsertCopilotBackgroundTask(
+        _ incoming: CopilotBackgroundTaskRecord,
+        sourceTool: CopilotBackgroundTaskTool
+    ) {
+        let previous = copilotBackgroundTasksByID[incoming.id]
+        var merged = previous ?? incoming
+
+        merged.sessionID = incoming.sessionID ?? merged.sessionID ?? activeSessionID
+        merged.toolCallID = incoming.toolCallID ?? merged.toolCallID
+        merged.description = firstNonEmptyString(incoming.description, merged.description) ?? merged.description
+        merged.statusLabel = firstNonEmptyString(incoming.statusLabel, merged.statusLabel) ?? merged.statusLabel
+        merged.agentType = firstNonEmptyString(incoming.agentType, merged.agentType)
+        merged.prompt = firstNonEmptyString(incoming.prompt, merged.prompt)
+        merged.latestIntent = firstNonEmptyString(incoming.latestIntent, merged.latestIntent)
+        merged.result = firstNonEmptyString(incoming.result, merged.result)
+        merged.error = firstNonEmptyString(incoming.error, merged.error)
+        merged.updatedAt = incoming.updatedAt
+        merged.sourceSlashCommand = incoming.sourceSlashCommand ?? merged.sourceSlashCommand
+
+        if previous == nil {
+            merged.startedAt = incoming.startedAt
+        }
+        if let completedAt = incoming.completedAt {
+            merged.completedAt = completedAt
+        }
+
+        if !incoming.recentActivity.isEmpty {
+            var seen = Set<String>()
+            merged.recentActivity = (incoming.recentActivity + merged.recentActivity)
+                .compactMap { line in
+                    let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !trimmed.isEmpty else { return nil }
+                    let normalized = trimmed.lowercased()
+                    guard seen.insert(normalized).inserted else { return nil }
+                    return trimmed
+                }
+                .prefix(6)
+                .map { $0 }
+        }
+
+        copilotBackgroundTasksByID[merged.id] = merged
+        if let toolCallID = merged.toolCallID?.nonEmpty {
+            copilotBackgroundTaskIDByToolCallID[toolCallID] = merged.id
+        }
+
+        emitCopilotBackgroundTaskTimelineMessageIfNeeded(
+            previous: previous,
+            current: merged,
+            sourceTool: sourceTool
+        )
+    }
+
+    private func emitCopilotBackgroundTaskTimelineMessageIfNeeded(
+        previous: CopilotBackgroundTaskRecord?,
+        current: CopilotBackgroundTaskRecord,
+        sourceTool: CopilotBackgroundTaskTool
+    ) {
+        let previousStatus = previous?.subagentStatus
+        let currentStatus = current.subagentStatus
+        let description = current.description.trimmingCharacters(in: .whitespacesAndNewlines)
+        let taskTitle = description.isEmpty ? "Background agent" : description
+
+        if previous == nil {
+            emitTimelineSystemMessage(
+                "Copilot started background agent: \(taskTitle).",
+                sessionID: current.sessionID
+            )
+            return
+        }
+
+        guard previousStatus != currentStatus else {
+            if sourceTool == .writeAgent,
+               let latestIntent = current.latestIntent,
+               latestIntent != previous?.latestIntent {
+                emitTimelineSystemMessage(
+                    "Copilot sent follow-up instructions to \(taskTitle).",
+                    sessionID: current.sessionID
+                )
+            }
+            return
+        }
+
+        let message: String
+        switch currentStatus {
+        case .completed:
+            message = "Copilot completed background agent: \(taskTitle)."
+        case .errored:
+            message = "Copilot background agent needs attention: \(taskTitle)."
+        case .waiting:
+            message = "Copilot background agent is waiting: \(taskTitle)."
+        case .spawning, .running:
+            message = "Copilot resumed background agent: \(taskTitle)."
+        case .closed:
+            message = "Copilot closed background agent: \(taskTitle)."
+        }
+
+        emitTimelineSystemMessage(
+            message,
+            sessionID: current.sessionID
+        )
+    }
+
+    private func copilotBackgroundTaskSummary() -> String? {
+        let activeCount = copilotBackgroundTasksByID.values.filter {
+            $0.subagentStatus.isActive
+        }.count
+        guard activeCount > 0 else { return nil }
+        return activeCount == 1
+            ? "1 background agent running"
+            : "\(activeCount) background agents running"
+    }
+
+    private func copilotBackgroundTaskRecords(
+        from update: [String: Any],
+        tool: CopilotBackgroundTaskTool,
+        sessionID: String?
+    ) -> [CopilotBackgroundTaskRecord] {
+        let rawInput = update["rawInput"] as? [String: Any] ?? [:]
+        let rawOutput = update["rawOutput"] as? [String: Any] ?? [:]
+        let toolCallID = firstNonEmptyString(update["toolCallId"] as? String)
+        let candidateDictionaries = copilotBackgroundTaskCandidateDictionaries(
+            output: rawOutput,
+            input: rawInput,
+            tool: tool
+        )
+        let fallbackTaskID = firstNonEmptyString(
+            copilotBackgroundTaskIdentifier(from: rawInput),
+            toolCallID.flatMap { copilotBackgroundTaskIDByToolCallID[$0] },
+            toolCallID
+        )
+        let fallbackDescription = firstNonEmptyString(
+            rawInput["description"] as? String,
+            rawInput["task"] as? String,
+            rawInput["title"] as? String,
+            pendingCopilotSlashCommand?.remainderText,
+            pendingCopilotSlashCommand?.label,
+            "Background agent"
+        ) ?? "Background agent"
+        let defaultStatus = firstNonEmptyString(
+            rawOutput["status"] as? String,
+            update["status"] as? String,
+            "running"
+        ) ?? "running"
+        let outputText = copilotOutputText(from: update)
+
+        var results: [CopilotBackgroundTaskRecord] = []
+        var seenIDs = Set<String>()
+        for candidate in candidateDictionaries {
+            guard let taskID = firstNonEmptyString(
+                copilotBackgroundTaskIdentifier(from: candidate),
+                fallbackTaskID
+            ) else {
+                continue
+            }
+            guard seenIDs.insert(taskID).inserted else { continue }
+
+            let statusLabel = firstNonEmptyString(
+                candidate["status"] as? String,
+                defaultStatus
+            ) ?? defaultStatus
+            let normalizedStatus = normalizedCopilotTaskStatus(statusLabel)
+            let resultText = firstNonEmptyString(
+                extractString(candidate["result"]),
+                normalizedStatus == "completed" ? outputText : nil
+            )
+            let errorText = firstNonEmptyString(
+                extractString(candidate["error"]),
+                normalizedStatus == "failed" ? outputText : nil
+            )
+
+            results.append(
+                CopilotBackgroundTaskRecord(
+                    id: taskID,
+                    sessionID: sessionID ?? activeSessionID,
+                    toolCallID: toolCallID,
+                    description: firstNonEmptyString(
+                        candidate["description"] as? String,
+                        candidate["title"] as? String,
+                        fallbackDescription
+                    ) ?? fallbackDescription,
+                    statusLabel: statusLabel,
+                    agentType: cleanedCopilotAgentType(
+                        firstNonEmptyString(
+                            candidate["agentType"] as? String,
+                            candidate["agent_type"] as? String,
+                            rawInput["agentType"] as? String,
+                            rawInput["agent_type"] as? String,
+                            candidate["agent"] as? String,
+                            rawInput["agent"] as? String
+                        )
+                    ),
+                    prompt: firstNonEmptyString(
+                        candidate["prompt"] as? String,
+                        rawInput["prompt"] as? String,
+                        rawInput["instructions"] as? String,
+                        rawInput["message"] as? String
+                    ),
+                    latestIntent: firstNonEmptyString(
+                        candidate["latestIntent"] as? String,
+                        candidate["latest_intent"] as? String,
+                        extractString(candidate["intent"])
+                    ),
+                    recentActivity: copilotBackgroundTaskRecentActivity(from: candidate),
+                    result: resultText,
+                    error: errorText,
+                    startedAt: previousBackgroundTaskStartDate(
+                        taskID: taskID,
+                        candidate: candidate
+                    ) ?? Date(),
+                    updatedAt: Date(),
+                    completedAt: normalizedStatus == "completed"
+                        || normalizedStatus == "failed"
+                        || normalizedStatus == "cancelled"
+                        || normalizedStatus == "killed"
+                        ? Date() : nil,
+                    sourceSlashCommand: pendingCopilotSlashCommand?.label
+                )
+            )
+        }
+
+        if results.isEmpty, let fallbackTaskID {
+            let statusLabel = defaultStatus
+            let normalizedStatus = normalizedCopilotTaskStatus(statusLabel)
+            results.append(
+                CopilotBackgroundTaskRecord(
+                    id: fallbackTaskID,
+                    sessionID: sessionID ?? activeSessionID,
+                    toolCallID: toolCallID,
+                    description: fallbackDescription,
+                    statusLabel: statusLabel,
+                    agentType: cleanedCopilotAgentType(
+                        firstNonEmptyString(
+                            rawInput["agentType"] as? String,
+                            rawInput["agent_type"] as? String,
+                            rawInput["agent"] as? String
+                        )
+                    ),
+                    prompt: firstNonEmptyString(
+                        rawInput["prompt"] as? String,
+                        rawInput["instructions"] as? String,
+                        rawInput["message"] as? String
+                    ),
+                    latestIntent: firstNonEmptyString(extractString(rawOutput["latestIntent"])),
+                    recentActivity: copilotBackgroundTaskRecentActivity(from: rawOutput),
+                    result: normalizedStatus == "completed" ? outputText : nil,
+                    error: normalizedStatus == "failed" ? outputText : nil,
+                    startedAt: previousBackgroundTaskStartDate(
+                        taskID: fallbackTaskID,
+                        candidate: rawOutput
+                    ) ?? Date(),
+                    updatedAt: Date(),
+                    completedAt: normalizedStatus == "completed"
+                        || normalizedStatus == "failed"
+                        || normalizedStatus == "cancelled"
+                        || normalizedStatus == "killed"
+                        ? Date() : nil,
+                    sourceSlashCommand: pendingCopilotSlashCommand?.label
+                )
+            )
+        }
+
+        return results
+    }
+
+    private func copilotBackgroundTaskCandidateDictionaries(
+        output: [String: Any],
+        input: [String: Any],
+        tool: CopilotBackgroundTaskTool
+    ) -> [[String: Any]] {
+        let arrayKeys = ["tasks", "agents", "items", "list", "data", "results"]
+        for key in arrayKeys {
+            if let rows = output[key] as? [[String: Any]], !rows.isEmpty {
+                return rows
+            }
+            if let values = output[key] as? [Any] {
+                let rows = values.compactMap { $0 as? [String: Any] }
+                if !rows.isEmpty {
+                    return rows
+                }
+            }
+        }
+
+        switch tool {
+        case .task, .readAgent, .writeAgent:
+            if !output.isEmpty {
+                return [output]
+            }
+            if !input.isEmpty {
+                return [input]
+            }
+            return []
+        case .listAgents:
+            if !output.isEmpty {
+                return [output]
+            }
+            return []
+        }
+    }
+
+    private func copilotBackgroundTaskIdentifier(
+        from dictionary: [String: Any]
+    ) -> String? {
+        firstNonEmptyString(
+            dictionary["taskId"] as? String,
+            dictionary["task_id"] as? String,
+            dictionary["agentId"] as? String,
+            dictionary["agent_id"] as? String,
+            dictionary["id"] as? String,
+            (dictionary["task"] as? [String: Any]).flatMap {
+                firstNonEmptyString(
+                    $0["id"] as? String,
+                    $0["taskId"] as? String,
+                    $0["agentId"] as? String
+                )
+            }
+        )
+    }
+
+    private func previousBackgroundTaskStartDate(
+        taskID: String,
+        candidate: [String: Any]
+    ) -> Date? {
+        if let existing = copilotBackgroundTasksByID[taskID] {
+            return existing.startedAt
+        }
+
+        let timestamp = (candidate["startedAt"] as? TimeInterval)
+            ?? (candidate["started_at"] as? TimeInterval)
+            ?? (candidate["timestamp"] as? TimeInterval)
+        guard let timestamp else { return nil }
+        return dateFromPossiblyMilliseconds(timestamp)
+    }
+
+    private func dateFromPossiblyMilliseconds(_ value: TimeInterval) -> Date {
+        if value > 10_000_000_000 {
+            return Date(timeIntervalSince1970: value / 1000)
+        }
+        return Date(timeIntervalSince1970: value)
+    }
+
+    private func copilotBackgroundTaskRecentActivity(
+        from dictionary: [String: Any]
+    ) -> [String] {
+        if let lines = dictionary["recentActivity"] as? [[String: Any]] {
+            return lines.compactMap {
+                firstNonEmptyString(
+                    $0["message"] as? String,
+                    $0["text"] as? String,
+                    extractString($0["content"])
+                )
+            }
+        }
+        if let lines = dictionary["recent_activity"] as? [[String: Any]] {
+            return lines.compactMap {
+                firstNonEmptyString(
+                    $0["message"] as? String,
+                    $0["text"] as? String
+                )
+            }
+        }
+        if let lines = dictionary["recentActivity"] as? [String] {
+            return lines.compactMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty }
+        }
+        if let lines = dictionary["recent_activity"] as? [String] {
+            return lines.compactMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty }
+        }
+        if let output = firstNonEmptyString(
+            dictionary["recentOutput"] as? String,
+            dictionary["recent_output"] as? String
+        ) {
+            return output
+                .split(separator: "\n")
+                .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+                .compactMap(\.nonEmpty)
+                .prefix(6)
+                .map { $0 }
+        }
+        return []
+    }
+
+    private func normalizedCopilotTaskStatus(_ rawValue: String) -> String {
+        rawValue
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "-", with: "_")
+            .replacingOccurrences(of: " ", with: "_")
+            .lowercased()
+    }
+
+    private func cleanedCopilotAgentType(_ rawValue: String?) -> String? {
+        guard let rawValue = rawValue?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+            return nil
+        }
+        let normalized = rawValue.lowercased()
+        if normalized == "agent" || normalized == "shell" {
+            return nil
+        }
+        return rawValue
     }
 
     private func materializeCLIFileAttachments(
@@ -10426,6 +11791,29 @@ final class CodexAssistantRuntime {
             return
         }
 
+        if handleCopilotBackgroundTaskToolUpdate(
+            update,
+            sessionID: sessionID,
+            isInitial: isInitial
+        ) {
+            return
+        }
+
+        // When the Copilot model uses `task_complete` to deliver its final
+        // response, the actual answer lives inside the tool's summary argument
+        // or output — not in a streamed `agent_message_chunk`.  Surface it as
+        // normal assistant text instead of rendering a tool-activity card.
+        if isCopilotTaskCompleteTool(update: update),
+           let summary = copilotTaskCompleteSummary(from: update) {
+            ensureStreamingIdentifiers()
+            let separator = streamingBuffer.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty != nil ? "\n\n" : ""
+            streamingBuffer += separator + summary
+            pendingStreamingDeltaBuffer += separator + summary
+            emitStreamingAssistantDelta(force: true)
+            updateHUD(phase: .streaming, title: "Responding", detail: nil)
+            return
+        }
+
         guard let item = copilotSyntheticItem(from: update) else { return }
         let status = (item["status"] as? String)?.lowercased() ?? "running"
         let isCompleted = !["pending", "running", "waiting", "inprogress", "in_progress"].contains(status)
@@ -10595,6 +11983,59 @@ final class CodexAssistantRuntime {
         }
 
         return false
+    }
+
+    // MARK: - Copilot task_complete extraction
+
+    /// Returns `true` when the Copilot tool update represents a `task_complete`
+    /// call — the mechanism the model uses to deliver its final answer as a
+    /// tool argument instead of a streamed assistant message.
+    private func isCopilotTaskCompleteTool(update: [String: Any]) -> Bool {
+        let normalizedTitle = (update["title"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        if normalizedTitle == "task complete" || normalizedTitle == "task_complete" {
+            return true
+        }
+        // Fall back to checking whether rawInput carries a `summary` key,
+        // which is the distinctive shape of a task_complete invocation.
+        if let rawInput = update["rawInput"] as? [String: Any],
+           rawInput["summary"] is String {
+            return true
+        }
+        return false
+    }
+
+    /// Extracts the assistant-facing summary text from a `task_complete` tool
+    /// update, preferring `rawInput.summary` (the model's own output) and
+    /// falling back to the tool result returned by the CLI.
+    private func copilotTaskCompleteSummary(from update: [String: Any]) -> String? {
+        if let rawInput = update["rawInput"] as? [String: Any],
+           let summary = (rawInput["summary"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
+            return summary
+        }
+        if let output = copilotOutputText(from: update)?
+            .trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
+            // The tool result often arrives with a "✓ Task completed:" prefix
+            // added by the CLI — strip it so the user sees clean prose.
+            let prefixes = [
+                "\u{2713} task completed:",
+                "task completed:",
+                "\u{2713} completed:",
+                "completed:"
+            ]
+            let lowered = output.lowercased()
+            for prefix in prefixes {
+                if lowered.hasPrefix(prefix) {
+                    let stripped = String(output.dropFirst(prefix.count))
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !stripped.isEmpty { return stripped }
+                }
+            }
+            return output
+        }
+        return nil
     }
 
     private func shouldSurfaceCopilotThought(_ delta: String) -> Bool {

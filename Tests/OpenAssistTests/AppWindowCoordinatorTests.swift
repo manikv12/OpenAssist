@@ -46,4 +46,30 @@ final class AppWindowCoordinatorTests: XCTestCase {
         XCTAssertEqual(fittedFrame.origin.x, visibleFrame.origin.x, accuracy: 0.5)
         XCTAssertEqual(fittedFrame.origin.y, visibleFrame.origin.y, accuracy: 0.5)
     }
+
+    func testAdaptedTargetSizeUsesPreferredSizeWhenVisibleFrameHasRoom() {
+        let visibleFrame = NSRect(x: 0, y: 0, width: 1600, height: 1000)
+
+        let targetSize = AppWindowFrameFitter.adaptedTargetSize(
+            preferredSize: NSSize(width: 1380, height: 860),
+            minimumSize: NSSize(width: 1080, height: 700),
+            visibleFrame: visibleFrame
+        )
+
+        XCTAssertEqual(targetSize.width, 1380, accuracy: 0.5)
+        XCTAssertEqual(targetSize.height, 860, accuracy: 0.5)
+    }
+
+    func testAdaptedTargetSizeShrinksToVisibleFramePaddingButRespectsMinimum() {
+        let visibleFrame = NSRect(x: 0, y: 0, width: 1180, height: 760)
+
+        let targetSize = AppWindowFrameFitter.adaptedTargetSize(
+            preferredSize: NSSize(width: 1380, height: 860),
+            minimumSize: NSSize(width: 1080, height: 700),
+            visibleFrame: visibleFrame
+        )
+
+        XCTAssertEqual(targetSize.width, 1132, accuracy: 0.5)
+        XCTAssertEqual(targetSize.height, 704, accuracy: 0.5)
+    }
 }

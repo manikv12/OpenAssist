@@ -9,6 +9,7 @@ private enum AssistantSidebarPane {
     case archived
     case automations
     case skills
+    case plugins
 }
 
 private enum AssistantNotesScope: String {
@@ -316,6 +317,8 @@ extension AssistantSidebarPane {
             return "automations"
         case .skills:
             return "skills"
+        case .plugins:
+            return "plugins"
         }
     }
 
@@ -331,6 +334,8 @@ extension AssistantSidebarPane {
             self = .automations
         case "skills":
             self = .skills
+        case "plugins":
+            self = .plugins
         default:
             return nil
         }
@@ -713,6 +718,7 @@ struct AssistantWindowView: View {
         get { AssistantSidebarPane(shellID: selectedSidebarPaneRawValue) ?? .threads }
         nonmutating set { selectedSidebarPaneRawValue = newValue.shellID }
     }
+    @State private var lastNonSkillsSidebarPane: AssistantSidebarPane = .threads
     @State private var showSkillWizardSheet = false
     @State private var showGitHubSkillImportSheet = false
     @State private var pendingScrollToLatestWorkItem: DispatchWorkItem?
@@ -726,6 +732,7 @@ struct AssistantWindowView: View {
     @State private var hoveredWorkspaceLaunchTargetID: String?
     @State private var showWorkspaceLaunchMenu = false
     @State private var cachedVisibleRenderItems: [AssistantTimelineRenderItem] = []
+    @State private var cachedChatWebMessages: [AssistantChatWebMessage] = []
     @State private var chatTimelineWebContainer: AssistantChatWebContainerView?
     @State private var threadNoteWebContainer: AssistantChatWebContainerView?
     @State private var isThreadNoteOpen = false
@@ -790,6 +797,11 @@ struct AssistantWindowView: View {
         0
     @State private var collapsedSidebarPreviewPane: String?
     @State private var sidebarDragStartWidth: CGFloat = 0
+    /// Transient width used while the resize handle is being dragged.
+    /// Kept as `@State` so we avoid writing to `@AppStorage` (UserDefaults)
+    /// on every frame, which causes synchronous I/O and laggy resizing.
+    /// The value is flushed to `@AppStorage` once on drag end.
+    @State private var sidebarDragLiveWidth: CGFloat = 0
     @State private var isSidebarResizeHandleHovered = false
     @AppStorage("assistantSidebarProjectsExpanded") private var areProjectsExpanded = true
     @AppStorage("assistantSidebarExpandedFolderIDs") private var expandedFolderIDsRaw = ""
@@ -821,9 +833,14 @@ struct AssistantWindowView: View {
             visibleLimit: visibleHistoryLimit,
             minimumVisibleChatMessages: Self.minimumVisibleChatMessagesBeforeLoadMore
         )
+        cachedChatWebMessages = computeChatWebMessages()
     }
 
     private var chatWebMessages: [AssistantChatWebMessage] {
+        cachedChatWebMessages
+    }
+
+    private func computeChatWebMessages() -> [AssistantChatWebMessage] {
         let _ = assistant.historyActionsRevision
         let sessionActivity = selectedSessionActivitySnapshot
         let messagesFirstMode = chatHistoryDisplayMode == .messagesFirst
@@ -945,6 +962,7 @@ struct AssistantWindowView: View {
             canEdit: false,
             rewriteAnchorID: nil,
             providerLabel: nil,
+            selectedPlugins: nil,
             activityIcon: nil,
             activityTitle: nil,
             activityDetail: nil,
@@ -4289,6 +4307,8 @@ struct AssistantWindowView: View {
             )
         case "captureScreenshotImport":
             let requestID = command.requestID ?? UUID().uuidString.lowercased()
+            let captureMode = ThreadNoteScreenshotCaptureMode(rawValue: command.captureMode ?? "")
+                ?? .area
             let sendCaptureResult = { (result: AssistantChatWebThreadNoteScreenshotCaptureResult) in
                 sendThreadNoteScreenshotCaptureResult(result, sourceContainer: sourceContainer)
             }
@@ -4300,6 +4320,8 @@ struct AssistantWindowView: View {
                         ok: false,
                         cancelled: false,
                         message: "Open a note before adding a screenshot.",
+                        captureMode: captureMode.rawValue,
+                        segmentCount: nil,
                         filename: nil,
                         mimeType: nil,
                         dataURL: nil
@@ -4309,11 +4331,17 @@ struct AssistantWindowView: View {
             }
 
             Task { @MainActor in
-                let result = await captureThreadNoteScreenshotImport(requestID: requestID)
+                let result = await captureThreadNoteScreenshotImport(
+                    requestID: requestID,
+                    captureMode: captureMode
+                )
                 sendCaptureResult(result)
             }
         case "processScreenshotImport":
             let requestID = command.requestID ?? UUID().uuidString.lowercased()
+            let captureMode = ThreadNoteScreenshotCaptureMode(rawValue: command.captureMode ?? "")
+                ?? .area
+            let captureSegmentCount = max(1, command.captureSegmentCount ?? 1)
             let sendProcessingResult = {
                 (result: AssistantChatWebThreadNoteScreenshotProcessingResult) in
                 sendThreadNoteScreenshotProcessingResult(result, sourceContainer: sourceContainer)
@@ -4322,11 +4350,11 @@ struct AssistantWindowView: View {
             guard resolvedOwner != nil, resolvedNoteID != nil else {
                 sendProcessingResult(
                     AssistantChatWebThreadNoteScreenshotProcessingResult(
-                        requestID: requestID,
-                        ok: false,
-                        message: "Open a note before adding a screenshot.",
-                        outputMode: command.outputMode,
-                        markdown: nil,
+                            requestID: requestID,
+                            ok: false,
+                            message: "Open a note before adding a screenshot.",
+                            outputMode: command.outputMode,
+                            markdown: nil,
                         rawText: nil,
                         usedVision: false
                     )
@@ -4373,7 +4401,9 @@ struct AssistantWindowView: View {
                 let result = await MemoryEntryExplanationService.shared.prepareThreadNoteScreenshotImport(
                     attachment: attachment,
                     outputMode: outputMode,
-                    styleInstruction: command.styleInstruction
+                    styleInstruction: command.styleInstruction,
+                    captureMode: captureMode,
+                    segmentCount: captureSegmentCount
                 )
 
                 switch result {
@@ -4873,7 +4903,8 @@ struct AssistantWindowView: View {
     }
 
     private func captureThreadNoteScreenshotImport(
-        requestID: String
+        requestID: String,
+        captureMode: ThreadNoteScreenshotCaptureMode
     ) async -> AssistantChatWebThreadNoteScreenshotCaptureResult {
         guard CGPreflightScreenCaptureAccess() else {
             return AssistantChatWebThreadNoteScreenshotCaptureResult(
@@ -4881,44 +4912,23 @@ struct AssistantWindowView: View {
                 ok: false,
                 cancelled: false,
                 message: "Grant Screen Recording in macOS Settings so Open Assist can capture screenshots.",
+                captureMode: captureMode.rawValue,
+                segmentCount: nil,
                 filename: nil,
                 mimeType: nil,
                 dataURL: nil
             )
         }
 
-        let fileManager = FileManager.default
-        let temporaryURL = fileManager.temporaryDirectory
-            .appendingPathComponent("openassist-thread-note-screenshot-\(UUID().uuidString)")
-            .appendingPathExtension("png")
-
-        defer {
-            try? fileManager.removeItem(at: temporaryURL)
-        }
-
         do {
-            let terminationStatus = try await runInteractiveScreenshot(to: temporaryURL)
-            guard fileManager.fileExists(atPath: temporaryURL.path) else {
+            guard let data = try await captureInteractiveScreenshotData() else {
                 return AssistantChatWebThreadNoteScreenshotCaptureResult(
                     requestID: requestID,
                     ok: false,
-                    cancelled: terminationStatus != 0,
-                    message: terminationStatus == 0
-                        ? "Open Assist could not find the captured screenshot."
-                        : nil,
-                    filename: nil,
-                    mimeType: nil,
-                    dataURL: nil
-                )
-            }
-
-            let data = try Data(contentsOf: temporaryURL)
-            guard !data.isEmpty else {
-                return AssistantChatWebThreadNoteScreenshotCaptureResult(
-                    requestID: requestID,
-                    ok: false,
-                    cancelled: false,
-                    message: "The captured screenshot was empty. Please try again.",
+                    cancelled: true,
+                    message: nil,
+                    captureMode: captureMode.rawValue,
+                    segmentCount: nil,
                     filename: nil,
                     mimeType: nil,
                     dataURL: nil
@@ -4930,7 +4940,9 @@ struct AssistantWindowView: View {
                 ok: true,
                 cancelled: false,
                 message: nil,
-                filename: "Screenshot-\(Date.now.formatted(.iso8601.year().month().day())).png",
+                captureMode: captureMode.rawValue,
+                segmentCount: 1,
+                filename: screenshotCaptureFilename(for: captureMode, segmentCount: 1),
                 mimeType: "image/png",
                 dataURL: "data:image/png;base64,\(data.base64EncodedString())"
             )
@@ -4940,10 +4952,66 @@ struct AssistantWindowView: View {
                 ok: false,
                 cancelled: false,
                 message: "Open Assist could not capture the screenshot: \(error.localizedDescription)",
+                captureMode: captureMode.rawValue,
+                segmentCount: nil,
                 filename: nil,
                 mimeType: nil,
                 dataURL: nil
             )
+        }
+    }
+
+    private func captureInteractiveScreenshotData() async throws -> Data? {
+        let fileManager = FileManager.default
+        let temporaryURL = fileManager.temporaryDirectory
+            .appendingPathComponent("openassist-thread-note-screenshot-\(UUID().uuidString)")
+            .appendingPathExtension("png")
+
+        defer {
+            try? fileManager.removeItem(at: temporaryURL)
+        }
+
+        let terminationStatus = try await runInteractiveScreenshot(to: temporaryURL)
+        guard fileManager.fileExists(atPath: temporaryURL.path) else {
+            if terminationStatus != 0 {
+                return nil
+            }
+
+            throw NSError(
+                domain: "OpenAssist.ThreadNoteScreenshot",
+                code: 1,
+                userInfo: [
+                    NSLocalizedDescriptionKey: "Open Assist could not find the captured screenshot."
+                ]
+            )
+        }
+
+        let data = try Data(contentsOf: temporaryURL)
+        guard !data.isEmpty else {
+            throw NSError(
+                domain: "OpenAssist.ThreadNoteScreenshot",
+                code: 2,
+                userInfo: [
+                    NSLocalizedDescriptionKey: "The captured screenshot was empty. Please try again."
+                ]
+            )
+        }
+
+        return data
+    }
+
+    private func screenshotCaptureFilename(
+        for captureMode: ThreadNoteScreenshotCaptureMode,
+        segmentCount: Int
+    ) -> String {
+        let dateStamp = Date.now.formatted(.iso8601.year().month().day())
+        switch captureMode {
+        case .area:
+            return "Screenshot-\(dateStamp).png"
+        case .scrolling:
+            return "Scrolling-Screenshot-\(dateStamp)-\(max(1, segmentCount)).png"
+        case .multiple:
+            return "Screenshots-\(dateStamp)-\(max(1, segmentCount)).png"
         }
     }
 
@@ -5363,6 +5431,12 @@ struct AssistantWindowView: View {
             || snapshot.awaitingAssistantStart
     }
 
+    private var composerCanSteerActiveTurn: Bool {
+        let snapshot = selectedSessionActivitySnapshot
+        return snapshot.canSteerActiveTurn
+            && snapshot.pendingPermissionRequest == nil
+    }
+
     private var composerActiveTurnPhase: String {
         let snapshot = selectedSessionActivitySnapshot
         if composerHasPendingInput || composerHasPendingToolApproval {
@@ -5431,6 +5505,11 @@ struct AssistantWindowView: View {
 
     private func scaledSidebarWidth(for safeWindowWidth: CGFloat, outerPadding: CGFloat) -> CGFloat
     {
+        // While dragging, the live width is already clamped — return it
+        // directly to avoid reading @AppStorage on every frame.
+        if sidebarDragLiveWidth > 0 {
+            return sidebarDragLiveWidth
+        }
         let maxSidebarWidth = max(210.0, safeWindowWidth - (outerPadding * 2) - 320.0 - 0.5)
         if isCompactSidebarPresentation {
             let compactMaxSidebarWidth = min(280.0, maxSidebarWidth)
@@ -5460,7 +5539,7 @@ struct AssistantWindowView: View {
                     .opacity((isSidebarResizeHandleHovered || sidebarDragStartWidth > 0) ? 1 : 0)
             )
             .gesture(
-                DragGesture(minimumDistance: 2)
+                DragGesture(minimumDistance: 0)
                     .onChanged { value in
                         if sidebarDragStartWidth == 0 {
                             sidebarDragStartWidth = layout.sidebarWidth
@@ -5470,15 +5549,34 @@ struct AssistantWindowView: View {
                         let maxWidth = max(
                             210.0, layout.windowWidth - (layout.outerPadding * 2) - 320.0 - 0.5)
                         let minWidth = isCompactSidebarPresentation ? 200.0 : 180.0
-                        let clampedWidth = Double(min(max(minWidth, newWidth), maxWidth))
-                        if isCompactSidebarPresentation {
-                            compactSidebarInnerWidth = clampedWidth
-                        } else {
-                            sidebarCustomWidth = clampedWidth
+                        // Snap to the exact pixel to avoid sub-pixel jitter, and
+                        // kill any implicit SwiftUI animation so the sidebar
+                        // tracks the cursor immediately instead of interpolating.
+                        let clamped = min(max(minWidth, newWidth), maxWidth).rounded()
+                        withTransaction(Transaction(animation: nil)) {
+                            sidebarDragLiveWidth = clamped
                         }
                     }
                     .onEnded { _ in
-                        sidebarDragStartWidth = 0
+                        // Persist the final width to AppStorage. Keep the
+                        // live width set until the next render so the
+                        // AppStorage → body propagation doesn't produce a
+                        // transient flash where the sidebar snaps to the
+                        // previously stored value.
+                        let finalWidth = sidebarDragLiveWidth > 0
+                            ? Double(sidebarDragLiveWidth)
+                            : Double(sidebarDragStartWidth)
+                        if finalWidth > 0 {
+                            if isCompactSidebarPresentation {
+                                compactSidebarInnerWidth = finalWidth
+                            } else {
+                                sidebarCustomWidth = finalWidth
+                            }
+                        }
+                        withTransaction(Transaction(animation: nil)) {
+                            sidebarDragLiveWidth = 0
+                            sidebarDragStartWidth = 0
+                        }
                         NSCursor.pop()
                     }
             )
@@ -6124,7 +6222,7 @@ struct AssistantWindowView: View {
         measuredHeight: CGFloat?
     ) -> CGFloat {
         let minHeight: CGFloat = compact ? 76 : 120
-        let maxHeight: CGFloat = compact ? 148 : 300
+        let maxHeight: CGFloat = compact ? 180 : 420
         let proposedHeight =
             measuredHeight
             ?? composerFallbackHeight(for: layout, compact: compact)
@@ -6156,7 +6254,9 @@ struct AssistantWindowView: View {
                 return
             }
 
-            composerMeasuredHeight = boundedHeight
+            withAnimation(.easeInOut(duration: 0.18)) {
+                composerMeasuredHeight = boundedHeight
+            }
         }
     }
 
@@ -6203,6 +6303,7 @@ struct AssistantWindowView: View {
                     id: AssistantSidebarPane.automations.shellID, label: "Automations",
                     symbol: "clock"),
                 .init(id: AssistantSidebarPane.skills.shellID, label: "Skills", symbol: "sparkles"),
+                .init(id: AssistantSidebarPane.plugins.shellID, label: "Plugins", symbol: "shippingbox"),
             ],
             allProjects: assistant.visibleProjects.map {
                 sidebarWebProject(for: $0, selectedProjectID: sidebarSelectedProjectID)
@@ -6318,6 +6419,7 @@ struct AssistantWindowView: View {
                 showNoteModeButton: !isNotesWorkspaceAssistant,
                 canOpenSkills: isCompactComposer
                     ? false : assistant.canAttachSkillsToSelectedThread,
+                canOpenPlugins: !isCompactComposer && assistant.canUseCodexPlugins,
                 preflightStatusMessage: isCompactComposer
                     ? notesAssistantPreflightStatusMessage : nil,
                 activeSkills: assistant.activeThreadSkills.map {
@@ -6327,6 +6429,22 @@ struct AssistantWindowView: View {
                         isMissing: $0.isMissing
                     )
                 },
+                selectedPlugins: assistant.visibleSelectedComposerPlugins.map {
+                    AssistantComposerWebPlugin(
+                        pluginID: $0.pluginID,
+                        displayName: $0.displayName,
+                        summary: $0.summary,
+                        needsSetup: $0.needsSetup
+                    )
+                },
+                availablePlugins: assistant.installedCodexPluginSelections.map {
+                    AssistantComposerWebPlugin(
+                        pluginID: $0.pluginID,
+                        displayName: $0.displayName,
+                        summary: $0.summary,
+                        needsSetup: $0.needsSetup
+                    )
+                },
                 attachments: assistant.attachments.map {
                     AssistantComposerWebAttachment(
                         id: $0.id.uuidString,
@@ -6334,7 +6452,11 @@ struct AssistantWindowView: View {
                         kind: $0.isImage ? "image" : "file",
                         previewDataURL: $0.previewDataURL
                     )
-                }
+                },
+                activeProviderID: assistant.visibleAssistantBackend.rawValue,
+                slashCommands: AssistantSlashCommandCatalog.composerCommands(
+                    for: assistant.visibleAssistantBackend
+                ).map(AssistantComposerWebSlashCommand.init(descriptor:))
             ),
             controls: AssistantComposerWebControlsState(
                 availability: runtimeControlsState.availability,
@@ -6361,6 +6483,7 @@ struct AssistantWindowView: View {
                 isBusy: composerCanCancelActiveTurn,
                 activeTurnPhase: composerActiveTurnPhase,
                 canCancelActiveTurn: composerCanCancelActiveTurn,
+                canSteerActiveTurn: composerCanSteerActiveTurn,
                 activeTurnProviderLabel: assistant.visibleAssistantBackend.shortDisplayName,
                 hasPendingToolApproval: composerHasPendingToolApproval,
                 hasPendingInput: composerHasPendingInput,
@@ -6934,6 +7057,7 @@ struct AssistantWindowView: View {
             else {
                 return
             }
+            persistThreadNoteIfNeeded(for: currentThreadNoteOwner)
             if pane == .archived {
                 showArchivedSidebar()
             } else {
@@ -7448,7 +7572,14 @@ struct AssistantWindowView: View {
             }
             pendingPermanentDeleteSession = session
         case "openAssistantSetup":
-            NotificationCenter.default.post(name: .openAssistOpenAssistantSetup, object: nil)
+            if presentationStyle == .compactSidebar {
+                NotificationCenter.default.post(
+                    name: .openAssistOpenSettings,
+                    object: SettingsRoute(section: .assistant, subsection: .assistantSetup)
+                )
+            } else {
+                NotificationCenter.default.post(name: .openAssistOpenAssistantSetup, object: nil)
+            }
         default:
             break
         }
@@ -7464,9 +7595,16 @@ struct AssistantWindowView: View {
         case "openFilePicker":
             openFilePicker()
             dismissComposerQuickActionsMenu()
+        case "captureScreenshotAttachment":
+            dismissComposerQuickActionsMenu()
+            captureComposerScreenshotAttachment()
         case "openSkillsPane":
             dismissComposerQuickActionsMenu()
             selectedSidebarPane = .skills
+        case "openPluginsPane":
+            dismissComposerQuickActionsMenu()
+            selectedSidebarPane = .plugins
+            Task { await assistant.refreshCodexPluginCatalogIfNeeded() }
         case "toggleQuickActionsMenu":
             toggleComposerQuickActionsMenu()
         case "removeAttachment":
@@ -7510,6 +7648,27 @@ struct AssistantWindowView: View {
             assistant.detachSkill(skillName)
         case "repairMissingSkillBindings":
             assistant.repairMissingSkillBindings()
+        case "selectComposerPlugin":
+            guard
+                let pluginID = (payload?["pluginId"] as? String)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .nonEmpty
+            else {
+                return
+            }
+            if let updatedDraft = payload?["draftText"] as? String {
+                assistant.promptDraft = updatedDraft
+            }
+            assistant.selectComposerPlugin(pluginID: pluginID)
+        case "removeComposerPlugin":
+            guard
+                let pluginID = (payload?["pluginId"] as? String)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .nonEmpty
+            else {
+                return
+            }
+            assistant.removeComposerPlugin(pluginID: pluginID)
         case "setInteractionMode":
             guard let rawMode = payload?["mode"] as? String,
                 let mode = AssistantInteractionMode(rawValue: rawMode)
@@ -7651,7 +7810,7 @@ struct AssistantWindowView: View {
     }
 
     private func assistantSplitBackground(layout: ChatLayoutMetrics) -> some View {
-        AppSplitChromeBackground(
+        return AppSplitChromeBackground(
             leadingPaneFraction: layout.visibleSidebarWidth > 0
                 ? min(
                     0.32, max(0.12, layout.visibleSidebarWidth / max(layout.windowWidth, 1)))
@@ -7659,8 +7818,14 @@ struct AssistantWindowView: View {
             leadingPaneMaxWidth: isCompactSidebarPresentation ? 240 : 280,
             leadingPaneWidth: layout.visibleSidebarWidth,
             leadingTint: AppVisualTheme.sidebarTint,
-            trailingTint: AppVisualTheme.windowBackground,
-            accent: AppVisualTheme.accentTint,
+            trailingTint: AppVisualTheme.assistantWindowBackgroundTint,
+            accent: AppVisualTheme.assistantWindowChromeAccent,
+            glowWarm: AppVisualTheme.assistantWindowGlowWarm,
+            glowCool: AppVisualTheme.assistantWindowGlowCool,
+            trailingMaterialOpacity: AppVisualTheme.isDarkAppearance ? 0.98 : 0.88,
+            trailingTintOpacityWhenMaterial: AppVisualTheme.isDarkAppearance ? 0.40 : 0.18,
+            trailingOverlayColor: AppVisualTheme.isDarkAppearance ? .black : .clear,
+            trailingOverlayOpacity: AppVisualTheme.isDarkAppearance ? 0.28 : 0,
             leadingPaneTransparent: projectNotesChromeState.effectiveSidebarCollapsed,
             showsLeadingDivider: false
         )
@@ -7726,6 +7891,15 @@ struct AssistantWindowView: View {
         }
         .onChange(of: assistant.selectedSessionID) { _ in
             recomputeVisibleRenderItems()
+        }
+        .onChange(of: assistant.historyActionsRevision) { _ in
+            cachedChatWebMessages = computeChatWebMessages()
+        }
+        .onChange(of: assistant.hasActiveTurn) { _ in
+            cachedChatWebMessages = computeChatWebMessages()
+        }
+        .onChange(of: assistant.pendingPermissionRequest?.id) { _ in
+            cachedChatWebMessages = computeChatWebMessages()
         }
         .onChange(of: assistant.lastAssistantNotesMutation?.id) { _ in
             refreshNotesAfterAssistantMutation(assistant.lastAssistantNotesMutation)
@@ -7896,7 +8070,22 @@ struct AssistantWindowView: View {
                 dismissTopBarDropdowns()
             }
         }
+        .onAppear {
+            if selectedSidebarPane != .skills && selectedSidebarPane != .plugins {
+                lastNonSkillsSidebarPane = selectedSidebarPane
+            }
+            Task {
+                if assistant.canUseCodexPlugins {
+                    await assistant.refreshCodexPluginCatalogIfNeeded()
+                } else {
+                    assistant.clearComposerPlugins()
+                }
+            }
+        }
         .onChange(of: selectedSidebarPane) { pane in
+            if pane != .skills && pane != .plugins {
+                lastNonSkillsSidebarPane = pane
+            }
             if pane != .threads, currentProjectNotesProject != nil {
                 closeProjectNotesIfNeeded()
             }
@@ -7909,6 +8098,15 @@ struct AssistantWindowView: View {
         .onChange(of: selectedNotesProjectID) { _ in
             syncAssistantNotesRuntimeContext()
             syncNotesAssistantConversationBinding()
+        }
+        .onChange(of: assistant.visibleAssistantBackend) { backend in
+            Task {
+                if backend == .codex {
+                    await assistant.refreshCodexPluginCatalogIfNeeded()
+                } else {
+                    assistant.clearComposerPlugins()
+                }
+            }
         }
         .onChange(of: selectedNotesProject?.id) { _ in
             syncAssistantNotesRuntimeContext()
@@ -7964,11 +8162,18 @@ struct AssistantWindowView: View {
         AssistantSidebarWebView(
             state: sidebarWebState,
             textScale: sidebarTextScale,
-            accentColor: AppVisualTheme.accentTint,
+            accentColor: AppVisualTheme.assistantWebAccentTint,
             onCommand: handleSidebarWebCommand
         )
+        .background(sidebarTranslucentBackground)
         .frame(width: width)
         .frame(maxHeight: .infinity, alignment: .top)
+        // Disable implicit frame animations during drag for snappier tracking.
+        .animation(nil, value: width)
+    }
+
+    private var sidebarTranslucentBackground: some View {
+        Color.clear
     }
 
     @ViewBuilder
@@ -7988,6 +8193,8 @@ struct AssistantWindowView: View {
             automationDetail
         case .skills:
             skillsDetail
+        case .plugins:
+            pluginsDetail
         }
     }
 
@@ -8356,7 +8563,7 @@ struct AssistantWindowView: View {
                                 typingDetail: isTransitioningChat ? "" : typingIndicatorDetail,
                                 textScale: CGFloat(chatTextScale),
                                 canLoadOlderHistory: webCanLoadOlderHistory,
-                                accentColor: AppVisualTheme.accentTint,
+                                accentColor: AppVisualTheme.assistantWebAccentTint,
                                 onScrollStateChanged: { isPinned, isScrolledUp in
                                     autoScrollPinnedToBottom = isPinned
                                     userHasScrolledUp = isScrolledUp
@@ -8498,9 +8705,7 @@ struct AssistantWindowView: View {
             }
         }  // end ZStack
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(
-            Color(red: 0.051, green: 0.067, blue: 0.090)
-        )
+        .background(Color.clear)
         .ignoresSafeArea(edges: .top)
     }
 
@@ -8525,7 +8730,7 @@ struct AssistantWindowView: View {
                 typingDetail: "",
                 textScale: CGFloat(chatTextScale),
                 canLoadOlderHistory: false,
-                accentColor: AppVisualTheme.accentTint,
+                accentColor: AppVisualTheme.assistantWebAccentTint,
                 onScrollStateChanged: { isPinned, isScrolledUp in
                     autoScrollPinnedToBottom = isPinned
                     userHasScrolledUp = isScrolledUp
@@ -8599,9 +8804,7 @@ struct AssistantWindowView: View {
             prepareProjectNotesWorkspace(for: project)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(
-            Color(red: 0.051, green: 0.067, blue: 0.090)
-        )
+        .background(Color.clear)
         .ignoresSafeArea(edges: .top)
     }
 
@@ -8629,9 +8832,7 @@ struct AssistantWindowView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(
-            Color(red: 0.051, green: 0.067, blue: 0.090)
-        )
+        .background(Color.clear)
         .ignoresSafeArea(edges: .top)
     }
 
@@ -8650,7 +8851,7 @@ struct AssistantWindowView: View {
                 typingDetail: "",
                 textScale: CGFloat(chatTextScale),
                 canLoadOlderHistory: false,
-                accentColor: AppVisualTheme.accentTint,
+                accentColor: AppVisualTheme.assistantWebAccentTint,
                 onScrollStateChanged: { isPinned, isScrolledUp in
                     autoScrollPinnedToBottom = isPinned
                     userHasScrolledUp = isScrolledUp
@@ -8709,7 +8910,7 @@ struct AssistantWindowView: View {
             notesAssistantOverlayCard(layout: layout, docked: true)
                 .frame(maxHeight: .infinity, alignment: .top)
                 .transition(.move(edge: .trailing).combined(with: .opacity))
-        } else {
+        } else if !showWorkspaceLaunchMenu && !showProviderPicker {
             VStack {
                 Spacer(minLength: 0)
                 notesAssistantOverlayHandle
@@ -8729,7 +8930,7 @@ struct AssistantWindowView: View {
                 .padding(.bottom, layout.isNarrow ? 12 : 16)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
                 .transition(.move(edge: .trailing).combined(with: .opacity))
-        } else {
+        } else if !showWorkspaceLaunchMenu && !showProviderPicker {
             notesAssistantOverlayHandle
                 .padding(.trailing, 8)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .trailing)
@@ -8857,7 +9058,7 @@ struct AssistantWindowView: View {
                             typingDetail: notesAssistantTypingIndicatorDetail,
                             textScale: CGFloat(chatTextScale),
                             canLoadOlderHistory: notesAssistantCanLoadOlderHistory,
-                            accentColor: AppVisualTheme.accentTint,
+                            accentColor: AppVisualTheme.assistantWebAccentTint,
                             onScrollStateChanged: { isPinned, isScrolledUp in
                                 autoScrollPinnedToBottom = isPinned
                                 userHasScrolledUp = isScrolledUp
@@ -9085,39 +9286,21 @@ struct AssistantWindowView: View {
             }
             syncAssistantNotesRuntimeContext()
         } label: {
-            VStack(spacing: 8) {
-                RoundedRectangle(cornerRadius: 999, style: .continuous)
-                    .fill(AppVisualTheme.accentTint.opacity(0.92))
-                    .frame(width: 4, height: 22)
-
-                Image(systemName: "sparkles")
-                    .font(.system(size: 10.5, weight: .semibold))
-                Image(systemName: "chevron.left")
-                    .font(.system(size: 9.5, weight: .bold))
-            }
-            .foregroundStyle(AppVisualTheme.foreground(0.82))
-            .frame(width: 28, height: 96)
-            .background(
-                RoundedRectangle(cornerRadius: 15, style: .continuous)
-                    .fill(
-                        LinearGradient(
-                            colors: [
-                                Color(red: 0.090, green: 0.110, blue: 0.144).opacity(0.98),
-                                Color(red: 0.060, green: 0.073, blue: 0.097).opacity(0.96),
-                            ],
-                            startPoint: .top,
-                            endPoint: .bottom
-                        )
-                    )
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 15, style: .continuous)
-                            .stroke(AppVisualTheme.surfaceStroke(0.12), lineWidth: 0.8)
-                    )
-            )
-            .shadow(color: Color.black.opacity(0.20), radius: 16, x: 0, y: 7)
+            Image(systemName: "chevron.left")
+                .font(.system(size: 10, weight: .bold))
+                .foregroundStyle(notesAssistantOverlayHandleTint.opacity(0.94))
+                .frame(width: 30, height: 30)
+                .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .help("Open notes assistant")
+    }
+
+    private var notesAssistantOverlayHandleTint: Color {
+        let accent = NSColor(AppVisualTheme.accentTint).usingColorSpace(.sRGB)
+            ?? NSColor(AppVisualTheme.accentTint)
+        let mixed = accent.blended(withFraction: 0.24, of: .white) ?? accent
+        return Color(nsColor: mixed)
     }
 
     private func notesAssistantOverlayIconButton(
@@ -9529,6 +9712,7 @@ struct AssistantWindowView: View {
     private func notesTopBar(layout: ChatLayoutMetrics) -> some View {
         let sideControlWidth: CGFloat = isCompactSidebarPresentation ? 164 : 176
         let titleHorizontalPadding: CGFloat = isCompactSidebarPresentation ? 10 : 16
+        let notesAssistantTriggerSymbol = "bubble.left.and.text.bubble.right"
 
         return HStack(spacing: 0) {
             HStack(spacing: 6) {
@@ -9551,8 +9735,10 @@ struct AssistantWindowView: View {
                     syncAssistantNotesRuntimeContext()
                 } label: {
                     topBarIconButton(
-                        symbol: isNotesAssistantPanelOpen ? "sidebar.right" : "sparkles",
-                        emphasized: isNotesAssistantPanelOpen
+                        symbol: isNotesAssistantPanelOpen
+                            ? "sidebar.right" : notesAssistantTriggerSymbol,
+                        emphasized: isNotesAssistantPanelOpen,
+                        tint: .orange
                     )
                 }
                 .buttonStyle(.plain)
@@ -9801,11 +9987,40 @@ struct AssistantWindowView: View {
         return VStack(spacing: 0) {
             AssistantSkillsPane(
                 assistant: assistant,
+                onBack: navigateBackFromSkillsPane,
                 onImportFolder: openSkillFolderImportPanel,
                 onImportGitHub: { showGitHubSkillImportSheet = true },
                 onCreateSkill: { showSkillWizardSheet = true },
                 onDeleteSkill: confirmDeleteSkill,
                 onTrySkill: trySkillFromLibrary
+            )
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(
+            LinearGradient(
+                colors: [
+                    AssistantWindowChrome.contentTop,
+                    AssistantWindowChrome.contentBottom,
+                ],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .stroke(AppVisualTheme.surfaceStroke(0.05), lineWidth: 0.5)
+        )
+        .padding(.top, 10)
+        .padding(.leading, 4)
+        .ignoresSafeArea(edges: .top)
+    }
+
+    private var pluginsDetail: some View {
+        VStack(spacing: 0) {
+            AssistantPluginsPane(
+                assistant: assistant,
+                onBack: navigateBackFromPluginsPane
             )
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -9897,11 +10112,22 @@ struct AssistantWindowView: View {
         }
 
         let effectiveHUD = snapshot.hudState ?? assistant.hudState
+        let hasPhantomPermissionState =
+            effectiveHUD.phase == .waitingForPermission
+            && snapshot.pendingPermissionRequest == nil
+        let fallbackActivity = activeCalls.first ?? recentCalls.first
         let title =
-            effectiveHUD.title
+            (hasPhantomPermissionState
+                ? fallbackActivity?.title
+                : effectiveHUD.title
+            )?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .nonEmpty ?? "Working"
-        let detail = effectiveHUD.detail?
+        let detail =
+            (hasPhantomPermissionState
+                ? fallbackActivity?.detail
+                : effectiveHUD.detail
+            )?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .nonEmpty
 
@@ -9941,6 +10167,10 @@ struct AssistantWindowView: View {
         }
 
         let hudPhase = snapshot.hudState?.phase ?? assistant.hudState.phase
+        let hasPhantomPermissionState =
+            hudPhase == .waitingForPermission
+            && !hasPendingInput
+            && !hasPendingToolApproval
         let phase: String
         if hasPendingInput || hasPendingToolApproval {
             phase = "needsInput"
@@ -9953,7 +10183,7 @@ struct AssistantWindowView: View {
             case .acting, .listening:
                 phase = "acting"
             case .waitingForPermission:
-                phase = "needsInput"
+                phase = hasPhantomPermissionState ? "acting" : "needsInput"
             case .idle, .success, .failed:
                 phase = isActive ? "acting" : "idle"
             }
@@ -10037,11 +10267,6 @@ struct AssistantWindowView: View {
                     )
                     .padding(.horizontal, 12)
                     .padding(.bottom, 10)
-                } else if hasToolActivity || toolCallsExpanded {
-                    toolActivityStrip
-                        .opacity(hasToolActivity ? 1 : 0)
-                        .frame(height: hasToolActivity ? nil : 0)
-                        .clipped()
                 }
 
                 if let composerPendingPermissionHelperText {
@@ -10615,11 +10840,11 @@ struct AssistantWindowView: View {
         dismissTopBarDropdowns()
     }
 
-    private func topBarIconButton(symbol: String, emphasized: Bool = false) -> some View {
+    private func topBarIconButton(symbol: String, emphasized: Bool = false, tint: Color? = nil) -> some View {
         Image(systemName: symbol)
             .font(.system(size: 11.5, weight: .medium))
             .foregroundStyle(
-                emphasized ? AppVisualTheme.accentTint : AppVisualTheme.foreground(0.52)
+                emphasized ? AppVisualTheme.accentTint : (tint ?? AppVisualTheme.foreground(0.52))
             )
             .frame(width: 30, height: 30)
             .background(
@@ -13972,7 +14197,7 @@ struct AssistantWindowView: View {
 
             AssistantComposerWebView(
                 state: state,
-                accentColor: AppVisualTheme.accentTint,
+                accentColor: AppVisualTheme.assistantWebAccentTint,
                 onHeightChange: { height in
                     updateComposerMeasuredHeight(height, compact: isCompactComposer)
                 },
@@ -14048,6 +14273,15 @@ struct AssistantWindowView: View {
                 openFilePicker()
             }
 
+            ComposerQuickActionItemView(
+                title: "Snipping tool",
+                subtitle: "Take a screenshot and attach it to this chat.",
+                symbol: "camera.viewfinder"
+            ) {
+                dismissComposerQuickActionsMenu()
+                captureComposerScreenshotAttachment()
+            }
+
             if state.base.canOpenSkills {
                 ComposerQuickActionItemView(
                     title: "Use skills",
@@ -14058,6 +14292,21 @@ struct AssistantWindowView: View {
                 ) {
                     dismissComposerQuickActionsMenu()
                     selectedSidebarPane = .skills
+                }
+            }
+
+            if state.base.canOpenPlugins {
+                ComposerQuickActionItemView(
+                    title: "Use plugins",
+                    subtitle: state.base.selectedPlugins.isEmpty
+                        ? "Browse plugins and use installed ones with @."
+                        : "\(state.base.selectedPlugins.count) plugin\(state.base.selectedPlugins.count == 1 ? "" : "s") selected for this message.",
+                    symbol: "shippingbox",
+                    isActive: !state.base.selectedPlugins.isEmpty
+                ) {
+                    dismissComposerQuickActionsMenu()
+                    selectedSidebarPane = .plugins
+                    Task { await assistant.refreshCodexPluginCatalogIfNeeded() }
                 }
             }
 
@@ -15076,7 +15325,7 @@ struct AssistantWindowView: View {
                     .foregroundStyle(AppVisualTheme.mutedText)
             }
 
-            if let summary = request.rawPayloadSummary, !summary.isEmpty {
+            if let summary = request.displayRawPayloadSummary {
                 Text(summary)
                     .font(.caption2.monospaced())
                     .foregroundStyle(AppVisualTheme.mutedText)
@@ -15084,6 +15333,29 @@ struct AssistantWindowView: View {
             }
 
             switch state {
+            case .waitingForInput where request.isStructuredApprovalPrompt:
+                AssistantStructuredApprovalView(
+                    accent: .orange,
+                    secondaryText: AppVisualTheme.mutedText,
+                    approveTitle: "Approve",
+                    rejectTitle: "Reject",
+                    cancelTitle: "Cancel Request"
+                ) {
+                    Task {
+                        await assistant.resolvePermission(
+                            answers: request.structuredApprovalAnswers(approved: true)
+                        )
+                    }
+                } onReject: {
+                    Task {
+                        await assistant.resolvePermission(
+                            answers: request.structuredApprovalAnswers(approved: false)
+                        )
+                    }
+                } onCancel: {
+                    Task { await assistant.cancelPermissionRequest() }
+                }
+
             case .waitingForInput where request.hasStructuredUserInput:
                 AssistantStructuredUserInputView(
                     request: request,
@@ -15448,6 +15720,60 @@ struct AssistantWindowView: View {
         }
     }
 
+    private func captureComposerScreenshotAttachment() {
+        Task { @MainActor in
+            guard CGPreflightScreenCaptureAccess() else {
+                presentComposerScreenshotAlert(
+                    messageText: "Allow Screen Recording",
+                    informativeText:
+                        "Grant Screen Recording in macOS Settings so Open Assist can capture a screenshot for chat."
+                )
+                return
+            }
+
+            do {
+                guard let data = try await captureInteractiveScreenshotData() else {
+                    return
+                }
+
+                assistant.attachments.append(
+                    AssistantAttachment(
+                        filename: composerScreenshotAttachmentFilename(),
+                        data: data,
+                        mimeType: "image/png"
+                    )
+                )
+            } catch {
+                presentComposerScreenshotAlert(
+                    messageText: "Could not capture screenshot",
+                    informativeText:
+                        "Open Assist could not capture that screenshot. \(error.localizedDescription)"
+                )
+            }
+        }
+    }
+
+    private func composerScreenshotAttachmentFilename() -> String {
+        let formatter = DateFormatter()
+        formatter.calendar = Calendar(identifier: .iso8601)
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = .current
+        formatter.dateFormat = "yyyy-MM-dd-HHmmss"
+        return "Screenshot-\(formatter.string(from: Date())).png"
+    }
+
+    private func presentComposerScreenshotAlert(
+        messageText: String,
+        informativeText: String
+    ) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = messageText
+        alert.informativeText = informativeText
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
+    }
+
     private func openSkillFolderImportPanel() {
         let panel = NSOpenPanel()
         panel.prompt = "Import Skill"
@@ -15474,6 +15800,14 @@ struct AssistantWindowView: View {
         if alert.runModal() == .alertFirstButtonReturn {
             assistant.deleteSkill(skill)
         }
+    }
+
+    private func navigateBackFromSkillsPane() {
+        selectedSidebarPane = lastNonSkillsSidebarPane
+    }
+
+    private func navigateBackFromPluginsPane() {
+        selectedSidebarPane = lastNonSkillsSidebarPane
     }
 
     private func trySkillFromLibrary(_ skill: AssistantSkillDescriptor, prompt: String) {

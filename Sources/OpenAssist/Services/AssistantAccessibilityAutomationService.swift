@@ -429,37 +429,45 @@ actor AssistantAccessibilityAutomationService {
         let match = try findElement(in: target.window, labelFilter: labelFilter, roleFilter: roleFilter)
         let targetDescription = match.label ?? match.role ?? "the target element"
 
-        if try performPrimaryAction(on: match.element) {
+        let axActionSucceeded = (try? performPrimaryAction(on: match.element)) ?? false
+
+        // Always send a CGEvent click at the element's frame center, even if AXPress
+        // succeeded. Electron/web-view apps often report AXPress success but don't
+        // propagate it to the web layer. The CGEvent click ensures the OS-level mouse
+        // event reaches the app. For native macOS apps this is harmless (double-action
+        // on an already-clicked element).
+        if let frame = match.frame {
+            try await helper.clickScreenPoint(
+                CGPoint(x: frame.midX, y: frame.midY),
+                buttonName: buttonName,
+                clickCount: 1
+            )
             return UISemanticActionResult(
-                summary: "Clicked \(targetDescription).",
+                summary: "Clicked \(targetDescription)\(axActionSucceeded ? " (AX + pixel)" : " using its screen position").",
                 appName: target.appName,
                 windowTitle: target.windowTitle,
                 targetDescription: targetDescription,
-                actuator: "ax",
-                confidence: 0.92,
+                actuator: axActionSucceeded ? "ax+pixel" : "ax-bounds",
+                confidence: 0.88,
                 verificationText: nil
             )
         }
 
-        guard let frame = match.frame else {
-            throw AssistantAccessibilityAutomationServiceError.actionFailed(
-                "The matching UI element does not expose a clickable action or usable bounds."
+        // No frame available — AXPress was the only option
+        if axActionSucceeded {
+            return UISemanticActionResult(
+                summary: "Clicked \(targetDescription) via Accessibility action.",
+                appName: target.appName,
+                windowTitle: target.windowTitle,
+                targetDescription: targetDescription,
+                actuator: "ax",
+                confidence: 0.72,
+                verificationText: nil
             )
         }
 
-        try await helper.clickScreenPoint(
-            CGPoint(x: frame.midX, y: frame.midY),
-            buttonName: buttonName,
-            clickCount: 1
-        )
-        return UISemanticActionResult(
-            summary: "Clicked \(targetDescription) using its screen position.",
-            appName: target.appName,
-            windowTitle: target.windowTitle,
-            targetDescription: targetDescription,
-            actuator: "ax-bounds",
-            confidence: 0.82,
-            verificationText: nil
+        throw AssistantAccessibilityAutomationServiceError.actionFailed(
+            "The matching UI element does not expose a clickable action or usable bounds."
         )
     }
 

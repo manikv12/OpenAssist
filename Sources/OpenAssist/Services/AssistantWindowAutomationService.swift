@@ -83,6 +83,21 @@ enum AssistantWindowListToolDefinition {
     ]
 }
 
+enum AssistantListDisplaysToolDefinition {
+    static let name = "list_displays"
+    static let toolKind = "displayInspection"
+
+    static let description = """
+    List all connected displays on this Mac with their display IDs, resolutions, and whether each is the primary display. Use the returned display_id values with screen_capture, computer_use, or window_capture to target a specific monitor.
+    """
+
+    static let inputSchema: [String: Any] = [
+        "type": "object",
+        "properties": [:] as [String: Any],
+        "additionalProperties": true
+    ]
+}
+
 enum AssistantWindowCaptureToolDefinition {
     static let name = "window_capture"
     static let toolKind = "windowCapture"
@@ -191,6 +206,18 @@ actor AssistantWindowAutomationService {
                 return "Capture a visible \(appName) window"
             }
             return "Capture a visible window"
+        }
+    }
+
+    struct DisplayInfo: Equatable, Sendable {
+        let displayID: CGDirectDisplayID
+        let frame: CGRect
+        let scaleFactor: CGFloat
+        let isMain: Bool
+        let isBuiltIn: Bool
+
+        var resolutionDescription: String {
+            "\(Int(frame.width))x\(Int(frame.height))"
         }
     }
 
@@ -440,6 +467,52 @@ actor AssistantWindowAutomationService {
                 contentItems: [.init(type: "inputText", text: message, imageURL: nil)],
                 success: false,
                 summary: message
+            )
+        }
+    }
+
+    func listDisplays(
+        arguments: Any,
+        preferredModelID: String?
+    ) async -> AssistantToolExecutionResult {
+        _ = preferredModelID
+        _ = arguments
+        let displays = Self.allDisplays()
+        if displays.isEmpty {
+            return AssistantToolExecutionResult(
+                contentItems: [.init(type: "inputText", text: "No displays found.", imageURL: nil)],
+                success: false,
+                summary: "No displays found."
+            )
+        }
+        let lines: [String] = displays.map { display in
+            var flags: [String] = []
+            if display.isMain { flags.append("primary") }
+            if display.isBuiltIn { flags.append("built-in") }
+            let flagStr = flags.isEmpty ? "" : " [\(flags.joined(separator: ", "))]"
+            let scale = display.scaleFactor > 1 ? " @\(Int(display.scaleFactor))x" : ""
+            return "display_id=\(display.displayID)  \(display.resolutionDescription)\(scale)\(flagStr)"
+        }
+        let message = (["Connected displays:"] + lines).joined(separator: "\n")
+        return AssistantToolExecutionResult(
+            contentItems: [.init(type: "inputText", text: message, imageURL: nil)],
+            success: true,
+            summary: "Listed \(displays.count) display(s)."
+        )
+    }
+
+    static func allDisplays() -> [DisplayInfo] {
+        NSScreen.screens.compactMap { screen in
+            guard let screenNumber = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else {
+                return nil
+            }
+            let displayID = CGDirectDisplayID(screenNumber.uint32Value)
+            return DisplayInfo(
+                displayID: displayID,
+                frame: screen.frame,
+                scaleFactor: screen.backingScaleFactor,
+                isMain: screen == NSScreen.main,
+                isBuiltIn: CGDisplayIsBuiltin(displayID) != 0
             )
         }
     }

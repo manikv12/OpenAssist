@@ -47,6 +47,72 @@ struct AssistantComposerWebSkill: Equatable {
     }
 }
 
+struct AssistantComposerWebPlugin: Equatable {
+    let pluginID: String
+    let displayName: String
+    let summary: String?
+    let needsSetup: Bool
+
+    func toJSON() -> [String: Any] {
+        var json: [String: Any] = [
+            "pluginId": pluginID,
+            "displayName": displayName,
+            "needsSetup": needsSetup,
+        ]
+        if let summary, !summary.isEmpty {
+            json["summary"] = summary
+        }
+        return json
+    }
+}
+
+struct AssistantComposerWebSlashCommand: Equatable {
+    let id: String
+    let label: String
+    let subtitle: String
+    let groupID: String
+    let groupLabel: String
+    let groupTone: String
+    let groupOrder: Int
+    let searchKeywords: [String]
+    let insertText: String
+    let behavior: String
+    let localMode: String?
+
+    init(descriptor: AssistantSlashCommandDescriptor) {
+        self.id = descriptor.id
+        self.label = descriptor.label
+        self.subtitle = descriptor.subtitle
+        self.groupID = descriptor.groupID
+        self.groupLabel = descriptor.groupLabel
+        self.groupTone = descriptor.groupTone
+        self.groupOrder = descriptor.groupOrder
+        self.searchKeywords = descriptor.searchKeywords
+        self.insertText = descriptor.insertText
+        self.behavior = descriptor.behavior.rawValue
+        self.localMode = descriptor.localMode
+    }
+
+    func toJSON() -> [String: Any] {
+        var json: [String: Any] = [
+            "id": id,
+            "label": label,
+            "subtitle": subtitle,
+            "groupId": groupID,
+            "groupLabel": groupLabel,
+            "groupTone": groupTone,
+            "groupOrder": groupOrder,
+            "searchKeywords": searchKeywords,
+            "insertText": insertText,
+            "behavior": behavior,
+        ]
+        if let localMode, !localMode.isEmpty {
+            json["localMode"] = localMode
+        }
+        return json
+    }
+}
+
 struct AssistantComposerWebBaseState: Equatable {
     let draftText: String
     let placeholder: String
@@ -58,9 +124,14 @@ struct AssistantComposerWebBaseState: Equatable {
     let noteModeHelperText: String?
     let showNoteModeButton: Bool
     let canOpenSkills: Bool
+    let canOpenPlugins: Bool
     let preflightStatusMessage: String?
     let activeSkills: [AssistantComposerWebSkill]
+    let selectedPlugins: [AssistantComposerWebPlugin]
+    let availablePlugins: [AssistantComposerWebPlugin]
     let attachments: [AssistantComposerWebAttachment]
+    let activeProviderID: String
+    let slashCommands: [AssistantComposerWebSlashCommand]
 
     func toJSON() -> [String: Any] {
         var json: [String: Any] = [
@@ -72,8 +143,13 @@ struct AssistantComposerWebBaseState: Equatable {
             "isNoteModeActive": isNoteModeActive,
             "showNoteModeButton": showNoteModeButton,
             "canOpenSkills": canOpenSkills,
+            "canOpenPlugins": canOpenPlugins,
             "activeSkills": activeSkills.map { $0.toJSON() },
+            "selectedPlugins": selectedPlugins.map { $0.toJSON() },
+            "availablePlugins": availablePlugins.map { $0.toJSON() },
             "attachments": attachments.map { $0.toJSON() },
+            "activeProviderId": activeProviderID,
+            "slashCommands": slashCommands.map { $0.toJSON() },
         ]
         if let noteModeLabel, !noteModeLabel.isEmpty {
             json["noteModeLabel"] = noteModeLabel
@@ -131,6 +207,7 @@ struct AssistantComposerWebActivityState: Equatable {
     let isBusy: Bool
     let activeTurnPhase: String
     let canCancelActiveTurn: Bool
+    let canSteerActiveTurn: Bool
     let activeTurnProviderLabel: String?
     let hasPendingToolApproval: Bool
     let hasPendingInput: Bool
@@ -143,6 +220,7 @@ struct AssistantComposerWebActivityState: Equatable {
             "isBusy": isBusy,
             "activeTurnPhase": activeTurnPhase,
             "canCancelActiveTurn": canCancelActiveTurn,
+            "canSteerActiveTurn": canSteerActiveTurn,
             "hasPendingToolApproval": hasPendingToolApproval,
             "hasPendingInput": hasPendingInput,
             "isVoiceCapturing": isVoiceCapturing,
@@ -280,11 +358,14 @@ final class AssistantComposerWebContainerView: NSView {
 
         let webView = AssistantInteractiveWebView(frame: .zero, configuration: config)
         webView.setValue(false, forKey: "drawsBackground")
+        webView.underPageBackgroundColor = .clear
         webView.allowsMagnification = false
         self.webView = webView
 
         super.init(frame: .zero)
         wantsLayer = true
+        layer?.isOpaque = false
+        layer?.backgroundColor = CGColor.clear
         webView.navigationDelegate = self
         addSubview(webView)
 

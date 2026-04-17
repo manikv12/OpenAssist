@@ -768,6 +768,7 @@ struct AssistantTranscriptEntry: Identifiable, Equatable, Codable, Sendable {
     let isStreaming: Bool
     let providerBackend: AssistantRuntimeBackend?
     let providerModelID: String?
+    let selectedPlugins: [AssistantComposerPluginSelection]?
 
     init(
         id: UUID = UUID(),
@@ -777,7 +778,8 @@ struct AssistantTranscriptEntry: Identifiable, Equatable, Codable, Sendable {
         emphasis: Bool = false,
         isStreaming: Bool = false,
         providerBackend: AssistantRuntimeBackend? = nil,
-        providerModelID: String? = nil
+        providerModelID: String? = nil,
+        selectedPlugins: [AssistantComposerPluginSelection]? = nil
     ) {
         self.id = id
         self.role = role
@@ -787,6 +789,7 @@ struct AssistantTranscriptEntry: Identifiable, Equatable, Codable, Sendable {
         self.isStreaming = isStreaming
         self.providerBackend = providerBackend
         self.providerModelID = providerModelID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+        self.selectedPlugins = selectedPlugins?.isEmpty == false ? selectedPlugins : nil
     }
 }
 
@@ -1647,6 +1650,39 @@ struct AssistantPermissionRequest: Identifiable, Equatable, Codable, Sendable {
         toolKind == "userInput" && !userInputQuestions.isEmpty
     }
 
+    var isStructuredApprovalPrompt: Bool {
+        guard hasStructuredUserInput, userInputQuestions.count == 1 else { return false }
+        let normalized = Self.normalizedApprovalPromptText(
+            userInputQuestions[0].prompt.nonEmpty ?? rationale ?? rawPayloadSummary ?? toolTitle
+        )
+        guard normalized.hasSuffix("?") else { return false }
+        return normalized.hasPrefix("allow ")
+            || normalized.hasPrefix("do you want ")
+            || normalized.hasPrefix("would you like ")
+            || normalized.hasPrefix("can i ")
+            || normalized.hasPrefix("can codex ")
+            || normalized.hasPrefix("should i ")
+    }
+
+    var displayRawPayloadSummary: String? {
+        let summary = rawPayloadSummary?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+        let rationale = rationale?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+        guard let summary else { return nil }
+        guard summary.caseInsensitiveCompare(rationale ?? "") != .orderedSame else { return nil }
+        return summary
+    }
+
+    func structuredApprovalAnswers(approved: Bool) -> [String: [String]] {
+        guard let question = userInputQuestions.first else { return [:] }
+        if let matchingOption = Self.matchingStructuredApprovalOption(
+            in: question.options,
+            approved: approved
+        ) {
+            return [question.id: [matchingOption.label]]
+        }
+        return [question.id: [approved ? "Yes" : "No"]]
+    }
+
     init(
         id: Int,
         sessionID: String,
@@ -1665,6 +1701,32 @@ struct AssistantPermissionRequest: Identifiable, Equatable, Codable, Sendable {
         self.options = options
         self.userInputQuestions = userInputQuestions
         self.rawPayloadSummary = rawPayloadSummary
+    }
+
+    private static func matchingStructuredApprovalOption(
+        in options: [AssistantUserInputQuestionOption],
+        approved: Bool
+    ) -> AssistantUserInputQuestionOption? {
+        let preferredTerms = approved
+            ? ["allow", "accept", "approve", "approved", "yes", "true"]
+            : ["decline", "deny", "reject", "rejected", "no", "false"]
+        return options.first { option in
+            let normalized = normalizedApprovalPromptText(option.label)
+            return preferredTerms.contains(where: { normalized == $0 || normalized.contains($0) })
+        }
+    }
+
+    private static func normalizedApprovalPromptText(_ text: String?) -> String {
+        guard let text else { return "" }
+        let directionalMarks = CharacterSet(charactersIn:
+            "\u{061C}\u{200E}\u{200F}\u{202A}\u{202B}\u{202C}\u{202D}\u{202E}\u{2066}\u{2067}\u{2068}\u{2069}"
+        )
+        let filtered = String(String.UnicodeScalarView(text.unicodeScalars.filter {
+            !directionalMarks.contains($0)
+        }))
+        return filtered
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
     }
 }
 
@@ -1849,6 +1911,8 @@ struct AssistantRemoteSessionSnapshot: Sendable {
     let pendingPermissionRequest: AssistantPermissionRequest?
     let hudState: AssistantHUDState?
     let hasActiveTurn: Bool
+    let toolCalls: [AssistantToolCallState]
+    let recentToolCalls: [AssistantToolCallState]
     let imageDelivery: AssistantRemoteImageDelivery?
 }
 
@@ -2307,6 +2371,10 @@ final class AssistantStore: ObservableObject {
 
     private func applyAssistantBackendSelectionState(_ backend: AssistantRuntimeBackend) {
         cancelSelectedSessionWarmup()
+        // Clear session selection first so its deferred didSet work (Fix 2)
+        // runs after the bulk reset below has already zeroed derived state,
+        // making the sync a cheap no-op.
+        selectedSessionID = nil
         settings.assistantBackend = backend
         let normalizedPreferredModelID = Self.normalizedStartupPreferredModelID(
             for: backend,
@@ -2331,7 +2399,6 @@ final class AssistantStore: ObservableObject {
         cachedRenderItems = []
         transcriptSessionID = nil
         timelineSessionID = nil
-        selectedSessionID = nil
         planEntries = []
         tokenUsage = .empty
         rateLimits = .empty
@@ -2875,6 +2942,8 @@ final class AssistantStore: ObservableObject {
     @Published private(set) var timelineItems: [AssistantTimelineItem] = []
     /// Pre-computed render items, rebuilt only when `timelineItems` changes (not on every @Published update).
     @Published private(set) var cachedRenderItems: [AssistantTimelineRenderItem] = []
+    /// Cached set of turn IDs that have plan items, to avoid O(n) scans on every streaming delta.
+    private var cachedVisiblePlanTurnIDs: Set<String> = []
     @Published private(set) var transcript: [AssistantTranscriptEntry] = []
     @Published private(set) var planEntries: [AssistantPlanEntry] = []
     @Published private(set) var toolCalls: [AssistantToolCallState] = []
@@ -2900,11 +2969,16 @@ final class AssistantStore: ObservableObject {
     @Published var selectedSessionID: String? {
         didSet {
             guard oldValue != selectedSessionID else { return }
+            clearComposerPlugins()
             restoreComposerState(for: selectedSessionID)
-            syncSelectedSessionExecutionState()
-            refreshActiveThreadSkills(syncRuntime: true)
+            // Defer heavier state sync to the next run-loop tick so the UI
+            // can reflect the session selection change immediately without
+            // blocking on execution-state rebuild, skill refresh, and git ops.
             Task { @MainActor [weak self] in
-                await self?.refreshSelectedCodeTrackingState()
+                guard let self else { return }
+                self.syncSelectedSessionExecutionState()
+                self.refreshActiveThreadSkills(syncRuntime: true)
+                await self.refreshSelectedCodeTrackingState()
             }
         }
     }
@@ -2924,6 +2998,15 @@ final class AssistantStore: ObservableObject {
         }
     }
     @Published private(set) var activeThreadSkills: [AssistantThreadSkillState] = []
+    @Published private(set) var codexPlugins: [AssistantCodexPluginSummary] = []
+    @Published private(set) var codexPluginDetailsByID: [String: AssistantCodexPluginDetail] = [:]
+    @Published private(set) var codexPluginAppStatuses: [AssistantCodexPluginAppStatus] = []
+    @Published private(set) var codexPluginMCPServerStatuses: [AssistantCodexPluginMCPServerStatus] = []
+    @Published private(set) var isRefreshingCodexPlugins = false
+    @Published private(set) var codexPluginErrorMessage: String?
+    @Published private(set) var codexPluginOperationIDs: Set<String> = []
+    @Published var selectedComposerPlugins: [AssistantComposerPluginSelection] = []
+    @Published private(set) var selectedComposerPluginOwnerSessionID: String?
     @Published private(set) var tokenUsage: TokenUsageSnapshot = .empty
     @Published private(set) var rateLimits: AccountRateLimits = .empty
     @Published private(set) var subagents: [SubagentState] = []
@@ -3050,10 +3133,13 @@ final class AssistantStore: ObservableObject {
     private var attachmentsBySessionID: [String: [AssistantAttachment]] = [:]
     private var sessionExecutionStateBySessionID: [String: AssistantSessionExecutionState] = [:]
     private var sessionRuntimesBySessionID: [String: CodexAssistantRuntime] = [:]
+    private var codexPluginUtilityRuntime: CodexAssistantRuntime?
+    private var codexPluginLastRefreshAt: Date?
     private var isRestoringComposerState = false
     private var memoryScopeBySessionID: [String: MemoryScopeContext] = [:]
     private var pendingResumeContextSessionIDs: Set<String> = []
     private var pendingResumeContextSnapshotsBySessionID: [String: String] = [:]
+    private var pendingResumeContextMetadataBySessionID: [String: [String: String]] = [:]
     private var pendingFreshSessionIDs: Set<String> = []
     private var pendingFreshSessionSourcesByID: [String: AssistantSessionSource] = [:]
     private var temporarySessionIDs: Set<String> = []
@@ -3263,6 +3349,9 @@ final class AssistantStore: ObservableObject {
         let runtime = runtimeFactory()
         sessionRuntimesBySessionID[normalizedSessionID] = runtime
         bindRuntimeCallbacks(runtime, preferredSessionID: sessionID)
+        if sessionsMatch(normalizedSessionID, selectedSessionID) {
+            applyCurrentRuntimeContext(to: runtime, threadID: normalizedSessionID)
+        }
         return runtime
     }
 
@@ -3276,6 +3365,882 @@ final class AssistantStore: ObservableObject {
         let runtime = runtimeFactory()
         bindRuntimeCallbacks(runtime, preferredSessionID: nil)
         return runtime
+    }
+
+    var canUseCodexPlugins: Bool {
+        visibleAssistantBackend == .codex
+    }
+
+    var installedCodexPluginSelections: [AssistantComposerPluginSelection] {
+        codexPlugins
+            .filter(\.isInstalled)
+            .map { plugin in
+                AssistantComposerPluginSelection(
+                    pluginID: plugin.id,
+                    displayName: plugin.displayName,
+                    summary: plugin.summary,
+                    needsSetup: codexPluginReadiness(for: plugin).state == .needsSetup
+                )
+            }
+            .sorted {
+                $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending
+            }
+    }
+
+    func refreshCodexPluginCatalogIfNeeded() async {
+        guard canUseCodexPlugins else { return }
+        if codexPlugins.isEmpty {
+            await refreshCodexPluginCatalog(forceRemoteSync: true)
+            return
+        }
+        if let lastRefresh = codexPluginLastRefreshAt,
+           Date().timeIntervalSince(lastRefresh) < 120 {
+            return
+        }
+        await refreshCodexPluginCatalog(forceRemoteSync: false)
+    }
+
+    func refreshCodexPluginCatalog(forceRemoteSync: Bool) async {
+        guard canUseCodexPlugins else {
+            codexPluginErrorMessage = nil
+            return
+        }
+        guard !isRefreshingCodexPlugins else { return }
+
+        isRefreshingCodexPlugins = true
+        defer { isRefreshingCodexPlugins = false }
+
+        do {
+            let summaries = try await fetchCodexPluginSummaries(
+                forceRemoteSync: forceRemoteSync
+            )
+            guard !summaries.isEmpty else {
+                codexPlugins = []
+                codexPluginDetailsByID = [:]
+                codexPluginAppStatuses = []
+                codexPluginMCPServerStatuses = []
+                codexPluginErrorMessage = "OpenAssist could not load the Codex plugin catalog."
+                lastStatusMessage = "Codex returned an empty plugin catalog."
+                return
+            }
+            let runtime = ensureCodexPluginUtilityRuntime()
+            let installedPluginIDs = Set(
+                summaries.filter(\.isInstalled).map { $0.id.lowercased() }
+            )
+
+            var nextDetails = codexPluginDetailsByID
+            nextDetails = nextDetails.filter { key, _ in
+                installedPluginIDs.contains(key.lowercased())
+            }
+
+            codexPlugins = summaries
+            codexPluginLastRefreshAt = Date()
+            codexPluginErrorMessage = nil
+            pruneSelectedComposerPlugins()
+
+            var warnings: [String] = []
+
+            do {
+                codexPluginAppStatuses = try await runtime.listPluginApps()
+            } catch {
+                warnings.append("Couldn't load plugin app setup state.")
+                lastStatusMessage = error.localizedDescription
+            }
+
+            do {
+                codexPluginMCPServerStatuses = try await runtime.listPluginMCPServerStatuses()
+            } catch {
+                warnings.append("Couldn't load plugin MCP setup state.")
+                lastStatusMessage = error.localizedDescription
+            }
+
+            for plugin in summaries where plugin.isInstalled {
+                if nextDetails[plugin.id] == nil {
+                    if let detail = try? await runtime.readPlugin(
+                        marketplacePath: plugin.marketplacePath,
+                        pluginName: plugin.pluginName
+                    ) {
+                        nextDetails[plugin.id] = detail
+                    }
+                }
+            }
+
+            codexPluginDetailsByID = nextDetails
+            codexPluginErrorMessage = warnings.joined(separator: "\n").nonEmpty
+        } catch {
+            codexPluginErrorMessage = error.localizedDescription
+            lastStatusMessage = error.localizedDescription
+        }
+    }
+
+    private func fetchCodexPluginSummaries(
+        forceRemoteSync: Bool
+    ) async throws -> [AssistantCodexPluginSummary] {
+        let preferredCWDs = codexPluginCatalogCWDs()
+        let attempts: [(label: String, restartRuntime: Bool, forceRemoteSync: Bool, cwds: [String])] = [
+            (
+                label: "initial",
+                restartRuntime: false,
+                forceRemoteSync: forceRemoteSync,
+                cwds: preferredCWDs
+            ),
+            (
+                label: "fresh-runtime",
+                restartRuntime: true,
+                forceRemoteSync: true,
+                cwds: preferredCWDs
+            ),
+            (
+                label: "fresh-runtime-no-cwds",
+                restartRuntime: true,
+                forceRemoteSync: true,
+                cwds: []
+            ),
+        ]
+
+        var lastError: Error?
+
+        for attempt in attempts {
+            if attempt.restartRuntime {
+                await resetCodexPluginUtilityRuntime()
+            }
+
+            do {
+                let summaries = try await ensureCodexPluginUtilityRuntime().listPlugins(
+                    cwds: attempt.cwds,
+                    forceRemoteSync: attempt.forceRemoteSync
+                )
+                if !summaries.isEmpty {
+                    if attempt.label != "initial" {
+                        CrashReporter.logInfo(
+                            "Assistant plugin catalog recovered via \(attempt.label) count=\(summaries.count)"
+                        )
+                    }
+                    return summaries
+                }
+
+                CrashReporter.logWarning(
+                    "Assistant plugin catalog returned empty via \(attempt.label) cwds=\(attempt.cwds.count) forceRemoteSync=\(attempt.forceRemoteSync)"
+                )
+            } catch {
+                lastError = error
+                CrashReporter.logWarning(
+                    "Assistant plugin catalog failed via \(attempt.label): \(error.localizedDescription)"
+                )
+            }
+        }
+
+        if let lastError {
+            throw lastError
+        }
+        return []
+    }
+
+    func loadCodexPluginDetail(pluginID: String) async {
+        guard let summary = codexPluginSummary(for: pluginID) else { return }
+        if codexPluginDetailsByID[summary.id] != nil {
+            return
+        }
+
+        do {
+            let detail = try await ensureCodexPluginUtilityRuntime().readPlugin(
+                marketplacePath: summary.marketplacePath,
+                pluginName: summary.pluginName
+            )
+            codexPluginDetailsByID[summary.id] = detail
+        } catch {
+            codexPluginErrorMessage = error.localizedDescription
+        }
+    }
+
+    func installCodexPlugin(pluginID: String) async {
+        guard let summary = codexPluginSummary(for: pluginID) else { return }
+        guard !codexPluginOperationIDs.contains(summary.id) else { return }
+
+        codexPluginOperationIDs.insert(summary.id)
+        defer { codexPluginOperationIDs.remove(summary.id) }
+
+        do {
+            let runtime = ensureCodexPluginUtilityRuntime()
+            try await runtime.installPlugin(
+                marketplacePath: summary.marketplacePath,
+                pluginName: summary.pluginName,
+                forceRemoteSync: true
+            )
+            try? await runtime.reloadMCPServerConfiguration()
+            lastStatusMessage = "Installed \(summary.displayName)."
+            await refreshCodexPluginCatalog(forceRemoteSync: true)
+        } catch {
+            codexPluginErrorMessage = error.localizedDescription
+            lastStatusMessage = error.localizedDescription
+        }
+    }
+
+    func uninstallCodexPlugin(pluginID: String) async {
+        guard let summary = codexPluginSummary(for: pluginID) else { return }
+        guard !codexPluginOperationIDs.contains(summary.id) else { return }
+
+        codexPluginOperationIDs.insert(summary.id)
+        defer { codexPluginOperationIDs.remove(summary.id) }
+
+        do {
+            let runtime = ensureCodexPluginUtilityRuntime()
+            try await runtime.uninstallPlugin(
+                pluginID: summary.id,
+                forceRemoteSync: true
+            )
+            try? await runtime.reloadMCPServerConfiguration()
+            selectedComposerPlugins.removeAll { $0.pluginID.caseInsensitiveCompare(summary.id) == .orderedSame }
+            if selectedComposerPlugins.isEmpty {
+                selectedComposerPluginOwnerSessionID = nil
+            }
+            lastStatusMessage = "Uninstalled \(summary.displayName)."
+            await refreshCodexPluginCatalog(forceRemoteSync: true)
+        } catch {
+            codexPluginErrorMessage = error.localizedDescription
+            lastStatusMessage = error.localizedDescription
+        }
+    }
+
+    func startCodexPluginMCPAuth(serverName: String) async {
+        guard let normalizedServerName = serverName.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+            return
+        }
+
+        do {
+            let url = try await ensureCodexPluginUtilityRuntime().beginMCPServerOAuthLogin(
+                serverName: normalizedServerName
+            )
+            if let url {
+                NSWorkspace.shared.open(url)
+            }
+            lastStatusMessage = "Started sign-in for \(normalizedServerName)."
+        } catch {
+            codexPluginErrorMessage = error.localizedDescription
+            lastStatusMessage = error.localizedDescription
+        }
+    }
+
+    func selectComposerPlugin(pluginID: String) {
+        guard let ownerSessionID = selectedSessionID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+            lastStatusMessage = "Open the chat you want to use first, then attach the plugin."
+            return
+        }
+        guard let selection = installedCodexPluginSelections.first(where: {
+            $0.pluginID.caseInsensitiveCompare(pluginID) == .orderedSame
+        }) else {
+            return
+        }
+        if let currentOwner = selectedComposerPluginOwnerSessionID?.nonEmpty,
+           !sessionsMatch(currentOwner, ownerSessionID) {
+            selectedComposerPlugins = []
+        }
+        selectedComposerPluginOwnerSessionID = ownerSessionID
+        guard !selectedComposerPlugins.contains(where: {
+            $0.pluginID.caseInsensitiveCompare(selection.pluginID) == .orderedSame
+        }) else {
+            return
+        }
+        selectedComposerPlugins.append(selection)
+        selectedComposerPlugins.sort {
+            $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending
+        }
+    }
+
+    func removeComposerPlugin(pluginID: String) {
+        selectedComposerPlugins.removeAll {
+            $0.pluginID.caseInsensitiveCompare(pluginID) == .orderedSame
+        }
+        if selectedComposerPlugins.isEmpty {
+            selectedComposerPluginOwnerSessionID = nil
+        }
+    }
+
+    func clearComposerPlugins() {
+        selectedComposerPlugins = []
+        selectedComposerPluginOwnerSessionID = nil
+    }
+
+    var visibleSelectedComposerPlugins: [AssistantComposerPluginSelection] {
+        guard let ownerSessionID = selectedComposerPluginOwnerSessionID?.nonEmpty,
+              let currentSessionID = selectedSessionID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty,
+              sessionsMatch(ownerSessionID, currentSessionID) else {
+            return []
+        }
+        return selectedComposerPlugins
+    }
+
+    func codexPluginDetail(for pluginID: String) -> AssistantCodexPluginDetail? {
+        guard let normalizedID = normalizedCodexPluginID(pluginID) else { return nil }
+        return codexPluginDetailsByID.first {
+            $0.key.caseInsensitiveCompare(normalizedID) == .orderedSame
+        }?.value
+    }
+
+    func codexPluginReadiness(for plugin: AssistantCodexPluginSummary) -> AssistantCodexPluginReadiness {
+        guard plugin.isInstalled else {
+            return AssistantCodexPluginReadiness(
+                state: .available,
+                appStatuses: [],
+                mcpStatuses: []
+            )
+        }
+
+        let detail = codexPluginDetail(for: plugin.id)
+        let appStatuses = (detail?.apps ?? []).compactMap { app in
+            codexPluginAppStatus(for: app, plugin: plugin)
+        }
+        let mcpStatuses = (detail?.mcpServers ?? []).compactMap { server in
+            codexPluginMCPServerStatuses.first {
+                $0.name.caseInsensitiveCompare(server.name) == .orderedSame
+            }
+        }
+        let needsSetup = appStatuses.contains(where: \.needsSetup)
+            || mcpStatuses.contains(where: \.needsSetup)
+        return AssistantCodexPluginReadiness(
+            state: needsSetup ? .needsSetup : .ready,
+            appStatuses: appStatuses,
+            mcpStatuses: mcpStatuses
+        )
+    }
+
+    private func ensureCodexPluginUtilityRuntime() -> CodexAssistantRuntime {
+        if let codexPluginUtilityRuntime {
+            return codexPluginUtilityRuntime
+        }
+
+        let runtime = runtimeFactory()
+        runtime.backend = .codex
+        runtime.onHealthUpdate = nil
+        runtime.onTranscript = nil
+        runtime.onTranscriptMutation = nil
+        runtime.onTimelineMutation = nil
+        runtime.onActivityItemUpdate = nil
+        runtime.onHUDUpdate = nil
+        runtime.onPlanUpdate = nil
+        runtime.onToolCallUpdate = nil
+        runtime.onPermissionRequest = nil
+        runtime.onSessionChange = nil
+        runtime.onStatusMessage = nil
+        runtime.onTokenUsageUpdate = nil
+        runtime.onSubagentUpdate = nil
+        runtime.onProposedPlan = nil
+        runtime.onModeRestriction = nil
+        runtime.onTurnCompletion = nil
+        runtime.onTitleRequest = nil
+        codexPluginUtilityRuntime = runtime
+        return runtime
+    }
+
+    private func resetCodexPluginUtilityRuntime() async {
+        guard let codexPluginUtilityRuntime else { return }
+        await codexPluginUtilityRuntime.stop()
+        self.codexPluginUtilityRuntime = nil
+    }
+
+    private func pruneSelectedComposerPlugins() {
+        let installedIDs = Set(codexPlugins.filter(\.isInstalled).map { $0.id.lowercased() })
+        selectedComposerPlugins.removeAll { selection in
+            !installedIDs.contains(selection.pluginID.lowercased())
+        }
+    }
+
+    private func codexPluginCatalogCWDs() -> [String] {
+        var values: [String] = []
+        var seen = Set<String>()
+
+        func append(path: String?) {
+            guard let trimmed = path?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+                return
+            }
+            let normalized = trimmed.lowercased()
+            guard seen.insert(normalized).inserted else { return }
+            values.append(trimmed)
+        }
+
+        append(path: selectedSessionID.flatMap { resolvedSessionCWD(for: $0) })
+        for project in visibleLeafProjects {
+            append(path: project.linkedFolderPath)
+        }
+        return values
+    }
+
+    private func normalizedCodexPluginID(_ pluginID: String?) -> String? {
+        pluginID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+    }
+
+    private func codexPluginSummary(for pluginID: String) -> AssistantCodexPluginSummary? {
+        guard let normalizedID = normalizedCodexPluginID(pluginID) else { return nil }
+        return codexPlugins.first {
+            $0.id.caseInsensitiveCompare(normalizedID) == .orderedSame
+        }
+    }
+
+    private func codexPluginAppStatus(
+        for app: AssistantCodexPluginApp,
+        plugin: AssistantCodexPluginSummary
+    ) -> AssistantCodexPluginAppStatus? {
+        codexPluginAppStatuses.first { status in
+            if status.id.caseInsensitiveCompare(app.id) == .orderedSame {
+                return true
+            }
+            if status.name.caseInsensitiveCompare(app.name) == .orderedSame {
+                return true
+            }
+            return status.pluginDisplayNames.contains {
+                $0.caseInsensitiveCompare(plugin.displayName) == .orderedSame
+            }
+        }
+    }
+
+    private func uniqueCodexPluginIDs(_ pluginIDs: [String]) -> [String] {
+        var seen = Set<String>()
+        return pluginIDs.compactMap { rawID in
+            guard let normalizedID = normalizedCodexPluginID(rawID) else { return nil }
+            let lowered = normalizedID.lowercased()
+            guard seen.insert(lowered).inserted else { return nil }
+            return normalizedID
+        }
+    }
+
+    private func resolvedComposerPluginSelections(
+        for pluginIDs: [String],
+        prompt: String? = nil
+    ) -> [AssistantComposerPluginSelection] {
+        uniqueCodexPluginIDs(pluginIDs).compactMap { pluginID in
+            if let selection = installedCodexPluginSelections.first(where: {
+                $0.pluginID.caseInsensitiveCompare(pluginID) == .orderedSame
+            }) {
+                if let summary = codexPluginSummary(for: selection.pluginID) {
+                    return AssistantComposerPluginSelection(
+                        pluginID: selection.pluginID,
+                        displayName: composerPluginSelectionDisplayName(
+                            for: summary,
+                            prompt: prompt
+                        ),
+                        summary: selection.summary,
+                        needsSetup: selection.needsSetup
+                    )
+                }
+                return selection
+            }
+            if let summary = codexPluginSummary(for: pluginID) {
+                return AssistantComposerPluginSelection(
+                    pluginID: summary.id,
+                    displayName: composerPluginSelectionDisplayName(
+                        for: summary,
+                        prompt: prompt
+                    ),
+                    summary: summary.summary,
+                    needsSetup: codexPluginReadiness(for: summary).state == .needsSetup
+                )
+            }
+
+            let pluginName = pluginID.split(separator: "@").first.map(String.init) ?? pluginID
+            return AssistantComposerPluginSelection(
+                pluginID: pluginID,
+                displayName: assistantDisplayPluginName(pluginName: pluginName),
+                summary: nil,
+                needsSetup: false
+            )
+        }
+    }
+
+    private func composerPluginSelectionDisplayName(
+        for plugin: AssistantCodexPluginSummary,
+        prompt: String?
+    ) -> String {
+        if let matchedApp = matchingComposerPluginAppStatuses(
+            for: plugin,
+            prompt: prompt
+        ).first {
+            return matchedApp.name
+        }
+
+        if plugin.displayName.caseInsensitiveCompare("Computer Use") == .orderedSame,
+           let targetName = inferredComputerUseTargetName(from: prompt) {
+            return targetName
+        }
+
+        return plugin.displayName
+    }
+
+    private func matchingComposerPluginAppStatuses(
+        for plugin: AssistantCodexPluginSummary,
+        prompt: String?
+    ) -> [AssistantCodexPluginAppStatus] {
+        guard let prompt = prompt?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+            return []
+        }
+
+        let accessibleApps = codexPluginReadiness(for: plugin).appStatuses
+            .filter { $0.isAccessible && $0.isEnabled }
+        guard !accessibleApps.isEmpty else { return [] }
+
+        let matches = accessibleApps.filter { promptMentionsCodexPluginApp($0, prompt: prompt) }
+            .sorted {
+                if $0.name.count == $1.name.count {
+                    return $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
+                }
+                return $0.name.count > $1.name.count
+            }
+        if !matches.isEmpty {
+            return matches
+        }
+
+        return accessibleApps.count == 1 ? accessibleApps : []
+    }
+
+    private func promptMentionsCodexPluginApp(
+        _ appStatus: AssistantCodexPluginAppStatus,
+        prompt: String
+    ) -> Bool {
+        pluginAppMatchCandidates(for: appStatus).contains { candidate in
+            promptContainsStandalonePhrase(candidate, within: prompt)
+        }
+    }
+
+    private func pluginAppMatchCandidates(
+        for appStatus: AssistantCodexPluginAppStatus
+    ) -> [String] {
+        var rawCandidates: [String] = [
+            appStatus.name,
+            appStatus.id,
+            appStatus.id.replacingOccurrences(of: ".", with: " "),
+            appStatus.id.replacingOccurrences(of: "-", with: " "),
+            appStatus.id.replacingOccurrences(of: "_", with: " "),
+        ]
+
+        let vendorPrefixes = ["microsoft ", "google ", "apple "]
+        let loweredName = appStatus.name.lowercased()
+        for prefix in vendorPrefixes where loweredName.hasPrefix(prefix) {
+            let trimmed = String(appStatus.name.dropFirst(prefix.count))
+            rawCandidates.append(trimmed)
+        }
+
+        var candidates: [String] = []
+        var seen = Set<String>()
+        for rawCandidate in rawCandidates {
+            guard let candidate = rawCandidate.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+                continue
+            }
+            let lowered = candidate.lowercased()
+            guard seen.insert(lowered).inserted else { continue }
+            candidates.append(candidate)
+        }
+
+        return candidates.sorted {
+            if $0.count == $1.count {
+                return $0.localizedCaseInsensitiveCompare($1) == .orderedAscending
+            }
+            return $0.count > $1.count
+        }
+    }
+
+    private func promptContainsStandalonePhrase(
+        _ phrase: String,
+        within prompt: String
+    ) -> Bool {
+        let trimmedPhrase = phrase.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedPhrase.isEmpty else { return false }
+        if trimmedPhrase.count < 4 && !trimmedPhrase.contains(" ") {
+            return false
+        }
+
+        let escaped = NSRegularExpression.escapedPattern(for: trimmedPhrase)
+        guard let regex = try? NSRegularExpression(
+            pattern: #"(?<![\p{L}\p{N}])\#(escaped)(?![\p{L}\p{N}])"#,
+            options: [.caseInsensitive]
+        ) else {
+            return false
+        }
+        let fullRange = NSRange(location: 0, length: (prompt as NSString).length)
+        return regex.firstMatch(in: prompt, range: fullRange) != nil
+    }
+
+    private func inferredComputerUseTargetName(from prompt: String?) -> String? {
+        guard let prompt = prompt?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+            return nil
+        }
+
+        let candidates = [
+            "Brave Browser",
+            "Microsoft Teams",
+            "Teams",
+            "Microsoft Outlook",
+            "Outlook",
+            "Google Chrome",
+            "Chrome",
+            "Safari",
+            "Messages",
+            "System Settings",
+            "Finder",
+            "Terminal",
+            "ChatGPT",
+            "Codex",
+            "Code - Insiders",
+            "Code",
+            "Notes",
+            "Calendar",
+            "Reminders",
+            "Preview",
+            "Microsoft Word",
+            "Word",
+            "Microsoft Excel",
+            "Excel",
+            "WhatsApp",
+        ]
+
+        return candidates.first {
+            promptContainsStandalonePhrase($0, within: prompt)
+        }
+    }
+
+    private func resolveCodexPluginPromptState(
+        prompt: String,
+        selectedPluginIDs: [String],
+        backend: AssistantRuntimeBackend
+    ) async -> (prompt: String, selectedPluginIDs: [String]) {
+        let normalizedIDs = uniqueCodexPluginIDs(selectedPluginIDs)
+        guard backend == .codex else {
+            return (prompt, normalizedIDs)
+        }
+
+        await refreshCodexPluginCatalogIfNeeded()
+        let installedPlugins = codexPlugins.filter(\.isInstalled)
+        guard !installedPlugins.isEmpty else {
+            return (prompt, normalizedIDs)
+        }
+
+        let installedPluginsByID = Dictionary(
+            uniqueKeysWithValues: installedPlugins.map { ($0.id.lowercased(), $0) }
+        )
+        var extractedPluginIDs: [String] = []
+        var resolvedPrompt = prompt
+
+        resolvedPrompt = replaceExplicitCodexPluginMarkdownLinks(
+            in: resolvedPrompt,
+            installedPluginsByID: installedPluginsByID,
+            extractedPluginIDs: &extractedPluginIDs
+        )
+        resolvedPrompt = replaceExplicitCodexPluginURLs(
+            in: resolvedPrompt,
+            installedPluginsByID: installedPluginsByID,
+            extractedPluginIDs: &extractedPluginIDs
+        )
+        extractedPluginIDs.append(
+            contentsOf: detectedCodexPluginMentionIDs(
+                in: resolvedPrompt,
+                installedPlugins: installedPlugins
+            )
+        )
+
+        return (
+            collapsePluginPromptWhitespace(in: resolvedPrompt),
+            uniqueCodexPluginIDs(normalizedIDs + extractedPluginIDs)
+        )
+    }
+
+    private func replaceExplicitCodexPluginMarkdownLinks(
+        in prompt: String,
+        installedPluginsByID: [String: AssistantCodexPluginSummary],
+        extractedPluginIDs: inout [String]
+    ) -> String {
+        guard let regex = try? NSRegularExpression(
+            pattern: #"\[([^\]]+)\]\(plugin://([^)]+)\)"#,
+            options: [.caseInsensitive]
+        ) else {
+            return prompt
+        }
+
+        let nsPrompt = prompt as NSString
+        let matches = regex.matches(
+            in: prompt,
+            range: NSRange(location: 0, length: nsPrompt.length)
+        )
+        guard !matches.isEmpty else { return prompt }
+
+        let mutable = NSMutableString(string: prompt)
+        for match in matches.reversed() {
+            guard match.numberOfRanges >= 3 else { continue }
+            let rawPluginID = nsPrompt.substring(with: match.range(at: 2))
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let plugin = installedPluginsByID[rawPluginID.lowercased()] else { continue }
+
+            let rawLabel = nsPrompt.substring(with: match.range(at: 1))
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let replacement = rawLabel.nonEmpty ?? "@\(plugin.displayName)"
+            extractedPluginIDs.append(plugin.id)
+            mutable.replaceCharacters(in: match.range, with: replacement)
+        }
+
+        return mutable as String
+    }
+
+    private func replaceExplicitCodexPluginURLs(
+        in prompt: String,
+        installedPluginsByID: [String: AssistantCodexPluginSummary],
+        extractedPluginIDs: inout [String]
+    ) -> String {
+        guard let regex = try? NSRegularExpression(
+            pattern: #"plugin://([A-Za-z0-9._-]+@[A-Za-z0-9._-]+)"#,
+            options: [.caseInsensitive]
+        ) else {
+            return prompt
+        }
+
+        let nsPrompt = prompt as NSString
+        let matches = regex.matches(
+            in: prompt,
+            range: NSRange(location: 0, length: nsPrompt.length)
+        )
+        guard !matches.isEmpty else { return prompt }
+
+        let mutable = NSMutableString(string: prompt)
+        for match in matches.reversed() {
+            guard match.numberOfRanges >= 2 else { continue }
+            let rawPluginID = nsPrompt.substring(with: match.range(at: 1))
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let plugin = installedPluginsByID[rawPluginID.lowercased()] else { continue }
+
+            extractedPluginIDs.append(plugin.id)
+            mutable.replaceCharacters(in: match.range, with: "@\(plugin.displayName)")
+        }
+
+        return mutable as String
+    }
+
+    private func detectedCodexPluginMentionIDs(
+        in prompt: String,
+        installedPlugins: [AssistantCodexPluginSummary]
+    ) -> [String] {
+        let orderedPlugins = installedPlugins.sorted {
+            if $0.displayName.count == $1.displayName.count {
+                return $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending
+            }
+            return $0.displayName.count > $1.displayName.count
+        }
+
+        var detectedIDs: [String] = []
+        let fullRange = NSRange(location: 0, length: (prompt as NSString).length)
+
+        for plugin in orderedPlugins {
+            let mentionCandidates = [
+                plugin.displayName,
+                plugin.pluginName,
+                plugin.pluginName.replacingOccurrences(of: "-", with: " "),
+            ].compactMap {
+                $0.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+            }
+
+            for candidate in mentionCandidates {
+                let escaped = NSRegularExpression.escapedPattern(for: candidate)
+                guard let regex = try? NSRegularExpression(
+                    pattern: #"(?<![\p{L}\p{N}_])@\#(escaped)(?=$|[\s\.,!?:;\)\]\}])"#,
+                    options: [.caseInsensitive]
+                ) else {
+                    continue
+                }
+
+                if regex.firstMatch(in: prompt, range: fullRange) != nil {
+                    detectedIDs.append(plugin.id)
+                    break
+                }
+            }
+        }
+
+        return detectedIDs
+    }
+
+    private func collapsePluginPromptWhitespace(in prompt: String) -> String {
+        var normalized = prompt
+        normalized = normalized.replacingOccurrences(
+            of: #"[ \t]{2,}"#,
+            with: " ",
+            options: .regularExpression
+        )
+        normalized = normalized.replacingOccurrences(
+            of: #"\n{3,}"#,
+            with: "\n\n",
+            options: .regularExpression
+        )
+        return normalized.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func codexPluginSelectionContextText(
+        for plugins: [AssistantCodexPluginSummary]
+    ) -> String? {
+        guard !plugins.isEmpty else { return nil }
+        let lines = plugins.map { "- \($0.displayName)" }
+        return """
+        Selected installed plugins for this turn:
+        \(lines.joined(separator: "\n"))
+
+        Prefer these plugins when they fit the request.
+        """
+    }
+
+    private func codexPluginContextPrefixText(
+        selectedPluginIDs: [String],
+        backend: AssistantRuntimeBackend
+    ) async -> String? {
+        guard backend == .codex else { return nil }
+        let normalizedIDs = uniqueCodexPluginIDs(selectedPluginIDs)
+        guard !normalizedIDs.isEmpty else { return nil }
+
+        await refreshCodexPluginCatalogIfNeeded()
+        let summaries = normalizedIDs.compactMap(codexPluginSummary(for:)).filter(\.isInstalled)
+        return codexPluginSelectionContextText(for: summaries)
+    }
+
+    private func resolvedCodexPluginPromptItems(
+        selectedPluginIDs: [String],
+        prompt: String,
+        backend: AssistantRuntimeBackend
+    ) async -> [AssistantCodexPromptInputItem] {
+        guard backend == .codex else { return [] }
+
+        let normalizedIDs = uniqueCodexPluginIDs(selectedPluginIDs)
+        guard !normalizedIDs.isEmpty else { return [] }
+
+        await refreshCodexPluginCatalogIfNeeded()
+
+        var selectedSummaries: [AssistantCodexPluginSummary] = []
+        var items: [AssistantCodexPromptInputItem] = []
+        var seenMentionPaths = Set<String>()
+
+        for pluginID in normalizedIDs {
+            guard let summary = codexPluginSummary(for: pluginID), summary.isInstalled else {
+                continue
+            }
+            selectedSummaries.append(summary)
+
+            if codexPluginDetail(for: summary.id) == nil {
+                await loadCodexPluginDetail(pluginID: summary.id)
+            }
+
+            let matchedAppStatuses = matchingComposerPluginAppStatuses(
+                for: summary,
+                prompt: prompt
+            )
+            for appStatus in matchedAppStatuses {
+                let mentionPath = "app://\(appStatus.id)"
+                guard seenMentionPaths.insert(mentionPath.lowercased()).inserted else { continue }
+                items.append(.mention(name: appStatus.name, path: mentionPath))
+            }
+
+            if summary.displayName.caseInsensitiveCompare("Computer Use") == .orderedSame,
+               matchedAppStatuses.isEmpty,
+               let targetName = inferredComputerUseTargetName(from: prompt) {
+                items.append(.text("For Computer Use, focus on \(targetName) on this Mac."))
+            }
+        }
+
+        if let context = codexPluginSelectionContextText(for: selectedSummaries) {
+            items.append(.text(context))
+        }
+
+        return items
     }
 
     private func sessionHasLiveRuntime(_ sessionID: String?) -> Bool {
@@ -3758,6 +4723,7 @@ final class AssistantStore: ObservableObject {
         for sessionID: String
     ) async throws {
         let runtimeForSession = ensureRuntime(for: sessionID)
+        runtimeForSession.setSelectedCodexPluginIDs(queuedPrompt.selectedPluginIDs)
         try await runtimeForSession.refreshCurrentSessionConfiguration(
             cwd: resolvedSessionCWD(for: sessionID),
             preferredModelID: queuedPrompt.preferredModelID
@@ -3767,6 +4733,11 @@ final class AssistantStore: ObservableObject {
             sessionID: sessionID,
             prompt: queuedPrompt.text,
             automationJob: queuedPrompt.automationJob
+        )
+        let pluginInputItems = await resolvedCodexPluginPromptItems(
+            selectedPluginIDs: queuedPrompt.selectedPluginIDs,
+            prompt: queuedPrompt.text,
+            backend: runtimeForSession.backend
         )
 
         recordOwnedSessionID(sessionID)
@@ -3778,11 +4749,14 @@ final class AssistantStore: ObservableObject {
             preferredModelID: queuedPrompt.preferredModelID,
             modelSupportsImageInput: queuedPrompt.modelSupportsImageInput,
             resumeContext: resumeContext,
-            memoryContext: memoryContext
+            memoryContext: memoryContext,
+            submittedSlashCommand: queuedPrompt.submittedSlashCommand,
+            structuredInputItems: pluginInputItems
         )
         await commitPendingHistoryEditIfNeeded(for: sessionID)
         pendingResumeContextSessionIDs.remove(sessionID)
         pendingResumeContextSnapshotsBySessionID.removeValue(forKey: sessionID)
+        pendingResumeContextMetadataBySessionID.removeValue(forKey: sessionID)
     }
 
     private func memoryContextForPrompt(
@@ -4888,6 +5862,7 @@ final class AssistantStore: ObservableObject {
             hudState: state.hudState,
             hasActiveTurn: runtime?.hasActiveTurn ?? state.hasActiveTurn,
             hasLiveClaudeProcess: runtime?.hasLiveClaudeProcess ?? state.hasLiveClaudeProcess,
+            canSteerActiveTurn: runtime?.canSteerActiveTurn ?? false,
             pendingPermissionRequest: state.pendingPermissionRequest,
             subagentCount: state.subagents.count,
             pendingOutgoingMessage: state.pendingOutgoingMessage,
@@ -5352,8 +6327,13 @@ final class AssistantStore: ObservableObject {
                 projectLinkedSessionIDs: projectLinkedSessionIDs,
                 excluding: knownSessionIDs
             )
-            let recoveredConversationStoreSessions = recoverConversationStoreOpenAssistSessions(
-                excluding: knownSessionIDs.union(recoveredProjectSessions.compactMap { normalizedSessionID($0.id) })
+            // Run conversation-store directory scan on a background thread to
+            // avoid blocking the main thread with snapshot reads during session
+            // list refreshes.
+            let capturedKnownSessionIDs = knownSessionIDs
+                .union(recoveredProjectSessions.compactMap { normalizedSessionID($0.id) })
+            let recoveredConversationStoreSessions = await loadConversationStoreSessionsInBackground(
+                excluding: capturedKnownSessionIDs
             )
             var merged = deduplicateSessions(
                 catalogSessions
@@ -5506,6 +6486,60 @@ final class AssistantStore: ObservableObject {
             }
 
             return conversationStoreSessionSummary(from: threadSummary)
+        }
+    }
+
+    /// Loads conversation-store sessions on a background thread so the
+    /// directory scan and snapshot reads don't block the main thread.
+    private func loadConversationStoreSessionsInBackground(
+        excluding knownSessionIDs: Set<String>
+    ) async -> [AssistantSessionSummary] {
+        let store = conversationStore
+        let capturedDeletedSessionIDs = deletedSessionIDs
+        return await withCheckedContinuation { continuation in
+            Self.conversationReadQueue.async {
+                let savedThreads = store.savedConversationThreads(includeNotesOnly: false)
+                guard !savedThreads.isEmpty else {
+                    continuation.resume(returning: [])
+                    return
+                }
+                let sessions = savedThreads.compactMap { threadSummary -> AssistantSessionSummary? in
+                    let normalizedThreadID = threadSummary.threadID
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                        .lowercased()
+                    guard !normalizedThreadID.isEmpty,
+                          !knownSessionIDs.contains(normalizedThreadID),
+                          !capturedDeletedSessionIDs.contains(normalizedThreadID),
+                          threadSummary.hasConversationContent else {
+                        return nil
+                    }
+                    let latestUserMessage = threadSummary.latestUserMessage?.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let latestAssistantMessage = threadSummary.latestAssistantMessage?.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let selectedNoteTitle = threadSummary.noteTitle?.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let preferredTitle = latestUserMessage ?? selectedNoteTitle ?? latestAssistantMessage ?? "Saved Open Assist Chat"
+                    let collapsedTitle = preferredTitle
+                        .replacingOccurrences(of: "\r\n", with: "\n")
+                        .components(separatedBy: .whitespacesAndNewlines)
+                        .filter { !$0.isEmpty }
+                        .joined(separator: " ")
+                    let title = collapsedTitle.isEmpty ? "Saved Open Assist Chat"
+                        : (collapsedTitle.count > 84 ? String(collapsedTitle.prefix(83)).trimmingCharacters(in: .whitespacesAndNewlines) + "\u{2026}" : collapsedTitle)
+                    return AssistantSessionSummary(
+                        id: normalizedThreadID,
+                        title: title,
+                        source: .openAssist,
+                        threadArchitectureVersion: .providerIndependentV2,
+                        conversationPersistence: .hybridJSONL,
+                        status: .idle,
+                        createdAt: threadSummary.lastUpdatedAt,
+                        updatedAt: threadSummary.lastUpdatedAt,
+                        summary: latestAssistantMessage ?? latestUserMessage ?? selectedNoteTitle,
+                        latestUserMessage: latestUserMessage,
+                        latestAssistantMessage: latestAssistantMessage
+                    )
+                }
+                continuation.resume(returning: sessions)
+            }
         }
     }
 
@@ -5924,6 +6958,7 @@ final class AssistantStore: ObservableObject {
         }
 
         let activitySnapshot = sessionActivitySnapshot(for: normalizedSessionID)
+        let toolState = sessionExecutionStateBySessionID[normalizedSessionID] ?? AssistantSessionExecutionState()
         let imageDelivery = await latestRemoteImageDelivery(
             for: normalizedSessionID,
             sessionTitle: session.title
@@ -5934,6 +6969,8 @@ final class AssistantStore: ObservableObject {
             pendingPermissionRequest: activitySnapshot.pendingPermissionRequest,
             hudState: activitySnapshot.hudState,
             hasActiveTurn: activitySnapshot.hasActiveTurn,
+            toolCalls: toolState.toolCalls,
+            recentToolCalls: toolState.recentToolCalls,
             imageDelivery: imageDelivery
         )
     }
@@ -5976,7 +7013,10 @@ final class AssistantStore: ObservableObject {
             )
         }
 
-        let signatureSeed = attachments.map(\.id).joined(separator: "|")
+        // Include the timeline item's ID in the signature so each observation is
+        // unique even if the screen pixels haven't changed. This prevents skipping
+        // delivery when the user explicitly asks to see the current screen again.
+        let signatureSeed = "\(imageItem.id)|\(attachments.map(\.id).joined(separator: "|"))"
         return AssistantRemoteImageDelivery(
             signature: MemoryIdentifier.stableHexDigest(for: signatureSeed),
             caption: caption,
@@ -5993,8 +7033,10 @@ final class AssistantStore: ObservableObject {
             currentTurnItems = timelineItems[...]
         }
 
+        // Only return images from the current turn. Don't fall back to the full
+        // timeline — that re-delivers stale screenshots from previous turns and
+        // causes duplicates on Telegram.
         return currentTurnItems.reversed().first(where: Self.isRemoteImageTimelineItem)
-            ?? timelineItems.reversed().first(where: Self.isRemoteImageTimelineItem)
     }
 
     private static func isRemoteImageTimelineItem(_ item: AssistantTimelineItem) -> Bool {
@@ -6804,10 +7846,18 @@ final class AssistantStore: ObservableObject {
     }
 
     func sendPrompt(_ prompt: String) async {
-        await sendPrompt(prompt, automationJob: nil)
+        await sendPrompt(prompt, selectedPluginIDs: nil, automationJob: nil)
     }
 
-    func sendPrompt(_ prompt: String, automationJob: ScheduledJob? = nil) async {
+    func sendPrompt(_ prompt: String, selectedPluginIDs: [String]? = nil) async {
+        await sendPrompt(prompt, selectedPluginIDs: selectedPluginIDs, automationJob: nil)
+    }
+
+    func sendPrompt(
+        _ prompt: String,
+        selectedPluginIDs: [String]? = nil,
+        automationJob: ScheduledJob? = nil
+    ) async {
         let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty || !attachments.isEmpty else { return }
         if let selectedSessionID,
@@ -6827,8 +7877,6 @@ final class AssistantStore: ObservableObject {
             }
             return
         }
-
-        lastSubmittedPrompt = trimmed
         let pendingAttachments = attachments
         lastSubmittedAttachments = pendingAttachments
         blockedModeSwitchSuggestion = nil
@@ -6860,26 +7908,45 @@ final class AssistantStore: ObservableObject {
         }
         attachments = []
         promptDraft = ""
+        let requestedPluginIDs = uniqueCodexPluginIDs(
+            selectedPluginIDs ?? visibleSelectedComposerPlugins.map(\.pluginID)
+        )
+        if selectedPluginIDs == nil {
+            clearComposerPlugins()
+        }
         isSendingPrompt = true
         let visibleSessionID = ensureVisibleSessionForPendingPrompt()
         let visibleRuntime = ensureRuntime(for: visibleSessionID)
+        let resolvedPromptState = await resolveCodexPluginPromptState(
+            prompt: trimmed,
+            selectedPluginIDs: requestedPluginIDs,
+            backend: visibleRuntime.backend
+        )
+        let resolvedPrompt = resolvedPromptState.prompt
+        let pendingSelectedPluginIDs = resolvedPromptState.selectedPluginIDs
+        visibleRuntime.setSelectedCodexPluginIDs(pendingSelectedPluginIDs)
         let canInjectIntoActiveClaudeTurn =
             visibleRuntime.backend == .claudeCode
             && visibleRuntime.hasActiveTurn
             && visibleRuntime.hasLiveClaudeProcess
             && sessionActivitySnapshot(for: visibleSessionID).pendingPermissionRequest == nil
             && pendingAttachments.isEmpty
+        let canSteerActiveCodexTurn =
+            visibleRuntime.canSteerActiveTurn
+            && sessionActivitySnapshot(for: visibleSessionID).pendingPermissionRequest == nil
         let shouldQueueBehindActiveTurn = assistantShouldQueuePromptBehindActiveTurn(
             sessionHasActiveTurn: sessionActivitySnapshot(for: visibleSessionID).hasActiveTurn,
             runtimeHasActiveTurn: visibleRuntime.hasActiveTurn
-        ) && !canInjectIntoActiveClaudeTurn
+        ) && !canInjectIntoActiveClaudeTurn && !canSteerActiveCodexTurn
         if canInjectIntoActiveClaudeTurn {
             lastStatusMessage = "Sent your follow-up to Claude. It will continue after the current reply."
+        } else if canSteerActiveCodexTurn {
+            lastStatusMessage = "Steering the active turn with your follow-up."
         } else if shouldQueueBehindActiveTurn {
             lastStatusMessage = "Queued your next message. It will send after the current reply finishes."
         } else {
             stagePendingOutgoingMessage(
-                prompt: trimmed,
+                prompt: resolvedPrompt,
                 attachments: pendingAttachments,
                 for: visibleSessionID
             )
@@ -6896,6 +7963,7 @@ final class AssistantStore: ObservableObject {
                 syncRuntimeContext()
             }
         }
+        lastSubmittedPrompt = resolvedPrompt
         syncRuntimeContext()
         var executionSessionID: String?
         var executionRuntime: CodexAssistantRuntime?
@@ -6908,8 +7976,12 @@ final class AssistantStore: ObservableObject {
             let resumeContext = resumeContextIfNeeded(for: sessionID)
             let memoryContext = try memoryContextForPrompt(
                 sessionID: sessionID,
-                prompt: trimmed,
+                prompt: resolvedPrompt,
                 automationJob: automationJob
+            )
+            let submittedSlashCommand = AssistantSlashCommandCatalog.detectLeadingCommand(
+                in: resolvedPrompt,
+                backend: runtimeForSession.backend
             )
 
             recordOwnedSessionID(sessionID)
@@ -6920,11 +7992,16 @@ final class AssistantStore: ObservableObject {
             toolCalls = []
             recentToolCalls = []
             let committedMessageCreatedAt = Date()
+            let committedSelectedPlugins = resolvedComposerPluginSelections(
+                for: pendingSelectedPluginIDs,
+                prompt: resolvedPrompt
+            )
             appendTranscriptEntry(
                 AssistantTranscriptEntry(
                     role: .user,
-                    text: trimmed,
-                    createdAt: committedMessageCreatedAt
+                    text: resolvedPrompt,
+                    createdAt: committedMessageCreatedAt,
+                    selectedPlugins: committedSelectedPlugins
                 )
             )
             let imageData = pendingAttachments.filter(\.isImage).map(\.data)
@@ -6932,43 +8009,73 @@ final class AssistantStore: ObservableObject {
                 .userMessage(
                     sessionID: sessionID,
                     turnID: nil,
-                    text: trimmed,
+                    text: resolvedPrompt,
                     createdAt: committedMessageCreatedAt,
                     imageAttachments: imageData.isEmpty ? nil : imageData,
+                    selectedPlugins: committedSelectedPlugins,
                     source: .runtime
                 )
             )
             didCommitUserMessage = true
             scheduleTrackedCodeCheckpointStartIfNeeded(for: sessionID)
+            if canSteerActiveCodexTurn {
+                let steeringPromptPrefix = await codexPluginContextPrefixText(
+                    selectedPluginIDs: pendingSelectedPluginIDs,
+                    backend: runtimeForSession.backend
+                )
+                try await runtimeForSession.steerActiveTurn(
+                    prompt: [steeringPromptPrefix, resolvedPrompt]
+                        .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty }
+                        .joined(separator: "\n\n"),
+                    attachments: pendingAttachments
+                )
+                await commitPendingHistoryEditIfNeeded(for: sessionID)
+                pendingResumeContextSessionIDs.remove(sessionID)
+                pendingResumeContextSnapshotsBySessionID.removeValue(forKey: sessionID)
+                pendingResumeContextMetadataBySessionID.removeValue(forKey: sessionID)
+                ensureSessionVisible(sessionID)
+                return
+            }
             if shouldQueueBehindActiveTurn {
                 enqueueQueuedPrompt(
                     AssistantQueuedPrompt(
-                        text: trimmed,
+                        text: resolvedPrompt,
                         attachments: pendingAttachments,
                         preferredModelID: selectedModelID,
                         modelSupportsImageInput: selectedModelSupportsImageInput,
+                        selectedPluginIDs: pendingSelectedPluginIDs,
                         automationJob: automationJob,
-                        createdAt: committedMessageCreatedAt
+                        createdAt: committedMessageCreatedAt,
+                        submittedSlashCommand: submittedSlashCommand
                     ),
                     for: sessionID
                 )
                 await commitPendingHistoryEditIfNeeded(for: sessionID)
                 pendingResumeContextSessionIDs.remove(sessionID)
                 pendingResumeContextSnapshotsBySessionID.removeValue(forKey: sessionID)
+                pendingResumeContextMetadataBySessionID.removeValue(forKey: sessionID)
                 ensureSessionVisible(sessionID)
                 return
             }
+            let pluginInputItems = await resolvedCodexPluginPromptItems(
+                selectedPluginIDs: pendingSelectedPluginIDs,
+                prompt: resolvedPrompt,
+                backend: runtimeForSession.backend
+            )
             try await runtimeForSession.sendPrompt(
-                trimmed,
+                resolvedPrompt,
                 attachments: pendingAttachments,
                 preferredModelID: selectedModelID,
                 modelSupportsImageInput: selectedModelSupportsImageInput,
                 resumeContext: resumeContext,
-                memoryContext: memoryContext
+                memoryContext: memoryContext,
+                submittedSlashCommand: submittedSlashCommand,
+                structuredInputItems: pluginInputItems
             )
             await commitPendingHistoryEditIfNeeded(for: sessionID)
             pendingResumeContextSessionIDs.remove(sessionID)
             pendingResumeContextSnapshotsBySessionID.removeValue(forKey: sessionID)
+            pendingResumeContextMetadataBySessionID.removeValue(forKey: sessionID)
             ensureSessionVisible(sessionID)
         } catch {
             let pendingSessionCandidates = [
@@ -8965,6 +10072,7 @@ final class AssistantStore: ObservableObject {
         pendingTimelineCacheSaveWorkItems[sessionID]?.cancel()
         pendingTimelineCacheSaveWorkItems.removeValue(forKey: sessionID)
         pendingResumeContextSnapshotsBySessionID.removeValue(forKey: sessionID)
+        pendingResumeContextMetadataBySessionID.removeValue(forKey: sessionID)
         transcriptEntriesBySessionID.removeValue(forKey: sessionID)
         timelineItemsBySessionID.removeValue(forKey: sessionID)
         requestedTimelineHistoryLimitBySessionID.removeValue(forKey: sessionID)
@@ -9148,6 +10256,37 @@ final class AssistantStore: ObservableObject {
     func cancelPermissionRequest() async {
         await runtime.cancelPendingPermissionRequest()
         pendingPermissionRequest = nil
+    }
+
+    /// Strip heavy imageAttachments data from screenshot timeline items that have
+    /// already been delivered to Telegram, keeping the text/metadata intact.
+    /// This prevents screenshots from accumulating on disk in session history.
+    func clearDeliveredScreenshotAttachments() {
+        guard let sessionID = selectedSessionID else { return }
+
+        var mutated = false
+        let items: [AssistantTimelineItem]
+        if sessionsMatch(timelineSessionID, sessionID) {
+            items = timelineItems
+        } else {
+            items = timelineItemsBySessionID[sessionID] ?? []
+        }
+
+        var cleaned = items
+        for index in cleaned.indices {
+            guard cleaned[index].kind == .system,
+                  cleaned[index].imageAttachments?.isEmpty == false,
+                  cleaned[index].id.hasPrefix("tool-screenshot-") else { continue }
+            cleaned[index].imageAttachments = nil
+            mutated = true
+        }
+
+        guard mutated else { return }
+        if sessionsMatch(timelineSessionID, sessionID) {
+            timelineItems = cleaned
+        } else {
+            timelineItemsBySessionID[sessionID] = cleaned
+        }
     }
 
     func alwaysAllowToolKind(_ toolKind: String) {
@@ -9846,35 +10985,49 @@ final class AssistantStore: ObservableObject {
         syncRuntimeContext()
     }
 
-    func requestBrowserProfileSelection() {
-        showBrowserProfilePicker = true
-    }
+    private func applyCurrentRuntimeContext(
+        to targetRuntime: CodexAssistantRuntime,
+        threadID: String?
+    ) {
+        targetRuntime.activeSkills = resolvedActiveSkillDescriptors(for: threadID)
+        targetRuntime.browserProfileContext = currentBrowserProfileContext
 
-    func syncRuntimeContext() {
-        runtime.activeSkills = resolvedActiveSkillDescriptors(for: selectedSessionID)
-        runtime.browserProfileContext = currentBrowserProfileContext
-        let notesRuntimeContext = activeAssistantNotesRuntimeContext()
-        // Combine global + per-session instructions
+        let usesSelectedSessionContext = sessionsMatch(threadID, selectedSessionID)
+        let notesRuntimeContext = usesSelectedSessionContext ? activeAssistantNotesRuntimeContext() : nil
+
         let global = settings.assistantCustomInstructions.trimmingCharacters(in: .whitespacesAndNewlines)
-        let session = sessionInstructions.trimmingCharacters(in: .whitespacesAndNewlines)
-        let oneShot = oneShotSessionInstructions?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let session = usesSelectedSessionContext
+            ? sessionInstructions.trimmingCharacters(in: .whitespacesAndNewlines)
+            : ""
+        let oneShot = usesSelectedSessionContext
+            ? oneShotSessionInstructions?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            : ""
         let contextualInstructions = notesRuntimeContext?.instructionText
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let mergedOneShot = [oneShot, contextualInstructions]
             .compactMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty }
             .joined(separator: "\n\n")
-        runtime.customInstructions = Self.combinedRuntimeInstructions(
+
+        targetRuntime.customInstructions = Self.combinedRuntimeInstructions(
             global: global,
             session: session,
             oneShot: mergedOneShot
         )
-        runtime.assistantNotesContext = notesRuntimeContext
-        runtime.setPreferredSubagentModelID(selectedSubagentModelID)
-        runtime.reasoningEffort = reasoningEffort.wireValue
-        runtime.serviceTier = fastModeEnabled ? "fast" : nil
-        runtime.interactionMode = interactionMode
-        runtime.maxToolCallsPerTurn = settings.assistantMaxToolCallsPerTurn
-        runtime.maxRepeatedCommandAttemptsPerTurn = settings.assistantMaxRepeatedCommandAttemptsPerTurn
+        targetRuntime.assistantNotesContext = notesRuntimeContext
+        targetRuntime.setPreferredSubagentModelID(selectedSubagentModelID)
+        targetRuntime.reasoningEffort = reasoningEffort.wireValue
+        targetRuntime.serviceTier = fastModeEnabled ? "fast" : nil
+        targetRuntime.interactionMode = interactionMode
+        targetRuntime.maxToolCallsPerTurn = settings.assistantMaxToolCallsPerTurn
+        targetRuntime.maxRepeatedCommandAttemptsPerTurn = settings.assistantMaxRepeatedCommandAttemptsPerTurn
+    }
+
+    func requestBrowserProfileSelection() {
+        showBrowserProfilePicker = true
+    }
+
+    func syncRuntimeContext() {
+        applyCurrentRuntimeContext(to: runtime, threadID: selectedSessionID)
         if !isRestoringSessionConfiguration {
             updateVisibleSessionConfiguration()
         }
@@ -10907,6 +12060,7 @@ final class AssistantStore: ObservableObject {
                         turnID: turnID,
                         text: normalizedDelta,
                         createdAt: createdAt,
+                        selectedPlugins: nil,
                         source: source
                     )
                 case .activity, .permission:
@@ -10914,9 +12068,8 @@ final class AssistantStore: ObservableObject {
                 }
 
                 items.append(annotatedTimelineItem(newItem, sessionID: targetSessionID))
+                sortTimelineItems(&items)
             }
-
-            sortTimelineItems(&items)
 
             if let targetSessionID {
                 timelineItemsBySessionID[targetSessionID] = items
@@ -13241,6 +14394,7 @@ final class AssistantStore: ObservableObject {
             sessionCatalog.saveNormalizedTimeline([], for: normalizedSessionID)
         }
         pendingResumeContextSnapshotsBySessionID.removeValue(forKey: normalizedSessionID)
+        pendingResumeContextMetadataBySessionID.removeValue(forKey: normalizedSessionID)
         pendingResumeContextSessionIDs.remove(normalizedSessionID)
         transcriptEntriesBySessionID.removeValue(forKey: normalizedSessionID)
         timelineItemsBySessionID.removeValue(forKey: normalizedSessionID)
@@ -13952,6 +15106,163 @@ final class AssistantStore: ObservableObject {
         return "\(header)\n\n\(shortenedBody)"
     }
 
+    struct ProviderRecoveryHandoffRequest: Equatable {
+        let summarySeed: String
+        let recentTurns: [PromptRewriteConversationTurn]
+        let context: PromptRewriteConversationContext
+        let metadata: [String: String]
+    }
+
+    struct ProviderRecoveryResumeContextResult: Equatable {
+        let text: String?
+        let metadata: [String: String]
+    }
+
+    static func buildProviderRecoveryHandoffRequest(
+        transcriptEntries: [AssistantTranscriptEntry],
+        timelineItems: [AssistantTimelineItem],
+        sessionSummary: AssistantSessionSummary?,
+        maxMeaningfulEntries: Int = 30
+    ) -> ProviderRecoveryHandoffRequest? {
+        let recentTurns = buildProviderRecoveryPromptTurns(
+            from: transcriptEntries,
+            maxMeaningfulEntries: maxMeaningfulEntries
+        )
+        let prioritizedImageAnswer = latestImageDerivedAnswer(in: timelineItems)
+
+        var sections: [String] = [
+            "# Provider Recovery Context",
+            "The original provider session could not be reopened. This summary will help a fresh provider session continue the same Open Assist chat."
+        ]
+
+        let sessionTitle = sessionSummary?.title.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+        let sessionSummaryText = sessionSummary?.summary?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+        let latestUserMessage = latestMeaningfulRecoveryUserText(
+            in: recentTurns,
+            fallback: sessionSummary?.latestUserMessage
+        )
+        let hasRecoverySignal = !recentTurns.isEmpty
+            || prioritizedImageAnswer != nil
+            || sessionTitle != nil
+            || sessionSummaryText != nil
+            || latestUserMessage != nil
+        guard hasRecoverySignal else { return nil }
+
+        if sessionTitle != nil || sessionSummaryText != nil || latestUserMessage != nil {
+            sections.append("")
+            sections.append("## Saved Thread Metadata")
+            if let sessionTitle {
+                sections.append("- Title: \(sessionTitle)")
+            }
+            if let sessionSummaryText {
+                sections.append("- Saved summary: \(sessionSummaryText)")
+            }
+            if let latestUserMessage {
+                sections.append("- Latest user request before fallback: \(latestUserMessage)")
+            }
+        }
+
+        if let prioritizedImageAnswer {
+            sections.append("")
+            sections.append("## Important Screenshot-Derived Answer")
+            if let userText = prioritizedImageAnswer.userText?.nonEmpty {
+                sections.append("- User prompt: \(userText)")
+            }
+            sections.append("- Assistant answer: \(prioritizedImageAnswer.assistantText)")
+        }
+
+        sections.append("")
+        sections.append("## Recovery Goal")
+        sections.append("- Continue the current task without asking the user to repeat older context unless something is truly missing.")
+        sections.append("- Preserve named entities, numbered lists, prior decisions, open questions, and screenshot-derived facts already established.")
+
+        let summarySeed = providerRecoverySummarySeed(
+            sections: sections,
+            limit: 2_600
+        )
+        let context = providerRecoveryConversationContext(for: sessionSummary)
+
+        var metadata: [String: String] = [
+            "recovery_recent_turn_count": "\(recentTurns.count)",
+            "recovery_recent_entry_limit": "\(maxMeaningfulEntries)",
+            "recovery_has_saved_thread_summary": sessionSummaryText == nil ? "false" : "true",
+            "recovery_included_image_answer": prioritizedImageAnswer == nil ? "false" : "true"
+        ]
+        if let sessionID = sessionSummary?.id.nonEmpty {
+            metadata["recovery_thread_id"] = sessionID
+        }
+        if let sessionTitle {
+            metadata["recovery_thread_title"] = normalizedResumeContextSnippet(sessionTitle, limit: 120)
+        }
+
+        guard summarySeed.nonEmpty != nil || !recentTurns.isEmpty else {
+            return nil
+        }
+
+        return ProviderRecoveryHandoffRequest(
+            summarySeed: summarySeed,
+            recentTurns: recentTurns,
+            context: context,
+            metadata: metadata
+        )
+    }
+
+    static func buildProviderRecoveryResumeContext(
+        transcriptEntries: [AssistantTranscriptEntry],
+        timelineItems: [AssistantTimelineItem],
+        sessionSummary: AssistantSessionSummary?,
+        rewriteProvider: MemoryRewriteExtractionProviding = StubMemoryRewriteExtractionProvider.shared,
+        timeoutSeconds: Int = 6
+    ) async -> ProviderRecoveryResumeContextResult {
+        let localFallback = buildResumeContext(
+            transcriptEntries: transcriptEntries,
+            sessionSummary: sessionSummary
+        )
+
+        guard let request = buildProviderRecoveryHandoffRequest(
+            transcriptEntries: transcriptEntries,
+            timelineItems: timelineItems,
+            sessionSummary: sessionSummary
+        ) else {
+            return ProviderRecoveryResumeContextResult(
+                text: localFallback,
+                metadata: [
+                    "recovery_summary_method": "local-short-fallback",
+                    "recovery_summary_timeout_seconds": "\(timeoutSeconds)",
+                    "recovery_used_deterministic_fallback": "true"
+                ]
+            )
+        }
+
+        let response = await rewriteProvider.summarizeConversationHandoff(
+            summarySeed: request.summarySeed,
+            recentTurns: request.recentTurns,
+            context: request.context,
+            timeoutSeconds: timeoutSeconds,
+            style: .providerRecovery
+        )
+
+        let normalizedMethod = MemoryTextNormalizer.collapsedWhitespace(response.method)
+        let normalizedText = normalizedProviderRecoverySummaryText(response.text, limit: 1_800)
+        let resolvedText = normalizedText.nonEmpty ?? localFallback
+        let usedDeterministicFallback = !normalizedMethod.lowercased().hasPrefix("ai")
+
+        var metadata = request.metadata
+        metadata["recovery_summary_method"] = normalizedMethod.isEmpty
+            ? "deterministic-fallback"
+            : normalizedMethod
+        metadata["recovery_summary_timeout_seconds"] = "\(timeoutSeconds)"
+        metadata["recovery_used_deterministic_fallback"] = usedDeterministicFallback ? "true" : "false"
+        if let confidence = response.confidence {
+            metadata["recovery_summary_confidence"] = String(format: "%.3f", max(0, min(1, confidence)))
+        }
+
+        return ProviderRecoveryResumeContextResult(
+            text: resolvedText,
+            metadata: metadata
+        )
+    }
+
     private func preferredSessionID(preferConversationContent: Bool = true) -> String? {
         let sourceSessions = visibleSidebarSessions
         if preferConversationContent,
@@ -14289,8 +15600,10 @@ final class AssistantStore: ObservableObject {
         pendingResumeContextSessionIDs.insert(normalizedSessionID)
         if let snapshot = buildResumeContextSnapshot(for: normalizedSessionID)?.nonEmpty {
             pendingResumeContextSnapshotsBySessionID[normalizedSessionID] = snapshot
+            pendingResumeContextMetadataBySessionID.removeValue(forKey: normalizedSessionID)
         } else {
             pendingResumeContextSnapshotsBySessionID.removeValue(forKey: normalizedSessionID)
+            pendingResumeContextMetadataBySessionID.removeValue(forKey: normalizedSessionID)
         }
     }
 
@@ -14385,9 +15698,69 @@ final class AssistantStore: ObservableObject {
         )
     }
 
+    private func buildProviderRecoveryResumeContextSnapshot(
+        for sessionID: String?
+    ) async -> ProviderRecoveryResumeContextResult {
+        guard let normalizedSessionID = sessionID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+            return ProviderRecoveryResumeContextResult(
+                text: nil,
+                metadata: [
+                    "recovery_summary_method": "local-short-fallback",
+                    "recovery_used_deterministic_fallback": "true"
+                ]
+            )
+        }
+
+        let history = await loadProviderRecoveryHistory(for: normalizedSessionID)
+        let summary = sessions.first(where: { sessionsMatch($0.id, normalizedSessionID) })
+        let result = await Self.buildProviderRecoveryResumeContext(
+            transcriptEntries: history.transcript,
+            timelineItems: history.timeline,
+            sessionSummary: summary
+        )
+
+        let method = result.metadata["recovery_summary_method"]?.lowercased() ?? "unknown"
+        if !method.hasPrefix("ai") {
+            CrashReporter.logWarning(
+                "Provider recovery resume context used deterministic fallback threadID=\(normalizedSessionID) method=\(method)"
+            )
+        }
+        return result
+    }
+
+    private func loadProviderRecoveryHistory(for sessionID: String) async -> SessionHistorySlice {
+        let transcriptLimit = 480
+        let timelineLimit = 480
+
+        let cachedTranscript = transcriptEntriesBySessionID[sessionID]
+            ?? (sessionsMatch(transcriptSessionID, sessionID) ? transcript : [])
+        let cachedTimeline = timelineItemsBySessionID[sessionID]
+            ?? (sessionsMatch(timelineSessionID, sessionID) ? timelineItems : [])
+
+        async let persistedTranscriptTask = loadPersistedTranscript(
+            sessionID: sessionID,
+            limit: transcriptLimit
+        )
+        async let persistedTimelineTask = loadPersistedTimeline(
+            sessionID: sessionID,
+            limit: timelineLimit
+        )
+        let (persistedTranscript, persistedTimeline) = await (
+            persistedTranscriptTask,
+            persistedTimelineTask
+        )
+
+        return SessionHistorySlice(
+            timeline: mergeTimelineHistory(persistedTimeline, with: cachedTimeline),
+            transcript: mergeTranscriptHistory(persistedTranscript, with: cachedTranscript)
+        )
+    }
+
     private func recoverMissingRollout(for sessionID: String?) async throws -> String {
         let sourceSessionID = sessionID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
-        let recoveredContext = buildResumeContextSnapshot(for: sessionID)
+        lastStatusMessage = "Rebuilding thread context for the new Claude session..."
+        let recoveredContextResult = await buildProviderRecoveryResumeContextSnapshot(for: sessionID)
+        let recoveredContext = recoveredContextResult.text
         let sourceSession = sourceSessionID.flatMap { sessionID in
             sessions.first(where: { sessionsMatch($0.id, sessionID) })
         }
@@ -14413,6 +15786,7 @@ final class AssistantStore: ObservableObject {
             )
             if let recoveredContext {
                 pendingResumeContextSnapshotsBySessionID[targetThreadID] = recoveredContext
+                pendingResumeContextMetadataBySessionID[targetThreadID] = recoveredContextResult.metadata
             }
             lastStatusMessage = "That saved provider session could not be reopened, so Open Assist started a fresh provider session inside the same chat."
             return targetThreadID
@@ -14428,8 +15802,9 @@ final class AssistantStore: ObservableObject {
         try? threadSkillStore.migrateBindings(from: sourceSessionID, to: replacementSessionID)
         if let recoveredContext {
             pendingResumeContextSnapshotsBySessionID[replacementSessionID] = recoveredContext
+            pendingResumeContextMetadataBySessionID[replacementSessionID] = recoveredContextResult.metadata
         }
-        lastStatusMessage = "That saved thread could not be reopened, so Open Assist started a new thread with a short recovered summary."
+        lastStatusMessage = "That saved thread could not be reopened, so Open Assist started a new thread with recovered context from the older chat."
         return replacementSessionID
     }
 
@@ -14570,13 +15945,16 @@ final class AssistantStore: ObservableObject {
               previousRenderItem.id == updatedItem.id,
               shouldRenderTimelineItem(
                 updatedItem,
-                planTurnIDs: planTurnIDsForVisibleTimeline(in: updatedItems)
+                planTurnIDs: cachedVisiblePlanTurnIDs
               ) else {
             return false
         }
 
         timelineItems = updatedItems
         timelineSessionID = sessionID
+        if updatedItem.kind == .plan, let turnID = updatedItem.turnID?.assistantNonEmpty {
+            cachedVisiblePlanTurnIDs.insert(turnID)
+        }
         var updatedRenderItems = cachedRenderItems
         updatedRenderItems[updatedRenderItems.count - 1] = .timeline(updatedItem)
         cachedRenderItems = updatedRenderItems
@@ -14586,6 +15964,7 @@ final class AssistantStore: ObservableObject {
     private func setVisibleTimeline(_ items: [AssistantTimelineItem], for sessionID: String?) {
         timelineItems = items
         timelineSessionID = sessionID
+        cachedVisiblePlanTurnIDs = planTurnIDsForVisibleTimeline(in: items)
         if let sessionID = sessionID?.nonEmpty {
             timelineItemsBySessionID[sessionID] = items
             persistConversationSnapshotIfNeeded(sessionID: sessionID)
@@ -15067,12 +16446,24 @@ final class AssistantStore: ObservableObject {
         return sessions.first(where: { self.sessionsMatch($0.id, normalizedSessionID) })?.isProviderIndependentThreadV2 == true
     }
 
+    /// Background queue for conversation store read operations (snapshot loading,
+    /// timeline/transcript retrieval) so they don't block the main thread.
+    private static let conversationReadQueue = DispatchQueue(
+        label: "com.openassist.conversation.read",
+        qos: .userInitiated
+    )
+
     private func loadPersistedTranscript(
         sessionID: String,
         limit: Int
     ) async -> [AssistantTranscriptEntry] {
         if isProviderIndependentThreadV2(sessionID: sessionID) {
-            return conversationStore.loadTranscript(threadID: sessionID, limit: limit)
+            let store = conversationStore
+            return await withCheckedContinuation { continuation in
+                Self.conversationReadQueue.async {
+                    continuation.resume(returning: store.loadTranscript(threadID: sessionID, limit: limit))
+                }
+            }
         }
         return await sessionCatalog.loadTranscript(sessionID: sessionID, limit: limit)
     }
@@ -15082,7 +16473,12 @@ final class AssistantStore: ObservableObject {
         limit: Int
     ) async -> [AssistantTimelineItem] {
         if isProviderIndependentThreadV2(sessionID: sessionID) {
-            return conversationStore.loadTimeline(threadID: sessionID, limit: limit)
+            let store = conversationStore
+            return await withCheckedContinuation { continuation in
+                Self.conversationReadQueue.async {
+                    continuation.resume(returning: store.loadTimeline(threadID: sessionID, limit: limit))
+                }
+            }
         }
         return await sessionCatalog.loadMergedTimeline(sessionID: sessionID, limit: limit)
     }
@@ -15093,11 +16489,16 @@ final class AssistantStore: ObservableObject {
         transcriptLimit: Int
     ) async -> CodexSessionCatalog.SessionHistoryChunk {
         if isProviderIndependentThreadV2(sessionID: sessionID) {
-            return conversationStore.loadRecentHistoryChunk(
-                threadID: sessionID,
-                timelineLimit: timelineLimit,
-                transcriptLimit: transcriptLimit
-            )
+            let store = conversationStore
+            return await withCheckedContinuation { continuation in
+                Self.conversationReadQueue.async {
+                    continuation.resume(returning: store.loadRecentHistoryChunk(
+                        threadID: sessionID,
+                        timelineLimit: timelineLimit,
+                        transcriptLimit: transcriptLimit
+                    ))
+                }
+            }
         }
         return await sessionCatalog.loadRecentHistoryChunk(
             sessionID: sessionID,
@@ -15631,6 +17032,183 @@ final class AssistantStore: ObservableObject {
 
         let cutoffIndex = collapsed.index(collapsed.startIndex, offsetBy: max(0, limit - 1))
         let prefix = String(collapsed[..<cutoffIndex]).trimmingCharacters(in: .whitespacesAndNewlines)
+        return prefix.isEmpty ? "" : prefix + "..."
+    }
+
+    private struct ProviderRecoveryImageDerivedAnswer: Equatable {
+        let userText: String?
+        let assistantText: String
+    }
+
+    private static func buildProviderRecoveryPromptTurns(
+        from transcriptEntries: [AssistantTranscriptEntry],
+        maxMeaningfulEntries: Int
+    ) -> [PromptRewriteConversationTurn] {
+        let meaningfulEntries = transcriptEntries
+            .filter { entry in
+                guard !entry.isStreaming else { return false }
+                switch entry.role {
+                case .user, .assistant, .error:
+                    return entry.text.nonEmpty != nil
+                case .system, .status, .tool, .permission:
+                    return false
+                }
+            }
+            .suffix(maxMeaningfulEntries)
+
+        var output: [PromptRewriteConversationTurn] = []
+        var pendingUserText: String?
+        var pendingTimestamp: Date?
+        var assistantParts: [String] = []
+
+        func flushTurn() {
+            guard pendingUserText != nil || !assistantParts.isEmpty else { return }
+            output.append(
+                PromptRewriteConversationTurn(
+                    userText: pendingUserText ?? "",
+                    assistantText: assistantParts.joined(separator: "\n"),
+                    timestamp: pendingTimestamp ?? Date()
+                )
+            )
+            pendingUserText = nil
+            pendingTimestamp = nil
+            assistantParts = []
+        }
+
+        for entry in meaningfulEntries {
+            let normalizedText = normalizedResumeContextSnippet(entry.text, limit: 480)
+            guard !normalizedText.isEmpty else { continue }
+
+            switch entry.role {
+            case .user:
+                flushTurn()
+                pendingUserText = normalizedText
+                pendingTimestamp = entry.createdAt
+            case .assistant:
+                assistantParts.append(normalizedText)
+                pendingTimestamp = entry.createdAt
+            case .error:
+                assistantParts.append("Error: \(normalizedText)")
+                pendingTimestamp = entry.createdAt
+            case .system, .status, .tool, .permission:
+                break
+            }
+        }
+
+        flushTurn()
+        return output
+    }
+
+    private static func latestImageDerivedAnswer(
+        in timelineItems: [AssistantTimelineItem]
+    ) -> ProviderRecoveryImageDerivedAnswer? {
+        let sortedItems = timelineItems.sorted {
+            if $0.sortDate == $1.sortDate {
+                return $0.id < $1.id
+            }
+            return $0.sortDate < $1.sortDate
+        }
+
+        for item in sortedItems.reversed() {
+            guard item.kind == .assistantFinal,
+                  let assistantText = item.text?.nonEmpty,
+                  recoveryTimelineTurnHasImages(item, in: sortedItems) else {
+                continue
+            }
+
+            let userText = latestUserTextForTimelineTurn(item.turnID, in: sortedItems)
+            return ProviderRecoveryImageDerivedAnswer(
+                userText: userText,
+                assistantText: normalizedResumeContextSnippet(assistantText, limit: 1_200)
+            )
+        }
+
+        return nil
+    }
+
+    private static func recoveryTimelineTurnHasImages(
+        _ item: AssistantTimelineItem,
+        in items: [AssistantTimelineItem]
+    ) -> Bool {
+        if item.imageAttachments?.isEmpty == false {
+            return true
+        }
+
+        guard let turnID = item.turnID?.nonEmpty else { return false }
+        return items.contains { candidate in
+            candidate.turnID?.nonEmpty == turnID && (candidate.imageAttachments?.isEmpty == false)
+        }
+    }
+
+    private static func latestUserTextForTimelineTurn(
+        _ turnID: String?,
+        in items: [AssistantTimelineItem]
+    ) -> String? {
+        guard let turnID = turnID?.nonEmpty else { return nil }
+        return items.reversed().first(where: { item in
+            item.turnID?.nonEmpty == turnID
+                && item.kind == .userMessage
+                && item.text?.nonEmpty != nil
+        })?.text.flatMap { normalizedResumeContextSnippet($0, limit: 420).nonEmpty }
+    }
+
+    private static func latestMeaningfulRecoveryUserText(
+        in turns: [PromptRewriteConversationTurn],
+        fallback: String?
+    ) -> String? {
+        if let recentUser = turns.reversed().compactMap({ $0.userText.nonEmpty }).first {
+            return normalizedResumeContextSnippet(recentUser, limit: 320)
+        }
+        guard let fallback = fallback?.nonEmpty else { return nil }
+        return normalizedResumeContextSnippet(fallback, limit: 320)
+    }
+
+    private static func providerRecoveryConversationContext(
+        for sessionSummary: AssistantSessionSummary?
+    ) -> PromptRewriteConversationContext {
+        let appName = ((Bundle.main.object(forInfoDictionaryKey: "CFBundleName") as? String)?.nonEmpty)
+            ?? "Open Assist"
+        let bundleIdentifier = Bundle.main.bundleIdentifier?.nonEmpty ?? "com.openassist.app"
+        return PromptRewriteConversationContext(
+            id: sessionSummary?.id.nonEmpty ?? UUID().uuidString,
+            appName: appName,
+            bundleIdentifier: bundleIdentifier,
+            screenLabel: "Assistant Thread Recovery",
+            fieldLabel: sessionSummary?.title.nonEmpty ?? "Chat Composer",
+            logicalSurfaceKey: "assistant-thread-recovery",
+            projectKey: sessionSummary?.projectID?.lowercased(),
+            projectLabel: sessionSummary?.projectName?.nonEmpty,
+            nativeThreadKey: sessionSummary?.id.nonEmpty,
+            people: []
+        )
+    }
+
+    private static func providerRecoverySummarySeed(
+        sections: [String],
+        limit: Int
+    ) -> String {
+        let joined = sections
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .joined(separator: "\n")
+        return normalizedProviderRecoverySummaryText(joined, limit: limit)
+    }
+
+    private static func normalizedProviderRecoverySummaryText(
+        _ text: String,
+        limit: Int
+    ) -> String {
+        let normalized = text
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else { return "" }
+        guard normalized.count > limit else { return normalized }
+
+        let cutoffIndex = normalized.index(
+            normalized.startIndex,
+            offsetBy: max(0, limit - 3)
+        )
+        let prefix = String(normalized[..<cutoffIndex]).trimmingCharacters(in: .whitespacesAndNewlines)
         return prefix.isEmpty ? "" : prefix + "..."
     }
 }

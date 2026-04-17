@@ -7,14 +7,25 @@ struct AssistantToolExecutionResult: Sendable {
         let imageURL: String?
 
         func dictionaryRepresentation() -> [String: Any] {
-            var dictionary: [String: Any] = ["type": type]
+            var dictionary: [String: Any] = ["type": codexWireType]
             if let text {
                 dictionary["text"] = text
             }
             if let imageURL {
-                dictionary["image_url"] = ["url": imageURL]
+                dictionary["image_url"] = imageURL
             }
             return dictionary
+        }
+
+        private var codexWireType: String {
+            switch type.trimmingCharacters(in: .whitespacesAndNewlines) {
+            case "inputText", "input_text":
+                return "input_text"
+            case "inputImage", "input_image":
+                return "input_image"
+            default:
+                return type
+            }
         }
     }
 

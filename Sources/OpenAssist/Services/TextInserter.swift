@@ -10,6 +10,21 @@ enum TextInserter {
         case empty = "empty"
     }
 
+    enum InsertionContext {
+        case standard
+        case dictation
+    }
+
+    enum InsertionPolicy: String, Equatable {
+        case standard = "standard"
+        case preferTypingFirst = "prefer-typing-first"
+    }
+
+    enum TypingStrategy: String, Equatable {
+        case unicodeEvents = "unicode-events"
+        case appleScriptKeystrokePreferred = "applescript-keystroke-preferred"
+    }
+
     struct InsertOutcome: Equatable {
         let result: Result
         let debugStatus: String?
@@ -88,8 +103,18 @@ enum TextInserter {
     private static let openAssistTransientMarkerType = NSPasteboard.PasteboardType("com.openassist.transient-marker")
 
     @MainActor
-    static func insert(_ text: String, copyToClipboard: Bool) -> Result {
-        let outcome = performInsert(text, copyToClipboard: copyToClipboard, runtime: makeLiveRuntime())
+    static func insert(
+        _ text: String,
+        copyToClipboard: Bool,
+        insertionContext: InsertionContext = .standard
+    ) -> Result {
+        let typingStrategy = liveTypingStrategy(for: insertionContext)
+        let outcome = performInsert(
+            text,
+            copyToClipboard: copyToClipboard,
+            insertionPolicy: liveInsertionPolicy(for: insertionContext),
+            runtime: makeLiveRuntime(typingStrategy: typingStrategy)
+        )
         lastDebugStatus = outcome.debugStatus
 
         if let debugStatus = outcome.debugStatus, outcome.result != .pasted {
@@ -100,8 +125,18 @@ enum TextInserter {
     }
 
     // Test-only insertion entrypoint used by smoke tests to validate clipboard flow deterministically.
-    static func insertForSmokeTests(_ text: String, copyToClipboard: Bool, runtime: Runtime) -> InsertOutcome {
-        performInsert(text, copyToClipboard: copyToClipboard, runtime: runtime)
+    static func insertForSmokeTests(
+        _ text: String,
+        copyToClipboard: Bool,
+        insertionPolicy: InsertionPolicy = .standard,
+        runtime: Runtime
+    ) -> InsertOutcome {
+        performInsert(
+            text,
+            copyToClipboard: copyToClipboard,
+            insertionPolicy: insertionPolicy,
+            runtime: runtime
+        )
     }
 
     private static func debugLog(_ message: String) {
@@ -116,12 +151,21 @@ enum TextInserter {
         }
     }
 
-    private static func performInsert(_ text: String, copyToClipboard: Bool, runtime: Runtime) -> InsertOutcome {
+    private static func performInsert(
+        _ text: String,
+        copyToClipboard: Bool,
+        insertionPolicy: InsertionPolicy,
+        runtime: Runtime
+    ) -> InsertOutcome {
         guard !text.isEmpty else { return InsertOutcome(result: .empty, debugStatus: nil) }
 
-        debugLog("performInsert: text=\(text.prefix(30))... copyToClipboard=\(copyToClipboard) AXTrusted=\(AXIsProcessTrusted())")
+        debugLog(
+            "performInsert: text=\(text.prefix(30))... copyToClipboard=\(copyToClipboard) policy=\(insertionPolicy.rawValue) AXTrusted=\(AXIsProcessTrusted())"
+        )
 
-        if runtime.shouldTryDirectInsert() {
+        if insertionPolicy == .preferTypingFirst {
+            debugLog("Direct insert SKIPPED by typing-first insertion policy")
+        } else if runtime.shouldTryDirectInsert() {
             if runtime.insertDirect(text) {
                 debugLog("Direct insert SUCCEEDED")
                 if copyToClipboard {
@@ -134,6 +178,11 @@ enum TextInserter {
             debugLog("Direct insert FAILED")
         } else {
             debugLog("Direct insert SKIPPED by app compatibility policy")
+        }
+
+        if insertionPolicy == .preferTypingFirst {
+            debugLog("Trying typingPreferred path")
+            return insertWithTypingPreferred(text, copyToClipboard: copyToClipboard, runtime: runtime)
         }
 
         if copyToClipboard {
@@ -155,6 +204,24 @@ enum TextInserter {
 
         debugLog("Typing insert FAILED after transient clipboard failure")
         return InsertOutcome(result: .notInserted, debugStatus: transientOutcome.debugStatus ?? "typing-unavailable")
+    }
+
+    private static func insertWithTypingPreferred(
+        _ text: String,
+        copyToClipboard: Bool,
+        runtime: Runtime
+    ) -> InsertOutcome {
+        if runtime.insertTyping(text) {
+            debugLog("typingPreferred: typing SUCCEEDED")
+            if copyToClipboard,
+               case let .failure(debugStatus) = runtime.writeClipboard(text) {
+                runtime.log("Typing insert succeeded but clipboard mirror failed [\(debugStatus)]")
+            }
+            return InsertOutcome(result: .pasted, debugStatus: nil)
+        }
+
+        debugLog("typingPreferred: typing FAILED")
+        return InsertOutcome(result: .notInserted, debugStatus: "typing-unavailable")
     }
 
     private static func insertWithClipboardPreferred(_ text: String, runtime: Runtime) -> InsertOutcome {
@@ -225,7 +292,7 @@ enum TextInserter {
     }
 
     @MainActor
-    private static func makeLiveRuntime() -> Runtime {
+    private static func makeLiveRuntime(typingStrategy: TypingStrategy) -> Runtime {
         Runtime(
             shouldTryDirectInsert: {
                 shouldTryDirectInsertForFrontmostApp()
@@ -234,7 +301,7 @@ enum TextInserter {
                 insertDirectlyIntoFocusedTextInput(text)
             },
             insertTyping: { text in
-                insertByTyping(text)
+                insertByTyping(text, strategy: typingStrategy)
             },
             writeClipboard: { text in
                 verifiedClipboardWrite(text)
@@ -385,6 +452,64 @@ enum TextInserter {
     }
 
     @MainActor
+    private static func liveTypingStrategy(for insertionContext: InsertionContext) -> TypingStrategy {
+        typingStrategy(
+            forFrontmostBundleIdentifier: NSWorkspace.shared.frontmostApplication?.bundleIdentifier,
+            insertionContext: insertionContext
+        )
+    }
+
+    static func typingStrategy(
+        forFrontmostBundleIdentifier bundleIdentifier: String?,
+        insertionContext: InsertionContext
+    ) -> TypingStrategy {
+        guard insertionContext == .dictation else {
+            return .unicodeEvents
+        }
+
+        if normalizedBundleIdentifier(bundleIdentifier) == "com.microsoft.rdc.macos" {
+            return .appleScriptKeystrokePreferred
+        }
+
+        return .unicodeEvents
+    }
+
+    @MainActor
+    private static func liveInsertionPolicy(for insertionContext: InsertionContext) -> InsertionPolicy {
+        insertionPolicy(
+            forFrontmostBundleIdentifier: NSWorkspace.shared.frontmostApplication?.bundleIdentifier,
+            insertionContext: insertionContext
+        )
+    }
+
+    static func insertionPolicy(
+        forFrontmostBundleIdentifier bundleIdentifier: String?,
+        insertionContext: InsertionContext
+    ) -> InsertionPolicy {
+        guard insertionContext == .dictation else {
+            return .standard
+        }
+
+        if normalizedBundleIdentifier(bundleIdentifier) == "com.microsoft.rdc.macos" {
+            return .preferTypingFirst
+        }
+
+        return .standard
+    }
+
+    private static func normalizedBundleIdentifier(_ bundleIdentifier: String?) -> String? {
+        guard let bundleIdentifier else {
+            return nil
+        }
+
+        let normalized = bundleIdentifier
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+
+        return normalized.isEmpty ? nil : normalized
+    }
+
+    @MainActor
     private static func shouldTryDirectInsertForFrontmostApp() -> Bool {
         // AX value mutations are app-specific and can duplicate text or preserve placeholder artifacts
         // in modern web/AI shells. Default to paste/typing paths unless explicitly opted in.
@@ -488,7 +613,20 @@ enum TextInserter {
     }
 
     // Non-clipboard fallback: types text directly into the focused field.
-    private static func insertByTyping(_ text: String) -> Bool {
+    private static func insertByTyping(_ text: String, strategy: TypingStrategy) -> Bool {
+        if strategy == .appleScriptKeystrokePreferred {
+            debugLog("typing: trying AppleScript keystroke path first")
+            if insertByAppleScriptKeystroke(text) {
+                debugLog("typing: AppleScript keystroke path SUCCEEDED")
+                return true
+            }
+            debugLog("typing: AppleScript keystroke path FAILED, falling back to unicode events")
+        }
+
+        return insertByUnicodeEvents(text)
+    }
+
+    private static func insertByUnicodeEvents(_ text: String) -> Bool {
         let source = CGEventSource(stateID: .combinedSessionState) ?? CGEventSource(stateID: .hidSystemState)
         guard let source else {
             return false
@@ -523,6 +661,73 @@ enum TextInserter {
         }
 
         return true
+    }
+
+    private static func insertByAppleScriptKeystroke(_ text: String) -> Bool {
+        let normalized = text
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+
+        var currentChunk = ""
+
+        func flushChunk() -> Bool {
+            guard !currentChunk.isEmpty else { return true }
+            let escaped = appleScriptEscaped(currentChunk)
+            let script = NSAppleScript(source: """
+                tell application "System Events"
+                    keystroke "\(escaped)"
+                end tell
+                """)
+            var error: NSDictionary?
+            script?.executeAndReturnError(&error)
+            let succeeded = error == nil
+            if !succeeded, let error {
+                debugLog("typing: AppleScript keystroke error \(error)")
+            }
+            currentChunk = ""
+            return succeeded
+        }
+
+        func sendSpecialKeyCode(_ keyCode: Int) -> Bool {
+            let script = NSAppleScript(source: """
+                tell application "System Events"
+                    key code \(keyCode)
+                end tell
+                """)
+            var error: NSDictionary?
+            script?.executeAndReturnError(&error)
+            let succeeded = error == nil
+            if !succeeded, let error {
+                debugLog("typing: AppleScript key code error \(error)")
+            }
+            return succeeded
+        }
+
+        for scalar in normalized.unicodeScalars {
+            switch scalar.value {
+            case 10:
+                guard flushChunk(), sendSpecialKeyCode(36) else {
+                    return false
+                }
+            case 9:
+                guard flushChunk(), sendSpecialKeyCode(48) else {
+                    return false
+                }
+            default:
+                currentChunk.unicodeScalars.append(scalar)
+                if currentChunk.count >= 48, !flushChunk() {
+                    return false
+                }
+            }
+        }
+
+        return flushChunk()
+    }
+
+    private static func appleScriptEscaped(_ value: String) -> String {
+        value
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
     }
 
     // Tries to insert/replace text in the currently focused element via Accessibility.

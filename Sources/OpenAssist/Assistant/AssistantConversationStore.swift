@@ -498,7 +498,7 @@ private struct AssistantConversationEventPayload: Codable, Equatable {
     }
 }
 
-private struct AssistantConversationEventRecord: Codable, Equatable {
+private struct AssistantConversationEventRecord: Codable, Equatable, Sendable {
     let sequence: Int
     let threadID: String
     let recordedAt: Date
@@ -519,6 +519,10 @@ final class AssistantConversationStore {
     private let fileManager: FileManager
     private let baseDirectoryURL: URL
     private let noteRecoveryStore: AssistantNoteRecoveryStore
+    private let eventPersistenceQueue = DispatchQueue(
+        label: "com.openassist.conversation.event-persistence",
+        qos: .utility
+    )
     private var nextSequenceByThreadID: [String: Int] = [:]
     private var cachedSavedConversationThreadSummaries: [Bool: [AssistantConversationThreadSummary]] = [:]
     private var cachedSavedConversationThreadSummariesStamp: Date?
@@ -989,6 +993,17 @@ final class AssistantConversationStore {
         }
 
         let previousText = loadThreadNoteText(threadID: normalizedThreadID, fileName: note.fileName)
+        let previousTrimmed = previousText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let nextTrimmed = normalizedText.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if nextTrimmed.isEmpty, !previousTrimmed.isEmpty, !forceHistorySnapshot {
+            return AssistantThreadNotesWorkspace(
+                threadID: normalizedThreadID,
+                manifest: manifest,
+                selectedNoteText: previousText
+            )
+        }
+
         if previousText != normalizedText {
             noteRecoveryStore.captureHistorySnapshot(
                 note: note,
@@ -996,11 +1011,11 @@ final class AssistantConversationStore {
                 ownerID: normalizedThreadID,
                 text: previousText,
                 at: now,
-                force: forceHistorySnapshot || normalizedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                force: forceHistorySnapshot || nextTrimmed.isEmpty
             )
         }
 
-        if normalizedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        if nextTrimmed.isEmpty {
             try? fileManager.removeItem(at: fileURL)
         } else {
             try fileManager.createDirectory(
@@ -1730,11 +1745,6 @@ final class AssistantConversationStore {
             return
         }
 
-        try fileManager.createDirectory(
-            at: eventLogURL.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
-
         let sequence = nextSequence(for: normalizedThreadID)
         let record = AssistantConversationEventRecord(
             sequence: sequence,
@@ -1744,22 +1754,38 @@ final class AssistantConversationStore {
             payload: payload
         )
 
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys]
-        var lineData = try encoder.encode(record)
-        lineData.append(0x0A)
-
-        if fileManager.fileExists(atPath: eventLogURL.path) {
-            let handle = try FileHandle(forWritingTo: eventLogURL)
-            defer { try? handle.close() }
-            try handle.seekToEnd()
-            try handle.write(contentsOf: lineData)
-        } else {
-            try lineData.write(to: eventLogURL, options: .atomic)
-        }
-
+        // Update in-memory state synchronously so callers see consistent sequences.
         nextSequenceByThreadID[normalizedThreadID] = sequence + 1
         invalidateSavedConversationThreadSummariesCache()
+
+        // Encode and write to disk on a background serial queue to avoid
+        // blocking the main thread on every streaming text delta.
+        let fm = fileManager
+        eventPersistenceQueue.async {
+            do {
+                try fm.createDirectory(
+                    at: eventLogURL.deletingLastPathComponent(),
+                    withIntermediateDirectories: true
+                )
+
+                let encoder = JSONEncoder()
+                encoder.outputFormatting = [.sortedKeys]
+                var lineData = try encoder.encode(record)
+                lineData.append(0x0A)
+
+                if fm.fileExists(atPath: eventLogURL.path) {
+                    let handle = try FileHandle(forWritingTo: eventLogURL)
+                    defer { try? handle.close() }
+                    try handle.seekToEnd()
+                    try handle.write(contentsOf: lineData)
+                } else {
+                    try lineData.write(to: eventLogURL, options: .atomic)
+                }
+            } catch {
+                // Best-effort persistence — the snapshot save acts as a
+                // durable fallback that will capture the full state.
+            }
+        }
     }
 
     private func nextSequence(for threadID: String) -> Int {
@@ -2220,6 +2246,7 @@ final class AssistantConversationStore {
                     turnID: deltaEvent.turnID,
                     text: deltaEvent.delta,
                     createdAt: deltaEvent.createdAt,
+                    selectedPlugins: nil,
                     providerBackend: deltaEvent.providerBackend,
                     providerModelID: deltaEvent.providerModelID,
                     source: deltaEvent.source
@@ -2276,6 +2303,7 @@ final class AssistantConversationStore {
                     sessionID: threadID,
                     text: text,
                     createdAt: entry.createdAt,
+                    selectedPlugins: entry.selectedPlugins,
                     providerBackend: entry.providerBackend,
                     providerModelID: entry.providerModelID,
                     source: .runtime

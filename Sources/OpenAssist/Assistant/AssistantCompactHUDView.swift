@@ -615,7 +615,7 @@ struct AssistantOrbHUDView: View {
                                 .fixedSize(horizontal: false, vertical: true)
                         }
 
-                        if let summary = request.rawPayloadSummary, !summary.isEmpty {
+                        if let summary = request.displayRawPayloadSummary {
                             Text(summary)
                                 .font(.system(size: 11, weight: .regular, design: .monospaced))
                                 .foregroundStyle(AppVisualTheme.foreground(0.58))
@@ -626,7 +626,21 @@ struct AssistantOrbHUDView: View {
                                     tint: orangeTint, cornerRadius: 14, fillOpacity: 0.08)
                         }
 
-                        if request.hasStructuredUserInput {
+                        if request.isStructuredApprovalPrompt {
+                            AssistantStructuredApprovalView(
+                                accent: orangeTint,
+                                secondaryText: AppVisualTheme.foreground(0.70),
+                                approveTitle: "Approve",
+                                rejectTitle: "Reject",
+                                cancelTitle: "Cancel Request"
+                            ) {
+                                model.onSubmitPermissionAnswers?(request.structuredApprovalAnswers(approved: true))
+                            } onReject: {
+                                model.onSubmitPermissionAnswers?(request.structuredApprovalAnswers(approved: false))
+                            } onCancel: {
+                                model.onCancelPermission?()
+                            }
+                        } else if request.hasStructuredUserInput {
                             AssistantStructuredUserInputView(
                                 request: request,
                                 accent: orangeTint,
@@ -2189,7 +2203,7 @@ struct AssistantNotchHUDView: View {
                             .fixedSize(horizontal: false, vertical: true)
                     }
 
-                    if let summary = request.rawPayloadSummary?.nonEmpty {
+                    if let summary = request.displayRawPayloadSummary {
                         Text(summary)
                             .font(.system(size: 10.5, weight: .regular, design: .monospaced))
                             .foregroundStyle(AppVisualTheme.foreground(0.58))
@@ -2199,7 +2213,21 @@ struct AssistantNotchHUDView: View {
                             .notchInsetSurface(tint: .orange, cornerRadius: 18, fillOpacity: 0.08)
                     }
 
-                    if request.hasStructuredUserInput {
+                    if request.isStructuredApprovalPrompt {
+                        AssistantStructuredApprovalView(
+                            accent: .orange,
+                            secondaryText: AppVisualTheme.foreground(0.70),
+                            approveTitle: "Approve",
+                            rejectTitle: "Reject",
+                            cancelTitle: "Cancel Request"
+                        ) {
+                            model.onSubmitPermissionAnswers?(request.structuredApprovalAnswers(approved: true))
+                        } onReject: {
+                            model.onSubmitPermissionAnswers?(request.structuredApprovalAnswers(approved: false))
+                        } onCancel: {
+                            model.onCancelPermission?()
+                        }
+                    } else if request.hasStructuredUserInput {
                         AssistantStructuredUserInputView(
                             request: request,
                             accent: .orange,

@@ -629,6 +629,7 @@ struct AIMemoryStudioView: View {
                 .frame(maxWidth: .infinity, alignment: .topLeading)
             }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 
     private var studioSidebar: some View {

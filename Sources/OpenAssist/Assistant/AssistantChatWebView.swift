@@ -128,6 +128,7 @@ struct AssistantChatWebMessage: Equatable {
     let canEdit: Bool
     let rewriteAnchorID: String?
     let providerLabel: String?
+    let selectedPlugins: [AssistantComposerWebPlugin]?
 
     // Activity
     let activityIcon: String?
@@ -157,6 +158,9 @@ struct AssistantChatWebMessage: Equatable {
         if canEdit { json["canEdit"] = true }
         if let rewriteAnchorID { json["rewriteAnchorID"] = rewriteAnchorID }
         if let providerLabel { json["providerLabel"] = providerLabel }
+        if let selectedPlugins, !selectedPlugins.isEmpty {
+            json["selectedPlugins"] = selectedPlugins.map { $0.toJSON() }
+        }
 
         if let images, !images.isEmpty {
             json["images"] = images.map(\.dataURL)
@@ -1078,6 +1082,8 @@ struct AssistantChatWebThreadNoteCommand {
     let sourceTextAfterMove: String?
     let requestID: String?
     let outputMode: String?
+    let captureMode: String?
+    let captureSegmentCount: Int?
     let filename: String?
     let mimeType: String?
     let dataURL: String?
@@ -1119,6 +1125,8 @@ struct AssistantChatWebThreadNoteCommand {
         sourceTextAfterMove: String?,
         requestID: String?,
         outputMode: String?,
+        captureMode: String?,
+        captureSegmentCount: Int?,
         filename: String?,
         mimeType: String?,
         dataURL: String?,
@@ -1159,6 +1167,8 @@ struct AssistantChatWebThreadNoteCommand {
         self.sourceTextAfterMove = sourceTextAfterMove
         self.requestID = requestID
         self.outputMode = outputMode
+        self.captureMode = captureMode
+        self.captureSegmentCount = captureSegmentCount
         self.filename = filename
         self.mimeType = mimeType
         self.dataURL = dataURL
@@ -1234,6 +1244,10 @@ struct AssistantChatWebThreadNoteCommand {
         self.outputMode = (payload["outputMode"] as? String)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .assistantNonEmpty
+        self.captureMode = (payload["captureMode"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .assistantNonEmpty
+        self.captureSegmentCount = (payload["captureSegmentCount"] as? NSNumber)?.intValue
         self.filename = (payload["filename"] as? String)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .assistantNonEmpty
@@ -1306,6 +1320,8 @@ struct AssistantChatWebThreadNoteScreenshotCaptureResult: Equatable {
     let ok: Bool
     let cancelled: Bool
     let message: String?
+    let captureMode: String?
+    let segmentCount: Int?
     let filename: String?
     let mimeType: String?
     let dataURL: String?
@@ -1316,6 +1332,8 @@ struct AssistantChatWebThreadNoteScreenshotCaptureResult: Equatable {
             "ok": ok,
             "cancelled": cancelled,
             "message": message ?? NSNull(),
+            "captureMode": captureMode ?? NSNull(),
+            "segmentCount": segmentCount ?? NSNull(),
             "filename": filename ?? NSNull(),
             "mimeType": mimeType ?? NSNull(),
             "dataUrl": dataURL ?? NSNull(),
@@ -1870,6 +1888,8 @@ final class AssistantChatWebCoordinator: NSObject, WKScriptMessageHandler {
                 sourceTextAfterMove: nil,
                 requestID: nil,
                 outputMode: nil,
+                captureMode: nil,
+                captureSegmentCount: nil,
                 filename: nil,
                 mimeType: nil,
                 dataURL: nil,
@@ -2872,6 +2892,7 @@ extension AssistantChatWebMessage {
             canEdit: canEdit,
             rewriteAnchorID: rewriteAnchorID,
             providerLabel: providerLabel,
+            selectedPlugins: selectedPlugins,
             activityIcon: activityIcon,
             activityTitle: activityTitle,
             activityDetail: activityDetail,
@@ -3208,6 +3229,14 @@ extension AssistantChatWebMessage {
             canEdit: historyAction?.canEdit ?? false,
             rewriteAnchorID: historyAction?.anchorID,
             providerLabel: providerLabel,
+            selectedPlugins: item.selectedPlugins?.map {
+                AssistantComposerWebPlugin(
+                    pluginID: $0.pluginID,
+                    displayName: $0.displayName,
+                    summary: $0.summary,
+                    needsSetup: $0.needsSetup
+                )
+            },
             activityIcon: activityIcon,
             activityTitle: activityTitle,
             activityDetail: activityDetail,
@@ -3271,6 +3300,7 @@ extension AssistantChatWebMessage {
             canEdit: false,
             rewriteAnchorID: nil,
             providerLabel: nil,
+            selectedPlugins: nil,
             activityIcon: nil,
             activityTitle: nil,
             activityDetail: nil,
@@ -3333,6 +3363,7 @@ extension AssistantChatWebMessage {
             canEdit: false,
             rewriteAnchorID: nil,
             providerLabel: nil,
+            selectedPlugins: nil,
             activityIcon: dominantKind,
             activityTitle: "Worked for \(collapsedConversationDurationLabel(for: summaryRenderItems))",
             activityDetail: collapsedConversationSummaryDetail(for: summaryRenderItems, activities: activities),
@@ -3387,6 +3418,7 @@ extension AssistantChatWebMessage {
             canEdit: false,
             rewriteAnchorID: nil,
             providerLabel: nil,
+            selectedPlugins: nil,
             activityIcon: dominantKind,
             activityTitle: "Worked for \(collapsedActivityDurationLabel(for: activities))",
             activityDetail: collapsedActivitySummaryDetail(for: activities),

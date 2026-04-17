@@ -212,6 +212,10 @@
   }
 }
 
+html {
+  background: transparent;
+}
+
 body {
   font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif;
   font-size: 13.8px;
@@ -1521,6 +1525,11 @@ body {
   border-color: color-mix(in srgb, var(--thread-note-accent) 24%, rgba(255,255,255,0.12));
 }
 
+.thread-note-icon-button.has-secondary-mode:not(.is-active) {
+  background: color-mix(in srgb, var(--thread-note-accent) 8%, rgba(255,255,255,0.03));
+  border-color: color-mix(in srgb, var(--thread-note-accent) 18%, rgba(255,255,255,0.08));
+}
+
 .thread-note-icon-button.is-danger {
   color: rgba(255,205,205,0.9);
 }
@@ -1533,6 +1542,65 @@ body {
 .thread-note-overflow-wrap {
   position: relative;
   display: inline-flex;
+}
+
+.thread-note-screenshot-capture-menu {
+  position: fixed;
+  left: var(--thread-note-screenshot-menu-x);
+  top: var(--thread-note-screenshot-menu-y);
+  z-index: 1450;
+  min-width: 210px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px;
+  border-radius: 16px;
+  border: 0.8px solid rgba(255,255,255,0.08);
+  background:
+    linear-gradient(180deg, rgba(28, 30, 36, 0.95), rgba(16, 18, 24, 0.96)),
+    radial-gradient(circle at top right, rgba(255,255,255,0.07), transparent 38%);
+  box-shadow:
+    0 24px 48px rgba(0,0,0,0.36),
+    inset 0 1px 0 rgba(255,255,255,0.05);
+  backdrop-filter: blur(26px) saturate(115%);
+  -webkit-backdrop-filter: blur(26px) saturate(115%);
+}
+
+.thread-note-screenshot-capture-menu-item {
+  appearance: none;
+  min-height: 34px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 0 10px;
+  border: none;
+  border-radius: 11px;
+  background: transparent;
+  color: var(--chat-text-strong);
+  font: inherit;
+  font-size: 11.5px;
+  font-weight: 650;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.14s ease, color 0.14s ease;
+}
+
+.thread-note-screenshot-capture-menu-item:hover {
+  background: rgba(255,255,255,0.055);
+}
+
+.thread-note-screenshot-capture-menu-item.is-active {
+  background: color-mix(in srgb, var(--thread-note-accent) 12%, rgba(255,255,255,0.03));
+  color: #fff6df;
+}
+
+.thread-note-screenshot-capture-menu-check {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--chat-text-soft);
 }
 
 .thread-note-overflow-menu {
@@ -2334,6 +2402,16 @@ body {
   flex-direction: column;
   gap: 8px;
   min-width: 0;
+}
+
+.thread-note-screenshot-mode-help {
+  padding: 8px 10px;
+  border-radius: 10px;
+  border: 0.8px solid rgba(255,255,255,0.06);
+  background: rgba(255,255,255,0.022);
+  color: var(--chat-text-muted);
+  font-size: 11px;
+  line-height: 1.45;
 }
 
 .thread-note-screenshot-meta-row {
@@ -5465,6 +5543,46 @@ body {
   overflow-wrap: break-word;
   white-space: pre-wrap;
   text-align: left;
+}
+
+.user-bubble-body {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 8px;
+}
+
+.user-bubble-text {
+  min-width: 0;
+  white-space: pre-wrap;
+}
+
+.user-plugin-chip-row {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.user-plugin-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  padding: 5px 10px;
+  border-radius: 999px;
+  background: rgba(111, 201, 255, 0.12);
+  border: 0.55px solid rgba(111, 201, 255, 0.28);
+  color: rgba(217, 243, 255, 0.98);
+  font-size: 0.88em;
+  font-weight: 600;
+  line-height: 1.2;
+}
+
+.user-plugin-chip.is-warning {
+  background: rgba(255, 184, 77, 0.16);
+  border-color: rgba(255, 184, 77, 0.3);
+  color: rgba(255, 225, 184, 0.96);
 }
 
 .user-image {
@@ -9525,12 +9643,14 @@ mark.find-highlight.find-active {
 /* React Composer */
 
 .oa-react-composer {
+  position: relative;
   width: 100%;
   max-width: 100%;
   min-width: 0;
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  justify-content: flex-end;
+  height: 100%;
   min-height: 0;
   padding: 8px 16px 8px;
   color: var(--chat-text);
@@ -9539,8 +9659,27 @@ mark.find-highlight.find-active {
 }
 
 .oa-react-composer.is-compact {
-  gap: 2px;
   padding: 2px 0 0;
+}
+
+.oa-react-composer__content {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+}
+
+.oa-react-composer.is-compact .oa-react-composer__content {
+  gap: 2px;
+}
+
+.oa-react-composer__surface-stack {
+  position: relative;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
 }
 
 .oa-react-composer__empty {
@@ -9848,28 +9987,52 @@ mark.find-highlight.find-active {
 
 .oa-react-composer__slash-menu {
   position: absolute;
-  left: 16px;
-  right: 16px;
-  bottom: 62px;
-  z-index: 4;
-  border-radius: 18px;
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  background: rgba(12, 17, 26, 0.96);
-  box-shadow: 0 18px 38px rgba(0, 0, 0, 0.34);
-  backdrop-filter: blur(18px);
-  overflow: hidden;
+  left: 8px;
+  bottom: calc(100% + 6px);
+  z-index: 10;
+  width: min(320px, calc(100% - 16px));
+  margin: 0;
+  padding: 6px;
+  max-height: 240px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  border-radius: 14px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(30, 34, 42, 0.97);
+  box-shadow:
+    0 8px 24px rgba(0, 0, 0, 0.35),
+    0 2px 8px rgba(0, 0, 0, 0.2);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  box-sizing: border-box;
+  will-change: transform, opacity;
+  transform-origin: bottom left;
+  animation: oa-composer-slash-menu-in 0.15s cubic-bezier(0.2, 0, 0.13, 1.02);
+}
+
+.oa-react-composer__slash-menu::-webkit-scrollbar {
+  width: 6px;
+}
+
+.oa-react-composer__slash-menu::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.oa-react-composer__slash-menu::-webkit-scrollbar-thumb {
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.12);
 }
 
 .oa-react-composer__slash-group {
-  padding: 10px 10px 8px;
+  padding: 4px 2px 2px;
 }
 
 .oa-react-composer__slash-group + .oa-react-composer__slash-group {
-  border-top: 1px solid rgba(255, 255, 255, 0.05);
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
 }
 
 .oa-react-composer__slash-group-title {
-  padding: 0 10px 8px;
+  padding: 2px 8px 4px;
   color: rgba(255, 255, 255, 0.38);
   font-size: 10px;
   font-weight: 700;
@@ -9880,38 +10043,62 @@ mark.find-highlight.find-active {
 .oa-react-composer__slash-item {
   width: 100%;
   display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 2px;
-  padding: 10px;
+  flex-direction: row;
+  align-items: baseline;
+  gap: 8px;
+  padding: 7px 10px;
   border: none;
-  border-radius: 12px;
+  border-radius: 8px;
   background: transparent;
-  color: rgba(255, 255, 255, 0.82);
+  color: rgba(255, 255, 255, 0.85);
   cursor: pointer;
-  transition: background 0.12s ease, transform 0.12s ease;
+  transition: background 0.1s ease;
+  text-align: left;
 }
 
 .oa-react-composer__slash-item:hover,
 .oa-react-composer__slash-item.is-selected {
-  background: rgba(255, 255, 255, 0.08);
-  transform: translateY(-1px);
+  background: rgba(255, 255, 255, 0.09);
+}
+
+.oa-react-composer__slash-item-header {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  flex-shrink: 0;
 }
 
 .oa-react-composer__slash-item-title {
   font-size: 13px;
-  font-weight: 700;
+  font-weight: 600;
+  letter-spacing: -0.01em;
 }
 
 .oa-react-composer__slash-item-subtitle,
 .oa-react-composer__slash-empty {
-  font-size: 12px;
-  line-height: 1.45;
-  color: rgba(255, 255, 255, 0.54);
+  font-size: 11.5px;
+  line-height: 1.4;
+  color: rgba(255, 255, 255, 0.45);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .oa-react-composer__slash-empty {
-  padding: 14px 16px;
+  padding: 12px 10px;
+}
+
+@keyframes oa-composer-slash-menu-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px) scale(0.97);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
 }
 
 @media (max-width: 720px) {
@@ -10432,9 +10619,7 @@ mark.find-highlight.find-active {
 }
 
 .oa-react-composer.is-compact .oa-react-composer__slash-menu {
-  left: 10px;
-  right: 10px;
-  bottom: 56px;
+  padding: 4px;
 }
 
 .oa-react-composer.is-compact .oa-react-composer__static-pill {

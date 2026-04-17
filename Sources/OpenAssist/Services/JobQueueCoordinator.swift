@@ -1,13 +1,16 @@
 import AppKit
 import Foundation
 
-/// Manages scheduled jobs: persistence, timer-based firing, and serialized execution.
+/// Manages scheduled jobs: persistence, timer-based firing, and parallel execution.
 ///
-/// All jobs currently share the same assistant runtime, so they must execute one at a time.
-/// Job type is still stored for UI and future routing, but execution is globally queued today.
+/// Independent jobs run concurrently. Each job gets its own dedicated session so the assistant
+/// retains context across runs without conflicting with other jobs.
 @MainActor
 final class JobQueueCoordinator: ObservableObject {
     static let shared = JobQueueCoordinator()
+
+    /// Maximum number of jobs that may execute at the same time.
+    static let maxConcurrentJobs = 4
 
     @Published private(set) var jobs: [ScheduledJob] = []
     @Published private(set) var runningJobIDs: Set<String> = []
@@ -21,7 +24,7 @@ final class JobQueueCoordinator: ObservableObject {
     private var hasStarted = false
     private var pendingExecutions: [PendingExecution] = []
     private var pendingExecutionJobIDs: Set<String> = []
-    private var activeExecution: PendingExecution?
+    private var activeExecutions: Set<String> = []
     private var activeRunsByJobID: [String: ScheduledJobRun] = [:]
 
     private init() {}
@@ -105,8 +108,8 @@ final class JobQueueCoordinator: ObservableObject {
     }
 
     func markJobExecutionFinished(id: String) {
-        guard activeExecution?.jobID == id else { return }
-        activeExecution = nil
+        guard activeExecutions.contains(id) else { return }
+        activeExecutions.remove(id)
         runningJobIDs.remove(id)
         startNextQueuedExecutionIfPossible()
     }
@@ -252,10 +255,10 @@ final class JobQueueCoordinator: ObservableObject {
         }
     }
 
-    // MARK: - Global Queue
+    // MARK: - Parallel Queue
 
     private func enqueue(jobID: String, allowsDisabledExecution: Bool) {
-        guard activeExecution?.jobID != jobID,
+        guard !activeExecutions.contains(jobID),
               !pendingExecutionJobIDs.contains(jobID),
               !runningJobIDs.contains(jobID) else { return }
         pendingExecutions.append(
@@ -266,15 +269,14 @@ final class JobQueueCoordinator: ObservableObject {
     }
 
     private func startNextQueuedExecutionIfPossible() {
-        guard activeExecution == nil else { return }
-
-        while !pendingExecutions.isEmpty {
+        while !pendingExecutions.isEmpty,
+              activeExecutions.count < Self.maxConcurrentJobs {
             let next = pendingExecutions.removeFirst()
             pendingExecutionJobIDs.remove(next.jobID)
             guard let job = jobs.first(where: { $0.id == next.jobID }) else { continue }
             guard next.allowsDisabledExecution || job.isEnabled else { continue }
 
-            activeExecution = next
+            activeExecutions.insert(job.id)
             runningJobIDs.insert(job.id)
 
             var userInfo: [String: Any] = [
@@ -294,7 +296,6 @@ final class JobQueueCoordinator: ObservableObject {
                 object: nil,
                 userInfo: userInfo
             )
-            return
         }
     }
 

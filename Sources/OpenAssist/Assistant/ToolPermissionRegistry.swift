@@ -318,9 +318,19 @@ enum ToolPermissionRegistry {
         """)
         lines.append("")
         lines.append("""
-        ### Computer Use
+        ### Computer Use — Your Primary Tool for Desktop Apps
 
-        The `computer_use` tool is for generic visual desktop interaction when `browser_use`, `app_action`, and the Accessibility UI tools are not enough. It needs Computer Use enabled in Settings plus Accessibility and Screen Recording permissions. Use `computer_use` only for screenshot-based observe, click, drag, scroll, keypress, type, or wait steps on the visible desktop.
+        For any task involving a desktop application (Teams, Slack, Discord, Claude, VS Code, Xcode, Spotify, or any other app visible on screen), **use `computer_use` directly** — observe the screen, identify what you need, and click/type to interact. Do NOT waste steps trying `ui_inspect`, `window_capture`, `screen_capture`, or shell commands to read app data files first. Those approaches almost never work for modern apps (especially Electron apps like Teams, Slack, Discord, Claude, VS Code).
+
+        **The correct approach for any "check X in app Y" task:**
+        1. Use `computer_use` with action `observe` to see the current screen
+        2. If the target app isn't visible, use `computer_use` with action `open_application` to launch it
+        3. Click, scroll, or type as needed to navigate to the information
+        4. Read the result from the screenshot
+
+        Only fall back to `browser_use` when you specifically need to open a web URL. Only use `app_action` for the supported native apps listed above (Reminders, Calendar, Contacts, Notes, Messages, Finder, Terminal, System Settings).
+
+        `computer_use` needs Computer Use enabled in Settings plus Accessibility and Screen Recording permissions.
         """ )
         lines.append("")
         lines.append("""

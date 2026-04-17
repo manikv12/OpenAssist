@@ -11,6 +11,8 @@ enum AssistantModePolicy {
         "browser_use",
         "app_action",
         "computer_use",
+        "computer_batch",
+        "spawn_session",
         "exec_command",
         "write_stdin",
         "read_terminal",

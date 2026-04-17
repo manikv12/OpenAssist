@@ -185,7 +185,10 @@ enum TelegramRemoteRenderer {
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    static func sessionHeaderText(snapshot: AssistantRemoteSessionSnapshot) -> String {
+    static func sessionHeaderText(
+        snapshot: AssistantRemoteSessionSnapshot,
+        selectedPluginNames: [String] = []
+    ) -> String {
         var lines = ["Session: \(displaySessionTitle(title: snapshot.session.title, isTemporary: snapshot.session.isTemporary))"]
         if snapshot.session.isTemporary {
             lines.append("Type: Temporary chat")
@@ -194,7 +197,47 @@ enum TelegramRemoteRenderer {
            !projectName.isEmpty {
             lines.append("Project: \(projectName)")
         }
+        if !selectedPluginNames.isEmpty {
+            lines.append("Plugins: \(selectedPluginNames.joined(separator: ", "))")
+        }
         return lines.joined(separator: "\n")
+    }
+
+    static func toolActivityText(snapshot: AssistantRemoteSessionSnapshot) -> String? {
+        let activeCalls = snapshot.toolCalls
+        let recentCalls = snapshot.recentToolCalls
+
+        guard !activeCalls.isEmpty || !recentCalls.isEmpty else { return nil }
+
+        var lines = ["Tool activity", ""]
+
+        if !activeCalls.isEmpty {
+            lines.append("Active:")
+            for call in activeCalls.prefix(4) {
+                let line = call.detail?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+                    .map { "• \(call.title): \(collapsed($0, maxLength: 90))" }
+                    ?? "• \(call.title)"
+                lines.append(line)
+            }
+            lines.append("")
+        }
+
+        if !recentCalls.isEmpty {
+            lines.append("Recent:")
+            for call in recentCalls.prefix(4) {
+                let status = call.status.trimmingCharacters(in: .whitespacesAndNewlines)
+                let detail = call.detail?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+                if let detail {
+                    lines.append("• \(call.title) [\(status)]: \(collapsed(detail, maxLength: 90))")
+                } else {
+                    lines.append("• \(call.title) [\(status)]")
+                }
+            }
+        }
+
+        return lines
+            .joined(separator: "\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     static func providerUsageText(

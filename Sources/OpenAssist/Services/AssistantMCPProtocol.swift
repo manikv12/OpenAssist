@@ -8,17 +8,32 @@ enum MCPProtocol {
     static let serverVersion = "1.0.0"
 
     // MARK: - Exposed Tool Names
+    //
+    // All registered tools are now exposed dynamically via AssistantToolCatalog.
+    // The legacy hard-coded set below is kept only as the minimum guarantee when
+    // the full catalog is unavailable.
 
     static let exposedToolNames: Set<String> = [
         "computer_use",
+        "computer_batch",
+        "spawn_session",
         "screen_capture",
         "window_list",
         "window_capture",
+        "list_displays",
+        "list_activities",
         "ui_inspect",
         "ui_click",
         "ui_type",
         "ui_press_key",
-        "view_image"
+        "view_image",
+        "app_action",
+        "browser_use",
+        "exec_command",
+        "write_stdin",
+        "read_terminal",
+        "image_generation",
+        "assistant_notes"
     ]
 
     // MARK: - Request Parsing
@@ -99,15 +114,13 @@ enum MCPProtocol {
     // MARK: - Tools List Response
 
     static func toolsListResult(descriptors: [AssistantToolDescriptor]) -> [String: Any] {
-        let tools = descriptors
-            .filter { exposedToolNames.contains($0.name) }
-            .map { descriptor -> [String: Any] in
-                [
-                    "name": descriptor.name,
-                    "description": descriptor.description,
-                    "inputSchema": descriptor.inputSchema
-                ]
-            }
+        let tools = descriptors.map { descriptor -> [String: Any] in
+            [
+                "name": descriptor.name,
+                "description": descriptor.description,
+                "inputSchema": descriptor.inputSchema
+            ]
+        }
         return ["tools": tools]
     }
 
