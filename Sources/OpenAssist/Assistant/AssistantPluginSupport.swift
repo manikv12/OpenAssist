@@ -129,8 +129,66 @@ struct AssistantComposerPluginSelection: Identifiable, Equatable, Codable, Senda
     let summary: String?
     let needsSetup: Bool
     let iconPath: String?
+    let iconRootPath: String?
+    let iconDataURL: String?
 
     var id: String { pluginID }
+
+    init(
+        pluginID: String,
+        displayName: String,
+        summary: String?,
+        needsSetup: Bool,
+        iconPath: String?,
+        iconRootPath: String?,
+        iconDataURL: String? = nil
+    ) {
+        self.pluginID = pluginID
+        self.displayName = displayName
+        self.summary = summary
+        self.needsSetup = needsSetup
+        self.iconPath = iconPath
+        self.iconRootPath = iconRootPath
+        self.iconDataURL = iconDataURL
+            ?? assistantPluginIconDataURL(for: iconPath, allowedRootPath: iconRootPath)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case pluginID
+        case displayName
+        case summary
+        case needsSetup
+        case iconPath
+        case iconRootPath
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let pluginID = try container.decode(String.self, forKey: .pluginID)
+        let displayName = try container.decode(String.self, forKey: .displayName)
+        let summary = try container.decodeIfPresent(String.self, forKey: .summary)
+        let needsSetup = try container.decode(Bool.self, forKey: .needsSetup)
+        let iconPath = try container.decodeIfPresent(String.self, forKey: .iconPath)
+        let iconRootPath = try container.decodeIfPresent(String.self, forKey: .iconRootPath)
+        self.init(
+            pluginID: pluginID,
+            displayName: displayName,
+            summary: summary,
+            needsSetup: needsSetup,
+            iconPath: iconPath,
+            iconRootPath: iconRootPath
+        )
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(pluginID, forKey: .pluginID)
+        try container.encode(displayName, forKey: .displayName)
+        try container.encodeIfPresent(summary, forKey: .summary)
+        try container.encode(needsSetup, forKey: .needsSetup)
+        try container.encodeIfPresent(iconPath, forKey: .iconPath)
+        try container.encodeIfPresent(iconRootPath, forKey: .iconRootPath)
+    }
 }
 
 enum AssistantCodexPluginReadinessState: String, Equatable, Sendable {
@@ -150,7 +208,25 @@ struct AssistantCodexPluginReadiness: Equatable, Sendable {
 }
 
 private let assistantCodexPluginWordJoiners = CharacterSet(charactersIn: "-_")
-private let assistantCodexPluginIconDataURLCache = NSCache<NSString, NSString>()
+private let assistantCodexPluginIconAllowedExtensions: Set<String> = [
+    "png",
+    "jpg",
+    "jpeg",
+    "gif",
+    "webp",
+    "bmp",
+    "tif",
+    "tiff",
+    "svg",
+    "icns",
+]
+private let assistantCodexPluginIconMaxBytes = 512 * 1024
+private let assistantCodexPluginIconDataURLCache: NSCache<NSString, NSString> = {
+    let cache = NSCache<NSString, NSString>()
+    cache.countLimit = 128
+    cache.totalCostLimit = 32 * 1024 * 1024
+    return cache
+}()
 
 func assistantDisplayPluginName(
     pluginName: String,
@@ -176,38 +252,93 @@ func assistantDisplayPluginName(
     }.joined(separator: " ")
 }
 
-func assistantPluginIconDataURL(for path: String?) -> String? {
-    guard let normalizedPath = assistantNormalizedPluginIconPath(path) else { return nil }
+func assistantPluginIconDataURL(
+    for path: String?,
+    allowedRootPath: String? = nil
+) -> String? {
+    guard
+        let fileURL = assistantNormalizedPluginIconFileURL(path),
+        let cacheKey = assistantPluginIconCacheKey(
+            for: fileURL,
+            allowedRootPath: allowedRootPath
+        )
+    else {
+        return nil
+    }
 
-    let cacheKey = normalizedPath as NSString
     if let cached = assistantCodexPluginIconDataURLCache.object(forKey: cacheKey) {
         return cached as String
     }
 
-    let fileURL: URL
-    if let url = URL(string: normalizedPath), url.isFileURL {
-        fileURL = url
-    } else {
-        fileURL = URL(fileURLWithPath: normalizedPath)
-    }
-
-    guard let data = try? Data(contentsOf: fileURL) else { return nil }
+    guard assistantPluginIconIsAllowed(fileURL, allowedRootPath: allowedRootPath) else { return nil }
+    guard let data = try? Data(contentsOf: fileURL, options: [.mappedIfSafe]) else { return nil }
     let mimeType = assistantPluginIconMIMEType(for: fileURL.pathExtension)
     let dataURL = "data:\(mimeType);base64,\(data.base64EncodedString())"
     assistantCodexPluginIconDataURLCache.setObject(dataURL as NSString, forKey: cacheKey, cost: data.count)
     return dataURL
 }
 
-private func assistantNormalizedPluginIconPath(_ path: String?) -> String? {
+private func assistantNormalizedPluginIconFileURL(_ path: String?) -> URL? {
     guard let trimmed = path?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
         return nil
     }
 
     if let url = URL(string: trimmed), url.isFileURL {
-        return url.absoluteString
+        return url.standardizedFileURL
     }
 
-    return NSString(string: trimmed).expandingTildeInPath
+    let expandedPath = NSString(string: trimmed).expandingTildeInPath
+    return URL(fileURLWithPath: expandedPath).standardizedFileURL
+}
+
+private func assistantPluginIconCacheKey(
+    for fileURL: URL,
+    allowedRootPath: String?
+) -> NSString? {
+    let rootKey = assistantNormalizedPluginIconFileURL(allowedRootPath)?
+        .path
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .nonEmpty
+        ?? "noroot"
+    return "\(rootKey)|\(fileURL.path)" as NSString
+}
+
+private func assistantPluginIconIsAllowed(
+    _ fileURL: URL,
+    allowedRootPath: String?
+) -> Bool {
+    let pathExtension = fileURL.pathExtension.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    guard assistantCodexPluginIconAllowedExtensions.contains(pathExtension) else { return false }
+
+    guard
+        let allowedRootURL = assistantNormalizedPluginIconFileURL(allowedRootPath),
+        assistantPluginIconPath(fileURL.path, isWithin: allowedRootURL.path)
+    else {
+        return false
+    }
+
+    let resourceValues = try? fileURL.resourceValues(forKeys: [
+        .isRegularFileKey,
+        .fileSizeKey,
+    ])
+    guard resourceValues?.isRegularFile == true else { return false }
+    guard let fileSize = resourceValues?.fileSize, fileSize > 0, fileSize <= assistantCodexPluginIconMaxBytes
+    else {
+        return false
+    }
+
+    return true
+}
+
+private func assistantPluginIconPath(
+    _ candidatePath: String,
+    isWithin allowedRootPath: String
+) -> Bool {
+    if candidatePath == allowedRootPath {
+        return true
+    }
+    let normalizedRoot = allowedRootPath.hasSuffix("/") ? allowedRootPath : allowedRootPath + "/"
+    return candidatePath.hasPrefix(normalizedRoot)
 }
 
 private func assistantPluginIconMIMEType(for pathExtension: String) -> String {

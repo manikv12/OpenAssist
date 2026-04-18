@@ -2,30 +2,47 @@ import AppKit
 import SwiftUI
 
 private enum AssistantPluginIconCache {
-    static let cache = NSCache<NSString, NSImage>()
+    static let cache: NSCache<NSString, NSImage> = {
+        let cache = NSCache<NSString, NSImage>()
+        cache.countLimit = 128
+        cache.totalCostLimit = 32 * 1024 * 1024
+        return cache
+    }()
+
+    private static func normalizedFileURL(for rawPath: String) -> URL? {
+        if rawPath.hasPrefix("/") || rawPath.hasPrefix("~") {
+            let expandedPath = NSString(string: rawPath).expandingTildeInPath
+            return URL(fileURLWithPath: expandedPath).standardizedFileURL
+        }
+
+        if let url = URL(string: rawPath), url.isFileURL {
+            return url.standardizedFileURL
+        }
+
+        return nil
+    }
+
+    private static func estimatedCost(for image: NSImage) -> Int {
+        let pixelWidth = max(Int(image.size.width), 1)
+        let pixelHeight = max(Int(image.size.height), 1)
+        return pixelWidth * pixelHeight * 4
+    }
 
     static func image(for rawPath: String?) -> NSImage? {
-        guard let rawPath = rawPath?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+        guard
+            let rawPath = rawPath?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty,
+            let fileURL = normalizedFileURL(for: rawPath)
+        else {
             return nil
         }
 
-        let key = rawPath as NSString
+        let key = fileURL.path as NSString
         if let cached = cache.object(forKey: key) {
             return cached
         }
 
-        let image: NSImage?
-        if rawPath.hasPrefix("/") || rawPath.hasPrefix("~") {
-            image = NSImage(contentsOfFile: NSString(string: rawPath).expandingTildeInPath)
-        } else if let url = URL(string: rawPath), url.isFileURL {
-            image = NSImage(contentsOf: url)
-        } else {
-            image = nil
-        }
-
-        if let image {
-            cache.setObject(image, forKey: key)
-        }
+        guard let image = NSImage(contentsOf: fileURL) else { return nil }
+        cache.setObject(image, forKey: key, cost: estimatedCost(for: image))
         return image
     }
 }

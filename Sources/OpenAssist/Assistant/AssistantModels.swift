@@ -3429,7 +3429,9 @@ final class AssistantStore: ObservableObject {
                     displayName: plugin.displayName,
                     summary: plugin.summary,
                     needsSetup: codexPluginReadiness(for: plugin).state == .needsSetup,
-                    iconPath: plugin.iconPath
+                    iconPath: plugin.iconPath,
+                    iconRootPath: plugin.source,
+                    iconDataURL: nil
                 )
             }
             .sorted {
@@ -3586,7 +3588,7 @@ final class AssistantStore: ObservableObject {
                 (
                     label: "fresh-runtime",
                     restartRuntime: true,
-                    forceRemoteSync: forceRemoteSync,
+                    forceRemoteSync: true,
                     cwds: preferredCWDs
                 ),
             ]
@@ -3595,7 +3597,7 @@ final class AssistantStore: ObservableObject {
                     (
                         label: "fresh-runtime-no-cwds",
                         restartRuntime: true,
-                        forceRemoteSync: forceRemoteSync,
+                        forceRemoteSync: true,
                         cwds: []
                     )
                 )
@@ -3796,11 +3798,17 @@ final class AssistantStore: ObservableObject {
             lastStatusMessage = "Open the chat you want to use first, then attach the plugin."
             return
         }
-        guard let selection = installedCodexPluginSelections.first(where: {
-            $0.pluginID.caseInsensitiveCompare(pluginID) == .orderedSame
-        }) else {
+        guard let summary = codexPluginSummary(for: pluginID), summary.isInstalled else {
             return
         }
+        let selection = AssistantComposerPluginSelection(
+            pluginID: summary.id,
+            displayName: summary.displayName,
+            summary: summary.summary,
+            needsSetup: codexPluginReadiness(for: summary).state == .needsSetup,
+            iconPath: summary.iconPath,
+            iconRootPath: summary.source
+        )
         if let currentOwner = selectedComposerPluginOwnerSessionID?.nonEmpty,
            !sessionsMatch(currentOwner, ownerSessionID) {
             selectedComposerPlugins = []
@@ -3990,7 +3998,8 @@ final class AssistantStore: ObservableObject {
                         ),
                         summary: selection.summary,
                         needsSetup: selection.needsSetup,
-                        iconPath: summary.iconPath ?? selection.iconPath
+                        iconPath: summary.iconPath ?? selection.iconPath,
+                        iconRootPath: summary.source ?? selection.iconRootPath
                     )
                 }
                 return selection
@@ -4004,7 +4013,8 @@ final class AssistantStore: ObservableObject {
                     ),
                     summary: summary.summary,
                     needsSetup: codexPluginReadiness(for: summary).state == .needsSetup,
-                    iconPath: summary.iconPath
+                    iconPath: summary.iconPath,
+                    iconRootPath: summary.source
                 )
             }
 
@@ -4014,7 +4024,8 @@ final class AssistantStore: ObservableObject {
                 displayName: assistantDisplayPluginName(pluginName: pluginName),
                 summary: nil,
                 needsSetup: false,
-                iconPath: nil
+                iconPath: nil,
+                iconRootPath: nil
             )
         }
     }
