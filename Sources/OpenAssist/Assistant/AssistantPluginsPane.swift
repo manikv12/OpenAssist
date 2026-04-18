@@ -1,6 +1,102 @@
 import AppKit
 import SwiftUI
 
+private enum AssistantPluginIconCache {
+    static let cache: NSCache<NSString, NSImage> = {
+        let cache = NSCache<NSString, NSImage>()
+        cache.countLimit = 128
+        cache.totalCostLimit = 32 * 1024 * 1024
+        return cache
+    }()
+
+    private static func normalizedFileURL(for rawPath: String) -> URL? {
+        if rawPath.hasPrefix("/") || rawPath.hasPrefix("~") {
+            let expandedPath = NSString(string: rawPath).expandingTildeInPath
+            return URL(fileURLWithPath: expandedPath).standardizedFileURL
+        }
+
+        if let url = URL(string: rawPath), url.isFileURL {
+            return url.standardizedFileURL
+        }
+
+        return nil
+    }
+
+    private static func estimatedCost(for image: NSImage) -> Int {
+        let pixelWidth = max(Int(image.size.width), 1)
+        let pixelHeight = max(Int(image.size.height), 1)
+        return pixelWidth * pixelHeight * 4
+    }
+
+    static func image(for rawPath: String?) -> NSImage? {
+        guard
+            let rawPath = rawPath?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty,
+            let fileURL = normalizedFileURL(for: rawPath)
+        else {
+            return nil
+        }
+
+        let key = fileURL.path as NSString
+        if let cached = cache.object(forKey: key) {
+            return cached
+        }
+
+        guard let image = NSImage(contentsOf: fileURL) else { return nil }
+        cache.setObject(image, forKey: key, cost: estimatedCost(for: image))
+        return image
+    }
+}
+
+private struct AssistantPluginIconView: View {
+    let iconPath: String?
+    let displayName: String
+    let size: CGFloat
+    let cornerRadius: CGFloat
+
+    private var image: NSImage? {
+        AssistantPluginIconCache.image(for: iconPath)
+    }
+
+    private var fallbackLabel: String {
+        let trimmed = displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        return String(trimmed.prefix(1)).uppercased().nonEmpty ?? "P"
+    }
+
+    var body: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                .fill(
+                    LinearGradient(
+                        colors: [
+                            AppVisualTheme.surfaceFill(0.11),
+                            AppVisualTheme.surfaceFill(0.04),
+                        ],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                )
+
+            if let image {
+                Image(nsImage: image)
+                    .resizable()
+                    .scaledToFit()
+                    .padding(size * 0.16)
+            } else {
+                Text(fallbackLabel)
+                    .font(.system(size: size * 0.40, weight: .bold, design: .rounded))
+                    .foregroundStyle(AppVisualTheme.foreground(0.68))
+            }
+        }
+        .frame(width: size, height: size)
+        .overlay(
+            RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                .stroke(AppVisualTheme.surfaceStroke(0.10), lineWidth: 0.7)
+        )
+        .shadow(color: .black.opacity(0.12), radius: 8, x: 0, y: 4)
+        .accessibilityLabel("\(displayName) icon")
+    }
+}
+
 struct AssistantPluginsPane: View {
     @ObservedObject var assistant: AssistantStore
     let onBack: () -> Void
@@ -59,6 +155,14 @@ struct AssistantPluginsPane: View {
             }
         }
         return filteredPlugins.first
+    }
+
+    private var pluginCatalogLoadFailed: Bool {
+        assistant.codexPlugins.isEmpty
+            && !assistant.isRefreshingCodexPlugins
+            && assistant.codexPluginErrorMessage?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .nonEmpty != nil
     }
 
     var body: some View {
@@ -182,6 +286,8 @@ struct AssistantPluginsPane: View {
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
                 .padding(.top, 8)
+            } else if pluginCatalogLoadFailed {
+                pluginCatalogFailureState
             } else if filteredPlugins.isEmpty {
                 VStack(alignment: .leading, spacing: 8) {
                     Text("No plugins match this filter.")
@@ -207,6 +313,23 @@ struct AssistantPluginsPane: View {
         .padding(16)
     }
 
+    private var pluginCatalogFailureState: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Couldn't load plugins.")
+                .font(.system(size: 13.5, weight: .semibold))
+                .foregroundStyle(AppVisualTheme.foreground(0.86))
+            Text("Try Refresh to load the Codex plugin catalog again.")
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(AppVisualTheme.foreground(0.56))
+            Button("Retry") {
+                Task { await assistant.refreshCodexPluginCatalog(forceRemoteSync: true) }
+            }
+            .buttonStyle(.bordered)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .padding(.top, 8)
+    }
+
     private func pluginRow(_ plugin: AssistantCodexPluginSummary) -> some View {
         let readiness = assistant.codexPluginReadiness(for: plugin)
         let isSelected = plugin.id.caseInsensitiveCompare(selectedPluginID ?? "") == .orderedSame
@@ -215,34 +338,43 @@ struct AssistantPluginsPane: View {
             selectedPluginID = plugin.id
             Task { await assistant.loadCodexPluginDetail(pluginID: plugin.id) }
         } label: {
-            VStack(alignment: .leading, spacing: 8) {
-                HStack(alignment: .top, spacing: 8) {
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text(plugin.displayName)
-                            .font(.system(size: 13.5, weight: .semibold))
-                            .foregroundStyle(AppVisualTheme.foreground(0.92))
-                            .lineLimit(1)
-                        Text(plugin.marketplaceName)
-                            .font(.system(size: 11, weight: .medium))
-                            .foregroundStyle(AppVisualTheme.foreground(0.46))
-                            .lineLimit(1)
-                    }
-                    Spacer(minLength: 8)
-                    readinessPill(
-                        title: plugin.isInstalled
-                            ? (readiness.state == .needsSetup ? "Needs setup" : "Installed")
-                            : "Available",
-                        tint: readiness.state == .needsSetup
-                            ? Color.orange
-                            : (plugin.isInstalled ? AppVisualTheme.accentTint : AppVisualTheme.foreground(0.62))
-                    )
-                }
+            HStack(alignment: .top, spacing: 10) {
+                AssistantPluginIconView(
+                    iconPath: plugin.iconPath,
+                    displayName: plugin.displayName,
+                    size: 42,
+                    cornerRadius: 13
+                )
 
-                if let summary = plugin.summary?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
-                    Text(summary)
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundStyle(AppVisualTheme.foreground(0.64))
-                        .lineLimit(2)
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(alignment: .top, spacing: 8) {
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(plugin.displayName)
+                                .font(.system(size: 13.5, weight: .semibold))
+                                .foregroundStyle(AppVisualTheme.foreground(0.92))
+                                .lineLimit(1)
+                            Text(plugin.marketplaceName)
+                                .font(.system(size: 11, weight: .medium))
+                                .foregroundStyle(AppVisualTheme.foreground(0.46))
+                                .lineLimit(1)
+                        }
+                        Spacer(minLength: 8)
+                        readinessPill(
+                            title: plugin.isInstalled
+                                ? (readiness.state == .needsSetup ? "Needs setup" : "Installed")
+                                : "Available",
+                            tint: readiness.state == .needsSetup
+                                ? Color.orange
+                                : (plugin.isInstalled ? AppVisualTheme.accentTint : AppVisualTheme.foreground(0.62))
+                        )
+                    }
+
+                    if let summary = plugin.summary?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
+                        Text(summary)
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundStyle(AppVisualTheme.foreground(0.64))
+                            .lineLimit(2)
+                    }
                 }
             }
             .padding(12)
@@ -276,6 +408,9 @@ struct AssistantPluginsPane: View {
                 }
                 .frame(maxWidth: .infinity, alignment: .topLeading)
                 .padding(20)
+            } else if pluginCatalogLoadFailed {
+                pluginCatalogFailureState
+                    .padding(20)
             } else if let plugin = selectedPlugin {
                 pluginDetail(plugin)
                     .padding(20)
@@ -301,9 +436,17 @@ struct AssistantPluginsPane: View {
         let isSelectedForMessage = assistant.visibleSelectedComposerPlugins.contains {
             $0.pluginID.caseInsensitiveCompare(plugin.id) == .orderedSame
         }
+        let iconPath = detail?.iconPath ?? plugin.iconPath
 
         VStack(alignment: .leading, spacing: 18) {
             HStack(alignment: .top, spacing: 12) {
+                AssistantPluginIconView(
+                    iconPath: iconPath,
+                    displayName: detail?.displayName ?? plugin.displayName,
+                    size: 58,
+                    cornerRadius: 18
+                )
+
                 VStack(alignment: .leading, spacing: 6) {
                     Text(detail?.displayName ?? plugin.displayName)
                         .font(.system(size: 22, weight: .bold))

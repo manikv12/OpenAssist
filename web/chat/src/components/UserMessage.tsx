@@ -3,6 +3,7 @@ import type { ChatMessage } from "../types";
 import { copyPlainText } from "../clipboard";
 import { AppIcon } from "./AppIcon";
 import { CollapsibleImageGallery } from "./CollapsibleImageGallery";
+import { PluginIcon } from "./PluginIcon";
 
 function UserMessageInner({ message }: { message: ChatMessage }) {
   const text = message.text || "";
@@ -83,7 +84,13 @@ function UserMessageInner({ message }: { message: ChatMessage }) {
                       key={plugin.pluginId}
                       className={`user-plugin-chip${plugin.needsSetup ? " is-warning" : ""}`}
                     >
-                      <AppIcon symbol="plug" size={12} strokeWidth={2.1} />
+                      <PluginIcon
+                        iconDataUrl={plugin.iconDataUrl}
+                        displayName={plugin.displayName}
+                        className="user-plugin-chip-icon"
+                        size={12}
+                        strokeWidth={2.1}
+                      />
                       <span>{plugin.displayName}</span>
                     </span>
                   ))}

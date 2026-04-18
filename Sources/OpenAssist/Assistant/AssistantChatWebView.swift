@@ -3234,7 +3234,8 @@ extension AssistantChatWebMessage {
                     pluginID: $0.pluginID,
                     displayName: $0.displayName,
                     summary: $0.summary,
-                    needsSetup: $0.needsSetup
+                    needsSetup: $0.needsSetup,
+                    iconDataURL: $0.iconDataURL
                 )
             },
             activityIcon: activityIcon,

@@ -1742,16 +1742,31 @@ final class CodexAssistantRuntime {
         return visionSignals.contains(where: normalized.contains)
     }
 
-    private func requestWithTimeout(
+    func requestWithTimeout(
         method: String,
         params: [String: Any],
         timeoutNanoseconds: UInt64 = 8_000_000_000
     ) async throws -> CodexResponsePayload {
+        let shouldLogLifecycle = [
+            "plugin/list",
+            "plugin/read",
+            "app/list",
+            "mcpServerStatus/list",
+            "config/mcpServer/reload",
+            "mcpServer/oauth/login",
+        ].contains(method)
+        let startedAt = Date()
+        if shouldLogLifecycle {
+            CrashReporter.logInfo(
+                "Assistant runtime request started method=\(method) timeoutMs=\(timeoutNanoseconds / 1_000_000)"
+            )
+        }
         let requestTask = Task { try await sendRequest(method: method, params: params) }
         let backendDisplayName = backend.displayName
 
         do {
-            return try await withThrowingTaskGroup(of: CodexResponsePayload.self) { group in
+            defer { requestTask.cancel() }
+            let response = try await withThrowingTaskGroup(of: CodexResponsePayload.self) { group in
                 group.addTask {
                     try await requestTask.value
                 }
@@ -1764,6 +1779,13 @@ final class CodexAssistantRuntime {
                 group.cancelAll()
                 return result ?? CodexResponsePayload(raw: [:])
             }
+            if shouldLogLifecycle {
+                let elapsedMs = Int(Date().timeIntervalSince(startedAt) * 1000)
+                CrashReporter.logInfo(
+                    "Assistant runtime request finished method=\(method) elapsedMs=\(elapsedMs)"
+                )
+            }
+            return response
         } catch {
             CrashReporter.logError("Assistant runtime request failed method=\(method) message=\(error.localizedDescription)")
             if case CodexAssistantRuntimeError.runtimeUnavailable = error {

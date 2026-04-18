@@ -1,11 +1,21 @@
 import Foundation
 
+private enum CodexPluginRequestTimeout {
+    static let catalog: UInt64 = 15_000_000_000
+    static let detail: UInt64 = 10_000_000_000
+    static let setupState: UInt64 = 8_000_000_000
+    static let oauth: UInt64 = 15_000_000_000
+}
+
 extension CodexAssistantRuntime {
     func listPlugins(
         cwds: [String] = [],
         forceRemoteSync: Bool = false
     ) async throws -> [AssistantCodexPluginSummary] {
         try await ensureTransport()
+        CrashReporter.logInfo(
+            "Assistant plugin request listPlugins started cwds=\(cwds.count) forceRemoteSync=\(forceRemoteSync)"
+        )
         var params: [String: Any] = [:]
         if !cwds.isEmpty {
             params["cwds"] = cwds
@@ -13,11 +23,28 @@ extension CodexAssistantRuntime {
         if forceRemoteSync {
             params["forceRemoteSync"] = true
         }
-        let response = try await sendRequest(method: "plugin/list", params: params)
-        return Self.parsePluginSummaries(from: response.raw)
+        let response = try await requestWithTimeout(
+            method: "plugin/list",
+            params: params,
+            timeoutNanoseconds: CodexPluginRequestTimeout.catalog
+        )
+        let summaries = Self.parsePluginSummaries(from: response.raw)
             .sorted {
                 $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending
             }
+        if let payload = response.raw as? [String: Any] {
+            let marketplaces = (payload["marketplaces"] as? [[String: Any]])?.count ?? 0
+            let marketplaceLoadErrors = (payload["marketplaceLoadErrors"] as? [[String: Any]])?.count ?? 0
+            let remoteSyncErrorPresent = payload["remoteSyncError"] != nil
+            CrashReporter.logInfo(
+                "Assistant plugin request listPlugins finished pluginCount=\(summaries.count) marketplaces=\(marketplaces) marketplaceLoadErrors=\(marketplaceLoadErrors) remoteSyncErrorPresent=\(remoteSyncErrorPresent)"
+            )
+        } else {
+            CrashReporter.logInfo(
+                "Assistant plugin request listPlugins finished pluginCount=\(summaries.count) payloadType=\(String(describing: type(of: response.raw)))"
+            )
+        }
+        return summaries
     }
 
     func readPlugin(
@@ -25,12 +52,16 @@ extension CodexAssistantRuntime {
         pluginName: String
     ) async throws -> AssistantCodexPluginDetail {
         try await ensureTransport()
-        let response = try await sendRequest(
+        CrashReporter.logInfo(
+            "Assistant plugin request readPlugin started marketplace=\(marketplacePath) plugin=\(pluginName)"
+        )
+        let response = try await requestWithTimeout(
             method: "plugin/read",
             params: [
                 "marketplacePath": marketplacePath,
                 "pluginName": pluginName,
-            ]
+            ],
+            timeoutNanoseconds: CodexPluginRequestTimeout.detail
         )
         guard let detail = Self.parsePluginDetail(
             from: response.raw,
@@ -41,6 +72,9 @@ extension CodexAssistantRuntime {
                 "Codex did not return readable details for \(pluginName)."
             )
         }
+        CrashReporter.logInfo(
+            "Assistant plugin request readPlugin finished marketplace=\(marketplacePath) plugin=\(pluginName) skills=\(detail.skills.count) apps=\(detail.apps.count) mcpServers=\(detail.mcpServers.count)"
+        )
         return detail
     }
 
@@ -74,16 +108,23 @@ extension CodexAssistantRuntime {
 
     func listPluginApps() async throws -> [AssistantCodexPluginAppStatus] {
         try await ensureTransport()
+        CrashReporter.logInfo("Assistant plugin request listPluginApps started")
         var apps: [AssistantCodexPluginAppStatus] = []
         var seen = Set<String>()
         var cursor: String?
+        var pageCount = 0
 
         while true {
             var params: [String: Any] = [:]
             if let cursor {
                 params["cursor"] = cursor
             }
-            let response = try await sendRequest(method: "app/list", params: params)
+            let response = try await requestWithTimeout(
+                method: "app/list",
+                params: params,
+                timeoutNanoseconds: CodexPluginRequestTimeout.setupState
+            )
+            pageCount += 1
             let parsed = Self.parseAppStatuses(from: response.raw)
             for app in parsed.items where seen.insert(app.id.lowercased()).inserted {
                 apps.append(app)
@@ -92,6 +133,9 @@ extension CodexAssistantRuntime {
             cursor = nextCursor
         }
 
+        CrashReporter.logInfo(
+            "Assistant plugin request listPluginApps finished appCount=\(apps.count) pageCount=\(pageCount)"
+        )
         return apps.sorted {
             $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
         }
@@ -99,23 +143,37 @@ extension CodexAssistantRuntime {
 
     func listPluginMCPServerStatuses() async throws -> [AssistantCodexPluginMCPServerStatus] {
         try await ensureTransport()
-        let response = try await sendRequest(method: "mcpServerStatus/list", params: [:])
-        return Self.parseMCPServerStatuses(from: response.raw)
+        CrashReporter.logInfo("Assistant plugin request listPluginMCPServerStatuses started")
+        let response = try await requestWithTimeout(
+            method: "mcpServerStatus/list",
+            params: [:],
+            timeoutNanoseconds: CodexPluginRequestTimeout.setupState
+        )
+        let statuses = Self.parseMCPServerStatuses(from: response.raw)
             .sorted {
                 $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
             }
+        CrashReporter.logInfo(
+            "Assistant plugin request listPluginMCPServerStatuses finished count=\(statuses.count)"
+        )
+        return statuses
     }
 
     func reloadMCPServerConfiguration() async throws {
         try await ensureTransport()
-        _ = try await sendRequest(method: "config/mcpServer/reload", params: [:])
+        _ = try await requestWithTimeout(
+            method: "config/mcpServer/reload",
+            params: [:],
+            timeoutNanoseconds: CodexPluginRequestTimeout.setupState
+        )
     }
 
     func beginMCPServerOAuthLogin(serverName: String) async throws -> URL? {
         try await ensureTransport()
-        let response = try await sendRequest(
+        let response = try await requestWithTimeout(
             method: "mcpServer/oauth/login",
-            params: ["serverName": serverName]
+            params: ["serverName": serverName],
+            timeoutNanoseconds: CodexPluginRequestTimeout.oauth
         )
         guard let payload = response.raw as? [String: Any] else { return nil }
         let rawURL = [
@@ -219,6 +277,12 @@ extension CodexAssistantRuntime {
             id: pluginID,
             pluginName: pluginName,
             displayName: displayName,
+            iconPath: pluginString(
+                interface?["logo"],
+                interface?["composerIcon"],
+                item["logo"],
+                item["icon"]
+            ),
             marketplaceName: marketplaceName,
             marketplacePath: marketplacePath,
             source: pluginString(source?["path"], source?["type"], item["sourcePath"]),
@@ -298,6 +362,12 @@ extension CodexAssistantRuntime {
             id: pluginString(summaryPayload["id"], payload["id"]) ?? "\(pluginName)@\(marketplacePath)",
             pluginName: pluginName,
             displayName: displayName,
+            iconPath: pluginString(
+                interface?["logo"],
+                interface?["composerIcon"],
+                summaryPayload["logo"],
+                payload["logo"]
+            ),
             marketplaceName: marketplaceName,
             marketplacePath: marketplacePath,
             summary: pluginString(

@@ -5579,6 +5579,29 @@ body {
   line-height: 1.2;
 }
 
+.plugin-chip-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  overflow: hidden;
+}
+
+.plugin-chip-icon img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+.user-plugin-chip-icon {
+  width: 16px;
+  height: 16px;
+  border-radius: 5px;
+  background: rgba(255, 255, 255, 0.12);
+  box-shadow: inset 0 0 0 0.6px rgba(255, 255, 255, 0.12);
+}
+
 .user-plugin-chip.is-warning {
   background: rgba(255, 184, 77, 0.16);
   border-color: rgba(255, 184, 77, 0.3);
@@ -9759,6 +9782,12 @@ mark.find-highlight.find-active {
   justify-content: center;
   background: rgba(255, 255, 255, 0.08);
   color: rgba(245, 245, 247, 0.88);
+}
+
+.oa-react-composer__chip-icon.is-plugin img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
 }
 
 .oa-react-composer__surface {

@@ -15,6 +15,7 @@ import type {
   AssistantRuntimeControlsAvailability,
 } from "../types";
 import { AppIcon } from "./AppIcon";
+import { PluginIcon } from "./PluginIcon";
 import { groupSlashCommands, matchesSlashCommand, type SlashCommandLike } from "./slashCommandUtils";
 
 interface ComposerViewProps {
@@ -942,9 +943,18 @@ export function ComposerView({
                 onDispatchCommand("removeComposerPlugin", { pluginId: plugin.pluginId })
               }
             >
-              <span>{`@${plugin.displayName}`}</span>
-              <span className="oa-react-composer__chip-meta">
-                {plugin.needsSetup ? "Needs setup" : "Remove"}
+              <PluginIcon
+                iconDataUrl={plugin.iconDataUrl}
+                displayName={plugin.displayName}
+                className="oa-react-composer__chip-icon is-plugin"
+                size={14}
+                strokeWidth={2}
+              />
+              <span className="oa-react-composer__chip-copy">
+                <span className="oa-react-composer__chip-title">{`@${plugin.displayName}`}</span>
+                <span className="oa-react-composer__chip-meta">
+                  {plugin.needsSetup ? "Needs setup" : "Remove"}
+                </span>
               </span>
             </button>
           ))}

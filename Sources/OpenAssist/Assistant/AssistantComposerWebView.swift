@@ -52,6 +52,7 @@ struct AssistantComposerWebPlugin: Equatable {
     let displayName: String
     let summary: String?
     let needsSetup: Bool
+    let iconDataURL: String?
 
     func toJSON() -> [String: Any] {
         var json: [String: Any] = [
@@ -61,6 +62,9 @@ struct AssistantComposerWebPlugin: Equatable {
         ]
         if let summary, !summary.isEmpty {
             json["summary"] = summary
+        }
+        if let iconDataURL, !iconDataURL.isEmpty {
+            json["iconDataUrl"] = iconDataURL
         }
         return json
     }
