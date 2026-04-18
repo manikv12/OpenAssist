@@ -488,6 +488,7 @@ export interface AssistantComposerPlugin {
   displayName: string;
   summary?: string;
   needsSetup: boolean;
+  iconDataUrl?: string;
 }
 
 export interface AssistantComposerSlashCommand {

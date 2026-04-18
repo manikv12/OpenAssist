@@ -3183,6 +3183,7 @@ final class AssistantStore: ObservableObject {
     private var sessionRuntimesBySessionID: [String: CodexAssistantRuntime] = [:]
     private var codexPluginUtilityRuntime: CodexAssistantRuntime?
     private var codexPluginLastRefreshAt: Date?
+    private var pendingCodexPluginCatalogRefreshForceRemoteSync: Bool?
     private var isRestoringComposerState = false
     private var memoryScopeBySessionID: [String: MemoryScopeContext] = [:]
     private var pendingResumeContextSessionIDs: Set<String> = []
@@ -3427,7 +3428,8 @@ final class AssistantStore: ObservableObject {
                     pluginID: plugin.id,
                     displayName: plugin.displayName,
                     summary: plugin.summary,
-                    needsSetup: codexPluginReadiness(for: plugin).state == .needsSetup
+                    needsSetup: codexPluginReadiness(for: plugin).state == .needsSetup,
+                    iconPath: plugin.iconPath
                 )
             }
             .sorted {
@@ -3453,107 +3455,168 @@ final class AssistantStore: ObservableObject {
             codexPluginErrorMessage = nil
             return
         }
-        guard !isRefreshingCodexPlugins else { return }
+        if isRefreshingCodexPlugins {
+            pendingCodexPluginCatalogRefreshForceRemoteSync =
+                (pendingCodexPluginCatalogRefreshForceRemoteSync ?? false) || forceRemoteSync
+            CrashReporter.logInfo(
+                "Assistant plugin catalog refresh queued forceRemoteSync=\(forceRemoteSync) pendingForceRemoteSync=\(pendingCodexPluginCatalogRefreshForceRemoteSync ?? false)"
+            )
+            return
+        }
 
+        CrashReporter.logInfo(
+            "Assistant plugin catalog refresh started forceRemoteSync=\(forceRemoteSync) existingCatalogCount=\(codexPlugins.count)"
+        )
         isRefreshingCodexPlugins = true
-        defer { isRefreshingCodexPlugins = false }
+        defer {
+            isRefreshingCodexPlugins = false
+            let queuedForceRemoteSync = pendingCodexPluginCatalogRefreshForceRemoteSync
+            pendingCodexPluginCatalogRefreshForceRemoteSync = nil
+            CrashReporter.logInfo(
+                "Assistant plugin catalog refresh finished finalCatalogCount=\(codexPlugins.count) queuedForceRemoteSync=\(queuedForceRemoteSync.map(String.init(describing:)) ?? "nil")"
+            )
+            if let queuedForceRemoteSync {
+                Task { [weak self] in
+                    await self?.refreshCodexPluginCatalog(forceRemoteSync: queuedForceRemoteSync)
+                }
+            }
+        }
+
+        let hadExistingCatalog = !codexPlugins.isEmpty
+
+        if forceRemoteSync && !hadExistingCatalog {
+            do {
+                CrashReporter.logInfo("Assistant plugin catalog bootstrap fetch starting")
+                let bootstrapSummaries = try await fetchCodexPluginSummaries(mode: .localBootstrap)
+                if !bootstrapSummaries.isEmpty {
+                    let warnings = await applyCodexPluginCatalog(bootstrapSummaries)
+                    codexPluginErrorMessage = warnings.joined(separator: "\n").nonEmpty
+                    lastStatusMessage = nil
+                    CrashReporter.logInfo(
+                        "Assistant plugin catalog bootstrap applied count=\(bootstrapSummaries.count) warnings=\(warnings.count)"
+                    )
+                }
+            } catch {
+                CrashReporter.logWarning(
+                    "Assistant plugin catalog local bootstrap failed: \(error.localizedDescription)"
+                )
+            }
+        }
 
         do {
+            CrashReporter.logInfo(
+                "Assistant plugin catalog standard fetch starting forceRemoteSync=\(forceRemoteSync)"
+            )
             let summaries = try await fetchCodexPluginSummaries(
-                forceRemoteSync: forceRemoteSync
+                mode: .standard(forceRemoteSync: forceRemoteSync)
             )
             guard !summaries.isEmpty else {
-                codexPlugins = []
+                let emptyCatalogMessage = "Codex returned an empty plugin catalog."
+                if codexPlugins.isEmpty {
+                    codexPluginDetailsByID = [:]
+                    codexPluginAppStatuses = []
+                    codexPluginMCPServerStatuses = []
+                    codexPluginErrorMessage = "OpenAssist couldn't load the Codex plugin catalog."
+                } else {
+                    codexPluginErrorMessage = """
+                    Showing the last loaded plugin list.
+                    Codex couldn't finish syncing plugins.
+                    """
+                }
+                lastStatusMessage = emptyCatalogMessage
+                CrashReporter.logWarning(
+                    "Assistant plugin catalog standard fetch returned empty existingCatalogCount=\(codexPlugins.count)"
+                )
+                return
+            }
+            let warnings = await applyCodexPluginCatalog(summaries)
+            codexPluginErrorMessage = warnings.joined(separator: "\n").nonEmpty
+            lastStatusMessage = nil
+            CrashReporter.logInfo(
+                "Assistant plugin catalog standard fetch applied count=\(summaries.count) warnings=\(warnings.count)"
+            )
+        } catch {
+            lastStatusMessage = error.localizedDescription
+            if codexPlugins.isEmpty {
                 codexPluginDetailsByID = [:]
                 codexPluginAppStatuses = []
                 codexPluginMCPServerStatuses = []
-                codexPluginErrorMessage = "OpenAssist could not load the Codex plugin catalog."
-                lastStatusMessage = "Codex returned an empty plugin catalog."
-                return
+                codexPluginErrorMessage = "OpenAssist couldn't load the Codex plugin catalog."
+            } else {
+                codexPluginErrorMessage = """
+                Showing the last loaded plugin list.
+                Codex couldn't finish syncing plugins.
+                """
             }
-            let runtime = ensureCodexPluginUtilityRuntime()
-            let installedPluginIDs = Set(
-                summaries.filter(\.isInstalled).map { $0.id.lowercased() }
+            CrashReporter.logWarning(
+                "Assistant plugin catalog refresh failed existingCatalogCount=\(codexPlugins.count) message=\(error.localizedDescription)"
             )
-
-            var nextDetails = codexPluginDetailsByID
-            nextDetails = nextDetails.filter { key, _ in
-                installedPluginIDs.contains(key.lowercased())
-            }
-
-            codexPlugins = summaries
-            codexPluginLastRefreshAt = Date()
-            codexPluginErrorMessage = nil
-            pruneSelectedComposerPlugins()
-
-            var warnings: [String] = []
-
-            do {
-                codexPluginAppStatuses = try await runtime.listPluginApps()
-            } catch {
-                warnings.append("Couldn't load plugin app setup state.")
-                lastStatusMessage = error.localizedDescription
-            }
-
-            do {
-                codexPluginMCPServerStatuses = try await runtime.listPluginMCPServerStatuses()
-            } catch {
-                warnings.append("Couldn't load plugin MCP setup state.")
-                lastStatusMessage = error.localizedDescription
-            }
-
-            for plugin in summaries where plugin.isInstalled {
-                if nextDetails[plugin.id] == nil {
-                    if let detail = try? await runtime.readPlugin(
-                        marketplacePath: plugin.marketplacePath,
-                        pluginName: plugin.pluginName
-                    ) {
-                        nextDetails[plugin.id] = detail
-                    }
-                }
-            }
-
-            codexPluginDetailsByID = nextDetails
-            codexPluginErrorMessage = warnings.joined(separator: "\n").nonEmpty
-        } catch {
-            codexPluginErrorMessage = error.localizedDescription
-            lastStatusMessage = error.localizedDescription
         }
     }
 
     private func fetchCodexPluginSummaries(
-        forceRemoteSync: Bool
+        mode: CodexPluginCatalogFetchMode
     ) async throws -> [AssistantCodexPluginSummary] {
-        let preferredCWDs = codexPluginCatalogCWDs()
-        let attempts: [(label: String, restartRuntime: Bool, forceRemoteSync: Bool, cwds: [String])] = [
-            (
-                label: "initial",
-                restartRuntime: false,
-                forceRemoteSync: forceRemoteSync,
-                cwds: preferredCWDs
-            ),
-            (
-                label: "fresh-runtime",
-                restartRuntime: true,
-                forceRemoteSync: true,
-                cwds: preferredCWDs
-            ),
-            (
-                label: "fresh-runtime-no-cwds",
-                restartRuntime: true,
-                forceRemoteSync: true,
-                cwds: []
-            ),
-        ]
+        let attempts: [(label: String, restartRuntime: Bool, forceRemoteSync: Bool, cwds: [String])]
+        switch mode {
+        case .localBootstrap:
+            attempts = [
+                (
+                    label: "local-bootstrap",
+                    restartRuntime: false,
+                    forceRemoteSync: false,
+                    cwds: []
+                ),
+                (
+                    label: "local-bootstrap-fresh-runtime",
+                    restartRuntime: true,
+                    forceRemoteSync: false,
+                    cwds: []
+                ),
+            ]
+        case .standard(let forceRemoteSync):
+            let preferredCWDs = codexPluginCatalogCWDs()
+            var nextAttempts: [(label: String, restartRuntime: Bool, forceRemoteSync: Bool, cwds: [String])] = [
+                (
+                    label: "initial",
+                    restartRuntime: false,
+                    forceRemoteSync: forceRemoteSync,
+                    cwds: preferredCWDs
+                ),
+                (
+                    label: "fresh-runtime",
+                    restartRuntime: true,
+                    forceRemoteSync: forceRemoteSync,
+                    cwds: preferredCWDs
+                ),
+            ]
+            if !preferredCWDs.isEmpty {
+                nextAttempts.append(
+                    (
+                        label: "fresh-runtime-no-cwds",
+                        restartRuntime: true,
+                        forceRemoteSync: forceRemoteSync,
+                        cwds: []
+                    )
+                )
+            }
+            attempts = nextAttempts
+        }
 
         var lastError: Error?
 
         for attempt in attempts {
             if attempt.restartRuntime {
+                CrashReporter.logInfo(
+                    "Assistant plugin catalog resetting utility runtime before \(attempt.label)"
+                )
                 await resetCodexPluginUtilityRuntime()
             }
 
             do {
+                CrashReporter.logInfo(
+                    "Assistant plugin catalog fetch attempt=\(attempt.label) cwds=\(attempt.cwds.count) forceRemoteSync=\(attempt.forceRemoteSync)"
+                )
                 let summaries = try await ensureCodexPluginUtilityRuntime().listPlugins(
                     cwds: attempt.cwds,
                     forceRemoteSync: attempt.forceRemoteSync
@@ -3582,6 +3645,65 @@ final class AssistantStore: ObservableObject {
             throw lastError
         }
         return []
+    }
+
+    private func applyCodexPluginCatalog(
+        _ summaries: [AssistantCodexPluginSummary]
+    ) async -> [String] {
+        let runtime = ensureCodexPluginUtilityRuntime()
+        let installedPluginIDs = Set(
+            summaries.filter(\.isInstalled).map { $0.id.lowercased() }
+        )
+        CrashReporter.logInfo(
+            "Assistant plugin catalog apply started summaryCount=\(summaries.count) installedCount=\(installedPluginIDs.count) cachedDetailCount=\(codexPluginDetailsByID.count)"
+        )
+
+        var nextDetails = codexPluginDetailsByID
+        nextDetails = nextDetails.filter { key, _ in
+            installedPluginIDs.contains(key.lowercased())
+        }
+
+        codexPlugins = summaries
+        codexPluginLastRefreshAt = Date()
+        pruneSelectedComposerPlugins()
+
+        var warnings: [String] = []
+
+        do {
+            codexPluginAppStatuses = try await runtime.listPluginApps()
+        } catch {
+            warnings.append("Couldn't load plugin app setup state.")
+            lastStatusMessage = error.localizedDescription
+        }
+
+        do {
+            codexPluginMCPServerStatuses = try await runtime.listPluginMCPServerStatuses()
+        } catch {
+            warnings.append("Couldn't load plugin MCP setup state.")
+            lastStatusMessage = error.localizedDescription
+        }
+
+        for plugin in summaries where plugin.isInstalled {
+            if nextDetails[plugin.id] == nil {
+                if let detail = try? await runtime.readPlugin(
+                    marketplacePath: plugin.marketplacePath,
+                    pluginName: plugin.pluginName
+                ) {
+                    nextDetails[plugin.id] = detail
+                }
+            }
+        }
+
+        codexPluginDetailsByID = nextDetails
+        CrashReporter.logInfo(
+            "Assistant plugin catalog apply finished detailCount=\(codexPluginDetailsByID.count) appStatusCount=\(codexPluginAppStatuses.count) mcpStatusCount=\(codexPluginMCPServerStatuses.count) warnings=\(warnings.count)"
+        )
+        return warnings
+    }
+
+    private enum CodexPluginCatalogFetchMode {
+        case localBootstrap
+        case standard(forceRemoteSync: Bool)
     }
 
     func loadCodexPluginDetail(pluginID: String) async {
@@ -3867,7 +3989,8 @@ final class AssistantStore: ObservableObject {
                             prompt: prompt
                         ),
                         summary: selection.summary,
-                        needsSetup: selection.needsSetup
+                        needsSetup: selection.needsSetup,
+                        iconPath: summary.iconPath ?? selection.iconPath
                     )
                 }
                 return selection
@@ -3880,7 +4003,8 @@ final class AssistantStore: ObservableObject {
                         prompt: prompt
                     ),
                     summary: summary.summary,
-                    needsSetup: codexPluginReadiness(for: summary).state == .needsSetup
+                    needsSetup: codexPluginReadiness(for: summary).state == .needsSetup,
+                    iconPath: summary.iconPath
                 )
             }
 
@@ -3889,7 +4013,8 @@ final class AssistantStore: ObservableObject {
                 pluginID: pluginID,
                 displayName: assistantDisplayPluginName(pluginName: pluginName),
                 summary: nil,
-                needsSetup: false
+                needsSetup: false,
+                iconPath: nil
             )
         }
     }

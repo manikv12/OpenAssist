@@ -96,6 +96,7 @@ struct AssistantCodexPluginSummary: Identifiable, Equatable, Sendable {
     let id: String
     let pluginName: String
     let displayName: String
+    let iconPath: String?
     let marketplaceName: String
     let marketplacePath: String
     let source: String?
@@ -111,6 +112,7 @@ struct AssistantCodexPluginDetail: Identifiable, Equatable, Sendable {
     let id: String
     let pluginName: String
     let displayName: String
+    let iconPath: String?
     let marketplaceName: String
     let marketplacePath: String
     let summary: String?
@@ -126,6 +128,7 @@ struct AssistantComposerPluginSelection: Identifiable, Equatable, Codable, Senda
     let displayName: String
     let summary: String?
     let needsSetup: Bool
+    let iconPath: String?
 
     var id: String { pluginID }
 }
@@ -147,6 +150,7 @@ struct AssistantCodexPluginReadiness: Equatable, Sendable {
 }
 
 private let assistantCodexPluginWordJoiners = CharacterSet(charactersIn: "-_")
+private let assistantCodexPluginIconDataURLCache = NSCache<NSString, NSString>()
 
 func assistantDisplayPluginName(
     pluginName: String,
@@ -170,4 +174,59 @@ func assistantDisplayPluginName(
         }
         return component.prefix(1).uppercased() + component.dropFirst()
     }.joined(separator: " ")
+}
+
+func assistantPluginIconDataURL(for path: String?) -> String? {
+    guard let normalizedPath = assistantNormalizedPluginIconPath(path) else { return nil }
+
+    let cacheKey = normalizedPath as NSString
+    if let cached = assistantCodexPluginIconDataURLCache.object(forKey: cacheKey) {
+        return cached as String
+    }
+
+    let fileURL: URL
+    if let url = URL(string: normalizedPath), url.isFileURL {
+        fileURL = url
+    } else {
+        fileURL = URL(fileURLWithPath: normalizedPath)
+    }
+
+    guard let data = try? Data(contentsOf: fileURL) else { return nil }
+    let mimeType = assistantPluginIconMIMEType(for: fileURL.pathExtension)
+    let dataURL = "data:\(mimeType);base64,\(data.base64EncodedString())"
+    assistantCodexPluginIconDataURLCache.setObject(dataURL as NSString, forKey: cacheKey, cost: data.count)
+    return dataURL
+}
+
+private func assistantNormalizedPluginIconPath(_ path: String?) -> String? {
+    guard let trimmed = path?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+        return nil
+    }
+
+    if let url = URL(string: trimmed), url.isFileURL {
+        return url.absoluteString
+    }
+
+    return NSString(string: trimmed).expandingTildeInPath
+}
+
+private func assistantPluginIconMIMEType(for pathExtension: String) -> String {
+    switch pathExtension.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+    case "svg":
+        return "image/svg+xml"
+    case "jpg", "jpeg":
+        return "image/jpeg"
+    case "gif":
+        return "image/gif"
+    case "webp":
+        return "image/webp"
+    case "bmp":
+        return "image/bmp"
+    case "tif", "tiff":
+        return "image/tiff"
+    case "icns":
+        return "image/icns"
+    default:
+        return "image/png"
+    }
 }
