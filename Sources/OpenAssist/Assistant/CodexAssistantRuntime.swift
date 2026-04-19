@@ -345,6 +345,7 @@ final class CodexAssistantRuntime {
     private var activeClaudeTurnContinuations: [CheckedContinuation<AssistantTurnCompletionStatus, Error>] = []
     private var activeClaudeQueuedPromptContexts: [ClaudeQueuedPromptContext] = []
     private var claudeCodeIdleTimeoutTask: Task<Void, Never>?
+    private var claudeTurnStallWatchdogTask: Task<Void, Never>?
     private var lastClaudeCodeActivityAt: Date?
     private var activeSessionID: String?
     private var activeSessionCWD: String?
@@ -381,6 +382,9 @@ final class CodexAssistantRuntime {
     private var idleRateLimitRefreshTask: Task<Void, Never>?
     private static let claudeCodeLiveProcessIdleTimeoutNanoseconds: UInt64 = 900_000_000_000
     private static let claudeCodeDeferredCompletionGracePeriodNanoseconds: UInt64 = 1_200_000_000
+    private static let claudeTurnStallTimeoutNanoseconds: UInt64 = 300_000_000_000          // 5 min of stream silence with no tool in flight
+    private static let claudeTurnStallTimeoutWithToolNanoseconds: UInt64 = 600_000_000_000  // 10 min of stream silence while a tool_use is running
+    private static let claudePermissionStaleTimeoutNanoseconds: UInt64 = 1_800_000_000_000  // 30 min while awaiting a user permission response
     private static let copilotCompletionQuietPeriodNanoseconds: UInt64 = 2_000_000_000
     private static let copilotCompletionActivityGracePeriodNanoseconds: UInt64 = 6_000_000_000
     private static let copilotCompletionHardTimeoutNanoseconds: UInt64 = 15_000_000_000
@@ -3257,6 +3261,11 @@ final class CodexAssistantRuntime {
     private func recordClaudeCodeActivity() {
         lastClaudeCodeActivityAt = Date()
         scheduleClaudeCodeIdleTimeoutIfNeeded()
+        // While a turn is in flight, every inbound payload resets the stall
+        // watchdog so long-but-progressing turns aren't killed.
+        if activeTurnID != nil {
+            scheduleClaudeTurnStallWatchdogIfNeeded()
+        }
     }
 
     private func scheduleClaudeCodeIdleTimeoutIfNeeded() {
@@ -3295,6 +3304,88 @@ final class CodexAssistantRuntime {
         return try await withCheckedThrowingContinuation { continuation in
             activeClaudeTurnContinuations.append(continuation)
         }
+    }
+
+    private func cancelClaudeTurnStallWatchdog() {
+        claudeTurnStallWatchdogTask?.cancel()
+        claudeTurnStallWatchdogTask = nil
+    }
+
+    /// Schedules a per-turn stall watchdog. Reset from `recordClaudeCodeActivity()`
+    /// on every inbound stream payload except `rate_limit_event`. Fires a synthetic
+    /// `failed` turn through the existing completion plumbing if Claude Code goes
+    /// silent for longer than the chosen window, so the UI never hangs forever.
+    private func scheduleClaudeTurnStallWatchdogIfNeeded() {
+        cancelClaudeTurnStallWatchdog()
+        guard backend == .claudeCode, activeTurnID != nil else { return }
+
+        let isAwaitingPermission = pendingPermissionContext != nil
+        let isAwaitingTool = claudeStreamingAwaitingToolExecution
+        let timeoutNanos: UInt64 = {
+            if isAwaitingPermission { return Self.claudePermissionStaleTimeoutNanoseconds }
+            if isAwaitingTool { return Self.claudeTurnStallTimeoutWithToolNanoseconds }
+            return Self.claudeTurnStallTimeoutNanoseconds
+        }()
+        let turnAtSchedule = activeTurnID
+
+        claudeTurnStallWatchdogTask = Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(nanoseconds: timeoutNanos)
+            } catch {
+                return
+            }
+            guard let self else { return }
+            guard !Task.isCancelled else { return }
+            // Re-check invariants after the sleep — the turn may have completed,
+            // been interrupted, or the runtime may have torn down.
+            guard self.backend == .claudeCode,
+                  self.activeTurnID != nil,
+                  self.activeTurnID == turnAtSchedule,
+                  !self.activeClaudeTurnContinuations.isEmpty else {
+                return
+            }
+            if isAwaitingPermission {
+                // While awaiting a user permission response we only fail if the
+                // subprocess has died under us; otherwise reschedule for another
+                // window so a user who steps away isn't penalised.
+                if self.activeClaudeProcess?.isRunning == true {
+                    self.scheduleClaudeTurnStallWatchdogIfNeeded()
+                    return
+                }
+            }
+            self.fireClaudeTurnStall(
+                awaitingTool: isAwaitingTool,
+                awaitingPermission: isAwaitingPermission,
+                timeoutNanos: timeoutNanos
+            )
+        }
+    }
+
+    private func fireClaudeTurnStall(
+        awaitingTool: Bool,
+        awaitingPermission: Bool,
+        timeoutNanos: UInt64
+    ) {
+        let seconds = Int(timeoutNanos / 1_000_000_000)
+        let reason: String
+        if awaitingPermission {
+            reason = "Claude Code exited while waiting for a permission response (\(seconds)s)."
+        } else if awaitingTool {
+            reason = "Claude Code stopped streaming while a tool was running — no activity for \(seconds)s. The session may be stuck; please retry."
+        } else {
+            reason = "Claude Code stopped streaming — no activity for \(seconds)s. The session may be stuck; please retry."
+        }
+        CrashReporter.logWarning("Claude turn stall watchdog fired: \(reason)")
+        // Route through the existing failure plumbing so HUD, transcript, and all
+        // pending continuations drain via `resolveAllActiveClaudeTurnContinuations`.
+        handleTurnCompleted([
+            "turn": [
+                "status": "failed",
+                "error": ["message": reason]
+            ]
+        ])
+        // Kill the zombie child so a subsequent turn respawns cleanly.
+        terminateActiveClaudeProcess(expected: false)
     }
 
     private func resolveNextActiveClaudeTurnContinuation(
@@ -4609,6 +4700,7 @@ final class CodexAssistantRuntime {
     private func handleTurnCompleted(_ params: [String: Any]) {
         cancelPendingCopilotPromptCompletion()
         cancelPendingClaudeCompletion()
+        cancelClaudeTurnStallWatchdog()
         materializeCopilotFallbackReplyIfNeeded()
         let completedTurnResponse = correctedAssistantImageFailureFallbackIfNeeded(streamingBuffer)
         let responsePreview = completedTurnResponse.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
@@ -5763,6 +5855,70 @@ final class CodexAssistantRuntime {
 
     func claudeCodeUserMessagePayloadForTesting(content: String) -> [String: Any] {
         Self.claudeCodeUserMessagePayload(content: content, sessionID: activeSessionID)
+    }
+
+    /// Mimics the in-flight state a real Claude turn occupies so stall-watchdog
+    /// and termination-safety-net behaviour can be exercised without spawning a
+    /// `claude` subprocess.
+    func beginClaudeTurnForTesting(
+        sessionID: String = "test-session",
+        turnID: String = "test-turn",
+        awaitingTool: Bool = false
+    ) {
+        backend = .claudeCode
+        activeSessionID = sessionID
+        activeTurnID = turnID
+        claudeStreamingAwaitingToolExecution = awaitingTool
+    }
+
+    /// Appends a checked continuation and returns its awaiter so tests can
+    /// assert how the watchdog or safety-net resolves a pending turn.
+    func awaitClaudeTurnCompletionForTesting() -> Task<AssistantTurnCompletionStatus, Error> {
+        Task { [weak self] in
+            guard let self else {
+                throw CodexAssistantRuntimeError.runtimeUnavailable("Runtime deallocated")
+            }
+            return try await self.waitForActiveClaudeTurnCompletion()
+        }
+    }
+
+    /// Directly invokes the stall-watchdog fire path as if the underlying
+    /// sleep had elapsed. Bypasses real time so tests stay fast.
+    func fireClaudeTurnStallForTesting(
+        awaitingTool: Bool = false,
+        awaitingPermission: Bool = false,
+        timeoutNanos: UInt64 = 300_000_000_000
+    ) {
+        cancelClaudeTurnStallWatchdog()
+        fireClaudeTurnStall(
+            awaitingTool: awaitingTool,
+            awaitingPermission: awaitingPermission,
+            timeoutNanos: timeoutNanos
+        )
+    }
+
+    /// Invokes the private process-termination handler with a fresh `Process`
+    /// instance so the `wasCurrentProcess == false` safety-net branch drains
+    /// pending continuations instead of hanging. Tests set up the pending
+    /// continuation via `awaitClaudeTurnCompletionForTesting` first.
+    func simulateClaudeStaleProcessTerminationForTesting(stderr: String = "") {
+        handleClaudeCodeLiveProcessTermination(
+            Process(),
+            snapshot: (
+                stdout: "",
+                stderr: stderr,
+                stdoutLines: [],
+                stderrLines: stderr.isEmpty ? [] : [stderr]
+            )
+        )
+    }
+
+    var pendingClaudeTurnContinuationCountForTesting: Int {
+        activeClaudeTurnContinuations.count
+    }
+
+    var claudeTurnStallWatchdogIsArmedForTesting: Bool {
+        claudeTurnStallWatchdogTask != nil
     }
 
     func claudeCodeElicitationContentForTesting(
@@ -8050,6 +8206,11 @@ final class CodexAssistantRuntime {
                 sessionID: sessionID
             )
             recordClaudeCodeActivity()
+            // Arm the stall watchdog before awaiting the turn. If Claude Code
+            // goes silent mid-stream (or exits silently after receiving our
+            // payload), the watchdog surfaces a failure instead of hanging the
+            // continuation forever.
+            scheduleClaudeTurnStallWatchdogIfNeeded()
             try writeClaudeCodeInputMessage(payload)
 
             let status = try await waitForActiveClaudeTurnCompletion()
@@ -8111,7 +8272,6 @@ final class CodexAssistantRuntime {
     }
 
     private func handleClaudeCodeStreamPayload(_ payload: [String: Any]) {
-        recordClaudeCodeActivity()
         let payloadSessionID = firstNonEmptyString(
             payload["session_id"] as? String,
             payload["sessionId"] as? String,
@@ -8120,6 +8280,13 @@ final class CodexAssistantRuntime {
         let payloadType = (payload["type"] as? String)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
+
+        // Record activity for every inbound payload except `rate_limit_event`,
+        // which is a low-rate housekeeping ping from the CLI and would otherwise
+        // mask a real stall by resetting the stall watchdog every ~20s.
+        if payloadType != "rate_limit_event" {
+            recordClaudeCodeActivity()
+        }
 
         // Any incoming payload except "result" (which handles its own
         // completion flow) means the CLI is still producing output and a
@@ -9237,7 +9404,20 @@ final class CodexAssistantRuntime {
             publishExecutionStateSnapshot()
         }
 
-        guard wasCurrentProcess else { return }
+        guard wasCurrentProcess else {
+            // Safety net: a stale termination callback while continuations
+            // are still pending (e.g. respawn mid-turn) must never leave the
+            // UI awaiting forever.
+            if !activeClaudeTurnContinuations.isEmpty {
+                cancelClaudeTurnStallWatchdog()
+                let message = "Claude Code exited before completing the turn."
+                resolveAllActiveClaudeTurnContinuations(
+                    status: .failed(message: message),
+                    error: CodexAssistantRuntimeError.requestFailed(message)
+                )
+            }
+            return
+        }
 
         let exitCode = Int(completed.terminationStatus)
         guard activeTurnID != nil else {
@@ -9249,6 +9429,22 @@ final class CodexAssistantRuntime {
                 )
                 onStatusMessage?(message)
                 updateHUD(phase: .idle, title: "Session ready", detail: nil)
+            }
+            // Safety net: child exited between stdin write and first stream
+            // event (so activeTurnID was never assigned) but the caller is
+            // still awaiting. Drain so `sendClaudeCodePrompt`'s continuation
+            // surfaces a real error instead of hanging.
+            if !activeClaudeTurnContinuations.isEmpty {
+                cancelClaudeTurnStallWatchdog()
+                let failureMessage = Self.commandFailureMessage(
+                    stdout: snapshot.stdout,
+                    stderr: snapshot.stderr,
+                    fallback: "Claude Code exited before the turn started."
+                )
+                resolveAllActiveClaudeTurnContinuations(
+                    status: .failed(message: failureMessage),
+                    error: CodexAssistantRuntimeError.requestFailed(failureMessage)
+                )
             }
             return
         }
@@ -9327,6 +9523,7 @@ final class CodexAssistantRuntime {
 
     private func terminateActiveClaudeProcess(expected _: Bool = true) {
         cancelClaudeCodeIdleTimeoutTask()
+        cancelClaudeTurnStallWatchdog()
         guard let activeClaudeProcess else {
             publishExecutionStateSnapshot()
             return
@@ -11369,6 +11566,11 @@ final class CodexAssistantRuntime {
                   self.pendingPermissionContext == nil else {
                 return
             }
+
+            // Cancel the stall watchdog before handing off to the completion
+            // path so a near-simultaneous timeout cannot synthesize a spurious
+            // failure after we've already emitted success.
+            self.cancelClaudeTurnStallWatchdog()
 
             if self.activeClaudeQueuedPromptContexts.count > 1 {
                 self.handleClaudeCodeIntermediateCompletion()

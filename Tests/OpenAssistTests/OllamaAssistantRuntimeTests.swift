@@ -86,7 +86,8 @@ final class OllamaAssistantRuntimeTests: XCTestCase {
         let snapshot = recorder.snapshot()
         XCTAssertEqual(snapshot.streamedAssistantText, "Hello world")
         XCTAssertEqual(snapshot.completionStatus, .completed)
-        XCTAssertEqual(await chatService.unloadedModelsSnapshot(), ["gemma4:e4b"])
+        let unloadedModels = await chatService.unloadedModelsSnapshot()
+        XCTAssertEqual(unloadedModels, ["gemma4:e4b"])
     }
 
     func testSendPromptExecutesToolCallAfterPermissionAndContinues() async throws {
@@ -147,7 +148,8 @@ final class OllamaAssistantRuntimeTests: XCTestCase {
         let snapshot = recorder.snapshot()
         XCTAssertEqual(snapshot.streamedAssistantText, "Done")
         XCTAssertEqual(snapshot.completionStatus, .completed)
-        XCTAssertEqual(await chatService.unloadedModelsSnapshot(), ["gemma4:e4b"])
+        let unloadedModels = await chatService.unloadedModelsSnapshot()
+        XCTAssertEqual(unloadedModels, ["gemma4:e4b"])
     }
 
     func testSendPromptEncodesImageAttachmentsAsBase64Images() async throws {
@@ -179,7 +181,8 @@ final class OllamaAssistantRuntimeTests: XCTestCase {
         let firstRequest = await chatService.requestsSnapshot().first
         let images = firstRequest?.messages.last?.images ?? []
         XCTAssertEqual(images, [imageData.base64EncodedString()])
-        XCTAssertEqual(await chatService.unloadedModelsSnapshot(), ["gemma4:e4b"])
+        let unloadedModels = await chatService.unloadedModelsSnapshot()
+        XCTAssertEqual(unloadedModels, ["gemma4:e4b"])
     }
 
     private func makeReadyRuntime(

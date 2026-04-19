@@ -50,6 +50,8 @@ final class TelegramRemoteRendererTests: XCTestCase {
                 detail: "Reading new output"
             ),
             hasActiveTurn: true,
+            toolCalls: [],
+            recentToolCalls: [],
             imageDelivery: nil
         )
 
@@ -57,6 +59,37 @@ final class TelegramRemoteRendererTests: XCTestCase {
 
         XCTAssertNotNil(streamText)
         XCTAssertEqual(streamText, "I am checking the logs now.")
+    }
+
+    func testStreamMessageKeepsActiveReplyWhenNextPromptIsQueued() {
+        let snapshot = AssistantRemoteSessionSnapshot(
+            session: AssistantSessionSummary(
+                id: "session-queued",
+                title: "Queued Follow Up",
+                source: .appServer,
+                status: .active
+            ),
+            transcriptEntries: [
+                AssistantTranscriptEntry(role: .user, text: "Check the logs."),
+                AssistantTranscriptEntry(role: .assistant, text: "I am still checking the logs now.", isStreaming: true),
+                AssistantTranscriptEntry(role: .user, text: "Also check the cache after that.")
+            ],
+            pendingPermissionRequest: nil,
+            hudState: AssistantHUDState(
+                phase: .streaming,
+                title: "Streaming",
+                detail: "Reading new output"
+            ),
+            hasActiveTurn: true,
+            toolCalls: [],
+            recentToolCalls: [],
+            imageDelivery: nil,
+            queuedPromptCount: 1
+        )
+
+        let streamText = TelegramRemoteRenderer.streamMessageText(snapshot: snapshot)
+
+        XCTAssertEqual(streamText, "I am still checking the logs now.")
     }
 
     func testStreamMessagePrefersAssistantReplyOverTrailingStatus() {
@@ -75,6 +108,8 @@ final class TelegramRemoteRendererTests: XCTestCase {
             pendingPermissionRequest: nil,
             hudState: .idle,
             hasActiveTurn: false,
+            toolCalls: [],
+            recentToolCalls: [],
             imageDelivery: nil
         )
 
@@ -99,6 +134,8 @@ final class TelegramRemoteRendererTests: XCTestCase {
             pendingPermissionRequest: nil,
             hudState: .idle,
             hasActiveTurn: false,
+            toolCalls: [],
+            recentToolCalls: [],
             imageDelivery: nil
         )
 
@@ -123,6 +160,8 @@ final class TelegramRemoteRendererTests: XCTestCase {
             pendingPermissionRequest: nil,
             hudState: .idle,
             hasActiveTurn: false,
+            toolCalls: [],
+            recentToolCalls: [],
             imageDelivery: nil
         )
 
@@ -259,12 +298,75 @@ final class TelegramRemoteRendererTests: XCTestCase {
                 detail: "Thinking..."
             ),
             hasActiveTurn: true,
+            toolCalls: [],
+            recentToolCalls: [],
             imageDelivery: nil
         )
 
         let streamText = TelegramRemoteRenderer.streamMessageText(snapshot: snapshot)
 
         XCTAssertNil(streamText)
+    }
+
+    func testCompactStatusTextShowsQueuedWorkSubtly() {
+        let snapshot = AssistantRemoteSessionSnapshot(
+            session: AssistantSessionSummary(
+                id: "session-status",
+                title: "Queued Work",
+                source: .appServer,
+                status: .active
+            ),
+            transcriptEntries: [],
+            pendingPermissionRequest: nil,
+            hudState: AssistantHUDState(
+                phase: .acting,
+                title: "Working",
+                detail: nil
+            ),
+            hasActiveTurn: true,
+            toolCalls: [],
+            recentToolCalls: [],
+            imageDelivery: nil,
+            queuedPromptCount: 2
+        )
+
+        XCTAssertEqual(
+            TelegramRemoteRenderer.compactStatusText(snapshot: snapshot),
+            "Working (2 queued)"
+        )
+    }
+
+    func testCompactStatusTextShowsSendingBeforeAssistantStarts() {
+        let snapshot = AssistantRemoteSessionSnapshot(
+            session: AssistantSessionSummary(
+                id: "session-pending",
+                title: "Pending Send",
+                source: .appServer,
+                status: .active
+            ),
+            transcriptEntries: [],
+            pendingPermissionRequest: nil,
+            hudState: AssistantHUDState(
+                phase: .thinking,
+                title: "Thinking",
+                detail: "Sending your message"
+            ),
+            hasActiveTurn: false,
+            toolCalls: [],
+            recentToolCalls: [],
+            imageDelivery: nil,
+            pendingOutgoingMessage: AssistantPendingOutgoingMessage(
+                text: "Please check this.",
+                imageAttachments: [],
+                createdAt: Date()
+            ),
+            awaitingAssistantStart: true
+        )
+
+        XCTAssertEqual(
+            TelegramRemoteRenderer.compactStatusText(snapshot: snapshot),
+            "Sending your message"
+        )
     }
 
     func testRenderMessageConvertsMarkdownToTelegramHTML() {

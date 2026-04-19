@@ -129,6 +129,7 @@ final class AssistantChatWebStreamingPlannerTests: XCTestCase {
             canEdit: false,
             rewriteAnchorID: nil,
             providerLabel: "Codex",
+            selectedPlugins: nil,
             activityIcon: nil,
             activityTitle: activityTitle,
             activityDetail: activityDetail,

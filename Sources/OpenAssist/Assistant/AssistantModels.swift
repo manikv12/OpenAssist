@@ -1962,6 +1962,38 @@ struct AssistantRemoteSessionSnapshot: Sendable {
     let toolCalls: [AssistantToolCallState]
     let recentToolCalls: [AssistantToolCallState]
     let imageDelivery: AssistantRemoteImageDelivery?
+    let activeTurnID: String?
+    let pendingOutgoingMessage: AssistantPendingOutgoingMessage?
+    let awaitingAssistantStart: Bool
+    let queuedPromptCount: Int
+
+    init(
+        session: AssistantSessionSummary,
+        transcriptEntries: [AssistantTranscriptEntry],
+        pendingPermissionRequest: AssistantPermissionRequest?,
+        hudState: AssistantHUDState?,
+        hasActiveTurn: Bool,
+        toolCalls: [AssistantToolCallState],
+        recentToolCalls: [AssistantToolCallState],
+        imageDelivery: AssistantRemoteImageDelivery?,
+        activeTurnID: String? = nil,
+        pendingOutgoingMessage: AssistantPendingOutgoingMessage? = nil,
+        awaitingAssistantStart: Bool = false,
+        queuedPromptCount: Int = 0
+    ) {
+        self.session = session
+        self.transcriptEntries = transcriptEntries
+        self.pendingPermissionRequest = pendingPermissionRequest
+        self.hudState = hudState
+        self.hasActiveTurn = hasActiveTurn
+        self.toolCalls = toolCalls
+        self.recentToolCalls = recentToolCalls
+        self.imageDelivery = imageDelivery
+        self.activeTurnID = activeTurnID
+        self.pendingOutgoingMessage = pendingOutgoingMessage
+        self.awaitingAssistantStart = awaitingAssistantStart
+        self.queuedPromptCount = queuedPromptCount
+    }
 }
 
 struct AssistantRemoteImageAttachment: Equatable, Sendable {
@@ -4360,7 +4392,9 @@ final class AssistantStore: ObservableObject {
         Selected installed plugins for this turn:
         \(lines.joined(separator: "\n"))
 
-        Prefer these plugins when they fit the request.
+        Treat these plugins as the required path for this request.
+        Use them first and do not switch to unrelated tools or a generic fallback just because it seems easier.
+        If the selected plugins cannot handle the request, say that clearly instead of silently doing the task another way.
         """
     }
 
@@ -4392,6 +4426,7 @@ final class AssistantStore: ObservableObject {
         var selectedSummaries: [AssistantCodexPluginSummary] = []
         var items: [AssistantCodexPromptInputItem] = []
         var seenMentionPaths = Set<String>()
+        var seenSkillPaths = Set<String>()
 
         for pluginID in normalizedIDs {
             guard let summary = codexPluginSummary(for: pluginID), summary.isInstalled else {
@@ -4401,6 +4436,20 @@ final class AssistantStore: ObservableObject {
 
             if codexPluginDetail(for: summary.id) == nil {
                 await loadCodexPluginDetail(pluginID: summary.id)
+            }
+
+            if let detail = codexPluginDetail(for: summary.id) {
+                for skill in detail.skills {
+                    let trimmedPath = skill.path
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !trimmedPath.isEmpty else { continue }
+                    guard seenSkillPaths.insert(trimmedPath.lowercased()).inserted else { continue }
+                    let skillName = skill.displayName
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                        .nonEmpty
+                        ?? skill.name
+                    items.append(.skill(name: skillName, path: trimmedPath))
+                }
             }
 
             let matchedAppStatuses = matchingComposerPluginAppStatuses(
@@ -6045,12 +6094,14 @@ final class AssistantStore: ObservableObject {
             sessionID: normalizedSessionID,
             hudState: state.hudState,
             hasActiveTurn: runtime?.hasActiveTurn ?? state.hasActiveTurn,
+            currentTurnID: runtime?.currentTurnID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty,
             hasLiveClaudeProcess: runtime?.hasLiveClaudeProcess ?? state.hasLiveClaudeProcess,
             canSteerActiveTurn: runtime?.canSteerActiveTurn ?? false,
             pendingPermissionRequest: state.pendingPermissionRequest,
             subagentCount: state.subagents.count,
             pendingOutgoingMessage: state.pendingOutgoingMessage,
-            awaitingAssistantStart: state.awaitingAssistantStart
+            awaitingAssistantStart: state.awaitingAssistantStart,
+            queuedPromptCount: state.queuedPrompts.count
         )
     }
 
@@ -7164,7 +7215,11 @@ final class AssistantStore: ObservableObject {
             hasActiveTurn: activitySnapshot.hasActiveTurn,
             toolCalls: toolState.toolCalls,
             recentToolCalls: toolState.recentToolCalls,
-            imageDelivery: imageDelivery
+            imageDelivery: imageDelivery,
+            activeTurnID: activitySnapshot.currentTurnID,
+            pendingOutgoingMessage: activitySnapshot.pendingOutgoingMessage,
+            awaitingAssistantStart: activitySnapshot.awaitingAssistantStart,
+            queuedPromptCount: activitySnapshot.queuedPromptCount
         )
     }
 

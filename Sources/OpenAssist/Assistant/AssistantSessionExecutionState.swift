@@ -36,22 +36,26 @@ struct AssistantSessionActivitySnapshot {
     let sessionID: String
     let hudState: AssistantHUDState?
     let hasActiveTurn: Bool
+    let currentTurnID: String?
     let hasLiveClaudeProcess: Bool
     let canSteerActiveTurn: Bool
     let pendingPermissionRequest: AssistantPermissionRequest?
     let subagentCount: Int
     let pendingOutgoingMessage: AssistantPendingOutgoingMessage?
     let awaitingAssistantStart: Bool
+    let queuedPromptCount: Int
 
     static let empty = AssistantSessionActivitySnapshot(
         sessionID: "",
         hudState: nil,
         hasActiveTurn: false,
+        currentTurnID: nil,
         hasLiveClaudeProcess: false,
         canSteerActiveTurn: false,
         pendingPermissionRequest: nil,
         subagentCount: 0,
         pendingOutgoingMessage: nil,
-        awaitingAssistantStart: false
+        awaitingAssistantStart: false,
+        queuedPromptCount: 0
     )
 }

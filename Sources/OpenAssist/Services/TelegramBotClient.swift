@@ -376,6 +376,24 @@ final class TelegramBotClient {
     }
 
     @discardableResult
+    func sendMessageDraft(
+        chatID: Int64,
+        draftID: Int,
+        text: String,
+        parseMode: TelegramParseMode? = nil
+    ) async throws -> Bool {
+        var payload: [String: Any] = [
+            "chat_id": chatID,
+            "draft_id": draftID,
+            "text": text
+        ]
+        if let parseMode {
+            payload["parse_mode"] = parseMode.rawValue
+        }
+        return try await perform(method: "sendMessageDraft", payload: payload, responseType: Bool.self)
+    }
+
+    @discardableResult
     func deleteMessage(chatID: Int64, messageID: Int) async throws -> Bool {
         try await perform(
             method: "deleteMessage",

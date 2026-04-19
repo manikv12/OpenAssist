@@ -109,6 +109,8 @@ final class TelegramRemoteCoordinator: ObservableObject {
         var permissionSlot = MessageSlot()
         var replyOverflowMessageIDs: [Int] = []
         var replyOverflowSignature: String?
+        var streamDraftID: Int?
+        var streamDraftSignature: String?
         var imageMessageIDs: [Int] = []
         var lastDeliveredImageSignature: String?
         var trackedMessageIDs: [Int] = []
@@ -144,6 +146,8 @@ final class TelegramRemoteCoordinator: ObservableObject {
             permissionSlot.reset()
             replyOverflowMessageIDs = []
             replyOverflowSignature = nil
+            streamDraftID = nil
+            streamDraftSignature = nil
             imageMessageIDs = []
             lastDeliveredImageSignature = nil
             resetStructuredInput()
@@ -181,6 +185,8 @@ final class TelegramRemoteCoordinator: ObservableObject {
             permissionSlot.reset()
             replyOverflowMessageIDs = []
             replyOverflowSignature = nil
+            streamDraftID = nil
+            streamDraftSignature = nil
             imageMessageIDs = []
             lastDeliveredImageSignature = nil
             trackedMessageIDs = []
@@ -466,7 +472,7 @@ final class TelegramRemoteCoordinator: ObservableObject {
             let snapshot = await refreshSelectedSessionView(chatID: ownerChatID)
             await updateTypingIndicator(chatID: ownerChatID, snapshot: snapshot)
             if chatState.controllerMenu == .home {
-                await renderHomeMenu(chatID: ownerChatID, notice: nil)
+                await renderHomeMenu(chatID: ownerChatID, notice: nil, sessionSnapshot: snapshot)
             }
 
             let refreshDelaySeconds = refreshIntervalSeconds(snapshot: snapshot)
@@ -871,6 +877,9 @@ final class TelegramRemoteCoordinator: ObservableObject {
             return
         }
 
+        if slot(for: .header).messageID != nil {
+            await clearSlot(chatID: chatID, kind: .header)
+        }
         if slot(for: .transcript).messageID != nil {
             await clearSlot(chatID: chatID, kind: .transcript)
         }
@@ -883,6 +892,7 @@ final class TelegramRemoteCoordinator: ObservableObject {
             chatState.resetStructuredInput()
         }
         detachSlot(.stream)
+        resetStreamDraftState()
         primeFastRefreshWindow()
 
         let selectedSessionID = chatState.selectedSessionID
@@ -1073,8 +1083,21 @@ final class TelegramRemoteCoordinator: ObservableObject {
         return fallback
     }
 
-    private func renderHomeMenu(chatID: Int64, notice: String?) async {
+    private func renderHomeMenu(
+        chatID: Int64,
+        notice: String?,
+        sessionSnapshot: AssistantRemoteSessionSnapshot? = nil
+    ) async {
         let status = await telegramSessionContext()
+        let currentSessionSnapshot: AssistantRemoteSessionSnapshot?
+        if let sessionSnapshot {
+            currentSessionSnapshot = sessionSnapshot
+        } else if let selectedSessionID = chatState.selectedSessionID?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !selectedSessionID.isEmpty {
+            currentSessionSnapshot = await bridge.sessionSnapshot(sessionID: selectedSessionID)
+        } else {
+            currentSessionSnapshot = nil
+        }
         let projectName = await currentProjectName()
         let selectedSessionLine = formattedSelectedSessionLine(
             sessionID: status.selectedSessionID,
@@ -1087,7 +1110,8 @@ final class TelegramRemoteCoordinator: ObservableObject {
             "",
             "Project: \(projectName ?? "All projects")",
             "Session: \(selectedSessionLine)",
-            "Backend: \(status.assistantBackendName)"
+            "Backend: \(status.assistantBackendName)",
+            "Status: \(TelegramRemoteRenderer.compactStatusText(snapshot: currentSessionSnapshot))"
         ]
 
         if !chatState.selectedPluginIDs.isEmpty {
@@ -1452,6 +1476,12 @@ final class TelegramRemoteCoordinator: ObservableObject {
             return nil
         }
 
+        let preservedTranscriptPreview = chatState.shouldShowTranscriptPreview
+        if force {
+            await clearSessionView(chatID: chatID)
+            chatState.shouldShowTranscriptPreview = preservedTranscriptPreview
+        }
+
         let expectedGeneration = chatState.viewGeneration
         guard let snapshot = await bridge.sessionSnapshot(sessionID: selectedSessionID) else {
             chatState.switchSessionView(to: nil)
@@ -1464,46 +1494,13 @@ final class TelegramRemoteCoordinator: ObservableObject {
             return snapshot
         }
 
-        let selectedPluginNames = await selectedPluginNames()
-
-        await upsertViewSlot(
-            chatID: chatID,
-            kind: .header,
-            text: TelegramRemoteRenderer.sessionHeaderText(
-                snapshot: snapshot,
-                selectedPluginNames: selectedPluginNames
-            ),
-            signaturePrefix: "header",
-            markup: snapshot.session.isTemporary
-                ? TelegramInlineKeyboardMarkup(inlineKeyboard: [[
-                    .init(text: "Keep Chat", callbackData: "act:keep")
-                ]])
-                : nil,
-            expectedGeneration: expectedGeneration
-        )
-
-        if chatState.shouldShowTranscriptPreview,
-           let catchUpText = TelegramRemoteRenderer.catchUpText(snapshot: snapshot) {
-            await upsertViewSlot(
-                chatID: chatID,
-                kind: .transcript,
-                text: catchUpText,
-                signaturePrefix: "transcript",
-                expectedGeneration: expectedGeneration
-            )
-        } else if slot(for: .transcript).messageID != nil, !chatState.shouldShowTranscriptPreview {
+        if slot(for: .header).messageID != nil {
+            await clearSlot(chatID: chatID, kind: .header)
+        }
+        if slot(for: .transcript).messageID != nil {
             await clearSlot(chatID: chatID, kind: .transcript)
         }
-
-        if let toolActivityText = TelegramRemoteRenderer.toolActivityText(snapshot: snapshot) {
-            await upsertViewSlot(
-                chatID: chatID,
-                kind: .toolActivity,
-                text: toolActivityText,
-                signaturePrefix: "tools",
-                expectedGeneration: expectedGeneration
-            )
-        } else if slot(for: .toolActivity).messageID != nil {
+        if slot(for: .toolActivity).messageID != nil {
             await clearSlot(chatID: chatID, kind: .toolActivity)
         }
 
@@ -1517,34 +1514,49 @@ final class TelegramRemoteCoordinator: ObservableObject {
         if let streamPresentation = TelegramRemoteRenderer.streamPresentation(snapshot: snapshot) {
             let renderedChunks = renderedMessageChunks(streamPresentation.text)
             let firstChunk = renderedChunks.first ?? renderedSingleMessage(streamPresentation.text)
-            await upsertViewSlot(
-                chatID: chatID,
-                kind: .stream,
-                rendered: firstChunk,
-                signaturePrefix: "\(streamPresentation.signaturePrefix):\(firstChunk.visibleSignature)",
-                expectedGeneration: expectedGeneration
-            )
-            if streamPresentation.allowsOverflow {
-                await syncReplyOverflowMessages(
+            if snapshot.hasActiveTurn,
+               let draftID = telegramDraftID(for: snapshot) {
+                await upsertTelegramDraft(
                     chatID: chatID,
-                    chunks: Array(renderedChunks.dropFirst()),
-                    signaturePrefix: streamPresentation.signaturePrefix,
+                    draftID: draftID,
+                    rendered: firstChunk,
+                    signature: "\(streamPresentation.signaturePrefix):\(firstChunk.visibleSignature)"
+                )
+                await clearReplyOverflowMessages(chatID: chatID)
+            } else {
+                resetStreamDraftState()
+                await upsertViewSlot(
+                    chatID: chatID,
+                    kind: .stream,
+                    rendered: firstChunk,
+                    signaturePrefix: "\(streamPresentation.signaturePrefix):\(firstChunk.visibleSignature)",
                     expectedGeneration: expectedGeneration
                 )
-            } else {
-                await clearReplyOverflowMessages(chatID: chatID)
+                if streamPresentation.allowsOverflow {
+                    await syncReplyOverflowMessages(
+                        chatID: chatID,
+                        chunks: Array(renderedChunks.dropFirst()),
+                        signaturePrefix: streamPresentation.signaturePrefix,
+                        expectedGeneration: expectedGeneration
+                    )
+                } else {
+                    await clearReplyOverflowMessages(chatID: chatID)
+                }
+                await ensureStreamSlotAppearsLast(
+                    chatID: chatID,
+                    firstChunk: firstChunk,
+                    overflowChunks: Array(renderedChunks.dropFirst()),
+                    signaturePrefix: streamPresentation.signaturePrefix,
+                    allowsOverflow: streamPresentation.allowsOverflow,
+                    expectedGeneration: expectedGeneration
+                )
             }
-            await ensureStreamSlotAppearsLast(
-                chatID: chatID,
-                firstChunk: firstChunk,
-                overflowChunks: Array(renderedChunks.dropFirst()),
-                signaturePrefix: streamPresentation.signaturePrefix,
-                allowsOverflow: streamPresentation.allowsOverflow,
-                expectedGeneration: expectedGeneration
-            )
         } else if slot(for: .stream).messageID != nil {
+            resetStreamDraftState()
             await clearSlot(chatID: chatID, kind: .stream)
             await clearReplyOverflowMessages(chatID: chatID)
+        } else {
+            resetStreamDraftState()
         }
 
         if let imageDelivery = snapshot.imageDelivery {
@@ -1941,11 +1953,60 @@ final class TelegramRemoteCoordinator: ObservableObject {
     private func clearSessionView(chatID: Int64) async {
         await clearSlot(chatID: chatID, kind: .header)
         await clearSlot(chatID: chatID, kind: .transcript)
+        await clearSlot(chatID: chatID, kind: .toolActivity)
         await clearSlot(chatID: chatID, kind: .stream)
         await clearSlot(chatID: chatID, kind: .permission)
         await clearReplyOverflowMessages(chatID: chatID)
         await clearImageMessages(chatID: chatID)
+        resetStreamDraftState()
         chatState.resetSessionView()
+    }
+
+    private func resetStreamDraftState() {
+        chatState.streamDraftID = nil
+        chatState.streamDraftSignature = nil
+    }
+
+    private func telegramDraftID(for snapshot: AssistantRemoteSessionSnapshot) -> Int? {
+        let key = snapshot.activeTurnID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+            ?? snapshot.session.id.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+        guard let key else {
+            return nil
+        }
+        let digest = MemoryIdentifier.stableHexDigest(for: "telegram-draft:\(key)")
+        let hexPrefix = String(digest.prefix(8))
+        let value = Int(hexPrefix, radix: 16) ?? 1
+        return max(1, value)
+    }
+
+    private func upsertTelegramDraft(
+        chatID: Int64,
+        draftID: Int,
+        rendered: TelegramRenderedText,
+        signature: String
+    ) async {
+        guard chatState.streamDraftID != draftID || chatState.streamDraftSignature != signature else {
+            return
+        }
+
+        do {
+            try await sendTelegramDraft(
+                chatID: chatID,
+                draftID: draftID,
+                rendered: rendered
+            )
+            chatState.streamDraftID = draftID
+            chatState.streamDraftSignature = signature
+        } catch {
+            resetStreamDraftState()
+            await upsertViewSlot(
+                chatID: chatID,
+                kind: .stream,
+                rendered: rendered,
+                signaturePrefix: signature,
+                expectedGeneration: chatState.viewGeneration
+            )
+        }
     }
 
     private func trackMessageID(_ messageID: Int) {
@@ -2454,14 +2515,14 @@ final class TelegramRemoteCoordinator: ObservableObject {
             return isFastRefreshWindowActive() ? 1 : 8
         }
         if snapshot.pendingPermissionRequest != nil {
-            return 0.75
+            return 1
         }
         if snapshot.hasActiveTurn {
             turnJustFinished = true
-            return 0.75
+            return 1
         }
         if !snapshot.toolCalls.isEmpty {
-            return 0.9
+            return 1
         }
         if isFastRefreshWindowActive() {
             return 1
@@ -2792,6 +2853,34 @@ final class TelegramRemoteCoordinator: ObservableObject {
                 messageID: messageID,
                 text: rendered.plainText,
                 replyMarkup: replyMarkup
+            )
+        }
+    }
+
+    private func sendTelegramDraft(
+        chatID: Int64,
+        draftID: Int,
+        rendered: TelegramRenderedText
+    ) async throws {
+        guard let client else {
+            throw TelegramBotClientError.invalidRequest
+        }
+
+        do {
+            _ = try await client.sendMessageDraft(
+                chatID: chatID,
+                draftID: draftID,
+                text: rendered.html,
+                parseMode: .html
+            )
+        } catch {
+            guard shouldRetryAsPlainText(after: error) else {
+                throw error
+            }
+            _ = try await client.sendMessageDraft(
+                chatID: chatID,
+                draftID: draftID,
+                text: rendered.plainText
             )
         }
     }

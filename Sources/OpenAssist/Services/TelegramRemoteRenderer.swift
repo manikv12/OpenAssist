@@ -316,13 +316,41 @@ enum TelegramRemoteRenderer {
         return "\(prefix)\(title)"
     }
 
+    static func compactStatusText(snapshot: AssistantRemoteSessionSnapshot?) -> String {
+        guard let snapshot else {
+            return "Ready"
+        }
+
+        if snapshot.pendingPermissionRequest != nil {
+            return "Waiting for approval"
+        }
+
+        if snapshot.awaitingAssistantStart || snapshot.pendingOutgoingMessage != nil {
+            return "Sending your message"
+        }
+
+        if snapshot.hasActiveTurn {
+            if snapshot.queuedPromptCount > 0 {
+                let suffix = snapshot.queuedPromptCount == 1 ? "1 queued" : "\(snapshot.queuedPromptCount) queued"
+                return "Working (\(suffix))"
+            }
+            return "Working"
+        }
+
+        if snapshot.queuedPromptCount > 0 {
+            return snapshot.queuedPromptCount == 1 ? "1 queued" : "\(snapshot.queuedPromptCount) queued"
+        }
+
+        return "Ready"
+    }
+
     static func streamMessageText(snapshot: AssistantRemoteSessionSnapshot) -> String? {
         streamPresentation(snapshot: snapshot)?.text
     }
 
     static func streamPresentation(snapshot: AssistantRemoteSessionSnapshot) -> StreamPresentation? {
         let currentTurnEntries: ArraySlice<AssistantTranscriptEntry>
-        if let lastUserIndex = snapshot.transcriptEntries.lastIndex(where: { $0.role == .user }) {
+        if let lastUserIndex = currentTurnAnchorUserIndex(snapshot: snapshot) {
             let nextIndex = snapshot.transcriptEntries.index(after: lastUserIndex)
             currentTurnEntries = snapshot.transcriptEntries[nextIndex...]
         } else {
@@ -343,7 +371,7 @@ enum TelegramRemoteRenderer {
 
         let preferredAssistant: (entry: AssistantTranscriptEntry, cleanedText: String)?
         if snapshot.hasActiveTurn {
-            preferredAssistant = assistantCandidates.last
+            preferredAssistant = assistantCandidates.last(where: { $0.entry.isStreaming }) ?? assistantCandidates.last
         } else if !assistantCandidates.isEmpty {
             let completedAssistants = assistantCandidates.filter { !$0.entry.isStreaming }
             if let latestCompleted = completedAssistants.last {
@@ -390,6 +418,20 @@ enum TelegramRemoteRenderer {
         }
 
         return nil
+    }
+
+    private static func currentTurnAnchorUserIndex(
+        snapshot: AssistantRemoteSessionSnapshot
+    ) -> Array<AssistantTranscriptEntry>.Index? {
+        let userIndices = snapshot.transcriptEntries.indices.filter { index in
+            snapshot.transcriptEntries[index].role == .user
+        }
+        guard !userIndices.isEmpty else {
+            return nil
+        }
+
+        let queuedUserCount = snapshot.hasActiveTurn ? max(0, snapshot.queuedPromptCount) : 0
+        return Array(userIndices.dropLast(queuedUserCount)).last ?? userIndices.last
     }
 
     static func permissionText(_ request: AssistantPermissionRequest) -> String {
