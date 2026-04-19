@@ -113,7 +113,7 @@ final class TelegramRemoteRendererTests: XCTestCase {
             imageDelivery: nil
         )
 
-        let streamText = TelegramRemoteRenderer.streamMessageText(snapshot: snapshot)
+        let streamText = TelegramRemoteRenderer.completedAttentionText(snapshot: snapshot)
 
         XCTAssertEqual(streamText, "I can see Telegram and Codex open on the screen.")
     }
@@ -366,6 +366,205 @@ final class TelegramRemoteRendererTests: XCTestCase {
         XCTAssertEqual(
             TelegramRemoteRenderer.compactStatusText(snapshot: snapshot),
             "Sending your message"
+        )
+    }
+
+    func testCompletedAttentionTextPrefersLatestCompletedAssistantReply() {
+        let snapshot = AssistantRemoteSessionSnapshot(
+            session: AssistantSessionSummary(
+                id: "session-complete",
+                title: "Completed Turn",
+                source: .appServer,
+                status: .completed
+            ),
+            transcriptEntries: [
+                AssistantTranscriptEntry(role: .user, text: "What happened?"),
+                AssistantTranscriptEntry(role: .assistant, text: "Short"),
+                AssistantTranscriptEntry(role: .assistant, text: "This is the final answer that should be sent to Telegram.")
+            ],
+            pendingPermissionRequest: nil,
+            latestRemoteAttentionEvent: AssistantRemoteAttentionEvent(
+                id: "completed:turn-1",
+                kind: .completed,
+                createdAt: Date(),
+                turnID: "turn-1",
+                permissionRequestID: nil,
+                failureText: nil
+            ),
+            hudState: .idle,
+            hasActiveTurn: false,
+            toolCalls: [],
+            recentToolCalls: [],
+            imageDelivery: nil
+        )
+
+        XCTAssertEqual(
+            TelegramRemoteRenderer.completedAttentionText(snapshot: snapshot),
+            "This is the final answer that should be sent to Telegram."
+        )
+    }
+
+    func testFailureAttentionTextUsesErrorTranscriptBeforeFallback() {
+        let snapshot = AssistantRemoteSessionSnapshot(
+            session: AssistantSessionSummary(
+                id: "session-failed",
+                title: "Failed Turn",
+                source: .appServer,
+                status: .active
+            ),
+            transcriptEntries: [
+                AssistantTranscriptEntry(role: .user, text: "Try it."),
+                AssistantTranscriptEntry(role: .error, text: "The command failed because access was denied.")
+            ],
+            pendingPermissionRequest: nil,
+            latestRemoteAttentionEvent: AssistantRemoteAttentionEvent(
+                id: "failed:turn-2",
+                kind: .failed,
+                createdAt: Date(),
+                turnID: "turn-2",
+                permissionRequestID: nil,
+                failureText: "Fallback failure text"
+            ),
+            hudState: .idle,
+            hasActiveTurn: false,
+            toolCalls: [],
+            recentToolCalls: [],
+            imageDelivery: nil
+        )
+
+        XCTAssertEqual(
+            TelegramRemoteRenderer.failureAttentionText(
+                snapshot: snapshot,
+                fallback: "Fallback failure text"
+            ),
+            "The command failed because access was denied."
+        )
+    }
+
+    func testFreshAttentionDeliveryReturnsCompletionForNewEvent() {
+        let snapshot = AssistantRemoteSessionSnapshot(
+            session: AssistantSessionSummary(
+                id: "session-complete",
+                title: "Completed Turn",
+                source: .appServer,
+                status: .completed
+            ),
+            transcriptEntries: [
+                AssistantTranscriptEntry(role: .user, text: "Summarize it."),
+                AssistantTranscriptEntry(role: .assistant, text: "Here is the final summary.")
+            ],
+            pendingPermissionRequest: nil,
+            latestRemoteAttentionEvent: AssistantRemoteAttentionEvent(
+                id: "completed:turn-3",
+                kind: .completed,
+                createdAt: Date(),
+                turnID: "turn-3",
+                permissionRequestID: nil,
+                failureText: nil
+            ),
+            hudState: .idle,
+            hasActiveTurn: false,
+            toolCalls: [],
+            recentToolCalls: [],
+            imageDelivery: nil
+        )
+
+        XCTAssertEqual(
+            TelegramRemoteCoordinator.freshAttentionDelivery(
+                snapshot: snapshot,
+                baselineAttentionEventID: "completed:older-turn",
+                lastDeliveredEventID: nil
+            ),
+            .init(
+                eventID: "completed:turn-3",
+                kind: .completion(text: "Here is the final summary.")
+            )
+        )
+    }
+
+    func testFreshAttentionDeliverySkipsBaselineEvent() {
+        let snapshot = AssistantRemoteSessionSnapshot(
+            session: AssistantSessionSummary(
+                id: "session-complete",
+                title: "Completed Turn",
+                source: .appServer,
+                status: .completed
+            ),
+            transcriptEntries: [
+                AssistantTranscriptEntry(role: .user, text: "Summarize it."),
+                AssistantTranscriptEntry(role: .assistant, text: "Here is the final summary.")
+            ],
+            pendingPermissionRequest: nil,
+            latestRemoteAttentionEvent: AssistantRemoteAttentionEvent(
+                id: "completed:turn-3",
+                kind: .completed,
+                createdAt: Date(),
+                turnID: "turn-3",
+                permissionRequestID: nil,
+                failureText: nil
+            ),
+            hudState: .idle,
+            hasActiveTurn: false,
+            toolCalls: [],
+            recentToolCalls: [],
+            imageDelivery: nil
+        )
+
+        XCTAssertNil(
+            TelegramRemoteCoordinator.freshAttentionDelivery(
+                snapshot: snapshot,
+                baselineAttentionEventID: "completed:turn-3",
+                lastDeliveredEventID: nil
+            )
+        )
+    }
+
+    func testFreshAttentionDeliveryReturnsPermissionRequestForNewApproval() {
+        let request = AssistantPermissionRequest(
+            id: 44,
+            sessionID: "session-permission",
+            toolTitle: "Use Browser",
+            toolKind: "computer",
+            rationale: "Need to inspect the page",
+            options: [
+                AssistantPermissionOption(id: "accept", title: "Approve", kind: nil, isDefault: true)
+            ],
+            rawPayloadSummary: nil
+        )
+        let snapshot = AssistantRemoteSessionSnapshot(
+            session: AssistantSessionSummary(
+                id: "session-permission",
+                title: "Approval Needed",
+                source: .appServer,
+                status: .active
+            ),
+            transcriptEntries: [],
+            pendingPermissionRequest: request,
+            latestRemoteAttentionEvent: AssistantRemoteAttentionEvent(
+                id: "permission:44",
+                kind: .permissionRequired,
+                createdAt: Date(),
+                turnID: nil,
+                permissionRequestID: 44,
+                failureText: nil
+            ),
+            hudState: .idle,
+            hasActiveTurn: true,
+            toolCalls: [],
+            recentToolCalls: [],
+            imageDelivery: nil
+        )
+
+        XCTAssertEqual(
+            TelegramRemoteCoordinator.freshAttentionDelivery(
+                snapshot: snapshot,
+                baselineAttentionEventID: nil,
+                lastDeliveredEventID: nil
+            ),
+            .init(
+                eventID: "permission:44",
+                kind: .permission(requestID: 44)
+            )
         )
     }
 

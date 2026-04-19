@@ -127,6 +127,41 @@ final class TelegramBotClientMediaPayloadTests: XCTestCase {
         XCTAssertEqual(json["parse_mode"] as? String, "HTML")
     }
 
+    func testSendMessageCanDisableNotification() async throws {
+        let requestBox = LockedURLRequestBox()
+        let client = makeStubbedClient { request in
+            requestBox.request = request
+            return (
+                HTTPURLResponse(
+                    url: try XCTUnwrap(request.url),
+                    statusCode: 200,
+                    httpVersion: nil,
+                    headerFields: nil
+                )!,
+                Data(
+                    """
+                    {"ok":true,"result":{"message_id":55,"date":1731120300,"chat":{"id":1001,"type":"private"},"text":"hello"}}
+                    """.utf8
+                )
+            )
+        }
+
+        _ = try await client.sendMessage(
+            chatID: 1001,
+            text: "hello",
+            disableNotification: true
+        )
+
+        let request = try XCTUnwrap(requestBox.request)
+        let body = try XCTUnwrap(readBody(from: request))
+        let json = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: body) as? [String: Any]
+        )
+        XCTAssertEqual((json["chat_id"] as? NSNumber)?.int64Value, 1001)
+        XCTAssertEqual(json["text"] as? String, "hello")
+        XCTAssertEqual(json["disable_notification"] as? Bool, true)
+    }
+
     private func makeStubbedClient(
         handler: @escaping @Sendable (URLRequest) throws -> (HTTPURLResponse, Data)
     ) -> TelegramBotClient {

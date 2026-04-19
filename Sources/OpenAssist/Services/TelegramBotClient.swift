@@ -276,13 +276,17 @@ final class TelegramBotClient {
         chatID: Int64,
         text: String,
         parseMode: TelegramParseMode? = nil,
-        replyMarkup: TelegramInlineKeyboardMarkup? = nil
+        replyMarkup: TelegramInlineKeyboardMarkup? = nil,
+        disableNotification: Bool = false
     ) async throws -> TelegramMessage {
         var payload: [String: Any] = [
             "chat_id": chatID,
             "text": text,
             "disable_web_page_preview": true
         ]
+        if disableNotification {
+            payload["disable_notification"] = true
+        }
         if let parseMode {
             payload["parse_mode"] = parseMode.rawValue
         }

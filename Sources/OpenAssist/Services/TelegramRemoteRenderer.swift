@@ -345,19 +345,76 @@ enum TelegramRemoteRenderer {
     }
 
     static func streamMessageText(snapshot: AssistantRemoteSessionSnapshot) -> String? {
-        streamPresentation(snapshot: snapshot)?.text
+        livePreviewPresentation(snapshot: snapshot)?.text
+    }
+
+    static func livePreviewPresentation(snapshot: AssistantRemoteSessionSnapshot) -> StreamPresentation? {
+        guard snapshot.hasActiveTurn else {
+            return nil
+        }
+        return assistantPresentation(snapshot: snapshot)
+    }
+
+    static func completedAttentionText(snapshot: AssistantRemoteSessionSnapshot) -> String? {
+        assistantPresentation(snapshot: snapshot, allowsOverflow: true)?.text
+    }
+
+    static func failureAttentionText(
+        snapshot: AssistantRemoteSessionSnapshot,
+        fallback: String? = nil
+    ) -> String? {
+        if let cleanedText = latestErrorText(snapshot: snapshot) {
+            return cleanedText
+        }
+        return AssistantVisibleTextSanitizer.clean(fallback)
     }
 
     static func streamPresentation(snapshot: AssistantRemoteSessionSnapshot) -> StreamPresentation? {
-        let currentTurnEntries: ArraySlice<AssistantTranscriptEntry>
-        if let lastUserIndex = currentTurnAnchorUserIndex(snapshot: snapshot) {
-            let nextIndex = snapshot.transcriptEntries.index(after: lastUserIndex)
-            currentTurnEntries = snapshot.transcriptEntries[nextIndex...]
-        } else {
-            guard !snapshot.hasActiveTurn, snapshot.pendingPermissionRequest == nil else {
-                return nil
-            }
-            currentTurnEntries = snapshot.transcriptEntries[...]
+        if let livePreview = livePreviewPresentation(snapshot: snapshot) {
+            return livePreview
+        }
+        if snapshot.hasActiveTurn || snapshot.pendingPermissionRequest != nil {
+            return nil
+        }
+        if let completedText = completedAttentionText(snapshot: snapshot),
+           let assistantEntry = preferredAssistantEntry(snapshot: snapshot) {
+            return StreamPresentation(
+                text: completedText,
+                signaturePrefix: "assistant:\(assistantEntry.id.uuidString):\(assistantEntry.isStreaming)",
+                allowsOverflow: true
+            )
+        }
+        if let latestError = latestErrorEntry(snapshot: snapshot),
+           let cleanedText = AssistantVisibleTextSanitizer.clean(latestError.text) {
+            return StreamPresentation(
+                text: cleanedText,
+                signaturePrefix: "error:\(latestError.id.uuidString)",
+                allowsOverflow: true
+            )
+        }
+        return nil
+    }
+
+    private static func assistantPresentation(
+        snapshot: AssistantRemoteSessionSnapshot,
+        allowsOverflow: Bool = false
+    ) -> StreamPresentation? {
+        guard let preferredAssistant = preferredAssistantEntry(snapshot: snapshot),
+              let cleanedText = AssistantVisibleTextSanitizer.clean(preferredAssistant.text) else {
+            return nil
+        }
+        return StreamPresentation(
+            text: cleanedText,
+            signaturePrefix: "assistant:\(preferredAssistant.id.uuidString):\(preferredAssistant.isStreaming)",
+            allowsOverflow: allowsOverflow && !preferredAssistant.isStreaming && !snapshot.hasActiveTurn
+        )
+    }
+
+    private static func preferredAssistantEntry(
+        snapshot: AssistantRemoteSessionSnapshot
+    ) -> AssistantTranscriptEntry? {
+        guard let currentTurnEntries = currentTurnEntries(snapshot: snapshot) else {
+            return nil
         }
 
         let assistantCandidates = currentTurnEntries.compactMap { entry -> (entry: AssistantTranscriptEntry, cleanedText: String)? in
@@ -395,29 +452,41 @@ enum TelegramRemoteRenderer {
         }
 
         if let preferredAssistant {
-            return StreamPresentation(
-                text: preferredAssistant.cleanedText,
-                signaturePrefix: "assistant:\(preferredAssistant.entry.id.uuidString):\(preferredAssistant.entry.isStreaming)",
-                allowsOverflow: !preferredAssistant.entry.isStreaming && !snapshot.hasActiveTurn
-            )
-        }
-
-        if let latestError = currentTurnEntries.last(where: { entry in
-            entry.role == .error && entry.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
-        }),
-           let cleanedText = AssistantVisibleTextSanitizer.clean(latestError.text) {
-            return StreamPresentation(
-                text: cleanedText,
-                signaturePrefix: "error:\(latestError.id.uuidString)",
-                allowsOverflow: true
-            )
-        }
-
-        if snapshot.hasActiveTurn || snapshot.pendingPermissionRequest != nil {
-            return nil
+            return preferredAssistant.entry
         }
 
         return nil
+    }
+
+    private static func currentTurnEntries(
+        snapshot: AssistantRemoteSessionSnapshot
+    ) -> ArraySlice<AssistantTranscriptEntry>? {
+        if let lastUserIndex = currentTurnAnchorUserIndex(snapshot: snapshot) {
+            let nextIndex = snapshot.transcriptEntries.index(after: lastUserIndex)
+            return snapshot.transcriptEntries[nextIndex...]
+        }
+        guard !snapshot.hasActiveTurn, snapshot.pendingPermissionRequest == nil else {
+            return nil
+        }
+        return snapshot.transcriptEntries[...]
+    }
+
+    private static func latestErrorEntry(
+        snapshot: AssistantRemoteSessionSnapshot
+    ) -> AssistantTranscriptEntry? {
+        guard let currentTurnEntries = currentTurnEntries(snapshot: snapshot) else {
+            return nil
+        }
+        return currentTurnEntries.last(where: { entry in
+            entry.role == .error && entry.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+        })
+    }
+
+    private static func latestErrorText(snapshot: AssistantRemoteSessionSnapshot) -> String? {
+        guard let latestError = latestErrorEntry(snapshot: snapshot) else {
+            return nil
+        }
+        return AssistantVisibleTextSanitizer.clean(latestError.text)
     }
 
     private static func currentTurnAnchorUserIndex(

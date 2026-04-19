@@ -109,11 +109,11 @@ final class TelegramRemoteCoordinator: ObservableObject {
         var permissionSlot = MessageSlot()
         var replyOverflowMessageIDs: [Int] = []
         var replyOverflowSignature: String?
-        var streamDraftID: Int?
-        var streamDraftSignature: String?
         var imageMessageIDs: [Int] = []
         var lastDeliveredImageSignature: String?
         var trackedMessageIDs: [Int] = []
+        var selectedSessionBaselineAttentionEventID: String?
+        var lastDeliveredAttentionEventID: String?
         var structuredQuestionIndex = 0
         var structuredAnswers: [String: [String]] = [:]
         var awaitingCustomAnswerQuestionID: String?
@@ -146,8 +146,6 @@ final class TelegramRemoteCoordinator: ObservableObject {
             permissionSlot.reset()
             replyOverflowMessageIDs = []
             replyOverflowSignature = nil
-            streamDraftID = nil
-            streamDraftSignature = nil
             imageMessageIDs = []
             lastDeliveredImageSignature = nil
             resetStructuredInput()
@@ -155,16 +153,19 @@ final class TelegramRemoteCoordinator: ObservableObject {
 
         mutating func switchSessionView(
             to sessionID: String?,
-            showTranscriptPreview: Bool = true
+            showTranscriptPreview: Bool = true,
+            baselineAttentionEventID: String? = nil
         ) {
             let previousSessionID = selectedSessionID?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
             let nextSessionID = sessionID?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
             if previousSessionID != nil, previousSessionID != nextSessionID {
                 selectedPluginIDs = []
                 pluginMenuPluginIDs = []
+                lastDeliveredAttentionEventID = nil
             }
             viewGeneration += 1
             selectedSessionID = sessionID
+            selectedSessionBaselineAttentionEventID = baselineAttentionEventID
             shouldShowTranscriptPreview = showTranscriptPreview
             resetStructuredInput()
         }
@@ -185,8 +186,6 @@ final class TelegramRemoteCoordinator: ObservableObject {
             permissionSlot.reset()
             replyOverflowMessageIDs = []
             replyOverflowSignature = nil
-            streamDraftID = nil
-            streamDraftSignature = nil
             imageMessageIDs = []
             lastDeliveredImageSignature = nil
             trackedMessageIDs = []
@@ -229,6 +228,17 @@ final class TelegramRemoteCoordinator: ObservableObject {
                 return "The audio upload finished, but no transcript text came back."
             }
         }
+    }
+
+    struct FreshAttentionDelivery: Equatable {
+        enum Kind: Equatable {
+            case completion(text: String)
+            case failure(text: String)
+            case permission(requestID: Int)
+        }
+
+        let eventID: String
+        let kind: Kind
     }
 
     private let bridge = AssistantRemoteBridge()
@@ -808,7 +818,10 @@ final class TelegramRemoteCoordinator: ObservableObject {
             snapshot = await bridge.startNewSession()
         }
         chatState.selectedPluginIDs = []
-        chatState.switchSessionView(to: snapshot?.session.id ?? bridge.statusSnapshot().selectedSessionID)
+        chatState.switchSessionView(
+            to: snapshot?.session.id ?? bridge.statusSnapshot().selectedSessionID,
+            baselineAttentionEventID: nil
+        )
         await clearTrackedChatHistory(chatID: chatID)
         if moveControllerToBottom {
             await moveControllerMessageToBottom(chatID: chatID)
@@ -838,10 +851,12 @@ final class TelegramRemoteCoordinator: ObservableObject {
 
     private func clearChatWindow(chatID: Int64) async {
         let selectedSessionID = chatState.selectedSessionID?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let baselineAttentionEventID = await currentAttentionEventID(for: selectedSessionID)
         await clearTrackedChatHistory(chatID: chatID)
         chatState.switchSessionView(
             to: selectedSessionID,
-            showTranscriptPreview: false
+            showTranscriptPreview: false,
+            baselineAttentionEventID: baselineAttentionEventID
         )
         await renderHomeMenu(
             chatID: chatID,
@@ -891,20 +906,32 @@ final class TelegramRemoteCoordinator: ObservableObject {
         } else {
             chatState.resetStructuredInput()
         }
-        detachSlot(.stream)
-        resetStreamDraftState()
         primeFastRefreshWindow()
 
         let selectedSessionID = chatState.selectedSessionID
+        let currentSessionSnapshot: AssistantRemoteSessionSnapshot?
+        if let selectedSessionID {
+            currentSessionSnapshot = await bridge.sessionSnapshot(sessionID: selectedSessionID)
+        } else {
+            currentSessionSnapshot = nil
+        }
+        let baselineAttentionEventID = currentSessionSnapshot?.latestRemoteAttentionEvent?.id
+        if currentSessionSnapshot?.hasActiveTurn != true {
+            await closeLivePreviewSurface(chatID: chatID)
+        }
         let snapshot = await bridge.sendPrompt(
             text,
             sessionID: selectedSessionID,
             selectedPluginIDs: chatState.selectedPluginIDs,
             oneShotInstructions: Self.telegramVisualConfirmationInstructions
         )
+        let resolvedSessionID = snapshot?.session.id ?? bridge.statusSnapshot().selectedSessionID
         chatState.switchSessionView(
-            to: snapshot?.session.id ?? bridge.statusSnapshot().selectedSessionID,
-            showTranscriptPreview: false
+            to: resolvedSessionID,
+            showTranscriptPreview: false,
+            baselineAttentionEventID: selectedSessionID?.caseInsensitiveCompare(resolvedSessionID ?? "") == .orderedSame
+                ? baselineAttentionEventID
+                : nil
         )
         primeFastRefreshWindow(seconds: 20)
         await renderHomeMenu(chatID: chatID, notice: successNotice)
@@ -1113,6 +1140,15 @@ final class TelegramRemoteCoordinator: ObservableObject {
             "Backend: \(status.assistantBackendName)",
             "Status: \(TelegramRemoteRenderer.compactStatusText(snapshot: currentSessionSnapshot))"
         ]
+
+        if chatState.shouldShowTranscriptPreview,
+           let currentSessionSnapshot,
+           !currentSessionSnapshot.hasActiveTurn,
+           currentSessionSnapshot.pendingPermissionRequest == nil,
+           let recentContext = TelegramRemoteRenderer.catchUpText(snapshot: currentSessionSnapshot) {
+            lines.append("")
+            lines.append(recentContext)
+        }
 
         if !chatState.selectedPluginIDs.isEmpty {
             let selectedPluginNames = await selectedPluginNames()
@@ -1504,59 +1540,71 @@ final class TelegramRemoteCoordinator: ObservableObject {
             await clearSlot(chatID: chatID, kind: .toolActivity)
         }
 
+        let freshAttention = Self.freshAttentionDelivery(
+            snapshot: snapshot,
+            baselineAttentionEventID: chatState.selectedSessionBaselineAttentionEventID,
+            lastDeliveredEventID: chatState.lastDeliveredAttentionEventID
+        )
+        let hasUndeliveredTerminalAttention = Self.hasUndeliveredTerminalAttention(
+            snapshot: snapshot,
+            baselineAttentionEventID: chatState.selectedSessionBaselineAttentionEventID,
+            lastDeliveredEventID: chatState.lastDeliveredAttentionEventID
+        )
+
         if let request = snapshot.pendingPermissionRequest {
-            await renderPermissionMessage(request, chatID: chatID, expectedGeneration: expectedGeneration)
+            let shouldForceFreshPermission: Bool
+            if case .permission = freshAttention?.kind {
+                shouldForceFreshPermission = true
+            } else {
+                shouldForceFreshPermission = false
+            }
+            await renderPermissionMessage(
+                request,
+                chatID: chatID,
+                expectedGeneration: expectedGeneration,
+                forceFresh: shouldForceFreshPermission
+            )
+            if shouldForceFreshPermission,
+               let freshAttention,
+               slot(for: .permission).messageID != nil {
+                chatState.lastDeliveredAttentionEventID = freshAttention.eventID
+            }
         } else if slot(for: .permission).messageID != nil {
             chatState.resetStructuredInput()
             await clearSlot(chatID: chatID, kind: .permission)
         }
 
-        if let streamPresentation = TelegramRemoteRenderer.streamPresentation(snapshot: snapshot) {
-            let renderedChunks = renderedMessageChunks(streamPresentation.text)
-            let firstChunk = renderedChunks.first ?? renderedSingleMessage(streamPresentation.text)
-            if snapshot.hasActiveTurn,
-               let draftID = telegramDraftID(for: snapshot) {
-                await upsertTelegramDraft(
-                    chatID: chatID,
-                    draftID: draftID,
-                    rendered: firstChunk,
-                    signature: "\(streamPresentation.signaturePrefix):\(firstChunk.visibleSignature)"
-                )
-                await clearReplyOverflowMessages(chatID: chatID)
-            } else {
-                resetStreamDraftState()
-                await upsertViewSlot(
-                    chatID: chatID,
-                    kind: .stream,
-                    rendered: firstChunk,
-                    signaturePrefix: "\(streamPresentation.signaturePrefix):\(firstChunk.visibleSignature)",
-                    expectedGeneration: expectedGeneration
-                )
-                if streamPresentation.allowsOverflow {
-                    await syncReplyOverflowMessages(
-                        chatID: chatID,
-                        chunks: Array(renderedChunks.dropFirst()),
-                        signaturePrefix: streamPresentation.signaturePrefix,
-                        expectedGeneration: expectedGeneration
-                    )
-                } else {
-                    await clearReplyOverflowMessages(chatID: chatID)
+        if let freshAttention {
+            switch freshAttention.kind {
+            case .completion(let text), .failure(let text):
+                if await sendFreshAttentionMessage(chatID: chatID, text: text) {
+                    chatState.lastDeliveredAttentionEventID = freshAttention.eventID
+                    await closeLivePreviewSurface(chatID: chatID)
                 }
-                await ensureStreamSlotAppearsLast(
-                    chatID: chatID,
-                    firstChunk: firstChunk,
-                    overflowChunks: Array(renderedChunks.dropFirst()),
-                    signaturePrefix: streamPresentation.signaturePrefix,
-                    allowsOverflow: streamPresentation.allowsOverflow,
-                    expectedGeneration: expectedGeneration
-                )
+            case .permission:
+                break
             }
-        } else if slot(for: .stream).messageID != nil {
-            resetStreamDraftState()
-            await clearSlot(chatID: chatID, kind: .stream)
+        }
+
+        if let streamPresentation = TelegramRemoteRenderer.livePreviewPresentation(snapshot: snapshot) {
+            let preview = renderedSingleMessage(streamPresentation.text)
+            await upsertViewSlot(
+                chatID: chatID,
+                kind: .stream,
+                rendered: preview,
+                signaturePrefix: "\(streamPresentation.signaturePrefix):\(preview.visibleSignature)",
+                expectedGeneration: expectedGeneration,
+                disableNotificationOnCreate: true
+            )
             await clearReplyOverflowMessages(chatID: chatID)
-        } else {
-            resetStreamDraftState()
+        } else if !snapshot.hasActiveTurn,
+                  snapshot.pendingPermissionRequest == nil,
+                  !hasUndeliveredTerminalAttention {
+            if slot(for: .stream).messageID != nil {
+                await closeLivePreviewSurface(chatID: chatID)
+            } else {
+                await clearReplyOverflowMessages(chatID: chatID)
+            }
         }
 
         if let imageDelivery = snapshot.imageDelivery {
@@ -1574,13 +1622,15 @@ final class TelegramRemoteCoordinator: ObservableObject {
     private func renderPermissionMessage(
         _ request: AssistantPermissionRequest,
         chatID: Int64,
-        expectedGeneration: Int
+        expectedGeneration: Int,
+        forceFresh: Bool = false
     ) async {
         if request.requiresDesktopAppConfirmation {
             await renderDesktopOnlyConfirmationPrompt(
                 request,
                 chatID: chatID,
-                expectedGeneration: expectedGeneration
+                expectedGeneration: expectedGeneration,
+                forceFresh: forceFresh
             )
             return
         }
@@ -1589,33 +1639,52 @@ final class TelegramRemoteCoordinator: ObservableObject {
             await renderStructuredApprovalPrompt(
                 request,
                 chatID: chatID,
-                expectedGeneration: expectedGeneration
+                expectedGeneration: expectedGeneration,
+                forceFresh: forceFresh
             )
             return
         }
 
         if request.hasStructuredUserInput {
-            await renderStructuredQuestion(request, chatID: chatID, expectedGeneration: expectedGeneration)
+            await renderStructuredQuestion(
+                request,
+                chatID: chatID,
+                expectedGeneration: expectedGeneration,
+                forceFresh: forceFresh
+            )
             return
         }
 
         let rows = request.options.enumerated().map { index, option in
             [TelegramInlineKeyboardButton(text: option.title, callbackData: "perm:o:\(index)")]
         }
-        await upsertViewSlot(
-            chatID: chatID,
-            kind: .permission,
-            text: TelegramRemoteRenderer.permissionText(request),
-            signaturePrefix: "perm:\(request.id)",
-            markup: TelegramInlineKeyboardMarkup(inlineKeyboard: rows),
-            expectedGeneration: expectedGeneration
-        )
+        let markup = TelegramInlineKeyboardMarkup(inlineKeyboard: rows)
+        if forceFresh {
+            await replaceViewSlotWithFreshMessage(
+                chatID: chatID,
+                kind: .permission,
+                text: TelegramRemoteRenderer.permissionText(request),
+                signaturePrefix: "perm:\(request.id)",
+                markup: markup,
+                expectedGeneration: expectedGeneration
+            )
+        } else {
+            await upsertViewSlot(
+                chatID: chatID,
+                kind: .permission,
+                text: TelegramRemoteRenderer.permissionText(request),
+                signaturePrefix: "perm:\(request.id)",
+                markup: markup,
+                expectedGeneration: expectedGeneration
+            )
+        }
     }
 
     private func renderStructuredApprovalPrompt(
         _ request: AssistantPermissionRequest,
         chatID: Int64,
-        expectedGeneration: Int
+        expectedGeneration: Int,
+        forceFresh: Bool = false
     ) async {
         let rows = [
             [TelegramInlineKeyboardButton(text: "Approve", callbackData: "perm:sa:approve")],
@@ -1623,20 +1692,33 @@ final class TelegramRemoteCoordinator: ObservableObject {
             [TelegramInlineKeyboardButton(text: "Cancel", callbackData: "perm:cancel")]
         ]
 
-        await upsertViewSlot(
-            chatID: chatID,
-            kind: .permission,
-            text: TelegramRemoteRenderer.permissionText(request),
-            signaturePrefix: "structured-approval:\(request.id)",
-            markup: TelegramInlineKeyboardMarkup(inlineKeyboard: rows),
-            expectedGeneration: expectedGeneration
-        )
+        let markup = TelegramInlineKeyboardMarkup(inlineKeyboard: rows)
+        if forceFresh {
+            await replaceViewSlotWithFreshMessage(
+                chatID: chatID,
+                kind: .permission,
+                text: TelegramRemoteRenderer.permissionText(request),
+                signaturePrefix: "structured-approval:\(request.id)",
+                markup: markup,
+                expectedGeneration: expectedGeneration
+            )
+        } else {
+            await upsertViewSlot(
+                chatID: chatID,
+                kind: .permission,
+                text: TelegramRemoteRenderer.permissionText(request),
+                signaturePrefix: "structured-approval:\(request.id)",
+                markup: markup,
+                expectedGeneration: expectedGeneration
+            )
+        }
     }
 
     private func renderDesktopOnlyConfirmationPrompt(
         _ request: AssistantPermissionRequest,
         chatID: Int64,
-        expectedGeneration: Int
+        expectedGeneration: Int,
+        forceFresh: Bool = false
     ) async {
         let text = """
         Finish this confirmation in Open Assist on your Mac.
@@ -1650,20 +1732,33 @@ final class TelegramRemoteCoordinator: ObservableObject {
             [TelegramInlineKeyboardButton(text: "Cancel Request", callbackData: "perm:cancel")]
         ]
 
-        await upsertViewSlot(
-            chatID: chatID,
-            kind: .permission,
-            text: text,
-            signaturePrefix: "desktop-only-confirmation:\(request.id)",
-            markup: TelegramInlineKeyboardMarkup(inlineKeyboard: rows),
-            expectedGeneration: expectedGeneration
-        )
+        let markup = TelegramInlineKeyboardMarkup(inlineKeyboard: rows)
+        if forceFresh {
+            await replaceViewSlotWithFreshMessage(
+                chatID: chatID,
+                kind: .permission,
+                text: text,
+                signaturePrefix: "desktop-only-confirmation:\(request.id)",
+                markup: markup,
+                expectedGeneration: expectedGeneration
+            )
+        } else {
+            await upsertViewSlot(
+                chatID: chatID,
+                kind: .permission,
+                text: text,
+                signaturePrefix: "desktop-only-confirmation:\(request.id)",
+                markup: markup,
+                expectedGeneration: expectedGeneration
+            )
+        }
     }
 
     private func renderStructuredQuestion(
         _ request: AssistantPermissionRequest,
         chatID: Int64,
-        expectedGeneration: Int? = nil
+        expectedGeneration: Int? = nil,
+        forceFresh: Bool = false
     ) async {
         let expectedGeneration = expectedGeneration ?? chatState.viewGeneration
         let questionIndex = min(chatState.structuredQuestionIndex, max(request.userInputQuestions.count - 1, 0))
@@ -1686,14 +1781,26 @@ final class TelegramRemoteCoordinator: ObservableObject {
             text += "\n\nReply with your custom answer in the next message."
         }
 
-        await upsertViewSlot(
-            chatID: chatID,
-            kind: .permission,
-            text: text,
-            signaturePrefix: "structured:\(request.id):\(question.id):\(chatState.awaitingCustomAnswerQuestionID ?? "")",
-            markup: TelegramInlineKeyboardMarkup(inlineKeyboard: rows),
-            expectedGeneration: expectedGeneration
-        )
+        let markup = TelegramInlineKeyboardMarkup(inlineKeyboard: rows)
+        if forceFresh {
+            await replaceViewSlotWithFreshMessage(
+                chatID: chatID,
+                kind: .permission,
+                text: text,
+                signaturePrefix: "structured:\(request.id):\(question.id):\(chatState.awaitingCustomAnswerQuestionID ?? "")",
+                markup: markup,
+                expectedGeneration: expectedGeneration
+            )
+        } else {
+            await upsertViewSlot(
+                chatID: chatID,
+                kind: .permission,
+                text: text,
+                signaturePrefix: "structured:\(request.id):\(question.id):\(chatState.awaitingCustomAnswerQuestionID ?? "")",
+                markup: markup,
+                expectedGeneration: expectedGeneration
+            )
+        }
     }
 
     private func continueStructuredInput(chatID: Int64) async {
@@ -1729,7 +1836,11 @@ final class TelegramRemoteCoordinator: ObservableObject {
         }
 
         let sessionID = chatState.sessionMenuSessionIDs[index]
-        chatState.switchSessionView(to: sessionID)
+        let baselineAttentionEventID = await currentAttentionEventID(for: sessionID)
+        chatState.switchSessionView(
+            to: sessionID,
+            baselineAttentionEventID: baselineAttentionEventID
+        )
         await clearTrackedChatHistory(chatID: chatID)
         _ = await bridge.openSession(sessionID: sessionID)
         await renderHomeMenu(chatID: chatID, notice: "Switched sessions.")
@@ -1761,7 +1872,11 @@ final class TelegramRemoteCoordinator: ObservableObject {
             nextSessionID = sessions.first?.id
         }
 
-        chatState.switchSessionView(to: nextSessionID)
+        let baselineAttentionEventID = await currentAttentionEventID(for: nextSessionID)
+        chatState.switchSessionView(
+            to: nextSessionID,
+            baselineAttentionEventID: baselineAttentionEventID
+        )
         if previousSessionID?.caseInsensitiveCompare(nextSessionID ?? "") != .orderedSame
             || selectedProjectID != nil {
             await clearTrackedChatHistory(chatID: chatID)
@@ -1827,7 +1942,12 @@ final class TelegramRemoteCoordinator: ObservableObject {
         if backend != .codex {
             chatState.selectedPluginIDs = []
         }
-        chatState.switchSessionView(to: bridge.statusSnapshot().selectedSessionID)
+        let nextSessionID = bridge.statusSnapshot().selectedSessionID
+        let baselineAttentionEventID = await currentAttentionEventID(for: nextSessionID)
+        chatState.switchSessionView(
+            to: nextSessionID,
+            baselineAttentionEventID: baselineAttentionEventID
+        )
         await clearTrackedChatHistory(chatID: chatID)
         await renderHomeMenu(
             chatID: chatID,
@@ -1958,55 +2078,112 @@ final class TelegramRemoteCoordinator: ObservableObject {
         await clearSlot(chatID: chatID, kind: .permission)
         await clearReplyOverflowMessages(chatID: chatID)
         await clearImageMessages(chatID: chatID)
-        resetStreamDraftState()
         chatState.resetSessionView()
     }
 
-    private func resetStreamDraftState() {
-        chatState.streamDraftID = nil
-        chatState.streamDraftSignature = nil
-    }
-
-    private func telegramDraftID(for snapshot: AssistantRemoteSessionSnapshot) -> Int? {
-        let key = snapshot.activeTurnID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
-            ?? snapshot.session.id.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
-        guard let key else {
-            return nil
-        }
-        let digest = MemoryIdentifier.stableHexDigest(for: "telegram-draft:\(key)")
-        let hexPrefix = String(digest.prefix(8))
-        let value = Int(hexPrefix, radix: 16) ?? 1
-        return max(1, value)
-    }
-
-    private func upsertTelegramDraft(
+    @discardableResult
+    private func replaceViewSlotWithFreshMessage(
         chatID: Int64,
-        draftID: Int,
-        rendered: TelegramRenderedText,
-        signature: String
-    ) async {
-        guard chatState.streamDraftID != draftID || chatState.streamDraftSignature != signature else {
+        kind: ViewSlot,
+        text: String,
+        signaturePrefix: String,
+        markup: TelegramInlineKeyboardMarkup? = nil,
+        expectedGeneration: Int
+    ) async -> Bool {
+        guard expectedGeneration == chatState.viewGeneration else {
+            return false
+        }
+
+        if slot(for: kind).messageID != nil {
+            await clearSlot(chatID: chatID, kind: kind)
+        }
+
+        guard expectedGeneration == chatState.viewGeneration else {
+            return false
+        }
+
+        let rendered = renderedSingleMessage(text)
+        if let message = try? await sendTelegramMessage(
+            chatID: chatID,
+            rendered: rendered,
+            replyMarkup: markup
+        ) {
+            var slot = slot(for: kind)
+            slot.messageID = message.messageID
+            slot.signature = "\(signaturePrefix):\(rendered.visibleSignature)"
+            setSlot(slot, for: kind)
+            return true
+        }
+
+        return false
+    }
+
+    private func closeLivePreviewSurface(chatID: Int64) async {
+        guard let messageID = slot(for: .stream).messageID else {
+            detachSlot(.stream)
+            await clearReplyOverflowMessages(chatID: chatID)
             return
         }
 
         do {
-            try await sendTelegramDraft(
-                chatID: chatID,
-                draftID: draftID,
-                rendered: rendered
-            )
-            chatState.streamDraftID = draftID
-            chatState.streamDraftSignature = signature
+            _ = try await client?.deleteMessage(chatID: chatID, messageID: messageID)
+            forgetMessageID(messageID)
         } catch {
-            resetStreamDraftState()
-            await upsertViewSlot(
+            _ = try? await editTelegramMessage(
                 chatID: chatID,
-                kind: .stream,
-                rendered: rendered,
-                signaturePrefix: signature,
-                expectedGeneration: chatState.viewGeneration
+                messageID: messageID,
+                text: "Preview finished. Final answer is below."
             )
         }
+        detachSlot(.stream)
+        await clearReplyOverflowMessages(chatID: chatID)
+    }
+
+    nonisolated static func freshAttentionDelivery(
+        snapshot: AssistantRemoteSessionSnapshot,
+        baselineAttentionEventID: String?,
+        lastDeliveredEventID: String?
+    ) -> FreshAttentionDelivery? {
+        guard let event = snapshot.latestRemoteAttentionEvent,
+              event.id != baselineAttentionEventID,
+              event.id != lastDeliveredEventID else {
+            return nil
+        }
+
+        switch event.kind {
+        case .completed:
+            guard let text = TelegramRemoteRenderer.completedAttentionText(snapshot: snapshot) else {
+                return nil
+            }
+            return FreshAttentionDelivery(eventID: event.id, kind: .completion(text: text))
+        case .failed:
+            guard let text = TelegramRemoteRenderer.failureAttentionText(
+                snapshot: snapshot,
+                fallback: event.failureText
+            ) else {
+                return nil
+            }
+            return FreshAttentionDelivery(eventID: event.id, kind: .failure(text: text))
+        case .permissionRequired:
+            guard let request = snapshot.pendingPermissionRequest,
+                  request.id == event.permissionRequestID else {
+                return nil
+            }
+            return FreshAttentionDelivery(eventID: event.id, kind: .permission(requestID: request.id))
+        }
+    }
+
+    nonisolated static func hasUndeliveredTerminalAttention(
+        snapshot: AssistantRemoteSessionSnapshot,
+        baselineAttentionEventID: String?,
+        lastDeliveredEventID: String?
+    ) -> Bool {
+        guard let event = snapshot.latestRemoteAttentionEvent,
+              event.id != baselineAttentionEventID,
+              event.id != lastDeliveredEventID else {
+            return false
+        }
+        return event.kind.isTerminal
     }
 
     private func trackMessageID(_ messageID: Int) {
@@ -2141,7 +2318,8 @@ final class TelegramRemoteCoordinator: ObservableObject {
         text: String,
         signaturePrefix: String,
         markup: TelegramInlineKeyboardMarkup? = nil,
-        expectedGeneration: Int
+        expectedGeneration: Int,
+        disableNotificationOnCreate: Bool = false
     ) async {
         await upsertViewSlot(
             chatID: chatID,
@@ -2149,7 +2327,8 @@ final class TelegramRemoteCoordinator: ObservableObject {
             rendered: renderedSingleMessage(text),
             signaturePrefix: signaturePrefix,
             markup: markup,
-            expectedGeneration: expectedGeneration
+            expectedGeneration: expectedGeneration,
+            disableNotificationOnCreate: disableNotificationOnCreate
         )
     }
 
@@ -2159,7 +2338,8 @@ final class TelegramRemoteCoordinator: ObservableObject {
         rendered: TelegramRenderedText,
         signaturePrefix: String,
         markup: TelegramInlineKeyboardMarkup? = nil,
-        expectedGeneration: Int
+        expectedGeneration: Int,
+        disableNotificationOnCreate: Bool = false
     ) async {
         guard expectedGeneration == chatState.viewGeneration else {
             return
@@ -2200,7 +2380,8 @@ final class TelegramRemoteCoordinator: ObservableObject {
         if let message = try? await sendTelegramMessage(
             chatID: chatID,
             rendered: rendered,
-            replyMarkup: markup
+            replyMarkup: markup,
+            disableNotification: disableNotificationOnCreate
         ) {
             guard expectedGeneration == chatState.viewGeneration else {
                 _ = try? await client?.deleteMessage(chatID: chatID, messageID: message.messageID)
@@ -2508,6 +2689,13 @@ final class TelegramRemoteCoordinator: ObservableObject {
         await bridge.selectProject(chatState.selectedProjectID)
     }
 
+    private func currentAttentionEventID(for sessionID: String?) async -> String? {
+        guard let normalizedSessionID = sessionID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+            return nil
+        }
+        return await bridge.sessionSnapshot(sessionID: normalizedSessionID)?.latestRemoteAttentionEvent?.id
+    }
+
     private var turnJustFinished = false
 
     private func refreshIntervalSeconds(snapshot: AssistantRemoteSessionSnapshot?) -> Double {
@@ -2544,7 +2732,9 @@ final class TelegramRemoteCoordinator: ObservableObject {
     }
 
     private func updateTypingIndicator(chatID: Int64, snapshot: AssistantRemoteSessionSnapshot?) async {
-        guard snapshot?.hasActiveTurn == true else {
+        guard let snapshot,
+              snapshot.hasActiveTurn,
+              TelegramRemoteRenderer.livePreviewPresentation(snapshot: snapshot) == nil else {
             stopTypingIndicator()
             return
         }
@@ -2768,22 +2958,52 @@ final class TelegramRemoteCoordinator: ObservableObject {
         )
     }
 
+    @discardableResult
+    private func sendFreshAttentionMessage(chatID: Int64, text: String) async -> Bool {
+        let chunks = renderedMessageChunks(text)
+        guard !chunks.isEmpty else {
+            return false
+        }
+
+        var didSendAnyMessage = false
+        for (index, chunk) in chunks.enumerated() {
+            do {
+                _ = try await sendTelegramMessage(
+                    chatID: chatID,
+                    rendered: chunk,
+                    disableNotification: index > 0
+                )
+                didSendAnyMessage = true
+            } catch {
+                lastErrorMessage = "Could not send Telegram update: \(error.localizedDescription)"
+                if !didSendAnyMessage {
+                    return false
+                }
+            }
+        }
+
+        return didSendAnyMessage
+    }
+
     private func sendTelegramMessage(
         chatID: Int64,
         text: String,
-        replyMarkup: TelegramInlineKeyboardMarkup? = nil
+        replyMarkup: TelegramInlineKeyboardMarkup? = nil,
+        disableNotification: Bool = false
     ) async throws -> TelegramMessage {
         try await sendTelegramMessage(
             chatID: chatID,
             rendered: renderedSingleMessage(text),
-            replyMarkup: replyMarkup
+            replyMarkup: replyMarkup,
+            disableNotification: disableNotification
         )
     }
 
     private func sendTelegramMessage(
         chatID: Int64,
         rendered: TelegramRenderedText,
-        replyMarkup: TelegramInlineKeyboardMarkup? = nil
+        replyMarkup: TelegramInlineKeyboardMarkup? = nil,
+        disableNotification: Bool = false
     ) async throws -> TelegramMessage {
         guard let client else {
             throw TelegramBotClientError.invalidRequest
@@ -2794,7 +3014,8 @@ final class TelegramRemoteCoordinator: ObservableObject {
                 chatID: chatID,
                 text: rendered.html,
                 parseMode: .html,
-                replyMarkup: replyMarkup
+                replyMarkup: replyMarkup,
+                disableNotification: disableNotification
             )
             trackMessageID(message.messageID)
             return message
@@ -2805,7 +3026,8 @@ final class TelegramRemoteCoordinator: ObservableObject {
             let message = try await client.sendMessage(
                 chatID: chatID,
                 text: rendered.plainText,
-                replyMarkup: replyMarkup
+                replyMarkup: replyMarkup,
+                disableNotification: disableNotification
             )
             trackMessageID(message.messageID)
             return message
@@ -2853,34 +3075,6 @@ final class TelegramRemoteCoordinator: ObservableObject {
                 messageID: messageID,
                 text: rendered.plainText,
                 replyMarkup: replyMarkup
-            )
-        }
-    }
-
-    private func sendTelegramDraft(
-        chatID: Int64,
-        draftID: Int,
-        rendered: TelegramRenderedText
-    ) async throws {
-        guard let client else {
-            throw TelegramBotClientError.invalidRequest
-        }
-
-        do {
-            _ = try await client.sendMessageDraft(
-                chatID: chatID,
-                draftID: draftID,
-                text: rendered.html,
-                parseMode: .html
-            )
-        } catch {
-            guard shouldRetryAsPlainText(after: error) else {
-                throw error
-            }
-            _ = try await client.sendMessageDraft(
-                chatID: chatID,
-                draftID: draftID,
-                text: rendered.plainText
             )
         }
     }
