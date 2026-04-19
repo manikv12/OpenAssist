@@ -10582,8 +10582,8 @@ final class AssistantStore: ObservableObject {
     /// Strip heavy imageAttachments data from screenshot timeline items that have
     /// already been delivered to Telegram, keeping the text/metadata intact.
     /// This prevents screenshots from accumulating on disk in session history.
-    func clearDeliveredScreenshotAttachments() {
-        guard let sessionID = selectedSessionID else { return }
+    func clearDeliveredScreenshotAttachments(sessionID: String? = nil) {
+        guard let sessionID = sessionID ?? selectedSessionID else { return }
 
         var mutated = false
         let items: [AssistantTimelineItem]
@@ -12783,12 +12783,15 @@ final class AssistantStore: ObservableObject {
 
     func selectProjectFilter(
         _ projectID: String?,
-        autoSelectVisibleSessionIfNeeded: Bool = true
+        autoSelectVisibleSessionIfNeeded: Bool = true,
+        toggleOffIfSame: Bool = true
     ) async {
         let nextFilter = resolvedProjectFilter(for: projectID)
         if let nextFilter,
            selectedProjectFilter == nextFilter {
-            selectedProjectFilter = nil
+            if toggleOffIfSame {
+                selectedProjectFilter = nil
+            }
             return
         }
 

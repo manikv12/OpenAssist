@@ -181,8 +181,16 @@ final class AssistantRemoteBridge {
         }
     }
 
-    func selectProject(_ projectID: String?) async {
-        await assistant.selectProjectFilter(projectID)
+    func selectProject(
+        _ projectID: String?,
+        autoSelectVisibleSessionIfNeeded: Bool = true,
+        toggleOffIfSame: Bool = true
+    ) async {
+        await assistant.selectProjectFilter(
+            projectID,
+            autoSelectVisibleSessionIfNeeded: autoSelectVisibleSessionIfNeeded,
+            toggleOffIfSame: toggleOffIfSame
+        )
     }
 
     func availableModels() async -> [AssistantModelOption] {
@@ -234,64 +242,131 @@ final class AssistantRemoteBridge {
         )
     }
 
-    func openSession(sessionID: String) async -> AssistantRemoteSessionSnapshot? {
-        let normalizedSessionID = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !normalizedSessionID.isEmpty else { return nil }
+    func openSession(
+        sessionID: String,
+        preserveVisibleSelection: Bool = false
+    ) async -> AssistantRemoteSessionSnapshot? {
+        let openAction: () async -> AssistantRemoteSessionSnapshot? = {
+            [assistant] in
+            let normalizedSessionID = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !normalizedSessionID.isEmpty else { return nil }
 
-        if let session = assistant.sessions.first(where: { $0.id.caseInsensitiveCompare(normalizedSessionID) == .orderedSame }) {
-            await assistant.openSession(session)
+            if let session = assistant.sessions.first(where: { $0.id.caseInsensitiveCompare(normalizedSessionID) == .orderedSame }) {
+                await assistant.openSession(session)
+                return await assistant.remoteSessionSnapshot(sessionID: normalizedSessionID)
+            }
+
+            await assistant.refreshSessions(limit: 200)
+            if let refreshedSession = assistant.sessions.first(where: { $0.id.caseInsensitiveCompare(normalizedSessionID) == .orderedSame }) {
+                await assistant.openSession(refreshedSession)
+                return await assistant.remoteSessionSnapshot(sessionID: normalizedSessionID)
+            }
+
+            guard let snapshot = await assistant.remoteSessionSnapshot(sessionID: normalizedSessionID) else {
+                return nil
+            }
+            await assistant.openSession(snapshot.session)
             return await assistant.remoteSessionSnapshot(sessionID: normalizedSessionID)
         }
 
-        await assistant.refreshSessions(limit: 200)
-        if let refreshedSession = assistant.sessions.first(where: { $0.id.caseInsensitiveCompare(normalizedSessionID) == .orderedSame }) {
-            await assistant.openSession(refreshedSession)
-            return await assistant.remoteSessionSnapshot(sessionID: normalizedSessionID)
+        if preserveVisibleSelection {
+            return await withPreservedDesktopContext(
+                preserveVisibleSelection: true,
+                temporaryProjectID: nil,
+                operation: openAction
+            )
         }
 
-        guard let snapshot = await assistant.remoteSessionSnapshot(sessionID: normalizedSessionID) else {
-            return nil
-        }
-        await assistant.openSession(snapshot.session)
-        return await assistant.remoteSessionSnapshot(sessionID: normalizedSessionID)
+        return await openAction()
     }
 
-    func startNewSession() async -> AssistantRemoteSessionSnapshot? {
-        if let reusableSessionID = reusableEmptyDraftSessionID(isTemporary: false) {
-            return await assistant.remoteSessionSnapshot(sessionID: reusableSessionID)
+    func startNewSession(
+        projectID: String? = nil,
+        preserveVisibleSelection: Bool = false
+    ) async -> AssistantRemoteSessionSnapshot? {
+        let allowDraftReuse = !preserveVisibleSelection
+        let startAction: () async -> AssistantRemoteSessionSnapshot? = {
+            [assistant, self] in
+            if allowDraftReuse,
+               let reusableSessionID = self.reusableEmptyDraftSessionID(isTemporary: false) {
+                return await assistant.remoteSessionSnapshot(sessionID: reusableSessionID)
+            }
+            await assistant.startNewSession()
+            guard let sessionID = assistant.selectedSessionID else { return nil }
+            return await assistant.remoteSessionSnapshot(sessionID: sessionID)
         }
-        await assistant.startNewSession()
-        guard let sessionID = assistant.selectedSessionID else { return nil }
-        return await assistant.remoteSessionSnapshot(sessionID: sessionID)
+
+        if preserveVisibleSelection || projectID != nil {
+            return await withPreservedDesktopContext(
+                preserveVisibleSelection: preserveVisibleSelection,
+                temporaryProjectID: projectID,
+                operation: startAction
+            )
+        }
+
+        return await startAction()
     }
 
-    func startNewTemporarySession() async -> AssistantRemoteSessionSnapshot? {
-        if let reusableSessionID = reusableEmptyDraftSessionID(isTemporary: true) {
-            return await assistant.remoteSessionSnapshot(sessionID: reusableSessionID)
+    func startNewTemporarySession(
+        projectID: String? = nil,
+        preserveVisibleSelection: Bool = false
+    ) async -> AssistantRemoteSessionSnapshot? {
+        let allowDraftReuse = !preserveVisibleSelection
+        let startAction: () async -> AssistantRemoteSessionSnapshot? = {
+            [assistant, self] in
+            if allowDraftReuse,
+               let reusableSessionID = self.reusableEmptyDraftSessionID(isTemporary: true) {
+                return await assistant.remoteSessionSnapshot(sessionID: reusableSessionID)
+            }
+            await assistant.startNewTemporarySession()
+            guard let sessionID = assistant.selectedSessionID else { return nil }
+            return await assistant.remoteSessionSnapshot(sessionID: sessionID)
         }
-        await assistant.startNewTemporarySession()
-        guard let sessionID = assistant.selectedSessionID else { return nil }
-        return await assistant.remoteSessionSnapshot(sessionID: sessionID)
+
+        if preserveVisibleSelection || projectID != nil {
+            return await withPreservedDesktopContext(
+                preserveVisibleSelection: preserveVisibleSelection,
+                temporaryProjectID: projectID,
+                operation: startAction
+            )
+        }
+
+        return await startAction()
     }
 
     func sendPrompt(
         _ prompt: String,
         sessionID: String?,
+        projectID: String? = nil,
         selectedPluginIDs: [String] = [],
-        oneShotInstructions: String? = nil
+        oneShotInstructions: String? = nil,
+        preserveVisibleSelection: Bool = false
     ) async -> AssistantRemoteSessionSnapshot? {
-        if let sessionID = sessionID?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !sessionID.isEmpty {
-            _ = await openSession(sessionID: sessionID)
+        let sendAction: () async -> AssistantRemoteSessionSnapshot? = {
+            [assistant, self] in
+            if let sessionID = sessionID?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !sessionID.isEmpty {
+                _ = await self.openSession(sessionID: sessionID, preserveVisibleSelection: false)
+            }
+
+            await assistant.sendPrompt(
+                prompt,
+                selectedPluginIDs: selectedPluginIDs,
+                oneShotInstructions: oneShotInstructions
+            )
+            guard let activeSessionID = assistant.selectedSessionID else { return nil }
+            return await assistant.remoteSessionSnapshot(sessionID: activeSessionID)
         }
 
-        await assistant.sendPrompt(
-            prompt,
-            selectedPluginIDs: selectedPluginIDs,
-            oneShotInstructions: oneShotInstructions
-        )
-        guard let activeSessionID = assistant.selectedSessionID else { return nil }
-        return await assistant.remoteSessionSnapshot(sessionID: activeSessionID)
+        if preserveVisibleSelection || projectID != nil {
+            return await withPreservedDesktopContext(
+                preserveVisibleSelection: preserveVisibleSelection,
+                temporaryProjectID: projectID,
+                operation: sendAction
+            )
+        }
+
+        return await sendAction()
     }
 
     func installedCodexPlugins() async -> [AssistantComposerPluginSelection] {
@@ -314,6 +389,78 @@ final class AssistantRemoteBridge {
         return selectedSession.id
     }
 
+    private func withPreservedDesktopContext<Result>(
+        preserveVisibleSelection: Bool,
+        temporaryProjectID: String?,
+        operation: () async -> Result
+    ) async -> Result {
+        let previousSessionID = assistant.selectedSessionID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+        let previousProjectFilterID = assistant.selectedProjectFilter?.id
+        let needsTemporaryProjectChange = normalizedIdentifier(temporaryProjectID) != normalizedIdentifier(previousProjectFilterID)
+
+        if needsTemporaryProjectChange {
+            await assistant.selectProjectFilter(
+                temporaryProjectID,
+                autoSelectVisibleSessionIfNeeded: false,
+                toggleOffIfSame: false
+            )
+        }
+
+        let result = await operation()
+
+        if needsTemporaryProjectChange {
+            await assistant.selectProjectFilter(
+                previousProjectFilterID,
+                autoSelectVisibleSessionIfNeeded: false,
+                toggleOffIfSame: false
+            )
+        }
+
+        guard preserveVisibleSelection,
+              let previousSessionID,
+              previousSessionID.caseInsensitiveCompare(assistant.selectedSessionID ?? "") != .orderedSame else {
+            return result
+        }
+
+        if let session = assistant.sessions.first(where: { $0.id.caseInsensitiveCompare(previousSessionID) == .orderedSame }) {
+            await assistant.openSession(session)
+        } else {
+            await assistant.refreshSessions(limit: 200)
+            if let session = assistant.sessions.first(where: { $0.id.caseInsensitiveCompare(previousSessionID) == .orderedSame }) {
+                await assistant.openSession(session)
+            }
+        }
+
+        return result
+    }
+
+    private func normalizedIdentifier(_ value: String?) -> String? {
+        value?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty?.lowercased()
+    }
+
+    private func withSessionContext<Result>(
+        sessionID: String?,
+        preserveVisibleSelection: Bool = false,
+        operation: @escaping () async -> Result
+    ) async -> Result {
+        let action: () async -> Result = { [self] in
+            if let normalizedSessionID = normalizedIdentifier(sessionID) {
+                _ = await openSession(sessionID: normalizedSessionID, preserveVisibleSelection: false)
+            }
+            return await operation()
+        }
+
+        if preserveVisibleSelection {
+            return await withPreservedDesktopContext(
+                preserveVisibleSelection: true,
+                temporaryProjectID: nil,
+                operation: action
+            )
+        }
+
+        return await action()
+    }
+
     private func remoteModelSummary(for modelID: String?) -> String? {
         guard let normalizedModelID = modelID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
             return nil
@@ -328,75 +475,128 @@ final class AssistantRemoteBridge {
         return normalizedModelID
     }
 
-    func chooseModel(_ modelID: String, sessionID: String?) async -> Bool {
-        if let sessionID = sessionID?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !sessionID.isEmpty {
-            _ = await openSession(sessionID: sessionID)
+    func chooseModel(
+        _ modelID: String,
+        sessionID: String?,
+        preserveVisibleSelection: Bool = false
+    ) async -> Bool {
+        await withSessionContext(
+            sessionID: sessionID,
+            preserveVisibleSelection: preserveVisibleSelection
+        ) { [assistant] in
+            guard assistant.visibleModels.contains(where: { $0.id == modelID }) else {
+                return false
+            }
+            assistant.applyRuntimeModelSelection(modelID, force: true)
+            return true
         }
-        guard assistant.visibleModels.contains(where: { $0.id == modelID }) else {
-            return false
-        }
-        assistant.applyRuntimeModelSelection(modelID, force: true)
-        return true
     }
 
-    func promoteTemporarySession(sessionID: String?) async -> Bool {
-        if let sessionID = sessionID?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !sessionID.isEmpty {
-            _ = await openSession(sessionID: sessionID)
+    func promoteTemporarySession(
+        sessionID: String?,
+        preserveVisibleSelection: Bool = false
+    ) async -> Bool {
+        await withSessionContext(
+            sessionID: sessionID,
+            preserveVisibleSelection: preserveVisibleSelection
+        ) { [assistant] in
+            guard let selectedSessionID = assistant.selectedSessionID else {
+                return false
+            }
+            guard assistant.sessions.contains(where: {
+                $0.id.caseInsensitiveCompare(selectedSessionID) == .orderedSame && $0.isTemporary
+            }) else {
+                return false
+            }
+            assistant.promoteTemporarySession(selectedSessionID)
+            return true
         }
-        guard let selectedSessionID = assistant.selectedSessionID else {
-            return false
-        }
-        guard assistant.sessions.contains(where: {
-            $0.id.caseInsensitiveCompare(selectedSessionID) == .orderedSame && $0.isTemporary
-        }) else {
-            return false
-        }
-        assistant.promoteTemporarySession(selectedSessionID)
-        return true
     }
 
-    func setInteractionMode(_ mode: AssistantInteractionMode, sessionID: String?) async {
-        if let sessionID = sessionID?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !sessionID.isEmpty {
-            _ = await openSession(sessionID: sessionID)
+    func setInteractionMode(
+        _ mode: AssistantInteractionMode,
+        sessionID: String?,
+        preserveVisibleSelection: Bool = false
+    ) async {
+        await withSessionContext(
+            sessionID: sessionID,
+            preserveVisibleSelection: preserveVisibleSelection
+        ) { [assistant] in
+            assistant.interactionMode = mode
         }
-        assistant.interactionMode = mode
     }
 
-    func setReasoningEffort(_ effort: AssistantReasoningEffort, sessionID: String?) async {
-        if let sessionID = sessionID?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !sessionID.isEmpty {
-            _ = await openSession(sessionID: sessionID)
+    func setReasoningEffort(
+        _ effort: AssistantReasoningEffort,
+        sessionID: String?,
+        preserveVisibleSelection: Bool = false
+    ) async {
+        await withSessionContext(
+            sessionID: sessionID,
+            preserveVisibleSelection: preserveVisibleSelection
+        ) { [assistant] in
+            assistant.reasoningEffort = effort
+            assistant.syncRuntimeContext()
         }
-        assistant.reasoningEffort = effort
-        assistant.syncRuntimeContext()
     }
 
     func sessionSnapshot(sessionID: String) async -> AssistantRemoteSessionSnapshot? {
         await assistant.remoteSessionSnapshot(sessionID: sessionID)
     }
 
-    func cancelActiveTurn() async {
-        await assistant.cancelActiveTurn()
+    func cancelActiveTurn(
+        sessionID: String? = nil,
+        preserveVisibleSelection: Bool = false
+    ) async {
+        await withSessionContext(
+            sessionID: sessionID,
+            preserveVisibleSelection: preserveVisibleSelection
+        ) { [assistant] in
+            await assistant.cancelActiveTurn()
+        }
     }
 
-    func resolvePermission(optionID: String) async {
-        await assistant.resolvePermission(optionID: optionID)
+    func resolvePermission(
+        optionID: String,
+        sessionID: String? = nil,
+        preserveVisibleSelection: Bool = false
+    ) async {
+        await withSessionContext(
+            sessionID: sessionID,
+            preserveVisibleSelection: preserveVisibleSelection
+        ) { [assistant] in
+            await assistant.resolvePermission(optionID: optionID)
+        }
     }
 
-    func resolvePermission(answers: [String: [String]]) async {
-        await assistant.resolvePermission(answers: answers)
+    func resolvePermission(
+        answers: [String: [String]],
+        sessionID: String? = nil,
+        preserveVisibleSelection: Bool = false
+    ) async {
+        await withSessionContext(
+            sessionID: sessionID,
+            preserveVisibleSelection: preserveVisibleSelection
+        ) { [assistant] in
+            await assistant.resolvePermission(answers: answers)
+        }
     }
 
-    func cancelPendingPermissionRequest() async {
-        await assistant.cancelPermissionRequest()
+    func cancelPendingPermissionRequest(
+        sessionID: String? = nil,
+        preserveVisibleSelection: Bool = false
+    ) async {
+        await withSessionContext(
+            sessionID: sessionID,
+            preserveVisibleSelection: preserveVisibleSelection
+        ) { [assistant] in
+            await assistant.cancelPermissionRequest()
+        }
     }
 
     /// Strip heavy image data from delivered screenshot timeline items to prevent
     /// screenshots from accumulating on disk in the session history.
-    func clearDeliveredScreenshotData() async {
-        assistant.clearDeliveredScreenshotAttachments()
+    func clearDeliveredScreenshotData(sessionID: String? = nil) async {
+        assistant.clearDeliveredScreenshotAttachments(sessionID: sessionID)
     }
 }
