@@ -92,6 +92,38 @@ final class TelegramRemoteRendererTests: XCTestCase {
         XCTAssertEqual(streamText, "I am still checking the logs now.")
     }
 
+    func testStreamMessageClampsQueuedPromptAnchorWhenQueuedCountExceedsVisibleTurns() {
+        let snapshot = AssistantRemoteSessionSnapshot(
+            session: AssistantSessionSummary(
+                id: "session-overflow-queued",
+                title: "Queued Overflow",
+                source: .appServer,
+                status: .active
+            ),
+            transcriptEntries: [
+                AssistantTranscriptEntry(role: .user, text: "Check the logs."),
+                AssistantTranscriptEntry(role: .assistant, text: "I am still checking the logs now.", isStreaming: true),
+                AssistantTranscriptEntry(role: .user, text: "Also check the cache after that.")
+            ],
+            pendingPermissionRequest: nil,
+            hudState: AssistantHUDState(
+                phase: .streaming,
+                title: "Streaming",
+                detail: "Reading new output"
+            ),
+            hasActiveTurn: true,
+            toolCalls: [],
+            recentToolCalls: [],
+            imageDelivery: nil,
+            queuedPromptCount: 3
+        )
+
+        XCTAssertEqual(
+            TelegramRemoteRenderer.streamMessageText(snapshot: snapshot),
+            "I am still checking the logs now."
+        )
+    }
+
     func testStreamMessagePrefersAssistantReplyOverTrailingStatus() {
         let snapshot = AssistantRemoteSessionSnapshot(
             session: AssistantSessionSummary(
@@ -482,6 +514,49 @@ final class TelegramRemoteRendererTests: XCTestCase {
         )
     }
 
+    func testCompletedAttentionTextUsesAttentionEventScopeInsteadOfNewerTurn() {
+        let startedAt = Date(timeIntervalSince1970: 1_000)
+        let event = AssistantRemoteAttentionEvent(
+            id: "completed:turn-1",
+            kind: .completed,
+            createdAt: startedAt.addingTimeInterval(3),
+            turnID: "turn-1",
+            permissionRequestID: nil,
+            failureText: nil
+        )
+        let snapshot = AssistantRemoteSessionSnapshot(
+            session: AssistantSessionSummary(
+                id: "session-turn-scope",
+                title: "Turn Scope",
+                source: .appServer,
+                status: .active
+            ),
+            transcriptEntries: [
+                AssistantTranscriptEntry(role: .user, text: "Turn one", createdAt: startedAt),
+                AssistantTranscriptEntry(role: .assistant, text: "Final answer for turn one.", createdAt: startedAt.addingTimeInterval(1.5)),
+                AssistantTranscriptEntry(role: .user, text: "Turn two", createdAt: startedAt.addingTimeInterval(2)),
+                AssistantTranscriptEntry(role: .assistant, text: "Streaming turn two", createdAt: startedAt.addingTimeInterval(4), isStreaming: true)
+            ],
+            pendingPermissionRequest: nil,
+            latestRemoteAttentionEvent: event,
+            hudState: AssistantHUDState(
+                phase: .streaming,
+                title: "Streaming",
+                detail: "Turn two is still running"
+            ),
+            hasActiveTurn: true,
+            toolCalls: [],
+            recentToolCalls: [],
+            imageDelivery: nil,
+            activeTurnID: "turn-2"
+        )
+
+        XCTAssertEqual(
+            TelegramRemoteRenderer.completedAttentionText(snapshot: snapshot, event: event),
+            "Final answer for turn one."
+        )
+    }
+
     func testFreshAttentionDeliverySkipsBaselineEvent() {
         let snapshot = AssistantRemoteSessionSnapshot(
             session: AssistantSessionSummary(
@@ -514,6 +589,43 @@ final class TelegramRemoteRendererTests: XCTestCase {
             TelegramRemoteCoordinator.freshAttentionDelivery(
                 snapshot: snapshot,
                 baselineAttentionEventID: "completed:turn-3",
+                lastDeliveredEventID: nil
+            )
+        )
+    }
+
+    func testHasUndeliveredTerminalAttentionSkipsCompletionWithoutRenderableText() {
+        let event = AssistantRemoteAttentionEvent(
+            id: "completed:turn-9",
+            kind: .completed,
+            createdAt: Date(),
+            turnID: "turn-9",
+            permissionRequestID: nil,
+            failureText: nil
+        )
+        let snapshot = AssistantRemoteSessionSnapshot(
+            session: AssistantSessionSummary(
+                id: "session-empty-complete",
+                title: "Empty Completion",
+                source: .appServer,
+                status: .completed
+            ),
+            transcriptEntries: [
+                AssistantTranscriptEntry(role: .user, text: "Hello")
+            ],
+            pendingPermissionRequest: nil,
+            latestRemoteAttentionEvent: event,
+            hudState: .idle,
+            hasActiveTurn: false,
+            toolCalls: [],
+            recentToolCalls: [],
+            imageDelivery: nil
+        )
+
+        XCTAssertFalse(
+            TelegramRemoteCoordinator.hasUndeliveredTerminalAttention(
+                snapshot: snapshot,
+                baselineAttentionEventID: nil,
                 lastDeliveredEventID: nil
             )
         )

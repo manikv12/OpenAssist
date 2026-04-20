@@ -355,14 +355,28 @@ enum TelegramRemoteRenderer {
         return assistantPresentation(snapshot: snapshot)
     }
 
-    static func completedAttentionText(snapshot: AssistantRemoteSessionSnapshot) -> String? {
-        assistantPresentation(snapshot: snapshot, allowsOverflow: true)?.text
+    static func completedAttentionText(
+        snapshot: AssistantRemoteSessionSnapshot,
+        event: AssistantRemoteAttentionEvent? = nil
+    ) -> String? {
+        if let event,
+           let scopedEntries = entriesScopedToAttention(snapshot: snapshot, event: event, anchorRoles: [.assistant]),
+           let preferredAssistant = preferredAssistantEntry(in: scopedEntries, hasActiveTurn: false) {
+            return AssistantVisibleTextSanitizer.clean(preferredAssistant.text)
+        }
+        return assistantPresentation(snapshot: snapshot, allowsOverflow: true)?.text
     }
 
     static func failureAttentionText(
         snapshot: AssistantRemoteSessionSnapshot,
+        event: AssistantRemoteAttentionEvent? = nil,
         fallback: String? = nil
     ) -> String? {
+        if let event,
+           let scopedEntries = entriesScopedToAttention(snapshot: snapshot, event: event, anchorRoles: [.error]),
+           let cleanedText = latestErrorText(in: scopedEntries) {
+            return cleanedText
+        }
         if let cleanedText = latestErrorText(snapshot: snapshot) {
             return cleanedText
         }
@@ -416,8 +430,14 @@ enum TelegramRemoteRenderer {
         guard let currentTurnEntries = currentTurnEntries(snapshot: snapshot) else {
             return nil
         }
+        return preferredAssistantEntry(in: Array(currentTurnEntries), hasActiveTurn: snapshot.hasActiveTurn)
+    }
 
-        let assistantCandidates = currentTurnEntries.compactMap { entry -> (entry: AssistantTranscriptEntry, cleanedText: String)? in
+    private static func preferredAssistantEntry(
+        in entries: [AssistantTranscriptEntry],
+        hasActiveTurn: Bool
+    ) -> AssistantTranscriptEntry? {
+        let assistantCandidates = entries.compactMap { entry -> (entry: AssistantTranscriptEntry, cleanedText: String)? in
             guard entry.role == .assistant,
                   entry.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false,
                   let cleanedText = AssistantVisibleTextSanitizer.clean(entry.text) else {
@@ -427,7 +447,7 @@ enum TelegramRemoteRenderer {
         }
 
         let preferredAssistant: (entry: AssistantTranscriptEntry, cleanedText: String)?
-        if snapshot.hasActiveTurn {
+        if hasActiveTurn {
             preferredAssistant = assistantCandidates.last(where: { $0.entry.isStreaming }) ?? assistantCandidates.last
         } else if !assistantCandidates.isEmpty {
             let completedAssistants = assistantCandidates.filter { !$0.entry.isStreaming }
@@ -489,6 +509,38 @@ enum TelegramRemoteRenderer {
         return AssistantVisibleTextSanitizer.clean(latestError.text)
     }
 
+    private static func latestErrorText(in entries: [AssistantTranscriptEntry]) -> String? {
+        guard let latestError = entries.last(where: { entry in
+            entry.role == .error && entry.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+        }) else {
+            return nil
+        }
+        return AssistantVisibleTextSanitizer.clean(latestError.text)
+    }
+
+    private static func entriesScopedToAttention(
+        snapshot: AssistantRemoteSessionSnapshot,
+        event: AssistantRemoteAttentionEvent,
+        anchorRoles: [AssistantTranscriptRole]
+    ) -> [AssistantTranscriptEntry]? {
+        for cutoff in [event.createdAt, event.createdAt.addingTimeInterval(1)] {
+            let entriesBeforeAttention = snapshot.transcriptEntries.filter { entry in
+                entry.createdAt <= cutoff
+            }
+            guard let anchorIndex = entriesBeforeAttention.lastIndex(where: { entry in
+                anchorRoles.contains(entry.role)
+                    && entry.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+            }) else {
+                continue
+            }
+            let startIndex = entriesBeforeAttention[..<anchorIndex].lastIndex(where: { entry in
+                entry.role == .user
+            }).map { entriesBeforeAttention.index(after: $0) } ?? entriesBeforeAttention.startIndex
+            return Array(entriesBeforeAttention[startIndex...anchorIndex])
+        }
+        return nil
+    }
+
     private static func currentTurnAnchorUserIndex(
         snapshot: AssistantRemoteSessionSnapshot
     ) -> Array<AssistantTranscriptEntry>.Index? {
@@ -499,8 +551,11 @@ enum TelegramRemoteRenderer {
             return nil
         }
 
-        let queuedUserCount = snapshot.hasActiveTurn ? max(0, snapshot.queuedPromptCount) : 0
-        return Array(userIndices.dropLast(queuedUserCount)).last ?? userIndices.last
+        let queuedUserCount = min(
+            max(0, snapshot.queuedPromptCount),
+            max(0, userIndices.count - 1)
+        )
+        return userIndices[userIndices.count - queuedUserCount - 1]
     }
 
     static func permissionText(_ request: AssistantPermissionRequest) -> String {

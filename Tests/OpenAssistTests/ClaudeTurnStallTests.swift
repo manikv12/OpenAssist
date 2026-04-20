@@ -92,7 +92,8 @@ final class ClaudeTurnStallTests: XCTestCase {
         await Task.yield()
         XCTAssertEqual(runtime.pendingClaudeTurnContinuationCountForTesting, 1)
 
-        // No active subprocess → the `wasCurrentProcess == false` branch runs.
+        // Simulate the "no current process or active turn" fallback path.
+        runtime.configureSessionForTesting(sessionID: "test-session", turnID: nil)
         runtime.simulateClaudeStaleProcessTerminationForTesting()
 
         do {
@@ -109,6 +110,89 @@ final class ClaudeTurnStallTests: XCTestCase {
             }
         }
         XCTAssertEqual(runtime.pendingClaudeTurnContinuationCountForTesting, 0)
+    }
+
+    func testStaleProcessTerminationDoesNotDrainPendingContinuationWhenReplacementProcessExists() async throws {
+        let runtime = CodexAssistantRuntime()
+        runtime.beginClaudeTurnForTesting()
+        runtime.installActiveClaudeProcessForTesting()
+
+        let awaiter = runtime.awaitClaudeTurnCompletionForTesting()
+        await Task.yield()
+        XCTAssertEqual(runtime.pendingClaudeTurnContinuationCountForTesting, 1)
+
+        runtime.simulateClaudeStaleProcessTerminationForTesting()
+
+        XCTAssertEqual(
+            runtime.pendingClaudeTurnContinuationCountForTesting,
+            1,
+            "A stale subprocess exit must not fail the healthy replacement turn"
+        )
+
+        runtime.fireClaudeTurnStallForTesting()
+        _ = try? await awaiter.value
+    }
+
+    func testPermissionStateChangeReschedulesStallWatchdogWithoutNewOutput() async throws {
+        let runtime = CodexAssistantRuntime()
+        runtime.beginClaudeTurnForTesting()
+
+        let awaiter = runtime.awaitClaudeTurnCompletionForTesting()
+        await Task.yield()
+
+        runtime.processClaudeCodeOutputLineForTesting(#"""
+        {"type":"system","session_id":"test-session"}
+        """#)
+        let generationBeforePermission = runtime.claudeTurnStallWatchdogGenerationForTesting
+
+        runtime.setPendingPermissionForTesting(true)
+        let generationWhileWaiting = runtime.claudeTurnStallWatchdogGenerationForTesting
+        XCTAssertGreaterThan(
+            generationWhileWaiting,
+            generationBeforePermission,
+            "Entering permission wait should reschedule the stall watchdog"
+        )
+
+        runtime.setPendingPermissionForTesting(false)
+        XCTAssertGreaterThan(
+            runtime.claudeTurnStallWatchdogGenerationForTesting,
+            generationWhileWaiting,
+            "Leaving permission wait should reschedule the stall watchdog again"
+        )
+
+        runtime.fireClaudeTurnStallForTesting()
+        _ = try? await awaiter.value
+    }
+
+    func testToolStateChangeReschedulesStallWatchdogWithoutNewOutput() async throws {
+        let runtime = CodexAssistantRuntime()
+        runtime.beginClaudeTurnForTesting()
+
+        let awaiter = runtime.awaitClaudeTurnCompletionForTesting()
+        await Task.yield()
+
+        runtime.processClaudeCodeOutputLineForTesting(#"""
+        {"type":"system","session_id":"test-session"}
+        """#)
+        let generationBeforeTool = runtime.claudeTurnStallWatchdogGenerationForTesting
+
+        runtime.setAwaitingToolExecutionForTesting(true)
+        let generationWhileAwaitingTool = runtime.claudeTurnStallWatchdogGenerationForTesting
+        XCTAssertGreaterThan(
+            generationWhileAwaitingTool,
+            generationBeforeTool,
+            "Entering tool execution wait should reschedule the stall watchdog"
+        )
+
+        runtime.setAwaitingToolExecutionForTesting(false)
+        XCTAssertGreaterThan(
+            runtime.claudeTurnStallWatchdogGenerationForTesting,
+            generationWhileAwaitingTool,
+            "Leaving tool execution wait should reschedule the stall watchdog again"
+        )
+
+        runtime.fireClaudeTurnStallForTesting()
+        _ = try? await awaiter.value
     }
 
     // MARK: - Rate limit event does not reset watchdog
@@ -129,17 +213,14 @@ final class ClaudeTurnStallTests: XCTestCase {
             "Watchdog should be armed after a real inbound event"
         )
 
-        // Grab the current task reference, deliver a rate_limit_event, and
-        // assert the watchdog task was NOT replaced (replacement would mean
-        // the rate-limit ping reset the timer).
-        let watchdogBefore = runtime.claudeTurnStallWatchdogIsArmedForTesting
+        let watchdogGenerationBefore = runtime.claudeTurnStallWatchdogGenerationForTesting
         runtime.processClaudeCodeOutputLineForTesting(#"""
         {"type":"rate_limit_event","session_id":"test-session"}
         """#)
-        let watchdogAfter = runtime.claudeTurnStallWatchdogIsArmedForTesting
+        let watchdogGenerationAfter = runtime.claudeTurnStallWatchdogGenerationForTesting
         XCTAssertEqual(
-            watchdogBefore,
-            watchdogAfter,
+            watchdogGenerationBefore,
+            watchdogGenerationAfter,
             "rate_limit_event must not reset the stall watchdog"
         )
 

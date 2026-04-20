@@ -346,6 +346,7 @@ final class CodexAssistantRuntime {
     private var activeClaudeQueuedPromptContexts: [ClaudeQueuedPromptContext] = []
     private var claudeCodeIdleTimeoutTask: Task<Void, Never>?
     private var claudeTurnStallWatchdogTask: Task<Void, Never>?
+    private var claudeTurnStallWatchdogGeneration: UInt64 = 0
     private var lastClaudeCodeActivityAt: Date?
     private var activeSessionID: String?
     private var activeSessionCWD: String?
@@ -365,7 +366,12 @@ final class CodexAssistantRuntime {
     private var toolCalls: [String: AssistantToolCallState] = [:]
     private var liveActivities: [String: AssistantActivityItem] = [:]
     private var locallySuccessfulDynamicToolCallIDs: Set<String> = []
-    private var pendingPermissionContext: PendingPermissionContext?
+    private var pendingPermissionContext: PendingPermissionContext? {
+        didSet {
+            guard oldValue?.request.id != pendingPermissionContext?.request.id else { return }
+            refreshClaudeTurnStallWatchdogForStateChange()
+        }
+    }
     private var loginRefreshTask: Task<Void, Never>?
     private var metadataRefreshTask: Task<Void, Never>?
     private var rateLimitRefreshTask: Task<Void, Never>?
@@ -3311,6 +3317,15 @@ final class CodexAssistantRuntime {
         claudeTurnStallWatchdogTask = nil
     }
 
+    private func refreshClaudeTurnStallWatchdogForStateChange() {
+        guard backend == .claudeCode else { return }
+        guard activeTurnID != nil else {
+            cancelClaudeTurnStallWatchdog()
+            return
+        }
+        scheduleClaudeTurnStallWatchdogIfNeeded()
+    }
+
     /// Schedules a per-turn stall watchdog. Reset from `recordClaudeCodeActivity()`
     /// on every inbound stream payload except `rate_limit_event`. Fires a synthetic
     /// `failed` turn through the existing completion plumbing if Claude Code goes
@@ -3327,6 +3342,7 @@ final class CodexAssistantRuntime {
             return Self.claudeTurnStallTimeoutNanoseconds
         }()
         let turnAtSchedule = activeTurnID
+        claudeTurnStallWatchdogGeneration &+= 1
 
         claudeTurnStallWatchdogTask = Task { @MainActor [weak self] in
             do {
@@ -5921,6 +5937,45 @@ final class CodexAssistantRuntime {
         claudeTurnStallWatchdogTask != nil
     }
 
+    var claudeTurnStallWatchdogGenerationForTesting: UInt64 {
+        claudeTurnStallWatchdogGeneration
+    }
+
+    func installActiveClaudeProcessForTesting() {
+        activeClaudeProcess = Process()
+    }
+
+    func setPendingPermissionForTesting(_ isPending: Bool) {
+        if isPending {
+            pendingPermissionContext = PendingPermissionContext(
+                request: AssistantPermissionRequest(
+                    id: 1,
+                    sessionID: activeSessionID ?? "test-session",
+                    toolTitle: "Computer Use",
+                    toolKind: "computer",
+                    rationale: "Testing permission flow",
+                    options: [
+                        AssistantPermissionOption(
+                            id: "approve",
+                            title: "Approve",
+                            kind: nil,
+                            isDefault: true
+                        )
+                    ],
+                    rawPayloadSummary: nil
+                )
+            ) { _ in
+            } cancelHandler: {
+            }
+        } else {
+            pendingPermissionContext = nil
+        }
+    }
+
+    func setAwaitingToolExecutionForTesting(_ isAwaitingTool: Bool) {
+        claudeStreamingAwaitingToolExecution = isAwaitingTool
+    }
+
     func claudeCodeElicitationContentForTesting(
         answers: [String: [String]],
         requestedSchema: [String: Any]?
@@ -6932,7 +6987,12 @@ final class CodexAssistantRuntime {
     /// meaning the CLI will execute tools before producing the next assistant
     /// message.  While this flag is set, message_stop must NOT schedule a
     /// deferred completion because the turn is still in progress.
-    private var claudeStreamingAwaitingToolExecution = false
+    private var claudeStreamingAwaitingToolExecution = false {
+        didSet {
+            guard oldValue != claudeStreamingAwaitingToolExecution else { return }
+            refreshClaudeTurnStallWatchdogForStateChange()
+        }
+    }
 
     /// Session IDs that have been detached. Notifications from these sessions are dropped.
     private var detachedSessionIDs: Set<String> = []
@@ -9408,7 +9468,9 @@ final class CodexAssistantRuntime {
             // Safety net: a stale termination callback while continuations
             // are still pending (e.g. respawn mid-turn) must never leave the
             // UI awaiting forever.
-            if !activeClaudeTurnContinuations.isEmpty {
+            if !activeClaudeTurnContinuations.isEmpty,
+               activeClaudeProcess == nil,
+               activeTurnID == nil {
                 cancelClaudeTurnStallWatchdog()
                 let message = "Claude Code exited before completing the turn."
                 resolveAllActiveClaudeTurnContinuations(

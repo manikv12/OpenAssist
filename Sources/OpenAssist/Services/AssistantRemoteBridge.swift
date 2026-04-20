@@ -345,8 +345,9 @@ final class AssistantRemoteBridge {
         let sendAction: () async -> AssistantRemoteSessionSnapshot? = {
             [assistant, self] in
             if let sessionID = sessionID?.trimmingCharacters(in: .whitespacesAndNewlines),
-               !sessionID.isEmpty {
-                _ = await self.openSession(sessionID: sessionID, preserveVisibleSelection: false)
+               !sessionID.isEmpty,
+               await self.openSession(sessionID: sessionID, preserveVisibleSelection: false) == nil {
+                return nil
             }
 
             await assistant.sendPrompt(
@@ -438,14 +439,45 @@ final class AssistantRemoteBridge {
         value?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty?.lowercased()
     }
 
-    private func withSessionContext<Result>(
+    private func openRequestedSessionIfNeeded(sessionID: String?) async -> Bool {
+        guard let normalizedSessionID = normalizedIdentifier(sessionID) else {
+            return true
+        }
+        return await openSession(sessionID: normalizedSessionID, preserveVisibleSelection: false) != nil
+    }
+
+    private func withSessionContext(
         sessionID: String?,
         preserveVisibleSelection: Bool = false,
-        operation: @escaping () async -> Result
-    ) async -> Result {
-        let action: () async -> Result = { [self] in
-            if let normalizedSessionID = normalizedIdentifier(sessionID) {
-                _ = await openSession(sessionID: normalizedSessionID, preserveVisibleSelection: false)
+        operation: @escaping () async -> Void
+    ) async {
+        let action: () async -> Void = { [self] in
+            guard await openRequestedSessionIfNeeded(sessionID: sessionID) else {
+                return
+            }
+            await operation()
+        }
+
+        if preserveVisibleSelection {
+            await withPreservedDesktopContext(
+                preserveVisibleSelection: true,
+                temporaryProjectID: nil,
+                operation: action
+            )
+            return
+        }
+
+        await action()
+    }
+
+    private func withSessionContextReturningBool(
+        sessionID: String?,
+        preserveVisibleSelection: Bool = false,
+        operation: @escaping () async -> Bool
+    ) async -> Bool {
+        let action: () async -> Bool = { [self] in
+            guard await openRequestedSessionIfNeeded(sessionID: sessionID) else {
+                return false
             }
             return await operation()
         }
@@ -480,7 +512,7 @@ final class AssistantRemoteBridge {
         sessionID: String?,
         preserveVisibleSelection: Bool = false
     ) async -> Bool {
-        await withSessionContext(
+        await withSessionContextReturningBool(
             sessionID: sessionID,
             preserveVisibleSelection: preserveVisibleSelection
         ) { [assistant] in
@@ -496,7 +528,7 @@ final class AssistantRemoteBridge {
         sessionID: String?,
         preserveVisibleSelection: Bool = false
     ) async -> Bool {
-        await withSessionContext(
+        await withSessionContextReturningBool(
             sessionID: sessionID,
             preserveVisibleSelection: preserveVisibleSelection
         ) { [assistant] in

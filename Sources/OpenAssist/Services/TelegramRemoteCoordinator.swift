@@ -2263,13 +2263,17 @@ final class TelegramRemoteCoordinator: ObservableObject {
 
         switch event.kind {
         case .completed:
-            guard let text = TelegramRemoteRenderer.completedAttentionText(snapshot: snapshot) else {
+            guard let text = TelegramRemoteRenderer.completedAttentionText(
+                snapshot: snapshot,
+                event: event
+            ) else {
                 return nil
             }
             return FreshAttentionDelivery(eventID: event.id, kind: .completion(text: text))
         case .failed:
             guard let text = TelegramRemoteRenderer.failureAttentionText(
                 snapshot: snapshot,
+                event: event,
                 fallback: event.failureText
             ) else {
                 return nil
@@ -2294,7 +2298,18 @@ final class TelegramRemoteCoordinator: ObservableObject {
               event.id != lastDeliveredEventID else {
             return false
         }
-        return event.kind.isTerminal
+        switch event.kind {
+        case .completed:
+            return TelegramRemoteRenderer.completedAttentionText(snapshot: snapshot, event: event) != nil
+        case .failed:
+            return TelegramRemoteRenderer.failureAttentionText(
+                snapshot: snapshot,
+                event: event,
+                fallback: event.failureText
+            ) != nil
+        case .permissionRequired:
+            return false
+        }
     }
 
     private func trackMessageID(_ messageID: Int) {
