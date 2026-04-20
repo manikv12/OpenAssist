@@ -193,6 +193,7 @@ final class AssistantWindowSupportTests: XCTestCase {
             canEdit: false,
             rewriteAnchorID: nil,
             providerLabel: nil,
+            selectedPlugins: nil,
             activityIcon: nil,
             activityTitle: nil,
             activityDetail: nil,
@@ -218,6 +219,7 @@ final class AssistantWindowSupportTests: XCTestCase {
             canEdit: false,
             rewriteAnchorID: nil,
             providerLabel: nil,
+            selectedPlugins: nil,
             activityIcon: nil,
             activityTitle: nil,
             activityDetail: nil,
@@ -858,7 +860,8 @@ final class AssistantWindowSupportTests: XCTestCase {
                     id: "history-1",
                     title: "Main note",
                     savedAtLabel: "Saved 5 minutes ago",
-                    preview: "Older draft"
+                    preview: "Older draft",
+                    markdown: "Older draft"
                 )
             ],
             recentlyDeletedNotes: [
@@ -866,7 +869,8 @@ final class AssistantWindowSupportTests: XCTestCase {
                     id: "deleted-1",
                     title: "Old note",
                     deletedAtLabel: "Deleted yesterday",
-                    preview: "Recovered content"
+                    preview: "Recovered content",
+                    markdown: "Recovered content"
                 )
             ]
         )

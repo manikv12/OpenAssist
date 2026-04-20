@@ -1957,11 +1957,46 @@ struct AssistantRemoteSessionSnapshot: Sendable {
     let session: AssistantSessionSummary
     let transcriptEntries: [AssistantTranscriptEntry]
     let pendingPermissionRequest: AssistantPermissionRequest?
+    let latestRemoteAttentionEvent: AssistantRemoteAttentionEvent?
     let hudState: AssistantHUDState?
     let hasActiveTurn: Bool
     let toolCalls: [AssistantToolCallState]
     let recentToolCalls: [AssistantToolCallState]
     let imageDelivery: AssistantRemoteImageDelivery?
+    let activeTurnID: String?
+    let pendingOutgoingMessage: AssistantPendingOutgoingMessage?
+    let awaitingAssistantStart: Bool
+    let queuedPromptCount: Int
+
+    init(
+        session: AssistantSessionSummary,
+        transcriptEntries: [AssistantTranscriptEntry],
+        pendingPermissionRequest: AssistantPermissionRequest?,
+        latestRemoteAttentionEvent: AssistantRemoteAttentionEvent? = nil,
+        hudState: AssistantHUDState?,
+        hasActiveTurn: Bool,
+        toolCalls: [AssistantToolCallState],
+        recentToolCalls: [AssistantToolCallState],
+        imageDelivery: AssistantRemoteImageDelivery?,
+        activeTurnID: String? = nil,
+        pendingOutgoingMessage: AssistantPendingOutgoingMessage? = nil,
+        awaitingAssistantStart: Bool = false,
+        queuedPromptCount: Int = 0
+    ) {
+        self.session = session
+        self.transcriptEntries = transcriptEntries
+        self.pendingPermissionRequest = pendingPermissionRequest
+        self.latestRemoteAttentionEvent = latestRemoteAttentionEvent
+        self.hudState = hudState
+        self.hasActiveTurn = hasActiveTurn
+        self.toolCalls = toolCalls
+        self.recentToolCalls = recentToolCalls
+        self.imageDelivery = imageDelivery
+        self.activeTurnID = activeTurnID
+        self.pendingOutgoingMessage = pendingOutgoingMessage
+        self.awaitingAssistantStart = awaitingAssistantStart
+        self.queuedPromptCount = queuedPromptCount
+    }
 }
 
 struct AssistantRemoteImageAttachment: Equatable, Sendable {
@@ -4360,7 +4395,9 @@ final class AssistantStore: ObservableObject {
         Selected installed plugins for this turn:
         \(lines.joined(separator: "\n"))
 
-        Prefer these plugins when they fit the request.
+        Treat these plugins as the required path for this request.
+        Use them first and do not switch to unrelated tools or a generic fallback just because it seems easier.
+        If the selected plugins cannot handle the request, say that clearly instead of silently doing the task another way.
         """
     }
 
@@ -4392,6 +4429,7 @@ final class AssistantStore: ObservableObject {
         var selectedSummaries: [AssistantCodexPluginSummary] = []
         var items: [AssistantCodexPromptInputItem] = []
         var seenMentionPaths = Set<String>()
+        var seenSkillPaths = Set<String>()
 
         for pluginID in normalizedIDs {
             guard let summary = codexPluginSummary(for: pluginID), summary.isInstalled else {
@@ -4401,6 +4439,20 @@ final class AssistantStore: ObservableObject {
 
             if codexPluginDetail(for: summary.id) == nil {
                 await loadCodexPluginDetail(pluginID: summary.id)
+            }
+
+            if let detail = codexPluginDetail(for: summary.id) {
+                for skill in detail.skills {
+                    let trimmedPath = skill.path
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !trimmedPath.isEmpty else { continue }
+                    guard seenSkillPaths.insert(trimmedPath.lowercased()).inserted else { continue }
+                    let skillName = skill.displayName
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                        .nonEmpty
+                        ?? skill.name
+                    items.append(.skill(name: skillName, path: trimmedPath))
+                }
             }
 
             let matchedAppStatuses = matchingComposerPluginAppStatuses(
@@ -5318,6 +5370,11 @@ final class AssistantStore: ObservableObject {
                         state.hasLiveClaudeProcess = runtime.hasLiveClaudeProcess
                         state.awaitingAssistantStart = false
                         state.pendingOutgoingMessage = nil
+                        state.latestRemoteAttentionEvent = self.remoteAttentionEvent(
+                            for: status,
+                            sessionID: completionSessionID,
+                            turnID: completionTurnID
+                        )
                         self.finalizeToolCallsForTurn(state: &state, status: status)
                         if state.hudState?.phase == .waitingForPermission {
                             state.hudState = .idle
@@ -5401,9 +5458,13 @@ final class AssistantStore: ObservableObject {
                 }
 
                 self.withSessionExecutionState(for: resolvedSessionID) { state in
+                    let previousRequestID = state.pendingPermissionRequest?.id
                     state.pendingPermissionRequest = request
                     state.hasActiveTurn = runtime.hasActiveTurn
                     state.hasLiveClaudeProcess = runtime.hasLiveClaudeProcess
+                    if let request, previousRequestID != request.id {
+                        state.latestRemoteAttentionEvent = self.remotePermissionAttentionEvent(for: request)
+                    }
                     if request != nil {
                         state.awaitingAssistantStart = false
                         let waitingTitle = request?.toolKind == "userInput"
@@ -6009,6 +6070,54 @@ final class AssistantStore: ObservableObject {
         }
     }
 
+    private func remoteAttentionEvent(
+        for status: AssistantTurnCompletionStatus,
+        sessionID: String,
+        turnID: String?
+    ) -> AssistantRemoteAttentionEvent? {
+        let normalizedTurnID = turnID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+        let timestamp = Date()
+        switch status {
+        case .completed:
+            let identifier = normalizedTurnID.map { "completed:\($0)" }
+                ?? "completed:\(sessionID):\(timestamp.timeIntervalSince1970)"
+            return AssistantRemoteAttentionEvent(
+                id: identifier,
+                kind: .completed,
+                createdAt: timestamp,
+                turnID: normalizedTurnID,
+                permissionRequestID: nil,
+                failureText: nil
+            )
+        case .failed(let message):
+            let identifier = normalizedTurnID.map { "failed:\($0)" }
+                ?? "failed:\(sessionID):\(timestamp.timeIntervalSince1970)"
+            return AssistantRemoteAttentionEvent(
+                id: identifier,
+                kind: .failed,
+                createdAt: timestamp,
+                turnID: normalizedTurnID,
+                permissionRequestID: nil,
+                failureText: message.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+            )
+        case .interrupted:
+            return nil
+        }
+    }
+
+    private func remotePermissionAttentionEvent(
+        for request: AssistantPermissionRequest
+    ) -> AssistantRemoteAttentionEvent {
+        AssistantRemoteAttentionEvent(
+            id: "permission:\(request.id)",
+            kind: .permissionRequired,
+            createdAt: Date(),
+            turnID: nil,
+            permissionRequestID: request.id,
+            failureText: nil
+        )
+    }
+
     private func notifyBackgroundTurnCompletionIfNeeded(
         sessionID: String?,
         turnID: String?,
@@ -6045,12 +6154,15 @@ final class AssistantStore: ObservableObject {
             sessionID: normalizedSessionID,
             hudState: state.hudState,
             hasActiveTurn: runtime?.hasActiveTurn ?? state.hasActiveTurn,
+            currentTurnID: runtime?.currentTurnID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty,
             hasLiveClaudeProcess: runtime?.hasLiveClaudeProcess ?? state.hasLiveClaudeProcess,
             canSteerActiveTurn: runtime?.canSteerActiveTurn ?? false,
             pendingPermissionRequest: state.pendingPermissionRequest,
+            latestRemoteAttentionEvent: state.latestRemoteAttentionEvent,
             subagentCount: state.subagents.count,
             pendingOutgoingMessage: state.pendingOutgoingMessage,
-            awaitingAssistantStart: state.awaitingAssistantStart
+            awaitingAssistantStart: state.awaitingAssistantStart,
+            queuedPromptCount: state.queuedPrompts.count
         )
     }
 
@@ -7160,11 +7272,16 @@ final class AssistantStore: ObservableObject {
             session: session,
             transcriptEntries: transcriptEntries,
             pendingPermissionRequest: activitySnapshot.pendingPermissionRequest,
+            latestRemoteAttentionEvent: activitySnapshot.latestRemoteAttentionEvent,
             hudState: activitySnapshot.hudState,
             hasActiveTurn: activitySnapshot.hasActiveTurn,
             toolCalls: toolState.toolCalls,
             recentToolCalls: toolState.recentToolCalls,
-            imageDelivery: imageDelivery
+            imageDelivery: imageDelivery,
+            activeTurnID: activitySnapshot.currentTurnID,
+            pendingOutgoingMessage: activitySnapshot.pendingOutgoingMessage,
+            awaitingAssistantStart: activitySnapshot.awaitingAssistantStart,
+            queuedPromptCount: activitySnapshot.queuedPromptCount
         )
     }
 
@@ -10465,8 +10582,8 @@ final class AssistantStore: ObservableObject {
     /// Strip heavy imageAttachments data from screenshot timeline items that have
     /// already been delivered to Telegram, keeping the text/metadata intact.
     /// This prevents screenshots from accumulating on disk in session history.
-    func clearDeliveredScreenshotAttachments() {
-        guard let sessionID = selectedSessionID else { return }
+    func clearDeliveredScreenshotAttachments(sessionID: String? = nil) {
+        guard let sessionID = sessionID ?? selectedSessionID else { return }
 
         var mutated = false
         let items: [AssistantTimelineItem]
@@ -12666,12 +12783,15 @@ final class AssistantStore: ObservableObject {
 
     func selectProjectFilter(
         _ projectID: String?,
-        autoSelectVisibleSessionIfNeeded: Bool = true
+        autoSelectVisibleSessionIfNeeded: Bool = true,
+        toggleOffIfSame: Bool = true
     ) async {
         let nextFilter = resolvedProjectFilter(for: projectID)
         if let nextFilter,
            selectedProjectFilter == nextFilter {
-            selectedProjectFilter = nil
+            if toggleOffIfSame {
+                selectedProjectFilter = nil
+            }
             return
         }
 

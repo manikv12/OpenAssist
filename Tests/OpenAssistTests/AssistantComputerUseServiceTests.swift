@@ -252,7 +252,8 @@ final class AssistantComputerUseServiceTests: XCTestCase {
                 return AssistantComputerUseService.FocusState(
                     targetBundleIdentifier: bundleIdentifier,
                     targetPID: ownerPID,
-                    hiddenAppPIDs: [100, 200]
+                    hiddenAppPIDs: [100, 200],
+                    didHideOwnApp: false
                 )
             },
             unfocusApp: { state in
@@ -297,7 +298,8 @@ final class AssistantComputerUseServiceTests: XCTestCase {
                 return AssistantComputerUseService.FocusState(
                     targetBundleIdentifier: "com.example.app",
                     targetPID: 42,
-                    hiddenAppPIDs: [100, 200, 300]
+                    hiddenAppPIDs: [100, 200, 300],
+                    didHideOwnApp: false
                 )
             },
             unfocusApp: { state in
@@ -326,7 +328,8 @@ final class AssistantComputerUseServiceTests: XCTestCase {
         let state = AssistantComputerUseService.FocusState(
             targetBundleIdentifier: "com.example.app",
             targetPID: 42,
-            hiddenAppPIDs: [100, 200, 300]
+            hiddenAppPIDs: [100, 200, 300],
+            didHideOwnApp: false
         )
         XCTAssertEqual(state.targetBundleIdentifier, "com.example.app")
         XCTAssertEqual(state.targetPID, 42)
@@ -337,7 +340,8 @@ final class AssistantComputerUseServiceTests: XCTestCase {
         let state = AssistantComputerUseService.FocusState(
             targetBundleIdentifier: nil,
             targetPID: 99,
-            hiddenAppPIDs: []
+            hiddenAppPIDs: [],
+            didHideOwnApp: false
         )
         XCTAssertNil(state.targetBundleIdentifier)
         XCTAssertEqual(state.targetPID, 99)

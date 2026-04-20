@@ -200,8 +200,14 @@ final class ClaudeCodeRuntimeParsingTests: XCTestCase {
 
         XCTAssertEqual(payload["type"] as? String, "user")
         XCTAssertEqual(payload["session_id"] as? String, "")
-        XCTAssertEqual((payload["message"] as? [String: Any])?["role"] as? String, "user")
-        XCTAssertEqual((payload["message"] as? [String: Any])?["content"] as? String, "Read this file")
+        let message = payload["message"] as? [String: Any]
+        XCTAssertEqual(message?["role"] as? String, "user")
+        // Content is a structured array of content blocks (per Claude Agent
+        // SDK stream-json format), not a bare string.
+        let blocks = message?["content"] as? [[String: Any]]
+        XCTAssertEqual(blocks?.count, 1)
+        XCTAssertEqual(blocks?.first?["type"] as? String, "text")
+        XCTAssertEqual(blocks?.first?["text"] as? String, "Read this file")
     }
 
     @MainActor

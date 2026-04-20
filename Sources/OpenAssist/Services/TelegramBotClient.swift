@@ -276,13 +276,17 @@ final class TelegramBotClient {
         chatID: Int64,
         text: String,
         parseMode: TelegramParseMode? = nil,
-        replyMarkup: TelegramInlineKeyboardMarkup? = nil
+        replyMarkup: TelegramInlineKeyboardMarkup? = nil,
+        disableNotification: Bool = false
     ) async throws -> TelegramMessage {
         var payload: [String: Any] = [
             "chat_id": chatID,
             "text": text,
             "disable_web_page_preview": true
         ]
+        if disableNotification {
+            payload["disable_notification"] = true
+        }
         if let parseMode {
             payload["parse_mode"] = parseMode.rawValue
         }
@@ -373,6 +377,24 @@ final class TelegramBotClient {
             payload["reply_markup"] = try replyMarkupDictionary(replyMarkup)
         }
         return try await perform(method: "editMessageText", payload: payload, responseType: TelegramMessage.self)
+    }
+
+    @discardableResult
+    func sendMessageDraft(
+        chatID: Int64,
+        draftID: Int,
+        text: String,
+        parseMode: TelegramParseMode? = nil
+    ) async throws -> Bool {
+        var payload: [String: Any] = [
+            "chat_id": chatID,
+            "draft_id": draftID,
+            "text": text
+        ]
+        if let parseMode {
+            payload["parse_mode"] = parseMode.rawValue
+        }
+        return try await perform(method: "sendMessageDraft", payload: payload, responseType: Bool.self)
     }
 
     @discardableResult
