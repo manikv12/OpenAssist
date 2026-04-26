@@ -3002,6 +3002,21 @@ function ThreadNoteDrawerOpenContent({
     pendingNavigationRef.current = null;
   }, []);
 
+  useEffect(() => {
+    return () => {
+      clearSaveDebounce();
+      clearSaveRetry();
+      clearActiveSave();
+      clearPendingNavigation();
+    };
+  }, [
+    clearActiveSave,
+    clearPendingNavigation,
+    clearSaveDebounce,
+    clearSaveRetry,
+    noteKey,
+  ]);
+
   const finishPendingNavigation = useCallback(() => {
     const pending = pendingNavigationRef.current;
     if (!pending) {
@@ -8514,21 +8529,21 @@ function ThreadNoteDrawerOpenContent({
                     <BackIcon />
                   </button>
                 ) : null}
-	                {isNotesWorkspace && !isExternalMarkdownFile && owningThreadId ? (
-	                  <button
-	                    type="button"
-	                    className="thread-note-icon-button"
-	                    onClick={() =>
-	                      runAfterSave(
-	                        () =>
-	                          dispatchThreadNoteCommand("openOwningThread", {
-	                            threadId: owningThreadId,
-	                            ownerKind: "thread",
-	                            ownerId: owningThreadId,
-	                          }),
-	                        "open the owning thread"
-	                      )
-	                    }
+                {isNotesWorkspace && !isExternalMarkdownFile && owningThreadId ? (
+                  <button
+                    type="button"
+                    className="thread-note-icon-button"
+                    onClick={() =>
+                      runAfterSave(
+                        () =>
+                          dispatchThreadNoteCommand("openOwningThread", {
+                            threadId: owningThreadId,
+                            ownerKind: "thread",
+                            ownerId: owningThreadId,
+                          }),
+                        "open the owning thread"
+                      )
+                    }
                     aria-label={`Open ${owningThreadTitle}`}
                     title={`Open ${owningThreadTitle}`}
                   >

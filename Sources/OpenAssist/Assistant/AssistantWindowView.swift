@@ -542,8 +542,12 @@ private final class AssistantThreadNoteDraftStore {
     private let diskWriteDebounce: TimeInterval = 0.25
 
     init() {
-        // Best-effort load of any surviving drafts from a prior session.
-        restorePersistedDrafts()
+        Task { @MainActor in
+            let restoredDrafts = await Task.detached(priority: .utility) {
+                Self.loadPersistedDraftsFromDisk()
+            }.value
+            mergePersistedDrafts(restoredDrafts)
+        }
     }
 
     func draft(ownerKey: String, noteID: String) -> String? {
@@ -661,14 +665,25 @@ private final class AssistantThreadNoteDraftStore {
         }
     }
 
-    private func restorePersistedDrafts() {
-        guard let rootURL = Self.draftsRootURL() else { return }
+    private func mergePersistedDrafts(_ restoredDrafts: [String: [String: String]]) {
+        for (ownerKey, drafts) in restoredDrafts where !drafts.isEmpty {
+            var currentDrafts = draftsByOwnerKey[ownerKey] ?? [:]
+            for (noteID, text) in drafts where currentDrafts[noteID] == nil {
+                currentDrafts[noteID] = text
+            }
+            draftsByOwnerKey[ownerKey] = currentDrafts
+        }
+    }
+
+    nonisolated private static func loadPersistedDraftsFromDisk() -> [String: [String: String]] {
+        guard let rootURL = Self.draftsRootURL() else { return [:] }
         guard let ownerDirs = try? FileManager.default.contentsOfDirectory(
             at: rootURL,
             includingPropertiesForKeys: nil
         ) else {
-            return
+            return [:]
         }
+        var restoredDraftsByOwnerKey: [String: [String: String]] = [:]
         for ownerDir in ownerDirs {
             let ownerKey = Self.decodeOwnerKeySegment(ownerDir.lastPathComponent)
             guard let draftFiles = try? FileManager.default.contentsOfDirectory(
@@ -688,16 +703,17 @@ private final class AssistantThreadNoteDraftStore {
                 drafts[noteID] = text
             }
             if !drafts.isEmpty {
-                draftsByOwnerKey[ownerKey] = drafts
+                restoredDraftsByOwnerKey[ownerKey] = drafts
             }
         }
+        return restoredDraftsByOwnerKey
     }
 
     private func diskKey(ownerKey: String, noteID: String) -> String {
         "\(ownerKey)\u{001F}\(noteID)"
     }
 
-    private static func draftsRootURL() -> URL? {
+    nonisolated private static func draftsRootURL() -> URL? {
         guard let appSupport = FileManager.default.urls(
             for: .applicationSupportDirectory,
             in: .userDomainMask
@@ -709,7 +725,7 @@ private final class AssistantThreadNoteDraftStore {
             .appendingPathComponent("note-drafts", isDirectory: true)
     }
 
-    private static func draftFileURL(ownerKey: String, noteID: String) -> URL? {
+    nonisolated private static func draftFileURL(ownerKey: String, noteID: String) -> URL? {
         guard let root = draftsRootURL() else { return nil }
         let encodedOwner = encodeOwnerKeySegment(ownerKey)
         let safeNoteID = noteID.addingPercentEncoding(
@@ -720,13 +736,13 @@ private final class AssistantThreadNoteDraftStore {
             .appendingPathComponent("\(safeNoteID).draft.md")
     }
 
-    private static func encodeOwnerKeySegment(_ ownerKey: String) -> String {
+    nonisolated private static func encodeOwnerKeySegment(_ ownerKey: String) -> String {
         ownerKey.addingPercentEncoding(
             withAllowedCharacters: .urlPathAllowed
         ) ?? ownerKey
     }
 
-    private static func decodeOwnerKeySegment(_ segment: String) -> String {
+    nonisolated private static func decodeOwnerKeySegment(_ segment: String) -> String {
         segment.removingPercentEncoding ?? segment
     }
 }
@@ -2136,15 +2152,28 @@ struct AssistantWindowView: View {
     }
 
     private func openExternalMarkdownFile(at fileURL: URL) {
-        do {
-            notesWorkspaceExternalMarkdownFile = try AssistantExternalMarkdownFileState.load(
-                from: fileURL)
+        isSavingExternalMarkdownFile = true
+        let targetURL = fileURL
+        Task { @MainActor in
+            let result = await Task.detached(priority: .userInitiated) {
+                () -> Result<AssistantExternalMarkdownFileState, AssistantExternalMarkdownFileError> in
+                do {
+                    return .success(try AssistantExternalMarkdownFileState.load(from: targetURL))
+                } catch let error as AssistantExternalMarkdownFileError {
+                    return .failure(error)
+                } catch {
+                    return .failure(.unreadableFile)
+                }
+            }.value
+
+            switch result {
+            case .success(let fileState):
+                notesWorkspaceExternalMarkdownFile = fileState
+            case .failure(let error):
+                assistant.lastStatusMessage =
+                    error.errorDescription ?? "Open Assist could not open that Markdown file."
+            }
             isSavingExternalMarkdownFile = false
-        } catch {
-            let message =
-                (error as? LocalizedError)?.errorDescription
-                ?? "Open Assist could not open that Markdown file."
-            assistant.lastStatusMessage = message
         }
     }
 
@@ -2157,7 +2186,8 @@ struct AssistantWindowView: View {
         requestID: String?,
         draftRevision: Int? = nil,
         text: String?,
-        sourceContainer: AssistantChatWebContainerView?
+        sourceContainer: AssistantChatWebContainerView?,
+        completion: ((Bool) -> Void)? = nil
     ) {
         guard var current = notesWorkspaceExternalMarkdownFile else {
             if let requestID {
@@ -2174,53 +2204,90 @@ struct AssistantWindowView: View {
                     sourceContainer: sourceContainer
                 )
             }
+            completion?(false)
             return
         }
 
         if let text {
             current = current.updatingDraft(text)
+            notesWorkspaceExternalMarkdownFile = current
         }
 
         isSavingExternalMarkdownFile = true
-        do {
-            let saved = try current.saving()
-            notesWorkspaceExternalMarkdownFile = saved
-            if let requestID {
-                sendThreadNoteSaveAck(
-                    AssistantChatWebThreadNoteSaveAck(
-                        requestID: requestID,
-                        ownerKind: nil,
-                        ownerID: nil,
-                        noteID: nil,
-                        draftRevision: draftRevision,
-                        status: "ok",
-                        errorMessage: nil
-                    ),
-                    sourceContainer: sourceContainer
-                )
+        let fileStateToSave = current
+        Task { @MainActor in
+            let result = await Task.detached(priority: .utility) {
+                () -> Result<AssistantExternalMarkdownFileState, AssistantExternalMarkdownFileError> in
+                do {
+                    return .success(try fileStateToSave.saving())
+                } catch let error as AssistantExternalMarkdownFileError {
+                    return .failure(error)
+                } catch {
+                    return .failure(.unwritableFile)
+                }
+            }.value
+
+            switch result {
+            case .success(let saved):
+                if let latest = notesWorkspaceExternalMarkdownFile,
+                   latest.fileURL == fileStateToSave.fileURL
+                {
+                    if latest.draftText == fileStateToSave.draftText {
+                        notesWorkspaceExternalMarkdownFile = saved
+                    } else {
+                        notesWorkspaceExternalMarkdownFile = AssistantExternalMarkdownFileState(
+                            fileURL: latest.fileURL,
+                            fileName: latest.fileName,
+                            savedText: saved.savedText,
+                            draftText: latest.draftText,
+                            lastSavedAt: saved.lastSavedAt,
+                            canSave: saved.canSave
+                        )
+                    }
+                }
+                if let requestID {
+                    sendThreadNoteSaveAck(
+                        AssistantChatWebThreadNoteSaveAck(
+                            requestID: requestID,
+                            ownerKind: nil,
+                            ownerID: nil,
+                            noteID: nil,
+                            draftRevision: draftRevision,
+                            status: "ok",
+                            errorMessage: nil
+                        ),
+                        sourceContainer: sourceContainer
+                    )
+                }
+                completion?(true)
+            case .failure(let error):
+                if let latest = notesWorkspaceExternalMarkdownFile,
+                   latest.fileURL == fileStateToSave.fileURL,
+                   latest.draftText == fileStateToSave.draftText
+                {
+                    notesWorkspaceExternalMarkdownFile = fileStateToSave
+                }
+                let message =
+                    error.errorDescription ?? "Open Assist could not save that Markdown file."
+                assistant.lastStatusMessage = message
+                if let requestID {
+                    sendThreadNoteSaveAck(
+                        AssistantChatWebThreadNoteSaveAck(
+                            requestID: requestID,
+                            ownerKind: nil,
+                            ownerID: nil,
+                            noteID: nil,
+                            draftRevision: draftRevision,
+                            status: "error",
+                            errorMessage: message
+                        ),
+                        sourceContainer: sourceContainer
+                    )
+                }
+                completion?(false)
             }
-        } catch {
-            notesWorkspaceExternalMarkdownFile = current
-            let message =
-                (error as? LocalizedError)?.errorDescription
-                ?? "Open Assist could not save that Markdown file."
-            assistant.lastStatusMessage = message
-            if let requestID {
-                sendThreadNoteSaveAck(
-                    AssistantChatWebThreadNoteSaveAck(
-                        requestID: requestID,
-                        ownerKind: nil,
-                        ownerID: nil,
-                        noteID: nil,
-                        draftRevision: draftRevision,
-                        status: "error",
-                        errorMessage: message
-                    ),
-                    sourceContainer: sourceContainer
-                )
-            }
+            isSavingExternalMarkdownFile = false
         }
-        isSavingExternalMarkdownFile = false
     }
 
     private func closeExternalMarkdownFile() {
@@ -2230,7 +2297,7 @@ struct AssistantWindowView: View {
     }
 
     private func switchAwayFromExternalMarkdownFileIfNeeded(
-        continueAction: () -> Void
+        continueAction: @escaping () -> Void
     ) {
         guard isNotesPaneActive, notesWorkspaceExternalMarkdownFile != nil else {
             continueAction()
@@ -2249,7 +2316,7 @@ struct AssistantWindowView: View {
     }
 
     private func confirmExternalMarkdownDiscardIfNeeded(
-        continueAction: () -> Void
+        continueAction: @escaping () -> Void
     ) {
         guard let externalFile = notesWorkspaceExternalMarkdownFile, externalFile.isDirty else {
             continueAction()
@@ -2267,9 +2334,14 @@ struct AssistantWindowView: View {
 
         switch alert.runModal() {
         case .alertFirstButtonReturn:
-            saveExternalMarkdownFile(requestID: nil, text: nil, sourceContainer: nil)
-            if notesWorkspaceExternalMarkdownFile?.isDirty == false {
-                continueAction()
+            saveExternalMarkdownFile(
+                requestID: nil,
+                text: nil,
+                sourceContainer: nil
+            ) { didSave in
+                if didSave {
+                    continueAction()
+                }
             }
         case .alertSecondButtonReturn:
             continueAction()
@@ -6774,15 +6846,12 @@ struct AssistantWindowView: View {
             return
         }
         guard saveManagedThreadNoteBeforeNavigation(reason: "switch notes") else { return }
-        let previousOwner = currentThreadNoteOwner
-        let previousNoteID = currentSelectedThreadNoteNoteID
         let scope: AssistantNotesScope = owner.kind == .project ? .project : .thread
         let selectedRow = sidebarNoteRows(for: project, scope: scope).first(where: {
             $0.target.ownerKind == owner.kind
                 && $0.target.ownerID.caseInsensitiveCompare(owner.id) == .orderedSame
                 && $0.target.noteID.caseInsensitiveCompare(noteID) == .orderedSame
         })
-        persistThreadNoteIfNeeded(for: previousOwner, noteID: previousNoteID)
         selectedSidebarPane = .notes
         selectedNotesScope = scope
         rememberNotesSelectionTarget(
@@ -15139,7 +15208,10 @@ struct AssistantWindowView: View {
             lines.append("Open note source: \(sourceLabel).")
         }
         if let filePath = ctx.filePath, !filePath.isEmpty {
-            lines.append("Open note file path: \(filePath).")
+            let fileName = URL(fileURLWithPath: filePath).lastPathComponent
+            if !fileName.isEmpty, fileName != ctx.noteTitle {
+                lines.append("Open note file name: \(fileName).")
+            }
         }
 
         let shouldAttachContent =

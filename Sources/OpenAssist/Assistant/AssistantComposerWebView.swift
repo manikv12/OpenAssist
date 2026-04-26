@@ -184,7 +184,18 @@ enum AssistantComposerNoteContentPolicy {
             return true
         }
 
-        let standaloneNoteWorkVerbs = [
+        var shortCommand = normalized
+        for prefix in ["please ", "can you ", "could you ", "help me "] {
+            if shortCommand.hasPrefix(prefix) {
+                shortCommand = String(shortCommand.dropFirst(prefix.count))
+                break
+            }
+        }
+        if shortCommand.hasSuffix(" please") {
+            shortCommand = String(shortCommand.dropLast(" please".count))
+        }
+
+        let bareNoteWorkCommands = [
             "summarize",
             "summarise",
             "organize",
@@ -192,7 +203,23 @@ enum AssistantComposerNoteContentPolicy {
             "clean up",
             "cleanup"
         ]
-        if standaloneNoteWorkVerbs.contains(where: normalized.contains) {
+        if bareNoteWorkCommands.contains(shortCommand) {
+            return true
+        }
+
+        let referentialNoteWorkCommands = [
+            "summarize this",
+            "summarise this",
+            "summarize it",
+            "summarise it",
+            "organize this",
+            "organise this",
+            "organize it",
+            "organise it",
+            "clean this up",
+            "clean it up"
+        ]
+        if referentialNoteWorkCommands.contains(shortCommand) {
             return true
         }
 

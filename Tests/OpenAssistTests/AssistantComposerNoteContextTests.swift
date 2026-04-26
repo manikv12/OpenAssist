@@ -36,6 +36,16 @@ final class AssistantComposerNoteContextTests: XCTestCase {
                 prompt: "Review the pull request"
             )
         )
+        XCTAssertFalse(
+            AssistantComposerNoteContentPolicy.shouldAutoAttachContent(
+                prompt: "Summarize today's market news"
+            )
+        )
+        XCTAssertFalse(
+            AssistantComposerNoteContentPolicy.shouldAutoAttachContent(
+                prompt: "Organize project tasks by owner"
+            )
+        )
     }
 
     func testManagedProjectNoteContextSerializesProjectFields() {
