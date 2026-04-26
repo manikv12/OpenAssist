@@ -208,6 +208,42 @@ final class AssistantSessionSummaryTests: XCTestCase {
         XCTAssertTrue(assistantShouldListSessionInSidebar(filledThread, selectedSessionID: nil))
     }
 
+    func testRemoteSurfaceHidesShadowProviderSessionWhenCanonicalThreadExists() {
+        let shadowSession = AssistantSessionSummary(
+            id: "codex-provider-session",
+            title: "Can you check my screen",
+            source: .appServer,
+            status: .idle,
+            latestUserMessage: "Can you check my screen"
+        )
+
+        XCTAssertFalse(
+            assistantShouldListSessionInRemoteSurface(
+                shadowSession,
+                selectedSessionID: nil,
+                canonicalThreadID: "openassist-thread"
+            )
+        )
+    }
+
+    func testRemoteSurfaceKeepsSelectedSessionVisibleWhileInspectingIt() {
+        let shadowSession = AssistantSessionSummary(
+            id: "codex-provider-session",
+            title: "Can you check my screen",
+            source: .appServer,
+            status: .idle,
+            latestUserMessage: "Can you check my screen"
+        )
+
+        XCTAssertTrue(
+            assistantShouldListSessionInRemoteSurface(
+                shadowSession,
+                selectedSessionID: "codex-provider-session",
+                canonicalThreadID: "openassist-thread"
+            )
+        )
+    }
+
     func testCleanupSessionMergeKeepsRegistryBackedV2Threads() {
         let liveSession = AssistantSessionSummary(
             id: "openassist-live",

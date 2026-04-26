@@ -739,6 +739,18 @@ final class AssistantProjectStore {
         let previousTrimmed = previousText.trimmingCharacters(in: .whitespacesAndNewlines)
         let nextTrimmed = normalizedText.trimmingCharacters(in: .whitespacesAndNewlines)
 
+        if previousText == normalizedText {
+            if manifest.selectedNoteID != resolvedNoteID {
+                manifest.selectedNoteID = resolvedNoteID
+                try storeProjectNoteManifest(manifest, projectID: normalizedProjectID)
+            }
+            return AssistantNotesWorkspace(
+                projectID: normalizedProjectID,
+                manifest: manifest,
+                selectedNoteText: previousText
+            )
+        }
+
         if nextTrimmed.isEmpty, !previousTrimmed.isEmpty, !forceHistorySnapshot {
             return AssistantNotesWorkspace(
                 projectID: normalizedProjectID,

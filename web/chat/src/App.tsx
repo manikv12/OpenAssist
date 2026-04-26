@@ -796,6 +796,22 @@ export function App() {
         );
       },
 
+      handleThreadNoteSaveAck: (result: {
+        requestId: string;
+        ownerKind?: string | null;
+        ownerId?: string | null;
+        noteId?: string | null;
+        draftRevision?: number | null;
+        status: "ok" | "error";
+        errorMessage?: string | null;
+      }) => {
+        window.dispatchEvent(
+          new CustomEvent("openassist:thread-note-save-ack", {
+            detail: result,
+          })
+        );
+      },
+
       setActiveWorkState: (next: ActiveWorkState | null) => {
         activeWorkRef.current = next;
         setActiveWorkState(next);
@@ -967,6 +983,25 @@ declare global {
         rawText?: string | null;
         usedVision?: boolean;
       }) => void;
+      handleThreadNoteSaveAck?: (result: {
+        requestId: string;
+        ownerKind?: string | null;
+        ownerId?: string | null;
+        noteId?: string | null;
+        draftRevision?: number | null;
+        status: "ok" | "error";
+        errorMessage?: string | null;
+      }) => void;
+      flushThreadNoteDraft?: () => {
+        ok: boolean;
+        ownerKind?: string | null;
+        ownerId?: string | null;
+        noteId?: string | null;
+        sourceKind?: string | null;
+        text?: string | null;
+        draftRevision?: number | null;
+        isDirty?: boolean;
+      } | null;
       updateMessage?: (
         messageID: string,
         text: string,

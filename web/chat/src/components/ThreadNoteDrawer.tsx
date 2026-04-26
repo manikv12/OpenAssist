@@ -518,7 +518,12 @@ interface VisibleTopLevelBlock {
   insertAt: number;
 }
 
-const THREAD_NOTE_SAVE_DEBOUNCE_MS = 500;
+const THREAD_NOTE_SAVE_DEBOUNCE_MS = 600;
+// Per-save ack timeout. If Swift doesn't ack within this, retry.
+const THREAD_NOTE_SAVE_ACK_TIMEOUT_MS = 10000;
+const THREAD_NOTE_NAVIGATION_SAVE_TIMEOUT_MS = 3500;
+// Backoff steps for save retries on explicit error or timeout.
+const THREAD_NOTE_SAVE_RETRY_DELAYS_MS: readonly number[] = [500, 1000, 2000, 4000];
 const DEFAULT_COLLAPSIBLE_SECTION_BODY = "Add notes here.";
 const THREAD_NOTE_HEADING_DROP_TARGET_CLASS = "is-drop-target";
 const THREAD_NOTE_INTERNAL_DRAG_MIME = "application/x-openassist-note-drag";
@@ -1349,6 +1354,8 @@ function buildImageSlashCommands(
 export function ThreadNoteDrawer({ state, onDispatchCommand }: Props) {
   const threadId = state?.threadId ?? null;
   const isNotesWorkspace = state?.presentation === "notesWorkspace";
+  const sourceDescriptor = state?.sourceDescriptor ?? null;
+  const isExternalMarkdownFile = sourceDescriptor?.sourceKind === "externalMarkdownFile";
   const ownerKind =
     state?.ownerKind ??
     (state?.notesScope === "project" ? "project" : state?.notesScope === "thread" ? "thread" : null);
@@ -1357,12 +1364,16 @@ export function ThreadNoteDrawer({ state, onDispatchCommand }: Props) {
   const isFullScreenWorkspace = isProjectFullScreen || isNotesWorkspace;
   const isAvailable = isNotesWorkspace
     ? Boolean(state?.isOpen)
-    : Boolean(ownerKind && ownerId && state?.canEdit);
+    : Boolean((ownerKind && ownerId) || isExternalMarkdownFile) && Boolean(state?.canEdit);
   const isOpen = Boolean(state?.isOpen && isAvailable);
   const layerRef = useRef<HTMLDivElement | null>(null);
   const placeholderText =
     state?.placeholder || "Write your thread note. Type / for Markdown blocks.";
-  const statusLabel = state?.isSaving ? "Saving..." : state?.lastSavedAtLabel || "";
+  const statusLabel = state?.isSaving
+    ? "Saving..."
+    : isExternalMarkdownFile && sourceDescriptor?.isDirty
+      ? "Unsaved changes"
+      : state?.lastSavedAtLabel || "";
 
   const handleToggleDrawer = useCallback(() => {
     if (!ownerKind || !ownerId) {
@@ -1414,16 +1425,16 @@ export function ThreadNoteDrawer({ state, onDispatchCommand }: Props) {
         </button>
       ) : null}
 
-      {isOpen && ownerKind ? (
+      {isOpen && (ownerKind || isExternalMarkdownFile) ? (
         <ThreadNoteErrorBoundary
-          resetKey={`${ownerKind}:${ownerId ?? "no-owner"}:${threadId ?? "no-thread"}:${state?.presentation ?? "drawer"}:${state?.viewMode ?? "edit"}:${state?.notesScope ?? "notes"}:${state?.selectedNoteId ?? "no-note"}`}
+          resetKey={`${sourceDescriptor?.sourceKind ?? "managedNote"}:${sourceDescriptor?.filePath ?? "no-file"}:${ownerKind ?? "no-owner-kind"}:${ownerId ?? "no-owner"}:${threadId ?? "no-thread"}:${state?.presentation ?? "drawer"}:${state?.viewMode ?? "edit"}:${state?.notesScope ?? "notes"}:${state?.selectedNoteId ?? "no-note"}`}
           state={state}
         >
           <ThreadNoteDrawerOpenContent
-            key={`${ownerKind}:${ownerId ?? "no-owner"}:${threadId ?? "no-thread"}:${state?.presentation ?? "drawer"}:${state?.viewMode ?? "edit"}:${state?.notesScope ?? "notes"}:${state?.selectedNoteId ?? "no-note"}`}
+            key={`${sourceDescriptor?.sourceKind ?? "managedNote"}:${sourceDescriptor?.filePath ?? "no-file"}:${ownerKind ?? "no-owner-kind"}:${ownerId ?? "no-owner"}:${threadId ?? "no-thread"}:${state?.presentation ?? "drawer"}:${state?.viewMode ?? "edit"}:${state?.notesScope ?? "notes"}:${state?.selectedNoteId ?? "no-note"}`}
             state={state}
             threadId={threadId}
-            ownerKind={ownerKind}
+            ownerKind={ownerKind ?? "project"}
             ownerId={ownerId ?? ""}
             isProjectFullScreen={isProjectFullScreen}
             isNotesWorkspace={isNotesWorkspace}
@@ -1465,6 +1476,8 @@ function ThreadNoteDrawerOpenContent({
 }: ThreadNoteDrawerOpenContentProps) {
   const isFullScreenWorkspace = isProjectFullScreen || isNotesWorkspace;
   const noteId = state?.selectedNoteId ?? null;
+  const sourceDescriptor = state?.sourceDescriptor ?? null;
+  const isExternalMarkdownFile = sourceDescriptor?.sourceKind === "externalMarkdownFile";
   const drawerRef = useRef<HTMLElement | null>(null);
   const floatingLayerRef = useRef<HTMLDivElement | null>(null);
   const editorBodyRef = useRef<HTMLDivElement>(null);
@@ -1678,7 +1691,15 @@ function ThreadNoteDrawerOpenContent({
 
   const isOpen = Boolean(state?.isOpen && state?.canEdit);
   const noteOwnerKey = `${ownerKind}:${ownerId}`;
-  const noteKey = `${noteOwnerKey}:${noteId ?? "none"}`;
+  const currentSaveOwnerKey = isExternalMarkdownFile
+    ? `external:${sourceDescriptor?.filePath ?? "file"}`
+    : noteOwnerKey;
+  const currentSaveNoteId = isExternalMarkdownFile
+    ? sourceDescriptor?.filePath ?? "external-file"
+    : noteId;
+  const noteKey = isExternalMarkdownFile
+    ? `external:${sourceDescriptor?.filePath ?? "none"}`
+    : `${noteOwnerKey}:${noteId ?? "none"}`;
   const isRawMarkdownMode =
     noteEditorSurfaceMode === "markdown" || forcedNoteEditorSurfaceMode === "markdown";
   const isRichEditorMode = !isRawMarkdownMode;
@@ -1732,6 +1753,59 @@ function ThreadNoteDrawerOpenContent({
   const previousProjectTransferOutcomeIdRef = useRef<string | null>(null);
   const latestDraftTextRef = useRef(draftText);
   const hasLocalDirtyChangesRef = useRef(hasLocalDirtyChanges);
+  const draftRevisionRef = useRef(0);
+  const lastSavedDraftRevisionRef = useRef(0);
+  // Track the most recent text we have told Swift about (either via
+  // updateDraft or save). Used to distinguish a "stale echo" state
+  // update (which should NOT overwrite newer local keystrokes) from a
+  // genuinely new external change (which should).
+  const lastSentToSwiftRef = useRef<string>(normalizeLineEndings(state?.text ?? ""));
+  // Track the owner of the previously mounted note so we can flush its
+  // pending edits before the UI switches to a different note.
+  const previousOwnerKindRef = useRef<string | null>(ownerKind ?? null);
+  const previousOwnerIdRef = useRef<string | null>(ownerId ?? null);
+  const previousNoteIdRef = useRef<string | null>(noteId ?? null);
+  const previousThreadIdRef = useRef<string | null>(threadId ?? null);
+  const currentSaveOwnerKeyRef = useRef(currentSaveOwnerKey);
+  const currentSaveNoteIdRef = useRef(currentSaveNoteId ?? "external-file");
+  const activeSaveRef = useRef<{
+    requestId: string;
+    text: string;
+    revision: number;
+    timeoutHandle: number;
+    ownerKey: string;
+    noteId: string;
+    retryCount: number;
+  } | null>(null);
+  const saveDebounceTimeoutRef = useRef<number | null>(null);
+  const saveRetryTimeoutRef = useRef<number | null>(null);
+  const requestSaveRef = useRef<(options?: { force?: boolean; retryCount?: number }) => void>(
+    () => {}
+  );
+  const queueAutosaveRef = useRef<() => void>(() => {});
+  const pendingNavigationRef = useRef<{
+    action: () => void;
+    reason: string;
+    timeoutHandle: number | null;
+  } | null>(null);
+  const [leavePrompt, setLeavePrompt] = useState<{
+    reason: string;
+    message: string;
+  } | null>(null);
+  // Last ack result (ok/error) per note — drives the "Saved" indicator
+  // and the error banner.
+  const [saveStatus, setSaveStatus] = useState<
+    | { kind: "idle" }
+    | { kind: "saving" }
+    | { kind: "saved"; at: number }
+    | { kind: "error"; message: string; at: number }
+  >({ kind: "idle" });
+  const saveStatusRef = useRef(saveStatus);
+  saveStatusRef.current = saveStatus;
+  // Timestamp of the most recent moment the draft contained non-empty
+  // text. Used to distinguish a genuine clear from a paste-replace
+  // micro-blink that transiently empties the document.
+  const lastNonEmptyDraftAtRef = useRef<number>(Date.now());
   const showImageNotice = useCallback((message: string) => {
     setImageNotice(message);
   }, []);
@@ -1741,6 +1815,11 @@ function ThreadNoteDrawerOpenContent({
 
   latestDraftTextRef.current = draftText;
   hasLocalDirtyChangesRef.current = hasLocalDirtyChanges;
+  currentSaveOwnerKeyRef.current = currentSaveOwnerKey;
+  currentSaveNoteIdRef.current = currentSaveNoteId ?? "external-file";
+  if (draftText.trim().length > 0) {
+    lastNonEmptyDraftAtRef.current = Date.now();
+  }
 
   useEffect(() => {
     latestImageUploadContextRef.current = {
@@ -2280,21 +2359,144 @@ function ThreadNoteDrawerOpenContent({
   );
 
   const dispatchDraftUpdate = useCallback(
-    (nextText: string) => {
+    (nextText: string, revision = draftRevisionRef.current) => {
       const normalized = normalizeLineEndings(nextText);
+      if (isExternalMarkdownFile) {
+        lastSentToSwiftRef.current = normalized;
+        onDispatchCommand("updateDraft", {
+          draftRevision: revision,
+          text: normalized,
+        });
+        return;
+      }
       if (!ownerKind || !ownerId || !noteId) {
         return;
       }
+      // Remember what we most recently told Swift about. The external
+      // state echo check in the note-sync effect relies on this ref to
+      // decide whether an incoming state is "what we asked for" (safe to
+      // apply) or "a stale echo" (unsafe — would clobber in-flight keys).
+      lastSentToSwiftRef.current = normalized;
+      // Telemetry (Step 7).
+      console.info("[thread-note save] updateDraft", {
+        noteId,
+        ownerKind,
+        ownerId,
+        byteCount: normalized.length,
+        revision,
+      });
       onDispatchCommand("updateDraft", {
         ...(threadId ? { threadId } : {}),
         ownerKind,
         ownerId,
         noteId,
+        draftRevision: revision,
         text: normalized,
       });
     },
-    [noteId, onDispatchCommand, ownerId, ownerKind, threadId]
+    [isExternalMarkdownFile, noteId, onDispatchCommand, ownerId, ownerKind, threadId]
   );
+
+  const updateDraftTextLocally = useCallback(
+    (nextText: string) => {
+      const normalized = normalizeLineEndings(nextText);
+      const nextRevision = draftRevisionRef.current + 1;
+      draftRevisionRef.current = nextRevision;
+      setDraftText(normalized);
+      setHasLocalDirtyChanges(true);
+      hasLocalDirtyChangesRef.current = true;
+      dispatchDraftUpdate(normalized, nextRevision);
+      queueAutosaveRef.current();
+      return normalized;
+    },
+    [dispatchDraftUpdate]
+  );
+
+  const readCurrentThreadNoteMarkdown = useCallback(() => {
+    const liveEditor = liveEditorRef.current;
+    if (isRichEditorMode && liveEditor && resolveEditorView(liveEditor)) {
+      try {
+        return normalizeLineEndings(
+          normalizeThreadNoteStoredMarkdown(liveEditor.getMarkdown())
+        );
+      } catch (error) {
+        console.error("Failed to read live rich note markdown", error);
+      }
+    }
+    return normalizeLineEndings(
+      normalizeThreadNoteStoredMarkdown(latestDraftTextRef.current)
+    );
+  }, [isRichEditorMode]);
+
+  useEffect(() => {
+    const flushThreadNoteDraft = () => {
+      const text = readCurrentThreadNoteMarkdown();
+      let revision = draftRevisionRef.current;
+      let isDirty = hasLocalDirtyChangesRef.current;
+
+      if (text !== latestDraftTextRef.current) {
+        revision += 1;
+        draftRevisionRef.current = revision;
+        setDraftText(text);
+        latestDraftTextRef.current = text;
+        setHasLocalDirtyChanges(true);
+        hasLocalDirtyChangesRef.current = true;
+        isDirty = true;
+      }
+
+      dispatchDraftUpdate(text, revision);
+
+      return {
+        ok: true,
+        sourceKind: sourceDescriptor?.sourceKind ?? "managedNote",
+        ownerKind: isExternalMarkdownFile ? null : ownerKind,
+        ownerId: isExternalMarkdownFile ? null : ownerId,
+        noteId: isExternalMarkdownFile ? null : noteId,
+        text,
+        draftRevision: revision,
+        isDirty,
+      };
+    };
+
+    let installedBridge: Window["chatBridge"] | null = null;
+    let rafID: number | null = null;
+    let isDisposed = false;
+
+    const installFlushBridge = () => {
+      if (isDisposed) {
+        return;
+      }
+
+      const bridge = window.chatBridge;
+      if (!bridge) {
+        rafID = window.requestAnimationFrame(installFlushBridge);
+        return;
+      }
+
+      installedBridge = bridge;
+      bridge.flushThreadNoteDraft = flushThreadNoteDraft;
+    };
+
+    installFlushBridge();
+
+    return () => {
+      isDisposed = true;
+      if (rafID !== null) {
+        window.cancelAnimationFrame(rafID);
+      }
+      if (installedBridge?.flushThreadNoteDraft === flushThreadNoteDraft) {
+        delete installedBridge.flushThreadNoteDraft;
+      }
+    };
+  }, [
+    dispatchDraftUpdate,
+    isExternalMarkdownFile,
+    noteId,
+    ownerId,
+    ownerKind,
+    readCurrentThreadNoteMarkdown,
+    sourceDescriptor?.sourceKind,
+  ]);
 
   const editor = useEditor(
     {
@@ -2391,10 +2593,7 @@ function ThreadNoteDrawerOpenContent({
                 ],
               });
               const nextMarkdown = normalizeLineEndings(currentEditor.getMarkdown());
-              setDraftText(nextMarkdown);
-              setHasLocalDirtyChanges(true);
-              hasLocalDirtyChangesRef.current = true;
-              dispatchDraftUpdate(nextMarkdown);
+              updateDraftTextLocally(nextMarkdown);
             });
             return true;
           }
@@ -2441,10 +2640,7 @@ function ThreadNoteDrawerOpenContent({
               images: successfulImages,
             });
             const nextMarkdown = normalizeLineEndings(currentEditor.getMarkdown());
-            setDraftText(nextMarkdown);
-            setHasLocalDirtyChanges(true);
-            hasLocalDirtyChangesRef.current = true;
-            dispatchDraftUpdate(nextMarkdown);
+            updateDraftTextLocally(nextMarkdown);
           });
           return true;
         },
@@ -2487,10 +2683,7 @@ function ThreadNoteDrawerOpenContent({
                 images: successfulImages,
               });
               const nextMarkdown = normalizeLineEndings(currentEditor.getMarkdown());
-              setDraftText(nextMarkdown);
-              setHasLocalDirtyChanges(true);
-              hasLocalDirtyChangesRef.current = true;
-              dispatchDraftUpdate(nextMarkdown);
+              updateDraftTextLocally(nextMarkdown);
             });
             return true;
           }
@@ -2500,11 +2693,11 @@ function ThreadNoteDrawerOpenContent({
       },
     },
     [
-      dispatchDraftUpdate,
       placeholderText,
       requestThreadNoteClipboardImageAsset,
       requestThreadNoteImageUploads,
       showImageNotice,
+      updateDraftTextLocally,
     ]
   );
 
@@ -2779,64 +2972,315 @@ function ThreadNoteDrawerOpenContent({
   mermaidPickerStateRef.current = mermaidPicker;
   selectedMermaidIndexRef.current = selectedMermaidIndex;
 
-  const updateDraftTextLocally = useCallback(
-    (nextText: string) => {
-      const normalized = normalizeLineEndings(nextText);
-      setDraftText(normalized);
-      setHasLocalDirtyChanges(true);
-      hasLocalDirtyChangesRef.current = true;
-      dispatchDraftUpdate(normalized);
-      return normalized;
+  const clearSaveDebounce = useCallback(() => {
+    if (saveDebounceTimeoutRef.current !== null) {
+      window.clearTimeout(saveDebounceTimeoutRef.current);
+      saveDebounceTimeoutRef.current = null;
+    }
+  }, []);
+
+  const clearActiveSave = useCallback(() => {
+    const active = activeSaveRef.current;
+    if (active) {
+      window.clearTimeout(active.timeoutHandle);
+      activeSaveRef.current = null;
+    }
+  }, []);
+
+  const clearSaveRetry = useCallback(() => {
+    if (saveRetryTimeoutRef.current !== null) {
+      window.clearTimeout(saveRetryTimeoutRef.current);
+      saveRetryTimeoutRef.current = null;
+    }
+  }, []);
+
+  const clearPendingNavigation = useCallback(() => {
+    const pending = pendingNavigationRef.current;
+    if (pending?.timeoutHandle !== null && pending?.timeoutHandle !== undefined) {
+      window.clearTimeout(pending.timeoutHandle);
+    }
+    pendingNavigationRef.current = null;
+  }, []);
+
+  const finishPendingNavigation = useCallback(() => {
+    const pending = pendingNavigationRef.current;
+    if (!pending) {
+      return;
+    }
+    clearPendingNavigation();
+    setLeavePrompt(null);
+    pending.action();
+  }, [clearPendingNavigation]);
+
+  const showSaveWarning = useCallback((message?: string) => {
+    const pending = pendingNavigationRef.current;
+    if (!pending) {
+      return;
+    }
+    if (pending.timeoutHandle !== null) {
+      window.clearTimeout(pending.timeoutHandle);
+      pendingNavigationRef.current = { ...pending, timeoutHandle: null };
+    }
+    setLeavePrompt({
+      reason: pending.reason,
+      message:
+        message ??
+        "Open Assist has not finished saving your latest note changes yet.",
+      });
+  }, []);
+
+  const scheduleSaveRetry = useCallback(
+    (retryCount: number) => {
+      if (retryCount >= THREAD_NOTE_SAVE_RETRY_DELAYS_MS.length) {
+        return false;
+      }
+      clearSaveRetry();
+      const delay = THREAD_NOTE_SAVE_RETRY_DELAYS_MS[retryCount];
+      const ownerKeyAtSchedule = currentSaveOwnerKeyRef.current;
+      const noteIdAtSchedule = currentSaveNoteIdRef.current;
+      saveRetryTimeoutRef.current = window.setTimeout(() => {
+        saveRetryTimeoutRef.current = null;
+        if (
+          ownerKeyAtSchedule !== currentSaveOwnerKeyRef.current ||
+          noteIdAtSchedule !== currentSaveNoteIdRef.current
+        ) {
+          return;
+        }
+        requestSaveRef.current({ force: true, retryCount: retryCount + 1 });
+      }, delay);
+      return true;
     },
-    [dispatchDraftUpdate]
+    [clearSaveRetry]
   );
 
-  const readCurrentThreadNoteMarkdown = useCallback(() => {
-    return normalizeLineEndings(
-      normalizeThreadNoteStoredMarkdown(latestDraftTextRef.current)
-    );
-  }, []);
+  const startSave = useCallback(
+    (text: string, revision: number, retryCount = 0) => {
+      clearSaveDebounce();
+      clearSaveRetry();
+      if (activeSaveRef.current) {
+        return;
+      }
+      if (isExternalMarkdownFile && !(sourceDescriptor?.canSave ?? false)) {
+        setSaveStatus({
+          kind: "error",
+          message: "This Markdown file is read-only right now.",
+          at: Date.now(),
+        });
+        showSaveWarning("This Markdown file is read-only right now.");
+        return;
+      }
+      if (!isExternalMarkdownFile && (!ownerKind || !ownerId || !noteId)) {
+        setSaveStatus({
+          kind: "error",
+          message: "Open Assist could not find the note to save.",
+          at: Date.now(),
+        });
+        showSaveWarning("Open Assist could not find the note to save.");
+        return;
+      }
+
+      const requestId = createSaveRequestID();
+      const timeoutHandle = window.setTimeout(() => {
+        const active = activeSaveRef.current;
+        if (!active || active.requestId !== requestId) {
+          return;
+        }
+        activeSaveRef.current = null;
+        setSaveStatus({
+          kind: "error",
+          message: "Open Assist is still waiting for the save to finish.",
+          at: Date.now(),
+        });
+        if (!scheduleSaveRetry(retryCount)) {
+          showSaveWarning("Open Assist could not confirm that this note was saved.");
+        }
+      }, THREAD_NOTE_SAVE_ACK_TIMEOUT_MS);
+
+      activeSaveRef.current = {
+        requestId,
+        text,
+        revision,
+        timeoutHandle,
+        ownerKey: currentSaveOwnerKey,
+        noteId: currentSaveNoteId ?? "external-file",
+        retryCount,
+      };
+      lastSentToSwiftRef.current = text;
+      setSaveStatus({ kind: "saving" });
+
+      onDispatchCommand("save", {
+        ...(threadId && !isExternalMarkdownFile ? { threadId } : {}),
+        ...(isExternalMarkdownFile
+          ? {}
+          : { ownerKind: ownerKind!, ownerId: ownerId!, noteId: noteId! }),
+        requestId,
+        draftRevision: revision,
+        text,
+      });
+    },
+    [
+      clearSaveRetry,
+      clearSaveDebounce,
+      currentSaveNoteId,
+      currentSaveOwnerKey,
+      isExternalMarkdownFile,
+      noteId,
+      onDispatchCommand,
+      ownerId,
+      ownerKind,
+      scheduleSaveRetry,
+      showSaveWarning,
+      sourceDescriptor?.canSave,
+      threadId,
+    ]
+  );
+
+  const requestSave = useCallback(
+    (options?: { force?: boolean; retryCount?: number }) => {
+      const text = readCurrentThreadNoteMarkdown();
+      let revision = draftRevisionRef.current;
+      if (text !== latestDraftTextRef.current) {
+        revision += 1;
+        draftRevisionRef.current = revision;
+        setDraftText(text);
+        latestDraftTextRef.current = text;
+        setHasLocalDirtyChanges(true);
+        hasLocalDirtyChangesRef.current = true;
+        dispatchDraftUpdate(text, revision);
+      }
+      const force = options?.force === true;
+
+      if (isExternalMarkdownFile && !force) {
+        return;
+      }
+      if (!force && !hasLocalDirtyChangesRef.current) {
+        return;
+      }
+      if (!force && revision <= lastSavedDraftRevisionRef.current) {
+        return;
+      }
+      if (activeSaveRef.current) {
+        return;
+      }
+      startSave(text, revision, options?.retryCount ?? 0);
+    },
+    [dispatchDraftUpdate, isExternalMarkdownFile, readCurrentThreadNoteMarkdown, startSave]
+  );
+  requestSaveRef.current = requestSave;
 
   const commitSave = useCallback(
     (nextText?: string, options?: { force?: boolean }) => {
       const normalized = normalizeLineEndings(
         nextText ?? readCurrentThreadNoteMarkdown()
       );
-      if (!ownerKind || !ownerId || !noteId) {
+      if (normalized !== latestDraftTextRef.current) {
+        const nextRevision = draftRevisionRef.current + 1;
+        draftRevisionRef.current = nextRevision;
+        setDraftText(normalized);
+        latestDraftTextRef.current = normalized;
+        setHasLocalDirtyChanges(true);
+        hasLocalDirtyChangesRef.current = true;
+        dispatchDraftUpdate(normalized, nextRevision);
+      }
+      requestSave({ force: options?.force === true });
+    },
+    [dispatchDraftUpdate, readCurrentThreadNoteMarkdown, requestSave]
+  );
+
+  const queueManagedAutosave = useCallback(() => {
+    if (
+      isExternalMarkdownFile ||
+      !isOpen ||
+      !ownerKind ||
+      !ownerId ||
+      !noteId
+    ) {
+      return;
+    }
+
+    clearSaveDebounce();
+    saveDebounceTimeoutRef.current = window.setTimeout(() => {
+      saveDebounceTimeoutRef.current = null;
+      commitSave();
+    }, THREAD_NOTE_SAVE_DEBOUNCE_MS);
+  }, [
+    clearSaveDebounce,
+    commitSave,
+    isExternalMarkdownFile,
+    isOpen,
+    noteId,
+    ownerId,
+    ownerKind,
+  ]);
+  queueAutosaveRef.current = queueManagedAutosave;
+
+  const runAfterSave = useCallback(
+    (action: () => void, reason: string) => {
+      const hasExternalUnsavedChanges =
+        isExternalMarkdownFile &&
+        (hasLocalDirtyChangesRef.current || sourceDescriptor?.isDirty === true);
+      const hasManagedUnfinishedWork =
+        !isExternalMarkdownFile &&
+        (hasLocalDirtyChangesRef.current || activeSaveRef.current !== null);
+
+      if (!hasExternalUnsavedChanges && !hasManagedUnfinishedWork) {
+        action();
         return;
       }
-      const shouldForceSave = options?.force === true;
-      if (!shouldForceSave && !hasLocalDirtyChangesRef.current) {
+
+      clearPendingNavigation();
+      const timeoutHandle = window.setTimeout(() => {
+        showSaveWarning();
+      }, THREAD_NOTE_NAVIGATION_SAVE_TIMEOUT_MS);
+      pendingNavigationRef.current = {
+        action,
+        reason,
+        timeoutHandle,
+      };
+
+      if (isExternalMarkdownFile) {
+        showSaveWarning("This file has unsaved changes.");
         return;
       }
-      const previousDraft = normalizeLineEndings(latestDraftTextRef.current ?? "");
-      if (
-        normalized.trim() === "" &&
-        previousDraft.trim() !== "" &&
-        !shouldForceSave
-      ) {
-        return;
-      }
-      setHasLocalDirtyChanges(false);
-      hasLocalDirtyChangesRef.current = false;
-      onDispatchCommand("save", {
-        ...(threadId ? { threadId } : {}),
-        ownerKind,
-        ownerId,
-        noteId,
-        text: normalized,
-      });
+
+      requestSave({ force: true });
     },
     [
-      noteId,
-      onDispatchCommand,
-      ownerId,
-      ownerKind,
-      readCurrentThreadNoteMarkdown,
-      setHasLocalDirtyChanges,
-      threadId,
+      clearPendingNavigation,
+      isExternalMarkdownFile,
+      requestSave,
+      showSaveWarning,
+      sourceDescriptor?.isDirty,
     ]
   );
+
+  const handleSaveWarningRetry = useCallback(() => {
+    setLeavePrompt(null);
+    if (isExternalMarkdownFile) {
+      commitSave(undefined, { force: true });
+      return;
+    }
+    requestSave({ force: true });
+  }, [commitSave, isExternalMarkdownFile, requestSave]);
+
+  const handleSaveWarningLeave = useCallback(() => {
+    const pending = pendingNavigationRef.current;
+    if (!pending) {
+      setLeavePrompt(null);
+      return;
+    }
+    clearSaveDebounce();
+    clearSaveRetry();
+    clearActiveSave();
+    clearPendingNavigation();
+    setLeavePrompt(null);
+    pending.action();
+  }, [clearActiveSave, clearPendingNavigation, clearSaveDebounce, clearSaveRetry]);
+
+  const handleSaveWarningStay = useCallback(() => {
+    clearPendingNavigation();
+    setLeavePrompt(null);
+  }, [clearPendingNavigation]);
 
   const commitEditorMarkdown = useCallback(
     (nextMarkdown: string) => {
@@ -2847,6 +3291,87 @@ function ThreadNoteDrawerOpenContent({
     },
     [commitSave, updateDraftTextLocally]
   );
+
+  useEffect(() => {
+    const handleSaveAck = (event: Event) => {
+      const detail = (event as CustomEvent<{
+        requestId: string;
+        ownerKind?: string;
+        ownerId?: string;
+        noteId?: string;
+        draftRevision?: number | null;
+        status: "ok" | "error";
+        errorMessage?: string;
+      }>).detail;
+      if (!detail?.requestId) {
+        return;
+      }
+      const active = activeSaveRef.current;
+      if (!active || active.requestId !== detail.requestId) {
+        return;
+      }
+      clearActiveSave();
+
+      if (detail.status === "ok") {
+        const acknowledgedRevision = detail.draftRevision ?? active.revision;
+        const latestText = normalizeLineEndings(latestDraftTextRef.current);
+        const ackMatchesCurrentSurface =
+          active.ownerKey === currentSaveOwnerKey &&
+          active.noteId === currentSaveNoteId;
+
+        if (!ackMatchesCurrentSurface) {
+          return;
+        }
+
+        if (
+          acknowledgedRevision === draftRevisionRef.current &&
+          active.text === latestText
+        ) {
+          lastSavedDraftRevisionRef.current = acknowledgedRevision;
+          setHasLocalDirtyChanges(false);
+          hasLocalDirtyChangesRef.current = false;
+          setSaveStatus({ kind: "saved", at: Date.now() });
+          finishPendingNavigation();
+          return;
+        }
+
+        setHasLocalDirtyChanges(true);
+        hasLocalDirtyChangesRef.current = true;
+        requestSave({ force: true });
+        return;
+      }
+
+      setSaveStatus({
+        kind: "error",
+        message:
+          detail.errorMessage ??
+          "Open Assist couldn't save this note. Retrying…",
+        at: Date.now(),
+      });
+      if (!scheduleSaveRetry(active.retryCount)) {
+        showSaveWarning(detail.errorMessage ?? "Open Assist could not save this note.");
+      }
+    };
+
+    window.addEventListener(
+      "openassist:thread-note-save-ack",
+      handleSaveAck as EventListener
+    );
+    return () => {
+      window.removeEventListener(
+        "openassist:thread-note-save-ack",
+        handleSaveAck as EventListener
+      );
+    };
+  }, [
+    clearActiveSave,
+    currentSaveNoteId,
+    currentSaveOwnerKey,
+    finishPendingNavigation,
+    requestSave,
+    scheduleSaveRetry,
+    showSaveWarning,
+  ]);
 
   const focusRawMarkdownEditor = useCallback(
     (selection?: { start: number; end: number }) => {
@@ -3573,14 +4098,17 @@ function ThreadNoteDrawerOpenContent({
       closeNoteContextMenu();
       setNoteLinkPicker(null);
       setNoteLinkSearch("");
-      commitSave();
-      dispatchThreadNoteCommand("openLinkedNote", {
-        ownerKind: target.ownerKind,
-        ownerId: target.ownerId,
-        noteId: target.noteId,
-      });
+      runAfterSave(
+        () =>
+          dispatchThreadNoteCommand("openLinkedNote", {
+            ownerKind: target.ownerKind,
+            ownerId: target.ownerId,
+            noteId: target.noteId,
+          }),
+        "open the linked note"
+      );
     },
-    [closeNoteContextMenu, commitSave, dispatchThreadNoteCommand, notes, showLinkNotice]
+    [closeNoteContextMenu, dispatchThreadNoteCommand, notes, runAfterSave, showLinkNotice]
   );
 
   useEffect(() => {
@@ -3662,6 +4190,20 @@ function ThreadNoteDrawerOpenContent({
 
     if (noteChanged) {
       previousNoteKeyRef.current = noteKey;
+      previousOwnerKindRef.current = ownerKind ?? null;
+      previousOwnerIdRef.current = ownerId ?? null;
+      previousNoteIdRef.current = noteId ?? null;
+      previousThreadIdRef.current = threadId ?? null;
+      clearSaveDebounce();
+      clearSaveRetry();
+      clearActiveSave();
+      clearPendingNavigation();
+      setLeavePrompt(null);
+      // Step 1: seed the "last sent" ref so subsequent external-echo
+      // checks know the baseline for this note.
+      lastSentToSwiftRef.current = externalText;
+      draftRevisionRef.current = 0;
+      lastSavedDraftRevisionRef.current = 0;
       isRichEditorReadyForInputRef.current = false;
       setDraftText(externalText);
       setHasLocalDirtyChanges(false);
@@ -3692,10 +4234,14 @@ function ThreadNoteDrawerOpenContent({
       pendingImagePickerInsertRef.current = null;
       summaryTargetRef.current = null;
       setChartStyleInstruction("");
-    } else if (hasLocalDirtyChanges && draftText === externalText) {
-      setHasLocalDirtyChanges(false);
-      hasLocalDirtyChangesRef.current = false;
-    } else if (!hasLocalDirtyChanges && draftText !== externalText) {
+    } else if (
+      // Step 1: only accept external state when it matches what we
+      // most recently sent to Swift. Otherwise it's a stale echo that
+      // would clobber keystrokes typed during the save round-trip.
+      !hasLocalDirtyChanges &&
+      draftText !== externalText &&
+      externalText === lastSentToSwiftRef.current
+    ) {
       setDraftText(externalText);
     }
 
@@ -3704,7 +4250,12 @@ function ThreadNoteDrawerOpenContent({
     const shouldSyncEditorContent =
       isRichEditorMode &&
       (noteChanged ||
-        (!hasLocalDirtyChanges && draftText !== externalText && !isEditorFocusedSafely));
+        !isRichEditorReadyForInputRef.current ||
+        (!hasLocalDirtyChanges &&
+          draftText !== externalText &&
+          // Step 1: same echo guard for the TipTap document sync.
+          externalText === lastSentToSwiftRef.current &&
+          !isEditorFocusedSafely));
 
     if (editor && shouldSyncEditorContent) {
       const syncEditorContent = () => {
@@ -3729,6 +4280,9 @@ function ThreadNoteDrawerOpenContent({
           if (!synced) {
             return;
           }
+          isRichEditorReadyForInputRef.current = true;
+          setForcedNoteEditorSurfaceMode(null);
+          setEditorLoadNotice(null);
         } else {
           isRichEditorReadyForInputRef.current = true;
           setForcedNoteEditorSurfaceMode(null);
@@ -3751,9 +4305,14 @@ function ThreadNoteDrawerOpenContent({
       }
     };
   }, [
+    clearActiveSave,
+    clearPendingNavigation,
+    clearSaveDebounce,
+    clearSaveRetry,
     draftText,
     editor,
     hasLocalDirtyChanges,
+    isExternalMarkdownFile,
     isRichEditorMode,
     isNotesWorkspace,
     noteKey,
@@ -3792,10 +4351,7 @@ function ThreadNoteDrawerOpenContent({
         return;
       }
       const nextText = normalizeLineEndings(editor.getMarkdown());
-      setDraftText(nextText);
-      setHasLocalDirtyChanges(true);
-      hasLocalDirtyChangesRef.current = true;
-      dispatchDraftUpdate(nextText);
+      updateDraftTextLocally(nextText);
       setHeadingTagEditor(null);
       refreshSlashQuery(editor);
     };
@@ -3808,7 +4364,9 @@ function ThreadNoteDrawerOpenContent({
       if (!isRichEditorReadyForInputRef.current) {
         return;
       }
-      commitSave(editor.getMarkdown());
+      if (!isExternalMarkdownFile) {
+        commitSave(editor.getMarkdown());
+      }
       setIsInTable(editor.isActive("table"));
       window.requestAnimationFrame(() => {
         const activeElement = document.activeElement;
@@ -4269,6 +4827,7 @@ function ThreadNoteDrawerOpenContent({
     closeNoteContextMenu,
     editor,
     isRichEditorMode,
+    isExternalMarkdownFile,
     isNotesWorkspace,
     openHeadingTagEditor,
     mermaidPickerItems,
@@ -4281,7 +4840,7 @@ function ThreadNoteDrawerOpenContent({
     ownerId,
     ownerKind,
     refreshSlashQuery,
-    dispatchDraftUpdate,
+    updateDraftTextLocally,
     state?.viewMode,
     threadId,
   ]);
@@ -4675,19 +5234,39 @@ function ThreadNoteDrawerOpenContent({
   }, [mermaidPicker?.step, mermaidPicker?.type]);
 
   useEffect(() => {
-    if (!isOpen || !ownerKind || !ownerId || !noteId || !hasLocalDirtyChanges) {
+    if (
+      isExternalMarkdownFile ||
+      !isOpen ||
+      !ownerKind ||
+      !ownerId ||
+      !noteId ||
+      !hasLocalDirtyChanges
+    ) {
       return;
     }
 
-    const timeout = window.setTimeout(() => {
+    clearSaveDebounce();
+    saveDebounceTimeoutRef.current = window.setTimeout(() => {
+      saveDebounceTimeoutRef.current = null;
       commitSave();
     }, THREAD_NOTE_SAVE_DEBOUNCE_MS);
 
-    return () => window.clearTimeout(timeout);
-  }, [commitSave, hasLocalDirtyChanges, isOpen, noteId, ownerId, ownerKind]);
+    return () => {
+      clearSaveDebounce();
+    };
+  }, [
+    clearSaveDebounce,
+    commitSave,
+    hasLocalDirtyChanges,
+    isExternalMarkdownFile,
+    isOpen,
+    noteId,
+    ownerId,
+    ownerKind,
+  ]);
 
   useEffect(() => {
-    if (!isOpen || !ownerKind || !ownerId || !noteId) {
+    if (!isOpen || (isExternalMarkdownFile ? !sourceDescriptor?.canSave : (!ownerKind || !ownerId || !noteId))) {
       return;
     }
 
@@ -4706,7 +5285,54 @@ function ThreadNoteDrawerOpenContent({
 
     document.addEventListener("keydown", handleSaveShortcut);
     return () => document.removeEventListener("keydown", handleSaveShortcut);
-  }, [commitSave, isOpen, noteId, ownerId, ownerKind]);
+  }, [commitSave, isExternalMarkdownFile, isOpen, noteId, ownerId, ownerKind, sourceDescriptor?.canSave]);
+
+  // Step 2: page-unload / visibility / blur flush. These fire when the
+  // WKWebView is about to be torn down (app quit, window destroyed) or
+  // loses focus to another window. If we have dirty changes, force-save
+  // synchronously so they don't die with the process.
+  useEffect(() => {
+    const hasUnfinishedSaveWork = () =>
+      hasLocalDirtyChangesRef.current || activeSaveRef.current !== null;
+
+    const flushIfDirty = (reason: string) => {
+      if (!hasLocalDirtyChangesRef.current) {
+        return;
+      }
+      console.info("[thread-note save] exit flush", { reason });
+      if (!isExternalMarkdownFile) {
+        commitSave(undefined, { force: true });
+      }
+    };
+
+    const handlePageHide = () => flushIfDirty("pagehide");
+    const handleBeforeUnload = (event: BeforeUnloadEvent) => {
+      if (!hasUnfinishedSaveWork()) {
+        return;
+      }
+      flushIfDirty("beforeunload");
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "hidden") {
+        flushIfDirty("visibilitychange");
+      }
+    };
+    const handleWindowBlur = () => flushIfDirty("window-blur");
+
+    window.addEventListener("pagehide", handlePageHide);
+    window.addEventListener("beforeunload", handleBeforeUnload);
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    window.addEventListener("blur", handleWindowBlur);
+    return () => {
+      flushIfDirty("unmount");
+      window.removeEventListener("pagehide", handlePageHide);
+      window.removeEventListener("beforeunload", handleBeforeUnload);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+      window.removeEventListener("blur", handleWindowBlur);
+    };
+  }, [commitSave, isExternalMarkdownFile]);
 
   useEffect(() => {
     if (!slashQuery && !mermaidPicker) {
@@ -4854,7 +5480,6 @@ function ThreadNoteDrawerOpenContent({
     if (!canCloseDrawer) {
       return;
     }
-    commitSave();
     if (isRichEditorMode && editor) {
       editor.commands.blur();
     } else {
@@ -4868,14 +5493,17 @@ function ThreadNoteDrawerOpenContent({
     setMermaidEditingContext(null);
     setMermaidPicker(null);
     closeNoteContextMenu();
-    dispatchThreadNoteCommand("setOpen", { isOpen: false });
+    runAfterSave(
+      () => dispatchThreadNoteCommand("setOpen", { isOpen: false }),
+      "close this note"
+    );
   }, [
     canCloseDrawer,
     closeNoteContextMenu,
-    commitSave,
     dispatchThreadNoteCommand,
     editor,
     isRichEditorMode,
+    runAfterSave,
   ]);
 
   useEffect(() => {
@@ -5176,26 +5804,28 @@ function ThreadNoteDrawerOpenContent({
   );
 
   const handleCreateNote = useCallback(() => {
-    commitSave();
     setIsSelectorOpen(false);
     setSelectorFilter("");
     setIsRenamingTitle(false);
-    dispatchThreadNoteCommand("createNote");
-  }, [commitSave, dispatchThreadNoteCommand]);
+    runAfterSave(() => dispatchThreadNoteCommand("createNote"), "create a new note");
+  }, [dispatchThreadNoteCommand, runAfterSave]);
 
   const handleCreateNoteForSource = useCallback(
     (sourceOwnerKind: string, sourceOwnerId: string) => {
-      commitSave();
       setIsSelectorOpen(false);
       setSelectorFilter("");
       setIsRenamingTitle(false);
-      onDispatchCommand("createNote", {
-        ...(threadId ? { threadId } : {}),
-        ownerKind: sourceOwnerKind,
-        ownerId: sourceOwnerId,
-      });
+      runAfterSave(
+        () =>
+          onDispatchCommand("createNote", {
+            ...(threadId ? { threadId } : {}),
+            ownerKind: sourceOwnerKind,
+            ownerId: sourceOwnerId,
+          }),
+        "create a new note"
+      );
     },
-    [commitSave, onDispatchCommand, threadId]
+    [onDispatchCommand, runAfterSave, threadId]
   );
 
   const handleOpenBatchOrganizer = useCallback(() => {
@@ -5523,12 +6153,14 @@ function ThreadNoteDrawerOpenContent({
       if (!historyVersionId) {
         return;
       }
-      commitSave();
-      dispatchThreadNoteCommand("restoreHistoryVersion", { historyVersionId });
       setIsHistoryPanelOpen(false);
       setRecoveryPreview(null);
+      runAfterSave(
+        () => dispatchThreadNoteCommand("restoreHistoryVersion", { historyVersionId }),
+        "restore the saved version"
+      );
     },
-    [commitSave, dispatchThreadNoteCommand]
+    [dispatchThreadNoteCommand, runAfterSave]
   );
 
   const handleDeleteHistoryVersion = useCallback(
@@ -5546,12 +6178,14 @@ function ThreadNoteDrawerOpenContent({
       if (!deletedNoteId) {
         return;
       }
-      commitSave();
-      dispatchThreadNoteCommand("restoreDeletedNote", { deletedNoteId });
       setIsHistoryPanelOpen(false);
       setRecoveryPreview(null);
+      runAfterSave(
+        () => dispatchThreadNoteCommand("restoreDeletedNote", { deletedNoteId }),
+        "restore the deleted note"
+      );
     },
-    [commitSave, dispatchThreadNoteCommand]
+    [dispatchThreadNoteCommand, runAfterSave]
   );
 
   const handleDeleteDeletedNote = useCallback(
@@ -5575,18 +6209,21 @@ function ThreadNoteDrawerOpenContent({
         setIsSelectorOpen(false);
         return;
       }
-      commitSave();
       setIsRenamingTitle(false);
       setSelectorFilter("");
-      onDispatchCommand("selectNote", {
-        ...(threadId ? { threadId } : {}),
-        ownerKind: nextOwnerKind,
-        ownerId: nextOwnerId,
-        noteId: nextNoteId,
-      });
       setIsSelectorOpen(false);
+      runAfterSave(
+        () =>
+          onDispatchCommand("selectNote", {
+            ...(threadId ? { threadId } : {}),
+            ownerKind: nextOwnerKind,
+            ownerId: nextOwnerId,
+            noteId: nextNoteId,
+          }),
+        "switch notes"
+      );
     },
-    [commitSave, noteId, onDispatchCommand, ownerId, ownerKind, threadId]
+    [noteId, onDispatchCommand, ownerId, ownerKind, runAfterSave, threadId]
   );
 
   const handleToggleSelectorMenu = useCallback(() => {
@@ -6172,8 +6809,16 @@ function ThreadNoteDrawerOpenContent({
       const nextMarkdown = normalizeLineEndings(
         isRichEditorMode && editor ? editor.getMarkdown() : latestDraftTextRef.current
       );
+      const previousMarkdown = normalizeLineEndings(latestDraftTextRef.current);
       setDraftText(nextMarkdown);
       latestDraftTextRef.current = nextMarkdown;
+      if (nextMarkdown !== previousMarkdown) {
+        const nextRevision = draftRevisionRef.current + 1;
+        draftRevisionRef.current = nextRevision;
+        setHasLocalDirtyChanges(true);
+        hasLocalDirtyChangesRef.current = true;
+        dispatchDraftUpdate(nextMarkdown, nextRevision);
+      }
 
       setSelectedImage(null);
       setIsInTable(false);
@@ -6217,6 +6862,7 @@ function ThreadNoteDrawerOpenContent({
       editor,
       focusRawMarkdownEditor,
       hideSelectionAssistantActions,
+      dispatchDraftUpdate,
       isRawMarkdownMode,
       isRichEditorMode,
       refreshSlashQuery,
@@ -6547,7 +7193,9 @@ function ThreadNoteDrawerOpenContent({
   const handleRawMarkdownBlur = useCallback(
     (event: React.FocusEvent<HTMLTextAreaElement>) => {
       refreshRawMarkdownSlashQuery(event.currentTarget);
-      commitSave(event.currentTarget.value);
+      if (!isExternalMarkdownFile) {
+        commitSave(event.currentTarget.value);
+      }
       window.requestAnimationFrame(() => {
         const activeElement = document.activeElement;
         const focusInsideFloatingLayer = Boolean(
@@ -6562,7 +7210,7 @@ function ThreadNoteDrawerOpenContent({
         setMermaidPicker(null);
       });
     },
-    [commitSave, refreshRawMarkdownSlashQuery]
+    [commitSave, isExternalMarkdownFile, refreshRawMarkdownSlashQuery]
   );
 
   const handleApplyOrganizeAIDraft = useCallback(
@@ -6887,7 +7535,7 @@ function ThreadNoteDrawerOpenContent({
       state?.availableSources,
     ]
   );
-  const isAIDraftBusy = Boolean(state?.isGeneratingAIDraft);
+  const isAIDraftBusy = !isExternalMarkdownFile && Boolean(state?.isGeneratingAIDraft);
   const selectedChartChoice =
     CHART_TYPE_CHOICES.find((option) => option.type === selectedChartType) ??
     CHART_TYPE_CHOICES[0];
@@ -6921,18 +7569,27 @@ function ThreadNoteDrawerOpenContent({
   const backlinks = state?.backlinks ?? [];
   const graph = state?.graph ?? null;
   const hasLinkedNotesPanel =
-    isNotesWorkspace || outgoingLinks.length > 0 || backlinks.length > 0 || Boolean(graph);
+    !isExternalMarkdownFile &&
+    (isNotesWorkspace || outgoingLinks.length > 0 || backlinks.length > 0 || Boolean(graph));
   const backButtonLabel = state?.previousLinkedNoteTitle?.trim() || "Back";
-  const canCreateNote = state?.canCreateNote ?? true;
+  const canCreateNote = !isExternalMarkdownFile && (state?.canCreateNote ?? true);
   const workspaceProjectTitle = state?.workspaceProjectTitle?.trim() || "Notes";
   const workspaceOwnerSubtitle = state?.workspaceOwnerSubtitle?.trim() || "";
   const owningThreadId = state?.owningThreadId ?? null;
   const owningThreadTitle = state?.owningThreadTitle?.trim() || "Open thread";
-  const noteKindLabel =
-    currentSourceLabel === "Project notes" ? "Project note" : "Thread note";
-  const noteContextPrefix = isNotesWorkspace ? "Notes" : currentSourceLabel;
-  const noteContextLabel =
-    (isNotesWorkspace ? workspaceProjectTitle : state?.ownerTitle?.trim()) || currentSourceLabel;
+  const noteKindLabel = isExternalMarkdownFile
+    ? "Markdown file"
+    : currentSourceLabel === "Project notes"
+      ? "Project note"
+      : "Thread note";
+  const noteContextPrefix = isExternalMarkdownFile
+    ? "Markdown file"
+    : isNotesWorkspace
+      ? "Notes"
+      : currentSourceLabel;
+  const noteContextLabel = isExternalMarkdownFile
+    ? sourceDescriptor?.fileName?.trim() || state?.selectedNoteTitle?.trim() || "Markdown file"
+    : (isNotesWorkspace ? workspaceProjectTitle : state?.ownerTitle?.trim()) || currentSourceLabel;
   const linkedNotesCount = outgoingLinks.length + backlinks.length;
   const relatedNotePreviewLabels = Array.from(
     new Set(
@@ -6946,7 +7603,12 @@ function ThreadNoteDrawerOpenContent({
     : graph
       ? "View the local note graph"
       : "No linked notes yet";
-  const canRequestSummary = hasAnyNotes && Boolean(draftText.trim() || noteSelection?.text?.trim());
+  const canRequestSummary =
+    !isExternalMarkdownFile && hasAnyNotes && Boolean(draftText.trim() || noteSelection?.text?.trim());
+  const canSaveCurrentDocument = isExternalMarkdownFile
+    ? Boolean(sourceDescriptor?.canSave)
+    : Boolean(state?.canEdit);
+  const canUseNoteOnlyActions = !isExternalMarkdownFile && hasAnyNotes;
   const selectedProjectTransferTarget =
     projectNoteTransfer?.targetNoteId
       ? projectNoteTransferTargets.find(
@@ -7112,9 +7774,8 @@ function ThreadNoteDrawerOpenContent({
     [openInternalNoteTarget, showLinkNotice]
   );
   const handleGoBackLinkedNote = useCallback(() => {
-    commitSave();
-    dispatchThreadNoteCommand("goBackLinkedNote");
-  }, [commitSave, dispatchThreadNoteCommand]);
+    runAfterSave(() => dispatchThreadNoteCommand("goBackLinkedNote"), "go back");
+  }, [dispatchThreadNoteCommand, runAfterSave]);
   const shouldShowSummaryAction = Boolean(canRequestSummary || state?.isGeneratingAIDraft);
   const handleOpenOrganizeConfirmation = useCallback(() => {
     if (!canRequestSummary || state?.isGeneratingAIDraft) {
@@ -7309,6 +7970,17 @@ function ThreadNoteDrawerOpenContent({
         {linkNotice ? <span className="thread-note-link-notice">{linkNotice}</span> : null}
         {editorLoadNotice ? (
           <span className="thread-note-link-notice">{editorLoadNotice}</span>
+        ) : null}
+        {saveStatus.kind === "error" ? (
+          <span
+            className="thread-note-link-notice thread-note-save-error"
+            role="status"
+          >
+            {saveStatus.message}
+          </span>
+        ) : null}
+        {saveStatus.kind === "saving" ? (
+          <span className="thread-note-link-notice">Saving...</span>
         ) : null}
         {imageNotice ? <span className="thread-note-link-notice">{imageNotice}</span> : null}
         {screenshotNotice ? (
@@ -7842,24 +8514,39 @@ function ThreadNoteDrawerOpenContent({
                     <BackIcon />
                   </button>
                 ) : null}
-                {isNotesWorkspace && owningThreadId ? (
-                  <button
-                    type="button"
-                    className="thread-note-icon-button"
-                    onClick={() =>
-                      dispatchThreadNoteCommand("openOwningThread", {
-                        threadId: owningThreadId,
-                        ownerKind: "thread",
-                        ownerId: owningThreadId,
-                      })
-                    }
+	                {isNotesWorkspace && !isExternalMarkdownFile && owningThreadId ? (
+	                  <button
+	                    type="button"
+	                    className="thread-note-icon-button"
+	                    onClick={() =>
+	                      runAfterSave(
+	                        () =>
+	                          dispatchThreadNoteCommand("openOwningThread", {
+	                            threadId: owningThreadId,
+	                            ownerKind: "thread",
+	                            ownerId: owningThreadId,
+	                          }),
+	                        "open the owning thread"
+	                      )
+	                    }
                     aria-label={`Open ${owningThreadTitle}`}
                     title={`Open ${owningThreadTitle}`}
                   >
                     <ArrowJumpIcon />
                   </button>
                 ) : null}
-                {hasAnyNotes ? (
+                {isNotesWorkspace ? (
+                  <button
+                    type="button"
+                    className="thread-note-icon-button"
+                    onClick={() => dispatchThreadNoteCommand("openMarkdownFile")}
+                    aria-label="Open Markdown file"
+                    title="Open Markdown file"
+                  >
+                    <span aria-hidden="true">#</span>
+                  </button>
+                ) : null}
+                {canUseNoteOnlyActions ? (
                   <button
                     type="button"
                     className="thread-note-icon-button"
@@ -7870,6 +8557,7 @@ function ThreadNoteDrawerOpenContent({
                     <EditIcon />
                   </button>
                 ) : null}
+                {!isExternalMarkdownFile ? (
                 <button
                   type="button"
                   className={[
@@ -7889,6 +8577,7 @@ function ThreadNoteDrawerOpenContent({
                 >
                   <ScreenshotIcon />
                 </button>
+                ) : null}
                 {screenshotCaptureMenuPosition ? (
                   <div
                     ref={screenshotCaptureMenuRef}
@@ -7958,18 +8647,19 @@ function ThreadNoteDrawerOpenContent({
                     </button>
                   </div>
                 ) : null}
-                {hasAnyNotes ? (
+                {(hasAnyNotes || isExternalMarkdownFile) ? (
                   <button
                     type="button"
                     className="thread-note-icon-button"
                     onClick={handleManualSave}
-                    disabled={!state?.canEdit}
-                    aria-label="Save note"
-                    title="Save note (\u2318S)"
+                    disabled={!canSaveCurrentDocument}
+                    aria-label={isExternalMarkdownFile ? "Save Markdown file" : "Save note"}
+                    title={`${isExternalMarkdownFile ? "Save Markdown file" : "Save note"} (\u2318S)`}
                   >
                     <SaveIcon />
                   </button>
                 ) : null}
+                {canUseNoteOnlyActions ? (
                 <button
                   className="thread-note-icon-button is-danger"
                   type="button"
@@ -7980,6 +8670,23 @@ function ThreadNoteDrawerOpenContent({
                 >
                   <TrashIcon />
                 </button>
+                ) : null}
+                {isExternalMarkdownFile ? (
+                  <button
+                    type="button"
+                    className="thread-note-icon-button"
+                    onClick={() =>
+                      runAfterSave(
+                        () => dispatchThreadNoteCommand("closeMarkdownFile"),
+                        "close this Markdown file"
+                      )
+                    }
+                    aria-label="Close Markdown file"
+                    title="Close Markdown file"
+                  >
+                    <span aria-hidden="true">×</span>
+                  </button>
+                ) : null}
                 <div className="thread-note-overflow-wrap">
                   <button
                     ref={overflowMenuTriggerRef}
@@ -8005,6 +8712,19 @@ function ThreadNoteDrawerOpenContent({
                         className="thread-note-overflow-item"
                         onClick={() => {
                           setIsOverflowMenuOpen(false);
+                          dispatchThreadNoteCommand("openMarkdownFile");
+                        }}
+                      >
+                        <span className="thread-note-overflow-item-glyph">#</span>
+                        <span>Open Markdown File</span>
+                      </button>
+                      {!isExternalMarkdownFile ? (
+                      <button
+                        type="button"
+                        role="menuitem"
+                        className="thread-note-overflow-item"
+                        onClick={() => {
+                          setIsOverflowMenuOpen(false);
                           handleOpenImagePicker();
                         }}
                         disabled={!hasAnyNotes || !state?.canEdit}
@@ -8012,7 +8732,8 @@ function ThreadNoteDrawerOpenContent({
                         <ImageIcon />
                         <span>Add image</span>
                       </button>
-                      {hasAnyNotes ? (
+                      ) : null}
+                      {canUseNoteOnlyActions ? (
                         <button
                           type="button"
                           role="menuitem"
@@ -8029,22 +8750,24 @@ function ThreadNoteDrawerOpenContent({
                           </span>
                         </button>
                       ) : null}
-                      <button
-                        type="button"
-                        role="menuitem"
-                        className="thread-note-overflow-item"
-                        onClick={() => {
-                          setIsOverflowMenuOpen(false);
-                          handleCreateNote();
-                        }}
-                        disabled={!canCreateNote}
-                      >
-                        <PlusIcon />
-                        <span>
-                          New {currentSourceLabel.toLowerCase().replace("notes", "note")}
-                        </span>
-                      </button>
-                      {isNotesWorkspace && state?.workspaceProjectId ? (
+                      {!isExternalMarkdownFile ? (
+                        <button
+                          type="button"
+                          role="menuitem"
+                          className="thread-note-overflow-item"
+                          onClick={() => {
+                            setIsOverflowMenuOpen(false);
+                            handleCreateNote();
+                          }}
+                          disabled={!canCreateNote}
+                        >
+                          <PlusIcon />
+                          <span>
+                            New {currentSourceLabel.toLowerCase().replace("notes", "note")}
+                          </span>
+                        </button>
+                      ) : null}
+                      {isNotesWorkspace && !isExternalMarkdownFile && state?.workspaceProjectId ? (
                         <button
                           type="button"
                           role="menuitem"
@@ -8058,7 +8781,7 @@ function ThreadNoteDrawerOpenContent({
                           <span>Organize selected notes</span>
                         </button>
                       ) : null}
-                      {!isFullScreenWorkspace ? (
+                      {!isFullScreenWorkspace && !isExternalMarkdownFile ? (
                         <button
                           type="button"
                           role="menuitem"
@@ -8087,6 +8810,23 @@ function ThreadNoteDrawerOpenContent({
                         >
                           <ExpandIcon expanded={isExpanded} />
                           <span>{isExpanded ? "Collapse note" : "Expand note"}</span>
+                        </button>
+                      ) : null}
+                      {isExternalMarkdownFile ? (
+                        <button
+                          type="button"
+                          role="menuitem"
+                          className="thread-note-overflow-item"
+                          onClick={() => {
+                            setIsOverflowMenuOpen(false);
+                            runAfterSave(
+                              () => dispatchThreadNoteCommand("closeMarkdownFile"),
+                              "close this Markdown file"
+                            );
+                          }}
+                        >
+                          <span className="thread-note-overflow-item-glyph">←</span>
+                          <span>Back to notes</span>
                         </button>
                       ) : null}
                     </div>
@@ -8158,6 +8898,15 @@ function ThreadNoteDrawerOpenContent({
                   {currentSourceLabel === "Project notes"
                     ? "New project note"
                     : "New thread note"}
+                </button>
+              ) : null}
+              {isNotesWorkspace ? (
+                <button
+                  type="button"
+                  className="thread-note-empty-button"
+                  onClick={() => dispatchThreadNoteCommand("openMarkdownFile")}
+                >
+                  Open Markdown File
                 </button>
               ) : null}
             </div>
@@ -9633,6 +10382,56 @@ function ThreadNoteDrawerOpenContent({
                   }}
                 >
                   Insert into note
+                </button>
+              </div>
+            </div>
+          </div>
+        ) : null}
+
+        {leavePrompt ? (
+          <div className="thread-note-dialog-layer" onClick={handleSaveWarningStay}>
+            <div
+              className="thread-note-dialog thread-note-save-warning-modal"
+              onClick={(event) => event.stopPropagation()}
+            >
+              <div className="thread-note-dialog-header">
+                <div className="thread-note-dialog-copy">
+                  <h2>Save changes first?</h2>
+                  <p>
+                    {leavePrompt.message} Save before you {leavePrompt.reason}, or stay
+                    here and keep editing.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  className="thread-note-icon-button thread-note-dialog-close"
+                  onClick={handleSaveWarningStay}
+                  aria-label="Stay on note"
+                >
+                  ×
+                </button>
+              </div>
+              <div className="thread-note-dialog-footer">
+                <button
+                  type="button"
+                  className="oa-button"
+                  onClick={handleSaveWarningStay}
+                >
+                  Stay
+                </button>
+                <button
+                  type="button"
+                  className="oa-button"
+                  onClick={handleSaveWarningLeave}
+                >
+                  Leave without saving
+                </button>
+                <button
+                  type="button"
+                  className="oa-button oa-button--primary"
+                  onClick={handleSaveWarningRetry}
+                >
+                  Save again
                 </button>
               </div>
             </div>
@@ -13037,6 +13836,14 @@ function createThreadNoteScreenshotRequestID(): string {
   }
 
   return `thread-note-screenshot-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function createSaveRequestID(): string {
+  if (typeof window !== "undefined" && window.crypto?.randomUUID) {
+    return window.crypto.randomUUID();
+  }
+
+  return `thread-note-save-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
 function readFileAsDataURL(file: File): Promise<string | null> {

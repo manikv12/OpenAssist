@@ -1,6 +1,15 @@
 /* ── Reset ── */
 *{margin:0;padding:0;box-sizing:border-box;}
 
+/* Pause all CSS animations when the host window is hidden/occluded.
+   Swift toggles `oa-idle` on <html> via AssistantChatWebView. */
+html.oa-idle,
+html.oa-idle *,
+html.oa-idle *::before,
+html.oa-idle *::after {
+  animation-play-state: paused !important;
+}
+
 :root {
   color-scheme: dark light;
   --chat-bg: rgb(13,17,23);
@@ -642,18 +651,28 @@ body {
 
 .thread-note-layer.is-project-fullscreen .thread-note-header-actions.is-project-document {
   display: flex;
-  flex-direction: column;
-  align-items: flex-end;
+  flex-direction: row;
+  align-items: center;
   justify-content: flex-end;
   gap: 10px;
-  flex-wrap: nowrap;
+  flex-wrap: wrap;
   flex: 0 0 auto;
   min-width: 0;
-  align-self: flex-start;
+  align-self: center;
 }
 
 .thread-note-layer.is-notes-workspace .thread-note-header-actions.is-project-document {
   min-width: 0;
+  flex-direction: row;
+  align-items: center;
+  align-self: center;
+  gap: 10px;
+}
+
+.thread-note-layer.is-notes-workspace .thread-note-document-meta-row,
+.thread-note-layer.is-project-fullscreen .thread-note-document-meta-row {
+  align-items: center;
+  gap: 16px;
 }
 
 .thread-note-layer.is-project-fullscreen .thread-note-utility-actions.is-inline-utility {
@@ -673,26 +692,39 @@ body {
 }
 
 .thread-note-layer.is-project-fullscreen .thread-note-editor-shell {
-  border-radius: 28px;
-  border: 0.8px solid rgba(255,255,255,0.05);
+  border-radius: 20px;
+  border: 0.8px solid rgba(255,255,255,0.04);
   background:
-    radial-gradient(circle at top, color-mix(in srgb, var(--thread-note-accent) 3%, transparent), transparent 36%),
-    linear-gradient(180deg, rgba(15,18,24,0.97), rgba(10,13,18,0.985));
-  box-shadow:
-    inset 0 1px 0 rgba(255,255,255,0.03),
-    0 16px 34px rgba(0,0,0,0.12);
+    radial-gradient(circle at top, color-mix(in srgb, var(--thread-note-accent) 2.2%, transparent), transparent 40%),
+    linear-gradient(180deg, rgba(13,16,22,0.6), rgba(10,13,18,0.7));
+  box-shadow: none;
+}
+
+.thread-note-layer.is-notes-workspace .thread-note-editor-shell {
+  border-radius: 18px;
+  border: 0.8px solid rgba(255,255,255,0.04);
+  background:
+    radial-gradient(circle at top, color-mix(in srgb, var(--thread-note-accent) 1.8%, transparent), transparent 42%),
+    linear-gradient(180deg, rgba(12,15,21,0.55), rgba(9,12,17,0.65));
+  box-shadow: none;
 }
 
 .thread-note-layer.is-project-fullscreen .thread-note-editor-body {
-  padding: 0 clamp(18px, 2vw, 32px);
+  padding: 0 clamp(10px, 1.2vw, 20px);
 }
 
 .thread-note-layer.is-project-fullscreen .thread-note-editor-content .thread-note-tiptap {
-  max-width: 920px;
+  max-width: min(1120px, 100%);
   margin: 0 auto;
-  padding: clamp(34px, 3.2vw, 48px) 0 76px;
-  font-size: 15.8px;
-  line-height: 1.86;
+  padding: clamp(34px, 3.2vw, 48px) clamp(12px, 1.6vw, 28px) 76px;
+  font-size: 16px;
+  line-height: 1.82;
+}
+
+.thread-note-layer.is-notes-workspace .thread-note-editor-content .thread-note-tiptap {
+  max-width: min(1160px, 100%);
+  margin: 0 auto;
+  padding: clamp(32px, 2.8vw, 44px) clamp(18px, 2vw, 36px) 72px;
 }
 
 .thread-note-layer.is-project-fullscreen .thread-note-editor-content .thread-note-tiptap h1,
@@ -769,17 +801,20 @@ body {
 }
 
 .thread-note-layer.is-notes-workspace .thread-note-links-panel.is-notes-workspace {
-  margin: 14px 4px 0;
+  margin: 20px 0 0;
   width: 100%;
   max-width: 100%;
   min-width: 0;
   min-height: initial;
-  padding: 0;
-  border-radius: 0;
+  padding: 18px 20px 20px;
+  padding-right: 44px;
+  border-radius: 16px;
   overflow: hidden;
   max-height: none;
-  background: transparent;
-  border: none;
+  background:
+    linear-gradient(180deg, rgba(255,255,255,0.012), rgba(255,255,255,0.004)),
+    rgba(10,13,18,0.4);
+  border: 0.8px solid rgba(255,255,255,0.055);
   box-shadow: none;
   backdrop-filter: none;
   align-self: stretch;
@@ -1723,16 +1758,28 @@ body {
   letter-spacing: 0.01em;
 }
 
+.thread-note-link-notice.thread-note-save-error {
+  background: rgba(255, 100, 100, 0.12);
+  border-color: rgba(255, 100, 100, 0.36);
+  color: rgb(255, 170, 170);
+}
+
 .thread-note-links-panel {
   display: flex;
   flex-direction: column;
-  gap: 12px;
-  margin: 14px 6px 0;
-  padding: 0;
+  gap: 14px;
+  margin: 20px 0 0;
+  padding: 18px 20px 20px;
+  padding-right: 40px;
   width: 100%;
   min-width: 0;
   max-width: 100%;
   box-sizing: border-box;
+  border-radius: 16px;
+  border: 0.8px solid rgba(255,255,255,0.055);
+  background:
+    linear-gradient(180deg, rgba(255,255,255,0.012), rgba(255,255,255,0.004)),
+    rgba(10,13,18,0.4);
 }
 
 .thread-note-links-toggle {
@@ -1743,88 +1790,90 @@ body {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
-  padding: 14px 16px;
-  border-radius: 18px;
-  border: 0.6px solid rgba(255,255,255,0.06);
-  background:
-    linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.008)),
-    rgba(255,255,255,0.012);
+  gap: 14px;
+  padding: 0;
+  border-radius: 0;
+  border: none;
+  background: transparent;
   color: var(--chat-text-strong);
   text-align: left;
   box-sizing: border-box;
   overflow: hidden;
   cursor: pointer;
-  transition:
-    background 0.14s ease,
-    border-color 0.14s ease,
-    transform 0.14s ease;
+  transition: opacity 0.14s ease;
 }
 
 .thread-note-links-toggle:hover {
-  background:
-    linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0.012)),
-    rgba(255,255,255,0.018);
-  border-color: rgba(255,255,255,0.10);
-  transform: translateY(-1px);
+  background: transparent;
+  border: none;
+  transform: none;
+  opacity: 0.88;
 }
 
 .thread-note-links-toggle-main {
   display: flex;
-  flex-direction: column;
-  gap: 4px;
+  flex-direction: row;
+  align-items: baseline;
+  gap: 12px;
   min-width: 0;
   flex: 1 1 auto;
 }
 
 .thread-note-links-toggle-label {
-  font-size: 12px;
+  font-size: 11px;
   font-weight: 700;
-  letter-spacing: 0.08em;
+  letter-spacing: 0.12em;
   text-transform: uppercase;
-  color: rgba(255,255,255,0.66);
+  color: rgba(255,255,255,0.5);
+  flex: 0 0 auto;
 }
 
 .thread-note-links-toggle-meta {
-  color: rgba(255,255,255,0.80);
-  font-size: 12.25px;
-  line-height: 1.45;
+  color: rgba(255,255,255,0.62);
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1.4;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  min-width: 0;
 }
 
 .thread-note-links-toggle-side {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
+  gap: 10px;
   flex: 0 0 auto;
   white-space: nowrap;
+  color: rgba(255,255,255,0.55);
 }
 
 .thread-note-links-toggle-count {
-  min-width: 26px;
-  height: 24px;
-  padding: 0 8px;
+  min-width: 22px;
+  height: 20px;
+  padding: 0 7px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   border-radius: 999px;
-  border: 0.6px solid rgba(255,255,255,0.08);
-  background: rgba(255,255,255,0.03);
-  color: rgba(255,255,255,0.82);
-  font-size: 11px;
+  border: none;
+  background: color-mix(in srgb, var(--thread-note-accent) 18%, rgba(255,255,255,0.04));
+  color: color-mix(in srgb, var(--thread-note-accent) 60%, rgba(255,255,255,0.85));
+  font-size: 10.5px;
   font-weight: 700;
+  letter-spacing: 0.02em;
 }
 
 .thread-note-links-body {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(min(220px, 100%), 1fr));
-  gap: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(min(260px, 100%), 1fr));
+  gap: 14px;
   width: 100%;
   min-width: 0;
   max-width: 100%;
   box-sizing: border-box;
+  padding-top: 14px;
+  border-top: 0.6px solid rgba(255,255,255,0.05);
 }
 
 .thread-note-links-section {
@@ -1832,18 +1881,18 @@ body {
   flex-direction: column;
   gap: 10px;
   min-width: 0;
-  padding: 14px 14px 15px;
-  border-radius: 16px;
-  border: 0.6px solid rgba(255,255,255,0.06);
-  background:
-    linear-gradient(180deg, rgba(255,255,255,0.018), rgba(255,255,255,0.008)),
-    rgba(255,255,255,0.01);
+  padding: 0;
+  border-radius: 0;
+  border: none;
+  background: transparent;
   box-sizing: border-box;
   overflow: hidden;
 }
 
 .thread-note-links-section.thread-note-links-graph-row {
   grid-column: 1 / -1;
+  padding-top: 12px;
+  border-top: 0.6px solid rgba(255,255,255,0.05);
 }
 
 .thread-note-links-section-header {
@@ -1852,83 +1901,129 @@ body {
   justify-content: space-between;
   gap: 12px;
   min-width: 0;
-  flex-wrap: wrap;
-  color: var(--chat-text-muted);
-  font-size: 11px;
-  font-weight: 650;
-  letter-spacing: 0.04em;
+  flex-wrap: nowrap;
+  color: rgba(255,255,255,0.46);
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
   text-transform: uppercase;
 }
 
-.thread-note-links-section-header span {
+.thread-note-links-section-header > span:first-child {
   min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.thread-note-links-section-header > span:last-child {
+  flex: 0 0 auto;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: rgba(255,255,255,0.04);
+  color: rgba(255,255,255,0.7);
+  font-size: 10.5px;
+  letter-spacing: 0.04em;
 }
 
 .thread-note-links-chip-grid {
   display: flex;
-  flex-wrap: wrap;
-  gap: 10px;
+  flex-direction: column;
+  gap: 6px;
   min-width: 0;
   max-width: 100%;
 }
 
 .thread-note-link-chip {
   appearance: none;
+  position: relative;
   min-width: 0;
   max-width: 100%;
-  display: inline-flex;
+  display: flex;
   flex-direction: column;
   align-items: flex-start;
   gap: 3px;
-  padding: 10px 12px;
-  border-radius: 14px;
-  border: 0.6px solid rgba(255,255,255,0.06);
-  background: rgba(255,255,255,0.018);
+  padding: 10px 14px 10px 14px;
+  border-radius: 10px;
+  border: 0.6px solid rgba(255,255,255,0.055);
+  background: rgba(255,255,255,0.014);
   color: var(--chat-text-strong);
   cursor: pointer;
   text-align: left;
   box-sizing: border-box;
   overflow: hidden;
-  transition: background 0.14s ease, border-color 0.14s ease, transform 0.14s ease;
+  transition:
+    background 0.14s ease,
+    border-color 0.14s ease,
+    transform 0.14s ease;
+}
+
+.thread-note-link-chip::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 8px;
+  bottom: 8px;
+  width: 2px;
+  border-radius: 0 2px 2px 0;
+  background: color-mix(in srgb, var(--thread-note-accent) 42%, transparent);
+  opacity: 0.75;
+  transition: opacity 0.14s ease, background 0.14s ease;
 }
 
 .thread-note-link-chip:hover {
-  background: rgba(255,255,255,0.045);
-  border-color: rgba(255,255,255,0.12);
+  background: rgba(255,255,255,0.035);
+  border-color: rgba(255,255,255,0.11);
   transform: translateY(-1px);
 }
 
+.thread-note-link-chip:hover::before {
+  opacity: 1;
+  background: color-mix(in srgb, var(--thread-note-accent) 68%, transparent);
+}
+
 .thread-note-link-chip.is-missing {
-  color: rgba(255,255,255,0.62);
+  color: rgba(255,255,255,0.52);
   border-style: dashed;
   cursor: default;
 }
 
+.thread-note-link-chip.is-missing::before {
+  background: rgba(255,255,255,0.14);
+  opacity: 0.5;
+}
+
 .thread-note-link-chip.is-missing:hover {
   transform: none;
-  background: rgba(255,255,255,0.02);
+  background: rgba(255,255,255,0.014);
+  border-color: rgba(255,255,255,0.055);
 }
 
 .thread-note-link-chip-title {
-  font-size: 12.5px;
-  font-weight: 650;
-  line-height: 1.3;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.35;
+  letter-spacing: -0.005em;
   max-width: 100%;
   overflow-wrap: anywhere;
+  color: var(--chat-text-strong);
 }
 
 .thread-note-link-chip-meta {
-  color: var(--chat-text-muted);
+  color: rgba(255,255,255,0.5);
   font-size: 11px;
+  font-weight: 500;
   line-height: 1.35;
   max-width: 100%;
   overflow-wrap: anywhere;
 }
 
 .thread-note-links-empty {
-  color: var(--chat-text-soft);
+  color: rgba(255,255,255,0.42);
   font-size: 12px;
+  font-style: italic;
   line-height: 1.5;
+  padding: 8px 0 2px;
 }
 
 .thread-note-links-graph-row {
@@ -2311,6 +2406,10 @@ body {
 
 .thread-note-organize-modal {
   max-width: 400px;
+}
+
+.thread-note-save-warning-modal {
+  max-width: 460px;
 }
 
 .thread-note-screenshot-import-modal {
@@ -9715,6 +9814,113 @@ mark.find-highlight.find-active {
   gap: 8px;
   overflow-x: auto;
   padding-bottom: 2px;
+}
+
+.oa-react-composer__chip-row--context {
+  overflow-x: visible;
+}
+
+.oa-react-composer__note-context-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  max-width: 100%;
+  padding: 6px 6px 6px 12px;
+  border-radius: 999px;
+  border: 0.6px solid color-mix(in srgb, var(--chat-accent-strong) 28%, rgba(255,255,255,0.08));
+  background: color-mix(in srgb, var(--chat-accent-strong) 8%, rgba(255,255,255,0.02));
+  color: var(--chat-text);
+  font-size: 12px;
+  line-height: 1.2;
+}
+
+.oa-react-composer__note-context-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: color-mix(in srgb, var(--chat-accent-strong) 75%, rgba(255,255,255,0.6));
+  flex: 0 0 auto;
+}
+
+.oa-react-composer__note-context-copy {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.oa-react-composer__note-context-label {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: rgba(255,255,255,0.5);
+  flex: 0 0 auto;
+}
+
+.oa-react-composer__note-context-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12.25px;
+  font-weight: 600;
+  color: var(--chat-text-strong);
+}
+
+.oa-react-composer__note-context-sep {
+  color: rgba(255,255,255,0.35);
+  font-weight: 400;
+}
+
+.oa-react-composer__note-context-toggle {
+  appearance: none;
+  flex: 0 0 auto;
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 0.6px solid rgba(255,255,255,0.08);
+  background: rgba(255,255,255,0.02);
+  color: rgba(255,255,255,0.7);
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.01em;
+  cursor: pointer;
+  transition: background 0.14s ease, border-color 0.14s ease, color 0.14s ease;
+}
+
+.oa-react-composer__note-context-toggle:hover {
+  background: rgba(255,255,255,0.05);
+  border-color: rgba(255,255,255,0.14);
+  color: var(--chat-text-strong);
+}
+
+.oa-react-composer__note-context-toggle.is-on {
+  border-color: color-mix(in srgb, var(--chat-accent-strong) 40%, rgba(255,255,255,0.14));
+  background: color-mix(in srgb, var(--chat-accent-strong) 18%, rgba(255,255,255,0.04));
+  color: color-mix(in srgb, var(--chat-accent-strong) 70%, rgba(255,255,255,0.9));
+}
+
+.oa-react-composer__note-context-dismiss {
+  appearance: none;
+  flex: 0 0 auto;
+  width: 22px;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  border: none;
+  background: rgba(255,255,255,0.04);
+  color: rgba(255,255,255,0.6);
+  cursor: pointer;
+  transition: background 0.14s ease, color 0.14s ease;
+}
+
+.oa-react-composer__note-context-dismiss:hover {
+  background: rgba(255,255,255,0.09);
+  color: var(--chat-text-strong);
 }
 
 .oa-react-composer__chip {

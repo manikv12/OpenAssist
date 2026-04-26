@@ -520,25 +520,214 @@ private final class AssistantThreadNoteMenuSelectionHandler: NSObject {
 }
 
 @MainActor
+/// In-memory draft cache plus a debounced disk mirror. The disk mirror
+/// exists so that if the app is hard-killed (crash, force quit, power
+/// loss) between the last keystroke and the next successful save, we
+/// can recover the unsaved text on relaunch.
+///
+/// Layout on disk:
+///   ~/Library/Application Support/OpenAssist/note-drafts/
+///       <urlEncoded ownerKey>/<noteID>.draft.md
+///
+/// Draft files are deleted after a successful save via
+/// `clearPersistedDraft(ownerKey:noteID:)`.
 private final class AssistantThreadNoteDraftStore {
     private var draftsByOwnerKey: [String: [String: String]] = [:]
+    private var revisionsByOwnerKey: [String: [String: Int]] = [:]
+    private var pendingDiskWrites: [String: DispatchWorkItem] = [:]
+    private let diskWriteQueue = DispatchQueue(
+        label: "OpenAssist.threadNoteDraftStore.disk",
+        qos: .utility
+    )
+    private let diskWriteDebounce: TimeInterval = 0.25
+
+    init() {
+        // Best-effort load of any surviving drafts from a prior session.
+        restorePersistedDrafts()
+    }
 
     func draft(ownerKey: String, noteID: String) -> String? {
         draftsByOwnerKey[ownerKey]?[noteID]
+    }
+
+    func draftRevision(ownerKey: String, noteID: String) -> Int? {
+        revisionsByOwnerKey[ownerKey]?[noteID]
     }
 
     func drafts(ownerKey: String) -> [String: String] {
         draftsByOwnerKey[ownerKey] ?? [:]
     }
 
-    func setDraft(_ text: String, ownerKey: String, noteID: String) {
+    func setDraft(_ text: String, ownerKey: String, noteID: String, revision: Int? = nil) {
+        if let revision,
+           let currentRevision = revisionsByOwnerKey[ownerKey]?[noteID],
+           revision < currentRevision
+        {
+            return
+        }
+
         var drafts = draftsByOwnerKey[ownerKey] ?? [:]
         drafts[noteID] = text
         draftsByOwnerKey[ownerKey] = drafts
+
+        if let revision {
+            var revisions = revisionsByOwnerKey[ownerKey] ?? [:]
+            revisions[noteID] = revision
+            revisionsByOwnerKey[ownerKey] = revisions
+        }
+        schedulePersist(ownerKey: ownerKey, noteID: noteID, text: text)
     }
 
     func replaceDrafts(_ drafts: [String: String], ownerKey: String) {
         draftsByOwnerKey[ownerKey] = drafts
+        if var revisions = revisionsByOwnerKey[ownerKey] {
+            let validNoteIDs = Set(drafts.keys)
+            revisions = revisions.filter { validNoteIDs.contains($0.key) }
+            revisionsByOwnerKey[ownerKey] = revisions
+        }
+        for (noteID, text) in drafts {
+            schedulePersist(ownerKey: ownerKey, noteID: noteID, text: text)
+        }
+    }
+
+    /// Call after a successful persisted save so the draft backup can
+    /// be cleaned up. The in-memory cache stays in place; only the
+    /// disk mirror is removed.
+    func clearPersistedDraft(ownerKey: String, noteID: String) {
+        let key = diskKey(ownerKey: ownerKey, noteID: noteID)
+        pendingDiskWrites.removeValue(forKey: key)?.cancel()
+        guard let url = Self.draftFileURL(ownerKey: ownerKey, noteID: noteID) else {
+            return
+        }
+        diskWriteQueue.async {
+            try? FileManager.default.removeItem(at: url)
+        }
+    }
+
+    func discardDraft(ownerKey: String, noteID: String) {
+        draftsByOwnerKey[ownerKey]?[noteID] = nil
+        revisionsByOwnerKey[ownerKey]?[noteID] = nil
+        clearPersistedDraft(ownerKey: ownerKey, noteID: noteID)
+    }
+
+    func clearPersistedDraftIfCurrent(
+        ownerKey: String,
+        noteID: String,
+        expectedText: String,
+        savedRevision: Int?
+    ) {
+        if let currentDraft = draft(ownerKey: ownerKey, noteID: noteID),
+           currentDraft != expectedText
+        {
+            return
+        }
+        if let savedRevision,
+           let currentRevision = draftRevision(ownerKey: ownerKey, noteID: noteID),
+           currentRevision > savedRevision
+        {
+            return
+        }
+        clearPersistedDraft(ownerKey: ownerKey, noteID: noteID)
+    }
+
+    // MARK: - Disk persistence
+
+    private func schedulePersist(ownerKey: String, noteID: String, text: String) {
+        let key = diskKey(ownerKey: ownerKey, noteID: noteID)
+        pendingDiskWrites.removeValue(forKey: key)?.cancel()
+
+        let work = DispatchWorkItem { [weak self] in
+            self?.persist(ownerKey: ownerKey, noteID: noteID, text: text)
+        }
+        pendingDiskWrites[key] = work
+        diskWriteQueue.asyncAfter(deadline: .now() + diskWriteDebounce, execute: work)
+    }
+
+    private func persist(ownerKey: String, noteID: String, text: String) {
+        guard let url = Self.draftFileURL(ownerKey: ownerKey, noteID: noteID) else {
+            return
+        }
+        let directory = url.deletingLastPathComponent()
+        do {
+            try FileManager.default.createDirectory(
+                at: directory,
+                withIntermediateDirectories: true
+            )
+            try text.write(to: url, atomically: true, encoding: .utf8)
+        } catch {
+            CrashReporter.logError(
+                "Failed to persist note draft (\(ownerKey)/\(noteID)): \(error.localizedDescription)"
+            )
+        }
+    }
+
+    private func restorePersistedDrafts() {
+        guard let rootURL = Self.draftsRootURL() else { return }
+        guard let ownerDirs = try? FileManager.default.contentsOfDirectory(
+            at: rootURL,
+            includingPropertiesForKeys: nil
+        ) else {
+            return
+        }
+        for ownerDir in ownerDirs {
+            let ownerKey = Self.decodeOwnerKeySegment(ownerDir.lastPathComponent)
+            guard let draftFiles = try? FileManager.default.contentsOfDirectory(
+                at: ownerDir,
+                includingPropertiesForKeys: nil
+            ) else {
+                continue
+            }
+            var drafts: [String: String] = [:]
+            for file in draftFiles {
+                let name = file.lastPathComponent
+                guard name.hasSuffix(".draft.md") else { continue }
+                let noteID = String(name.dropLast(".draft.md".count))
+                guard let text = try? String(contentsOf: file, encoding: .utf8) else {
+                    continue
+                }
+                drafts[noteID] = text
+            }
+            if !drafts.isEmpty {
+                draftsByOwnerKey[ownerKey] = drafts
+            }
+        }
+    }
+
+    private func diskKey(ownerKey: String, noteID: String) -> String {
+        "\(ownerKey)\u{001F}\(noteID)"
+    }
+
+    private static func draftsRootURL() -> URL? {
+        guard let appSupport = FileManager.default.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        ).first else {
+            return nil
+        }
+        return appSupport
+            .appendingPathComponent("OpenAssist", isDirectory: true)
+            .appendingPathComponent("note-drafts", isDirectory: true)
+    }
+
+    private static func draftFileURL(ownerKey: String, noteID: String) -> URL? {
+        guard let root = draftsRootURL() else { return nil }
+        let encodedOwner = encodeOwnerKeySegment(ownerKey)
+        let safeNoteID = noteID.addingPercentEncoding(
+            withAllowedCharacters: .urlPathAllowed
+        ) ?? noteID
+        return root
+            .appendingPathComponent(encodedOwner, isDirectory: true)
+            .appendingPathComponent("\(safeNoteID).draft.md")
+    }
+
+    private static func encodeOwnerKeySegment(_ ownerKey: String) -> String {
+        ownerKey.addingPercentEncoding(
+            withAllowedCharacters: .urlPathAllowed
+        ) ?? ownerKey
+    }
+
+    private static func decodeOwnerKeySegment(_ segment: String) -> String {
+        segment.removingPercentEncoding ?? segment
     }
 }
 
@@ -754,9 +943,13 @@ struct AssistantWindowView: View {
     @State private var noteManifestByOwnerKey: [String: AssistantNoteManifest] = [:]
     @State private var noteDraftStore = AssistantThreadNoteDraftStore()
     @State private var noteLastSavedAtByOwnerKey: [String: [String: Date]] = [:]
+    @State private var notesWorkspaceExternalMarkdownFile: AssistantExternalMarkdownFileState?
+    @State private var isSavingExternalMarkdownFile = false
     @State private var threadNoteNavigationStackByContextKey:
         [String: [AssistantNoteNavigationEntry]] = [:]
     @State private var threadNoteSavingNoteKeys: Set<String> = []
+    @State private var composerNoteContextDismissedKeys: Set<String> = []
+    @State private var composerNoteContextIncludeContentKeys: Set<String> = []
     @State private var threadNoteAIDraftPreviewByOwnerKey:
         [String: AssistantChatWebThreadNoteAIPreview] = [:]
     @State private var threadNoteGeneratingAIDraftOwnerKeys: Set<String> = []
@@ -1899,12 +2092,381 @@ struct AssistantWindowView: View {
             .map { noteMarkdownForDisplay(owner: owner, noteID: noteID, text: $0.text) } ?? ""
     }
 
+    private func externalMarkdownSourceDescriptor(
+        for file: AssistantExternalMarkdownFileState?
+    ) -> AssistantChatWebThreadNoteSourceDescriptor? {
+        guard let file else { return nil }
+        return AssistantChatWebThreadNoteSourceDescriptor(
+            sourceKind: "externalMarkdownFile",
+            filePath: file.filePath,
+            fileName: file.fileName,
+            isDirty: file.isDirty,
+            canSave: file.canSave
+        )
+    }
+
+    private func presentOpenMarkdownFilePanel() {
+        let panel = NSOpenPanel()
+        panel.message = "Choose a Markdown file to open in Notes mode."
+        panel.prompt = "Open Markdown File"
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.canCreateDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.resolvesAliases = true
+        panel.allowedContentTypes = [
+            UTType(filenameExtension: "md") ?? .plainText,
+            UTType(filenameExtension: "markdown") ?? .plainText,
+        ]
+
+        if let workspaceURL = currentWorkspaceURL {
+            let directoryURL =
+                FileManager.default.fileExists(atPath: workspaceURL.path, isDirectory: nil)
+                ? (workspaceURL.hasDirectoryPath
+                    ? workspaceURL
+                    : workspaceURL.deletingLastPathComponent())
+                : workspaceURL.deletingLastPathComponent()
+            panel.directoryURL = directoryURL
+        }
+
+        guard panel.runModal() == .OK, let fileURL = panel.url else { return }
+        confirmExternalMarkdownDiscardIfNeeded {
+            openExternalMarkdownFile(at: fileURL)
+        }
+    }
+
+    private func openExternalMarkdownFile(at fileURL: URL) {
+        do {
+            notesWorkspaceExternalMarkdownFile = try AssistantExternalMarkdownFileState.load(
+                from: fileURL)
+            isSavingExternalMarkdownFile = false
+        } catch {
+            let message =
+                (error as? LocalizedError)?.errorDescription
+                ?? "Open Assist could not open that Markdown file."
+            assistant.lastStatusMessage = message
+        }
+    }
+
+    private func updateExternalMarkdownDraft(_ text: String) {
+        guard let current = notesWorkspaceExternalMarkdownFile else { return }
+        notesWorkspaceExternalMarkdownFile = current.updatingDraft(text)
+    }
+
+    private func saveExternalMarkdownFile(
+        requestID: String?,
+        draftRevision: Int? = nil,
+        text: String?,
+        sourceContainer: AssistantChatWebContainerView?
+    ) {
+        guard var current = notesWorkspaceExternalMarkdownFile else {
+            if let requestID {
+                sendThreadNoteSaveAck(
+                    AssistantChatWebThreadNoteSaveAck(
+                        requestID: requestID,
+                        ownerKind: nil,
+                        ownerID: nil,
+                        noteID: nil,
+                        draftRevision: draftRevision,
+                        status: "error",
+                        errorMessage: "Open Assist could not find the open Markdown file."
+                    ),
+                    sourceContainer: sourceContainer
+                )
+            }
+            return
+        }
+
+        if let text {
+            current = current.updatingDraft(text)
+        }
+
+        isSavingExternalMarkdownFile = true
+        do {
+            let saved = try current.saving()
+            notesWorkspaceExternalMarkdownFile = saved
+            if let requestID {
+                sendThreadNoteSaveAck(
+                    AssistantChatWebThreadNoteSaveAck(
+                        requestID: requestID,
+                        ownerKind: nil,
+                        ownerID: nil,
+                        noteID: nil,
+                        draftRevision: draftRevision,
+                        status: "ok",
+                        errorMessage: nil
+                    ),
+                    sourceContainer: sourceContainer
+                )
+            }
+        } catch {
+            notesWorkspaceExternalMarkdownFile = current
+            let message =
+                (error as? LocalizedError)?.errorDescription
+                ?? "Open Assist could not save that Markdown file."
+            assistant.lastStatusMessage = message
+            if let requestID {
+                sendThreadNoteSaveAck(
+                    AssistantChatWebThreadNoteSaveAck(
+                        requestID: requestID,
+                        ownerKind: nil,
+                        ownerID: nil,
+                        noteID: nil,
+                        draftRevision: draftRevision,
+                        status: "error",
+                        errorMessage: message
+                    ),
+                    sourceContainer: sourceContainer
+                )
+            }
+        }
+        isSavingExternalMarkdownFile = false
+    }
+
+    private func closeExternalMarkdownFile() {
+        confirmExternalMarkdownDiscardIfNeeded {
+            discardExternalMarkdownFileSession()
+        }
+    }
+
+    private func switchAwayFromExternalMarkdownFileIfNeeded(
+        continueAction: () -> Void
+    ) {
+        guard isNotesPaneActive, notesWorkspaceExternalMarkdownFile != nil else {
+            continueAction()
+            return
+        }
+
+        confirmExternalMarkdownDiscardIfNeeded {
+            discardExternalMarkdownFileSession()
+            continueAction()
+        }
+    }
+
+    private func discardExternalMarkdownFileSession() {
+        notesWorkspaceExternalMarkdownFile = nil
+        isSavingExternalMarkdownFile = false
+    }
+
+    private func confirmExternalMarkdownDiscardIfNeeded(
+        continueAction: () -> Void
+    ) {
+        guard let externalFile = notesWorkspaceExternalMarkdownFile, externalFile.isDirty else {
+            continueAction()
+            return
+        }
+
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Save changes to \(externalFile.fileName)?"
+        alert.informativeText =
+            "You have unsaved Markdown changes. Save them before switching away, discard them, or cancel."
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Discard")
+        alert.addButton(withTitle: "Cancel")
+
+        switch alert.runModal() {
+        case .alertFirstButtonReturn:
+            saveExternalMarkdownFile(requestID: nil, text: nil, sourceContainer: nil)
+            if notesWorkspaceExternalMarkdownFile?.isDirty == false {
+                continueAction()
+            }
+        case .alertSecondButtonReturn:
+            continueAction()
+        default:
+            return
+        }
+    }
+
+    private func confirmManagedThreadNoteLeaveAfterSaveFailure(
+        reason: String,
+        retrySave: () -> Bool
+    ) -> Bool {
+        while true {
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = "Save changes first?"
+            alert.informativeText =
+                "Open Assist could not save this note. Save again before you \(reason), leave without saving, or stay here."
+            alert.addButton(withTitle: "Save again")
+            alert.addButton(withTitle: "Leave without saving")
+            alert.addButton(withTitle: "Stay")
+
+            switch alert.runModal() {
+            case .alertFirstButtonReturn:
+                if retrySave() {
+                    return true
+                }
+            case .alertSecondButtonReturn:
+                return true
+            default:
+                return false
+            }
+        }
+    }
+
+    private func storedNotePersistenceText(
+        owner: AssistantNoteOwnerKey,
+        noteID: String
+    ) -> String? {
+        loadStoredNotes(for: owner)
+            .first(where: { $0.noteID.caseInsensitiveCompare(noteID) == .orderedSame })?
+            .text
+    }
+
+    private func managedThreadNoteUnsavedDraft(
+        owner: AssistantNoteOwnerKey,
+        noteID: String
+    ) -> (title: String, draftText: String)? {
+        guard let draftText = noteDraftStore.draft(
+            ownerKey: owner.storageKey,
+            noteID: noteID
+        ) else {
+            return nil
+        }
+
+        let persistedDraftText = noteMarkdownForPersistence(
+            owner: owner,
+            noteID: noteID,
+            text: draftText
+        )
+        let storedText = storedNotePersistenceText(owner: owner, noteID: noteID) ?? ""
+        guard persistedDraftText != storedText else {
+            return nil
+        }
+
+        let title =
+            noteManifest(for: owner).notes.first(where: {
+                $0.id.caseInsensitiveCompare(noteID) == .orderedSame
+            })?.title.nonEmpty
+            ?? loadStoredNotes(for: owner).first(where: {
+                $0.noteID.caseInsensitiveCompare(noteID) == .orderedSame
+            })?.title.nonEmpty
+            ?? "Untitled note"
+        return (title, draftText)
+    }
+
+    private func confirmManagedThreadNoteDiscardIfNeeded(
+        owner: AssistantNoteOwnerKey,
+        noteID: String?,
+        reason: String,
+        retrySave: () -> Bool
+    ) -> Bool {
+        guard let noteID,
+            let dirtyDraft = managedThreadNoteUnsavedDraft(owner: owner, noteID: noteID)
+        else {
+            return true
+        }
+
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Save changes to \(dirtyDraft.title)?"
+        alert.informativeText =
+            "This note has unsaved changes. Save them before you \(reason), discard them, or stay here."
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Discard")
+        alert.addButton(withTitle: "Cancel")
+
+        switch alert.runModal() {
+        case .alertFirstButtonReturn:
+            if retrySave() {
+                return true
+            }
+            return confirmManagedThreadNoteLeaveAfterSaveFailure(
+                reason: reason,
+                retrySave: retrySave
+            )
+        case .alertSecondButtonReturn:
+            noteDraftStore.discardDraft(ownerKey: owner.storageKey, noteID: noteID)
+            return true
+        default:
+            return false
+        }
+    }
+
+    private func flushCurrentThreadNoteDraftFromWeb() async {
+        guard let snapshot = await threadNoteWebContainer?.flushThreadNoteDraftSnapshot(),
+            (snapshot["ok"] as? Bool) == true,
+            let text = snapshot["text"] as? String
+        else {
+            return
+        }
+
+        if snapshot["sourceKind"] as? String == "externalMarkdownFile" {
+            updateExternalMarkdownDraft(text)
+            return
+        }
+
+        guard let ownerKindRaw = snapshot["ownerKind"] as? String,
+            let ownerKind = AssistantNoteOwnerKind(rawValue: ownerKindRaw),
+            let ownerID = (snapshot["ownerId"] as? String)?.nonEmpty,
+            let noteID = (snapshot["noteId"] as? String)?.nonEmpty
+        else {
+            return
+        }
+
+        let revision: Int?
+        if let number = snapshot["draftRevision"] as? NSNumber {
+            revision = number.intValue
+        } else {
+            revision = snapshot["draftRevision"] as? Int
+        }
+
+        let owner = AssistantNoteOwnerKey(kind: ownerKind, id: ownerID)
+        noteDraftStore.setDraft(
+            text,
+            ownerKey: owner.storageKey,
+            noteID: noteID,
+            revision: revision
+        )
+    }
+
+    private func saveManagedThreadNoteBeforeNavigation(reason: String) -> Bool {
+        guard let owner = currentThreadNoteOwner else { return true }
+        let noteID = currentSelectedThreadNoteNoteID
+        let retrySave = {
+            persistThreadNoteIfNeeded(for: owner, noteID: noteID)
+        }
+        if let noteID,
+            managedThreadNoteUnsavedDraft(owner: owner, noteID: noteID) != nil
+        {
+            return confirmManagedThreadNoteDiscardIfNeeded(
+                owner: owner,
+                noteID: noteID,
+                reason: reason,
+                retrySave: retrySave
+            )
+        }
+        if retrySave() {
+            return true
+        }
+        return confirmManagedThreadNoteLeaveAfterSaveFailure(
+            reason: reason,
+            retrySave: retrySave
+        )
+    }
+
+    private func prepareToLeaveCurrentNoteScreen(reason: String) -> Bool {
+        if isNotesPaneActive, notesWorkspaceExternalMarkdownFile != nil {
+            var shouldContinue = false
+            switchAwayFromExternalMarkdownFileIfNeeded {
+                shouldContinue = true
+            }
+            return shouldContinue
+        }
+
+        return saveManagedThreadNoteBeforeNavigation(reason: reason)
+    }
+
     private var currentThreadNoteManifest: AssistantNoteManifest {
         guard let owner = currentThreadNoteOwner else { return AssistantNoteManifest() }
         return noteManifest(for: owner)
     }
 
     private var currentDisplayedNoteTarget: AssistantNoteLinkTarget? {
+        if isNotesPaneActive, notesWorkspaceExternalMarkdownFile != nil {
+            return nil
+        }
         if isNotesPaneActive,
             let project = selectedNotesProject
         {
@@ -1924,6 +2486,9 @@ struct AssistantWindowView: View {
     }
 
     private var currentDisplayedNoteTitle: String? {
+        if let externalFile = isNotesPaneActive ? notesWorkspaceExternalMarkdownFile : nil {
+            return externalFile.fileName
+        }
         if isNotesPaneActive,
             let project = selectedNotesProject,
             let currentTarget = currentNotesSelectionTarget(
@@ -2111,6 +2676,57 @@ struct AssistantWindowView: View {
         return noteDraftText(for: owner, noteID: noteID)
     }
 
+    private func composerNoteContextKey(ownerKind: String, ownerID: String, noteID: String)
+        -> String
+    {
+        "\(ownerKind)|\(ownerID)|\(noteID)"
+    }
+
+    private func externalMarkdownComposerNoteContextKey(filePath: String) -> String {
+        "externalMarkdownFile|\(filePath)"
+    }
+
+    private var composerNoteContextForState: AssistantComposerWebNoteContext? {
+        if isNotesPaneActive, let externalFile = notesWorkspaceExternalMarkdownFile {
+            let key = externalMarkdownComposerNoteContextKey(filePath: externalFile.filePath)
+            if composerNoteContextDismissedKeys.contains(key) { return nil }
+
+            return AssistantComposerWebNoteContext(
+                noteTitle: externalFile.fileName,
+                projectTitle: selectedNotesProject?.name,
+                ownerKind: nil,
+                ownerID: nil,
+                noteID: nil,
+                contextKey: key,
+                sourceLabel: "Markdown file",
+                filePath: externalFile.filePath,
+                includeContent: composerNoteContextIncludeContentKeys.contains(key)
+            )
+        }
+
+        guard let target = currentDisplayedNoteTarget,
+            let noteTitle = currentDisplayedNoteTitle?.nonEmpty
+        else {
+            return nil
+        }
+
+        let key = composerNoteContextKey(
+            ownerKind: target.ownerKind.rawValue, ownerID: target.ownerID, noteID: target.noteID)
+        if composerNoteContextDismissedKeys.contains(key) { return nil }
+
+        return AssistantComposerWebNoteContext(
+            noteTitle: noteTitle,
+            projectTitle: isNotesPaneActive ? selectedNotesProject?.name : currentProjectNotesProject?.name,
+            ownerKind: target.ownerKind.rawValue,
+            ownerID: target.ownerID,
+            noteID: target.noteID,
+            contextKey: key,
+            sourceLabel: sourceLabel(for: target.ownerKind, ownerID: target.ownerID),
+            filePath: nil,
+            includeContent: composerNoteContextIncludeContentKeys.contains(key)
+        )
+    }
+
     private var chatWebThreadNoteState: AssistantChatWebThreadNoteState {
         if isNotesPaneActive {
             return notesWorkspaceThreadNoteState(for: selectedNotesProject)
@@ -2205,6 +2821,7 @@ struct AssistantWindowView: View {
             lastSavedAtLabel: threadNoteSavedLabel(for: savedAt),
             canEdit: owner != nil,
             placeholder: notePlaceholder(for: owner),
+            sourceDescriptor: nil,
             aiDraftPreview: owner.flatMap { threadNoteAIDraftPreviewByOwnerKey[$0.storageKey] },
             projectNoteTransferPreview: owner.flatMap {
                 threadNoteProjectTransferPreviewByOwnerKey[$0.storageKey]
@@ -2232,6 +2849,104 @@ struct AssistantWindowView: View {
     private func notesWorkspaceThreadNoteState(
         for project: AssistantProject?
     ) -> AssistantChatWebThreadNoteState {
+        if let externalFile = notesWorkspaceExternalMarkdownFile {
+            let availableSources: [AssistantChatWebThreadNoteSource]
+            let notes: [AssistantChatWebThreadNoteItem]
+            if let project {
+                let universe = notesUniverse(for: project)
+                availableSources =
+                    [
+                        AssistantChatWebThreadNoteSource(
+                            ownerKind: universe.projectOwner.kind.rawValue,
+                            ownerID: universe.projectOwner.id,
+                            ownerTitle: project.name,
+                            sourceLabel: universe.projectOwner.displaySourceLabel
+                        )
+                    ]
+                    + universe.threadSources
+                    .filter { !$0.notes.isEmpty }
+                    .map { source in
+                        AssistantChatWebThreadNoteSource(
+                            ownerKind: source.owner.kind.rawValue,
+                            ownerID: source.owner.id,
+                            ownerTitle: source.session.title,
+                            sourceLabel: source.owner.displaySourceLabel
+                        )
+                    }
+
+                notes =
+                    universe.projectNotes.map { note in
+                        AssistantChatWebThreadNoteItem(
+                            id: note.noteID,
+                            title: note.title,
+                            noteType: note.noteType.rawValue,
+                            updatedAtLabel: threadNoteSavedLabel(for: note.updatedAt),
+                            ownerKind: note.ownerKind.rawValue,
+                            ownerID: note.ownerID,
+                            sourceLabel: "Project notes"
+                        )
+                    }
+                    + universe.threadNotes.map { note in
+                        AssistantChatWebThreadNoteItem(
+                            id: note.noteID,
+                            title: note.title,
+                            noteType: note.noteType.rawValue,
+                            updatedAtLabel: threadNoteSavedLabel(for: note.updatedAt),
+                            ownerKind: note.ownerKind.rawValue,
+                            ownerID: note.ownerID,
+                            sourceLabel: "Thread notes"
+                        )
+                    }
+            } else {
+                availableSources = []
+                notes = []
+            }
+
+            return AssistantChatWebThreadNoteState(
+                threadID: nil,
+                ownerKind: nil,
+                ownerID: nil,
+                ownerTitle: "Markdown file",
+                presentation: "notesWorkspace",
+                notesScope: selectedNotesScope.rawValue,
+                workspaceProjectID: project?.id,
+                workspaceProjectTitle: project?.name,
+                workspaceOwnerSubtitle: externalFile.directoryPath,
+                canCreateNote: false,
+                owningThreadID: nil,
+                owningThreadTitle: nil,
+                availableSources: availableSources,
+                notes: notes,
+                selectedNoteID: nil,
+                selectedNoteTitle: externalFile.fileName,
+                text: externalFile.draftText,
+                isOpen: true,
+                isExpanded: true,
+                viewMode: threadNoteViewMode,
+                hasAnyNotes: true,
+                isSaving: isSavingExternalMarkdownFile,
+                isGeneratingAIDraft: false,
+                isGeneratingProjectTransferPreview: false,
+                isGeneratingBatchNotePlanPreview: false,
+                aiDraftMode: nil,
+                lastSavedAtLabel: threadNoteSavedLabel(for: externalFile.lastSavedAt),
+                canEdit: true,
+                placeholder: "Edit the opened Markdown file or switch to Preview.",
+                sourceDescriptor: externalMarkdownSourceDescriptor(for: externalFile),
+                aiDraftPreview: nil,
+                projectNoteTransferPreview: nil,
+                projectNoteTransferOutcome: nil,
+                batchNotePlanPreview: nil,
+                outgoingLinks: [],
+                backlinks: [],
+                graph: nil,
+                canNavigateBack: false,
+                previousLinkedNoteTitle: nil,
+                historyVersions: [],
+                recentlyDeletedNotes: []
+            )
+        }
+
         guard let project else {
             return AssistantChatWebThreadNoteState(
                 threadID: nil,
@@ -2264,6 +2979,7 @@ struct AssistantWindowView: View {
                 lastSavedAtLabel: nil,
                 canEdit: true,
                 placeholder: notePlaceholder(for: nil),
+                sourceDescriptor: nil,
                 aiDraftPreview: nil,
                 projectNoteTransferPreview: nil,
                 projectNoteTransferOutcome: nil,
@@ -2410,6 +3126,7 @@ struct AssistantWindowView: View {
             lastSavedAtLabel: threadNoteSavedLabel(for: savedAt),
             canEdit: true,
             placeholder: notePlaceholder(for: selectedOwner),
+            sourceDescriptor: nil,
             aiDraftPreview: selectedOwner.flatMap {
                 threadNoteAIDraftPreviewByOwnerKey[$0.storageKey]
             },
@@ -2467,12 +3184,35 @@ struct AssistantWindowView: View {
         var drafts = noteDraftStore.drafts(ownerKey: owner.storageKey)
             .filter { validNoteIDs.contains($0.key) }
         if let selectedNote = workspace.selectedNote {
-            drafts[selectedNote.id] = noteMarkdownForDisplay(
+            let workspaceText = noteMarkdownForDisplay(
                 owner: owner,
                 noteID: selectedNote.id,
                 text: workspace.selectedNoteText
             )
+            // Preserve the in-memory draft if it differs from the
+            // workspace's saved text. A difference means JS pushed a
+            // newer `updateDraft` that hasn't been persisted yet — and
+            // blindly overwriting it here would silently lose those
+            // in-flight edits. This was the root cause of the
+            // "sometimes loses what I wrote" bug: an unrelated workspace
+            // refresh (sidebar, backlink, mutation) would stomp the
+            // unsaved draft between keystroke and save.
+            //
+            // Only update this entry if there's no existing draft yet,
+            // or if the workspace text already matches what we have —
+            // i.e. the workspace itself is the authoritative source
+            // because a save just completed.
+            let currentDraft = drafts[selectedNote.id]
+            if currentDraft == nil || currentDraft == workspaceText {
+                drafts[selectedNote.id] = workspaceText
+            }
+            // For all OTHER notes we still prefer the workspace's
+            // on-disk text — those aren't being actively edited.
         }
+        // For the non-selected notes, let the workspace's manifest drive
+        // the cache: drop any stale entries (handled by the filter
+        // above) but don't try to eagerly populate (noteDraftText falls
+        // back to disk for notes with no draft entry).
         noteDraftStore.replaceDrafts(drafts, ownerKey: owner.storageKey)
 
         var savedAt = noteLastSavedAtByOwnerKey[owner.storageKey] ?? [:]
@@ -3903,21 +4643,85 @@ struct AssistantWindowView: View {
         }
     }
 
+    @discardableResult
     private func persistThreadNoteIfNeeded(
         for owner: AssistantNoteOwnerKey?,
         noteID: String? = nil,
-        forceHistorySnapshot: Bool = true
-    ) {
+        forceHistorySnapshot: Bool = true,
+        requestID: String? = nil,
+        draftRevision: Int? = nil,
+        explicitText: String? = nil,
+        sourceContainer: AssistantChatWebContainerView? = nil
+    ) -> Bool {
         guard let owner else {
-            return
+            if let requestID {
+                // We can't resolve an owner, so there's nothing to
+                // persist — but we still need to ack so the JS side
+                // doesn't time out.
+                sendThreadNoteSaveAck(
+                    AssistantChatWebThreadNoteSaveAck(
+                        requestID: requestID,
+                        ownerKind: nil,
+                        ownerID: nil,
+                        noteID: nil,
+                        draftRevision: draftRevision,
+                        status: "error",
+                        errorMessage: "Open Assist could not find the note owner for this save."
+                    ),
+                    sourceContainer: sourceContainer
+                )
+                return false
+            }
+            return true
         }
 
         let manifest = noteManifest(for: owner)
         let resolvedNoteID = noteID ?? currentSelectedThreadNoteNoteID ?? manifest.selectedNote?.id
-        guard let resolvedNoteID,
-            let draftText = noteDraftStore.draft(ownerKey: owner.storageKey, noteID: resolvedNoteID)
-        else {
-            return
+        guard let resolvedNoteID else {
+            if let requestID {
+                sendThreadNoteSaveAck(
+                    AssistantChatWebThreadNoteSaveAck(
+                        requestID: requestID,
+                        ownerKind: owner.kind.rawValue,
+                        ownerID: owner.id,
+                        noteID: nil,
+                        draftRevision: draftRevision,
+                        status: "error",
+                        errorMessage: "Open Assist could not find a note to save."
+                    ),
+                    sourceContainer: sourceContainer
+                )
+                return false
+            }
+            return true
+        }
+
+        let draftText: String
+        if let explicitText {
+            draftText = explicitText
+        } else if let storedDraft = noteDraftStore.draft(
+            ownerKey: owner.storageKey,
+            noteID: resolvedNoteID
+        ) {
+            draftText = storedDraft
+        } else {
+            if let requestID {
+                sendThreadNoteSaveAck(
+                    AssistantChatWebThreadNoteSaveAck(
+                        requestID: requestID,
+                        ownerKind: owner.kind.rawValue,
+                        ownerID: owner.id,
+                        noteID: resolvedNoteID,
+                        draftRevision: draftRevision,
+                        status: "error",
+                        errorMessage:
+                            "Open Assist could not find a draft to save for this note."
+                    ),
+                    sourceContainer: sourceContainer
+                )
+                return false
+            }
+            return true
         }
 
         let persistedDraftText = noteMarkdownForPersistence(
@@ -3928,18 +4732,23 @@ struct AssistantWindowView: View {
 
         let storageKey = threadNoteStorageKey(owner: owner, noteID: resolvedNoteID)
         threadNoteSavingNoteKeys.insert(storageKey)
+        defer {
+            DispatchQueue.main.async {
+                threadNoteSavingNoteKeys.remove(storageKey)
+            }
+        }
 
-        let workspace: AssistantNotesWorkspace?
+        let saveResult: Result<AssistantNotesWorkspace, AssistantNoteSaveError>
         switch owner.kind {
         case .thread:
-            workspace = assistant.saveThreadNote(
+            saveResult = assistant.saveThreadNoteResult(
                 threadID: owner.id,
                 noteID: resolvedNoteID,
                 text: persistedDraftText,
                 forceHistorySnapshot: forceHistorySnapshot
             )
         case .project:
-            workspace = assistant.saveProjectNote(
+            saveResult = assistant.saveProjectNoteResult(
                 projectID: owner.id,
                 noteID: resolvedNoteID,
                 text: persistedDraftText,
@@ -3947,12 +4756,69 @@ struct AssistantWindowView: View {
             )
         }
 
-        if let workspace {
+        switch saveResult {
+        case .success(let workspace):
             applyThreadNoteWorkspace(workspace)
+            // Step 5: the content is now safely on disk in the real
+            // notes store. Delete the draft backup so we don't offer
+            // stale recovery on next relaunch.
+            noteDraftStore.clearPersistedDraftIfCurrent(
+                ownerKey: owner.storageKey,
+                noteID: resolvedNoteID,
+                expectedText: draftText,
+                savedRevision: draftRevision
+            )
+            if let requestID {
+                sendThreadNoteSaveAck(
+                    AssistantChatWebThreadNoteSaveAck(
+                        requestID: requestID,
+                        ownerKind: owner.kind.rawValue,
+                        ownerID: owner.id,
+                        noteID: resolvedNoteID,
+                        draftRevision: draftRevision,
+                        status: "ok",
+                        errorMessage: nil
+                    ),
+                    sourceContainer: sourceContainer
+                )
+            }
+            return true
+        case .failure(let error):
+            if let requestID {
+                sendThreadNoteSaveAck(
+                    AssistantChatWebThreadNoteSaveAck(
+                        requestID: requestID,
+                        ownerKind: owner.kind.rawValue,
+                        ownerID: owner.id,
+                        noteID: resolvedNoteID,
+                        draftRevision: draftRevision,
+                        status: "error",
+                        errorMessage: error.errorDescription
+                            ?? "Open Assist could not save this note."
+                    ),
+                    sourceContainer: sourceContainer
+                )
+            }
+            return false
         }
 
-        DispatchQueue.main.async {
-            threadNoteSavingNoteKeys.remove(storageKey)
+    }
+
+    /// Route a save-ack to all live web containers (so both the chat
+    /// timeline and the drawer, if separately mounted, get the result).
+    private func sendThreadNoteSaveAck(
+        _ ack: AssistantChatWebThreadNoteSaveAck,
+        sourceContainer: AssistantChatWebContainerView?
+    ) {
+        let candidateContainers = [
+            sourceContainer, threadNoteWebContainer, chatTimelineWebContainer,
+        ]
+        var delivered = Set<ObjectIdentifier>()
+        for container in candidateContainers {
+            guard let container else { continue }
+            let identity = ObjectIdentifier(container)
+            guard delivered.insert(identity).inserted else { continue }
+            container.applyThreadNoteSaveAck(ack)
         }
     }
 
@@ -4458,6 +5324,12 @@ struct AssistantWindowView: View {
             else { return }
             threadNoteViewMode = viewMode
         case "selectNote":
+            if isNotesPaneActive, notesWorkspaceExternalMarkdownFile != nil {
+                switchAwayFromExternalMarkdownFileIfNeeded {
+                    handleThreadNoteCommand(command, sourceContainer: sourceContainer)
+                }
+                return
+            }
             persistThreadNoteIfNeeded(for: currentThreadNoteOwner)
             guard let resolvedOwner,
                 let resolvedNoteID
@@ -4505,7 +5377,17 @@ struct AssistantWindowView: View {
                 let anchorRect = command.viewportRect
             else { return }
             presentThreadNoteMenu(threadID: resolvedThreadID, anchorRect: anchorRect)
+        case "openMarkdownFile":
+            presentOpenMarkdownFilePanel()
+        case "closeMarkdownFile":
+            closeExternalMarkdownFile()
         case "createNote":
+            if isNotesPaneActive, notesWorkspaceExternalMarkdownFile != nil {
+                switchAwayFromExternalMarkdownFileIfNeeded {
+                    handleThreadNoteCommand(command, sourceContainer: sourceContainer)
+                }
+                return
+            }
             persistThreadNoteIfNeeded(for: currentThreadNoteOwner)
             guard let resolvedOwner else { return }
             if isNotesPaneActive,
@@ -4610,24 +5492,70 @@ struct AssistantWindowView: View {
                 )
             }
         case "updateDraft":
+            if isNotesPaneActive, notesWorkspaceExternalMarkdownFile != nil,
+                let text = command.text
+            {
+                updateExternalMarkdownDraft(text)
+                return
+            }
             guard let resolvedOwner,
                 let resolvedNoteID,
                 let text = command.text
             else { return }
             noteDraftStore.setDraft(
-                text, ownerKey: resolvedOwner.storageKey, noteID: resolvedNoteID)
+                text,
+                ownerKey: resolvedOwner.storageKey,
+                noteID: resolvedNoteID,
+                revision: command.draftRevision
+            )
         case "save":
+            if isNotesPaneActive, notesWorkspaceExternalMarkdownFile != nil {
+                saveExternalMarkdownFile(
+                    requestID: command.requestID,
+                    draftRevision: command.draftRevision,
+                    text: command.text,
+                    sourceContainer: sourceContainer
+                )
+                return
+            }
             guard let resolvedOwner,
                 let resolvedNoteID
-            else { return }
+            else {
+                // Still ack so JS doesn't time out on a save it issued
+                // for an owner we can no longer resolve.
+                if let requestID = command.requestID {
+                    sendThreadNoteSaveAck(
+                        AssistantChatWebThreadNoteSaveAck(
+                            requestID: requestID,
+                            ownerKind: command.ownerKind,
+                            ownerID: command.ownerID,
+                            noteID: command.noteID,
+                            draftRevision: command.draftRevision,
+                            status: "error",
+                            errorMessage:
+                                "Open Assist could not find this note anymore. Please reopen it."
+                        ),
+                        sourceContainer: sourceContainer
+                    )
+                }
+                return
+            }
             if let text = command.text {
                 noteDraftStore.setDraft(
-                    text, ownerKey: resolvedOwner.storageKey, noteID: resolvedNoteID)
+                    text,
+                    ownerKey: resolvedOwner.storageKey,
+                    noteID: resolvedNoteID,
+                    revision: command.draftRevision
+                )
             }
             persistThreadNoteIfNeeded(
                 for: resolvedOwner,
                 noteID: resolvedNoteID,
-                forceHistorySnapshot: false
+                forceHistorySnapshot: false,
+                requestID: command.requestID,
+                draftRevision: command.draftRevision,
+                explicitText: command.text,
+                sourceContainer: sourceContainer
             )
         case "restoreHistoryVersion":
             guard let resolvedOwner,
@@ -4895,6 +5823,7 @@ struct AssistantWindowView: View {
             else {
                 return
             }
+            guard prepareToLeaveCurrentNoteScreen(reason: "open the owning thread") else { return }
             selectedSidebarPane = .threads
             openThread(threadID)
         default:
@@ -5800,7 +6729,7 @@ struct AssistantWindowView: View {
     }
 
     private func selectNotesProject(_ project: AssistantProject?) {
-        persistThreadNoteIfNeeded(for: currentThreadNoteOwner)
+        guard prepareToLeaveCurrentNoteScreen(reason: "switch note projects") else { return }
         selectedNotesProjectID = project?.id
         if let project,
             let parentID = project.parentID
@@ -5812,7 +6741,7 @@ struct AssistantWindowView: View {
     }
 
     private func setNotesScope(_ scope: AssistantNotesScope) {
-        persistThreadNoteIfNeeded(for: currentThreadNoteOwner)
+        guard prepareToLeaveCurrentNoteScreen(reason: "switch note sections") else { return }
         selectedNotesScope = scope
         selectedSidebarPane = .notes
     }
@@ -5821,21 +6750,46 @@ struct AssistantWindowView: View {
         owner: AssistantNoteOwnerKey,
         noteID: String
     ) {
+        Task { @MainActor in
+            await selectSidebarNoteAfterFlushing(owner: owner, noteID: noteID)
+        }
+    }
+
+    private func selectSidebarNoteAfterFlushing(
+        owner: AssistantNoteOwnerKey,
+        noteID: String
+    ) async {
+        await flushCurrentThreadNoteDraftFromWeb()
+
+        if isNotesPaneActive, notesWorkspaceExternalMarkdownFile != nil {
+            switchAwayFromExternalMarkdownFileIfNeeded {
+                selectSidebarNote(owner: owner, noteID: noteID)
+            }
+            return
+        }
+
         guard let project = selectedNotesProject else { return }
+        let target = AssistantNoteLinkTarget(ownerKind: owner.kind, ownerID: owner.id, noteID: noteID)
+        if currentDisplayedNoteTarget == target {
+            return
+        }
+        guard saveManagedThreadNoteBeforeNavigation(reason: "switch notes") else { return }
+        let previousOwner = currentThreadNoteOwner
+        let previousNoteID = currentSelectedThreadNoteNoteID
         let scope: AssistantNotesScope = owner.kind == .project ? .project : .thread
         let selectedRow = sidebarNoteRows(for: project, scope: scope).first(where: {
             $0.target.ownerKind == owner.kind
                 && $0.target.ownerID.caseInsensitiveCompare(owner.id) == .orderedSame
                 && $0.target.noteID.caseInsensitiveCompare(noteID) == .orderedSame
         })
+        persistThreadNoteIfNeeded(for: previousOwner, noteID: previousNoteID)
         selectedSidebarPane = .notes
         selectedNotesScope = scope
         rememberNotesSelectionTarget(
-            AssistantNoteLinkTarget(ownerKind: owner.kind, ownerID: owner.id, noteID: noteID),
+            target,
             projectID: project.id,
             scope: scope
         )
-        persistThreadNoteIfNeeded(for: currentThreadNoteOwner)
         if scope == .project {
             setNoteFolderPathExpanded(
                 folderID: selectedRow?.folderID,
@@ -5846,6 +6800,41 @@ struct AssistantWindowView: View {
         if let workspace = selectNotesWorkspace(for: owner, noteID: noteID) {
             applyThreadNoteWorkspace(workspace)
             clearThreadNoteAIDraftState(for: owner)
+        }
+    }
+
+    private func createSidebarProjectNote(
+        project: AssistantProject,
+        folderID: String?
+    ) {
+        switchAwayFromExternalMarkdownFileIfNeeded {
+            persistThreadNoteIfNeeded(
+                for: currentThreadNoteOwner,
+                noteID: currentSelectedThreadNoteNoteID
+            )
+            guard let workspace = assistant.createProjectNote(
+                projectID: project.id,
+                title: nil,
+                folderID: folderID
+            ),
+                let noteID = workspace.selectedNote?.id
+            else {
+                return
+            }
+            applyThreadNoteWorkspace(workspace)
+            clearThreadNoteAIDraftState(for: AssistantNoteOwnerKey(kind: .project, id: project.id))
+            if let folderID {
+                setNoteFolderPathExpanded(
+                    folderID: folderID,
+                    folders: workspace.manifest.folders
+                )
+            }
+            rememberNotesSelectionTarget(
+                AssistantNoteLinkTarget(ownerKind: .project, ownerID: project.id, noteID: noteID),
+                projectID: project.id,
+                scope: .project
+            )
+            selectedSidebarPane = .notes
         }
     }
 
@@ -6095,6 +7084,9 @@ struct AssistantWindowView: View {
     /// On-disk URL of the markdown file for the currently displayed note, if any.
     /// Returns `nil` when no note is focused or the note has no saved file yet.
     private var currentNoteMarkdownFileURL: URL? {
+        if let externalFile = isNotesPaneActive ? notesWorkspaceExternalMarkdownFile : nil {
+            return externalFile.fileURL
+        }
         guard let target = currentDisplayedNoteTarget else { return nil }
         return assistant.noteMarkdownFileURL(
             ownerKind: target.ownerKind,
@@ -6458,7 +7450,8 @@ struct AssistantWindowView: View {
                 activeProviderID: assistant.visibleAssistantBackend.rawValue,
                 slashCommands: AssistantSlashCommandCatalog.composerCommands(
                     for: assistant.visibleAssistantBackend
-                ).map(AssistantComposerWebSlashCommand.init(descriptor:))
+                ).map(AssistantComposerWebSlashCommand.init(descriptor:)),
+                noteContext: composerNoteContextForState
             ),
             controls: AssistantComposerWebControlsState(
                 availability: runtimeControlsState.availability,
@@ -7021,6 +8014,7 @@ struct AssistantWindowView: View {
     }
 
     private func startNewThreadFromSidebar() {
+        guard prepareToLeaveCurrentNoteScreen(reason: "start a new thread") else { return }
         selectedSidebarPane = .threads
         closeProjectNotesIfNeeded()
         threadsDetailMode = .chat
@@ -7033,6 +8027,7 @@ struct AssistantWindowView: View {
     }
 
     private func startNewTemporaryThreadFromSidebar() {
+        guard prepareToLeaveCurrentNoteScreen(reason: "start a temporary thread") else { return }
         selectedSidebarPane = .threads
         closeProjectNotesIfNeeded()
         threadsDetailMode = .chat
@@ -7059,7 +8054,9 @@ struct AssistantWindowView: View {
             else {
                 return
             }
-            persistThreadNoteIfNeeded(for: currentThreadNoteOwner)
+            guard pane == selectedSidebarPane || prepareToLeaveCurrentNoteScreen(reason: "switch screens") else {
+                return
+            }
             if pane == .archived {
                 showArchivedSidebar()
             } else {
@@ -7096,6 +8093,7 @@ struct AssistantWindowView: View {
                 areNotesExpanded.toggle()
             }
         case "selectProjectFilter":
+            guard prepareToLeaveCurrentNoteScreen(reason: "switch screens") else { return }
             selectedSidebarPane = .threads
             let projectID = (payload?["projectId"] as? String)?
                 .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -7176,29 +8174,7 @@ struct AssistantWindowView: View {
             let folderID = (payload?["folderId"] as? String)?
                 .trimmingCharacters(in: .whitespacesAndNewlines)
                 .nonEmpty
-            guard let workspace = assistant.createProjectNote(
-                projectID: project.id,
-                title: nil,
-                folderID: folderID
-            ),
-                let noteID = workspace.selectedNote?.id
-            else {
-                return
-            }
-            applyThreadNoteWorkspace(workspace)
-            clearThreadNoteAIDraftState(for: AssistantNoteOwnerKey(kind: .project, id: project.id))
-            if let folderID {
-                setNoteFolderPathExpanded(
-                    folderID: folderID,
-                    folders: workspace.manifest.folders
-                )
-            }
-            rememberNotesSelectionTarget(
-                AssistantNoteLinkTarget(ownerKind: .project, ownerID: project.id, noteID: noteID),
-                projectID: project.id,
-                scope: .project
-            )
-            selectedSidebarPane = .notes
+            createSidebarProjectNote(project: project, folderID: folderID)
         case "createNoteFolderPrompt":
             guard let project = selectedNotesProject,
                 selectedNotesScope == .project
@@ -7343,6 +8319,7 @@ struct AssistantWindowView: View {
             else {
                 return
             }
+            guard prepareToLeaveCurrentNoteScreen(reason: "open another thread") else { return }
             if let paneID = payload?["pane"] as? String,
                 paneID.caseInsensitiveCompare(AssistantSidebarPane.archived.shellID) == .orderedSame
             {
@@ -7602,13 +8579,28 @@ struct AssistantWindowView: View {
             captureComposerScreenshotAttachment()
         case "openSkillsPane":
             dismissComposerQuickActionsMenu()
+            guard prepareToLeaveCurrentNoteScreen(reason: "open Skills") else { return }
             selectedSidebarPane = .skills
         case "openPluginsPane":
             dismissComposerQuickActionsMenu()
+            guard prepareToLeaveCurrentNoteScreen(reason: "open Plugins") else { return }
             selectedSidebarPane = .plugins
             Task { await assistant.refreshCodexPluginCatalogIfNeeded() }
         case "toggleQuickActionsMenu":
             toggleComposerQuickActionsMenu()
+        case "dismissNoteContext":
+            if let ctx = composerNoteContextForState {
+                composerNoteContextDismissedKeys.insert(ctx.contextKey)
+                composerNoteContextIncludeContentKeys.remove(ctx.contextKey)
+            }
+        case "toggleNoteContextContent":
+            if let ctx = composerNoteContextForState {
+                if composerNoteContextIncludeContentKeys.contains(ctx.contextKey) {
+                    composerNoteContextIncludeContentKeys.remove(ctx.contextKey)
+                } else {
+                    composerNoteContextIncludeContentKeys.insert(ctx.contextKey)
+                }
+            }
         case "removeAttachment":
             guard
                 let attachmentID = (payload?["attachmentId"] as? String)?
@@ -14112,11 +15104,82 @@ struct AssistantWindowView: View {
     private func sendCurrentPrompt() {
         userHasScrolledUp = false
         let prompt = assistant.promptDraft
+        let contextInstructions = buildNoteContextInstructions()
         if let appDelegate = AppDelegate.shared {
-            appDelegate.sendAssistantTypedPrompt(prompt)
+            appDelegate.sendAssistantTypedPrompt(
+                prompt, oneShotInstructions: contextInstructions)
         } else {
-            Task { await assistant.sendPrompt(prompt) }
+            Task {
+                await assistant.sendPrompt(
+                    prompt,
+                    selectedPluginIDs: nil,
+                    automationJob: nil,
+                    oneShotInstructions: contextInstructions
+                )
+            }
         }
+    }
+
+    private func buildNoteContextInstructions() -> String? {
+        guard let ctx = composerNoteContextForState else { return nil }
+
+        var lines: [String] = []
+        let projectPart: String
+        if let projectTitle = ctx.projectTitle, !projectTitle.isEmpty {
+            projectPart = " in project \"\(projectTitle)\""
+        } else {
+            projectPart = ""
+        }
+        lines.append(
+            "The user is currently viewing the note \"\(ctx.noteTitle)\"\(projectPart). "
+                + "When they refer to \"this note\", \"the note\", \"here\", or similar, they mean this note. "
+                + "If the user's question is clearly unrelated to the note, ignore this context."
+        )
+        if let sourceLabel = ctx.sourceLabel, !sourceLabel.isEmpty {
+            lines.append("Open note source: \(sourceLabel).")
+        }
+        if let filePath = ctx.filePath, !filePath.isEmpty {
+            lines.append("Open note file path: \(filePath).")
+        }
+
+        let shouldAttachContent =
+            ctx.includeContent
+            || AssistantComposerNoteContentPolicy.shouldAutoAttachContent(prompt: assistant.promptDraft)
+        if shouldAttachContent,
+            let raw = noteContentText(for: ctx)
+        {
+            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                let cap = 6000
+                let clipped =
+                    trimmed.count > cap
+                    ? String(trimmed.prefix(cap)) + "\n\n…[note truncated]" : trimmed
+                lines.append("Note content:\n\(clipped)")
+            }
+        }
+
+        return lines.joined(separator: "\n\n")
+    }
+
+    private func noteContentText(for ctx: AssistantComposerWebNoteContext) -> String? {
+        if let ownerKindRaw = ctx.ownerKind,
+            let ownerKind = AssistantNoteOwnerKind(rawValue: ownerKindRaw),
+            let ownerID = ctx.ownerID,
+            let noteID = ctx.noteID
+        {
+            return noteDraftText(
+                for: AssistantNoteOwnerKey(kind: ownerKind, id: ownerID),
+                noteID: noteID
+            )
+        }
+
+        if let filePath = ctx.filePath,
+            notesWorkspaceExternalMarkdownFile?.filePath == filePath
+        {
+            return notesWorkspaceExternalMarkdownFile?.draftText
+        }
+
+        return nil
     }
 
     private func toggleInteractionMode() {
@@ -14293,6 +15356,7 @@ struct AssistantWindowView: View {
                     symbol: "sparkles"
                 ) {
                     dismissComposerQuickActionsMenu()
+                    guard prepareToLeaveCurrentNoteScreen(reason: "open Skills") else { return }
                     selectedSidebarPane = .skills
                 }
             }
@@ -14307,6 +15371,7 @@ struct AssistantWindowView: View {
                     isActive: !state.base.selectedPlugins.isEmpty
                 ) {
                     dismissComposerQuickActionsMenu()
+                    guard prepareToLeaveCurrentNoteScreen(reason: "open Plugins") else { return }
                     selectedSidebarPane = .plugins
                     Task { await assistant.refreshCodexPluginCatalogIfNeeded() }
                 }
@@ -15643,6 +16708,7 @@ struct AssistantWindowView: View {
             },
             onRepair: {
                 assistant.repairMissingSkillBindings()
+                guard prepareToLeaveCurrentNoteScreen(reason: "open Skills") else { return }
                 selectedSidebarPane = .skills
             }
         )

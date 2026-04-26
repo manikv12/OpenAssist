@@ -646,6 +646,7 @@ final class SettingsStore: ObservableObject {
         static let telegramPendingDisplayName = "OpenAssist.telegramPendingDisplayName"
         static let telegramLastProcessedUpdateID = "OpenAssist.telegramLastProcessedUpdateID"
         static let telegramTrackedMessageIDs = "OpenAssist.telegramTrackedMessageIDs"
+        static let telegramSelectedSessionID = "OpenAssist.telegramSelectedSessionID"
         static let promptRewriteEnabled = "OpenAssist.promptRewriteEnabled"
         static let promptRewriteAutoInsertEnabled = "OpenAssist.promptRewriteAutoInsertEnabled"
         static let memoryIndexingEnabled = "OpenAssist.memoryIndexingEnabled"
@@ -3064,6 +3065,7 @@ final class SettingsStore: ObservableObject {
                 clearTelegramRemoteOwner()
                 telegramLastProcessedUpdateID = 0
                 telegramTrackedMessageIDs = []
+                telegramSelectedSessionID = ""
             }
 
             Self.storeTelegramBotToken(normalizedNewValue)
@@ -3083,6 +3085,14 @@ final class SettingsStore: ObservableObject {
         }
         set {
             defaults.set(Self.normalizedTelegramMessageIDs(newValue), forKey: Keys.telegramTrackedMessageIDs)
+        }
+    }
+
+    var telegramSelectedSessionID: String {
+        get { defaults.string(forKey: Keys.telegramSelectedSessionID) ?? "" }
+        set {
+            let normalizedValue = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            defaults.set(normalizedValue, forKey: Keys.telegramSelectedSessionID)
         }
     }
 
@@ -3120,6 +3130,7 @@ final class SettingsStore: ObservableObject {
             telegramOwnerUserID = ""
             telegramOwnerChatID = ""
             telegramTrackedMessageIDs = []
+            telegramSelectedSessionID = ""
         }
     }
 

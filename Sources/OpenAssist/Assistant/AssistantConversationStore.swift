@@ -996,6 +996,18 @@ final class AssistantConversationStore {
         let previousTrimmed = previousText.trimmingCharacters(in: .whitespacesAndNewlines)
         let nextTrimmed = normalizedText.trimmingCharacters(in: .whitespacesAndNewlines)
 
+        if previousText == normalizedText {
+            if manifest.selectedNoteID != resolvedNoteID {
+                manifest.selectedNoteID = resolvedNoteID
+                try storeThreadNoteManifest(manifest, threadID: normalizedThreadID)
+            }
+            return AssistantThreadNotesWorkspace(
+                threadID: normalizedThreadID,
+                manifest: manifest,
+                selectedNoteText: previousText
+            )
+        }
+
         if nextTrimmed.isEmpty, !previousTrimmed.isEmpty, !forceHistorySnapshot {
             return AssistantThreadNotesWorkspace(
                 threadID: normalizedThreadID,
