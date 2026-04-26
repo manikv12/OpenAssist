@@ -961,6 +961,47 @@ export function ComposerView({
         </div>
       ) : null}
 
+      {state.noteContext ? (
+        <div className="oa-react-composer__chip-row oa-react-composer__chip-row--context">
+          <div className="oa-react-composer__note-context-chip">
+            <span className="oa-react-composer__note-context-icon" aria-hidden="true">
+              <AppIcon symbol="doc.text" size={14} strokeWidth={2} />
+            </span>
+            <span className="oa-react-composer__note-context-copy">
+              <span className="oa-react-composer__note-context-label">Viewing</span>
+              <span className="oa-react-composer__note-context-title">
+                {state.noteContext.noteTitle}
+                {state.noteContext.projectTitle ? (
+                  <>
+                    <span className="oa-react-composer__note-context-sep"> · </span>
+                    {state.noteContext.projectTitle}
+                  </>
+                ) : null}
+              </span>
+            </span>
+            <button
+              type="button"
+              className={`oa-react-composer__note-context-toggle${
+                state.noteContext.includeContent ? " is-on" : ""
+              }`}
+              onClick={() => onDispatchCommand("toggleNoteContextContent")}
+              aria-pressed={state.noteContext.includeContent}
+              title="Attach the note's contents to your prompt"
+            >
+              {state.noteContext.includeContent ? "Content attached" : "Include content"}
+            </button>
+            <button
+              type="button"
+              className="oa-react-composer__note-context-dismiss"
+              onClick={() => onDispatchCommand("dismissNoteContext")}
+              aria-label="Stop sharing note context with the assistant"
+            >
+              <AppIcon symbol="xmark" size={11} strokeWidth={2.4} />
+            </button>
+          </div>
+        </div>
+      ) : null}
+
       {state.attachments.length ? (
         <div className="oa-react-composer__chip-row">
           {state.attachments.map((attachment) => (

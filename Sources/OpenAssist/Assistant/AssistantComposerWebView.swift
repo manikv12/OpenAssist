@@ -117,6 +117,138 @@ struct AssistantComposerWebSlashCommand: Equatable {
     }
 }
 
+struct AssistantComposerWebNoteContext: Equatable {
+    let noteTitle: String
+    let projectTitle: String?
+    let ownerKind: String?
+    let ownerID: String?
+    let noteID: String?
+    let contextKey: String
+    let sourceLabel: String?
+    let filePath: String?
+    let includeContent: Bool
+
+    func toJSON() -> [String: Any] {
+        var json: [String: Any] = [
+            "noteTitle": noteTitle,
+            "contextKey": contextKey,
+            "includeContent": includeContent,
+        ]
+        if let projectTitle, !projectTitle.isEmpty {
+            json["projectTitle"] = projectTitle
+        }
+        if let ownerKind, !ownerKind.isEmpty {
+            json["ownerKind"] = ownerKind
+        }
+        if let ownerID, !ownerID.isEmpty {
+            json["ownerId"] = ownerID
+        }
+        if let noteID, !noteID.isEmpty {
+            json["noteId"] = noteID
+        }
+        if let sourceLabel, !sourceLabel.isEmpty {
+            json["sourceLabel"] = sourceLabel
+        }
+        if let filePath, !filePath.isEmpty {
+            json["filePath"] = filePath
+        }
+        return json
+    }
+}
+
+enum AssistantComposerNoteContentPolicy {
+    static func shouldAutoAttachContent(prompt: String) -> Bool {
+        let normalized = prompt
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\t", with: " ")
+            .split(separator: " ")
+            .joined(separator: " ")
+            .lowercased()
+        guard !normalized.isEmpty else { return false }
+
+        let directReferences = [
+            "this note",
+            "the note",
+            "open note",
+            "current note",
+            "selected note",
+            "this project note",
+            "this thread note",
+            "into this note",
+            "to this note",
+            "in this note",
+            "about this note",
+            "ask about this note"
+        ]
+        if directReferences.contains(where: normalized.contains) {
+            return true
+        }
+
+        var shortCommand = normalized
+        for prefix in ["please ", "can you ", "could you ", "help me "] {
+            if shortCommand.hasPrefix(prefix) {
+                shortCommand = String(shortCommand.dropFirst(prefix.count))
+                break
+            }
+        }
+        if shortCommand.hasSuffix(" please") {
+            shortCommand = String(shortCommand.dropLast(" please".count))
+        }
+
+        let bareNoteWorkCommands = [
+            "summarize",
+            "summarise",
+            "organize",
+            "organise",
+            "clean up",
+            "cleanup"
+        ]
+        if bareNoteWorkCommands.contains(shortCommand) {
+            return true
+        }
+
+        let referentialNoteWorkCommands = [
+            "summarize this",
+            "summarise this",
+            "summarize it",
+            "summarise it",
+            "organize this",
+            "organise this",
+            "organize it",
+            "organise it",
+            "clean this up",
+            "clean it up"
+        ]
+        if referentialNoteWorkCommands.contains(shortCommand) {
+            return true
+        }
+
+        let explicitNoteWorkVerbs = [
+            "review",
+            "rewrite",
+            "polish"
+        ]
+        if explicitNoteWorkVerbs.contains(where: normalized.contains),
+            normalized.contains("note") || normalized.contains("here")
+        {
+            return true
+        }
+
+        let addOrChartRequests = [
+            "add ",
+            "insert ",
+            "append ",
+            "write ",
+            "make a chart",
+            "create a chart",
+            "generate a chart",
+            "build a chart"
+        ]
+        return addOrChartRequests.contains(where: normalized.contains)
+            && (normalized.contains("note") || normalized.contains("here"))
+    }
+}
+
 struct AssistantComposerWebBaseState: Equatable {
     let draftText: String
     let placeholder: String
@@ -136,6 +268,7 @@ struct AssistantComposerWebBaseState: Equatable {
     let attachments: [AssistantComposerWebAttachment]
     let activeProviderID: String
     let slashCommands: [AssistantComposerWebSlashCommand]
+    let noteContext: AssistantComposerWebNoteContext?
 
     func toJSON() -> [String: Any] {
         var json: [String: Any] = [
@@ -163,6 +296,9 @@ struct AssistantComposerWebBaseState: Equatable {
         }
         if let preflightStatusMessage, !preflightStatusMessage.isEmpty {
             json["preflightStatusMessage"] = preflightStatusMessage
+        }
+        if let noteContext {
+            json["noteContext"] = noteContext.toJSON()
         }
         return json
     }

@@ -2406,7 +2406,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         startRecording()
     }
 
-    func sendAssistantTypedPrompt(_ prompt: String) {
+    func sendAssistantTypedPrompt(_ prompt: String, oneShotInstructions: String? = nil) {
         let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty || !assistantController.attachments.isEmpty else { return }
 
@@ -2425,7 +2425,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         assistantController.stopAssistantVoicePlayback()
 
         Task { @MainActor in
-            await assistantController.sendPrompt(trimmed)
+            await assistantController.sendPrompt(
+                trimmed,
+                selectedPluginIDs: nil,
+                automationJob: nil,
+                oneShotInstructions: oneShotInstructions
+            )
             self.updateMenuState()
         }
     }

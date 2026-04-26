@@ -88,7 +88,11 @@ final class AssistantRemoteBridge {
         assistant.rateLimits
     }
 
-    func listSessions(limit: Int = 8, projectID: String? = nil) async -> [AssistantSessionSummary] {
+    func listSessions(
+        limit: Int = 8,
+        projectID: String? = nil,
+        selectedSessionID: String? = nil
+    ) async -> [AssistantSessionSummary] {
         let refreshLimit: Int
         if let normalizedProjectID = projectID?.trimmingCharacters(in: .whitespacesAndNewlines),
            !normalizedProjectID.isEmpty {
@@ -97,58 +101,12 @@ final class AssistantRemoteBridge {
             refreshLimit = max(limit, 20)
         }
 
-        await assistant.refreshSessions(limit: refreshLimit)
-        let visibleProjectIDs = Set(assistant.visibleLeafProjects.map {
-            $0.id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        })
-        let selectedSessionID = assistant.selectedSessionID
-        let visibleSessions = assistant.sessions.filter { session in
-            guard !session.isArchived,
-                  assistantSessionSupportsCurrentThreadUI(session) else {
-                return false
-            }
-            if session.isProviderIndependentThreadV2,
-               !session.hasConversationContent,
-               session.id.caseInsensitiveCompare(selectedSessionID ?? "") != .orderedSame {
-                return false
-            }
-            guard let sessionProjectID = session.projectID?.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines).nonEmpty?.lowercased() else {
-                return true
-            }
-            return visibleProjectIDs.contains(sessionProjectID)
-        }
-
-        guard let normalizedProjectID = projectID?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !normalizedProjectID.isEmpty else {
-            return Array(visibleSessions.prefix(limit))
-        }
-
-        if let selectedFolder = assistant.visibleFolders.first(where: {
-            $0.id.caseInsensitiveCompare(normalizedProjectID) == .orderedSame
-        }) {
-            let descendantProjectIDs = Set<String>(
-                assistant.visibleLeafProjects.compactMap { project in
-                    guard let parentID = project.parentID,
-                          parentID.caseInsensitiveCompare(selectedFolder.id) == .orderedSame else {
-                        return nil
-                    }
-                    return project.id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-                }
-            )
-            let matchingSessions = visibleSessions.filter { session in
-                guard let sessionProjectID = session.projectID?.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines).nonEmpty?.lowercased() else {
-                    return false
-                }
-                return descendantProjectIDs.contains(sessionProjectID)
-            }
-            return Array(matchingSessions.prefix(limit))
-        }
-
-        let matchingSessions = visibleSessions.filter { session in
-            session.projectID?.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
-                .caseInsensitiveCompare(normalizedProjectID) == .orderedSame
-        }
-        return Array(matchingSessions.prefix(limit))
+        let visibleSessions = await visibleRemoteSessions(
+            projectID: projectID,
+            selectedSessionID: selectedSessionID,
+            refreshLimit: refreshLimit
+        )
+        return Array(visibleSessions.prefix(limit))
     }
 
     func availableProjects() async -> [AssistantRemoteProjectOption] {
@@ -572,8 +530,22 @@ final class AssistantRemoteBridge {
         }
     }
 
-    func sessionSnapshot(sessionID: String) async -> AssistantRemoteSessionSnapshot? {
-        await assistant.remoteSessionSnapshot(sessionID: sessionID)
+    func sessionSnapshot(
+        sessionID: String,
+        projectID: String? = nil,
+        selectedSessionID: String? = nil
+    ) async -> AssistantRemoteSessionSnapshot? {
+        let visibleSessions = await visibleRemoteSessions(
+            projectID: projectID,
+            selectedSessionID: selectedSessionID,
+            refreshLimit: 200
+        )
+        guard visibleSessions.contains(where: {
+            $0.id.caseInsensitiveCompare(sessionID) == .orderedSame
+        }) else {
+            return nil
+        }
+        return await assistant.remoteSessionSnapshot(sessionID: sessionID)
     }
 
     func cancelActiveTurn(
@@ -630,5 +602,87 @@ final class AssistantRemoteBridge {
     /// screenshots from accumulating on disk in the session history.
     func clearDeliveredScreenshotData(sessionID: String? = nil) async {
         assistant.clearDeliveredScreenshotAttachments(sessionID: sessionID)
+    }
+
+    private func visibleRemoteSessions(
+        projectID: String?,
+        selectedSessionID: String?,
+        refreshLimit: Int
+    ) async -> [AssistantSessionSummary] {
+        await assistant.refreshSessions(limit: refreshLimit)
+
+        let visibleProjectIDs = Set(assistant.visibleLeafProjects.map {
+            $0.id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        })
+
+        let baseVisibleSessions = assistant.sessions.filter { session in
+            guard !session.isArchived,
+                  assistantSessionSupportsCurrentThreadUI(session),
+                  assistantShouldListSessionInRemoteSurface(
+                      session,
+                      selectedSessionID: selectedSessionID,
+                      canonicalThreadID: canonicalThreadID(forProviderSessionID: session.id)
+                  ) else {
+                return false
+            }
+
+            guard let sessionProjectID = session.projectID?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .nonEmpty?
+                .lowercased() else {
+                return true
+            }
+
+            return visibleProjectIDs.contains(sessionProjectID)
+        }
+
+        guard let normalizedProjectID = projectID?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !normalizedProjectID.isEmpty else {
+            return baseVisibleSessions
+        }
+
+        if let selectedFolder = assistant.visibleFolders.first(where: {
+            $0.id.caseInsensitiveCompare(normalizedProjectID) == .orderedSame
+        }) {
+            let descendantProjectIDs = Set<String>(
+                assistant.visibleLeafProjects.compactMap { project in
+                    guard let parentID = project.parentID,
+                          parentID.caseInsensitiveCompare(selectedFolder.id) == .orderedSame else {
+                        return nil
+                    }
+                    return project.id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                }
+            )
+
+            return baseVisibleSessions.filter { session in
+                guard let sessionProjectID = session.projectID?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .nonEmpty?
+                    .lowercased() else {
+                    return false
+                }
+
+                return descendantProjectIDs.contains(sessionProjectID)
+            }
+        }
+
+        return baseVisibleSessions.filter { session in
+            session.projectID?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .caseInsensitiveCompare(normalizedProjectID) == .orderedSame
+        }
+    }
+
+    private func canonicalThreadID(forProviderSessionID providerSessionID: String?) -> String? {
+        guard let normalizedProviderSessionID = normalizedIdentifier(providerSessionID) else {
+            return nil
+        }
+
+        return assistant.sessions.first(where: { session in
+            normalizedIdentifier(session.activeProviderSessionID) == normalizedProviderSessionID
+                || session.providerBindingsByBackend.contains(where: { binding in
+                    normalizedIdentifier(binding.providerSessionID) == normalizedProviderSessionID
+                })
+        })?.id
     }
 }

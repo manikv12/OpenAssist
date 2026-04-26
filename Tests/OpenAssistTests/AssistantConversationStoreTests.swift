@@ -558,6 +558,52 @@ final class AssistantConversationStoreTests: XCTestCase {
         XCTAssertEqual(selectedFirst.notes.last?.order, 1)
     }
 
+    func testSavingUnchangedThreadNoteDoesNotUpdateTimestampOrReorder() throws {
+        let fileManager = FileManager.default
+        let directoryURL = fileManager.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? fileManager.removeItem(at: directoryURL) }
+
+        let store = AssistantConversationStore(
+            fileManager: fileManager,
+            baseDirectoryURL: directoryURL
+        )
+
+        let threadID = "thread-note-noop-save"
+        let firstWorkspace = try store.createThreadNote(threadID: threadID, title: "First")
+        let firstNote = try XCTUnwrap(firstWorkspace.selectedNote)
+        let firstSavedAt = Date(timeIntervalSince1970: 1_700_000_000)
+        _ = try store.saveThreadNote(
+            threadID: threadID,
+            noteID: firstNote.id,
+            text: "First body",
+            now: firstSavedAt
+        )
+
+        let secondWorkspace = try store.createThreadNote(threadID: threadID, title: "Second")
+        let secondNote = try XCTUnwrap(secondWorkspace.selectedNote)
+        _ = try store.saveThreadNote(
+            threadID: threadID,
+            noteID: secondNote.id,
+            text: "Second body",
+            now: Date(timeIntervalSince1970: 1_700_000_100)
+        )
+
+        let unchanged = try store.saveThreadNote(
+            threadID: threadID,
+            noteID: firstNote.id,
+            text: "First body",
+            now: Date(timeIntervalSince1970: 1_700_001_000)
+        )
+
+        XCTAssertEqual(unchanged.notes.map(\.id), [firstNote.id, secondNote.id])
+        XCTAssertEqual(unchanged.selectedNote?.id, firstNote.id)
+        XCTAssertEqual(
+            unchanged.notes.first(where: { $0.id == firstNote.id })?.updatedAt,
+            firstSavedAt
+        )
+    }
+
     func testLegacyNotesMarkdownMigratesIntoManifestBackedNote() throws {
         let fileManager = FileManager.default
         let directoryURL = fileManager.temporaryDirectory

@@ -305,6 +305,14 @@ export interface ThreadDeletedNoteItem {
   markdown: string;
 }
 
+export interface ThreadNoteSourceDescriptor {
+  sourceKind: "managedNote" | "externalMarkdownFile" | string;
+  filePath?: string | null;
+  fileName?: string | null;
+  isDirty: boolean;
+  canSave: boolean;
+}
+
 export interface ThreadNoteState {
   threadId: string | null;
   ownerKind?: "thread" | "project" | string | null;
@@ -335,6 +343,7 @@ export interface ThreadNoteState {
   lastSavedAtLabel?: string | null;
   canEdit: boolean;
   placeholder: string;
+  sourceDescriptor?: ThreadNoteSourceDescriptor | null;
   aiDraftPreview?: ThreadNoteAIDraftPreview | null;
   projectNoteTransferPreview?: ThreadNoteProjectTransferPreview | null;
   projectNoteTransferOutcome?: ThreadNoteProjectTransferOutcome | null;
@@ -505,6 +514,18 @@ export interface AssistantComposerSlashCommand {
   localMode?: "note" | "chat" | string;
 }
 
+export interface AssistantComposerNoteContext {
+  noteTitle: string;
+  projectTitle?: string;
+  ownerKind?: "thread" | "project";
+  ownerId?: string;
+  noteId?: string;
+  contextKey?: string;
+  sourceLabel?: string;
+  filePath?: string;
+  includeContent: boolean;
+}
+
 export interface AssistantComposerState {
   draftText: string;
   placeholder: string;
@@ -524,6 +545,7 @@ export interface AssistantComposerState {
   attachments: AssistantComposerAttachment[];
   activeProviderId: string;
   slashCommands: AssistantComposerSlashCommand[];
+  noteContext?: AssistantComposerNoteContext | null;
 }
 
 export type AssistantRuntimeControlsAvailability =

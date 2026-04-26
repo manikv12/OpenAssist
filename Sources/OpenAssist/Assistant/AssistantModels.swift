@@ -1482,6 +1482,19 @@ func assistantShouldHideShadowProviderSession(
         != normalizedAssistantSessionKey(session.id)
 }
 
+func assistantShouldListSessionInRemoteSurface(
+    _ session: AssistantSessionSummary,
+    selectedSessionID: String?,
+    canonicalThreadID: String?
+) -> Bool {
+    assistantShouldListSessionInSidebar(session, selectedSessionID: selectedSessionID)
+        && !assistantShouldHideShadowProviderSession(
+            session,
+            selectedSessionID: selectedSessionID,
+            canonicalThreadID: canonicalThreadID
+        )
+}
+
 func assistantMergedSessionsForCleanup(
     liveSessions: [AssistantSessionSummary],
     catalogSessions: [AssistantSessionSummary],
@@ -2089,6 +2102,20 @@ enum AssistantHistoryMutationError: LocalizedError {
             return "Open Assist could not find the saved checkpoint needed for this rewind."
         case .missingCheckpointAnchor:
             return "Open Assist could not find the original request for that checkpoint."
+        }
+    }
+}
+
+enum AssistantNoteSaveError: LocalizedError {
+    case invalidInput(String)
+    case underlying(Error)
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidInput(let message):
+            return message
+        case .underlying(let error):
+            return error.localizedDescription
         }
     }
 }
@@ -9466,7 +9493,31 @@ final class AssistantStore: ObservableObject {
         text: String,
         forceHistorySnapshot: Bool = false
     ) -> AssistantThreadNotesWorkspace? {
-        guard let normalizedThreadID = normalizedSessionID(threadID) else { return nil }
+        switch saveThreadNoteResult(
+            threadID: threadID,
+            noteID: noteID,
+            text: text,
+            forceHistorySnapshot: forceHistorySnapshot
+        ) {
+        case .success(let workspace):
+            return workspace
+        case .failure:
+            return nil
+        }
+    }
+
+    /// Result-returning variant used by the save-ack path so callers can
+    /// surface the underlying error to the user / bridge it to JS.
+    /// Existing nil-returning callers keep using `saveThreadNote` above.
+    func saveThreadNoteResult(
+        threadID: String?,
+        noteID: String?,
+        text: String,
+        forceHistorySnapshot: Bool = false
+    ) -> Result<AssistantThreadNotesWorkspace, AssistantNoteSaveError> {
+        guard let normalizedThreadID = normalizedSessionID(threadID) else {
+            return .failure(.invalidInput("threadID is missing or empty."))
+        }
         let normalizedNoteID = noteID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
         do {
             let workspace = try conversationStore.saveThreadNote(
@@ -9476,11 +9527,11 @@ final class AssistantStore: ObservableObject {
                 forceHistorySnapshot: forceHistorySnapshot
             )
             _ = try? AssistantNotesBackupController.shared.maybeRunAutomaticBackupIfNeeded()
-            return workspace
+            return .success(workspace)
         } catch {
             lastStatusMessage = "Could not save the thread note."
             CrashReporter.logError("Thread note save failed: \(error.localizedDescription)")
-            return nil
+            return .failure(.underlying(error))
         }
     }
 
@@ -9901,8 +9952,31 @@ final class AssistantStore: ObservableObject {
         text: String,
         forceHistorySnapshot: Bool = false
     ) -> AssistantNotesWorkspace? {
-        guard let normalizedProjectID = projectID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+        switch saveProjectNoteResult(
+            projectID: projectID,
+            noteID: noteID,
+            text: text,
+            forceHistorySnapshot: forceHistorySnapshot
+        ) {
+        case .success(let workspace):
+            return workspace
+        case .failure:
             return nil
+        }
+    }
+
+    /// Result-returning variant. See `saveThreadNoteResult` for rationale.
+    func saveProjectNoteResult(
+        projectID: String?,
+        noteID: String?,
+        text: String,
+        forceHistorySnapshot: Bool = false
+    ) -> Result<AssistantNotesWorkspace, AssistantNoteSaveError> {
+        guard let normalizedProjectID = projectID?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nonEmpty
+        else {
+            return .failure(.invalidInput("projectID is missing or empty."))
         }
         let normalizedNoteID = noteID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
         do {
@@ -9913,11 +9987,11 @@ final class AssistantStore: ObservableObject {
                 forceHistorySnapshot: forceHistorySnapshot
             )
             _ = try? AssistantNotesBackupController.shared.maybeRunAutomaticBackupIfNeeded()
-            return workspace
+            return .success(workspace)
         } catch {
             lastStatusMessage = "Could not save the project note."
             CrashReporter.logError("Project note save failed: \(error.localizedDescription)")
-            return nil
+            return .failure(.underlying(error))
         }
     }
 

@@ -1,47 +1,24 @@
-<p align="center">
-  <img src="Assets/OpenAssistLogo.svg" alt="Open Assist" width="120" />
-</p>
+# Open Assist
 
-<h1 align="center">Open Assist</h1>
+A macOS AI assistant with chat, voice, local or cloud models, and approved automation.
 
-<p align="center">
-  A macOS AI assistant with chat, voice, local or cloud models, and approved automation.
-</p>
 
-<p align="center">
-  <a href="https://github.com/manikv12/OpenAssist/releases"><img alt="Download" src="https://img.shields.io/github/v/release/manikv12/OpenAssist?label=Download&color=0f172a&style=flat-square" /></a>
-  <img alt="macOS" src="https://img.shields.io/badge/macOS-13.3%2B-blue?style=flat-square" />
-  <img alt="Swift" src="https://img.shields.io/badge/Swift-5.9-orange?style=flat-square" />
-  <img alt="License" src="https://img.shields.io/github/license/manikv12/OpenAssist?style=flat-square" />
-</p>
 
 ---
 
 ## Product Preview
 
-<p align="center">
-  <img src="Assets/README/openassist-agent-weather.png" alt="Open Assist assistant window showing the weather chat with the notch HUD floating above it" width="100%" />
-</p>
 
-<p align="center">
-  <sub>The main assistant workspace with projects, threads, and the floating HUD.</sub>
-</p>
 
-<p align="center">
-  <img src="Assets/README/openassist-ai-studio.png" alt="Open Assist settings and AI Studio surfaces with the notch HUD preview" width="100%" />
-</p>
+The main assistant workspace with projects, threads, and the floating HUD.
 
-<p align="center">
-  <sub>Settings and AI Studio for providers, models, memory, and advanced controls.</sub>
-</p>
 
-<p align="center">
-  <img src="Assets/README/openassist-voice-hud.png" alt="Open Assist voice transcription HUD with colorful live input bars" width="100%" />
-</p>
 
-<p align="center">
-  <sub>The voice HUD for dictation, push-to-talk, and voice-first tasks.</sub>
-</p>
+Settings and AI Studio for providers, models, memory, and advanced controls.
+
+
+
+The voice HUD for dictation, push-to-talk, and voice-first tasks.
 
 ## What It Does
 
@@ -146,11 +123,13 @@ Example prompts:
 
 ## Default Shortcuts
 
-| Action | Default shortcut |
-|---|---|
-| Hold-to-talk | `Option + Command + Space` |
+
+| Action                      | Default shortcut                     |
+| --------------------------- | ------------------------------------ |
+| Hold-to-talk                | `Option + Command + Space`           |
 | Toggle continuous dictation | `Control + Option + Command + Space` |
-| Paste last transcript | `Option + Command + V` |
+| Paste last transcript       | `Option + Command + V`               |
+
 
 You can change these in Settings.
 

@@ -714,6 +714,24 @@ struct AssistantChatWebThreadDeletedNoteItem: Equatable {
     }
 }
 
+struct AssistantChatWebThreadNoteSourceDescriptor: Equatable {
+    let sourceKind: String
+    let filePath: String?
+    let fileName: String?
+    let isDirty: Bool
+    let canSave: Bool
+
+    func toJSON() -> [String: Any] {
+        [
+            "sourceKind": sourceKind,
+            "filePath": filePath ?? NSNull(),
+            "fileName": fileName ?? NSNull(),
+            "isDirty": isDirty,
+            "canSave": canSave,
+        ]
+    }
+}
+
 struct AssistantChatWebThreadNoteState: Equatable {
     let threadID: String?
     let ownerKind: String?
@@ -744,6 +762,7 @@ struct AssistantChatWebThreadNoteState: Equatable {
     let lastSavedAtLabel: String?
     let canEdit: Bool
     let placeholder: String
+    let sourceDescriptor: AssistantChatWebThreadNoteSourceDescriptor?
     let aiDraftPreview: AssistantChatWebThreadNoteAIPreview?
     let projectNoteTransferPreview: AssistantChatWebProjectNoteTransferPreview?
     let projectNoteTransferOutcome: AssistantChatWebProjectNoteTransferOutcome?
@@ -755,6 +774,92 @@ struct AssistantChatWebThreadNoteState: Equatable {
     let previousLinkedNoteTitle: String?
     let historyVersions: [AssistantChatWebThreadNoteHistoryItem]
     let recentlyDeletedNotes: [AssistantChatWebThreadDeletedNoteItem]
+
+    init(
+        threadID: String?,
+        ownerKind: String?,
+        ownerID: String?,
+        ownerTitle: String,
+        presentation: String,
+        notesScope: String?,
+        workspaceProjectID: String?,
+        workspaceProjectTitle: String?,
+        workspaceOwnerSubtitle: String?,
+        canCreateNote: Bool,
+        owningThreadID: String?,
+        owningThreadTitle: String?,
+        availableSources: [AssistantChatWebThreadNoteSource],
+        notes: [AssistantChatWebThreadNoteItem],
+        selectedNoteID: String?,
+        selectedNoteTitle: String,
+        text: String,
+        isOpen: Bool,
+        isExpanded: Bool,
+        viewMode: String,
+        hasAnyNotes: Bool,
+        isSaving: Bool,
+        isGeneratingAIDraft: Bool,
+        isGeneratingProjectTransferPreview: Bool,
+        isGeneratingBatchNotePlanPreview: Bool,
+        aiDraftMode: String?,
+        lastSavedAtLabel: String?,
+        canEdit: Bool,
+        placeholder: String,
+        sourceDescriptor: AssistantChatWebThreadNoteSourceDescriptor? = nil,
+        aiDraftPreview: AssistantChatWebThreadNoteAIPreview?,
+        projectNoteTransferPreview: AssistantChatWebProjectNoteTransferPreview?,
+        projectNoteTransferOutcome: AssistantChatWebProjectNoteTransferOutcome?,
+        batchNotePlanPreview: AssistantChatWebBatchNotePlanPreview?,
+        outgoingLinks: [AssistantChatWebThreadNoteRelationshipItem],
+        backlinks: [AssistantChatWebThreadNoteRelationshipItem],
+        graph: AssistantChatWebThreadNoteGraph?,
+        canNavigateBack: Bool,
+        previousLinkedNoteTitle: String?,
+        historyVersions: [AssistantChatWebThreadNoteHistoryItem],
+        recentlyDeletedNotes: [AssistantChatWebThreadDeletedNoteItem]
+    ) {
+        self.threadID = threadID
+        self.ownerKind = ownerKind
+        self.ownerID = ownerID
+        self.ownerTitle = ownerTitle
+        self.presentation = presentation
+        self.notesScope = notesScope
+        self.workspaceProjectID = workspaceProjectID
+        self.workspaceProjectTitle = workspaceProjectTitle
+        self.workspaceOwnerSubtitle = workspaceOwnerSubtitle
+        self.canCreateNote = canCreateNote
+        self.owningThreadID = owningThreadID
+        self.owningThreadTitle = owningThreadTitle
+        self.availableSources = availableSources
+        self.notes = notes
+        self.selectedNoteID = selectedNoteID
+        self.selectedNoteTitle = selectedNoteTitle
+        self.text = text
+        self.isOpen = isOpen
+        self.isExpanded = isExpanded
+        self.viewMode = viewMode
+        self.hasAnyNotes = hasAnyNotes
+        self.isSaving = isSaving
+        self.isGeneratingAIDraft = isGeneratingAIDraft
+        self.isGeneratingProjectTransferPreview = isGeneratingProjectTransferPreview
+        self.isGeneratingBatchNotePlanPreview = isGeneratingBatchNotePlanPreview
+        self.aiDraftMode = aiDraftMode
+        self.lastSavedAtLabel = lastSavedAtLabel
+        self.canEdit = canEdit
+        self.placeholder = placeholder
+        self.sourceDescriptor = sourceDescriptor
+        self.aiDraftPreview = aiDraftPreview
+        self.projectNoteTransferPreview = projectNoteTransferPreview
+        self.projectNoteTransferOutcome = projectNoteTransferOutcome
+        self.batchNotePlanPreview = batchNotePlanPreview
+        self.outgoingLinks = outgoingLinks
+        self.backlinks = backlinks
+        self.graph = graph
+        self.canNavigateBack = canNavigateBack
+        self.previousLinkedNoteTitle = previousLinkedNoteTitle
+        self.historyVersions = historyVersions
+        self.recentlyDeletedNotes = recentlyDeletedNotes
+    }
 
     func toJSON() -> [String: Any] {
         var json: [String: Any] = [
@@ -787,6 +892,7 @@ struct AssistantChatWebThreadNoteState: Equatable {
             "lastSavedAtLabel": lastSavedAtLabel ?? NSNull(),
             "canEdit": canEdit,
             "placeholder": placeholder,
+            "sourceDescriptor": sourceDescriptor?.toJSON() ?? NSNull(),
             "outgoingLinks": outgoingLinks.map { $0.toJSON() },
             "backlinks": backlinks.map { $0.toJSON() },
             "graph": graph?.toJSON() ?? NSNull(),
@@ -1081,6 +1187,7 @@ struct AssistantChatWebThreadNoteCommand {
     let sourceNoteTitle: String?
     let sourceTextAfterMove: String?
     let requestID: String?
+    let draftRevision: Int?
     let outputMode: String?
     let captureMode: String?
     let captureSegmentCount: Int?
@@ -1124,6 +1231,7 @@ struct AssistantChatWebThreadNoteCommand {
         sourceNoteTitle: String?,
         sourceTextAfterMove: String?,
         requestID: String?,
+        draftRevision: Int?,
         outputMode: String?,
         captureMode: String?,
         captureSegmentCount: Int?,
@@ -1166,6 +1274,7 @@ struct AssistantChatWebThreadNoteCommand {
         self.sourceNoteTitle = sourceNoteTitle
         self.sourceTextAfterMove = sourceTextAfterMove
         self.requestID = requestID
+        self.draftRevision = draftRevision
         self.outputMode = outputMode
         self.captureMode = captureMode
         self.captureSegmentCount = captureSegmentCount
@@ -1241,6 +1350,7 @@ struct AssistantChatWebThreadNoteCommand {
         self.requestID = (payload["requestId"] as? String)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .assistantNonEmpty
+        self.draftRevision = (payload["draftRevision"] as? NSNumber)?.intValue
         self.outputMode = (payload["outputMode"] as? String)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .assistantNonEmpty
@@ -1359,6 +1469,32 @@ struct AssistantChatWebThreadNoteScreenshotProcessingResult: Equatable {
             "markdown": markdown ?? NSNull(),
             "rawText": rawText ?? NSNull(),
             "usedVision": usedVision,
+        ]
+    }
+}
+
+/// Result of a thread-note save. Posted back to the WebView so the JS
+/// side can clear its dirty flag (on ok) or surface an error (on
+/// failure) — without the ack, the JS optimistically clears dirty at
+/// dispatch time and can desync from the real persisted state.
+struct AssistantChatWebThreadNoteSaveAck: Equatable {
+    let requestID: String
+    let ownerKind: String?
+    let ownerID: String?
+    let noteID: String?
+    let draftRevision: Int?
+    let status: String      // "ok" or "error"
+    let errorMessage: String?
+
+    func toJSON() -> [String: Any] {
+        [
+            "requestId": requestID,
+            "ownerKind": ownerKind ?? NSNull(),
+            "ownerId": ownerID ?? NSNull(),
+            "noteId": noteID ?? NSNull(),
+            "draftRevision": draftRevision ?? NSNull(),
+            "status": status,
+            "errorMessage": errorMessage ?? NSNull(),
         ]
     }
 }
@@ -1887,6 +2023,7 @@ final class AssistantChatWebCoordinator: NSObject, WKScriptMessageHandler {
                 sourceNoteTitle: nil,
                 sourceTextAfterMove: nil,
                 requestID: nil,
+                draftRevision: nil,
                 outputMode: nil,
                 captureMode: nil,
                 captureSegmentCount: nil,
@@ -2115,7 +2252,12 @@ final class AssistantChatWebContainerView: NSView, WKNavigationDelegate, WKUIDel
     // Throttling for streaming updates
     private var throttleTimer: Timer?
     private var lastRenderedMessages: [AssistantChatWebMessage] = []
-    private static let throttleInterval: TimeInterval = 1.0 / 60.0
+    private var idleFlushTickCount: Int = 0
+    private static let throttleInterval: TimeInterval = 1.0 / 30.0
+    // If N consecutive flushes produce no events, stop the timer regardless of
+    // `shouldBatchStreamEvents()` — this is the safety net for stale active
+    // states that would otherwise keep the timer running forever while idle.
+    private static let maxIdleFlushTicks: Int = 4
 
     init(
         coordinator: AssistantChatWebCoordinator,
@@ -2397,6 +2539,26 @@ final class AssistantChatWebContainerView: NSView, WKNavigationDelegate, WKUIDel
         sendThreadNoteScreenshotProcessingResult(result)
     }
 
+    func applyThreadNoteSaveAck(_ ack: AssistantChatWebThreadNoteSaveAck) {
+        sendThreadNoteSaveAck(ack)
+    }
+
+    func flushThreadNoteDraftSnapshot() async -> [String: Any]? {
+        guard isReady else { return nil }
+
+        return await withCheckedContinuation { continuation in
+            webView.evaluateJavaScript(
+                "chatBridge.flushThreadNoteDraft?.() ?? null"
+            ) { result, error in
+                if error != nil {
+                    continuation.resume(returning: nil)
+                    return
+                }
+                continuation.resume(returning: result as? [String: Any])
+            }
+        }
+    }
+
     func applyActiveWorkState(_ activeWorkState: AssistantChatWebActiveWorkState?) {
         requestedActiveWorkState = activeWorkState
 
@@ -2531,6 +2693,7 @@ final class AssistantChatWebContainerView: NSView, WKNavigationDelegate, WKUIDel
     private func invalidateThrottleTimer() {
         throttleTimer?.invalidate()
         throttleTimer = nil
+        idleFlushTickCount = 0
     }
 
     private func flushStreamingState() {
@@ -2548,10 +2711,16 @@ final class AssistantChatWebContainerView: NSView, WKNavigationDelegate, WKUIDel
         guard !events.isEmpty else {
             if !shouldBatchStreamEvents() {
                 invalidateThrottleTimer()
+            } else {
+                idleFlushTickCount += 1
+                if idleFlushTickCount >= Self.maxIdleFlushTicks {
+                    invalidateThrottleTimer()
+                }
             }
             return
         }
 
+        idleFlushTickCount = 0
         sendStreamEvents(events, renderedMessages: requestedMessages)
 
         if !shouldBatchStreamEvents() {
@@ -2774,6 +2943,23 @@ final class AssistantChatWebContainerView: NSView, WKNavigationDelegate, WKUIDel
 
         webView.evaluateJavaScript(
             "chatBridge.handleThreadNoteScreenshotProcessingResult?.(\(jsonString))",
+            completionHandler: nil
+        )
+    }
+
+    private func sendThreadNoteSaveAck(_ ack: AssistantChatWebThreadNoteSaveAck) {
+        // If the web view isn't ready, we intentionally drop the ack —
+        // the JS side will time out and retry, which is the correct
+        // behavior for a save whose web process just died/reloaded.
+        guard isReady else { return }
+
+        guard let data = try? JSONSerialization.data(withJSONObject: ack.toJSON()),
+              let jsonString = String(data: data, encoding: .utf8) else {
+            return
+        }
+
+        webView.evaluateJavaScript(
+            "chatBridge.handleThreadNoteSaveAck?.(\(jsonString))",
             completionHandler: nil
         )
     }
