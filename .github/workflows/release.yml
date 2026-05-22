@@ -28,6 +28,13 @@ jobs:
       - name: Install create-dmg
         run: npm install -g create-dmg
 
+      - name: Setup Node for Electron
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: electron-react/package-lock.json
+
       - name: Cache Swift build artifacts
         uses: actions/cache@v4
         with:
@@ -57,6 +64,10 @@ jobs:
           security list-keychains -d user -s "$KEYCHAIN_PATH" "$(security list-keychains -d user | sed s/\"//g)"
           security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
 
+      - name: Extract version from tag
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
       - name: Build & package DMG
         env:
           DEVELOPER_ID: ${{ secrets.DEVELOPER_ID }}
@@ -69,9 +80,21 @@ jobs:
           APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
         run: Scripts/notarize.sh "dist/Open Assist.dmg"
 
-      - name: Extract version from tag
-        id: version
-        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      - name: Build & package Electron DMG
+        env:
+          DEVELOPER_ID: ${{ secrets.DEVELOPER_ID }}
+          OPENASSIST_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          cd electron-react
+          npm ci
+          OPENASSIST_BUILD_VERSION="$(git rev-list --count HEAD)" npm run release:mac
+
+      - name: Notarize Electron DMG
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: Scripts/notarize.sh "electron-react/dist/Open Assist Electron.dmg"
 
       - name: Download Sparkle tools
         run: |
@@ -140,7 +163,9 @@ jobs:
           tag_name: ${{ github.ref_name }}
           draft: false
           body_path: dist/release-notes.md
-          files: "dist/Open Assist.dmg"
+          files: |
+            dist/Open Assist.dmg
+            electron-react/dist/Open Assist Electron.dmg
 
       - name: Prepare Pages content
         run: mkdir -p pages && cp dist/appcast.xml pages/appcast.xml
