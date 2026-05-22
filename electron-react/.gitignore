@@ -1,6 +1,7 @@
 node_modules/
 dist-electron/
 dist-renderer/
+dist/
 out/
 out-unpacked/
 .vite/

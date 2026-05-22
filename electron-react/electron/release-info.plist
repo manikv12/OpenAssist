@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>LSApplicationCategoryType</key>
+  <string>public.app-category.productivity</string>
+  <key>NSAppleEventsUsageDescription</key>
+  <string>Open Assist uses Apple Events only when you ask it to control another Mac app.</string>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>Open Assist uses the microphone for dictation and realtime voice conversations.</string>
+  <key>NSSpeechRecognitionUsageDescription</key>
+  <string>Open Assist can use speech recognition when you choose voice input.</string>
+</dict>
+</plist>
