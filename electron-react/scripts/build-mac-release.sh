@@ -54,6 +54,60 @@ if [ ! -d "$APP_PATH" ]; then
   exit 1
 fi
 
+sign_target() {
+  local target="$1"
+  if [ -n "${DEVELOPER_ID:-}" ]; then
+    codesign --force --options runtime --timestamp --sign "$SIGN_ID" "$target"
+  else
+    codesign --force --options runtime --sign - "$target"
+  fi
+}
+
+normalize_framework_layout() {
+  local framework_path="$1"
+  local version_dir="${framework_path}/Versions/A"
+  if [ ! -d "$version_dir" ]; then
+    return
+  fi
+
+  rm -rf "${framework_path}/Versions/Current"
+  ln -s "A" "${framework_path}/Versions/Current"
+
+  for linked_dir in Headers Modules Resources; do
+    if [ -e "${version_dir}/${linked_dir}" ]; then
+      rm -rf "${framework_path}/${linked_dir}"
+      ln -s "Versions/Current/${linked_dir}" "${framework_path}/${linked_dir}"
+    fi
+  done
+
+  local info_plist="${version_dir}/Resources/Info.plist"
+  local executable_name=""
+  if [ -f "$info_plist" ]; then
+    executable_name="$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$info_plist" 2>/dev/null || true)"
+  fi
+  if [ -n "$executable_name" ] && [ -e "${version_dir}/${executable_name}" ]; then
+    rm -rf "${framework_path}/${executable_name}"
+    ln -s "Versions/Current/${executable_name}" "${framework_path}/${executable_name}"
+  fi
+}
+
+APP_RESOURCE_ROOT="${APP_PATH}/Contents/Resources/app"
+if [ -d "$APP_RESOURCE_ROOT" ]; then
+  while IFS= read -r -d '' framework_path; do
+    normalize_framework_layout "$framework_path"
+    sign_target "$framework_path"
+  done < <(find "$APP_RESOURCE_ROOT" -type d -name "*.framework" -print0)
+
+  while IFS= read -r -d '' native_file; do
+    case "$native_file" in
+      *.framework/*) continue ;;
+    esac
+    if file "$native_file" | grep -q "Mach-O"; then
+      sign_target "$native_file"
+    fi
+  done < <(find "$APP_RESOURCE_ROOT" -type f -perm -111 -print0)
+fi
+
 if [ -n "${DEVELOPER_ID:-}" ]; then
   codesign --force --deep --options runtime --timestamp --entitlements "$ENTITLEMENTS" --sign "$SIGN_ID" "$APP_PATH"
 else
