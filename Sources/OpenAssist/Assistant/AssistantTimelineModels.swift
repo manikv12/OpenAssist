@@ -509,20 +509,30 @@ private func assistantImageOpenTargets(
     return results
 }
 
+private let assistantFilePathScanMaxRawCharacters = 16_384
+private let assistantFilePathScanMaxLines = 120
+private let assistantFilePathScanMaxLineCharacters = 1_024
+private let assistantFilePathCandidateMaxCharacters = 512
+
 private func assistantExtractFilePathCandidates(from rawDetails: String) -> [String] {
-    let normalized = rawDetails.replacingOccurrences(of: "\r\n", with: "\n")
+    let normalized = rawDetails
+        .prefix(assistantFilePathScanMaxRawCharacters)
+        .replacingOccurrences(of: "\r\n", with: "\n")
     let lines = normalized.split(whereSeparator: \.isNewline)
     var candidates: [String] = []
     var seen = Set<String>()
 
     func append(_ candidate: String) {
+        guard candidate.count <= assistantFilePathCandidateMaxCharacters else { return }
         let normalizedCandidate = assistantNormalizedPathCandidate(candidate)
         guard let normalizedCandidate, seen.insert(normalizedCandidate).inserted else { return }
         candidates.append(normalizedCandidate)
     }
 
-    for rawLine in lines {
-        let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+    for rawLine in lines.prefix(assistantFilePathScanMaxLines) {
+        let line = rawLine
+            .prefix(assistantFilePathScanMaxLineCharacters)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !line.isEmpty else { continue }
 
         if let gitStylePath = assistantFirstRegexCapture(
@@ -631,6 +641,7 @@ private func assistantLoadImageData(from fileURL: URL) -> Data? {
 private func assistantNormalizedPathCandidate(_ candidate: String) -> String? {
     var value = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !value.isEmpty else { return nil }
+    guard value.count <= assistantFilePathCandidateMaxCharacters else { return nil }
 
     value = value
         .trimmingCharacters(in: CharacterSet(charactersIn: "\"'`()[]{}<>"))
@@ -683,6 +694,7 @@ private func assistantURLDisplayLabel(_ url: URL) -> String {
 }
 
 private func assistantRegexMatches(in text: String, pattern: String) -> [String] {
+    guard text.count <= assistantFilePathScanMaxLineCharacters else { return [] }
     guard let regex = try? NSRegularExpression(pattern: pattern) else { return [] }
     let range = NSRange(text.startIndex..<text.endIndex, in: text)
     return regex.matches(in: text, options: [], range: range).compactMap {
@@ -692,6 +704,7 @@ private func assistantRegexMatches(in text: String, pattern: String) -> [String]
 }
 
 private func assistantFirstRegexCapture(in text: String, pattern: String) -> String? {
+    guard text.count <= assistantFilePathScanMaxLineCharacters else { return nil }
     guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
     let range = NSRange(text.startIndex..<text.endIndex, in: text)
     guard let match = regex.firstMatch(in: text, options: [], range: range),

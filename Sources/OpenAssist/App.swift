@@ -792,6 +792,25 @@ struct OpenAssistApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
     @StateObject private var settings = SettingsStore.shared
 
+    init() {
+        // CLI mode: `OpenAssist --cli <namespace> <subcommand>...`
+        // Intercept here — before AppKit/SwiftUI initializes — so the CLI
+        // never has to wait for the GUI to come up. Each CLI namespace is
+        // expected to call exit(), so this never returns when matched.
+        if let cliIndex = CommandLine.arguments.firstIndex(of: "--cli"),
+            cliIndex + 1 < CommandLine.arguments.count
+        {
+            let cliArgs = Array(CommandLine.arguments[(cliIndex + 1)...])
+            switch cliArgs.first {
+            case "extension":
+                AssistantExtensionCLI.run(arguments: Array(cliArgs.dropFirst()))
+            default:
+                FileHandle.standardError.write(Data("error: unknown CLI namespace '\(cliArgs.first ?? "")'\n".utf8))
+                exit(2)
+            }
+        }
+    }
+
     var body: some Scene {
         Settings {
             SettingsView()
@@ -867,6 +886,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
     private let settings = SettingsStore.shared
     private let automationAPICoordinator = AutomationAPICoordinator.shared
     private let telegramRemoteCoordinator = TelegramRemoteCoordinator.shared
+    private let remoteAccessCoordinator = RemoteAccessCoordinator.shared
     private let adaptiveCorrectionStore = AdaptiveCorrectionStore.shared
     private let promptRewriteService = PromptRewriteService.shared
     private let assistantVoiceDraftRefinementService = AssistantVoiceDraftRefinementService()
@@ -1196,6 +1216,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
             AssistantMCPServerMain.run(bridgePort: port)
             // run(bridgePort:) calls exit() and never returns
         }
+
+        // Discover installed extensions and start the ones the user has enabled.
+        // Done before status bar setup so any UI hook can read the current list.
+        AssistantExtensionManager.shared.reload()
+        AssistantExtensionManager.shared.startEnabled()
 
         Self.shared = self
         CrashReporter.install()
@@ -1736,6 +1761,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, NS
         settings.onChange = nil
         automationAPICoordinator.stop()
         telegramRemoteCoordinator.stop()
+        AssistantExtensionManager.shared.stopAll()
         adaptiveCorrectionObserver?.cancel()
         adaptiveCorrectionObserver = nil
         assistantHUDObserver?.cancel()
@@ -5135,6 +5161,7 @@ struct SettingsView: View {
     @StateObject private var updateCheckStatusStore = UpdateCheckStatusStore.shared
     @StateObject private var automationAPICoordinator = AutomationAPICoordinator.shared
     @StateObject private var telegramRemoteCoordinator = TelegramRemoteCoordinator.shared
+    @StateObject private var remoteAccessCoordinator = RemoteAccessCoordinator.shared
     @StateObject private var notesBackupController = AssistantNotesBackupController.shared
     @State private var selectedSection: SettingsSection = .assistant
     @State private var selectedIntegrationsPage: SettingsAdvancedPage = .overview
@@ -5654,6 +5681,8 @@ struct SettingsView: View {
         switch route.subsection {
         case .integrationTelegram:
             return .telegramRemote
+        case .integrationRemoteAccess:
+            return .remoteAccess
         case .automationNotifications, .automationLocalAPI:
             return .automationNotifications
         default:
@@ -6667,10 +6696,13 @@ struct SettingsView: View {
     private var integrationsSettingsSection: some View {
         VStack(alignment: .leading, spacing: 14) {
             settingsAnchors([
-                SettingsSubsection.integrationTelegram.rawValue
+                SettingsSubsection.automationNotifications.rawValue,
+                SettingsSubsection.automationLocalAPI.rawValue,
+                SettingsSubsection.integrationTelegram.rawValue,
+                SettingsSubsection.integrationRemoteAccess.rawValue,
             ])
 
-            telegramSettingsSection
+            integrationsSection
         }
     }
 
@@ -8782,6 +8814,20 @@ struct SettingsView: View {
             "Telegram remote is off. Open the focused page to add a bot token, pair your Telegram DM, and control Open Assist while you are away from the Mac."
     }
 
+    private var remoteAccessOverviewSummary: String {
+        if !remoteAccessCoordinator.remoteAccessEnabled {
+            return "Remote Access is off. Enable the helper, pair a browser with a QR code, and add a Cloudflare tunnel only if you need access away from your Mac."
+        }
+        if remoteAccessCoordinator.pairedDevices.isEmpty {
+            return "Remote Access is on, but no devices are paired yet. Generate a pairing code from the focused page to connect a phone, tablet, or another browser."
+        }
+        if let publicURL = remoteAccessCoordinator.tunnelStatus.publicURL?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !publicURL.isEmpty {
+            return "Remote Access is live with \(remoteAccessCoordinator.pairedDevices.count) paired device(s) and a public URL at \(publicURL)."
+        }
+        return "Remote Access is running locally with \(remoteAccessCoordinator.pairedDevices.count) paired device(s). Open the focused page for the helper URL, QR pairing, and tunnel controls."
+    }
+
     private var telegramBotChatURL: URL? {
         let label = telegramRemoteCoordinator.botIdentityLabel.trimmingCharacters(
             in: .whitespacesAndNewlines)
@@ -8797,7 +8843,7 @@ struct SettingsView: View {
             Button {
                 selectedIntegrationsPage = .overview
             } label: {
-                Label("Back to Advanced", systemImage: "chevron.left")
+                Label("Back to Integrations", systemImage: "chevron.left")
                     .font(.callout.weight(.medium))
             }
             .buttonStyle(.plain)
@@ -8822,7 +8868,7 @@ struct SettingsView: View {
             Button {
                 selectedIntegrationsPage = .overview
             } label: {
-                Label("Back to Advanced", systemImage: "chevron.left")
+                Label("Back to Integrations", systemImage: "chevron.left")
                     .font(.callout.weight(.medium))
             }
             .buttonStyle(.plain)
@@ -8842,12 +8888,37 @@ struct SettingsView: View {
     }
 
     @ViewBuilder
+    private var remoteAccessDetailHeader: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Button {
+                selectedIntegrationsPage = .overview
+            } label: {
+                Label("Back to Integrations", systemImage: "chevron.left")
+                    .font(.callout.weight(.medium))
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(AppVisualTheme.accentTint)
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Remote Access")
+                    .font(.title3.bold())
+                    .foregroundStyle(AppVisualTheme.foreground(0.97))
+                Text(
+                    "Use Open Assist from your phone, tablet, or another browser. Cloudflare is optional."
+                )
+                .font(.callout)
+                .foregroundStyle(AppVisualTheme.mutedText)
+            }
+        }
+    }
+
+    @ViewBuilder
     private var integrationsSection: some View {
         Group {
             switch selectedIntegrationsPage {
             case .overview:
                 VStack(alignment: .leading, spacing: 14) {
-                    settingsSectionHeader(for: .advanced)
+                    settingsSectionHeader(for: .integrations)
 
                     settingsCollapsibleCard(
                         id: "integrations.overview.automationNotifications",
@@ -8898,6 +8969,33 @@ struct SettingsView: View {
                             Spacer()
                             Button("Open Telegram Remote") {
                                 selectedIntegrationsPage = .telegramRemote
+                            }
+                            .buttonStyle(.borderedProminent)
+                        }
+                    }
+
+                    settingsCollapsibleCard(
+                        id: "integrations.overview.remoteAccess",
+                        title: "Remote Access",
+                        subtitle:
+                            "Use the remote web UI with pairing and optional Cloudflare access.",
+                        symbol: "iphone.gen3.and.arrow.left.and.arrow.right",
+                        tint: AppVisualTheme.accentTint
+                    ) {
+                        Text(remoteAccessOverviewSummary)
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+
+                        HStack {
+                            Text(
+                                remoteAccessCoordinator.remoteAccessEnabled
+                                    ? "Remote Access is on." : "Remote Access is off."
+                            )
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            Spacer()
+                            Button("Open Remote Access") {
+                                selectedIntegrationsPage = .remoteAccess
                             }
                             .buttonStyle(.borderedProminent)
                         }
@@ -9441,6 +9539,12 @@ struct SettingsView: View {
                 .onAppear {
                     telegramActionMessage = nil
                     telegramBotTokenDraft = settings.telegramBotToken
+                }
+
+            case .remoteAccess:
+                VStack(alignment: .leading, spacing: 14) {
+                    remoteAccessDetailHeader
+                    RemoteAccessSettingsView(coordinator: remoteAccessCoordinator)
                 }
             }
         }

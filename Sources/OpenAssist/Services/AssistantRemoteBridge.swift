@@ -1,5 +1,142 @@
 import Foundation
 
+@MainActor
+protocol RemoteAccessBridge: AnyObject {
+    func prime() async
+    func statusSnapshot() -> AssistantRemoteStatusSnapshot
+    func listSessions(
+        limit: Int,
+        projectID: String?,
+        selectedSessionID: String?
+    ) async -> [AssistantSessionSummary]
+    func availableModels() async -> [AssistantModelOption]
+    func availableBackends() -> [AssistantRuntimeBackend]
+    func selectBackend(
+        _ backend: AssistantRuntimeBackend,
+        sessionID: String?,
+        preserveVisibleSelection: Bool
+    ) async -> Bool
+    func openSession(
+        sessionID: String,
+        preserveVisibleSelection: Bool
+    ) async -> AssistantRemoteSessionSnapshot?
+    func startNewSession(
+        projectID: String?,
+        preserveVisibleSelection: Bool
+    ) async -> AssistantRemoteSessionSnapshot?
+    func startNewTemporarySession(
+        projectID: String?,
+        preserveVisibleSelection: Bool
+    ) async -> AssistantRemoteSessionSnapshot?
+    func sendPrompt(
+        _ prompt: String,
+        sessionID: String?,
+        projectID: String?,
+        selectedPluginIDs: [String],
+        oneShotInstructions: String?,
+        preserveVisibleSelection: Bool
+    ) async -> AssistantRemoteSessionSnapshot?
+    func installedCodexPlugins() async -> [AssistantComposerPluginSelection]
+    func selectedPluginIDs(
+        sessionID: String?,
+        preserveVisibleSelection: Bool
+    ) async -> [String]
+    func applyPlugins(
+        _ pluginIDs: [String],
+        sessionID: String?,
+        preserveVisibleSelection: Bool
+    ) async -> Bool
+    func chooseModel(
+        _ modelID: String,
+        sessionID: String?,
+        preserveVisibleSelection: Bool
+    ) async -> Bool
+    func setInteractionMode(
+        _ mode: AssistantInteractionMode,
+        sessionID: String?,
+        preserveVisibleSelection: Bool
+    ) async
+    func setReasoningEffort(
+        _ effort: AssistantReasoningEffort,
+        sessionID: String?,
+        preserveVisibleSelection: Bool
+    ) async
+    func sessionSnapshot(
+        sessionID: String,
+        projectID: String?,
+        selectedSessionID: String?
+    ) async -> AssistantRemoteSessionSnapshot?
+    func cancelActiveTurn(
+        sessionID: String?,
+        preserveVisibleSelection: Bool
+    ) async
+    func resolvePermission(
+        optionID: String,
+        sessionID: String?,
+        preserveVisibleSelection: Bool
+    ) async
+    func resolvePermission(
+        answers: [String: [String]],
+        sessionID: String?,
+        preserveVisibleSelection: Bool
+    ) async
+    func cancelPendingPermissionRequest(
+        sessionID: String?,
+        preserveVisibleSelection: Bool
+    ) async
+    func archiveSession(sessionID: String) async -> Bool
+    func deleteSession(sessionID: String) async -> Bool
+    func availableProjects() async -> [AssistantRemoteProjectOption]
+}
+
+extension RemoteAccessBridge {
+    func listSessions(
+        limit: Int = 8,
+        selectedSessionID: String? = nil
+    ) async -> [AssistantSessionSummary] {
+        await listSessions(limit: limit, projectID: nil, selectedSessionID: selectedSessionID)
+    }
+
+    func startNewSession(
+        projectID: String? = nil,
+        preserveVisibleSelection: Bool = false
+    ) async -> AssistantRemoteSessionSnapshot? {
+        await startNewSession(projectID: projectID, preserveVisibleSelection: preserveVisibleSelection)
+    }
+
+    func startNewTemporarySession(
+        projectID: String? = nil,
+        preserveVisibleSelection: Bool = false
+    ) async -> AssistantRemoteSessionSnapshot? {
+        await startNewTemporarySession(projectID: projectID, preserveVisibleSelection: preserveVisibleSelection)
+    }
+
+    func sendPrompt(
+        _ prompt: String,
+        sessionID: String?,
+        selectedPluginIDs: [String] = [],
+        oneShotInstructions: String? = nil,
+        preserveVisibleSelection: Bool = false
+    ) async -> AssistantRemoteSessionSnapshot? {
+        await sendPrompt(
+            prompt,
+            sessionID: sessionID,
+            projectID: nil,
+            selectedPluginIDs: selectedPluginIDs,
+            oneShotInstructions: oneShotInstructions,
+            preserveVisibleSelection: preserveVisibleSelection
+        )
+    }
+
+    func sessionSnapshot(
+        sessionID: String,
+        projectID: String? = nil,
+        selectedSessionID: String? = nil
+    ) async -> AssistantRemoteSessionSnapshot? {
+        await sessionSnapshot(sessionID: sessionID, projectID: projectID, selectedSessionID: selectedSessionID)
+    }
+}
+
 struct AssistantRemoteStatusSnapshot: Sendable {
     let runtimeHealth: AssistantRuntimeHealth
     let assistantBackend: AssistantRuntimeBackend
@@ -14,6 +151,7 @@ struct AssistantRemoteStatusSnapshot: Sendable {
     let canAdjustReasoningEffort: Bool
     let fastModeEnabled: Bool
     let tokenUsage: TokenUsageSnapshot
+    let rateLimits: AccountRateLimits
     let lastStatusMessage: String?
 
     var assistantBackendName: String {
@@ -36,8 +174,19 @@ struct AssistantRemoteProjectOption: Identifiable, Sendable {
 }
 
 @MainActor
-final class AssistantRemoteBridge {
+final class AssistantRemoteBridge: RemoteAccessBridge {
+    private static let passiveSessionRefreshInterval: TimeInterval = 8
+    /// How long after a successful environment refresh prime() will skip
+    /// re-running the refresh. Subscriber churn (e.g. an iPhone reconnecting
+    /// every couple of seconds) used to retrigger refreshEnvironment on every
+    /// reconnect, which made the remote runtime status flap between
+    /// "Loading models..." and ready.
+    private static let environmentRefreshCooldown: TimeInterval = 30
+
     private let assistant: AssistantStore
+    private var lastVisibleSessionsRefreshAt: Date?
+    private var lastVisibleSessionsRefreshLimit = 0
+    private var lastEnvironmentRefreshAt: Date?
 
     init(assistant: AssistantStore) {
         self.assistant = assistant
@@ -48,8 +197,25 @@ final class AssistantRemoteBridge {
     }
 
     func prime() async {
-        await assistant.refreshEnvironment()
+        if shouldRefreshEnvironmentForPrime() {
+            await assistant.refreshEnvironment()
+            lastEnvironmentRefreshAt = Date()
+        }
         await assistant.refreshSessions(limit: 20)
+        noteVisibleSessionsRefresh(limit: 20)
+    }
+
+    private func shouldRefreshEnvironmentForPrime() -> Bool {
+        // Always refresh on the first prime — we have no cached environment yet.
+        guard let lastEnvironmentRefreshAt else { return true }
+        // If the runtime is not currently in a ready/active state, force a
+        // fresh refresh so a recovering subscriber does not stay stuck on a
+        // stale "unavailable" snapshot.
+        if !assistant.isRuntimeReadyForConversation { return true }
+        // Otherwise, skip the costly refresh if a successful one ran recently.
+        // This prevents subscriber-reconnect churn from flapping the global
+        // isLoadingModels flag and the remote "Loading models..." banner.
+        return Date().timeIntervalSince(lastEnvironmentRefreshAt) >= Self.environmentRefreshCooldown
     }
 
     func statusSnapshot() -> AssistantRemoteStatusSnapshot {
@@ -80,6 +246,7 @@ final class AssistantRemoteBridge {
             canAdjustReasoningEffort: effortState.canAdjust,
             fastModeEnabled: selectedSession?.fastModeEnabled ?? assistant.fastModeEnabled,
             tokenUsage: assistant.tokenUsage,
+            rateLimits: assistant.rateLimits,
             lastStatusMessage: assistant.lastStatusMessage
         )
     }
@@ -110,7 +277,7 @@ final class AssistantRemoteBridge {
     }
 
     func availableProjects() async -> [AssistantRemoteProjectOption] {
-        await assistant.refreshSessions(limit: 40)
+        await refreshVisibleSessionsIfNeeded(limit: 40)
         return assistant.visibleProjects.map { project in
             let sessionCount = assistant.sessions.reduce(into: 0) { count, session in
                 guard let sessionProjectID = session.projectID?.trimmingCharacters(in: .whitespacesAndNewlines) else {
@@ -152,7 +319,6 @@ final class AssistantRemoteBridge {
     }
 
     func availableModels() async -> [AssistantModelOption] {
-        await assistant.refreshEnvironment()
         return assistant.visibleModels
     }
 
@@ -160,8 +326,17 @@ final class AssistantRemoteBridge {
         assistant.selectableAssistantBackends
     }
 
-    func selectBackend(_ backend: AssistantRuntimeBackend) async -> Bool {
-        await assistant.switchAssistantBackend(backend)
+    func selectBackend(
+        _ backend: AssistantRuntimeBackend,
+        sessionID: String?,
+        preserveVisibleSelection: Bool = false
+    ) async -> Bool {
+        await withSessionContextReturningBool(
+            sessionID: sessionID,
+            preserveVisibleSelection: preserveVisibleSelection
+        ) { [assistant] in
+            await assistant.switchAssistantBackend(backend)
+        }
     }
 
     func reasoningEffortState(
@@ -243,10 +418,20 @@ final class AssistantRemoteBridge {
         preserveVisibleSelection: Bool = false
     ) async -> AssistantRemoteSessionSnapshot? {
         let allowDraftReuse = !preserveVisibleSelection
+        if preserveVisibleSelection {
+            return await assistant.startRemoteBackgroundSession(
+                projectID: projectID,
+                isTemporary: false
+            )
+        }
+
         let startAction: () async -> AssistantRemoteSessionSnapshot? = {
             [assistant, self] in
             if allowDraftReuse,
-               let reusableSessionID = self.reusableEmptyDraftSessionID(isTemporary: false) {
+               let reusableSessionID = self.reusableEmptyDraftSessionID(
+                   isTemporary: false,
+                   projectID: projectID
+               ) {
                 return await assistant.remoteSessionSnapshot(sessionID: reusableSessionID)
             }
             await assistant.startNewSession()
@@ -254,14 +439,7 @@ final class AssistantRemoteBridge {
             return await assistant.remoteSessionSnapshot(sessionID: sessionID)
         }
 
-        if preserveVisibleSelection || projectID != nil {
-            return await withPreservedDesktopContext(
-                preserveVisibleSelection: preserveVisibleSelection,
-                temporaryProjectID: projectID,
-                operation: startAction
-            )
-        }
-
+        await selectProjectContext(projectID)
         return await startAction()
     }
 
@@ -270,10 +448,20 @@ final class AssistantRemoteBridge {
         preserveVisibleSelection: Bool = false
     ) async -> AssistantRemoteSessionSnapshot? {
         let allowDraftReuse = !preserveVisibleSelection
+        if preserveVisibleSelection {
+            return await assistant.startRemoteBackgroundSession(
+                projectID: projectID,
+                isTemporary: true
+            )
+        }
+
         let startAction: () async -> AssistantRemoteSessionSnapshot? = {
             [assistant, self] in
             if allowDraftReuse,
-               let reusableSessionID = self.reusableEmptyDraftSessionID(isTemporary: true) {
+               let reusableSessionID = self.reusableEmptyDraftSessionID(
+                   isTemporary: true,
+                   projectID: projectID
+               ) {
                 return await assistant.remoteSessionSnapshot(sessionID: reusableSessionID)
             }
             await assistant.startNewTemporarySession()
@@ -281,14 +469,7 @@ final class AssistantRemoteBridge {
             return await assistant.remoteSessionSnapshot(sessionID: sessionID)
         }
 
-        if preserveVisibleSelection || projectID != nil {
-            return await withPreservedDesktopContext(
-                preserveVisibleSelection: preserveVisibleSelection,
-                temporaryProjectID: projectID,
-                operation: startAction
-            )
-        }
-
+        await selectProjectContext(projectID)
         return await startAction()
     }
 
@@ -300,6 +481,16 @@ final class AssistantRemoteBridge {
         oneShotInstructions: String? = nil,
         preserveVisibleSelection: Bool = false
     ) async -> AssistantRemoteSessionSnapshot? {
+        if preserveVisibleSelection {
+            return await assistant.sendRemotePromptInBackground(
+                prompt,
+                sessionID: sessionID,
+                projectID: projectID,
+                selectedPluginIDs: selectedPluginIDs,
+                oneShotInstructions: oneShotInstructions
+            )
+        }
+
         let sendAction: () async -> AssistantRemoteSessionSnapshot? = {
             [assistant, self] in
             if let sessionID = sessionID?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -317,7 +508,7 @@ final class AssistantRemoteBridge {
             return await assistant.remoteSessionSnapshot(sessionID: activeSessionID)
         }
 
-        if preserveVisibleSelection || projectID != nil {
+        if preserveVisibleSelection {
             return await withPreservedDesktopContext(
                 preserveVisibleSelection: preserveVisibleSelection,
                 temporaryProjectID: projectID,
@@ -325,6 +516,7 @@ final class AssistantRemoteBridge {
             )
         }
 
+        await selectProjectContext(projectID)
         return await sendAction()
     }
 
@@ -333,7 +525,45 @@ final class AssistantRemoteBridge {
         return assistant.installedCodexPluginSelections
     }
 
-    private func reusableEmptyDraftSessionID(isTemporary: Bool) -> String? {
+    func selectedPluginIDs(
+        sessionID: String?,
+        preserveVisibleSelection: Bool = false
+    ) async -> [String] {
+        await withSessionContextReturningValue(
+            sessionID: sessionID,
+            preserveVisibleSelection: preserveVisibleSelection
+        ) { [assistant] in
+            assistant.selectedComposerPlugins.map(\.pluginID)
+        } fallback: {
+            []
+        }
+    }
+
+    func applyPlugins(
+        _ pluginIDs: [String],
+        sessionID: String?,
+        preserveVisibleSelection: Bool = false
+    ) async -> Bool {
+        await withSessionContextReturningBool(
+            sessionID: sessionID,
+            preserveVisibleSelection: preserveVisibleSelection
+        ) { [assistant] in
+            let installedSelections = assistant.installedCodexPluginSelections
+            let requestedIDs = Set(
+                pluginIDs.compactMap {
+                    $0.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+                }
+            )
+            let selections = installedSelections.filter { requestedIDs.contains($0.pluginID) }
+            guard selections.count == requestedIDs.count else {
+                return false
+            }
+            assistant.selectedComposerPlugins = selections
+            return true
+        }
+    }
+
+    private func reusableEmptyDraftSessionID(isTemporary: Bool, projectID: String?) -> String? {
         guard let selectedSessionID = assistant.selectedSessionID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty,
               let selectedSession = assistant.sessions.first(where: {
                   $0.id.caseInsensitiveCompare(selectedSessionID) == .orderedSame
@@ -341,6 +571,7 @@ final class AssistantRemoteBridge {
               selectedSession.isProviderIndependentThreadV2,
               !selectedSession.isArchived,
               selectedSession.isTemporary == isTemporary,
+              normalizedIdentifier(selectedSession.projectID) == normalizedIdentifier(projectID),
               !selectedSession.hasConversationContent else {
             return nil
         }
@@ -384,13 +615,26 @@ final class AssistantRemoteBridge {
         if let session = assistant.sessions.first(where: { $0.id.caseInsensitiveCompare(previousSessionID) == .orderedSame }) {
             await assistant.openSession(session)
         } else {
-            await assistant.refreshSessions(limit: 200)
+            await refreshVisibleSessionsIfNeeded(limit: 200, force: true)
             if let session = assistant.sessions.first(where: { $0.id.caseInsensitiveCompare(previousSessionID) == .orderedSame }) {
                 await assistant.openSession(session)
             }
         }
 
         return result
+    }
+
+    private func selectProjectContext(_ projectID: String?) async {
+        let requestedProjectID = projectID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+        guard normalizedIdentifier(requestedProjectID) != normalizedIdentifier(assistant.selectedProjectFilter?.id) else {
+            return
+        }
+
+        await assistant.selectProjectFilter(
+            requestedProjectID,
+            autoSelectVisibleSessionIfNeeded: false,
+            toggleOffIfSame: false
+        )
     }
 
     private func normalizedIdentifier(_ value: String?) -> String? {
@@ -436,6 +680,30 @@ final class AssistantRemoteBridge {
         let action: () async -> Bool = { [self] in
             guard await openRequestedSessionIfNeeded(sessionID: sessionID) else {
                 return false
+            }
+            return await operation()
+        }
+
+        if preserveVisibleSelection {
+            return await withPreservedDesktopContext(
+                preserveVisibleSelection: true,
+                temporaryProjectID: nil,
+                operation: action
+            )
+        }
+
+        return await action()
+    }
+
+    private func withSessionContextReturningValue<Result>(
+        sessionID: String?,
+        preserveVisibleSelection: Bool = false,
+        operation: @escaping () async -> Result,
+        fallback: @escaping () -> Result
+    ) async -> Result {
+        let action: () async -> Result = { [self] in
+            guard await openRequestedSessionIfNeeded(sessionID: sessionID) else {
+                return fallback()
             }
             return await operation()
         }
@@ -598,6 +866,24 @@ final class AssistantRemoteBridge {
         }
     }
 
+    func archiveSession(sessionID: String) async -> Bool {
+        let trimmed = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        await assistant.archiveSession(
+            trimmed,
+            retentionHours: SettingsStore.shared.assistantArchiveDefaultRetentionHours,
+            updateDefaultRetention: false
+        )
+        return true
+    }
+
+    func deleteSession(sessionID: String) async -> Bool {
+        let trimmed = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        await assistant.deleteSession(trimmed)
+        return true
+    }
+
     /// Strip heavy image data from delivered screenshot timeline items to prevent
     /// screenshots from accumulating on disk in the session history.
     func clearDeliveredScreenshotData(sessionID: String? = nil) async {
@@ -609,7 +895,7 @@ final class AssistantRemoteBridge {
         selectedSessionID: String?,
         refreshLimit: Int
     ) async -> [AssistantSessionSummary] {
-        await assistant.refreshSessions(limit: refreshLimit)
+        await refreshVisibleSessionsIfNeeded(limit: refreshLimit)
 
         let visibleProjectIDs = Set(assistant.visibleLeafProjects.map {
             $0.id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -684,5 +970,24 @@ final class AssistantRemoteBridge {
                     normalizedIdentifier(binding.providerSessionID) == normalizedProviderSessionID
                 })
         })?.id
+    }
+
+    private func refreshVisibleSessionsIfNeeded(limit: Int, force: Bool = false) async {
+        let now = Date()
+        let shouldRefresh =
+            force
+            || assistant.sessions.isEmpty
+            || lastVisibleSessionsRefreshAt == nil
+            || limit > lastVisibleSessionsRefreshLimit
+            || now.timeIntervalSince(lastVisibleSessionsRefreshAt ?? .distantPast) >= Self.passiveSessionRefreshInterval
+
+        guard shouldRefresh else { return }
+        await assistant.refreshSessions(limit: limit)
+        noteVisibleSessionsRefresh(limit: limit, at: now)
+    }
+
+    private func noteVisibleSessionsRefresh(limit: Int, at date: Date = Date()) {
+        lastVisibleSessionsRefreshAt = date
+        lastVisibleSessionsRefreshLimit = max(lastVisibleSessionsRefreshLimit, limit)
     }
 }

@@ -47,6 +47,7 @@ final class AudioTranscriptionService {
     private enum Constants {
         static let openAICompatibleUploadLimitBytes = 24_000_000
         static let chatGPTTranscriptionsURL = URL(string: "https://chatgpt.com/backend-api/transcribe")!
+        static let chatGPTWebUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     }
 
     private let session: URLSession
@@ -364,6 +365,11 @@ final class AudioTranscriptionService {
         request.timeoutInterval = timeout
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+        request.setValue(Constants.chatGPTWebUserAgent, forHTTPHeaderField: "User-Agent")
+        request.setValue("https://chatgpt.com", forHTTPHeaderField: "Origin")
+        request.setValue("https://chatgpt.com/", forHTTPHeaderField: "Referer")
+        request.setValue("application/json, text/plain, */*", forHTTPHeaderField: "Accept")
+        request.setValue("en-US,en;q=0.9", forHTTPHeaderField: "Accept-Language")
         request.httpBody = makeMultipartFormData(
             boundary: boundary,
             fields: [],

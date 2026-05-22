@@ -883,6 +883,9 @@ final class AssistantSessionInteractionTests: XCTestCase {
 
         XCTAssertEqual(finalActivity?.title, "Image Generation")
         XCTAssertEqual(finalActivity?.status, .completed)
+        XCTAssertEqual(finalActivity?.rawDetails, "Generated image.")
+        XCTAssertFalse(finalActivity?.rawDetails?.contains("data:image") == true)
+        XCTAssertFalse(finalActivity?.rawDetails?.contains("Zm9v") == true)
     }
 
     @MainActor
@@ -1440,7 +1443,6 @@ final class AssistantSessionInteractionTests: XCTestCase {
         XCTAssertEqual(
             runtime.dynamicToolNamesForTesting(mode: .agentic),
             [
-                "generate_image",
                 "assistant_notes",
                 "app_action",
                 "browser_use",
@@ -1455,7 +1457,12 @@ final class AssistantSessionInteractionTests: XCTestCase {
                 "ui_click",
                 "ui_type",
                 "ui_press_key",
-                "computer_use"
+                "list_activities",
+                "list_displays",
+                "computer_use",
+                "computer_batch",
+                "spawn_session",
+                "generate_image"
             ]
         )
     }
@@ -1861,11 +1868,10 @@ final class AssistantSessionInteractionTests: XCTestCase {
         }
 
         XCTAssertEqual(runtime.dynamicToolNamesForTesting(mode: .conversational), ["generate_image"])
-        XCTAssertEqual(runtime.dynamicToolNamesForTesting(mode: .plan), ["generate_image", "assistant_notes"])
+        XCTAssertEqual(runtime.dynamicToolNamesForTesting(mode: .plan), ["assistant_notes", "generate_image"])
         XCTAssertEqual(
             runtime.dynamicToolNamesForTesting(mode: .agentic),
             [
-                "generate_image",
                 "assistant_notes",
                 "app_action",
                 "browser_use",
@@ -1879,7 +1885,11 @@ final class AssistantSessionInteractionTests: XCTestCase {
                 "ui_inspect",
                 "ui_click",
                 "ui_type",
-                "ui_press_key"
+                "ui_press_key",
+                "list_activities",
+                "list_displays",
+                "spawn_session",
+                "generate_image"
             ]
         )
     }

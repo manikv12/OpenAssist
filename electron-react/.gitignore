@@ -1,0 +1,8 @@
+node_modules/
+dist-electron/
+dist-renderer/
+out/
+out-unpacked/
+.vite/
+*.log
+verification/

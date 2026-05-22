@@ -11,12 +11,8 @@ final class AssistantToolExecutionResultTests: XCTestCase {
 
         let dictionary = item.dictionaryRepresentation()
 
-        XCTAssertEqual(dictionary["type"] as? String, "inputImage")
+        XCTAssertEqual(dictionary["type"] as? String, "input_image")
         XCTAssertNil(dictionary["imageUrl"])
-
-        guard let imageURL = dictionary["image_url"] as? [String: Any] else {
-            return XCTFail("Expected nested image_url payload")
-        }
-        XCTAssertEqual(imageURL["url"] as? String, "data:image/png;base64,abc")
+        XCTAssertEqual(dictionary["image_url"] as? String, "data:image/png;base64,abc")
     }
 }

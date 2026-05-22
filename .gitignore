@@ -27,3 +27,23 @@ web/chat/dist/
 *.csr
 *.certSigningRequest
 *.p12
+
+# Playwright MCP scratch logs and page snapshots
+.playwright-mcp/
+
+# Markdown chat backup variants left during iteration
+Resources/markdown-chat.*-backup.html
+Resources/markdown-chat.staged-recovery.html
+
+# Stray Vite chunks accidentally written to repo root.
+# Real outputs go to electron-react/dist-*, web/*/dist.
+/*-????????.js
+/*-????????.js.map
+
+# One-off dev screenshots / audit notes left at repo root
+/composer-agent-pulse-style.png
+/openassist-react-thread.png
+/topbar-icon-preview.png
+/working-status-agent-pulse-style.png
+/openassist-electron-react-audit-snapshot.md
+/provider-dropdown-audit.md

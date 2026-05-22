@@ -248,6 +248,7 @@ Docs/                            User-facing docs
 Wiki/                            Product and setup notes
 Vendor/Whisper/                  Bundled whisper.cpp XCFramework
 web/chat/                        React chat UI inside the assistant window
+web/remote/                      React remote-access web UI served by the local helper
 ```
 
 Good places to start:

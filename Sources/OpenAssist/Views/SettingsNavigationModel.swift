@@ -230,6 +230,7 @@ enum SettingsSubsection: String, CaseIterable, Identifiable, Sendable {
     case appearanceTheme = "appearance.theme"
 
     case integrationTelegram = "integrations.telegram.setup"
+    case integrationRemoteAccess = "integrations.remoteAccess.setup"
 
     case generalNotesBackup = "general.notesBackup"
     case generalAppInfo = "general.appInfo"
@@ -316,6 +317,8 @@ enum SettingsSubsection: String, CaseIterable, Identifiable, Sendable {
             return "Theme"
         case .integrationTelegram:
             return "Telegram"
+        case .integrationRemoteAccess:
+            return "Remote Access"
         case .generalNotesBackup:
             return "Notes Backup"
         case .generalAppInfo:
@@ -350,7 +353,7 @@ enum SettingsSubsection: String, CaseIterable, Identifiable, Sendable {
             return .privacyPermissions
         case .appearanceSounds, .appearanceTheme:
             return .appearance
-        case .integrationTelegram:
+        case .integrationTelegram, .integrationRemoteAccess:
             return .integrations
         case .generalNotesBackup, .generalAppInfo, .generalDiagnostics, .generalUninstall:
             return .general
@@ -447,6 +450,8 @@ enum SettingsSubsection: String, CaseIterable, Identifiable, Sendable {
             return .automationLocalAPI
         case "integrations.telegram.setup":
             return .integrationTelegram
+        case "integrations.remoteAccess.setup":
+            return .integrationRemoteAccess
         case "advanced.appInfo":
             return .generalAppInfo
         case "advanced.diagnostics":
@@ -463,6 +468,7 @@ enum SettingsAdvancedPage: String, CaseIterable, Identifiable, Sendable {
     case overview
     case automationNotifications
     case telegramRemote
+    case remoteAccess
 
     var id: Self { self }
 }
@@ -726,10 +732,20 @@ enum SettingsNavigationModel {
             keywords: ["sounds", "feedback", "dictation sounds", "audio cues"]
         ),
         .init(
-            destination: SettingsRoute(section: .integrations, subsection: .integrationTelegram),
+            destination: SettingsRoute(
+                section: .integrations,
+                subsection: .integrationTelegram,
+                advancedPage: .telegramRemote
+            ),
             title: "Telegram remote",
             detail: "Control the selected Open Assist session from a private Telegram bot chat",
             keywords: ["telegram", "remote", "bot", "chat", "session"]
+        ),
+        .init(
+            destination: SettingsRoute(section: .integrations, subsection: .integrationRemoteAccess),
+            title: "Remote access",
+            detail: "Use the built-in web helper, pair devices with QR codes, and expose it through Cloudflare Tunnel",
+            keywords: ["remote access", "cloudflare", "tunnel", "web ui", "pairing", "qr", "phone"]
         ),
         .init(
             destination: SettingsRoute(section: .general, subsection: .generalNotesBackup),

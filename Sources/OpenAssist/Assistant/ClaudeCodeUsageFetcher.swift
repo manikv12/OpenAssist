@@ -389,37 +389,37 @@ struct ClaudeCodeUsageFetcher {
     ) -> ClaudeCodeUsageSnapshot {
         let sessionWindow = makeWindow(response.fiveHour, windowDurationMins: 300)
         let weeklyWindow = makeWindow(response.sevenDay, windowDurationMins: 10_080)
-        let sonnetWindow = makeWindow(
+        let sonnetWeeklyWindow = makeWindow(
             response.sevenDaySonnet,
             windowDurationMins: 10_080,
             fallbackResetsAt: response.sevenDay?.resetsAt
-        )
-        let opusWindow = makeWindow(
+        ) ?? weeklyWindow
+        let opusWeeklyWindow = makeWindow(
             response.sevenDayOpus,
             windowDurationMins: 10_080,
             fallbackResetsAt: response.sevenDay?.resetsAt
-        )
+        ) ?? weeklyWindow
 
         var additionalBuckets: [AccountRateLimitBucket] = []
-        if let resolvedSonnetWindow = sonnetWindow {
+        if sessionWindow != nil || sonnetWeeklyWindow != nil {
             additionalBuckets.append(
                 AccountRateLimitBucket(
                     limitID: "sonnet",
                     limitName: "Sonnet",
-                    primary: resolvedSonnetWindow,
-                    secondary: sessionWindow,
+                    primary: sessionWindow,
+                    secondary: sonnetWeeklyWindow,
                     hasCredits: true,
                     unlimited: false
                 )
             )
         }
-        if let resolvedOpusWindow = opusWindow {
+        if sessionWindow != nil || opusWeeklyWindow != nil {
             additionalBuckets.append(
                 AccountRateLimitBucket(
                     limitID: "opus",
                     limitName: "Opus",
-                    primary: resolvedOpusWindow,
-                    secondary: sessionWindow,
+                    primary: sessionWindow,
+                    secondary: opusWeeklyWindow,
                     hasCredits: true,
                     unlimited: false
                 )

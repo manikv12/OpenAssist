@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleIdentifier</key>
+  <string>com.developingadventures.OpenAssist.ElectronAppleSpeechHelper</string>
+  <key>CFBundleName</key>
+  <string>Open Assist Speech Helper</string>
+  <key>CFBundleExecutable</key>
+  <string>apple-speech-helper</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>LSUIElement</key>
+  <true/>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>Open Assist uses the microphone to turn your spoken assistant task into text.</string>
+  <key>NSSpeechRecognitionUsageDescription</key>
+  <string>Open Assist uses Apple Speech Recognition to transcribe voice task entry.</string>
+</dict>
+</plist>

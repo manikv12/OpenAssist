@@ -144,6 +144,41 @@ func assistantDecodeNotesAssistantSessionRegistries(
     return [:]
 }
 
+private final class AssistantNotesSessionRegistryCache {
+    static let shared = AssistantNotesSessionRegistryCache()
+
+    private let lock = NSLock()
+    private var cachedJSONString: String?
+    private var cachedRegistries: [String: AssistantNotesProjectSessionRegistry] = [:]
+    private var cachedHiddenSessionIDs: Set<String> = []
+
+    func snapshot(
+        from jsonString: String
+    ) -> (
+        registries: [String: AssistantNotesProjectSessionRegistry],
+        hiddenSessionIDs: Set<String>
+    ) {
+        lock.lock()
+        defer { lock.unlock() }
+
+        if cachedJSONString == jsonString {
+            return (cachedRegistries, cachedHiddenSessionIDs)
+        }
+
+        let registries = assistantDecodeNotesAssistantSessionRegistries(from: jsonString)
+        let hiddenSessionIDs = Set(
+            registries.values
+                .flatMap(\.sessionIDs)
+                .compactMap { assistantNormalizedNotesSessionID($0)?.lowercased() }
+        )
+
+        cachedJSONString = jsonString
+        cachedRegistries = registries
+        cachedHiddenSessionIDs = hiddenSessionIDs
+        return (registries, hiddenSessionIDs)
+    }
+}
+
 func assistantEncodeNotesAssistantSessionRegistries(
     _ registries: [String: AssistantNotesProjectSessionRegistry]
 ) -> String? {
@@ -893,6 +928,7 @@ struct AssistantWindowView: View {
     @ObservedObject var assistant: AssistantStore
     let presentationStyle: AssistantWindowPresentationStyle
     @ObservedObject private var jobQueue = JobQueueCoordinator.shared
+    private let remoteAccessCoordinator = RemoteAccessCoordinator.shared
 
     @State private var isRefreshing = false
     @State private var toolCallsExpanded = false
@@ -1273,7 +1309,9 @@ struct AssistantWindowView: View {
         [String: AssistantNotesProjectSessionRegistry]
     {
         get {
-            assistantDecodeNotesAssistantSessionRegistries(from: notesAssistantSessionMapJSON)
+            AssistantNotesSessionRegistryCache.shared
+                .snapshot(from: notesAssistantSessionMapJSON)
+                .registries
         }
         nonmutating set {
             guard let encoded = assistantEncodeNotesAssistantSessionRegistries(newValue) else {
@@ -1285,11 +1323,9 @@ struct AssistantWindowView: View {
     }
 
     private var hiddenNotesAssistantSessionIDs: Set<String> {
-        Set(
-            notesAssistantSessionRegistriesByProjectID.values
-                .flatMap(\.sessionIDs)
-                .compactMap { assistantNormalizedNotesSessionID($0)?.lowercased() }
-        )
+        AssistantNotesSessionRegistryCache.shared
+            .snapshot(from: notesAssistantSessionMapJSON)
+            .hiddenSessionIDs
     }
 
     private func notesAssistantSessionRegistry(for projectID: String?)
@@ -2528,6 +2564,23 @@ struct AssistantWindowView: View {
         }
 
         return saveManagedThreadNoteBeforeNavigation(reason: reason)
+    }
+
+    private func prepareToLeaveCurrentNoteScreenAfterWebFlush(reason: String) async -> Bool {
+        await flushCurrentThreadNoteDraftFromWeb()
+        return prepareToLeaveCurrentNoteScreen(reason: reason)
+    }
+
+    private func runAfterCurrentNoteIsSafeToLeave(
+        reason: String,
+        action: @escaping @MainActor () -> Void
+    ) {
+        Task { @MainActor in
+            guard await prepareToLeaveCurrentNoteScreenAfterWebFlush(reason: reason) else {
+                return
+            }
+            action()
+        }
     }
 
     private var currentThreadNoteManifest: AssistantNoteManifest {
@@ -5895,9 +5948,10 @@ struct AssistantWindowView: View {
             else {
                 return
             }
-            guard prepareToLeaveCurrentNoteScreen(reason: "open the owning thread") else { return }
-            selectedSidebarPane = .threads
-            openThread(threadID)
+            runAfterCurrentNoteIsSafeToLeave(reason: "open the owning thread") {
+                selectedSidebarPane = .threads
+                openThread(threadID)
+            }
         default:
             break
         }
@@ -6801,21 +6855,23 @@ struct AssistantWindowView: View {
     }
 
     private func selectNotesProject(_ project: AssistantProject?) {
-        guard prepareToLeaveCurrentNoteScreen(reason: "switch note projects") else { return }
-        selectedNotesProjectID = project?.id
-        if let project,
-            let parentID = project.parentID
-        {
-            setFolderExpanded(parentID, expanded: true)
+        runAfterCurrentNoteIsSafeToLeave(reason: "switch note projects") {
+            selectedNotesProjectID = project?.id
+            if let project,
+                let parentID = project.parentID
+            {
+                setFolderExpanded(parentID, expanded: true)
+            }
+            selectedSidebarPane = .notes
+            ensureNotesProjectSelectionIfNeeded()
         }
-        selectedSidebarPane = .notes
-        ensureNotesProjectSelectionIfNeeded()
     }
 
     private func setNotesScope(_ scope: AssistantNotesScope) {
-        guard prepareToLeaveCurrentNoteScreen(reason: "switch note sections") else { return }
-        selectedNotesScope = scope
-        selectedSidebarPane = .notes
+        runAfterCurrentNoteIsSafeToLeave(reason: "switch note sections") {
+            selectedNotesScope = scope
+            selectedSidebarPane = .notes
+        }
     }
 
     private func selectSidebarNote(
@@ -7322,6 +7378,11 @@ struct AssistantWindowView: View {
     }
 
     private var sidebarWebState: AssistantSidebarWebState {
+        let selectedProjectID = sidebarSelectedProjectID
+        let threadCountsByProjectID = projectThreadCountByProjectID
+        let folderThreadCountsByProjectID = folderThreadCountByProjectID(
+            threadCountsByProjectID: threadCountsByProjectID
+        )
         let notesRows = notesSidebarRows
         let noteFolderRows = notesSidebarFolderRows
         return AssistantSidebarWebState(
@@ -7367,7 +7428,12 @@ struct AssistantWindowView: View {
                 .init(id: AssistantSidebarPane.plugins.shellID, label: "Plugins", symbol: "shippingbox"),
             ],
             allProjects: assistant.visibleProjects.map {
-                sidebarWebProject(for: $0, selectedProjectID: sidebarSelectedProjectID)
+                sidebarWebProject(
+                    for: $0,
+                    selectedProjectID: selectedProjectID,
+                    threadCountsByProjectID: threadCountsByProjectID,
+                    folderThreadCountsByProjectID: folderThreadCountsByProjectID
+                )
             },
             hiddenProjects: assistant.hiddenProjects.map { project in
                 AssistantSidebarWebHiddenProject(
@@ -7377,7 +7443,12 @@ struct AssistantWindowView: View {
                 )
             },
             projects: displayedSidebarProjects.map {
-                sidebarWebProject(for: $0, selectedProjectID: sidebarSelectedProjectID)
+                sidebarWebProject(
+                    for: $0,
+                    selectedProjectID: selectedProjectID,
+                    threadCountsByProjectID: threadCountsByProjectID,
+                    folderThreadCountsByProjectID: folderThreadCountsByProjectID
+                )
             },
             threads:
                 sidebarVisibleSessions
@@ -7447,6 +7518,8 @@ struct AssistantWindowView: View {
         )
         let noteModeLabel: String?
         let noteModeHelperText: String?
+        let remoteControl = isNotesWorkspaceAssistant ? nil : selectedRemoteControl
+        let remoteControlActive = remoteControl != nil
 
         if isNotesWorkspaceAssistant {
             noteModeLabel = nil
@@ -7467,13 +7540,15 @@ struct AssistantWindowView: View {
         return AssistantComposerWebState(
             base: AssistantComposerWebBaseState(
                 draftText: assistant.promptDraft,
-                placeholder: composerPlaceholder(
+                placeholder: remoteControl.map {
+                    "Remote control is active from \($0.deviceName)"
+                } ?? composerPlaceholder(
                     isNoteModeActive: isNoteModeActive,
                     isNotesWorkspaceAssistant: isNotesWorkspaceAssistant
                 ),
                 isCompactComposer: isCompactComposer,
-                isEnabled: settings.assistantBetaEnabled && !isVoiceCapturing,
-                canSend: canSendMessage && !isVoiceCapturing,
+                isEnabled: settings.assistantBetaEnabled && !isVoiceCapturing && !remoteControlActive,
+                canSend: canSendMessage && !isVoiceCapturing && !remoteControlActive,
                 isNoteModeActive: isNoteModeActive,
                 noteModeLabel: noteModeLabel,
                 noteModeHelperText: noteModeHelperText,
@@ -7590,6 +7665,23 @@ struct AssistantWindowView: View {
                 return
             }
             result[projectID, default: 0] += 1
+        }
+    }
+
+    private func folderThreadCountByProjectID(
+        threadCountsByProjectID: [String: Int]
+    ) -> [String: Int] {
+        let leafProjectsByParentID = Dictionary(
+            grouping: assistant.visibleLeafProjects,
+            by: { normalizedSidebarProjectID($0.parentID) ?? "" }
+        )
+        return assistant.visibleFolders.reduce(into: [:]) { result, folder in
+            guard let folderID = normalizedSidebarProjectID(folder.id) else { return }
+            let childProjects = leafProjectsByParentID[folderID] ?? []
+            result[folderID] = childProjects.reduce(into: 0) { count, childProject in
+                guard let childProjectID = normalizedSidebarProjectID(childProject.id) else { return }
+                count += threadCountsByProjectID[childProjectID, default: 0]
+            }
         }
     }
 
@@ -7754,10 +7846,18 @@ struct AssistantWindowView: View {
         return "Only \(project.name) chats are shown. New chats stay here."
     }
 
-    private func projectThreadSubtitle(for project: AssistantProject, focused: Bool) -> String {
+    private func projectThreadSubtitle(
+        for project: AssistantProject,
+        focused: Bool,
+        threadCountsByProjectID: [String: Int],
+        folderThreadCountsByProjectID: [String: Int]
+    ) -> String {
         if project.isFolder {
             let childCount = visibleChildProjects(for: project).count
-            let threadCount = threadCount(inFolder: project)
+            let threadCount = folderThreadCountsByProjectID[
+                normalizedSidebarProjectID(project.id) ?? "",
+                default: 0
+            ]
             if childCount == 0 {
                 return "No projects yet"
             }
@@ -7775,7 +7875,10 @@ struct AssistantWindowView: View {
                 ? "\(projectLabel) · \(threadLabel) here" : "\(projectLabel) · \(threadLabel)"
         }
 
-        let count = projectThreadCountByProjectID[project.id.lowercased(), default: 0]
+        let count = threadCountsByProjectID[
+            normalizedSidebarProjectID(project.id) ?? "",
+            default: 0
+        ]
 
         switch count {
         case 0:
@@ -7888,7 +7991,9 @@ struct AssistantWindowView: View {
 
     private func sidebarWebProject(
         for project: AssistantProject,
-        selectedProjectID: String?
+        selectedProjectID: String?,
+        threadCountsByProjectID: [String: Int],
+        folderThreadCountsByProjectID: [String: Int]
     ) -> AssistantSidebarWebProject {
         let isSelected = selectedProjectID?.caseInsensitiveCompare(project.id) == .orderedSame
         let linkedFolderPath = project.linkedFolderPath?.trimmingCharacters(
@@ -7897,7 +8002,12 @@ struct AssistantWindowView: View {
         let subtitle =
             selectedSidebarPane == .notes
             ? projectNotesSubtitle(for: project, focused: isSelected)
-            : projectThreadSubtitle(for: project, focused: isSelected)
+            : projectThreadSubtitle(
+                for: project,
+                focused: isSelected,
+                threadCountsByProjectID: threadCountsByProjectID,
+                folderThreadCountsByProjectID: folderThreadCountsByProjectID
+            )
         return AssistantSidebarWebProject(
             id: project.id,
             name: project.name,
@@ -8083,29 +8193,31 @@ struct AssistantWindowView: View {
     }
 
     private func startNewThreadFromSidebar() {
-        guard prepareToLeaveCurrentNoteScreen(reason: "start a new thread") else { return }
-        selectedSidebarPane = .threads
-        closeProjectNotesIfNeeded()
-        threadsDetailMode = .chat
-        if !areThreadsExpanded {
-            withAnimation(sidebarDisclosureAnimation) {
-                areThreadsExpanded = true
+        runAfterCurrentNoteIsSafeToLeave(reason: "start a new thread") {
+            selectedSidebarPane = .threads
+            closeProjectNotesIfNeeded()
+            threadsDetailMode = .chat
+            if !areThreadsExpanded {
+                withAnimation(sidebarDisclosureAnimation) {
+                    areThreadsExpanded = true
+                }
             }
+            Task { await assistant.startNewSession() }
         }
-        Task { await assistant.startNewSession() }
     }
 
     private func startNewTemporaryThreadFromSidebar() {
-        guard prepareToLeaveCurrentNoteScreen(reason: "start a temporary thread") else { return }
-        selectedSidebarPane = .threads
-        closeProjectNotesIfNeeded()
-        threadsDetailMode = .chat
-        if !areThreadsExpanded {
-            withAnimation(sidebarDisclosureAnimation) {
-                areThreadsExpanded = true
+        runAfterCurrentNoteIsSafeToLeave(reason: "start a temporary thread") {
+            selectedSidebarPane = .threads
+            closeProjectNotesIfNeeded()
+            threadsDetailMode = .chat
+            if !areThreadsExpanded {
+                withAnimation(sidebarDisclosureAnimation) {
+                    areThreadsExpanded = true
+                }
             }
+            Task { await assistant.startNewTemporarySession() }
         }
-        Task { await assistant.startNewTemporarySession() }
     }
 
     private func handleSidebarWebCommand(type: String, payload: [String: Any]?) {
@@ -8123,19 +8235,26 @@ struct AssistantWindowView: View {
             else {
                 return
             }
-            guard pane == selectedSidebarPane || prepareToLeaveCurrentNoteScreen(reason: "switch screens") else {
-                return
+            let applyPaneSelection = {
+                if pane == .archived {
+                    showArchivedSidebar()
+                } else {
+                    if pane != .threads {
+                        closeProjectNotesIfNeeded()
+                    }
+                    selectedSidebarPane = pane
+                    if pane == .notes {
+                        ensureNotesProjectSelectionIfNeeded()
+                    }
+                }
             }
-            if pane == .archived {
-                showArchivedSidebar()
+            if pane == selectedSidebarPane {
+                applyPaneSelection()
             } else {
-                if pane != .threads {
-                    closeProjectNotesIfNeeded()
-                }
-                selectedSidebarPane = pane
-                if pane == .notes {
-                    ensureNotesProjectSelectionIfNeeded()
-                }
+                runAfterCurrentNoteIsSafeToLeave(
+                    reason: "switch screens",
+                    action: applyPaneSelection
+                )
             }
         case "setCollapsedPreviewPane":
             let isOpen = payload?["open"] as? Bool ?? false
@@ -8162,27 +8281,28 @@ struct AssistantWindowView: View {
                 areNotesExpanded.toggle()
             }
         case "selectProjectFilter":
-            guard prepareToLeaveCurrentNoteScreen(reason: "switch screens") else { return }
-            selectedSidebarPane = .threads
-            let projectID = (payload?["projectId"] as? String)?
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-                .nonEmpty
-            if let projectID,
-                let project = sidebarProject(for: projectID),
-                let parentID = project.parentID
-            {
-                setFolderExpanded(parentID, expanded: true)
-            }
-            if let projectID,
-                let project = sidebarProject(for: projectID)
-            {
-                closeProjectNotesIfNeeded()
-                threadsDetailMode = .chat
-                Task { await assistant.selectProjectFilter(project.id) }
-            } else {
-                closeProjectNotesIfNeeded()
-                threadsDetailMode = .chat
-                Task { await assistant.selectProjectFilter(nil) }
+            runAfterCurrentNoteIsSafeToLeave(reason: "switch screens") {
+                selectedSidebarPane = .threads
+                let projectID = (payload?["projectId"] as? String)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .nonEmpty
+                if let projectID,
+                    let project = sidebarProject(for: projectID),
+                    let parentID = project.parentID
+                {
+                    setFolderExpanded(parentID, expanded: true)
+                }
+                if let projectID,
+                    let project = sidebarProject(for: projectID)
+                {
+                    closeProjectNotesIfNeeded()
+                    threadsDetailMode = .chat
+                    Task { await assistant.selectProjectFilter(project.id) }
+                } else {
+                    closeProjectNotesIfNeeded()
+                    threadsDetailMode = .chat
+                    Task { await assistant.selectProjectFilter(nil) }
+                }
             }
         case "selectNotesProject":
             let projectID = (payload?["projectId"] as? String)?
@@ -8388,15 +8508,16 @@ struct AssistantWindowView: View {
             else {
                 return
             }
-            guard prepareToLeaveCurrentNoteScreen(reason: "open another thread") else { return }
-            if let paneID = payload?["pane"] as? String,
-                paneID.caseInsensitiveCompare(AssistantSidebarPane.archived.shellID) == .orderedSame
-            {
-                selectedSidebarPane = .archived
-            } else {
-                selectedSidebarPane = .threads
+            runAfterCurrentNoteIsSafeToLeave(reason: "open another thread") {
+                if let paneID = payload?["pane"] as? String,
+                    paneID.caseInsensitiveCompare(AssistantSidebarPane.archived.shellID) == .orderedSame
+                {
+                    selectedSidebarPane = .archived
+                } else {
+                    selectedSidebarPane = .threads
+                }
+                openThread(sessionID)
             }
-            openThread(sessionID)
         case "loadMoreSessions":
             assistant.loadMoreSessions()
         case "createProjectPrompt":
@@ -8636,8 +8757,10 @@ struct AssistantWindowView: View {
     private func handleComposerWebCommand(type: String, payload: [String: Any]?) {
         switch type {
         case "updatePromptDraft":
+            guard selectedRemoteControl == nil else { return }
             assistant.promptDraft = (payload?["text"] as? String) ?? ""
         case "sendPrompt":
+            guard selectedRemoteControl == nil else { return }
             sendCurrentPrompt()
             dismissComposerQuickActionsMenu()
         case "openFilePicker":
@@ -8648,13 +8771,15 @@ struct AssistantWindowView: View {
             captureComposerScreenshotAttachment()
         case "openSkillsPane":
             dismissComposerQuickActionsMenu()
-            guard prepareToLeaveCurrentNoteScreen(reason: "open Skills") else { return }
-            selectedSidebarPane = .skills
+            runAfterCurrentNoteIsSafeToLeave(reason: "open Skills") {
+                selectedSidebarPane = .skills
+            }
         case "openPluginsPane":
             dismissComposerQuickActionsMenu()
-            guard prepareToLeaveCurrentNoteScreen(reason: "open Plugins") else { return }
-            selectedSidebarPane = .plugins
-            Task { await assistant.refreshCodexPluginCatalogIfNeeded() }
+            runAfterCurrentNoteIsSafeToLeave(reason: "open Plugins") {
+                selectedSidebarPane = .plugins
+                Task { await assistant.refreshCodexPluginCatalogIfNeeded() }
+            }
         case "toggleQuickActionsMenu":
             toggleComposerQuickActionsMenu()
         case "dismissNoteContext":
@@ -14486,9 +14611,7 @@ struct AssistantWindowView: View {
         -> [TimelineActivityDetailSectionData]
     {
         guard
-            let trimmed = rawDetails?
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-                .assistantNonEmpty
+            let trimmed = AssistantTimelineDetailSanitizer.sanitized(rawDetails)
         else {
             return []
         }
@@ -14774,7 +14897,7 @@ struct AssistantWindowView: View {
             return nil
         }
 
-        if let rawDetails = activity.rawDetails?.assistantNonEmpty {
+        if let rawDetails = AssistantTimelineDetailSanitizer.sanitized(activity.rawDetails) {
             return rawDetails.replacingOccurrences(of: "\n", with: " ")
         }
 
@@ -15171,6 +15294,7 @@ struct AssistantWindowView: View {
     }
 
     private func sendCurrentPrompt() {
+        guard selectedRemoteControl == nil else { return }
         userHasScrolledUp = false
         let prompt = assistant.promptDraft
         let contextInstructions = buildNoteContextInstructions()
@@ -15265,6 +15389,14 @@ struct AssistantWindowView: View {
         )
     }
 
+    private var selectedRemoteControl: RemoteAccessControlState? {
+        remoteAccessCoordinator.remoteControl(for: assistant.selectedSessionID)
+    }
+
+    private var selectedRemoteControlBannerText: String? {
+        remoteAccessCoordinator.remoteControlBannerText(for: assistant.selectedSessionID)
+    }
+
     @ViewBuilder
     private var chatComposerBanners: some View {
         if let voiceBanner = composerVoiceBanner {
@@ -15276,7 +15408,19 @@ struct AssistantWindowView: View {
             .padding(.bottom, 6)
         }
 
-        if let blockedReason = assistant.conversationBlockedReason {
+        if let remoteControlBannerText = selectedRemoteControlBannerText {
+            composerStatusBanner(
+                symbol: "iphone.gen3.radiowaves.left.and.right",
+                text: remoteControlBannerText,
+                tint: AppVisualTheme.accentTint
+            ) {
+                remoteControlTakeOverButton()
+            }
+            .padding(.bottom, 6)
+        }
+
+        if selectedRemoteControl == nil,
+           let blockedReason = assistant.conversationBlockedReason {
             composerStatusBanner(
                 symbol: assistant.isLoadingModels ? "hourglass" : "exclamationmark.circle",
                 text: blockedReason,
@@ -15358,6 +15502,7 @@ struct AssistantWindowView: View {
     private var canSendMessage: Bool {
         canStartConversation
             && composerPendingPermissionHelperText == nil
+            && selectedRemoteControl == nil
             && (!trimmedPromptDraft.isEmpty || !assistant.attachments.isEmpty)
     }
 
@@ -15428,8 +15573,9 @@ struct AssistantWindowView: View {
                     symbol: "sparkles"
                 ) {
                     dismissComposerQuickActionsMenu()
-                    guard prepareToLeaveCurrentNoteScreen(reason: "open Skills") else { return }
-                    selectedSidebarPane = .skills
+                    runAfterCurrentNoteIsSafeToLeave(reason: "open Skills") {
+                        selectedSidebarPane = .skills
+                    }
                 }
             }
 
@@ -15443,9 +15589,10 @@ struct AssistantWindowView: View {
                     isActive: !state.base.selectedPlugins.isEmpty
                 ) {
                     dismissComposerQuickActionsMenu()
-                    guard prepareToLeaveCurrentNoteScreen(reason: "open Plugins") else { return }
-                    selectedSidebarPane = .plugins
-                    Task { await assistant.refreshCodexPluginCatalogIfNeeded() }
+                    runAfterCurrentNoteIsSafeToLeave(reason: "open Plugins") {
+                        selectedSidebarPane = .plugins
+                        Task { await assistant.refreshCodexPluginCatalogIfNeeded() }
+                    }
                 }
             }
 
@@ -15876,6 +16023,25 @@ struct AssistantWindowView: View {
         }
     }
 
+    private func remoteControlTakeOverButton() -> some View {
+        Button("Take Over") {
+            remoteAccessCoordinator.takeOverSession(assistant.selectedSessionID)
+        }
+        .buttonStyle(.plain)
+        .font(.system(size: 10.5, weight: .semibold))
+        .foregroundStyle(AppVisualTheme.foreground(0.94))
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(
+            Capsule(style: .continuous)
+                .fill(AppVisualTheme.accentTint.opacity(0.18))
+                .overlay(
+                    Capsule(style: .continuous)
+                        .stroke(AppVisualTheme.surfaceStroke(0.10), lineWidth: 0.5)
+                )
+        )
+    }
+
     @ViewBuilder
     private func modeSwitchSuggestionButtons(_ suggestion: AssistantModeSwitchSuggestion)
         -> some View
@@ -15907,6 +16073,52 @@ struct AssistantWindowView: View {
 
     private func providerBrandColor(for backend: AssistantRuntimeBackend) -> Color {
         Color(red: backend.brandHue.red, green: backend.brandHue.green, blue: backend.brandHue.blue)
+    }
+
+    private static let providerMarkImageCache = NSCache<NSString, NSImage>()
+
+    private func providerMarkImage(for backend: AssistantRuntimeBackend) -> NSImage? {
+        let fileName: String
+        switch backend {
+        case .codex: fileName = "provider-mark-codex"
+        case .copilot: fileName = "provider-mark-copilot"
+        case .claudeCode: fileName = "provider-mark-claude"
+        case .ollamaLocal: fileName = "provider-mark-ollama"
+        }
+
+        if let cached = Self.providerMarkImageCache.object(forKey: fileName as NSString) {
+            return cached
+        }
+        guard let url = Bundle.main.url(forResource: fileName, withExtension: "pdf"),
+              let image = NSImage(contentsOf: url) else {
+            return nil
+        }
+        // Render the PDF as a template so SwiftUI's foreground style tints it
+        // with the provider brand color rather than rendering the raw black ink.
+        image.isTemplate = true
+        Self.providerMarkImageCache.setObject(image, forKey: fileName as NSString)
+        return image
+    }
+
+    @ViewBuilder
+    private func providerMarkView(
+        for backend: AssistantRuntimeBackend,
+        size: CGFloat
+    ) -> some View {
+        if let nsImage = providerMarkImage(for: backend) {
+            Image(nsImage: nsImage)
+                .resizable()
+                .renderingMode(.template)
+                .interpolation(.high)
+                .aspectRatio(contentMode: .fit)
+                .frame(width: size, height: size)
+                .foregroundStyle(providerBrandColor(for: backend))
+        } else {
+            // Fallback to the original colored dot if the asset is missing.
+            Circle()
+                .fill(providerBrandColor(for: backend).opacity(0.9))
+                .frame(width: max(5, size * 0.4), height: max(5, size * 0.4))
+        }
     }
 
     private func providerPickerStatus(
@@ -16108,10 +16320,8 @@ struct AssistantWindowView: View {
         return Button {
             toggleProviderPicker()
         } label: {
-            HStack(spacing: 5) {
-                Circle()
-                    .fill(brandColor.opacity(0.9))
-                    .frame(width: 6, height: 6)
+            HStack(spacing: 6) {
+                providerMarkView(for: selected, size: 14)
                     .shadow(color: brandColor.opacity(0.34), radius: 4, x: 0, y: 0)
 
                 Text(selected.shortDisplayName)
@@ -16182,9 +16392,7 @@ struct AssistantWindowView: View {
                 } label: {
                     VStack(alignment: .leading, spacing: 6) {
                         HStack(spacing: 8) {
-                            Circle()
-                                .fill(backendColor.opacity(0.9))
-                                .frame(width: 5, height: 5)
+                            providerMarkView(for: backend, size: 14)
 
                             Text(backend.shortDisplayName)
                                 .font(.system(size: 11.5, weight: isActive ? .semibold : .medium))
@@ -16203,12 +16411,6 @@ struct AssistantWindowView: View {
                                     Capsule(style: .continuous)
                                         .fill(status.color.opacity(isActive ? 0.18 : 0.12))
                                 )
-
-                            if isActive {
-                                Image(systemName: "checkmark")
-                                    .font(.system(size: 9, weight: .bold))
-                                    .foregroundStyle(backendColor.opacity(0.8))
-                            }
                         }
 
                         if let detail = status.detail {
@@ -16780,8 +16982,9 @@ struct AssistantWindowView: View {
             },
             onRepair: {
                 assistant.repairMissingSkillBindings()
-                guard prepareToLeaveCurrentNoteScreen(reason: "open Skills") else { return }
-                selectedSidebarPane = .skills
+                runAfterCurrentNoteIsSafeToLeave(reason: "open Skills") {
+                    selectedSidebarPane = .skills
+                }
             }
         )
     }

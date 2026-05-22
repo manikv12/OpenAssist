@@ -96,7 +96,7 @@ final class AccountRateLimitsTests: XCTestCase {
 
         XCTAssertEqual(entries.count, 2)
         XCTAssertEqual(entries.map(\.window.windowLabel), ["5h", "Weekly"])
-        XCTAssertEqual(entries.map(\.showsResetInline), [false, true])
+        XCTAssertEqual(entries.map(\.showsResetInline), [true, true])
     }
 
     private func fullRateLimitsPayload() -> [String: Any] {

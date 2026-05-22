@@ -142,6 +142,21 @@ if [ -n "${DEVELOPER_ID:-}" ]; then
 else
     echo "  No DEVELOPER_ID set — using ad-hoc signature with hardened runtime entitlements."
     echo "  (This keeps local testing closer to the shipped app.)"
+    for xpc in "$APP_DIR/Contents/Frameworks/Sparkle.framework/Versions/B/XPCServices/"*.xpc; do
+        [ -d "$xpc" ] && codesign --force --options runtime --sign - "$xpc"
+    done
+    if [ -d "$APP_DIR/Contents/Frameworks/Sparkle.framework/Versions/B/Updater.app" ]; then
+        codesign --force --deep --options runtime --sign - \
+            "$APP_DIR/Contents/Frameworks/Sparkle.framework/Versions/B/Updater.app"
+    fi
+    for helper in \
+        "$APP_DIR/Contents/Frameworks/Sparkle.framework/Versions/B/Autoupdate" \
+        "$APP_DIR/Contents/Frameworks/Sparkle.framework/Versions/B/Sparkle"
+    do
+        [ -e "$helper" ] && codesign --force --options runtime --sign - "$helper"
+    done
+    codesign --force --options runtime --sign - \
+        "$APP_DIR/Contents/Frameworks/Sparkle.framework/Versions/B"
     codesign --force --deep --options runtime --entitlements Resources/OpenAssist.entitlements --sign - "$APP_DIR"
 fi
 

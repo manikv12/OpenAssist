@@ -61,11 +61,20 @@ struct CopilotTokenResolver {
             return environmentToken
         }
 
-        if let storedToken = loadStoredCopilotToken() {
-            return storedToken
+        // Order matches CodexPulse: env → plaintext config → gh CLI → keychain.
+        // gh CLI usually has a fresh token even when the Copilot keychain entry
+        // is missing (e.g. if the user signs in via `gh auth login` only), so it
+        // should be tried before walking the Keychain.
+        let plaintextToken = loadStoredPlaintextCopilotToken()
+        if let plaintextToken {
+            return plaintextToken
         }
 
-        return await loadGitHubCLIToken()
+        if let ghToken = await loadGitHubCLIToken() {
+            return ghToken
+        }
+
+        return loadCopilotKeychainToken()
     }
 
     private func preferredEnvironmentToken() -> String? {
@@ -78,29 +87,45 @@ struct CopilotTokenResolver {
         return nil
     }
 
-    private func loadStoredCopilotToken() -> String? {
+    private func loadStoredPlaintextCopilotToken() -> String? {
         let config = loadStoredConfig()
+        guard config?.storeTokenPlaintext == true else { return nil }
         let accounts = storedAccounts(from: config)
 
-        if config?.storeTokenPlaintext == true {
-            for account in accounts {
-                if let token = config?.copilotTokens?[account.storageKey]?.trimmingCharacters(in: .whitespacesAndNewlines),
-                   !token.isEmpty {
-                    return token
-                }
-            }
-
-            if let fallback = config?.copilotTokens?.values
-                .map({ $0.trimmingCharacters(in: .whitespacesAndNewlines) })
-                .first(where: { !$0.isEmpty }) {
-                return fallback
+        for account in accounts {
+            if let token = config?.copilotTokens?[account.storageKey]?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+               !token.isEmpty {
+                return token
             }
         }
 
+        return config?.copilotTokens?.values
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first(where: { !$0.isEmpty })
+    }
+
+    private func loadCopilotKeychainToken() -> String? {
+        let config = loadStoredConfig()
+        let accounts = storedAccounts(from: config)
+
         for account in accounts {
-            if let token = keychain.loadToken(service: Self.copilotCLIKeychainService, account: account.storageKey) {
+            if let token = keychain.loadToken(
+                service: Self.copilotCLIKeychainService,
+                account: account.storageKey
+            ) {
                 return token
             }
+        }
+
+        // CodexPulse also tries a "github.com" account label and a fully
+        // unscoped lookup. Some Copilot CLI versions store the token under
+        // these alternate keys, so we mirror that fallback chain.
+        if let token = keychain.loadToken(
+            service: Self.copilotCLIKeychainService,
+            account: "github.com"
+        ) {
+            return token
         }
 
         return keychain.loadToken(service: Self.copilotCLIKeychainService, account: nil)

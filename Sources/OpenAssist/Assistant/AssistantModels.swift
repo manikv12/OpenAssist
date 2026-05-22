@@ -2586,6 +2586,9 @@ final class AssistantStore: ObservableObject {
             return false
         }
 
+        if let normalizedThreadID = normalizedSessionID(threadID) {
+            pendingProviderSwitchesBySessionID[normalizedThreadID] = backend
+        }
         let previousBackend = session.activeProviderBackend
         settings.assistantBackend = backend
 
@@ -2989,13 +2992,17 @@ final class AssistantStore: ObservableObject {
     }
 
     var visibleSidebarSessionsIgnoringProjectFilter: [AssistantSessionSummary] {
-        visibleSidebarProjectSessions.filter { session in
+        let canonicalThreadIDsByProviderSessionID = canonicalThreadIDLookupByProviderSessionID()
+        return visibleSidebarProjectSessions.filter { session in
             !session.isArchived
                 && assistantShouldListSessionInSidebar(session, selectedSessionID: selectedSessionID)
                 && !assistantShouldHideShadowProviderSession(
                     session,
                     selectedSessionID: selectedSessionID,
-                    canonicalThreadID: canonicalThreadID(forProviderSessionID: session.id)
+                    canonicalThreadID: canonicalThreadID(
+                        forProviderSessionID: session.id,
+                        lookup: canonicalThreadIDsByProviderSessionID
+                    )
                 )
         }
     }
@@ -3027,25 +3034,33 @@ final class AssistantStore: ObservableObject {
     }
 
     var visibleSidebarSessions: [AssistantSessionSummary] {
-        projectFilteredSidebarSessions.filter { session in
+        let canonicalThreadIDsByProviderSessionID = canonicalThreadIDLookupByProviderSessionID()
+        return projectFilteredSidebarSessions.filter { session in
             !session.isArchived
                 && assistantShouldListSessionInSidebar(session, selectedSessionID: selectedSessionID)
                 && !assistantShouldHideShadowProviderSession(
                     session,
                     selectedSessionID: selectedSessionID,
-                    canonicalThreadID: canonicalThreadID(forProviderSessionID: session.id)
+                    canonicalThreadID: canonicalThreadID(
+                        forProviderSessionID: session.id,
+                        lookup: canonicalThreadIDsByProviderSessionID
+                    )
                 )
         }
     }
 
     var visibleArchivedSidebarSessions: [AssistantSessionSummary] {
-        projectFilteredSidebarSessions.filter { session in
+        let canonicalThreadIDsByProviderSessionID = canonicalThreadIDLookupByProviderSessionID()
+        return projectFilteredSidebarSessions.filter { session in
             session.isArchived
                 && assistantShouldListSessionInSidebar(session, selectedSessionID: selectedSessionID)
                 && !assistantShouldHideShadowProviderSession(
                     session,
                     selectedSessionID: selectedSessionID,
-                    canonicalThreadID: canonicalThreadID(forProviderSessionID: session.id)
+                    canonicalThreadID: canonicalThreadID(
+                        forProviderSessionID: session.id,
+                        lookup: canonicalThreadIDsByProviderSessionID
+                    )
                 )
         }
     }
@@ -3223,6 +3238,7 @@ final class AssistantStore: ObservableObject {
     private var timelineItemsBySessionID: [String: [AssistantTimelineItem]] = [:]
     private var providerRuntimeSurfaceByThreadID: [String: [AssistantRuntimeBackend: AssistantProviderRuntimeSurfaceSnapshot]] = [:]
     private var providerAvailableModelsByBackend: [AssistantRuntimeBackend: [AssistantModelOption]] = [:]
+    private var pendingProviderSwitchesBySessionID: [String: AssistantRuntimeBackend] = [:]
     private var requestedTimelineHistoryLimitBySessionID: [String: Int] = [:]
     private var requestedTranscriptHistoryLimitBySessionID: [String: Int] = [:]
     private var canLoadMoreHistoryBySessionID: [String: Bool] = [:]
@@ -4590,6 +4606,31 @@ final class AssistantStore: ObservableObject {
         })?.id
     }
 
+    private func canonicalThreadIDLookupByProviderSessionID() -> [String: String] {
+        sessions.reduce(into: [:]) { lookup, session in
+            let canonicalThreadID = session.id
+            if let activeProviderSessionID = normalizedSessionID(session.activeProviderSessionID) {
+                lookup[activeProviderSessionID] = canonicalThreadID
+            }
+            for binding in session.providerBindingsByBackend {
+                guard let providerSessionID = normalizedSessionID(binding.providerSessionID) else {
+                    continue
+                }
+                lookup[providerSessionID] = canonicalThreadID
+            }
+        }
+    }
+
+    private func canonicalThreadID(
+        forProviderSessionID providerSessionID: String?,
+        lookup: [String: String]
+    ) -> String? {
+        guard let normalizedProviderSessionID = normalizedSessionID(providerSessionID) else {
+            return nil
+        }
+        return lookup[normalizedProviderSessionID]
+    }
+
     private func managedSessionID(for runtime: CodexAssistantRuntime) -> String? {
         Self.resolvedManagedSessionID(
             boundSessionID: sessionIDBoundToRuntime(runtime),
@@ -4634,13 +4675,22 @@ final class AssistantStore: ObservableObject {
         if let requestSessionID = requestSessionID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
             return canonicalThreadID(forProviderSessionID: requestSessionID) ?? requestSessionID
         }
+        // Prefer the runtime registry binding over the provider-session-ID lookup.
+        // Each per-session runtime is registered as
+        // sessionRuntimesBySessionID[canonicalThreadID] = runtime, so this returns
+        // the canonical thread directly. The canonicalThreadID(forProviderSessionID:)
+        // lookup walks every session's bindings and returns the first match — if
+        // a stale or shared provider session ID lingers in another thread's
+        // binding, that lookup attributes events to the wrong row, which makes
+        // unrelated threads look freshly updated.
+        if let boundSessionID = sessionIDBoundToRuntime(runtime) {
+            return boundSessionID
+        }
         if let runtimeSessionID = runtime.currentSessionID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
             return canonicalThreadID(forProviderSessionID: runtimeSessionID)
-                ?? sessionIDBoundToRuntime(runtime)
                 ?? runtimeSessionID
         }
-        return sessionIDBoundToRuntime(runtime)
-            ?? preferredSessionID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+        return preferredSessionID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
     }
 
     private func resolvedMutationSessionID(
@@ -5280,9 +5330,18 @@ final class AssistantStore: ObservableObject {
                     case .installRequired, .loginRequired, .failed, .unavailable:
                         self.isLoadingModels = false
                     case .ready, .active:
-                        if let detail = health.detail?.trimmingCharacters(in: .whitespacesAndNewlines),
-                           !detail.isEmpty,
-                           !detail.localizedCaseInsensitiveContains("loading model") {
+                        // Clear the isLoadingModels flag whenever the runtime
+                        // reports a healthy state, unless the detail string
+                        // explicitly says we are still loading models. The
+                        // previous logic also required the detail to be
+                        // non-empty, which left the flag stuck true after a
+                        // successful refresh that returned no detail. That
+                        // stuck flag, combined with any later refresh, made
+                        // the remote "Loading models..." banner flicker.
+                        let detail = health.detail?
+                            .trimmingCharacters(in: .whitespacesAndNewlines)
+                        let stillLoading = detail?.localizedCaseInsensitiveContains("loading model") == true
+                        if !stillLoading {
                             self.isLoadingModels = false
                         }
                     default:
@@ -6668,6 +6727,7 @@ final class AssistantStore: ObservableObject {
             let persistedSessionIDs = Set(merged.compactMap { normalizedSessionID($0.id) })
             reconcilePendingFreshSessions(with: persistedSessionIDs)
             merged = mergePendingFreshSessions(into: merged)
+            merged = applyPendingProviderSwitchOverrides(to: merged)
             merged = sortSessionsByRecency(deduplicateSessions(merged))
 
             if let currentSelectedSessionID = selectedSessionID?.nonEmpty,
@@ -7265,7 +7325,8 @@ final class AssistantStore: ObservableObject {
             }
         }
 
-        guard let session = sessionSummary else { return nil }
+        guard let sessionSummary else { return nil }
+        let session = applyPendingProviderSwitchOverride(to: sessionSummary)
 
         let transcriptEntries: [AssistantTranscriptEntry]
         if sessionsMatch(transcriptSessionID, normalizedSessionID) {
@@ -7603,11 +7664,18 @@ final class AssistantStore: ObservableObject {
     }
 
     @discardableResult
-    private func createOpenAssistThread(cwd: String? = nil, isTemporary: Bool) -> String {
+    private func createOpenAssistThread(
+        cwd: String? = nil,
+        isTemporary: Bool,
+        project: AssistantProject? = nil,
+        useSelectedProjectContext: Bool = true
+    ) -> String {
         let sessionID = Self.makeOpenAssistThreadID()
         deletedSessionIDs.remove(sessionID.lowercased())
-        let requestedCWD = cwd ?? selectedProjectLinkedFolderPathIfUsable()
-        let targetProjectID = selectedProject?.id
+        let targetProject = project ?? (useSelectedProjectContext ? selectedProject : nil)
+        let requestedCWD = cwd
+            ?? targetProject.flatMap { resolvedProjectLinkedFolderPath($0.linkedFolderPath) }
+        let targetProjectID = targetProject?.id
         let now = Date()
         let thread = AssistantSessionSummary(
             id: sessionID,
@@ -7634,7 +7702,7 @@ final class AssistantStore: ObservableObject {
             latestAssistantMessage: nil,
             isTemporary: isTemporary,
             projectID: targetProjectID,
-            projectName: selectedProject?.name,
+            projectName: targetProject?.name,
             linkedProjectFolderPath: requestedCWD
         )
 
@@ -7653,6 +7721,201 @@ final class AssistantStore: ObservableObject {
         sessions.insert(thread, at: 0)
         persistManagedSessionsSnapshot()
         return sessionID
+    }
+
+    func startRemoteBackgroundSession(projectID: String?, isTemporary: Bool) async -> AssistantRemoteSessionSnapshot? {
+        guard canCreateThread else {
+            lastStatusMessage = "Finish the current undo or edit before starting a new thread."
+            return nil
+        }
+
+        let targetProject: AssistantProject?
+        if let normalizedProjectID = projectID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
+            guard let project = visibleLeafProjects.first(where: {
+                $0.id.trimmingCharacters(in: .whitespacesAndNewlines)
+                    .caseInsensitiveCompare(normalizedProjectID) == .orderedSame
+            }) else {
+                return nil
+            }
+            targetProject = project
+        } else {
+            targetProject = nil
+        }
+
+        let sessionID = createOpenAssistThread(
+            isTemporary: isTemporary,
+            project: targetProject,
+            useSelectedProjectContext: false
+        )
+        ensureSessionVisible(sessionID)
+        return await remoteSessionSnapshot(sessionID: sessionID)
+    }
+
+    func sendRemotePromptInBackground(
+        _ prompt: String,
+        sessionID requestedSessionID: String?,
+        projectID: String?,
+        selectedPluginIDs: [String],
+        oneShotInstructions: String?
+    ) async -> AssistantRemoteSessionSnapshot? {
+        let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+
+        let targetSessionID: String
+        if let normalizedSessionID = requestedSessionID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
+            targetSessionID = normalizedSessionID
+        } else if let created = await startRemoteBackgroundSession(projectID: projectID, isTemporary: false) {
+            targetSessionID = created.session.id
+        } else {
+            return nil
+        }
+
+        if sessionActivitySnapshot(for: targetSessionID).pendingPermissionRequest != nil {
+            return nil
+        }
+
+        let runtimeForSession = ensureRuntime(for: targetSessionID)
+        let preferredModelID = sessions.first(where: { sessionsMatch($0.id, targetSessionID) })?
+            .latestModel?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nonEmpty ?? selectedModelID
+        let desiredBackend = sessions.first(where: { sessionsMatch($0.id, targetSessionID) }).map(backend(for:)) ?? assistantBackend
+        applyRemoteRuntimeContext(
+            to: runtimeForSession,
+            threadID: targetSessionID,
+            oneShotInstructions: oneShotInstructions
+        )
+        await ensureRuntimeBackend(runtimeForSession, matches: desiredBackend)
+
+        let resolvedPromptState = await resolveCodexPluginPromptState(
+            prompt: trimmed,
+            selectedPluginIDs: uniqueCodexPluginIDs(selectedPluginIDs),
+            backend: runtimeForSession.backend
+        )
+        let resolvedPrompt = resolvedPromptState.prompt
+        let pendingSelectedPluginIDs = resolvedPromptState.selectedPluginIDs
+        runtimeForSession.setSelectedCodexPluginIDs(pendingSelectedPluginIDs)
+
+        let canSteerActiveCodexTurn =
+            runtimeForSession.canSteerActiveTurn
+            && sessionActivitySnapshot(for: targetSessionID).pendingPermissionRequest == nil
+        let shouldQueueBehindActiveTurn = assistantShouldQueuePromptBehindActiveTurn(
+            sessionHasActiveTurn: sessionActivitySnapshot(for: targetSessionID).hasActiveTurn,
+            runtimeHasActiveTurn: runtimeForSession.hasActiveTurn
+        ) && !canSteerActiveCodexTurn
+
+        stagePendingOutgoingMessage(prompt: resolvedPrompt, attachments: [], for: targetSessionID)
+        let committedMessageCreatedAt = Date()
+        let committedSelectedPlugins = resolvedComposerPluginSelections(
+            for: pendingSelectedPluginIDs,
+            prompt: resolvedPrompt
+        )
+        appendTranscriptEntry(
+            AssistantTranscriptEntry(
+                role: .user,
+                text: resolvedPrompt,
+                createdAt: committedMessageCreatedAt,
+                selectedPlugins: committedSelectedPlugins
+            ),
+            sessionID: targetSessionID
+        )
+        appendTimelineItem(
+            .userMessage(
+                sessionID: targetSessionID,
+                turnID: nil,
+                text: resolvedPrompt,
+                createdAt: committedMessageCreatedAt,
+                imageAttachments: nil,
+                selectedPlugins: committedSelectedPlugins,
+                source: .runtime
+            )
+        )
+
+        do {
+            let executionSessionID = try await prepareRemoteRuntimeForPrompt(
+                threadID: targetSessionID,
+                runtime: runtimeForSession,
+                preferredModelID: preferredModelID
+            )
+            let resumeContext = resumeContextIfNeeded(for: executionSessionID)
+            let memoryContext = try memoryContextForPrompt(
+                sessionID: executionSessionID,
+                prompt: resolvedPrompt,
+                automationJob: nil
+            )
+            let submittedSlashCommand = AssistantSlashCommandCatalog.detectLeadingCommand(
+                in: resolvedPrompt,
+                backend: runtimeForSession.backend
+            )
+
+            if canSteerActiveCodexTurn {
+                let steeringPromptPrefix = await codexPluginContextPrefixText(
+                    selectedPluginIDs: pendingSelectedPluginIDs,
+                    backend: runtimeForSession.backend
+                )
+                try await runtimeForSession.steerActiveTurn(
+                    prompt: [steeringPromptPrefix, resolvedPrompt]
+                        .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty }
+                        .joined(separator: "\n\n"),
+                    attachments: []
+                )
+            } else if shouldQueueBehindActiveTurn {
+                enqueueQueuedPrompt(
+                    AssistantQueuedPrompt(
+                        text: resolvedPrompt,
+                        attachments: [],
+                        preferredModelID: preferredModelID,
+                        modelSupportsImageInput: selectedModelSupportsImageInput,
+                        selectedPluginIDs: pendingSelectedPluginIDs,
+                        automationJob: nil,
+                        createdAt: committedMessageCreatedAt,
+                        submittedSlashCommand: submittedSlashCommand
+                    ),
+                    for: executionSessionID
+                )
+            } else {
+                let pluginInputItems = await resolvedCodexPluginPromptItems(
+                    selectedPluginIDs: pendingSelectedPluginIDs,
+                    prompt: resolvedPrompt,
+                    backend: runtimeForSession.backend
+                )
+                try await runtimeForSession.sendPrompt(
+                    resolvedPrompt,
+                    attachments: [],
+                    preferredModelID: preferredModelID,
+                    modelSupportsImageInput: selectedModelSupportsImageInput,
+                    resumeContext: resumeContext,
+                    memoryContext: memoryContext,
+                    submittedSlashCommand: submittedSlashCommand,
+                    structuredInputItems: pluginInputItems
+                )
+            }
+
+            await commitPendingHistoryEditIfNeeded(for: executionSessionID)
+            pendingResumeContextSessionIDs.remove(executionSessionID)
+            pendingResumeContextSnapshotsBySessionID.removeValue(forKey: executionSessionID)
+            pendingResumeContextMetadataBySessionID.removeValue(forKey: executionSessionID)
+            ensureSessionVisible(executionSessionID)
+            return await remoteSessionSnapshot(sessionID: executionSessionID)
+        } catch {
+            clearPendingSendState(for: targetSessionID)
+            let message = error.localizedDescription
+            appendTranscriptEntry(
+                AssistantTranscriptEntry(role: .error, text: message, emphasis: true),
+                sessionID: targetSessionID
+            )
+            appendTimelineItem(
+                .system(
+                    sessionID: targetSessionID,
+                    text: message,
+                    createdAt: Date(),
+                    emphasis: true,
+                    source: .runtime
+                )
+            )
+            ensureSessionVisible(targetSessionID)
+            return await remoteSessionSnapshot(sessionID: targetSessionID)
+        }
     }
 
     private func ensureVisibleSessionForPendingPrompt() -> String {
@@ -10306,9 +10569,21 @@ final class AssistantStore: ObservableObject {
 
         markSessionPendingDeletion(normalizedSessionID)
         do {
+            // Stop the per-session runtime synchronously before deleting on-disk
+            // artifacts. The previous condition compared currentSessionID (the
+            // provider session ID, e.g. a Codex thread ID) to normalizedSessionID
+            // (the canonical OpenAssist thread ID) — those are different IDs by
+            // design for canonical threads, so the await never ran. The runtime
+            // kept living, kept writing to its rollout JSONL, and the session
+            // catalog kept re-introducing the row on the next refresh — which
+            // looked to the user like the deleted thread "coming back" and its
+            // updatedAt timestamp jumping around.
+            //
+            // sessionRuntimesBySessionID is keyed by canonical thread ID, so any
+            // runtime returned by runtime(for: normalizedSessionID) is bound to
+            // exactly this session and can safely be stopped.
             if stopRuntimeIfNeeded,
-               let sessionRuntime = runtime(for: normalizedSessionID),
-               sessionRuntime.currentSessionID?.caseInsensitiveCompare(normalizedSessionID) == .orderedSame {
+               let sessionRuntime = runtime(for: normalizedSessionID) {
                 await sessionRuntime.stop()
             }
             return try deleteSessionArtifactsLocally(normalizedSessionID)
@@ -11417,6 +11692,33 @@ final class AssistantStore: ObservableObject {
         targetRuntime.maxRepeatedCommandAttemptsPerTurn = settings.assistantMaxRepeatedCommandAttemptsPerTurn
     }
 
+    private func applyRemoteRuntimeContext(
+        to targetRuntime: CodexAssistantRuntime,
+        threadID: String?,
+        oneShotInstructions: String?
+    ) {
+        targetRuntime.activeSkills = resolvedActiveSkillDescriptors(for: threadID)
+        targetRuntime.browserProfileContext = currentBrowserProfileContext
+
+        let global = settings.assistantCustomInstructions.trimmingCharacters(in: .whitespacesAndNewlines)
+        let oneShot = oneShotInstructions?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nonEmpty ?? ""
+
+        targetRuntime.customInstructions = Self.combinedRuntimeInstructions(
+            global: global,
+            session: "",
+            oneShot: oneShot
+        )
+        targetRuntime.assistantNotesContext = nil
+        targetRuntime.setPreferredSubagentModelID(selectedSubagentModelID)
+        targetRuntime.reasoningEffort = reasoningEffort.wireValue
+        targetRuntime.serviceTier = fastModeEnabled ? "fast" : nil
+        targetRuntime.interactionMode = interactionMode
+        targetRuntime.maxToolCallsPerTurn = settings.assistantMaxToolCallsPerTurn
+        targetRuntime.maxRepeatedCommandAttemptsPerTurn = settings.assistantMaxRepeatedCommandAttemptsPerTurn
+    }
+
     func requestBrowserProfileSelection() {
         showBrowserProfilePicker = true
     }
@@ -11766,6 +12068,17 @@ final class AssistantStore: ObservableObject {
 
     private func ensureSessionVisible(_ sessionID: String?) {
         guard let sessionID, !sessionID.isEmpty else { return }
+        // If the supplied ID is actually a provider session ID already bound to
+        // an existing canonical thread, redirect to that thread instead of
+        // creating a duplicate "shadow" row. This protects callers that pass a
+        // runtime/provider session ID by mistake and keeps the canonical thread
+        // as the single source of truth.
+        if sessions.firstIndex(where: { $0.id == sessionID }) == nil,
+           let canonicalID = canonicalThreadID(forProviderSessionID: sessionID),
+           sessions.contains(where: { $0.id == canonicalID }) {
+            ensureSessionVisible(canonicalID)
+            return
+        }
         if let existingIndex = sessions.firstIndex(where: { $0.id == sessionID }) {
             sessions[existingIndex].status = Self.normalizedFreshSessionStatus(
                 currentStatus: sessions[existingIndex].status,
@@ -12654,7 +12967,12 @@ final class AssistantStore: ObservableObject {
     }
 
     private func updateVisibleSessionPreview(with entry: AssistantTranscriptEntry, sessionID: String? = nil) {
-        guard let sessionID = sessionID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty ?? selectedSessionID,
+        // Require an explicit sessionID. Falling back to selectedSessionID here
+        // used to attribute runtime events to whichever thread the user happened
+        // to have open on the Mac, which surfaced as another thread's "1m"
+        // freshness timestamp jumping while the actually-chatted thread stayed
+        // stale.
+        guard let sessionID = sessionID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty,
               let sessionIndex = sessions.firstIndex(where: { sessionsMatch($0.id, sessionID) }),
               let text = entry.text.assistantNonEmpty else {
             return
@@ -13130,6 +13448,22 @@ final class AssistantStore: ObservableObject {
             let normalizedSessionID = session.id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
             if let projectID = snapshot.threadAssignments[normalizedSessionID],
                let project = projectsByID[projectID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()] {
+                let effectiveFolder = resolvedProjectLinkedFolderPath(project.linkedFolderPath)
+                updated.projectID = project.id
+                updated.projectName = project.name
+                updated.linkedProjectFolderPath = project.linkedFolderPath
+                updated.projectFolderMissing = project.linkedFolderPath != nil && effectiveFolder == nil
+                updated.effectiveCWD = effectiveFolder ?? session.cwd
+            } else if session.isCanonicalThread,
+                      let existingProjectID = session.projectID?
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                        .nonEmpty,
+                      let project = projectsByID[existingProjectID.lowercased()] {
+                // The session record already carries a project assignment but the
+                // store snapshot doesn't have it yet (e.g., a refresh raced with
+                // assignThread, or persistence hasn't caught up). Preserve the
+                // session's existing assignment so a remote-started thread does
+                // not vanish from its project filter mid-run.
                 let effectiveFolder = resolvedProjectLinkedFolderPath(project.linkedFolderPath)
                 updated.projectID = project.id
                 updated.projectName = project.name
@@ -15692,6 +16026,83 @@ final class AssistantStore: ObservableObject {
         return hours == 1 ? "1 hour" : "\(hours) hours"
     }
 
+    private func prepareRemoteRuntimeForPrompt(
+        threadID: String,
+        runtime targetRuntime: CodexAssistantRuntime,
+        preferredModelID: String?
+    ) async throws -> String {
+        let normalizedThreadID = threadID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedThreadID.isEmpty else {
+            throw NSError(
+                domain: "OpenAssist.RemoteAccess",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "Missing thread ID."]
+            )
+        }
+
+        let targetSession = sessions.first(where: { sessionsMatch($0.id, normalizedThreadID) })
+        if let targetSession,
+           targetSession.isCanonicalThread {
+            let providerBackend = backend(for: targetSession)
+            await ensureRuntimeBackend(targetRuntime, matches: providerBackend)
+            try ensureLiveRuntimeCapacity(for: normalizedThreadID)
+
+            if let providerSessionID = providerSessionID(for: targetSession) {
+                if let currentSessionID = targetRuntime.currentSessionID?.nonEmpty,
+                   sessionsMatch(currentSessionID, providerSessionID) {
+                    try await targetRuntime.refreshCurrentSessionConfiguration(
+                        cwd: resolvedSessionCWD(for: normalizedThreadID),
+                        preferredModelID: preferredModelID
+                    )
+                    return normalizedThreadID
+                }
+
+                try await targetRuntime.resumeSession(
+                    providerSessionID,
+                    cwd: resolvedSessionCWD(for: normalizedThreadID),
+                    preferredModelID: preferredModelID
+                )
+                updateProviderLink(
+                    forThreadID: normalizedThreadID,
+                    backend: providerBackend,
+                    providerSessionID: targetRuntime.currentSessionID ?? providerSessionID
+                )
+                markPendingResumeContext(for: normalizedThreadID)
+                return normalizedThreadID
+            }
+
+            let startedProviderSessionID = try await targetRuntime.startNewSession(
+                cwd: resolvedSessionCWD(for: normalizedThreadID),
+                preferredModelID: preferredModelID
+            )
+            updateProviderLink(
+                forThreadID: normalizedThreadID,
+                backend: providerBackend,
+                providerSessionID: startedProviderSessionID
+            )
+            markPendingResumeContext(for: normalizedThreadID)
+            return normalizedThreadID
+        }
+
+        if let currentSessionID = targetRuntime.currentSessionID?.nonEmpty,
+           sessionsMatch(currentSessionID, normalizedThreadID) {
+            try await targetRuntime.refreshCurrentSessionConfiguration(
+                cwd: resolvedSessionCWD(for: normalizedThreadID),
+                preferredModelID: preferredModelID
+            )
+            return normalizedThreadID
+        }
+
+        try ensureLiveRuntimeCapacity(for: normalizedThreadID)
+        try await targetRuntime.resumeSession(
+            normalizedThreadID,
+            cwd: resolvedSessionCWD(for: normalizedThreadID),
+            preferredModelID: preferredModelID
+        )
+        markPendingResumeContext(for: normalizedThreadID)
+        return normalizedThreadID
+    }
+
     private func prepareSessionForPrompt() async throws -> String {
         if let selectedSessionID = selectedSessionID?.nonEmpty {
             let selectedRuntime = ensureRuntime(for: selectedSessionID)
@@ -17050,10 +17461,47 @@ final class AssistantStore: ObservableObject {
     }
 
     private func backend(for session: AssistantSessionSummary) -> AssistantRuntimeBackend {
+        if session.isProviderIndependentThreadV2,
+           let normalizedID = normalizedSessionID(session.id),
+           let pendingBackend = pendingProviderSwitchesBySessionID[normalizedID] {
+            return pendingBackend
+        }
         if let providerBackend = session.activeProviderBackend {
             return providerBackend
         }
         return assistantBackend
+    }
+
+    private func applyPendingProviderSwitchOverrides(
+        to sessions: [AssistantSessionSummary]
+    ) -> [AssistantSessionSummary] {
+        sessions.map(applyPendingProviderSwitchOverride(to:))
+    }
+
+    private func applyPendingProviderSwitchOverride(
+        to session: AssistantSessionSummary
+    ) -> AssistantSessionSummary {
+        guard session.isProviderIndependentThreadV2,
+              let normalizedID = normalizedSessionID(session.id),
+              let pendingBackend = pendingProviderSwitchesBySessionID[normalizedID] else {
+            return session
+        }
+
+        var updated = session
+        if updated.providerBinding(for: pendingBackend) == nil {
+            updated.setProviderBinding(
+                AssistantProviderBinding(
+                    backend: pendingBackend,
+                    latestModelID: updated.modelID,
+                    latestInteractionMode: updated.latestInteractionMode ?? interactionMode,
+                    latestReasoningEffort: updated.latestReasoningEffort ?? reasoningEffort,
+                    latestServiceTier: updated.latestServiceTier,
+                    lastConnectedAt: Date()
+                )
+            )
+        }
+        updated.activeProvider = pendingBackend
+        return updated
     }
 
     private func providerSessionID(
@@ -17665,8 +18113,26 @@ extension String {
 
 extension AssistantSessionSummary {
     var hasConversationContent: Bool {
-        summary?.assistantNonEmpty != nil
+        if summary?.assistantNonEmpty != nil
             || latestUserMessage?.assistantNonEmpty != nil
-            || latestAssistantMessage?.assistantNonEmpty != nil
+            || latestAssistantMessage?.assistantNonEmpty != nil {
+            return true
+        }
+        // A canonical thread that has been bound to a provider session has work
+        // attached to it (an active or completed turn on the runtime side), even
+        // if the surface-level preview fields haven't been populated yet. Treat
+        // this as content so the row stays visible while the agent is working.
+        if isCanonicalThread {
+            if providerSessionID?.assistantNonEmpty != nil
+                || activeProviderSessionID?.assistantNonEmpty != nil {
+                return true
+            }
+            if providerBindingsByBackend.contains(where: {
+                $0.providerSessionID?.assistantNonEmpty != nil
+            }) {
+                return true
+            }
+        }
+        return false
     }
 }

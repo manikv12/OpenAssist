@@ -208,6 +208,64 @@ final class AssistantSessionSummaryTests: XCTestCase {
         XCTAssertTrue(assistantShouldListSessionInSidebar(filledThread, selectedSessionID: nil))
     }
 
+    func testCanonicalThreadWithProviderBindingStaysVisibleEvenWithoutPreviewText() {
+        // A remote-started thread is bound to a provider session ID before its
+        // latestUserMessage/latestAssistantMessage preview fields land. The thread
+        // should remain visible in the sidebar so it does not vanish mid-run.
+        let workingThread = AssistantSessionSummary(
+            id: "openassist-remote-working",
+            title: "New Assistant Session",
+            source: .openAssist,
+            threadArchitectureVersion: .providerIndependentV2,
+            providerBindingsByBackend: [
+                AssistantProviderBinding(
+                    backend: .codex,
+                    providerSessionID: "codex-thread-abc"
+                )
+            ],
+            status: .active,
+            summary: nil,
+            latestUserMessage: nil,
+            latestAssistantMessage: nil
+        )
+
+        XCTAssertTrue(workingThread.hasConversationContent)
+        XCTAssertTrue(assistantShouldListSessionInSidebar(workingThread, selectedSessionID: nil))
+    }
+
+    func testCanonicalThreadWithLegacyProviderSessionIDStaysVisible() {
+        // Older sessions stored the active provider session ID directly on the
+        // top-level providerSessionID field. That should also count as "has work."
+        let legacyBoundThread = AssistantSessionSummary(
+            id: "openassist-legacy-bound",
+            title: "New Assistant Session",
+            source: .openAssist,
+            threadArchitectureVersion: .providerIndependentV2,
+            providerSessionID: "codex-thread-legacy",
+            status: .active
+        )
+
+        XCTAssertTrue(legacyBoundThread.hasConversationContent)
+        XCTAssertTrue(assistantShouldListSessionInSidebar(legacyBoundThread, selectedSessionID: nil))
+    }
+
+    func testNonCanonicalSessionWithoutPreviewTextStaysHiddenEvenIfBound() {
+        // Defense in depth: a non-canonical (shadow) session must not become
+        // visible just because it carries a provider session ID. The shadow
+        // filter is the right tool for that case.
+        let shadow = AssistantSessionSummary(
+            id: "codex-shadow",
+            title: "shadow",
+            source: .appServer,
+            providerSessionID: "codex-thread-shadow",
+            status: .active,
+            latestUserMessage: nil,
+            latestAssistantMessage: nil
+        )
+
+        XCTAssertFalse(shadow.hasConversationContent)
+    }
+
     func testRemoteSurfaceHidesShadowProviderSessionWhenCanonicalThreadExists() {
         let shadowSession = AssistantSessionSummary(
             id: "codex-provider-session",

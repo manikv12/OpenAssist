@@ -515,6 +515,7 @@ final class AssistantConversationStore {
     private static let defaultThreadNoteTitle = "Untitled note"
     private static let snapshotFilename = "conversation.json"
     private static let eventLogFilename = "conversation.events.jsonl"
+    private static let eventPersistenceQueueKey = DispatchSpecificKey<Bool>()
 
     private let fileManager: FileManager
     private let baseDirectoryURL: URL
@@ -547,6 +548,7 @@ final class AssistantConversationStore {
             recoveryRootURL: self.baseDirectoryURL
                 .appendingPathComponent(Self.noteRecoveryDirectoryName, isDirectory: true)
         )
+        eventPersistenceQueue.setSpecific(key: Self.eventPersistenceQueueKey, value: true)
     }
 
     var storageURL: URL {
@@ -556,6 +558,7 @@ final class AssistantConversationStore {
     func loadSnapshot(threadID: String) -> AssistantConversationSnapshot? {
         let normalizedThreadID = normalizedThreadID(threadID)
         guard !normalizedThreadID.isEmpty else { return nil }
+        waitForPendingEventPersistence()
 
         let storedSnapshot = readStoredSnapshot(threadID: normalizedThreadID)
         let logExists = eventLogFileURL(for: normalizedThreadID).map {
@@ -592,6 +595,11 @@ final class AssistantConversationStore {
             snapshot: resolvedSnapshot,
             logExists: logExists
         )
+    }
+
+    private func waitForPendingEventPersistence() {
+        guard DispatchQueue.getSpecific(key: Self.eventPersistenceQueueKey) != true else { return }
+        eventPersistenceQueue.sync {}
     }
 
     func loadTimeline(threadID: String, limit: Int) -> [AssistantTimelineItem] {

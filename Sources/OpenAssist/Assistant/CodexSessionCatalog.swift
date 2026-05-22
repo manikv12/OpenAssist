@@ -1261,19 +1261,23 @@ struct CodexSessionCatalog {
                     let summary = existingActivity?.friendlySummary
                         ?? savedActivitySummary(kind: kind, title: title)
 
+                    let imageAttachments = extractImageAttachments(from: payload["output"])
+                    let outputDetails = title == "Image Generation" && !imageAttachments.isEmpty
+                        ? "Generated image."
+                        : rawOutput
+
                     updateTimelineActivityOutput(
                         callID: callID,
                         kind: kind,
                         title: title,
                         friendlySummary: summary,
-                        rawDetails: rawOutput,
+                        rawDetails: outputDetails,
                         status: .completed,
                         sessionID: sessionID,
                         timestamp: lineTimestamp,
                         items: &items,
                         activityIndexByID: &activityIndexByID
                     )
-                    let imageAttachments = extractImageAttachments(from: payload["output"])
                     if !imageAttachments.isEmpty {
                         let imageTitle = title == "Image Generation"
                             ? "Generated image"
@@ -2034,10 +2038,15 @@ struct CodexSessionCatalog {
             return nil
         }
 
-        if value.count <= limit {
-            return value
+        let sanitized = AssistantTimelineDetailSanitizer.sanitized(value, limit: limit)
+        guard let sanitized else {
+            return nil
         }
-        return String(value.prefix(limit - 1)) + "…"
+
+        if sanitized.count <= limit {
+            return sanitized
+        }
+        return String(sanitized.prefix(max(0, limit - 3))) + "..."
     }
 
     private func decodedJSONObject(from rawJSONString: String) -> [String: Any]? {

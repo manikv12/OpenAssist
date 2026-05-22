@@ -601,6 +601,7 @@ private struct AssistantCompactSidebarRootView: View {
     let assistant: AssistantStore
     @ObservedObject var settings: SettingsStore
     @ObservedObject var viewModel: AssistantCompactSidebarManager.ViewModel
+    @State private var isHandleHovered = false
     let onToggleOpen: () -> Void
     let onMoveEdge: (AssistantCompactSidebarEdge) -> Void
     let onOpenFullAssistant: () -> Void
@@ -641,21 +642,16 @@ private struct AssistantCompactSidebarRootView: View {
 
     private var handle: some View {
         Button(action: onToggleOpen) {
-            RoundedRectangle(cornerRadius: 9, style: .continuous)
-                .fill(handleBackground)
-                .overlay(
-                    RoundedRectangle(cornerRadius: 9, style: .continuous)
-                        .stroke(handleStroke, lineWidth: 1)
-                )
-                .overlay {
-                    Image(systemName: handleSymbol)
-                        .font(.system(size: 10, weight: .bold))
-                        .foregroundStyle(handleTint)
-                }
-                .frame(width: 18, height: 84)
-                .shadow(color: handleGlow, radius: 14, x: 0, y: 0)
+            Image(systemName: handleSymbol)
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(handleTint)
+                .frame(width: handleWidth, height: 84)
+                .scaleEffect(isHandleHovered ? 1.18 : 1)
+                .animation(.easeOut(duration: 0.14), value: isHandleHovered)
+                .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .onHover { isHandleHovered = $0 }
         .frame(width: handleWidth)
         .frame(maxHeight: .infinity, alignment: .center)
         .zIndex(2)
@@ -716,39 +712,6 @@ private struct AssistantCompactSidebarRootView: View {
     }
 
     private var handleTint: Color {
-        switch viewModel.hudState.phase {
-        case .idle:
-            return AppVisualTheme.foreground(0.92)
-        case .listening:
-            return .green.opacity(0.88)
-        case .thinking, .acting, .streaming:
-            return AppVisualTheme.accentTint
-        case .waitingForPermission:
-            return .orange.opacity(0.92)
-        case .success:
-            return .mint.opacity(0.9)
-        case .failed:
-            return .red.opacity(0.9)
-        }
-    }
-
-    private var handleBackground: LinearGradient {
-        LinearGradient(
-            colors: [
-                AppVisualTheme.sidebarTint.opacity(viewModel.isOpen ? 0.82 : 0.76),
-                AppVisualTheme.accentTint.opacity(viewModel.isOpen ? 0.22 : 0.18),
-                AppVisualTheme.accentTint.opacity(viewModel.isOpen ? 0.52 : 0.42)
-            ],
-            startPoint: .top,
-            endPoint: .bottom
-        )
-    }
-
-    private var handleStroke: Color {
-        AppVisualTheme.accentTint.opacity(viewModel.isOpen ? 0.28 : 0.22)
-    }
-
-    private var handleGlow: Color {
-        AppVisualTheme.accentTint.opacity(viewModel.isOpen ? 0.24 : 0.18)
+        AppVisualTheme.accentTint.opacity(isHandleHovered ? 0.94 : (viewModel.isOpen ? 0.9 : 0.74))
     }
 }

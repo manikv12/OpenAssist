@@ -106,7 +106,7 @@ final class CopilotUsageFetcherTests: XCTestCase {
         XCTAssertEqual(token, "config-token")
     }
 
-    func testTokenResolverReadsCopilotKeychainTokenBeforeGhFallback() async throws {
+    func testTokenResolverPrefersGitHubCLIBeforeKeychain() async throws {
         let tempHome = try makeTemporaryHomeDirectory()
         defer { try? FileManager.default.removeItem(at: tempHome) }
 
@@ -125,6 +125,37 @@ final class CopilotUsageFetcherTests: XCTestCase {
         let resolver = CopilotTokenResolver(
             environment: [:],
             runner: StubCommandRunner(stdout: "gh-token\n"),
+            fileManager: .default,
+            homeDirectory: tempHome,
+            keychain: StubCopilotKeychainReader(tokens: [
+                "copilot-cli|https://github.com:monalisa": "keychain-token"
+            ])
+        )
+
+        let token = await resolver.resolveGitHubToken()
+
+        XCTAssertEqual(token, "gh-token")
+    }
+
+    func testTokenResolverFallsBackToKeychainWhenGhFails() async throws {
+        let tempHome = try makeTemporaryHomeDirectory()
+        defer { try? FileManager.default.removeItem(at: tempHome) }
+
+        try writeCopilotConfig(
+            to: tempHome,
+            json: #"""
+            {
+              "last_logged_in_user": {
+                "host": "https://github.com",
+                "login": "monalisa"
+              }
+            }
+            """#
+        )
+
+        let resolver = CopilotTokenResolver(
+            environment: [:],
+            runner: StubCommandRunner(exitCode: 1),
             fileManager: .default,
             homeDirectory: tempHome,
             keychain: StubCopilotKeychainReader(tokens: [

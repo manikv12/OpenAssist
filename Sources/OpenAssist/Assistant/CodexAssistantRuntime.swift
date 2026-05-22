@@ -544,7 +544,9 @@ final class CodexAssistantRuntime {
         onHealthUpdate?(health)
 
         // Refresh rate limits when the selected model can change the visible bucket.
-        if (backend == .codex || backend == .claudeCode), changed, currentAccountSnapshot.isLoggedIn {
+        if (backend == .codex || backend == .claudeCode || backend == .copilot),
+           changed,
+           currentAccountSnapshot.isLoggedIn {
             Task { await refreshRateLimits() }
         }
     }
@@ -1536,6 +1538,10 @@ final class CodexAssistantRuntime {
                     currentAccountSnapshot.planType = snapshot.planType
                     onAccountUpdate?(currentAccountSnapshot)
                 }
+
+                CrashReporter.logInfo(
+                    "Copilot usage refresh succeeded plan=\(snapshot.planType ?? "unknown") primary=\(snapshot.rateLimits.primary?.usedPercent.description ?? "nil") secondary=\(snapshot.rateLimits.secondary?.usedPercent.description ?? "nil")"
+                )
             } catch {
                 CrashReporter.logInfo("Copilot usage refresh failed: \(error.localizedDescription)")
             }
@@ -3129,12 +3135,13 @@ final class CodexAssistantRuntime {
 
     private func startRateLimitRefreshLoopIfNeeded() {
         cancelRateLimitRefreshLoop()
-        guard backend == .claudeCode,
+        guard (backend == .claudeCode || backend == .copilot),
               activeTurnID != nil,
               currentAccountSnapshot.isLoggedIn else {
             return
         }
 
+        let activeBackend = backend
         let refreshTaskID = UUID()
         rateLimitRefreshTaskID = refreshTaskID
         rateLimitRefreshTask = Task { @MainActor [weak self] in
@@ -3150,7 +3157,7 @@ final class CodexAssistantRuntime {
                 }
 
                 guard !Task.isCancelled,
-                      self.backend == .claudeCode,
+                      self.backend == activeBackend,
                       self.activeTurnID != nil,
                       self.currentAccountSnapshot.isLoggedIn else {
                     break
@@ -3176,8 +3183,10 @@ final class CodexAssistantRuntime {
         idleRateLimitRefreshTask?.cancel()
         idleRateLimitRefreshTask = nil
 
-        guard backend == .claudeCode, currentAccountSnapshot.isLoggedIn else { return }
+        guard (backend == .claudeCode || backend == .copilot),
+              currentAccountSnapshot.isLoggedIn else { return }
 
+        let activeBackend = backend
         idleRateLimitRefreshTask = Task { @MainActor [weak self] in
             while !Task.isCancelled {
                 do {
@@ -3188,7 +3197,7 @@ final class CodexAssistantRuntime {
 
                 guard let self,
                       !Task.isCancelled,
-                      self.backend == .claudeCode,
+                      self.backend == activeBackend,
                       self.activeTurnID == nil,
                       self.currentAccountSnapshot.isLoggedIn else {
                     break
@@ -5286,6 +5295,7 @@ final class CodexAssistantRuntime {
         let rawKind = normalizedActivityType(item["type"] as? String ?? state.kind ?? "other")
         let kind = activityKind(from: rawKind)
         let status = parsedActivityStatus(from: state.status, fallback: .running)
+        let toolName = dynamicToolName(from: item)
         let details = firstNonEmptyString(
             state.detail,
             item["command"] as? String,
@@ -5294,6 +5304,13 @@ final class CodexAssistantRuntime {
             extractString(item["arguments"]),
             extractString(item["result"])
         )
+        let rawDetails: String?
+        if toolName == AssistantImageGenerationToolDefinition.name,
+           rawContainsGeneratedImageContent(item["result"]) || rawContainsGeneratedImageContent(item["output"]) {
+            rawDetails = "Generated image."
+        } else {
+            rawDetails = compactDetail(details)
+        }
 
         return AssistantActivityItem(
             id: state.id,
@@ -5303,7 +5320,7 @@ final class CodexAssistantRuntime {
             title: state.title,
             status: status,
             friendlySummary: activitySummary(kind: kind, title: state.title),
-            rawDetails: compactDetail(details),
+            rawDetails: rawDetails,
             startedAt: liveActivities[state.id]?.startedAt ?? Date(),
             updatedAt: Date(),
             source: .runtime
@@ -7492,7 +7509,7 @@ final class CodexAssistantRuntime {
     }
 
     private func compactDetail(_ text: String?) -> String? {
-        text?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+        AssistantTimelineDetailSanitizer.sanitized(text)
     }
 
     /// Detects osascript or AppleScript commands that target privacy-protected macOS apps.
@@ -10458,6 +10475,7 @@ final class CodexAssistantRuntime {
         }
 
         await refreshRateLimits()
+        startIdleRateLimitRefreshIfNeeded()
 
         let health = connectedHealthForCurrentState()
         onHealthUpdate?(health)
