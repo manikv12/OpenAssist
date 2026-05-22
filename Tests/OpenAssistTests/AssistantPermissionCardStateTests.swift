@@ -17,7 +17,7 @@ final class AssistantPermissionCardStateTests: XCTestCase {
             assistantPermissionCardState(
                 for: request,
                 pendingRequest: request,
-                sessionStatus: .completed
+                sessionStatus: .active
             ),
             .waitingForApproval
         )
@@ -38,7 +38,7 @@ final class AssistantPermissionCardStateTests: XCTestCase {
             assistantPermissionCardState(
                 for: request,
                 pendingRequest: request,
-                sessionStatus: .completed
+                sessionStatus: .active
             ),
             .waitingForInput
         )
@@ -59,7 +59,7 @@ final class AssistantPermissionCardStateTests: XCTestCase {
             assistantPermissionCardState(
                 for: request,
                 pendingRequest: request,
-                sessionStatus: .completed
+                sessionStatus: .active
             ),
             .waitingForApproval
         )

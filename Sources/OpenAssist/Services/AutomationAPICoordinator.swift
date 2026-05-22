@@ -7,6 +7,8 @@ import UserNotifications
 final class AutomationAPICoordinator: NSObject, ObservableObject {
     static let shared = AutomationAPICoordinator()
     private static let codexCloudPollIntervalNanoseconds: UInt64 = 60_000_000_000
+    private static let availableVoiceRefreshInterval: TimeInterval = 300
+    private static let codexCLIStatusRefreshInterval: TimeInterval = 60
     private static let automationNotificationIdentifierPrefix = "openassist-automation-"
     private static let automationNotificationUserInfoKey = "openassistAutomation"
 
@@ -40,12 +42,14 @@ final class AutomationAPICoordinator: NSObject, ObservableObject {
     private weak var settings: SettingsStore?
     private var codexCloudMonitoringTask: Task<Void, Never>?
     private var lastCodexCloudLoggedError: String?
+    private var lastAvailableVoiceRefreshAt: Date?
+    private var lastCodexCLIStatusRefreshAt: Date?
     private var notificationInteractionHandler: (@MainActor (_ source: String?) -> Void)?
 
     private override init() {
         super.init()
         notificationCenter.delegate = self
-        refreshAvailableVoices()
+        refreshAvailableVoices(force: true)
         Task {
             await refreshNotificationAuthorizationState()
         }
@@ -75,7 +79,9 @@ final class AutomationAPICoordinator: NSObject, ObservableObject {
 
     func applySettings(_ settings: SettingsStore) {
         self.settings = settings
-        refreshAvailableVoices()
+        if settings.automationAPISpeechEnabled {
+            refreshAvailableVoices()
+        }
         let configuration = settings.automationAPIServerConfiguration
         if configuration != currentConfiguration {
             currentConfiguration = configuration
@@ -99,7 +105,7 @@ final class AutomationAPICoordinator: NSObject, ObservableObject {
         }
 
         applyCodexCloudMonitoring(using: settings)
-        refreshCodexCLIStatus()
+        refreshCodexCLIStatusIfNeeded()
 
         Task {
             await refreshNotificationAuthorizationState()
@@ -501,7 +507,14 @@ final class AutomationAPICoordinator: NSObject, ObservableObject {
         nsSound.play()
     }
 
-    private func refreshAvailableVoices() {
+    private func refreshAvailableVoices(force: Bool = false) {
+        let now = Date()
+        if !force,
+           let lastAvailableVoiceRefreshAt,
+           now.timeIntervalSince(lastAvailableVoiceRefreshAt) < Self.availableVoiceRefreshInterval {
+            return
+        }
+        lastAvailableVoiceRefreshAt = now
         availableVoices = [
             AutomationAPIVoiceOption(id: "", name: "System Default", language: "")
         ] + AVSpeechSynthesisVoice.speechVoices()
@@ -515,6 +528,16 @@ final class AutomationAPICoordinator: NSObject, ObservableObject {
             .sorted { lhs, rhs in
                 lhs.displayLabel.localizedCaseInsensitiveCompare(rhs.displayLabel) == .orderedAscending
             }
+    }
+
+    private func refreshCodexCLIStatusIfNeeded() {
+        let now = Date()
+        if let lastCodexCLIStatusRefreshAt,
+           now.timeIntervalSince(lastCodexCLIStatusRefreshAt) < Self.codexCLIStatusRefreshInterval {
+            return
+        }
+        lastCodexCLIStatusRefreshAt = now
+        refreshCodexCLIStatus()
     }
 
     private static func authorizationState(from status: UNAuthorizationStatus) -> AutomationAPINotificationAuthorizationState {

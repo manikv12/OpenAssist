@@ -1709,9 +1709,7 @@ private func assistantChatWebDetailSections(
     from rawDetails: String?
 ) -> [AssistantChatWebDetailSection] {
     guard
-        let trimmed = rawDetails?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .assistantNonEmpty
+        let trimmed = AssistantTimelineDetailSanitizer.sanitized(rawDetails)
     else {
         return []
     }

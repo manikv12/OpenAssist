@@ -256,7 +256,7 @@ final class AssistantMemoryRetrievalServiceTests: XCTestCase {
                 threadID: "thread-project-2",
                 memoryType: .constraint,
                 title: "Keep it simple",
-                summary: "Explain regex implementation details in simpler words.",
+                summary: "Can you explain our regex search implementation in easier words? Use simpler words.",
                 detail: "Use easy wording when explaining regex implementation because the user prefers simpler English.",
                 keywords: ["regex", "implementation", "simple", "easier", "explain", "english"],
                 confidence: 0.95,
@@ -274,7 +274,7 @@ final class AssistantMemoryRetrievalServiceTests: XCTestCase {
                 threadID: nil,
                 memoryType: .lesson,
                 title: "Regex implementation",
-                summary: "In OpenAssist, prefer ripgrep for fast regex-based code search.",
+                summary: "Can you explain our regex search implementation in easier words? Prefer ripgrep for fast code search.",
                 detail: "Use ripgrep for regex-heavy repository search tasks.",
                 keywords: ["regex", "ripgrep", "search", "openassist"],
                 confidence: 0.9,
@@ -286,7 +286,7 @@ final class AssistantMemoryRetrievalServiceTests: XCTestCase {
             threadID: "thread-project-2",
             prompt: "Can you explain our regex search implementation in easier words?",
             cwd: "/tmp/openassist",
-            summaryMaxChars: 1400,
+            summaryMaxChars: 4000,
             longTermScope: projectScope,
             projectContextBlock: "Project context:\n- Project name: OpenAssist"
         )

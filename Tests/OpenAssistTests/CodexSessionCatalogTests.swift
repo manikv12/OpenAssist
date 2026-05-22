@@ -1122,6 +1122,10 @@ final class CodexSessionCatalogTests: XCTestCase {
         XCTAssertEqual(activity.kind, .dynamicToolCall)
         XCTAssertEqual(activity.title, "Image Generation")
         XCTAssertEqual(activity.friendlySummary, "Generated an image.")
+        XCTAssertTrue(activity.rawDetails?.contains("Create a playful banana robot mascot") == true)
+        XCTAssertTrue(activity.rawDetails?.contains("Generated image.") == true)
+        XCTAssertFalse(activity.rawDetails?.contains("data:image") == true)
+        XCTAssertFalse(activity.rawDetails?.contains(base64) == true)
 
         let imageItem = try XCTUnwrap(
             timeline.first(where: {

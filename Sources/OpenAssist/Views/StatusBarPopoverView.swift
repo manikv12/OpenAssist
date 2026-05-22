@@ -21,6 +21,7 @@ final class StatusBarViewModel: ObservableObject {
     var onSpeakAssistantTask: (() -> Void)?
     var onStopAssistant: (() -> Void)?
     var onOpenSettings: (() -> Void)?
+    var onOpenAbout: (() -> Void)?
     var onQuit: (() -> Void)?
 }
 
@@ -137,6 +138,14 @@ struct StatusBarPopoverView: View {
 
                 VStack(alignment: .leading, spacing: 5) {
                     sectionTitle("System")
+                    PopoverMenuRow(
+                        icon: "info.circle.fill",
+                        label: "About Open Assist",
+                        iconTint: AppVisualTheme.accentTint
+                    ) {
+                        viewModel.onOpenAbout?()
+                    }
+
                     PopoverMenuRow(
                         icon: "power",
                         label: "Quit Open Assist",

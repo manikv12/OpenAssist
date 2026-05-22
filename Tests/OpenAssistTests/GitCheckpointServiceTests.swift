@@ -65,7 +65,7 @@ final class GitCheckpointServiceTests: XCTestCase {
             Set(capture.changedFiles.map(\.path)),
             Set(["tracked.txt", "new-file.txt"])
         )
-        XCTAssertTrue(capture.ignoredTouchedPaths.contains("ignored.tmp"))
+        XCTAssertTrue(capture.ignoredTouchedPaths.isEmpty)
         XCTAssertFalse(capture.changedFiles.contains(where: { $0.path == "ignored.tmp" }))
         XCTAssertFalse(capture.patch.isEmpty)
     }

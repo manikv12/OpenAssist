@@ -2064,7 +2064,11 @@ final class TelegramRemoteCoordinator: ObservableObject {
             throw TelegramBotClientError.server(message: "That backend is no longer supported.")
         }
 
-        let changed = await bridge.selectBackend(backend)
+        let changed = await bridge.selectBackend(
+            backend,
+            sessionID: chatState.selectedSessionID,
+            preserveVisibleSelection: false
+        )
         if backend != .codex {
             chatState.selectedPluginIDs = []
         }
@@ -2785,6 +2789,7 @@ final class TelegramRemoteCoordinator: ObservableObject {
                 canAdjustReasoningEffort: fallback.canAdjustReasoningEffort,
                 fastModeEnabled: fallback.fastModeEnabled,
                 tokenUsage: fallback.tokenUsage,
+                rateLimits: fallback.rateLimits,
                 lastStatusMessage: fallback.lastStatusMessage
             )
         }
@@ -2812,6 +2817,7 @@ final class TelegramRemoteCoordinator: ObservableObject {
             canAdjustReasoningEffort: effortState.canAdjust,
             fastModeEnabled: snapshot.session.fastModeEnabled,
             tokenUsage: fallback.tokenUsage,
+            rateLimits: fallback.rateLimits,
             lastStatusMessage: fallback.lastStatusMessage
         )
     }

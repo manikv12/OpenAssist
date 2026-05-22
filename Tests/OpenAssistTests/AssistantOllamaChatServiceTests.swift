@@ -60,7 +60,7 @@ final class AssistantOllamaChatServiceTests: XCTestCase {
             XCTAssertEqual(request.url?.absoluteString, "http://127.0.0.1:11434/api/generate")
             XCTAssertEqual(request.httpMethod, "POST")
 
-            let body = try XCTUnwrap(request.httpBody)
+            let body = try XCTUnwrap(self.requestBodyData(request))
             let payload = try XCTUnwrap(
                 JSONSerialization.jsonObject(with: body) as? [String: Any]
             )
@@ -84,6 +84,33 @@ final class AssistantOllamaChatServiceTests: XCTestCase {
         )
 
         try await service.unloadModel(named: "gemma4:e4b")
+    }
+
+    private func requestBodyData(_ request: URLRequest) -> Data? {
+        if let body = request.httpBody {
+            return body
+        }
+        guard let stream = request.httpBodyStream else {
+            return nil
+        }
+
+        stream.open()
+        defer { stream.close() }
+
+        var data = Data()
+        let bufferSize = 4096
+        let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: bufferSize)
+        defer { buffer.deallocate() }
+
+        while stream.hasBytesAvailable {
+            let count = stream.read(buffer, maxLength: bufferSize)
+            if count > 0 {
+                data.append(buffer, count: count)
+            } else {
+                break
+            }
+        }
+        return data.isEmpty ? nil : data
     }
 
     private func makeSession(

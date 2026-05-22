@@ -233,6 +233,7 @@ final class TelegramRemoteRendererTests: XCTestCase {
             canAdjustReasoningEffort: true,
             fastModeEnabled: false,
             tokenUsage: .empty,
+            rateLimits: .empty,
             lastStatusMessage: nil
         )
         let fiveHour = try XCTUnwrap(
@@ -301,6 +302,7 @@ final class TelegramRemoteRendererTests: XCTestCase {
             canAdjustReasoningEffort: true,
             fastModeEnabled: false,
             tokenUsage: .empty,
+            rateLimits: .empty,
             lastStatusMessage: nil
         )
 

@@ -906,6 +906,7 @@ export function ComposerView({
   return (
     <div
       className={`oa-react-composer${state.isCompactComposer ? " is-compact" : ""}`}
+      data-provider={state.activeProviderId ?? undefined}
       ref={composerRef}
     >
       <div className="oa-react-composer__content" ref={composerContentRef}>

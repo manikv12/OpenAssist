@@ -58,14 +58,14 @@ html.oa-idle *::after {
   --chat-code-inserted: #c3e88d;
   --chat-code-important: #c792ea;
   --chat-code-namespace-opacity: 0.7;
-  --chat-thinking-text: rgba(241,250,255,0.98);
-  --chat-thinking-shimmer-start: rgba(112,193,255,0.22);
-  --chat-thinking-shimmer-mid: rgba(170,224,255,0.96);
-  --chat-thinking-shimmer-end: rgba(231,248,255,0.34);
-  --chat-working-aurora-text: rgba(223,244,255,0.92);
-  --chat-working-aurora-start: rgba(112,193,255,0.42);
-  --chat-working-aurora-mid: rgba(170,224,255,1.0);
-  --chat-working-aurora-end: rgba(231,248,255,0.44);
+  --chat-thinking-text: var(--chat-accent-strong);
+  --chat-thinking-shimmer-start: color-mix(in srgb, var(--chat-accent) 20%, transparent);
+  --chat-thinking-shimmer-mid: color-mix(in srgb, var(--chat-accent-strong) 88%, var(--chat-text-strong));
+  --chat-thinking-shimmer-end: color-mix(in srgb, var(--chat-accent) 30%, var(--chat-text-strong));
+  --chat-working-aurora-text: var(--chat-accent-strong);
+  --chat-working-aurora-start: color-mix(in srgb, var(--chat-accent) 42%, transparent);
+  --chat-working-aurora-mid: color-mix(in srgb, var(--chat-accent-strong) 92%, var(--chat-text-strong));
+  --chat-working-aurora-end: color-mix(in srgb, var(--chat-accent) 42%, var(--chat-text-strong));
   --chat-shimmer-overlay-start: rgba(255,255,255,0.012);
   --chat-shimmer-overlay-mid: rgba(255,255,255,0.085);
   --chat-shimmer-overlay-end: rgba(255,255,255,0.016);
@@ -127,6 +127,17 @@ html.oa-idle *::after {
   --status-success: rgb(80,200,120);
   --status-warning: rgb(255,184,76);
   --status-error: rgb(255,108,108);
+
+  /* Dim text (used in active-work cards, typing indicators) */
+  --chat-text-dim: rgba(255,255,255,0.45);
+
+  /* Glass morphism tokens */
+  --glass-bg: rgba(22,22,28,0.55);
+  --glass-bg-strong: rgba(22,22,28,0.72);
+  --glass-border: rgba(255,255,255,0.08);
+  --glass-highlight: rgba(255,255,255,0.08);
+  --glass-shadow: 0 14px 40px rgba(0,0,0,0.45);
+  --glass-blur: 22px;
 }
 
 @media (prefers-color-scheme: light) {
@@ -177,14 +188,14 @@ html.oa-idle *::after {
     --chat-code-inserted: #15803d;
     --chat-code-important: #7c3aed;
     --chat-code-namespace-opacity: 0.72;
-    --chat-thinking-text: rgba(10,66,118,0.94);
-    --chat-thinking-shimmer-start: rgba(31,127,214,0.16);
-    --chat-thinking-shimmer-mid: rgba(78,163,255,0.88);
-    --chat-thinking-shimmer-end: rgba(183,232,255,0.26);
-    --chat-working-aurora-text: rgba(23,109,188,0.84);
-    --chat-working-aurora-start: rgba(31,127,214,0.40);
-    --chat-working-aurora-mid: rgba(78,163,255,1.0);
-    --chat-working-aurora-end: rgba(183,232,255,0.42);
+    --chat-thinking-text: var(--chat-accent-strong);
+    --chat-thinking-shimmer-start: color-mix(in srgb, var(--chat-accent) 16%, transparent);
+    --chat-thinking-shimmer-mid: color-mix(in srgb, var(--chat-accent-strong) 88%, var(--chat-text-strong));
+    --chat-thinking-shimmer-end: color-mix(in srgb, var(--chat-accent) 26%, var(--chat-text-strong));
+    --chat-working-aurora-text: var(--chat-accent-strong);
+    --chat-working-aurora-start: color-mix(in srgb, var(--chat-accent) 36%, transparent);
+    --chat-working-aurora-mid: color-mix(in srgb, var(--chat-accent-strong) 92%, var(--chat-text-strong));
+    --chat-working-aurora-end: color-mix(in srgb, var(--chat-accent) 38%, var(--chat-text-strong));
     --chat-shimmer-overlay-start: rgba(15,23,42,0.01);
     --chat-shimmer-overlay-mid: rgba(15,23,42,0.06);
     --chat-shimmer-overlay-end: rgba(15,23,42,0.014);
@@ -218,6 +229,16 @@ html.oa-idle *::after {
     --mermaid-cluster-fill: rgba(15,23,42,0.03);
     --mermaid-cluster-border: rgba(15,23,42,0.12);
     --mermaid-cluster-label: rgba(15,23,42,0.56);
+
+    /* Dim text (light mode) */
+    --chat-text-dim: rgba(15,23,42,0.48);
+
+    /* Glass morphism tokens (light mode) */
+    --glass-bg: rgba(255,255,255,0.55);
+    --glass-bg-strong: rgba(255,255,255,0.72);
+    --glass-border: rgba(15,23,42,0.08);
+    --glass-highlight: rgba(255,255,255,0.6);
+    --glass-shadow: 0 10px 30px rgba(15,23,42,0.08);
   }
 }
 
@@ -267,48 +288,38 @@ body {
   transition: padding-right 0.26s ease;
 }
 
-.chat-shell[data-active-provider="codex"] {
-  --chat-thinking-text: var(--chat-provider-codex-text);
-  --chat-thinking-shimmer-start: rgba(127,148,255,0.18);
-  --chat-thinking-shimmer-mid: rgba(165,181,255,0.82);
-  --chat-thinking-shimmer-end: rgba(238,243,255,0.30);
-  --chat-working-aurora-text: var(--chat-provider-codex-text);
-  --chat-working-aurora-start: rgba(127,148,255,0.42);
-  --chat-working-aurora-mid: rgba(165,181,255,1.0);
-  --chat-working-aurora-end: rgba(238,243,255,0.44);
+/* ── Provider tinting on composer surface ── */
+.oa-react-composer[data-provider="codex"] .oa-react-composer__surface {
+  border-color: color-mix(in srgb, var(--chat-provider-codex-start) 28%, var(--glass-border));
+}
+.oa-react-composer[data-provider="codex"] .oa-react-composer__surface:focus-within {
+  border-color: color-mix(in srgb, var(--chat-provider-codex-start) 48%, transparent);
+  box-shadow:
+    inset 0 1px 0 var(--glass-highlight),
+    var(--glass-shadow),
+    0 0 0 3px color-mix(in srgb, var(--chat-provider-codex-start) 14%, transparent);
 }
 
-.chat-shell[data-active-provider="default"] {
-  --chat-thinking-text: var(--chat-provider-cloud-text);
-  --chat-thinking-shimmer-start: rgba(112,193,255,0.22);
-  --chat-thinking-shimmer-mid: rgba(170,224,255,0.96);
-  --chat-thinking-shimmer-end: rgba(231,248,255,0.34);
-  --chat-working-aurora-text: var(--chat-provider-cloud-text);
-  --chat-working-aurora-start: rgba(112,193,255,0.42);
-  --chat-working-aurora-mid: rgba(170,224,255,1.0);
-  --chat-working-aurora-end: rgba(231,248,255,0.44);
+.oa-react-composer[data-provider="copilot"] .oa-react-composer__surface {
+  border-color: color-mix(in srgb, var(--chat-provider-copilot-start) 28%, var(--glass-border));
+}
+.oa-react-composer[data-provider="copilot"] .oa-react-composer__surface:focus-within {
+  border-color: color-mix(in srgb, var(--chat-provider-copilot-start) 48%, transparent);
+  box-shadow:
+    inset 0 1px 0 var(--glass-highlight),
+    var(--glass-shadow),
+    0 0 0 3px color-mix(in srgb, var(--chat-provider-copilot-start) 14%, transparent);
 }
 
-.chat-shell[data-active-provider="copilot"] {
-  --chat-thinking-text: var(--chat-provider-copilot-text);
-  --chat-thinking-shimmer-start: rgba(200,152,253,0.18);
-  --chat-thinking-shimmer-mid: rgba(180,120,255,0.80);
-  --chat-thinking-shimmer-end: rgba(240,138,58,0.24);
-  --chat-working-aurora-text: var(--chat-provider-copilot-text);
-  --chat-working-aurora-start: rgba(200,152,253,0.42);
-  --chat-working-aurora-mid: rgba(180,120,255,1.0);
-  --chat-working-aurora-end: rgba(240,138,58,0.42);
+.oa-react-composer[data-provider="claude"] .oa-react-composer__surface {
+  border-color: color-mix(in srgb, var(--chat-provider-claude-start) 28%, var(--glass-border));
 }
-
-.chat-shell[data-active-provider="claude"] {
-  --chat-thinking-text: var(--chat-provider-claude-text);
-  --chat-thinking-shimmer-start: rgba(255,179,107,0.20);
-  --chat-thinking-shimmer-mid: rgba(255,160,80,0.82);
-  --chat-thinking-shimmer-end: rgba(255,211,173,0.28);
-  --chat-working-aurora-text: var(--chat-provider-claude-text);
-  --chat-working-aurora-start: rgba(255,179,107,0.42);
-  --chat-working-aurora-mid: rgba(255,160,80,1.0);
-  --chat-working-aurora-end: rgba(255,144,64,0.42);
+.oa-react-composer[data-provider="claude"] .oa-react-composer__surface:focus-within {
+  border-color: color-mix(in srgb, var(--chat-provider-claude-start) 48%, transparent);
+  box-shadow:
+    inset 0 1px 0 var(--glass-highlight),
+    var(--glass-shadow),
+    0 0 0 3px color-mix(in srgb, var(--chat-provider-claude-start) 14%, transparent);
 }
 
 .chat-stage {
@@ -4927,50 +4938,6 @@ body {
     --thread-note-surface-bottom: rgba(242,244,248,0.92);
   }
 
-  .chat-shell[data-active-provider="codex"] {
-    --chat-thinking-text: var(--chat-provider-codex-text);
-    --chat-thinking-shimmer-start: rgba(77,105,222,0.12);
-    --chat-thinking-shimmer-mid: rgba(104,131,234,0.62);
-    --chat-thinking-shimmer-end: rgba(147,166,255,0.20);
-    --chat-working-aurora-text: var(--chat-provider-codex-text);
-    --chat-working-aurora-start: rgba(77,105,222,0.40);
-    --chat-working-aurora-mid: rgba(77,105,222,1.0);
-    --chat-working-aurora-end: rgba(147,166,255,0.42);
-  }
-
-  .chat-shell[data-active-provider="default"] {
-    --chat-thinking-text: var(--chat-provider-cloud-text);
-    --chat-thinking-shimmer-start: rgba(31,127,214,0.16);
-    --chat-thinking-shimmer-mid: rgba(78,163,255,0.88);
-    --chat-thinking-shimmer-end: rgba(183,232,255,0.26);
-    --chat-working-aurora-text: var(--chat-provider-cloud-text);
-    --chat-working-aurora-start: rgba(31,127,214,0.68);
-    --chat-working-aurora-mid: rgba(78,163,255,0.84);
-    --chat-working-aurora-end: rgba(183,232,255,0.72);
-  }
-
-  .chat-shell[data-active-provider="copilot"] {
-    --chat-thinking-text: var(--chat-provider-copilot-text);
-    --chat-thinking-shimmer-start: rgba(67,23,158,0.12);
-    --chat-thinking-shimmer-mid: rgba(133,52,243,0.58);
-    --chat-thinking-shimmer-end: rgba(197,50,17,0.14);
-    --chat-working-aurora-text: var(--chat-provider-copilot-text);
-    --chat-working-aurora-start: rgba(67,23,158,0.40);
-    --chat-working-aurora-mid: rgba(155,90,255,1.0);
-    --chat-working-aurora-end: rgba(197,50,17,0.40);
-  }
-
-  .chat-shell[data-active-provider="claude"] {
-    --chat-thinking-text: var(--chat-provider-claude-text);
-    --chat-thinking-shimmer-start: rgba(199,91,18,0.12);
-    --chat-thinking-shimmer-mid: rgba(249,115,22,0.56);
-    --chat-thinking-shimmer-end: rgba(255,185,128,0.18);
-    --chat-working-aurora-text: var(--chat-provider-claude-text);
-    --chat-working-aurora-start: rgba(199,91,18,0.40);
-    --chat-working-aurora-mid: rgba(249,135,42,1.0);
-    --chat-working-aurora-end: rgba(255,155,84,0.42);
-  }
-
   .thread-note-drawer {
     background:
       radial-gradient(
@@ -5835,28 +5802,16 @@ body {
   background:
     linear-gradient(180deg, rgba(255, 255, 255, 0.032), rgba(255, 255, 255, 0.016)),
     rgba(255, 255, 255, 0.014);
-  border: 1px solid rgba(255, 255, 255, 0.055);
+  border: 1px solid color-mix(in srgb, var(--chat-accent) 22%, rgba(255, 255, 255, 0.055));
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
 }
 
-.assistant-row.streaming[data-provider="codex"] .assistant-message-stage {
-  border-color: color-mix(in srgb, var(--chat-provider-codex-start) 30%, rgba(255, 255, 255, 0.04));
-}
-
-.assistant-row.streaming[data-provider="copilot"] .assistant-message-stage {
-  border-color: color-mix(in srgb, var(--chat-provider-copilot-mid) 30%, rgba(255, 255, 255, 0.04));
-}
-
-.assistant-row.streaming[data-provider="claude"] .assistant-message-stage {
-  border-color: color-mix(in srgb, var(--chat-provider-claude-mid) 32%, rgba(255, 255, 255, 0.04));
-}
-
 .assistant-provider-footer {
-  --assistant-provider-start: var(--chat-provider-cloud-start);
-  --assistant-provider-mid: var(--chat-provider-cloud-mid);
-  --assistant-provider-end: var(--chat-provider-cloud-end);
-  --assistant-provider-glow: var(--chat-provider-cloud-glow);
-  --assistant-provider-text: var(--chat-provider-cloud-text);
+  --assistant-provider-start: color-mix(in srgb, var(--chat-accent) 88%, var(--chat-text-strong));
+  --assistant-provider-mid: var(--chat-accent-strong);
+  --assistant-provider-end: color-mix(in srgb, var(--chat-accent) 40%, var(--chat-text-strong));
+  --assistant-provider-glow: color-mix(in srgb, var(--chat-accent) 28%, transparent);
+  --assistant-provider-text: var(--chat-accent-strong);
   display: inline-flex;
   align-items: center;
   flex-wrap: wrap;
@@ -5873,6 +5828,14 @@ body {
   --assistant-provider-end: var(--chat-provider-codex-end);
   --assistant-provider-glow: var(--chat-provider-codex-glow);
   --assistant-provider-text: var(--chat-provider-codex-text);
+}
+
+.assistant-provider-footer[data-provider="default"] {
+  --assistant-provider-start: var(--chat-provider-cloud-start);
+  --assistant-provider-mid: var(--chat-provider-cloud-mid);
+  --assistant-provider-end: var(--chat-provider-cloud-end);
+  --assistant-provider-glow: var(--chat-provider-cloud-glow);
+  --assistant-provider-text: var(--chat-provider-cloud-text);
 }
 
 .assistant-provider-footer[data-provider="copilot"] {
@@ -6849,7 +6812,10 @@ body {
   min-height: 0;
   padding: var(--oa-sidebar-pad-y) var(--oa-sidebar-pad-x) calc(12px * var(--oa-sidebar-scale));
   color: var(--chat-text);
-  background: transparent;
+  background: var(--glass-bg-strong);
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(180%);
+  backdrop-filter: blur(var(--glass-blur)) saturate(180%);
+  border-right: 1px solid var(--glass-border);
   position: relative;
 }
 
@@ -8494,20 +8460,8 @@ body {
   background:
     linear-gradient(180deg, rgba(255, 255, 255, 0.022), rgba(255, 255, 255, 0.012)),
     rgba(255, 255, 255, 0.012);
-  border: 0.55px solid rgba(255, 255, 255, 0.055);
+  border: 0.55px solid color-mix(in srgb, var(--chat-accent) 18%, rgba(255, 255, 255, 0.055));
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.022);
-}
-
-.active-work-card[data-provider="codex"] {
-  border-color: color-mix(in srgb, var(--chat-provider-codex-start) 26%, rgba(255, 255, 255, 0.05));
-}
-
-.active-work-card[data-provider="copilot"] {
-  border-color: color-mix(in srgb, var(--chat-provider-copilot-mid) 28%, rgba(255, 255, 255, 0.05));
-}
-
-.active-work-card[data-provider="claude"] {
-  border-color: color-mix(in srgb, var(--chat-provider-claude-mid) 28%, rgba(255, 255, 255, 0.05));
 }
 
 .active-work-header {
@@ -8526,10 +8480,10 @@ body {
 }
 
 .active-work-title {
-  --active-work-provider-start: var(--chat-provider-cloud-start);
-  --active-work-provider-mid: var(--chat-provider-cloud-mid);
-  --active-work-provider-end: var(--chat-provider-cloud-end);
-  --active-work-provider-glow: var(--chat-provider-cloud-glow);
+  --active-work-provider-start: color-mix(in srgb, var(--chat-accent) 88%, var(--chat-text-strong));
+  --active-work-provider-mid: var(--chat-accent-strong);
+  --active-work-provider-end: color-mix(in srgb, var(--chat-accent) 40%, var(--chat-text-strong));
+  --active-work-provider-glow: color-mix(in srgb, var(--chat-accent) 28%, transparent);
   font-size: 13px;
   font-weight: 620;
   line-height: 1.2;
@@ -8550,6 +8504,13 @@ body {
   --active-work-provider-mid: var(--chat-provider-codex-mid);
   --active-work-provider-end: var(--chat-provider-codex-end);
   --active-work-provider-glow: var(--chat-provider-codex-glow);
+}
+
+.active-work-title[data-provider="default"] {
+  --active-work-provider-start: var(--chat-provider-cloud-start);
+  --active-work-provider-mid: var(--chat-provider-cloud-mid);
+  --active-work-provider-end: var(--chat-provider-cloud-end);
+  --active-work-provider-glow: var(--chat-provider-cloud-glow);
 }
 
 .active-work-title[data-provider="copilot"] {
@@ -10003,11 +9964,13 @@ mark.find-highlight.find-active {
   max-width: 100%;
   min-width: 0;
   border-radius: 28px;
-  border: 1px solid rgba(255, 255, 255, 0.05);
-  background: var(--chat-bg);
+  border: 1px solid var(--glass-border);
+  background: var(--glass-bg-strong);
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(180%);
+  backdrop-filter: blur(var(--glass-blur)) saturate(180%);
   box-shadow:
-    inset 0 1px rgba(255, 255, 255, 0.03),
-    0 10px 30px rgba(0, 0, 0, 0.20);
+    inset 0 1px 0 var(--glass-highlight),
+    var(--glass-shadow);
   overflow: hidden;
   box-sizing: border-box;
   transition:
@@ -10018,11 +9981,10 @@ mark.find-highlight.find-active {
 
 .oa-react-composer.is-compact .oa-react-composer__surface {
   border-radius: 16px;
-  border-color: rgba(255, 255, 255, 0.045);
-  background:
-    linear-gradient(180deg, rgba(12, 16, 24, 0.88) 0%, rgba(8, 12, 18, 0.92) 100%);
+  border-color: var(--glass-border);
+  background: var(--glass-bg-strong);
   box-shadow:
-    inset 0 1px rgba(255, 255, 255, 0.03),
+    inset 0 1px 0 var(--glass-highlight),
     0 8px 20px rgba(0, 0, 0, 0.16);
 }
 
@@ -10036,15 +9998,15 @@ mark.find-highlight.find-active {
 }
 
 .oa-react-composer__surface:focus-within {
-  border-color: rgba(255, 255, 255, 0.08);
+  border-color: color-mix(in srgb, var(--glass-border) 100%, rgba(255,255,255,0.10) 50%);
   box-shadow:
-    inset 0 1px rgba(255, 255, 255, 0.04),
-    0 12px 34px rgba(0, 0, 0, 0.22);
+    inset 0 1px 0 var(--glass-highlight),
+    var(--glass-shadow);
 }
 
 .oa-react-composer__surface.is-drop-target {
   border-color: rgba(133, 194, 255, 0.34);
-  background: var(--chat-bg);
+  background: var(--glass-bg-strong);
   box-shadow:
     inset 0 0 0 1px rgba(133, 194, 255, 0.08),
     0 14px 36px rgba(0, 0, 0, 0.24);
