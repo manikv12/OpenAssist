@@ -40,11 +40,28 @@ echo "Submitting $DMG for notarization..."
 echo "  Apple ID:  $APPLE_ID"
 echo "  Team ID:   $APPLE_TEAM_ID"
 
+NOTARY_OUTPUT="$(mktemp)"
+set +e
 xcrun notarytool submit "$DMG" \
     --apple-id "$APPLE_ID" \
     --team-id "$APPLE_TEAM_ID" \
     --password "$APPLE_APP_PASSWORD" \
-    --wait
+    --wait 2>&1 | tee "$NOTARY_OUTPUT"
+NOTARY_STATUS=${PIPESTATUS[0]}
+set -e
+
+SUBMISSION_ID="$(awk '/^[[:space:]]*id:/ {print $2; exit}' "$NOTARY_OUTPUT")"
+if [ "$NOTARY_STATUS" -ne 0 ] || grep -q "status: Invalid" "$NOTARY_OUTPUT"; then
+    if [ -n "$SUBMISSION_ID" ]; then
+        echo ""
+        echo "Notarization failed. Apple notary log:"
+        xcrun notarytool log "$SUBMISSION_ID" \
+            --apple-id "$APPLE_ID" \
+            --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_PASSWORD" || true
+    fi
+    exit 1
+fi
 
 echo ""
 echo "Stapling notarization ticket to $DMG..."
