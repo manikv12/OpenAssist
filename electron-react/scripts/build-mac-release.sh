@@ -92,20 +92,20 @@ normalize_framework_layout() {
 }
 
 APP_RESOURCE_ROOT="${APP_PATH}/Contents/Resources/app"
-if [ -d "$APP_RESOURCE_ROOT" ]; then
+if [ -d "$APP_PATH" ]; then
   while IFS= read -r -d '' framework_path; do
     normalize_framework_layout "$framework_path"
-    sign_target "$framework_path"
-  done < <(find "$APP_RESOURCE_ROOT" -type d -name "*.framework" -print0)
+  done < <(find "$APP_PATH" -type d -name "*.framework" -print0)
 
   while IFS= read -r -d '' native_file; do
-    case "$native_file" in
-      *.framework/*) continue ;;
-    esac
     if file "$native_file" | grep -q "Mach-O"; then
       sign_target "$native_file"
     fi
-  done < <(find "$APP_RESOURCE_ROOT" -type f -print0)
+  done < <(find "$APP_PATH" -type f -print0)
+
+  while IFS= read -r -d '' framework_path; do
+    sign_target "$framework_path"
+  done < <(find "$APP_PATH" -depth -type d -name "*.framework" -print0)
 fi
 
 if [ -n "${DEVELOPER_ID:-}" ]; then
