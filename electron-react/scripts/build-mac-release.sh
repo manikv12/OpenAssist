@@ -105,7 +105,7 @@ if [ -d "$APP_RESOURCE_ROOT" ]; then
     if file "$native_file" | grep -q "Mach-O"; then
       sign_target "$native_file"
     fi
-  done < <(find "$APP_RESOURCE_ROOT" -type f -perm -111 -print0)
+  done < <(find "$APP_RESOURCE_ROOT" -type f -print0)
 fi
 
 if [ -n "${DEVELOPER_ID:-}" ]; then
