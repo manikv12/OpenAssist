@@ -42,12 +42,7 @@ PACKAGER_ARGS=(
 
 if [ -n "${DEVELOPER_ID:-}" ]; then
   SIGN_ID="Developer ID Application: ${DEVELOPER_ID}"
-  echo "Packaging and signing with ${SIGN_ID}..."
-  PACKAGER_ARGS+=(
-    --osx-sign.identity="$SIGN_ID"
-    --osx-sign.entitlements="$ENTITLEMENTS"
-    --osx-sign.entitlements-inherit="$ENTITLEMENTS"
-  )
+  echo "Packaging without automatic Electron signing; signing final app with ${SIGN_ID}..."
 else
   echo "Packaging without Developer ID; applying local ad-hoc signature after packaging."
 fi
@@ -59,7 +54,9 @@ if [ ! -d "$APP_PATH" ]; then
   exit 1
 fi
 
-if [ -z "${DEVELOPER_ID:-}" ]; then
+if [ -n "${DEVELOPER_ID:-}" ]; then
+  codesign --force --deep --options runtime --timestamp --entitlements "$ENTITLEMENTS" --sign "$SIGN_ID" "$APP_PATH"
+else
   codesign --force --deep --options runtime --entitlements "$ENTITLEMENTS" --sign - "$APP_PATH"
 fi
 
