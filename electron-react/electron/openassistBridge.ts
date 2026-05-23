@@ -9,11 +9,39 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { Worker } from "node:worker_threads";
 import { CodexRealtimeProxy } from "./realtimeProxy.js";
+import {
+  GitCheckpointService,
+  type CodeCheckpointFile,
+  type CodeCheckpointPhase,
+  type GitCheckpointRepositoryContext,
+  type GitCheckpointSnapshot
+} from "./gitCheckpointService.js";
 
 const execFileAsync = promisify(execFile);
 const macAbsoluteEpochOffset = 978_307_200;
 const secureCredentialsFileName = "electron-secure-credentials.json";
 const transcriptionRequestTimeoutMs = 35_000;
+const gitCheckpointService = new GitCheckpointService();
+
+let threadsChangedListener: (() => void) | null = null;
+export function setThreadsChangedListener(listener: (() => void) | null) {
+  threadsChangedListener = listener;
+}
+function notifyThreadsChanged() {
+  if (!threadsChangedListener) return;
+  try {
+    threadsChangedListener();
+  } catch (error) {
+    bridgeDebugLog(`threads-changed broadcast failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+const pendingCodeCheckpointBaselinesBySessionID = new Map<string, {
+  sessionID: string;
+  checkpointID: string;
+  repository: GitCheckpointRepositoryContext;
+  beforeSnapshot: GitCheckpointSnapshot;
+  startedAt: number;
+}>();
 type KokoroVoiceID = NonNullable<import("kokoro-js").GenerateOptions["voice"]>;
 
 type JsonObject = Record<string, unknown>;
@@ -22,6 +50,7 @@ type AssistantBackend =
   | "codex"
   | "copilot"
   | "claudeCode"
+  | "antigravityCLI"
   | "ollamaLocal";
 type RuntimeAssistantBackend = AssistantBackend;
 type CodexReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
@@ -182,6 +211,8 @@ type ThreadItem = {
   updatedAt?: number;
   isArchived?: boolean;
   isTemporary?: boolean;
+  isRunning?: boolean;
+  runStatusText?: string;
   active?: boolean;
 };
 
@@ -189,8 +220,12 @@ type ChatMessage = {
   id: string;
   role: "user" | "assistant" | "activity";
   text: string;
+  attachments?: ComposerImageAttachment[];
+  artifacts?: MessageArtifact[];
   provider?: string;
   status?: "completed" | "running";
+  turnID?: string;
+  checkpointInfo?: MessageCheckpointInfo;
   activityTitle?: string;
   activityKind?: string;
   activityStatus?: "pending" | "running" | "completed" | "failed" | "waiting";
@@ -215,12 +250,83 @@ type ChatMessage = {
   updatedAt?: number;
 };
 
+type MessageArtifact = {
+  id: string;
+  kind: "image" | "file";
+  name: string;
+  path: string;
+  mimeType?: string;
+  dataURL?: string;
+  size?: number;
+  width?: number;
+  height?: number;
+};
+
+type ComposerImageAttachment = {
+  id: string;
+  name: string;
+  mimeType: string;
+  dataURL: string;
+  size?: number;
+};
+
+type CodeCheckpointTurnStatus = "completed" | "failed" | "cancelled";
+
+type CodeCheckpointSummary = {
+  id: string;
+  checkpointNumber: number;
+  createdAt: number;
+  turnStatus: CodeCheckpointTurnStatus;
+  summary: string;
+  patch: string;
+  changedFiles: CodeCheckpointFile[];
+  ignoredTouchedPaths: string[];
+  beforeSnapshot: GitCheckpointSnapshot;
+  afterSnapshot: GitCheckpointSnapshot;
+  associatedMessageID?: string;
+  associatedTurnID?: string;
+  associatedUserMessageID?: string;
+};
+
+type CodeTrackingState = {
+  sessionID: string;
+  availability: "available" | "unavailable" | "error";
+  repoRootPath?: string;
+  repoLabel?: string;
+  checkpoints: CodeCheckpointSummary[];
+  currentCheckpointPosition: number;
+  errorMessage?: string;
+};
+
+type CodeReviewPanelState = {
+  sessionID: string;
+  repoRootPath: string;
+  repoLabel: string;
+  checkpoints: CodeCheckpointSummary[];
+  currentCheckpointPosition: number;
+  selectedCheckpointID: string;
+  hasActiveTurn: boolean;
+  actionsLocked: boolean;
+};
+
+type MessageCheckpointInfo = {
+  checkpoint: CodeCheckpointSummary;
+  checkpointIndex: number;
+  currentCheckpointPosition: number;
+  totalCheckpointCount: number;
+  hasActiveTurn: boolean;
+  actionsLocked: boolean;
+  futureTurnsHidden: boolean;
+};
+
 type ProviderRunEvent =
   | { runID?: string; threadID: string; type: "status"; provider: string; text: string }
   | { runID?: string; threadID: string; type: "assistant-delta"; provider: string; delta: string }
   | { runID?: string; threadID: string; type: "activity"; provider: string; activity: ChatMessage }
   | { runID?: string; threadID: string; type: "completed"; provider: string }
   | { runID?: string; threadID: string; type: "failed"; provider: string; error: string };
+type CapturedOutputSource = "stdout" | "stderr";
+type CapturedOutputHandler = (source: CapturedOutputSource, chunk: string, stdout: string, stderr: string) => void;
 
 type NoteItem = {
   id: string;
@@ -689,12 +795,166 @@ function killProcessQuietly(pid: number, signal: NodeJS.Signals) {
 async function terminateProcessTree(rootPID: number, reason: string) {
   const descendants = await descendantProcessIDs(rootPID);
   const tree = [...descendants.reverse(), rootPID];
-  bridgeDebugLog(`terminating Codex helper tree reason="${reason}" pids=${tree.join(",")}`);
+  bridgeDebugLog(`terminating provider helper tree reason="${reason}" pids=${tree.join(",")}`);
   for (const pid of tree) killProcessQuietly(pid, "SIGTERM");
   await delay(900);
   for (const pid of tree) {
     if (isProcessAlive(pid)) killProcessQuietly(pid, "SIGKILL");
   }
+}
+
+function elapsedProcessSeconds(value: string) {
+  const text = value.trim();
+  if (!text) return 0;
+  const daySplit = text.split("-");
+  const dayCount = daySplit.length > 1 ? Number.parseInt(daySplit[0] ?? "0", 10) : 0;
+  const timePart = daySplit.length > 1 ? daySplit.slice(1).join("-") : text;
+  const timeParts = timePart.split(":").map((part) => Number.parseInt(part, 10));
+  if (timeParts.some((part) => !Number.isFinite(part))) return 0;
+  const [hours, minutes, seconds] = timeParts.length === 3
+    ? timeParts
+    : timeParts.length === 2
+      ? [0, timeParts[0], timeParts[1]]
+      : [0, 0, timeParts[0]];
+  return (Number.isFinite(dayCount) ? dayCount : 0) * 86_400
+    + (hours ?? 0) * 3_600
+    + (minutes ?? 0) * 60
+    + (seconds ?? 0);
+}
+
+function parseProcessSnapshotLine(line: string) {
+  const match = line.match(/^\s*(\d+)\s+(\d+)\s+(\S+)\s+(.+)$/);
+  if (!match) return null;
+  return {
+    pid: Number.parseInt(match[1] ?? "", 10),
+    ppid: Number.parseInt(match[2] ?? "", 10),
+    elapsedSeconds: elapsedProcessSeconds(match[3] ?? ""),
+    command: match[4] ?? ""
+  };
+}
+
+async function processSnapshot() {
+  try {
+    const { stdout } = await execFileAsync("ps", ["-axo", "pid=,ppid=,etime=,command="], { maxBuffer: 2_000_000 });
+    return stdout
+      .split(/\r?\n/)
+      .map(parseProcessSnapshotLine)
+      .filter((entry): entry is NonNullable<ReturnType<typeof parseProcessSnapshotLine>> => Boolean(entry));
+  } catch (error) {
+    bridgeDebugLog(`process snapshot failed: ${error instanceof Error ? error.message : String(error)}`);
+    return [];
+  }
+}
+
+function computerUseHelperKind(command: string): "mcp" | "turn-ended" | "service" | "browser-mcp" | "browser-chrome" | null {
+  if (command.includes("SkyComputerUseClient")) {
+    if (/(^|\s)mcp($|\s)/.test(command)) return "mcp";
+    if (/(^|\s)turn-ended($|\s)/.test(command)) return "turn-ended";
+  }
+  if (command.includes("SkyComputerUseService")) return "service";
+  if (
+    command.includes(".codex/playwright-chrome-profile")
+    && (command.includes("playwright-mcp") || command.includes("@playwright/mcp"))
+  ) {
+    return "browser-mcp";
+  }
+  if (
+    command.includes("/Applications/Google Chrome.app/")
+    && command.includes(".codex/playwright-chrome-profile")
+  ) {
+    return "browser-chrome";
+  }
+  return null;
+}
+
+function isCodexAppServerCommand(command: string) {
+  return /\bcodex(?:\s+|\S*\/codex\s+)app-server\b/.test(command);
+}
+
+async function cleanupOpenAssistOwnedCodexAppServers(currentAppServerPID?: number, reason = "OpenAssist Codex app-server cleanup") {
+  const protectedPIDs = new Set<number>();
+  if (currentAppServerPID && Number.isFinite(currentAppServerPID)) {
+    protectedPIDs.add(currentAppServerPID);
+    for (const descendant of await descendantProcessIDs(currentAppServerPID)) {
+      protectedPIDs.add(descendant);
+    }
+  }
+  const snapshot = await processSnapshot();
+  const ownedServers = snapshot
+    .filter((entry) => entry.ppid === process.pid && isCodexAppServerCommand(entry.command))
+    .filter((entry) => !protectedPIDs.has(entry.pid))
+    .filter((entry) => entry.elapsedSeconds >= 15);
+  if (!ownedServers.length) return { killed: [] as number[] };
+  bridgeDebugLog(`${reason} killing roots=${ownedServers.map((entry) => entry.pid).join(",")} details=${ownedServers.map((entry) => `${entry.pid}:${entry.elapsedSeconds}s:${entry.command.slice(0, 120)}`).join(" | ")}`);
+  const killed = new Set<number>();
+  for (const entry of ownedServers) {
+    const descendants = await descendantProcessIDs(entry.pid);
+    for (const descendant of descendants) killed.add(descendant);
+    killed.add(entry.pid);
+    await terminateProcessTree(entry.pid, reason);
+  }
+  return { killed: Array.from(killed) };
+}
+
+function staleComputerUseHelperThresholdSeconds(kind: ReturnType<typeof computerUseHelperKind>) {
+  if (kind === "turn-ended") return 60;
+  if (kind === "service") return 180;
+  if (kind === "browser-mcp" || kind === "browser-chrome") return 180;
+  return 180;
+}
+
+async function cleanupStaleComputerUseHelpers(currentAppServerPID?: number, options: { allowDuringActiveToolCall?: boolean } = {}) {
+  if (!options.allowDuringActiveToolCall && activeComputerUseToolCalls.size > 0) {
+    bridgeDebugLog(`Computer Use stale helper cleanup skipped because ${activeComputerUseToolCalls.size} tool call(s) are still active.`);
+    return { killed: [] as number[] };
+  }
+  const protectedPIDs = new Set<number>();
+  if (currentAppServerPID && Number.isFinite(currentAppServerPID)) {
+    protectedPIDs.add(currentAppServerPID);
+  }
+  const staleHelpers = (await processSnapshot())
+    .map((entry) => ({ ...entry, kind: computerUseHelperKind(entry.command) }))
+    .filter((entry) => Boolean(entry.kind))
+    .filter((entry) => !protectedPIDs.has(entry.pid) && !protectedPIDs.has(entry.ppid))
+    .filter((entry) => entry.elapsedSeconds >= staleComputerUseHelperThresholdSeconds(entry.kind));
+  if (!staleHelpers.length) {
+    bridgeDebugLog("Computer Use stale helper cleanup found no stale helpers.");
+    return { killed: [] as number[] };
+  }
+  const selectedPIDs = new Set(staleHelpers.map((entry) => entry.pid));
+  const rootPIDs = staleHelpers
+    .filter((entry) => !selectedPIDs.has(entry.ppid))
+    .map((entry) => entry.pid);
+  bridgeDebugLog(`Computer Use stale helper cleanup killing roots=${rootPIDs.join(",")} details=${staleHelpers.map((entry) => `${entry.pid}:${entry.kind}:${entry.elapsedSeconds}s`).join(",")}`);
+  const killed = new Set<number>();
+  for (const pid of rootPIDs) {
+    const descendants = await descendantProcessIDs(pid);
+    for (const descendant of descendants) killed.add(descendant);
+    killed.add(pid);
+    await terminateProcessTree(pid, "Computer Use stale helper cleanup");
+  }
+  return { killed: Array.from(killed) };
+}
+
+async function resetCodexIfCurrentComputerUseHelperExists(reason: string) {
+  const currentPID = codexTransport.currentPID();
+  if (!currentPID || !Number.isFinite(currentPID) || activeComputerUseToolCalls.size > 0) {
+    return false;
+  }
+  await cleanupOpenAssistOwnedCodexAppServers(currentPID, "Clean stale OpenAssist Codex app-servers before Computer Use").catch((error) => {
+    bridgeDebugLog(`OpenAssist Codex app-server cleanup before Computer Use failed: ${error instanceof Error ? error.stack ?? error.message : String(error)}`);
+  });
+  const currentHelpers = (await processSnapshot())
+    .map((entry) => ({ ...entry, kind: computerUseHelperKind(entry.command) }))
+    .filter((entry) => Boolean(entry.kind))
+    .filter((entry) => entry.pid !== currentPID && entry.ppid === currentPID);
+  if (!currentHelpers.length) return false;
+  bridgeDebugLog(`Computer Use helper already attached before turn; restarting Codex reason="${reason}" details=${currentHelpers.map((entry) => `${entry.pid}:${entry.kind}:${entry.elapsedSeconds}s`).join(",")}`);
+  await codexTransport.restart(reason);
+  await cleanupStaleComputerUseHelpers(undefined, { allowDuringActiveToolCall: true }).catch((error) => {
+    bridgeDebugLog(`Computer Use cleanup after current-helper restart failed: ${error instanceof Error ? error.stack ?? error.message : String(error)}`);
+  });
+  return true;
 }
 
 function codexConfigPath() {
@@ -719,6 +979,99 @@ type CodexRuntimeOptions = {
   pluginIDs?: string[];
   sessionInstructions?: string;
 };
+
+const maxComposerImageAttachments = 6;
+const maxComposerImageAttachmentBytes = 12 * 1024 * 1024;
+
+function dataURLImageMimeType(rawValue: string) {
+  const match = /^data:([^;,]+);base64,/i.exec(rawValue.trim());
+  return match?.[1]?.trim().toLowerCase() || "";
+}
+
+function normalizedComposerAttachmentName(rawValue: unknown, fallbackIndex: number, mimeType: string) {
+  const fallbackExtension = mimeType === "image/jpeg" ? "jpg" : mimeType.split("/")[1]?.split("+")[0] || "png";
+  const fallback = `attached-image-${fallbackIndex}.${fallbackExtension}`;
+  const value = typeof rawValue === "string" ? rawValue.trim() : "";
+  if (!value) return fallback;
+  const basename = path.basename(value).replace(/[/:\\]/g, "-").trim();
+  return basename || fallback;
+}
+
+function normalizeComposerImageAttachments(rawValue: unknown): ComposerImageAttachment[] {
+  if (!Array.isArray(rawValue)) return [];
+  return rawValue.slice(0, maxComposerImageAttachments).map((item, index) => {
+    if (!item || typeof item !== "object") {
+      throw new Error("Image attachment data was not valid.");
+    }
+    const object = item as Record<string, unknown>;
+    const dataURL = typeof object.dataURL === "string" ? object.dataURL.trim() : "";
+    const commaIndex = dataURL.indexOf(",");
+    if (commaIndex <= 0 || !dataURL.toLowerCase().startsWith("data:image/")) {
+      throw new Error("Only image attachments can be sent right now.");
+    }
+    const mimeType = dataURLImageMimeType(dataURL) || "image/png";
+    const encodedPayload = dataURL.slice(commaIndex + 1).replace(/\s+/g, "");
+    if (!encodedPayload) {
+      throw new Error("Image attachment data was empty.");
+    }
+    const imageData = Buffer.from(encodedPayload, "base64");
+    if (!imageData.length) {
+      throw new Error("Image attachment data was empty.");
+    }
+    if (imageData.length > maxComposerImageAttachmentBytes) {
+      throw new Error("One image is too large. Please attach an image under 12 MB.");
+    }
+    return {
+      id: typeof object.id === "string" && object.id.trim() ? object.id.trim() : `attachment-${randomUUID().toLowerCase()}`,
+      name: normalizedComposerAttachmentName(object.name, index + 1, mimeType),
+      mimeType,
+      dataURL: `data:${mimeType};base64,${encodedPayload}`,
+      size: typeof object.size === "number" && Number.isFinite(object.size) ? object.size : imageData.length
+    };
+  });
+}
+
+function composerImageInputItems(attachments: ComposerImageAttachment[]) {
+  return attachments.flatMap((attachment, index) => [
+    {
+      type: "text",
+      text: `Attached image ${index + 1}: ${attachment.name}`,
+      text_elements: []
+    },
+    {
+      type: "image",
+      url: attachment.dataURL
+    }
+  ] satisfies JsonObject[]);
+}
+
+function composerImageInstructionItems(attachments: ComposerImageAttachment[]) {
+  if (!attachments.length) return [] as JsonObject[];
+  return [{
+    type: "text",
+    text: "If image attachments are present, analyze those attached images directly. Do not use tools or browser/app automation just to inspect attached images.",
+    text_elements: []
+  } as JsonObject];
+}
+
+async function materializeComposerImageAttachments(threadID: string, attachments: ComposerImageAttachment[]) {
+  if (!attachments.length) return "";
+  const directory = path.join(os.tmpdir(), `openassist-chat-images-${threadID.replace(/[^a-z0-9_-]/gi, "-")}-${randomUUID().toLowerCase()}`);
+  fs.mkdirSync(directory, { recursive: true });
+  const lines = [
+    "Image attachments are available on disk for this turn.",
+    "Open and inspect these files directly if the user's request depends on the image:"
+  ];
+  attachments.forEach((attachment, index) => {
+    const commaIndex = attachment.dataURL.indexOf(",");
+    const data = Buffer.from(attachment.dataURL.slice(commaIndex + 1), "base64");
+    const filename = normalizedComposerAttachmentName(attachment.name, index + 1, attachment.mimeType);
+    const filePath = path.join(directory, filename);
+    fs.writeFileSync(filePath, data);
+    lines.push(`- ${attachment.name} [${attachment.mimeType}]: ${filePath}`);
+  });
+  return lines.join("\n");
+}
 
 const codexComputerUsePluginIDs = new Set([
   "computer-use@openai-bundled",
@@ -749,6 +1102,59 @@ function canonicalizeCodexPluginIDs(pluginIDs: string[] = []): string[] {
     result.push(canonical);
   }
   return result;
+}
+
+function pluginBackedSkillPluginName(skillID: string) {
+  const trimmed = skillID.trim();
+  const separatorIndex = trimmed.indexOf(":");
+  if (separatorIndex <= 0) return "";
+  return trimmed.slice(0, separatorIndex).trim().toLowerCase();
+}
+
+async function normalizeCodexToolSelection(pluginIDs: string[] = [], skillIDs: string[] = []) {
+  const canonicalPluginIDs = canonicalizeCodexPluginIDs(pluginIDs);
+  const pluginSkillIDs = skillIDs.filter((id) => typeof id === "string" && pluginBackedSkillPluginName(id));
+  if (!pluginSkillIDs.length) return { pluginIDs: canonicalPluginIDs, skillIDs };
+
+  const pluginByName = new Map<string, string>();
+  try {
+    const plugins = await loadPlugins();
+    for (const plugin of plugins) {
+      if (plugin.status !== "Installed") continue;
+      const canonicalID = canonicalizeCodexPluginID(plugin.id);
+      const candidates = [
+        plugin.pluginName,
+        plugin.id.split("@")[0],
+        plugin.title
+      ];
+      for (const candidate of candidates) {
+        const key = candidate?.trim().toLowerCase();
+        if (key && !pluginByName.has(key)) pluginByName.set(key, canonicalID);
+      }
+    }
+  } catch (error) {
+    bridgeDebugLog(`Could not normalize plugin-backed skill selections: ${error instanceof Error ? error.message : String(error)}`);
+  }
+
+  const pluginIDsByKey = new Map<string, string>();
+  for (const pluginID of canonicalPluginIDs) pluginIDsByKey.set(pluginID.toLowerCase(), pluginID);
+
+  const nextSkillIDs: string[] = [];
+  const seenSkillIDs = new Set<string>();
+  for (const skillID of skillIDs) {
+    const pluginName = pluginBackedSkillPluginName(skillID);
+    const pluginID = pluginName ? pluginByName.get(pluginName) : undefined;
+    if (pluginID) {
+      pluginIDsByKey.set(pluginID.toLowerCase(), pluginID);
+      continue;
+    }
+    const skillKey = normalizedSkillID(skillID);
+    if (!skillKey || seenSkillIDs.has(skillKey)) continue;
+    seenSkillIDs.add(skillKey);
+    nextSkillIDs.push(skillID);
+  }
+
+  return { pluginIDs: Array.from(pluginIDsByKey.values()), skillIDs: nextSkillIDs };
 }
 
 const localDesktopAutomationToolNames = new Set([
@@ -903,15 +1309,6 @@ function buildCodexRuntimeInstructions(session: SessionSummary | undefined, opti
     codexModeInstructions(mode),
     codexWorkspaceBoundaryInstructions(session)
   ];
-  if (shouldPreferCodexComputerUsePlugin(options.pluginIDs)) {
-    sections.push([
-      "# Computer Use In OpenAssist",
-      "",
-      "OpenAssist can launch Computer Use from a different macOS permission path than Codex.app.",
-      "For Apple apps like Notes, Calendar, Mail, and Finder, first use direct read-only macOS commands such as osascript when the task is only to search or read content.",
-      "Use Computer Use for visible UI interaction. If a Computer Use app-state call fails or times out, do not retry it in the same turn; switch to a direct fallback and report the result."
-    ].join("\n"));
-  }
   const sessionInstructions = options.sessionInstructions?.trim();
   if (sessionInstructions) {
     sections.push(`# Custom Instructions\n\n${sessionInstructions}`);
@@ -1709,6 +2106,13 @@ function cloudTranscriptionDefaultBaseURL(provider: string) {
     default:
       return "https://chatgpt.com/backend-api";
   }
+}
+
+async function writeCloudTranscriptionProviderSelection(provider: string, resetProviderDefaults: boolean) {
+  await writeStringDefault("OpenAssist.cloudTranscriptionProvider", provider);
+  if (!resetProviderDefaults) return;
+  await writeStringDefault("OpenAssist.cloudTranscriptionModel", cloudTranscriptionDefaultModel(provider));
+  await writeStringDefault("OpenAssist.cloudTranscriptionBaseURL", cloudTranscriptionDefaultBaseURL(provider));
 }
 
 function promptRewriteKeychainAccount(provider: string) {
@@ -2714,8 +3118,12 @@ async function voiceInputConfiguration() {
     whisperModelInstalled: settings.whisperModelInstalled,
     whisperInstalledModels: settings.whisperInstalledModels,
     cloudTranscriptionProvider: settings.cloudTranscriptionProvider,
-    cloudTranscriptionModel: settings.cloudTranscriptionModel,
-    cloudTranscriptionBaseURL: settings.cloudTranscriptionBaseURL,
+    cloudTranscriptionModel: settings.cloudTranscriptionProvider === "ChatGPT / Codex Session"
+      ? cloudTranscriptionDefaultModel(settings.cloudTranscriptionProvider)
+      : settings.cloudTranscriptionModel,
+    cloudTranscriptionBaseURL: settings.cloudTranscriptionProvider === "ChatGPT / Codex Session"
+      ? cloudTranscriptionDefaultBaseURL(settings.cloudTranscriptionProvider)
+      : settings.cloudTranscriptionBaseURL,
     cloudTranscriptionProviderRequiresKey: cloudTranscriptionProviderRequiresKey(settings.cloudTranscriptionProvider),
     cloudTranscriptionAPIKeyConfigured: settings.cloudTranscriptionAPIKeyConfigured,
     dictationStartSoundName: settings.dictationStartSoundName,
@@ -2765,8 +3173,12 @@ async function transcribeAudioFile(input: AudioTranscriptionFile) {
   if (!fs.existsSync(input.filePath)) throw new Error("Captured audio file was not found.");
   const audio = fs.readFileSync(input.filePath);
   const provider = settings.cloudTranscriptionProvider;
-  const model = settings.cloudTranscriptionModel || cloudTranscriptionDefaultModel(provider);
-  const baseURL = settings.cloudTranscriptionBaseURL || cloudTranscriptionDefaultBaseURL(provider);
+  const model = provider === "ChatGPT / Codex Session"
+    ? cloudTranscriptionDefaultModel(provider)
+    : settings.cloudTranscriptionModel || cloudTranscriptionDefaultModel(provider);
+  const baseURL = provider === "ChatGPT / Codex Session"
+    ? cloudTranscriptionDefaultBaseURL(provider)
+    : settings.cloudTranscriptionBaseURL || cloudTranscriptionDefaultBaseURL(provider);
   const fileName = normalizedFileName(input.fileName, "voice-input.wav");
   const mimeType = normalizedMimeType(input.mimeType, "audio/wav");
   if (provider === "ChatGPT / Codex Session") {
@@ -2892,7 +3304,7 @@ function makeProviderUsage(
   planType?: string | null
 ): ProviderUsageSnapshot | null {
   if (backend === "ollamaLocal") return null;
-  if (!primary && !secondary && !context) return null;
+  if (!primary && !secondary && !context && !planType) return null;
   return {
     providerBackend: backend,
     providerLabel: providerLabel(backend),
@@ -3165,6 +3577,7 @@ function usageSnapshotsByBackend(): Partial<Record<RuntimeAssistantBackend, Prov
     codex: usageSnapshotForBackend("codex"),
     copilot: usageSnapshotForBackend("copilot"),
     claudeCode: usageSnapshotForBackend("claudeCode"),
+    antigravityCLI: usageSnapshotForBackend("antigravityCLI"),
     ollamaLocal: null
   };
 }
@@ -3181,6 +3594,271 @@ function readCodexDefaultModel() {
 
 function providerModelOption(id: string, displayName = id, description = displayName): ProviderModelOption {
   return { id, displayName, description, hidden: false, isInstalled: true };
+}
+
+function antigravityModelID(displayName: string) {
+  return displayName
+    .trim()
+    .toLowerCase()
+    .replace(/\(([^)]+)\)/g, "$1")
+    .replace(/[^a-z0-9.]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+function antigravityModelOptions(): ProviderModelOption[] {
+  return [
+    {
+      ...providerModelOption(
+        "gemini-3.5-flash-high",
+        "Gemini 3.5 Flash (High)",
+        "Fast · Limited time"
+      ),
+      isDefault: true
+    },
+    providerModelOption(
+      "gemini-3.5-flash-low",
+      "Gemini 3.5 Flash (Low)",
+      "Fast · Limited time"
+    ),
+    providerModelOption(
+      "gemini-3.1-pro-high",
+      "Gemini 3.1 Pro (High)",
+      "Antigravity reasoning model from local Antigravity account state."
+    ),
+    providerModelOption(
+      "gemini-3.1-pro-low",
+      "Gemini 3.1 Pro (Low)",
+      "Antigravity reasoning model from local Antigravity account state."
+    ),
+    providerModelOption(
+      "claude-sonnet-4.6-thinking",
+      "Claude Sonnet 4.6 (Thinking)",
+      "Antigravity reasoning model from local Antigravity account state."
+    ),
+    providerModelOption(
+      "claude-opus-4.6-thinking",
+      "Claude Opus 4.6 (Thinking)",
+      "Antigravity reasoning model from local Antigravity account state."
+    ),
+    providerModelOption(
+      "gpt-oss-120b-medium",
+      "GPT-OSS 120B (Medium)",
+      "Recommended"
+    ),
+    {
+      ...providerModelOption(
+        "antigravity-default",
+        "Gemini 3.5 Flash (High)",
+        "Legacy Open Assist default. Antigravity will use its selected reasoning model."
+      ),
+      hidden: true
+    }
+  ];
+}
+
+function readProtoVarint(buffer: Buffer, offset: number): [number, number] | null {
+  let value = 0;
+  let shift = 0;
+  for (let cursor = offset; cursor < buffer.length; cursor += 1) {
+    const byte = buffer[cursor];
+    value += (byte & 0x7f) * (2 ** shift);
+    if ((byte & 0x80) === 0) return [value, cursor + 1];
+    shift += 7;
+    if (shift > 49) return null;
+  }
+  return null;
+}
+
+function lengthDelimitedProtoFields(buffer: Buffer) {
+  const fields: Buffer[] = [];
+  let offset = 0;
+  while (offset < buffer.length) {
+    const tag = readProtoVarint(buffer, offset);
+    if (!tag) return fields;
+    offset = tag[1];
+    const wireType = tag[0] & 7;
+    if (wireType === 0) {
+      const next = readProtoVarint(buffer, offset);
+      if (!next) return fields;
+      offset = next[1];
+    } else if (wireType === 1) {
+      offset += 8;
+    } else if (wireType === 2) {
+      const lengthValue = readProtoVarint(buffer, offset);
+      if (!lengthValue) return fields;
+      const length = lengthValue[0];
+      offset = lengthValue[1];
+      if (length < 0 || offset + length > buffer.length) return fields;
+      const value = buffer.subarray(offset, offset + length);
+      if (value.length > 0) fields.push(value);
+      offset += length;
+    } else if (wireType === 5) {
+      offset += 4;
+    } else {
+      return fields;
+    }
+  }
+  return fields;
+}
+
+function printableStrings(buffer: Buffer) {
+  const strings: string[] = [];
+  let start = -1;
+  for (let index = 0; index <= buffer.length; index += 1) {
+    const byte = index < buffer.length ? buffer[index] : 0;
+    const printable = byte >= 32 && byte <= 126;
+    if (printable && start < 0) start = index;
+    if ((!printable || index === buffer.length) && start >= 0) {
+      if (index - start >= 4) strings.push(buffer.toString("utf8", start, index));
+      start = -1;
+    }
+  }
+  return strings;
+}
+
+function base64Decode(value: string): Buffer | null {
+  const compact = value.trim().replace(/\s+/g, "");
+  if (!compact || compact.length < 4 || !/^[A-Za-z0-9+/]+={0,2}$/.test(compact)) return null;
+  try {
+    const padded = compact.padEnd(Math.ceil(compact.length / 4) * 4, "=");
+    const decoded = Buffer.from(padded, "base64");
+    return decoded.length ? decoded : null;
+  } catch {
+    return null;
+  }
+}
+
+function antigravityDecodedStateBuffers(rawBase64: string) {
+  const first = base64Decode(rawBase64);
+  if (!first) return [];
+  const buffers: Buffer[] = [];
+  const queue = [first];
+  const seen = new Set<string>();
+  while (queue.length && buffers.length < 300) {
+    const buffer = queue.shift();
+    if (!buffer || buffer.length > 1_000_000) continue;
+    const key = `${buffer.length}:${buffer.subarray(0, 16).toString("hex")}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    buffers.push(buffer);
+    for (const field of lengthDelimitedProtoFields(buffer)) {
+      queue.push(field);
+      for (const text of printableStrings(field)) {
+        if (text.length >= 16) {
+          const decoded = base64Decode(text);
+          if (decoded) queue.push(decoded);
+        }
+      }
+    }
+    for (const text of printableStrings(buffer)) {
+      if (text.length >= 16) {
+        const decoded = base64Decode(text);
+        if (decoded) queue.push(decoded);
+      }
+    }
+  }
+  return buffers;
+}
+
+function isAntigravityModelName(value: string) {
+  return /^(Gemini|Claude|GPT-OSS)\b/i.test(value)
+    && value.length <= 80
+    && !value.includes("/")
+    && !value.includes("@")
+    && (/\d/.test(value) || /^Claude\b/i.test(value));
+}
+
+function antigravityModelsFromState(rawBase64: string): ProviderModelOption[] {
+  const descriptors = new Set(["Fast", "Limited time", "Recommended"]);
+  const strings = antigravityDecodedStateBuffers(rawBase64)
+    .flatMap(printableStrings)
+    .map((value) => value.replace(/\s+/g, " ").trim())
+    .filter(Boolean);
+  const models: ProviderModelOption[] = [];
+  const seen = new Set<string>();
+  for (let index = 0; index < strings.length; index += 1) {
+    const displayName = strings[index];
+    if (!isAntigravityModelName(displayName)) continue;
+    const normalized = displayName.toLowerCase();
+    if (seen.has(normalized)) continue;
+    seen.add(normalized);
+    const notes: string[] = [];
+    for (const next of strings.slice(index + 1, index + 5)) {
+      if (isAntigravityModelName(next)) break;
+      if (descriptors.has(next) && !notes.includes(next)) notes.push(next);
+    }
+    models.push({
+      ...providerModelOption(
+        antigravityModelID(displayName),
+        displayName,
+        notes.length ? notes.join(" · ") : "Antigravity reasoning model from local Antigravity account state."
+      ),
+      isDefault: models.length === 0
+    });
+  }
+  if (!models.length) return [];
+  return [
+    ...models,
+    {
+      ...providerModelOption(
+        "antigravity-default",
+        models[0].displayName,
+        "Legacy Open Assist default. Antigravity will use its selected reasoning model."
+      ),
+      hidden: true
+    }
+  ];
+}
+
+let antigravityModelCache: { expiresAt: number; value: ProviderModelOption[] } | null = null;
+
+function antigravityGlobalStorageDatabase() {
+  return path.join(os.homedir(), "Library", "Application Support", "Antigravity", "User", "globalStorage", "state.vscdb");
+}
+
+async function readAntigravityUnifiedStateValue(key: string) {
+  const database = antigravityGlobalStorageDatabase();
+  if (!fs.existsSync(database)) return "";
+  const { stdout } = await execFileAsync("sqlite3", [
+    "-noheader",
+    "-batch",
+    database,
+    `select value from ItemTable where key='${key.replace(/'/g, "''")}' limit 1;`
+  ], { timeout: 2500 });
+  return stdout.trim();
+}
+
+async function loadAntigravityModelsFromState(): Promise<ProviderModelOption[]> {
+  const now = Date.now();
+  if (antigravityModelCache && antigravityModelCache.expiresAt > now) return antigravityModelCache.value;
+  const rawState = await readAntigravityUnifiedStateValue("antigravityUnifiedStateSync.userStatus");
+  const models = uniqueProviderModels(antigravityModelsFromState(String(rawState)));
+  const value = models.length ? models : fallbackModelOptionsForBackend("antigravityCLI");
+  antigravityModelCache = { expiresAt: now + 60_000, value };
+  return value;
+}
+
+function antigravityPlanFromState(rawBase64: string) {
+  const strings = antigravityDecodedStateBuffers(rawBase64)
+    .flatMap(printableStrings)
+    .map((value) => value.replace(/\s+/g, " ").trim());
+  return strings.find((value) => /^Google AI (Pro|Ultra)$/i.test(value))
+    ?? strings.find((value) => /^Google AI\b/i.test(value))
+    ?? null;
+}
+
+async function refreshAntigravityUsageFromState() {
+  const rawState = await readAntigravityUnifiedStateValue("antigravityUnifiedStateSync.userStatus");
+  const planType = antigravityPlanFromState(String(rawState));
+  if (!planType) return;
+  const existing = runtimeUsageByBackend.antigravityCLI;
+  runtimeUsageByBackend.antigravityCLI = makeProviderUsage(
+    "antigravityCLI",
+    existing?.primary ?? null,
+    existing?.secondary ?? null,
+    existing?.context ?? null,
+    planType
+  ) ?? existing;
 }
 
 function fallbackModelOptionsForBackend(backend: AssistantBackend): ProviderModelOption[] {
@@ -3205,6 +3883,9 @@ function fallbackModelOptionsForBackend(backend: AssistantBackend): ProviderMode
       providerModelOption("opus", "Claude Opus", "Higher-capability Claude Code model alias"),
       providerModelOption("haiku", "Claude Haiku", "Fast Claude Code model alias")
     ];
+  }
+  if (backend === "antigravityCLI") {
+    return antigravityModelOptions();
   }
   if (backend === "ollamaLocal") {
     return [
@@ -3389,6 +4070,13 @@ export async function listProviderModels(rawBackend: string): Promise<ProviderMo
       return fallbackModelOptionsForBackend("copilot");
     }
   }
+  if (backend === "antigravityCLI") {
+    try {
+      return await loadAntigravityModelsFromState();
+    } catch {
+      return fallbackModelOptionsForBackend("antigravityCLI");
+    }
+  }
   return fallbackModelOptionsForBackend(backend);
 }
 
@@ -3552,6 +4240,27 @@ function conversationHasVisibleMessages(snapshot: { transcript?: JsonObject[] })
   });
 }
 
+function attachActivityArtifactsToAssistantMessages(messages: ChatMessage[]) {
+  let pendingArtifacts: MessageArtifact[] = [];
+  return messages.map((message) => {
+    if (message.role === "user") {
+      pendingArtifacts = [];
+      return message;
+    }
+    if (message.role === "activity") {
+      pendingArtifacts = uniqueArtifacts([...pendingArtifacts, ...(message.artifacts ?? [])]);
+      return message;
+    }
+    if (message.role === "assistant") {
+      const existingArtifacts = message.artifacts ?? [];
+      const artifacts = existingArtifacts.length ? existingArtifacts : pendingArtifacts;
+      pendingArtifacts = [];
+      return artifacts.length ? { ...message, artifacts } : message;
+    }
+    return message;
+  });
+}
+
 function conversationHasThreadNotes(threadID: string) {
   const notesRoot = threadNotesDirectory(threadID);
   if (!fs.existsSync(notesRoot)) return false;
@@ -3622,7 +4331,7 @@ function loadThreads(projects: LoadedProjects): ThreadItem[] {
   return threads.slice(0, 120);
 }
 
-function loadThreadMessages(threadID: string): ThreadDetail {
+async function loadThreadMessages(threadID: string): Promise<ThreadDetail> {
   const filePath = path.join(conversationStoreRoot(), threadID, "conversation.json");
   const snapshot = readJSON<{ threadID?: string; transcript?: JsonObject[]; timeline?: JsonObject[] }>(filePath, {});
   const transcript = snapshot.transcript ?? [];
@@ -3648,8 +4357,10 @@ function loadThreadMessages(threadID: string): ThreadDetail {
           id: String(entry.id ?? `${threadID}-timeline-assistant-${index}`),
           role: "assistant",
           text,
+          artifacts: messageArtifactsFromStored(entry.artifacts),
           provider: typeof entry.providerBackend === "string" ? providerLabel(entry.providerBackend) : undefined,
           status: entry.isStreaming === true ? "running" : "completed",
+          turnID: firstRuntimeString(entry.turnID, entry.turnId) || undefined,
           createdAt: swiftDateToMs(entry.createdAt),
           updatedAt: swiftDateToMs(entry.updatedAt)
         };
@@ -3661,7 +4372,11 @@ function loadThreadMessages(threadID: string): ThreadDetail {
         const imagePath = firstRuntimeString(activity.imagePath, activity.image_path);
         const imageMimeType = firstRuntimeString(activity.imageMimeType, activity.image_mime_type) || imageMimeTypeFromPath(imagePath) || "image/png";
         const storedImageDataURL = firstRawRuntimeString(activity.imageDataURL, activity.image_data_url);
-        const imageDataURL = storedImageDataURL || imageDataURLFromFile(imagePath, imageMimeType);
+        const storedArtifacts = messageArtifactsFromStored(activity.artifacts);
+        const inferredArtifacts = storedArtifacts.length ? storedArtifacts : messageArtifactsFromText(detail);
+        const imageArtifact = inferredArtifacts.find((artifact) => artifact.kind === "image" && artifact.dataURL);
+        const imageDataURL = storedImageDataURL || imageDataURLFromFile(imagePath, imageMimeType) || imageArtifact?.dataURL;
+        const artifacts = inferredArtifacts;
         const normalizedTitle = title.replace(/\s+/g, " ").trim().toLowerCase();
         if (normalizedTitle === "user message") return null;
         if (isRuntimeMessageItemType(activityKind)) return null;
@@ -3685,16 +4400,17 @@ function loadThreadMessages(threadID: string): ThreadDetail {
           role: "activity",
           provider: typeof entry.providerBackend === "string" ? providerLabel(entry.providerBackend) : undefined,
           text: detail || title,
+          artifacts,
           status: activityStatus === "running" || activityStatus === "waiting" || activityStatus === "pending" ? "running" : "completed",
           activityTitle: title,
           activityKind,
           activityStatus,
           activityDetail: detail || undefined,
           imageDataURL,
-          imagePath: imagePath || undefined,
+          imagePath: imagePath || imageArtifact?.path || undefined,
           imagePrompt: firstRuntimeString(activity.imagePrompt, activity.image_prompt) || undefined,
-          imageMimeType: imageDataURL || imagePath ? imageMimeType : undefined,
-          imageName: firstRuntimeString(activity.imageName, activity.image_name) || imageFileNameFromPath(imagePath),
+          imageMimeType: imageDataURL || imagePath || imageArtifact ? imageArtifact?.mimeType || imageMimeType : undefined,
+          imageName: firstRuntimeString(activity.imageName, activity.image_name) || imageFileNameFromPath(imagePath) || imageArtifact?.name,
           approvalRequestID: validJsonRequestID(activity.approvalRequestID ?? activity.approval_request_id),
           approvalKind: firstRuntimeString(activity.approvalKind, activity.approval_kind) as ChatMessage["approvalKind"],
           approvalPrompt: firstRuntimeString(activity.approvalPrompt, activity.approval_prompt) || undefined,
@@ -3718,10 +4434,12 @@ function loadThreadMessages(threadID: string): ThreadDetail {
           provider: typeof entry.providerBackend === "string" ? providerLabel(entry.providerBackend) : undefined
         }))
         .filter((message) => message.text);
+  const messagesWithArtifacts = attachActivityArtifactsToAssistantMessages(messages);
+  const codeTrackingState = await loadCodeTrackingState(threadID).catch(() => readCodeTrackingState(threadID));
   return {
     threadID,
-    title: messages.find((message) => message.role === "user")?.text.slice(0, 80) || "Untitled chat",
-    messages
+    title: messagesWithArtifacts.find((message) => message.role === "user")?.text.slice(0, 80) || "Untitled chat",
+    messages: attachCodeCheckpointInfo(messagesWithArtifacts, codeTrackingState)
   };
 }
 
@@ -3965,6 +4683,41 @@ function conversationSnapshotPath(threadID: string) {
   return path.join(conversationStoreRoot(), threadID, "conversation.json");
 }
 
+function codeTrackingStatePath(threadID: string) {
+  return path.join(conversationStoreRoot(), threadID, "code-tracking.json");
+}
+
+function emptyCodeTrackingState(threadID: string): CodeTrackingState {
+  return {
+    sessionID: threadID,
+    availability: "unavailable",
+    checkpoints: [],
+    currentCheckpointPosition: -1
+  };
+}
+
+function readCodeTrackingState(threadID: string): CodeTrackingState {
+  const snapshot = readJSON<Partial<CodeTrackingState>>(codeTrackingStatePath(threadID), emptyCodeTrackingState(threadID));
+  return {
+    sessionID: String(snapshot.sessionID || threadID),
+    availability: snapshot.availability === "available" || snapshot.availability === "error" ? snapshot.availability : "unavailable",
+    repoRootPath: typeof snapshot.repoRootPath === "string" ? snapshot.repoRootPath : undefined,
+    repoLabel: typeof snapshot.repoLabel === "string" ? snapshot.repoLabel : undefined,
+    checkpoints: Array.isArray(snapshot.checkpoints) ? snapshot.checkpoints as CodeCheckpointSummary[] : [],
+    currentCheckpointPosition: typeof snapshot.currentCheckpointPosition === "number" && Number.isFinite(snapshot.currentCheckpointPosition)
+      ? Number(snapshot.currentCheckpointPosition)
+      : -1,
+    errorMessage: typeof snapshot.errorMessage === "string" ? snapshot.errorMessage : undefined
+  };
+}
+
+function writeCodeTrackingState(state: CodeTrackingState) {
+  writeJSON(codeTrackingStatePath(state.sessionID), {
+    version: 1,
+    ...state
+  });
+}
+
 function readConversationSnapshot(threadID: string) {
   return readJSON<{
     version?: number;
@@ -3996,6 +4749,328 @@ function writeConversationSnapshot(threadID: string, snapshot: JsonObject) {
     ...snapshot,
     updatedAt: currentSwiftDate()
   });
+}
+
+function clampCodeTrackingState(state: CodeTrackingState): CodeTrackingState {
+  const maxPosition = state.checkpoints.length - 1;
+  const currentCheckpointPosition = state.checkpoints.length
+    ? Math.max(-1, Math.min(state.currentCheckpointPosition, maxPosition))
+    : -1;
+  return {
+    ...state,
+    currentCheckpointPosition
+  };
+}
+
+function saveCodeTrackingState(state: CodeTrackingState) {
+  const normalized = clampCodeTrackingState(state);
+  writeCodeTrackingState(normalized);
+  return normalized;
+}
+
+async function repositoryForTrackedCode(threadID: string, fallbackState?: CodeTrackingState): Promise<GitCheckpointRepositoryContext | null> {
+  const session = findSession(threadID);
+  const cwd = sessionWorkingDirectory(session)?.trim() || fallbackState?.repoRootPath?.trim();
+  if (!cwd) return null;
+  return gitCheckpointService.repositoryContext(cwd);
+}
+
+async function loadCodeTrackingState(threadID: string): Promise<CodeTrackingState> {
+  let state = readCodeTrackingState(threadID);
+  const repository = await repositoryForTrackedCode(threadID, state);
+  if (!repository) {
+    state = saveCodeTrackingState({
+      ...state,
+      availability: "unavailable",
+      repoRootPath: undefined,
+      repoLabel: undefined
+    });
+    return state;
+  }
+
+  state = {
+    ...state,
+    availability: "available",
+    repoRootPath: repository.rootPath,
+    repoLabel: repository.label
+  };
+
+  state = await recoverIncompleteTrackedCodeCheckpoints(threadID, repository, state);
+  return saveCodeTrackingState(state);
+}
+
+async function recoverIncompleteTrackedCodeCheckpoints(
+  threadID: string,
+  repository: GitCheckpointRepositoryContext,
+  state: CodeTrackingState
+): Promise<CodeTrackingState> {
+  const existingIDs = new Set(state.checkpoints.map((checkpoint) => checkpoint.id));
+  const storedRefs = await gitCheckpointService.storedCheckpointRefs(repository, threadID);
+  let nextState = state;
+  for (const refState of storedRefs) {
+    if (existingIDs.has(refState.checkpointID)) continue;
+    if (!refState.hasBeforeWorktreeRef || !refState.hasBeforeIndexRef) continue;
+    try {
+      const beforeSnapshot = await gitCheckpointService.loadSnapshot(repository, threadID, refState.checkpointID, "before");
+      if (!beforeSnapshot) continue;
+      const afterSnapshot = refState.hasAfterWorktreeRef && refState.hasAfterIndexRef
+        ? await gitCheckpointService.loadSnapshot(repository, threadID, refState.checkpointID, "after")
+        : await gitCheckpointService.captureSnapshot(repository, threadID, refState.checkpointID, "after");
+      if (!afterSnapshot) continue;
+      const capture = await gitCheckpointService.buildCaptureResult(repository, beforeSnapshot, afterSnapshot);
+      if (!capture.changedFiles.length) {
+        await gitCheckpointService.deleteRefs(repository.rootPath, [
+          beforeSnapshot.worktreeRef,
+          beforeSnapshot.indexRef,
+          afterSnapshot.worktreeRef,
+          afterSnapshot.indexRef
+        ]);
+        continue;
+      }
+      const checkpoint: CodeCheckpointSummary = {
+        id: refState.checkpointID,
+        checkpointNumber: nextState.checkpoints.length + 1,
+        createdAt: currentSwiftDate(),
+        turnStatus: "completed",
+        summary: capture.summary,
+        patch: capture.patch,
+        changedFiles: capture.changedFiles,
+        ignoredTouchedPaths: capture.ignoredTouchedPaths,
+        beforeSnapshot,
+        afterSnapshot
+      };
+      nextState = {
+        ...nextState,
+        checkpoints: [...nextState.checkpoints, checkpoint],
+        currentCheckpointPosition: nextState.checkpoints.length
+      };
+      existingIDs.add(refState.checkpointID);
+      bridgeDebugLog(`recovered Electron code checkpoint threadID=${threadID} checkpointID=${refState.checkpointID}`);
+    } catch (error) {
+      bridgeDebugLog(`failed to recover Electron code checkpoint threadID=${threadID} checkpointID=${refState.checkpointID} error=${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  return nextState;
+}
+
+async function beginTrackedCodeCheckpointIfNeeded(
+  threadID: string,
+  interactionMode: string | undefined,
+  settings: SettingsSnapshot
+) {
+  if (!settings.assistantTrackCodeChangesInGitRepos) return;
+  if (normalizeCodexInteractionMode(interactionMode) !== "agentic") return;
+  if (pendingCodeCheckpointBaselinesBySessionID.has(threadID)) return;
+  const repository = await repositoryForTrackedCode(threadID);
+  if (!repository) {
+    saveCodeTrackingState({
+      ...readCodeTrackingState(threadID),
+      sessionID: threadID,
+      availability: "unavailable",
+      repoRootPath: undefined,
+      repoLabel: undefined
+    });
+    return;
+  }
+  const checkpointID = randomUUID().toLowerCase();
+  try {
+    const beforeSnapshot = await gitCheckpointService.captureSnapshot(repository, threadID, checkpointID, "before");
+    pendingCodeCheckpointBaselinesBySessionID.set(threadID, {
+      sessionID: threadID,
+      checkpointID,
+      repository,
+      beforeSnapshot,
+      startedAt: currentSwiftDate()
+    });
+    saveCodeTrackingState({
+      ...readCodeTrackingState(threadID),
+      sessionID: threadID,
+      availability: "available",
+      repoRootPath: repository.rootPath,
+      repoLabel: repository.label
+    });
+    bridgeDebugLog(`started Electron code checkpoint threadID=${threadID} checkpointID=${checkpointID}`);
+  } catch (error) {
+    saveCodeTrackingState({
+      ...readCodeTrackingState(threadID),
+      sessionID: threadID,
+      availability: "error",
+      repoRootPath: repository.rootPath,
+      repoLabel: repository.label,
+      errorMessage: error instanceof Error ? error.message : String(error)
+    });
+    bridgeDebugLog(`failed to start Electron code checkpoint threadID=${threadID} error=${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+async function finalizeTrackedCodeCheckpointIfNeeded(options: {
+  threadID: string;
+  turnID?: string;
+  assistantMessageID?: string;
+  userMessageID?: string;
+  turnStatus: CodeCheckpointTurnStatus;
+}) {
+  const baseline = pendingCodeCheckpointBaselinesBySessionID.get(options.threadID);
+  if (!baseline) return undefined;
+  pendingCodeCheckpointBaselinesBySessionID.delete(options.threadID);
+  try {
+    const afterSnapshot = await gitCheckpointService.captureSnapshot(
+      baseline.repository,
+      options.threadID,
+      baseline.checkpointID,
+      "after"
+    );
+    const capture = await gitCheckpointService.buildCaptureResult(
+      baseline.repository,
+      baseline.beforeSnapshot,
+      afterSnapshot
+    );
+    if (!capture.changedFiles.length) {
+      await gitCheckpointService.deleteRefs(baseline.repository.rootPath, [
+        baseline.beforeSnapshot.worktreeRef,
+        baseline.beforeSnapshot.indexRef,
+        afterSnapshot.worktreeRef,
+        afterSnapshot.indexRef
+      ]);
+      await loadCodeTrackingState(options.threadID);
+      return undefined;
+    }
+    const state = await loadCodeTrackingState(options.threadID);
+    const retainedCheckpoints = state.checkpoints.slice(0, Math.max(0, state.currentCheckpointPosition + 1));
+    const checkpoint: CodeCheckpointSummary = {
+      id: baseline.checkpointID,
+      checkpointNumber: retainedCheckpoints.length + 1,
+      createdAt: currentSwiftDate(),
+      turnStatus: options.turnStatus,
+      summary: capture.summary,
+      patch: capture.patch,
+      changedFiles: capture.changedFiles,
+      ignoredTouchedPaths: capture.ignoredTouchedPaths,
+      beforeSnapshot: baseline.beforeSnapshot,
+      afterSnapshot,
+      associatedMessageID: options.assistantMessageID,
+      associatedTurnID: options.turnID,
+      associatedUserMessageID: options.userMessageID
+    };
+    const nextState = saveCodeTrackingState({
+      ...state,
+      availability: "available",
+      repoRootPath: baseline.repository.rootPath,
+      repoLabel: baseline.repository.label,
+      checkpoints: [...retainedCheckpoints, checkpoint],
+      currentCheckpointPosition: retainedCheckpoints.length
+    });
+    bridgeDebugLog(`finalized Electron code checkpoint threadID=${options.threadID} checkpointID=${checkpoint.id} files=${checkpoint.changedFiles.length}`);
+    return { checkpoint, state: nextState };
+  } catch (error) {
+    saveCodeTrackingState({
+      ...readCodeTrackingState(options.threadID),
+      sessionID: options.threadID,
+      availability: "error",
+      repoRootPath: baseline.repository.rootPath,
+      repoLabel: baseline.repository.label,
+      errorMessage: error instanceof Error ? error.message : String(error)
+    });
+    bridgeDebugLog(`failed to finalize Electron code checkpoint threadID=${options.threadID} checkpointID=${baseline.checkpointID} error=${error instanceof Error ? error.message : String(error)}`);
+    return undefined;
+  }
+}
+
+function checkpointInfoFor(checkpoint: CodeCheckpointSummary, state: CodeTrackingState): MessageCheckpointInfo {
+  const checkpointIndex = Math.max(0, state.checkpoints.findIndex((item) => item.id === checkpoint.id));
+  return {
+    checkpoint,
+    checkpointIndex,
+    currentCheckpointPosition: state.currentCheckpointPosition,
+    totalCheckpointCount: state.checkpoints.length,
+    hasActiveTurn: false,
+    actionsLocked: false,
+    futureTurnsHidden: checkpointIndex > state.currentCheckpointPosition
+  };
+}
+
+function attachCodeCheckpointInfo(messages: ChatMessage[], state: CodeTrackingState) {
+  if (state.availability !== "available" || !state.checkpoints.length) return messages;
+  const byID = new Map(messages.map((message) => [message.id, message]));
+  for (let index = 0; index < state.checkpoints.length; index += 1) {
+    const checkpoint = state.checkpoints[index];
+    if (!checkpoint) continue;
+    let target = checkpoint.associatedMessageID ? byID.get(checkpoint.associatedMessageID) : undefined;
+    if (!target && checkpoint.associatedTurnID) {
+      target = messages.find((message) =>
+        message.role === "assistant" && message.turnID === checkpoint.associatedTurnID
+      );
+    }
+    if (!target) {
+      const checkpointCreatedAtMs = swiftDateToMs(checkpoint.createdAt) ?? Date.now();
+      target = [...messages]
+        .reverse()
+        .find((message) => message.role === "assistant" && (message.createdAt ?? 0) <= checkpointCreatedAtMs);
+    }
+    if (!target || target.role !== "assistant") continue;
+    target.checkpointInfo = {
+      checkpoint,
+      checkpointIndex: index,
+      currentCheckpointPosition: state.currentCheckpointPosition,
+      totalCheckpointCount: state.checkpoints.length,
+      hasActiveTurn: false,
+      actionsLocked: false,
+      futureTurnsHidden: index > state.currentCheckpointPosition
+    };
+  }
+  return messages;
+}
+
+async function openCodeReview(threadID: string, checkpointID?: string): Promise<CodeReviewPanelState | null> {
+  const state = await loadCodeTrackingState(threadID);
+  if (state.availability !== "available" || !state.repoRootPath || !state.repoLabel || !state.checkpoints.length) {
+    return null;
+  }
+  const selectedCheckpointID = checkpointID && state.checkpoints.some((checkpoint) => checkpoint.id === checkpointID)
+    ? checkpointID
+    : state.checkpoints[Math.max(0, state.currentCheckpointPosition)]?.id ?? state.checkpoints.at(-1)?.id ?? "";
+  if (!selectedCheckpointID) return null;
+  return {
+    sessionID: threadID,
+    repoRootPath: state.repoRootPath,
+    repoLabel: state.repoLabel,
+    checkpoints: state.checkpoints,
+    currentCheckpointPosition: state.currentCheckpointPosition,
+    selectedCheckpointID,
+    hasActiveTurn: pendingCodeCheckpointBaselinesBySessionID.has(threadID),
+    actionsLocked: false
+  };
+}
+
+async function restoreCodeCheckpoint(threadID: string, checkpointID: string) {
+  const state = await loadCodeTrackingState(threadID);
+  const repository = await repositoryForTrackedCode(threadID, state);
+  if (!repository) throw new Error("Open Assist could not find a Git repository for this chat.");
+  const checkpointIndex = state.checkpoints.findIndex((checkpoint) => checkpoint.id === checkpointID);
+  if (checkpointIndex < 0) throw new Error("Open Assist could not find that saved checkpoint.");
+  const checkpoint = state.checkpoints[checkpointIndex];
+  const isUndo = checkpointIndex === state.currentCheckpointPosition;
+  const isRedo = checkpointIndex === state.currentCheckpointPosition + 1;
+  if (!isUndo && !isRedo) {
+    throw new Error("Open Assist can only restore the current checkpoint or the next hidden checkpoint.");
+  }
+  const expectedSnapshot = isUndo ? checkpoint.afterSnapshot : checkpoint.beforeSnapshot;
+  const guard = await gitCheckpointService.restoreGuard(
+    repository,
+    expectedSnapshot.worktreeTree,
+    expectedSnapshot.indexTree
+  );
+  if (!guard.isAllowed) throw new Error(guard.message ?? "Open Assist can’t restore this checkpoint right now.");
+  await gitCheckpointService.restore(repository, checkpoint.changedFiles, isUndo ? "before" : "after");
+  const nextState = saveCodeTrackingState({
+    ...state,
+    currentCheckpointPosition: isUndo ? checkpointIndex - 1 : checkpointIndex
+  });
+  return {
+    ok: true,
+    state: nextState,
+    panel: await openCodeReview(threadID, checkpointID)
+  };
 }
 
 function loadSessionRegistry() {
@@ -4450,6 +5525,10 @@ function normalizedModelForBackend(backend: AssistantBackend, rawModelID?: unkno
   const requested = pluginString(rawModelID)?.trim() ?? "";
   const lowered = requested.toLowerCase();
   if (backend === "ollamaLocal") return requested || "gemma4:e2b";
+  if (backend === "antigravityCLI") {
+    if (!requested || lowered === "antigravity-default") return "gemini-3.5-flash-high";
+    return requested;
+  }
   if (backend === "claudeCode") {
     if (lowered.includes("opus")) return "opus";
     if (lowered.includes("haiku")) return "haiku";
@@ -4465,7 +5544,7 @@ function normalizedModelForBackend(backend: AssistantBackend, rawModelID?: unkno
 export async function setThreadProvider(threadID: string, rawBackend: string, rawModelID?: string) {
   const backend = normalizeBackend(rawBackend);
   if (!isRuntimeBackend(backend)) {
-    throw new Error("Main chat runtime must be Codex, Claude, Copilot, or Ollama.");
+    throw new Error("Main chat runtime must be Codex, Claude, Copilot, Antigravity, or Ollama.");
   }
   const session = ensureOpenAssistSessionRecord(threadID, backend);
   const existing = session.providerBindingsByBackend ?? [];
@@ -4568,6 +5647,7 @@ function deleteSessionPermanently(threadID: string) {
 
 function providerLabel(raw: string) {
   if (raw === "claudeCode") return "Claude";
+  if (raw === "antigravityCLI") return "Antigravity";
   if (raw === "copilot") return "Copilot";
   if (raw === "ollamaLocal") return "Ollama";
   if (raw === "githubCopilot") return "Copilot";
@@ -5353,32 +6433,390 @@ async function pluginPromptItems(pluginIDs: string[], prompt: string) {
     name: pluginMentionName(pluginID, pluginByID.get(pluginID.toLowerCase())),
     path: `plugin://${pluginID}`
   }));
-  if (shouldPreferCodexComputerUsePlugin(canonicalIDs)) {
-    inputItems.push({
-      type: "text",
-      text: [
-        "OpenAssist Computer Use note: Computer Use app-state calls can time out from this app.",
-        "For a Notes read/search request, use read-only osascript first instead of waiting on get_app_state/list_apps.",
-        "If a Computer Use call fails once, do not retry it in this turn."
-      ].join(" ")
-    });
-  }
+  const appStatuses = await listPluginAppStatuses().catch((error) => {
+    bridgeDebugLog(`Codex app/list failed while building plugin prompt items: ${error instanceof Error ? error.message : String(error)}`);
+    return [] as PluginAppStatus[];
+  });
+  const seenAppMentionPaths = new Set<string>();
   for (const plugin of plugins) {
     const detail = await readPluginDetail(plugin).catch(() => null);
     if (!detail) continue;
     for (const skill of detail.skills) {
       if (skill.path) {
-        inputItems.push({ type: "skill", name: skill.displayName || skill.name || plugin.title, path: skill.path });
+        inputItems.push({ type: "skill", name: pluginSkillInputName(plugin, skill), path: skill.path });
       }
     }
-    for (const app of detail.apps) {
-      const appName = String(app.name ?? "").trim();
-      if (app.id && appName && prompt.toLowerCase().includes(appName.toLowerCase())) {
-        inputItems.push({ type: "mention", name: appName || plugin.title, path: `app://${app.id}` });
-      }
+    for (const app of matchingPluginAppStatuses(plugin, prompt, detail.apps, appStatuses)) {
+      const appName = app.name.trim();
+      const mentionPath = `app://${app.id}`;
+      const key = mentionPath.toLowerCase();
+      if (!app.id || !appName || seenAppMentionPaths.has(key)) continue;
+      seenAppMentionPaths.add(key);
+      inputItems.push({ type: "mention", name: appName, path: mentionPath });
     }
   }
+  const selectionContext = codexPluginSelectionContextText(plugins);
+  if (selectionContext) {
+    inputItems.push({ type: "text", text: selectionContext });
+  }
+  const computerUseGuidance = computerUsePluginTurnGuidance(canonicalIDs);
+  if (computerUseGuidance) {
+    inputItems.push({ type: "text", text: computerUseGuidance });
+  }
   return inputItems;
+}
+
+function codexPluginSelectionContextText(plugins: PluginItem[]) {
+  const installed = plugins.filter((plugin) => plugin.status === "Installed");
+  if (!installed.length) return "";
+  const lines = installed.map((plugin) => `- ${plugin.title}`);
+  return [
+    "Selected installed plugins for this turn:",
+    lines.join("\n"),
+    "",
+    "Treat these plugins as the required path for this request.",
+    "Use them first and do not switch to unrelated tools or a generic fallback just because it seems easier.",
+    "If the selected plugins cannot handle the request, say that clearly instead of silently doing the task another way."
+  ].join("\n");
+}
+
+function computerUsePluginTurnGuidance(pluginIDs: string[]) {
+  if (!shouldPreferCodexComputerUsePlugin(pluginIDs)) return "";
+  return [
+    "Computer Use is selected for this turn.",
+    "If app metadata or an app mention is present in this turn, use that selected app with Computer Use instead of guessing another app.",
+    "Call Computer Use directly for the named visible Mac app when the target is clear.",
+    "If direct app access fails with an \"Invalid app\" error, retry once with the nearest app display name from app metadata. If it still fails, report the failed app name and ask the user to bring the app forward."
+  ].join("\n");
+}
+
+function pluginSkillInputName(
+  plugin: PluginItem,
+  skill: { name?: string; displayName?: string }
+) {
+  const rawName = pluginString(skill.displayName, skill.name);
+  if (!rawName) return plugin.title;
+  const normalizedName = rawName.trim().toLowerCase();
+  const normalizedPluginName = plugin.pluginName?.trim().toLowerCase();
+  if (
+    normalizedName.includes(":")
+    || normalizedName === normalizedPluginName
+    || (normalizedPluginName && normalizedName === `${normalizedPluginName}:${normalizedPluginName}`)
+  ) {
+    return plugin.title;
+  }
+  return rawName;
+}
+
+async function pluginSelectionGuidanceText(pluginIDs: string[]) {
+  const canonicalIDs = canonicalizeCodexPluginIDs(pluginIDs);
+  if (!canonicalIDs.length) return "";
+  const normalizedIDs = new Set(canonicalIDs.map(normalizedCodexPluginID).filter((id): id is string => Boolean(id)));
+  const installedPlugins = (await loadPlugins()).filter((plugin) => plugin.status === "Installed");
+  const pluginByID = new Map<string, PluginItem>();
+  for (const plugin of installedPlugins) {
+    for (const candidate of pluginIDCandidates(plugin)) {
+      if (normalizedIDs.has(candidate)) pluginByID.set(candidate, plugin);
+    }
+  }
+  const plugins = canonicalIDs
+    .map((pluginID) => pluginByID.get(pluginID.toLowerCase()))
+    .filter((plugin): plugin is PluginItem => Boolean(plugin));
+  return [
+    codexPluginSelectionContextText(plugins),
+    computerUsePluginTurnGuidance(canonicalIDs)
+  ].filter(Boolean).join("\n\n");
+}
+
+type PluginAppStatus = {
+  id: string;
+  name: string;
+  isAccessible: boolean;
+  isEnabled: boolean;
+  pluginDisplayNames: string[];
+};
+
+let pluginAppStatusCache: { expiresAt: number; value: PluginAppStatus[] } | null = null;
+let localMacApplicationNameCache: { expiresAt: number; value: string[] } | null = null;
+
+type ComputerUseAppTarget = {
+  name: string;
+  appID?: string;
+  aliases: string[];
+  source: "codex-app-list" | "mac-applications";
+};
+
+function pluginBool(value: unknown, fallback: boolean) {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return value !== 0;
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (["true", "yes", "1", "enabled"].includes(normalized)) return true;
+    if (["false", "no", "0", "disabled"].includes(normalized)) return false;
+  }
+  return fallback;
+}
+
+function parsePluginAppStatuses(raw: unknown) {
+  const payload = asObject(raw);
+  const rawItems = Array.isArray(payload?.data)
+    ? payload?.data
+    : Array.isArray(payload?.apps)
+      ? payload?.apps
+      : Array.isArray(raw)
+        ? raw
+        : [];
+  const items = rawItems
+    .map(asObject)
+    .filter(Boolean)
+    .map((item) => {
+      const id = pluginString(item?.id, item?.connectorId, item?.name) ?? "";
+      const name = pluginString(item?.name, item?.displayName, item?.id) ?? id;
+      const pluginDisplayNames = Array.isArray(item?.pluginDisplayNames)
+        ? item.pluginDisplayNames.map(String).map((value) => value.trim()).filter(Boolean)
+        : [];
+      return {
+        id,
+        name: titleFromSkill(name),
+        isAccessible: pluginBool(item?.isAccessible, false),
+        isEnabled: pluginBool(item?.isEnabled, true),
+        pluginDisplayNames
+      } satisfies PluginAppStatus;
+    })
+    .filter((item) => item.id && item.name);
+  return {
+    items,
+    nextCursor: pluginString(payload?.nextCursor)
+  };
+}
+
+async function listPluginAppStatuses() {
+  const now = Date.now();
+  if (pluginAppStatusCache && pluginAppStatusCache.expiresAt > now) {
+    return pluginAppStatusCache.value;
+  }
+  const apps: PluginAppStatus[] = [];
+  const seen = new Set<string>();
+  let cursor: string | undefined;
+  for (let page = 0; page < 8; page += 1) {
+    const response = await withTimeout(
+      codexTransport.request("app/list", cursor ? { cursor } : {}),
+      8_000
+    );
+    const parsed = parsePluginAppStatuses(response);
+    for (const app of parsed.items) {
+      const key = app.id.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      apps.push(app);
+    }
+    if (!parsed.nextCursor) break;
+    cursor = parsed.nextCursor;
+  }
+  pluginAppStatusCache = {
+    expiresAt: Date.now() + 30_000,
+    value: apps
+  };
+  bridgeDebugLog(`Codex app/list returned ${apps.length} app status item(s).`);
+  return apps;
+}
+
+function promptContainsStandalonePhrase(phrase: string, prompt: string) {
+  const trimmed = phrase.trim();
+  if (!trimmed) return false;
+  const escaped = trimmed.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(^|[^A-Za-z0-9])${escaped}([^A-Za-z0-9]|$)`, "i").test(prompt);
+}
+
+function appMatchedAliases(app: Pick<PluginAppStatus, "id" | "name">, prompt: string) {
+  const appName = app.name.trim().toLowerCase();
+  return appMatchCandidates(app)
+    .filter((candidate) => promptContainsStandalonePhrase(candidate, prompt))
+    .filter((candidate) => candidate.trim().toLowerCase() !== appName);
+}
+
+function appMatchCandidates(app: Pick<PluginAppStatus, "id" | "name">) {
+  const rawCandidates = [
+    app.name,
+    app.id,
+    app.id.replace(/[._-]+/g, " ")
+  ];
+  const loweredName = app.name.toLowerCase();
+  for (const prefix of ["microsoft ", "google ", "apple "]) {
+    if (loweredName.startsWith(prefix)) rawCandidates.push(app.name.slice(prefix.length));
+  }
+  for (const suffix of [" browser", " app", " application"]) {
+    if (loweredName.endsWith(suffix) && app.name.length > suffix.length) {
+      rawCandidates.push(app.name.slice(0, -suffix.length));
+    }
+  }
+  const idTokens = app.id
+    .split(/[._\-\s]+/g)
+    .map((token) => token.trim())
+    .filter(Boolean);
+  const genericIDTokens = new Set(["app", "application", "browser", "com", "helper", "mac", "macos", "osx"]);
+  for (const token of idTokens) {
+    const key = token.toLowerCase();
+    if (key.length >= 3 && !genericIDTokens.has(key)) {
+      rawCandidates.push(token);
+    }
+  }
+  const seen = new Set<string>();
+  return rawCandidates
+    .map((value) => value.trim())
+    .filter(Boolean)
+    .filter((value) => {
+      const key = value.toLowerCase();
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .sort((a, b) => b.length - a.length || a.localeCompare(b));
+}
+
+function collectLocalAppBundleNames(root: string, depth = 0): string[] {
+  if (depth > 3 || !fs.existsSync(root)) return [];
+  const names: string[] = [];
+  let entries: fs.Dirent[] = [];
+  try {
+    entries = fs.readdirSync(root, { withFileTypes: true });
+  } catch {
+    return names;
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const fullPath = path.join(root, entry.name);
+    if (entry.name.endsWith(".app")) {
+      names.push(entry.name.replace(/\.app$/i, ""));
+      continue;
+    }
+    names.push(...collectLocalAppBundleNames(fullPath, depth + 1));
+  }
+  return names;
+}
+
+function localMacApplicationNames() {
+  const now = Date.now();
+  if (localMacApplicationNameCache && localMacApplicationNameCache.expiresAt > now) {
+    return localMacApplicationNameCache.value;
+  }
+  const roots = [
+    "/Applications",
+    "/System/Applications",
+    path.join(os.homedir(), "Applications")
+  ];
+  const seen = new Set<string>();
+  const value = roots
+    .flatMap((root) => collectLocalAppBundleNames(root))
+    .map((name) => name.trim())
+    .filter(Boolean)
+    .filter((name) => {
+      const key = name.toLowerCase();
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  localMacApplicationNameCache = { expiresAt: now + 120_000, value };
+  return value;
+}
+
+function localComputerUseAppTargets(prompt: string): ComputerUseAppTarget[] {
+  const promptText = prompt.trim();
+  if (!promptText) return [];
+  return localMacApplicationNames()
+    .map((name) => {
+      const aliases = appMatchedAliases({ id: name, name }, promptText);
+      return { name, aliases };
+    })
+    .filter((target) => promptContainsStandalonePhrase(target.name, promptText) || target.aliases.length > 0)
+    .map((target) => ({
+      name: target.name,
+      aliases: target.aliases,
+      source: "mac-applications" as const
+    }))
+    .sort((a, b) => b.name.length - a.name.length || a.name.localeCompare(b.name))
+    .slice(0, 3);
+}
+
+function mergeComputerUseAppTargets(targets: ComputerUseAppTarget[]) {
+  const merged = new Map<string, ComputerUseAppTarget>();
+  for (const target of targets) {
+    const name = target.name.trim();
+    if (!name) continue;
+    const key = name.toLowerCase();
+    const existing = merged.get(key);
+    if (!existing) {
+      merged.set(key, {
+        ...target,
+        name,
+        aliases: Array.from(new Set(target.aliases.map((alias) => alias.trim()).filter(Boolean)))
+      });
+      continue;
+    }
+    existing.appID ||= target.appID;
+    existing.aliases = Array.from(new Set([...existing.aliases, ...target.aliases].map((alias) => alias.trim()).filter(Boolean)));
+    if (existing.source !== "codex-app-list" && target.source === "codex-app-list") {
+      existing.source = target.source;
+    }
+  }
+  return Array.from(merged.values());
+}
+
+function computerUseTargetAppGuidance(pluginIDs: string[], targets: ComputerUseAppTarget[]) {
+  if (!shouldPreferCodexComputerUsePlugin(pluginIDs) || !targets.length) return "";
+  const lines = targets.slice(0, 3).map((target) => {
+    const aliases = target.aliases.length
+      ? ` Matched user wording: ${target.aliases.map((alias) => `"${alias}"`).join(", ")}.`
+      : "";
+    const id = target.appID ? ` App mention path: app://${target.appID}.` : "";
+    return `- Use app: "${target.name}".${aliases}${id}`;
+  });
+  return [
+    "Resolved Computer Use target app from installed app metadata:",
+    lines.join("\n"),
+    "Use the exact app display name above in Computer Use tool arguments.",
+    "Do not pass the shorter wording from the user prompt when an exact app display name is listed.",
+    "Do not call list_apps only to resolve an app target already listed here."
+  ].join("\n");
+}
+
+function appStatusBelongsToPlugin(
+  status: PluginAppStatus,
+  plugin: PluginItem,
+  detailApps: Array<{ id: string; name: string }>
+) {
+  if (shouldPreferCodexComputerUsePlugin([plugin.id])) {
+    return true;
+  }
+  if (detailApps.some((app) =>
+    app.id.localeCompare(status.id, undefined, { sensitivity: "accent" }) === 0
+    || app.name.localeCompare(status.name, undefined, { sensitivity: "accent" }) === 0
+  )) {
+    return true;
+  }
+  return status.pluginDisplayNames.some((name) =>
+    name.localeCompare(plugin.title, undefined, { sensitivity: "accent" }) === 0
+    || (plugin.pluginName ? name.localeCompare(plugin.pluginName, undefined, { sensitivity: "accent" }) === 0 : false)
+  );
+}
+
+function matchingPluginAppStatuses(
+  plugin: PluginItem,
+  prompt: string,
+  detailApps: Array<{ id: string; name: string }>,
+  appStatuses: PluginAppStatus[]
+) {
+  const promptText = prompt.trim();
+  if (!promptText) return [];
+  const accessible = appStatuses.filter((status) =>
+    status.isAccessible
+    && status.isEnabled
+    && appStatusBelongsToPlugin(status, plugin, detailApps)
+  );
+  return accessible
+    .filter((status) => appMatchCandidates(status).some((candidate) => promptContainsStandalonePhrase(candidate, promptText)))
+    .sort((a, b) => b.name.length - a.name.length || a.name.localeCompare(b.name))
+    .slice(0, 3);
 }
 
 async function readPluginDetail(plugin: PluginItem) {
@@ -5891,7 +7329,7 @@ async function updateSetting(key: SettingsUpdateKey, value: boolean | string | n
       if (!isCloudTranscriptionProvider(nextProvider)) {
         throw new Error("Cloud transcription provider must match a native OpenAssist provider.");
       }
-      await writeStringDefault(setting.defaultsKey, nextProvider);
+      await writeCloudTranscriptionProviderSelection(nextProvider, true);
     } else if (key === "transcriptionEngine") {
       const validEngines = new Set(["Apple Speech", "whisper.cpp", "Cloud Providers"]);
       const nextEngine = String(value);
@@ -6014,7 +7452,8 @@ async function saveCloudTranscriptionAPIKey(provider: string, rawValue: string) 
   if (!isCloudTranscriptionProvider(provider)) {
     throw new Error("Cloud transcription provider must match a native OpenAssist provider.");
   }
-  await writeStringDefault("OpenAssist.cloudTranscriptionProvider", provider);
+  const currentProvider = await readDefault("OpenAssist.cloudTranscriptionProvider", "OpenAI");
+  await writeCloudTranscriptionProviderSelection(provider, currentProvider !== provider);
   if (!cloudTranscriptionProviderRequiresKey(provider)) {
     await deleteKeychainPassword(cloudTranscriptionKeychainAccount(provider));
     const settings = await loadSettings();
@@ -6037,7 +7476,8 @@ async function clearCloudTranscriptionAPIKey(provider: string) {
   if (!isCloudTranscriptionProvider(provider)) {
     throw new Error("Cloud transcription provider must match a native OpenAssist provider.");
   }
-  await writeStringDefault("OpenAssist.cloudTranscriptionProvider", provider);
+  const currentProvider = await readDefault("OpenAssist.cloudTranscriptionProvider", "OpenAI");
+  await writeCloudTranscriptionProviderSelection(provider, currentProvider !== provider);
   await deleteKeychainPassword(cloudTranscriptionKeychainAccount(provider));
   const settings = await loadSettings();
   return {
@@ -6331,6 +7771,9 @@ class CodexAppServerTransport extends EventEmitter {
 
   private async startProcess() {
     if (this.process) return;
+    await cleanupOpenAssistOwnedCodexAppServers(undefined, "Clean stale OpenAssist Codex app-servers before Codex start").catch((error) => {
+      bridgeDebugLog(`OpenAssist Codex app-server pre-start cleanup failed: ${error instanceof Error ? error.stack ?? error.message : String(error)}`);
+    });
     const codexExecutable = resolveCodexExecutable();
     const realtimeProxyBaseURL = await configureCodexRealtimeProxy();
     const appServerArgs = [
@@ -6347,7 +7790,11 @@ class CodexAppServerTransport extends EventEmitter {
       "-c",
       "realtime.version=\"v2\"",
       "-c",
-      "realtime.type=\"conversational\""
+      "realtime.type=\"conversational\"",
+      // OpenAssist owns the turn lifecycle; do not inherit user-level Codex
+      // notify hooks that can launch stale Computer Use helpers after a turn.
+      "-c",
+      "notify=[]"
     ];
     const appServerEnv = {
       ...process.env,
@@ -6358,7 +7805,16 @@ class CodexAppServerTransport extends EventEmitter {
       // accepts the request but never responds to tool calls like list_apps.
       CODEX_INTERNAL_ORIGINATOR_OVERRIDE: process.env.CODEX_INTERNAL_ORIGINATOR_OVERRIDE ?? "Codex",
       LOG_FORMAT: process.env.LOG_FORMAT ?? "json",
-      RUST_LOG: process.env.RUST_LOG ?? "warn"
+      RUST_LOG: process.env.RUST_LOG ?? "warn",
+      // When Codex (and the SkyComputerUseClient MCP helper it spawns) runs
+      // with stdout piped to us instead of a TTY, libc switches to fully
+      // buffered mode. Small JSON-RPC replies (e.g. get_app_state) sit in
+      // the child's stdout buffer until it fills, and the parent's read
+      // hangs forever. See openai/codex#23840. These env vars ask the
+      // Foundation/Python/coreutils stacks to keep line buffering.
+      NSUnbufferedIO: process.env.NSUnbufferedIO ?? "YES",
+      PYTHONUNBUFFERED: process.env.PYTHONUNBUFFERED ?? "1",
+      STDBUF: process.env.STDBUF ?? "L"
     };
     bridgeDebugLog(`starting Codex app-server executable=${codexExecutable} realtimeProxy=${realtimeProxyBaseURL}`);
     this.emit("status", `Starting Codex App Server: ${codexExecutable}`);
@@ -6388,6 +7844,7 @@ class CodexAppServerTransport extends EventEmitter {
       bridgeDebugLog(`Codex app-server exited pid=${child.pid ?? "unknown"} code=${code ?? "null"} signal=${signal ?? "null"}`);
       this.process = undefined;
       this.rejectPending(new Error("Codex App Server exited."));
+      clearActiveComputerUseToolCalls("Codex App Server exited");
       clearProviderBindingsForBackend("codex");
       bridgeDebugLog(`Codex provider bindings cleared after unexpected exit pid=${child.pid ?? "unknown"}`);
     });
@@ -6405,6 +7862,11 @@ class CodexAppServerTransport extends EventEmitter {
       this.restartPromise = undefined;
     });
     return this.restartPromise;
+  }
+
+  currentPID() {
+    const pid = this.process?.pid;
+    return typeof pid === "number" && Number.isFinite(pid) ? pid : undefined;
   }
 
   async request(method: string, params: JsonObject = {}, forcedID?: number, timeoutMs = 120_000) {
@@ -6469,6 +7931,7 @@ class CodexAppServerTransport extends EventEmitter {
     this.process = undefined;
     this.buffer = "";
     this.rejectPending(new Error(`Codex App Server restarted: ${reason}`));
+    clearActiveComputerUseToolCalls(reason);
     clearProviderBindingsForBackend("codex");
     bridgeDebugLog(`Codex provider bindings cleared on restart reason="${reason}"`);
     if (!child) {
@@ -6535,9 +7998,12 @@ type ActiveProviderRun = {
   openAssistThreadID: string;
   pluginIDs?: string[];
   providerThreadID?: string;
+  processPID?: number;
+  terminateProcess?: (reason: string) => Promise<void>;
   turnID?: string;
   stopped?: boolean;
   rejectStop?: (error: Error) => void;
+  emitStatus?: (text: string) => void;
 };
 
 const activeProviderRuns = new Map<string, ActiveProviderRun>();
@@ -6596,10 +8062,14 @@ export async function stopProviderRun(clientRunID?: string) {
 
   run.stopped = true;
   let interruptError: string | undefined;
-  try {
-    await interruptCodexRun(run, 5_000);
-  } catch (error) {
-    interruptError = error instanceof Error ? error.message : "Could not interrupt the active turn.";
+  if (run.backend === "codex") {
+    try {
+      await interruptCodexRun(run, 5_000);
+    } catch (error) {
+      interruptError = error instanceof Error ? error.message : "Could not interrupt the active turn.";
+    }
+  } else if (run.terminateProcess) {
+    await run.terminateProcess("user stopped turn");
   }
   run.rejectStop?.(new ProviderRunStoppedError(run.provider));
   const restartResult = await restartCodexAfterStoppedRunIfNeeded(run, interruptError);
@@ -6735,7 +8205,15 @@ async function stopCodexRealtimeDelegation() {
 }
 
 async function startCodexRealtimeVoice(
-  options: { threadID?: string; provider?: string; interactionMode?: string; permissionMode?: string; reasoningEffort?: string } = {},
+  options: {
+    threadID?: string;
+    provider?: string;
+    interactionMode?: string;
+    permissionMode?: string;
+    reasoningEffort?: string;
+    pluginIDs?: string[];
+    skillIDs?: string[];
+  } = {},
   eventSink?: (event: { type: string; payload?: unknown }) => void
 ) {
   const requestedThreadID = options.threadID?.trim() || "new";
@@ -6782,14 +8260,29 @@ async function startCodexRealtimeVoice(
 
   const modelID = modelForBackend("codex", settings, session);
   bridgeDebugLog(`[realtime.voice] ensuring Codex provider session thread=${openAssistThreadID} model=${modelID}`);
+  const normalizedToolSelection = await normalizeCodexToolSelection(options.pluginIDs ?? [], options.skillIDs ?? []);
   const realtimeRuntimeOptions: CodexRuntimeOptions = {
     interactionMode: options.interactionMode ?? session.latestInteractionMode ?? "agentic",
     permissionMode: options.permissionMode ?? session.latestPermissionMode ?? "fullAccess",
-    reasoningEffort: normalizeCodexReasoningEffort(options.reasoningEffort ?? session.latestReasoningEffort)
+    reasoningEffort: normalizeCodexReasoningEffort(options.reasoningEffort ?? session.latestReasoningEffort),
+    pluginIDs: normalizedToolSelection.pluginIDs
   };
   let providerThreadID: string;
   let insertedSystemMessage = false;
   try {
+    if (shouldPreferCodexComputerUsePlugin(realtimeRuntimeOptions.pluginIDs)) {
+      const didResetActiveComputerUse = await resetCodexIfComputerUseAlreadyActive("Reset stale active Computer Use tool before starting Live Voice");
+      if (didResetActiveComputerUse) {
+        bridgeDebugLog("[realtime.voice] reset active Computer Use before realtime start");
+      }
+      const didResetExistingHelper = await resetCodexIfCurrentComputerUseHelperExists("Reset existing Computer Use helper before starting Live Voice");
+      if (didResetExistingHelper) {
+        bridgeDebugLog("[realtime.voice] reset existing Computer Use helper before realtime start");
+      }
+      await cleanupStaleComputerUseHelpers(codexTransport.currentPID()).catch((error) => {
+        bridgeDebugLog(`[realtime.voice] Computer Use stale helper cleanup failed: ${error instanceof Error ? error.message : String(error)}`);
+      });
+    }
     const providerSession = await liveVoiceStartTimeout(ensureCodexProviderSession(openAssistThreadID, modelID, realtimeRuntimeOptions));
     providerThreadID = providerSession.providerSessionID;
     insertedSystemMessage = providerSession.insertedSystemMessage;
@@ -7086,6 +8579,10 @@ async function startCodexRealtimeVoice(
   codexTransport.on("notification", onNotification);
 
   try {
+    const realtimeStartPrompt = [
+      "Start a live voice session for this OpenAssist Codex thread.",
+      await pluginSelectionGuidanceText(realtimeRuntimeOptions.pluginIDs ?? [])
+    ].filter(Boolean).join("\n\n");
     bridgeDebugLog(`[realtime.voice] sending thread/realtime/start providerThread=${providerThreadID}`);
     await liveVoiceStartTimeout(Promise.race([
       codexTransport.request("thread/realtime/start", {
@@ -7093,7 +8590,7 @@ async function startCodexRealtimeVoice(
         outputModality: "audio",
         transport: { type: "websocket" },
         voice: settings.realtimeOpenAIVoice || defaultRealtimeOpenAIVoice,
-        prompt: "Start a live voice session for this OpenAssist Codex thread."
+        prompt: realtimeStartPrompt
       }, undefined, codexRealtimeStartTimeoutMs),
       startFailure
     ]));
@@ -7188,6 +8685,23 @@ codexTransport.on("notification", (method: string, params: JsonObject) => {
 });
 
 const codexToolCallStartTimes = new Map<string, { startMs: number; toolName: string; args: string }>();
+const computerUseToolNames = new Set([
+  "get_app_state",
+  "list_apps",
+  "click",
+  "double_click",
+  "right_click",
+  "type_text",
+  "set_value",
+  "scroll",
+  "press_key"
+]);
+const activeComputerUseToolCalls = new Map<string, {
+  startMs: number;
+  toolName: string;
+  args: string;
+}>();
+const computerUseLongRunningLastLogAt = new Map<string, number>();
 
 function compactArgsForLog(value: unknown): string {
   if (value == null) return "";
@@ -7198,6 +8712,74 @@ function compactArgsForLog(value: unknown): string {
     return String(value);
   }
 }
+
+function isComputerUseRuntimeToolCall(toolName: string, params: JsonObject, item: JsonObject) {
+  const normalizedToolName = toolName.trim().toLowerCase();
+  const serverName = firstRuntimeString(
+    item.server,
+    item.serverName,
+    item.server_name,
+    item.mcpServer,
+    item.mcp_server,
+    params.server,
+    params.serverName,
+    params.server_name
+  ).toLowerCase();
+  return serverName.includes("computer-use") || computerUseToolNames.has(normalizedToolName);
+}
+
+function clearActiveComputerUseToolCalls(reason: string) {
+  if (!activeComputerUseToolCalls.size) return;
+  const details = Array.from(activeComputerUseToolCalls.entries())
+    .map(([callID, call]) => `${callID}:${call.toolName}:${Date.now() - call.startMs}ms`)
+    .join(",");
+  bridgeDebugLog(`clearing active Computer Use tool calls reason="${reason}" details=${details}`);
+  activeComputerUseToolCalls.clear();
+  computerUseLongRunningLastLogAt.clear();
+}
+
+function activeComputerUseToolCallDetails() {
+  const now = Date.now();
+  return Array.from(activeComputerUseToolCalls.entries()).map(([callID, call]) => ({
+    callID,
+    ...call,
+    elapsedMs: now - call.startMs
+  }));
+}
+
+async function resetCodexIfComputerUseAlreadyActive(reason: string) {
+  const activeCalls = activeComputerUseToolCallDetails();
+  if (!activeCalls.length) return false;
+  bridgeDebugLog(`Computer Use active before new turn; restarting Codex reason="${reason}" details=${activeCalls.map((call) => `${call.callID}:${call.toolName}:${call.elapsedMs}ms`).join(",")}`);
+  await codexTransport.restart(reason);
+  clearActiveComputerUseToolCalls(reason);
+  await cleanupStaleComputerUseHelpers(undefined, { allowDuringActiveToolCall: true }).catch((error) => {
+    bridgeDebugLog(`Computer Use cleanup after restart failed: ${error instanceof Error ? error.stack ?? error.message : String(error)}`);
+  });
+  return true;
+}
+
+const COMPUTER_USE_LONG_RUNNING_LOG_MS = (() => {
+  const raw = Number(process.env.OPENASSIST_COMPUTER_USE_LONG_RUNNING_LOG_MS);
+  return Number.isFinite(raw) && raw >= 30_000 ? raw : 120_000;
+})();
+const COMPUTER_USE_LONG_RUNNING_POLL_MS = 15_000;
+const COMPUTER_USE_LONG_RUNNING_REPEAT_MS = 60_000;
+
+const computerUseLongRunningMonitor = setInterval(() => {
+  if (!activeComputerUseToolCalls.size) return;
+  const now = Date.now();
+  for (const call of activeComputerUseToolCallDetails()) {
+    if (call.elapsedMs < COMPUTER_USE_LONG_RUNNING_LOG_MS) continue;
+    const lastLogAt = computerUseLongRunningLastLogAt.get(call.callID) ?? 0;
+    if (now - lastLogAt < COMPUTER_USE_LONG_RUNNING_REPEAT_MS) continue;
+    computerUseLongRunningLastLogAt.set(call.callID, now);
+    bridgeDebugLog(
+      `Computer Use tool call still running; leaving Codex active callID=${call.callID} tool="${call.toolName}" elapsedMs=${call.elapsedMs} args=${call.args}`
+    );
+  }
+}, COMPUTER_USE_LONG_RUNNING_POLL_MS);
+computerUseLongRunningMonitor.unref?.();
 
 function logCodexToolCallActivity(method: string, params: JsonObject) {
   const item = runtimeItemPayload(params);
@@ -7252,6 +8834,7 @@ function logCodexToolCallActivity(method: string, params: JsonObject) {
     params.state,
     item.state
   ).toLowerCase();
+  const computerUseTool = isComputerUseRuntimeToolCall(toolName, params, item);
   const isStart = isStartMethod
     || (looksLikeToolCall && !tracked && (status === "running" || status === "in_progress" || status === "pending" || status === ""));
   const isEnd = isEndMethod
@@ -7264,6 +8847,10 @@ function logCodexToolCallActivity(method: string, params: JsonObject) {
   if (isStart && !codexToolCallStartTimes.has(callID)) {
     codexToolCallStartTimes.set(callID, { startMs: Date.now(), toolName, args: argsCompact });
     bridgeDebugLog(`codex tool call start tool="${toolName}" callID=${callID} method=${method} type=${itemType} args=${argsCompact}`);
+    if (computerUseTool) {
+      activeComputerUseToolCalls.set(callID, { startMs: Date.now(), toolName, args: argsCompact });
+      bridgeDebugLog(`Computer Use tool call active callID=${callID} tool="${toolName}" args=${argsCompact}`);
+    }
     return;
   }
   if (isEnd) {
@@ -7273,9 +8860,17 @@ function logCodexToolCallActivity(method: string, params: JsonObject) {
       const resolvedStatus = status || (lowerMethod.endsWith("/failed") ? "failed" : "completed");
       bridgeDebugLog(`codex tool call end tool="${start.toolName}" callID=${callID} status=${resolvedStatus} elapsedMs=${elapsedMs}`);
       codexToolCallStartTimes.delete(callID);
+      if (activeComputerUseToolCalls.delete(callID)) {
+        computerUseLongRunningLastLogAt.delete(callID);
+        bridgeDebugLog(`Computer Use tool call cleared callID=${callID} status=${resolvedStatus} elapsedMs=${elapsedMs}`);
+      }
     } else if (looksLikeToolCall) {
       const resolvedStatus = status || (lowerMethod.endsWith("/failed") ? "failed" : "completed");
       bridgeDebugLog(`codex tool call end tool="${toolName}" callID=${callID} method=${method} type=${itemType} status=${resolvedStatus} elapsedMs=unknown`);
+      if (activeComputerUseToolCalls.delete(callID)) {
+        computerUseLongRunningLastLogAt.delete(callID);
+        bridgeDebugLog(`Computer Use tool call cleared callID=${callID} status=${resolvedStatus} elapsedMs=unknown`);
+      }
     }
   }
 }
@@ -7286,6 +8881,14 @@ async function refreshUsageForBackend(
 ) {
   if (backend === "claudeCode") {
     usageSnapshotForBackend("claudeCode");
+    return;
+  }
+  if (backend === "antigravityCLI") {
+    try {
+      await refreshAntigravityUsageFromState();
+    } catch {
+      usageSnapshotForBackend("antigravityCLI");
+    }
     return;
   }
   if (backend === "copilot") {
@@ -7385,26 +8988,29 @@ function normalizeBackend(raw?: string): AssistantBackend {
   const lowered = value.toLowerCase();
   if (lowered === "copilot" || lowered === "githubcopilot") return "copilot";
   if (lowered === "claude" || lowered === "claudecode" || lowered === "anthropic-cli") return "claudeCode";
+  if (lowered === "antigravity" || lowered === "antigravitycli" || lowered === "googleantigravity" || lowered === "agy") return "antigravityCLI";
   if (lowered === "ollama" || lowered === "ollamalocal" || lowered === "ollama (local)") return "ollamaLocal";
   return "codex";
 }
 
-const runtimeBackendOrder: RuntimeAssistantBackend[] = ["codex", "copilot", "claudeCode", "ollamaLocal"];
+const runtimeBackendOrder: RuntimeAssistantBackend[] = ["codex", "copilot", "claudeCode", "antigravityCLI", "ollamaLocal"];
 const runtimeBackendExecutable: Record<RuntimeAssistantBackend, string> = {
   codex: "codex",
   claudeCode: "claude",
+  antigravityCLI: "agy",
   copilot: "copilot",
   ollamaLocal: "ollama"
 };
 
 function isRuntimeBackend(backend: AssistantBackend): backend is RuntimeAssistantBackend {
-  return backend === "codex" || backend === "copilot" || backend === "claudeCode" || backend === "ollamaLocal";
+  return backend === "codex" || backend === "copilot" || backend === "claudeCode" || backend === "antigravityCLI" || backend === "ollamaLocal";
 }
 
 function assistantPATH() {
   const additions = [
     path.join(os.homedir(), ".npm-global/bin"),
     path.join(os.homedir(), ".local/bin"),
+    path.join(os.homedir(), "Library", "Application Support", "Antigravity", "bin"),
     "/opt/homebrew/bin",
     "/usr/local/bin",
     "/usr/bin",
@@ -7413,15 +9019,45 @@ function assistantPATH() {
   return [process.env.PATH, ...additions].filter(Boolean).join(path.delimiter);
 }
 
-async function executableExists(executable: string) {
+const antigravityCLIInstallCommand = "curl -fsSL https://antigravity.google/cli/install.sh | bash";
+
+function antigravityCLIExecutableCandidates() {
+  return [
+    path.join(os.homedir(), ".local/bin", "agy"),
+    path.join(os.homedir(), ".npm-global/bin", "agy"),
+    path.join(os.homedir(), "Library", "Application Support", "Antigravity", "bin", "agy"),
+    "/opt/homebrew/bin/agy",
+    "/usr/local/bin/agy",
+    "/usr/bin/agy"
+  ];
+}
+
+function executableFileExists(filePath: string) {
   try {
-    await execFileAsync("/usr/bin/env", ["which", executable], {
-      env: { ...process.env, PATH: assistantPATH() }
-    });
+    fs.accessSync(filePath, fs.constants.X_OK);
     return true;
   } catch {
     return false;
   }
+}
+
+async function resolveExecutablePath(executable: string) {
+  if (executable === "agy") {
+    const direct = antigravityCLIExecutableCandidates().find(executableFileExists);
+    if (direct) return direct;
+  }
+  try {
+    const { stdout } = await execFileAsync("/usr/bin/env", ["which", executable], {
+      env: { ...process.env, PATH: assistantPATH() }
+    });
+    return stdout.trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+async function executableExists(executable: string) {
+  return Boolean(await resolveExecutablePath(executable));
 }
 
 async function selectableAssistantBackends(preferred: RuntimeAssistantBackend): Promise<RuntimeAssistantBackend[]> {
@@ -7488,9 +9124,11 @@ async function runtimeSetupSnapshot(
   if (!installed && backend !== "ollamaLocal") {
     value = runtimeSetupFallback(
       "Install required",
-      `${runtimeBackendExecutable[backend]} was not found on PATH.`,
+      backend === "antigravityCLI"
+        ? `Antigravity CLI was not found. Install it with: ${antigravityCLIInstallCommand}`
+        : `${runtimeBackendExecutable[backend]} was not found on PATH.`,
       "warning",
-      `Install ${runtimeBackendExecutable[backend]}`
+      backend === "antigravityCLI" ? antigravityCLIInstallCommand : `Install ${runtimeBackendExecutable[backend]}`
     );
   } else if (backend === "codex") {
     value = {
@@ -7519,6 +9157,15 @@ async function runtimeSetupSnapshot(
       assistantRuntimeLoginCommand: "claude auth login",
       assistantRuntimeStatusTone: "ready"
     };
+  } else if (backend === "antigravityCLI") {
+    value = {
+      assistantRuntimeStatus: "Runtime detected",
+      assistantRuntimeDetail: "Antigravity CLI is installed. Run agy in Terminal if Google sign-in is needed.",
+      assistantRuntimeAccount: "Handled by Antigravity CLI",
+      assistantRuntimeAuthMode: "Google Antigravity subscription",
+      assistantRuntimeLoginCommand: "agy",
+      assistantRuntimeStatusTone: "ready"
+    };
   } else {
     const running = await ollamaServerIsRunning();
     value = {
@@ -7540,6 +9187,7 @@ async function runtimeSetupSnapshot(
 function startedSessionMessage(backend: AssistantBackend) {
   if (backend === "copilot") return "Started a new GitHub Copilot thread.";
   if (backend === "claudeCode") return "Started a new Claude Code thread.";
+  if (backend === "antigravityCLI") return "Started a new Antigravity thread.";
   if (backend === "ollamaLocal") return "Started a new Ollama (Local) thread.";
   return "Started a new Codex thread.";
 }
@@ -7614,9 +9262,19 @@ function timelineUserMessage(threadID: string, text: string, createdAt: number):
   };
 }
 
-function timelineAssistantFinal(threadID: string, text: string, backend: AssistantBackend, modelID: string, turnID: string, createdAt: number): JsonObject {
+function timelineAssistantFinal(
+  threadID: string,
+  text: string,
+  backend: AssistantBackend,
+  modelID: string,
+  turnID: string,
+  createdAt: number,
+  id = `assistant-final-${makeID()}`,
+  checkpointReferences: string[] = [],
+  artifacts: MessageArtifact[] = []
+): JsonObject {
   return {
-    id: `assistant-final-${makeID()}`,
+    id,
     kind: "assistantFinal",
     sessionID: threadID,
     source: "runtime",
@@ -7626,6 +9284,8 @@ function timelineAssistantFinal(threadID: string, text: string, backend: Assista
     providerBackend: backend,
     providerModelID: modelID,
     turnID,
+    checkpointReferences,
+    artifacts,
     createdAt,
     updatedAt: createdAt
   };
@@ -7729,6 +9389,66 @@ function imageMimeTypeFromPath(filePath?: string) {
   return "image/png";
 }
 
+function imageMimeTypeFromFile(filePath?: string) {
+  const resolved = filePath?.trim();
+  if (!resolved || !fs.existsSync(resolved)) return imageMimeTypeFromPath(resolved);
+  try {
+    const header = fs.readFileSync(resolved).subarray(0, 12);
+    if (header[0] === 0xff && header[1] === 0xd8) return "image/jpeg";
+    if (header.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return "image/png";
+    if (header.subarray(0, 4).toString("ascii") === "GIF8") return "image/gif";
+    if (header.subarray(0, 4).toString("ascii") === "RIFF" && header.subarray(8, 12).toString("ascii") === "WEBP") return "image/webp";
+  } catch {
+    // Fall back to the extension below.
+  }
+  return imageMimeTypeFromPath(resolved);
+}
+
+function jpegDimensions(buffer: Buffer) {
+  let offset = 2;
+  while (offset + 9 < buffer.length) {
+    if (buffer[offset] !== 0xff) {
+      offset += 1;
+      continue;
+    }
+    const marker = buffer[offset + 1];
+    const length = buffer.readUInt16BE(offset + 2);
+    if (length < 2) return null;
+    const isStartOfFrame = (marker >= 0xc0 && marker <= 0xc3)
+      || (marker >= 0xc5 && marker <= 0xc7)
+      || (marker >= 0xc9 && marker <= 0xcb)
+      || (marker >= 0xcd && marker <= 0xcf);
+    if (isStartOfFrame && offset + 8 < buffer.length) {
+      return {
+        width: buffer.readUInt16BE(offset + 7),
+        height: buffer.readUInt16BE(offset + 5)
+      };
+    }
+    offset += 2 + length;
+  }
+  return null;
+}
+
+function imageDimensionsFromFile(filePath?: string): { width?: number; height?: number } {
+  const resolved = filePath?.trim();
+  if (!resolved || !fs.existsSync(resolved)) return {};
+  try {
+    const buffer = fs.readFileSync(resolved).subarray(0, 512 * 1024);
+    if (buffer.length >= 24 && buffer.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) {
+      return {
+        width: buffer.readUInt32BE(16),
+        height: buffer.readUInt32BE(20)
+      };
+    }
+    if (buffer.length >= 10 && buffer[0] === 0xff && buffer[1] === 0xd8) {
+      return jpegDimensions(buffer) ?? {};
+    }
+  } catch {
+    // Dimensions are helpful metadata only; do not block artifact display.
+  }
+  return {};
+}
+
 function imageMimeTypeFromBase64(value: string) {
   const sample = value.trim().slice(0, 24);
   if (sample.startsWith("/9j/")) return "image/jpeg";
@@ -7760,6 +9480,99 @@ function imageDataURLFromFile(filePath?: string, mimeType?: string) {
 function imageFileNameFromPath(filePath?: string) {
   const name = path.basename(filePath ?? "").trim();
   return name || undefined;
+}
+
+function isImageArtifactPath(filePath: string) {
+  return /\.(png|jpe?g|webp|gif)$/i.test(filePath);
+}
+
+function normalizeArtifactPath(rawPath: string) {
+  let filePath = rawPath.trim().replace(/^file:\/\//i, "");
+  filePath = filePath.replace(/[)\].,;:]+$/g, "");
+  if (filePath.startsWith("~")) filePath = path.join(os.homedir(), filePath.slice(1));
+  try {
+    filePath = decodeURI(filePath);
+  } catch {
+    // Keep the original path if it is not URI-encoded.
+  }
+  return path.resolve(filePath);
+}
+
+function messageArtifactFromPath(rawPath: string): MessageArtifact | null {
+  const filePath = normalizeArtifactPath(rawPath);
+  if (!fs.existsSync(filePath)) return null;
+  const stat = fs.statSync(filePath);
+  if (!stat.isFile()) return null;
+  const isImage = isImageArtifactPath(filePath);
+  const mimeType = isImage ? imageMimeTypeFromFile(filePath) : undefined;
+  const dimensions = isImage ? imageDimensionsFromFile(filePath) : {};
+  return {
+    id: `artifact-${Buffer.from(filePath).toString("base64url").slice(0, 48)}`,
+    kind: isImage ? "image" : "file",
+    name: path.basename(filePath),
+    path: filePath,
+    mimeType,
+    dataURL: isImage ? imageDataURLFromFile(filePath, mimeType) : undefined,
+    size: stat.size,
+    width: dimensions.width,
+    height: dimensions.height
+  };
+}
+
+function uniqueArtifacts(artifacts: MessageArtifact[]) {
+  const seen = new Set<string>();
+  const result: MessageArtifact[] = [];
+  for (const artifact of artifacts) {
+    if (seen.has(artifact.path)) continue;
+    seen.add(artifact.path);
+    result.push(artifact);
+  }
+  return result;
+}
+
+function artifactPathsFromText(value: string) {
+  const paths: string[] = [];
+  const text = value.replace(/\r/g, "\n");
+  const pathPattern = /(?:file:\/\/)?(\/(?:Users|Volumes|private|var|tmp)\/[^\n\r`"']+?\.(?:png|jpe?g|webp|gif|svg|pdf|html?|mp4|mov|txt|md|csv|json))/gi;
+  for (const match of text.matchAll(pathPattern)) {
+    if (match[1]) paths.push(match[1]);
+  }
+  return paths;
+}
+
+function messageArtifactsFromText(value: string) {
+  return uniqueArtifacts(
+    artifactPathsFromText(value)
+      .map(messageArtifactFromPath)
+      .filter((artifact): artifact is MessageArtifact => Boolean(artifact))
+  );
+}
+
+function messageArtifactsFromStored(value: unknown) {
+  if (!Array.isArray(value)) return [];
+  return uniqueArtifacts(value
+    .map((raw) => {
+      const object = asObject(raw);
+      if (!object) return null;
+      const artifactPath = firstRuntimeString(object.path, object.filePath, object.file_path);
+      if (!artifactPath) return null;
+      const fromDisk = messageArtifactFromPath(artifactPath);
+      if (fromDisk) return fromDisk;
+      const name = firstRuntimeString(object.name) || path.basename(artifactPath);
+      const kind = String(object.kind ?? "").toLowerCase() === "image" ? "image" : "file";
+      return {
+        id: firstRuntimeString(object.id) || `artifact-${Buffer.from(artifactPath).toString("base64url").slice(0, 48)}`,
+        kind,
+        name,
+        path: artifactPath,
+        mimeType: firstRuntimeString(object.mimeType, object.mime_type) || undefined,
+        dataURL: firstRawRuntimeString(object.dataURL, object.data_url) || undefined,
+        size: Number.isFinite(Number(object.size)) ? Number(object.size) : undefined,
+        width: Number.isFinite(Number(object.width)) ? Number(object.width) : undefined,
+        height: Number.isFinite(Number(object.height)) ? Number(object.height) : undefined
+      } satisfies MessageArtifact;
+    })
+    .filter((artifact): artifact is MessageArtifact => Boolean(artifact)));
 }
 
 function imageGenerationMessageFields(item: JsonObject): Pick<ChatMessage, "imageDataURL" | "imagePath" | "imagePrompt" | "imageMimeType" | "imageName"> {
@@ -8303,6 +10116,7 @@ function timelineActivity(threadID: string, activity: ChatMessage, turnID: strin
       status: activity.activityStatus ?? "running",
       friendlySummary: activity.activityTitle ?? "Tool",
       rawDetails: activity.activityDetail ?? activity.text,
+      artifacts: activity.artifacts,
       imagePath: activity.imagePath,
       imageDataURL: activity.imagePath ? undefined : activity.imageDataURL,
       imagePrompt: activity.imagePrompt,
@@ -8429,6 +10243,9 @@ function persistCompletedTurn({
   prompt,
   responseText,
   insertedSystemMessage,
+  assistantMessageID,
+  checkpointReferences = [],
+  assistantArtifacts = [],
   reasoningEffort,
   interactionMode,
   permissionMode
@@ -8442,6 +10259,9 @@ function persistCompletedTurn({
   prompt: string;
   responseText: string;
   insertedSystemMessage: boolean;
+  assistantMessageID?: string;
+  checkpointReferences?: string[];
+  assistantArtifacts?: MessageArtifact[];
   reasoningEffort?: string;
   interactionMode?: string;
   permissionMode?: string;
@@ -8467,7 +10287,18 @@ function persistCompletedTurn({
   const assistantCreatedAt = currentSwiftDate();
   const finalizedTurnActivities = currentTurnActivities.map((entry) => finalizedTimelineActivity(entry, assistantCreatedAt));
   const userTimeline = timelineUserMessage(threadID, prompt, userCreatedAt);
-  const assistantTimeline = timelineAssistantFinal(threadID, responseText, backend, modelID, providerTurnID, assistantCreatedAt);
+  const turnCheckpointReferences = [...checkpointReferences];
+  const assistantTimeline = timelineAssistantFinal(
+    threadID,
+    responseText,
+    backend,
+    modelID,
+    providerTurnID,
+    assistantCreatedAt,
+    assistantMessageID,
+    turnCheckpointReferences,
+    assistantArtifacts
+  );
   timeline.length = 0;
   timeline.push(...timelineWithoutTurnActivities, userTimeline, ...finalizedTurnActivities, assistantTimeline);
   const userTranscript = transcriptEntry("user", prompt, backend, modelID);
@@ -8482,7 +10313,7 @@ function persistCompletedTurn({
     messageIDs: [assistantTimeline.id],
     createdAt: assistantCreatedAt,
     updatedAt: assistantCreatedAt,
-    checkpointReferences: []
+    checkpointReferences: turnCheckpointReferences
   });
   if (!isTransient) {
     writeConversationSnapshot(threadID, {
@@ -8504,16 +10335,17 @@ function persistCompletedTurn({
   session.activeProvider = backend;
   const updatedSession = updateSession(session);
   const thread = threadItemForCompletedSession(updatedSession);
+  notifyThreadsChanged();
   return {
     session: updatedSession,
     thread,
-    title: thread.title
+    title: thread.title,
+    assistantMessageID: String(assistantTimeline.id ?? "")
   };
 }
 
 async function ensureCodexProviderSession(threadID: string, modelID: string, options: CodexRuntimeOptions = {}) {
-  const session = findSession(threadID);
-  if (!session) throw new Error("OpenAssist thread was not found.");
+  const session = findSession(threadID) ?? ensureOpenAssistSessionRecord(threadID, "codex", modelID);
   const existing = providerBinding(session, "codex")?.providerSessionID;
   if (typeof existing === "string" && existing.trim()) {
     await codexTransport.request("thread/resume", codexThreadResumeParams(existing, session, modelID, options));
@@ -8547,7 +10379,7 @@ async function sendOllamaMessage(threadID: string, prompt: string, modelID: stri
 }
 
 function providerWorkingDirectory(session: SessionSummary | undefined) {
-  return sessionWorkingDirectory(session) || os.homedir();
+  return sessionWorkingDirectory(session) || openAssistRepoRoot();
 }
 
 function ensureCLIProviderSession(threadID: string, backend: Exclude<AssistantBackend, "codex" | "ollamaLocal">, modelID: string) {
@@ -8563,38 +10395,93 @@ function ensureCLIProviderSession(threadID: string, backend: Exclude<AssistantBa
   return { providerSessionID, insertedSystemMessage: true };
 }
 
-async function execCaptured(command: string, args: string[], cwd: string) {
+async function execCaptured(
+  command: string,
+  args: string[],
+  cwd: string,
+  timeoutMs = 180_000,
+  run?: ActiveProviderRun,
+  failFast?: (stdout: string, stderr: string) => Error | null,
+  onOutput?: CapturedOutputHandler
+) {
   return new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
     const child = spawn(command, args, {
       cwd,
-      env: process.env,
+      env: { ...process.env, PATH: assistantPATH() },
       stdio: ["ignore", "pipe", "pipe"]
     });
     let stdout = "";
     let stderr = "";
-    const timer = setTimeout(() => {
-      child.kill("SIGTERM");
-      const error = new Error(`${command} timed out.`);
+    let forcedError: Error | null = null;
+    let settled = false;
+    const commandLabel = path.basename(command);
+    const terminateWithError = (error: Error, reason: string) => {
+      if (forcedError) return;
       Object.assign(error, { stdout, stderr });
-      reject(error);
-    }, 180_000);
+      forcedError = error;
+      clearTimeout(timer);
+      if (child.pid) {
+        void terminateProcessTree(child.pid, reason);
+      } else {
+        child.kill("SIGTERM");
+      }
+    };
+    const clearRunProcess = () => {
+      if (run && run.processPID === child.pid) {
+        run.processPID = undefined;
+        run.terminateProcess = undefined;
+      }
+    };
+    const timer = setTimeout(() => {
+      const error = new Error(`${commandLabel} timed out.`);
+      terminateWithError(error, `${commandLabel} timed out`);
+    }, timeoutMs);
+    if (run && child.pid) {
+      run.processPID = child.pid;
+      run.terminateProcess = async (reason: string) => {
+        const error = new ProviderRunStoppedError(run.provider);
+        Object.assign(error, { stdout, stderr });
+        forcedError = error;
+        clearTimeout(timer);
+        await terminateProcessTree(child.pid!, `${commandLabel}: ${reason}`);
+      };
+    }
     child.stdout?.setEncoding("utf8");
     child.stderr?.setEncoding("utf8");
     child.stdout?.on("data", (chunk) => {
-      stdout += String(chunk);
+      const text = String(chunk);
+      stdout += text;
       if (stdout.length > 8_000_000) stdout = stdout.slice(-4_000_000);
+      onOutput?.("stdout", text, stdout, stderr);
+      const error = failFast?.(stdout, stderr);
+      if (error) terminateWithError(error, `${commandLabel} output matched fail-fast condition`);
     });
     child.stderr?.on("data", (chunk) => {
-      stderr += String(chunk);
+      const text = String(chunk);
+      stderr += text;
       if (stderr.length > 2_000_000) stderr = stderr.slice(-1_000_000);
+      onOutput?.("stderr", text, stdout, stderr);
+      const error = failFast?.(stdout, stderr);
+      if (error) terminateWithError(error, `${commandLabel} output matched fail-fast condition`);
     });
     child.on("error", (error) => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timer);
+      clearRunProcess();
       Object.assign(error, { stdout, stderr });
       reject(error);
     });
     child.on("close", (code) => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timer);
+      clearRunProcess();
+      if (forcedError) {
+        Object.assign(forcedError, { stdout, stderr });
+        reject(forcedError);
+        return;
+      }
       if (code === 0) {
         resolve({ stdout, stderr });
         return;
@@ -8618,7 +10505,67 @@ function textFromUnknown(value: unknown): string[] {
   return [];
 }
 
-function providerCLIText(stdout: string, stderr: string) {
+function isAntigravityProgressText(value: string) {
+  const normalized = value.replace(/\s+/g, " ").trim().toLowerCase();
+  if (!normalized) return true;
+  return normalized.includes("no tool calls made in this turn")
+    && normalized.includes("waiting for background task updates");
+}
+
+function antigravityTimedOut(value: string) {
+  return /error:\s*timed out waiting for response/i.test(value);
+}
+
+function antigravityAuthRequired(value: string) {
+  return /authentication required/i.test(value)
+    || /authentication timed out/i.test(value)
+    || /accounts\.google\.com\/o\/oauth2/i.test(value)
+    || /paste the authorization code/i.test(value);
+}
+
+function antigravityAuthRequiredMessage() {
+  return "Antigravity CLI needs Google sign-in. Run `agy` in Terminal, finish the Google login, then try again in OpenAssist.";
+}
+
+function cleanAntigravityText(value: string) {
+  let text = value.replace(/\r/g, "").trim();
+  text = text.replace(/^message:[a-z0-9-]+/i, "").trim();
+  const taskMarker = text.match(/\/task-\s*/);
+  if (taskMarker?.index != null) {
+    text = text.slice(taskMarker.index + taskMarker[0].length).trim();
+  }
+  text = text
+    .replace(/^\{?Status:[\s\S]*?\/task-\s*/i, "")
+    .replace(/\n?}\s*$/g, "")
+    .trim();
+  return text;
+}
+
+function antigravityTaskStatusText(stdout: string, stderr: string) {
+  const source = `${stdout}\n${stderr}`.replace(/\r/g, "");
+  const eventStart = source.lastIndexOf("message:task-status-changed");
+  if (eventStart < 0) return "";
+  const eventText = source.slice(eventStart);
+  const taskMarker = eventText.match(/\/task-\s*/);
+  if (!taskMarker?.index) return "";
+  let text = eventText.slice(taskMarker.index + taskMarker[0].length);
+  const nextEvent = text.search(/\nmessage:[a-z0-9-]+/i);
+  if (nextEvent >= 0) text = text.slice(0, nextEvent);
+  return cleanAntigravityText(text);
+}
+
+function antigravityCLIText(stdout: string, stderr: string) {
+  if (antigravityAuthRequired(`${stdout}\n${stderr}`)) return "";
+  const taskText = antigravityTaskStatusText(stdout, stderr);
+  if (taskText && !isAntigravityProgressText(taskText) && !antigravityTimedOut(taskText)) return taskText;
+  const lines = `${stdout}\n${stderr}`
+    .split(/\r?\n/)
+    .map(cleanAntigravityText)
+    .filter((line) => line && !isAntigravityProgressText(line) && !antigravityTimedOut(line));
+  return lines.join("\n").trim();
+}
+
+function providerCLIText(stdout: string, stderr: string, backend?: RuntimeAssistantBackend) {
   const candidates: string[] = [];
   for (const line of stdout.split(/\r?\n/)) {
     const trimmed = line.trim();
@@ -8633,12 +10580,68 @@ function providerCLIText(stdout: string, stderr: string) {
     .map((candidate) => candidate.trim())
     .filter((candidate) => candidate && candidate.length > 2);
   if (cleanCandidates.length) return cleanCandidates[cleanCandidates.length - 1];
+  if (backend === "antigravityCLI") {
+    const antigravityText = antigravityCLIText(stdout, stderr);
+    if (antigravityText) return antigravityText;
+    return "";
+  }
   const plain = stdout.trim();
   if (plain) return plain;
   return stderr.trim();
 }
 
-async function sendCopilotMessage(providerSessionID: string, session: SessionSummary | undefined, prompt: string, modelID: string) {
+function providerCLIJSONObjects(stdout: string, stderr: string): JsonObject[] {
+  const objects: JsonObject[] = [];
+  for (const line of `${stdout}\n${stderr}`.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) continue;
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (Array.isArray(parsed)) {
+        objects.push(...parsed.map(asObject).filter(Boolean) as JsonObject[]);
+      } else {
+        const object = asObject(parsed);
+        if (object) objects.push(object);
+      }
+    } catch {
+      // Keep reading; provider CLIs can mix JSON metadata with plain progress text.
+    }
+  }
+  return objects;
+}
+
+function recordUsageFromProviderCLIOutput(backend: RuntimeAssistantBackend, stdout: string, stderr: string) {
+  for (const object of providerCLIJSONObjects(stdout, stderr)) {
+    const metadata = asObject(object.metadata) ?? asObject(object.meta) ?? {};
+    const stats = asObject(object.stats) ?? asObject(object.metrics) ?? {};
+    const usage = object.tokenUsage
+      ?? object.token_usage
+      ?? object.usage
+      ?? metadata.tokenUsage
+      ?? metadata.token_usage
+      ?? metadata.usage
+      ?? stats.tokenUsage
+      ?? stats.token_usage
+      ?? stats.usage;
+    if (usage) recordTokenUsage(backend, usage);
+
+    const rateLimits = object.rateLimits
+      ?? object.rate_limits
+      ?? metadata.rateLimits
+      ?? metadata.rate_limits
+      ?? stats.rateLimits
+      ?? stats.rate_limits;
+    if (rateLimits) recordRateLimits(backend, { rateLimits });
+  }
+}
+
+async function sendCopilotMessage(
+  providerSessionID: string,
+  session: SessionSummary | undefined,
+  prompt: string,
+  modelID: string,
+  run?: ActiveProviderRun
+) {
   const args = [
     "--prompt",
     prompt,
@@ -8650,11 +10653,18 @@ async function sendCopilotMessage(providerSessionID: string, session: SessionSum
     `--resume=${providerSessionID}`
   ];
   if (modelID && modelID !== "default") args.push("--model", modelID);
-  const { stdout, stderr } = await execCaptured("copilot", args, providerWorkingDirectory(session));
+  const { stdout, stderr } = await execCaptured("copilot", args, providerWorkingDirectory(session), undefined, run);
   return providerCLIText(stdout, stderr) || "GitHub Copilot completed without a text response.";
 }
 
-async function sendClaudeCodeMessage(providerSessionID: string, session: SessionSummary | undefined, prompt: string, modelID: string, isNewSession: boolean) {
+async function sendClaudeCodeMessage(
+  providerSessionID: string,
+  session: SessionSummary | undefined,
+  prompt: string,
+  modelID: string,
+  isNewSession: boolean,
+  run?: ActiveProviderRun
+) {
   const args = [
     "-p",
     prompt,
@@ -8666,7 +10676,7 @@ async function sendClaudeCodeMessage(providerSessionID: string, session: Session
   if (isNewSession) args.push("--session-id", providerSessionID);
   else args.push("--resume", providerSessionID);
   if (modelID && modelID !== "default") args.push("--model", modelID);
-  const { stdout, stderr } = await execCaptured("claude", args, providerWorkingDirectory(session));
+  const { stdout, stderr } = await execCaptured("claude", args, providerWorkingDirectory(session), undefined, run);
   return providerCLIText(stdout, stderr) || "Claude Code completed without a text response.";
 }
 
@@ -8674,6 +10684,590 @@ function promptWithSessionInstructions(prompt: string, sessionInstructions?: str
   const instructions = sessionInstructions?.trim();
   if (!instructions) return prompt;
   return `Session instructions for this chat:\n${instructions}\n\nUser task:\n${prompt}`;
+}
+
+function promptWithRecentConversationContext(threadID: string, prompt: string) {
+  const snapshot = readConversationSnapshot(threadID);
+  const context = (snapshot.transcript ?? [])
+    .filter((entry) => entry.role === "user" || entry.role === "assistant")
+    .map((entry) => {
+      const role = entry.role === "assistant" ? "Assistant" : "User";
+      const text = String(entry.text ?? "").replace(/\s+/g, " ").trim();
+      return text ? `${role}: ${text}` : "";
+    })
+    .filter(Boolean)
+    .slice(-12)
+    .join("\n");
+  if (!context) return prompt;
+  return `Conversation context from this Open Assist chat:\n${context}\n\nCurrent user task:\n${prompt}`;
+}
+
+function isSimpleChatPrompt(prompt: string) {
+  const normalized = prompt
+    .trim()
+    .toLowerCase()
+    .replace(/[!.?\s]+$/g, "")
+    .replace(/\s+/g, " ");
+  return [
+    "hi",
+    "hello",
+    "hey",
+    "yo",
+    "ok",
+    "okay",
+    "thanks",
+    "thank you",
+    "hmm",
+    "mmh",
+    "test"
+  ].includes(normalized);
+}
+
+function looksLikeImageArtifactTask(prompt: string) {
+  const normalized = prompt.toLowerCase();
+  const mentionsImage = /\b(image|photo|picture|screenshot|thumbnail|banner|cover|mockup|gradient|background|wallpaper|attached image)\b/.test(normalized);
+  const asksVisualWork = /\b(generate|create|make|edit|enhance|upscale|resize|crop|add|put|place|remove|replace|style|mockup|gradient)\b/.test(normalized);
+  return mentionsImage && asksVisualWork;
+}
+
+function antigravityImageQualityGuidance(prompt: string) {
+  if (!looksLikeImageArtifactTask(prompt)) return "";
+  return [
+    "Image artifact quality:",
+    "- For attached screenshot/photo edits, preserve the original image pixels when possible.",
+    "- Prefer local image composition or editing scripts for simple edits like adding a gradient, frame, crop, resize, or background.",
+    "- Avoid using generative image recreation for screenshots because it can make text/UI blurry and low-resolution.",
+    "- Save final image artifacts as PNG when possible, at the source image size or larger.",
+    "- If you must use generate_image, request the highest available resolution and state any quality limitation plainly.",
+    "- Do not say only \"workspace artifacts\"; include the absolute saved file path so OpenAssist can render the artifact card."
+  ].join("\n");
+}
+
+function antigravityPrompt(threadID: string, prompt: string, cwd: string) {
+  const currentTask = prompt.trim();
+  const imageQualityGuidance = antigravityImageQualityGuidance(currentTask);
+  const header = [
+    "OpenAssist is sending one user task to Antigravity.",
+    `Workspace: ${cwd}`,
+    "Reply only to the current user task.",
+    "If the current task is a greeting, reply briefly and ask how you can help.",
+    "Do not inspect repo files or run commands unless the current user task clearly asks for that.",
+    imageQualityGuidance
+  ].filter(Boolean).join("\n");
+
+  if (isSimpleChatPrompt(currentTask)) {
+    return `The user said: ${currentTask}. Respond with one short friendly greeting and ask how you can help.`;
+  }
+
+  const withContext = promptWithRecentConversationContext(threadID, currentTask);
+  return `${header}\n\n${withContext}`;
+}
+
+type AntigravityProgressCallbacks = {
+  emitActivity: (activity: ChatMessage) => void;
+  emitStatus?: (text: string) => void;
+};
+
+function antigravityProgressLogPath(providerTurnID: string) {
+  return path.join(os.tmpdir(), `openassist-antigravity-${providerTurnID}.log`);
+}
+
+function antigravityConversationIDFromLog(value: string) {
+  const match = value.match(/(?:conversation=|Created conversation )([0-9a-f-]{36})/i);
+  return match?.[1]?.toLowerCase() ?? "";
+}
+
+function antigravityTranscriptPath(conversationID: string) {
+  return path.join(
+    os.homedir(),
+    ".gemini",
+    "antigravity-cli",
+    "brain",
+    conversationID,
+    ".system_generated",
+    "logs",
+    "transcript.jsonl"
+  );
+}
+
+function antigravityActivityStatus(raw: unknown): ChatMessage["activityStatus"] {
+  const value = String(raw ?? "").toLowerCase();
+  if (value.includes("fail") || value.includes("error")) return "failed";
+  if (value.includes("done") || value.includes("complete") || value.includes("success")) return "completed";
+  if (value.includes("wait")) return "waiting";
+  if (value.includes("pending")) return "pending";
+  return "running";
+}
+
+function antigravityActivityTime(raw: unknown) {
+  const parsed = Date.parse(String(raw ?? ""));
+  return Number.isFinite(parsed) ? parsed : Date.now();
+}
+
+function antigravityReadableType(raw: unknown) {
+  const value = String(raw ?? "Tool").toLowerCase().replace(/[_-]+/g, " ");
+  return value.replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+function cleanAntigravityArg(value: string) {
+  const trimmed = value.trim();
+  if (trimmed.length >= 2 && trimmed.startsWith("\"") && trimmed.endsWith("\"")) {
+    try {
+      return JSON.parse(trimmed) as string;
+    } catch {
+      return trimmed.slice(1, -1);
+    }
+  }
+  return trimmed;
+}
+
+function antigravityToolCallDetail(toolName: string, args: JsonObject) {
+  const commandLine = cleanAntigravityArg(firstRuntimeString(args.CommandLine, args.commandLine, args.command, args.Command));
+  const cwd = cleanAntigravityArg(firstRuntimeString(args.Cwd, args.cwd, args.WorkingDirectory, args.workingDirectory));
+  const absolutePath = cleanAntigravityArg(firstRuntimeString(args.AbsolutePath, args.absolutePath, args.path, args.filePath));
+  const toolAction = cleanAntigravityArg(firstRuntimeString(args.toolAction, args.action));
+  const lines: string[] = [];
+  if (commandLine) lines.push(`Command\n${commandLine}`);
+  else if (absolutePath) lines.push(`File\n${absolutePath}`);
+  if (cwd) lines.push(`Working directory\n${cwd}`);
+  if (toolAction && !lines.length) lines.push(toolAction);
+  if (!lines.length && Object.keys(args).length) {
+    lines.push(JSON.stringify(args, null, 2).slice(0, 1600));
+  }
+  return lines.join("\n\n") || toolName;
+}
+
+function antigravityToolActivityKind(toolName: string) {
+  const normalized = toolName.replace(/[_\s-]+/g, "").toLowerCase();
+  if (normalized.includes("generateimage") || normalized.includes("imagegeneration")) return "imageGeneration";
+  if (normalized.includes("command") || normalized.includes("terminal")) return "terminal";
+  if (normalized.includes("browser") || normalized.includes("chrome")) return "browserAutomation";
+  if (normalized.includes("file")) return "fileChange";
+  return "mcpToolCall";
+}
+
+function cleanAntigravityToolResultContent(content: string) {
+  const artifacts = messageArtifactsFromText(content);
+  if (artifacts.some((artifact) => artifact.kind === "image")) return "Generated image is ready.";
+  if (artifacts.length) return `Saved ${artifacts[0].name}.`;
+  let text = content
+    .replace(/\r/g, "")
+    .replace(/\t+/g, "")
+    .split("\n")
+    .map((line) => line.trimEnd())
+    .join("\n")
+    .replace(/^Created At:.*$/gmi, "")
+    .replace(/^Completed At:.*$/gmi, "")
+    .replace(/^The following is the entire, complete content of the requested file\.\s*$/gmi, "")
+    .replace(/^The above content shows the entire, complete file contents of the requested file\.\s*$/gmi, "")
+    .trim();
+  const filePath = text.match(/File Path:\s*`?file:\/\/([^`\n]+)`?/i)?.[1];
+  if (filePath) {
+    const totalLines = text.match(/Total Lines:\s*(\d+)/i)?.[1];
+    const lineText = totalLines ? ` · ${totalLines} lines` : "";
+    return `Viewed ${path.basename(filePath)}${lineText}`;
+  }
+  const failed = text.match(/The command failed with exit code:\s*(\d+)/i)?.[1];
+  text = text
+    .replace(/The command completed successfully\.\s*/gi, "")
+    .replace(/The command failed with exit code:\s*\d+\s*/gi, "")
+    .trim();
+  const outputMatch = text.match(/(?:^|\n)\s*Output:\s*\n([\s\S]*?)(?=\n\s*(?:Stdout|Stderr):|\s*$)/i);
+  const stdoutMatch = text.match(/(?:^|\n)\s*Stdout:\s*\n([\s\S]*?)(?=\n\s*Stderr:|\s*$)/i);
+  const stderrMatch = text.match(/(?:^|\n)\s*Stderr:\s*\n([\s\S]*?)$/i);
+  const output = (outputMatch?.[1] || stdoutMatch?.[1] || "").trim();
+  const stderr = (stderrMatch?.[1] || "").trim();
+  if (output) return output.length > 1800 ? `${output.slice(0, 1800)}...` : output;
+  if (stderr) return stderr.length > 1800 ? `${stderr.slice(0, 1800)}...` : stderr;
+  const cleaned = text
+    .replace(/(?:^|\n)\s*(?:Output|Stdout|Stderr):\s*/gi, "\n")
+    .trim();
+  if (cleaned) return cleaned.length > 1800 ? `${cleaned.slice(0, 1800)}...` : cleaned;
+  return failed ? `Command failed with exit code ${failed}.` : "Command completed.";
+}
+
+function antigravityToolResultDetail(previousDetail: string, content: string) {
+  const cleaned = cleanAntigravityToolResultContent(content);
+  if (!cleaned) return previousDetail;
+  return previousDetail ? `${previousDetail}\n\nResult\n${cleaned}` : cleaned;
+}
+
+function antigravityActivity(
+  providerTurnID: string,
+  suffix: string,
+  title: string,
+  detail: string,
+  kind: string,
+  status: ChatMessage["activityStatus"],
+  createdAt = Date.now()
+): ChatMessage {
+  return {
+    id: `activity-antigravity-${providerTurnID}-${suffix}`,
+    role: "activity",
+    text: detail,
+    provider: "Antigravity",
+    status: status === "completed" || status === "failed" ? "completed" : "running",
+    activityTitle: title,
+    activityKind: kind,
+    activityStatus: status,
+    activityDetail: detail,
+    createdAt,
+    updatedAt: Date.now()
+  };
+}
+
+function cleanAntigravityReasoning(value: string) {
+  return value
+    .replace(/\r/g, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function antigravityPlannerReasoning(entry: JsonObject, includeContent: boolean) {
+  const content = includeContent ? cleanAntigravityReasoning(String(entry.content ?? "")) : "";
+  const thinking = cleanAntigravityReasoning(String(entry.thinking ?? ""));
+  return [content, thinking]
+    .filter((part) => part && !/^(reasoning|thinking|\[\]|\{\}|null|undefined|"")$/i.test(part))
+    .join("\n\n");
+}
+
+function antigravityTranscriptEntries(conversationID: string) {
+  const transcriptPath = antigravityTranscriptPath(conversationID);
+  if (!fs.existsSync(transcriptPath)) return [];
+  return fs.readFileSync(transcriptPath, "utf8")
+    .split(/\r?\n/)
+    .map((line) => {
+      const trimmed = line.trim();
+      if (!trimmed) return null;
+      try {
+        return asObject(JSON.parse(trimmed));
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean) as JsonObject[];
+}
+
+function antigravityFinalResponseFromTranscript(conversationID: string) {
+  const candidates = antigravityTranscriptEntries(conversationID)
+    .filter((entry) => String(entry.type ?? "").toUpperCase() === "PLANNER_RESPONSE")
+    .filter((entry) => typeof entry.content === "string" && entry.content.trim())
+    .filter((entry) => !Array.isArray(entry.tool_calls) || entry.tool_calls.length === 0)
+    .map((entry) => String(entry.content).trim());
+  return candidates[candidates.length - 1] ?? "";
+}
+
+function antigravityArtifactsFromTranscript(conversationID: string) {
+  if (!conversationID) return [];
+  const artifacts = antigravityTranscriptEntries(conversationID).flatMap((entry) => {
+    const content = String(entry.content ?? "");
+    return content ? messageArtifactsFromText(content) : [];
+  });
+  return uniqueArtifacts(artifacts);
+}
+
+function antigravityConversationIDFromLogFile(logPath: string) {
+  if (!fs.existsSync(logPath)) return "";
+  try {
+    return antigravityConversationIDFromLog(fs.readFileSync(logPath, "utf8"));
+  } catch {
+    return "";
+  }
+}
+
+function startAntigravityProgressWatcher(
+  threadID: string,
+  providerTurnID: string,
+  logPath: string,
+  callbacks: AntigravityProgressCallbacks
+) {
+  let logOffset = 0;
+  let transcriptOffset = 0;
+  let transcriptRemainder = "";
+  let conversationID = "";
+  let ticking = false;
+  const emittedStatuses = new Set<string>();
+  const pendingToolActivityIDs: string[] = [];
+  const toolActivities = new Map<string, ChatMessage>();
+  const startupActivityID = `activity-antigravity-${providerTurnID}-startup`;
+
+  const emitStatusOnce = (key: string, text: string) => {
+    if (emittedStatuses.has(key)) return;
+    emittedStatuses.add(key);
+    callbacks.emitStatus?.(text);
+  };
+
+  const emitActivity = (activity: ChatMessage) => {
+    callbacks.emitActivity(activity);
+    upsertRuntimeActivity(threadID, activity, providerTurnID);
+  };
+
+  const emitStartupActivity = (status: ChatMessage["activityStatus"], detail: string) => {
+    emitActivity({
+      ...antigravityActivity(
+        providerTurnID,
+        "startup",
+        "Preparing Antigravity",
+        detail,
+        "providerProgress",
+        status
+      ),
+      id: startupActivityID
+    });
+  };
+
+  const readChunk = (filePath: string, offset: number) => {
+    if (!fs.existsSync(filePath)) return { chunk: "", offset };
+    const text = fs.readFileSync(filePath, "utf8");
+    const safeOffset = text.length < offset ? 0 : offset;
+    return { chunk: text.slice(safeOffset), offset: text.length };
+  };
+
+  const handlePlannerToolCalls = (entry: JsonObject) => {
+    const toolCalls = Array.isArray(entry.tool_calls) ? entry.tool_calls : [];
+    const stepIndex = Number(entry.step_index ?? Date.now());
+    const createdAt = antigravityActivityTime(entry.created_at);
+    const reasoning = antigravityPlannerReasoning(entry, toolCalls.length > 0);
+    if (reasoning) {
+      emitActivity(antigravityActivity(
+        providerTurnID,
+        `reasoning-${stepIndex}`,
+        "Reasoning",
+        reasoning,
+        "reasoning",
+        "completed",
+        createdAt
+      ));
+    }
+    toolCalls.forEach((rawCall, index) => {
+      const call = asObject(rawCall);
+      if (!call) return;
+      const toolName = firstRuntimeString(call.name, call.tool_name, call.type) || "tool";
+      const args = asObject(call.args) ?? {};
+      const title = firstRuntimeString(args.toolSummary, args.toolAction, call.friendlySummary)
+        || antigravityReadableType(toolName);
+      const detail = antigravityToolCallDetail(toolName, args);
+      const idSuffix = `tool-${stepIndex}-${index}`;
+      const activity = antigravityActivity(
+        providerTurnID,
+        idSuffix,
+        title,
+        detail,
+        antigravityToolActivityKind(toolName),
+        "running",
+        createdAt
+      );
+      toolActivities.set(activity.id, activity);
+      pendingToolActivityIDs.push(activity.id);
+      emitActivity(activity);
+    });
+  };
+
+  const handleToolResult = (entry: JsonObject) => {
+    const content = String(entry.content ?? "").trim();
+    const artifacts = messageArtifactsFromText(content);
+    const imageArtifact = artifacts.find((artifact) => artifact.kind === "image" && artifact.dataURL);
+    const queuedID = pendingToolActivityIDs.shift();
+    const fallbackSuffix = `result-${entry.step_index ?? Date.now()}`;
+    const previous = queuedID ? toolActivities.get(queuedID) : undefined;
+    const baseID = queuedID ?? `activity-antigravity-${providerTurnID}-${fallbackSuffix}`;
+    const nextDetail = antigravityToolResultDetail(previous?.activityDetail || "", content);
+    const activity = {
+      ...antigravityActivity(
+        providerTurnID,
+        baseID.replace(`activity-antigravity-${providerTurnID}-`, ""),
+        previous?.activityTitle || antigravityReadableType(entry.type),
+        imageArtifact ? "Generated image is ready." : nextDetail,
+        imageArtifact ? "imageGeneration" : previous?.activityKind || antigravityToolActivityKind(String(entry.type ?? "tool")),
+        entry.error ? "failed" : antigravityActivityStatus(entry.status),
+        previous?.createdAt ?? antigravityActivityTime(entry.created_at)
+      ),
+      id: baseID,
+      artifacts,
+      imageDataURL: imageArtifact?.dataURL ?? previous?.imageDataURL,
+      imagePath: imageArtifact?.path ?? previous?.imagePath,
+      imageMimeType: imageArtifact?.mimeType ?? previous?.imageMimeType,
+      imageName: imageArtifact?.name ?? previous?.imageName
+    };
+    toolActivities.set(activity.id, activity);
+    emitActivity(activity);
+  };
+
+  const handleTranscriptLine = (line: string) => {
+    const trimmed = line.trim();
+    if (!trimmed) return;
+    let parsed: JsonObject | null = null;
+    try {
+      parsed = asObject(JSON.parse(trimmed));
+    } catch {
+      return;
+    }
+    if (!parsed) return;
+    const type = String(parsed.type ?? "").toUpperCase();
+    if (type === "PLANNER_RESPONSE") {
+      handlePlannerToolCalls(parsed);
+      if (parsed.content) emitStatusOnce("final-response", "Antigravity is finishing the answer...");
+      return;
+    }
+    if (type === "USER_INPUT" || type === "CONVERSATION_HISTORY") return;
+    if (pendingToolActivityIDs.length) {
+      handleToolResult(parsed);
+      return;
+    }
+    const content = String(parsed.content ?? "").trim();
+    if (!content) return;
+    emitActivity(antigravityActivity(
+      providerTurnID,
+      `step-${parsed.step_index ?? Date.now()}`,
+      antigravityReadableType(type),
+      content.slice(0, 3000),
+      antigravityToolActivityKind(type),
+      antigravityActivityStatus(parsed.status),
+      antigravityActivityTime(parsed.created_at)
+    ));
+  };
+
+  const processTranscript = () => {
+    if (!conversationID) return;
+    const transcriptPath = antigravityTranscriptPath(conversationID);
+    const result = readChunk(transcriptPath, transcriptOffset);
+    transcriptOffset = result.offset;
+    if (!result.chunk) return;
+    const combined = `${transcriptRemainder}${result.chunk}`;
+    const lastNewline = combined.lastIndexOf("\n");
+    if (lastNewline < 0) {
+      transcriptRemainder = combined;
+      return;
+    }
+    const complete = combined.slice(0, lastNewline);
+    transcriptRemainder = combined.slice(lastNewline + 1);
+    for (const line of complete.split(/\r?\n/)) handleTranscriptLine(line);
+  };
+
+  const tick = () => {
+    if (ticking) return;
+    ticking = true;
+    try {
+      const result = readChunk(logPath, logOffset);
+      logOffset = result.offset;
+      const logChunk = result.chunk;
+      if (logChunk) {
+        if (!conversationID) {
+          conversationID = antigravityConversationIDFromLog(logChunk);
+          if (conversationID) {
+            emitStatusOnce("conversation", "Antigravity started the task...");
+            emitStartupActivity("completed", "Antigravity started the task.");
+          }
+        }
+        if (/not authenticated, trying silent auth/i.test(logChunk)) emitStatusOnce("auth", "Antigravity is signing in...");
+        if (/silent auth succeeded/i.test(logChunk)) emitStatusOnce("auth-ok", "Antigravity signed in.");
+        if (/sending message/i.test(logChunk)) emitStatusOnce("message", "Antigravity is reading the task...");
+        if (/streamGenerateContent/i.test(logChunk)) emitStatusOnce("generate", "Antigravity is generating...");
+      }
+      processTranscript();
+    } catch (error) {
+      bridgeDebugLog(`Antigravity progress watcher ignored error: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      ticking = false;
+    }
+  };
+
+  const timer = setInterval(tick, 500);
+  emitStartupActivity("running", "Starting Antigravity CLI and waiting for live steps.");
+  tick();
+  return {
+    flush: tick,
+    conversationID: () => conversationID,
+    stop: () => {
+      clearInterval(timer);
+      tick();
+      if (transcriptRemainder.trim()) {
+        handleTranscriptLine(transcriptRemainder);
+        transcriptRemainder = "";
+      }
+      emitStartupActivity("completed", conversationID ? "Antigravity finished reading the task." : "Antigravity finished.");
+    }
+  };
+}
+
+async function sendAntigravityMessage(
+  session: SessionSummary | undefined,
+  threadID: string,
+  prompt: string,
+  providerTurnID: string,
+  run?: ActiveProviderRun,
+  callbacks?: AntigravityProgressCallbacks
+) {
+  const executablePath = await resolveExecutablePath("agy");
+  if (!executablePath) {
+    throw new Error(`Antigravity CLI is not installed yet. Install it with: ${antigravityCLIInstallCommand}`);
+  }
+  const cwd = providerWorkingDirectory(session);
+  const promptWithContext = antigravityPrompt(threadID, prompt, cwd);
+  const logPath = antigravityProgressLogPath(providerTurnID);
+  try {
+    fs.rmSync(logPath, { force: true });
+  } catch {
+    // The log is best-effort progress UI. A stale cleanup failure should not block the run.
+  }
+  const progressWatcher = callbacks
+    ? startAntigravityProgressWatcher(threadID, providerTurnID, logPath, callbacks)
+    : null;
+  const args = [
+    "--print",
+    promptWithContext,
+    "--dangerously-skip-permissions",
+    "--print-timeout",
+    "20m",
+    "--add-dir",
+    cwd,
+    "--log-file",
+    logPath
+  ];
+  let stdout = "";
+  let stderr = "";
+  try {
+    const result = await execCaptured(
+      executablePath,
+      args,
+      cwd,
+      20 * 60_000,
+      run,
+      (currentStdout, currentStderr) => antigravityAuthRequired(`${currentStdout}\n${currentStderr}`)
+        ? new Error(antigravityAuthRequiredMessage())
+        : null,
+      () => progressWatcher?.flush()
+    );
+    stdout = result.stdout;
+    stderr = result.stderr;
+  } catch (error) {
+    const captured = error as Error & { stdout?: string; stderr?: string };
+    const output = `${captured.stdout ?? ""}\n${captured.stderr ?? ""}\n${captured.message}`;
+    if (antigravityAuthRequired(output)) {
+      throw new Error(antigravityAuthRequiredMessage());
+    }
+    throw error;
+  } finally {
+    progressWatcher?.stop();
+  }
+  recordUsageFromProviderCLIOutput("antigravityCLI", stdout, stderr);
+  if (antigravityAuthRequired(`${stdout}\n${stderr}`)) {
+    throw new Error(antigravityAuthRequiredMessage());
+  }
+  const conversationID = progressWatcher?.conversationID() || antigravityConversationIDFromLogFile(logPath);
+  const responseText = (conversationID ? antigravityFinalResponseFromTranscript(conversationID) : "")
+    || providerCLIText(stdout, stderr, "antigravityCLI");
+  const artifacts = conversationID ? antigravityArtifactsFromTranscript(conversationID) : messageArtifactsFromText(`${stdout}\n${stderr}`);
+  if (!responseText && antigravityTimedOut(`${stdout}\n${stderr}`)) {
+    throw new Error("Antigravity timed out waiting for a response.");
+  }
+  if (responseText && antigravityTimedOut(responseText)) {
+    throw new Error("Antigravity timed out waiting for a response.");
+  }
+  return {
+    text: responseText || "Antigravity completed without a text response.",
+    artifacts
+  };
 }
 
 function diagnosticString(value: unknown) {
@@ -8744,12 +11338,18 @@ export async function sendCodexMessage(
   permissionMode?: string,
   skillIDs: string[] = [],
   clientRunID?: string,
+  attachments?: unknown[],
   eventSink?: (event: ProviderRunEvent) => void
 ) {
   const normalized = prompt.trim();
-  if (!normalized) throw new Error("Message is empty.");
-  pluginIDs = canonicalizeCodexPluginIDs(pluginIDs);
-  const runtimePrompt = promptWithSessionInstructions(normalized, sessionInstructions);
+  const imageAttachments = normalizeComposerImageAttachments(attachments);
+  if (!normalized && !imageAttachments.length) throw new Error("Message is empty.");
+  const normalizedToolSelection = await normalizeCodexToolSelection(pluginIDs, skillIDs);
+  pluginIDs = normalizedToolSelection.pluginIDs;
+  skillIDs = normalizedToolSelection.skillIDs;
+  const providerPrompt = normalized || "Please analyze the attached image.";
+  let runtimePrompt = promptWithSessionInstructions(providerPrompt, sessionInstructions);
+  const visibleUserText = normalized || (imageAttachments.length === 1 ? "Attached image" : `${imageAttachments.length} attached images`);
   const codexReasoningEffort = normalizeCodexReasoningEffort(reasoningEffort);
   const settings = await loadSettings();
   let openAssistThreadID = threadID?.startsWith("openassist-")
@@ -8763,7 +11363,12 @@ export async function sendCodexMessage(
   }
   const backend = normalizeBackend(String(session.activeProvider ?? settings.assistantBackend ?? "codex"));
   const modelID = modelForBackend(backend, settings, session);
-  const activeRun: ActiveProviderRun | undefined = clientRunID && backend === "codex"
+  if (backend !== "codex" && imageAttachments.length) {
+    const imageAttachmentContext = await materializeComposerImageAttachments(openAssistThreadID, imageAttachments);
+    runtimePrompt = [runtimePrompt, imageAttachmentContext].filter(Boolean).join("\n\n");
+  }
+  const supportsStopping = backend === "codex" || backend === "copilot" || backend === "claudeCode" || backend === "antigravityCLI";
+  const activeRun: ActiveProviderRun | undefined = clientRunID && supportsStopping
     ? {
         backend,
         provider: providerLabel(backend),
@@ -8787,21 +11392,44 @@ export async function sendCodexMessage(
       ...event
     } as ProviderRunEvent);
   };
+  if (activeRun) {
+    activeRun.emitStatus = (text: string) => emitRunEvent({ type: "status", text });
+  }
   emitRunEvent({ type: "status", text: `Loading ${providerLabel(backend)} provider...` });
   if (backend === "ollamaLocal") {
     const existing = providerBinding(session, "ollamaLocal")?.providerSessionID;
     updateProviderBinding(openAssistThreadID, "ollamaLocal", openAssistThreadID, modelID);
-    const responseText = await sendOllamaMessage(openAssistThreadID, runtimePrompt, modelID);
+    await beginTrackedCodeCheckpointIfNeeded(openAssistThreadID, interactionMode, settings);
     const providerTurnID = `ollama-turn-${randomUUID().toLowerCase()}`;
+    let responseText = "";
+    try {
+      responseText = await sendOllamaMessage(openAssistThreadID, runtimePrompt, modelID);
+    } catch (error) {
+      await finalizeTrackedCodeCheckpointIfNeeded({
+        threadID: openAssistThreadID,
+        turnID: providerTurnID,
+        turnStatus: "failed"
+      });
+      throw error;
+    }
+    const assistantMessageID = `assistant-final-${makeID()}`;
+    const finalizedCheckpoint = await finalizeTrackedCodeCheckpointIfNeeded({
+      threadID: openAssistThreadID,
+      turnID: providerTurnID,
+      assistantMessageID,
+      turnStatus: "completed"
+    });
     const completedTurn = persistCompletedTurn({
       threadID: openAssistThreadID,
       backend,
       providerSessionID: openAssistThreadID,
       providerTurnID,
       modelID,
-      prompt: normalized,
+      prompt: providerPrompt,
       responseText,
       insertedSystemMessage: !(typeof existing === "string" && existing.trim()),
+      assistantMessageID,
+      checkpointReferences: finalizedCheckpoint ? [finalizedCheckpoint.checkpoint.id] : [],
       reasoningEffort: codexReasoningEffort,
       interactionMode,
       permissionMode
@@ -8811,16 +11439,20 @@ export async function sendCodexMessage(
       threadID: openAssistThreadID,
       title: completedTurn.title,
       thread: completedTurn.thread,
-      user: { id: `user-${Date.now()}`, role: "user", text: normalized } satisfies ChatMessage,
+      user: { id: `user-${Date.now()}`, role: "user", text: visibleUserText, attachments: imageAttachments } satisfies ChatMessage,
       assistant: {
-        id: `assistant-${Date.now()}`,
+        id: assistantMessageID,
         role: "assistant",
         text: responseText,
-        provider: providerLabel(backend)
+        provider: providerLabel(backend),
+        turnID: providerTurnID,
+        checkpointInfo: finalizedCheckpoint
+          ? checkpointInfoFor(finalizedCheckpoint.checkpoint, finalizedCheckpoint.state)
+          : undefined
       } satisfies ChatMessage
     };
   }
-  if (backend === "copilot" || backend === "claudeCode") {
+  if (backend === "copilot" || backend === "claudeCode" || backend === "antigravityCLI") {
     const providerSession = ensureCLIProviderSession(openAssistThreadID, backend, modelID);
     session = findSession(openAssistThreadID);
     emitRunEvent({ type: "activity", activity: {
@@ -8836,34 +11468,89 @@ export async function sendCodexMessage(
       createdAt: Date.now(),
       updatedAt: Date.now()
     } });
-    const responseText = backend === "copilot"
-      ? await sendCopilotMessage(providerSession.providerSessionID, session, runtimePrompt, modelID)
-      : await sendClaudeCodeMessage(providerSession.providerSessionID, session, runtimePrompt, modelID, providerSession.insertedSystemMessage);
-    const providerTurnID = `${backend === "copilot" ? "copilot" : "claude"}-turn-${randomUUID().toLowerCase()}`;
+    const providerTurnPrefix = backend === "copilot"
+      ? "copilot"
+      : backend === "claudeCode"
+        ? "claude"
+        : "antigravity";
+    const providerTurnID = `${providerTurnPrefix}-turn-${randomUUID().toLowerCase()}`;
+    let responseText = "";
+    let assistantArtifacts: MessageArtifact[] = [];
+    try {
+      await beginTrackedCodeCheckpointIfNeeded(openAssistThreadID, interactionMode, settings);
+      if (backend === "copilot") {
+        responseText = await Promise.race([
+          sendCopilotMessage(providerSession.providerSessionID, session, runtimePrompt, modelID, activeRun),
+          stopPromise
+        ]);
+      } else if (backend === "claudeCode") {
+        responseText = await Promise.race([
+          sendClaudeCodeMessage(providerSession.providerSessionID, session, runtimePrompt, modelID, providerSession.insertedSystemMessage, activeRun),
+          stopPromise
+        ]);
+      } else {
+        const emitAntigravityActivity = (activity: ChatMessage) => {
+          emitRunEvent({ type: "activity", activity });
+        };
+        const antigravityResult = await Promise.race([
+          sendAntigravityMessage(session, openAssistThreadID, runtimePrompt, providerTurnID, activeRun, {
+            emitActivity: emitAntigravityActivity,
+            emitStatus: (text) => emitRunEvent({ type: "status", text })
+          }),
+          stopPromise
+        ]);
+        responseText = antigravityResult.text;
+        assistantArtifacts = antigravityResult.artifacts;
+      }
+    } catch (error) {
+      await finalizeTrackedCodeCheckpointIfNeeded({
+        threadID: openAssistThreadID,
+        turnID: providerTurnID,
+        turnStatus: error instanceof ProviderRunStoppedError ? "cancelled" : "failed"
+      });
+      if (clientRunID) activeProviderRuns.delete(clientRunID);
+      throw error;
+    }
+    const assistantMessageID = `assistant-final-${makeID()}`;
+    const finalizedCheckpoint = await finalizeTrackedCodeCheckpointIfNeeded({
+      threadID: openAssistThreadID,
+      turnID: providerTurnID,
+      assistantMessageID,
+      turnStatus: "completed"
+    });
     const completedTurn = persistCompletedTurn({
       threadID: openAssistThreadID,
       backend,
       providerSessionID: providerSession.providerSessionID,
       providerTurnID,
       modelID,
-      prompt: normalized,
+      prompt: providerPrompt,
       responseText,
       insertedSystemMessage: providerSession.insertedSystemMessage,
+      assistantMessageID,
+      checkpointReferences: finalizedCheckpoint ? [finalizedCheckpoint.checkpoint.id] : [],
+      assistantArtifacts,
       reasoningEffort: codexReasoningEffort,
       interactionMode,
       permissionMode
     });
     emitRunEvent({ type: "completed" });
+    if (clientRunID) activeProviderRuns.delete(clientRunID);
     return {
       threadID: openAssistThreadID,
       title: completedTurn.title,
       thread: completedTurn.thread,
-      user: { id: `user-${Date.now()}`, role: "user", text: normalized } satisfies ChatMessage,
+      user: { id: `user-${Date.now()}`, role: "user", text: visibleUserText, attachments: imageAttachments } satisfies ChatMessage,
       assistant: {
-        id: `assistant-${Date.now()}`,
+        id: assistantMessageID,
         role: "assistant",
         text: responseText,
-        provider: providerLabel(backend)
+        artifacts: assistantArtifacts,
+        provider: providerLabel(backend),
+        turnID: providerTurnID,
+        checkpointInfo: finalizedCheckpoint
+          ? checkpointInfoFor(finalizedCheckpoint.checkpoint, finalizedCheckpoint.state)
+          : undefined
       } satisfies ChatMessage
     };
   }
@@ -8877,7 +11564,28 @@ export async function sendCodexMessage(
     pluginIDs,
     sessionInstructions
   };
+  if (shouldPreferCodexComputerUsePlugin(pluginIDs)) {
+    emitRunEvent({ type: "status", text: "Preparing Computer Use..." });
+    try {
+      const didResetActiveComputerUse = await resetCodexIfComputerUseAlreadyActive("Reset stale active Computer Use tool before starting a new turn");
+      if (didResetActiveComputerUse) {
+        emitRunEvent({ type: "status", text: "Reset stale Computer Use work. Starting clean..." });
+      }
+      const didResetExistingHelper = await resetCodexIfCurrentComputerUseHelperExists("Reset existing Computer Use helper before starting a new turn");
+      if (didResetExistingHelper) {
+        emitRunEvent({ type: "status", text: "Reset existing Computer Use helper. Starting clean..." });
+      }
+      const cleanup = await cleanupStaleComputerUseHelpers(codexTransport.currentPID());
+      if (cleanup.killed.length) {
+        bridgeDebugLog(`Computer Use stale helper cleanup completed before provider session killed=${cleanup.killed.join(",")}`);
+        emitRunEvent({ type: "status", text: "Cleaned up stale Computer Use helpers. Starting Codex..." });
+      }
+    } catch (error) {
+      bridgeDebugLog(`Computer Use stale helper cleanup failed: ${error instanceof Error ? error.stack ?? error.message : String(error)}`);
+    }
+  }
   const providerSession = await ensureCodexProviderSession(openAssistThreadID, modelID, codexRuntimeOptions);
+  await beginTrackedCodeCheckpointIfNeeded(openAssistThreadID, interactionMode, settings);
   if (activeRun) {
     activeRun.providerThreadID = providerSession.providerSessionID;
   }
@@ -8996,17 +11704,21 @@ export async function sendCodexMessage(
   codexTransport.on("notification", onNotification);
   try {
     const turnComplete = waitForTurnComplete();
-    const pluginItems = await pluginPromptItems(pluginIDs, normalized);
-    const structuredItems = dedupeInputItems([
-      ...(await threadSkillPromptItems(openAssistThreadID)),
-      ...(await selectedSkillPromptItems(skillIDs)),
-      ...imageGenerationSkillPromptItems(normalized),
-      ...pluginItems
-    ]);
+    const pluginItems = await pluginPromptItems(pluginIDs, providerPrompt);
+    const structuredItems = [
+      ...composerImageInputItems(imageAttachments),
+      ...dedupeInputItems([
+        ...(await threadSkillPromptItems(openAssistThreadID)),
+        ...(await selectedSkillPromptItems(skillIDs)),
+        ...imageGenerationSkillPromptItems(providerPrompt),
+        ...pluginItems
+      ]),
+      ...composerImageInstructionItems(imageAttachments)
+    ];
     const startedTurn = await Promise.race([
       codexTransport.request(
         "turn/start",
-        codexTurnStartParams(providerSession.providerSessionID, normalized, structuredItems, modelID, codexRuntimeOptions)
+        codexTurnStartParams(providerSession.providerSessionID, providerPrompt, structuredItems, modelID, codexRuntimeOptions)
       ) as Promise<JsonObject>,
       stopPromise
     ]);
@@ -9026,12 +11738,26 @@ export async function sendCodexMessage(
     }
     providerTurnID = completed.turnID ?? providerTurnID;
     activityTurnIDs.add(providerTurnID);
+  } catch (error) {
+    await finalizeTrackedCodeCheckpointIfNeeded({
+      threadID: openAssistThreadID,
+      turnID: providerTurnID,
+      turnStatus: error instanceof ProviderRunStoppedError ? "cancelled" : "failed"
+    });
+    throw error;
   } finally {
     codexTransport.off("notification", onNotification);
     if (clientRunID) activeProviderRuns.delete(clientRunID);
   }
   const finalText = responseText.trim() || (didGenerateImage ? "Generated image is ready." : "The Codex turn completed without a text response.");
   const shouldRestartAfterComputerUseTimeout = didObserveComputerUseToolFailure || responseIndicatesComputerUseTimeout(finalText);
+  const assistantMessageID = `assistant-final-${makeID()}`;
+  const finalizedCheckpoint = await finalizeTrackedCodeCheckpointIfNeeded({
+    threadID: openAssistThreadID,
+    turnID: providerTurnID,
+    assistantMessageID,
+    turnStatus: "completed"
+  });
   const completedTurn = persistCompletedTurn({
     threadID: openAssistThreadID,
     backend,
@@ -9039,9 +11765,11 @@ export async function sendCodexMessage(
     providerTurnID,
     activityTurnIDs: Array.from(activityTurnIDs),
     modelID,
-    prompt: normalized,
+    prompt: providerPrompt,
     responseText: finalText,
     insertedSystemMessage: providerSession.insertedSystemMessage,
+    assistantMessageID,
+    checkpointReferences: finalizedCheckpoint ? [finalizedCheckpoint.checkpoint.id] : [],
     reasoningEffort: codexReasoningEffort,
     interactionMode,
     permissionMode
@@ -9052,18 +11780,25 @@ export async function sendCodexMessage(
     await codexTransport.restart("Codex reported a Computer Use timeout").catch((error) => {
       bridgeDebugLog(`restart after Computer Use timeout failed: ${error instanceof Error ? error.stack ?? error.message : String(error)}`);
     });
+    await cleanupStaleComputerUseHelpers(undefined, { allowDuringActiveToolCall: true }).catch((error) => {
+      bridgeDebugLog(`cleanup after Computer Use timeout failed: ${error instanceof Error ? error.stack ?? error.message : String(error)}`);
+    });
   }
   emitRunEvent({ type: "completed" });
   return {
     threadID: openAssistThreadID,
     title: completedTurn.title,
     thread: completedTurn.thread,
-    user: { id: `user-${Date.now()}`, role: "user", text: normalized } satisfies ChatMessage,
+    user: { id: `user-${Date.now()}`, role: "user", text: visibleUserText, attachments: imageAttachments } satisfies ChatMessage,
     assistant: {
-      id: `assistant-${Date.now()}`,
+      id: assistantMessageID,
       role: "assistant",
       text: finalText,
-      provider: "Codex"
+      provider: "Codex",
+      turnID: providerTurnID,
+      checkpointInfo: finalizedCheckpoint
+        ? checkpointInfoFor(finalizedCheckpoint.checkpoint, finalizedCheckpoint.state)
+        : undefined
     } satisfies ChatMessage
   };
 }
@@ -9072,6 +11807,7 @@ export async function codexRuntimeParityProbe(options: {
   prompt?: string;
   cwd?: string;
   pluginIDs?: string[];
+  skillIDs?: string[];
   sessionInstructions?: string;
   reasoningEffort?: string;
   interactionMode?: string;
@@ -9082,7 +11818,8 @@ export async function codexRuntimeParityProbe(options: {
   const cwd = options.cwd?.trim() || undefined;
   const modelID = options.modelID?.trim() || readCodexDefaultModel();
   const reasoningEffort = normalizeCodexReasoningEffort(options.reasoningEffort);
-  const canonicalPluginIDs = canonicalizeCodexPluginIDs(options.pluginIDs ?? []);
+  const normalizedToolSelection = await normalizeCodexToolSelection(options.pluginIDs ?? [], options.skillIDs ?? []);
+  const canonicalPluginIDs = normalizedToolSelection.pluginIDs;
   const runtimeOptions: CodexRuntimeOptions = {
     interactionMode: options.interactionMode,
     permissionMode: options.permissionMode,
@@ -9098,7 +11835,26 @@ export async function codexRuntimeParityProbe(options: {
     ...(cwd ? { cwd, effectiveCWD: cwd } : {})
   };
   const pluginItems = await pluginPromptItems(canonicalPluginIDs, prompt);
-  const structuredInputItems = dedupeInputItems(pluginItems);
+  const skillItems = await selectedSkillPromptItems(normalizedToolSelection.skillIDs);
+  const structuredInputItems = dedupeInputItems([...skillItems, ...pluginItems]);
+  const appStatuses = await listPluginAppStatuses().catch(() => [] as PluginAppStatus[]);
+  const appStatusProbeMatches = appStatuses
+    .filter((status) => appMatchCandidates(status).some((candidate) => promptContainsStandalonePhrase(candidate, prompt)))
+    .slice(0, 20)
+    .map((status) => ({
+      id: status.id,
+      name: status.name,
+      isAccessible: status.isAccessible,
+      isEnabled: status.isEnabled,
+      pluginDisplayNames: status.pluginDisplayNames
+    }));
+  const appStatusProbeSample = appStatuses.slice(0, 20).map((status) => ({
+    id: status.id,
+    name: status.name,
+    isAccessible: status.isAccessible,
+    isEnabled: status.isEnabled,
+    pluginDisplayNames: status.pluginDisplayNames
+  }));
   const sampleDesktopSpecs = [
     { name: "app_action" },
     { name: "computer_use" },
@@ -9122,6 +11878,8 @@ export async function codexRuntimeParityProbe(options: {
     threadResume: codexThreadResumeParams("codex-runtime-probe-thread", session, modelID, runtimeOptions),
     turnStart: codexTurnStartParams("codex-runtime-probe-thread", prompt, structuredInputItems, modelID, runtimeOptions),
     pluginItems: structuredInputItems,
+    appStatusProbeMatches,
+    appStatusProbeSample,
     desktopToolSuppression: {
       baseline: sampleDesktopSpecs.map((spec) => spec.name),
       filtered: filteredSampleSpecs.map((spec) => spec.name)
@@ -9175,6 +11933,7 @@ export {
   installKokoroVoiceModel,
   importSkillFolder,
   importSkillFromGitHub,
+  loadCodeTrackingState,
   loadProjectMemory,
   loadThreadMessages,
   loadThreadMemory,
@@ -9185,6 +11944,7 @@ export {
   promoteTemporarySession,
   renameProject,
   renameSession,
+  openCodeReview,
   createScheduledJob,
   saveThreadNote,
   saveProjectNote,
@@ -9219,6 +11979,7 @@ export {
   updateProjectLinkedFolder,
   updateSetting,
   updateShortcut,
+  restoreCodeCheckpoint,
   voiceInputConfiguration,
   writeThreadSkillBinding as toggleThreadSkill
 };

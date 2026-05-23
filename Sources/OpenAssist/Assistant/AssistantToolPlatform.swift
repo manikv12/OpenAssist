@@ -55,6 +55,18 @@ struct ClaudeCodeBackendAdapter: AssistantBackendAdapter {
     )
 }
 
+struct AntigravityCLIBackendAdapter: AssistantBackendAdapter {
+    let backend: AssistantRuntimeBackend = .antigravityCLI
+    let capabilities = AssistantBackendCapabilities(
+        supportsStructuredToolCalls: false,
+        supportsImageInput: false,
+        maxPracticalToolCount: nil,
+        supportsLongToolOutputs: true,
+        supportsContinuation: true,
+        preferredToolSurface: .granular
+    )
+}
+
 struct OllamaLocalBackendAdapter: AssistantBackendAdapter {
     let backend: AssistantRuntimeBackend = .ollamaLocal
     let capabilities = AssistantBackendCapabilities(
@@ -76,6 +88,8 @@ enum AssistantBackendAdapterRegistry {
             return CopilotBackendAdapter()
         case .claudeCode:
             return ClaudeCodeBackendAdapter()
+        case .antigravityCLI:
+            return AntigravityCLIBackendAdapter()
         case .ollamaLocal:
             return OllamaLocalBackendAdapter()
         }

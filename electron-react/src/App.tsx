@@ -32,6 +32,7 @@ import {
   GitBranch,
   Hammer,
   Heading2,
+  ImagePlus,
   Italic,
   Keyboard,
   Layers3,
@@ -99,6 +100,7 @@ import {
   X
 } from "./components/CodexIcons";
 import claudeMark from "./assets/provider-marks/claude.svg";
+import antigravityMark from "./assets/provider-marks/antigravity.png";
 import codexMark from "./assets/provider-marks/codex.svg";
 import copilotMark from "./assets/provider-marks/copilot.svg";
 import ollamaMark from "./assets/provider-marks/ollama.svg";
@@ -106,6 +108,7 @@ import { settingsSections } from "./data";
 import type {
   AutomationItem,
   ChatMessage,
+  ComposerImageAttachment,
   NoteDetail,
   NoteFolderItem,
   NoteItem,
@@ -137,14 +140,85 @@ type ProviderKey =
   | "codex"
   | "copilot"
   | "claudeCode"
+  | "antigravityCLI"
   | "ollamaLocal";
 type ApprovalOption = NonNullable<ChatMessage["approvalOptions"]>[number];
 type ApprovalResponder = (message: ChatMessage, option: ApprovalOption) => void;
-type RuntimeProviderKey = Extract<ProviderKey, "codex" | "copilot" | "claudeCode" | "ollamaLocal">;
+type CheckpointRestoreHandler = (checkpointID: string) => void | Promise<void>;
+type MessageArtifact = NonNullable<ChatMessage["artifacts"]>[number];
+type RuntimeProviderKey = Extract<ProviderKey, "codex" | "copilot" | "claudeCode" | "antigravityCLI" | "ollamaLocal">;
 type CodexPermissionMode = "default" | "autoReview" | "fullAccess" | "custom";
 type VoiceInputStatus = "idle" | "listening" | "processing" | "unsupported" | "error";
 type LiveVoiceStatus = "idle" | "connecting" | "listening" | "speaking" | "delegating" | "error";
+const MAX_PARALLEL_THREAD_RUNS = 6;
+const MAX_COMPOSER_IMAGE_ATTACHMENTS = 6;
+const MAX_COMPOSER_IMAGE_BYTES = 12 * 1024 * 1024;
+
+function mimeTypeForImageName(name: string) {
+  const ext = name.split(".").pop()?.toLowerCase();
+  if (ext === "jpg" || ext === "jpeg") return "image/jpeg";
+  if (ext === "gif") return "image/gif";
+  if (ext === "webp") return "image/webp";
+  if (ext === "svg") return "image/svg+xml";
+  if (ext === "tif" || ext === "tiff") return "image/tiff";
+  if (ext === "heic") return "image/heic";
+  if (ext === "heif") return "image/heif";
+  return "image/png";
+}
+
+function isSupportedComposerImage(file: File) {
+  return file.type.startsWith("image/") || /\.(png|jpe?g|gif|webp|tiff?|svg|heic|heif)$/i.test(file.name);
+}
+
+function readableFileSize(bytes?: number) {
+  if (!bytes || bytes <= 0) return "";
+  if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(bytes > 10 * 1024 * 1024 ? 0 : 1)} MB`;
+}
+
+function readImageFileAttachment(file: File): Promise<ComposerImageAttachment> {
+  return new Promise((resolve, reject) => {
+    if (!isSupportedComposerImage(file)) {
+      reject(new Error("Only images can be attached here."));
+      return;
+    }
+    if (file.size > MAX_COMPOSER_IMAGE_BYTES) {
+      reject(new Error("One image is too large. Please attach an image under 12 MB."));
+      return;
+    }
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error("Could not read that image."));
+    reader.onload = () => {
+      const rawDataURL = typeof reader.result === "string" ? reader.result : "";
+      if (!rawDataURL) {
+        reject(new Error("Could not read that image."));
+        return;
+      }
+      const mimeType = file.type.startsWith("image/") ? file.type : mimeTypeForImageName(file.name);
+      const dataURL = rawDataURL.startsWith("data:;base64,")
+        ? rawDataURL.replace("data:;base64,", `data:${mimeType};base64,`)
+        : rawDataURL;
+      resolve({
+        id: `image-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+        name: file.name || "attached-image.png",
+        mimeType,
+        dataURL,
+        size: file.size
+      });
+    };
+    reader.readAsDataURL(file);
+  });
+}
 const DEFAULT_THREAD_TITLE = "New Assistant Session";
+
+type ActiveThreadRun = {
+  runID: string;
+  threadID: string;
+  provider: string;
+  startedAt: number;
+  statusText?: string;
+  stopRequested?: boolean;
+};
 
 function usableThreadTitle(title?: string | null) {
   const trimmed = title?.replace(/\s+/g, " ").trim();
@@ -154,6 +228,11 @@ function usableThreadTitle(title?: string | null) {
 function chatTitleForPrompt(prompt: string) {
   const squashed = prompt.replace(/\s+/g, " ").trim();
   return squashed.length > 78 ? `${squashed.slice(0, 77).trimEnd()}...` : squashed || DEFAULT_THREAD_TITLE;
+}
+
+function usableOpenAssistThreadID(threadID?: string | null) {
+  const trimmed = threadID?.trim();
+  return trimmed && /^openassist-[0-9a-f-]{36}$/i.test(trimmed) ? trimmed : undefined;
 }
 
 type RealtimeAudioChunk = {
@@ -171,6 +250,8 @@ type OpenAssistRealtimeAPI = {
     interactionMode?: string;
     permissionMode?: string;
     reasoningEffort?: string;
+    pluginIDs?: string[];
+    skillIDs?: string[];
   }) => Promise<RealtimeStartResult>;
   appendAudio: (chunk: RealtimeAudioChunk) => Promise<{ ok: boolean; error?: string }>;
   appendText: (text: string) => Promise<{ ok: boolean; error?: string }>;
@@ -255,6 +336,11 @@ function base64ToPCM16(data: string) {
 function realtimePayloadText(payload: any) {
   if (typeof payload === "string") return payload;
   return payload?.delta ?? payload?.text ?? payload?.transcript ?? payload?.message ?? "";
+}
+
+function isBenignRealtimeCancelError(message: string) {
+  const normalized = String(message || "").toLowerCase();
+  return normalized.includes("cancel") && normalized.includes("no active response");
 }
 
 function realtimePayloadRole(payload: any) {
@@ -472,6 +558,7 @@ const runtimeProviderOptions: RuntimeProviderOption[] = [
   { key: "codex", label: "Codex", detail: "Uses your signed-in ChatGPT/Codex subscription" },
   { key: "copilot", label: "Copilot", detail: "GitHub Copilot CLI session" },
   { key: "claudeCode", label: "Claude", detail: "Claude Code CLI session" },
+  { key: "antigravityCLI", label: "Antigravity", detail: "Google Antigravity CLI subscription session" },
   { key: "ollamaLocal", label: "Ollama", detail: "Local Ollama chat model" }
 ];
 
@@ -1182,11 +1269,63 @@ const setupRequiredDetails: Record<RuntimeProviderKey, string> = {
   codex: "Install or sign in to Codex from Open Assist",
   copilot: "Install or sign in to GitHub Copilot",
   claudeCode: "Install or sign in to Claude Code",
+  antigravityCLI: "Install or sign in to Antigravity CLI",
   ollamaLocal: "Open Local AI Setup for Ollama"
 };
 
 function modelOption(id: string, displayName = id, description = displayName, disabled = false): ProviderModelOption {
   return { id, displayName, description, hidden: false, isInstalled: true, disabled };
+}
+
+function antigravityModelOptions(): ProviderModelOption[] {
+  return [
+    {
+      ...modelOption(
+        "gemini-3.5-flash-high",
+        "Gemini 3.5 Flash (High)",
+        "Fast · Limited time"
+      ),
+      isDefault: true
+    },
+    modelOption(
+      "gemini-3.5-flash-low",
+      "Gemini 3.5 Flash (Low)",
+      "Fast · Limited time"
+    ),
+    modelOption(
+      "gemini-3.1-pro-high",
+      "Gemini 3.1 Pro (High)",
+      "Antigravity reasoning model from local Antigravity account state."
+    ),
+    modelOption(
+      "gemini-3.1-pro-low",
+      "Gemini 3.1 Pro (Low)",
+      "Antigravity reasoning model from local Antigravity account state."
+    ),
+    modelOption(
+      "claude-sonnet-4.6-thinking",
+      "Claude Sonnet 4.6 (Thinking)",
+      "Antigravity reasoning model from local Antigravity account state."
+    ),
+    modelOption(
+      "claude-opus-4.6-thinking",
+      "Claude Opus 4.6 (Thinking)",
+      "Antigravity reasoning model from local Antigravity account state."
+    ),
+    modelOption(
+      "gpt-oss-120b-medium",
+      "GPT-OSS 120B (Medium)",
+      "Recommended"
+    ),
+    {
+      ...modelOption(
+        "antigravity-default",
+        "Gemini 3.5 Flash (High)",
+        "Legacy Open Assist default. Antigravity will use its selected reasoning model."
+      ),
+      hidden: true
+    }
+  ];
 }
 
 const fallbackModelOptionsByProvider: Partial<Record<ProviderKey, ProviderModelOption[]>> = {
@@ -1201,6 +1340,7 @@ const fallbackModelOptionsByProvider: Partial<Record<ProviderKey, ProviderModelO
     modelOption("opus", "Claude Opus"),
     modelOption("haiku", "Claude Haiku")
   ],
+  antigravityCLI: antigravityModelOptions(),
   copilot: [
     modelOption("auto", "Auto", "Let Copilot pick the best model"),
     modelOption("gpt-5.4", "GPT-5.4"),
@@ -1227,7 +1367,7 @@ function fallbackModelOptionsForProvider(provider: ProviderKey) {
 
 function providerModelIDs(provider: ProviderKey, loadedModels?: ProviderModelOption[]) {
   const options = loadedModels?.length ? loadedModels : fallbackModelOptionsForProvider(provider);
-  return options.map((option) => option.id);
+  return options.filter((option) => !option.hidden).map((option) => option.id);
 }
 
 function modelMatchesProvider(provider: ProviderKey, model?: string | null, loadedModels?: ProviderModelOption[]) {
@@ -3079,8 +3219,10 @@ const providerMarks: Partial<Record<ProviderKey, string>> = {
   codex: codexMark,
   copilot: copilotMark,
   claudeCode: claudeMark,
+  antigravityCLI: antigravityMark,
   ollamaLocal: ollamaMark
 };
+const originalColorProviderMarks = new Set<ProviderKey>(["antigravityCLI"]);
 
 type SidebarIconComponent = ComponentType<{ size?: number | string; strokeWidth?: number | string; className?: string }>;
 
@@ -3191,12 +3333,13 @@ function providerKey(raw?: string): ProviderKey {
   const value = (raw || "").toLowerCase();
   if (value.includes("copilot") || value.includes("github")) return "copilot";
   if (value.includes("claude")) return "claudeCode";
+  if (value.includes("antigravity") || value === "agy") return "antigravityCLI";
   if (value.includes("ollama")) return "ollamaLocal";
   return "codex";
 }
 
 function isRuntimeProviderKey(key: ProviderKey): key is RuntimeProviderKey {
-  return key === "codex" || key === "copilot" || key === "claudeCode" || key === "ollamaLocal";
+  return key === "codex" || key === "copilot" || key === "claudeCode" || key === "antigravityCLI" || key === "ollamaLocal";
 }
 
 function runtimeProviderKey(raw?: string): RuntimeProviderKey {
@@ -3303,9 +3446,12 @@ function withTimeout<T>(promise: Promise<T> | undefined, timeoutMs: number, mess
 function ProviderMark({ provider, className }: { provider?: string; className?: string }) {
   const key = providerKey(provider);
   const mark = providerMarks[key];
+  const shouldRenderOriginalColors = originalColorProviderMarks.has(key);
   return (
     <span className={cx("provider-mark", `provider-mark-${key}`, className)} aria-hidden="true">
-      {mark ? (
+      {mark && shouldRenderOriginalColors ? (
+        <img className="provider-mark-glyph provider-mark-image provider-mark-img" src={mark} alt="" draggable={false} />
+      ) : mark ? (
         <span
           className="provider-mark-glyph provider-mark-image"
           style={{
@@ -3516,6 +3662,70 @@ function ActivityPreviewStrip({
       {previewActivities.map((activity) => (
         <ActivityImageThumbnail key={activity.id} activity={activity} label="Open image in Preview" />
       ))}
+    </div>
+  );
+}
+
+function MessageArtifacts({ artifacts }: { artifacts?: MessageArtifact[] }) {
+  const visibleArtifacts = (artifacts ?? []).filter((artifact) => artifact.path || artifact.dataURL);
+  if (!visibleArtifacts.length) return null;
+  const openArtifact = (artifact: MessageArtifact) => {
+    if (artifact.path) {
+      void window.openAssistElectron?.openLocalPath?.(artifact.path);
+      return;
+    }
+    if (artifact.dataURL) openImagePreviewDataURL(artifact.dataURL);
+  };
+  const revealArtifact = (artifact: MessageArtifact) => {
+    if (!artifact.path) return;
+    void window.openAssistElectron?.revealLocalPath?.(artifact.path);
+  };
+  return (
+    <div className="message-artifacts" aria-label="Generated artifacts">
+      {visibleArtifacts.map((artifact) => {
+        const size = readableFileSize(artifact.size);
+        const dimensions = artifact.width && artifact.height ? `${artifact.width} x ${artifact.height}` : "";
+        const isSmallImage = artifact.kind === "image" && artifact.width && artifact.height && Math.max(artifact.width, artifact.height) <= 1024;
+        const format = artifact.mimeType?.split("/")[1]?.toUpperCase();
+        const subtitle = [artifact.kind === "image" ? "Generated image" : "Generated file", dimensions, format, size, compactPath(artifact.path)]
+          .filter(Boolean)
+          .join(" · ");
+        return (
+          <div key={artifact.id || artifact.path} className={cx("message-artifact-card", isSmallImage && "is-low-res")}>
+            {artifact.kind === "image" && artifact.dataURL ? (
+              <button
+                type="button"
+                className="message-artifact-preview"
+                onClick={() => openArtifact(artifact)}
+                title="Open artifact"
+              >
+                <img src={artifact.dataURL} alt={artifact.name} draggable={false} />
+              </button>
+            ) : (
+              <span className="message-artifact-file-icon" aria-hidden="true">
+                <FileText size={18} />
+              </span>
+            )}
+            <div className="message-artifact-copy">
+              <strong>{artifact.name || "Generated artifact"}</strong>
+              <span>{subtitle}</span>
+              {isSmallImage && <em>Preview quality</em>}
+            </div>
+            <div className="message-artifact-actions">
+              <button type="button" onClick={() => openArtifact(artifact)} title="Open artifact">
+                <ExternalLink size={13} />
+                Open
+              </button>
+              {artifact.path && (
+                <button type="button" onClick={() => revealArtifact(artifact)} title="Show in Finder">
+                  <Folder size={13} />
+                  Finder
+                </button>
+              )}
+            </div>
+          </div>
+        );
+      })}
     </div>
   );
 }
@@ -4662,26 +4872,34 @@ function Sidebar({
           </div>
           {!threadsCollapsed && (
           <div className="thread-list">
-            {visibleThreads.map((thread) => (
-              <button
-                key={thread.id}
-                className={cx(
-                  "thread-row",
-                  `thread-row-provider-${runtimeProviderKey(thread.activeProvider)}`,
-                  (selectedThreadID ? thread.id === selectedThreadID : thread.active) && "active"
-                )}
-                onClick={() => onSelectThread(thread.id)}
-                onContextMenu={(event) => {
-                  event.preventDefault();
-                  event.stopPropagation();
-                  setContextMenu({ kind: "thread", threadID: thread.id, ...menuPosition(event) });
-                }}
-              >
-                <span className="thread-title">{thread.title}</span>
-                <span className="thread-age">{thread.age}</span>
-                {(thread.isTemporary || thread.project) && <small>{thread.isTemporary ? "Temporary" : thread.project}</small>}
-              </button>
-            ))}
+            {visibleThreads.map((thread) => {
+              const isThreadRunning = Boolean(thread.isRunning);
+              return (
+                <button
+                  key={thread.id}
+                  className={cx(
+                    "thread-row",
+                    `thread-row-provider-${runtimeProviderKey(thread.activeProvider)}`,
+                    isThreadRunning && "is-running",
+                    (selectedThreadID ? thread.id === selectedThreadID : thread.active) && "active"
+                  )}
+                  title={isThreadRunning ? thread.runStatusText || "This chat is running" : undefined}
+                  onClick={() => onSelectThread(thread.id)}
+                  onContextMenu={(event) => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    setContextMenu({ kind: "thread", threadID: thread.id, ...menuPosition(event) });
+                  }}
+                >
+                  {isThreadRunning && <span className="thread-running-spinner" aria-hidden="true" />}
+                  <span className="thread-title">{thread.title}</span>
+                  <span className="thread-age">{thread.age}</span>
+                  {(thread.isTemporary || thread.project || isThreadRunning) && (
+                    <small>{isThreadRunning ? "Working" : thread.isTemporary ? "Temporary" : thread.project}</small>
+                  )}
+                </button>
+              );
+            })}
             {hasMoreThreads && (
               <button className="thread-row show-more-row" onClick={() => setThreadLimit((value) => Math.min(value + 28, threads.length))}>
                 <span className="thread-title">Show more threads</span>
@@ -5021,7 +5239,7 @@ function ComposerContextBar({
         })}
         {!windows.length && !context && (
           <span className="composer-usage-pending">
-            <Gauge size={13} /> Usage pending
+            <Gauge size={13} /> {usage?.planType ? `${usage.planType} plan` : "Usage pending"}
           </span>
         )}
       </div>
@@ -5106,6 +5324,38 @@ function shouldShowLiveVoiceStatusPanel(status: LiveVoiceStatus, text?: string) 
   return status === "listening" || status === "speaking" || status === "delegating";
 }
 
+function DictationStatusPanel({
+  status,
+  text
+}: {
+  status: VoiceInputStatus;
+  text?: string;
+}) {
+  if (status !== "listening" && status !== "processing") return null;
+  const isProcessing = status === "processing";
+  const label = isProcessing ? "Transcribing voice" : "Voice-to-text listening";
+  const displayText = text?.trim() || (isProcessing ? "Turning your recording into composer text." : "Recording into the composer.");
+
+  return (
+    <div className={cx("composer-dictation-panel", `state-${status}`)} role="status" title={displayText}>
+      <span className="composer-dictation-panel-icon" aria-hidden="true">
+        {isProcessing ? <span className="voice-loading-spinner menu-spinner" /> : <Mic size={15} />}
+      </span>
+      <span className="composer-dictation-panel-copy">
+        <span className="composer-dictation-panel-label">{label}</span>
+        <span className="composer-dictation-panel-text">{displayText}</span>
+      </span>
+      {!isProcessing && (
+        <span className="composer-dictation-bars" aria-hidden="true">
+          <span />
+          <span />
+          <span />
+        </span>
+      )}
+    </div>
+  );
+}
+
 function usageWindowResetText(window: NonNullable<ProviderUsageSnapshot["primary"]>) {
   const resetDate = window.resetsAt ? new Date(window.resetsAt) : null;
   const hasResetDate = resetDate && Number.isFinite(resetDate.getTime());
@@ -5174,23 +5424,135 @@ function ComposerUsageRing({
   );
 }
 
+function checkpointChangeBadge(changeKind: NonNullable<ChatMessage["checkpointInfo"]>["checkpoint"]["changedFiles"][number]["changeKind"]) {
+  if (changeKind === "added") return "A";
+  if (changeKind === "deleted") return "D";
+  if (changeKind === "typeChanged") return "T";
+  return "M";
+}
+
+function checkpointChangeLabel(changeKind: NonNullable<ChatMessage["checkpointInfo"]>["checkpoint"]["changedFiles"][number]["changeKind"]) {
+  if (changeKind === "added") return "Added";
+  if (changeKind === "deleted") return "Deleted";
+  if (changeKind === "typeChanged") return "Type changed";
+  if (changeKind === "changed") return "Changed";
+  return "Modified";
+}
+
+function CodeCheckpointCard({
+  threadID,
+  info,
+  onRestore
+}: {
+  threadID?: string;
+  info: NonNullable<ChatMessage["checkpointInfo"]>;
+  onRestore?: CheckpointRestoreHandler;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const checkpoint = info.checkpoint;
+  const files = checkpoint.changedFiles ?? [];
+  const canUndo = info.checkpointIndex === info.currentCheckpointPosition;
+  const canRedo = info.checkpointIndex === info.currentCheckpointPosition + 1;
+  const canRestore = Boolean(threadID && onRestore && !info.actionsLocked && !info.hasActiveTurn && (canUndo || canRedo));
+  const restoreLabel = canUndo ? "Undo changes" : canRedo ? "Redo changes" : "Not current";
+  const visibleFiles = files.slice(0, 6);
+  const remainingFileCount = Math.max(0, files.length - visibleFiles.length);
+  const patchPreview = checkpoint.patch.length > 12000
+    ? `${checkpoint.patch.slice(0, 12000)}\n\n... diff shortened in chat.`
+    : checkpoint.patch;
+
+  const openReview = async () => {
+    if (threadID) {
+      await window.openAssistElectron?.openCodeReview?.(threadID, checkpoint.id).catch(() => null);
+    }
+    setExpanded((value) => !value);
+  };
+
+  const restore = async () => {
+    if (!canRestore) return;
+    setBusy(true);
+    try {
+      await onRestore?.(checkpoint.id);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className={cx("checkpoint-card", info.futureTurnsHidden && "future")}>
+      <div className="checkpoint-card-head">
+        <span className="checkpoint-icon">
+          <GitBranch size={14} />
+        </span>
+        <span className="checkpoint-title">
+          <strong>{checkpoint.summary || `${files.length} ${files.length === 1 ? "file" : "files"} changed`}</strong>
+          <small>Checkpoint {checkpoint.checkpointNumber}</small>
+        </span>
+        <span className="checkpoint-status">
+          {checkpoint.turnStatus === "completed" ? "Saved" : checkpoint.turnStatus === "cancelled" ? "Stopped" : "Needs review"}
+        </span>
+      </div>
+      {visibleFiles.length > 0 && (
+        <div className="checkpoint-files" aria-label="Changed files">
+          {visibleFiles.map((file) => (
+            <span className="checkpoint-file" key={`${checkpoint.id}-${file.path}`} title={`${checkpointChangeLabel(file.changeKind)} ${file.path}`}>
+              <span>{checkpointChangeBadge(file.changeKind)}</span>
+              <FileText size={12} />
+              <b>{file.path}</b>
+            </span>
+          ))}
+          {remainingFileCount > 0 && <span className="checkpoint-more">+{remainingFileCount} more</span>}
+        </div>
+      )}
+      <div className="checkpoint-actions">
+        <button type="button" onClick={() => { void openReview(); }}>
+          <Code2 size={13} />
+          {expanded ? "Hide diff" : "Review diff"}
+        </button>
+        <button type="button" disabled={!canRestore || busy} onClick={() => { void restore(); }}>
+          <RefreshCw size={13} />
+          {busy ? "Restoring..." : restoreLabel}
+        </button>
+      </div>
+      <AnimatePresence initial={false}>
+        {expanded && (
+          <motion.div
+            className="checkpoint-diff"
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: "auto", opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
+            transition={{ duration: 0.16, ease: [0.22, 1, 0.36, 1] }}
+          >
+            <pre>{patchPreview || "No text diff was available for these files."}</pre>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
+  );
+}
+
 function MessageBubble({
   message,
+  threadID,
   mentionCatalog,
   onAddTextToThreadNote,
   onUseTextInComposer,
   onOpenThreadNote,
   onSpeakText,
   onRespondToApproval,
+  onRestoreCodeCheckpoint,
   embedded = false
 }: {
   message: ChatMessage;
+  threadID?: string;
   mentionCatalog: Record<string, ComposerMentionEntry>;
   onAddTextToThreadNote?: (text: string) => void;
   onUseTextInComposer?: (text: string) => void;
   onOpenThreadNote?: () => void;
   onSpeakText?: (text: string) => void | Promise<void>;
   onRespondToApproval?: ApprovalResponder;
+  onRestoreCodeCheckpoint?: CheckpointRestoreHandler;
   embedded?: boolean;
 }) {
   const isRunningAssistant = message.role === "assistant" && message.status === "running";
@@ -5417,13 +5779,34 @@ function MessageBubble({
   }
 
   if (message.role === "user") {
+    const attachments = message.attachments ?? [];
     return (
       <motion.div {...layoutProps} {...motionProps} className="message-row user-message" onContextMenu={openMessageContextMenu}>
         <button className="copy-button" aria-label="Copy message" onClick={copyMessage}>
           <Copy size={14} />
         </button>
-        <div className="user-bubble">
-          <UserMessageMentionText text={message.text} catalog={mentionCatalog} />
+        <div className={cx("user-bubble", attachments.length > 0 && "has-attachments")}>
+          {attachments.length > 0 && (
+            <div className="user-attachment-grid" aria-label="Attached images">
+              {attachments.map((attachment) => (
+                <button
+                  key={attachment.id}
+                  type="button"
+                  className="user-attachment-thumb"
+                  title={attachment.name}
+                  onDoubleClick={(event) => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    openImagePreviewDataURL(attachment.dataURL);
+                  }}
+                >
+                  <img src={attachment.dataURL} alt={attachment.name} draggable={false} />
+                  <span>{attachment.name}</span>
+                </button>
+              ))}
+            </div>
+          )}
+          {message.text.trim() && <UserMessageMentionText text={message.text} catalog={mentionCatalog} />}
         </div>
         <FloatingContextMenu menu={messageContextMenu} onClose={() => setMessageContextMenu(null)} />
       </motion.div>
@@ -5447,6 +5830,14 @@ function MessageBubble({
       </button>
       <div className={cx("assistant-copy", `assistant-copy-${providerKey(assistantProvider)}`)}>
         <MarkdownPreview markdown={message.text} className="assistant-markdown-shell" emptyText="" />
+        <MessageArtifacts artifacts={message.artifacts} />
+        {message.checkpointInfo && (
+          <CodeCheckpointCard
+            threadID={threadID}
+            info={message.checkpointInfo}
+            onRestore={onRestoreCodeCheckpoint}
+          />
+        )}
         {message.provider && (
           <small className={cx("provider-tag", `provider-tag-${providerKey(message.provider)}`)}>
             <ProviderMark provider={message.provider} className="provider-mark-inline" />
@@ -5636,6 +6027,12 @@ function buildChatTimeline(messages: ChatMessage[]): ChatTimelineItem[] {
         innerItems.push({ kind: "message", message });
         continue;
       }
+      if (message.activityKind === "reasoning") {
+        if (!reasoningActivityText(message)) continue;
+        flushWork();
+        thinkingBuffer.push(message);
+        continue;
+      }
       if (isImageGenerationActivity(message)) {
         if (!activityPreviewURL(message)) continue;
         flushWork();
@@ -5766,6 +6163,7 @@ function isGenericWorkActivity(activity: ChatMessage) {
   const label = detail || title;
   const emptyLabel = !label || /^(reasoning|thinking|\[\]|\{\}|null|undefined|"")$/.test(label);
   if (title === "user message") return true;
+  if (kind === "provider") return true;
   if (kind === "usermessage" || kind === "agentmessage" || kind === "assistantmessage" || kind === "message") return true;
   if (!label && (kind === "reasoning" || kind === "usermessage" || kind === "agentmessage" || kind === "assistantmessage")) return true;
   if ((kind === "reasoning" || title === "reasoning") && emptyLabel) return true;
@@ -6194,6 +6592,7 @@ function WorkActivityGroup({
 function CompletedTurnGroup({
   innerItems,
   toolStepCount,
+  threadID,
   activeWorkGroupID,
   onRespondToApproval,
   onStop,
@@ -6201,10 +6600,12 @@ function CompletedTurnGroup({
   onAddTextToThreadNote,
   onComposerText,
   onOpenThreadNote,
-  onSpeakText
+  onSpeakText,
+  onRestoreCodeCheckpoint
 }: {
   innerItems: ChatTimelineItem[];
   toolStepCount: number;
+  threadID?: string;
   activeWorkGroupID?: string | null;
   onRespondToApproval?: ApprovalResponder;
   onStop?: () => void;
@@ -6213,6 +6614,7 @@ function CompletedTurnGroup({
   onComposerText?: (text: string) => void;
   onOpenThreadNote?: () => void;
   onSpeakText?: (text: string) => void;
+  onRestoreCodeCheckpoint?: CheckpointRestoreHandler;
 }) {
   const [expanded, setExpanded] = useState(false);
   const stepLabel = `Worked through ${toolStepCount} ${toolStepCount === 1 ? "step" : "steps"}`;
@@ -6267,12 +6669,14 @@ function CompletedTurnGroup({
               <MessageBubble
                 key={inner.message.id}
                 message={inner.message}
+                threadID={threadID}
                 mentionCatalog={messageMentionCatalog}
                 onAddTextToThreadNote={onAddTextToThreadNote}
                 onUseTextInComposer={onComposerText}
                 onOpenThreadNote={onOpenThreadNote}
                 onSpeakText={onSpeakText}
                 onRespondToApproval={onRespondToApproval}
+                onRestoreCodeCheckpoint={onRestoreCodeCheckpoint}
                 embedded
               />
             ) : null)}
@@ -6342,6 +6746,22 @@ function skillComposerSlug(skill: SkillItem) {
   return normalizeComposerMentionSlug(skill.id || skill.title);
 }
 
+function pluginBackedSkillPluginSlug(skill: SkillItem) {
+  const separatorIndex = skill.id.indexOf(":");
+  if (separatorIndex <= 0) return "";
+  return normalizeComposerMentionSlug(skill.id.slice(0, separatorIndex));
+}
+
+function pluginForImportedSkill(skill: SkillItem, plugins: PluginItem[]) {
+  const pluginSlug = pluginBackedSkillPluginSlug(skill);
+  if (!pluginSlug) return undefined;
+  return plugins.find((plugin) => plugin.status === "Installed" && pluginComposerSlug(plugin) === pluginSlug);
+}
+
+function composerMentionSkills(plugins: PluginItem[], skills: SkillItem[]) {
+  return skills.filter((skill) => !pluginForImportedSkill(skill, plugins));
+}
+
 function buildComposerMentionCatalog(plugins: PluginItem[], skills: SkillItem[]) {
   const catalog: Record<string, ComposerMentionEntry> = {};
   plugins
@@ -6359,7 +6779,7 @@ function buildComposerMentionCatalog(plugins: PluginItem[], skills: SkillItem[])
         insertText: `@${slug} `
       };
     });
-  skills.forEach((skill) => {
+  composerMentionSkills(plugins, skills).forEach((skill) => {
     const slug = skillComposerSlug(skill);
     if (!slug || catalog[slug]) return;
     catalog[slug] = {
@@ -6427,7 +6847,7 @@ function buildComposerMentionSections(
     })
     .filter((item): item is ComposerMentionEntry => Boolean(item))
     .slice(0, 8);
-  const skillItems = skills
+  const skillItems = composerMentionSkills(plugins, skills)
     .map((skill) => {
       const slug = skillComposerSlug(skill);
       if (!slug || !mentionMatches([slug, skill.title, skill.description], query)) return null;
@@ -6721,11 +7141,18 @@ function Composer({
   liveVoiceStatus,
   liveVoiceStatusText,
   liveVoiceEnabled,
+  liveVoiceSettingEnabled,
+  liveVoiceKeyConfigured,
+  attachments,
+  attachmentError,
   plugins,
   skills,
   onChange,
   onSend,
   onStop,
+  onAttachImages,
+  onRemoveAttachment,
+  onClearAttachmentError,
   onVoiceInput,
   onLiveVoice,
   onOpenRealtimeSettings,
@@ -6757,11 +7184,18 @@ function Composer({
   liveVoiceStatus: LiveVoiceStatus;
   liveVoiceStatusText?: string;
   liveVoiceEnabled: boolean;
+  liveVoiceSettingEnabled: boolean;
+  liveVoiceKeyConfigured: boolean;
+  attachments: ComposerImageAttachment[];
+  attachmentError?: string | null;
   plugins: PluginItem[];
   skills: SkillItem[];
   onChange: (value: string) => void;
   onSend: () => void;
   onStop?: () => void;
+  onAttachImages: (files: File[]) => void;
+  onRemoveAttachment: (id: string) => void;
+  onClearAttachmentError: () => void;
   onVoiceInput: () => void;
   onLiveVoice: () => void;
   onOpenRealtimeSettings: () => void;
@@ -6781,7 +7215,9 @@ function Composer({
   const [activeMentionIndex, setActiveMentionIndex] = useState(0);
   const [dismissedMentionKey, setDismissedMentionKey] = useState<string | null>(null);
   const [voiceMenuOpen, setVoiceMenuOpen] = useState(false);
+  const [isDraggingImage, setIsDraggingImage] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const imageInputRef = useRef<HTMLInputElement | null>(null);
   const pendingSelectionRef = useRef<number | null>(null);
   const handledMentionDeleteRef = useRef(false);
   const actionsMenuRef = useRef<HTMLDivElement | null>(null);
@@ -6792,31 +7228,63 @@ function Composer({
   const isProcessingVoice = voiceStatus === "processing";
   const voiceLabel = isProcessingVoice ? "Transcribing voice" : isListening ? "Stop voice input" : "Voice input";
   const liveVoiceActive = liveVoiceStatus !== "idle" && liveVoiceStatus !== "error";
+  const liveVoiceReady = liveVoiceEnabled && liveVoiceSettingEnabled && liveVoiceKeyConfigured;
   const liveVoiceLabel = !liveVoiceEnabled
     ? "Live Voice is only available with Codex"
-    : liveVoiceActive
-      ? "Stop Live Voice"
-      : liveVoiceStatus === "error"
-        ? "Restart Live Voice"
-        : "Start Codex Live Voice";
-  const voiceControlActive = liveVoiceActive || isListening || voiceMenuOpen;
-  const voiceControlLabel = liveVoiceActive ? liveVoiceLabel : isListening ? voiceLabel : "Voice input options";
-  const voiceControlStatus = liveVoiceActive
+    : !liveVoiceSettingEnabled && !liveVoiceActive
+      ? "Turn on Live Voice"
+      : !liveVoiceKeyConfigured && !liveVoiceActive
+        ? "Set up Live Voice"
+        : liveVoiceActive
+          ? "Stop Live Voice"
+          : liveVoiceStatus === "error"
+            ? "Restart Live Voice"
+            : "Start Codex Live Voice";
+  const liveVoiceOptionDetail = !liveVoiceEnabled
+    ? "Only available with Codex provider"
+    : !liveVoiceSettingEnabled
+      ? "Turn on in Voice settings"
+      : !liveVoiceKeyConfigured
+        ? "Add OpenAI key in Settings"
+        : "Realtime conversation with Codex";
+  const primaryVoiceMode: "live" | "dictate" = isListening ? "dictate" : liveVoiceActive || liveVoiceReady ? "live" : "dictate";
+  const primaryVoiceActive = primaryVoiceMode === "live" ? liveVoiceActive : isListening;
+  const primaryVoiceLabel = primaryVoiceMode === "live" ? liveVoiceLabel : voiceLabel;
+  const primaryVoiceStatus = primaryVoiceMode === "live"
     ? liveVoiceStatus
     : isListening
       ? "listening"
-      : liveVoiceStatus === "error"
-        ? "error"
-        : "idle";
+      : "idle";
+  const primaryVoiceDisabled = primaryVoiceMode === "dictate" && isProcessingVoice;
+  const closeComposerMenus = () => {
+    setShowActions(false);
+    setModelOpen(false);
+    setPermissionOpen(false);
+  };
+  const runPrimaryVoiceAction = () => {
+    if (primaryVoiceDisabled) return;
+    setVoiceMenuOpen(false);
+    closeComposerMenus();
+    if (primaryVoiceMode === "live") {
+      onLiveVoice();
+      return;
+    }
+    onVoiceInput();
+  };
   const activePermissionOption = codexPermissionOptions.find((option) => option.value === permissionMode) ?? codexPermissionOptions[0];
   const ActivePermissionIcon = activePermissionOption.Icon;
   const modelSections = modelFamilySections(activeProviderKey, modelName, modelOptions);
   const selectedModelSection = modelSections.find((section) =>
     section.models.some((model) => model.id.toLowerCase() === modelName.trim().toLowerCase())
   )?.key;
+  const selectedModelOption = modelSections
+    .flatMap((section) => section.models)
+    .find((model) => model.id.toLowerCase() === modelName.trim().toLowerCase());
   const [expandedModelSections, setExpandedModelSections] = useState<string[]>([]);
-  const compactModelName = compactComposerModelName(modelName);
+  const compactModelName = selectedModelOption?.displayName ?? compactComposerModelName(modelName);
   const hasText = value.trim().length > 0;
+  const hasAttachments = attachments.length > 0;
+  const hasContent = hasText || hasAttachments;
   const mentionPlugins = useMemo(() => (activeProviderKey === "codex" ? plugins : []), [activeProviderKey, plugins]);
   const mentionSkills = useMemo(() => (activeProviderKey === "codex" ? skills : []), [activeProviderKey, skills]);
   const mentionCatalog = useMemo(
@@ -6857,6 +7325,18 @@ function Composer({
     onChange(next.value);
     setMentionCursor(next.cursor);
   };
+  const attachImageFiles = (files: File[]) => {
+    const imageFiles = files.filter(isSupportedComposerImage);
+    if (!imageFiles.length) return;
+    onClearAttachmentError();
+    onAttachImages(imageFiles);
+  };
+  const openImagePicker = () => {
+    setShowActions(false);
+    imageInputRef.current?.click();
+  };
+  const dragContainsFile = (event: React.DragEvent) =>
+    Array.from(event.dataTransfer.types).includes("Files");
 
   useEffect(() => {
     if (modelOpen) setExpandedModelSections(selectedModelSection ? [selectedModelSection] : modelSections.slice(0, 1).map((section) => section.key));
@@ -6899,6 +7379,17 @@ function Composer({
     <div className="composer-wrap">
       <div className="composer-stack">
         <AnimatePresence initial={false}>
+          {isListening && (
+            <motion.div
+              className="composer-dictation-panel-motion"
+              initial={{ opacity: 0, y: 6 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: 4 }}
+              transition={{ duration: 0.16, ease: [0.22, 1, 0.36, 1] }}
+            >
+              <DictationStatusPanel status={voiceStatus} text={voiceStatusText} />
+            </motion.div>
+          )}
           {shouldShowLiveVoiceStatusPanel(liveVoiceStatus, liveVoiceStatusText) && (
             <motion.div
               className="composer-live-voice-panel-motion"
@@ -6915,7 +7406,67 @@ function Composer({
             </motion.div>
           )}
         </AnimatePresence>
-      <motion.div layout className={cx("composer", isListening && "is-listening", hasText && "has-text")}>
+      <input
+        ref={imageInputRef}
+        className="composer-image-input"
+        type="file"
+        accept="image/*"
+        multiple
+        tabIndex={-1}
+        onChange={(event) => {
+          attachImageFiles(Array.from(event.currentTarget.files ?? []));
+          event.currentTarget.value = "";
+        }}
+      />
+      <motion.div
+        layout
+        className={cx("composer", isListening && "is-listening", hasContent && "has-text", isDraggingImage && "is-dragging-image")}
+        onDragOver={(event) => {
+          if (!dragContainsFile(event)) return;
+          event.preventDefault();
+          setIsDraggingImage(true);
+        }}
+        onDragLeave={(event) => {
+          if (!event.currentTarget.contains(event.relatedTarget as Node | null)) {
+            setIsDraggingImage(false);
+          }
+        }}
+        onDrop={(event) => {
+          if (!dragContainsFile(event)) return;
+          event.preventDefault();
+          setIsDraggingImage(false);
+          attachImageFiles(Array.from(event.dataTransfer.files ?? []));
+        }}
+      >
+        <AnimatePresence initial={false}>
+          {(hasAttachments || attachmentError) && (
+            <motion.div
+              className="composer-attachments-row"
+              initial={{ opacity: 0, y: -4 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -4 }}
+              transition={{ duration: 0.14, ease: [0.22, 1, 0.36, 1] }}
+            >
+              {attachments.map((attachment) => (
+                <div className="composer-attachment-chip" key={attachment.id}>
+                  <img src={attachment.dataURL} alt={attachment.name} draggable={false} />
+                  <span>
+                    <strong>{attachment.name}</strong>
+                    <small>{readableFileSize(attachment.size) || "Image"}</small>
+                  </span>
+                  <button type="button" aria-label={`Remove ${attachment.name}`} onClick={() => onRemoveAttachment(attachment.id)}>
+                    <X size={11} />
+                  </button>
+                </div>
+              ))}
+              {attachmentError && (
+                <button type="button" className="composer-attachment-error" onClick={onClearAttachmentError}>
+                  {attachmentError}
+                </button>
+              )}
+            </motion.div>
+          )}
+        </AnimatePresence>
         <div className={cx("composer-input-shell", hasRichMentions && "has-rich-mentions")}>
           {hasRichMentions && <ComposerRichDraftPreview cursor={mentionCursor} tokens={composerDraftTokens} />}
           <textarea
@@ -6934,6 +7485,12 @@ function Composer({
             }}
             placeholder="What would you like to do?"
             onClick={updateMentionCursor}
+            onPaste={(event) => {
+              const files = Array.from(event.clipboardData.files ?? []).filter(isSupportedComposerImage);
+              if (!files.length) return;
+              event.preventDefault();
+              attachImageFiles(files);
+            }}
             onKeyDown={(event) => {
               const cursor = event.currentTarget.selectionStart ?? mentionCursor;
               const selectionEnd = event.currentTarget.selectionEnd ?? cursor;
@@ -6978,7 +7535,7 @@ function Composer({
               }
               if (event.key === "Enter" && !event.shiftKey) {
                 event.preventDefault();
-                if (!disabled && hasText) onSend();
+                if (!disabled && hasContent) onSend();
               }
             }}
             onKeyUp={updateMentionCursor}
@@ -7016,6 +7573,13 @@ function Composer({
             <AnimatePresence>
               {showActions && (
                 <motion.div {...popoverMotion} className="quick-actions-menu">
+                  <button onClick={openImagePicker}>
+                    <ImagePlus size={15} />
+                    <span>
+                      Attach image
+                      <small>Send a screenshot or photo to the agent</small>
+                    </span>
+                  </button>
                   <button onClick={() => { setShowActions(false); onOpenSkills(); }}>
                     <Sparkles size={15} />
                     <span>
@@ -7192,31 +7756,51 @@ function Composer({
             </AnimatePresence>
           </div>
 	          <div className="composer-menu-wrap composer-voice-wrap" ref={voiceMenuRef}>
-	            <IconButton
-	              label={voiceControlLabel}
-	              active={voiceControlActive}
-	              className={cx("composer-live-voice-button", `state-${voiceControlStatus}`)}
-	              tone={voiceControlActive ? "blue" : "subtle"}
-	              onClick={() => {
-	                setVoiceMenuOpen((value) => !value);
-	                setShowActions(false);
-	                setModelOpen(false);
-	                setPermissionOpen(false);
-	              }}
-	            >
-	              <RealtimeVoiceMark size={18} active={liveVoiceActive || isListening} />
-	            </IconButton>
+	            <div className={cx("composer-voice-control", voiceMenuOpen && "active")}>
+	              <IconButton
+	                label={primaryVoiceLabel}
+	                active={primaryVoiceActive}
+	                className={cx(
+	                  "composer-voice-main-button",
+	                  primaryVoiceMode === "live" ? "composer-live-voice-button" : "composer-dictation-button",
+	                  `state-${primaryVoiceStatus}`
+	                )}
+	                disabled={primaryVoiceDisabled}
+	                tone={primaryVoiceActive ? "blue" : "subtle"}
+	                onClick={runPrimaryVoiceAction}
+	              >
+	                {primaryVoiceMode === "live"
+	                  ? <RealtimeVoiceMark size={18} active={liveVoiceActive} />
+	                  : <Mic size={18} />}
+	              </IconButton>
+	              <button
+	                type="button"
+	                className="composer-voice-switch-button"
+	                aria-label="Choose voice mode"
+	                title="Choose voice mode"
+	                onClick={() => {
+	                  setVoiceMenuOpen((value) => !value);
+	                  closeComposerMenus();
+	                }}
+	              >
+	                <ChevronDown size={12} />
+	              </button>
+	            </div>
 	            <AnimatePresence>
 	              {voiceMenuOpen && (
 	                <motion.div {...popoverMotion} className="composer-popover voice-popover">
 	                  <div className="popover-kicker">Voice</div>
 	                  <button
 	                    type="button"
-	                    className={cx("voice-option", liveVoiceActive && "active")}
+	                    className={cx("voice-option", liveVoiceActive && "active", !liveVoiceReady && liveVoiceEnabled && "setup")}
 	                    disabled={!liveVoiceEnabled || liveVoiceStatus === "connecting"}
 	                    onClick={() => {
 	                      if (!liveVoiceEnabled || liveVoiceStatus === "connecting") return;
 	                      setVoiceMenuOpen(false);
+	                      if (!liveVoiceReady && !liveVoiceActive) {
+	                        onOpenRealtimeSettings();
+	                        return;
+	                      }
 	                      onLiveVoice();
 	                    }}
 	                  >
@@ -7224,8 +7808,8 @@ function Composer({
 	                      <RealtimeVoiceMark size={16} active={liveVoiceActive} />
 	                    </span>
 	                    <span className="voice-option-copy">
-	                      <strong>{liveVoiceActive ? "Stop Live Voice" : liveVoiceStatus === "error" ? "Restart Live Voice" : "Live Voice"}</strong>
-	                      <small>{liveVoiceEnabled ? "Realtime conversation with Codex" : "Only available with Codex provider"}</small>
+	                      <strong>{liveVoiceActive ? "Stop Live Voice" : liveVoiceStatus === "error" && liveVoiceReady ? "Restart Live Voice" : liveVoiceReady ? "Live Voice" : "Set up Live Voice"}</strong>
+	                      <small>{liveVoiceOptionDetail}</small>
 	                    </span>
 	                    {liveVoiceActive && <Check size={14} />}
 	                  </button>
@@ -7255,7 +7839,7 @@ function Composer({
               <Square size={13} fill="currentColor" strokeWidth={2.4} />
             </IconButton>
           ) : (
-            <IconButton label="Send message" tone="gold" onClick={onSend} disabled={!hasText}>
+            <IconButton label="Send message" tone="gold" onClick={onSend} disabled={!hasContent}>
               <ArrowUp size={18} />
             </IconButton>
           )}
@@ -7276,6 +7860,7 @@ function Composer({
 
 function ThreadsView({
   compact,
+  threadID,
   onToggleCompact,
   onHideWindow,
   onOpenThreadNote,
@@ -7298,15 +7883,22 @@ function ThreadsView({
   reasoningEffort,
   messages,
   composerText,
+  composerAttachments,
+  composerAttachmentError,
   isSending,
   voiceStatus,
   voiceStatusText,
   voiceError,
   liveVoiceStatus,
   liveVoiceStatusText,
+  liveVoiceSettingEnabled,
+  liveVoiceKeyConfigured,
   plugins,
   skills,
   onComposerText,
+  onAttachImages,
+  onRemoveAttachment,
+  onClearAttachmentError,
   onSend,
   onStop,
   onVoiceInput,
@@ -7319,10 +7911,12 @@ function ThreadsView({
   onAddTextToThreadNote,
   onSpeakText,
   onRespondToApproval,
+  onRestoreCodeCheckpoint,
   onSelectProvider,
   onSelectModel
 }: {
   compact: boolean;
+  threadID?: string;
   onToggleCompact: () => void;
   onHideWindow: () => void;
   onOpenThreadNote: () => void;
@@ -7345,15 +7939,22 @@ function ThreadsView({
   reasoningEffort: string;
   messages: ChatMessage[];
   composerText: string;
+  composerAttachments: ComposerImageAttachment[];
+  composerAttachmentError?: string | null;
   isSending: boolean;
   voiceStatus: VoiceInputStatus;
   voiceStatusText?: string;
   voiceError?: string;
   liveVoiceStatus: LiveVoiceStatus;
   liveVoiceStatusText?: string;
+  liveVoiceSettingEnabled: boolean;
+  liveVoiceKeyConfigured: boolean;
   plugins: PluginItem[];
   skills: SkillItem[];
   onComposerText: (value: string) => void;
+  onAttachImages: (files: File[]) => void;
+  onRemoveAttachment: (id: string) => void;
+  onClearAttachmentError: () => void;
   onSend: () => void;
   onStop: () => void;
   onVoiceInput: () => void;
@@ -7366,6 +7967,7 @@ function ThreadsView({
   onAddTextToThreadNote: (text: string) => void;
   onSpeakText: (text: string) => void | Promise<void>;
   onRespondToApproval: ApprovalResponder;
+  onRestoreCodeCheckpoint?: CheckpointRestoreHandler;
   onSelectProvider: (provider: ProviderKey) => void;
   onSelectModel: (model: string) => void;
 }) {
@@ -7423,6 +8025,7 @@ function ThreadsView({
               key={item.id}
               innerItems={item.items}
               toolStepCount={item.toolStepCount}
+              threadID={threadID}
               activeWorkGroupID={activeWorkGroupID}
               onRespondToApproval={onRespondToApproval}
               onStop={onStop}
@@ -7431,17 +8034,20 @@ function ThreadsView({
               onComposerText={onComposerText}
               onOpenThreadNote={onOpenThreadNote}
               onSpeakText={onSpeakText}
+              onRestoreCodeCheckpoint={onRestoreCodeCheckpoint}
             />
           ) : (
             <MessageBubble
               key={item.message.id}
               message={item.message}
+              threadID={threadID}
               mentionCatalog={messageMentionCatalog}
               onAddTextToThreadNote={onAddTextToThreadNote}
               onUseTextInComposer={onComposerText}
               onOpenThreadNote={onOpenThreadNote}
               onSpeakText={onSpeakText}
               onRespondToApproval={onRespondToApproval}
+              onRestoreCodeCheckpoint={onRestoreCodeCheckpoint}
             />
           ))}
           {!messages.length && (
@@ -7470,14 +8076,21 @@ function ThreadsView({
         voiceStatus={voiceStatus}
         voiceStatusText={voiceStatusText}
         voiceError={voiceError}
-        liveVoiceStatus={liveVoiceStatus}
-        liveVoiceStatusText={liveVoiceStatusText}
+	        liveVoiceStatus={liveVoiceStatus}
+	        liveVoiceStatusText={liveVoiceStatusText}
         liveVoiceEnabled={providerKey === "codex"}
+        liveVoiceSettingEnabled={liveVoiceSettingEnabled}
+        liveVoiceKeyConfigured={liveVoiceKeyConfigured}
+        attachments={composerAttachments}
+        attachmentError={composerAttachmentError}
         plugins={plugins}
         skills={skills}
         onChange={onComposerText}
         onSend={onSend}
         onStop={onStop}
+        onAttachImages={onAttachImages}
+        onRemoveAttachment={onRemoveAttachment}
+        onClearAttachmentError={onClearAttachmentError}
         onVoiceInput={onVoiceInput}
         onLiveVoice={onLiveVoice}
         onOpenRealtimeSettings={onOpenRealtimeSettings}
@@ -9681,8 +10294,6 @@ function SettingsContent({
       setAppearanceStatus("");
     };
     const versionLabel = `Version ${settings?.appVersion || "1.0.7"} (${settings?.buildNumber || "69"})`;
-    const openPrivacySettings = () =>
-      window.openAssistElectron?.openExternal("x-apple.systempreferences:com.apple.preference.security");
     return (
       <div className="settings-stack single" key="app">
         <div className="settings-card expanded">
@@ -9856,21 +10467,7 @@ function SettingsContent({
           onUpdateSetting={onUpdateSetting}
         />
 
-        <div className="settings-card">
-          <div className="card-heading">
-            <Shield size={22} />
-            <span>
-              <strong>macOS Permissions</strong>
-              <small>Open system preference shortcuts to grant system API access.</small>
-            </span>
-          </div>
-          <div className="inline-actions">
-            <button onClick={openPrivacySettings}>Open Accessibility</button>
-            <button onClick={openPrivacySettings}>Open Microphone</button>
-            <button onClick={openPrivacySettings}>Open Speech Recognition</button>
-            <button onClick={openPrivacySettings}>Open Screen Recording</button>
-          </div>
-        </div>
+        <MacOSPermissionsCard />
 
         <div className="settings-card">
           <div className="card-heading">
@@ -10580,6 +11177,170 @@ function ShortcutRecorderRow({
   );
 }
 
+type MacPermissionState = "granted" | "denied" | "not-determined" | "unknown";
+type MacPermissionsSnapshot = {
+  platformSupported: boolean;
+  accessibility: MacPermissionState;
+  screenRecording: MacPermissionState;
+  microphone: MacPermissionState;
+};
+type MacPermissionKind = "accessibility" | "screenRecording" | "microphone" | "speechRecognition" | "automation";
+
+function permissionStatusLabel(state: MacPermissionState) {
+  if (state === "granted") return "Granted";
+  if (state === "denied") return "Not granted";
+  if (state === "not-determined") return "Not set";
+  return "Unknown";
+}
+
+function MacOSPermissionsCard() {
+  const [snapshot, setSnapshot] = useState<MacPermissionsSnapshot | null>(null);
+  const [bridgeError, setBridgeError] = useState<string | null>(null);
+  const [requestingKind, setRequestingKind] = useState<MacPermissionKind | null>(null);
+  const isMac = (window.openAssistElectron?.platform ?? "") === "darwin";
+
+  useEffect(() => {
+    if (!isMac) return;
+    let cancelled = false;
+    const refresh = async () => {
+      const bridge = window.openAssistElectron?.getMacOSPermissions;
+      if (typeof bridge !== "function") {
+        if (!cancelled) setBridgeError("This Open Assist build is out of date. Quit it fully and run npm run dev again so the main process picks up the new permission APIs.");
+        return;
+      }
+      try {
+        const next = await bridge();
+        if (!cancelled && next) {
+          setSnapshot(next);
+          setBridgeError(null);
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setBridgeError(error instanceof Error ? error.message : "Could not read permission status from the main process.");
+        }
+      }
+    };
+    void refresh();
+    const intervalID = window.setInterval(refresh, 3_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(intervalID);
+    };
+  }, [isMac]);
+
+  if (!isMac) return null;
+
+  const requestPermission = async (kind: MacPermissionKind) => {
+    setRequestingKind(kind);
+    try {
+      await window.openAssistElectron?.requestMacOSPermission(kind);
+      const next = await window.openAssistElectron?.getMacOSPermissions();
+      if (next) setSnapshot(next);
+    } finally {
+      setRequestingKind(null);
+    }
+  };
+
+  const accessibility = snapshot?.accessibility ?? "unknown";
+  const screenRecording = snapshot?.screenRecording ?? "unknown";
+  const microphone = snapshot?.microphone ?? "unknown";
+  const computerUseBlocked = accessibility !== "granted" || screenRecording !== "granted";
+
+  const renderRow = (
+    title: string,
+    subtitle: string,
+    state: MacPermissionState,
+    kind: MacPermissionKind
+  ) => {
+    const isGranted = state === "granted";
+    const pillClass = isGranted ? "open-pill" : "open-pill open-pill-warning";
+    return (
+      <div className="permission-status-row" key={kind}>
+        <span className="permission-status-icon"><Shield size={18} /></span>
+        <span className="permission-status-text">
+          <strong>{title}</strong>
+          <small>{subtitle}</small>
+        </span>
+        <span className={pillClass}>
+          {permissionStatusLabel(state)} {isGranted && <Check size={14} />}
+        </span>
+        <button
+          type="button"
+          className="permission-status-action"
+          onClick={() => void requestPermission(kind)}
+          disabled={requestingKind === kind}
+        >
+          {isGranted ? "Re-check" : requestingKind === kind ? "Opening..." : "Grant"}
+        </button>
+      </div>
+    );
+  };
+
+  return (
+    <div className="settings-card">
+      <div className="card-heading">
+        <Shield size={22} />
+        <span>
+          <strong>macOS Permissions</strong>
+          <small>
+            Computer Use needs Accessibility and Screen Recording. Without them,
+            tools like get_app_state hang forever.
+          </small>
+        </span>
+      </div>
+      {bridgeError && (
+        <div className="permission-banner">
+          <strong>Permission check unavailable.</strong>
+          <span>{bridgeError}</span>
+        </div>
+      )}
+      {!bridgeError && computerUseBlocked && (
+        <div className="permission-banner">
+          <strong>Computer Use is blocked.</strong>
+          <span>
+            Grant Accessibility and Screen Recording to this app, then quit and
+            relaunch so macOS picks up the change.
+          </span>
+        </div>
+      )}
+      {renderRow(
+        "Accessibility",
+        "Required for Computer Use to attach to other apps.",
+        accessibility,
+        "accessibility"
+      )}
+      {renderRow(
+        "Screen Recording",
+        "Required for Computer Use to read window state and take screenshots.",
+        screenRecording,
+        "screenRecording"
+      )}
+      {renderRow(
+        "Microphone",
+        "Required for dictation and realtime voice.",
+        microphone,
+        "microphone"
+      )}
+      <div className="inline-actions">
+        <button
+          type="button"
+          onClick={() => void requestPermission("automation")}
+          disabled={requestingKind === "automation"}
+        >
+          Open Automation pane
+        </button>
+        <button
+          type="button"
+          onClick={() => void requestPermission("speechRecognition")}
+          disabled={requestingKind === "speechRecognition"}
+        >
+          Open Speech Recognition pane
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function DisclosureCard({ icon, title, subtitle }: { icon: React.ReactNode; title: string; subtitle: string }) {
   return (
     <div className="disclosure-card">
@@ -10630,6 +11391,8 @@ function FeatureRouter({
   noteDraft,
   noteSaveStatus,
   composerText,
+  composerAttachments,
+  composerAttachmentError,
   isSending,
   interactionMode,
   permissionMode,
@@ -10643,6 +11406,9 @@ function FeatureRouter({
   selectedPluginID,
   selectedPluginIDs,
   onComposerText,
+  onAttachImages,
+  onRemoveAttachment,
+  onClearAttachmentError,
   onSend,
   onStop,
   onVoiceInput,
@@ -10655,6 +11421,7 @@ function FeatureRouter({
   onAddTextToThreadNote,
   onSpeakText,
   onRespondToApproval,
+  onRestoreCodeCheckpoint,
   onSelectProvider,
   onSelectModel,
   onSelectNotesProject,
@@ -10706,6 +11473,8 @@ function FeatureRouter({
   noteDraft: string;
   noteSaveStatus: NoteSaveStatus;
   composerText: string;
+  composerAttachments: ComposerImageAttachment[];
+  composerAttachmentError?: string | null;
   isSending: boolean;
   interactionMode: string;
   permissionMode: CodexPermissionMode;
@@ -10719,6 +11488,9 @@ function FeatureRouter({
   selectedPluginID?: string;
   selectedPluginIDs: string[];
   onComposerText: (value: string) => void;
+  onAttachImages: (files: File[]) => void;
+  onRemoveAttachment: (id: string) => void;
+  onClearAttachmentError: () => void;
   onSend: () => void;
   onStop: () => void;
   onVoiceInput: () => void;
@@ -10731,6 +11503,7 @@ function FeatureRouter({
   onAddTextToThreadNote: (text: string) => void;
   onSpeakText: (text: string) => void | Promise<void>;
   onRespondToApproval: ApprovalResponder;
+  onRestoreCodeCheckpoint?: CheckpointRestoreHandler;
   onSelectProvider: (provider: ProviderKey) => void;
   onSelectModel: (model: string) => void;
   onSelectNotesProject: (projectID: string) => void;
@@ -10853,6 +11626,7 @@ function FeatureRouter({
       return (
         <ThreadsView
           compact={compact}
+          threadID={threadDetail?.threadID ?? selectedThreadID}
           onToggleCompact={onToggleCompact}
           onHideWindow={onHideWindow}
           onOpenThreadNote={onOpenThreadNote}
@@ -10875,15 +11649,22 @@ function FeatureRouter({
           reasoningEffort={reasoningEffort}
           messages={threadDetail?.messages ?? []}
           composerText={composerText}
+          composerAttachments={composerAttachments}
+          composerAttachmentError={composerAttachmentError}
           isSending={isSending}
           voiceStatus={voiceStatus}
           voiceStatusText={voiceStatusText}
-          voiceError={voiceError}
-          liveVoiceStatus={liveVoiceStatus}
-          liveVoiceStatusText={liveVoiceStatusText}
-          plugins={appState.plugins}
+	          voiceError={voiceError}
+	          liveVoiceStatus={liveVoiceStatus}
+	          liveVoiceStatusText={liveVoiceStatusText}
+	          liveVoiceSettingEnabled={appState.settings.realtimeVoiceEnabled ?? true}
+	          liveVoiceKeyConfigured={appState.settings.realtimeOpenAIAPIKeyConfigured ?? false}
+	          plugins={appState.plugins}
           skills={appState.skills}
           onComposerText={onComposerText}
+          onAttachImages={onAttachImages}
+          onRemoveAttachment={onRemoveAttachment}
+          onClearAttachmentError={onClearAttachmentError}
           onSend={onSend}
           onStop={onStop}
           onVoiceInput={onVoiceInput}
@@ -10896,6 +11677,7 @@ function FeatureRouter({
           onAddTextToThreadNote={onAddTextToThreadNote}
           onSpeakText={onSpeakText}
           onRespondToApproval={onRespondToApproval}
+          onRestoreCodeCheckpoint={onRestoreCodeCheckpoint}
           onSelectProvider={onSelectProvider}
           onSelectModel={onSelectModel}
         />
@@ -11028,7 +11810,7 @@ export function App() {
       appVersion: "1.0.7",
       buildNumber: "69",
       assistantBackend: "codex",
-      availableAssistantBackends: ["codex", "copilot", "claudeCode", "ollamaLocal"],
+      availableAssistantBackends: ["codex", "copilot", "claudeCode", "antigravityCLI", "ollamaLocal"],
       assistantRuntimeStatus: "Checking",
       assistantRuntimeDetail: "Reading the selected runtime status.",
       assistantRuntimeAccount: "Not connected",
@@ -11154,9 +11936,10 @@ export function App() {
   const [selectedPluginID, setSelectedPluginID] = useState<string | undefined>(undefined);
   const [selectedPluginIDs, setSelectedPluginIDs] = useState<string[]>([]);
   const [composerText, setComposerText] = useState("");
-  const [isSending, setIsSending] = useState(false);
-  const activeProviderRunIDRef = useRef<string | null>(null);
-  const stopRequestedRef = useRef(false);
+  const [composerAttachments, setComposerAttachments] = useState<ComposerImageAttachment[]>([]);
+  const [composerAttachmentError, setComposerAttachmentError] = useState<string | null>(null);
+  const [activeThreadRuns, setActiveThreadRuns] = useState<Record<string, ActiveThreadRun>>({});
+  const activeThreadRunsRef = useRef<Record<string, ActiveThreadRun>>({});
   const [interactionMode, setInteractionMode] = useState("Agentic");
   const [permissionMode, setPermissionMode] = useState<CodexPermissionMode>("fullAccess");
   const [reasoningEffort, setReasoningEffort] = useState("High");
@@ -11346,6 +12129,34 @@ export function App() {
   const selectedThread = appState.threads.find((thread) => thread.id === selectedThreadID);
   const activeProviderKey = runtimeProviderKey(selectedThread?.activeProvider || appState.settings.assistantBackend || "codex");
   const activeProviderName = providerLabel(activeProviderKey);
+  const selectedThreadRun = selectedThreadID ? activeThreadRuns[selectedThreadID] : undefined;
+  const isSending = Boolean(selectedThreadRun);
+  const visibleProviderStatus = selectedThreadRun?.statusText ?? providerStatus;
+
+  useEffect(() => {
+    activeThreadRunsRef.current = activeThreadRuns;
+  }, [activeThreadRuns]);
+
+  const updateActiveThreadRun = (threadID: string, runID: string, patch: Partial<ActiveThreadRun>) => {
+    setActiveThreadRuns((current) => {
+      const existing = current[threadID];
+      if (!existing || existing.runID !== runID) return current;
+      const next = { ...current, [threadID]: { ...existing, ...patch } };
+      activeThreadRunsRef.current = next;
+      return next;
+    });
+  };
+
+  const clearActiveThreadRun = (threadID: string, runID: string) => {
+    setActiveThreadRuns((current) => {
+      const existing = current[threadID];
+      if (!existing || existing.runID !== runID) return current;
+      const next = { ...current };
+      delete next[threadID];
+      activeThreadRunsRef.current = next;
+      return next;
+    });
+  };
 
   useEffect(() => {
     noteDraftRef.current = noteDraft;
@@ -11588,14 +12399,24 @@ export function App() {
     setSelectedProjectID((current) =>
       current && normalizedState.projects.some((project) => sameID(project.id, current)) ? current : undefined
     );
-    const threadID = selectedThreadID && normalizedState.threads.some((thread) => thread.id === selectedThreadID)
-      ? selectedThreadID
-      : normalizedState.activeThreadID ?? normalizedState.threads[0]?.id;
+    const visibleThreads = showArchivedThreads
+      ? normalizedState.threads
+      : normalizedState.threads.filter((thread) => !thread.isArchived);
+    const currentSelectedThreadID = usableOpenAssistThreadID(selectedThreadIDRef.current);
+    const selectedVisibleThreadID = currentSelectedThreadID && visibleThreads.some((thread) => sameID(thread.id, currentSelectedThreadID))
+      ? currentSelectedThreadID
+      : undefined;
+    const activeVisibleThreadID = normalizedState.activeThreadID && visibleThreads.some((thread) => sameID(thread.id, normalizedState.activeThreadID))
+      ? normalizedState.activeThreadID
+      : undefined;
+    const threadID = selectedVisibleThreadID ?? activeVisibleThreadID ?? visibleThreads[0]?.id;
     if (threadID) {
+      selectedThreadIDRef.current = threadID;
       setSelectedThreadID(threadID);
       const detail = await window.openAssistElectron?.loadThread(threadID);
       if (detail) setThreadDetail(detail);
     } else {
+      selectedThreadIDRef.current = undefined;
       setSelectedThreadID(undefined);
       setThreadDetail(null);
     }
@@ -11700,7 +12521,25 @@ export function App() {
     void window.openAssistElectron?.openSettingsWindow?.("voice");
   };
 
-  const currentThreadID = () => threadDetail?.threadID ?? selectedThreadID;
+  const currentThreadID = () => usableOpenAssistThreadID(threadDetail?.threadID ?? selectedThreadIDRef.current ?? selectedThreadID);
+
+  const restoreCodeCheckpoint = async (checkpointID: string) => {
+    const threadID = currentThreadID();
+    if (!threadID) return;
+    setProviderStatus("Restoring code checkpoint...");
+    try {
+      await window.openAssistElectron?.restoreCodeCheckpoint?.(threadID, checkpointID);
+      const detail = await window.openAssistElectron?.loadThread(threadID);
+      if (detail) setThreadDetail(detail);
+      void refreshAppState();
+      setProviderStatus("Code checkpoint restored.");
+      window.setTimeout(() => {
+        setProviderStatus((current) => current === "Code checkpoint restored." ? null : current);
+      }, 1600);
+    } catch (error) {
+      setProviderStatus(error instanceof Error ? error.message : "Open Assist could not restore that checkpoint.");
+    }
+  };
 
   const openThreadNoteForThread = async (threadID?: string) => {
     if (!threadID) return;
@@ -12320,9 +13159,12 @@ export function App() {
     setLiveVoiceStatusText("Connecting to OpenAI Realtime...");
     try {
       const targetThreadID = currentThreadID();
+      const composerMentions = composerMentionIDs(composerText, appState.plugins, appState.skills);
+      const liveVoicePluginIDs = Array.from(new Set([...selectedPluginIDs, ...composerMentions.pluginIDs]));
       console.debug("[OpenAssist Live Voice] start requested", {
         threadId: targetThreadID,
-        provider: activeProviderKey
+        provider: activeProviderKey,
+        pluginIDs: liveVoicePluginIDs
       });
       const result = await withTimeout(
         api.start({
@@ -12330,7 +13172,9 @@ export function App() {
           provider: "codex",
           interactionMode,
           permissionMode,
-          reasoningEffort
+          reasoningEffort,
+          pluginIDs: liveVoicePluginIDs,
+          skillIDs: composerMentions.skillIDs
         }),
         liveVoiceConnectTimeoutMs,
         "Live Voice did not connect. Check the OpenAI API key and realtime model in Settings."
@@ -12541,7 +13385,15 @@ export function App() {
         return;
       }
       if (lowerType.includes("error")) {
-        void stopLiveVoice("error", realtimePayloadText(event.payload) || "Live Voice failed.");
+        const message = realtimePayloadText(event.payload) || "Live Voice failed.";
+        if (isBenignRealtimeCancelError(message)) {
+          if (liveVoiceActiveRef.current) {
+            setLiveVoiceStatus("listening");
+            setLiveVoiceStatusText("Live Voice listening");
+          }
+          return;
+        }
+        void stopLiveVoice("error", message);
         return;
       }
       if (lowerType.includes("done") || lowerType.includes("completed")) {
@@ -12631,6 +13483,23 @@ export function App() {
       }
     });
   }, [compact, sidebarOpen, appState.settings.compactEdge]);
+
+  const refreshAppStateRef = useRef(refreshAppState);
+  refreshAppStateRef.current = refreshAppState;
+  useEffect(() => {
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const unsubscribe = window.openAssistElectron?.onThreadsUpdated?.(() => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => {
+        timer = null;
+        void refreshAppStateRef.current();
+      }, 75);
+    });
+    return () => {
+      if (timer) clearTimeout(timer);
+      unsubscribe?.();
+    };
+  }, []);
 
   useEffect(() => {
     return window.openAssistElectron?.onSidebarBlurCollapse?.((state) => {
@@ -13078,13 +13947,15 @@ export function App() {
   };
 
   const archiveThreadFromMenu = async (thread: ThreadItem) => {
+    const wasSelected = sameID(selectedThreadIDRef.current ?? selectedThreadID, thread.id);
     const updated = await window.openAssistElectron?.archiveSession(thread.id);
     if (!updated) return;
-    await refreshAppState();
-    if (selectedThreadID === thread.id) {
+    if (wasSelected) {
+      selectedThreadIDRef.current = undefined;
       setSelectedThreadID(undefined);
       setThreadDetail(null);
     }
+    await refreshAppState();
   };
 
   const unarchiveThreadFromMenu = async (thread: ThreadItem) => {
@@ -13094,8 +13965,11 @@ export function App() {
 
   const deleteThreadPermanentlyFromMenu = async (thread: ThreadItem) => {
     if (!window.confirm(`Delete "${thread.title}" permanently? This cannot be undone.`)) return;
-    await window.openAssistElectron?.deleteSessionPermanently(thread.id);
-    if (selectedThreadID === thread.id) {
+    const wasSelected = sameID(selectedThreadIDRef.current ?? selectedThreadID, thread.id);
+    const result = await window.openAssistElectron?.deleteSessionPermanently(thread.id);
+    if (!result?.ok) return;
+    if (wasSelected) {
+      selectedThreadIDRef.current = undefined;
       setSelectedThreadID(undefined);
       setThreadDetail(null);
     }
@@ -13456,34 +14330,117 @@ export function App() {
     }
   };
 
+  const attachComposerImages = async (files: File[]) => {
+    const slots = MAX_COMPOSER_IMAGE_ATTACHMENTS - composerAttachments.length;
+    if (slots <= 0) {
+      setComposerAttachmentError(`You can attach up to ${MAX_COMPOSER_IMAGE_ATTACHMENTS} images.`);
+      return;
+    }
+    const imageFiles = files.filter(isSupportedComposerImage);
+    const selectedFiles = imageFiles.slice(0, slots);
+    if (!selectedFiles.length) {
+      setComposerAttachmentError("Only images can be attached here.");
+      return;
+    }
+    const nextAttachments: ComposerImageAttachment[] = [];
+    let nextError: string | null = imageFiles.length > selectedFiles.length
+      ? `Only ${MAX_COMPOSER_IMAGE_ATTACHMENTS} images can be attached.`
+      : files.length > imageFiles.length
+        ? "Only images can be attached here."
+      : null;
+    for (const file of selectedFiles) {
+      try {
+        nextAttachments.push(await readImageFileAttachment(file));
+      } catch (error) {
+        nextError = error instanceof Error ? error.message : "Could not attach that image.";
+      }
+    }
+    if (nextAttachments.length) {
+      setComposerAttachments((current) => [...current, ...nextAttachments].slice(0, MAX_COMPOSER_IMAGE_ATTACHMENTS));
+    }
+    setComposerAttachmentError(nextError);
+  };
+
+  const removeComposerAttachment = (id: string) => {
+    setComposerAttachments((current) => current.filter((attachment) => attachment.id !== id));
+    setComposerAttachmentError(null);
+  };
+
   const sendMessage = async () => {
-    if (isSending) return;
     if (nativeVoiceActiveRef.current) {
       await stopVoiceInput();
     } else if (recognitionRef.current) {
       recognitionRef.current.stop();
     }
     const prompt = composerText.trim();
-    if (!prompt) return;
-    const candidateThreadID = threadDetail?.threadID ?? selectedThreadID;
-    const targetThreadID = candidateThreadID && appState.threads.some((thread) => thread.id === candidateThreadID)
-      ? candidateThreadID
-      : undefined;
+    const turnAttachments = composerAttachments;
+    const hasAttachments = turnAttachments.length > 0;
+    if (!prompt && !hasAttachments) return;
+    const candidateThreadID = threadDetail?.threadID ?? selectedThreadIDRef.current ?? selectedThreadID;
+    const targetThreadID = usableOpenAssistThreadID(candidateThreadID);
     const fallbackProject = appState.projects.find((project) => selectedProjectID && sameID(project.id, selectedProjectID));
+    const titleSeed = prompt || (hasAttachments ? "Attached image" : "");
     const optimisticTitle = targetThreadID
-      ? usableThreadTitle(threadDetail?.title) ?? usableThreadTitle(selectedThread?.title) ?? chatTitleForPrompt(prompt)
-      : chatTitleForPrompt(prompt);
+      ? usableThreadTitle(threadDetail?.title) ?? usableThreadTitle(selectedThread?.title) ?? chatTitleForPrompt(titleSeed)
+      : chatTitleForPrompt(titleSeed);
     const titleForDetail = (current?: ThreadDetail | null) =>
       targetThreadID ? usableThreadTitle(current?.title) ?? optimisticTitle : optimisticTitle;
     const composerMentions = composerMentionIDs(prompt, appState.plugins, appState.skills);
     const turnPluginIDs = Array.from(new Set([...selectedPluginIDs, ...composerMentions.pluginIDs]));
-    setComposerText("");
-    setIsSending(true);
     const turnStartedAt = Date.now();
     const providerRunID = `provider-run-${turnStartedAt}-${Math.random().toString(16).slice(2)}`;
-    activeProviderRunIDRef.current = providerRunID;
-    stopRequestedRef.current = false;
-    const optimisticUser: ChatMessage = { id: `local-user-${turnStartedAt}`, role: "user", text: prompt };
+    const runThreadID = targetThreadID ?? `pending-thread-${providerRunID}`;
+    const currentRuns = activeThreadRunsRef.current;
+    if (targetThreadID && currentRuns[targetThreadID]) {
+      setProviderStatus("This chat is already working. Open another chat to start a new task.");
+      return;
+    }
+    if (Object.keys(currentRuns).length >= MAX_PARALLEL_THREAD_RUNS) {
+      setProviderStatus(`You can run up to ${MAX_PARALLEL_THREAD_RUNS} chats at once. Stop one or let one finish first.`);
+      return;
+    }
+    const originSelectedThreadID = selectedThreadIDRef.current ?? selectedThreadID;
+    const shouldRenderRunThread = (threadID?: string) => {
+      const currentThreadID = selectedThreadIDRef.current ?? selectedThreadID;
+      if (threadID && currentThreadID && sameID(currentThreadID, threadID)) return true;
+      if (!targetThreadID && !currentThreadID && !originSelectedThreadID) return true;
+      return false;
+    };
+    const shouldShowCompletedThread = (threadID: string) => {
+      if (targetThreadID) return shouldRenderRunThread(threadID);
+      const currentThreadID = selectedThreadIDRef.current ?? selectedThreadID;
+      if (!currentThreadID && !originSelectedThreadID) return true;
+      return Boolean(currentThreadID && originSelectedThreadID && sameID(currentThreadID, originSelectedThreadID));
+    };
+    setComposerText("");
+    setComposerAttachments([]);
+    setComposerAttachmentError(null);
+    const nextActiveRuns = {
+      ...activeThreadRunsRef.current,
+      [runThreadID]: {
+        runID: providerRunID,
+        threadID: runThreadID,
+        provider: activeProviderName,
+        startedAt: turnStartedAt,
+        statusText: `Loading ${activeProviderName} provider...`
+      }
+    };
+    activeThreadRunsRef.current = nextActiveRuns;
+    setActiveThreadRuns(nextActiveRuns);
+    if (targetThreadID) {
+      setAppState((current) => ({
+        ...current,
+        threads: current.threads.map((thread) => thread.id === targetThreadID
+          ? { ...thread, title: optimisticTitle, updatedAt: turnStartedAt, age: "now", active: true }
+          : thread)
+      }));
+    }
+    const optimisticUser: ChatMessage = {
+      id: `local-user-${turnStartedAt}`,
+      role: "user",
+      text: prompt || (turnAttachments.length === 1 ? "Attached image" : `${turnAttachments.length} attached images`),
+      attachments: turnAttachments
+    };
     const pendingAssistant: ChatMessage = {
       id: `local-assistant-streaming-${turnStartedAt}`,
       role: "assistant",
@@ -13556,10 +14513,12 @@ export function App() {
     const unsubscribeProviderEvents = window.openAssistElectron?.onProviderEvent?.((event: ProviderRunEvent) => {
       if (event.runID !== providerRunID) return;
       if (event.type === "status") {
-        setProviderStatus(event.text);
+        updateActiveThreadRun(runThreadID, providerRunID, { statusText: event.text });
+        if (shouldRenderRunThread(event.threadID)) setProviderStatus(event.text);
         return;
       }
       if (event.type === "assistant-delta") {
+        if (!shouldRenderRunThread(event.threadID)) return;
         setThreadDetail((current) => {
           const messages = current?.messages ?? [];
           const pending = messages.find((message) => message.id === pendingAssistant.id) ?? pendingAssistant;
@@ -13578,6 +14537,7 @@ export function App() {
         return;
       }
       if (event.type === "activity") {
+        if (!shouldRenderRunThread(event.threadID)) return;
         setThreadDetail((current) => ({
           threadID: event.threadID,
           title: titleForDetail(current),
@@ -13586,19 +14546,25 @@ export function App() {
         return;
       }
       if (event.type === "failed") {
-        setProviderStatus(`${event.provider} failed`);
+        updateActiveThreadRun(runThreadID, providerRunID, { statusText: `${event.provider} failed` });
+        if (shouldRenderRunThread(event.threadID)) setProviderStatus(`${event.provider} failed`);
         return;
       }
       if (event.type === "completed") {
-        setProviderStatus(`${event.provider} completed`);
-        window.setTimeout(() => setProviderStatus((current) => current === `${event.provider} completed` ? null : current), 1500);
+        updateActiveThreadRun(runThreadID, providerRunID, { statusText: `${event.provider} completed` });
+        if (shouldRenderRunThread(event.threadID)) {
+          setProviderStatus(`${event.provider} completed`);
+          window.setTimeout(() => setProviderStatus((current) => current === `${event.provider} completed` ? null : current), 1500);
+        }
       }
     });
-    setThreadDetail((current) => ({
-      threadID: targetThreadID ?? "new",
-      title: titleForDetail(current),
-      messages: [...(targetThreadID ? current?.messages ?? [] : []), optimisticUser, pendingAssistant]
-    }));
+    if (shouldRenderRunThread(targetThreadID)) {
+      setThreadDetail((current) => ({
+        threadID: targetThreadID ?? "new",
+        title: titleForDetail(current),
+        messages: [...(targetThreadID ? current?.messages ?? [] : []), optimisticUser, pendingAssistant]
+      }));
+    }
     try {
       const result = await window.openAssistElectron?.sendMessage(
         prompt,
@@ -13609,7 +14575,8 @@ export function App() {
         interactionMode,
         permissionMode,
         composerMentions.skillIDs,
-        providerRunID
+        providerRunID,
+        turnAttachments
       );
       if (result) {
         const completedTitle =
@@ -13617,20 +14584,23 @@ export function App() {
           usableThreadTitle(result.title) ??
           optimisticTitle;
         const completedAt = Date.now();
-        setSelectedThreadID(result.threadID);
-        setThreadDetail((current) => {
-          const currentMessages = current?.messages ?? [];
-          return {
-            threadID: result.threadID,
-            title: completedTitle,
-            messages: [
-              ...(targetThreadID ? messagesWithoutCurrentTurn(currentMessages) : []),
-              result.user,
-              ...finalizedActiveTurnActivities(currentMessages),
-              result.assistant
-            ]
-          };
-        });
+        if (shouldShowCompletedThread(result.threadID)) {
+          selectedThreadIDRef.current = result.threadID;
+          setSelectedThreadID(result.threadID);
+          setThreadDetail((current) => {
+            const currentMessages = current?.messages ?? [];
+            return {
+              threadID: result.threadID,
+              title: completedTitle,
+              messages: [
+                ...(targetThreadID ? messagesWithoutCurrentTurn(currentMessages) : []),
+                result.user,
+                ...finalizedActiveTurnActivities(currentMessages),
+                result.assistant
+              ]
+            };
+          });
+        }
         setAppState((current) => {
           const fallbackThread: ThreadItem = {
             id: result.threadID,
@@ -13670,36 +14640,40 @@ export function App() {
     } catch (error) {
       const message = readableProviderError(error);
       const provider = activeProviderName;
-      const wasStopped = stopRequestedRef.current || /stopp?ed|cancelled|canceled|interrupt/i.test(message);
-      setThreadDetail((current) => {
-        const currentMessages = current?.messages ?? [];
-        return {
-          threadID: targetThreadID ?? "new",
-          title: titleForDetail(current),
-          messages: [
-            ...(targetThreadID ? messagesWithoutCurrentTurn(currentMessages) : []),
-            optimisticUser,
-            ...finalizedActiveTurnActivities(currentMessages, wasStopped ? "completed" : "failed"),
-            {
-              id: `assistant-error-${Date.now()}`,
-              role: "assistant",
-              provider,
-              text: wasStopped ? `${provider} was stopped.` : `${provider} could not finish this turn: ${message}`
-            }
-          ]
-        };
+      const wasStopped = activeThreadRunsRef.current[runThreadID]?.stopRequested || /stopp?ed|cancelled|canceled|interrupt/i.test(message);
+      updateActiveThreadRun(runThreadID, providerRunID, {
+        statusText: wasStopped ? `${provider} stopped` : `${provider} failed`
       });
+      if (shouldRenderRunThread(targetThreadID)) {
+        setThreadDetail((current) => {
+          const currentMessages = current?.messages ?? [];
+          return {
+            threadID: targetThreadID ?? "new",
+            title: titleForDetail(current),
+            messages: [
+              ...(targetThreadID ? messagesWithoutCurrentTurn(currentMessages) : []),
+              optimisticUser,
+              ...finalizedActiveTurnActivities(currentMessages, wasStopped ? "completed" : "failed"),
+              {
+                id: `assistant-error-${Date.now()}`,
+                role: "assistant",
+                provider,
+                text: wasStopped ? `${provider} was stopped.` : `${provider} could not finish this turn: ${message}`
+              }
+            ]
+          };
+        });
+      }
     } finally {
       unsubscribeProviderEvents?.();
-      if (activeProviderRunIDRef.current === providerRunID) activeProviderRunIDRef.current = null;
-      stopRequestedRef.current = false;
-      setIsSending(false);
+      clearActiveThreadRun(runThreadID, providerRunID);
     }
   };
 
   const stopMessage = async () => {
-    const runID = activeProviderRunIDRef.current;
-    if (!isSending || !runID) {
+    const threadID = selectedThreadIDRef.current ?? selectedThreadID;
+    const selectedRun = threadID ? activeThreadRunsRef.current[threadID] : undefined;
+    if (!selectedRun) {
       if (liveVoiceStatus !== "delegating") return;
       setProviderStatus("Stopping Codex task...");
       try {
@@ -13715,10 +14689,13 @@ export function App() {
       }
       return;
     }
-    stopRequestedRef.current = true;
-    setProviderStatus("Stopping Codex...");
+    updateActiveThreadRun(selectedRun.threadID, selectedRun.runID, {
+      stopRequested: true,
+      statusText: `Stopping ${selectedRun.provider}...`
+    });
+    setProviderStatus(`Stopping ${selectedRun.provider}...`);
     try {
-      const result = await window.openAssistElectron?.stopMessage(runID);
+      const result = await window.openAssistElectron?.stopMessage(selectedRun.runID);
       if (result && !result.ok && result.error) setProviderStatus(result.error);
     } catch (error) {
       const message = error instanceof Error ? error.message : "Could not stop the current turn.";
@@ -13763,6 +14740,16 @@ export function App() {
     return thread.projectID
       ? thread.projectID.toLowerCase() === selectedProjectID.toLowerCase()
       : false;
+  }).map((thread) => {
+    const run = activeThreadRuns[thread.id];
+    return run
+      ? {
+          ...thread,
+          isRunning: true,
+          runStatusText: run.statusText,
+          updatedAt: Math.max(thread.updatedAt ?? 0, run.startedAt)
+        }
+      : thread;
   }).sort((left, right) => (right.updatedAt ?? 0) - (left.updatedAt ?? 0));
   const toggleArchivedThreads = () => {
     setShowArchivedThreads((current) => !current);
@@ -13879,6 +14866,8 @@ export function App() {
         noteDraft={noteDraft}
         noteSaveStatus={noteSaveStatus}
         composerText={composerText}
+        composerAttachments={composerAttachments}
+        composerAttachmentError={composerAttachmentError}
         isSending={isSending}
         interactionMode={interactionMode}
         permissionMode={permissionMode}
@@ -13888,10 +14877,13 @@ export function App() {
         voiceError={voiceError}
         liveVoiceStatus={liveVoiceStatus}
         liveVoiceStatusText={liveVoiceStatusText}
-        providerStatus={providerStatus}
+        providerStatus={visibleProviderStatus}
         selectedPluginID={selectedPluginID}
         selectedPluginIDs={selectedPluginIDs}
         onComposerText={setComposerText}
+        onAttachImages={(files) => { void attachComposerImages(files); }}
+        onRemoveAttachment={removeComposerAttachment}
+        onClearAttachmentError={() => setComposerAttachmentError(null)}
         onSend={sendMessage}
         onStop={stopMessage}
         onVoiceInput={toggleVoiceInput}
@@ -13904,6 +14896,7 @@ export function App() {
         onAddTextToThreadNote={(text) => { void appendTextToThreadNote(text); }}
         onSpeakText={(text) => { void speakAssistantText(text, true); }}
         onRespondToApproval={respondToApproval}
+        onRestoreCodeCheckpoint={restoreCodeCheckpoint}
         onSelectProvider={selectProvider}
         onSelectModel={selectModel}
         onSelectNotesProject={(projectID) => { void selectNotesProject(projectID); }}

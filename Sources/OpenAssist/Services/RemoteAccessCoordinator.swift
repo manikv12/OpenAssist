@@ -690,12 +690,12 @@ final class RemoteAccessCoordinator: ObservableObject {
         rateLimits: AccountRateLimits,
         tokenUsage: TokenUsageSnapshot
     ) -> RemoteAccessUsage? {
-        // We surface Codex, Copilot, and Claude Code usage. Ollama runs locally
-        // so it has no quota to report.
+        // We surface cloud provider usage when the provider exposes it. Ollama
+        // runs locally so it has no quota to report.
         switch backend {
         case .ollamaLocal:
             return nil
-        case .codex, .copilot, .claudeCode:
+        case .codex, .copilot, .claudeCode, .antigravityCLI:
             break
         }
 

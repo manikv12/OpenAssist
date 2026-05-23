@@ -67,6 +67,11 @@
   --provider-claude-gradient: linear-gradient(135deg, #c58b5a 0%, #ff8a3d 54%, #ffd0a2 100%);
   --provider-claude-bg-gradient: linear-gradient(135deg, rgba(255, 179, 107, 0.18), rgba(255, 138, 61, 0.08));
   --provider-claude-border: rgba(255, 179, 107, 0.34);
+  --provider-antigravity: #3186FF;
+  --provider-antigravity-gradient: linear-gradient(135deg, #3186FF 0%, #749BFF 22%, #FC413D 46%, #FFE432 68%, #00B95C 100%);
+  --provider-antigravity-working-gradient: linear-gradient(135deg, #3186FF 0%, #749BFF 54%, #00B95C 100%);
+  --provider-antigravity-bg-gradient: linear-gradient(135deg, rgba(49, 134, 255, 0.18), rgba(0, 185, 92, 0.08));
+  --provider-antigravity-border: rgba(49, 134, 255, 0.34);
   --provider-ollama: #61bf73;
   --provider-ollama-gradient: linear-gradient(135deg, #3ea65a 0%, #61bf73 54%, #b9efc3 100%);
   --provider-ollama-bg-gradient: linear-gradient(135deg, rgba(97, 191, 115, 0.18), rgba(62, 166, 90, 0.08));
@@ -1067,6 +1072,40 @@ textarea {
   color: var(--text-strong);
 }
 
+.thread-row.is-running {
+  grid-template-columns: 14px minmax(0, 1fr) auto;
+  gap: 4px 6px;
+}
+
+.thread-row.is-running .thread-running-spinner {
+  grid-column: 1;
+  grid-row: 1 / span 2;
+}
+
+.thread-row.is-running .thread-title {
+  grid-column: 2;
+}
+
+.thread-row.is-running .thread-age {
+  grid-column: 3;
+}
+
+.thread-row.is-running small {
+  grid-column: 2 / -1;
+}
+
+.thread-running-spinner {
+  width: 11px;
+  height: 11px;
+  align-self: start;
+  margin-top: 2px;
+  border: 1.7px solid color-mix(in srgb, var(--provider-color) 22%, transparent);
+  border-top-color: color-mix(in srgb, var(--provider-color) 88%, white 12%);
+  border-radius: 999px;
+  animation: voice-loading-spin 760ms linear infinite;
+  filter: drop-shadow(0 0 7px color-mix(in srgb, var(--provider-color) 30%, transparent));
+}
+
 .thread-row-provider-codex {
   --provider-color: var(--provider-codex);
   --provider-gradient: var(--provider-codex-gradient);
@@ -1086,6 +1125,13 @@ textarea {
   --provider-gradient: var(--provider-claude-gradient);
   --provider-bg-gradient: var(--provider-claude-bg-gradient);
   --provider-border: var(--provider-claude-border);
+}
+
+.thread-row-provider-antigravityCLI {
+  --provider-color: var(--provider-antigravity);
+  --provider-gradient: var(--provider-antigravity-gradient);
+  --provider-bg-gradient: var(--provider-antigravity-bg-gradient);
+  --provider-border: var(--provider-antigravity-border);
 }
 
 .thread-row-provider-ollamaLocal {
@@ -1402,6 +1448,13 @@ textarea {
   --provider-border: var(--provider-claude-border);
 }
 
+.provider-pill-antigravityCLI {
+  --provider-color: var(--provider-antigravity);
+  --provider-gradient: var(--provider-antigravity-gradient);
+  --provider-bg-gradient: var(--provider-antigravity-bg-gradient);
+  --provider-border: var(--provider-antigravity-border);
+}
+
 .provider-pill-ollamaLocal {
   --provider-color: var(--provider-ollama);
   --provider-gradient: var(--provider-ollama-gradient);
@@ -1537,6 +1590,13 @@ textarea {
   --provider-border: var(--provider-claude-border);
 }
 
+.provider-popover button.provider-option-antigravityCLI {
+  --provider-color: var(--provider-antigravity);
+  --provider-gradient: var(--provider-antigravity-gradient);
+  --provider-bg-gradient: var(--provider-antigravity-bg-gradient);
+  --provider-border: var(--provider-antigravity-border);
+}
+
 .provider-popover button.provider-option-ollamaLocal {
   --provider-color: var(--provider-ollama);
   --provider-gradient: var(--provider-ollama-gradient);
@@ -1658,6 +1718,14 @@ textarea {
   -webkit-mask-size: contain;
 }
 
+.provider-mark-img {
+  background: none;
+  mask-image: none;
+  -webkit-mask-image: none;
+  object-fit: contain;
+  opacity: 1;
+}
+
 .provider-pill .provider-mark {
   width: 16px;
   height: 16px;
@@ -1682,6 +1750,13 @@ textarea {
   --provider-gradient: var(--provider-claude-gradient);
   --provider-bg-gradient: var(--provider-claude-bg-gradient);
   --provider-border: var(--provider-claude-border);
+}
+
+.provider-mark-antigravityCLI {
+  --provider-color: var(--provider-antigravity);
+  --provider-gradient: var(--provider-antigravity-gradient);
+  --provider-bg-gradient: var(--provider-antigravity-bg-gradient);
+  --provider-border: var(--provider-antigravity-border);
 }
 
 .provider-mark-ollamaLocal {
@@ -2156,8 +2231,56 @@ textarea {
   overflow-wrap: anywhere;
 }
 
+.user-bubble.has-attachments {
+  display: grid;
+  gap: 8px;
+  padding: 8px 10px 11px;
+}
+
+.user-attachment-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  max-width: 100%;
+}
+
+.user-attachment-thumb {
+  width: 124px;
+  min-width: 0;
+  display: grid;
+  gap: 5px;
+  padding: 4px;
+  border-radius: 10px;
+  color: rgba(235, 242, 252, 0.82);
+  background: rgba(255, 255, 255, 0.07);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.08);
+  text-align: left;
+}
+
+.user-attachment-thumb img {
+  width: 100%;
+  height: 82px;
+  object-fit: cover;
+  border-radius: 7px;
+  background: rgba(0, 0, 0, 0.18);
+}
+
+.user-attachment-thumb span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 10.5px;
+  font-weight: 650;
+}
+
 .app-shell.mode-light .user-bubble {
   background: rgba(232, 235, 240, 0.96);
+}
+
+.app-shell.mode-light .user-attachment-thumb {
+  color: rgba(25, 34, 48, 0.78);
+  background: rgba(255, 255, 255, 0.56);
+  box-shadow: inset 0 0 0 1px rgba(25, 34, 48, 0.08);
 }
 
 .user-bubble-rich {
@@ -2416,6 +2539,11 @@ textarea {
   --working-gradient: var(--provider-claude-gradient);
 }
 
+.assistant-working-row-antigravitycli {
+  --working-color: var(--provider-antigravity);
+  --working-gradient: var(--provider-antigravity-working-gradient);
+}
+
 .assistant-working-row-ollamalocal {
   --working-color: var(--provider-ollama);
   --working-gradient: var(--provider-ollama-gradient);
@@ -2531,11 +2659,186 @@ textarea {
   --provider-border: var(--provider-claude-border);
 }
 
+.provider-tag-antigravityCLI {
+  --provider-color: var(--provider-antigravity);
+  --provider-gradient: var(--provider-antigravity-gradient);
+  --provider-bg-gradient: var(--provider-antigravity-bg-gradient);
+  --provider-border: var(--provider-antigravity-border);
+}
+
 .provider-tag-ollamaLocal {
   --provider-color: var(--provider-ollama);
   --provider-gradient: var(--provider-ollama-gradient);
   --provider-bg-gradient: var(--provider-ollama-bg-gradient);
   --provider-border: var(--provider-ollama-border);
+}
+
+.checkpoint-card {
+  width: min(720px, 100%);
+  margin: 14px 0 8px;
+  overflow: hidden;
+  border-radius: 9px;
+  color: color-mix(in srgb, var(--text) 88%, transparent);
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--theme-accent, #7f94ff) 5%, transparent), transparent),
+    rgba(16, 18, 24, 0.34);
+  box-shadow:
+    inset 0 0 0 1px rgba(255, 255, 255, 0.058),
+    0 10px 26px rgba(0, 0, 0, 0.12);
+}
+
+.checkpoint-card.future {
+  opacity: 0.72;
+}
+
+.checkpoint-card-head {
+  display: grid;
+  grid-template-columns: 26px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 9px;
+  padding: 10px 11px 8px;
+}
+
+.checkpoint-icon {
+  width: 26px;
+  height: 26px;
+  display: grid;
+  place-items: center;
+  border-radius: 7px;
+  color: color-mix(in srgb, var(--theme-accent, #7f94ff) 80%, white 20%);
+  background: color-mix(in srgb, var(--theme-accent, #7f94ff) 11%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--theme-accent, #7f94ff) 18%, transparent);
+}
+
+.checkpoint-title {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.checkpoint-title strong {
+  overflow: hidden;
+  color: color-mix(in srgb, var(--text-strong) 88%, transparent);
+  font-size: 12.5px;
+  font-weight: 670;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.checkpoint-title small,
+.checkpoint-status,
+.checkpoint-more {
+  color: color-mix(in srgb, var(--text) 48%, transparent);
+  font-size: 10.5px;
+  font-weight: 620;
+  letter-spacing: 0;
+}
+
+.checkpoint-status {
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.045);
+}
+
+.checkpoint-files {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 0 11px 9px 46px;
+}
+
+.checkpoint-file,
+.checkpoint-more {
+  min-width: 0;
+  max-width: 100%;
+  height: 24px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 0 7px;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.034);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.045);
+}
+
+.checkpoint-file span {
+  width: 14px;
+  height: 14px;
+  display: grid;
+  place-items: center;
+  border-radius: 4px;
+  color: color-mix(in srgb, var(--theme-accent, #7f94ff) 78%, white 22%);
+  background: color-mix(in srgb, var(--theme-accent, #7f94ff) 12%, transparent);
+  font-size: 9px;
+  font-weight: 800;
+}
+
+.checkpoint-file svg {
+  flex: 0 0 auto;
+  color: color-mix(in srgb, var(--text) 52%, transparent);
+}
+
+.checkpoint-file b {
+  min-width: 0;
+  overflow: hidden;
+  color: color-mix(in srgb, var(--text) 72%, transparent);
+  font-size: 11.5px;
+  font-weight: 590;
+  line-height: 1;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.checkpoint-actions {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 11px 11px 46px;
+}
+
+.checkpoint-actions button {
+  min-height: 27px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 9px;
+  border-radius: 7px;
+  color: color-mix(in srgb, var(--text) 68%, transparent);
+  background: rgba(255, 255, 255, 0.04);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.052);
+  font-size: 11.5px;
+  font-weight: 650;
+  transition: color 140ms ease, background 140ms ease, box-shadow 140ms ease;
+}
+
+.checkpoint-actions button:hover:not(:disabled),
+.checkpoint-actions button:focus-visible:not(:disabled) {
+  color: var(--text-strong);
+  background: rgba(255, 255, 255, 0.07);
+  outline: none;
+}
+
+.checkpoint-actions button:disabled {
+  cursor: default;
+  opacity: 0.45;
+}
+
+.checkpoint-diff {
+  border-top: 1px solid rgba(255, 255, 255, 0.055);
+}
+
+.checkpoint-diff pre {
+  max-height: 280px;
+  margin: 0;
+  overflow: auto;
+  padding: 10px 12px;
+  color: color-mix(in srgb, var(--text) 68%, transparent);
+  background: rgba(3, 5, 9, 0.32);
+  font-family: var(--theme-code-font, ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace);
+  font-size: 10.8px;
+  line-height: 1.45;
+  white-space: pre-wrap;
 }
 
 .work-card {
@@ -2560,6 +2863,10 @@ textarea {
 
 .work-card-claudeCode {
   --work-accent: var(--provider-claude);
+}
+
+.work-card-antigravityCLI {
+  --work-accent: var(--provider-antigravity);
 }
 
 .work-card-ollamaLocal {
@@ -2602,6 +2909,11 @@ textarea {
 .work-summary-line-claudeCode {
   --provider-color: var(--provider-claude);
   --provider-gradient: var(--provider-claude-gradient);
+}
+
+.work-summary-line-antigravityCLI {
+  --provider-color: var(--provider-antigravity);
+  --provider-gradient: var(--provider-antigravity-gradient);
 }
 
 .work-summary-line-ollamaLocal {
@@ -3221,6 +3533,10 @@ textarea {
   --activity-accent: var(--provider-claude);
 }
 
+.activity-card-antigravityCLI {
+  --activity-accent: var(--provider-antigravity);
+}
+
 .activity-card-ollamaLocal {
   --activity-accent: var(--provider-ollama);
 }
@@ -3428,6 +3744,144 @@ textarea {
   outline: none;
 }
 
+.message-artifacts {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.message-artifact-card {
+  display: grid;
+  grid-template-columns: 54px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 11px;
+  width: min(100%, 720px);
+  padding: 8px;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.085);
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.055), rgba(255, 255, 255, 0.028)),
+    rgba(9, 12, 18, 0.54);
+  box-shadow: inset 0 1px rgba(255, 255, 255, 0.05), 0 10px 26px rgba(0, 0, 0, 0.18);
+}
+
+.message-artifact-card.is-low-res {
+  border-color: rgba(255, 176, 96, 0.22);
+  background:
+    linear-gradient(180deg, rgba(255, 176, 96, 0.07), rgba(255, 255, 255, 0.026)),
+    rgba(9, 12, 18, 0.54);
+}
+
+.message-artifact-preview,
+.message-artifact-file-icon {
+  width: 54px;
+  height: 42px;
+  border-radius: 9px;
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  background: rgba(255, 255, 255, 0.055);
+}
+
+.message-artifact-preview {
+  display: block;
+  padding: 0;
+  cursor: pointer;
+}
+
+.message-artifact-preview img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.message-artifact-file-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: rgba(235, 238, 245, 0.66);
+}
+
+.message-artifact-copy {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.message-artifact-copy strong {
+  overflow: hidden;
+  color: rgba(245, 247, 251, 0.92);
+  font-size: 13px;
+  font-weight: 720;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.message-artifact-copy span {
+  overflow: hidden;
+  color: rgba(235, 238, 245, 0.52);
+  font-size: 11.5px;
+  font-weight: 560;
+  line-height: 1.3;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.message-artifact-copy em {
+  color: rgba(255, 198, 126, 0.72);
+  font-size: 10.5px;
+  font-style: normal;
+  font-weight: 680;
+  line-height: 1.2;
+}
+
+.message-artifact-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.message-artifact-actions button {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 28px;
+  padding: 0 9px;
+  border-radius: 8px;
+  color: rgba(235, 238, 245, 0.78);
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.075);
+  font-size: 11.5px;
+  font-weight: 680;
+}
+
+.message-artifact-actions button:hover,
+.message-artifact-actions button:focus-visible {
+  color: rgba(255, 255, 255, 0.95);
+  background: rgba(255, 255, 255, 0.105);
+  outline: none;
+}
+
+@media (max-width: 720px) {
+  .message-artifact-card {
+    grid-template-columns: 48px minmax(0, 1fr);
+  }
+
+  .message-artifact-preview,
+  .message-artifact-file-icon {
+    width: 48px;
+    height: 38px;
+  }
+
+  .message-artifact-actions {
+    grid-column: 2;
+    justify-content: flex-start;
+  }
+}
+
 .composer-wrap {
   position: relative;
   flex: 0 0 auto;
@@ -3506,6 +3960,110 @@ textarea {
 
 .composer.is-listening {
   box-shadow: none;
+}
+
+.composer.is-dragging-image {
+  background: color-mix(in srgb, var(--theme-accent, #4f8dff) 12%, rgba(40, 44, 52, 0.98));
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--theme-accent, #4f8dff) 36%, transparent);
+}
+
+.composer-image-input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.composer-attachments-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  margin: -2px 0 0;
+}
+
+.composer-attachment-chip {
+  min-width: 0;
+  max-width: min(240px, 100%);
+  display: inline-grid;
+  grid-template-columns: 32px minmax(0, 1fr) 20px;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 5px 4px 4px;
+  border-radius: 10px;
+  color: var(--text-strong);
+  background: rgba(255, 255, 255, 0.07);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.08);
+}
+
+.composer-attachment-chip img {
+  width: 32px;
+  height: 32px;
+  object-fit: cover;
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.18);
+}
+
+.composer-attachment-chip span {
+  min-width: 0;
+  display: grid;
+  gap: 1px;
+}
+
+.composer-attachment-chip strong,
+.composer-attachment-chip small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.composer-attachment-chip strong {
+  font-size: 11.5px;
+  font-weight: 720;
+}
+
+.composer-attachment-chip small {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 560;
+}
+
+.composer-attachment-chip button {
+  width: 20px;
+  height: 20px;
+  display: grid;
+  place-items: center;
+  border-radius: 999px;
+  color: rgba(232, 238, 245, 0.62);
+  background: rgba(255, 255, 255, 0.07);
+}
+
+.composer-attachment-chip button:hover,
+.composer-attachment-chip button:focus-visible {
+  color: var(--text-strong);
+  background: rgba(255, 255, 255, 0.12);
+  outline: none;
+}
+
+.composer-attachment-error {
+  min-height: 40px;
+  padding: 6px 10px;
+  border-radius: 10px;
+  color: #ffd9a3;
+  background: rgba(245, 158, 11, 0.12);
+  box-shadow: inset 0 0 0 1px rgba(245, 158, 11, 0.18);
+  font-size: 11.5px;
+  font-weight: 680;
+}
+
+.app-shell.mode-light .composer-attachment-chip {
+  background: rgba(255, 255, 255, 0.58);
+  box-shadow: inset 0 0 0 1px rgba(25, 34, 48, 0.08);
+}
+
+.app-shell.mode-light .composer-attachment-chip button {
+  color: rgba(25, 34, 48, 0.54);
+  background: rgba(25, 34, 48, 0.06);
 }
 
 .composer-input-shell {
@@ -3638,6 +4196,7 @@ textarea {
   font-weight: 440;
 }
 
+.composer-dictation-panel-motion,
 .composer-live-voice-panel-motion {
   position: absolute;
   left: 0;
@@ -3646,6 +4205,117 @@ textarea {
   z-index: 3;
   overflow: hidden;
   pointer-events: auto;
+}
+
+.composer-dictation-panel-motion + .composer-live-voice-panel-motion {
+  bottom: calc(100% + 52px);
+}
+
+.composer-dictation-panel {
+  --dictation-accent: #5ee0ae;
+  width: 100%;
+  min-height: 38px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  overflow: hidden;
+  padding: 7px 10px;
+  border-radius: 18px;
+  color: color-mix(in srgb, var(--dictation-accent) 78%, var(--text-strong) 22%);
+  background:
+    linear-gradient(
+      180deg,
+      color-mix(in srgb, var(--dictation-accent) 15%, transparent),
+      color-mix(in srgb, var(--dictation-accent) 6%, transparent)
+    ),
+    rgba(255, 255, 255, 0.035);
+  box-shadow:
+    inset 0 0 0 1px color-mix(in srgb, var(--dictation-accent) 24%, transparent),
+    inset 0 1px 0 rgba(255, 255, 255, 0.055),
+    0 0 0 3px color-mix(in srgb, var(--dictation-accent) 7%, transparent);
+}
+
+.composer-dictation-panel.state-processing {
+  --dictation-accent: var(--gold-strong);
+}
+
+.composer-dictation-panel-icon {
+  width: 22px;
+  height: 22px;
+  flex: 0 0 auto;
+  display: inline-grid;
+  place-items: center;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--dictation-accent) 16%, transparent);
+  box-shadow:
+    inset 0 0 0 1px color-mix(in srgb, var(--dictation-accent) 24%, transparent),
+    0 0 14px color-mix(in srgb, var(--dictation-accent) 8%, transparent);
+}
+
+.composer-dictation-panel-copy {
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.composer-dictation-panel-label {
+  flex: 0 0 auto;
+  color: color-mix(in srgb, var(--dictation-accent) 78%, var(--text-strong) 22%);
+  font-size: 11px;
+  font-weight: 720;
+  letter-spacing: 0;
+  white-space: nowrap;
+}
+
+.composer-dictation-panel-text {
+  min-width: 0;
+  overflow: hidden;
+  color: color-mix(in srgb, var(--text-strong) 92%, var(--dictation-accent) 8%);
+  font-size: 12.5px;
+  font-weight: 620;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.composer-dictation-bars {
+  height: 18px;
+  margin-left: auto;
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+
+.composer-dictation-bars span {
+  width: 3px;
+  height: 8px;
+  border-radius: 999px;
+  background: currentColor;
+  opacity: 0.78;
+  animation: dictation-bar-pulse 860ms ease-in-out infinite;
+}
+
+.composer-dictation-bars span:nth-child(2) {
+  animation-delay: 120ms;
+}
+
+.composer-dictation-bars span:nth-child(3) {
+  animation-delay: 240ms;
+}
+
+@keyframes dictation-bar-pulse {
+  0%,
+  100% {
+    transform: scaleY(0.55);
+    opacity: 0.46;
+  }
+
+  50% {
+    transform: scaleY(1.25);
+    opacity: 0.92;
+  }
 }
 
 .composer-live-voice-panel {
@@ -3790,12 +4460,35 @@ textarea {
     0 0 0 3px color-mix(in srgb, var(--realtime-voice-accent) 7%, transparent);
 }
 
+.app-shell.mode-light .composer-dictation-panel {
+  color: color-mix(in srgb, var(--dictation-accent) 58%, var(--theme-foreground, #0d0d0d) 42%);
+  background:
+    linear-gradient(
+      180deg,
+      color-mix(in srgb, var(--dictation-accent) 15%, transparent),
+      color-mix(in srgb, var(--dictation-accent) 6%, transparent)
+    ),
+    rgba(255, 255, 255, 0.52);
+  box-shadow:
+    inset 0 0 0 1px color-mix(in srgb, var(--dictation-accent) 22%, transparent),
+    inset 0 1px 0 rgba(255, 255, 255, 0.62),
+    0 0 0 3px color-mix(in srgb, var(--dictation-accent) 7%, transparent);
+}
+
 .app-shell.mode-light .composer-live-voice-panel-label {
   color: color-mix(in srgb, var(--realtime-voice-accent) 66%, var(--theme-foreground, #0d0d0d) 34%);
 }
 
 .app-shell.mode-light .composer-live-voice-panel-text {
   color: color-mix(in srgb, var(--theme-foreground, #0d0d0d) 86%, var(--realtime-voice-accent) 14%);
+}
+
+.app-shell.mode-light .composer-dictation-panel-label {
+  color: color-mix(in srgb, var(--dictation-accent) 66%, var(--theme-foreground, #0d0d0d) 34%);
+}
+
+.app-shell.mode-light .composer-dictation-panel-text {
+  color: color-mix(in srgb, var(--theme-foreground, #0d0d0d) 86%, var(--dictation-accent) 14%);
 }
 
 .composer-tools {
@@ -3825,6 +4518,59 @@ textarea {
 .composer .composer-live-voice-button {
   --realtime-voice-accent: rgba(232, 238, 245, 0.72);
   --realtime-voice-on-accent: #11161e;
+}
+
+.composer-voice-control {
+  height: 30px;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  border-radius: 999px;
+}
+
+.composer .composer-voice-main-button {
+  flex: 0 0 auto;
+}
+
+.composer .composer-voice-main-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.52;
+}
+
+.composer .composer-dictation-button.state-listening {
+  color: #5ee0ae;
+  background: rgba(94, 224, 174, 0.10);
+  box-shadow:
+    inset 0 0 0 1px rgba(94, 224, 174, 0.18),
+    0 0 0 3px rgba(94, 224, 174, 0.08);
+}
+
+.composer .composer-voice-switch-button {
+  width: 20px;
+  height: 30px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  color: rgba(232, 238, 245, 0.56);
+  background: transparent;
+  transition: color 140ms ease, background 140ms ease, transform 140ms var(--motion);
+}
+
+.composer .composer-voice-switch-button:hover,
+.composer .composer-voice-switch-button:focus-visible,
+.composer-voice-control.active .composer-voice-switch-button {
+  color: var(--text-strong);
+  background: rgba(255, 255, 255, 0.08);
+  outline: none;
+}
+
+.composer .composer-voice-switch-button svg {
+  transition: transform 140ms var(--motion);
+}
+
+.composer-voice-control.active .composer-voice-switch-button svg {
+  transform: rotate(180deg);
 }
 
 .composer .composer-live-voice-button.state-connecting {
@@ -4084,6 +4830,10 @@ textarea {
 .composer-popover .voice-option.active {
   color: var(--text-strong);
   background: rgba(128, 149, 255, 0.12);
+}
+
+.composer-popover .voice-option.setup {
+  color: rgba(232, 238, 245, 0.92);
 }
 
 .composer-popover .voice-option > svg:last-child {
@@ -4367,6 +5117,10 @@ textarea {
 
 .model-family-section-google {
   --model-family-color: #7ab8ff;
+}
+
+.model-family-section-antigravityCLI {
+  --model-family-color: var(--provider-antigravity);
 }
 
 .model-family-section-xai,
@@ -6331,6 +7085,13 @@ textarea {
   --provider-border: var(--provider-claude-border);
 }
 
+.composer-popover .composer-provider-option-antigravityCLI {
+  --provider-color: var(--provider-antigravity);
+  --provider-gradient: var(--provider-antigravity-gradient);
+  --provider-bg-gradient: var(--provider-antigravity-bg-gradient);
+  --provider-border: var(--provider-antigravity-border);
+}
+
 .composer-popover .composer-provider-option-ollamaLocal {
   --provider-color: var(--provider-ollama);
   --provider-gradient: var(--provider-ollama-gradient);
@@ -6432,6 +7193,13 @@ textarea {
   --provider-gradient: var(--provider-claude-gradient);
   --provider-bg-gradient: var(--provider-claude-bg-gradient);
   --provider-border: var(--provider-claude-border);
+}
+
+.composer-provider-antigravityCLI {
+  --provider-color: var(--provider-antigravity);
+  --provider-gradient: var(--provider-antigravity-gradient);
+  --provider-bg-gradient: var(--provider-antigravity-bg-gradient);
+  --provider-border: var(--provider-antigravity-border);
 }
 
 .composer-provider-ollamaLocal {
@@ -8710,6 +9478,89 @@ textarea {
   background: rgba(199, 166, 96, 0.09);
 }
 
+.open-pill.open-pill-warning {
+  color: #ff7a59;
+  background: rgba(255, 122, 89, 0.12);
+}
+
+.permission-banner {
+  margin: 8px 0 12px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: rgba(255, 122, 89, 0.10);
+  border: 1px solid rgba(255, 122, 89, 0.35);
+  display: grid;
+  gap: 4px;
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+
+.permission-banner strong {
+  color: #ff7a59;
+  font-weight: 800;
+}
+
+.permission-status-row {
+  display: grid;
+  grid-template-columns: 32px 1fr auto auto;
+  align-items: center;
+  column-gap: 12px;
+  padding: 12px 14px;
+  margin-top: 8px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.035);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.04);
+}
+
+.permission-status-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--gold);
+}
+
+.permission-status-text {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.permission-status-text strong {
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.permission-status-text small {
+  font-size: 12px;
+  color: var(--mute);
+  line-height: 1.4;
+}
+
+.permission-status-action {
+  padding: 6px 12px;
+  border-radius: 8px;
+  font-size: 12px;
+  font-weight: 700;
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text);
+  border: none;
+  cursor: pointer;
+  transition: background 150ms ease;
+}
+
+.permission-status-action:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.14);
+}
+
+.permission-status-action:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
 .theme-mode-row,
 .theme-config-row {
   min-height: 48px;
@@ -9608,18 +10459,29 @@ body:has(.compact-mode) {
   border-radius: 26px;
 }
 
+.compact-mode .composer-dictation-panel,
 .compact-mode .composer-live-voice-panel {
   min-height: 38px;
   padding: 7px 10px;
   border-radius: 16px;
 }
 
+.compact-mode .composer-attachments-row {
+  gap: 5px;
+}
+
+.compact-mode .composer-attachment-chip {
+  max-width: 100%;
+}
+
+.compact-mode .composer-dictation-panel-copy,
 .compact-mode .composer-live-voice-panel-copy {
   align-items: flex-start;
   flex-direction: column;
   gap: 1px;
 }
 
+.compact-mode .composer-dictation-panel-text,
 .compact-mode .composer-live-voice-panel-text {
   white-space: normal;
   display: -webkit-box;

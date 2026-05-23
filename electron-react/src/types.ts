@@ -23,15 +23,41 @@ export type ThreadItem = {
   updatedAt?: number;
   isArchived?: boolean;
   isTemporary?: boolean;
+  isRunning?: boolean;
+  runStatusText?: string;
   active?: boolean;
+};
+
+export type ComposerImageAttachment = {
+  id: string;
+  name: string;
+  mimeType: string;
+  dataURL: string;
+  size?: number;
+};
+
+export type MessageArtifact = {
+  id: string;
+  kind: "image" | "file";
+  name: string;
+  path: string;
+  mimeType?: string;
+  dataURL?: string;
+  size?: number;
+  width?: number;
+  height?: number;
 };
 
 export type ChatMessage = {
   id: string;
   role: "user" | "assistant" | "activity";
   text: string;
+  attachments?: ComposerImageAttachment[];
+  artifacts?: MessageArtifact[];
   provider?: string;
   status?: "completed" | "running";
+  turnID?: string;
+  checkpointInfo?: MessageCheckpointInfo;
   activityTitle?: string;
   activityKind?: string;
   activityStatus?: "pending" | "running" | "completed" | "failed" | "waiting";
@@ -54,6 +80,81 @@ export type ChatMessage = {
   approvalResolved?: boolean;
   createdAt?: number;
   updatedAt?: number;
+};
+
+export type CodeCheckpointTurnStatus = "completed" | "failed" | "cancelled";
+
+export type GitCheckpointPathState = {
+  blobID: string | null;
+  mode: string | null;
+  objectType: string | null;
+};
+
+export type GitCheckpointSnapshot = {
+  worktreeRef: string;
+  worktreeCommit: string;
+  worktreeTree: string;
+  indexRef: string;
+  indexCommit: string;
+  indexTree: string;
+  ignoredFingerprints: Record<string, never>;
+};
+
+export type CodeCheckpointFile = {
+  path: string;
+  changeKind: "added" | "modified" | "deleted" | "changed" | "typeChanged";
+  beforeWorktree: GitCheckpointPathState;
+  afterWorktree: GitCheckpointPathState;
+  beforeIndex: GitCheckpointPathState;
+  afterIndex: GitCheckpointPathState;
+  isBinary: boolean;
+};
+
+export type CodeCheckpointSummary = {
+  id: string;
+  checkpointNumber: number;
+  createdAt: number;
+  turnStatus: CodeCheckpointTurnStatus;
+  summary: string;
+  patch: string;
+  changedFiles: CodeCheckpointFile[];
+  ignoredTouchedPaths: string[];
+  beforeSnapshot: GitCheckpointSnapshot;
+  afterSnapshot: GitCheckpointSnapshot;
+  associatedMessageID?: string;
+  associatedTurnID?: string;
+  associatedUserMessageID?: string;
+};
+
+export type CodeTrackingState = {
+  sessionID: string;
+  availability: "available" | "unavailable" | "error";
+  repoRootPath?: string;
+  repoLabel?: string;
+  checkpoints: CodeCheckpointSummary[];
+  currentCheckpointPosition: number;
+  errorMessage?: string;
+};
+
+export type CodeReviewPanelState = {
+  sessionID: string;
+  repoRootPath: string;
+  repoLabel: string;
+  checkpoints: CodeCheckpointSummary[];
+  currentCheckpointPosition: number;
+  selectedCheckpointID: string;
+  hasActiveTurn: boolean;
+  actionsLocked: boolean;
+};
+
+export type MessageCheckpointInfo = {
+  checkpoint: CodeCheckpointSummary;
+  checkpointIndex: number;
+  currentCheckpointPosition: number;
+  totalCheckpointCount: number;
+  hasActiveTurn: boolean;
+  actionsLocked: boolean;
+  futureTurnsHidden: boolean;
 };
 
 export type ProviderRunEvent =

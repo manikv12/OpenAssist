@@ -4,6 +4,15 @@ interface Window {
   openAssistElectron?: {
     platform: string;
     openExternal: (url: string) => Promise<void>;
+    getMacOSPermissions: () => Promise<{
+      platformSupported: boolean;
+      accessibility: "granted" | "denied" | "not-determined" | "unknown";
+      screenRecording: "granted" | "denied" | "not-determined" | "unknown";
+      microphone: "granted" | "denied" | "not-determined" | "unknown";
+    }>;
+    requestMacOSPermission: (
+      kind: "accessibility" | "screenRecording" | "microphone" | "speechRecognition" | "automation"
+    ) => Promise<{ ok: boolean; opened: boolean; error?: string }>;
     openTarget: (target: string, workspaceRootPath?: string | null) => Promise<{ ok: boolean; path?: string; error?: string }>;
     workspaceLaunchTargets: () => Promise<Array<{
       id: string;
@@ -49,6 +58,12 @@ interface Window {
     loadAppState: () => Promise<import("./types").OpenAssistAppState>;
     listProviderModels: (backend: string) => Promise<import("./types").ProviderModelOption[]>;
     loadThread: (threadID: string) => Promise<import("./types").ThreadDetail>;
+    loadCodeTrackingState: (threadID: string) => Promise<import("./types").CodeTrackingState>;
+    openCodeReview: (threadID: string, checkpointID?: string) => Promise<import("./types").CodeReviewPanelState | null>;
+    restoreCodeCheckpoint: (
+      threadID: string,
+      checkpointID: string
+    ) => Promise<{ ok: boolean; state: import("./types").CodeTrackingState; panel: import("./types").CodeReviewPanelState | null }>;
     createThread: (projectID?: string, isTemporary?: boolean) => Promise<{
       thread: import("./types").ThreadItem;
       detail: import("./types").ThreadDetail;
@@ -124,7 +139,8 @@ interface Window {
       interactionMode?: string,
       permissionMode?: string,
       skillIDs?: string[],
-      clientRunID?: string
+      clientRunID?: string,
+      attachments?: import("./types").ComposerImageAttachment[]
     ) => Promise<{
       threadID: string;
       title?: string;
@@ -136,6 +152,7 @@ interface Window {
       prompt?: string;
       cwd?: string;
       pluginIDs?: string[];
+      skillIDs?: string[];
       sessionInstructions?: string;
       reasoningEffort?: string;
       interactionMode?: string;
@@ -229,6 +246,8 @@ interface Window {
     }>;
     openImageInPreview: (dataURL: string) => Promise<{ ok: boolean; error?: string }>;
     saveImage: (dataURL: string, defaultName?: string) => Promise<{ ok: boolean; path?: string; canceled?: boolean; error?: string }>;
+    openLocalPath: (filePath: string) => Promise<{ ok: boolean; path?: string; error?: string }>;
+    revealLocalPath: (filePath: string) => Promise<{ ok: boolean; path?: string; error?: string }>;
     setScreenAnalysisFrameVisible: (visible: boolean) => Promise<{ ok: boolean; error?: string }>;
     setScreenAnalysisPanelCollapsed: (collapsed: boolean) => Promise<{ ok: boolean; error?: string }>;
     startScreenAnalysisAtSamePlace: () => Promise<{ ok: boolean; error?: string }>;
@@ -252,6 +271,7 @@ interface Window {
         command: "open-assistant" | "speak-assistant-task" | "toggle-dictation" | "open-history" | "open-models" | "open-settings"
       ) => void
     ) => () => void;
+    onThreadsUpdated: (callback: () => void) => () => void;
   };
   openAssistRealtime?: {
     start: (options?: {
@@ -261,6 +281,8 @@ interface Window {
       interactionMode?: string;
       permissionMode?: string;
       reasoningEffort?: string;
+      pluginIDs?: string[];
+      skillIDs?: string[];
     }) => Promise<{
       ok: boolean;
       threadId?: string;

@@ -3,7 +3,7 @@ import path from "node:path";
 import { execFileSync } from "node:child_process";
 
 const endpoint = process.env.OPENASSIST_ELECTRON_CDP ?? "http://127.0.0.1:8315/json/list";
-const expectedProviders = ["Codex", "Copilot", "Claude", "Ollama"];
+const expectedProviders = ["Codex", "Copilot", "Claude", "Antigravity", "Ollama"];
 const forbiddenProviders = ["OpenAI", "Google AI Studio", "OpenRouter", "Groq", "Anthropic", "Grok"];
 
 function assert(condition, message) {
@@ -90,8 +90,15 @@ function assertNoLocalChatStores() {
 
 function assertProviderMarkAssets() {
   const assetsRoot = path.join(process.cwd(), "src", "assets", "provider-marks");
-  for (const name of ["codex", "copilot", "claude", "ollama"]) {
-    const filePath = path.join(assetsRoot, `${name}.svg`);
+  const expectedAssets = {
+    codex: "codex.svg",
+    copilot: "copilot.svg",
+    claude: "claude.svg",
+    antigravity: "antigravity.png",
+    ollama: "ollama.svg"
+  };
+  for (const [name, fileName] of Object.entries(expectedAssets)) {
+    const filePath = path.join(assetsRoot, fileName);
     assert(fs.existsSync(filePath), `Missing provider mark asset: ${filePath}`);
     assert(fs.statSync(filePath).size > 100, `Provider mark asset is empty: ${filePath}`);
   }
@@ -371,6 +378,15 @@ try {
       && temporaryThreadLifecycle.destroyOk
       && !temporaryThreadLifecycle.visibleAfterDestroy
     );
+    const codeTrackingBridgeProbe = {
+      hasLoad: typeof window.openAssistElectron.loadCodeTrackingState === "function",
+      hasOpenReview: typeof window.openAssistElectron.openCodeReview === "function",
+      hasRestore: typeof window.openAssistElectron.restoreCodeCheckpoint === "function",
+      noProjectState: null
+    };
+    if (codeTrackingBridgeProbe.hasLoad) {
+      codeTrackingBridgeProbe.noProjectState = await window.openAssistElectron.loadCodeTrackingState(tempThread.thread.id);
+    }
     const codexRuntimeParityProbe = window.openAssistElectron.codexRuntimeParityProbe
       ? await window.openAssistElectron.codexRuntimeParityProbe({
         prompt: "Can you check X notifications in the browser?",
@@ -1149,7 +1165,7 @@ try {
     let providerRoundTrip = { skipped: true };
     if (providerRoundTripThread && window.openAssistElectron.setThreadProvider) {
       const originalProvider = providerRoundTripThread.activeProvider;
-      const runtimeProviders = ["codex", "copilot", "claudeCode", "ollamaLocal"];
+      const runtimeProviders = ["codex", "copilot", "claudeCode", "antigravityCLI", "ollamaLocal"];
       const originalRuntimeProvider = runtimeProviders.includes(originalProvider) ? originalProvider : "codex";
       const targetProvider = originalRuntimeProvider === "ollamaLocal" ? "codex" : "ollamaLocal";
       const updated = await window.openAssistElectron.setThreadProvider(providerRoundTripThread.id, targetProvider);
@@ -1270,6 +1286,7 @@ try {
       },
 	      temporaryThreadLifecycleWorked,
 	      temporaryThreadLifecycle,
+      codeTrackingBridgeProbe,
       codexRuntimeParityWorked,
       codexRuntimeParityProbe,
       codexDefaultPermissionProbe,
@@ -1331,7 +1348,7 @@ try {
 	  assert(result.editorMenuWorked, "Top code menu should expose real open-workspace actions, not model choices.");
 	  assert(result.composerModelSelectorWorked, "Model selector should live in the bottom composer controls.");
 	  assert(result.permissionMenuWorked && result.permissionSelectionWorked, "Codex permission menu should expose official permission modes and update the composer pill.");
-	  assert(JSON.stringify(result.providerBrandColors) === JSON.stringify({ Codex: "#7f94ff", Copilot: "#c898fd", Claude: "#ffb36b", Ollama: "#61bf73" }), `Provider brand colors should match native backend hues: ${JSON.stringify(result.providerBrandColors)}`);
+	  assert(JSON.stringify(result.providerBrandColors) === JSON.stringify({ Codex: "#7f94ff", Copilot: "#c898fd", Claude: "#ffb36b", Antigravity: "#3186ff", Ollama: "#61bf73" }), `Provider brand colors should match native backend hues: ${JSON.stringify(result.providerBrandColors)}`);
 	  assert(result.providerMarkImagesWorked, "Runtime provider menu should render provider mark image assets for every provider.");
 	  assert(result.assistantSidebarUpdateHidden, "Assistant sidebar should not show the app update card.");
 	  assert(result.settingsUpdateCardScoped, "App update card should stay scoped to the Settings sidebar.");
@@ -1347,6 +1364,17 @@ try {
   assert(result.projectCreatePanelWorked, "Project create button should open the project/group creation panel.");
   assert(result.temporaryThreadButtonWorked, "Sidebar should expose a first-class temporary chat action.");
   assert(result.temporaryThreadLifecycleWorked, `Temporary chat should be transient and locally cleaned up: ${JSON.stringify(result.temporaryThreadLifecycle)}`);
+  assert(
+    result.codeTrackingBridgeProbe.hasLoad
+    && result.codeTrackingBridgeProbe.hasOpenReview
+    && result.codeTrackingBridgeProbe.hasRestore,
+    `Code tracking bridge should expose load/review/restore APIs: ${JSON.stringify(result.codeTrackingBridgeProbe)}`
+  );
+  assert(
+    result.codeTrackingBridgeProbe.noProjectState?.availability === "unavailable"
+    && !result.codeTrackingBridgeProbe.noProjectState?.repoRootPath,
+    `No-project code tracking should not fall back to the OpenAssist repo: ${JSON.stringify(result.codeTrackingBridgeProbe.noProjectState)}`
+  );
   assert(result.codexRuntimeParityWorked, `Codex runtime params should match clean Swift parity: ${JSON.stringify({
     runtime: result.codexRuntimeParityProbe,
     defaultPermissions: result.codexDefaultPermissionProbe,

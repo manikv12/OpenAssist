@@ -2832,7 +2832,7 @@ final class AssistantStore: ObservableObject {
             )
             await waitForCachedModels(threadID: session.id, backend: backend)
             await warmRuntime.stop()
-        case .claudeCode:
+        case .claudeCode, .antigravityCLI:
             let warmRuntime = runtime ?? makeBackgroundWarmupRuntime(
                 preferredSessionID: session.id,
                 backend: backend
@@ -6040,6 +6040,11 @@ final class AssistantStore: ObservableObject {
                 "conversation not found with session id",
                 "conversation not found"
             ]
+        case .antigravityCLI:
+            recoverableFragments = [
+                "conversation not found",
+                "session not found"
+            ]
         case .codex:
             recoverableFragments = []
         case .ollamaLocal:
@@ -8716,6 +8721,8 @@ final class AssistantStore: ObservableObject {
                     return "GitHub Copilot had an internal session problem. Open Assist repaired the Copilot session. Use Try again."
                 case .claudeCode:
                     return "Claude had a saved session problem. Open Assist repaired the Claude session. Use Try again."
+                case .antigravityCLI:
+                    return "Antigravity had a saved session problem. Open Assist repaired the Antigravity session. Use Try again."
                 case .codex:
                     return "The assistant session had an internal problem. Open Assist repaired it. Use Try again."
                 case .ollamaLocal:

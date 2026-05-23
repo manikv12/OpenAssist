@@ -3,6 +3,8 @@ import { contextBridge, ipcRenderer } from "electron";
 contextBridge.exposeInMainWorld("openAssistElectron", {
   platform: process.platform,
   openExternal: (url: string) => ipcRenderer.invoke("open-external", url),
+  getMacOSPermissions: () => ipcRenderer.invoke("openassist:get-macos-permissions"),
+  requestMacOSPermission: (kind: string) => ipcRenderer.invoke("openassist:request-macos-permission", kind),
   openTarget: (target: string, workspaceRootPath?: string | null) => ipcRenderer.invoke("openassist:open-target", target, workspaceRootPath),
   workspaceLaunchTargets: () => ipcRenderer.invoke("openassist:workspace-launch-targets"),
   readClipboardText: () => ipcRenderer.invoke("openassist:read-clipboard-text"),
@@ -26,6 +28,10 @@ contextBridge.exposeInMainWorld("openAssistElectron", {
   loadAppState: () => ipcRenderer.invoke("openassist:load-app-state"),
   listProviderModels: (backend: string) => ipcRenderer.invoke("openassist:list-provider-models", backend),
   loadThread: (threadID: string) => ipcRenderer.invoke("openassist:load-thread", threadID),
+  loadCodeTrackingState: (threadID: string) => ipcRenderer.invoke("openassist:load-code-tracking-state", threadID),
+  openCodeReview: (threadID: string, checkpointID?: string) => ipcRenderer.invoke("openassist:open-code-review", threadID, checkpointID),
+  restoreCodeCheckpoint: (threadID: string, checkpointID: string) =>
+    ipcRenderer.invoke("openassist:restore-code-checkpoint", threadID, checkpointID),
   loadThreadNote: (threadID: string) => ipcRenderer.invoke("openassist:load-thread-note", threadID),
   createThreadNote: (threadID: string, title?: string) => ipcRenderer.invoke("openassist:create-thread-note", threadID, title),
   saveThreadNote: (threadID: string, noteID: string | undefined, markdown: string) =>
@@ -91,8 +97,8 @@ contextBridge.exposeInMainWorld("openAssistElectron", {
   declineTelegramPairing: () => ipcRenderer.invoke("openassist:decline-telegram-pairing"),
   forgetTelegramPairing: () => ipcRenderer.invoke("openassist:forget-telegram-pairing"),
   testTelegramConnection: (token?: string) => ipcRenderer.invoke("openassist:test-telegram-connection", token),
-  sendMessage: (prompt: string, threadID?: string, pluginIDs?: string[], sessionInstructions?: string, reasoningEffort?: string, interactionMode?: string, permissionMode?: string, skillIDs?: string[], clientRunID?: string) =>
-    ipcRenderer.invoke("openassist:send-message", prompt, threadID, pluginIDs, sessionInstructions, reasoningEffort, interactionMode, permissionMode, skillIDs, clientRunID),
+  sendMessage: (prompt: string, threadID?: string, pluginIDs?: string[], sessionInstructions?: string, reasoningEffort?: string, interactionMode?: string, permissionMode?: string, skillIDs?: string[], clientRunID?: string, attachments?: unknown[]) =>
+    ipcRenderer.invoke("openassist:send-message", prompt, threadID, pluginIDs, sessionInstructions, reasoningEffort, interactionMode, permissionMode, skillIDs, clientRunID, attachments),
   codexRuntimeParityProbe: (options?: unknown) => ipcRenderer.invoke("openassist:codex-runtime-parity-probe", options),
   stopMessage: (clientRunID?: string) => ipcRenderer.invoke("openassist:stop-message", clientRunID),
   respondProviderRequest: (requestID: string | number, result: unknown) =>
@@ -148,6 +154,10 @@ contextBridge.exposeInMainWorld("openAssistElectron", {
     ipcRenderer.invoke("openassist:open-image-in-preview", dataURL),
   saveImage: (dataURL: string, defaultName?: string) =>
     ipcRenderer.invoke("openassist:save-image", dataURL, defaultName),
+  openLocalPath: (filePath: string) =>
+    ipcRenderer.invoke("openassist:open-local-path", filePath),
+  revealLocalPath: (filePath: string) =>
+    ipcRenderer.invoke("openassist:reveal-local-path", filePath),
   setScreenAnalysisFrameVisible: (visible: boolean) =>
     ipcRenderer.invoke("openassist:set-screen-analysis-frame-visible", visible),
   setScreenAnalysisPanelCollapsed: (collapsed: boolean) =>
@@ -191,6 +201,11 @@ contextBridge.exposeInMainWorld("openAssistElectron", {
     const listener = (_event: Electron.IpcRendererEvent, command: string) => callback(command);
     ipcRenderer.on("openassist:menu-bar-command", listener);
     return () => ipcRenderer.removeListener("openassist:menu-bar-command", listener);
+  },
+  onThreadsUpdated: (callback: () => void) => {
+    const listener = () => callback();
+    ipcRenderer.on("openassist:threads-updated", listener);
+    return () => ipcRenderer.removeListener("openassist:threads-updated", listener);
   }
 });
 
@@ -202,6 +217,8 @@ contextBridge.exposeInMainWorld("openAssistRealtime", {
     interactionMode?: string;
     permissionMode?: string;
     reasoningEffort?: string;
+    pluginIDs?: string[];
+    skillIDs?: string[];
   }) =>
     ipcRenderer.invoke("openassist:realtime-start", options),
   appendAudio: (chunk: {

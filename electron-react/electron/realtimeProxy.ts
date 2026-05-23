@@ -17,6 +17,8 @@ type PendingHandoff = {
   callID: string;
   prompt: string;
   replyMode: "function" | "message";
+  backendText: string;
+  answerSent: boolean;
 };
 
 type DelegationDecision =
@@ -25,6 +27,15 @@ type DelegationDecision =
 
 const defaultRealtimeModel = "gpt-realtime-mini";
 const defaultRealtimeVoice = "marin";
+const autoHandoffDelayMs = 2_500;
+
+function makeShortRealtimeID(prefix: string, sequence = 0) {
+  const safePrefix = prefix.replace(/[^a-z0-9_]/gi, "").slice(0, 10) || "oa";
+  const timestamp = Date.now().toString(36);
+  const seq = Math.max(0, sequence).toString(36);
+  const suffix = Math.random().toString(36).slice(2, 8);
+  return `${safePrefix}_${timestamp}_${seq}_${suffix}`.slice(0, 32);
+}
 
 function jsonObject(value: unknown): JsonObject | undefined {
   return value && typeof value === "object" && !Array.isArray(value) ? value as JsonObject : undefined;
@@ -43,6 +54,11 @@ function parseJSON(value: string) {
   } catch {
     return undefined;
   }
+}
+
+function isBenignRealtimeCancelError(message: string) {
+  const normalized = String(message || "").toLowerCase();
+  return normalized.includes("cancel") && normalized.includes("no active response");
 }
 
 function normalizeRealtimeIntent(text: string) {
@@ -105,6 +121,23 @@ function isVagueRealtimeFollowupTask(text: string) {
   if (!/\b(it|that|this|same|again|previous|last|yesterday|tomorrow)\b/.test(text)) return false;
   if (!/\b(check|inspect|open|read|find|search|look|use|do|run|get|show|compare)\b/.test(text)) return false;
   return !/\b(browser|brave|chrome|square|calendar|notes|mail|finder|repo|repository|codebase|terminal|file|website|webpage|notification|notifications)\b/.test(text);
+}
+
+function looksIncompleteForDelegation(text: string) {
+  const raw = String(text || "").trim();
+  const normalized = normalizeRealtimeIntent(raw);
+  if (!normalized) return true;
+  const words = normalized.split(/\s+/).filter(Boolean);
+  if (words.length <= 3 && !/\b(open|check|inspect|search|find|read|fix|add|run|test)\b/.test(normalized)) {
+    return true;
+  }
+  if (/\b(and|or|then|to|for|with|using|about|because|so|if|when|while)$/i.test(normalized)) {
+    return true;
+  }
+  if (/^(if|whether|when|while|because|so|and|also|then)\b/.test(normalized)) {
+    return !/\b(check|find|search|look up|open|inspect|tell me|let me know|report|answer|summarize|explain)\b/.test(normalized);
+  }
+  return /[,;:]$/.test(raw);
 }
 
 function isConversationFollowupQuestion(text: string) {
@@ -189,6 +222,63 @@ function conversationItemUserText(event: JsonObject) {
     .trim();
 }
 
+function isBackendProgressMessage(text: string) {
+  const trimmed = String(text || "").trim();
+  if (!trimmed) return false;
+  const normalized = trimmed.toLowerCase();
+  return normalized.startsWith("[backend]")
+    || normalized.startsWith("[codex progress]")
+    || normalized.startsWith("[codex status]")
+    || normalized.startsWith("[agent progress]")
+    || normalized.startsWith("[agent status]");
+}
+
+function isCodexFinalResultMessage(text: string) {
+  return String(text || "").trim().toLowerCase().startsWith("[codex task finished]");
+}
+
+function extractRealtimeText(value: unknown): string {
+  if (typeof value === "string") return value.trim();
+  const object = jsonObject(value);
+  if (!object) return "";
+  const direct = stringValue(object.output, object.output_text, object.text, object.transcript, object.delta);
+  if (direct) return direct;
+  const nestedItem = extractRealtimeText(object.item);
+  if (nestedItem) return nestedItem;
+  const content = Array.isArray(object.content) ? object.content : [];
+  return content
+    .map((entry) => extractRealtimeText(entry))
+    .filter(Boolean)
+    .join(" ")
+    .trim();
+}
+
+function appendHandoffText(existing: string, next: string) {
+  const clean = String(next || "")
+    .replace(/^\s*\[BACKEND\]\s*/i, "")
+    .replace(/^\s*\[Codex progress\]\s*/i, "")
+    .replace(/^\s*\[Codex status\]\s*/i, "")
+    .trim();
+  if (!clean) return existing;
+  if (!existing.trim()) return clean;
+  if (existing.includes(clean)) return existing;
+  return `${existing.trim()}\n\n${clean}`;
+}
+
+function isBackgroundAgentFinishedOutput(text: string) {
+  return /^background agent (finished|completed|failed)\b/i.test(String(text || "").trim());
+}
+
+function formatCodexResultForRealtime(output: string) {
+  const cleanOutput = String(output || "").trim() || "Codex finished the task.";
+  return [
+    "[Codex task finished]",
+    cleanOutput,
+    "",
+    "Speak only the Codex answer above. Do not add new facts or contradict it."
+  ].join("\n");
+}
+
 function contextualizeRealtimeDelegationPrompt(prompt: string, lastDelegationPrompt: string) {
   const repairedPrompt = repairRealtimeDelegationText(prompt);
   const normalizedPrompt = normalizeRealtimeIntent(repairedPrompt);
@@ -262,6 +352,15 @@ function decideRealtimeDelegation(prompt: string, hasActiveHandoff: boolean, las
     };
   }
 
+  if (looksIncompleteForDelegation(repairedPrompt)) {
+    return {
+      allow: false,
+      output: "The user may still be speaking. Wait for the complete request.",
+      createResponse: false,
+      reason: "incomplete request"
+    };
+  }
+
   if (!looksLikeCodexTask(normalizedPrompt)) {
     return {
       allow: false,
@@ -310,10 +409,16 @@ function realtimeInstructions(codexInstructions: string) {
     "Agentic means the request needs tools, files, code changes, terminal commands, browser/computer use, website/app inspection, account data, current/live information, or multi-step work.",
     "For coding, codebase, repo, app, terminal, debugging, install, file, browser, computer, desktop app, website, current/live data, or configuration work, call background_agent with the user's exact request.",
     "Only call background_agent when the user gives a clear task that needs Codex tools.",
+    "Do not call background_agent while the user sounds mid-sentence, is pausing, or has only said the first part of a longer task.",
+    "If the request starts like a fragment, for example \"if...\", \"when...\", \"and...\", or \"also...\", call wait_for_user and wait for the complete request.",
     "Follow-up task requests like \"check it for yesterday\" or \"do the same for yesterday\" should call background_agent using the recent Codex task as context.",
     "If the user only says ok, yes, no, mhm, hmm, thanks, or another short acknowledgement, do not call background_agent.",
     "If Codex is already working and the user gives a tiny acknowledgement or vague follow-up, do not start a new background_agent task.",
-    "After calling background_agent, wait for the Codex result before giving task details.",
+    "After calling background_agent, stay quiet about task progress and wait for the final Codex result before giving task details.",
+    "Messages that start with [BACKEND], [Codex progress], or [Codex status] are hidden progress from Codex. Do not read, summarize, or respond to them out loud.",
+    "While Codex is working, keep listening to the user. Answer a new direct user question if needed, but do not start another background_agent task until the current one finishes.",
+    "Only speak the delegated task result when a message or background_agent result starts with [Codex task finished].",
+    "When you see [Codex task finished], use only that Codex result. Do not add new facts, search your memory, or contradict the result.",
     "Do not invent codebase details.",
     codexInstructions.trim()
       ? ["", "# Codex Session Context", "Use this only as background context. Do not read it aloud unless the user asks.", codexInstructions.trim()].join("\n")
@@ -334,6 +439,7 @@ function realtimeSessionConfig(config: RealtimeProxyConfig, codexInstructions: s
         transcription: { model: "gpt-4o-mini-transcribe", language: "en" },
         turn_detection: {
           type: "semantic_vad",
+          eagerness: "low",
           interrupt_response: !quiet,
           create_response: !quiet
         }
@@ -389,8 +495,10 @@ class RealtimeProxySession {
   private audioItemID = "";
   private audioMs = 0;
   private openAIResponseActive = false;
+  private openAIResponseCreatePending = false;
   private pendingHandoffs = new Map<string, PendingHandoff>();
   private handledCalls = new Set<string>();
+  private localMessageHandoffCallIDs = new Set<string>();
   private lastDelegationPrompt = "";
   private lastAutoHandoffNormalizedPrompt = "";
   private autoHandoffTimer?: NodeJS.Timeout;
@@ -534,14 +642,31 @@ class RealtimeProxySession {
     }
 
     if (event.type === "conversation.handoff.append") {
-      await this.completeHandoff(event);
+      this.appendHandoff(event);
       return;
     }
 
+    if (await this.handleHandoffFinishedItem(event)) {
+      return;
+    }
+
+    if (this.isLocalMessageHandoffOutput(event)) return;
+
     const userText = conversationItemUserText(event);
-    if (userText) this.scheduleAutoHandoff(userText);
+    if (userText && this.pendingHandoffs.size > 0 && isBackendProgressMessage(userText)) {
+      this.appendTextToLatestHandoff(userText);
+      this.log(`[realtime.proxy] swallowed backend progress while delegated task is running: ${userText.slice(0, 160)}`);
+      return;
+    }
+    if (userText && !isBackendProgressMessage(userText) && !isCodexFinalResultMessage(userText)) {
+      this.scheduleAutoHandoff(userText);
+    }
 
     if (event.type === "response.create" && this.quiet) return;
+    if (event.type === "response.create" && this.pendingHandoffs.size > 0) {
+      this.log("[realtime.proxy] ignored response.create while Codex handoff is active; waiting for final Codex result.");
+      return;
+    }
 
     const upstream = await this.ensureUpstream();
     if (!upstream) return;
@@ -556,6 +681,16 @@ class RealtimeProxySession {
     if (event.type === "error") {
       const error = jsonObject(event.error);
       const messageText = stringValue(error?.message, event.message) || "OpenAI Realtime error.";
+      if (isBenignRealtimeCancelError(messageText)) {
+        this.openAIResponseActive = false;
+        this.log(`[realtime.proxy] ignored stale cancel: ${messageText}`);
+        return;
+      }
+      if (/active response in progress/i.test(messageText)) {
+        this.openAIResponseCreatePending = true;
+        this.log(`[realtime.proxy] delayed response.create after active-response error: ${messageText}`);
+        return;
+      }
       this.log(`[realtime.proxy] OpenAI error: ${messageText}`);
       this.sendToCodex({ type: "error", error: { message: messageText } });
       return;
@@ -577,7 +712,11 @@ class RealtimeProxySession {
 
     if (event.type === "conversation.item.input_audio_transcription.completed") {
       const transcript = stringValue(event.transcript, event.text);
-      if (transcript) this.scheduleAutoHandoff(transcript);
+      if (transcript && (isBackendProgressMessage(transcript) || isCodexFinalResultMessage(transcript))) {
+        this.log(`[realtime.proxy] ignored backend transcript from OpenAI: ${transcript.slice(0, 160)}`);
+      } else if (transcript) {
+        this.scheduleAutoHandoff(transcript);
+      }
       this.sendToCodex(event);
       return;
     }
@@ -632,6 +771,7 @@ class RealtimeProxySession {
       this.audioMs = 0;
       this.openAIResponseActive = false;
       this.sendToCodex(event);
+      this.flushOpenAIResponseCreate();
       return;
     }
 
@@ -639,7 +779,11 @@ class RealtimeProxySession {
   }
 
   private async handleFunctionCall(item: JsonObject) {
-    const callID = stringValue(item.call_id) || `call_openassist_${Date.now()}`;
+    const callID = stringValue(item.call_id);
+    if (!callID) {
+      this.log(`[realtime.proxy] ignored function call without call_id: ${stringValue(item.name) || "unknown"}`);
+      return;
+    }
     if (this.handledCalls.has(callID)) return;
     this.handledCalls.add(callID);
     if (this.handledCalls.size > 100) {
@@ -667,6 +811,11 @@ class RealtimeProxySession {
     this.clearAutoHandoff();
     const args = jsonObject(parseJSON(stringValue(item.arguments))) ?? {};
     const rawPrompt = stringValue(args.prompt, args.task, item.arguments) || "Continue the user's requested task.";
+    if (this.pendingHandoffs.size > 0) {
+      this.log(`[realtime.proxy] ignored background_agent while Codex task is already running: ${rawPrompt.slice(0, 160)}`);
+      this.sendFunctionOutput(callID, "Codex is already working on the delegated task. Stay quiet about progress and wait for the final result.", false);
+      return;
+    }
     const decision = decideRealtimeDelegation(rawPrompt, this.pendingHandoffs.size > 0, this.lastDelegationPrompt);
     if (!decision.allow) {
       this.log(`[realtime.proxy] ignored background_agent (${decision.reason}): ${rawPrompt.slice(0, 160)}`);
@@ -688,13 +837,14 @@ class RealtimeProxySession {
 
   private scheduleAutoHandoff(transcript: string) {
     if (this.quiet) return;
+    if (this.pendingHandoffs.size > 0) return;
     const decision = decideRealtimeDelegation(transcript, this.pendingHandoffs.size > 0, this.lastDelegationPrompt);
     if (!decision.allow) return;
     if (decision.normalizedPrompt === this.lastAutoHandoffNormalizedPrompt) return;
     this.clearAutoHandoff();
     this.autoHandoffTimer = setTimeout(() => {
       void this.runAutoHandoff(transcript);
-    }, 650);
+    }, autoHandoffDelayMs);
   }
 
   private async runAutoHandoff(transcript: string) {
@@ -711,9 +861,71 @@ class RealtimeProxySession {
       this.openAIResponseActive = false;
     }
     this.truncateOpenAIAudio();
-    const callID = `call_openassist_auto_${Date.now()}_${++this.autoHandoffSequence}`;
+    const callID = makeShortRealtimeID("calloa", ++this.autoHandoffSequence);
     this.log(`[realtime.proxy] auto background_agent: ${decision.prompt.slice(0, 160)}`);
     this.startCodexHandoff(callID, decision.prompt, "message");
+  }
+
+  private rememberLocalMessageHandoffCallID(callID: string) {
+    this.localMessageHandoffCallIDs.add(callID);
+    if (this.localMessageHandoffCallIDs.size <= 100) return;
+    const oldest = this.localMessageHandoffCallIDs.values().next().value;
+    if (oldest) this.localMessageHandoffCallIDs.delete(oldest);
+  }
+
+  private latestPendingHandoff() {
+    return Array.from(this.pendingHandoffs.values()).at(-1);
+  }
+
+  private appendTextToLatestHandoff(text: string) {
+    const handoff = this.latestPendingHandoff();
+    if (!handoff) return false;
+    const next = appendHandoffText(handoff.backendText, text);
+    if (next === handoff.backendText) return false;
+    handoff.backendText = next;
+    return true;
+  }
+
+  private appendHandoff(event: JsonObject) {
+    const callID = stringValue(event.handoff_id, event.call_id)
+      || this.pendingHandoffs.keys().next().value
+      || "";
+    const handoff = callID ? this.pendingHandoffs.get(callID) : this.latestPendingHandoff();
+    const text = extractRealtimeText(event);
+    if (!handoff || !text) {
+      this.log(`[realtime.proxy] ignored handoff append call_id=${callID || "none"} text=${text.slice(0, 120)}`);
+      return;
+    }
+    handoff.backendText = appendHandoffText(handoff.backendText, text);
+    this.log(`[realtime.proxy] buffered Codex handoff output call_id=${handoff.callID} chars=${handoff.backendText.length}`);
+  }
+
+  private async handleHandoffFinishedItem(event: JsonObject) {
+    if (event.type !== "conversation.item.create") return false;
+    const item = jsonObject(event.item);
+    if (item?.type !== "function_call_output") return false;
+    const callID = stringValue(item.call_id, event.call_id)
+      || this.pendingHandoffs.keys().next().value
+      || "";
+    const output = extractRealtimeText(item.output ?? item);
+    if (!isBackgroundAgentFinishedOutput(output)) return false;
+    const handoff = callID ? this.pendingHandoffs.get(callID) : this.latestPendingHandoff();
+    if (!handoff) {
+      this.log(`[realtime.proxy] ignored completed handoff with no pending call: ${callID || "none"}`);
+      return true;
+    }
+    await this.completeHandoff(handoff.callID, output);
+    return true;
+  }
+
+  private isLocalMessageHandoffOutput(event: JsonObject) {
+    if (event.type !== "conversation.item.create") return false;
+    const item = jsonObject(event.item);
+    if (item?.type !== "function_call_output") return false;
+    const callID = stringValue(item.call_id, event.call_id);
+    if (!callID || !this.localMessageHandoffCallIDs.has(callID)) return false;
+    this.log(`[realtime.proxy] swallowed local auto-handoff output: ${callID}`);
+    return true;
   }
 
   private clearAutoHandoff() {
@@ -724,8 +936,9 @@ class RealtimeProxySession {
 
   private startCodexHandoff(callID: string, prompt: string, replyMode: PendingHandoff["replyMode"]) {
     this.lastDelegationPrompt = prompt;
-    this.pendingHandoffs.set(callID, { callID, prompt, replyMode });
-    const itemID = `item_openassist_handoff_${Date.now()}`;
+    this.pendingHandoffs.set(callID, { callID, prompt, replyMode, backendText: "", answerSent: false });
+    if (replyMode === "message") this.rememberLocalMessageHandoffCallID(callID);
+    const itemID = makeShortRealtimeID("itemoa", this.autoHandoffSequence);
     this.sendToCodex({ type: "conversation.input_transcript.delta", delta: prompt });
     this.sendToCodex({
       type: "conversation.handoff.requested",
@@ -746,26 +959,26 @@ class RealtimeProxySession {
     });
   }
 
-  private async completeHandoff(event: JsonObject) {
-    const callID = stringValue(event.handoff_id, event.call_id)
-      || this.pendingHandoffs.keys().next().value
-      || "";
-    if (!callID) return;
+  private async completeHandoff(callID: string, fallbackOutput = "") {
     const handoff = this.pendingHandoffs.get(callID);
-    const text = stringValue(
-      event.output,
-      event.output_text,
-      event.text,
-      event.transcript,
-      jsonObject(event.item)?.output,
-      jsonObject(event.item)?.text
-    ) || "Codex finished the task.";
+    if (!handoff) {
+      this.log(`[realtime.proxy] ignored completed handoff with no pending call: ${callID}`);
+      return;
+    }
+    if (handoff.answerSent) {
+      this.log(`[realtime.proxy] ignored duplicate completed handoff: ${callID}`);
+      return;
+    }
+    handoff.answerSent = true;
+    const text = handoff.backendText.trim()
+      || String(fallbackOutput || "").replace(/^background agent (finished|completed|failed):?\s*/i, "").trim()
+      || "Codex finished the task.";
     this.pendingHandoffs.delete(callID);
     await this.ensureUpstream();
-    if (handoff?.replyMode === "message") {
+    if (handoff.replyMode === "message") {
       this.sendCodexResultMessage(text);
     } else {
-      this.sendFunctionOutput(callID, text, true);
+      this.sendFunctionOutput(callID, text, true, { codexResult: true });
     }
   }
 
@@ -778,26 +991,50 @@ class RealtimeProxySession {
         content: [
           {
             type: "input_text",
-            text: `[Codex task finished]\n${output}`
+            text: formatCodexResultForRealtime(output)
           }
         ]
       }
     });
-    if (!this.quiet) this.sendUpstream({ type: "response.create" });
+    this.requestOpenAIResponseCreate();
   }
 
-  private sendFunctionOutput(callID: string, output: string, createResponse: boolean) {
+  private sendFunctionOutput(
+    callID: string,
+    output: string,
+    createResponse: boolean,
+    options: { codexResult?: boolean } = {}
+  ) {
     this.sendUpstream({
       type: "conversation.item.create",
       item: {
         type: "function_call_output",
         call_id: callID,
-        output
+        output: options.codexResult ? formatCodexResultForRealtime(output) : output
       }
     });
     if (createResponse && !this.quiet) {
-      this.sendUpstream({ type: "response.create" });
+      this.requestOpenAIResponseCreate();
     }
+  }
+
+  private requestOpenAIResponseCreate() {
+    if (this.quiet) return;
+    if (this.openAIResponseActive) {
+      this.openAIResponseCreatePending = true;
+      this.log("[realtime.proxy] delayed response.create because OpenAI response is still active.");
+      return;
+    }
+    this.sendUpstream({
+      type: "response.create",
+      response: { output_modalities: ["audio"] }
+    });
+  }
+
+  private flushOpenAIResponseCreate() {
+    if (!this.openAIResponseCreatePending) return;
+    this.openAIResponseCreatePending = false;
+    this.requestOpenAIResponseCreate();
   }
 
   private truncateOpenAIAudio() {

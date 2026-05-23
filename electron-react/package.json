@@ -15,6 +15,7 @@
     "release:mac": "bash scripts/build-mac-release.sh",
     "verify:running": "node scripts/verify-running-electron.mjs",
     "verify:packaged": "npm run package:mac && node scripts/verify-packaged-electron.mjs && node scripts/verify-insertion-smoke.mjs",
+    "verify:git-checkpoints": "npm run build && node scripts/verify-git-checkpoint-service.mjs",
     "verify:realtime-protocol": "node scripts/verify-codex-realtime-protocol.mjs",
     "verify:insertion": "node scripts/verify-insertion-smoke.mjs",
     "capture:native": "node scripts/capture-native-reference.mjs",

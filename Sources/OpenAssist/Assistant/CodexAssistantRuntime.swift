@@ -342,6 +342,7 @@ final class CodexAssistantRuntime {
     private var activeClaudeProcessModelID: String?
     private var activeClaudeProcessPermissionMode: String?
     private var activeClaudeProcessAllowedTools: [String] = []
+    private var activeAntigravityProcess: Process?
     private var activeClaudeTurnContinuations: [CheckedContinuation<AssistantTurnCompletionStatus, Error>] = []
     private var activeClaudeQueuedPromptContexts: [ClaudeQueuedPromptContext] = []
     private var claudeCodeIdleTimeoutTask: Task<Void, Never>?
@@ -484,6 +485,7 @@ final class CodexAssistantRuntime {
     var canSteerActiveTurn: Bool {
         backend != .claudeCode
             && backend != .copilot
+            && backend != .antigravityCLI
             && backend != .ollamaLocal
             && activeTurnID != nil
     }
@@ -561,6 +563,7 @@ final class CodexAssistantRuntime {
         resolveAllActiveClaudeTurnContinuations(status: .interrupted)
         activeClaudeQueuedPromptContexts.removeAll()
         terminateActiveClaudeProcess()
+        terminateActiveAntigravityProcess()
         activeOllamaTurnTask?.cancel()
         activeOllamaTurnTask = nil
         ollamaMessageHistoryBySessionID.removeAll()
@@ -587,6 +590,8 @@ final class CodexAssistantRuntime {
             return try await refreshCopilotEnvironment(cwd: activeSessionCWD)
         case .claudeCode:
             return try await refreshClaudeCodeEnvironment(cwd: activeSessionCWD)
+        case .antigravityCLI:
+            return try await refreshAntigravityEnvironment(cwd: activeSessionCWD)
         case .ollamaLocal:
             return try await refreshOllamaEnvironment()
         }
@@ -642,6 +647,13 @@ final class CodexAssistantRuntime {
             onStatusMessage?("Run `claude auth login` in Terminal, then return to Open Assist.")
             onHealthUpdate?(makeHealth(availability: .loginRequired, summary: backend.loginRequiredSummary))
             return .runCommand(backend.loginCommands.first ?? "claude auth login")
+        case .antigravityCLI:
+            guard await resolvedExecutablePath() != nil else {
+                throw CodexAssistantRuntimeError.runtimeUnavailable("Antigravity CLI is not installed on this Mac.")
+            }
+            onStatusMessage?("Run `agy` in Terminal, finish Google sign-in if prompted, then return to Open Assist.")
+            onHealthUpdate?(makeHealth(availability: .loginRequired, summary: backend.loginRequiredSummary))
+            return .runCommand(backend.loginCommands.first ?? "agy")
         case .ollamaLocal:
             onStatusMessage?("Ollama uses local setup instead of sign-in. Open Local AI Setup to install Ollama or download Gemma 4.")
             return .none
@@ -714,6 +726,13 @@ final class CodexAssistantRuntime {
         }
         if backend == .claudeCode {
             return try await startClaudeCodeSession(
+                cwd: cwd,
+                preferredModelID: preferredModelID ?? self.preferredModelID,
+                announce: true
+            )
+        }
+        if backend == .antigravityCLI {
+            return try await startAntigravitySession(
                 cwd: cwd,
                 preferredModelID: preferredModelID ?? self.preferredModelID,
                 announce: true
@@ -795,6 +814,15 @@ final class CodexAssistantRuntime {
             )
             return
         }
+        if backend == .antigravityCLI {
+            try await resumeAntigravitySession(
+                sessionID,
+                cwd: cwd,
+                preferredModelID: preferredModelID ?? self.preferredModelID,
+                announce: true
+            )
+            return
+        }
         try await ensureTransport()
         _ = try await sendRequest(
             method: "thread/resume",
@@ -852,6 +880,15 @@ final class CodexAssistantRuntime {
             )
             return
         }
+        if backend == .antigravityCLI {
+            try await resumeAntigravitySession(
+                sessionID,
+                cwd: cwd,
+                preferredModelID: preferredModelID ?? self.preferredModelID,
+                announce: false
+            )
+            return
+        }
         try await ensureTransport()
         _ = try await sendRequest(
             method: "thread/resume",
@@ -894,6 +931,14 @@ final class CodexAssistantRuntime {
         }
         if backend == .claudeCode {
             try await refreshClaudeCodeCurrentSessionConfiguration(
+                sessionID: activeSessionID,
+                cwd: cwd,
+                preferredModelID: preferredModelID ?? self.preferredModelID
+            )
+            return
+        }
+        if backend == .antigravityCLI {
+            try await refreshAntigravityCurrentSessionConfiguration(
                 sessionID: activeSessionID,
                 cwd: cwd,
                 preferredModelID: preferredModelID ?? self.preferredModelID
@@ -998,6 +1043,17 @@ final class CodexAssistantRuntime {
             )
             return
         }
+        if backend == .antigravityCLI {
+            try await sendAntigravityPrompt(
+                sessionID: activeSessionID,
+                prompt: trimmed,
+                attachments: attachments,
+                preferredModelID: preferredModelID ?? self.preferredModelID,
+                resumeContext: resumeContext,
+                memoryContext: memoryContext
+            )
+            return
+        }
 
         turnToolCallCount = 0
         repeatedCommandTracker.reset()
@@ -1071,6 +1127,19 @@ final class CodexAssistantRuntime {
             finalizeActiveActivities(with: .interrupted)
             self.activeTurnID = nil
             terminateActiveClaudeProcess()
+            allowsProposedPlanForActiveTurn = false
+            updateHUD(phase: .idle, title: "Cancelled", detail: nil)
+            if hadActiveTurn {
+                onTurnCompletion?(.interrupted)
+            }
+            onHealthUpdate?(makeHealth(availability: .ready, summary: backend.connectedSummary))
+            return
+        }
+        if backend == .antigravityCLI {
+            let hadActiveTurn = activeTurnID != nil
+            terminateActiveAntigravityProcess()
+            finalizeActiveActivities(with: .interrupted)
+            self.activeTurnID = nil
             allowsProposedPlanForActiveTurn = false
             updateHUD(phase: .idle, title: "Cancelled", detail: nil)
             if hadActiveTurn {
@@ -1185,6 +1254,9 @@ final class CodexAssistantRuntime {
             activeClaudeQueuedPromptContexts.removeAll()
             terminateActiveClaudeProcess(expected: true)
         }
+        if backend == .antigravityCLI {
+            terminateActiveAntigravityProcess()
+        }
         if backend == .ollamaLocal {
             activeOllamaTurnTask?.cancel()
             activeOllamaTurnTask = nil
@@ -1216,6 +1288,8 @@ final class CodexAssistantRuntime {
             return try await listCopilotSessions(limit: limit)
         case .claudeCode:
             return []
+        case .antigravityCLI:
+            return []
         case .ollamaLocal:
             return []
         }
@@ -1231,6 +1305,7 @@ final class CodexAssistantRuntime {
         transportStartupTask = nil
         resolveAllActiveClaudeTurnContinuations(status: .interrupted)
         terminateActiveClaudeProcess()
+        terminateActiveAntigravityProcess()
         activeOllamaTurnTask?.cancel()
         activeOllamaTurnTask = nil
         if backend == .ollamaLocal {
@@ -1352,6 +1427,9 @@ final class CodexAssistantRuntime {
         if backend == .claudeCode {
             throw CodexAssistantRuntimeError.runtimeUnavailable("Claude Code uses the headless CLI flow, not the ACP transport.")
         }
+        if backend == .antigravityCLI {
+            throw CodexAssistantRuntimeError.runtimeUnavailable("Antigravity CLI uses the print CLI flow, not the ACP transport.")
+        }
         if backend == .ollamaLocal {
             throw CodexAssistantRuntimeError.runtimeUnavailable("Ollama (Local) uses the native local chat API, not the ACP transport.")
         }
@@ -1386,6 +1464,8 @@ final class CodexAssistantRuntime {
                 throw CodexAssistantRuntimeError.runtimeUnavailable("GitHub Copilot CLI is not installed on this Mac.")
             case .claudeCode:
                 throw CodexAssistantRuntimeError.runtimeUnavailable("Claude Code is not installed on this Mac.")
+            case .antigravityCLI:
+                throw CodexAssistantRuntimeError.runtimeUnavailable("Antigravity CLI is not installed on this Mac.")
             case .ollamaLocal:
                 throw CodexAssistantRuntimeError.runtimeUnavailable("Ollama is not installed on this Mac.")
             }
@@ -1411,6 +1491,8 @@ final class CodexAssistantRuntime {
                     )
                 case .claudeCode:
                     throw CodexAssistantRuntimeError.runtimeUnavailable("Claude Code does not use the ACP transport.")
+                case .antigravityCLI:
+                    throw CodexAssistantRuntimeError.runtimeUnavailable("Antigravity CLI does not use the ACP transport.")
                 case .ollamaLocal:
                     throw CodexAssistantRuntimeError.runtimeUnavailable("Ollama (Local) does not use the ACP transport.")
                 }
@@ -1458,6 +1540,11 @@ final class CodexAssistantRuntime {
             return account
         case .claudeCode:
             let account = try await refreshClaudeCodeAccountState()
+            currentAccountSnapshot = account
+            onAccountUpdate?(account)
+            return account
+        case .antigravityCLI:
+            let account = signedInAntigravityAccountSnapshot()
             currentAccountSnapshot = account
             onAccountUpdate?(account)
             return account
@@ -1574,6 +1661,9 @@ final class CodexAssistantRuntime {
             } catch {
                 CrashReporter.logInfo("Claude Code usage refresh failed: \(error.localizedDescription)")
             }
+        case .antigravityCLI:
+            currentRateLimits = .empty
+            onRateLimitsUpdate?(currentRateLimits)
         case .ollamaLocal:
             currentRateLimits = .empty
             onRateLimitsUpdate?(currentRateLimits)
@@ -1607,6 +1697,12 @@ final class CodexAssistantRuntime {
         }
         if backend == .claudeCode {
             let models = staticClaudeCodeModels()
+            currentModels = models
+            onModelsUpdate?(models)
+            return models
+        }
+        if backend == .antigravityCLI {
+            let models = staticAntigravityModels()
             currentModels = models
             onModelsUpdate?(models)
             return models
@@ -8014,6 +8110,432 @@ final class CodexAssistantRuntime {
             return merged.nonEmpty
         }
         return nil
+    }
+
+    private func refreshAntigravityEnvironment(cwd: String?) async throws -> AssistantEnvironmentDetails {
+        guard let executablePath = await resolvedExecutablePath() else {
+            throw CodexAssistantRuntimeError.runtimeUnavailable("Antigravity CLI is not installed on this Mac.")
+        }
+
+        currentCodexPath = executablePath
+        let account = try await refreshAccountState()
+        let models = try await refreshModels()
+        await refreshRateLimits()
+
+        let health = makeHealth(
+            availability: activeTurnID == nil ? .ready : .active,
+            summary: account.isLoggedIn ? backend.connectedSummary : backend.loginRequiredSummary,
+            detail: account.isLoggedIn ? nil : "Run `agy` in Terminal if Google sign-in is needed."
+        )
+        activeSessionCWD = cwd?.nonEmpty ?? activeSessionCWD
+        onHealthUpdate?(health)
+        return AssistantEnvironmentDetails(health: health, account: account, models: models)
+    }
+
+    private func signedInAntigravityAccountSnapshot() -> AssistantAccountSnapshot {
+        AssistantAccountSnapshot(
+            authMode: .chatGPT,
+            email: "Google Antigravity",
+            planType: nil,
+            requiresOpenAIAuth: false,
+            loginInProgress: false,
+            pendingLoginURL: nil,
+            pendingLoginID: nil
+        )
+    }
+
+    private func staticAntigravityModels() -> [AssistantModelOption] {
+        [
+            AssistantModelOption(
+                id: "gemini-3.5-flash-high",
+                displayName: "Gemini 3.5 Flash (High)",
+                description: "Fast · Limited time",
+                isDefault: true,
+                hidden: false,
+                supportedReasoningEfforts: [],
+                defaultReasoningEffort: nil,
+                inputModalities: ["text"]
+            ),
+            AssistantModelOption(
+                id: "gemini-3.5-flash-low",
+                displayName: "Gemini 3.5 Flash (Low)",
+                description: "Fast · Limited time",
+                isDefault: false,
+                hidden: false,
+                supportedReasoningEfforts: [],
+                defaultReasoningEffort: nil,
+                inputModalities: ["text"]
+            ),
+            AssistantModelOption(
+                id: "gemini-3.1-pro-high",
+                displayName: "Gemini 3.1 Pro (High)",
+                description: "Antigravity reasoning model from local Antigravity account state.",
+                isDefault: false,
+                hidden: false,
+                supportedReasoningEfforts: [],
+                defaultReasoningEffort: nil,
+                inputModalities: ["text"]
+            ),
+            AssistantModelOption(
+                id: "gemini-3.1-pro-low",
+                displayName: "Gemini 3.1 Pro (Low)",
+                description: "Antigravity reasoning model from local Antigravity account state.",
+                isDefault: false,
+                hidden: false,
+                supportedReasoningEfforts: [],
+                defaultReasoningEffort: nil,
+                inputModalities: ["text"]
+            ),
+            AssistantModelOption(
+                id: "claude-sonnet-4.6-thinking",
+                displayName: "Claude Sonnet 4.6 (Thinking)",
+                description: "Antigravity reasoning model from local Antigravity account state.",
+                isDefault: false,
+                hidden: false,
+                supportedReasoningEfforts: [],
+                defaultReasoningEffort: nil,
+                inputModalities: ["text"]
+            ),
+            AssistantModelOption(
+                id: "claude-opus-4.6-thinking",
+                displayName: "Claude Opus 4.6 (Thinking)",
+                description: "Antigravity reasoning model from local Antigravity account state.",
+                isDefault: false,
+                hidden: false,
+                supportedReasoningEfforts: [],
+                defaultReasoningEffort: nil,
+                inputModalities: ["text"]
+            ),
+            AssistantModelOption(
+                id: "gpt-oss-120b-medium",
+                displayName: "GPT-OSS 120B (Medium)",
+                description: "Recommended",
+                isDefault: false,
+                hidden: false,
+                supportedReasoningEfforts: [],
+                defaultReasoningEffort: nil,
+                inputModalities: ["text"]
+            ),
+            AssistantModelOption(
+                id: "antigravity-default",
+                displayName: "Gemini 3.5 Flash (High)",
+                description: "Legacy Open Assist default. Antigravity will use its selected reasoning model.",
+                isDefault: false,
+                hidden: true,
+                supportedReasoningEfforts: [],
+                defaultReasoningEffort: nil,
+                inputModalities: ["text"]
+            )
+        ]
+    }
+
+    private func resolvedAntigravityWorkingDirectory(_ cwd: String?) -> String {
+        resolvedCopilotWorkingDirectory(cwd)
+    }
+
+    private func startAntigravitySession(
+        cwd: String?,
+        preferredModelID: String?,
+        announce: Bool
+    ) async throws -> String {
+        guard await resolvedExecutablePath() != nil else {
+            throw CodexAssistantRuntimeError.runtimeUnavailable("Antigravity CLI is not installed on this Mac.")
+        }
+
+        let resolvedCWD = resolvedAntigravityWorkingDirectory(cwd)
+        if announce {
+            toolCalls.removeAll()
+            liveActivities.removeAll()
+            clearSubagents(publish: false)
+            repeatedCommandTracker.reset()
+            resetStreamingTimelineState()
+            clearPersistedCLIAttachmentMaterialization()
+            onToolCallUpdate?([])
+            onPlanUpdate?(activeSessionID, [])
+            onSubagentUpdate?([])
+            onTimelineMutation?(.reset(sessionID: nil))
+            onPermissionRequest?(nil)
+            sessionTurnCount = 0
+            firstTurnUserPrompt = nil
+        }
+
+        terminateActiveAntigravityProcess()
+        let sessionID = "antigravity-\(UUID().uuidString.lowercased())"
+        activeSessionID = sessionID
+        activeSessionCWD = resolvedCWD
+        currentTokenUsageSnapshot = .empty
+        onTokenUsageUpdate?(currentTokenUsageSnapshot)
+        if let requestedModelID = preferredModelID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
+            self.preferredModelID = requestedModelID
+        }
+
+        currentAccountSnapshot = signedInAntigravityAccountSnapshot()
+        onAccountUpdate?(currentAccountSnapshot)
+        currentRateLimits = .empty
+        onRateLimitsUpdate?(currentRateLimits)
+
+        if announce {
+            onSessionChange?(sessionID)
+            onTranscript?(AssistantTranscriptEntry(role: .system, text: backend.startedSessionMessage, emphasis: true))
+        }
+
+        onHealthUpdate?(makeHealth(availability: .ready, summary: backend.connectedSummary))
+        updateHUD(phase: .idle, title: "Assistant is ready", detail: nil)
+        return sessionID
+    }
+
+    private func resumeAntigravitySession(
+        _ sessionID: String,
+        cwd: String?,
+        preferredModelID: String?,
+        announce: Bool
+    ) async throws {
+        guard await resolvedExecutablePath() != nil else {
+            throw CodexAssistantRuntimeError.runtimeUnavailable("Antigravity CLI is not installed on this Mac.")
+        }
+
+        activeSessionID = sessionID
+        activeSessionCWD = resolvedAntigravityWorkingDirectory(cwd)
+        sessionTurnCount = 1
+        currentTokenUsageSnapshot = .empty
+        onTokenUsageUpdate?(currentTokenUsageSnapshot)
+        if let requestedModelID = preferredModelID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
+            self.preferredModelID = requestedModelID
+        }
+
+        currentAccountSnapshot = signedInAntigravityAccountSnapshot()
+        onAccountUpdate?(currentAccountSnapshot)
+
+        onSessionChange?(sessionID)
+        if announce {
+            onTranscript?(AssistantTranscriptEntry(role: .system, text: backend.loadedSessionMessage(sessionID), emphasis: true))
+        }
+        onHealthUpdate?(makeHealth(availability: .ready, summary: backend.connectedSummary))
+        updateHUD(phase: .idle, title: "Session ready", detail: nil)
+    }
+
+    private func refreshAntigravityCurrentSessionConfiguration(
+        sessionID: String,
+        cwd: String?,
+        preferredModelID: String?
+    ) async throws {
+        guard await resolvedExecutablePath() != nil else {
+            throw CodexAssistantRuntimeError.runtimeUnavailable("Antigravity CLI is not installed on this Mac.")
+        }
+
+        activeSessionID = sessionID
+        activeSessionCWD = resolvedAntigravityWorkingDirectory(cwd)
+        if let requestedModelID = preferredModelID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
+            self.preferredModelID = requestedModelID
+        }
+        currentAccountSnapshot = signedInAntigravityAccountSnapshot()
+        onAccountUpdate?(currentAccountSnapshot)
+        onHealthUpdate?(makeHealth(
+            availability: activeTurnID == nil ? .ready : .active,
+            summary: activeTurnID == nil ? backend.connectedSummary : backend.activeSummary
+        ))
+    }
+
+    private func sendAntigravityPrompt(
+        sessionID: String,
+        prompt: String,
+        attachments: [AssistantAttachment],
+        preferredModelID: String?,
+        resumeContext: String?,
+        memoryContext: String?
+    ) async throws {
+        guard let executablePath = await resolvedExecutablePath() else {
+            throw CodexAssistantRuntimeError.runtimeUnavailable("Antigravity CLI is not installed on this Mac.")
+        }
+
+        let resolvedCWD = resolvedAntigravityWorkingDirectory(activeSessionCWD)
+        try await refreshAntigravityCurrentSessionConfiguration(
+            sessionID: sessionID,
+            cwd: resolvedCWD,
+            preferredModelID: preferredModelID
+        )
+
+        let attachmentContext = try resolvedCLIAttachmentContext(
+            sessionID: sessionID,
+            attachments: attachments
+        )
+        let fullPrompt = buildAntigravityPrompt(
+            prompt: prompt,
+            resumeContext: resumeContext,
+            memoryContext: memoryContext,
+            attachmentContext: attachmentContext
+        )
+
+        turnToolCallCount = 0
+        repeatedCommandTracker.reset()
+        let turnID = activeTurnID?.nonEmpty ?? "antigravity-turn-\(UUID().uuidString)"
+        activeTurnID = turnID
+        publishExecutionStateSnapshot()
+        updateHUD(phase: .streaming, title: "Starting", detail: nil)
+        onHealthUpdate?(makeHealth(availability: .active, summary: backend.activeSummary))
+
+        let arguments = Self.antigravityCLIArguments(
+            prompt: fullPrompt,
+            workingDirectory: resolvedCWD
+        )
+
+        do {
+            let result = try await runAntigravityCommand(
+                executablePath: executablePath,
+                arguments: arguments,
+                workingDirectory: resolvedCWD
+            )
+
+            guard activeTurnID == turnID else { return }
+
+            let stderr = result.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !stderr.isEmpty {
+                onStatusMessage?(stderr)
+            }
+
+            guard result.exitCode == 0 else {
+                let message = Self.commandFailureMessage(
+                    stdout: result.stdout,
+                    stderr: result.stderr,
+                    fallback: "Antigravity CLI could not finish this turn."
+                )
+                handleTurnCompleted([
+                    "turn": [
+                        "status": "failed",
+                        "error": ["message": message]
+                    ]
+                ])
+                throw CodexAssistantRuntimeError.requestFailed(message)
+            }
+
+            let responseText = result.stdout
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .nonEmpty ?? "Antigravity finished without text."
+            ensureStreamingIdentifiers()
+            streamingBuffer = responseText
+            pendingStreamingDeltaBuffer = responseText
+            emitStreamingAssistantDelta(force: true)
+            handleTurnCompleted(["turn": ["status": "completed"]])
+        } catch {
+            guard activeTurnID == turnID else { return }
+            handleTurnCompleted([
+                "turn": [
+                    "status": "failed",
+                    "error": ["message": error.localizedDescription]
+                ]
+            ])
+            throw error
+        }
+    }
+
+    private func buildAntigravityPrompt(
+        prompt: String,
+        resumeContext: String?,
+        memoryContext: String?,
+        attachmentContext: String?
+    ) -> String {
+        var sections: [String] = []
+        sections.append(antigravityModeInstruction())
+        if let attachmentContext = attachmentContext?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
+            sections.append(attachmentContext)
+        }
+        if let memoryContext = memoryContext?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
+            sections.append("Relevant memory:\n\(memoryContext)")
+        }
+        if let resumeContext = resumeContext?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
+            sections.append("Conversation context:\n\(resumeContext)")
+        }
+        sections.append(prompt)
+        return sections.joined(separator: "\n\n")
+    }
+
+    private func antigravityModeInstruction() -> String {
+        switch interactionMode.normalizedForActiveUse {
+        case .plan:
+            return "You are being used from Open Assist in Plan mode. Inspect what you need, but do not edit files. Return a clear plan."
+        case .conversational:
+            return "You are being used from Open Assist in Chat mode. Answer clearly. Do not edit files unless the user explicitly asks to switch to an agentic task."
+        case .agentic:
+            return "You are being used from Open Assist in Agent mode. Use Antigravity CLI's built-in tools to complete the user's task in the current workspace."
+        }
+    }
+
+    nonisolated static func antigravityCLIArguments(
+        prompt: String,
+        workingDirectory: String?
+    ) -> [String] {
+        var arguments = [
+            "--print",
+            "--sandbox",
+            "--print-timeout",
+            "20m"
+        ]
+        if let workingDirectory = workingDirectory?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
+            arguments.append(contentsOf: ["--add-dir", workingDirectory])
+        }
+        arguments.append(prompt)
+        return arguments
+    }
+
+    private func runAntigravityCommand(
+        executablePath: String,
+        arguments: [String],
+        workingDirectory: String?
+    ) async throws -> CommandExecutionResult {
+        try await withCheckedThrowingContinuation { continuation in
+            let process = Process()
+            let stdout = Pipe()
+            let stderr = Pipe()
+
+            process.executableURL = URL(fileURLWithPath: executablePath)
+            process.arguments = arguments
+            process.environment = AssistantCommandEnvironment.mergedEnvironment()
+            if let workingDirectory {
+                process.currentDirectoryURL = URL(fileURLWithPath: workingDirectory, isDirectory: true)
+            }
+            process.standardOutput = stdout
+            process.standardError = stderr
+            process.terminationHandler = { [weak self] completed in
+                let outData = stdout.fileHandleForReading.readDataToEndOfFile()
+                let errData = stderr.fileHandleForReading.readDataToEndOfFile()
+                Task { @MainActor [weak self] in
+                    if self?.activeAntigravityProcess === completed {
+                        self?.activeAntigravityProcess = nil
+                    }
+                    continuation.resume(
+                        returning: CommandExecutionResult(
+                            exitCode: completed.terminationStatus,
+                            stdout: String(decoding: outData, as: UTF8.self),
+                            stderr: String(decoding: errData, as: UTF8.self)
+                        )
+                    )
+                }
+            }
+
+            do {
+                activeAntigravityProcess = process
+                try process.run()
+            } catch {
+                activeAntigravityProcess = nil
+                continuation.resume(
+                    throwing: CodexAssistantRuntimeError.runtimeUnavailable(
+                        "Could not launch Antigravity CLI: \(error.localizedDescription)"
+                    )
+                )
+            }
+        }
+    }
+
+    private func terminateActiveAntigravityProcess() {
+        guard let activeAntigravityProcess else {
+            publishExecutionStateSnapshot()
+            return
+        }
+        if activeAntigravityProcess.isRunning {
+            activeAntigravityProcess.terminate()
+        }
+        self.activeAntigravityProcess = nil
+        publishExecutionStateSnapshot()
     }
 
     private func refreshClaudeCodeEnvironment(cwd: String?) async throws -> AssistantEnvironmentDetails {

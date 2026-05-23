@@ -16077,26 +16077,40 @@ struct AssistantWindowView: View {
 
     private static let providerMarkImageCache = NSCache<NSString, NSImage>()
 
-    private func providerMarkImage(for backend: AssistantRuntimeBackend) -> NSImage? {
-        let fileName: String
+    private func providerMarkAsset(
+        for backend: AssistantRuntimeBackend
+    ) -> (fileName: String, fileExtension: String, rendersAsTemplate: Bool) {
         switch backend {
-        case .codex: fileName = "provider-mark-codex"
-        case .copilot: fileName = "provider-mark-copilot"
-        case .claudeCode: fileName = "provider-mark-claude"
-        case .ollamaLocal: fileName = "provider-mark-ollama"
+        case .codex:
+            return ("provider-mark-codex", "pdf", true)
+        case .copilot:
+            return ("provider-mark-copilot", "pdf", true)
+        case .claudeCode:
+            return ("provider-mark-claude", "pdf", true)
+        case .antigravityCLI:
+            return ("provider-mark-antigravity", "png", false)
+        case .ollamaLocal:
+            return ("provider-mark-ollama", "pdf", true)
         }
+    }
 
-        if let cached = Self.providerMarkImageCache.object(forKey: fileName as NSString) {
+    private func providerMarkImage(for backend: AssistantRuntimeBackend) -> NSImage? {
+        let asset = providerMarkAsset(for: backend)
+        let cacheKey = "\(asset.fileName).\(asset.fileExtension)"
+
+        if let cached = Self.providerMarkImageCache.object(forKey: cacheKey as NSString) {
             return cached
         }
-        guard let url = Bundle.main.url(forResource: fileName, withExtension: "pdf"),
+        guard let url = Bundle.main.url(
+            forResource: asset.fileName,
+            withExtension: asset.fileExtension
+        ),
               let image = NSImage(contentsOf: url) else {
             return nil
         }
-        // Render the PDF as a template so SwiftUI's foreground style tints it
-        // with the provider brand color rather than rendering the raw black ink.
-        image.isTemplate = true
-        Self.providerMarkImageCache.setObject(image, forKey: fileName as NSString)
+        // Template assets use the provider color; Antigravity keeps its official multicolor mark.
+        image.isTemplate = asset.rendersAsTemplate
+        Self.providerMarkImageCache.setObject(image, forKey: cacheKey as NSString)
         return image
     }
 
@@ -16106,13 +16120,22 @@ struct AssistantWindowView: View {
         size: CGFloat
     ) -> some View {
         if let nsImage = providerMarkImage(for: backend) {
-            Image(nsImage: nsImage)
-                .resizable()
-                .renderingMode(.template)
-                .interpolation(.high)
-                .aspectRatio(contentMode: .fit)
-                .frame(width: size, height: size)
-                .foregroundStyle(providerBrandColor(for: backend))
+            if providerMarkAsset(for: backend).rendersAsTemplate {
+                Image(nsImage: nsImage)
+                    .resizable()
+                    .renderingMode(.template)
+                    .interpolation(.high)
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: size, height: size)
+                    .foregroundStyle(providerBrandColor(for: backend))
+            } else {
+                Image(nsImage: nsImage)
+                    .resizable()
+                    .renderingMode(.original)
+                    .interpolation(.high)
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: size, height: size)
+            }
         } else {
             // Fallback to the original colored dot if the asset is missing.
             Circle()

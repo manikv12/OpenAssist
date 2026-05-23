@@ -1,4 +1,4 @@
-import { app, BrowserWindow, clipboard, dialog, globalShortcut, ipcMain, Menu, nativeImage, nativeTheme, screen, session, shell, Tray, type OpenDialogOptions, type WebContents } from "electron";
+import { app, BrowserWindow, clipboard, dialog, globalShortcut, ipcMain, Menu, nativeImage, nativeTheme, screen, session, shell, systemPreferences, Tray, type OpenDialogOptions, type WebContents } from "electron";
 import fs from "node:fs";
 import { execFileSync, spawn, execFile, type ChildProcess } from "node:child_process";
 import path from "node:path";
@@ -49,6 +49,13 @@ function broadcastRealtimeEvent(payload: unknown, sender?: WebContents) {
   targets.forEach((target) => target.send("openassist:realtime-event", payload));
 }
 
+function broadcastThreadsUpdated() {
+  BrowserWindow.getAllWindows().forEach((window) => {
+    if (window.isDestroyed() || window.webContents.isDestroyed()) return;
+    window.webContents.send("openassist:threads-updated");
+  });
+}
+
 let lastVoiceHUDAppearance: Pick<VoiceHUDPayload, "theme" | "colorTheme" | "chromeStyle"> = {
   theme: "Vibrant Spectrum",
   colorTheme: "Ocean",
@@ -70,6 +77,9 @@ let voiceCapture: {
   sessionDirectory: string;
   appPath: string;
   engine: "appleSpeech" | "cloudProviders" | "whisperCpp";
+  helperProcess?: ChildProcess;
+  helperPid?: number;
+  startedAt: number;
   audioPath?: string;
   fileName?: string;
   mimeType?: string;
@@ -4866,6 +4876,20 @@ async function saveImageDataURL(dataURL: string, defaultName = "openassist-image
   return { ok: true, path: result.filePath };
 }
 
+async function openLocalPath(filePath: string) {
+  const targetPath = String(filePath ?? "").trim();
+  if (!targetPath || !fs.existsSync(targetPath)) return { ok: false, error: "File was not found." };
+  const openError = await shell.openPath(targetPath);
+  return openError ? { ok: false, error: openError, path: targetPath } : { ok: true, path: targetPath };
+}
+
+function revealLocalPath(filePath: string) {
+  const targetPath = String(filePath ?? "").trim();
+  if (!targetPath || !fs.existsSync(targetPath)) return { ok: false, error: "File was not found." };
+  shell.showItemInFolder(targetPath);
+  return { ok: true, path: targetPath };
+}
+
 function setScreenAnalysisFrameVisible(visible: boolean) {
   screenAnalysisFrameVisible = visible;
   if (!screenAnalysisFrameWindow || screenAnalysisFrameWindow.isDestroyed()) {
@@ -6111,9 +6135,122 @@ function requestVoiceHelperStop(sessionDirectory: string) {
   }
 }
 
+function voiceCaptureRootDirectory() {
+  return path.join(app.getPath("userData"), "voice-captures");
+}
+
+function isProcessAlive(pid: number) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function terminateVoiceHelperPid(pid: number | undefined, reason: string) {
+  if (!pid || !Number.isFinite(pid) || pid <= 0) return;
+  if (!isProcessAlive(pid)) return;
+  debugLog(`terminating voice helper pid=${pid} reason="${reason}"`);
+  try {
+    process.kill(pid, "SIGTERM");
+  } catch {
+    return;
+  }
+  const timer = setTimeout(() => {
+    if (!isProcessAlive(pid)) return;
+    try {
+      debugLog(`force killing voice helper pid=${pid} reason="${reason}"`);
+      process.kill(pid, "SIGKILL");
+    } catch {
+      // The helper already exited.
+    }
+  }, 1200);
+  timer.unref?.();
+}
+
+function terminateVoiceHelperCapture(captureState: NonNullable<typeof voiceCapture>, reason: string) {
+  captureState.helperProcess?.kill("SIGTERM");
+  terminateVoiceHelperPid(captureState.helperPid, reason);
+}
+
+async function listAppleSpeechHelperProcesses() {
+  if (process.platform !== "darwin") return [];
+  try {
+    const { stdout } = await runProcessWithOutput("/bin/ps", ["-axo", "pid=,etimes=,command="], 5000);
+    return stdout
+      .split(/\r?\n/)
+      .map((line) => {
+        const match = line.match(/^\s*(\d+)\s+(\d+)\s+(.+)$/);
+        if (!match) return null;
+        return {
+          pid: Number(match[1]),
+          ageMs: Number(match[2]) * 1000,
+          command: match[3]
+        };
+      })
+      .filter((item): item is { pid: number; ageMs: number; command: string } => Boolean(item))
+      .filter((item) => item.command.includes("apple-speech-helper") && item.command.includes("Open Assist Speech Helper.app"));
+  } catch (error) {
+    debugLog(`voice helper process scan failed: ${error instanceof Error ? error.message : String(error)}`);
+    return [];
+  }
+}
+
+async function cleanupStaleVoiceHelpers(reason: string, keepPid?: number) {
+  const helpers = await listAppleSpeechHelperProcesses();
+  let killed = 0;
+  for (const helper of helpers) {
+    if (keepPid && helper.pid === keepPid) continue;
+    killed += 1;
+    terminateVoiceHelperPid(helper.pid, reason);
+  }
+  if (killed > 0) {
+    debugLog(`voice helper cleanup reason="${reason}" killed=${killed}`);
+  }
+}
+
+function cleanupOldVoiceCaptureDirectories() {
+  const root = voiceCaptureRootDirectory();
+  try {
+    if (!fs.existsSync(root)) return;
+    const activeDirectory = voiceCapture?.sessionDirectory;
+    const entries = fs.readdirSync(root, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => {
+        const fullPath = path.join(root, entry.name);
+        try {
+          return { path: fullPath, mtimeMs: fs.statSync(fullPath).mtimeMs };
+        } catch {
+          return null;
+        }
+      })
+      .filter((entry): entry is { path: string; mtimeMs: number } => Boolean(entry))
+      .sort((lhs, rhs) => rhs.mtimeMs - lhs.mtimeMs);
+    const maxAgeMs = 24 * 60 * 60 * 1000;
+    const maxKeptDirectories = 80;
+    let removed = 0;
+    entries.forEach((entry, index) => {
+      if (activeDirectory && entry.path === activeDirectory) return;
+      const isOld = Date.now() - entry.mtimeMs > maxAgeMs;
+      const isPastLimit = index >= maxKeptDirectories;
+      if (!isOld && !isPastLimit) return;
+      fs.rmSync(entry.path, { recursive: true, force: true });
+      removed += 1;
+    });
+    if (removed > 0) {
+      debugLog(`voice capture directory cleanup removed=${removed}`);
+    }
+  } catch (error) {
+    debugLog(`voice capture directory cleanup failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
 function clearMismatchedVoiceCapture(engine: NonNullable<typeof voiceCapture>["engine"]) {
   if (!voiceCapture || voiceCapture.engine === engine) return;
-  requestVoiceHelperStop(voiceCapture.sessionDirectory);
+  const captureState = voiceCapture;
+  requestVoiceHelperStop(captureState.sessionDirectory);
+  terminateVoiceHelperCapture(captureState, "switching voice engine");
   voiceCapture = null;
   stopVoiceLevelPolling();
 }
@@ -6157,6 +6294,8 @@ function launchVoiceHelperApp(helperAppPath: string, sessionDirectory: string, m
     debugLog(`voice helper launch failed: ${error instanceof Error ? error.message : String(error)}`);
   });
   child.unref();
+  debugLog(`voice helper launched pid=${child.pid ?? "unknown"} mode=${mode} session=${sessionDirectory}`);
+  return child;
 }
 
 function startVoiceLevelPolling(sessionDirectory: string) {
@@ -6196,19 +6335,30 @@ async function startAppleVoiceInput(options?: VoiceStartOptions) {
   if (process.platform !== "darwin") {
     return { ok: false, error: "Native voice input is only available on macOS." };
   }
+  await cleanupStaleVoiceHelpers("before Apple Speech start", voiceCapture?.helperPid);
+  cleanupOldVoiceCaptureDirectories();
   clearMismatchedVoiceCapture("appleSpeech");
   if (voiceCapture) {
     return { ok: true };
   }
 
   const helperAppPath = await ensureAppleSpeechHelper();
-  const sessionDirectory = path.join(app.getPath("userData"), "voice-captures", `${Date.now()}-${Math.random().toString(16).slice(2)}`);
+  const sessionDirectory = path.join(voiceCaptureRootDirectory(), `${Date.now()}-${Math.random().toString(16).slice(2)}`);
   fs.mkdirSync(sessionDirectory, { recursive: true });
-  voiceCapture = { sessionDirectory, appPath: helperAppPath, engine: "appleSpeech", voiceOptions: options };
-  launchVoiceHelperApp(helperAppPath, sessionDirectory, "speech", options);
+  const helperProcess = launchVoiceHelperApp(helperAppPath, sessionDirectory, "speech", options);
+  voiceCapture = {
+    sessionDirectory,
+    appPath: helperAppPath,
+    engine: "appleSpeech",
+    helperProcess,
+    helperPid: helperProcess.pid,
+    startedAt: Date.now(),
+    voiceOptions: options
+  };
   const ready = await waitForVoiceFile(sessionDirectory, ["ready.json", "error.json"], 12000);
   if (!ready) {
     requestVoiceHelperStop(sessionDirectory);
+    terminateVoiceHelperCapture(voiceCapture, "Apple Speech startup timeout");
     voiceCapture = null;
     return { ok: false, error: voiceStartupTimeoutMessage(sessionDirectory, "Voice input did not become ready in time.") };
   }
@@ -6227,18 +6377,25 @@ async function stopAppleVoiceInput() {
   if (captureState.engine !== "appleSpeech") return { ok: false, text: "", error: "Apple Speech voice input is not running." };
   if (captureState.processing) return { ok: false, text: "", error: "Voice transcription is already processing." };
   captureState.processing = true;
+  const stopStartedAt = Date.now();
+  debugLog(`Apple Speech stop requested pid=${captureState.helperPid ?? "unknown"} session=${captureState.sessionDirectory}`);
   playDictationFeedbackSound("stopListening", captureState.voiceOptions);
   scheduleProcessingFeedbackSound(captureState);
   try {
     fs.writeFileSync(path.join(captureState.sessionDirectory, "stop"), "1", "utf8");
     const finished = await waitForVoiceFile(captureState.sessionDirectory, ["final.json", "error.json"], 9000);
-    if (!finished) return { ok: false, text: "", error: "Voice input did not finish in time." };
+    if (!finished) {
+      terminateVoiceHelperCapture(captureState, "Apple Speech finish timeout");
+      return { ok: false, text: "", error: "Voice input did not finish in time." };
+    }
     if (finished.name === "error.json") return { ok: false, text: "", error: finished.payload.message ?? "Voice input failed." };
+    debugLog(`Apple Speech stop completed elapsedMs=${Date.now() - stopStartedAt} chars=${(finished.payload.text ?? "").length}`);
     return {
       ok: true,
       text: (finished.payload.text ?? "").trim()
     };
   } finally {
+    terminateVoiceHelperCapture(captureState, "Apple Speech stop cleanup");
     if (voiceCapture === captureState) voiceCapture = null;
     stopVoiceLevelPolling();
     updateMenuBarVoiceStatus({ visible: false, status: "idle" });
@@ -6260,6 +6417,8 @@ async function startCloudVoiceInput(configuration?: VoiceStartOptions) {
   if (process.platform !== "darwin") {
     return { ok: false, error: "Cloud voice capture is only available on macOS in this Electron port." };
   }
+  await cleanupStaleVoiceHelpers("before cloud voice start", voiceCapture?.helperPid);
+  cleanupOldVoiceCaptureDirectories();
   clearMismatchedVoiceCapture("cloudProviders");
   if (voiceCapture) {
     return { ok: true };
@@ -6275,13 +6434,22 @@ async function startCloudVoiceInput(configuration?: VoiceStartOptions) {
 
   prewarmCloudVoiceTranscription(configuration);
   const helperAppPath = await ensureAppleSpeechHelper();
-  const sessionDirectory = path.join(app.getPath("userData"), "voice-captures", `${Date.now()}-${Math.random().toString(16).slice(2)}`);
+  const sessionDirectory = path.join(voiceCaptureRootDirectory(), `${Date.now()}-${Math.random().toString(16).slice(2)}`);
   fs.mkdirSync(sessionDirectory, { recursive: true });
-  voiceCapture = { sessionDirectory, appPath: helperAppPath, engine: "cloudProviders", voiceOptions: configuration };
-  launchVoiceHelperApp(helperAppPath, sessionDirectory, "recording", configuration);
+  const helperProcess = launchVoiceHelperApp(helperAppPath, sessionDirectory, "recording", configuration);
+  voiceCapture = {
+    sessionDirectory,
+    appPath: helperAppPath,
+    engine: "cloudProviders",
+    helperProcess,
+    helperPid: helperProcess.pid,
+    startedAt: Date.now(),
+    voiceOptions: configuration
+  };
   const ready = await waitForVoiceFile(sessionDirectory, ["ready.json", "error.json"], 12000);
   if (!ready) {
     requestVoiceHelperStop(sessionDirectory);
+    terminateVoiceHelperCapture(voiceCapture, "cloud voice startup timeout");
     voiceCapture = null;
     return { ok: false, error: voiceStartupTimeoutMessage(sessionDirectory, "Voice recording did not become ready in time.") };
   }
@@ -6300,12 +6468,17 @@ async function stopCloudVoiceInput() {
   if (captureState.engine !== "cloudProviders") return { ok: false, text: "", error: "Cloud voice input is not running." };
   if (captureState.processing) return { ok: false, text: "", error: "Voice transcription is already processing." };
   captureState.processing = true;
+  const stopStartedAt = Date.now();
+  debugLog(`cloud voice stop requested provider=${captureState.voiceOptions?.cloudTranscriptionProvider ?? "unknown"} pid=${captureState.helperPid ?? "unknown"} session=${captureState.sessionDirectory}`);
   playDictationFeedbackSound("stopListening", captureState.voiceOptions);
   scheduleProcessingFeedbackSound(captureState);
   try {
     fs.writeFileSync(path.join(captureState.sessionDirectory, "stop"), "1", "utf8");
     const finished = await waitForVoiceFile(captureState.sessionDirectory, ["final.json", "error.json"], 15000);
-    if (!finished) return { ok: false, text: "", error: "Voice recording did not finish in time." };
+    if (!finished) {
+      terminateVoiceHelperCapture(captureState, "cloud voice recording finish timeout");
+      return { ok: false, text: "", error: "Voice recording did not finish in time." };
+    }
     if (finished.name === "error.json") return { ok: false, text: "", error: finished.payload.message ?? "Voice recording failed." };
     const audioPath = finished.payload.audioPath;
     if (!audioPath || !fs.existsSync(audioPath)) {
@@ -6316,6 +6489,7 @@ async function stopCloudVoiceInput() {
       fileName: finished.payload.fileName || path.basename(audioPath),
       mimeType: finished.payload.mimeType || "audio/wav"
     });
+    debugLog(`cloud voice stop completed elapsedMs=${Date.now() - stopStartedAt} chars=${text.length}`);
     return { ok: true, text: text.trim() };
   } catch (error) {
     return {
@@ -6324,6 +6498,7 @@ async function stopCloudVoiceInput() {
       error: error instanceof Error ? error.message : "Cloud transcription failed."
     };
   } finally {
+    terminateVoiceHelperCapture(captureState, "cloud voice stop cleanup");
     if (voiceCapture === captureState) voiceCapture = null;
     stopVoiceLevelPolling();
     updateMenuBarVoiceStatus({ visible: false, status: "idle" });
@@ -6370,6 +6545,8 @@ async function startWhisperVoiceInput(configuration?: VoiceStartOptions) {
   if (process.platform !== "darwin") {
     return { ok: false, error: "whisper.cpp voice input is only available on macOS in this Electron port." };
   }
+  await cleanupStaleVoiceHelpers("before whisper voice start", voiceCapture?.helperPid);
+  cleanupOldVoiceCaptureDirectories();
   clearMismatchedVoiceCapture("whisperCpp");
   if (voiceCapture) {
     return { ok: true };
@@ -6388,7 +6565,7 @@ async function startWhisperVoiceInput(configuration?: VoiceStartOptions) {
   }
 
   const helperAppPath = await ensureAppleSpeechHelper();
-  const sessionDirectory = path.join(app.getPath("userData"), "voice-captures", `${Date.now()}-${Math.random().toString(16).slice(2)}`);
+  const sessionDirectory = path.join(voiceCaptureRootDirectory(), `${Date.now()}-${Math.random().toString(16).slice(2)}`);
   const modelID = resolvedModel.modelID;
   const coreMLDirectoryPath = whisperCoreMLDirectoryPath(modelID);
   const shouldForceCPUForStability = modelID.startsWith("small") || modelID.startsWith("medium");
@@ -6396,19 +6573,23 @@ async function startWhisperVoiceInput(configuration?: VoiceStartOptions) {
     && fs.existsSync(coreMLDirectoryPath)
     && !shouldForceCPUForStability;
   fs.mkdirSync(sessionDirectory, { recursive: true });
+  const helperProcess = launchVoiceHelperApp(helperAppPath, sessionDirectory, "recording", configuration);
   voiceCapture = {
     sessionDirectory,
     appPath: helperAppPath,
     engine: "whisperCpp",
+    helperProcess,
+    helperPid: helperProcess.pid,
+    startedAt: Date.now(),
     voiceOptions: configuration,
     whisperModelID: modelID,
     whisperModelPath: resolvedModel.modelPath,
     whisperUseCoreML: useCoreML
   };
-  launchVoiceHelperApp(helperAppPath, sessionDirectory, "recording", configuration);
   const ready = await waitForVoiceFile(sessionDirectory, ["ready.json", "error.json"], 12000);
   if (!ready) {
     requestVoiceHelperStop(sessionDirectory);
+    terminateVoiceHelperCapture(voiceCapture, "whisper voice startup timeout");
     voiceCapture = null;
     return { ok: false, error: voiceStartupTimeoutMessage(sessionDirectory, "whisper.cpp voice recording did not become ready in time.") };
   }
@@ -6427,12 +6608,17 @@ async function stopWhisperVoiceInput() {
   if (captureState.engine !== "whisperCpp") return { ok: false, text: "", error: "whisper.cpp voice input is not running." };
   if (captureState.processing) return { ok: false, text: "", error: "Voice transcription is already processing." };
   captureState.processing = true;
+  const stopStartedAt = Date.now();
+  debugLog(`whisper voice stop requested model=${captureState.whisperModelID ?? "unknown"} pid=${captureState.helperPid ?? "unknown"} session=${captureState.sessionDirectory}`);
   playDictationFeedbackSound("stopListening", captureState.voiceOptions);
   scheduleProcessingFeedbackSound(captureState);
   try {
     fs.writeFileSync(path.join(captureState.sessionDirectory, "stop"), "1", "utf8");
     const finished = await waitForVoiceFile(captureState.sessionDirectory, ["final.json", "error.json"], 15000);
-    if (!finished) return { ok: false, text: "", error: "whisper.cpp voice recording did not finish in time." };
+    if (!finished) {
+      terminateVoiceHelperCapture(captureState, "whisper voice recording finish timeout");
+      return { ok: false, text: "", error: "whisper.cpp voice recording did not finish in time." };
+    }
     if (finished.name === "error.json") return { ok: false, text: "", error: finished.payload.message ?? "whisper.cpp voice recording failed." };
     const audioPath = finished.payload.audioPath;
     if (!audioPath || !fs.existsSync(audioPath)) {
@@ -6443,6 +6629,7 @@ async function stopWhisperVoiceInput() {
       return { ok: false, text: "", error: "Selected whisper.cpp model is not installed." };
     }
     const text = await transcribeWithLocalWhisper(audioPath, modelPath, captureState.whisperUseCoreML === true);
+    debugLog(`whisper voice stop completed elapsedMs=${Date.now() - stopStartedAt} chars=${text.length}`);
     return { ok: true, text };
   } catch (error) {
     return {
@@ -6451,6 +6638,7 @@ async function stopWhisperVoiceInput() {
       error: error instanceof Error ? error.message : "whisper.cpp transcription failed."
     };
   } finally {
+    terminateVoiceHelperCapture(captureState, "whisper voice stop cleanup");
     if (voiceCapture === captureState) voiceCapture = null;
     stopVoiceLevelPolling();
     updateMenuBarVoiceStatus({ visible: false, status: "idle" });
@@ -6503,6 +6691,11 @@ function openAssistTargetPath(target: string) {
 
 app.whenReady().then(() => {
   debugLog("app ready");
+  void cleanupStaleVoiceHelpers("app ready")
+    .then(() => cleanupOldVoiceCaptureDirectories())
+    .catch((error) => {
+      debugLog(`startup voice cleanup failed: ${error instanceof Error ? error.message : String(error)}`);
+    });
   if (process.platform === "darwin") {
     ensureRegularDockPresence("app ready");
     try {
@@ -6540,7 +6733,10 @@ app.whenReady().then(() => {
   app.setAboutPanelOptions({ applicationName: "Open Assist" });
   installApplicationMenu();
   void openAssistBridge()
-    .then((bridge) => bridge.prewarmAssistantVoiceOutput())
+    .then((bridge) => {
+      bridge.setThreadsChangedListener(broadcastThreadsUpdated);
+      return bridge.prewarmAssistantVoiceOutput();
+    })
     .catch((error) => {
       debugLog(`assistant voice prewarm failed: ${error instanceof Error ? error.message : String(error)}`);
     });
@@ -6555,6 +6751,103 @@ app.whenReady().then(() => {
       await shell.openExternal(url);
     }
   });
+
+  ipcMain.handle("openassist:get-macos-permissions", async () => {
+    if (process.platform !== "darwin") {
+      return {
+        platformSupported: false,
+        accessibility: "unknown" as const,
+        screenRecording: "unknown" as const,
+        microphone: "unknown" as const
+      };
+    }
+    const accessibilityTrusted = systemPreferences.isTrustedAccessibilityClient(false);
+    let screenRecording: "granted" | "denied" | "not-determined" | "unknown" = "unknown";
+    try {
+      const status = systemPreferences.getMediaAccessStatus("screen");
+      screenRecording = status === "granted"
+        ? "granted"
+        : status === "denied" || status === "restricted"
+          ? "denied"
+          : "not-determined";
+    } catch {
+      screenRecording = "unknown";
+    }
+    let microphone: "granted" | "denied" | "not-determined" | "unknown" = "unknown";
+    try {
+      const status = systemPreferences.getMediaAccessStatus("microphone");
+      microphone = status === "granted"
+        ? "granted"
+        : status === "denied" || status === "restricted"
+          ? "denied"
+          : "not-determined";
+    } catch {
+      microphone = "unknown";
+    }
+    return {
+      platformSupported: true,
+      accessibility: accessibilityTrusted ? "granted" : "denied",
+      screenRecording,
+      microphone
+    };
+  });
+
+  ipcMain.handle("openassist:request-macos-permission", async (_event, kind: string) => {
+    if (process.platform !== "darwin") return { ok: false, opened: false };
+    switch (kind) {
+      case "accessibility": {
+        // Triggers the system prompt the first time; on later calls macOS just
+        // remembers the previous answer, so we also open the pane below so the
+        // user can flip it back on if they denied it earlier.
+        systemPreferences.isTrustedAccessibilityClient(true);
+        await shell.openExternal(
+          "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
+        );
+        return { ok: true, opened: true };
+      }
+      case "screenRecording": {
+        try {
+          // Asking for "screen" via getMediaAccessStatus does not prompt, but a
+          // CGRequestScreenCaptureAccess-style call does. Electron exposes that
+          // indirectly by accessing the desktop capturer; the most reliable
+          // cross-version path is to just open the System Settings pane.
+          await shell.openExternal(
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
+          );
+        } catch {
+          // Ignore — opening the pane is best-effort.
+        }
+        return { ok: true, opened: true };
+      }
+      case "microphone": {
+        try {
+          await systemPreferences.askForMediaAccess("microphone");
+        } catch {
+          // Some macOS versions throw if Info.plist usage strings are missing;
+          // fall back to opening the pane.
+        }
+        await shell.openExternal(
+          "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"
+        );
+        return { ok: true, opened: true };
+      }
+      case "speechRecognition": {
+        await shell.openExternal(
+          "x-apple.systempreferences:com.apple.preference.security?Privacy_SpeechRecognition"
+        );
+        return { ok: true, opened: true };
+      }
+      case "automation": {
+        await shell.openExternal(
+          "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation"
+        );
+        return { ok: true, opened: true };
+      }
+      default:
+        return { ok: false, opened: false, error: `Unknown permission kind: ${kind}` };
+    }
+  });
+
   ipcMain.handle("openassist:workspace-launch-targets", async () => workspaceLaunchTargetSnapshots());
   ipcMain.handle("openassist:read-clipboard-text", async () => clipboard.readText());
   ipcMain.handle("openassist:write-clipboard-text", async (_event, text: string) => {
@@ -6600,6 +6893,15 @@ app.whenReady().then(() => {
   ipcMain.handle("openassist:load-app-state", async () => (await openAssistBridge()).loadOpenAssistAppState());
   ipcMain.handle("openassist:list-provider-models", async (_event, backend: string) => (await openAssistBridge()).listProviderModels(backend));
   ipcMain.handle("openassist:load-thread", async (_event, threadID: string) => (await openAssistBridge()).loadThreadMessages(threadID));
+  ipcMain.handle("openassist:load-code-tracking-state", async (_event, threadID: string) =>
+    (await openAssistBridge()).loadCodeTrackingState(threadID)
+  );
+  ipcMain.handle("openassist:open-code-review", async (_event, threadID: string, checkpointID?: string) =>
+    (await openAssistBridge()).openCodeReview(threadID, checkpointID)
+  );
+  ipcMain.handle("openassist:restore-code-checkpoint", async (_event, threadID: string, checkpointID: string) =>
+    (await openAssistBridge()).restoreCodeCheckpoint(threadID, checkpointID)
+  );
   ipcMain.handle("openassist:load-thread-note", async (_event, threadID: string) => (await openAssistBridge()).loadThreadNoteWorkspace(threadID));
   ipcMain.handle("openassist:create-thread-note", async (_event, threadID: string, title?: string) =>
     (await openAssistBridge()).createThreadNote(threadID, title)
@@ -6736,6 +7038,12 @@ app.whenReady().then(() => {
   ipcMain.handle("openassist:save-image", async (_event, dataURL: string, defaultName?: string) =>
     saveImageDataURL(dataURL, defaultName)
   );
+  ipcMain.handle("openassist:open-local-path", async (_event, filePath: string) =>
+    openLocalPath(filePath)
+  );
+  ipcMain.handle("openassist:reveal-local-path", async (_event, filePath: string) =>
+    revealLocalPath(filePath)
+  );
   ipcMain.handle("openassist:set-screen-analysis-frame-visible", async (_event, visible: boolean) =>
     setScreenAnalysisFrameVisible(visible)
   );
@@ -6867,7 +7175,8 @@ app.whenReady().then(() => {
     interactionMode?: string,
     permissionMode?: string,
     skillIDs?: string[],
-    clientRunID?: string
+    clientRunID?: string,
+    attachments?: unknown[]
   ) => {
     const bridge = await openAssistBridge();
     try {
@@ -6881,6 +7190,7 @@ app.whenReady().then(() => {
         permissionMode,
         skillIDs,
         clientRunID,
+        attachments,
         (providerEvent: unknown) => {
           if (!event.sender.isDestroyed()) {
             event.sender.send("openassist:provider-event", providerEvent);
@@ -6929,6 +7239,8 @@ app.whenReady().then(() => {
     interactionMode?: string;
     permissionMode?: string;
     reasoningEffort?: string;
+    pluginIDs?: string[];
+    skillIDs?: string[];
   }) =>
     (await openAssistBridge()).startCodexRealtimeVoice(
       {
@@ -6936,7 +7248,9 @@ app.whenReady().then(() => {
         provider: options?.provider,
         interactionMode: options?.interactionMode,
         permissionMode: options?.permissionMode,
-        reasoningEffort: options?.reasoningEffort
+        reasoningEffort: options?.reasoningEffort,
+        pluginIDs: options?.pluginIDs,
+        skillIDs: options?.skillIDs
       },
       (payload: unknown) => {
         broadcastRealtimeEvent(payload, event.sender);

@@ -4,6 +4,7 @@ enum AssistantRuntimeBackend: String, CaseIterable, Identifiable, Codable, Senda
     case codex
     case copilot
     case claudeCode
+    case antigravityCLI
     case ollamaLocal
 
     var id: String { rawValue }
@@ -16,6 +17,8 @@ enum AssistantRuntimeBackend: String, CaseIterable, Identifiable, Codable, Senda
             return (0.784, 0.596, 0.992)   // #c898fd
         case .claudeCode:
             return (1.0, 0.702, 0.420)     // #ffb36b
+        case .antigravityCLI:
+            return (0.192, 0.525, 1.0)     // #3186ff
         case .ollamaLocal:
             return (0.380, 0.749, 0.451)   // #61bf73
         }
@@ -29,6 +32,8 @@ enum AssistantRuntimeBackend: String, CaseIterable, Identifiable, Codable, Senda
             return "GitHub Copilot"
         case .claudeCode:
             return "Claude Code"
+        case .antigravityCLI:
+            return "Google Antigravity"
         case .ollamaLocal:
             return "Ollama (Local)"
         }
@@ -42,6 +47,8 @@ enum AssistantRuntimeBackend: String, CaseIterable, Identifiable, Codable, Senda
             return "Copilot"
         case .claudeCode:
             return "Claude"
+        case .antigravityCLI:
+            return "Antigravity"
         case .ollamaLocal:
             return "Ollama"
         }
@@ -55,6 +62,8 @@ enum AssistantRuntimeBackend: String, CaseIterable, Identifiable, Codable, Senda
             return "copilot"
         case .claudeCode:
             return "claude"
+        case .antigravityCLI:
+            return "agy"
         case .ollamaLocal:
             return "ollama"
         }
@@ -68,6 +77,8 @@ enum AssistantRuntimeBackend: String, CaseIterable, Identifiable, Codable, Senda
             return ["npm install -g @github/copilot"]
         case .claudeCode:
             return ["npm install -g @anthropic-ai/claude-code"]
+        case .antigravityCLI:
+            return ["curl -fsSL https://antigravity.google/cli/install.sh | bash"]
         case .ollamaLocal:
             return []
         }
@@ -81,6 +92,8 @@ enum AssistantRuntimeBackend: String, CaseIterable, Identifiable, Codable, Senda
             return ["copilot login"]
         case .claudeCode:
             return ["claude auth login"]
+        case .antigravityCLI:
+            return ["agy"]
         case .ollamaLocal:
             return []
         }
@@ -94,6 +107,8 @@ enum AssistantRuntimeBackend: String, CaseIterable, Identifiable, Codable, Senda
             return URL(string: "https://docs.github.com/copilot/concepts/agents/about-copilot-cli")
         case .claudeCode:
             return URL(string: "https://code.claude.com/docs/en/headless")
+        case .antigravityCLI:
+            return URL(string: "https://antigravity.google/docs/cli-getting-started")
         case .ollamaLocal:
             return URL(string: "https://ollama.com/library/gemma4")
         }
@@ -106,6 +121,8 @@ enum AssistantRuntimeBackend: String, CaseIterable, Identifiable, Codable, Senda
         case .copilot:
             return .cli
         case .claudeCode:
+            return .cli
+        case .antigravityCLI:
             return .cli
         case .ollamaLocal:
             return .openAssist
@@ -120,6 +137,8 @@ enum AssistantRuntimeBackend: String, CaseIterable, Identifiable, Codable, Senda
             return "Install Copilot CLI"
         case .claudeCode:
             return "Install Claude Code"
+        case .antigravityCLI:
+            return "Install Antigravity CLI"
         case .ollamaLocal:
             return "Open Local AI Setup"
         }
@@ -133,6 +152,8 @@ enum AssistantRuntimeBackend: String, CaseIterable, Identifiable, Codable, Senda
             return "Copilot Docs"
         case .claudeCode:
             return "Claude Docs"
+        case .antigravityCLI:
+            return "Antigravity Docs"
         case .ollamaLocal:
             return "Gemma 4 Guide"
         }
@@ -146,6 +167,8 @@ enum AssistantRuntimeBackend: String, CaseIterable, Identifiable, Codable, Senda
             return "Sign In to GitHub Copilot"
         case .claudeCode:
             return "Sign In to Claude Code"
+        case .antigravityCLI:
+            return "Sign In to Antigravity"
         case .ollamaLocal:
             return "Open Local AI Setup"
         }
@@ -153,7 +176,7 @@ enum AssistantRuntimeBackend: String, CaseIterable, Identifiable, Codable, Senda
 
     var requiresLogin: Bool {
         switch self {
-        case .codex, .copilot, .claudeCode:
+        case .codex, .copilot, .claudeCode, .antigravityCLI:
             return true
         case .ollamaLocal:
             return false
@@ -180,6 +203,8 @@ enum AssistantRuntimeBackend: String, CaseIterable, Identifiable, Codable, Senda
             return "Sign in to GitHub Copilot"
         case .claudeCode:
             return "Sign in to Claude Code"
+        case .antigravityCLI:
+            return "Sign in to Antigravity"
         case .ollamaLocal:
             return "Open Local AI Setup"
         }
@@ -193,6 +218,8 @@ enum AssistantRuntimeBackend: String, CaseIterable, Identifiable, Codable, Senda
             return "Sign in to GitHub Copilot to use the assistant"
         case .claudeCode:
             return "Sign in to Claude Code to use the assistant"
+        case .antigravityCLI:
+            return "Sign in to Antigravity to use the assistant"
         case .ollamaLocal:
             return "Open Local AI Setup to use Ollama and Gemma 4"
         }
@@ -202,7 +229,7 @@ enum AssistantRuntimeBackend: String, CaseIterable, Identifiable, Codable, Senda
         switch self {
         case .ollamaLocal:
             return "Open Local AI Setup to install Ollama or download Gemma 4"
-        case .codex, .copilot, .claudeCode:
+        case .codex, .copilot, .claudeCode, .antigravityCLI:
             return "\(installActionTitle) to start the assistant"
         }
     }
@@ -215,6 +242,8 @@ enum AssistantRuntimeBackend: String, CaseIterable, Identifiable, Codable, Senda
             return "Connecting to GitHub Copilot"
         case .claudeCode:
             return "Preparing Claude Code"
+        case .antigravityCLI:
+            return "Preparing Antigravity"
         case .ollamaLocal:
             return "Preparing Ollama (Local)"
         }
@@ -228,6 +257,8 @@ enum AssistantRuntimeBackend: String, CaseIterable, Identifiable, Codable, Senda
             return "Could not start GitHub Copilot"
         case .claudeCode:
             return "Could not start Claude Code"
+        case .antigravityCLI:
+            return "Could not start Antigravity"
         case .ollamaLocal:
             return "Could not start Ollama (Local)"
         }
@@ -265,6 +296,8 @@ enum AssistantRuntimeBackend: String, CaseIterable, Identifiable, Codable, Senda
             return "Signed out of GitHub Copilot"
         case .claudeCode:
             return "Signed out of Claude Code"
+        case .antigravityCLI:
+            return "Signed out of Antigravity"
         case .ollamaLocal:
             return "Ollama (Local) does not use sign-in"
         }
@@ -278,6 +311,8 @@ enum AssistantRuntimeBackend: String, CaseIterable, Identifiable, Codable, Senda
             return "Started a new GitHub Copilot session."
         case .claudeCode:
             return "Started a new Claude Code session."
+        case .antigravityCLI:
+            return "Started a new Antigravity session."
         case .ollamaLocal:
             return "Started a new local Ollama thread."
         }
@@ -291,6 +326,8 @@ enum AssistantRuntimeBackend: String, CaseIterable, Identifiable, Codable, Senda
             return "Loaded GitHub Copilot session \(sessionID)."
         case .claudeCode:
             return "Loaded Claude Code session \(sessionID)."
+        case .antigravityCLI:
+            return "Loaded Antigravity session \(sessionID)."
         case .ollamaLocal:
             return "Loaded local Ollama thread \(sessionID)."
         }
