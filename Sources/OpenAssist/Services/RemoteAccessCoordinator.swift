@@ -518,7 +518,9 @@ final class RemoteAccessCoordinator: ObservableObject {
         case ("GET", "/"):
             return .response(Self.htmlResponse(html: loadRemoteAccessHTML()))
         case ("GET", "/remote/v1/health"):
-            return .response(Self.jsonResponse(makeHealthResponse()))
+            let revealDetails = touchAuthorizedDevice(from: request.headerValue(for: "authorization")) != nil
+                || acceptsPairingCode(request.headerValue(for: "x-openassist-pairing-code"))
+            return .response(Self.jsonResponse(makeHealthResponse(revealDetails: revealDetails)))
         case ("POST", "/remote/v1/pair/claim"):
             let decoder = Self.jsonDecoder
             guard let pairRequest = try? decoder.decode(RemoteAccessPairClaimRequest.self, from: request.body) else {
@@ -1135,7 +1137,10 @@ final class RemoteAccessCoordinator: ObservableObject {
                 error: "That pairing code has expired."
             )
         }
-        guard challenge.code == request.code?.trimmingCharacters(in: .whitespacesAndNewlines) else {
+        guard Self.constantTimeStringEquals(
+            challenge.code,
+            request.code?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        ) else {
             return RemoteAccessPairClaimResponse(
                 ok: false,
                 machineID: nil,
@@ -1163,10 +1168,7 @@ final class RemoteAccessCoordinator: ObservableObject {
             lastSeenAt: Date(),
             userAgent: userAgent?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
         )
-        pairedDevices.removeAll {
-            $0.name.caseInsensitiveCompare(device.name) == .orderedSame
-                && $0.userAgent == device.userAgent
-        }
+        pairedDevices.removeAll { Self.normalizedPairedDeviceKey($0) == Self.normalizedPairedDeviceKey(device) }
         pairedDevices.append(device)
         pairedDevices.sort { $0.createdAt > $1.createdAt }
         activePairingChallenge = nil
@@ -1188,7 +1190,9 @@ final class RemoteAccessCoordinator: ObservableObject {
             return nil
         }
         let tokenHash = Self.sha256Hex(token)
-        guard let index = pairedDevices.firstIndex(where: { $0.tokenHash == tokenHash }) else {
+        guard let index = pairedDevices.firstIndex(where: {
+            Self.constantTimeStringEquals($0.tokenHash, tokenHash)
+        }) else {
             return nil
         }
         pairedDevices[index].lastSeenAt = Date()
@@ -1196,8 +1200,36 @@ final class RemoteAccessCoordinator: ObservableObject {
         return pairedDevices[index]
     }
 
-    private func makeHealthResponse() -> RemoteAccessHealthResponse {
-        RemoteAccessHealthResponse(
+    private func acceptsPairingCode(_ code: String?) -> Bool {
+        guard let challenge = activePairingChallenge else { return false }
+        guard challenge.expiresAt >= Date() else {
+            activePairingChallenge = nil
+            return false
+        }
+        return Self.constantTimeStringEquals(
+            challenge.code,
+            code?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        )
+    }
+
+    private func makeHealthResponse(revealDetails: Bool) -> RemoteAccessHealthResponse {
+        guard revealDetails else {
+            return RemoteAccessHealthResponse(
+                ok: true,
+                helperState: "Locked",
+                helperMessage: "Pair with the current code from the Mac to continue.",
+                machineID: nil,
+                machineName: nil,
+                appVersion: nil,
+                localBaseURL: nil,
+                publicBaseURL: nil,
+                tunnelMode: nil,
+                adminPasswordRequired: adminPasswordConfigured,
+                pairingRequired: true
+            )
+        }
+
+        return RemoteAccessHealthResponse(
             ok: true,
             helperState: helperState,
             helperMessage: helperMessage,
@@ -1207,7 +1239,8 @@ final class RemoteAccessCoordinator: ObservableObject {
             localBaseURL: localBaseURLString,
             publicBaseURL: tunnelStatus.publicURL,
             tunnelMode: tunnelMode.rawValue,
-            adminPasswordRequired: adminPasswordConfigured
+            adminPasswordRequired: adminPasswordConfigured,
+            pairingRequired: false
         )
     }
 
@@ -1491,6 +1524,10 @@ final class RemoteAccessCoordinator: ObservableObject {
         return diff == 0
     }
 
+    private static func constantTimeStringEquals(_ lhs: String, _ rhs: String) -> Bool {
+        constantTimeEquals(Array(lhs.utf8), Array(rhs.utf8))
+    }
+
     private static func base64URLEncoded(_ data: Data) -> String {
         data.base64EncodedString()
             .replacingOccurrences(of: "+", with: "-")
@@ -1527,7 +1564,36 @@ final class RemoteAccessCoordinator: ObservableObject {
               let devices = try? jsonDecoder.decode([RemoteAccessPairedDeviceRecord].self, from: data) else {
             return []
         }
-        return devices.sorted { $0.createdAt > $1.createdAt }
+        return deduplicatedPairedDeviceRecords(devices)
+    }
+
+    private static func normalizedPairedDeviceKey(_ device: RemoteAccessPairedDeviceRecord) -> String {
+        let name = device.name
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .lowercased()
+        return name.isEmpty ? "mobile remote" : name
+    }
+
+    private static func pairedDeviceActivityDate(_ device: RemoteAccessPairedDeviceRecord) -> Date {
+        device.lastSeenAt ?? device.createdAt
+    }
+
+    private static func deduplicatedPairedDeviceRecords(
+        _ devices: [RemoteAccessPairedDeviceRecord]
+    ) -> [RemoteAccessPairedDeviceRecord] {
+        var newestByDevice: [String: RemoteAccessPairedDeviceRecord] = [:]
+        for device in devices {
+            let key = normalizedPairedDeviceKey(device)
+            if let existing = newestByDevice[key],
+               pairedDeviceActivityDate(existing) >= pairedDeviceActivityDate(device) {
+                continue
+            }
+            newestByDevice[key] = device
+        }
+        return newestByDevice.values.sorted {
+            pairedDeviceActivityDate($0) > pairedDeviceActivityDate($1)
+        }
     }
 
     private static func deviceNameFromUserAgent(_ userAgent: String?) -> String {

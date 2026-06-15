@@ -201,15 +201,16 @@ export interface RemoteAccessMachine {
 
 export interface RemoteAccessHealthResponse {
   ok: boolean;
-  helperState: string;
+  helperState?: string | null;
   helperMessage?: string | null;
-  machineID: string;
-  machineName: string;
-  appVersion: string;
-  localBaseURL: string;
+  machineID?: string | null;
+  machineName?: string | null;
+  appVersion?: string | null;
+  localBaseURL?: string | null;
   publicBaseURL?: string | null;
-  tunnelMode: string;
+  tunnelMode?: string | null;
   adminPasswordRequired: boolean;
+  pairingRequired?: boolean;
 }
 
 export interface RemoteAccessSnapshot {

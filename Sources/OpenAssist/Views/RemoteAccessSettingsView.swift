@@ -386,9 +386,9 @@ struct RemoteAccessSettingsView: View {
         GroupBox {
             VStack(alignment: .leading, spacing: 12) {
                 HStack(spacing: 10) {
-                    Button(coordinator.activePairingChallenge == nil ? "Generate Pairing Code" : "Rotate Pairing Code") {
+                    Button("Generate New Code") {
                         coordinator.rotatePairingChallenge()
-                        statusMessage = "Pairing code generated."
+                        statusMessage = "New pairing code generated."
                     }
                     .buttonStyle(.borderedProminent)
                     .disabled(!coordinator.remoteAccessEnabled)
@@ -402,6 +402,11 @@ struct RemoteAccessSettingsView: View {
 
                     Spacer()
                 }
+
+                Text("Each code works one time and expires after 5 minutes.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
 
                 if let challenge = coordinator.activePairingChallenge,
                    let pairingURL = coordinator.bestPairingURL()?.absoluteString {

@@ -494,6 +494,7 @@ final class CodexAssistantRuntime {
         preferredModelID: String? = nil,
         preferredSubagentModelID: String? = nil,
         assistantNotesService: AssistantNotesToolService? = nil,
+        assistantPlannerService: AssistantPlannerToolService? = nil,
         browserUseService: AssistantBrowserUseService? = nil,
         appActionService: AssistantAppActionService? = nil,
         computerUseService: AssistantComputerUseService? = nil,
@@ -517,8 +518,10 @@ final class CodexAssistantRuntime {
         self.windowAutomationService = windowAutomationService ?? AssistantWindowAutomationService()
         self.accessibilityAutomationService = accessibilityAutomationService ?? AssistantAccessibilityAutomationService()
         let resolvedAssistantNotesService = assistantNotesService ?? AssistantNotesToolService()
+        let resolvedAssistantPlannerService = assistantPlannerService ?? AssistantPlannerToolService()
         self.toolExecutor = AssistantToolExecutor(
             assistantNotesService: resolvedAssistantNotesService,
+            assistantPlannerService: resolvedAssistantPlannerService,
             browserUseService: self.browserUseService,
             appActionService: self.appActionService,
             computerUseService: self.computerUseService,
@@ -2453,6 +2456,7 @@ final class CodexAssistantRuntime {
                     attachments: currentTurnAttachments,
                     sessionID: sessionID,
                     assistantNotesContext: assistantNotesContext,
+                    assistantPlannerContext: assistantPlannerContext,
                     preferredModelID: preferredModelID,
                     browserLoginResume: browserLoginResume,
                     interactionMode: interactionMode
@@ -4378,6 +4382,7 @@ final class CodexAssistantRuntime {
                 attachments: currentTurnAttachments,
                 sessionID: sessionID ?? activeSessionID ?? "",
                 assistantNotesContext: assistantNotesContext,
+                assistantPlannerContext: assistantPlannerContext,
                 preferredModelID: preferredModelID,
                 browserLoginResume: browserLoginResume,
                 interactionMode: interactionMode
@@ -7081,6 +7086,7 @@ final class CodexAssistantRuntime {
     var browserProfileContext: [String: String]?
     var customInstructions: String?
     var assistantNotesContext: AssistantNotesRuntimeContext?
+    var assistantPlannerContext: AssistantPlannerRuntimeContext?
     var activeSkills: [AssistantSkillDescriptor] = []
     var reasoningEffort: String?
     var serviceTier: String?
@@ -13659,12 +13665,16 @@ extension CodexAssistantRuntime: AssistantMCPToolBridgeDelegate {
         let resolvedAssistantNotesContext: AssistantNotesRuntimeContext? = await MainActor.run {
             self.assistantNotesContext
         }
+        let resolvedAssistantPlannerContext: AssistantPlannerRuntimeContext? = await MainActor.run {
+            self.assistantPlannerContext
+        }
         let context = AssistantToolExecutionContext(
             toolName: toolName,
             arguments: arguments,
             attachments: [],
             sessionID: resolvedSessionID,
             assistantNotesContext: resolvedAssistantNotesContext,
+            assistantPlannerContext: resolvedAssistantPlannerContext,
             preferredModelID: resolvedModelID,
             browserLoginResume: false,
             interactionMode: resolvedInteractionMode

@@ -68,6 +68,7 @@ struct AssistantNotesRuntimeContext: Equatable, Sendable {
             "Use `assistant_notes` as the source of truth for note questions before relying on memory summaries.",
             "Default note scope: \(defaultScopeDescription).",
             "Project notes are the main notes. Thread notes are side notes.",
+            "When the user names a note, refers to a project note, or says \"the note\"/\"this note\", add or edit it through `assistant_notes`. Do NOT use `assistant_planner` for that, because the planner defaults to today's day page instead of the named note.",
             "For note changes, prepare a preview first and only apply after confirmation."
         ]
 
@@ -143,6 +144,9 @@ struct AssistantNotesRuntimeContext: Equatable, Sendable {
                     "- \(workspaceNotes.count - visibleNotes.count) more notes are available in this scope."
                 )
             }
+            lines.append(
+                "If the user mentions one of these notes by name, target it with `assistant_notes` (by its note id) instead of `assistant_planner`."
+            )
         }
 
         lines.append(

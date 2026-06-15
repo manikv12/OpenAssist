@@ -6387,7 +6387,7 @@ struct SettingsView: View {
     private var notesBackupCard: some View {
         settingsCollapsibleCard(
             id: "general.notesBackup",
-            title: "Notes Backup",
+            title: "Notes & Planner Backup",
             subtitle:
                 "Keep note history in the app and a second local backup in a separate folder.",
             symbol: "externaldrive.badge.timemachine",
@@ -6432,7 +6432,7 @@ struct SettingsView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 } else {
-                    Text("No local notes backup has finished yet.")
+                    Text("No local notes or planner backup has finished yet.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -6448,7 +6448,7 @@ struct SettingsView: View {
                     settings.assistantNotesBackupFolderPath = ""
                     notesBackupController.refreshStatus()
                     notesBackupActionMessage =
-                        "Open Assist switched back to the default notes backup folder."
+                        "Open Assist switched back to the default notes and planner backup folder."
                 }
                 .buttonStyle(.bordered)
 
@@ -6531,8 +6531,8 @@ struct SettingsView: View {
         panel.allowsMultipleSelection = false
         panel.canCreateDirectories = true
         panel.prompt = "Choose Backup Folder"
-        panel.title = "Choose a local notes backup folder"
-        panel.message = "Open Assist will keep extra notes backups in this folder."
+        panel.title = "Choose a local notes and planner backup folder"
+        panel.message = "Open Assist will keep extra notes and planner backups in this folder."
         if !settings.assistantNotesBackupFolderPath.trimmingCharacters(in: .whitespacesAndNewlines)
             .isEmpty
         {
@@ -6549,14 +6549,14 @@ struct SettingsView: View {
         settings.assistantNotesBackupFolderPath = selectedURL.standardizedFileURL.path
         notesBackupController.refreshStatus()
         notesBackupActionMessage =
-            "Open Assist will use the selected folder for future notes backups."
+            "Open Assist will use the selected folder for future notes and planner backups."
     }
 
     private func runNotesBackupNow() {
         do {
             if let backupSet = try notesBackupController.runManualBackup() {
                 notesBackupActionMessage =
-                    "Created a notes backup for \(notesBackupTimestamp(backupSet.createdAt))."
+                    "Created a notes and planner backup for \(notesBackupTimestamp(backupSet.createdAt))."
             } else {
                 notesBackupActionMessage =
                     "No note changes were detected since the newest backup, so Open Assist kept the latest backup set."
@@ -6570,7 +6570,7 @@ struct SettingsView: View {
         do {
             let restored = try notesBackupController.restoreBackupSet(id: backupSet.id)
             notesBackupActionMessage =
-                "Restored notes backup from \(notesBackupTimestamp(restored.createdAt)). Reopen the notes view or restart Open Assist if you still see older data."
+                "Restored notes and planner backup from \(notesBackupTimestamp(restored.createdAt)). Reopen the notes or planner view, or restart Open Assist if you still see older data."
         } catch {
             notesBackupActionMessage = error.localizedDescription
         }

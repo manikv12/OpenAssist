@@ -17,6 +17,17 @@ private func argumentValue(after flag: String) -> String? {
 }
 
 private let selectedMicrophoneUID = argumentValue(after: "--microphone-uid")
+private let wakePhrase = argumentValue(after: "--wake-word")
+
+private func normalizedWakeText(_ value: String) -> String {
+    let lowercased = value.lowercased()
+    let scalars = lowercased.unicodeScalars.map { scalar -> Character in
+        CharacterSet.alphanumerics.contains(scalar) ? Character(scalar) : " "
+    }
+    return String(scalars)
+        .split(separator: " ")
+        .joined(separator: " ")
+}
 
 private func emit(_ payload: [String: String]) {
     if let data = try? JSONSerialization.data(withJSONObject: payload),
@@ -299,6 +310,8 @@ private final class AudioFileCapture: NSObject {
 private final class AppleSpeechCapture: NSObject {
     private let audioEngine = AVAudioEngine()
     private let recognizer = SFSpeechRecognizer(locale: Locale.current) ?? SFSpeechRecognizer()
+    private let wakePhrase: String?
+    private let normalizedWakePhrase: String?
     private var request: SFSpeechAudioBufferRecognitionRequest?
     private var task: SFSpeechRecognitionTask?
     private var bestText = ""
@@ -309,6 +322,18 @@ private final class AppleSpeechCapture: NSObject {
         selectedUID: selectedMicrophoneUID,
         preferExternal: shouldPreferExternalMicrophone
     )
+
+    init(wakePhrase: String? = nil) {
+        let trimmedPhrase = wakePhrase?.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.wakePhrase = trimmedPhrase?.isEmpty == false ? trimmedPhrase : nil
+        if let trimmedPhrase, !trimmedPhrase.isEmpty {
+            let normalized = normalizedWakeText(trimmedPhrase)
+            self.normalizedWakePhrase = normalized.isEmpty ? nil : normalized
+        } else {
+            self.normalizedWakePhrase = nil
+        }
+        super.init()
+    }
 
     func requestPermissions(_ completion: @escaping (Bool, String?) -> Void) {
         emit(["type": "status", "message": "Waiting for Speech Recognition permission."])
@@ -343,6 +368,20 @@ private final class AppleSpeechCapture: NSObject {
             microphoneSelection.apply()
             let nextRequest = SFSpeechAudioBufferRecognitionRequest()
             nextRequest.shouldReportPartialResults = true
+            if normalizedWakePhrase != nil {
+                if #available(macOS 10.15, *) {
+                    guard recognizer.supportsOnDeviceRecognition else {
+                        microphoneSelection.restore()
+                        emit(["type": "error", "message": "Wake word requires on-device Apple Speech recognition, but it is not available for this language."])
+                        exit(2)
+                    }
+                    nextRequest.requiresOnDeviceRecognition = true
+                } else {
+                    microphoneSelection.restore()
+                    emit(["type": "error", "message": "Wake word requires macOS 10.15 or newer for on-device recognition."])
+                    exit(2)
+                }
+            }
             if #available(macOS 13.0, *) {
                 nextRequest.addsPunctuation = true
             }
@@ -364,6 +403,7 @@ private final class AppleSpeechCapture: NSObject {
                 guard let self else { return }
                 if let result {
                     self.bestText = result.bestTranscription.formattedString
+                    self.checkWakePhrase(self.bestText)
                 }
                 if result?.isFinal == true {
                     self.finishAndExit()
@@ -376,7 +416,7 @@ private final class AppleSpeechCapture: NSObject {
                 }
             }
 
-            emit(["type": "ready", "message": "listening"])
+            emit(["type": "ready", "message": self.normalizedWakePhrase == nil ? "listening" : "wake-listening"])
         } catch {
             microphoneSelection.restore()
             emit(["type": "error", "message": error.localizedDescription])
@@ -405,6 +445,26 @@ private final class AppleSpeechCapture: NSObject {
         task?.cancel()
         microphoneSelection.restore()
         emit(["type": "final", "text": bestText])
+        exit(0)
+    }
+
+    private func checkWakePhrase(_ text: String) {
+        guard let normalizedWakePhrase, !normalizedWakePhrase.isEmpty else { return }
+        let normalizedText = normalizedWakeText(text)
+        guard normalizedText.contains(normalizedWakePhrase) else { return }
+        guard !didFinish else { return }
+        didFinish = true
+        isStopping = true
+        audioEngine.inputNode.removeTap(onBus: 0)
+        audioEngine.stop()
+        request?.endAudio()
+        task?.cancel()
+        microphoneSelection.restore()
+        emit([
+            "type": "detected",
+            "phrase": wakePhrase ?? "",
+            "text": text
+        ])
         exit(0)
     }
 
@@ -461,7 +521,7 @@ if shouldRecordAudioFile {
 
     RunLoop.main.run()
 } else {
-    let capture = AppleSpeechCapture()
+    let capture = AppleSpeechCapture(wakePhrase: wakePhrase)
     capture.requestPermissions { allowed, message in
         guard allowed else {
             emit(["type": "error", "message": message ?? "Voice permission was not granted."])

@@ -303,7 +303,7 @@ interface RecoveryPreviewState {
   id: string;
 }
 
-type NoteContextMenuLayer = "root" | "format" | "links" | "ai";
+type NoteContextMenuLayer = "root" | "format" | "links" | "planner" | "ai";
 type ChartChoiceType = MermaidTemplateType | "auto";
 
 interface MermaidEditingContext {
@@ -455,6 +455,176 @@ interface ThreadNoteScreenshotImportState {
   isProcessing: boolean;
   processed: ThreadNoteScreenshotProcessingResult | null;
   error: string | null;
+}
+
+type PlannerReadableSectionKind =
+  | "top"
+  | "schedule"
+  | "tasks"
+  | "notes"
+  | "journal"
+  | "links"
+  | "done"
+  | "section";
+
+interface PlannerReadableSection {
+  title: string;
+  body: string;
+  kind: PlannerReadableSectionKind;
+}
+
+interface PlannerReadableModel {
+  intro: string;
+  sections: PlannerReadableSection[];
+}
+
+function plannerReadableSectionKind(title: string): PlannerReadableSectionKind {
+  const normalized = title.trim().toLowerCase();
+  if (normalized === "top 3" || normalized === "top three") return "top";
+  if (normalized === "schedule") return "schedule";
+  if (normalized === "tasks" || normalized === "todo" || normalized === "to do") return "tasks";
+  if (normalized === "notes") return "notes";
+  if (normalized === "journal") return "journal";
+  if (normalized === "linked notes" || normalized === "links") return "links";
+  if (normalized === "done" || normalized === "completed") return "done";
+  return "section";
+}
+
+function plannerReadableIcon(kind: PlannerReadableSectionKind) {
+  switch (kind) {
+    case "top":
+      return <SparklesIcon />;
+    case "schedule":
+      return <CalendarIcon />;
+    case "tasks":
+      return <LineFormatIcon />;
+    case "notes":
+      return <EditIcon />;
+    case "journal":
+      return <HistoryIcon />;
+    case "links":
+      return <LinkIcon />;
+    case "done":
+      return <SaveIcon />;
+    case "section":
+    default:
+      return <SectionToggleIcon />;
+  }
+}
+
+function parsePlannerReadableMarkdown(markdown: string): PlannerReadableModel {
+  const lines = markdown.replace(/\r\n/g, "\n").split("\n");
+  const intro: string[] = [];
+  const sections: PlannerReadableSection[] = [];
+  let current: { title: string; body: string[]; kind: PlannerReadableSectionKind } | null = null;
+  let inFence: string | null = null;
+
+  const fenceMarker = (line: string) => line.match(/^\s*(```|~~~)/)?.[1] ?? null;
+  const flush = () => {
+    if (!current) return;
+    sections.push({
+      title: current.title,
+      kind: current.kind,
+      body: current.body.join("\n").trim(),
+    });
+    current = null;
+  };
+
+  for (const line of lines) {
+    const marker = fenceMarker(line);
+    if (inFence) {
+      if (current) current.body.push(line);
+      else intro.push(line);
+      if (marker && line.trimStart().startsWith(inFence)) inFence = null;
+      continue;
+    }
+
+    if (marker) {
+      inFence = marker;
+      if (current) current.body.push(line);
+      else intro.push(line);
+      continue;
+    }
+
+    const heading = line.match(/^##\s+(.+?)\s*$/);
+    if (heading) {
+      flush();
+      const title = heading[1].trim();
+      current = { title, kind: plannerReadableSectionKind(title), body: [] };
+      continue;
+    }
+
+    if (current) current.body.push(line);
+    else intro.push(line);
+  }
+
+  flush();
+  return {
+    intro: intro.join("\n").trim(),
+    sections,
+  };
+}
+
+function PlannerReadablePreview({
+  markdown,
+  onMermaidRenderErrorChange,
+}: {
+  markdown: string;
+  onMermaidRenderErrorChange?: (error: string | null) => void;
+}) {
+  const model = useMemo(() => parsePlannerReadableMarkdown(markdown), [markdown]);
+
+  if (!model.sections.length) {
+    return (
+      <div className="assistant-markdown-shell oa-markdown-surface thread-note-summary-preview">
+        <MarkdownContent
+          markdown={markdown}
+          mermaidDisplayMode="noteCompact"
+          onMermaidRenderErrorChange={onMermaidRenderErrorChange}
+        />
+      </div>
+    );
+  }
+
+  return (
+    <div className="thread-note-planner-readable">
+      {model.intro ? (
+        <div className="thread-note-planner-readable-intro assistant-markdown-shell oa-markdown-surface thread-note-summary-preview">
+          <MarkdownContent
+            markdown={model.intro}
+            mermaidDisplayMode="noteCompact"
+            onMermaidRenderErrorChange={onMermaidRenderErrorChange}
+          />
+        </div>
+      ) : null}
+      <div className="thread-note-planner-readable-grid">
+        {model.sections.map((section, index) => (
+          <section
+            key={`${section.kind}-${section.title}-${index}`}
+            className={`thread-note-planner-readable-section kind-${section.kind}`}
+          >
+            <div className="thread-note-planner-readable-section-head">
+              <span className="thread-note-planner-readable-section-icon" aria-hidden="true">
+                {plannerReadableIcon(section.kind)}
+              </span>
+              <strong>{section.title}</strong>
+            </div>
+            <div className="thread-note-planner-readable-section-body assistant-markdown-shell oa-markdown-surface thread-note-summary-preview">
+              {section.body.trim() ? (
+                <MarkdownContent
+                  markdown={section.body}
+                  mermaidDisplayMode="noteCompact"
+                  onMermaidRenderErrorChange={onMermaidRenderErrorChange}
+                />
+              ) : (
+                <p className="thread-note-planner-readable-empty">Nothing yet.</p>
+              )}
+            </div>
+          </section>
+        ))}
+      </div>
+    </div>
+  );
 }
 
 type ThreadNoteScreenshotCaptureMode = "area" | "scrolling" | "multiple";
@@ -1374,6 +1544,30 @@ export function ThreadNoteDrawer({ state, onDispatchCommand }: Props) {
     : isExternalMarkdownFile && sourceDescriptor?.isDirty
       ? "Unsaved changes"
       : state?.lastSavedAtLabel || "";
+  const plannerStyleTokens = state?.plannerStyleTokens ?? null;
+  const plannerStyleVars =
+    ownerKind === "planner" && plannerStyleTokens
+      ? ({
+          ...(plannerStyleTokens.colors?.primary
+            ? {
+                "--thread-note-accent": plannerStyleTokens.colors.primary,
+                "--thread-note-accent-strong": plannerStyleTokens.colors.primary,
+                "--chat-accent": plannerStyleTokens.colors.primary,
+              }
+            : {}),
+          ...(plannerStyleTokens.colors?.surface
+            ? {
+                "--thread-note-shell-top": plannerStyleTokens.colors.surface,
+                "--thread-note-shell-bottom": plannerStyleTokens.colors.surface,
+                "--thread-note-surface-top": plannerStyleTokens.colors.surface,
+                "--thread-note-surface-bottom": plannerStyleTokens.colors.surface,
+              }
+            : {}),
+          ...(plannerStyleTokens.rounded?.md
+            ? { "--thread-note-planner-radius": plannerStyleTokens.rounded.md }
+            : {}),
+        } as CSSProperties)
+      : undefined;
 
   const handleToggleDrawer = useCallback(() => {
     if (!ownerKind || !ownerId) {
@@ -1407,9 +1601,11 @@ export function ThreadNoteDrawer({ state, onDispatchCommand }: Props) {
         state?.isExpanded ? "is-expanded" : "",
         isFullScreenWorkspace ? "is-project-fullscreen" : "",
         isNotesWorkspace ? "is-notes-workspace" : "",
+        ownerKind === "planner" ? "is-planner-workspace" : "",
       ]
         .filter(Boolean)
         .join(" ")}
+      style={plannerStyleVars}
     >
       {isAvailable && !isOpen && !isNotesWorkspace ? (
         <button
@@ -4075,6 +4271,20 @@ function ThreadNoteDrawerOpenContent({
     [editor]
   );
 
+  const plannerDayIdFromOffset = useCallback((offsetDays: number) => {
+    const date = new Date();
+    date.setDate(date.getDate() + offsetDays);
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, "0");
+    const day = String(date.getDate()).padStart(2, "0");
+    return `${year}-${month}-${day}`;
+  }, []);
+
+  const normalizePlannerDayId = useCallback((value: string | null | undefined) => {
+    const trimmed = (value ?? "").trim();
+    return /^\d{4}-\d{2}-\d{2}$/.test(trimmed) ? trimmed : null;
+  }, []);
+
   const buildMarkdownAfterDeletingRange = useCallback(
     (from: number, to: number) => {
       if (!editor || from >= to) {
@@ -4091,6 +4301,72 @@ function ThreadNoteDrawerOpenContent({
       }
     },
     [draftText, editor]
+  );
+
+  const isPlannerDay = ownerKind === "planner";
+
+  const handleScheduleSelectionToPlanner = useCallback(
+    (
+      mode: "move" | "copy" | "link",
+      targetDayId: string,
+      options?: { promptForDate?: boolean }
+    ) => {
+      if (!noteContextMenu || noteContextMenu.sourceKind !== "selection") {
+        return;
+      }
+
+      const resolvedDayId = options?.promptForDate
+        ? normalizePlannerDayId(window.prompt("Planner date (YYYY-MM-DD)", targetDayId))
+        : normalizePlannerDayId(targetDayId);
+      if (!resolvedDayId) {
+        showLinkNotice("Use a planner date like 2026-05-24.");
+        closeNoteContextMenu();
+        return;
+      }
+
+      const selectedMarkdown =
+        serializeMarkdownForRange(noteContextMenu.from, noteContextMenu.to) ||
+        noteContextMenu.selectedText;
+      const sourceTextAfterMove =
+        mode === "move" && isPlannerDay
+          ? buildMarkdownAfterDeletingRange(noteContextMenu.from, noteContextMenu.to)
+          : undefined;
+
+      closeNoteContextMenu();
+      runAfterSave(
+        () => {
+          dispatchThreadNoteCommand("scheduleSelectionToPlanner", {
+            selectedText: selectedMarkdown,
+            plannerScheduleMode: mode,
+            targetDayId: resolvedDayId,
+            sourceNoteTitle: state?.selectedNoteTitle ?? "",
+            ...(sourceTextAfterMove ? { sourceTextAfterMove } : {}),
+          });
+
+          if (mode === "move" && isPlannerDay && editor) {
+            editor
+              .chain()
+              .focus()
+              .deleteRange({ from: noteContextMenu.from, to: noteContextMenu.to })
+              .run();
+          }
+        },
+        mode === "move" ? "move this planner item" : "add this to the planner"
+      );
+    },
+    [
+      buildMarkdownAfterDeletingRange,
+      closeNoteContextMenu,
+      dispatchThreadNoteCommand,
+      editor,
+      isPlannerDay,
+      normalizePlannerDayId,
+      noteContextMenu,
+      runAfterSave,
+      serializeMarkdownForRange,
+      showLinkNotice,
+      state?.selectedNoteTitle,
+    ]
   );
 
   const openInternalNoteTarget = useCallback(
@@ -7844,6 +8120,10 @@ function ThreadNoteDrawerOpenContent({
       ownerKind === "thread" &&
       currentProjectTransferProjectId
   );
+  const canScheduleSelectionToPlanner = Boolean(
+    noteContextMenu?.sourceKind === "selection" &&
+      noteContextMenu.selectedText.trim()
+  );
   const canIndentBlockFromMenu = Boolean(
     editor &&
       noteContextMenu?.sourceKind === "selection" &&
@@ -7864,6 +8144,8 @@ function ThreadNoteDrawerOpenContent({
     ? "Formatting"
     : noteContextMenuLayer === "links"
       ? "Links"
+    : noteContextMenuLayer === "planner"
+      ? "Planner"
     : noteContextMenuLayer === "ai"
       ? "AI actions"
       : noteContextMenu?.sourceKind === "selection"
@@ -9123,13 +9405,20 @@ function ThreadNoteDrawerOpenContent({
                   </div>
                   <div className="thread-note-preview-surface">
                     {draftText.trim() ? (
-                      <div className="assistant-markdown-shell oa-markdown-surface thread-note-summary-preview">
-                        <MarkdownContent
+                      ownerKind === "planner" ? (
+                        <PlannerReadablePreview
                           markdown={draftText}
-                          mermaidDisplayMode="noteCompact"
                           onMermaidRenderErrorChange={setChartRenderError}
                         />
-                      </div>
+                      ) : (
+                        <div className="assistant-markdown-shell oa-markdown-surface thread-note-summary-preview">
+                          <MarkdownContent
+                            markdown={draftText}
+                            mermaidDisplayMode="noteCompact"
+                            onMermaidRenderErrorChange={setChartRenderError}
+                          />
+                        </div>
+                      )
                     ) : (
                       <div className="thread-note-preview-empty">
                         This note is empty right now.
@@ -10767,6 +11056,28 @@ function ThreadNoteDrawerOpenContent({
                 </span>
               </button>
             ) : null}
+            {noteContextMenuLayer === "root" && canScheduleSelectionToPlanner ? (
+              <button
+                type="button"
+                className="oa-react-context-menu__item oa-react-context-menu__item--submenu"
+                onClick={() => setNoteContextMenuLayer("planner")}
+              >
+                <span className="oa-react-context-menu__item-main">
+                  <span className="oa-react-context-menu__item-icon" aria-hidden="true">
+                    <CalendarIcon />
+                  </span>
+                  <span className="oa-react-context-menu__item-copy">
+                    <span className="oa-react-context-menu__item-label">Planner</span>
+                    <span className="oa-react-context-menu__item-description">
+                      {isPlannerDay ? "Move unfinished items to another day" : "Copy or link this into a day"}
+                    </span>
+                  </span>
+                </span>
+                <span className="oa-react-context-menu__item-trailing" aria-hidden="true">
+                  <ChevronRightIcon />
+                </span>
+              </button>
+            ) : null}
             {noteContextMenuLayer === "root" && noteContextMenuHasAIActions ? (
               <button
                 type="button"
@@ -10788,6 +11099,153 @@ function ThreadNoteDrawerOpenContent({
                   <ChevronRightIcon />
                 </span>
               </button>
+            ) : null}
+            {noteContextMenuLayer === "planner" ? (
+              <>
+                {isPlannerDay ? (
+                  <>
+                    <button
+                      type="button"
+                      className="oa-react-context-menu__item"
+                      onClick={() =>
+                        handleScheduleSelectionToPlanner("move", plannerDayIdFromOffset(1))
+                      }
+                    >
+                      <span className="oa-react-context-menu__item-main">
+                        <span className="oa-react-context-menu__item-icon" aria-hidden="true">
+                          <CalendarIcon />
+                        </span>
+                        <span>Move to tomorrow</span>
+                      </span>
+                    </button>
+                    <button
+                      type="button"
+                      className="oa-react-context-menu__item"
+                      onClick={() =>
+                        handleScheduleSelectionToPlanner("move", plannerDayIdFromOffset(7))
+                      }
+                    >
+                      <span className="oa-react-context-menu__item-main">
+                        <span className="oa-react-context-menu__item-icon" aria-hidden="true">
+                          <CalendarIcon />
+                        </span>
+                        <span>Move to next week</span>
+                      </span>
+                    </button>
+                    <button
+                      type="button"
+                      className="oa-react-context-menu__item"
+                      onClick={() =>
+                        handleScheduleSelectionToPlanner("move", plannerDayIdFromOffset(1), {
+                          promptForDate: true,
+                        })
+                      }
+                    >
+                      <span className="oa-react-context-menu__item-main">
+                        <span className="oa-react-context-menu__item-icon" aria-hidden="true">
+                          <CalendarIcon />
+                        </span>
+                        <span>Move to date...</span>
+                      </span>
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <button
+                      type="button"
+                      className="oa-react-context-menu__item"
+                      onClick={() =>
+                        handleScheduleSelectionToPlanner("copy", plannerDayIdFromOffset(0))
+                      }
+                    >
+                      <span className="oa-react-context-menu__item-main">
+                        <span className="oa-react-context-menu__item-icon" aria-hidden="true">
+                          <CalendarIcon />
+                        </span>
+                        <span>Copy to today</span>
+                      </span>
+                    </button>
+                    <button
+                      type="button"
+                      className="oa-react-context-menu__item"
+                      onClick={() =>
+                        handleScheduleSelectionToPlanner("copy", plannerDayIdFromOffset(1))
+                      }
+                    >
+                      <span className="oa-react-context-menu__item-main">
+                        <span className="oa-react-context-menu__item-icon" aria-hidden="true">
+                          <CalendarIcon />
+                        </span>
+                        <span>Copy to tomorrow</span>
+                      </span>
+                    </button>
+                    <button
+                      type="button"
+                      className="oa-react-context-menu__item"
+                      onClick={() =>
+                        handleScheduleSelectionToPlanner("copy", plannerDayIdFromOffset(7))
+                      }
+                    >
+                      <span className="oa-react-context-menu__item-main">
+                        <span className="oa-react-context-menu__item-icon" aria-hidden="true">
+                          <CalendarIcon />
+                        </span>
+                        <span>Copy to next week</span>
+                      </span>
+                    </button>
+                    <button
+                      type="button"
+                      className="oa-react-context-menu__item"
+                      onClick={() =>
+                        handleScheduleSelectionToPlanner("link", plannerDayIdFromOffset(0))
+                      }
+                    >
+                      <span className="oa-react-context-menu__item-main">
+                        <span className="oa-react-context-menu__item-icon" aria-hidden="true">
+                          <LinkIcon />
+                        </span>
+                        <span>Link in today</span>
+                      </span>
+                    </button>
+                    <button
+                      type="button"
+                      className="oa-react-context-menu__item"
+                      onClick={() =>
+                        handleScheduleSelectionToPlanner("link", plannerDayIdFromOffset(1), {
+                          promptForDate: true,
+                        })
+                      }
+                    >
+                      <span className="oa-react-context-menu__item-main">
+                        <span className="oa-react-context-menu__item-icon" aria-hidden="true">
+                          <LinkIcon />
+                        </span>
+                        <span>Link in date...</span>
+                      </span>
+                    </button>
+                    <button
+                      type="button"
+                      className="oa-react-context-menu__item"
+                      onClick={() =>
+                        handleScheduleSelectionToPlanner("copy", plannerDayIdFromOffset(1), {
+                          promptForDate: true,
+                        })
+                      }
+                    >
+                      <span className="oa-react-context-menu__item-main">
+                        <span className="oa-react-context-menu__item-icon" aria-hidden="true">
+                          <CalendarIcon />
+                        </span>
+                        <span>Copy to date...</span>
+                      </span>
+                    </button>
+                  </>
+                )}
+                <div className="oa-react-context-menu__separator" />
+                <div className="oa-react-context-menu__note">
+                  Planner items go into Tasks, Notes, or Linked Notes automatically.
+                </div>
+              </>
             ) : null}
             {noteContextMenuLayer === "links" ? (
               <>
@@ -11482,6 +11940,22 @@ function HistoryIcon() {
       <path d="M2.75 8a5.25 5.25 0 1 0 1.45-3.6" />
       <path d="M2.75 3.45v2.3h2.3" />
       <path d="M8 4.8v3.4l2.2 1.4" />
+    </svg>
+  );
+}
+
+function CalendarIcon() {
+  return (
+    <svg viewBox="0 0 16 16" aria-hidden="true">
+      <path d="M4.8 2.55v2" />
+      <path d="M11.2 2.55v2" />
+      <path d="M3.35 6h9.3" />
+      <rect x="2.7" y="3.7" width="10.6" height="9.6" rx="1.7" />
+      <path d="M5 8.35h1.2" />
+      <path d="M7.4 8.35h1.2" />
+      <path d="M9.8 8.35H11" />
+      <path d="M5 10.65h1.2" />
+      <path d="M7.4 10.65h1.2" />
     </svg>
   );
 }

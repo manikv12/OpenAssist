@@ -803,6 +803,7 @@ final class AssistantNotesBackupController: ObservableObject {
     private let settings: SettingsStore
     private let projectRootURL: URL
     private let conversationRootURL: URL
+    private let plannerRootURL: URL
 
     @Published private(set) var status: AssistantNotesBackupStatus
 
@@ -810,7 +811,8 @@ final class AssistantNotesBackupController: ObservableObject {
         fileManager: FileManager = .default,
         settings: SettingsStore? = nil,
         projectRootURL: URL? = nil,
-        conversationRootURL: URL? = nil
+        conversationRootURL: URL? = nil,
+        plannerRootURL: URL? = nil
     ) {
         self.fileManager = fileManager
         self.settings = settings ?? SettingsStore.shared
@@ -825,6 +827,10 @@ final class AssistantNotesBackupController: ObservableObject {
             ?? applicationSupport
             .appendingPathComponent("OpenAssist", isDirectory: true)
             .appendingPathComponent("AssistantConversationStore", isDirectory: true)
+        self.plannerRootURL = plannerRootURL
+            ?? applicationSupport
+            .appendingPathComponent("OpenAssist", isDirectory: true)
+            .appendingPathComponent("Planner", isDirectory: true)
         let initialFolder = AssistantNotesBackupController.resolvedBackupFolderURL(
             fileManager: fileManager,
             settings: self.settings
@@ -881,6 +887,7 @@ final class AssistantNotesBackupController: ObservableObject {
 
         try restoreProjectPayload(from: backupDirectoryURL)
         try restoreConversationPayload(from: backupDirectoryURL)
+        try restorePlannerPayload(from: backupDirectoryURL)
         refreshStatus()
         return summary
     }
@@ -902,6 +909,7 @@ final class AssistantNotesBackupController: ObservableObject {
         do {
             try writeProjectPayload(to: backupDirectoryURL)
             try writeConversationPayload(to: backupDirectoryURL)
+            try writePlannerPayload(to: backupDirectoryURL)
             let manifest = AssistantNotesBackupManifest(
                 id: backupID,
                 createdAt: referenceDate,
@@ -936,6 +944,7 @@ final class AssistantNotesBackupController: ObservableObject {
         try fileManager.createDirectory(at: backupDirectoryURL, withIntermediateDirectories: true)
         try writeProjectPayload(to: backupDirectoryURL)
         try writeConversationPayload(to: backupDirectoryURL)
+        try writePlannerPayload(to: backupDirectoryURL)
         let manifest = AssistantNotesBackupManifest(
             id: backupID,
             createdAt: referenceDate,
@@ -1001,6 +1010,27 @@ final class AssistantNotesBackupController: ObservableObject {
             try copyItemReplacingIfNeeded(
                 at: recoveryURL,
                 to: targetRoot.appendingPathComponent("Recovery", isDirectory: true)
+            )
+        }
+    }
+
+    private func writePlannerPayload(to backupDirectoryURL: URL) throws {
+        let targetRoot = backupDirectoryURL.appendingPathComponent("planner", isDirectory: true)
+        try fileManager.createDirectory(at: targetRoot, withIntermediateDirectories: true)
+        for name in ["Daily", "Templates", "Recovery"] {
+            let sourceURL = plannerRootURL.appendingPathComponent(name, isDirectory: true)
+            if fileManager.fileExists(atPath: sourceURL.path) {
+                try copyItemReplacingIfNeeded(
+                    at: sourceURL,
+                    to: targetRoot.appendingPathComponent(name, isDirectory: true)
+                )
+            }
+        }
+        let designURL = plannerRootURL.appendingPathComponent("DESIGN.md", isDirectory: false)
+        if fileManager.fileExists(atPath: designURL.path) {
+            try copyItemReplacingIfNeeded(
+                at: designURL,
+                to: targetRoot.appendingPathComponent("DESIGN.md", isDirectory: false)
             )
         }
     }
@@ -1079,10 +1109,34 @@ final class AssistantNotesBackupController: ObservableObject {
         }
     }
 
+    private func restorePlannerPayload(from backupDirectoryURL: URL) throws {
+        let sourceRoot = backupDirectoryURL.appendingPathComponent("planner", isDirectory: true)
+        guard fileManager.fileExists(atPath: sourceRoot.path) else {
+            return
+        }
+
+        try fileManager.createDirectory(at: plannerRootURL, withIntermediateDirectories: true)
+        for name in ["Daily", "Templates", "Recovery"] {
+            let targetURL = plannerRootURL.appendingPathComponent(name, isDirectory: true)
+            try? fileManager.removeItem(at: targetURL)
+            let sourceURL = sourceRoot.appendingPathComponent(name, isDirectory: true)
+            if fileManager.fileExists(atPath: sourceURL.path) {
+                try copyItemReplacingIfNeeded(at: sourceURL, to: targetURL)
+            }
+        }
+        let targetDesignURL = plannerRootURL.appendingPathComponent("DESIGN.md", isDirectory: false)
+        try? fileManager.removeItem(at: targetDesignURL)
+        let sourceDesignURL = sourceRoot.appendingPathComponent("DESIGN.md", isDirectory: false)
+        if fileManager.fileExists(atPath: sourceDesignURL.path) {
+            try copyItemReplacingIfNeeded(at: sourceDesignURL, to: targetDesignURL)
+        }
+    }
+
     private func currentSourceSignature() throws -> String {
         var parts: [String] = []
         parts.append(contentsOf: try fingerprintEntriesForProjectRoot())
         parts.append(contentsOf: try fingerprintEntriesForConversationRoot())
+        parts.append(contentsOf: try fingerprintEntriesForPlannerRoot())
         return AssistantNoteRecoveryStore.sha256(parts.sorted().joined(separator: "\n"))
     }
 
@@ -1123,6 +1177,21 @@ final class AssistantNotesBackupController: ObservableObject {
         let recoveryURL = conversationRootURL.appendingPathComponent("Recovery", isDirectory: true)
         if fileManager.fileExists(atPath: recoveryURL.path) {
             entries.append(contentsOf: try fingerprintDirectory(at: recoveryURL, prefix: "thread/Recovery"))
+        }
+        return entries
+    }
+
+    private func fingerprintEntriesForPlannerRoot() throws -> [String] {
+        var entries: [String] = []
+        for name in ["Daily", "Templates", "Recovery"] {
+            let sourceURL = plannerRootURL.appendingPathComponent(name, isDirectory: true)
+            if fileManager.fileExists(atPath: sourceURL.path) {
+                entries.append(contentsOf: try fingerprintDirectory(at: sourceURL, prefix: "planner/\(name)"))
+            }
+        }
+        let designURL = plannerRootURL.appendingPathComponent("DESIGN.md", isDirectory: false)
+        if fileManager.fileExists(atPath: designURL.path) {
+            entries.append(try fingerprintEntry(for: designURL, relativePath: "planner/DESIGN.md"))
         }
         return entries
     }

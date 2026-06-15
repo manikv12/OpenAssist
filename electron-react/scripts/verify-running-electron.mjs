@@ -26,24 +26,38 @@ async function connectToRenderer() {
   const socket = new WebSocket(target.webSocketDebuggerUrl);
   const pending = new Map();
   let id = 0;
+  const rejectPending = (error) => {
+    for (const { reject, timer } of pending.values()) {
+      clearTimeout(timer);
+      reject(error);
+    }
+    pending.clear();
+  };
 
   socket.onmessage = (event) => {
     const message = JSON.parse(event.data);
     if (!message.id || !pending.has(message.id)) return;
     const { resolve, reject } = pending.get(message.id);
+    clearTimeout(pending.get(message.id).timer);
     pending.delete(message.id);
     if (message.error) reject(new Error(JSON.stringify(message.error)));
     else resolve(message.result);
   };
+  socket.onclose = () => rejectPending(new Error("Electron renderer debug socket closed before verification finished."));
 
   await new Promise((resolve, reject) => {
     socket.onopen = resolve;
     socket.onerror = reject;
   });
+  socket.onerror = () => rejectPending(new Error("Electron renderer debug socket failed during verification."));
 
   const send = (method, params = {}) => new Promise((resolve, reject) => {
     const requestID = ++id;
-    pending.set(requestID, { resolve, reject });
+    const timer = setTimeout(() => {
+      pending.delete(requestID);
+      reject(new Error(`${method} timed out while verifying Electron renderer.`));
+    }, 90_000);
+    pending.set(requestID, { resolve, reject, timer });
     socket.send(JSON.stringify({ id: requestID, method, params }));
   });
 
@@ -143,17 +157,20 @@ import CoreGraphics
 import Foundation
 
 let titleMatch = ${JSON.stringify(titleMatch)}
+let matchingVoiceHUD = titleMatch == "Open Assist Voice HUD"
 let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
 let candidates = windows.compactMap { window -> String? in
   let owner = window[kCGWindowOwnerName as String] as? String ?? ""
   let title = window[kCGWindowName as String] as? String ?? ""
   guard owner == "Electron" || owner == "Open Assist" else { return nil }
-  guard title == titleMatch else { return nil }
   guard let bounds = window[kCGWindowBounds as String] as? [String: Any],
         let width = bounds["Width"] as? Double,
         let height = bounds["Height"] as? Double,
         let x = bounds["X"] as? Double,
         let y = bounds["Y"] as? Double else { return nil }
+  let titleMatches = title == titleMatch
+  let framelessVoiceHUDMatches = matchingVoiceHUD && title.isEmpty && width >= 30 && width <= 540 && height >= 30 && height <= 60
+  guard titleMatches || framelessVoiceHUDMatches else { return nil }
   return "{\\"owner\\":\\"\\(owner)\\",\\"title\\":\\"\\(title)\\",\\"x\\":\\(x),\\"y\\":\\(y),\\"width\\":\\(width),\\"height\\":\\(height)}"
 }
 

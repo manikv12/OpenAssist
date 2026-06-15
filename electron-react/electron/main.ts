@@ -1,9 +1,9 @@
-import { app, BrowserWindow, clipboard, dialog, globalShortcut, ipcMain, Menu, nativeImage, nativeTheme, screen, session, shell, systemPreferences, Tray, type OpenDialogOptions, type WebContents } from "electron";
+import { app, BrowserWindow, clipboard, dialog, globalShortcut, ipcMain, Menu, nativeImage, nativeTheme, screen, session, shell, systemPreferences, Tray, type ContextMenuParams, type OpenDialogOptions, type WebContents } from "electron";
 import fs from "node:fs";
 import { execFileSync, spawn, execFile, type ChildProcess } from "node:child_process";
 import path from "node:path";
 import os from "node:os";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -12,6 +12,7 @@ const isDev = Boolean(process.env.VITE_DEV_SERVER_URL);
 const isAccessibilityTestMode = process.env.OPENASSIST_ELECTRON_AX_TEST === "1";
 const shouldForceAccessibility = process.env.OPENASSIST_ELECTRON_NO_FORCE_AX !== "1";
 
+app.commandLine.appendSwitch("enable-features", "CanvasDrawElement");
 app.setName("Open Assist");
 const debugLogPath = process.env.OPENASSIST_ELECTRON_DEBUG_LOG;
 let mainWindow: BrowserWindow | null = null;
@@ -24,19 +25,51 @@ let screenAnalysisWindowReady = false;
 let screenAnalysisFrameVisible = true;
 let screenAnalysisPanelExpandedHeight = 380;
 let screenAnalysisHiddenMainWindow = false;
+let screenAnalysisStatus: "idle" | "prompt" | "analyzing" | "result" = "idle";
 let transcriptHistoryWindow: BrowserWindow | null = null;
 let settingsWindow: BrowserWindow | null = null;
 let menuBarTray: Tray | null = null;
 let menuBarPopoverWindow: BrowserWindow | null = null;
 let menuBarPopoverShownAt = 0;
 let menuBarPopoverBlurTimer: NodeJS.Timeout | null = null;
+let menuBarPopoverContentReady = false;
+let menuBarPopoverAppearanceSignature = "";
+let menuBarPopoverWarmed = false;
 let isQuitting = false;
+let ollamaQuitCleanupStarted = false;
+let ollamaQuitCleanupFinished = false;
 let voiceHUDReady = false;
 let pendingVoiceHUDPayload: VoiceHUDPayload | null = null;
 let voiceHUDLevelTimer: NodeJS.Timeout | null = null;
 let voiceHUDLevelMtime = 0;
 let smoothedVoiceLevel = 0;
 let voiceHUDAutoHideTimer: NodeJS.Timeout | null = null;
+let voiceCaptureHUDKeepAliveTimer: NodeJS.Timeout | null = null;
+
+type SpellcheckContextPayload = {
+  misspelledWord: string;
+  suggestions: string[];
+  isEditable: boolean;
+  createdAt: number;
+};
+const spellcheckContextByWebContentsID = new Map<number, SpellcheckContextPayload>();
+
+function safeSendWebContents(target: WebContents | null | undefined, channel: string, ...args: unknown[]) {
+  if (!target || target.isDestroyed()) return false;
+  try {
+    target.send(channel, ...args);
+    return true;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    debugLog(`safe send skipped channel=${channel} error=${message}`);
+    return false;
+  }
+}
+
+function safeSendWindow(window: BrowserWindow | null | undefined, channel: string, ...args: unknown[]) {
+  if (!window || window.isDestroyed() || window.webContents.isDestroyed()) return false;
+  return safeSendWebContents(window.webContents, channel, ...args);
+}
 
 function broadcastRealtimeEvent(payload: unknown, sender?: WebContents) {
   const targets = new Set<WebContents>();
@@ -46,25 +79,67 @@ function broadcastRealtimeEvent(payload: unknown, sender?: WebContents) {
       targets.add(window.webContents);
     }
   });
-  targets.forEach((target) => target.send("openassist:realtime-event", payload));
+  targets.forEach((target) => safeSendWebContents(target, "openassist:realtime-event", payload));
+}
+
+function normalizeSpellcheckContext(params: ContextMenuParams): SpellcheckContextPayload | null {
+  const misspelledWord = String(params.misspelledWord ?? "").trim();
+  const suggestions = Array.from(new Set((params.dictionarySuggestions ?? [])
+    .map((suggestion) => String(suggestion ?? "").trim())
+    .filter(Boolean)))
+    .slice(0, 8);
+  if (!misspelledWord) return null;
+  return {
+    misspelledWord,
+    suggestions,
+    isEditable: Boolean(params.isEditable),
+    createdAt: Date.now()
+  };
+}
+
+function attachSpellcheckContext(window: BrowserWindow) {
+  window.webContents.on("context-menu", (_event, params) => {
+    const payload = normalizeSpellcheckContext(params);
+    if (payload) {
+      spellcheckContextByWebContentsID.set(window.webContents.id, payload);
+      safeSendWindow(window, "openassist:spellcheck-context", payload);
+      return;
+    }
+    spellcheckContextByWebContentsID.delete(window.webContents.id);
+  });
+  window.webContents.once("destroyed", () => {
+    spellcheckContextByWebContentsID.delete(window.webContents.id);
+  });
 }
 
 function broadcastThreadsUpdated() {
   BrowserWindow.getAllWindows().forEach((window) => {
-    if (window.isDestroyed() || window.webContents.isDestroyed()) return;
-    window.webContents.send("openassist:threads-updated");
+    safeSendWindow(window, "openassist:threads-updated");
+  });
+}
+
+// Background app-state pass updates (plugins, automations, full thread list,
+// usage refresh) stream to the renderer here, mirroring the existing
+// threads-updated pattern. The renderer subscribes via
+// window.openAssistElectron.onAppStateBackgroundReady.
+function broadcastAppStateBackgroundUpdate(update: unknown) {
+  BrowserWindow.getAllWindows().forEach((window) => {
+    safeSendWindow(window, "openassist:app-state-background-update", update);
   });
 }
 
 let lastVoiceHUDAppearance: Pick<VoiceHUDPayload, "theme" | "colorTheme" | "chromeStyle"> = {
   theme: "Vibrant Spectrum",
   colorTheme: "Ocean",
-  chromeStyle: "Glass (High Contrast)"
+  chromeStyle: "Liquid Glass"
 };
 let frontmostTrackerTimer: NodeJS.Timeout | null = null;
 let lastExternalApplication: FrontmostApplicationSnapshot | null = null;
-let currentWindowMode: "full" | "sidebar" = "full";
+type AssistantWindowMode = "full" | "sidebar" | "notch";
+
+let currentWindowMode: AssistantWindowMode = "full";
 let currentSidebarOpen = true;
+let currentNotchDockRevealed = false;
 let currentSidebarEdge: "left" | "right" = "right";
 let sidebarPinnedPreference = true;
 let sidebarScreenFollowTimer: NodeJS.Timeout | null = null;
@@ -89,8 +164,56 @@ let voiceCapture: {
   whisperModelPath?: string;
   whisperUseCoreML?: boolean;
 } | null = null;
+type WakeWordStatusState = "idle" | "starting" | "listening" | "detected" | "error" | "stopped";
+type WakeWordStatusPayload = {
+  state: WakeWordStatusState;
+  source: "today";
+  engine: "openWakeWord" | "appleSpeechPhrase";
+  phrase: string;
+  enabled?: boolean;
+  message?: string;
+  error?: string;
+  startedAt?: number;
+  detectedAt?: number;
+};
+type WakeWordCaptureState = {
+  sessionDirectory: string;
+  helperProcess?: ChildProcess;
+  helperPid?: number;
+  launchedViaLaunchServices?: boolean;
+  phrase: string;
+  startedAt: number;
+  detected: boolean;
+  ready: boolean;
+  stopping: boolean;
+  stdoutBuffer: string;
+  fileEventMtimes?: Record<string, number>;
+  pollTimer?: NodeJS.Timeout;
+};
+let wakeWordCapture: WakeWordCaptureState | null = null;
+let wakeWordRestartTimer: NodeJS.Timeout | null = null;
+let wakeWordCrashCount = 0;
+let wakeWordLastCrashAt = 0;
+let wakeWordStatus: WakeWordStatusPayload = {
+  state: "idle",
+  source: "today",
+  engine: "appleSpeechPhrase",
+  phrase: "Hey Open Assist",
+  enabled: false,
+  message: "Wake word is off."
+};
 type OpenAssistBridge = typeof import("./openassistBridge.js");
 let bridgeModule: Promise<OpenAssistBridge> | null = null;
+type LocalVoiceTranscriptionRequest = {
+  audioBase64?: string;
+  fileName?: string;
+  mimeType?: string;
+  transcriptionEngine?: string;
+  cloudTranscriptionProvider?: string;
+  cloudTranscriptionAPIKeyConfigured?: boolean;
+  whisperModel?: string;
+  whisperUseCoreML?: boolean;
+};
 type ScreenRect = {
   x: number;
   y: number;
@@ -166,6 +289,10 @@ type VoiceStartOptions = {
   selectedMicrophoneUID?: string;
   whisperModel?: string;
   whisperUseCoreML?: boolean;
+  floatingHUDEnabled?: boolean;
+  waveformTheme?: string;
+  colorTheme?: string;
+  appChromeStyle?: string;
   dictationStartSoundName?: string;
   dictationStopSoundName?: string;
   dictationProcessingSoundName?: string;
@@ -270,11 +397,60 @@ function electronDebugLogPath() {
   }
 }
 
-function debugLog(message: string) {
+// Async batched log writer. fs.appendFileSync is called from 95+ sites,
+// some on hot paths (IPC, screen analysis, AppleScript callbacks). Buffering
+// the lines and flushing every 250 ms (or when the buffer exceeds 4 KB) keeps
+// the main Node event loop unblocked. Synchronous flushes still happen on
+// quit so logs aren't lost.
+const debugLogBuffer: string[] = [];
+let debugLogPending = 0;
+let debugLogFlushTimer: NodeJS.Timeout | null = null;
+let debugLogWriteInFlight = false;
+
+function flushDebugLogAsync() {
+  if (debugLogFlushTimer) {
+    clearTimeout(debugLogFlushTimer);
+    debugLogFlushTimer = null;
+  }
+  if (debugLogWriteInFlight) return;
+  if (debugLogBuffer.length === 0) return;
+  const chunk = debugLogBuffer.join("");
+  debugLogBuffer.length = 0;
+  debugLogPending = 0;
+  debugLogWriteInFlight = true;
+  fs.appendFile(electronDebugLogPath(), chunk, "utf8", () => {
+    debugLogWriteInFlight = false;
+    if (debugLogBuffer.length > 0) flushDebugLogAsync();
+  });
+}
+
+function flushDebugLogSync() {
+  if (debugLogFlushTimer) {
+    clearTimeout(debugLogFlushTimer);
+    debugLogFlushTimer = null;
+  }
+  if (debugLogBuffer.length === 0) return;
+  const chunk = debugLogBuffer.join("");
+  debugLogBuffer.length = 0;
+  debugLogPending = 0;
   try {
-    fs.appendFileSync(electronDebugLogPath(), `[${new Date().toISOString()}] ${message}\n`, "utf8");
+    fs.appendFileSync(electronDebugLogPath(), chunk, "utf8");
   } catch {
-    // Never let logging break the app.
+    // Never let logging break shutdown.
+  }
+}
+
+function debugLog(message: string) {
+  const line = `[${new Date().toISOString()}] ${message}\n`;
+  debugLogBuffer.push(line);
+  debugLogPending += line.length;
+  if (debugLogPending >= 4096) {
+    flushDebugLogAsync();
+    return;
+  }
+  if (!debugLogFlushTimer) {
+    debugLogFlushTimer = setTimeout(flushDebugLogAsync, 250);
+    debugLogFlushTimer.unref?.();
   }
 }
 
@@ -294,9 +470,13 @@ function maybeOpenDevTools(window: BrowserWindow, label: string) {
 
 debugLog("main module loaded");
 
+const openAssistDefaultsDomain = "com.developingadventures.OpenAssist";
+const liquidGlassChromeStyle = "Liquid Glass";
+const liquidGlassDefaultMigrationKey = "OpenAssist.liquidGlassDefaultMigrated";
+
 function readNativeDefaultSync(key: string, fallback: string) {
   try {
-    const stdout = execFileSync("defaults", ["read", "com.developingadventures.OpenAssist", key], {
+    const stdout = execFileSync("defaults", ["read", openAssistDefaultsDomain, key], {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"]
     });
@@ -309,6 +489,83 @@ function readNativeDefaultSync(key: string, fallback: string) {
 function readNativeNumberDefaultSync(key: string, fallback: number) {
   const value = Number(readNativeDefaultSync(key, String(fallback)));
   return Number.isFinite(value) ? value : fallback;
+}
+
+function readNativeBoolDefaultSync(key: string, fallback: boolean) {
+  const value = readNativeDefaultSync(key, fallback ? "1" : "0").trim().toLowerCase();
+  if (["1", "true", "yes"].includes(value)) return true;
+  if (["0", "false", "no"].includes(value)) return false;
+  return fallback;
+}
+
+function writeNativeStringDefaultSync(key: string, value: string) {
+  execFileSync("defaults", ["write", openAssistDefaultsDomain, key, "-string", value], { stdio: "ignore" });
+}
+
+function writeNativeBoolDefaultSync(key: string, value: boolean) {
+  execFileSync("defaults", ["write", openAssistDefaultsDomain, key, "-bool", value ? "true" : "false"], {
+    stdio: "ignore"
+  });
+}
+
+function synchronizeNativeDefaultsSync() {
+  try {
+    execFileSync("defaults", ["synchronize", openAssistDefaultsDomain], { stdio: "ignore" });
+  } catch {
+    // The write already happened; synchronize is best effort on macOS.
+  }
+}
+
+function migrateLiquidGlassDefaultSync() {
+  if (readNativeBoolDefaultSync(liquidGlassDefaultMigrationKey, false)) return;
+  try {
+    writeNativeStringDefaultSync("OpenAssist.appChromeStyle", liquidGlassChromeStyle);
+    writeNativeBoolDefaultSync(liquidGlassDefaultMigrationKey, true);
+    synchronizeNativeDefaultsSync();
+    debugLog("migrated default app chrome style to Liquid Glass");
+  } catch (error) {
+    debugLog(`liquid glass default migration failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+function initialAppearanceSettings() {
+  migrateLiquidGlassDefaultSync();
+  return {
+    themeMode: readNativeDefaultSync("OpenAssist.themeMode", "System"),
+    colorTheme: readNativeDefaultSync("OpenAssist.colorTheme", "Ocean"),
+    appChromeStyle: readNativeDefaultSync("OpenAssist.appChromeStyle", liquidGlassChromeStyle),
+    lightThemeAccent: readNativeDefaultSync("OpenAssist.lightTheme.accent", "#0169CC"),
+    lightThemeBackground: readNativeDefaultSync("OpenAssist.lightTheme.background", "#FFFFFF"),
+    lightThemeForeground: readNativeDefaultSync("OpenAssist.lightTheme.foreground", "#0D0D0D"),
+    lightThemeUIFont: readNativeDefaultSync("OpenAssist.lightTheme.uiFont", "-apple-system, BlinkMacSystemFont, \"SF Pro Text\", \"Helvetica Neue\", Arial, sans-serif"),
+    lightThemeCodeFont: readNativeDefaultSync("OpenAssist.lightTheme.codeFont", "ui-monospace, SFMono-Regular, Menlo, monospace"),
+    lightThemeTranslucentSidebar: readNativeBoolDefaultSync("OpenAssist.lightTheme.translucentSidebar", false),
+    lightThemeContrast: readNativeDefaultSync("OpenAssist.lightTheme.contrast", "45"),
+    lightThemeCodeThemeID: readNativeDefaultSync("OpenAssist.lightTheme.codeThemeID", "codex"),
+    lightThemeDiffAdded: readNativeDefaultSync("OpenAssist.lightTheme.diffAdded", "#00a240"),
+    lightThemeDiffRemoved: readNativeDefaultSync("OpenAssist.lightTheme.diffRemoved", "#ba2623"),
+    lightThemeSkill: readNativeDefaultSync("OpenAssist.lightTheme.skill", "#924ff7"),
+    darkThemeAccent: readNativeDefaultSync("OpenAssist.darkTheme.accent", "#1F6FEB"),
+    darkThemeBackground: readNativeDefaultSync("OpenAssist.darkTheme.background", "#0D1117"),
+    darkThemeForeground: readNativeDefaultSync("OpenAssist.darkTheme.foreground", "#E6EDF3"),
+    darkThemeUIFont: readNativeDefaultSync("OpenAssist.darkTheme.uiFont", "-apple-system, BlinkMacSystemFont, \"SF Pro Text\", \"Helvetica Neue\", Arial, sans-serif"),
+    darkThemeCodeFont: readNativeDefaultSync("OpenAssist.darkTheme.codeFont", "ui-monospace, SFMono-Regular, Menlo, monospace"),
+    darkThemeTranslucentSidebar: readNativeBoolDefaultSync("OpenAssist.darkTheme.translucentSidebar", true),
+    darkThemeContrast: readNativeDefaultSync("OpenAssist.darkTheme.contrast", "89"),
+    darkThemeCodeThemeID: readNativeDefaultSync("OpenAssist.darkTheme.codeThemeID", "github"),
+    darkThemeDiffAdded: readNativeDefaultSync("OpenAssist.darkTheme.diffAdded", "#40c977"),
+    darkThemeDiffRemoved: readNativeDefaultSync("OpenAssist.darkTheme.diffRemoved", "#fa423e"),
+    darkThemeSkill: readNativeDefaultSync("OpenAssist.darkTheme.skill", "#ad7bf9"),
+    pointerCursors: readNativeBoolDefaultSync("OpenAssist.usePointerCursors", false),
+    fontSmoothing: readNativeBoolDefaultSync("OpenAssist.fontSmoothing", true),
+    reduceMotionMode: readNativeDefaultSync("OpenAssist.reduceMotionMode", "System"),
+    uiFontSize: readNativeDefaultSync("OpenAssist.uiFontSize", "13"),
+    codeFontSize: readNativeDefaultSync("OpenAssist.codeFontSize", "12")
+  };
+}
+
+function initialAppearanceQuery() {
+  return { initialAppearance: JSON.stringify(initialAppearanceSettings()) };
 }
 
 function dictationSoundSettingKey(cue: DictationFeedbackCue) {
@@ -465,6 +722,12 @@ function restoreMainWindowAfterScreenAnalysis(reason: string) {
   }
 }
 
+function discardScreenAnalysisMainWindowRestore(reason: string) {
+  if (!screenAnalysisHiddenMainWindow) return;
+  screenAnalysisHiddenMainWindow = false;
+  debugLog(`screen analysis leaving main assistant window hidden reason=${reason}`);
+}
+
 function escapeHTML(value: string) {
   return value
     .replace(/&/g, "&amp;")
@@ -592,9 +855,10 @@ function updateMenuBarIcon() {
 
 function refreshMenuBarPopoverIfVisible() {
   const window = menuBarPopoverWindow;
-  if (!window || window.isDestroyed() || !window.isVisible()) return;
-  positionMenuBarPopoverWindow(window);
-  window.loadURL(`data:text/html;base64,${Buffer.from(menuBarPopoverHTML()).toString("base64")}`);
+  if (!window || window.isDestroyed()) return;
+  // Update only the dynamic regions in place; no full document reload, so there
+  // is no flicker and it stays cheap even while listening.
+  refreshMenuBarPopoverDynamicState();
 }
 
 function startMenuBarIconAnimation() {
@@ -682,16 +946,82 @@ function menuBarActivityDetail() {
   return menuBarVoiceText;
 }
 
+function safePopoverCSSColor(value: string | undefined, fallback: string) {
+  const trimmed = String(value || "").trim();
+  return /^#[0-9a-fA-F]{3,8}$/.test(trimmed) ? trimmed : fallback;
+}
+
+function menuBarPopoverAppearance() {
+  const appearance = initialAppearanceSettings();
+  const requestedMode = String(appearance.themeMode || "System").toLowerCase();
+  const mode = requestedMode === "light"
+    ? "light"
+    : requestedMode === "dark"
+      ? "dark"
+      : nativeTheme.shouldUseDarkColors ? "dark" : "light";
+  const palette = screenAnalysisAppThemePalette(appearance.colorTheme);
+  if (mode === "light") {
+    return {
+      mode,
+      accent: safePopoverCSSColor(appearance.lightThemeAccent, palette[0] || "#0169CC"),
+      skill: safePopoverCSSColor(appearance.lightThemeSkill, palette[1] || "#924ff7"),
+      background: safePopoverCSSColor(appearance.lightThemeBackground, "#FFFFFF"),
+      foreground: safePopoverCSSColor(appearance.lightThemeForeground, "#0D0D0D")
+    };
+  }
+  return {
+    mode,
+    accent: safePopoverCSSColor(appearance.darkThemeAccent, palette[0] || "#8fb0ff"),
+    skill: safePopoverCSSColor(appearance.darkThemeSkill, palette[1] || "#72d99d"),
+    background: safePopoverCSSColor(appearance.darkThemeBackground, palette[2] || "#0D1117"),
+    foreground: safePopoverCSSColor(appearance.darkThemeForeground, "#E6EDF3")
+  };
+}
+
+function menuBarPopoverAppearanceSignatureValue() {
+  const appearance = menuBarPopoverAppearance();
+  return [appearance.mode, appearance.accent, appearance.skill, appearance.background, appearance.foreground].join("|");
+}
+
+// Builds a tiny script that refreshes only the dynamic bits of an already
+// loaded popover, so opening it never has to reload the whole document.
+function menuBarPopoverDynamicScript() {
+  const statusLabel = menuBarHeaderStatusLabel();
+  const dictationLabel = menuBarVoiceStatus === "listening" ? "Stop Dictation" : "Start Dictation";
+  const activityHTML = menuBarActivityHTML();
+  return `(() => {
+    const status = document.getElementById("oa-status-label");
+    if (status) status.textContent = ${JSON.stringify(statusLabel)};
+    const dictation = document.getElementById("oa-dictation-label");
+    if (dictation) dictation.textContent = ${JSON.stringify(dictationLabel)};
+    const activity = document.getElementById("oa-activity");
+    if (activity) activity.innerHTML = ${JSON.stringify(activityHTML)};
+  })();`;
+}
+
+function refreshMenuBarPopoverDynamicState() {
+  const window = menuBarPopoverWindow;
+  if (!window || window.isDestroyed() || !menuBarPopoverContentReady) return;
+  window.webContents.executeJavaScript(menuBarPopoverDynamicScript()).catch(() => {});
+}
+
 function menuBarPopoverHTML() {
   const dictationLabel = menuBarVoiceStatus === "listening" ? "Stop Dictation" : "Start Dictation";
-  const popoverTheme = nativeTheme.shouldUseDarkColors ? "dark" : "light";
+  const popoverAppearance = menuBarPopoverAppearance();
+  const popoverTheme = popoverAppearance.mode;
   const logoDataURL = assetDataURL("assets/AppLogo.png", "image/png");
   return `<!doctype html>
 <html>
 <head>
 <meta charset="utf-8" />
 <style>
-  :root { color-scheme: ${popoverTheme}; }
+  :root {
+    color-scheme: ${popoverTheme};
+    --menu-accent: ${popoverAppearance.accent};
+    --menu-skill: ${popoverAppearance.skill};
+    --menu-bg: ${popoverAppearance.background};
+    --menu-fg: ${popoverAppearance.foreground};
+  }
   html, body {
     width: 100%;
     height: 100%;
@@ -707,39 +1037,29 @@ function menuBarPopoverHTML() {
     position: relative;
     width: 100%;
     height: 100%;
-    padding: 12px;
-    color: rgba(242, 238, 232, 0.94);
+    padding: 10px;
+    color: color-mix(in srgb, var(--menu-fg) 94%, white 6%);
     background:
-      radial-gradient(120% 92% at 0% 100%, rgba(134, 55, 34, 0.40), transparent 58%),
-      radial-gradient(100% 90% at 100% 0%, rgba(45, 74, 100, 0.26), transparent 60%),
-      linear-gradient(180deg, rgba(61, 42, 32, 0.965), rgba(34, 20, 14, 0.985));
-    border: 1px solid rgba(255, 255, 255, 0.12);
-    border-radius: 24px;
+      linear-gradient(180deg, color-mix(in srgb, var(--menu-fg) 7%, transparent), color-mix(in srgb, var(--menu-fg) 1.5%, transparent) 58%),
+      radial-gradient(120% 70% at 12% -6%, color-mix(in srgb, var(--menu-accent) 17%, transparent), transparent 58%),
+      radial-gradient(110% 80% at 100% 12%, color-mix(in srgb, var(--menu-skill) 9%, transparent), transparent 62%),
+      color-mix(in srgb, var(--menu-bg) 90%, transparent);
+    border: 0.5px solid color-mix(in srgb, var(--menu-fg) 14%, transparent);
+    border-radius: 16px;
     box-shadow:
-      0 24px 52px rgba(0, 0, 0, 0.42),
-      0 2px 10px rgba(0, 0, 0, 0.18),
-      inset 0 1px 0 rgba(255,255,255,0.08);
-    backdrop-filter: blur(30px) saturate(1.28);
-  }
-  .popover::before {
-    position: absolute;
-    top: -11px;
-    left: calc(50% - 13px);
-    width: 0;
-    height: 0;
-    border-left: 13px solid transparent;
-    border-right: 13px solid transparent;
-    border-bottom: 13px solid rgba(55, 34, 24, 0.98);
-    background: transparent;
-    filter: none;
-    content: "";
+      0 16px 44px rgba(0, 0, 0, 0.32),
+      0 1px 3px rgba(0, 0, 0, 0.20),
+      inset 0 0.5px 0 color-mix(in srgb, var(--menu-fg) 18%, transparent);
+    backdrop-filter: blur(28px) saturate(1.7);
+    -webkit-backdrop-filter: blur(28px) saturate(1.7);
   }
   .popover::after {
     position: absolute;
     inset: 0;
     border-radius: inherit;
     pointer-events: none;
-    box-shadow: inset 0 0 0 0.5px rgba(255,255,255,0.08);
+    box-shadow: inset 0 0 0 0.5px color-mix(in srgb, var(--menu-fg) 8%, transparent);
+    background: color-mix(in srgb, var(--menu-fg) 5%, transparent);
     content: "";
   }
   .inner { position: relative; z-index: 1; }
@@ -758,9 +1078,9 @@ function menuBarPopoverHTML() {
     place-items: center;
     border-radius: 999px;
     overflow: hidden;
-    border: 1px solid rgba(238, 206, 91, 0.72);
-    color: rgba(241, 207, 94, 0.96);
-    box-shadow: 0 0 18px rgba(238, 169, 73, 0.16);
+    border: 1px solid color-mix(in srgb, var(--menu-accent) 72%, rgba(255,255,255,0.12));
+    color: color-mix(in srgb, var(--menu-accent) 88%, white 12%);
+    box-shadow: 0 0 18px color-mix(in srgb, var(--menu-accent) 18%, transparent);
   }
   .logo img { width: 100%; height: 100%; display: block; object-fit: cover; }
   .logo svg { width: 21px; height: 21px; }
@@ -769,7 +1089,7 @@ function menuBarPopoverHTML() {
     font-size: 15px;
     line-height: 1.1;
     font-weight: 650;
-    color: rgba(255, 255, 255, 0.95);
+    color: color-mix(in srgb, var(--menu-fg) 95%, white 5%);
   }
   .status-line {
     display: grid;
@@ -777,7 +1097,7 @@ function menuBarPopoverHTML() {
     align-items: baseline;
     gap: 7px;
     margin-top: 3px;
-    color: rgba(225, 215, 204, 0.66);
+    color: color-mix(in srgb, var(--menu-fg) 66%, transparent);
     font-size: 11px;
     font-weight: 560;
   }
@@ -791,7 +1111,7 @@ function menuBarPopoverHTML() {
   .status-line span:last-child {
     font-size: 10px;
     font-weight: 650;
-    color: rgba(225, 215, 204, 0.54);
+    color: color-mix(in srgb, var(--menu-fg) 54%, transparent);
     white-space: nowrap;
   }
   .activity-card {
@@ -865,10 +1185,10 @@ function menuBarPopoverHTML() {
   .activity-card.finalizing {
     background:
       linear-gradient(180deg, rgba(255,255,255,0.055), rgba(255,255,255,0.012)),
-      rgba(231, 151, 74, 0.075);
-    box-shadow: inset 0 0 0 0.5px rgba(231, 151, 74, 0.16);
+      color-mix(in srgb, var(--menu-accent) 10%, transparent);
+    box-shadow: inset 0 0 0 0.5px color-mix(in srgb, var(--menu-accent) 18%, transparent);
   }
-  .activity-card.finalizing .activity-label { color: rgba(236, 174, 92, 0.96); }
+  .activity-card.finalizing .activity-label { color: color-mix(in srgb, var(--menu-accent) 82%, white 18%); }
   @keyframes recordingPulse {
     from { transform: scale(0.72); opacity: 1; }
     to { transform: scale(1.42); opacity: 0; }
@@ -879,12 +1199,12 @@ function menuBarPopoverHTML() {
   .divider {
     height: 1px;
     margin: 0 -12px 8px;
-    background: rgba(255, 255, 255, 0.10);
+    background: color-mix(in srgb, var(--menu-fg) 10%, transparent);
   }
   .section-title {
     margin: 9px 0 4px;
     padding: 0 6px;
-    color: rgba(218, 207, 195, 0.58);
+    color: color-mix(in srgb, var(--menu-fg) 58%, transparent);
     font-size: 10px;
     font-weight: 650;
   }
@@ -898,24 +1218,24 @@ function menuBarPopoverHTML() {
     padding: 8px 10px;
     border-radius: 7px;
   }
-  .menu-row:hover { background: rgba(255, 255, 255, 0.078); }
+  .menu-row:hover { background: color-mix(in srgb, var(--menu-accent) 12%, transparent); }
   .menu-icon {
     width: 22px;
     height: 22px;
     display: grid;
     place-items: center;
     border-radius: 7px;
-    color: rgba(236, 168, 77, 0.94);
+    color: color-mix(in srgb, var(--menu-accent) 90%, white 10%);
     background:
-      linear-gradient(180deg, rgba(255,255,255,0.07), rgba(255,255,255,0.01)),
-      rgba(184, 106, 37, 0.22);
-    box-shadow: inset 0 0 0 0.5px rgba(255,255,255,0.075);
+      linear-gradient(180deg, color-mix(in srgb, var(--menu-fg) 7%, transparent), color-mix(in srgb, var(--menu-fg) 1%, transparent)),
+      color-mix(in srgb, var(--menu-accent) 22%, transparent);
+    box-shadow: inset 0 0 0 0.5px color-mix(in srgb, var(--menu-fg) 8%, transparent);
   }
-  .tone-ai { color: rgba(240, 190, 86, 0.96); background-color: rgba(190, 119, 39, 0.24); }
-  .tone-accent { color: rgba(231, 147, 65, 0.96); background-color: rgba(184, 106, 37, 0.22); }
-  .tone-history { color: rgba(230, 176, 70, 0.94); background-color: rgba(157, 114, 34, 0.20); }
-  .tone-settings { color: rgba(235, 168, 79, 0.95); background-color: rgba(177, 103, 38, 0.20); }
-  .tone-neutral { color: rgba(204, 199, 194, 0.72); background-color: rgba(255,255,255,0.07); }
+  .tone-ai { color: color-mix(in srgb, var(--menu-accent) 82%, white 18%); background-color: color-mix(in srgb, var(--menu-accent) 24%, transparent); }
+  .tone-accent { color: color-mix(in srgb, var(--menu-accent) 92%, white 8%); background-color: color-mix(in srgb, var(--menu-accent) 22%, transparent); }
+  .tone-history { color: color-mix(in srgb, var(--menu-skill) 82%, white 18%); background-color: color-mix(in srgb, var(--menu-skill) 20%, transparent); }
+  .tone-settings { color: color-mix(in srgb, var(--menu-accent) 86%, white 14%); background-color: color-mix(in srgb, var(--menu-accent) 19%, transparent); }
+  .tone-neutral { color: color-mix(in srgb, var(--menu-fg) 72%, transparent); background-color: color-mix(in srgb, var(--menu-fg) 7%, transparent); }
   .menu-icon svg { width: 12px; height: 12px; stroke-width: 2.15; }
   .row-text {
     display: grid;
@@ -923,7 +1243,7 @@ function menuBarPopoverHTML() {
     min-width: 0;
   }
   .row-label {
-    color: rgba(247, 245, 242, 0.91);
+    color: color-mix(in srgb, var(--menu-fg) 91%, white 9%);
     font-size: 13px;
     font-weight: 560;
     line-height: 1.16;
@@ -931,7 +1251,7 @@ function menuBarPopoverHTML() {
   .row-detail {
     max-width: 190px;
     overflow: hidden;
-    color: rgba(226, 217, 206, 0.48);
+    color: color-mix(in srgb, var(--menu-fg) 48%, transparent);
     font-size: 10px;
     font-weight: 520;
     line-height: 1.25;
@@ -939,33 +1259,31 @@ function menuBarPopoverHTML() {
     white-space: nowrap;
   }
   .shortcut {
-    color: rgba(226, 217, 206, 0.58);
+    color: color-mix(in srgb, var(--menu-fg) 58%, transparent);
     font-family: ui-monospace, "SF Mono", Menlo, monospace;
     font-size: 11px;
     font-weight: 450;
   }
-  .row-spacer { height: 1px; margin: 8px 0; background: rgba(255, 255, 255, 0.10); }
+  .row-spacer { height: 1px; margin: 8px 0; background: color-mix(in srgb, var(--menu-fg) 10%, transparent); }
   body[data-theme="light"] .popover {
-    color: rgba(35, 31, 27, 0.94);
+    color: color-mix(in srgb, var(--menu-fg) 94%, black 6%);
     background:
-      radial-gradient(115% 95% at 0% 100%, rgba(218, 157, 81, 0.22), transparent 58%),
-      radial-gradient(100% 95% at 100% 0%, rgba(112, 138, 172, 0.18), transparent 60%),
-      linear-gradient(180deg, rgba(255, 251, 246, 0.985), rgba(238, 229, 219, 0.985));
-    border-color: rgba(44, 36, 28, 0.14);
-    box-shadow: 0 22px 46px rgba(68, 54, 42, 0.22), inset 0 1px 0 rgba(255,255,255,0.72);
+      linear-gradient(180deg, rgba(255,255,255,0.76), rgba(255,255,255,0.36) 58%),
+      radial-gradient(110% 90% at 6% 0%, color-mix(in srgb, var(--menu-accent) 20%, transparent), transparent 62%),
+      radial-gradient(94% 90% at 100% 18%, color-mix(in srgb, var(--menu-skill) 13%, transparent), transparent 66%),
+      color-mix(in srgb, var(--menu-bg) 78%, transparent);
+    border-color: color-mix(in srgb, var(--menu-accent) 18%, rgba(44, 56, 74, 0.12));
+    box-shadow: 0 22px 48px rgba(48, 60, 78, 0.20), inset 0 1px 0 rgba(255,255,255,0.74);
   }
-  body[data-theme="light"] .popover::before {
-    border-bottom-color: rgba(247, 238, 228, 0.98);
-  }
-  body[data-theme="light"] .title { color: rgba(33, 29, 26, 0.95); }
+  body[data-theme="light"] .title { color: color-mix(in srgb, var(--menu-fg) 94%, black 6%); }
   body[data-theme="light"] .status-line,
   body[data-theme="light"] .section-title,
   body[data-theme="light"] .shortcut {
-    color: rgba(77, 65, 55, 0.66);
+    color: color-mix(in srgb, var(--menu-fg) 66%, transparent);
   }
   body[data-theme="light"] .divider,
   body[data-theme="light"] .row-spacer {
-    background: rgba(70, 55, 42, 0.13);
+    background: color-mix(in srgb, var(--menu-fg) 13%, transparent);
   }
   body[data-theme="light"] .activity-card {
     background:
@@ -976,18 +1294,18 @@ function menuBarPopoverHTML() {
   body[data-theme="light"] .activity-card.finalizing {
     background:
       linear-gradient(180deg, rgba(255,255,255,0.66), rgba(255,255,255,0.14)),
-      rgba(190, 119, 39, 0.095);
-    box-shadow: inset 0 0 0 0.5px rgba(151, 86, 28, 0.16);
+      color-mix(in srgb, var(--menu-accent) 11%, transparent);
+    box-shadow: inset 0 0 0 0.5px color-mix(in srgb, var(--menu-accent) 16%, transparent);
   }
-  body[data-theme="light"] .menu-row:hover { background: rgba(80, 58, 37, 0.07); }
+  body[data-theme="light"] .menu-row:hover { background: color-mix(in srgb, var(--menu-accent) 9%, transparent); }
   body[data-theme="light"] .menu-icon {
-    color: rgba(151, 86, 28, 0.94);
-    background: rgba(187, 118, 51, 0.16);
+    color: color-mix(in srgb, var(--menu-accent) 82%, black 18%);
+    background: color-mix(in srgb, var(--menu-accent) 16%, transparent);
   }
-  body[data-theme="light"] .tone-ai { color: rgba(135, 82, 22, 0.94); background-color: rgba(190, 119, 39, 0.15); }
-  body[data-theme="light"] .tone-neutral { color: rgba(94, 86, 79, 0.70); background-color: rgba(70,55,42,0.07); }
-  body[data-theme="light"] .row-label { color: rgba(39, 34, 30, 0.92); }
-  body[data-theme="light"] .row-detail { color: rgba(82, 70, 60, 0.52); }
+  body[data-theme="light"] .tone-ai { color: color-mix(in srgb, var(--menu-accent) 80%, black 20%); background-color: color-mix(in srgb, var(--menu-accent) 15%, transparent); }
+  body[data-theme="light"] .tone-neutral { color: color-mix(in srgb, var(--menu-fg) 70%, transparent); background-color: color-mix(in srgb, var(--menu-fg) 7%, transparent); }
+  body[data-theme="light"] .row-label { color: color-mix(in srgb, var(--menu-fg) 92%, black 8%); }
+  body[data-theme="light"] .row-detail { color: color-mix(in srgb, var(--menu-fg) 52%, transparent); }
 </style>
 </head>
 <body data-theme="${popoverTheme}">
@@ -999,10 +1317,10 @@ function menuBarPopoverHTML() {
         </div>
         <div class="header-copy">
           <h1 class="title">Open Assist</h1>
-          <div class="status-line"><span>${escapeHTML(menuBarHeaderStatusLabel())}</span><span>Quick Controls</span></div>
+          <div class="status-line"><span id="oa-status-label">${escapeHTML(menuBarHeaderStatusLabel())}</span><span>Quick Controls</span></div>
         </div>
       </header>
-      ${menuBarActivityHTML()}
+      <div id="oa-activity">${menuBarActivityHTML()}</div>
       <div class="divider"></div>
       <section>
         <div class="section-title">Assistant</div>
@@ -1012,7 +1330,7 @@ function menuBarPopoverHTML() {
       <div class="row-spacer"></div>
       <section>
         <div class="section-title">Voice & Dictation</div>
-        ${menuBarRow("toggle-dictation", dictationLabel, "", "mic", "", "accent")}
+        ${menuBarRow("toggle-dictation", dictationLabel, "", "mic", "", "accent", "oa-dictation-label")}
         ${menuBarRow("paste-last-transcript", "Paste Last Transcript", "", "clipboard", "⌘⌥V", "accent")}
       </section>
       <div class="row-spacer"></div>
@@ -1093,11 +1411,13 @@ function menuBarRow(
   detail: string,
   icon: Parameters<typeof menuBarIconSVG>[0],
   shortcut = "",
-  tone: MenuBarIconTone = "accent"
+  tone: MenuBarIconTone = "accent",
+  labelId = ""
 ) {
+  const labelIdAttr = labelId ? ` id="${labelId}"` : "";
   return `<button class="menu-row" data-action="${action}">
     <span class="menu-icon tone-${tone}">${menuBarIconSVG(icon)}</span>
-    <span class="row-text"><span class="row-label">${escapeHTML(label)}</span>${detail ? `<span class="row-detail">${escapeHTML(detail)}</span>` : ""}</span>
+    <span class="row-text"><span class="row-label"${labelIdAttr}>${escapeHTML(label)}</span>${detail ? `<span class="row-detail">${escapeHTML(detail)}</span>` : ""}</span>
     ${shortcut ? `<span class="shortcut">${escapeHTML(shortcut)}</span>` : ""}
   </button>`;
 }
@@ -1140,6 +1460,16 @@ function scheduleMenuBarPopoverBlurHide(reason: string) {
   }, 90);
 }
 
+// Loads (or reloads) the popover document. We keep the window alive and only
+// reload when the theme/appearance actually changes, so opening the popover is
+// instant in the common case.
+function loadMenuBarPopoverContent(window: BrowserWindow) {
+  const html = menuBarPopoverHTML();
+  menuBarPopoverContentReady = false;
+  menuBarPopoverAppearanceSignature = menuBarPopoverAppearanceSignatureValue();
+  window.loadURL(`data:text/html;base64,${Buffer.from(html).toString("base64")}`);
+}
+
 function ensureMenuBarPopoverWindow() {
   if (menuBarPopoverWindow && !menuBarPopoverWindow.isDestroyed()) return menuBarPopoverWindow;
   const window = new BrowserWindow({
@@ -1162,7 +1492,8 @@ function ensureMenuBarPopoverWindow() {
       devTools: enableDevTools,
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: false
+      sandbox: false,
+      backgroundThrottling: false
     }
   });
   window.on("focus", clearMenuBarPopoverBlurTimer);
@@ -1171,31 +1502,80 @@ function ensureMenuBarPopoverWindow() {
   window.webContents.on("before-input-event", (_event, input) => {
     if (input.type === "keyDown" && input.key === "Escape") hideMenuBarPopover("escape");
   });
+  window.webContents.on("did-finish-load", () => {
+    menuBarPopoverContentReady = true;
+    refreshMenuBarPopoverDynamicState();
+    warmMenuBarPopoverCompositor(window);
+  });
   window.on("closed", () => {
     clearMenuBarPopoverBlurTimer();
+    menuBarPopoverContentReady = false;
+    menuBarPopoverWarmed = false;
     if (menuBarPopoverWindow === window) menuBarPopoverWindow = null;
   });
   menuBarPopoverWindow = window;
+  loadMenuBarPopoverContent(window);
   return window;
+}
+
+// macOS only allocates and composites a transparent/vibrancy window's surface on
+// its first show, which is the main source of the open lag. Show it once well
+// offscreen (no focus, no flash) and immediately hide it so the real first click
+// reveals an already-composited window instantly.
+function warmMenuBarPopoverCompositor(window: BrowserWindow) {
+  if (menuBarPopoverWarmed || window.isDestroyed() || window.isVisible()) return;
+  menuBarPopoverWarmed = true;
+  try {
+    window.setBounds({ x: -32000, y: -32000, ...menuBarPopoverSize }, false);
+    window.showInactive();
+    setTimeout(() => {
+      if (!window.isDestroyed() && !window.isVisible()) return;
+      if (!window.isDestroyed()) window.hide();
+    }, 60);
+  } catch {
+    // Non-fatal: if warming fails the first real show just pays the usual cost.
+  }
+}
+
+// Pre-create and pre-load the popover during startup so the very first click
+// is instant instead of paying for window creation + document load.
+function prewarmMenuBarPopover() {
+  ensureMenuBarPopoverWindow();
 }
 
 function showMenuBarPopover() {
   const window = ensureMenuBarPopoverWindow();
-  menuBarPopoverShownAt = Date.now();
-  positionMenuBarPopoverWindow(window);
-  const html = menuBarPopoverHTML();
-  window.loadURL(`data:text/html;base64,${Buffer.from(html).toString("base64")}`);
-  const showLoadedPopover = () => {
+  // If the theme changed since we last loaded, refresh the whole document.
+  if (menuBarPopoverContentReady && menuBarPopoverAppearanceSignature !== menuBarPopoverAppearanceSignatureValue()) {
+    loadMenuBarPopoverContent(window);
+  }
+  const reveal = () => {
     if (window.isDestroyed()) return;
     menuBarPopoverShownAt = Date.now();
     positionMenuBarPopoverWindow(window);
+    window.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
     window.show();
+    // The popover must become the key window, otherwise macOS never fires the
+    // "blur" event when the user clicks another app/the desktop and it would
+    // stay open. For an accessory (menu-bar) app, focusing the window is not
+    // enough on its own, so we also steal app focus on macOS.
+    if (process.platform === "darwin") {
+      app.focus({ steal: true });
+    }
     window.focus();
+    // Refresh dynamic text after showing; executeJavaScript is async so it never
+    // delays the window appearing.
+    refreshMenuBarPopoverDynamicState();
   };
-  window.once("ready-to-show", showLoadedPopover);
+  if (menuBarPopoverContentReady) {
+    reveal();
+    return;
+  }
+  // First load not finished yet: reveal as soon as it is (with a short fallback).
+  window.webContents.once("did-finish-load", reveal);
   setTimeout(() => {
-    if (!window.isDestroyed() && !window.isVisible()) showLoadedPopover();
-  }, 160);
+    if (!window.isDestroyed() && !window.isVisible()) reveal();
+  }, 200);
 }
 
 function toggleMenuBarPopover() {
@@ -1218,7 +1598,7 @@ function showMainWindowFromMenuBar(command?: MenuBarCommand, visible = true) {
   }
   if (command) {
     const send = () => {
-      if (!window.isDestroyed()) window.webContents.send("openassist:menu-bar-command", command);
+      safeSendWindow(window, "openassist:menu-bar-command", command);
     };
     if (window.webContents.isLoading()) {
       window.webContents.once("did-finish-load", () => setTimeout(send, 20));
@@ -1278,6 +1658,7 @@ function setupMenuBarTray() {
   menuBarTray.on("click", toggleMenuBarPopover);
   menuBarTray.on("right-click", toggleMenuBarPopover);
   updateMenuBarIcon();
+  prewarmMenuBarPopover();
 }
 
 function installApplicationMenu() {
@@ -1392,7 +1773,10 @@ function syncSidebarScreenFollowTimer() {
     if (targetDisplay.id !== currentDisplay.id) {
       applyWindowMode(window, "sidebar", currentSidebarOpen, currentSidebarEdge);
     }
-  }, 120);
+    // 500 ms is imperceptible for "follow the screen the cursor is on" and
+    // saves ~4× the wakeups vs the previous 120 ms cadence. The race for
+    // very fast cursor moves is fine: applyWindowMode() is idempotent.
+  }, 500);
   sidebarScreenFollowTimer.unref?.();
 }
 
@@ -1409,7 +1793,7 @@ function collapseUnpinnedSidebar(reason: string) {
   }
   debugLog(`collapse unpinned sidebar reason=${reason}`);
   currentSidebarOpen = false;
-  window.webContents.send("openassist:sidebar-blur-collapse", {
+  safeSendWindow(window, "openassist:sidebar-blur-collapse", {
     sidebarOpen: false,
     sidebarEdge: currentSidebarEdge
   });
@@ -1421,12 +1805,19 @@ function collapseUnpinnedSidebar(reason: string) {
   return true;
 }
 
-function applyWindowMode(window: BrowserWindow, mode: "full" | "sidebar", sidebarOpen = true, sidebarEdge: "left" | "right" = "right") {
+function applyWindowMode(
+  window: BrowserWindow,
+  mode: AssistantWindowMode,
+  sidebarOpen = true,
+  sidebarEdge: "left" | "right" = "right",
+  notchDockRevealed = sidebarOpen
+) {
   const previousWindowMode = currentWindowMode;
   const previousSidebarOpen = currentSidebarOpen;
   const previousSidebarEdge = currentSidebarEdge;
   currentWindowMode = mode;
-  currentSidebarOpen = mode === "sidebar" ? sidebarOpen : true;
+  currentSidebarOpen = mode === "sidebar" || mode === "notch" ? sidebarOpen : true;
+  currentNotchDockRevealed = mode === "notch" ? Boolean(sidebarOpen || notchDockRevealed) : false;
   if (mode === "sidebar") currentSidebarEdge = sidebarEdge;
   syncSidebarScreenFollowTimer();
   if (mode === "sidebar") {
@@ -1470,6 +1861,7 @@ function applyWindowMode(window: BrowserWindow, mode: "full" | "sidebar", sideba
 
     window.setMinimumSize(handleWidth, sidebarOpen ? minimumPanelHeight : handleHeight);
     window.setResizable(false);
+    window.setIgnoreMouseEvents(false);
     window.setFocusable(sidebarOpen);
     const keepOnTop = !sidebarOpen || sidebarPinnedPreference;
     window.setAlwaysOnTop(keepOnTop, "floating");
@@ -1478,7 +1870,7 @@ function applyWindowMode(window: BrowserWindow, mode: "full" | "sidebar", sideba
     }
     window.setHasShadow(sidebarOpen);
     window.setBackgroundColor("#00000000");
-    if (process.platform === "darwin") window.setVibrancy(null);
+    if (process.platform === "darwin") window.setVibrancy("sidebar");
     if (process.platform === "darwin") window.setWindowButtonVisibility(false);
     const x = sidebarOpen
       ? sidebarEdge === "left"
@@ -1503,7 +1895,52 @@ function applyWindowMode(window: BrowserWindow, mode: "full" | "sidebar", sideba
     return;
   }
 
+  if (mode === "notch") {
+    stopSidebarScreenFollowTimer();
+    const previousBounds = window.getBounds();
+    const previousCenter = {
+      x: Math.round(previousBounds.x + previousBounds.width / 2),
+      y: Math.round(previousBounds.y + Math.min(previousBounds.height / 2, 80))
+    };
+    const display = previousWindowMode === "notch" && window.isVisible()
+      ? screen.getDisplayNearestPoint(previousCenter)
+      : sidebarTargetDisplay();
+    const { workArea } = display;
+    const collapsedSize = { width: 320, height: 50 };
+    const hiddenSize = { width: 320, height: 18 };
+    const openWidth = Math.min(520, Math.max(320, workArea.width - 32));
+    const openHeight = Math.min(480, Math.max(300, workArea.height - 28));
+    const isDockRevealed = !sidebarOpen && currentNotchDockRevealed;
+    const width = sidebarOpen ? Math.round(openWidth) : isDockRevealed ? collapsedSize.width : hiddenSize.width;
+    const height = sidebarOpen ? Math.round(openHeight) : isDockRevealed ? collapsedSize.height : hiddenSize.height;
+    const x = workArea.x + Math.round((workArea.width - width) / 2);
+    const y = workArea.y + (sidebarOpen || isDockRevealed ? 6 : 0);
+
+    window.setMinimumSize(sidebarOpen ? 520 : 120, sidebarOpen ? 300 : 2);
+    window.setResizable(false);
+    window.setIgnoreMouseEvents(false);
+    window.setFocusable(sidebarOpen);
+    window.setAlwaysOnTop(true, "floating");
+    if (!window.isVisibleOnAllWorkspaces()) {
+      window.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+    }
+    window.setHasShadow(sidebarOpen || isDockRevealed);
+    window.setBackgroundColor("#00000000");
+    if (process.platform === "darwin") window.setVibrancy("sidebar");
+    if (process.platform === "darwin") window.setWindowButtonVisibility(false);
+    window.setBounds({ x, y, width, height }, false);
+    if (sidebarOpen) {
+      ensureRegularDockPresence("show notch window");
+      window.show();
+      window.focus();
+    } else {
+      window.showInactive();
+    }
+    return;
+  }
+
   window.setFocusable(true);
+  window.setIgnoreMouseEvents(false);
   window.setAlwaysOnTop(false);
   if (window.isVisibleOnAllWorkspaces()) {
     window.setVisibleOnAllWorkspaces(false);
@@ -1531,7 +1968,7 @@ function toggleMainWindowVisibility() {
     ensureRegularDockPresence("toggle show main window");
     window.show();
   }
-  window.webContents.send("openassist:toggle-sidebar-shortcut");
+  safeSendWindow(window, "openassist:toggle-sidebar-shortcut");
 }
 
 function voiceHUDHTML() {
@@ -1639,6 +2076,27 @@ function voiceHUDHTML() {
     gap: 8px;
     height: 100%;
     width: 100%;
+  }
+  html[data-chrome-style="liquid-glass"] .hud {
+    background:
+      linear-gradient(180deg, rgba(255,255,255,0.12), rgba(255,255,255,0.018) 64%),
+      radial-gradient(90% 80% at 12% 0%, rgba(120, 151, 220, 0.22), transparent 62%),
+      rgba(18, 21, 28, 0.62);
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.12),
+      0 18px 48px rgba(0, 0, 0, 0.26);
+    backdrop-filter: blur(24px) saturate(1.22);
+    -webkit-backdrop-filter: blur(24px) saturate(1.22);
+  }
+  html[data-chrome-style="liquid-glass"][data-status="analysis-result"] .hud,
+  html[data-chrome-style="liquid-glass"][data-status="analyzing-input"] .hud {
+    background:
+      linear-gradient(180deg, rgba(255,255,255,0.11), rgba(255,255,255,0.020) 64%),
+      radial-gradient(110% 90% at 10% 0%, rgba(120, 151, 220, 0.18), transparent 62%),
+      rgba(18, 21, 28, 0.76);
+    backdrop-filter: blur(28px) saturate(1.18);
+    -webkit-backdrop-filter: blur(28px) saturate(1.18);
   }
 	  .hud-dot {
 	    width: 7px;
@@ -2375,7 +2833,8 @@ function ensureVoiceHUDWindow() {
       devTools: enableDevTools,
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: false
+      sandbox: false,
+      backgroundThrottling: true
     }
   });
   window.setIgnoreMouseEvents(false);
@@ -2487,11 +2946,49 @@ function isInteractiveVoiceHUDStatus(status: VoiceHUDPayload["status"]) {
 
 function activeVoiceCaptureHUDPayload(): VoiceHUDPayload | null {
   if (!voiceCapture) return null;
+  if (voiceCapture.voiceOptions?.floatingHUDEnabled === false) return null;
   return {
     visible: true,
     status: voiceCapture.processing ? "processing" : "listening",
-    level: voiceCapture.processing ? undefined : menuBarVoiceLevel
+    level: voiceCapture.processing ? undefined : menuBarVoiceLevel,
+    theme: voiceCapture.voiceOptions?.waveformTheme ?? lastVoiceHUDAppearance.theme,
+    colorTheme: voiceCapture.voiceOptions?.colorTheme ?? lastVoiceHUDAppearance.colorTheme,
+    chromeStyle: voiceCapture.voiceOptions?.appChromeStyle ?? lastVoiceHUDAppearance.chromeStyle
   };
+}
+
+function showActiveVoiceCaptureHUD() {
+  const payload = activeVoiceCaptureHUDPayload();
+  if (!payload) return;
+  void updateVoiceHUD(payload);
+}
+
+// While a native voice capture is running the main process is the single owner of
+// the floating HUD: the renderer cannot hide it (every hide path in updateVoiceHUD
+// re-asserts the capture payload), and this keep-alive re-shows the window if it is
+// ever hidden out-of-band (app deactivation when the helper launches, Space changes,
+// the OS dropping a borderless panel, etc.). It self-terminates when the capture ends.
+function ensureVoiceCaptureHUDKeepAlive() {
+  if (voiceCaptureHUDKeepAliveTimer) return;
+  voiceCaptureHUDKeepAliveTimer = setInterval(() => {
+    if (!voiceCapture) {
+      stopVoiceCaptureHUDKeepAlive();
+      return;
+    }
+    const payload = activeVoiceCaptureHUDPayload();
+    if (!payload) return; // Floating HUD is disabled in settings.
+    if (!voiceHUDWindow || voiceHUDWindow.isDestroyed() || !voiceHUDWindow.isVisible()) {
+      debugLog("voice capture HUD keep-alive re-showing hidden HUD");
+      showActiveVoiceCaptureHUD();
+    }
+  }, 200);
+  voiceCaptureHUDKeepAliveTimer.unref?.();
+}
+
+function stopVoiceCaptureHUDKeepAlive() {
+  if (!voiceCaptureHUDKeepAliveTimer) return;
+  clearInterval(voiceCaptureHUDKeepAliveTimer);
+  voiceCaptureHUDKeepAliveTimer = null;
 }
 
 async function updateVoiceHUD(payload: VoiceHUDPayload) {
@@ -2544,12 +3041,22 @@ async function updateVoiceHUD(payload: VoiceHUDPayload) {
       || nextPayload.status === "analyzing-input"
     );
   if (!shouldShow) {
+    const activeCapturePayload = activeVoiceCaptureHUDPayload();
+    if (activeCapturePayload) {
+      debugLog("voice HUD hide ignored (non-visible status) while native capture is active");
+      return updateVoiceHUD(activeCapturePayload);
+    }
     pendingVoiceHUDPayload = null;
     voiceHUDWindow?.hide();
     updateMenuBarVoiceStatus({ visible: false, status: "idle" });
     return { ok: true, visible: false };
   }
   if (shouldSuppressFloatingVoiceHUD(nextPayload)) {
+    const activeCapturePayload = activeVoiceCaptureHUDPayload();
+    if (activeCapturePayload) {
+      debugLog("voice HUD app-focus suppression ignored while native capture is active");
+      return updateVoiceHUD(activeCapturePayload);
+    }
     clearVoiceHUDAutoHide();
     pendingVoiceHUDPayload = storedVoiceHUDPayload(nextPayload);
     voiceHUDWindow?.hide();
@@ -2579,7 +3086,7 @@ async function updateVoiceHUD(payload: VoiceHUDPayload) {
       text: nextPayload.text ?? "",
       theme: nextPayload.theme ?? "Vibrant Spectrum",
       colorTheme: nextPayload.colorTheme ?? "Ocean",
-      chromeStyle: nextPayload.chromeStyle ?? "Glass (High Contrast)",
+      chromeStyle: nextPayload.chromeStyle ?? "Liquid Glass",
       level: nextPayload.level ?? 0,
       tone: nextPayload.tone ?? (nextPayload.status === "error" || nextPayload.status === "unsupported" ? "error" : "success"),
       source: nextPayload.source ?? "",
@@ -2740,7 +3247,7 @@ function handleConfiguredShortcut(target: ShortcutTarget, phase: ShortcutPhase =
   const window = mainWindow;
   if (!window || window.isDestroyed()) return;
   const sendShortcut = () => {
-    if (!window.isDestroyed()) window.webContents.send("openassist:voice-shortcut", target, phase);
+    safeSendWindow(window, "openassist:voice-shortcut", target, phase);
   };
   const sendWhenReady = () => {
     if (window.webContents.isLoading()) {
@@ -2902,7 +3409,7 @@ async function refreshShortcutMonitor(shortcuts: Array<{ target: ShortcutTarget;
 
 async function refreshConfiguredShortcuts() {
   try {
-    const state = await (await openAssistBridge()).loadOpenAssistAppState();
+    const state = await (await openAssistBridge()).loadOpenAssistSettingsAppState();
     registerConfiguredShortcuts(state.settings);
   } catch (error) {
     debugLog(`shortcut refresh failed: ${error instanceof Error ? error.stack ?? error.message : String(error)}`);
@@ -2913,6 +3420,41 @@ let lastCapturedImageBuffer: Buffer | null = null;
 let lastCapturedScreenRect: ScreenRect | null = null;
 let lastCapturedPreviewDataURL = "";
 let lastScreenAnalysisReferenceImages: Array<{ name: string; data: Buffer; mimeType: string; previewDataURL: string }> = [];
+let screenAnalysisBufferEvictionTimer: NodeJS.Timeout | null = null;
+
+// A 4K screenshot is ~10-20 MB and reference images stack up to 4. They live
+// in the main process as raw Buffers forever after a single screen-analysis
+// session. We evict 30 s after the session goes idle so a long-running
+// app's main RSS doesn't carry them indefinitely.
+function scheduleScreenAnalysisBufferEviction() {
+  if (screenAnalysisBufferEvictionTimer) {
+    clearTimeout(screenAnalysisBufferEvictionTimer);
+  }
+  screenAnalysisBufferEvictionTimer = setTimeout(() => {
+    screenAnalysisBufferEvictionTimer = null;
+    if (screenAnalysisStatus !== "idle") return;
+    if (
+      lastCapturedImageBuffer ||
+      lastCapturedPreviewDataURL ||
+      lastScreenAnalysisReferenceImages.length > 0
+    ) {
+      debugLog(
+        `screen analysis buffer eviction: image=${lastCapturedImageBuffer ? lastCapturedImageBuffer.length : 0}B refs=${lastScreenAnalysisReferenceImages.length}`
+      );
+    }
+    lastCapturedImageBuffer = null;
+    lastCapturedScreenRect = null;
+    lastCapturedPreviewDataURL = "";
+    lastScreenAnalysisReferenceImages = [];
+  }, 30_000);
+  screenAnalysisBufferEvictionTimer.unref?.();
+}
+
+function cancelScreenAnalysisBufferEviction() {
+  if (!screenAnalysisBufferEvictionTimer) return;
+  clearTimeout(screenAnalysisBufferEvictionTimer);
+  screenAnalysisBufferEvictionTimer = null;
+}
 let screenAnalysisRunID = 0;
 let pendingScreenSelectionResolve: ((rect: ScreenRect) => void) | null = null;
 let pendingScreenSelectionReject: ((error: Error) => void) | null = null;
@@ -3046,10 +3588,30 @@ const screenSnipPalettes: Record<string, string[]> = {
   "vibrant-spectrum": ["#4f8fe8", "#a363b7", "#df4546", "#ddb52d", "#39a268"],
   "professional-tech": ["#78b7ff", "#837bff", "#55d0c0", "#69d58c"],
   "monochrome": ["#d8dbe0", "#bdc2ca", "#8d949e", "#f2f4f7"],
+  "openai-horizon": ["#1f6fff", "#5fb7ff", "#86e0d6", "#f2efe8"],
+  "openai-emotive": ["#2764ff", "#58d1ff", "#b7c7ff", "#f7f2ea"],
+  "openai-bloom": ["#2dd4bf", "#73d6ff", "#9f8cff", "#f4efe6"],
+  "openai-sky": ["#3a7dff", "#6fd3ff", "#b8e6ff", "#fff4d8"],
+  "gpt-5-5-thinking": ["#3157ff", "#6f7dff", "#a685ff", "#f1eaff"],
+  "gpt-5-5-pro": ["#2447d8", "#4a9fff", "#7ee7d8", "#fff0c7"],
+  "codex-blueprint": ["#3f7dff", "#70b7ff", "#c6e2ff", "#f7fbff"],
+  "codex-agent": ["#4d8dff", "#5fd3ff", "#55e0bd", "#eef7ff"],
   "neon-lagoon": ["#74d5ff", "#54e3da", "#56edb2", "#91ef78"],
   "sunset-candy": ["#6e8dff", "#d45a8b", "#ef4b55", "#ebb934"],
   "cosmic-pop": ["#58a9ff", "#945fe3", "#eb4b82", "#f27d3a"],
   "mint-blush": ["#6fa7ff", "#c175b7", "#ef6f7f", "#5bca95"]
+};
+
+const screenSnipPaletteLabels: Record<string, string> = {
+  "match-voice-hud": "Match Voice HUD",
+  "openai-horizon": "OpenAI Horizon",
+  "openai-emotive": "OpenAI Emotive",
+  "openai-bloom": "OpenAI Bloom",
+  "openai-sky": "OpenAI Sky",
+  "gpt-5-5-thinking": "GPT-5.5 Thinking",
+  "gpt-5-5-pro": "GPT-5.5 Pro",
+  "codex-blueprint": "Codex Blueprint",
+  "codex-agent": "Codex Agent"
 };
 
 const screenAnalysisAppThemePalettes: Record<string, string[]> = {
@@ -3088,7 +3650,7 @@ function readScreenSnipTheme(): string {
   } catch {
     // file missing or unreadable — fall through
   }
-  cachedScreenSnipTheme = "prism";
+  cachedScreenSnipTheme = "match-voice-hud";
   return cachedScreenSnipTheme;
 }
 
@@ -3107,11 +3669,17 @@ function normalizePaletteKey(key?: string) {
 
 function screenAnalysisPalette(_theme?: string) {
   const userKey = normalizePaletteKey(readScreenSnipTheme());
-  if (userKey && userKey !== "match-voice-hud" && screenSnipPalettes[userKey] && screenSnipPalettes[userKey].length) {
+  if (
+    userKey
+    && userKey !== "match-voice-hud"
+    && userKey !== "prism"
+    && screenSnipPalettes[userKey]
+    && screenSnipPalettes[userKey].length
+  ) {
     return screenSnipPalettes[userKey];
   }
-  const fallbackKey = normalizePaletteKey(lastVoiceHUDAppearance.theme) || "vibrant-spectrum";
-  return screenSnipPalettes[fallbackKey] ?? screenSnipPalettes["vibrant-spectrum"];
+  const [accent, skill, background, foreground] = screenAnalysisCurrentThemeColors();
+  return [accent, skill, foreground, background];
 }
 
 function screenAnalysisAppThemePalette(theme?: string) {
@@ -3119,12 +3687,16 @@ function screenAnalysisAppThemePalette(theme?: string) {
   return screenAnalysisAppThemePalettes[themeKey] ?? screenAnalysisAppThemePalettes.ocean;
 }
 
+function screenAnalysisCurrentThemeColors() {
+  const appearance = menuBarPopoverAppearance();
+  return [appearance.accent, appearance.skill, appearance.background, appearance.foreground];
+}
+
 function listScreenSnipPresets() {
   return Object.entries(screenSnipPalettes).map(([key, colors]) => ({
     key,
-    label: key === "match-voice-hud"
-      ? "Match Voice HUD"
-      : key.split("-").map((part) => part.charAt(0).toUpperCase() + part.slice(1)).join(" "),
+    label: screenSnipPaletteLabels[key]
+      ?? key.split("-").map((part) => part.charAt(0).toUpperCase() + part.slice(1)).join(" "),
     colors: colors.length ? colors : ["#4f8fe8", "#a363b7", "#df4546", "#ddb52d"]
   }));
 }
@@ -3260,16 +3832,20 @@ html, body, #root {
   min-height: 140px;
   max-height: 380px;
   border-radius: 16px;
-  background: rgba(20, 22, 28, 0.97);
-  border: 1px solid color-mix(in srgb, var(--theme-accent) 18%, rgba(255,255,255,0.10));
+  background:
+    linear-gradient(180deg, rgba(255,255,255,0.045), rgba(255,255,255,0.012) 64%),
+    color-mix(in srgb, var(--theme-base) 91%, #10131a 9%);
+  border: 1px solid color-mix(in srgb, var(--theme-accent) 16%, rgba(255,255,255,0.13));
   box-shadow:
-    0 18px 56px rgba(0,0,0,0.50),
-    0 0 18px color-mix(in srgb, var(--theme-accent) 10%, transparent);
+    inset 0 1px 0 rgba(255,255,255,0.08),
+    inset 0 0 0 1px rgba(255,255,255,0.035);
   padding: 12px 12px 10px;
   display: flex;
   flex-direction: column;
   gap: 10px;
   -webkit-font-smoothing: antialiased;
+  backdrop-filter: blur(8px) saturate(1.03);
+  -webkit-backdrop-filter: blur(8px) saturate(1.03);
 }
 ::-webkit-scrollbar {
   width: 8px;
@@ -3379,7 +3955,7 @@ html, body, #root {
 .screenshot-preview:hover {
   transform: scale(1.02);
   border-color: color-mix(in srgb, var(--theme-accent) 52%, white 10%);
-  box-shadow: 0 0 14px color-mix(in srgb, var(--theme-accent) 18%, transparent);
+  box-shadow: none;
 }
 .screenshot-preview img {
   width: 100%;
@@ -3420,16 +3996,28 @@ html, body, #root {
   display: flex;
   align-items: center;
   gap: 0;
-  background: rgba(255,255,255,0.06);
-  border: 1px solid rgba(255,255,255,0.13);
+  background:
+    linear-gradient(
+      180deg,
+      color-mix(in srgb, var(--theme-accent) 9%, rgba(255,255,255,0.055)),
+      color-mix(in srgb, var(--theme-base) 86%, rgba(255,255,255,0.035))
+    );
+  border: 1px solid color-mix(in srgb, var(--theme-accent) 24%, rgba(255,255,255,0.12));
   border-radius: 12px;
   padding: 4px 4px 4px 6px;
   transition: border-color 0.15s ease, background 0.15s ease;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
 }
 .composer:focus-within {
   border-color: color-mix(in srgb, var(--theme-accent) 45%, white 10%);
-  background: rgba(255,255,255,0.08);
-  box-shadow: 0 0 0 2px color-mix(in srgb, var(--theme-accent) 12%, transparent);
+  background:
+    linear-gradient(
+      180deg,
+      color-mix(in srgb, var(--theme-accent) 14%, rgba(255,255,255,0.065)),
+      color-mix(in srgb, var(--theme-base) 82%, rgba(255,255,255,0.045))
+    );
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--theme-accent) 26%, transparent);
 }
 .composer input {
   flex: 1 1 auto;
@@ -3443,7 +4031,7 @@ html, body, #root {
   font-size: 13px;
   font-weight: 500;
 }
-.composer input::placeholder { color: rgba(255,255,255,0.42); }
+.composer input::placeholder { color: color-mix(in srgb, var(--theme-accent) 22%, rgba(255,255,255,0.46)); }
 .composer,
 .screenshot-preview,
 .result,
@@ -3475,7 +4063,10 @@ input {
   flex: 0 0 28px;
   transition: background 0.12s ease, color 0.12s ease;
 }
-.icon-btn:hover { background: rgba(255,255,255,0.08); color: rgba(255,255,255,0.95); }
+.icon-btn:hover {
+  background: color-mix(in srgb, var(--theme-accent) 12%, rgba(255,255,255,0.06));
+  color: color-mix(in srgb, var(--theme-accent) 58%, white 42%);
+}
 .icon-btn svg { width: 14px; height: 14px; stroke-width: 2; }
 .icon-btn:disabled { opacity: 0.45; cursor: not-allowed; }
 .send-btn {
@@ -4452,7 +5043,8 @@ function ensureScreenAnalysisWindow() {
       devTools: enableDevTools,
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: false
+      sandbox: false,
+      backgroundThrottling: true
     }
   });
   window.setAlwaysOnTop(true, "status");
@@ -4463,7 +5055,14 @@ function ensureScreenAnalysisWindow() {
     if (screenAnalysisWindow === window) screenAnalysisWindow = null;
     screenAnalysisWindowReady = false;
     stopAssistantVoiceOutputForSessionEnd("screen analysis HUD closed");
-    restoreMainWindowAfterScreenAnalysis("screen analysis HUD closed");
+    if (screenAnalysisStatus === "result") {
+      screenAnalysisStatus = "idle";
+      discardScreenAnalysisMainWindowRestore("screen analysis result HUD closed");
+    } else {
+      screenAnalysisStatus = "idle";
+      restoreMainWindowAfterScreenAnalysis("screen analysis HUD closed");
+    }
+    scheduleScreenAnalysisBufferEviction();
   });
   window.webContents.once("did-finish-load", () => {
     screenAnalysisWindowReady = true;
@@ -4495,7 +5094,8 @@ function ensureScreenAnalysisFrameWindow() {
       devTools: enableDevTools,
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: false
+      sandbox: false,
+      backgroundThrottling: true
     }
   });
   window.setIgnoreMouseEvents(true, { forward: true });
@@ -4539,10 +5139,14 @@ async function updateScreenAnalysisOverlay(payload: {
   images?: ScreenAnalysisGeneratedImage[];
   tone?: "error" | "success";
 }) {
+  screenAnalysisStatus = payload.status;
+  // Any non-idle status means we still want the captured buffers around.
+  // (payload.status is typed as "prompt"|"analyzing"|"result", never "idle".)
+  cancelScreenAnalysisBufferEviction();
   const window = ensureScreenAnalysisWindow();
   const frameWindow = ensureScreenAnalysisFrameWindow();
   const colors = screenAnalysisPalette(lastVoiceHUDAppearance.theme);
-  const themeColors = screenAnalysisAppThemePalette(lastVoiceHUDAppearance.colorTheme);
+  const themeColors = screenAnalysisCurrentThemeColors();
   if (payload.status !== "result") {
     screenAnalysisFrameVisible = true;
   }
@@ -4633,7 +5237,8 @@ function selectScreenRect(): Promise<ScreenRect> {
         devTools: enableDevTools,
         contextIsolation: true,
         nodeIntegration: false,
-        sandbox: false
+        sandbox: false,
+        backgroundThrottling: true
       }
     });
     window.setAlwaysOnTop(true, "screen-saver");
@@ -4883,6 +5488,114 @@ async function openLocalPath(filePath: string) {
   return openError ? { ok: false, error: openError, path: targetPath } : { ok: true, path: targetPath };
 }
 
+type LocalFilePreviewKind =
+  | "image"
+  | "pdf"
+  | "markdown"
+  | "html"
+  | "json"
+  | "csv"
+  | "code"
+  | "text"
+  | "unsupported";
+
+const LOCAL_FILE_TEXT_PREVIEW_LIMIT = 900 * 1024;
+const LOCAL_FILE_BINARY_PREVIEW_LIMIT = 28 * 1024 * 1024;
+
+const markdownPreviewExtensions = new Set([".md", ".markdown", ".mdown", ".mkd"]);
+const htmlPreviewExtensions = new Set([".html", ".htm"]);
+const csvPreviewExtensions = new Set([".csv", ".tsv"]);
+const textPreviewExtensions = new Set([
+  ".txt", ".log", ".env", ".gitignore", ".npmrc", ".yml", ".yaml", ".toml", ".ini", ".xml",
+  ".svg", ".jsonl", ".ndjson"
+]);
+const codePreviewExtensions = new Set([
+  ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".css", ".scss", ".less", ".sh", ".bash", ".zsh",
+  ".py", ".rb", ".go", ".rs", ".java", ".kt", ".swift", ".c", ".cc", ".cpp", ".h", ".hpp", ".cs",
+  ".php", ".sql", ".graphql", ".gql", ".feature", ".dockerfile", ".rs", ".lua", ".r", ".pl"
+]);
+
+function previewMimeTypeForPath(filePath: string) {
+  const ext = path.extname(filePath).toLowerCase();
+  if (ext === ".png") return "image/png";
+  if (ext === ".jpg" || ext === ".jpeg") return "image/jpeg";
+  if (ext === ".webp") return "image/webp";
+  if (ext === ".gif") return "image/gif";
+  if (ext === ".svg") return "image/svg+xml";
+  if (ext === ".pdf") return "application/pdf";
+  if (ext === ".html" || ext === ".htm") return "text/html";
+  if (ext === ".md" || ext === ".markdown" || ext === ".mdown" || ext === ".mkd") return "text/markdown";
+  if (ext === ".json") return "application/json";
+  if (ext === ".csv") return "text/csv";
+  if (ext === ".tsv") return "text/tab-separated-values";
+  if (textPreviewExtensions.has(ext) || codePreviewExtensions.has(ext)) return "text/plain";
+  return "application/octet-stream";
+}
+
+function previewKindForPath(filePath: string): LocalFilePreviewKind {
+  const ext = path.extname(filePath).toLowerCase();
+  const name = path.basename(filePath).toLowerCase();
+  if ([".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg"].includes(ext)) return "image";
+  if (ext === ".pdf") return "pdf";
+  if (markdownPreviewExtensions.has(ext)) return "markdown";
+  if (htmlPreviewExtensions.has(ext)) return "html";
+  if (ext === ".json" || ext === ".jsonc") return "json";
+  if (csvPreviewExtensions.has(ext)) return "csv";
+  if (codePreviewExtensions.has(ext) || name === "dockerfile" || name === "makefile") return "code";
+  if (textPreviewExtensions.has(ext)) return "text";
+  return "unsupported";
+}
+
+async function readTextPreview(filePath: string, size: number) {
+  const byteCount = Math.min(size, LOCAL_FILE_TEXT_PREVIEW_LIMIT + 1);
+  const handle = await fs.promises.open(filePath, "r");
+  try {
+    const buffer = Buffer.alloc(byteCount);
+    const { bytesRead } = await handle.read(buffer, 0, byteCount, 0);
+    const clipped = buffer.subarray(0, Math.min(bytesRead, LOCAL_FILE_TEXT_PREVIEW_LIMIT));
+    return {
+      text: clipped.toString("utf8"),
+      truncated: bytesRead > LOCAL_FILE_TEXT_PREVIEW_LIMIT || size > LOCAL_FILE_TEXT_PREVIEW_LIMIT
+    };
+  } finally {
+    await handle.close();
+  }
+}
+
+async function getLocalFilePreview(filePath: string) {
+  const targetPath = String(filePath ?? "").trim();
+  if (!targetPath || !fs.existsSync(targetPath)) return { ok: false, error: "File was not found.", path: targetPath };
+  const stat = await fs.promises.stat(targetPath);
+  if (!stat.isFile()) return { ok: false, error: "Only files can be previewed.", path: targetPath, name: path.basename(targetPath) };
+  const kind = previewKindForPath(targetPath);
+  const mimeType = previewMimeTypeForPath(targetPath);
+  const base = {
+    ok: true as const,
+    path: targetPath,
+    name: path.basename(targetPath),
+    extension: path.extname(targetPath).toLowerCase(),
+    mimeType,
+    size: stat.size,
+    kind,
+    fileURL: pathToFileURL(targetPath).toString()
+  };
+
+  if (kind === "image" || kind === "pdf") {
+    if (stat.size > LOCAL_FILE_BINARY_PREVIEW_LIMIT) {
+      return { ...base, kind: "unsupported" as const, tooLarge: true };
+    }
+    const data = await fs.promises.readFile(targetPath);
+    return { ...base, dataURL: `data:${mimeType};base64,${data.toString("base64")}` };
+  }
+
+  if (kind !== "unsupported") {
+    const { text, truncated } = await readTextPreview(targetPath, stat.size);
+    return { ...base, text, truncated };
+  }
+
+  return base;
+}
+
 function revealLocalPath(filePath: string) {
   const targetPath = String(filePath ?? "").trim();
   if (!targetPath || !fs.existsSync(targetPath)) return { ok: false, error: "File was not found." };
@@ -4932,6 +5645,7 @@ async function restartScreenAnalysisAtSamePlace() {
   }
   screenAnalysisRunID += 1;
   screenAnalysisFrameVisible = true;
+  cancelScreenAnalysisBufferEviction();
   const imageBuffer = await captureScreenRect(rect);
   lastCapturedImageBuffer = imageBuffer;
   lastCapturedPreviewDataURL = `data:image/png;base64,${imageBuffer.toString("base64")}`;
@@ -4956,7 +5670,8 @@ async function submitScreenAnalysisPrompt(instruction: string, options: { readba
 }
 
 async function cancelScreenAnalysisPrompt() {
-  debugLog("screen analysis prompt cancelled");
+  const shouldRestoreMainWindow = screenAnalysisStatus !== "result";
+  debugLog(`screen analysis prompt cancelled status=${screenAnalysisStatus}`);
   screenAnalysisRunID += 1;
   try {
     (await openAssistBridge()).stopAssistantVoiceOutput();
@@ -4972,7 +5687,13 @@ async function cancelScreenAnalysisPrompt() {
   screenSelectionWindow = null;
   screenAnalysisFrameWindow?.hide();
   screenAnalysisWindow?.hide();
-  restoreMainWindowAfterScreenAnalysis("screen analysis cancelled");
+  screenAnalysisStatus = "idle";
+  scheduleScreenAnalysisBufferEviction();
+  if (shouldRestoreMainWindow) {
+    restoreMainWindowAfterScreenAnalysis("screen analysis cancelled");
+  } else {
+    discardScreenAnalysisMainWindowRestore("screen analysis result closed");
+  }
   return { ok: true };
 }
 
@@ -5069,9 +5790,11 @@ function createMainWindow(options: { initiallyHidden?: boolean } = {}) {
       devTools: enableDevTools,
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: false
+      sandbox: false,
+      spellcheck: true
     }
   });
+  attachSpellcheckContext(window);
   window.accessibleTitle = "Open Assist";
   if (!isAccessibilityTestMode && process.platform === "darwin") {
     window.setBackgroundColor("#00000000");
@@ -5119,16 +5842,28 @@ function createMainWindow(options: { initiallyHidden?: boolean } = {}) {
   });
   window.on("blur", () => {
     collapseUnpinnedSidebar("main window blur");
+    syncFrontmostApplicationTracker();
+  });
+  // Keep the frontmost-app poller in step with mainWindow visibility.
+  // (No-op when not on darwin.)
+  window.on("focus", () => syncFrontmostApplicationTracker());
+  window.on("show", () => syncFrontmostApplicationTracker());
+  window.on("hide", () => syncFrontmostApplicationTracker());
+  window.on("minimize", () => syncFrontmostApplicationTracker());
+  window.on("restore", () => syncFrontmostApplicationTracker());
+  window.on("app-command", (event, command) => {
+    const normalizedCommand = String(command || "").toLowerCase();
+    const direction = normalizedCommand === "browser-backward"
+      ? "back"
+      : normalizedCommand === "browser-forward"
+        ? "forward"
+        : null;
+    if (!direction) return;
+    event.preventDefault();
+    safeSendWindow(window, "openassist:navigation-command", direction);
   });
 
-  if (isDev && process.env.VITE_DEV_SERVER_URL) {
-    debugLog(`loadURL ${process.env.VITE_DEV_SERVER_URL}`);
-    window.loadURL(process.env.VITE_DEV_SERVER_URL);
-  } else {
-    const indexPath = path.join(__dirname, "../dist-renderer/index.html");
-    debugLog(`loadFile ${indexPath} exists=${fs.existsSync(indexPath)}`);
-    window.loadFile(indexPath);
-  }
+  loadRendererWindow(window);
   maybeOpenDevTools(window, "main");
 
   mainWindow = window;
@@ -5137,16 +5872,17 @@ function createMainWindow(options: { initiallyHidden?: boolean } = {}) {
 }
 
 function loadRendererWindow(window: BrowserWindow, query?: Record<string, string>) {
+  const fullQuery = { ...initialAppearanceQuery(), ...(query ?? {}) };
   if (isDev && process.env.VITE_DEV_SERVER_URL) {
     const url = new URL(process.env.VITE_DEV_SERVER_URL);
-    for (const [key, value] of Object.entries(query ?? {})) url.searchParams.set(key, value);
+    for (const [key, value] of Object.entries(fullQuery)) url.searchParams.set(key, value);
     debugLog(`loadURL ${url.toString()}`);
     window.loadURL(url.toString());
     return;
   }
   const indexPath = path.join(__dirname, "../dist-renderer/index.html");
   debugLog(`loadFile ${indexPath} exists=${fs.existsSync(indexPath)} query=${JSON.stringify(query ?? {})}`);
-  window.loadFile(indexPath, query ? { query } : undefined);
+  window.loadFile(indexPath, { query: fullQuery });
 }
 
 function createTranscriptHistoryWindow() {
@@ -5172,7 +5908,8 @@ function createTranscriptHistoryWindow() {
       devTools: enableDevTools,
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: false
+      sandbox: false,
+      backgroundThrottling: true
     }
   });
   window.accessibleTitle = "Transcript History";
@@ -5216,7 +5953,8 @@ function createSettingsWindow(section = "assistant") {
       devTools: enableDevTools,
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: false
+      sandbox: false,
+      backgroundThrottling: true
     }
   });
   window.accessibleTitle = "Open Assist Settings";
@@ -5224,6 +5962,11 @@ function createSettingsWindow(section = "assistant") {
     window.setBackgroundColor("#00000000");
     window.setVibrancy("menu");
   }
+  window.on("close", (event) => {
+    if (isQuitting) return;
+    event.preventDefault();
+    window.hide();
+  });
   window.on("closed", () => {
     if (settingsWindow === window) settingsWindow = null;
   });
@@ -5231,6 +5974,15 @@ function createSettingsWindow(section = "assistant") {
   maybeOpenDevTools(window, "settings");
   settingsWindow = window;
   return window;
+}
+
+function prewarmSettingsWindow() {
+  if (isQuitting) return;
+  try {
+    createSettingsWindow("assistant");
+  } catch (error) {
+    debugLog(`settings window prewarm failed: ${error instanceof Error ? error.stack ?? error.message : String(error)}`);
+  }
 }
 
 async function showTranscriptHistoryWindow() {
@@ -5252,10 +6004,10 @@ async function showSettingsWindow(section = "assistant") {
   window.focus();
   if (window.webContents.isLoading()) {
     window.webContents.once("did-finish-load", () => {
-      window.webContents.send("openassist:settings-section", targetSection);
+      safeSendWindow(window, "openassist:settings-section", targetSection);
     });
   } else {
-    window.webContents.send("openassist:settings-section", targetSection);
+    safeSendWindow(window, "openassist:settings-section", targetSection);
   }
   return { ok: true };
 }
@@ -5379,11 +6131,35 @@ async function refreshFrontmostApplicationSnapshot() {
 }
 
 function startFrontmostApplicationTracker() {
-  if (process.platform !== "darwin" || frontmostTrackerTimer) return;
-  void refreshFrontmostApplicationSnapshot();
-  frontmostTrackerTimer = setInterval(() => {
+  if (process.platform !== "darwin") return;
+  // The tracker only does useful work when another app is in front, because
+  // refreshFrontmostApplicationSnapshot() filters out our own pid before
+  // updating lastExternalApplication. So we only run it while our window is
+  // visible and blurred. When our window is focused or hidden, the poll is
+  // a wasted osascript fork — at idle that was ~24 wakeups/s on the main
+  // process. See docs/perf-audit-idle.md (baseline).
+  syncFrontmostApplicationTracker();
+}
+
+function syncFrontmostApplicationTracker() {
+  if (process.platform !== "darwin") return;
+  const window = mainWindow;
+  const shouldPoll =
+    !!window &&
+    !window.isDestroyed() &&
+    window.isVisible() &&
+    !window.isMinimized() &&
+    !window.isFocused();
+  if (shouldPoll) {
+    if (frontmostTrackerTimer) return;
     void refreshFrontmostApplicationSnapshot();
-  }, 1200);
+    frontmostTrackerTimer = setInterval(() => {
+      void refreshFrontmostApplicationSnapshot();
+    }, 1200);
+  } else if (frontmostTrackerTimer) {
+    clearInterval(frontmostTrackerTimer);
+    frontmostTrackerTimer = null;
+  }
 }
 
 function stopFrontmostApplicationTracker() {
@@ -5866,29 +6642,44 @@ async function workspaceLaunchTargetSnapshots() {
   return snapshots;
 }
 
-function workspaceRootFromRequest(requestedPath?: unknown) {
+function workspacePathFromRequest(requestedPath?: unknown) {
   const rawPath = typeof requestedPath === "string" ? requestedPath.trim() : "";
-  if (!rawPath) return openAssistRepoRoot();
+  if (!rawPath) {
+    const fallbackPath = openAssistRepoRoot();
+    return { path: fallbackPath, directory: fallbackPath, isFile: false };
+  }
   const expandedPath = rawPath.startsWith("~")
     ? path.join(app.getPath("home"), rawPath.slice(1))
     : rawPath;
   const resolvedPath = path.resolve(expandedPath);
-  if (!fs.existsSync(resolvedPath)) return openAssistRepoRoot();
+  if (!fs.existsSync(resolvedPath)) {
+    const fallbackPath = openAssistRepoRoot();
+    return { path: fallbackPath, directory: fallbackPath, isFile: false };
+  }
   try {
     const stat = fs.statSync(resolvedPath);
-    return stat.isDirectory() ? resolvedPath : path.dirname(resolvedPath);
+    return {
+      path: resolvedPath,
+      directory: stat.isDirectory() ? resolvedPath : path.dirname(resolvedPath),
+      isFile: stat.isFile()
+    };
   } catch {
-    return openAssistRepoRoot();
+    const fallbackPath = openAssistRepoRoot();
+    return { path: fallbackPath, directory: fallbackPath, isFile: false };
   }
 }
 
 async function openWorkspaceLaunchTarget(targetID: string, workspaceRootPath?: unknown) {
   const target = workspaceLaunchTargets.find((item) => item.id === targetID);
   if (!target) return { ok: false, error: "Unknown workspace target." };
-  const workspaceRoot = workspaceRootFromRequest(workspaceRootPath);
+  const requested = workspacePathFromRequest(workspaceRootPath);
   if (target.launchStyle === "revealInFinder") {
-    const error = await shell.openPath(workspaceRoot);
-    return error ? { ok: false, error, path: workspaceRoot } : { ok: true, path: workspaceRoot };
+    if (requested.isFile) {
+      shell.showItemInFolder(requested.path);
+      return { ok: true, path: requested.path };
+    }
+    const error = await shell.openPath(requested.directory);
+    return error ? { ok: false, error, path: requested.directory } : { ok: true, path: requested.directory };
   }
 
   const applicationPath = applicationPathForTarget(target);
@@ -5897,11 +6688,60 @@ async function openWorkspaceLaunchTarget(targetID: string, workspaceRootPath?: u
   }
 
   const args = applicationPath
-    ? ["-a", target.appNames[0], workspaceRoot]
-    : ["-b", target.bundleIdentifiers[0], workspaceRoot];
+    ? ["-a", target.appNames[0], requested.path]
+    : ["-b", target.bundleIdentifiers[0], requested.path];
   const child = spawn("open", args, { detached: true, stdio: "ignore" });
   child.unref();
-  return { ok: true, path: workspaceRoot };
+  return { ok: true, path: requested.path };
+}
+
+function exactFilePathFromRequest(requestedPath?: unknown) {
+  const rawPath = typeof requestedPath === "string" ? requestedPath.trim() : "";
+  if (!rawPath) return null;
+  const expandedPath = rawPath.startsWith("~")
+    ? path.join(app.getPath("home"), rawPath.slice(1))
+    : rawPath;
+  const resolvedPath = path.resolve(expandedPath);
+  if (!fs.existsSync(resolvedPath)) return null;
+  try {
+    return fs.statSync(resolvedPath).isFile() ? resolvedPath : null;
+  } catch {
+    return null;
+  }
+}
+
+async function openFileLaunchTarget(targetID: string, requestedPath?: unknown) {
+  const target = workspaceLaunchTargets.find((item) => item.id === targetID);
+  if (!target) return { ok: false, error: "Unknown file target." };
+  const filePath = exactFilePathFromRequest(requestedPath);
+  if (!filePath) return { ok: false, error: "The selected note file was not found." };
+  if (target.launchStyle === "revealInFinder") {
+    shell.showItemInFolder(filePath);
+    return { ok: true, path: filePath };
+  }
+
+  const applicationPath = applicationPathForTarget(target);
+  if (!applicationPath && !target.bundleIdentifiers[0]) {
+    return { ok: false, error: `${target.title} is not installed on this Mac.` };
+  }
+
+  const args = applicationPath
+    ? ["-a", target.appNames[0], filePath]
+    : ["-b", target.bundleIdentifiers[0], filePath];
+  const child = spawn("open", args, { detached: true, stdio: "ignore" });
+  child.unref();
+  return { ok: true, path: filePath };
+}
+
+function titleForMarkdownImport(filePath: string, markdown: string) {
+  const headingMatch = String(markdown ?? "").match(/^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$/m);
+  const rawTitle = headingMatch?.[1] || path.basename(filePath, path.extname(filePath));
+  return rawTitle
+    .replace(/\[([^\]]*)\]\([^)]+\)/g, "$1")
+    .replace(/[*_`~>#]/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 120) || "Imported note";
 }
 
 function appleSpeechHelperSourcePath() {
@@ -5925,37 +6765,64 @@ async function ensureAppleSpeechHelper() {
   if (!sourcePath) throw new Error("Apple Speech helper source was not found.");
   const infoPlistPath = appleSpeechHelperInfoPlistPath();
   if (!infoPlistPath) throw new Error("Apple Speech helper Info.plist was not found.");
+  const helperBuildVersion = "2026-06-12-launchservices-target-26";
+  const helperBundleIdentifier = "com.developingadventures.OpenAssist.ElectronAppleSpeechHelper";
   const helperDirectory = path.join(app.getPath("userData"), "helpers");
   fs.mkdirSync(helperDirectory, { recursive: true });
   const helperAppPath = path.join(helperDirectory, "Open Assist Speech Helper.app");
   const contentsPath = path.join(helperAppPath, "Contents");
   const macOSPath = path.join(contentsPath, "MacOS");
   const infoPlistOutputPath = path.join(contentsPath, "Info.plist");
+  const legacyBuildMarkerPath = path.join(contentsPath, ".openassist-helper-build");
+  const buildMarkerPath = path.join(helperDirectory, ".openassist-apple-speech-helper-build");
   const helperPath = path.join(macOSPath, "apple-speech-helper");
   const sourceStat = fs.statSync(sourcePath);
   const plistStat = fs.statSync(infoPlistPath);
   const helperStat = fs.existsSync(helperPath) ? fs.statSync(helperPath) : null;
   const plistOutputStat = fs.existsSync(infoPlistOutputPath) ? fs.statSync(infoPlistOutputPath) : null;
-  if (!helperStat || !plistOutputStat || helperStat.mtimeMs < sourceStat.mtimeMs || plistOutputStat.mtimeMs < plistStat.mtimeMs) {
+  const buildMarker = fs.existsSync(buildMarkerPath) ? fs.readFileSync(buildMarkerPath, "utf8").trim() : "";
+  if (
+    !helperStat ||
+    !plistOutputStat ||
+    helperStat.mtimeMs < sourceStat.mtimeMs ||
+    plistOutputStat.mtimeMs < plistStat.mtimeMs ||
+    buildMarker !== helperBuildVersion ||
+    fs.existsSync(legacyBuildMarkerPath)
+  ) {
     fs.mkdirSync(macOSPath, { recursive: true });
     fs.copyFileSync(infoPlistPath, infoPlistOutputPath);
+    fs.rmSync(legacyBuildMarkerPath, { force: true });
     await runProcess("/usr/bin/swiftc", [
+      "-target",
+      "arm64-apple-macos26.0",
       "-framework",
       "AVFoundation",
       "-framework",
       "CoreAudio",
       "-framework",
       "Speech",
+      "-Xlinker",
+      "-sectcreate",
+      "-Xlinker",
+      "__TEXT",
+      "-Xlinker",
+      "__info_plist",
+      "-Xlinker",
+      infoPlistPath,
       sourcePath,
       "-o",
       helperPath
     ]);
     fs.chmodSync(helperPath, 0o755);
-    try {
-      await runProcess("/usr/bin/codesign", ["--force", "--sign", "-", helperAppPath]);
-    } catch {
-      // Ad-hoc signing is helpful for TCC, but the helper can still run unsigned in dev.
-    }
+    await runProcess("/usr/bin/codesign", [
+      "--force",
+      "--sign",
+      "-",
+      "--identifier",
+      helperBundleIdentifier,
+      helperAppPath
+    ]);
+    fs.writeFileSync(buildMarkerPath, helperBuildVersion, "utf8");
   }
   return helperAppPath;
 }
@@ -6117,6 +6984,7 @@ function stopVoiceLevelPolling() {
     clearInterval(voiceHUDLevelTimer);
     voiceHUDLevelTimer = null;
   }
+  stopVoiceCaptureHUDKeepAlive();
   voiceHUDLevelMtime = 0;
   smoothedVoiceLevel = 0;
 }
@@ -6124,6 +6992,12 @@ function stopVoiceLevelPolling() {
 function voiceStartupTimeoutMessage(sessionDirectory: string, fallback: string) {
   const status = readJsonFile<{ message?: string }>(path.join(sessionDirectory, "status.json"));
   const message = status?.message?.trim();
+  if (/Speech Recognition permission/i.test(message ?? "")) {
+    return "Apple Speech is waiting for macOS Speech Recognition permission. Open System Settings > Privacy & Security > Speech Recognition, allow Open Assist Speech Helper, then try again.";
+  }
+  if (/Microphone permission/i.test(message ?? "")) {
+    return "Apple Speech is waiting for macOS Microphone permission. Open System Settings > Privacy & Security > Microphone, allow Open Assist Speech Helper, then try again.";
+  }
   return message ? `${message} Allow it in the macOS prompt, then try again.` : fallback;
 }
 
@@ -6289,17 +7163,361 @@ function launchVoiceHelperApp(helperAppPath: string, sessionDirectory: string, m
   if (shouldPreferExternalMicrophone(options)) args.push("--prefer-external-microphone");
   const microphoneUID = selectedMicrophoneArgument(options);
   if (microphoneUID) args.push("--microphone-uid", microphoneUID);
-  const child = spawn(helperPath, args, { detached: true, stdio: "ignore" });
+  const child = mode === "speech"
+    ? spawn("/usr/bin/open", ["-n", helperAppPath, "--args", ...args], { detached: true, stdio: "ignore" })
+    : spawn(helperPath, args, { detached: true, stdio: "ignore" });
   child.on("error", (error) => {
     debugLog(`voice helper launch failed: ${error instanceof Error ? error.message : String(error)}`);
   });
   child.unref();
-  debugLog(`voice helper launched pid=${child.pid ?? "unknown"} mode=${mode} session=${sessionDirectory}`);
+  debugLog(`voice helper launched pid=${child.pid ?? "unknown"} mode=${mode} via=${mode === "speech" ? "launchservices" : "direct"} session=${sessionDirectory}`);
   return child;
+}
+
+function sanitizeWakePhrase(value?: unknown) {
+  const phrase = String(value ?? "Hey Open Assist").replace(/\s+/g, " ").trim();
+  return phrase ? phrase.slice(0, 80) : "Hey Open Assist";
+}
+
+function wakeWordCaptureRootDirectory() {
+  return path.join(app.getPath("userData"), "wake-word-captures");
+}
+
+function broadcastWakeWordStatus(patch: Partial<WakeWordStatusPayload>) {
+  wakeWordStatus = {
+    ...wakeWordStatus,
+    ...patch,
+    source: "today",
+    engine: patch.engine ?? wakeWordStatus.engine ?? "appleSpeechPhrase",
+    phrase: sanitizeWakePhrase(patch.phrase ?? wakeWordStatus.phrase),
+    message: patch.message ?? (patch.state === "error" ? undefined : wakeWordStatus.message),
+    error: patch.state === "error" ? patch.error ?? wakeWordStatus.error : undefined
+  };
+  debugLog(`wake-word status=${wakeWordStatus.state} enabled=${wakeWordStatus.enabled === true} phrase="${wakeWordStatus.phrase}" message="${wakeWordStatus.message ?? wakeWordStatus.error ?? ""}"`);
+  BrowserWindow.getAllWindows().forEach((window) => {
+    if (!window.isDestroyed() && !window.webContents.isDestroyed()) {
+      safeSendWebContents(window.webContents, "openassist:wake-word-status", wakeWordStatus);
+    }
+  });
+}
+
+function cleanupOldWakeWordCaptureDirectories() {
+  const root = wakeWordCaptureRootDirectory();
+  try {
+    if (!fs.existsSync(root)) return;
+    const activeDirectory = wakeWordCapture?.sessionDirectory;
+    const entries = fs.readdirSync(root, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => {
+        const fullPath = path.join(root, entry.name);
+        try {
+          return { path: fullPath, mtimeMs: fs.statSync(fullPath).mtimeMs };
+        } catch {
+          return null;
+        }
+      })
+      .filter((entry): entry is { path: string; mtimeMs: number } => Boolean(entry))
+      .sort((lhs, rhs) => rhs.mtimeMs - lhs.mtimeMs);
+    let removed = 0;
+    entries.forEach((entry, index) => {
+      if (activeDirectory && entry.path === activeDirectory) return;
+      const isOld = Date.now() - entry.mtimeMs > 24 * 60 * 60 * 1000;
+      const isPastLimit = index >= 40;
+      if (!isOld && !isPastLimit) return;
+      fs.rmSync(entry.path, { recursive: true, force: true });
+      removed += 1;
+    });
+    if (removed > 0) debugLog(`wake-word capture directory cleanup removed=${removed}`);
+  } catch (error) {
+    debugLog(`wake-word capture directory cleanup failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+function clearWakeWordRestartTimer() {
+  if (!wakeWordRestartTimer) return;
+  clearTimeout(wakeWordRestartTimer);
+  wakeWordRestartTimer = null;
+}
+
+function requestWakeWordHelperStop(captureState: WakeWordCaptureState) {
+  try {
+    fs.writeFileSync(path.join(captureState.sessionDirectory, "stop"), "1", "utf8");
+  } catch {
+    // Best effort. The helper may already be closed.
+  }
+}
+
+function clearWakeWordFilePolling(captureState: WakeWordCaptureState) {
+  if (!captureState.pollTimer) return;
+  clearInterval(captureState.pollTimer);
+  captureState.pollTimer = undefined;
+}
+
+function terminateWakeWordCapture(captureState: WakeWordCaptureState, reason: string) {
+  debugLog(`wake-word helper stop requested pid=${captureState.helperPid ?? "unknown"} reason="${reason}"`);
+  captureState.stopping = true;
+  clearWakeWordFilePolling(captureState);
+  requestWakeWordHelperStop(captureState);
+  captureState.helperProcess?.kill("SIGTERM");
+  terminateVoiceHelperPid(captureState.helperPid, reason);
+}
+
+async function stopWakeWordForToday(reason = "manual") {
+  clearWakeWordRestartTimer();
+  const captureState = wakeWordCapture;
+  if (captureState) {
+    terminateWakeWordCapture(captureState, reason);
+    wakeWordCapture = null;
+  }
+  if (!voiceCapture) {
+    setTimeout(() => {
+      void cleanupStaleVoiceHelpers(`after wake word stop: ${reason}`)
+        .catch((error) => {
+          debugLog(`wake-word helper cleanup failed: ${error instanceof Error ? error.message : String(error)}`);
+        });
+    }, 350).unref?.();
+  }
+  broadcastWakeWordStatus({
+    state: "stopped",
+    enabled: false,
+    message: reason === "paused"
+      ? "Wake word is paused so the microphone stays off."
+      : reason === "manual"
+        ? "Wake word stopped."
+        : `Wake word stopped: ${reason}.`
+  });
+  return { ok: true, status: wakeWordStatus };
+}
+
+function scheduleWakeWordRestart(options: WakeWordStartOptions, delayMs = 900) {
+  if (isQuitting || wakeWordStatus.enabled !== true) return;
+  clearWakeWordRestartTimer();
+  wakeWordRestartTimer = setTimeout(() => {
+    wakeWordRestartTimer = null;
+    void startWakeWordForToday(options).catch((error) => {
+      broadcastWakeWordStatus({
+        state: "error",
+        enabled: true,
+        error: error instanceof Error ? error.message : "Could not restart wake word."
+      });
+    });
+  }, delayMs);
+  wakeWordRestartTimer.unref?.();
+}
+
+function handleWakeWordHelperEvent(captureState: WakeWordCaptureState, payload: Record<string, unknown>, options: WakeWordStartOptions) {
+  const type = String(payload.type ?? "");
+  if (type === "status") {
+    const message = String(payload.message ?? "Wake word is starting.");
+    broadcastWakeWordStatus({
+      state: "starting",
+      enabled: true,
+      phrase: captureState.phrase,
+      startedAt: captureState.startedAt,
+      message
+    });
+    return;
+  }
+  if (type === "ready") {
+    captureState.ready = true;
+    wakeWordCrashCount = 0;
+    wakeWordLastCrashAt = 0;
+    broadcastWakeWordStatus({
+      state: "listening",
+      enabled: true,
+      phrase: captureState.phrase,
+      startedAt: captureState.startedAt,
+      message: "Wake word is listening for Today."
+    });
+    return;
+  }
+  if (type === "detected") {
+    captureState.detected = true;
+    wakeWordCrashCount = 0;
+    wakeWordLastCrashAt = 0;
+    clearWakeWordFilePolling(captureState);
+    if (wakeWordCapture === captureState) wakeWordCapture = null;
+    broadcastWakeWordStatus({
+      state: "detected",
+      enabled: true,
+      phrase: captureState.phrase,
+      detectedAt: Date.now(),
+      message: "Wake word heard. Starting Today Live Voice."
+    });
+    return;
+  }
+  if (type === "error") {
+    const message = String(payload.message ?? "Wake word helper failed.");
+    clearWakeWordFilePolling(captureState);
+    if (wakeWordCapture === captureState) wakeWordCapture = null;
+    broadcastWakeWordStatus({ state: "error", enabled: true, phrase: captureState.phrase, error: message });
+    const canRetry = !/(permission|requires on-device|not available for this language|macos 10\.15)/i.test(message);
+    if (canRetry) scheduleWakeWordRestart(options, 1800);
+  }
+}
+
+function startWakeWordFilePolling(captureState: WakeWordCaptureState, options: WakeWordStartOptions) {
+  captureState.fileEventMtimes = {};
+  const eventFiles = ["status.json", "ready.json", "detected.json", "error.json"];
+  const poll = () => {
+    if (wakeWordCapture !== captureState) {
+      clearWakeWordFilePolling(captureState);
+      return;
+    }
+    for (const fileName of eventFiles) {
+      const filePath = path.join(captureState.sessionDirectory, fileName);
+      try {
+        const stat = fs.statSync(filePath);
+        if (captureState.fileEventMtimes?.[fileName] === stat.mtimeMs) continue;
+        captureState.fileEventMtimes = {
+          ...(captureState.fileEventMtimes ?? {}),
+          [fileName]: stat.mtimeMs
+        };
+        const payload = readJsonFile<Record<string, unknown>>(filePath);
+        if (payload) handleWakeWordHelperEvent(captureState, payload, options);
+      } catch {
+        // The helper writes each event file only when that event happens.
+      }
+    }
+  };
+  poll();
+  captureState.pollTimer = setInterval(poll, 160);
+  captureState.pollTimer.unref?.();
+}
+
+type WakeWordStartOptions = Pick<VoiceStartOptions, "autoDetectMicrophone" | "selectedMicrophoneUID"> & {
+  phrase?: string;
+};
+
+async function startWakeWordForToday(options: WakeWordStartOptions = {}) {
+  if (process.platform !== "darwin") {
+    const status = {
+      ...wakeWordStatus,
+      state: "error" as const,
+      enabled: false,
+      error: "Wake word is only available on macOS in this build."
+    };
+    broadcastWakeWordStatus(status);
+    return { ok: false, status, error: status.error };
+  }
+  clearWakeWordRestartTimer();
+  const phrase = sanitizeWakePhrase(options.phrase);
+  if (wakeWordCapture && !wakeWordCapture.stopping) {
+    broadcastWakeWordStatus({
+      state: wakeWordStatus.state === "listening" ? "listening" : "starting",
+      enabled: true,
+      phrase,
+      message: "Wake word is already running."
+    });
+    return { ok: true, status: wakeWordStatus };
+  }
+  await cleanupStaleVoiceHelpers("before wake word start", voiceCapture?.helperPid);
+  cleanupOldWakeWordCaptureDirectories();
+  const helperAppPath = await ensureAppleSpeechHelper();
+  const sessionDirectory = path.join(wakeWordCaptureRootDirectory(), `${Date.now()}-${Math.random().toString(16).slice(2)}`);
+  fs.mkdirSync(sessionDirectory, { recursive: true });
+  const args = [sessionDirectory, "--wake-word", phrase];
+  if (shouldPreferExternalMicrophone(options)) args.push("--prefer-external-microphone");
+  const microphoneUID = selectedMicrophoneArgument(options);
+  if (microphoneUID) args.push("--microphone-uid", microphoneUID);
+  const helperProcess = spawn("/usr/bin/open", ["-n", helperAppPath, "--args", ...args], { stdio: "ignore" });
+  const captureState: WakeWordCaptureState = {
+    sessionDirectory,
+    helperProcess,
+    helperPid: helperProcess.pid,
+    launchedViaLaunchServices: true,
+    phrase,
+    startedAt: Date.now(),
+    detected: false,
+    ready: false,
+    stopping: false,
+    stdoutBuffer: ""
+  };
+  wakeWordCapture = captureState;
+  broadcastWakeWordStatus({
+    state: "starting",
+    enabled: true,
+    phrase,
+    startedAt: captureState.startedAt,
+    message: "Starting wake word for Today."
+  });
+  helperProcess.stdout?.setEncoding("utf8");
+  helperProcess.stdout?.on("data", (chunk) => {
+    captureState.stdoutBuffer += String(chunk);
+    const lines = captureState.stdoutBuffer.split(/\r?\n/);
+    captureState.stdoutBuffer = lines.pop() ?? "";
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      try {
+        const payload = JSON.parse(trimmed) as Record<string, unknown>;
+        handleWakeWordHelperEvent(captureState, payload, options);
+      } catch {
+        debugLog(`wake-word helper stdout=${trimmed.slice(0, 300)}`);
+      }
+    }
+  });
+  helperProcess.stderr?.setEncoding("utf8");
+  helperProcess.stderr?.on("data", (chunk) => {
+    const text = String(chunk).trim();
+    if (text) debugLog(`wake-word helper stderr=${text.slice(0, 500)}`);
+  });
+  helperProcess.on("error", (error) => {
+    if (wakeWordCapture === captureState) wakeWordCapture = null;
+    broadcastWakeWordStatus({
+      state: "error",
+      enabled: true,
+      phrase,
+      error: error instanceof Error ? error.message : "Could not start wake word helper."
+    });
+  });
+  helperProcess.on("close", (code, signal) => {
+    if (captureState.launchedViaLaunchServices) return;
+    debugLog(`wake-word helper closed pid=${captureState.helperPid ?? "unknown"} code=${code ?? "null"} signal=${signal ?? "null"} detected=${captureState.detected} stopping=${captureState.stopping}`);
+    if (wakeWordCapture === captureState) wakeWordCapture = null;
+    if (isQuitting) return;
+    if (captureState.detected) return;
+    if (captureState.stopping || wakeWordStatus.enabled !== true) {
+      broadcastWakeWordStatus({ state: "stopped", enabled: false, phrase, message: "Wake word stopped." });
+      return;
+    }
+    if (!captureState.ready) {
+      const now = Date.now();
+      wakeWordCrashCount = now - wakeWordLastCrashAt > 60_000 ? 1 : wakeWordCrashCount + 1;
+      wakeWordLastCrashAt = now;
+      if (wakeWordCrashCount >= 3) {
+        broadcastWakeWordStatus({
+          state: "error",
+          enabled: true,
+          phrase,
+          error: "Wake word helper crashed before it could start. Open macOS Settings > Privacy & Security and allow Microphone and Speech Recognition for Open Assist, then restart Open Assist."
+        });
+        return;
+      }
+      broadcastWakeWordStatus({
+        state: "starting",
+        enabled: true,
+        phrase,
+        message: `Wake word helper stopped while starting. Retrying ${wakeWordCrashCount}/3...`
+      });
+      scheduleWakeWordRestart(options, wakeWordCrashCount === 1 ? 1800 : 4200);
+      return;
+    }
+    broadcastWakeWordStatus({
+      state: "starting",
+      enabled: true,
+      phrase,
+      message: "Wake word helper restarted after it stopped."
+    });
+    scheduleWakeWordRestart(options);
+  });
+  startWakeWordFilePolling(captureState, options);
+  return { ok: true, status: wakeWordStatus };
 }
 
 function startVoiceLevelPolling(sessionDirectory: string) {
   stopVoiceLevelPolling();
+  ensureVoiceCaptureHUDKeepAlive();
   updateMenuBarVoiceStatus({ visible: true, status: "listening", level: menuBarVoiceLevel });
   const levelPath = path.join(sessionDirectory, "level.json");
   voiceHUDLevelTimer = setInterval(() => {
@@ -6355,7 +7573,9 @@ async function startAppleVoiceInput(options?: VoiceStartOptions) {
     startedAt: Date.now(),
     voiceOptions: options
   };
-  const ready = await waitForVoiceFile(sessionDirectory, ["ready.json", "error.json"], 12000);
+  ensureVoiceCaptureHUDKeepAlive();
+  showActiveVoiceCaptureHUD();
+  const ready = await waitForVoiceFile(sessionDirectory, ["ready.json", "error.json"], 90_000);
   if (!ready) {
     requestVoiceHelperStop(sessionDirectory);
     terminateVoiceHelperCapture(voiceCapture, "Apple Speech startup timeout");
@@ -6367,6 +7587,7 @@ async function startAppleVoiceInput(options?: VoiceStartOptions) {
     return { ok: false, error: ready.payload.message ?? "Voice input failed." };
   }
   startVoiceLevelPolling(sessionDirectory);
+  showActiveVoiceCaptureHUD();
   playDictationFeedbackSound("startListening", options);
   return { ok: true };
 }
@@ -6399,6 +7620,13 @@ async function stopAppleVoiceInput() {
     if (voiceCapture === captureState) voiceCapture = null;
     stopVoiceLevelPolling();
     updateMenuBarVoiceStatus({ visible: false, status: "idle" });
+    setTimeout(() => {
+      if (voiceCapture) return;
+      void cleanupStaleVoiceHelpers("after Apple Speech stop")
+        .catch((error) => {
+          debugLog(`post Apple Speech cleanup failed: ${error instanceof Error ? error.message : String(error)}`);
+        });
+    }, 500).unref?.();
   }
 }
 
@@ -6446,6 +7674,8 @@ async function startCloudVoiceInput(configuration?: VoiceStartOptions) {
     startedAt: Date.now(),
     voiceOptions: configuration
   };
+  ensureVoiceCaptureHUDKeepAlive();
+  showActiveVoiceCaptureHUD();
   const ready = await waitForVoiceFile(sessionDirectory, ["ready.json", "error.json"], 12000);
   if (!ready) {
     requestVoiceHelperStop(sessionDirectory);
@@ -6458,6 +7688,7 @@ async function startCloudVoiceInput(configuration?: VoiceStartOptions) {
     return { ok: false, error: ready.payload.message ?? "Voice recording failed." };
   }
   startVoiceLevelPolling(sessionDirectory);
+  showActiveVoiceCaptureHUD();
   playDictationFeedbackSound("startListening", configuration);
   return { ok: true };
 }
@@ -6541,6 +7772,93 @@ async function transcribeWithLocalWhisper(audioPath: string, modelPath: string, 
   }
 }
 
+function localVoiceCaptureDirectory() {
+  return path.join(app.getPath("userData"), "local-voice-agent");
+}
+
+function audioBufferFromBase64(rawValue: string) {
+  const trimmed = rawValue.trim();
+  const base64 = trimmed.includes(",") ? trimmed.slice(trimmed.indexOf(",") + 1) : trimmed;
+  return Buffer.from(base64, "base64");
+}
+
+function writeLocalVoiceAudioFile(request?: LocalVoiceTranscriptionRequest) {
+  const buffer = audioBufferFromBase64(request?.audioBase64 ?? "");
+  if (!buffer.length) throw new Error("Local Voice Agent did not capture audio.");
+  const directory = localVoiceCaptureDirectory();
+  fs.mkdirSync(directory, { recursive: true });
+  const requestedName = request?.fileName?.trim() || "local-voice.wav";
+  const extension = path.extname(requestedName).replace(/[^a-zA-Z0-9.]/g, "") || ".wav";
+  const audioPath = path.join(directory, `utterance-${Date.now()}-${Math.random().toString(16).slice(2)}${extension}`);
+  fs.writeFileSync(audioPath, buffer);
+  return {
+    audioPath,
+    fileName: requestedName,
+    mimeType: request?.mimeType || "audio/wav",
+    byteLength: buffer.length
+  };
+}
+
+async function transcribeLocalVoiceAudio(request?: LocalVoiceTranscriptionRequest) {
+  const engine = request?.transcriptionEngine || "whisper.cpp";
+  let audioPath = "";
+  const startedAt = Date.now();
+  try {
+    const written = writeLocalVoiceAudioFile(request);
+    audioPath = written.audioPath;
+    debugLog(
+      `local voice stt started engine=${engine} provider=${request?.cloudTranscriptionProvider || ""} bytes=${written.byteLength}`
+    );
+    if (engine === "Cloud Providers") {
+      const provider = request?.cloudTranscriptionProvider || "OpenAI";
+      if (provider !== "ChatGPT / Codex Session" && request?.cloudTranscriptionAPIKeyConfigured === false) {
+        return { ok: false, text: "", error: `${provider} transcription needs an API key in Settings > Voice & Dictation.` };
+      }
+      const text = await (await openAssistBridge()).transcribeAudioFile({
+        filePath: written.audioPath,
+        fileName: written.fileName,
+        mimeType: written.mimeType
+      });
+      debugLog(`local voice stt completed engine=${engine} provider=${provider} chars=${text.trim().length} elapsedMs=${Date.now() - startedAt}`);
+      return { ok: true, text: text.trim(), engine };
+    }
+    if (engine !== "whisper.cpp") {
+      return {
+        ok: false,
+        text: "",
+        error: "Local Voice Agent needs whisper.cpp or Cloud Providers. Apple Speech is only for normal dictation."
+      };
+    }
+    const resolvedModel = resolveInstalledWhisperModel(request?.whisperModel || "base.en");
+    if (!resolvedModel) {
+      return {
+        ok: false,
+        text: "",
+        error: "whisper.cpp model is not installed. Open Settings > Voice & Dictation and install a Whisper model first."
+      };
+    }
+    const modelID = resolvedModel.modelID;
+    const shouldForceCPUForStability = modelID.startsWith("small") || modelID.startsWith("medium");
+    const useCoreML = Boolean(request?.whisperUseCoreML)
+      && fs.existsSync(whisperCoreMLDirectoryPath(modelID))
+      && !shouldForceCPUForStability;
+    const text = await transcribeWithLocalWhisper(written.audioPath, resolvedModel.modelPath, useCoreML);
+    debugLog(`local voice stt completed engine=${engine} model=${modelID} coreML=${String(useCoreML)} chars=${text.trim().length} elapsedMs=${Date.now() - startedAt}`);
+    return { ok: true, text: text.trim(), engine, modelID, useCoreML };
+  } catch (error) {
+    debugLog(`local voice stt failed engine=${engine} elapsedMs=${Date.now() - startedAt}: ${error instanceof Error ? error.message : String(error)}`);
+    return {
+      ok: false,
+      text: "",
+      error: error instanceof Error ? error.message : "Local voice transcription failed."
+    };
+  } finally {
+    if (audioPath) {
+      fs.promises.rm(audioPath, { force: true }).catch(() => undefined);
+    }
+  }
+}
+
 async function startWhisperVoiceInput(configuration?: VoiceStartOptions) {
   if (process.platform !== "darwin") {
     return { ok: false, error: "whisper.cpp voice input is only available on macOS in this Electron port." };
@@ -6586,6 +7904,8 @@ async function startWhisperVoiceInput(configuration?: VoiceStartOptions) {
     whisperModelPath: resolvedModel.modelPath,
     whisperUseCoreML: useCoreML
   };
+  ensureVoiceCaptureHUDKeepAlive();
+  showActiveVoiceCaptureHUD();
   const ready = await waitForVoiceFile(sessionDirectory, ["ready.json", "error.json"], 12000);
   if (!ready) {
     requestVoiceHelperStop(sessionDirectory);
@@ -6598,6 +7918,7 @@ async function startWhisperVoiceInput(configuration?: VoiceStartOptions) {
     return { ok: false, error: ready.payload.message ?? "whisper.cpp voice recording failed." };
   }
   startVoiceLevelPolling(sessionDirectory);
+  showActiveVoiceCaptureHUD();
   playDictationFeedbackSound("startListening", configuration);
   return { ok: true, modelID, useCoreML };
 }
@@ -6696,6 +8017,15 @@ app.whenReady().then(() => {
     .catch((error) => {
       debugLog(`startup voice cleanup failed: ${error instanceof Error ? error.message : String(error)}`);
     });
+  // Kill Computer Use helpers orphaned by a previous crash so they don't pile up.
+  void openAssistBridge()
+    .then((bridge) => bridge.cleanupOrphanedComputerUseHelpersOnStartup())
+    .then((result) => {
+      if (result.killed.length) debugLog(`startup: cleaned ${result.killed.length} orphaned Computer Use helper(s)`);
+    })
+    .catch((error) => {
+      debugLog(`startup Computer Use cleanup failed: ${error instanceof Error ? error.message : String(error)}`);
+    });
   if (process.platform === "darwin") {
     ensureRegularDockPresence("app ready");
     try {
@@ -6735,6 +8065,7 @@ app.whenReady().then(() => {
   void openAssistBridge()
     .then((bridge) => {
       bridge.setThreadsChangedListener(broadcastThreadsUpdated);
+      bridge.setAppStateBackgroundUpdateListener(broadcastAppStateBackgroundUpdate);
       return bridge.prewarmAssistantVoiceOutput();
     })
     .catch((error) => {
@@ -6750,6 +8081,34 @@ app.whenReady().then(() => {
     if (typeof url === "string" && /^(https?:\/\/|x-apple\.systempreferences:)/.test(url)) {
       await shell.openExternal(url);
     }
+  });
+
+  // Dev-only perf snapshot. Gated on the same env var that opens CDP so it
+  // cannot be hit from a packaged production build.
+  ipcMain.handle("openassist:__perf-snapshot", async () => {
+    if (!enableElectronDebugging) return { error: "disabled" } as const;
+    let v8Stats: unknown = null;
+    try {
+      const v8 = await import("node:v8");
+      v8Stats = v8.getHeapStatistics();
+    } catch {
+      v8Stats = null;
+    }
+    let processMemoryInfo: unknown = null;
+    try {
+      processMemoryInfo = await process.getProcessMemoryInfo();
+    } catch {
+      processMemoryInfo = null;
+    }
+    return {
+      capturedAt: Date.now(),
+      appMetrics: app.getAppMetrics(),
+      processMemoryInfo,
+      v8: v8Stats,
+      resourceUsage: process.resourceUsage(),
+      mainPid: process.pid,
+      uptimeSeconds: process.uptime()
+    };
   });
 
   ipcMain.handle("openassist:get-macos-permissions", async () => {
@@ -6848,11 +8207,42 @@ app.whenReady().then(() => {
     }
   });
 
+  ipcMain.handle("openassist:get-computer-use-activity", async () => {
+    try {
+      return await (await openAssistBridge()).getComputerUseActivity();
+    } catch (error) {
+      return { active: false, activeToolCalls: 0, helpers: [], error: error instanceof Error ? error.message : String(error) };
+    }
+  });
+  ipcMain.handle("openassist:force-stop-computer-use", async () => {
+    try {
+      return await (await openAssistBridge()).forceStopComputerUse();
+    } catch (error) {
+      return { stopped: false, killed: [], restarted: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  });
+
   ipcMain.handle("openassist:workspace-launch-targets", async () => workspaceLaunchTargetSnapshots());
   ipcMain.handle("openassist:read-clipboard-text", async () => clipboard.readText());
   ipcMain.handle("openassist:write-clipboard-text", async (_event, text: string) => {
     clipboard.writeText(String(text ?? ""));
     return { ok: true };
+  });
+  ipcMain.handle("openassist:get-spellcheck-context", async (event) => {
+    const payload = spellcheckContextByWebContentsID.get(event.sender.id);
+    if (!payload || Date.now() - payload.createdAt > 4000) return null;
+    return payload;
+  });
+  ipcMain.handle("openassist:replace-misspelling", async (event, text: string) => {
+    const replacement = String(text ?? "").trim();
+    if (!replacement) return { ok: false, error: "No spelling suggestion selected." };
+    try {
+      event.sender.replaceMisspelling(replacement);
+      spellcheckContextByWebContentsID.delete(event.sender.id);
+      return { ok: true };
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
   });
   ipcMain.handle("openassist:insert-transcript-text", async (_event, text: string) => insertTranscriptText(text));
   ipcMain.handle("openassist:add-transcript-history", async (_event, text: string) => addTranscriptHistory(text));
@@ -6874,6 +8264,9 @@ app.whenReady().then(() => {
     if (target.startsWith("workspace:")) {
       return openWorkspaceLaunchTarget(target.slice("workspace:".length), workspaceRootPath);
     }
+    if (target.startsWith("file:")) {
+      return openFileLaunchTarget(target.slice("file:".length), workspaceRootPath);
+    }
     if (target === "repoInVSCode") {
       return openWorkspaceLaunchTarget("vscode", workspaceRootPath);
     }
@@ -6891,8 +8284,33 @@ app.whenReady().then(() => {
     return error ? { ok: false, error } : { ok: true, path: targetPath };
   });
   ipcMain.handle("openassist:load-app-state", async () => (await openAssistBridge()).loadOpenAssistAppState());
+  ipcMain.handle("openassist:load-settings-app-state", async () => (await openAssistBridge()).loadOpenAssistSettingsAppState());
   ipcMain.handle("openassist:list-provider-models", async (_event, backend: string) => (await openAssistBridge()).listProviderModels(backend));
+  ipcMain.handle("openassist:list-ollama-catalog-models", async () => (await openAssistBridge()).listOllamaCatalogModels());
+  ipcMain.handle("openassist:refresh-ollama-website-catalog", async () => (await openAssistBridge()).refreshOllamaWebsiteCatalog());
+  ipcMain.handle("openassist:pull-ollama-model", async (event, modelID: string) => {
+    const sender = event.sender;
+    return (await openAssistBridge()).pullOllamaModel(modelID, (progress: unknown) => {
+      if (!sender.isDestroyed()) sender.send("openassist:ollama-model-download-progress", progress);
+    });
+  });
+  ipcMain.handle("openassist:delete-ollama-model", async (_event, modelID: string) => (await openAssistBridge()).deleteOllamaModel(modelID));
+  ipcMain.handle("openassist:get-ollama-runtime-status", async () => (await openAssistBridge()).getOllamaRuntimeStatus());
+  ipcMain.handle("openassist:start-ollama-runtime", async () => (await openAssistBridge()).startOllamaRuntime());
+  ipcMain.handle("openassist:stop-ollama-runtime", async () => (await openAssistBridge()).stopOllamaRuntime());
+  ipcMain.handle("openassist:open-ollama-download", async () => (await openAssistBridge()).openOllamaDownloadPage());
+  ipcMain.handle("openassist:update-ollama-runtime", async (event) => {
+    const sender = event.sender;
+    return (await openAssistBridge()).updateOllamaRuntime((progress: unknown) => {
+      if (!sender.isDestroyed()) sender.send("openassist:ollama-runtime-update-progress", progress);
+    });
+  });
   ipcMain.handle("openassist:load-thread", async (_event, threadID: string) => (await openAssistBridge()).loadThreadMessages(threadID));
+  ipcMain.handle(
+    "openassist:load-thread-messages-before",
+    async (_event, threadID: string, beforeMessageID: string, turnLimit?: number) =>
+      (await openAssistBridge()).loadThreadMessages(threadID, { beforeMessageID, turnLimit })
+  );
   ipcMain.handle("openassist:load-code-tracking-state", async (_event, threadID: string) =>
     (await openAssistBridge()).loadCodeTrackingState(threadID)
   );
@@ -6909,10 +8327,64 @@ app.whenReady().then(() => {
   ipcMain.handle("openassist:save-thread-note", async (_event, threadID: string, noteID: string | undefined, markdown: string) =>
     (await openAssistBridge()).saveThreadNote(threadID, noteID, markdown)
   );
+  ipcMain.handle("openassist:rename-thread-note", async (_event, threadID: string, noteID: string, title: string) =>
+    (await openAssistBridge()).renameThreadNote(threadID, noteID, title)
+  );
   ipcMain.handle("openassist:select-thread-note", async (_event, threadID: string, noteID: string) =>
     (await openAssistBridge()).selectThreadNote(threadID, noteID)
   );
+  ipcMain.handle("openassist:load-planner-day", async (_event, dayID?: string) =>
+    (await openAssistBridge()).loadPlannerDay(dayID)
+  );
+  ipcMain.handle("openassist:load-planner-backlog", async () =>
+    (await openAssistBridge()).loadPlannerBacklog()
+  );
+  ipcMain.handle("openassist:list-planner-days", async (_event, limit?: number, activeDayID?: string) =>
+    (await openAssistBridge()).listPlannerDays(limit, activeDayID)
+  );
+  ipcMain.handle("openassist:save-planner-day", async (_event, dayID: string | undefined, markdown: string) =>
+    (await openAssistBridge()).savePlannerDay(dayID, markdown)
+  );
+  ipcMain.handle("openassist:schedule-selection-to-planner", async (_event, request: unknown) =>
+    (await openAssistBridge()).scheduleSelectionToPlanner(request as any)
+  );
+  ipcMain.handle("openassist:list-daily-items", async (_event, dayID?: string) =>
+    (await openAssistBridge()).listDailyItems(dayID)
+  );
+  ipcMain.handle("openassist:list-backlog-items", async () =>
+    (await openAssistBridge()).listBacklogItems()
+  );
+  ipcMain.handle("openassist:upsert-daily-item", async (_event, item: unknown) =>
+    (await openAssistBridge()).upsertDailyItem(item as any)
+  );
+  ipcMain.handle("openassist:toggle-daily-item", async (_event, dayID: string | undefined, itemID: string, checked: boolean) =>
+    (await openAssistBridge()).toggleDailyItem(dayID, itemID, checked)
+  );
+  ipcMain.handle("openassist:delete-daily-item", async (_event, dayID: string | undefined, itemID: string) =>
+    (await openAssistBridge()).deleteDailyItem(dayID, itemID)
+  );
+  ipcMain.handle("openassist:link-daily-item-note", async (_event, dayID: string | undefined, itemID: string, target: unknown) =>
+    (await openAssistBridge()).linkDailyItemNote(dayID, itemID, target as any)
+  );
+  ipcMain.handle("openassist:upsert-backlog-item", async (_event, item: unknown) =>
+    (await openAssistBridge()).upsertBacklogItem(item as any)
+  );
+  ipcMain.handle("openassist:toggle-backlog-item", async (_event, itemID: string, checked: boolean) =>
+    (await openAssistBridge()).toggleBacklogItem(itemID, checked)
+  );
+  ipcMain.handle("openassist:delete-backlog-item", async (_event, itemID: string) =>
+    (await openAssistBridge()).deleteBacklogItem(itemID)
+  );
+  ipcMain.handle("openassist:move-daily-item-to-backlog", async (_event, dayID: string | undefined, itemID: string) =>
+    (await openAssistBridge()).moveDailyItemToBacklog(dayID, itemID)
+  );
+  ipcMain.handle("openassist:schedule-backlog-item", async (_event, itemID: string, targetDayID: string) =>
+    (await openAssistBridge()).scheduleBacklogItem(itemID, targetDayID)
+  );
   ipcMain.handle("openassist:load-thread-memory", async (_event, threadID: string) => (await openAssistBridge()).loadThreadMemory(threadID));
+  ipcMain.handle("openassist:thread-agent-files-path", async (_event, threadID: string) =>
+    (await openAssistBridge()).threadAgentFilesPath(threadID)
+  );
   ipcMain.handle("openassist:create-thread", async (_event, projectID?: string, isTemporary?: boolean) =>
     (await openAssistBridge()).createAssistantThread(projectID, false, isTemporary === true)
   );
@@ -6937,6 +8409,16 @@ app.whenReady().then(() => {
     const result = owner ? await dialog.showOpenDialog(owner, options) : await dialog.showOpenDialog(options);
     if (result.canceled || !result.filePaths[0]) return null;
     return (await openAssistBridge()).updateProjectLinkedFolder(projectID, result.filePaths[0]);
+  });
+  ipcMain.handle("openassist:open-project-folder", async (_event, parentID?: string | null) => {
+    const owner = BrowserWindow.fromWebContents(_event.sender) ?? mainWindow;
+    const options: Electron.OpenDialogOptions = {
+      title: "Open Existing Project Folder",
+      properties: ["openDirectory"]
+    };
+    const result = owner ? await dialog.showOpenDialog(owner, options) : await dialog.showOpenDialog(options);
+    if (result.canceled || !result.filePaths[0]) return null;
+    return (await openAssistBridge()).createProjectFromFolder(result.filePaths[0], parentID);
   });
   ipcMain.handle("openassist:remove-project-folder-link", async (_event, projectID: string) =>
     (await openAssistBridge()).updateProjectLinkedFolder(projectID, null)
@@ -6978,12 +8460,84 @@ app.whenReady().then(() => {
     (await openAssistBridge()).deleteSessionPermanently(threadID)
   );
   ipcMain.handle("openassist:load-note", async (_event, projectID: string, noteID: string) => (await openAssistBridge()).loadNote(projectID, noteID));
+  ipcMain.handle("openassist:list-note-history", async (_event, projectID: string, noteID: string) =>
+    (await openAssistBridge()).listProjectNoteHistory(projectID, noteID)
+  );
+  ipcMain.handle("openassist:restore-note-history", async (_event, projectID: string, noteID: string, historyID: string) =>
+    (await openAssistBridge()).restoreProjectNoteHistory(projectID, noteID, historyID)
+  );
+  ipcMain.handle("openassist:load-note-links", async (_event, target: unknown, currentMarkdown?: string) =>
+    (await openAssistBridge()).loadNoteLinks(target, currentMarkdown)
+  );
   ipcMain.handle("openassist:read-note-image", async (_event, notePath: string, imageSrc: string) =>
     (await openAssistBridge()).readNoteImageDataURL(notePath, imageSrc)
   );
+  ipcMain.handle("openassist:open-markdown-file-for-import", async (_event) => {
+    const owner = BrowserWindow.fromWebContents(_event.sender) ?? mainWindow;
+    const options: Electron.OpenDialogOptions = {
+      title: "Open Markdown File",
+      properties: ["openFile"],
+      filters: [
+        { name: "Markdown", extensions: ["md", "markdown", "mdown", "mkd"] },
+        { name: "All Files", extensions: ["*"] }
+      ]
+    };
+    const result = owner ? await dialog.showOpenDialog(owner, options) : await dialog.showOpenDialog(options);
+    if (result.canceled || !result.filePaths[0]) return null;
+    const filePath = result.filePaths[0];
+    const markdown = fs.readFileSync(filePath, "utf8").replace(/\r\n/g, "\n");
+    return {
+      path: filePath,
+      fileName: path.basename(filePath),
+      title: titleForMarkdownImport(filePath, markdown),
+      markdown
+    };
+  });
   ipcMain.handle("openassist:create-note", async (_event, projectID: string) => (await openAssistBridge()).createProjectNote(projectID));
+  ipcMain.handle("openassist:rename-note", async (_event, projectID: string, noteID: string, title: string) =>
+    (await openAssistBridge()).renameProjectNote(projectID, noteID, title)
+  );
   ipcMain.handle("openassist:save-note", async (_event, projectID: string, noteID: string, markdown: string) =>
     (await openAssistBridge()).saveProjectNote(projectID, noteID, markdown)
+  );
+  ipcMain.handle("openassist:cleanup-note-with-codex", async (_event, request: unknown) =>
+    (await openAssistBridge()).cleanupNoteWithCodex(request as any)
+  );
+  ipcMain.handle("openassist:delete-note", async (_event, projectID: string, noteID: string) =>
+    (await openAssistBridge()).deleteProjectNote(projectID, noteID)
+  );
+  ipcMain.handle("openassist:archive-note", async (_event, projectID: string, noteID: string) =>
+    (await openAssistBridge()).archiveProjectNote(projectID, noteID)
+  );
+  ipcMain.handle("openassist:restore-note", async (_event, projectID: string, noteID: string) =>
+    (await openAssistBridge()).restoreProjectNote(projectID, noteID)
+  );
+  ipcMain.handle("openassist:delete-note-permanently", async (_event, projectID: string, noteID: string) =>
+    (await openAssistBridge()).deleteProjectNotePermanently(projectID, noteID)
+  );
+  ipcMain.handle("openassist:create-note-folder", async (_event, projectID: string, name: string) =>
+    (await openAssistBridge()).createProjectNoteFolder(projectID, name)
+  );
+  ipcMain.handle("openassist:rename-note-folder", async (_event, projectID: string, folderID: string, name: string) =>
+    (await openAssistBridge()).renameProjectNoteFolder(projectID, folderID, name)
+  );
+  ipcMain.handle("openassist:delete-note-folder", async (_event, projectID: string, folderID: string) =>
+    (await openAssistBridge()).deleteProjectNoteFolder(projectID, folderID)
+  );
+  ipcMain.handle("openassist:move-note-to-folder", async (_event, projectID: string, noteID: string, folderID: string | null) =>
+    (await openAssistBridge()).moveProjectNoteToFolder(projectID, noteID, folderID)
+  );
+  ipcMain.handle("openassist:delete-thread-note", async (_event, threadID: string, noteID: string) =>
+    (await openAssistBridge()).deleteThreadNote(threadID, noteID)
+  );
+  ipcMain.handle("openassist:archive-thread-note", async (_event, threadID: string, noteID: string) =>
+    (await openAssistBridge()).archiveThreadNote(threadID, noteID)
+  );
+  ipcMain.handle("openassist:restore-thread-note", async (_event, threadID: string, noteID: string) =>
+    (await openAssistBridge()).restoreThreadNote(threadID, noteID)
+  );
+  ipcMain.handle("openassist:delete-thread-note-permanently", async (_event, threadID: string, noteID: string) =>
+    (await openAssistBridge()).deleteThreadNotePermanently(threadID, noteID)
   );
   ipcMain.handle("openassist:toggle-skill", async (_event, threadID: string, skillID: string, attached: boolean) =>
     (await openAssistBridge()).toggleThreadSkill(threadID, skillID, attached)
@@ -7010,8 +8564,43 @@ app.whenReady().then(() => {
   ipcMain.handle("openassist:toggle-scheduled-job", async (_event, jobID: string, enabled: boolean) =>
     (await openAssistBridge()).toggleScheduledJob(jobID, enabled)
   );
-  ipcMain.handle("openassist:update-setting", async (_event, key: string, value: boolean | string | number) =>
-    (await openAssistBridge()).updateSetting(key as Parameters<OpenAssistBridge["updateSetting"]>[0], value)
+  ipcMain.handle("openassist:update-setting", async (_event, key: string, value: boolean | string | number) => {
+    const updated = await (await openAssistBridge()).updateSetting(
+      key as Parameters<OpenAssistBridge["updateSetting"]>[0],
+      value
+    );
+    // Broadcast so other open windows (settings ↔ main) stay in sync.
+    for (const window of BrowserWindow.getAllWindows()) {
+      safeSendWindow(window, "openassist:settings-updated", updated);
+    }
+    return updated;
+  });
+  ipcMain.handle("openassist:update-settings", async (_event, updates: Parameters<OpenAssistBridge["updateSettings"]>[0]) => {
+    const updated = await (await openAssistBridge()).updateSettings(updates);
+    // Broadcast once for grouped edits like color theme presets.
+    for (const window of BrowserWindow.getAllWindows()) {
+      safeSendWindow(window, "openassist:settings-updated", updated);
+    }
+    return updated;
+  });
+  ipcMain.handle("openassist:preview-color-theme", async (_event, theme: string | null) => {
+    const nextTheme = typeof theme === "string" && theme.trim() ? theme.trim() : null;
+    for (const window of BrowserWindow.getAllWindows()) {
+      safeSendWindow(window, "openassist:color-theme-preview", nextTheme);
+    }
+    return { ok: true };
+  });
+  ipcMain.handle("openassist:knowledge-status", async () =>
+    (await openAssistBridge()).loadKnowledgeStatus()
+  );
+  ipcMain.handle("openassist:list-knowledge-requests", async (_event, status?: "pending" | "applied" | "rejected") =>
+    (await openAssistBridge()).listKnowledgeWriteRequests(status)
+  );
+  ipcMain.handle("openassist:apply-knowledge-preview", async (_event, requestID: string) =>
+    (await openAssistBridge()).applyKnowledgePreview(requestID)
+  );
+  ipcMain.handle("openassist:reject-knowledge-request", async (_event, requestID: string) =>
+    (await openAssistBridge()).rejectKnowledgeRequest(requestID)
   );
   ipcMain.handle("openassist:update-shortcut", async (_event, target: string, keyCode: number, modifiers: number) => {
     const settings = await (await openAssistBridge()).updateShortcut(
@@ -7041,6 +8630,9 @@ app.whenReady().then(() => {
   ipcMain.handle("openassist:open-local-path", async (_event, filePath: string) =>
     openLocalPath(filePath)
   );
+  ipcMain.handle("openassist:get-local-file-preview", async (_event, filePath: string) =>
+    getLocalFilePreview(filePath)
+  );
   ipcMain.handle("openassist:reveal-local-path", async (_event, filePath: string) =>
     revealLocalPath(filePath)
   );
@@ -7061,6 +8653,10 @@ app.whenReady().then(() => {
     const key = normalizePaletteKey(theme);
     if (!screenSnipPalettes[key]) return { ok: false, error: "Unknown theme." };
     writeScreenSnipTheme(key);
+    const payload = { selected: key, colors: screenSnipPalettes[key] };
+    BrowserWindow.getAllWindows().forEach((window) => {
+      safeSendWindow(window, "openassist:screen-snip-theme-changed", payload);
+    });
     return { ok: true, selected: key };
   });
   ipcMain.handle("openassist:choose-screen-analysis-reference-images", async () =>
@@ -7147,6 +8743,12 @@ app.whenReady().then(() => {
   ipcMain.handle("openassist:clear-realtime-openai-api-key", async () =>
     (await openAssistBridge()).clearRealtimeOpenAIAPIKey()
   );
+  ipcMain.handle("openassist:save-realtime-gemini-api-key", async (_event, token: string) =>
+    (await openAssistBridge()).saveRealtimeGeminiAPIKey(token)
+  );
+  ipcMain.handle("openassist:clear-realtime-gemini-api-key", async () =>
+    (await openAssistBridge()).clearRealtimeGeminiAPIKey()
+  );
   ipcMain.handle("openassist:save-telegram-bot-token", async (_event, token: string) =>
     (await openAssistBridge()).saveTelegramBotToken(token)
   );
@@ -7165,6 +8767,21 @@ app.whenReady().then(() => {
   ipcMain.handle("openassist:test-telegram-connection", async (_event, token?: string) =>
     (await openAssistBridge()).testTelegramConnection(token)
   );
+  ipcMain.handle("openassist:rotate-remote-access-pairing-code", async () =>
+    (await openAssistBridge()).rotateRemoteAccessPairingCode()
+  );
+  ipcMain.handle("openassist:clear-remote-access-pairing-code", async () =>
+    (await openAssistBridge()).clearRemoteAccessPairingCode()
+  );
+  ipcMain.handle("openassist:open-tailscale-app", async () =>
+    (await openAssistBridge()).openTailscaleApp()
+  );
+  ipcMain.handle("openassist:start-remote-access-easy-qr", async () =>
+    (await openAssistBridge()).startRemoteAccessEasyQR()
+  );
+  ipcMain.handle("openassist:stop-remote-access-easy-qr", async () =>
+    (await openAssistBridge()).stopRemoteAccessEasyQR()
+  );
   ipcMain.handle("openassist:send-message", async (
     event,
     prompt: string,
@@ -7179,6 +8796,10 @@ app.whenReady().then(() => {
     attachments?: unknown[]
   ) => {
     const bridge = await openAssistBridge();
+    const replyTarget = event.sender;
+    const sendProviderEvent = (providerEvent: unknown) => {
+      safeSendWebContents(replyTarget, "openassist:provider-event", providerEvent);
+    };
     try {
       return await bridge.sendCodexMessage(
         prompt,
@@ -7191,22 +8812,16 @@ app.whenReady().then(() => {
         skillIDs,
         clientRunID,
         attachments,
-        (providerEvent: unknown) => {
-          if (!event.sender.isDestroyed()) {
-            event.sender.send("openassist:provider-event", providerEvent);
-          }
-        }
+        sendProviderEvent
       );
     } catch (error) {
-      if (!event.sender.isDestroyed()) {
-        event.sender.send("openassist:provider-event", {
-          runID: clientRunID,
-          threadID: threadID || "new",
-          type: "failed",
-          provider: "Assistant",
-          error: error instanceof Error ? error.message : "The provider failed before returning a response."
-        });
-      }
+      sendProviderEvent({
+        runID: clientRunID,
+        threadID: threadID || "new",
+        type: "failed",
+        provider: "Assistant",
+        error: error instanceof Error ? error.message : "The provider failed before returning a response."
+      });
       throw error;
     }
   });
@@ -7222,16 +8837,59 @@ app.whenReady().then(() => {
   ipcMain.handle("openassist:install-kokoro-voice-model", async (_event, voiceID?: string) =>
     (await openAssistBridge()).installKokoroVoiceModel(voiceID)
   );
-  ipcMain.handle("openassist:speak-assistant-response", async (_event, text: string, options?: { force?: boolean }) =>
+  ipcMain.handle("openassist:speak-assistant-response", async (_event, text: string, options?: { force?: boolean; engine?: string; voice?: string }) =>
     (await openAssistBridge()).speakAssistantResponse(text, options)
+  );
+  ipcMain.handle("openassist:prepare-read-aloud-audio", async (_event, text: string, options?: { engine?: string; voice?: string; model?: string }) =>
+    (await openAssistBridge()).prepareReadAloudAudio(text, options)
+  );
+  ipcMain.handle("openassist:start-note-read-aloud", async (event, request?: { text?: string; source?: "selection" | "whole-note" | "message"; title?: string; targetID?: string }) => {
+    const replyTarget = event.sender;
+    return (await openAssistBridge()).startNoteReadAloud(
+      {
+        text: request?.text ?? "",
+        source: request?.source,
+        title: request?.title,
+        targetID: request?.targetID
+      },
+      (state: unknown) => safeSendWebContents(replyTarget, "openassist:note-read-aloud-state", state)
+    );
+  });
+  ipcMain.handle("openassist:pause-note-read-aloud", async () =>
+    (await openAssistBridge()).pauseNoteReadAloud()
+  );
+  ipcMain.handle("openassist:resume-note-read-aloud", async () =>
+    (await openAssistBridge()).resumeNoteReadAloud()
+  );
+  ipcMain.handle("openassist:stop-note-read-aloud", async () =>
+    (await openAssistBridge()).stopNoteReadAloud()
+  );
+  ipcMain.handle("openassist:prewarm-assistant-voice-output", async (_event, options?: { engine?: string; voice?: string }) =>
+    (await openAssistBridge()).prewarmAssistantVoiceOutput(options)
   );
   ipcMain.handle("openassist:stop-assistant-voice-output", async () =>
     (await openAssistBridge()).stopAssistantVoiceOutput()
   );
+  ipcMain.handle("openassist:start-wake-word-for-today", async (_event, options?: WakeWordStartOptions) =>
+    startWakeWordForToday(options)
+  );
+  ipcMain.handle("openassist:stop-wake-word-for-today", async (_event, reason?: string) =>
+    stopWakeWordForToday(typeof reason === "string" && reason.trim() ? reason.trim() : "manual")
+  );
+  ipcMain.handle("openassist:get-wake-word-status", async () => wakeWordStatus);
   ipcMain.handle("openassist:voice-input-configuration", async () => (await openAssistBridge()).voiceInputConfiguration());
   ipcMain.handle("openassist:list-microphones", async () => listMicrophones());
   ipcMain.handle("openassist:start-voice-input", async (_event, options?: VoiceStartOptions) => startConfiguredVoiceInput(options));
   ipcMain.handle("openassist:stop-voice-input", async () => stopConfiguredVoiceInput());
+  ipcMain.handle("openassist:local-voice-transcribe", async (_event, request?: LocalVoiceTranscriptionRequest) =>
+    transcribeLocalVoiceAudio(request)
+  );
+  ipcMain.handle("openassist:local-voice-classify", async (_event, input: unknown) =>
+    (await openAssistBridge()).classifyLocalVoiceTranscript(input as Parameters<(typeof import("./openassistBridge.js"))["classifyLocalVoiceTranscript"]>[0])
+  );
+  ipcMain.handle("openassist:local-voice-direct-knowledge", async (_event, input: unknown) =>
+    (await openAssistBridge()).handleLocalVoiceDirectKnowledge(input as Parameters<(typeof import("./openassistBridge.js"))["handleLocalVoiceDirectKnowledge"]>[0])
+  );
   ipcMain.handle("openassist:realtime-start", async (event, options?: {
     threadID?: string;
     threadId?: string;
@@ -7241,6 +8899,7 @@ app.whenReady().then(() => {
     reasoningEffort?: string;
     pluginIDs?: string[];
     skillIDs?: string[];
+    contextHint?: string;
   }) =>
     (await openAssistBridge()).startCodexRealtimeVoice(
       {
@@ -7250,7 +8909,8 @@ app.whenReady().then(() => {
         permissionMode: options?.permissionMode,
         reasoningEffort: options?.reasoningEffort,
         pluginIDs: options?.pluginIDs,
-        skillIDs: options?.skillIDs
+        skillIDs: options?.skillIDs,
+        contextHint: options?.contextHint
       },
       (payload: unknown) => {
         broadcastRealtimeEvent(payload, event.sender);
@@ -7263,6 +8923,9 @@ app.whenReady().then(() => {
   ipcMain.handle("openassist:realtime-append-text", async (_event, text: string) =>
     (await openAssistBridge()).appendCodexRealtimeText(text)
   );
+  ipcMain.handle("openassist:realtime-append-images", async (_event, input: unknown) =>
+    (await openAssistBridge()).appendCodexRealtimeImages(input)
+  );
   ipcMain.handle("openassist:realtime-stop", async () =>
     (await openAssistBridge()).stopCodexRealtimeVoice()
   );
@@ -7273,9 +8936,24 @@ app.whenReady().then(() => {
     (await openAssistBridge()).listCodexRealtimeVoices()
   );
   ipcMain.handle("openassist:update-voice-hud", async (_event, payload: VoiceHUDPayload) => updateVoiceHUD(payload ?? { visible: false }));
-  ipcMain.handle("openassist:set-window-mode", async (_event, mode: "full" | "sidebar", sidebarOpen?: boolean, sidebarEdge?: "left" | "right") => {
-    const window = BrowserWindow.fromWebContents(_event.sender) ?? mainWindow;
-    if (window) applyWindowMode(window, mode === "sidebar" ? "sidebar" : "full", sidebarOpen !== false, sidebarEdge === "left" ? "left" : "right");
+  ipcMain.handle("openassist:set-window-mode", async (
+    _event,
+    mode: AssistantWindowMode,
+    sidebarOpen?: boolean,
+    sidebarEdge?: "left" | "right",
+    notchDockRevealed?: boolean
+  ) => {
+    const window = mainWindow;
+    if (window && !window.isDestroyed()) {
+      const nextMode: AssistantWindowMode = mode === "sidebar" || mode === "notch" ? mode : "full";
+      applyWindowMode(
+        window,
+        nextMode,
+        sidebarOpen !== false,
+        sidebarEdge === "left" ? "left" : "right",
+        Boolean(notchDockRevealed)
+      );
+    }
     return { ok: true };
   });
   ipcMain.handle("openassist:hide-window", async (_event) => {
@@ -7303,6 +8981,7 @@ app.whenReady().then(() => {
   setTimeout(prewarmVoiceHUDWindow, 250);
   setTimeout(prewarmVoiceHelperBuild, 700);
   setTimeout(installApplicationMenu, 800);
+  setTimeout(prewarmSettingsWindow, 2200);
   startFrontmostApplicationTracker();
   globalShortcut.register("CommandOrControl+Shift+Space", toggleMainWindowVisibility);
   registerFixedShortcuts();
@@ -7323,16 +9002,46 @@ app.whenReady().then(() => {
   });
 });
 
-app.on("before-quit", () => {
+app.on("before-quit", (event) => {
   isQuitting = true;
+  if (!ollamaQuitCleanupStarted && !ollamaQuitCleanupFinished) {
+    event.preventDefault();
+    ollamaQuitCleanupStarted = true;
+    debugLog("before-quit: unloading Ollama models used by Open Assist");
+    const cleanupTimeout = new Promise<void>((resolve) => setTimeout(resolve, 3_500));
+    void Promise.race([
+      openAssistBridge()
+        .then((bridge) => bridge.unloadOllamaModelsUsedThisSession())
+        .then((result) => {
+          debugLog(`before-quit: Ollama unload result=${JSON.stringify(result)}`);
+        })
+        .catch((error) => {
+          debugLog(`before-quit: Ollama unload failed=${error instanceof Error ? error.message : String(error)}`);
+        }),
+      cleanupTimeout
+    ]).finally(() => {
+      ollamaQuitCleanupFinished = true;
+      flushDebugLogSync();
+      app.quit();
+    });
+    return;
+  }
+  flushDebugLogSync();
 });
 
 app.on("will-quit", () => {
   isQuitting = true;
+  const wakeCapture = wakeWordCapture;
+  if (wakeCapture) {
+    terminateWakeWordCapture(wakeCapture, "app quit");
+    wakeWordCapture = null;
+  }
+  clearWakeWordRestartTimer();
   stopAssistantVoiceOutputForSessionEnd("app quit");
   shortcutMonitorGeneration += 1;
   stopShortcutMonitor();
   stopFrontmostApplicationTracker();
+  flushDebugLogSync();
   stopVoiceLevelPolling();
   if (menuBarIconTimer) {
     clearInterval(menuBarIconTimer);

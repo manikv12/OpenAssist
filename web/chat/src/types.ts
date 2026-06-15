@@ -313,6 +313,14 @@ export interface ThreadNoteSourceDescriptor {
   canSave: boolean;
 }
 
+export interface PlannerStyleTokens {
+  colors?: Record<string, string>;
+  typography?: Record<string, Record<string, string>>;
+  spacing?: Record<string, string>;
+  rounded?: Record<string, string>;
+  warning?: string | null;
+}
+
 export interface ThreadNoteState {
   threadId: string | null;
   ownerKind?: "thread" | "project" | string | null;
@@ -344,6 +352,7 @@ export interface ThreadNoteState {
   canEdit: boolean;
   placeholder: string;
   sourceDescriptor?: ThreadNoteSourceDescriptor | null;
+  plannerStyleTokens?: PlannerStyleTokens | null;
   aiDraftPreview?: ThreadNoteAIDraftPreview | null;
   projectNoteTransferPreview?: ThreadNoteProjectTransferPreview | null;
   projectNoteTransferOutcome?: ThreadNoteProjectTransferOutcome | null;

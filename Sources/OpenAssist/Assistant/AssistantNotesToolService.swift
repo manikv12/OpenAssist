@@ -15,7 +15,7 @@ enum AssistantNotesToolDefinition {
     static let toolKind = "assistantNotes"
 
     static let description = """
-    Read and manage Open Assist project and thread notes for the active project. Use this to list notes, search real note files, read one note, prepare a preview for adding content to the best note, prepare a preview for organizing an existing note, and apply a previously prepared preview after confirmation. Project notes are the main notes. Thread notes are side notes.
+    Read and manage Open Assist project and thread notes for the active project. Use this to list notes, search real note files, read one note, prepare a preview for adding content to the best note, prepare a preview for organizing an existing note, and apply a previously prepared preview after confirmation. Project notes are the main notes. Thread notes are side notes. ALWAYS use this tool (not `assistant_planner`) whenever the user refers to a specific named note, a project note, or "the note"/"this note". Only use `assistant_planner` when the user clearly means the daily planner or a specific day.
     """
 
     static let inputSchema: [String: Any] = [
@@ -900,6 +900,10 @@ final class AssistantNotesToolService {
                         noteID: previousSelectedNoteID
                     )
                 }
+            case .planner:
+                throw AssistantNotesToolServiceError.unavailableScope(
+                    "Planner days use assistant_planner. Prepare and apply planner changes with that tool instead."
+                )
             }
 
             let savedNote = try latestStoredNote(
@@ -977,6 +981,10 @@ final class AssistantNotesToolService {
                 )
             case .thread:
                 return resolveThreadScope(threadID: ownerID)
+            case .planner:
+                throw AssistantNotesToolServiceError.unavailableScope(
+                    "Planner days use assistant_planner, not assistant_notes."
+                )
             }
         }
 
@@ -1366,6 +1374,10 @@ final class AssistantNotesToolService {
             notes = conversationStore.loadThreadStoredNotes(threadID: ownerID)
         case .project:
             notes = try projectStore.loadProjectStoredNotes(projectID: ownerID)
+        case .planner:
+            throw AssistantNotesToolServiceError.unavailableScope(
+                "Planner days use assistant_planner, not assistant_notes."
+            )
         }
         guard let note = notes.first(where: {
             $0.noteID.caseInsensitiveCompare(noteID) == .orderedSame
@@ -1418,6 +1430,8 @@ final class AssistantNotesToolService {
             return "Project notes"
         case .thread:
             return "Thread notes"
+        case .planner:
+            return "Planner"
         }
     }
 

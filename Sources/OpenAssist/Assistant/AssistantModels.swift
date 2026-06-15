@@ -3209,6 +3209,7 @@ final class AssistantStore: ObservableObject {
     private let settings: SettingsStore
     private let memoryStore: MemorySQLiteStore
     private let projectStore: AssistantProjectStore
+    private let plannerStore: AssistantPlannerStore
     private let temporarySessionStore: AssistantTemporarySessionStore
     private let sessionRegistry: AssistantSessionRegistry
     private let threadSkillStore: AssistantThreadSkillStore
@@ -3224,6 +3225,7 @@ final class AssistantStore: ObservableObject {
     private let completionNotificationService: AssistantCompletionNotificationService
     private let conversationStore: AssistantConversationStore
     private let assistantNotesToolService: AssistantNotesToolService
+    private let assistantPlannerToolService: AssistantPlannerToolService
     private let threadRewriteService: CodexThreadRewriteService
     private let gitCheckpointService: GitCheckpointService
     private let conversationCheckpointStore: AssistantConversationCheckpointStore
@@ -3253,6 +3255,7 @@ final class AssistantStore: ObservableObject {
     private var isRestoringSessionConfiguration = false
     private var oneShotSessionInstructions: String?
     private var notesWorkspaceRuntimeContext: AssistantNotesRuntimeContext?
+    private var plannerRuntimeContext: AssistantPlannerRuntimeContext?
     private var blockedModeSwitchSuggestion: AssistantModeSwitchSuggestion?
     private var proposedPlanSessionID: String?
     private var composerDraftBySessionID: [String: String] = [:]
@@ -3312,6 +3315,7 @@ final class AssistantStore: ObservableObject {
         settings: SettingsStore? = nil,
         memoryStore: MemorySQLiteStore? = nil,
         projectStore: AssistantProjectStore? = nil,
+        plannerStore: AssistantPlannerStore? = nil,
         temporarySessionStore: AssistantTemporarySessionStore? = nil,
         sessionRegistry: AssistantSessionRegistry? = nil,
         threadSkillStore: AssistantThreadSkillStore? = nil,
@@ -3344,21 +3348,30 @@ final class AssistantStore: ObservableObject {
         self.selectedSubagentModelID = resolvedSettings.assistantPreferredSubagentModelID.nonEmpty
         let resolvedProjectStore = projectStore ?? AssistantProjectStore()
         let resolvedConversationStore = conversationStore ?? AssistantConversationStore()
+        let resolvedPlannerStore = plannerStore ?? AssistantPlannerStore()
         let resolvedAssistantNotesToolService = AssistantNotesToolService(
             projectStore: resolvedProjectStore,
             conversationStore: resolvedConversationStore
         )
+        let resolvedAssistantPlannerToolService = AssistantPlannerToolService(
+            plannerStore: resolvedPlannerStore
+        )
         let initialRuntime = runtime ?? CodexAssistantRuntime(
             preferredModelID: initialPreferredModelID,
             preferredSubagentModelID: resolvedSettings.assistantPreferredSubagentModelID.nonEmpty,
-            assistantNotesService: resolvedAssistantNotesToolService
+            assistantNotesService: resolvedAssistantNotesToolService,
+            assistantPlannerService: resolvedAssistantPlannerToolService
         )
         initialRuntime.backend = resolvedSettings.assistantBackend
         self.rootRuntime = initialRuntime
         let transcriptionRuntime = CodexAssistantRuntime()
         transcriptionRuntime.backend = .codex
         self.codexTranscriptionRuntime = transcriptionRuntime
-        self.runtimeFactory = { [settings = resolvedSettings, assistantNotesToolService = resolvedAssistantNotesToolService] in
+        self.runtimeFactory = { [
+            settings = resolvedSettings,
+            assistantNotesToolService = resolvedAssistantNotesToolService,
+            assistantPlannerToolService = resolvedAssistantPlannerToolService
+        ] in
             let preferredModelID = Self.normalizedStartupPreferredModelID(
                 for: settings.assistantBackend,
                 storedModelID: settings.assistantPreferredModelID.nonEmpty
@@ -3366,7 +3379,8 @@ final class AssistantStore: ObservableObject {
             let runtime = CodexAssistantRuntime(
                 preferredModelID: preferredModelID,
                 preferredSubagentModelID: settings.assistantPreferredSubagentModelID.nonEmpty,
-                assistantNotesService: assistantNotesToolService
+                assistantNotesService: assistantNotesToolService,
+                assistantPlannerService: assistantPlannerToolService
             )
             runtime.backend = settings.assistantBackend
             return runtime
@@ -3374,6 +3388,7 @@ final class AssistantStore: ObservableObject {
         let resolvedMemoryStore = memoryStore ?? (try? MemorySQLiteStore()) ?? MemorySQLiteStore.fallback()
         self.memoryStore = resolvedMemoryStore
         self.projectStore = resolvedProjectStore
+        self.plannerStore = resolvedPlannerStore
         self.temporarySessionStore = temporarySessionStore ?? AssistantTemporarySessionStore()
         self.sessionRegistry = sessionRegistry ?? AssistantSessionRegistry()
         let resolvedSkillScanService = skillScanService ?? AssistantSkillScanService()
@@ -3397,6 +3412,7 @@ final class AssistantStore: ObservableObject {
         )
         self.conversationStore = resolvedConversationStore
         self.assistantNotesToolService = resolvedAssistantNotesToolService
+        self.assistantPlannerToolService = resolvedAssistantPlannerToolService
         self.gitCheckpointService = GitCheckpointService()
         self.conversationCheckpointStore = AssistantConversationCheckpointStore(
             sessionCatalog: self.sessionCatalog,
@@ -9673,7 +9689,134 @@ final class AssistantStore: ObservableObject {
                 projectID: trimmedOwner,
                 noteID: trimmedNoteID
             )
+        case .planner:
+            return plannerStore.dayMarkdownFileURL(dayID: trimmedNoteID)
         }
+    }
+
+    func currentPlannerDayID(for date: Date = Date()) -> String {
+        plannerStore.dayID(for: date)
+    }
+
+    func plannerDate(from dayID: String) -> Date? {
+        try? plannerStore.date(from: dayID)
+    }
+
+    func loadPlannerWorkspace(dayID: String? = nil, createIfMissing: Bool = true) -> AssistantNotesWorkspace? {
+        do {
+            if let dayID = dayID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty {
+                return try plannerStore.loadWorkspace(dayID: dayID, createIfMissing: createIfMissing)
+            }
+            return try plannerStore.loadWorkspace(createIfMissing: createIfMissing)
+        } catch {
+            lastStatusMessage = "Could not load the planner."
+            CrashReporter.logError("Planner load failed: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    func loadPlannerStoredNotes(limit: Int? = nil) -> [AssistantStoredNote] {
+        do {
+            return try plannerStore.loadStoredNotes(limit: limit)
+        } catch {
+            lastStatusMessage = "Could not load planner days."
+            CrashReporter.logError("Planner list failed: \(error.localizedDescription)")
+            return []
+        }
+    }
+
+    func plannerStyleTokens() -> AssistantPlannerStyleTokens {
+        plannerStore.loadStyleTokens()
+    }
+
+    func selectPlannerDay(dayID: String?) -> AssistantNotesWorkspace? {
+        guard let dayID = dayID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+            return loadPlannerWorkspace()
+        }
+        return loadPlannerWorkspace(dayID: dayID)
+    }
+
+    func savePlannerDay(
+        dayID: String?,
+        text: String,
+        forceHistorySnapshot: Bool = false
+    ) -> AssistantNotesWorkspace? {
+        switch savePlannerDayResult(
+            dayID: dayID,
+            text: text,
+            forceHistorySnapshot: forceHistorySnapshot
+        ) {
+        case .success(let workspace):
+            return workspace
+        case .failure:
+            return nil
+        }
+    }
+
+    func savePlannerDayResult(
+        dayID: String?,
+        text: String,
+        forceHistorySnapshot: Bool = false
+    ) -> Result<AssistantNotesWorkspace, AssistantNoteSaveError> {
+        let normalizedDayID =
+            dayID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+            ?? plannerStore.dayID(for: Date())
+        do {
+            let workspace = try plannerStore.saveDay(
+                dayID: normalizedDayID,
+                text: text,
+                forceHistorySnapshot: forceHistorySnapshot
+            )
+            _ = try? AssistantNotesBackupController.shared.maybeRunAutomaticBackupIfNeeded()
+            return .success(workspace)
+        } catch {
+            lastStatusMessage = "Could not save the planner day."
+            CrashReporter.logError("Planner save failed: \(error.localizedDescription)")
+            return .failure(.underlying(error))
+        }
+    }
+
+    func appendToPlanner(_ request: AssistantPlannerScheduleRequest) -> AssistantNotesWorkspace? {
+        do {
+            let workspace = try plannerStore.appendScheduledItem(request)
+            _ = try? AssistantNotesBackupController.shared.maybeRunAutomaticBackupIfNeeded()
+            return workspace
+        } catch {
+            lastStatusMessage = "Could not add that to the planner."
+            CrashReporter.logError("Planner append failed: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    func plannerHistoryVersions(dayID: String?) -> [AssistantNoteHistoryVersion] {
+        guard let dayID = dayID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+            return []
+        }
+        return plannerStore.historyVersions(dayID: dayID)
+    }
+
+    func restorePlannerHistoryVersion(dayID: String?, versionID: String?) -> AssistantNotesWorkspace? {
+        guard let dayID = dayID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty,
+              let versionID = versionID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+            return nil
+        }
+        do {
+            let workspace = try plannerStore.restoreHistoryVersion(dayID: dayID, versionID: versionID)
+            _ = try? AssistantNotesBackupController.shared.maybeRunAutomaticBackupIfNeeded()
+            return workspace
+        } catch {
+            lastStatusMessage = "Could not restore that planner version."
+            CrashReporter.logError("Planner history restore failed: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    func deletePlannerHistoryVersion(dayID: String?, versionID: String?) -> AssistantNotesWorkspace? {
+        guard let dayID = dayID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty,
+              let versionID = versionID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+            return nil
+        }
+        return try? plannerStore.deleteHistoryVersion(dayID: dayID, versionID: versionID)
     }
 
     func threadNoteLastSavedAt(threadID: String?) -> Date? {
@@ -11671,6 +11814,7 @@ final class AssistantStore: ObservableObject {
 
         let usesSelectedSessionContext = sessionsMatch(threadID, selectedSessionID)
         let notesRuntimeContext = usesSelectedSessionContext ? activeAssistantNotesRuntimeContext() : nil
+        let plannerRuntimeContext = usesSelectedSessionContext ? self.plannerRuntimeContext : nil
 
         let global = settings.assistantCustomInstructions.trimmingCharacters(in: .whitespacesAndNewlines)
         let session = usesSelectedSessionContext
@@ -11679,9 +11823,11 @@ final class AssistantStore: ObservableObject {
         let oneShot = usesSelectedSessionContext
             ? oneShotSessionInstructions?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             : ""
-        let contextualInstructions = notesRuntimeContext?.instructionText
+        let notesInstructions = notesRuntimeContext?.instructionText
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let mergedOneShot = [oneShot, contextualInstructions]
+        let plannerInstructions = plannerRuntimeContext?.instructionText
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let mergedOneShot = [oneShot, notesInstructions, plannerInstructions]
             .compactMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty }
             .joined(separator: "\n\n")
 
@@ -11691,6 +11837,7 @@ final class AssistantStore: ObservableObject {
             oneShot: mergedOneShot
         )
         targetRuntime.assistantNotesContext = notesRuntimeContext
+        targetRuntime.assistantPlannerContext = plannerRuntimeContext
         targetRuntime.setPreferredSubagentModelID(selectedSubagentModelID)
         targetRuntime.reasoningEffort = reasoningEffort.wireValue
         targetRuntime.serviceTier = fastModeEnabled ? "fast" : nil
@@ -11718,6 +11865,7 @@ final class AssistantStore: ObservableObject {
             oneShot: oneShot
         )
         targetRuntime.assistantNotesContext = nil
+        targetRuntime.assistantPlannerContext = nil
         targetRuntime.setPreferredSubagentModelID(selectedSubagentModelID)
         targetRuntime.reasoningEffort = reasoningEffort.wireValue
         targetRuntime.serviceTier = fastModeEnabled ? "fast" : nil
@@ -11742,6 +11890,14 @@ final class AssistantStore: ObservableObject {
             return
         }
         notesWorkspaceRuntimeContext = context
+        syncRuntimeContext()
+    }
+
+    func setPlannerRuntimeContext(_ context: AssistantPlannerRuntimeContext?) {
+        if plannerRuntimeContext == context {
+            return
+        }
+        plannerRuntimeContext = context
         syncRuntimeContext()
     }
 

@@ -1,14 +1,22 @@
-import { spawn, execFile } from "node:child_process";
-import { randomUUID } from "node:crypto";
-import { app, safeStorage } from "electron";
+import { spawn, execFile, execFileSync } from "node:child_process";
+import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import { app, safeStorage, shell } from "electron";
 import { EventEmitter } from "node:events";
 import fs from "node:fs";
+import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { Worker } from "node:worker_threads";
-import { CodexRealtimeProxy } from "./realtimeProxy.js";
+import {
+  CodexRealtimeProxy,
+  type RealtimeDelegationMode,
+  type RealtimeDelegationRouteInput,
+  type RealtimeDelegationRouteResult,
+  type RealtimeProxyConfig,
+  type RealtimeVisualContext
+} from "./realtimeProxy.js";
 import {
   GitCheckpointService,
   type CodeCheckpointFile,
@@ -16,6 +24,29 @@ import {
   type GitCheckpointRepositoryContext,
   type GitCheckpointSnapshot
 } from "./gitCheckpointService.js";
+import {
+  formatOllamaUpgradeHint,
+  getOllamaRuntimeStatus,
+  isOllamaVersionUpgradeError,
+  OLLAMA_DOWNLOAD_URL,
+  startOllamaRuntime,
+  stopOllamaRuntime,
+  updateOllamaRuntime,
+  type OllamaRuntimeStatus,
+  type OllamaRuntimeUpdateProgress
+} from "./ollamaRuntime.js";
+import {
+  curatedOllamaCatalog,
+  mergeCatalogWithInstalled,
+  mergeCatalogWithWebsiteModels,
+  physicalMemoryBytes,
+  sortOllamaCatalog,
+  type OllamaCatalogModelOption
+} from "./ollamaModelCatalog.js";
+import {
+  fetchOllamaWebsiteModelOptions,
+  websiteCatalogStatusMessage
+} from "./ollamaWebsiteModelCatalog.js";
 
 const execFileAsync = promisify(execFile);
 const macAbsoluteEpochOffset = 978_307_200;
@@ -46,6 +77,68 @@ type KokoroVoiceID = NonNullable<import("kokoro-js").GenerateOptions["voice"]>;
 
 type JsonObject = Record<string, unknown>;
 type JsonRequestID = string | number;
+type NoteAICleanupMode = "cleanup" | "summarize" | "decisions" | "custom";
+type NoteAICleanupScope = "selection" | "whole-note";
+type NoteAICleanupRequest = {
+  noteID?: string;
+  projectID?: string;
+  title?: string;
+  markdown: string;
+  scope: NoteAICleanupScope;
+  mode: NoteAICleanupMode;
+  instruction?: string;
+};
+type NoteAICleanupResult = {
+  ok: boolean;
+  markdown?: string;
+  title?: string;
+  summary?: string;
+  confidence?: number;
+  warnings?: string[];
+  usedBlocks?: string[];
+  rawText?: string;
+  error?: string;
+};
+type KnowledgeRuntimeAccess = { baseURL: string; token: string };
+type NoteReadAloudSource = "selection" | "whole-note" | "message";
+type NoteReadAloudStatus = "idle" | "preparing" | "playing" | "paused" | "finished" | "error";
+type NoteReadAloudRequest = {
+  text: string;
+  source?: NoteReadAloudSource;
+  title?: string;
+  targetID?: string;
+};
+type NoteReadAloudState = {
+  status: NoteReadAloudStatus;
+  source?: NoteReadAloudSource;
+  title?: string;
+  targetID?: string;
+  currentSegment: number;
+  totalSegments: number;
+  progressLabel?: string;
+  error?: string;
+  engine?: string;
+  voice?: string;
+  model?: string;
+  audioDataURL?: string;
+  mimeType?: string;
+};
+type NoteReadAloudSession = NoteReadAloudState & {
+  id: number;
+  speechRunID: number;
+  segments: string[];
+  engine: AssistantVoiceEngine;
+  voice?: string;
+  pauseWaiters?: Array<() => void>;
+  runnerActive?: boolean;
+};
+type NoteReadAloudEmitter = (state: NoteReadAloudState) => void;
+type NoteReadAloudSegmentResult = {
+  ok: boolean;
+  skipped?: boolean;
+  stopped?: boolean;
+  error?: string;
+};
 type AssistantBackend =
   | "codex"
   | "copilot"
@@ -68,13 +161,46 @@ type ProviderModelOption = {
 };
 
 const keychainService = "com.developingadventures.OpenAssist";
+const openAssistDefaultsDomain = "com.developingadventures.OpenAssist";
+const liquidGlassChromeStyle = "Liquid Glass";
+const liquidGlassDefaultMigrationKey = "OpenAssist.liquidGlassDefaultMigrated";
 const telegramBotTokenKeychainAccount = "telegram-bot-token";
 const googleAIStudioAPIKeychainAccount = "google-ai-studio-api-key";
 const promptRewriteProviderAPIKeychainAccountPrefix = "prompt-rewrite-provider-api-key";
 const cloudTranscriptionProviderAPIKeychainAccountPrefix = "cloud-transcription-provider-api-key";
 const realtimeOpenAIAPIKeychainAccount = "realtime-openai-api-key";
+const knowledgeAccessTokenFileName = "token.txt";
+const knowledgeServerStateFileName = "server.json";
+const defaultKnowledgeServerPort = "45833";
 const defaultRealtimeOpenAIModel = "gpt-realtime-mini";
 const defaultRealtimeOpenAIVoice = "marin";
+const defaultRealtimeVoiceProvider = "openaiRealtime";
+const defaultRealtimeGeminiModel = "gemini-3.1-flash-live-preview";
+const defaultRealtimeGeminiVoice = "Aoede";
+const defaultLiveVoiceMode = "openaiRealtime";
+const defaultRealtimeDelegationMode: RealtimeDelegationMode = "autoHardTasksOnly";
+const defaultLocalVoiceModel = "gemma4:e2b";
+const defaultSpeechOutputRewriteModel = "gemma4:e2b";
+const defaultPocketTTSVoiceID = "eve";
+const defaultOpenAITTSModel = "gpt-4o-mini-tts";
+const defaultOpenAITTSVoice = "coral";
+const defaultGeminiTTSModel = "gemini-3.1-flash-tts-preview";
+const defaultGeminiTTSVoice = "Aoede";
+const defaultPocketTTSServerHost = "127.0.0.1";
+const defaultPocketTTSServerPort = 45_839;
+const assistantVoiceEnginePocketDefaultMigrationKey = "OpenAssist.assistantVoiceEnginePocketDefaultMigrated";
+
+function normalizeRealtimeDelegationMode(value: unknown): RealtimeDelegationMode {
+  const mode = String(value ?? "").trim();
+  return mode === "alwaysDelegate" || mode === "neverDelegate" || mode === "autoHardTasksOnly"
+    ? mode
+    : defaultRealtimeDelegationMode;
+}
+const pocketTTSPrewarmPhrases = [
+  "Sure, what do you need help with?",
+  "What would you like me to do?",
+  "I'm on it."
+];
 const codexRealtimePlaceholderAPIKey = "local-realtime-placeholder";
 const codexRealtimeStartTimeoutMs = 8_000;
 const promptRewriteProviders = [
@@ -118,6 +244,78 @@ const defaultDictationFeedbackVolume = 0.10;
 const kokoroModelID = "onnx-community/Kokoro-82M-v1.0-ONNX";
 const defaultKokoroVoiceID: KokoroVoiceID = "af_heart";
 const assistantSpeechChunkCharacters = 1_100;
+const pocketTTSVoiceIDs = new Set([
+  "alba",
+  "anna",
+  "azelma",
+  "bill_boerst",
+  "caro_davy",
+  "charles",
+  "cosette",
+  "eponine",
+  "eve",
+  "fantine",
+  "george",
+  "jane",
+  "jean",
+  "javert",
+  "marius",
+  "mary",
+  "michael",
+  "paul",
+  "peter_yearsley",
+  "stuart_bell",
+  "vera"
+]);
+const openAITTSVoiceIDs = new Set([
+  "alloy",
+  "arbor",
+  "ash",
+  "ballad",
+  "breeze",
+  "cedar",
+  "coral",
+  "cove",
+  "echo",
+  "fable",
+  "marin",
+  "nova",
+  "onyx",
+  "sage",
+  "shimmer",
+  "verse"
+]);
+const geminiTTSVoiceIDs = new Set([
+  "Achernar",
+  "Achird",
+  "Algenib",
+  "Algieba",
+  "Alnilam",
+  "Aoede",
+  "Autonoe",
+  "Callirrhoe",
+  "Charon",
+  "Despina",
+  "Enceladus",
+  "Erinome",
+  "Fenrir",
+  "Gacrux",
+  "Iapetus",
+  "Kore",
+  "Laomedeia",
+  "Leda",
+  "Orus",
+  "Pulcherrima",
+  "Puck",
+  "Rasalgethi",
+  "Sadachbia",
+  "Sadaltager",
+  "Schedar",
+  "Sulafat",
+  "Umbriel",
+  "Vindemiatrix",
+  "Zephyr"
+]);
 const kokoroVoiceIDs = new Set<KokoroVoiceID>([
   "af_heart",
   "af_alloy",
@@ -149,8 +347,14 @@ const kokoroVoiceIDs = new Set<KokoroVoiceID>([
   "bm_lewis"
 ]);
 let assistantSpeechProcess: ReturnType<typeof spawn> | null = null;
+let assistantSpeechProcessPaused = false;
 let assistantSpeechRunID = 0;
+let noteReadAloudRunID = 0;
+let noteReadAloudSession: NoteReadAloudSession | null = null;
+let noteReadAloudStateEmitter: NoteReadAloudEmitter | null = null;
 let kokoroWorker: Worker | null = null;
+let pocketTTSServerProcess: ReturnType<typeof spawn> | null = null;
+let pocketTTSServerStartPromise: Promise<string> | null = null;
 const kokoroWorkerRequests = new Map<string, {
   resolve: (outputPath?: string) => void;
   reject: (error: Error) => void;
@@ -210,6 +414,8 @@ type ThreadItem = {
   age: string;
   updatedAt?: number;
   isArchived?: boolean;
+  archivedAt?: number;
+  autoDeleteAfter?: number | null;
   isTemporary?: boolean;
   isRunning?: boolean;
   runStatusText?: string;
@@ -220,6 +426,7 @@ type ChatMessage = {
   id: string;
   role: "user" | "assistant" | "activity";
   text: string;
+  source?: "runtime" | "realtimeVoice" | string;
   attachments?: ComposerImageAttachment[];
   artifacts?: MessageArtifact[];
   provider?: string;
@@ -268,6 +475,10 @@ type ComposerImageAttachment = {
   mimeType: string;
   dataURL: string;
   size?: number;
+  // "image" attachments are sent inline to the model as images.
+  // "file" attachments are written to disk and the path is given to the agent.
+  // Missing value is treated as "image" for backward compatibility.
+  kind?: "image" | "file";
 };
 
 type CodeCheckpointTurnStatus = "completed" | "failed" | "cancelled";
@@ -336,6 +547,9 @@ type NoteItem = {
   projectName?: string;
   folderID?: string | null;
   updatedAt?: number;
+  isArchived?: boolean;
+  archivedAt?: number;
+  autoDeleteAfter?: number | null;
   active?: boolean;
 };
 
@@ -349,6 +563,8 @@ type ThreadNoteListItem = {
   projectName?: string;
   updatedAt?: number;
   isArchived?: boolean;
+  archivedAt?: number;
+  autoDeleteAfter?: number | null;
   active?: boolean;
 };
 
@@ -434,6 +650,7 @@ type SettingsSnapshot = {
   darkThemeDiffRemoved: string;
   darkThemeSkill: string;
   pointerCursors: boolean;
+  fontSmoothing: boolean;
   reduceMotionMode: string;
   uiFontSize: string;
   codeFontSize: string;
@@ -447,10 +664,31 @@ type SettingsSnapshot = {
   realtimeMaskedOpenAIAPIKey: string;
   realtimeOpenAIModel: string;
   realtimeOpenAIVoice: string;
+  realtimeVoiceProvider: string;
+  realtimeGeminiAPIKeyConfigured: boolean;
+  realtimeMaskedGeminiAPIKey: string;
+  realtimeGeminiModel: string;
+  realtimeGeminiVoice: string;
+  liveVoiceMode: string;
+  todayWakeWordEnabled: boolean;
+  todayWakeWordPhrase: string;
+  realtimeDelegationMode: RealtimeDelegationMode;
+  localVoiceModel: string;
+  speechOutputRewriteModel: string;
   assistantVoiceOutputEnabled: boolean;
   computerUseEnabled: boolean;
   memoryEnabled: boolean;
+  knowledgeAccessEnabled: boolean;
+  knowledgeExternalAccessEnabled: boolean;
+  knowledgeAgentAccessEnabled: boolean;
+  knowledgeRealtimeVoiceAccessEnabled: boolean;
+  knowledgeOrganizerEnabled: boolean;
+  knowledgeServerPort: string;
+  knowledgeServerURL: string;
+  knowledgeTokenConfigured: boolean;
+  knowledgePendingRequestCount: number;
   assistantTrackCodeChangesInGitRepos: boolean;
+  archiveAutoDeleteDays: number | null;
   automationAPIPort: string;
   browserProfile: string;
   holdToTalkShortcut: string;
@@ -478,6 +716,13 @@ type SettingsSnapshot = {
   whisperModelInstalled: boolean;
   voiceEngine: string;
   kokoroVoice: string;
+  pocketTTSVoice: string;
+  openAITTSModel: string;
+  openAITTSVoice: string;
+  noteCleanupModel: string;
+  noteCleanupReasoningEffort: string;
+  geminiTTSModel: string;
+  geminiTTSVoice: string;
   kokoroModelInstalled: boolean;
   kokoroModelPath: string;
   kokoroModelDetail: string;
@@ -496,6 +741,26 @@ type SettingsSnapshot = {
   remoteAccessEnabled: boolean;
   remoteAccessPort: string;
   remoteAccessPublicURL: string;
+  remoteAccessNetworkMode: "localOnly" | "localNetwork" | "tailscale";
+  remoteAccessTailscaleHost: string;
+  remoteAccessLocalNetworkURL: string;
+  remoteAccessTailscaleURL: string;
+  remoteAccessEasyTunnelURL: string;
+  remoteAccessEasyTunnelRunning: boolean;
+  remoteAccessEasyTunnelStatusMessage: string;
+  remoteAccessTunnelHelperInstalled: boolean;
+  remoteAccessTunnelHelperInstalling: boolean;
+  remoteAccessTailscaleInstalled: boolean;
+  remoteAccessTailscaleRunning: boolean;
+  remoteAccessDetectedTailscaleHost: string;
+  remoteAccessTailscaleAppPath: string;
+  remoteAccessTailscaleInstallURL: string;
+  remoteAccessTailscaleStatusMessage: string;
+  remoteAccessPairingCode: string;
+  remoteAccessPairingURL: string;
+  remoteAccessPairingExpiresAt: number | null;
+  remoteAccessServerRunning: boolean;
+  remoteAccessDeviceCount: number;
   localAIRuntimeVersion: string;
   promptRewriteProvider: string;
   promptRewriteModel: string;
@@ -555,12 +820,30 @@ type SettingsUpdateKey =
   | "realtimeVoiceEnabled"
   | "realtimeOpenAIModel"
   | "realtimeOpenAIVoice"
+  | "realtimeVoiceProvider"
+  | "realtimeGeminiModel"
+  | "realtimeGeminiVoice"
+  | "liveVoiceMode"
+  | "todayWakeWordEnabled"
+  | "todayWakeWordPhrase"
+  | "realtimeDelegationMode"
+  | "localVoiceModel"
+  | "speechOutputRewriteModel"
   | "assistantVoiceOutputEnabled"
   | "computerUseEnabled"
   | "memoryEnabled"
+  | "knowledgeAccessEnabled"
+  | "knowledgeExternalAccessEnabled"
+  | "knowledgeAgentAccessEnabled"
+  | "knowledgeRealtimeVoiceAccessEnabled"
+  | "knowledgeOrganizerEnabled"
+  | "knowledgeServerPort"
   | "assistantTrackCodeChangesInGitRepos"
+  | "archiveAutoDeleteDays"
   | "telegramEnabled"
   | "remoteAccessEnabled"
+  | "remoteAccessNetworkMode"
+  | "remoteAccessTailscaleHost"
   | "compactStyle"
   | "compactEdge"
   | "assistantBackend"
@@ -591,6 +874,7 @@ type SettingsUpdateKey =
   | "darkThemeDiffRemoved"
   | "darkThemeSkill"
   | "pointerCursors"
+  | "fontSmoothing"
   | "reduceMotionMode"
   | "uiFontSize"
   | "codeFontSize"
@@ -611,6 +895,13 @@ type SettingsUpdateKey =
   | "selectedMicrophoneUID"
   | "voiceEngine"
   | "kokoroVoice"
+  | "pocketTTSVoice"
+  | "openAITTSModel"
+  | "openAITTSVoice"
+  | "noteCleanupModel"
+  | "noteCleanupReasoningEffort"
+  | "geminiTTSModel"
+  | "geminiTTSVoice"
   | "whisperModel"
   | "whisperUseCoreML"
   | "transcriptionEngine";
@@ -622,6 +913,9 @@ export type OpenAssistAppState = {
   notes: NoteItem[];
   threadNotes: ThreadNoteListItem[];
   noteFolders: NoteFolderItem[];
+  plannerDays: PlannerDaySummary[];
+  plannerBacklog?: PlannerBacklogDetail | null;
+  backlogItems?: DailyItem[];
   automations: AutomationItem[];
   skills: SkillItem[];
   plugins: PluginItem[];
@@ -637,6 +931,9 @@ export type ThreadDetail = {
   threadID: string;
   title: string;
   messages: ChatMessage[];
+  hasMoreBefore?: boolean;
+  oldestMessageID?: string;
+  loadedTurnCount?: number;
 };
 
 export type ThreadNoteSummary = {
@@ -644,6 +941,9 @@ export type ThreadNoteSummary = {
   title: string;
   fileName: string;
   updatedAt?: number;
+  isArchived?: boolean;
+  archivedAt?: number;
+  autoDeleteAfter?: number | null;
 };
 
 export type ThreadNoteWorkspace = {
@@ -661,6 +961,139 @@ export type NoteDetail = {
   title: string;
   markdown: string;
   path?: string;
+};
+
+type NoteLinkOwnerKind = "project" | "thread" | "planner";
+
+type NoteLinkTarget = {
+  ownerKind: NoteLinkOwnerKind;
+  ownerId: string;
+  noteId: string;
+};
+
+type NoteLinkRelation = NoteLinkTarget & {
+  title: string;
+  sourceLabel: string;
+  occurrenceCount: number;
+  isMissing?: boolean;
+};
+
+type NoteLinkGraphNode = NoteLinkTarget & {
+  id: string;
+  title: string;
+  sourceLabel: string;
+  isCurrent?: boolean;
+  isMissing?: boolean;
+};
+
+type NoteLinkGraphEdge = {
+  from: string;
+  to: string;
+  occurrenceCount: number;
+};
+
+type NoteLinkGraph = {
+  nodeCount: number;
+  edgeCount: number;
+  mermaidCode: string;
+  nodes: NoteLinkGraphNode[];
+  edges: NoteLinkGraphEdge[];
+};
+
+type NoteLinksSnapshot = {
+  outgoingLinks: NoteLinkRelation[];
+  backlinks: NoteLinkRelation[];
+  graph: NoteLinkGraph | null;
+};
+
+type StoredNoteLinkRecord = NoteLinkTarget & {
+  key: string;
+  title: string;
+  sourceLabel: string;
+  markdown: string;
+};
+
+type PlannerDaySummary = {
+  id: string;
+  title: string;
+  subtitle: string;
+  path: string;
+  updatedAt?: number;
+  active?: boolean;
+};
+
+type PlannerDayDetail = PlannerDaySummary & {
+  markdown: string;
+};
+
+type PlannerBacklogDetail = PlannerDaySummary & {
+  markdown: string;
+};
+
+type DailyItemStatus = "todo" | "doing" | "done";
+
+type DailyItemStep = {
+  id: string;
+  text: string;
+  checked: boolean;
+};
+
+type DailyItemScopeTag = {
+  marker: "@" | "#";
+  label: string;
+  kind: "project" | "folder" | "unresolved";
+  id?: string;
+};
+
+type DailyItem = {
+  id: string;
+  dayID: string;
+  title: string;
+  status: DailyItemStatus;
+  checked: boolean;
+  projectID?: string;
+  folderID?: string;
+  projectName?: string;
+  folderName?: string;
+  area?: string;
+  scopeTags?: DailyItemScopeTag[];
+  detailsMarkdown: string;
+  steps: DailyItemStep[];
+  links: NoteLinkTarget[];
+  createdAt: string;
+  updatedAt: string;
+  order: number;
+  structured?: boolean;
+  line?: number;
+};
+
+type DailyItemInput = Partial<Omit<DailyItem, "id" | "createdAt" | "updatedAt" | "structured" | "line">> & {
+  id?: string;
+  dayID?: string;
+  title: string;
+};
+
+type DailyItemMutationResult = {
+  day: PlannerDayDetail;
+  items: DailyItem[];
+  item?: DailyItem | null;
+};
+
+type BacklogItemMutationResult = {
+  backlog: PlannerBacklogDetail;
+  items: DailyItem[];
+  item?: DailyItem | null;
+  scheduledDay?: PlannerDayDetail;
+  scheduledItems?: DailyItem[];
+};
+
+type PlannerScheduleRequest = {
+  mode?: "move" | "copy" | "link";
+  targetDayID?: string;
+  selectedText?: string;
+  sourceTitle?: string;
+  sourceTarget?: NoteLinkTarget | null;
+  sourceDayID?: string;
 };
 
 type SessionSummary = JsonObject & {
@@ -683,6 +1116,8 @@ type SessionSummary = JsonObject & {
   latestReasoningEffort?: string;
   latestPermissionMode?: string;
   isArchived?: boolean;
+  archivedAt?: number;
+  autoDeleteAfter?: number | null;
   isTemporary?: boolean;
   projectID?: string;
   projectName?: string;
@@ -698,6 +1133,22 @@ type LoadedProjects = {
   threadAssignments: Record<string, string>;
   threadTitles: Map<string, string>;
 };
+
+type AgentFilesManifest = {
+  threadID: string;
+  projectID: string;
+  threadTitle: string;
+  threadFolder: string;
+  createdAt: number;
+  updatedAt: number;
+  previousLocations: string[];
+  linkedFolderPath?: string;
+};
+
+const unassignedAgentFilesProjectID = "_UNASSIGNED";
+const agentFilesDirectoryName = "AgentFiles";
+const agentFilesManifestName = "manifest.json";
+const agentFilesMovedToName = "moved-to.json";
 
 function supportRoot() {
   return path.join(os.homedir(), "Library/Application Support/OpenAssist");
@@ -715,6 +1166,10 @@ function assistantVoiceLog(message: string) {
 
 function projectStoreRoot() {
   return path.join(supportRoot(), "AssistantProjects");
+}
+
+function cleanupBackupsRoot() {
+  return path.join(supportRoot(), "CleanupBackups");
 }
 
 function conversationStoreRoot() {
@@ -936,6 +1391,76 @@ async function cleanupStaleComputerUseHelpers(currentAppServerPID?: number, opti
   return { killed: Array.from(killed) };
 }
 
+// Report any Computer Use helper processes currently running, so the UI can show
+// "Computer Use is active" and offer a force-stop (useful after a crash leaves an
+// orphaned helper). See docs/computer-use-troubleshooting.md.
+export async function getComputerUseActivity() {
+  const helpers = (await processSnapshot())
+    .map((entry) => ({ ...entry, kind: computerUseHelperKind(entry.command) }))
+    .filter((entry) => Boolean(entry.kind))
+    .map((entry) => ({
+      pid: entry.pid,
+      kind: entry.kind as string,
+      elapsedSeconds: entry.elapsedSeconds
+    }));
+  return {
+    active: helpers.length > 0,
+    activeToolCalls: activeComputerUseToolCalls.size,
+    helpers
+  };
+}
+
+// On app launch, kill any Computer Use helper processes orphaned by a previous
+// crashed/force-quit session so they don't pile up (we have seen 10+ accumulate,
+// which makes turns hang on "Transport closed"). No Codex restart here — Codex
+// is not running yet at startup. See docs/computer-use-troubleshooting.md.
+export async function cleanupOrphanedComputerUseHelpersOnStartup() {
+  const orphans = (await processSnapshot())
+    .map((entry) => ({ ...entry, kind: computerUseHelperKind(entry.command) }))
+    .filter((entry) => Boolean(entry.kind));
+  if (!orphans.length) return { killed: [] as number[] };
+  bridgeDebugLog(`Startup: killing ${orphans.length} orphaned Computer Use helper(s) details=${orphans.map((entry) => `${entry.pid}:${entry.kind}:${entry.elapsedSeconds}s`).join(",")}`);
+  const killed: number[] = [];
+  for (const orphan of orphans) {
+    if (isProcessAlive(orphan.pid)) {
+      killProcessQuietly(orphan.pid, "SIGKILL");
+      killed.push(orphan.pid);
+    }
+  }
+  return { killed };
+}
+
+// User-triggered force stop: kill every Computer Use helper and restart the Codex
+// backend for a fully clean slate. Used by the Settings "Force stop" button.
+export async function forceStopComputerUse() {
+  const before = await getComputerUseActivity();
+  const cleanup = await cleanupStaleComputerUseHelpers(undefined, { allowDuringActiveToolCall: true })
+    .catch((error) => {
+      bridgeDebugLog(`forceStopComputerUse cleanup failed: ${error instanceof Error ? error.stack ?? error.message : String(error)}`);
+      return { killed: [] as number[] };
+    });
+  // Belt-and-suspenders: also SIGKILL any helper the snapshot-based cleanup missed.
+  for (const helper of before.helpers) {
+    if (isProcessAlive(helper.pid)) killProcessQuietly(helper.pid, "SIGKILL");
+  }
+  let restarted = false;
+  try {
+    await codexTransport.restart("User force-stopped Computer Use");
+    restarted = true;
+  } catch (error) {
+    bridgeDebugLog(`forceStopComputerUse Codex restart failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  return { stopped: before.active || cleanup.killed.length > 0, killed: cleanup.killed, restarted };
+}
+
+// Minimum age (seconds) before an attached helper is considered stuck rather
+// than a healthy helper from the previous turn. The Computer Use MCP helper
+// stays attached to the Codex app-server between turns and is reused; killing a
+// freshly-attached one closes its transport mid-call ("Transport closed") and
+// breaks the very turn we are about to start. See
+// docs/computer-use-troubleshooting.md.
+const ATTACHED_HELPER_RESTART_MIN_AGE_SECONDS = 180;
+
 async function resetCodexIfCurrentComputerUseHelperExists(reason: string) {
   const currentPID = codexTransport.currentPID();
   if (!currentPID || !Number.isFinite(currentPID) || activeComputerUseToolCalls.size > 0) {
@@ -949,13 +1474,29 @@ async function resetCodexIfCurrentComputerUseHelperExists(reason: string) {
     .filter((entry) => Boolean(entry.kind))
     .filter((entry) => entry.pid !== currentPID && entry.ppid === currentPID);
   if (!currentHelpers.length) return false;
-  bridgeDebugLog(`Computer Use helper already attached before turn; restarting Codex reason="${reason}" details=${currentHelpers.map((entry) => `${entry.pid}:${entry.kind}:${entry.elapsedSeconds}s`).join(",")}`);
+  // Only restart when an attached helper is actually OLD/stuck. A helper that
+  // attached a few seconds ago is the normal reused helper — restarting Codex
+  // here kills it mid-flight and the turn fails with "Transport closed".
+  const stuckHelpers = currentHelpers.filter(
+    (entry) => entry.elapsedSeconds >= ATTACHED_HELPER_RESTART_MIN_AGE_SECONDS
+  );
+  if (!stuckHelpers.length) {
+    bridgeDebugLog(`Computer Use helper attached but healthy (reusing); not restarting reason="${reason}" details=${currentHelpers.map((entry) => `${entry.pid}:${entry.kind}:${entry.elapsedSeconds}s`).join(",")}`);
+    return false;
+  }
+  bridgeDebugLog(`Computer Use helper attached and stuck (>=${ATTACHED_HELPER_RESTART_MIN_AGE_SECONDS}s); restarting Codex reason="${reason}" details=${stuckHelpers.map((entry) => `${entry.pid}:${entry.kind}:${entry.elapsedSeconds}s`).join(",")}`);
   await codexTransport.restart(reason);
   await cleanupStaleComputerUseHelpers(undefined, { allowDuringActiveToolCall: true }).catch((error) => {
     bridgeDebugLog(`Computer Use cleanup after current-helper restart failed: ${error instanceof Error ? error.stack ?? error.message : String(error)}`);
   });
   return true;
 }
+
+// NOTE: An earlier "preflight" probe (spawned its own list_apps before each
+// turn to detect missing permissions) was removed — it left an orphan helper
+// that raced with cleanup and made the helper-kill bug worse. The real fix was
+// to stop killing the live helper (see resetCodexIfCurrentComputerUseHelperExists
+// and docs/computer-use-troubleshooting.md).
 
 function codexConfigPath() {
   return path.join(codexRoot(), "config.toml");
@@ -969,6 +1510,16 @@ function sessionWorkingDirectory(session: SessionSummary | undefined) {
   return session?.effectiveCWD || session?.cwd || undefined;
 }
 
+function sameResolvedPath(left?: string | null, right?: string | null) {
+  if (!left || !right) return false;
+  return path.resolve(left) === path.resolve(right);
+}
+
+function pathIsInside(childPath: string, parentPath: string) {
+  const relative = path.relative(path.resolve(parentPath), path.resolve(childPath));
+  return relative === "" || (!!relative && !relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
 type CodexInteractionMode = "conversational" | "plan" | "agentic";
 type CodexPermissionMode = "default" | "autoReview" | "fullAccess" | "custom";
 
@@ -978,19 +1529,32 @@ type CodexRuntimeOptions = {
   reasoningEffort?: CodexReasoningEffort;
   pluginIDs?: string[];
   sessionInstructions?: string;
+  knowledgeAccessEnabled?: boolean;
 };
 
 const maxComposerImageAttachments = 6;
 const maxComposerImageAttachmentBytes = 12 * 1024 * 1024;
+// Non-image files (PDFs, documents, code, archives, etc.) can be larger than
+// images, so they get a more generous size limit.
+const maxComposerFileAttachmentBytes = 64 * 1024 * 1024;
 
 function dataURLImageMimeType(rawValue: string) {
   const match = /^data:([^;,]+);base64,/i.exec(rawValue.trim());
   return match?.[1]?.trim().toLowerCase() || "";
 }
 
+function composerAttachmentKind(rawValue: unknown, mimeType: string): "image" | "file" {
+  if (rawValue === "file") return "file";
+  if (rawValue === "image") return "image";
+  return mimeType.startsWith("image/") ? "image" : "file";
+}
+
 function normalizedComposerAttachmentName(rawValue: unknown, fallbackIndex: number, mimeType: string) {
-  const fallbackExtension = mimeType === "image/jpeg" ? "jpg" : mimeType.split("/")[1]?.split("+")[0] || "png";
-  const fallback = `attached-image-${fallbackIndex}.${fallbackExtension}`;
+  const isImage = mimeType.startsWith("image/");
+  const fallbackExtension = isImage
+    ? (mimeType === "image/jpeg" ? "jpg" : mimeType.split("/")[1]?.split("+")[0] || "png")
+    : (mimeType.split("/")[1]?.split("+")[0] || "dat");
+  const fallback = `${isImage ? "attached-image" : "attached-file"}-${fallbackIndex}.${fallbackExtension}`;
   const value = typeof rawValue === "string" ? rawValue.trim() : "";
   if (!value) return fallback;
   const basename = path.basename(value).replace(/[/:\\]/g, "-").trim();
@@ -1001,38 +1565,136 @@ function normalizeComposerImageAttachments(rawValue: unknown): ComposerImageAtta
   if (!Array.isArray(rawValue)) return [];
   return rawValue.slice(0, maxComposerImageAttachments).map((item, index) => {
     if (!item || typeof item !== "object") {
-      throw new Error("Image attachment data was not valid.");
+      throw new Error("Attachment data was not valid.");
     }
     const object = item as Record<string, unknown>;
     const dataURL = typeof object.dataURL === "string" ? object.dataURL.trim() : "";
     const commaIndex = dataURL.indexOf(",");
-    if (commaIndex <= 0 || !dataURL.toLowerCase().startsWith("data:image/")) {
-      throw new Error("Only image attachments can be sent right now.");
+    if (commaIndex <= 0 || !/^data:[^,]*,/i.test(dataURL)) {
+      throw new Error("Attachment data was not valid.");
     }
-    const mimeType = dataURLImageMimeType(dataURL) || "image/png";
+    const isImageData = dataURL.toLowerCase().startsWith("data:image/");
+    const mimeType = isImageData
+      ? (dataURLImageMimeType(dataURL) || "image/png")
+      : (dataURLImageMimeType(dataURL) || "application/octet-stream");
+    const kind = composerAttachmentKind(object.kind, mimeType);
     const encodedPayload = dataURL.slice(commaIndex + 1).replace(/\s+/g, "");
     if (!encodedPayload) {
-      throw new Error("Image attachment data was empty.");
+      throw new Error("Attachment data was empty.");
     }
-    const imageData = Buffer.from(encodedPayload, "base64");
-    if (!imageData.length) {
-      throw new Error("Image attachment data was empty.");
+    const fileData = Buffer.from(encodedPayload, "base64");
+    if (!fileData.length) {
+      throw new Error("Attachment data was empty.");
     }
-    if (imageData.length > maxComposerImageAttachmentBytes) {
-      throw new Error("One image is too large. Please attach an image under 12 MB.");
+    if (kind === "image") {
+      if (fileData.length > maxComposerImageAttachmentBytes) {
+        throw new Error("One image is too large. Please attach an image under 12 MB.");
+      }
+    } else if (fileData.length > maxComposerFileAttachmentBytes) {
+      throw new Error("One file is too large. Please attach a file under 64 MB.");
     }
     return {
       id: typeof object.id === "string" && object.id.trim() ? object.id.trim() : `attachment-${randomUUID().toLowerCase()}`,
       name: normalizedComposerAttachmentName(object.name, index + 1, mimeType),
       mimeType,
       dataURL: `data:${mimeType};base64,${encodedPayload}`,
-      size: typeof object.size === "number" && Number.isFinite(object.size) ? object.size : imageData.length
+      size: typeof object.size === "number" && Number.isFinite(object.size) ? object.size : fileData.length,
+      kind
     };
   });
 }
 
+function composerAttachmentDataBuffer(attachment: ComposerImageAttachment) {
+  const commaIndex = attachment.dataURL.indexOf(",");
+  if (commaIndex <= 0) return Buffer.alloc(0);
+  return Buffer.from(attachment.dataURL.slice(commaIndex + 1).replace(/\s+/g, ""), "base64");
+}
+
+function persistedComposerAttachmentFileName(attachment: ComposerImageAttachment, index: number) {
+  const safeID = attachment.id.replace(/[^a-z0-9_-]+/gi, "-").replace(/^-+|-+$/g, "") || `attachment-${index + 1}`;
+  const safeName = normalizedComposerAttachmentName(attachment.name, index + 1, attachment.mimeType);
+  return `${safeID}-${safeName}`;
+}
+
+function persistComposerMessageAttachments(threadID: string, attachments: ComposerImageAttachment[]) {
+  return attachments.map((attachment, index) => {
+    const persisted: JsonObject = {
+      id: attachment.id,
+      name: attachment.name,
+      mimeType: attachment.mimeType,
+      size: attachment.size,
+      kind: attachment.kind
+    };
+    try {
+      const directory = path.join(conversationStoreRoot(), threadID, "attachments");
+      fs.mkdirSync(directory, { recursive: true });
+      const filePath = path.join(directory, persistedComposerAttachmentFileName(attachment, index));
+      fs.writeFileSync(filePath, composerAttachmentDataBuffer(attachment));
+      persisted.filePath = filePath;
+    } catch (error) {
+      bridgeDebugLog(`Failed to persist composer attachment preview: ${error instanceof Error ? error.message : String(error)}`);
+      persisted.dataURL = attachment.dataURL;
+    }
+    return persisted;
+  });
+}
+
+function composerAttachmentDataURLFromStored(object: JsonObject) {
+  const dataURL = typeof object.dataURL === "string" ? object.dataURL.trim() : "";
+  if (dataURL) return dataURL;
+  const filePath = firstRuntimeString(object.filePath, object.file_path, object.path);
+  const mimeType = firstRuntimeString(object.mimeType, object.mime_type) || imageMimeTypeFromPath(filePath) || "application/octet-stream";
+  return imageDataURLFromFile(filePath, mimeType) || "";
+}
+
+function storedComposerMessageAttachments(rawValue: unknown) {
+  if (!Array.isArray(rawValue)) return [];
+  const attachments: ComposerImageAttachment[] = [];
+  rawValue.forEach((raw, index) => {
+    const object = runtimeObject(raw);
+    if (!object) return;
+    const dataURL = composerAttachmentDataURLFromStored(object);
+    if (!dataURL) return;
+    try {
+      attachments.push(...normalizeComposerImageAttachments([{
+        id: firstRuntimeString(object.id) || `attachment-${index + 1}`,
+        name: firstRuntimeString(object.name, object.fileName, object.filename),
+        mimeType: firstRuntimeString(object.mimeType, object.mime_type),
+        dataURL,
+        size: Number.isFinite(Number(object.size)) ? Number(object.size) : undefined,
+        kind: firstRuntimeString(object.kind)
+      }]));
+    } catch (error) {
+      bridgeDebugLog(`Failed to load stored composer attachment preview: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  });
+  return attachments;
+}
+
+function composerImageAttachmentsOf(attachments: ComposerImageAttachment[]) {
+  return attachments.filter((attachment) => composerAttachmentKind(attachment.kind, attachment.mimeType) === "image");
+}
+
+function composerFileAttachmentsOf(attachments: ComposerImageAttachment[]) {
+  return attachments.filter((attachment) => composerAttachmentKind(attachment.kind, attachment.mimeType) === "file");
+}
+
+// Builds the short user-visible text shown for a message that only carries
+// attachments, e.g. "Attached image", "2 attached files", or "1 image, 1 file".
+function composerAttachmentSummaryText(attachments: ComposerImageAttachment[]) {
+  const imageCount = composerImageAttachmentsOf(attachments).length;
+  const fileCount = composerFileAttachmentsOf(attachments).length;
+  const parts: string[] = [];
+  if (imageCount) parts.push(`${imageCount} ${imageCount === 1 ? "image" : "images"}`);
+  if (fileCount) parts.push(`${fileCount} ${fileCount === 1 ? "file" : "files"}`);
+  if (!parts.length) return "Attachment";
+  if (imageCount && !fileCount && imageCount === 1) return "Attached image";
+  if (fileCount && !imageCount && fileCount === 1) return "Attached file";
+  return `Attached ${parts.join(" and ")}`;
+}
+
 function composerImageInputItems(attachments: ComposerImageAttachment[]) {
-  return attachments.flatMap((attachment, index) => [
+  return composerImageAttachmentsOf(attachments).flatMap((attachment, index) => [
     {
       type: "text",
       text: `Attached image ${index + 1}: ${attachment.name}`,
@@ -1046,7 +1708,7 @@ function composerImageInputItems(attachments: ComposerImageAttachment[]) {
 }
 
 function composerImageInstructionItems(attachments: ComposerImageAttachment[]) {
-  if (!attachments.length) return [] as JsonObject[];
+  if (!composerImageAttachmentsOf(attachments).length) return [] as JsonObject[];
   return [{
     type: "text",
     text: "If image attachments are present, analyze those attached images directly. Do not use tools or browser/app automation just to inspect attached images.",
@@ -1054,15 +1716,39 @@ function composerImageInstructionItems(attachments: ComposerImageAttachment[]) {
   } as JsonObject];
 }
 
+// Writes the attached files to a temporary folder and returns a text block that
+// tells the agent the on-disk paths so it can open and work on them. Inline
+// images are skipped here because the model already receives them directly.
+async function materializeComposerFileAttachments(threadID: string, attachments: ComposerImageAttachment[]) {
+  const fileAttachments = composerFileAttachmentsOf(attachments);
+  if (!fileAttachments.length) return "";
+  const directory = path.join(os.tmpdir(), `openassist-chat-files-${threadID.replace(/[^a-z0-9_-]/gi, "-")}-${randomUUID().toLowerCase()}`);
+  fs.mkdirSync(directory, { recursive: true });
+  const lines = [
+    "File attachments are available on disk for this turn.",
+    "Open and read these files directly if the user's request depends on them:"
+  ];
+  fileAttachments.forEach((attachment, index) => {
+    const commaIndex = attachment.dataURL.indexOf(",");
+    const data = Buffer.from(attachment.dataURL.slice(commaIndex + 1), "base64");
+    const filename = normalizedComposerAttachmentName(attachment.name, index + 1, attachment.mimeType);
+    const filePath = path.join(directory, filename);
+    fs.writeFileSync(filePath, data);
+    lines.push(`- ${attachment.name} [${attachment.mimeType}]: ${filePath}`);
+  });
+  return lines.join("\n");
+}
+
 async function materializeComposerImageAttachments(threadID: string, attachments: ComposerImageAttachment[]) {
-  if (!attachments.length) return "";
+  const imageAttachments = composerImageAttachmentsOf(attachments);
+  if (!imageAttachments.length) return "";
   const directory = path.join(os.tmpdir(), `openassist-chat-images-${threadID.replace(/[^a-z0-9_-]/gi, "-")}-${randomUUID().toLowerCase()}`);
   fs.mkdirSync(directory, { recursive: true });
   const lines = [
     "Image attachments are available on disk for this turn.",
     "Open and inspect these files directly if the user's request depends on the image:"
   ];
-  attachments.forEach((attachment, index) => {
+  imageAttachments.forEach((attachment, index) => {
     const commaIndex = attachment.dataURL.indexOf(",");
     const data = Buffer.from(attachment.dataURL.slice(commaIndex + 1), "base64");
     const filename = normalizedComposerAttachmentName(attachment.name, index + 1, attachment.mimeType);
@@ -1191,8 +1877,11 @@ function normalizeCodexPermissionMode(raw?: string): CodexPermissionMode {
   return "default";
 }
 
-function codexPermissionProfile(id: string): JsonObject {
-  return { type: "profile", id };
+// codex app-server >= 0.139 takes `permissions` as a plain profile-id string
+// (e.g. ":workspace"); the older { type: "profile", id } object form is
+// rejected with "invalid type: map, expected a string".
+function codexPermissionProfile(id: string): string {
+  return id;
 }
 
 function codexThreadPermissionParams(modeInput?: string): JsonObject {
@@ -1285,22 +1974,45 @@ function codexModeInstructions(mode: CodexInteractionMode) {
 
 function codexWorkspaceBoundaryInstructions(session: SessionSummary | undefined) {
   const cwd = sessionWorkingDirectory(session)?.trim();
+  const linkedWorkspace = normalizeLinkedFolderPath(session?.linkedProjectFolderPath);
   if (cwd) {
-    return [
+    const lines = [
       "# Workspace Boundary",
       "",
-      `This thread is attached to the workspace \`${cwd}\`.`,
-      "Stay inside this workspace unless the user clearly asks you to inspect somewhere else.",
-      "Do not search parent folders, sibling projects, or the user's home directory just to guess where files live."
-    ].join("\n");
+      `This thread's app-managed Agent Files folder is \`${cwd}\`.`,
+      "Save generated reports, dashboards, notes, JSON, CSV, HTML, images, and analysis outputs in this Agent Files folder.",
+      "Do not use the OpenAssist app repo root as a default write location.",
+      "Only write to a linked repo or external folder when the user clearly asks for that exact file/folder change."
+    ];
+    if (linkedWorkspace) {
+      lines.push(
+        "",
+        `Linked workspace for read/context: \`${linkedWorkspace}\`.`,
+        "You may inspect it when it is relevant, but treat it as read-only unless the user clearly asks to modify it."
+      );
+    }
+    return lines.join("\n");
   }
   return [
     "# Workspace Boundary",
     "",
-    "This thread does not have an attached workspace folder.",
+    "This thread does not have an Agent Files folder yet.",
     "Do not scan the user's home directory or unrelated folders trying to guess where the project lives.",
     "Work only with the files already provided in the thread, selected skills, selected plugins, or paths the user explicitly names."
   ].join("\n");
+}
+
+function promptWithAgentFilesContext(prompt: string, session: SessionSummary | undefined, agentFilesPath: string) {
+  const linkedWorkspace = normalizeLinkedFolderPath(session?.linkedProjectFolderPath);
+  const lines = [
+    "OpenAssist storage rules:",
+    `- Save generated reports, dashboards, notes, JSON, CSV, HTML, images, and analysis outputs in: ${agentFilesPath}`,
+    "- Do not write generated files into a linked repo or external folder unless the user clearly asks for that exact file/folder change."
+  ];
+  if (linkedWorkspace) {
+    lines.push(`- Linked workspace for read/context: ${linkedWorkspace}`);
+  }
+  return `${lines.join("\n")}\n\nUser task:\n${prompt}`;
 }
 
 function buildCodexRuntimeInstructions(session: SessionSummary | undefined, options: CodexRuntimeOptions = {}) {
@@ -1309,6 +2021,9 @@ function buildCodexRuntimeInstructions(session: SessionSummary | undefined, opti
     codexModeInstructions(mode),
     codexWorkspaceBoundaryInstructions(session)
   ];
+  if (options.knowledgeAccessEnabled) {
+    sections.push(openAssistKnowledgeAgentInstructions("Codex"));
+  }
   const sessionInstructions = options.sessionInstructions?.trim();
   if (sessionInstructions) {
     sections.push(`# Custom Instructions\n\n${sessionInstructions}`);
@@ -1379,13 +2094,79 @@ function readJSON<T>(filePath: string, fallback: T): T {
   }
 }
 
-async function readDefault(key: string, fallback: string) {
-  try {
-    const { stdout } = await execFileAsync("defaults", ["read", "com.developingadventures.OpenAssist", key]);
-    return stdout.trim() || fallback;
-  } catch {
-    return fallback;
+// Bulk-cache for `defaults` reads.
+// loadSettings() reads ~100 keys at startup. Each `defaults read <domain> <key>`
+// was a separate process fork at ~13 ms each = ~1.3 s of dead time. We now
+// pull the entire domain once via `defaults export <domain> -` (one fork),
+// parse the plist XML into a Map<string, string>, and serve every subsequent
+// readDefault from memory. The cache is invalidated whenever the app writes
+// a default (writeStringDefault / writeBoolDefault etc.) or after a TTL of
+// 30 s as a safety belt for external changes.
+let defaultsCache: Map<string, string> | null = null;
+let defaultsCacheLoadedAt = 0;
+let defaultsCacheInflight: Promise<Map<string, string>> | null = null;
+const DEFAULTS_CACHE_TTL_MS = 30_000;
+
+function parsePlistXmlScalars(xml: string): Map<string, string> {
+  const out = new Map<string, string>();
+  // Walk <key>NAME</key><TYPE>VALUE</TYPE> pairs at any depth in the top dict.
+  // We deliberately only capture scalar types — string/integer/real/bool —
+  // and treat <data>/<array>/<dict> as "not a string default", letting the
+  // caller's fallback win. That's the same behavior as the old per-key
+  // `defaults read KEY` (it errors and we return the fallback).
+  const re = /<key>([^<]+)<\/key>\s*(?:<string>([^]*?)<\/string>|<integer>([^]*?)<\/integer>|<real>([^]*?)<\/real>|<(true|false)\s*\/>)/g;
+  // Decode common XML entities back to source characters.
+  const decode = (s: string) =>
+    s
+      .replace(/&amp;/g, "&")
+      .replace(/&lt;/g, "<")
+      .replace(/&gt;/g, ">")
+      .replace(/&quot;/g, '"')
+      .replace(/&apos;/g, "'");
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(xml)) !== null) {
+    const key = m[1];
+    if (m[2] !== undefined) out.set(key, decode(m[2]));
+    else if (m[3] !== undefined) out.set(key, m[3].trim());
+    else if (m[4] !== undefined) out.set(key, m[4].trim());
+    else if (m[5] !== undefined) out.set(key, m[5] === "true" ? "1" : "0");
   }
+  return out;
+}
+
+async function loadDefaultsCache(): Promise<Map<string, string>> {
+  const now = Date.now();
+  if (defaultsCache && now - defaultsCacheLoadedAt < DEFAULTS_CACHE_TTL_MS) {
+    return defaultsCache;
+  }
+  if (defaultsCacheInflight) return defaultsCacheInflight;
+  defaultsCacheInflight = (async () => {
+    try {
+      const { stdout } = await execFileAsync("defaults", ["export", openAssistDefaultsDomain, "-"]);
+      defaultsCache = parsePlistXmlScalars(stdout);
+    } catch {
+      defaultsCache = new Map();
+    }
+    defaultsCacheLoadedAt = Date.now();
+    defaultsCacheInflight = null;
+    return defaultsCache;
+  })();
+  return defaultsCacheInflight;
+}
+
+// Hard-invalidate the defaults cache. Currently unused (writes patch the
+// cache in place) but kept for future external-change scenarios.
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+function invalidateDefaultsCache() {
+  defaultsCache = null;
+  defaultsCacheLoadedAt = 0;
+}
+
+async function readDefault(key: string, fallback: string) {
+  const cache = await loadDefaultsCache();
+  const value = cache.get(key);
+  if (value !== undefined && value.length > 0) return value;
+  return fallback;
 }
 
 async function readBoolDefault(key: string, fallback: boolean) {
@@ -1399,40 +2180,45 @@ async function readNumberDefault(key: string, fallback: number) {
 }
 
 async function writeStringDefault(defaultsKey: string, nextValue: string) {
-  await execFileAsync("defaults", ["write", "com.developingadventures.OpenAssist", defaultsKey, "-string", nextValue]);
+  await execFileAsync("defaults", ["write", openAssistDefaultsDomain, defaultsKey, "-string", nextValue]);
+  if (defaultsCache) defaultsCache.set(defaultsKey, nextValue);
   await synchronizeDefaults();
 }
 
 async function writeNumberDefault(defaultsKey: string, nextValue: number) {
-  await execFileAsync("defaults", ["write", "com.developingadventures.OpenAssist", defaultsKey, "-float", String(nextValue)]);
+  await execFileAsync("defaults", ["write", openAssistDefaultsDomain, defaultsKey, "-float", String(nextValue)]);
+  if (defaultsCache) defaultsCache.set(defaultsKey, String(nextValue));
   await synchronizeDefaults();
 }
 
 async function writeBoolDefault(defaultsKey: string, nextValue: boolean) {
   await execFileAsync("defaults", [
     "write",
-    "com.developingadventures.OpenAssist",
+    openAssistDefaultsDomain,
     defaultsKey,
     "-bool",
     nextValue ? "true" : "false"
   ]);
+  if (defaultsCache) defaultsCache.set(defaultsKey, nextValue ? "1" : "0");
   await synchronizeDefaults();
 }
 
 async function writeIntDefault(defaultsKey: string, nextValue: number) {
   await execFileAsync("defaults", [
     "write",
-    "com.developingadventures.OpenAssist",
+    openAssistDefaultsDomain,
     defaultsKey,
     "-int",
     String(nextValue)
   ]);
+  if (defaultsCache) defaultsCache.set(defaultsKey, String(nextValue));
   await synchronizeDefaults();
 }
 
 async function deleteDefault(defaultsKey: string) {
   try {
-    await execFileAsync("defaults", ["delete", "com.developingadventures.OpenAssist", defaultsKey]);
+    await execFileAsync("defaults", ["delete", openAssistDefaultsDomain, defaultsKey]);
+    if (defaultsCache) defaultsCache.delete(defaultsKey);
     await synchronizeDefaults();
   } catch {
     // Missing defaults are already cleared.
@@ -1441,10 +2227,29 @@ async function deleteDefault(defaultsKey: string) {
 
 async function synchronizeDefaults() {
   try {
-    await execFileAsync("defaults", ["synchronize", "com.developingadventures.OpenAssist"]);
+    await execFileAsync("defaults", ["synchronize", openAssistDefaultsDomain]);
   } catch {
     // Some macOS versions ignore this command for app domains; the write already happened.
   }
+  // Mark cache loadedAt expired but keep the in-memory map for now — the
+  // individual write-paths above patched the key. The next readDefault after
+  // TTL passes will refresh fully if needed.
+}
+
+let liquidGlassDefaultMigrationPromise: Promise<void> | null = null;
+
+async function ensureLiquidGlassDefaultMigrated() {
+  if (!liquidGlassDefaultMigrationPromise) {
+    liquidGlassDefaultMigrationPromise = (async () => {
+      const migrated = (await readDefault(liquidGlassDefaultMigrationKey, "0")).toLowerCase();
+      if (["1", "true", "yes"].includes(migrated)) return;
+      await writeStringDefault("OpenAssist.appChromeStyle", liquidGlassChromeStyle);
+      await writeBoolDefault(liquidGlassDefaultMigrationKey, true);
+    })().catch((error) => {
+      bridgeDebugLog(`liquid glass default migration failed: ${error instanceof Error ? error.message : String(error)}`);
+    });
+  }
+  await liquidGlassDefaultMigrationPromise;
 }
 
 type SecureCredentialRecord = {
@@ -1762,12 +2567,36 @@ function kokoroOutputDirectory() {
   return path.join(kokoroVoiceDirectory(), "generated");
 }
 
+function pocketTTSVoiceDirectory() {
+  return path.join(assistantVoiceRoot(), "PocketTTS");
+}
+
+function pocketTTSOutputDirectory() {
+  return path.join(pocketTTSVoiceDirectory(), "generated");
+}
+
+function pocketTTSCacheDirectory() {
+  return path.join(pocketTTSVoiceDirectory(), "cache");
+}
+
+function cloudTTSVoiceDirectory() {
+  return path.join(assistantVoiceRoot(), "CloudTTS");
+}
+
+function cloudTTSOutputDirectory() {
+  return path.join(cloudTTSVoiceDirectory(), "generated");
+}
+
+function cloudTTSCacheDirectory() {
+  return path.join(cloudTTSVoiceDirectory(), "cache");
+}
+
 function isGeneratedAssistantVoiceFile(filePath: string) {
-  const outputRoot = path.resolve(kokoroOutputDirectory());
+  const outputRoots = [kokoroOutputDirectory(), pocketTTSOutputDirectory(), cloudTTSOutputDirectory()].map((entry) => path.resolve(entry));
   const resolvedPath = path.resolve(filePath);
   return (
-    path.dirname(resolvedPath) === outputRoot &&
-    /^assistant-reply-\d+(?:-\d+)?\.wav$/.test(path.basename(resolvedPath))
+    outputRoots.includes(path.dirname(resolvedPath)) &&
+    /^assistant-reply-\d+(?:-\d+)?\.(?:wav|mp3)$/.test(path.basename(resolvedPath))
   );
 }
 
@@ -1783,13 +2612,14 @@ function removeGeneratedAssistantVoiceFile(filePath: string) {
 }
 
 function cleanupGeneratedAssistantVoiceFiles(exceptPath?: string) {
-  const outputDirectory = kokoroOutputDirectory();
-  if (!fs.existsSync(outputDirectory)) return;
   const exceptResolvedPath = exceptPath ? path.resolve(exceptPath) : "";
-  for (const fileName of fs.readdirSync(outputDirectory)) {
-    const filePath = path.join(outputDirectory, fileName);
-    if (exceptResolvedPath && path.resolve(filePath) === exceptResolvedPath) continue;
-    if (isGeneratedAssistantVoiceFile(filePath)) removeGeneratedAssistantVoiceFile(filePath);
+  for (const outputDirectory of [kokoroOutputDirectory(), pocketTTSOutputDirectory(), cloudTTSOutputDirectory()]) {
+    if (!fs.existsSync(outputDirectory)) continue;
+    for (const fileName of fs.readdirSync(outputDirectory)) {
+      const filePath = path.join(outputDirectory, fileName);
+      if (exceptResolvedPath && path.resolve(filePath) === exceptResolvedPath) continue;
+      if (isGeneratedAssistantVoiceFile(filePath)) removeGeneratedAssistantVoiceFile(filePath);
+    }
   }
 }
 
@@ -1804,6 +2634,59 @@ function kokoroInstalled() {
 function safeKokoroVoiceID(rawValue: string): KokoroVoiceID {
   const value = rawValue.trim() as KokoroVoiceID;
   return kokoroVoiceIDs.has(value) ? value : defaultKokoroVoiceID;
+}
+
+function safePocketTTSVoiceID(rawValue: unknown) {
+  const value = String(rawValue ?? "").trim().toLowerCase();
+  return pocketTTSVoiceIDs.has(value) ? value : defaultPocketTTSVoiceID;
+}
+
+function safeOpenAITTSVoice(rawValue: unknown) {
+  const value = String(rawValue ?? "").trim().toLowerCase();
+  return openAITTSVoiceIDs.has(value) ? value : defaultOpenAITTSVoice;
+}
+
+function safeGeminiTTSVoice(rawValue: unknown) {
+  const trimmed = String(rawValue ?? "").trim();
+  const value = [...geminiTTSVoiceIDs].find((voice) => voice.toLowerCase() === trimmed.toLowerCase());
+  return value || defaultGeminiTTSVoice;
+}
+
+function safeOpenAITTSModel(rawValue: unknown) {
+  const value = String(rawValue ?? "").trim();
+  return value || defaultOpenAITTSModel;
+}
+
+function safeGeminiTTSModel(rawValue: unknown) {
+  const value = String(rawValue ?? "").trim();
+  return value || defaultGeminiTTSModel;
+}
+
+type AssistantVoiceEngine = "autoCloudTTS" | "openaiTTS" | "geminiTTS" | "pocketTTS" | "kokoroLocal" | "macos";
+
+function safeAssistantVoiceEngine(rawValue: unknown): AssistantVoiceEngine {
+  const value = String(rawValue ?? "").trim();
+  if (
+    value === "autoCloudTTS"
+    || value === "openaiTTS"
+    || value === "geminiTTS"
+    || value === "kokoroLocal"
+    || value === "macos"
+  ) return value;
+  return "pocketTTS";
+}
+
+async function readAssistantVoiceEngineSetting(): Promise<AssistantVoiceEngine> {
+  const storedValue = await readDefault("OpenAssist.assistantVoiceEngine", "");
+  const migrationDone = await readBoolDefault(assistantVoiceEnginePocketDefaultMigrationKey, false);
+  if (!migrationDone) {
+    await writeBoolDefault(assistantVoiceEnginePocketDefaultMigrationKey, true);
+    if (!storedValue || storedValue === "kokoroLocal" || storedValue === "humeOctave") {
+      await writeStringDefault("OpenAssist.assistantVoiceEngine", "pocketTTS");
+      return "pocketTTS";
+    }
+  }
+  return safeAssistantVoiceEngine(storedValue || "pocketTTS");
 }
 
 function rejectPendingKokoroWorkerRequests(error: Error) {
@@ -1885,6 +2768,7 @@ async function prewarmKokoroWorker() {
 
 function assistantSpeechText(rawText: string) {
   return rawText
+    .replace(/<!--[\s\S]*?-->/g, " ")
     .replace(/```[\s\S]*?```/g, " ")
     .replace(/`([^`]+)`/g, "$1")
     .replace(/!\[[^\]]*]\([^)]+\)/g, " ")
@@ -1945,6 +2829,31 @@ function stopAssistantSpeechProcess() {
     assistantSpeechProcess.kill();
   }
   assistantSpeechProcess = null;
+  assistantSpeechProcessPaused = false;
+}
+
+function pauseAssistantSpeechProcess() {
+  if (!assistantSpeechProcess || assistantSpeechProcess.killed) return false;
+  try {
+    assistantSpeechProcess.kill("SIGSTOP");
+    assistantSpeechProcessPaused = true;
+    return true;
+  } catch (error) {
+    assistantVoiceLog(`pause speech process failed: ${error instanceof Error ? error.message : String(error)}`);
+    return false;
+  }
+}
+
+function resumeAssistantSpeechProcess() {
+  if (!assistantSpeechProcess || assistantSpeechProcess.killed || !assistantSpeechProcessPaused) return false;
+  try {
+    assistantSpeechProcess.kill("SIGCONT");
+    assistantSpeechProcessPaused = false;
+    return true;
+  } catch (error) {
+    assistantVoiceLog(`resume speech process failed: ${error instanceof Error ? error.message : String(error)}`);
+    return false;
+  }
 }
 
 function beginAssistantSpeechRun() {
@@ -1970,7 +2879,10 @@ function playAudioFile(filePath: string, options: { deleteAfterPlayback?: boolea
     const finish = (error?: Error) => {
       if (settled) return;
       settled = true;
-      if (assistantSpeechProcess === child) assistantSpeechProcess = null;
+      if (assistantSpeechProcess === child) {
+        assistantSpeechProcess = null;
+        assistantSpeechProcessPaused = false;
+      }
       if (options.deleteAfterPlayback) removeGeneratedAssistantVoiceFile(filePath);
       error ? reject(error) : resolve();
     };
@@ -1979,6 +2891,577 @@ function playAudioFile(filePath: string, options: { deleteAfterPlayback?: boolea
       code === 0 || code === null ? finish() : finish(new Error(`Audio playback exited with code ${code}.`));
     });
   });
+}
+
+function localVoiceOllamaMessages(systemPrompt: string, userPrompt: string) {
+  return [
+    { role: "system", content: systemPrompt },
+    { role: "user", content: userPrompt }
+  ];
+}
+
+function extractJSONFromText(text: string) {
+  const trimmed = text.trim();
+  if (!trimmed) return undefined;
+  const candidates = [
+    trimmed,
+    trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i)?.[1]?.trim(),
+    trimmed.match(/\{[\s\S]*\}/)?.[0]?.trim()
+  ].filter(Boolean) as string[];
+  for (const candidate of candidates) {
+    try {
+      return jsonObject(JSON.parse(candidate));
+    } catch {
+      // Keep trying less exact extracts.
+    }
+  }
+  return undefined;
+}
+
+async function runLocalOllamaText({
+  model,
+  messages,
+  timeoutMs,
+  numPredict = 256,
+  json = false
+}: {
+  model: string;
+  messages: Array<{ role: string; content: string }>;
+  timeoutMs: number;
+  numPredict?: number;
+  json?: boolean;
+}) {
+  const requestedModelID = model || defaultLocalVoiceModel;
+  let modelID = requestedModelID;
+  try {
+    modelID = await resolveAvailableOllamaModelID(requestedModelID);
+  } catch (error) {
+    if (error instanceof Error && /No Ollama models are installed|No usable Ollama model/.test(error.message)) throw error;
+  }
+  markOllamaModelUsed(modelID);
+  const response = await fetchWithTimeout("http://127.0.0.1:11434/api/chat", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: modelID,
+      messages,
+      stream: false,
+      think: false,
+      keep_alive: "5m",
+      format: json ? "json" : undefined,
+      options: {
+        temperature: 0,
+        top_p: 0.9,
+        num_ctx: 2048,
+        num_predict: numPredict
+      }
+    })
+  }, timeoutMs, "Local Gemma request timed out.");
+  const payload = await responsePayload(response);
+  if (!response.ok) {
+    throw new Error(providerErrorFromPayload(payload.json, payload.body, response.status));
+  }
+  markOllamaModelUsed(modelID);
+  const object = jsonObject(payload.json) ?? {};
+  const message = jsonObject(object.message);
+  return firstRawRuntimeString(message?.content, object.response, object.content);
+}
+
+function isLocalVoiceControlTranscript(transcript: string) {
+  return /\b(stop|pause|mute|cancel|resume|start) (listening|voice|speaking|talking|task|agent)\b/i.test(transcript);
+}
+
+function isVagueLocalVoiceHelpTranscript(transcript: string) {
+  return /^(hey\s+)?(open assist|openassist|assistant|codex)?\s*(can|could|would|will)\s+you\s+help\b/i.test(transcript)
+    || /^(hey\s+)?(open assist|openassist|assistant|codex)?\s*i\s+need\s+help\b/i.test(transcript)
+    || /^(hey\s+)?(open assist|openassist|assistant|codex)?\s*(are you there|hello|hi|hey)\b/i.test(transcript);
+}
+
+function isLocalVoiceTranscriptAddressed(transcript: string) {
+  return /\b(open assist|openassist|assistant|codex)\b/i.test(transcript);
+}
+
+function hasLocalVoiceAgentWork(transcript: string) {
+  return /\b(computer|note|today|planner|task|summarize|add|move|change|check|search|make|create|remind|schedule|write|send|explain|tell me|show|find|open|delete|update|fix|run|test)\b/i.test(transcript)
+    || /^(what|when|where|why|how|who|which)\b/i.test(transcript);
+}
+
+function fallbackLocalVoiceDecision(input: LocalVoiceClassifyInput): LocalVoiceClassifyResult {
+  const transcript = input.transcript.replace(/\s+/g, " ").trim();
+  if (!transcript || transcript.length < 3) {
+    return { decision: "ignore", taskText: "", confidence: 0.9, reason: "empty or too short" };
+  }
+  if (isLocalVoiceControlTranscript(transcript)) {
+    return { decision: "control", taskText: transcript, confidence: 0.82, reason: "voice control phrase" };
+  }
+  if (
+    isVagueLocalVoiceHelpTranscript(transcript)
+  ) {
+    return { decision: "clarify", taskText: "Sure, what do you need help with?", confidence: 0.78, reason: "addressed but no task yet" };
+  }
+  if (input.agentRunning && /^(actually|also|and|no|wait|instead|make it|move it|change it|do that|same|yes|yeah|ok|okay)\b/i.test(transcript)) {
+    return { decision: "follow_up", taskText: transcript, confidence: 0.72, reason: "short follow-up while agent is running" };
+  }
+  const addressed = isLocalVoiceTranscriptAddressed(transcript);
+  const actionable = hasLocalVoiceAgentWork(transcript);
+  if (!addressed && !actionable) {
+    return { decision: "ignore", taskText: "", confidence: 0.72, reason: "speech not addressed to OpenAssist and no agent task" };
+  }
+  if (addressed && !actionable) {
+    return { decision: "clarify", taskText: "What would you like me to do?", confidence: 0.72, reason: "addressed but no actionable task" };
+  }
+  return { decision: input.lastUserTask ? "follow_up" : "new_task", taskText: transcript, confidence: 0.58, reason: "fallback intent" };
+}
+
+type LocalVoiceClassifyInput = {
+  transcript: string;
+  lastUserTask?: string;
+  agentRunning?: boolean;
+  surface?: string;
+  voiceState?: string;
+};
+
+type LocalVoiceClassifyResult = {
+  decision: "ignore" | "follow_up" | "new_task" | "clarify" | "control";
+  taskText: string;
+  confidence: number;
+  reason: string;
+};
+
+async function classifyLocalVoiceTranscript(input: LocalVoiceClassifyInput): Promise<LocalVoiceClassifyResult> {
+  const transcript = input.transcript.replace(/\s+/g, " ").trim();
+  const fallback = fallbackLocalVoiceDecision({ ...input, transcript });
+  if (!transcript) return fallback;
+  const settings = await loadSettings();
+  const systemPrompt = [
+    "You are OpenAssist's continuous listening gate.",
+    "Decide whether a transcript is meant for OpenAssist.",
+    "Return strict JSON only with decision, taskText, confidence, and reason.",
+    "decision must be one of: ignore, follow_up, new_task, clarify, control.",
+    "Use ignore for background noise, side conversation, TV, or speech not addressed to OpenAssist.",
+    "Use follow_up when the user continues or corrects the last task.",
+    "Use control for stop listening, pause, resume, cancel task, or stop speaking.",
+    "Use clarify when it sounds addressed to OpenAssist but is too unclear to act.",
+    "Use clarify for vague helper phrases with no task, like 'can you help me with something', 'I need help', 'hello assistant', or 'are you there'.",
+    "For clarify, taskText must be one short question for the user, not the original transcript.",
+    "Only use new_task or follow_up when there is a real task or question that the active provider needs to answer or do.",
+    "Never invent a task. taskText should be empty for ignore."
+  ].join("\n");
+  const startedAt = Date.now();
+  const userPrompt = JSON.stringify({
+    transcript,
+    lastUserTask: input.lastUserTask ?? "",
+    agentRunning: input.agentRunning === true,
+    surface: input.surface ?? "thread",
+    voiceState: input.voiceState ?? "listening"
+  }, null, 2);
+  try {
+    const text = await runLocalOllamaText({
+      model: settings.localVoiceModel || defaultLocalVoiceModel,
+      messages: localVoiceOllamaMessages(systemPrompt, userPrompt),
+      timeoutMs: 3500,
+      numPredict: 140,
+      json: true
+    });
+    const object = extractJSONFromText(text);
+    const rawDecision = String(object?.decision ?? "").trim().toLowerCase();
+    let validDecision = ["ignore", "follow_up", "new_task", "clarify", "control"].includes(rawDecision)
+      ? rawDecision as LocalVoiceClassifyResult["decision"]
+      : fallback.decision;
+    let confidence = Math.max(0, Math.min(1, Number(object?.confidence ?? fallback.confidence)));
+    let taskText = validDecision === "ignore"
+      ? ""
+      : firstRawRuntimeString(object?.taskText, object?.task, object?.text, transcript);
+    if ((validDecision === "new_task" || validDecision === "follow_up") && isVagueLocalVoiceHelpTranscript(transcript)) {
+      validDecision = "clarify";
+      taskText = "Sure, what do you need help with?";
+      confidence = Math.max(confidence, 0.78);
+    } else if (
+      (validDecision === "new_task" || validDecision === "follow_up")
+      && !input.lastUserTask
+      && !isLocalVoiceTranscriptAddressed(transcript)
+      && !hasLocalVoiceAgentWork(transcript)
+    ) {
+      validDecision = "ignore";
+      taskText = "";
+      confidence = Math.max(confidence, 0.72);
+    }
+    assistantVoiceLog(
+      `local voice classifier completed decision=${validDecision} confidence=${confidence.toFixed(2)} elapsedMs=${Date.now() - startedAt}`
+    );
+    return {
+      decision: validDecision,
+      taskText: taskText.trim(),
+      confidence,
+      reason: firstRawRuntimeString(object?.reason, fallback.reason).slice(0, 240)
+    };
+  } catch (error) {
+    assistantVoiceLog(`local voice classifier fallback elapsedMs=${Date.now() - startedAt}: ${error instanceof Error ? error.message : String(error)}`);
+    return fallback;
+  }
+}
+
+function normalizeRealtimeRouteDecision(value: unknown): RealtimeDelegationRouteResult["decision"] {
+  const decision = String(value ?? "").trim().toLowerCase();
+  return ["delegate", "answer_direct", "clarify", "ignore", "control"].includes(decision)
+    ? decision as RealtimeDelegationRouteResult["decision"]
+    : "answer_direct";
+}
+
+function clampRealtimeRouteConfidence(value: unknown, fallback = 0.5) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return fallback;
+  return Math.max(0, Math.min(1, number));
+}
+
+async function classifyRealtimeDelegation(
+  input: RealtimeDelegationRouteInput,
+  settings: SettingsSnapshot
+): Promise<RealtimeDelegationRouteResult> {
+  const startedAt = Date.now();
+  const systemPrompt = [
+    "You are OpenAssist's realtime delegation gate.",
+    "Decide if the latest voice request should go to the background agent.",
+    "Return strict JSON only with decision, taskText, responseText, confidence, and reason.",
+    "decision must be one of: delegate, answer_direct, clarify, ignore, control.",
+    "Use delegate only for real work that needs files, code, terminal, browser, computer use, repo/app debugging, or multi-step provider work.",
+    "Do not delegate quick OpenAssist knowledge tasks when realtime tools can handle them: Today planner, Backlog, journal, notes search, open tasks, adding a simple daily/backlog item, or marking a task done.",
+    "Delegate complex notes/planner rewrites only when a simple tool or exact approval preview is not enough.",
+    "Use answer_direct for casual questions, status questions, questions about the previous result, or 'did you already find/do/check it' questions.",
+    "Use clarify for vague help requests or missing target details.",
+    "Use ignore for side conversation, background speech, repeated assistant text, or noise.",
+    "Use control for stop listening, pause, resume, cancel task, or stop speaking.",
+    "If unsure, do not delegate.",
+    "For delegate, taskText must be the clean task for the agent.",
+    "For answer_direct or clarify, responseText should be one short sentence or instruction for the voice model."
+  ].join("\n");
+  const userPrompt = JSON.stringify({
+    source: input.source,
+    provider: input.provider,
+    agentLabel: input.agentLabel,
+    prompt: input.prompt,
+    proposedTaskText: input.proposedTaskText,
+    lastDelegationPrompt: input.lastDelegationPrompt,
+    lastDelegationResult: input.lastDelegationResult,
+    hasActiveHandoff: input.hasActiveHandoff,
+    voiceState: input.voiceState
+  }, null, 2);
+
+  const text = await runLocalOllamaText({
+    model: settings.localVoiceModel || defaultLocalVoiceModel,
+    messages: localVoiceOllamaMessages(systemPrompt, userPrompt),
+    timeoutMs: 400,
+    numPredict: 140,
+    json: true
+  });
+  const object = extractJSONFromText(text);
+  const result: RealtimeDelegationRouteResult = {
+    decision: normalizeRealtimeRouteDecision(object?.decision),
+    taskText: firstRawRuntimeString(object?.taskText, object?.task),
+    responseText: firstRawRuntimeString(object?.responseText, object?.response),
+    confidence: clampRealtimeRouteConfidence(object?.confidence),
+    reason: firstRawRuntimeString(object?.reason).slice(0, 240)
+  };
+  assistantVoiceLog(
+    `realtime delegation router completed decision=${result.decision} confidence=${(result.confidence ?? 0).toFixed(2)} source=${input.source} elapsedMs=${Date.now() - startedAt}`
+  );
+  return result;
+}
+
+function realtimeDelegationRouter(settings: SettingsSnapshot): RealtimeProxyConfig["delegationRouter"] {
+  return {
+    route: (input) => classifyRealtimeDelegation(input, settings)
+  };
+}
+
+async function rewriteSpeechTextForTTS(rawText: string, settings: SettingsSnapshot) {
+  const text = assistantSpeechText(rawText);
+  if (!text) return "";
+  const startedAt = Date.now();
+  if (!speechTextNeedsRewrite(text)) {
+    assistantVoiceLog(`speech rewrite skipped simple chars=${text.length}`);
+    return text;
+  }
+  const systemPrompt = [
+    "You rewrite assistant text so a text-to-speech model says it naturally.",
+    "Return plain spoken text only.",
+    "Expand numbers, money, units, shorthand, and abbreviations when context is clear.",
+    "Examples: 100M -> one hundred million, $3.5B -> three point five billion dollars, 250ms -> two hundred fifty milliseconds, 6x -> six times.",
+    "Do not add facts or change meaning.",
+    "Remove markdown syntax, code fences, bullets, tables, links, and UI-only labels."
+  ].join("\n");
+  const userPrompt = `Rewrite this for speech:\n\n${text}`;
+  try {
+    const rewritten = await runLocalOllamaText({
+      model: settings.speechOutputRewriteModel || defaultSpeechOutputRewriteModel,
+      messages: localVoiceOllamaMessages(systemPrompt, userPrompt),
+      timeoutMs: 5000,
+      numPredict: 700
+    });
+    const cleaned = assistantSpeechText(rewritten);
+    assistantVoiceLog(`speech rewrite completed chars=${cleaned.length || text.length} elapsedMs=${Date.now() - startedAt}`);
+    return cleaned || text;
+  } catch (error) {
+    assistantVoiceLog(`speech rewrite fallback elapsedMs=${Date.now() - startedAt}: ${error instanceof Error ? error.message : String(error)}`);
+    return text;
+  }
+}
+
+function speechTextNeedsRewrite(text: string) {
+  return text.includes("\n")
+    || /https?:\/\//i.test(text)
+    || /[`*_#[\]|<>]/.test(text)
+    || /[$€£¥]?\d/.test(text)
+    || /\b[A-Z]{2,}\b/.test(text);
+}
+
+function pocketTTSCommandCandidates() {
+  return [
+    process.env.POCKET_TTS_UVX_PATH,
+    path.join(os.homedir(), ".local/bin/uvx"),
+    "/opt/homebrew/bin/uvx",
+    "/usr/local/bin/uvx",
+    "uvx"
+  ].filter(Boolean) as string[];
+}
+
+function normalizedPocketTTSCachePhrase(text: string) {
+  const normalized = text.replace(/\s+/g, " ").trim().toLowerCase();
+  return pocketTTSPrewarmPhrases.find((phrase) => phrase.toLowerCase() === normalized);
+}
+
+function cachedPocketTTSAudioPath(text: string, voiceID: string) {
+  const phrase = normalizedPocketTTSCachePhrase(text);
+  if (!phrase) return "";
+  const key = createHash("sha256")
+    .update(`${safePocketTTSVoiceID(voiceID)}\n${phrase}`)
+    .digest("hex")
+    .slice(0, 24);
+  return path.join(pocketTTSCacheDirectory(), `${safePocketTTSVoiceID(voiceID)}-${key}.wav`);
+}
+
+function pocketTTSServerHost() {
+  return process.env.OPENASSIST_POCKET_TTS_HOST?.trim() || defaultPocketTTSServerHost;
+}
+
+function pocketTTSServerPort() {
+  const parsed = Number.parseInt(process.env.OPENASSIST_POCKET_TTS_PORT || "", 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : defaultPocketTTSServerPort;
+}
+
+function pocketTTSServerBaseURL() {
+  const override = process.env.OPENASSIST_POCKET_TTS_URL?.trim();
+  if (override) return override.replace(/\/+$/, "");
+  return `http://${pocketTTSServerHost()}:${pocketTTSServerPort()}`;
+}
+
+async function isPocketTTSServerHealthy(baseURL: string) {
+  try {
+    const response = await fetchWithTimeout(baseURL, { method: "GET" }, 900, "Pocket TTS server probe timed out.");
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+
+async function waitForPocketTTSServer(baseURL: string, child: ReturnType<typeof spawn>, output: () => string) {
+  const deadline = Date.now() + 18_000;
+  while (Date.now() < deadline) {
+    if (await isPocketTTSServerHealthy(baseURL)) return;
+    if (child.exitCode !== null) {
+      throw new Error(`Pocket TTS server exited ${child.exitCode}. ${output()}`.trim());
+    }
+    await delay(250);
+  }
+  throw new Error(`Pocket TTS server did not become ready. ${output()}`.trim());
+}
+
+async function spawnPocketTTSServer(command: string) {
+  const args = [
+    "pocket-tts",
+    "serve",
+    "--host",
+    pocketTTSServerHost(),
+    "--port",
+    String(pocketTTSServerPort())
+  ];
+  const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"] });
+  let stderr = "";
+  let stdout = "";
+  const appendOutput = (current: string, chunk: unknown) => `${current}${String(chunk)}`.slice(-4_000);
+  child.stdout.on("data", (chunk) => {
+    stdout = appendOutput(stdout, chunk);
+  });
+  child.stderr.on("data", (chunk) => {
+    stderr = appendOutput(stderr, chunk);
+  });
+  let spawned = false;
+  await new Promise<void>((resolve, reject) => {
+    child.once("spawn", () => {
+      spawned = true;
+      resolve();
+    });
+    child.once("error", reject);
+    child.once("exit", (code, signal) => {
+      if (pocketTTSServerProcess === child) pocketTTSServerProcess = null;
+      assistantVoiceLog(`pocket tts server exited code=${code ?? "null"} signal=${signal ?? "null"}`);
+      if (!spawned) reject(new Error(`Pocket TTS server failed to start. ${stderr || stdout}`.trim()));
+    });
+  });
+  return {
+    child,
+    output: () => [stderr.trim(), stdout.trim()].filter(Boolean).join("\n")
+  };
+}
+
+async function ensurePocketTTSServer(runID: number) {
+  if (process.env.OPENASSIST_POCKET_TTS_DISABLE_SERVER === "1") {
+    throw new Error("Pocket TTS server is disabled.");
+  }
+  const baseURL = pocketTTSServerBaseURL();
+  if (await isPocketTTSServerHealthy(baseURL)) return baseURL;
+  if (pocketTTSServerStartPromise) return pocketTTSServerStartPromise;
+
+  pocketTTSServerStartPromise = (async () => {
+    const startedAt = Date.now();
+    const errors: string[] = [];
+    for (const command of pocketTTSCommandCandidates()) {
+      if (runID !== assistantSpeechRunID) return "";
+      try {
+        const server = await spawnPocketTTSServer(command);
+        pocketTTSServerProcess = server.child;
+        await waitForPocketTTSServer(baseURL, server.child, server.output);
+        assistantVoiceLog(`pocket tts server ready command=${command} elapsedMs=${Date.now() - startedAt}`);
+        return baseURL;
+      } catch (error) {
+        errors.push(`${path.basename(command)}: ${error instanceof Error ? error.message : String(error)}`);
+        if (pocketTTSServerProcess && !pocketTTSServerProcess.killed) pocketTTSServerProcess.kill();
+        pocketTTSServerProcess = null;
+      }
+    }
+    throw new Error(`Pocket TTS server failed to start. ${errors.join(" ")}`.trim());
+  })().finally(() => {
+    pocketTTSServerStartPromise = null;
+  });
+
+  return pocketTTSServerStartPromise;
+}
+
+async function generatePocketTTSAudioFileWithServer(text: string, voiceID: string, outputPath: string, runID: number) {
+  const startedAt = Date.now();
+  const baseURL = await ensurePocketTTSServer(runID);
+  if (!baseURL || runID !== assistantSpeechRunID) return "";
+  const formData = new FormData();
+  formData.append("text", text);
+  formData.append("voice_url", safePocketTTSVoiceID(voiceID));
+  const response = await fetchWithTimeout(`${baseURL}/tts`, {
+    method: "POST",
+    body: formData
+  }, 70_000, "Pocket TTS server generation timed out.");
+  const payload = await responsePayload(response);
+  if (!response.ok) {
+    throw new Error(providerErrorFromPayload(payload.json, payload.body, response.status));
+  }
+  if (!payload.body.length) throw new Error("Pocket TTS server returned empty audio.");
+  fs.writeFileSync(outputPath, payload.body);
+  assistantVoiceLog(`pocket tts server generated bytes=${payload.body.length} elapsedMs=${Date.now() - startedAt}`);
+  return outputPath;
+}
+
+function generatePocketTTSAudioFileWithCLI(text: string, voiceID: string, outputPath: string, runID: number) {
+  const args = [
+    "pocket-tts",
+    "generate",
+    "--quiet",
+    "--voice",
+    safePocketTTSVoiceID(voiceID),
+    "--output-path",
+    outputPath,
+    "--text",
+    text
+  ];
+  const candidates = pocketTTSCommandCandidates();
+  return new Promise<string>((resolve, reject) => {
+    const startedAt = Date.now();
+    const tryCandidate = (index: number, previousErrors: string[] = []) => {
+      if (runID !== assistantSpeechRunID) {
+        resolve("");
+        return;
+      }
+      const command = candidates[index];
+      if (!command) {
+        reject(new Error(`Pocket TTS is not available. Install uv/uvx and Pocket TTS first. ${previousErrors.join(" ")}`.trim()));
+        return;
+      }
+      const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"] });
+      let settled = false;
+      let stderr = "";
+      child.stderr.on("data", (chunk) => {
+        stderr += String(chunk);
+      });
+      const tryNext = (message: string) => {
+        if (settled) return;
+        settled = true;
+        tryCandidate(index + 1, [...previousErrors, message]);
+      };
+      child.once("error", (error) => {
+        tryNext(`${path.basename(command)}: ${error.message}`);
+      });
+      child.once("exit", (code) => {
+        if (settled) return;
+        settled = true;
+        if (code === 0 && fs.existsSync(outputPath)) {
+          assistantVoiceLog(`pocket tts cli generated command=${command} elapsedMs=${Date.now() - startedAt}`);
+          resolve(outputPath);
+          return;
+        }
+        tryCandidate(index + 1, [...previousErrors, `${path.basename(command)} exited ${code}: ${stderr.trim()}`]);
+      });
+    };
+    tryCandidate(0);
+  });
+}
+
+async function generatePocketTTSAudioFile(text: string, voiceID: string, outputPath: string, runID: number) {
+  try {
+    return await generatePocketTTSAudioFileWithServer(text, voiceID, outputPath, runID);
+  } catch (error) {
+    assistantVoiceLog(`pocket tts server fallback: ${error instanceof Error ? error.message : String(error)}`);
+    return generatePocketTTSAudioFileWithCLI(text, voiceID, outputPath, runID);
+  }
+}
+
+async function speakWithPocketTTS(rawText: string, voiceID: string, settings: SettingsSnapshot) {
+  const speechRunID = beginAssistantSpeechRun();
+  const startedAt = Date.now();
+  const text = await rewriteSpeechTextForTTS(rawText, settings);
+  if (speechRunID !== assistantSpeechRunID) {
+    return { ok: true, skipped: true, reason: "Assistant voice output was stopped." };
+  }
+  if (!text) return { ok: true, skipped: true, reason: "No assistant text to speak." };
+  assistantVoiceLog(`pocket tts speak started voice=${safePocketTTSVoiceID(voiceID)} chars=${text.length}`);
+  fs.mkdirSync(pocketTTSOutputDirectory(), { recursive: true });
+  fs.mkdirSync(pocketTTSCacheDirectory(), { recursive: true });
+  cleanupGeneratedAssistantVoiceFiles();
+  const cachedPath = cachedPocketTTSAudioPath(text, voiceID);
+  const outputPath = cachedPath || path.join(pocketTTSOutputDirectory(), `assistant-reply-${Date.now()}-0.wav`);
+  if (cachedPath && fs.existsSync(cachedPath)) {
+    assistantVoiceLog(`pocket tts cache hit voice=${safePocketTTSVoiceID(voiceID)} chars=${text.length}`);
+    const playbackStartedAt = Date.now();
+    await playAudioFile(cachedPath, { deleteAfterPlayback: false });
+    assistantVoiceLog(`pocket tts speak completed cache=true playbackMs=${Date.now() - playbackStartedAt} totalMs=${Date.now() - startedAt}`);
+    return { ok: true, engine: "pocketTTS", voice: safePocketTTSVoiceID(voiceID) };
+  }
+  const generatedPath = await generatePocketTTSAudioFile(text, voiceID, outputPath, speechRunID);
+  if (!generatedPath) return { ok: true, skipped: true, reason: "Assistant voice output was stopped." };
+  if (speechRunID !== assistantSpeechRunID) {
+    if (!cachedPath) removeGeneratedAssistantVoiceFile(generatedPath);
+    return { ok: true, skipped: true, reason: "Assistant voice output was stopped." };
+  }
+  const playbackStartedAt = Date.now();
+  await playAudioFile(generatedPath, { deleteAfterPlayback: !cachedPath });
+  assistantVoiceLog(`pocket tts speak completed cache=${String(Boolean(cachedPath))} playbackMs=${Date.now() - playbackStartedAt} totalMs=${Date.now() - startedAt}`);
+  return { ok: true, engine: "pocketTTS", voice: safePocketTTSVoiceID(voiceID) };
 }
 
 async function generateKokoroAudioFile(
@@ -2170,6 +3653,15 @@ async function resolveRealtimeOpenAIAPIKey() {
   };
 }
 
+async function resolveRealtimeGeminiAPIKey() {
+  const key = await readKeychainPassword(googleAIStudioAPIKeychainAccount);
+  return {
+    apiKey: key || undefined,
+    configured: Boolean(key),
+    label: key ? "Using saved Google AI key" : keychainStatus(false, true)
+  };
+}
+
 function normalizedDictationSoundName(value: string, fallback: string) {
   return (dictationSoundOptions as readonly string[]).includes(value) ? value : fallback;
 }
@@ -2311,6 +3803,190 @@ function providerErrorFromPayload(json: unknown, body: Buffer, status: number) {
     if (message) return message;
   }
   return body.toString("utf8").trim() || `HTTP ${status}`;
+}
+
+function audioMimeTypeFromPath(filePath: string) {
+  const ext = path.extname(filePath).toLowerCase();
+  if (ext === ".mp3") return "audio/mpeg";
+  if (ext === ".aiff" || ext === ".aif") return "audio/aiff";
+  return "audio/wav";
+}
+
+function audioDataURLFromFile(filePath: string, mimeType = audioMimeTypeFromPath(filePath)) {
+  return `data:${mimeType};base64,${fs.readFileSync(filePath).toString("base64")}`;
+}
+
+function cloudTTSCachePath(engine: string, model: string, voice: string, text: string, extension = "wav") {
+  const key = createHash("sha256").update(`${engine}\n${model}\n${voice}\n${text}`).digest("hex").slice(0, 32);
+  return path.join(cloudTTSCacheDirectory(), `${engine}-${key}.${extension}`);
+}
+
+function runAudioUtility(command: string, args: string[], input?: string) {
+  return new Promise<void>((resolve, reject) => {
+    const child = spawn(command, args, { stdio: [input ? "pipe" : "ignore", "ignore", "pipe"] });
+    let stderr = "";
+    child.stderr?.on("data", (chunk) => {
+      stderr = `${stderr}${String(chunk)}`.slice(-4_000);
+    });
+    child.once("error", reject);
+    child.once("exit", (code) => {
+      if (code === 0 || code === null) {
+        resolve();
+        return;
+      }
+      reject(new Error(`${path.basename(command)} exited ${code}. ${stderr.trim()}`.trim()));
+    });
+    if (input && child.stdin) child.stdin.end(input);
+  });
+}
+
+async function generateMacOSTTSAudioFile(text: string) {
+  const model = "say";
+  const voice = "system";
+  const cachedPath = cloudTTSCachePath("macos", model, voice, text, "wav");
+  fs.mkdirSync(cloudTTSCacheDirectory(), { recursive: true });
+  if (fs.existsSync(cachedPath)) return { path: cachedPath, mimeType: "audio/wav", engine: "macos", model, voice };
+  const tempAIFFPath = path.join(cloudTTSCacheDirectory(), `macos-${process.pid}-${Date.now()}.aiff`);
+  try {
+    await runAudioUtility("/usr/bin/say", ["-o", tempAIFFPath], text);
+    await runAudioUtility("/usr/bin/afconvert", ["-f", "WAVE", "-d", "LEI16", tempAIFFPath, cachedPath]);
+  } finally {
+    if (fs.existsSync(tempAIFFPath)) fs.unlinkSync(tempAIFFPath);
+  }
+  if (!fs.existsSync(cachedPath)) throw new Error("macOS voice did not create audio.");
+  return { path: cachedPath, mimeType: "audio/wav", engine: "macos", model, voice };
+}
+
+function wavBufferFromPCM16LE(pcm: Buffer, sampleRate = 24_000, channels = 1) {
+  const bitsPerSample = 16;
+  const byteRate = sampleRate * channels * bitsPerSample / 8;
+  const blockAlign = channels * bitsPerSample / 8;
+  const header = Buffer.alloc(44);
+  header.write("RIFF", 0);
+  header.writeUInt32LE(36 + pcm.length, 4);
+  header.write("WAVE", 8);
+  header.write("fmt ", 12);
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20);
+  header.writeUInt16LE(channels, 22);
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE(byteRate, 28);
+  header.writeUInt16LE(blockAlign, 32);
+  header.writeUInt16LE(bitsPerSample, 34);
+  header.write("data", 36);
+  header.writeUInt32LE(pcm.length, 40);
+  return Buffer.concat([header, pcm]);
+}
+
+function sampleRateFromAudioMimeType(mimeType: string) {
+  const match = /rate=(\d+)/i.exec(mimeType);
+  const rate = match ? Number(match[1]) : 0;
+  return Number.isFinite(rate) && rate > 0 ? rate : 24_000;
+}
+
+async function generateOpenAITTSAudioFile(text: string, settings: SettingsSnapshot) {
+  const auth = await resolveRealtimeOpenAIAPIKey();
+  if (!auth.apiKey) throw new Error("Add an OpenAI API key in Settings before using OpenAI TTS.");
+  const model = safeOpenAITTSModel(settings.openAITTSModel);
+  const voice = safeOpenAITTSVoice(settings.openAITTSVoice);
+  const cachedPath = cloudTTSCachePath("openai", model, voice, text, "wav");
+  fs.mkdirSync(cloudTTSCacheDirectory(), { recursive: true });
+  if (fs.existsSync(cachedPath)) return { path: cachedPath, mimeType: "audio/wav", engine: "openaiTTS", model, voice };
+  const response = await fetchWithTimeout(
+    "https://api.openai.com/v1/audio/speech",
+    {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${auth.apiKey}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        model,
+        voice,
+        input: text,
+        response_format: "wav"
+      })
+    },
+    60_000,
+    "OpenAI TTS timed out. Check your connection and API key, then try again."
+  );
+  const body = Buffer.from(await response.arrayBuffer());
+  if (!response.ok) {
+    let json: unknown = null;
+    try { json = JSON.parse(body.toString("utf8")); } catch { /* binary or empty error body */ }
+    throw new Error(`OpenAI TTS failed: ${providerErrorFromPayload(json, body, response.status)}`);
+  }
+  if (!body.length) throw new Error("OpenAI TTS returned empty audio.");
+  fs.writeFileSync(cachedPath, body);
+  return { path: cachedPath, mimeType: "audio/wav", engine: "openaiTTS", model, voice };
+}
+
+function geminiInlineAudioParts(json: unknown) {
+  const root = json && typeof json === "object" ? json as JsonObject : {};
+  const candidates = Array.isArray(root.candidates) ? root.candidates : [];
+  const parts: Array<{ data: string; mimeType: string }> = [];
+  for (const candidate of candidates) {
+    const content = (candidate as JsonObject | undefined)?.content as JsonObject | undefined;
+    const contentParts = Array.isArray(content?.parts) ? content.parts : [];
+    for (const part of contentParts) {
+      const object = part as JsonObject;
+      const inlineData = (object.inlineData || object.inline_data) as JsonObject | undefined;
+      const data = firstNonEmptyString(inlineData?.data);
+      if (!data) continue;
+      parts.push({
+        data,
+        mimeType: firstNonEmptyString(inlineData?.mimeType, inlineData?.mime_type) || "audio/L16;codec=pcm;rate=24000"
+      });
+    }
+  }
+  return parts;
+}
+
+async function generateGeminiTTSAudioFile(text: string, settings: SettingsSnapshot) {
+  const auth = await resolveRealtimeGeminiAPIKey();
+  if (!auth.apiKey) throw new Error("Add a Gemini API key in Settings before using Gemini TTS.");
+  const model = safeGeminiTTSModel(settings.geminiTTSModel);
+  const voice = safeGeminiTTSVoice(settings.geminiTTSVoice);
+  const cachedPath = cloudTTSCachePath("gemini", model, voice, text, "wav");
+  fs.mkdirSync(cloudTTSCacheDirectory(), { recursive: true });
+  if (fs.existsSync(cachedPath)) return { path: cachedPath, mimeType: "audio/wav", engine: "geminiTTS", model, voice };
+  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(auth.apiKey)}`;
+  const response = await fetchWithTimeout(
+    endpoint,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [{ role: "user", parts: [{ text }] }],
+        generationConfig: {
+          responseModalities: ["AUDIO"],
+          speechConfig: {
+            voiceConfig: {
+              prebuiltVoiceConfig: { voiceName: voice }
+            }
+          }
+        }
+      })
+    },
+    60_000,
+    "Gemini TTS timed out. Check your connection and API key, then try again."
+  );
+  const body = Buffer.from(await response.arrayBuffer());
+  let json: unknown = null;
+  try { json = JSON.parse(body.toString("utf8")); } catch { /* ignore */ }
+  if (!response.ok) {
+    throw new Error(`Gemini TTS failed: ${providerErrorFromPayload(json, body, response.status)}`);
+  }
+  const parts = geminiInlineAudioParts(json);
+  if (!parts.length) throw new Error("Gemini TTS returned no audio.");
+  const mimeType = parts[0].mimeType;
+  const rawAudio = Buffer.concat(parts.map((part) => Buffer.from(part.data, "base64")));
+  const audio = /^audio\/(?:wav|x-wav)/i.test(mimeType) || rawAudio.subarray(0, 4).toString("ascii") === "RIFF"
+    ? rawAudio
+    : wavBufferFromPCM16LE(rawAudio, sampleRateFromAudioMimeType(mimeType), 1);
+  if (!audio.length) throw new Error("Gemini TTS returned empty audio.");
+  fs.writeFileSync(cachedPath, audio);
+  return { path: cachedPath, mimeType: "audio/wav", engine: "geminiTTS", model, voice };
 }
 
 function decodeOpenAICompatibleText(json: unknown) {
@@ -2631,7 +4307,7 @@ async function analyzeScreenWithCodexImageGeneration(
   tools: { webSearch: boolean; imageGeneration: boolean };
 }> {
   const settings = await loadSettings();
-  const model = normalizedModelForBackend("codex", settings.model || readCodexDefaultModel());
+  const model = normalizedModelForBackend("codex", settings.noteCleanupModel || settings.model || readCodexDefaultModel());
   const started = await codexTransport.request("thread/start", {
     approvalPolicy: "on-request",
     sandbox: "workspace-write",
@@ -2713,7 +4389,7 @@ async function analyzeScreenWithCodexImageGeneration(
       threadId: providerThreadID,
       input,
       approvalPolicy: "on-request",
-      effort: "low"
+      effort: normalizeCodexReasoningEffort(settings.noteCleanupReasoningEffort) ?? "low"
     }) as JsonObject;
     const turn = runtimeObject(startedTurn.turn);
     providerTurnID = firstRuntimeString(turn?.id, providerTurnID);
@@ -2754,10 +4430,11 @@ async function analyzeScreenWithCodex(
 
   const auth = await resolveCodexTranscriptionAuthContext();
   const settings = await loadSettings();
-  let model = settings.model || "gpt-4o";
-  if (!model.startsWith("gpt-") && !model.startsWith("o1") && !model.startsWith("o3")) {
-    model = "gpt-4o";
-  }
+  // This request goes to the Codex backend, which only accepts GPT-5 / *-codex
+  // models. Prefer the user's note-cleanup model choice, then the main chat model,
+  // and always pass through codexSafeModel so a non-Codex model (e.g. "gpt-4o")
+  // can never be sent.
+  const model = codexSafeModel(settings.noteCleanupModel || settings.model);
 
   const base64Image = imageBuffer.toString("base64");
   const imageDataURL = `data:image/png;base64,${base64Image}`;
@@ -2803,6 +4480,10 @@ async function analyzeScreenWithCodex(
   if (tools.length) {
     payload.tools = tools;
     payload.tool_choice = "auto";
+  }
+  const screenReasoningEffort = normalizeCodexReasoningEffort(settings.noteCleanupReasoningEffort);
+  if (screenReasoningEffort) {
+    payload.reasoning = { effort: screenReasoningEffort };
   }
 
   const response = await fetchWithTimeout("https://chatgpt.com/backend-api/codex/responses", {
@@ -3022,6 +4703,470 @@ async function analyzeScreenWithCodex(
       imageGeneration: false
     }
   };
+}
+
+function normalizeNoteAICleanupRequest(raw: unknown): NoteAICleanupRequest {
+  const object = raw && typeof raw === "object" ? raw as JsonObject : {};
+  const markdown = typeof object.markdown === "string" ? object.markdown.replace(/\r\n/g, "\n") : "";
+  if (!markdown.trim()) throw new Error("No note text was provided.");
+  const rawScope = String(object.scope ?? "whole-note");
+  const scope: NoteAICleanupScope = rawScope === "selection" ? "selection" : "whole-note";
+  const rawMode = String(object.mode ?? "cleanup");
+  const mode: NoteAICleanupMode =
+    rawMode === "summarize" || rawMode === "decisions" || rawMode === "custom" ? rawMode : "cleanup";
+  return {
+    noteID: typeof object.noteID === "string" ? object.noteID : undefined,
+    projectID: typeof object.projectID === "string" ? object.projectID : undefined,
+    title: typeof object.title === "string" ? object.title : undefined,
+    markdown,
+    scope,
+    mode,
+    instruction: typeof object.instruction === "string" ? object.instruction : undefined
+  };
+}
+
+function noteCleanupModeInstruction(mode: NoteAICleanupMode, instruction?: string) {
+  const custom = instruction?.trim();
+  if (mode === "summarize") {
+    return "Summarize the note into a cleaner, shorter version. Keep important facts, dates, paths, commands, code, decisions, and next steps.";
+  }
+  if (mode === "decisions") {
+    return "Extract and organize decisions, successes, warnings/risks, info, and next steps. Use OpenAssist callouts when they make the note easier to scan.";
+  }
+  if (mode === "custom") {
+    return custom || "Clean up the note using the user's custom instruction.";
+  }
+  return "Clean up grammar, structure, headings, spacing, and readability while preserving all important details.";
+}
+
+function openAssistNoteStyleGuide(): string {
+  return [
+    "# OpenAssist Note Formatting Guide",
+    "",
+    "Use these blocks to improve note readability. Prefer normal headings, paragraphs, and lists for most content.",
+    "Use rich blocks only when they genuinely improve scanning.",
+    "",
+    "## Callout blocks",
+    "Syntax: ::: kind {title=\"Title\" icon=\"icon\" color=\"color\"}",
+    "",
+    "Text here (one short paragraph or up to three bullets).",
+    "",
+    ":::",
+    "",
+    "Supported kinds:",
+    "- decision  — a clear resolved choice (icon: circle-gauge, color: blue)",
+    "- warning   — a risk or blocker (icon: warning, color: red)",
+    "- info      — background context or note (icon: info, color: blue)",
+    "- success   — completed result or win (icon: check, color: green)",
+    "- next      — clear next step or follow-up (icon: check, color: green)",
+    "- comment   — side note or remark (icon: message, color: purple)",
+    "",
+    "The {title=...} attrs block is optional. Icon and color have defaults per kind.",
+    "Keep callouts short: one short paragraph or ≤ 3 bullets. Never wrap long content in a callout.",
+    "Only use multiple callouts when mode is decisions/extraction. In all other cases use ≤ 2 total per note.",
+    "Never put an implementation plan, large table, or whole section inside a callout.",
+    "",
+    "## 2-column layout (Main / Details)",
+    "Use for comparing two perspectives or splitting overview from details.",
+    "",
+    "| Main | Details |",
+    "| --- | --- |",
+    "| First main point<br>Second main point | Detail A<br>Detail B |",
+    "",
+    "Use <br> to put multiple lines inside a single cell.",
+    "",
+    "## 3-column layout (Now / Next / Later)",
+    "Use for roadmaps, priority stacks, or timeline breakdowns.",
+    "",
+    "| Now | Next | Later |",
+    "| --- | --- | --- |",
+    "| Doing this now | Planned next | Future idea |",
+    "",
+    "## Images and links",
+    "Use standard Markdown: ![alt](url) for images, [text](url) for links.",
+    "",
+    "## When not to use rich blocks",
+    "- Do not use callouts just to decorate plain facts.",
+    "- Do not use layout tables for content that fits naturally as a list.",
+    "- Do not create a column layout with only one meaningful column.",
+    "- Always write exact apply-ready markdown before submitting an organize request.",
+  ].join("\n");
+}
+
+function noteCleanupWantsWebSearch(request: NoteAICleanupRequest) {
+  const text = `${request.instruction ?? ""}\n${request.markdown.slice(0, 1200)}`.toLowerCase();
+  return /\b(web|search|browse|internet|online|latest|current|today|news|verify|source|look\s*up|google)\b/.test(text);
+}
+
+async function readCodexResponsesText(response: Response) {
+  const reader = response.body?.getReader();
+  if (!reader) throw new Error("Response body is not readable.");
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let fullText = "";
+  const textFromContent = (content: unknown): string | undefined => {
+    if (!Array.isArray(content)) return undefined;
+    const parts: string[] = [];
+    for (const entry of content) {
+      if (!entry || typeof entry !== "object") continue;
+      const text = (entry as { text?: unknown }).text;
+      if (typeof text === "string") parts.push(text);
+    }
+    return parts.length ? parts.join("") : undefined;
+  };
+  const extractOutputText = (value: unknown): string | undefined => {
+    if (!value || typeof value !== "object") return undefined;
+    const directText = (value as { text?: unknown; output_text?: unknown }).text
+      ?? (value as { text?: unknown; output_text?: unknown }).output_text;
+    if (typeof directText === "string") return directText;
+    const contentText = textFromContent((value as { content?: unknown }).content);
+    if (contentText) return contentText;
+    const output = (value as { output?: unknown }).output;
+    if (!Array.isArray(output)) return undefined;
+    const parts: string[] = [];
+    for (const item of output) {
+      const text = extractOutputText(item);
+      if (text) parts.push(text);
+    }
+    return parts.length ? parts.join("") : undefined;
+  };
+  const appendText = (text: unknown) => {
+    if (typeof text === "string") fullText += text;
+    else if (text && typeof text === "object" && typeof (text as { text?: unknown }).text === "string") {
+      fullText += (text as { text: string }).text;
+    }
+  };
+  const replaceText = (text: unknown) => {
+    if (typeof text === "string") fullText = text;
+  };
+  const handleEvent = (event: unknown) => {
+    if (!event || typeof event !== "object") return;
+    const typedEvent = event as {
+      type?: string;
+      delta?: unknown;
+      text?: unknown;
+      item?: unknown;
+      part?: unknown;
+      response?: unknown;
+      output_text?: unknown;
+      error?: { message?: unknown };
+    };
+    if (typedEvent.type === "response.failed") {
+      throw new Error(
+        (typedEvent.response as { error?: { message?: unknown } } | undefined)?.error?.message as string
+          || typedEvent.error?.message as string
+          || "Codex cleanup failed."
+      );
+    }
+    if (typedEvent.type?.endsWith(".delta")) {
+      appendText(typedEvent.delta);
+      return;
+    }
+    if (typedEvent.type?.endsWith(".done")) {
+      replaceText(
+        typedEvent.text
+          ?? extractOutputText(typedEvent.item)
+          ?? extractOutputText(typedEvent.part)
+          ?? typedEvent.output_text
+      );
+      return;
+    }
+    if (typedEvent.type === "response.completed") {
+      replaceText(extractOutputText(typedEvent.response));
+      return;
+    }
+    appendText(typedEvent.delta);
+    replaceText(typedEvent.output_text ?? extractOutputText(typedEvent.response));
+  };
+  const handleDataPayload = (dataStr: string) => {
+    if (!dataStr.trim() || dataStr.trim() === "[DONE]") return;
+    handleEvent(JSON.parse(dataStr));
+  };
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || "";
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith("data: ")) continue;
+        try {
+          handleDataPayload(trimmed.slice(6));
+        } catch (error) {
+          if (!(error instanceof SyntaxError)) throw error;
+        }
+      }
+    }
+    const trailing = buffer.trim();
+    if (trailing.startsWith("data: ")) {
+      try {
+        handleDataPayload(trailing.slice(6));
+      } catch (error) {
+        if (!(error instanceof SyntaxError)) throw error;
+      }
+    } else if (trailing.startsWith("{")) {
+      try {
+        replaceText(extractOutputText(JSON.parse(trailing)));
+      } catch (error) {
+        if (!(error instanceof SyntaxError)) throw error;
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  return fullText.trim();
+}
+
+function extractJSONObjectStringFromText(text: string) {
+  const trimmed = text.trim()
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```$/i, "")
+    .trim();
+  if (trimmed.startsWith("{") && trimmed.endsWith("}")) return trimmed;
+  const firstBrace = trimmed.indexOf("{");
+  if (firstBrace < 0) return "";
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let index = firstBrace; index < trimmed.length; index += 1) {
+    const char = trimmed[index];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (char === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (char === "\"") {
+      inString = !inString;
+      continue;
+    }
+    if (inString) continue;
+    if (char === "{") depth += 1;
+    if (char === "}") {
+      depth -= 1;
+      if (depth === 0) return trimmed.slice(firstBrace, index + 1);
+    }
+  }
+  return "";
+}
+
+function cleanNoteCleanupTitle(value: unknown, fallback?: string) {
+  const raw = typeof value === "string" ? value : fallback ?? "";
+  return raw
+    .replace(/[\r\n]+/g, " ")
+    .replace(/\s+/g, " ")
+    .replace(/^["'`]+|["'`]+$/g, "")
+    .trim()
+    .slice(0, 90);
+}
+
+function normalizeStringList(value: unknown) {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item) => String(item ?? "").trim())
+    .filter(Boolean)
+    .slice(0, 8);
+}
+
+const noteCleanupCalloutTitleFallbacks: Record<string, string> = {
+  decision: "Decision",
+  comment: "Comment",
+  next: "Next steps",
+  warning: "Warning",
+  info: "Info",
+  success: "Success",
+  task: "Task group"
+};
+
+function titleFromNoteCleanupCalloutOpening(kind: string, openingLine: string) {
+  const rest = openingLine
+    .replace(/^\s*:::\s*(decision|comment|next|warning|info|success|task)\b/i, "")
+    .trim();
+  const quotedTitle = rest.match(/\btitle\s*=\s*"([^"]+)"/i)?.[1]
+    ?? rest.match(/\btitle\s*=\s*'([^']+)'/i)?.[1];
+  const bareTitle = rest.replace(/\{[^}]*\}/g, "").trim();
+  const title = (quotedTitle || bareTitle || noteCleanupCalloutTitleFallbacks[kind] || "Note")
+    .replace(/\s+/g, " ")
+    .trim();
+  return title.length > 110 ? `${title.slice(0, 107).trim()}...` : title;
+}
+
+function shouldKeepNoteCleanupCallout(bodyText: string, mode: NoteAICleanupMode) {
+  const lineCount = bodyText.split("\n").filter((line) => line.trim()).length;
+  const hasStructuredContent = /^#{1,6}\s+/m.test(bodyText)
+    || /^```|^~~~/m.test(bodyText)
+    || /^\|.+\|$/m.test(bodyText)
+    || /^\s*(?:[-*+]|\d+[.)])\s+/m.test(bodyText);
+  const maxLength = mode === "decisions" ? 420 : 180;
+  const maxLines = mode === "decisions" ? 8 : 4;
+  return bodyText.length <= maxLength && lineCount <= maxLines && !hasStructuredContent;
+}
+
+function normalizeNoteCleanupCallouts(markdown: string, mode: NoteAICleanupMode) {
+  const lines = markdown.replace(/\r\n/g, "\n").split("\n");
+  const result: string[] = [];
+  let index = 0;
+  while (index < lines.length) {
+    const opening = lines[index]?.match(/^\s*:::\s*(decision|comment|next|warning|info|success|task)\b.*$/i);
+    if (!opening) {
+      result.push(lines[index] ?? "");
+      index += 1;
+      continue;
+    }
+    const openingLine = lines[index] ?? `::: ${opening[1].toLowerCase()}`;
+    const kind = opening[1].toLowerCase();
+    const body: string[] = [];
+    index += 1;
+    while (index < lines.length && !/^:::\s*$/.test(lines[index] ?? "")) {
+      body.push(lines[index] ?? "");
+      index += 1;
+    }
+    const hasClosing = index < lines.length;
+    if (hasClosing) index += 1;
+    const bodyText = body.join("\n").trim();
+    if (hasClosing && shouldKeepNoteCleanupCallout(bodyText, mode)) {
+      result.push(openingLine, ...body, ":::");
+      continue;
+    }
+    const title = titleFromNoteCleanupCalloutOpening(kind, openingLine);
+    if (bodyText) {
+      result.push(`## ${title}`, "", bodyText);
+    } else {
+      result.push(`## ${title}`);
+    }
+  }
+  return result.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+function parseNoteCleanupResult(text: string, fallbackTitle?: string, mode: NoteAICleanupMode = "cleanup"): NoteAICleanupResult {
+  const jsonText = extractJSONObjectStringFromText(text);
+  if (!jsonText) {
+    throw new Error("Codex did not return cleanup JSON.");
+  }
+  const parsed = jsonObject(JSON.parse(jsonText));
+  if (!parsed) throw new Error("Codex cleanup JSON was not an object.");
+  const markdown = typeof parsed.markdown === "string"
+    ? normalizeNoteCleanupCallouts(parsed.markdown, mode)
+    : "";
+  if (!markdown) throw new Error("Codex cleanup did not return markdown.");
+  const confidence = typeof parsed.confidence === "number"
+    ? Math.max(0, Math.min(1, parsed.confidence))
+    : undefined;
+  const allowedBlocks = new Set(["decision", "success", "next", "warning", "info"]);
+  const usedBlocks = normalizeStringList(parsed.usedBlocks)
+    .map((item) => item.toLowerCase())
+    .filter((item) => allowedBlocks.has(item));
+  return {
+    ok: true,
+    markdown,
+    title: cleanNoteCleanupTitle(parsed.title, fallbackTitle),
+    summary: typeof parsed.summary === "string" ? parsed.summary.trim().slice(0, 500) : undefined,
+    confidence,
+    warnings: normalizeStringList(parsed.warnings),
+    usedBlocks,
+    rawText: text
+  };
+}
+
+async function cleanupNoteWithCodex(rawRequest: unknown): Promise<NoteAICleanupResult> {
+  try {
+    const request = normalizeNoteAICleanupRequest(rawRequest);
+    const auth = await resolveCodexTranscriptionAuthContext();
+    const settings = await loadSettings();
+    // Codex backend only accepts GPT-5 / *-codex models. Prefer the user's
+    // note-cleanup model choice, then the main chat model, and always pass through
+    // codexSafeModel so a non-Codex model (e.g. "gpt-4o") can never be sent.
+    const model = codexSafeModel(settings.noteCleanupModel || settings.model);
+    const wantsWebSearch = noteCleanupWantsWebSearch(request);
+    const modeInstruction = noteCleanupModeInstruction(request.mode, request.instruction);
+    const cleanupInstructions = [
+      "You are the OpenAssist note cleanup assistant.",
+      "Return strict JSON only. No prose outside JSON.",
+      "JSON shape: {\"markdown\":\"...\",\"title\":\"...\",\"summary\":\"...\",\"confidence\":0.0,\"warnings\":[],\"usedBlocks\":[]}.",
+      "The markdown field must be the complete replacement for the provided scope only.",
+      request.scope === "selection"
+        ? "The user selected part of a note. Return only the cleaned replacement for that selected text."
+        : "The user provided the whole note. Return the cleaned full note.",
+      "Preserve important technical details, paths, dates, commands, code, numbers, names, and exact requirements.",
+      "Do not invent facts. Do not add web/current information unless the user explicitly asked for online/current/search work.",
+      "Use OpenAssist markdown tools when helpful: headings, lists, task lists, code blocks, tables, note links, and layout tables.",
+      "For long notes, split dense sections into OpenAssist layout tables when it improves scanning.",
+      "Use a 2-column layout as: | Main | Details | then | --- | --- | then one row with content separated by <br> inside cells.",
+      "Use a 3-column layout as: | Now | Next | Later | then | --- | --- | --- | then one row with content separated by <br> inside cells.",
+      request.mode === "decisions"
+        ? "Use callouts sparingly for short highlights only: ::: decision ... :::, ::: success ... :::, ::: next ... :::, ::: warning ... :::, ::: info ... :::."
+        : "Do not create OpenAssist callouts in this mode. Use normal headings, paragraphs, lists, tables, and code blocks instead.",
+      "Never wrap implementation plans, code, tables, or whole sections inside a callout.",
+      "Never use a long sentence as a callout title with a long body below it.",
+      "Callouts, when allowed, must be short: one short paragraph or up to three bullets. Keep long details as normal markdown below headings.",
+      "Only decisions mode should create multiple callout blocks. Even then, keep each callout short and put details below as normal markdown.",
+      "If you use callouts, put their lowercase names in usedBlocks. Allowed usedBlocks: decision, success, next, warning, info.",
+      "Suggest a short useful title. If the existing title is already good, keep it.",
+      "Keep the note easy to scan."
+    ].join("\n");
+    const userPayload = [
+      `Mode: ${request.mode}`,
+      `Scope: ${request.scope}`,
+      `Current title: ${request.title?.trim() || "Untitled note"}`,
+      `Instruction: ${modeInstruction}`,
+      request.mode === "custom" && request.instruction?.trim() ? `User custom instruction: ${request.instruction.trim()}` : "",
+      "",
+      "Markdown to clean:",
+      "```markdown",
+      request.markdown,
+      "```"
+    ].filter(Boolean).join("\n");
+    const payload: JsonObject = {
+      model,
+      store: false,
+      stream: true,
+      instructions: cleanupInstructions,
+      input: [
+        {
+          role: "system",
+          content: [{ type: "input_text", text: cleanupInstructions }]
+        },
+        {
+          role: "user",
+          content: [{ type: "input_text", text: userPayload }]
+        }
+      ]
+    };
+    if (wantsWebSearch) {
+      payload.tools = [{ type: "web_search" }];
+      payload.tool_choice = "auto";
+    }
+    const cleanupReasoningEffort = normalizeCodexReasoningEffort(settings.noteCleanupReasoningEffort);
+    if (cleanupReasoningEffort) {
+      payload.reasoning = { effort: cleanupReasoningEffort };
+    }
+    const response = await fetchWithTimeout("https://chatgpt.com/backend-api/codex/responses", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${auth.token}`,
+        "Content-Type": "application/json",
+        "User-Agent": chatGPTWebUserAgent,
+        "Origin": "https://chatgpt.com"
+      },
+      body: JSON.stringify(payload)
+    }, 90000, "Codex note cleanup request timed out.");
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`Codex API request failed: ${response.status} ${errorText}`);
+    }
+    const text = await readCodexResponsesText(response);
+    return parseNoteCleanupResult(text, request.title, request.mode);
+  } catch (error) {
+    return {
+      ok: false,
+      error: error instanceof Error ? error.message : String(error)
+    };
+  }
 }
 
 async function postChatGPTTranscription({
@@ -3592,6 +5737,24 @@ function readCodexDefaultModel() {
   }
 }
 
+// The Codex (ChatGPT) backend only accepts GPT-5 family models and *-codex models.
+// Older ids such as "gpt-4o", "gpt-4.1", "o1", "o3" are rejected with a 400, so a
+// `gpt-` prefix check alone is not enough (gpt-4o passes it). Use this to decide
+// whether a stored model is safe to send to Codex.
+function isCodexCompatibleModel(rawModelID?: unknown): boolean {
+  const normalized = pluginString(rawModelID)?.trim().toLowerCase() ?? "";
+  if (!normalized) return false;
+  if (normalized.includes("codex")) return true;
+  return /^gpt-5(\.|-|$)/.test(normalized);
+}
+
+// Returns a model that is safe to send to the Codex backend. Prefers the requested
+// model when it is Codex-compatible; otherwise falls back to the Codex default.
+function codexSafeModel(rawModelID?: unknown): string {
+  const requested = pluginString(rawModelID)?.trim() ?? "";
+  return isCodexCompatibleModel(requested) ? requested : readCodexDefaultModel();
+}
+
 function providerModelOption(id: string, displayName = id, description = displayName): ProviderModelOption {
   return { id, displayName, description, hidden: false, isInstalled: true };
 }
@@ -3890,8 +6053,8 @@ function fallbackModelOptionsForBackend(backend: AssistantBackend): ProviderMode
   if (backend === "ollamaLocal") {
     return [
       providerModelOption("gemma4:e2b", "gemma4:e2b"),
-      providerModelOption("llama3.1", "llama3.1"),
-      providerModelOption("gpt-oss:20b", "gpt-oss:20b")
+      providerModelOption("llama3.2:latest", "llama3.2:latest"),
+      providerModelOption("llama3.2:1b", "llama3.2:1b")
     ];
   }
   return [
@@ -3946,6 +6109,64 @@ function copilotModelFromRow(row: JsonObject, currentModelID?: string): Provider
 }
 
 let copilotModelCache: { expiresAt: number; value: ProviderModelOption[] } | null = null;
+let ollamaModelCache: { expiresAt: number; value: ProviderModelOption[] } | null = null;
+let ollamaCatalogCache: { expiresAt: number; value: OllamaCatalogModelOption[] } | null = null;
+const ollamaModelsUsedThisSession = new Set<string>();
+
+type OllamaModelDownloadProgress = {
+  modelID: string;
+  status: string;
+  completed?: number;
+  total?: number;
+  percent?: number;
+  done?: boolean;
+  error?: string;
+};
+
+function normalizeOllamaModelName(rawModelID: unknown) {
+  const modelID = pluginString(rawModelID)?.trim() ?? "";
+  if (!modelID) throw new Error("Enter an Ollama model name.");
+  if (/[\r\n]/.test(modelID)) throw new Error("Ollama model name must be one line.");
+  return modelID;
+}
+
+function markOllamaModelUsed(modelID: unknown) {
+  const normalized = pluginString(modelID)?.trim();
+  if (normalized) ollamaModelsUsedThisSession.add(normalized);
+}
+
+async function resolveAvailableOllamaModelID(rawModelID: unknown) {
+  const requested = pluginString(rawModelID)?.trim() || defaultLocalVoiceModel;
+  const installed = await loadOllamaModelsFromTags();
+  if (!installed.length) {
+    throw new Error("No Ollama models are installed. Download a model before using Ollama.");
+  }
+  const exact = installed.find((model) => model.id.trim().toLowerCase() === requested.toLowerCase())?.id;
+  if (exact) return exact;
+  const defaultInstalled = installed.find((model) => model.id.trim().toLowerCase() === defaultLocalVoiceModel.toLowerCase())?.id;
+  const fallback = defaultInstalled || installed.find((model) => model.id.trim())?.id;
+  if (fallback) {
+    bridgeDebugLog(`[ollama] model ${requested} is not installed; using ${fallback}`);
+    return fallback;
+  }
+  throw new Error("No usable Ollama model is installed.");
+}
+
+async function parseOllamaError(response: Response, fallback: string) {
+  let detail = "";
+  try {
+    const text = await response.text();
+    if (text.trim().startsWith("{")) {
+      const payload = JSON.parse(text) as JsonObject;
+      detail = pluginString(payload.error, payload.message) ?? "";
+    } else {
+      detail = text.trim();
+    }
+  } catch {
+    detail = "";
+  }
+  return detail ? `${fallback}: ${detail}` : fallback;
+}
 
 async function loadCopilotModelsFromACP(): Promise<ProviderModelOption[]> {
   const now = Date.now();
@@ -4061,6 +6282,31 @@ async function loadCopilotModelsFromACP(): Promise<ProviderModelOption[]> {
   return models;
 }
 
+async function loadOllamaModelsFromTags(): Promise<ProviderModelOption[]> {
+  const now = Date.now();
+  if (ollamaModelCache && ollamaModelCache.expiresAt > now) return ollamaModelCache.value;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 1500);
+  try {
+    const response = await fetch("http://127.0.0.1:11434/api/tags", { signal: controller.signal });
+    if (!response.ok) throw new Error(`Ollama model list returned ${response.status}.`);
+    const payload = await response.json() as JsonObject;
+    const rows = Array.isArray(payload.models) ? payload.models : [];
+    const models = uniqueProviderModels(rows
+      .map((row) => {
+        const object = asObject(row);
+        const id = pluginString(object?.name, object?.model)?.trim();
+        if (!id) return null;
+        return providerModelOption(id, id, "Installed Ollama model");
+      })
+      .filter(Boolean) as ProviderModelOption[]);
+    ollamaModelCache = { expiresAt: now + 30_000, value: models };
+    return models;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export async function listProviderModels(rawBackend: string): Promise<ProviderModelOption[]> {
   const backend = normalizeBackend(rawBackend);
   if (backend === "copilot") {
@@ -4077,7 +6323,248 @@ export async function listProviderModels(rawBackend: string): Promise<ProviderMo
       return fallbackModelOptionsForBackend("antigravityCLI");
     }
   }
+  if (backend === "ollamaLocal") {
+    try {
+      return await loadOllamaModelsFromTags();
+    } catch {
+      return fallbackModelOptionsForBackend("ollamaLocal");
+    }
+  }
   return fallbackModelOptionsForBackend(backend);
+}
+
+function percentFromOllamaProgress(completed?: number, total?: number) {
+  if (!completed || !total || total <= 0) return undefined;
+  return Math.max(0, Math.min(100, Math.round((completed / total) * 100)));
+}
+
+async function readOllamaPullStream(
+  response: Response,
+  modelID: string,
+  onProgress?: (progress: OllamaModelDownloadProgress) => void
+) {
+  if (!response.body) return;
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let lastProgress: OllamaModelDownloadProgress = { modelID, status: "Downloading" };
+  const emit = (progress: OllamaModelDownloadProgress) => {
+    lastProgress = { ...lastProgress, ...progress, modelID };
+    onProgress?.(lastProgress);
+  };
+  emit({ modelID, status: "Starting download", percent: 0 });
+  while (true) {
+    const { done, value } = await reader.read();
+    buffer += decoder.decode(value ?? new Uint8Array(), { stream: !done });
+    const lines = buffer.split(/\r?\n/);
+    buffer = done ? "" : lines.pop() ?? "";
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      let payload: JsonObject;
+      try {
+        payload = JSON.parse(trimmed) as JsonObject;
+      } catch {
+        continue;
+      }
+      const error = pluginString(payload.error);
+      if (error) {
+        emit({ modelID, status: "Download failed", error });
+        throw new Error(error);
+      }
+      const status = pluginString(payload.status) ?? "Downloading";
+      const completed = typeof payload.completed === "number" ? payload.completed : undefined;
+      const total = typeof payload.total === "number" ? payload.total : undefined;
+      emit({
+        modelID,
+        status,
+        completed,
+        total,
+        percent: percentFromOllamaProgress(completed, total)
+      });
+    }
+    if (done) break;
+  }
+}
+
+async function pullOllamaModel(
+  rawModelID: string,
+  onProgress?: (progress: OllamaModelDownloadProgress) => void
+): Promise<{ ok: boolean; modelID: string; models: ProviderModelOption[] }> {
+  const modelID = normalizeOllamaModelName(rawModelID);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 90 * 60_000);
+  try {
+    const response = await fetch("http://127.0.0.1:11434/api/pull", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      signal: controller.signal,
+      body: JSON.stringify({ name: modelID, stream: true })
+    });
+    if (!response.ok) {
+      throw new Error(await parseOllamaError(response, `Could not download ${modelID}`));
+    }
+    await readOllamaPullStream(response, modelID, onProgress);
+    ollamaModelCache = null;
+    ollamaCatalogCache = null;
+    onProgress?.({ modelID, status: "Downloaded", percent: 100, done: true });
+    return {
+      ok: true,
+      modelID,
+      models: await loadOllamaModelsFromTags().catch(() => fallbackModelOptionsForBackend("ollamaLocal"))
+    };
+  } catch (error) {
+    if (error instanceof Error && error.name === "AbortError") {
+      onProgress?.({ modelID, status: "Download timed out", error: "Download took too long." });
+      throw new Error(`Downloading ${modelID} took too long. Ollama may still be pulling it in the background.`);
+    }
+    if (error instanceof Error) {
+      let message = error.message;
+      if (isOllamaVersionUpgradeError(message)) {
+        try {
+          const runtimeStatus = await getOllamaRuntimeStatus();
+          message = formatOllamaUpgradeHint(message, runtimeStatus.latestVersion);
+        } catch {
+          message = formatOllamaUpgradeHint(message);
+        }
+      }
+      onProgress?.({ modelID, status: "Download failed", error: message });
+      throw new Error(message);
+    }
+    throw new Error(`Could not download ${modelID}.`);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function buildOllamaCatalogModels(includeWebsite = false): Promise<OllamaCatalogModelOption[]> {
+  const memoryBytes = physicalMemoryBytes();
+  let catalog = curatedOllamaCatalog(memoryBytes);
+  if (includeWebsite && ollamaCatalogCache && ollamaCatalogCache.expiresAt > Date.now()) {
+    catalog = ollamaCatalogCache.value;
+  } else if (includeWebsite) {
+    const websiteModels = await fetchOllamaWebsiteModelOptions(12);
+    catalog = mergeCatalogWithWebsiteModels(curatedOllamaCatalog(memoryBytes), websiteModels);
+    ollamaCatalogCache = { expiresAt: Date.now() + 5 * 60_000, value: catalog };
+  }
+  const installed = await loadOllamaModelsFromTags().catch(() => [] as ProviderModelOption[]);
+  const installedIDs = installed.map((model) => model.id);
+  return sortOllamaCatalog(mergeCatalogWithInstalled(catalog, installedIDs));
+}
+
+async function listOllamaCatalogModels(): Promise<OllamaCatalogModelOption[]> {
+  return buildOllamaCatalogModels(Boolean(ollamaCatalogCache && ollamaCatalogCache.expiresAt > Date.now()));
+}
+
+async function refreshOllamaWebsiteCatalog(): Promise<{
+  ok: boolean;
+  models: OllamaCatalogModelOption[];
+  statusMessage: string;
+}> {
+  const curated = curatedOllamaCatalog(physicalMemoryBytes());
+  const curatedCount = curated.length;
+  try {
+    const websiteModels = await fetchOllamaWebsiteModelOptions(12);
+    const merged = mergeCatalogWithWebsiteModels(curated, websiteModels);
+    ollamaCatalogCache = { expiresAt: Date.now() + 5 * 60_000, value: merged };
+    const installed = await loadOllamaModelsFromTags().catch(() => [] as ProviderModelOption[]);
+    const models = sortOllamaCatalog(mergeCatalogWithInstalled(merged, installed.map((model) => model.id)));
+    return {
+      ok: true,
+      models,
+      statusMessage: websiteCatalogStatusMessage(merged, curatedCount)
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const installed = await loadOllamaModelsFromTags().catch(() => [] as ProviderModelOption[]);
+    const models = sortOllamaCatalog(mergeCatalogWithInstalled(curated, installed.map((model) => model.id)));
+    return {
+      ok: false,
+      models,
+      statusMessage: websiteCatalogStatusMessage([], curatedCount, message)
+    };
+  }
+}
+
+async function deleteOllamaModel(rawModelID: string): Promise<{ ok: boolean; modelID: string; models: ProviderModelOption[] }> {
+  const modelID = normalizeOllamaModelName(rawModelID);
+  const response = await fetch("http://127.0.0.1:11434/api/delete", {
+    method: "DELETE",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name: modelID })
+  });
+  if (!response.ok) {
+    throw new Error(await parseOllamaError(response, `Could not delete ${modelID}`));
+  }
+  ollamaModelCache = null;
+  ollamaCatalogCache = null;
+  return {
+    ok: true,
+    modelID,
+    models: await loadOllamaModelsFromTags().catch(() => fallbackModelOptionsForBackend("ollamaLocal"))
+  };
+}
+
+async function getOllamaRuntimeStatusForBridge(): Promise<OllamaRuntimeStatus> {
+  return getOllamaRuntimeStatus();
+}
+
+async function openOllamaDownloadPage(): Promise<{ ok: boolean; url: string }> {
+  await shell.openExternal(OLLAMA_DOWNLOAD_URL);
+  return { ok: true, url: OLLAMA_DOWNLOAD_URL };
+}
+
+async function updateOllamaRuntimeForBridge(
+  onProgress?: (progress: OllamaRuntimeUpdateProgress) => void
+): Promise<{ ok: boolean; status: OllamaRuntimeStatus; openedExternal?: boolean }> {
+  return updateOllamaRuntime(onProgress);
+}
+
+async function startOllamaRuntimeForBridge(): Promise<{ ok: boolean; status: OllamaRuntimeStatus }> {
+  return startOllamaRuntime();
+}
+
+async function stopOllamaRuntimeForBridge(): Promise<{ ok: boolean; status: OllamaRuntimeStatus }> {
+  return stopOllamaRuntime();
+}
+
+async function unloadOllamaModel(modelID: string) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 2_000);
+  try {
+    await fetch("http://127.0.0.1:11434/api/generate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      signal: controller.signal,
+      body: JSON.stringify({
+        model: modelID,
+        prompt: "",
+        stream: false,
+        keep_alive: 0
+      })
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function unloadOllamaModelsUsedThisSession(): Promise<{ ok: boolean; unloaded: string[]; failed: string[] }> {
+  const models = Array.from(ollamaModelsUsedThisSession).filter(Boolean);
+  const unloaded: string[] = [];
+  const failed: string[] = [];
+  for (const modelID of models) {
+    try {
+      await unloadOllamaModel(modelID);
+      unloaded.push(modelID);
+    } catch {
+      failed.push(modelID);
+    }
+  }
+  ollamaModelsUsedThisSession.clear();
+  if (unloaded.length || failed.length) {
+    bridgeDebugLog(`[ollama] unloaded=${unloaded.join(",") || "<none>"} failed=${failed.join(",") || "<none>"}`);
+  }
+  return { ok: failed.length === 0, unloaded, failed };
 }
 
 function normalizeCodexReasoningEffort(raw?: string): CodexReasoningEffort | undefined {
@@ -4098,6 +6585,28 @@ function swiftDateToMs(value: unknown): number | undefined {
 
 function currentSwiftDate() {
   return Date.now() / 1000 - macAbsoluteEpochOffset;
+}
+
+function storedArchiveDateToMs(value: unknown): number | undefined {
+  if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
+  if (value > 10_000_000_000) return value;
+  return swiftDateToMs(value);
+}
+
+function archiveRetentionMs(settings: Pick<SettingsSnapshot, "archiveAutoDeleteDays">) {
+  const days = Number(settings.archiveAutoDeleteDays ?? 0);
+  if (!Number.isFinite(days) || days <= 0) return null;
+  return days * 24 * 60 * 60 * 1000;
+}
+
+function shouldAutoDeleteArchivedRecord(record: JsonObject, settings: Pick<SettingsSnapshot, "archiveAutoDeleteDays">, nowMs = Date.now()) {
+  if (record.isArchived !== true) return false;
+  const explicitDeleteAt = storedArchiveDateToMs(record.autoDeleteAfter);
+  if (explicitDeleteAt && explicitDeleteAt <= nowMs) return true;
+  const retentionMs = archiveRetentionMs(settings);
+  if (!retentionMs) return false;
+  const archivedAt = storedArchiveDateToMs(record.archivedAt);
+  return Boolean(archivedAt && archivedAt + retentionMs <= nowMs);
 }
 
 function writeJSON(filePath: string, value: unknown) {
@@ -4128,8 +6637,14 @@ function relativeAge(ms?: number) {
 }
 
 function noteSubtitle(updatedAt?: number) {
-  const age = relativeAge(updatedAt);
-  return age ? `Saved ${age} ago` : "Saved";
+  return relativeAge(updatedAt);
+}
+
+function noteHistorySavedAtLabel(savedAt?: number) {
+  const ms = swiftDateToMs(savedAt);
+  if (!ms) return "Saved version";
+  const age = relativeAge(ms);
+  return age ? `Saved ${age} ago` : "Saved just now";
 }
 
 function normalizeTitle(value: unknown, fallback = "Untitled") {
@@ -4146,11 +6661,7 @@ function iconForProject(rawIcon: unknown, kind?: string, linkedFolderPath?: unkn
 }
 
 function loadProjects(): LoadedProjects {
-  const filePath = path.join(projectStoreRoot(), "projects.json");
-  const snapshot = readJSON<{ projects?: JsonObject[]; threadAssignments?: Record<string, string>; brainByProjectID?: Record<string, JsonObject> }>(
-    filePath,
-    {}
-  );
+  const { snapshot } = projectStoreSnapshot();
   const projectNotesByID = new Map<string, number>();
   const threadTitles = new Map<string, string>();
   const projectNameByID = new Map<string, string>();
@@ -4166,8 +6677,8 @@ function loadProjects(): LoadedProjects {
     projectNameByID.set(projectID.toLowerCase(), title);
     recordsByID.set(projectID.toLowerCase(), project);
     const manifestPath = path.join(projectStoreRoot(), "ProjectNotes", projectID.toUpperCase(), "notes", "manifest.json");
-    const manifest = readJSON<{ notes?: unknown[] }>(manifestPath, {});
-    projectNotesByID.set(projectID, manifest.notes?.length ?? 0);
+    const manifest = readJSON<{ notes?: JsonObject[] }>(manifestPath, {});
+    projectNotesByID.set(projectID, (manifest.notes ?? []).filter((note) => note.isArchived !== true).length);
   }
 
   for (const [projectID, brain] of Object.entries(snapshot.brainByProjectID ?? {})) {
@@ -4178,8 +6689,8 @@ function loadProjects(): LoadedProjects {
     }
     if (!projectNotesByID.has(projectID)) {
       const manifestPath = path.join(projectStoreRoot(), "ProjectNotes", projectID.toUpperCase(), "notes", "manifest.json");
-      const manifest = readJSON<{ notes?: unknown[] }>(manifestPath, {});
-      projectNotesByID.set(projectID, manifest.notes?.length ?? 0);
+      const manifest = readJSON<{ notes?: JsonObject[] }>(manifestPath, {});
+      projectNotesByID.set(projectID, (manifest.notes ?? []).filter((note) => note.isArchived !== true).length);
     }
   }
 
@@ -4273,11 +6784,13 @@ function cleanupEmptyConversationThreads() {
   const root = conversationStoreRoot();
   if (!fs.existsSync(root)) return 0;
   const removedThreadIDs: string[] = [];
+  const activeRealtimeThreadID = activeRealtimeSession?.openAssistThreadID.toLowerCase();
   for (const dir of fs.readdirSync(root)) {
     const filePath = path.join(root, dir, "conversation.json");
     if (!fs.existsSync(filePath)) continue;
     const snapshot = readJSON<{ threadID?: string; transcript?: JsonObject[] }>(filePath, {});
     const threadID = snapshot.threadID ?? dir;
+    if (activeRealtimeThreadID && threadID.toLowerCase() === activeRealtimeThreadID) continue;
     if (conversationHasVisibleMessages(snapshot) || conversationHasThreadNotes(threadID)) continue;
     fs.rmSync(path.join(root, dir), { recursive: true, force: true });
     removeProjectThreadAssignment(threadID);
@@ -4291,14 +6804,32 @@ function cleanupEmptyConversationThreads() {
   return removedThreadIDs.length;
 }
 
-function loadThreads(projects: LoadedProjects): ThreadItem[] {
+function loadThreads(
+  projects: LoadedProjects,
+  options: { limit?: number } = {}
+): ThreadItem[] {
   const root = conversationStoreRoot();
   if (!fs.existsSync(root)) return [];
   const registryByID = new Map(loadSessionRegistry().sessions.map((session) => [session.id.toLowerCase(), session]));
-  const threads: ThreadItem[] = [];
-  for (const dir of fs.readdirSync(root)) {
+  const limit = typeof options.limit === "number" ? Math.max(1, options.limit) : 120;
+  // Sort directories by mtime descending so we can stop reading conversation
+  // bodies once we have `limit` valid threads. This trades 81 disk reads for
+  // ~10 on cold start.
+  const dirs = fs.readdirSync(root).map((dir) => {
     const filePath = path.join(root, dir, "conversation.json");
-    if (!fs.existsSync(filePath)) continue;
+    let mtimeMs = 0;
+    try {
+      mtimeMs = fs.statSync(filePath).mtimeMs;
+    } catch {
+      // missing — sort to the end
+    }
+    return { dir, filePath, mtimeMs };
+  }).filter((entry) => entry.mtimeMs > 0);
+  dirs.sort((a, b) => b.mtimeMs - a.mtimeMs);
+
+  const threads: ThreadItem[] = [];
+  for (const { dir, filePath } of dirs) {
+    if (threads.length >= limit) break;
     const snapshot = readJSON<{ threadID?: string; updatedAt?: number; transcript?: JsonObject[]; timeline?: JsonObject[] }>(filePath, {});
     if (!conversationHasVisibleMessages(snapshot)) continue;
     const threadID = snapshot.threadID ?? dir;
@@ -4323,29 +6854,132 @@ function loadThreads(projects: LoadedProjects): ThreadItem[] {
       age: relativeAge(updatedAt),
       updatedAt,
       isArchived: registrySession?.isArchived === true,
+      archivedAt: storedArchiveDateToMs(registrySession?.archivedAt),
+      autoDeleteAfter: storedArchiveDateToMs(registrySession?.autoDeleteAfter) ?? null,
       isTemporary: registrySession?.isTemporary === true
     });
   }
   threads.sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0));
   if (threads.length) threads[0].active = true;
-  return threads.slice(0, 120);
+  return threads;
 }
 
-async function loadThreadMessages(threadID: string): Promise<ThreadDetail> {
-  const filePath = path.join(conversationStoreRoot(), threadID, "conversation.json");
-  const snapshot = readJSON<{ threadID?: string; transcript?: JsonObject[]; timeline?: JsonObject[] }>(filePath, {});
+const DEFAULT_THREAD_TURN_PAGE_SIZE = 7;
+
+type ThreadMessageLoadOptions = {
+  beforeMessageID?: string;
+  turnLimit?: number;
+};
+
+type ConversationSnapshot = {
+  threadID?: string;
+  transcript?: JsonObject[];
+  timeline?: JsonObject[];
+};
+
+function boundedThreadTurnLimit(value?: number) {
+  if (!Number.isFinite(value ?? Number.NaN)) return DEFAULT_THREAD_TURN_PAGE_SIZE;
+  return Math.min(20, Math.max(1, Math.floor(value ?? DEFAULT_THREAD_TURN_PAGE_SIZE)));
+}
+
+function threadItemPageByTurns<T>(
+  items: T[],
+  options: ThreadMessageLoadOptions,
+  itemID: (item: T) => string,
+  isUserItem: (item: T) => boolean
+) {
+  const turnLimit = boundedThreadTurnLimit(options.turnLimit);
+  const beforeIndex = options.beforeMessageID
+    ? items.findIndex((item) => itemID(item) === options.beforeMessageID)
+    : -1;
+  const endIndex = beforeIndex >= 0 ? beforeIndex : items.length;
+  const source = items.slice(0, endIndex);
+  if (!source.length) {
+    return {
+      items: [] as T[],
+      hasMoreBefore: false,
+      oldestMessageID: undefined,
+      loadedTurnCount: 0
+    };
+  }
+
+  let startIndex = 0;
+  let loadedTurnCount = 0;
+  for (let index = source.length - 1; index >= 0; index -= 1) {
+    const item = source[index];
+    if (item === undefined || !isUserItem(item)) continue;
+    loadedTurnCount += 1;
+    if (loadedTurnCount >= turnLimit) {
+      startIndex = index;
+      break;
+    }
+  }
+
+  const pageItems = source.slice(startIndex);
+  return {
+    items: pageItems,
+    hasMoreBefore: startIndex > 0,
+    oldestMessageID: pageItems[0] ? itemID(pageItems[0]) : undefined,
+    loadedTurnCount
+  };
+}
+
+type IndexedTimelineEntry = {
+  entry: JsonObject;
+  index: number;
+};
+
+type IndexedTranscriptEntry = {
+  entry: JsonObject;
+  index: number;
+};
+
+function timelineDisplayID(threadID: string, entry: JsonObject, index: number) {
+  const kind = String(entry.kind ?? "");
+  if (kind === "userMessage") return String(entry.id ?? `${threadID}-timeline-user-${index}`);
+  if (kind === "assistantFinal" || kind === "assistantProgress") {
+    return String(entry.id ?? `${threadID}-timeline-assistant-${index}`);
+  }
+  if (kind === "activity") {
+    const activity = runtimeObject(entry.activity);
+    return String(activity?.id ?? entry.id ?? `${threadID}-activity-${index}`);
+  }
+  return String(entry.id ?? `${threadID}-timeline-${index}`);
+}
+
+function firstVisibleTimelineUserText(items: IndexedTimelineEntry[]) {
+  for (const item of items) {
+    if (timelineEntryKind(item.entry) !== "userMessage") continue;
+    const text = normalizeTitle(item.entry.text, "");
+    if (text) return text;
+  }
+  return "";
+}
+
+function messagesFromConversationSnapshot(threadID: string, snapshot: ConversationSnapshot, options: ThreadMessageLoadOptions = {}) {
   const transcript = snapshot.transcript ?? [];
-  const timelineMessages: ChatMessage[] = displayOrderedTimeline(snapshot.timeline ?? [])
-    .map((entry, index): ChatMessage | null => {
+  const timelineItems = displayOrderedTimeline(snapshot.timeline ?? [])
+    .map((entry, index) => ({ entry, index }));
+  const timelinePage = threadItemPageByTurns(
+    timelineItems,
+    options,
+    (item) => timelineDisplayID(threadID, item.entry, item.index),
+    (item) => timelineEntryKind(item.entry) === "userMessage"
+  );
+  const timelineMessages: ChatMessage[] = timelinePage.items
+    .map(({ entry, index }, pageIndex): ChatMessage | null => {
       const kind = String(entry.kind ?? "");
       const activity = runtimeObject(entry.activity);
       if (kind === "userMessage") {
         const text = normalizeTitle(entry.text, "");
         if (!text) return null;
+        const attachments = storedComposerMessageAttachments(entry.attachments);
         return {
-          id: String(entry.id ?? `${threadID}-timeline-user-${index}`),
+          id: timelineDisplayID(threadID, entry, index),
           role: "user",
           text,
+          source: firstRuntimeString(entry.source) || undefined,
+          attachments: attachments.length ? attachments : undefined,
           createdAt: swiftDateToMs(entry.createdAt),
           updatedAt: swiftDateToMs(entry.updatedAt)
         };
@@ -4353,10 +6987,25 @@ async function loadThreadMessages(threadID: string): Promise<ThreadDetail> {
       if (kind === "assistantFinal" || kind === "assistantProgress") {
         const text = normalizeTitle(entry.text, "");
         if (!text) return null;
+        let previousUserSource = "";
+        for (let priorIndex = pageIndex - 1; priorIndex >= 0; priorIndex -= 1) {
+          const previousEntry = timelinePage.items[priorIndex]?.entry;
+          const previousKind = previousEntry ? timelineEntryKind(previousEntry) : "";
+          if (previousKind === "userMessage") {
+            previousUserSource = firstRuntimeString(previousEntry?.source);
+            break;
+          }
+          if (previousKind === "assistantFinal" || previousKind === "assistantProgress") break;
+        }
+        const storedSource = firstRuntimeString(entry.source);
+        const displaySource = previousUserSource === "realtimeVoice" && (!storedSource || storedSource === "runtime")
+          ? "realtimeVoice"
+          : storedSource || undefined;
         return {
-          id: String(entry.id ?? `${threadID}-timeline-assistant-${index}`),
+          id: timelineDisplayID(threadID, entry, index),
           role: "assistant",
           text,
+          source: displaySource,
           artifacts: messageArtifactsFromStored(entry.artifacts),
           provider: typeof entry.providerBackend === "string" ? providerLabel(entry.providerBackend) : undefined,
           status: entry.isStreaming === true ? "running" : "completed",
@@ -4396,7 +7045,7 @@ async function loadThreadMessages(threadID: string): Promise<ThreadDetail> {
                 ? "running"
                 : "completed";
         return {
-          id: String(activity.id ?? entry.id ?? `${threadID}-activity-${index}`),
+          id: timelineDisplayID(threadID, entry, index),
           role: "activity",
           provider: typeof entry.providerBackend === "string" ? providerLabel(entry.providerBackend) : undefined,
           text: detail || title,
@@ -4423,24 +7072,102 @@ async function loadThreadMessages(threadID: string): Promise<ThreadDetail> {
       return null;
     })
     .filter((message): message is ChatMessage => Boolean(message));
-  const messages: ChatMessage[] = timelineMessages.length
-    ? timelineMessages
-    : transcript
-        .filter((entry) => entry.role === "user" || entry.role === "assistant")
-        .map((entry, index) => ({
-          id: String(entry.id ?? `${threadID}-${index}`),
-          role: entry.role as "user" | "assistant",
-          text: normalizeTitle(entry.text, ""),
-          provider: typeof entry.providerBackend === "string" ? providerLabel(entry.providerBackend) : undefined
-        }))
-        .filter((message) => message.text);
-  const messagesWithArtifacts = attachActivityArtifactsToAssistantMessages(messages);
+  if (timelineMessages.length) {
+    return {
+      title: firstVisibleTimelineUserText(timelineItems),
+      messages: markRealtimeVoiceUserMessages(attachActivityArtifactsToAssistantMessages(timelineMessages)),
+      hasMoreBefore: timelinePage.hasMoreBefore,
+      oldestMessageID: timelineMessages[0]?.id,
+      loadedTurnCount: timelinePage.loadedTurnCount
+    };
+  }
+
+  const transcriptItems = transcript
+    .filter((entry) => entry.role === "user" || entry.role === "assistant")
+    .map((entry, index) => ({ entry, index }));
+  const transcriptPage = threadItemPageByTurns(
+    transcriptItems,
+    options,
+    (item) => String(item.entry.id ?? `${threadID}-${item.index}`),
+    (item) => item.entry.role === "user"
+  );
+  const messages: ChatMessage[] = transcriptPage.items
+    .map(({ entry, index }) => ({
+      id: String(entry.id ?? `${threadID}-${index}`),
+      role: entry.role as "user" | "assistant",
+      text: normalizeTitle(entry.text, ""),
+      provider: typeof entry.providerBackend === "string" ? providerLabel(entry.providerBackend) : undefined
+    }))
+    .filter((message) => message.text);
+  const transcriptTitle = transcriptItems
+    .filter((item) => item.entry.role === "user")
+    .map((item) => normalizeTitle(item.entry.text, ""))
+    .find(Boolean) ?? "";
+  return {
+    title: transcriptTitle,
+    messages: markRealtimeVoiceUserMessages(attachActivityArtifactsToAssistantMessages(messages)),
+    hasMoreBefore: transcriptPage.hasMoreBefore,
+    oldestMessageID: messages[0]?.id,
+    loadedTurnCount: transcriptPage.loadedTurnCount
+  };
+}
+
+async function loadThreadMessages(threadID: string, options: ThreadMessageLoadOptions = {}): Promise<ThreadDetail> {
+  const filePath = path.join(conversationStoreRoot(), threadID, "conversation.json");
+  const snapshot = readJSON<ConversationSnapshot>(filePath, {});
+  const page = messagesFromConversationSnapshot(threadID, snapshot, options);
   const codeTrackingState = await loadCodeTrackingState(threadID).catch(() => readCodeTrackingState(threadID));
   return {
     threadID,
-    title: messagesWithArtifacts.find((message) => message.role === "user")?.text.slice(0, 80) || "Untitled chat",
-    messages: attachCodeCheckpointInfo(messagesWithArtifacts, codeTrackingState)
+    title: page.title.slice(0, 80) || "Untitled chat",
+    messages: attachCodeCheckpointInfo(page.messages, codeTrackingState),
+    hasMoreBefore: page.hasMoreBefore,
+    oldestMessageID: page.oldestMessageID,
+    loadedTurnCount: page.loadedTurnCount
   };
+}
+
+function isRealtimeDelegationChatActivity(message: ChatMessage) {
+  if (message.role !== "activity") return false;
+  const kind = String(message.activityKind ?? "").replace(/[_\s-]+/g, "").toLowerCase();
+  const title = String(message.activityTitle ?? "").replace(/\s+/g, " ").trim().toLowerCase();
+  return kind === "realtimedelegation"
+    || (kind === "subagent" && title.includes("realtime"))
+    || message.id.includes("realtime-delegation");
+}
+
+function markRealtimeVoiceUserMessages(messages: ChatMessage[]) {
+  const next = messages.map((message) => ({ ...message }));
+  let latestUserIndex = -1;
+  let hasRealtimeDelegation = false;
+  const markLatestUser = () => {
+    if (latestUserIndex >= 0 && hasRealtimeDelegation) {
+      next[latestUserIndex] = {
+        ...next[latestUserIndex],
+        source: "realtimeVoice"
+      };
+    }
+  };
+  for (let index = 0; index < next.length; index += 1) {
+    const message = next[index];
+    if (message.role === "user") {
+      markLatestUser();
+      latestUserIndex = index;
+      hasRealtimeDelegation = message.source === "realtimeVoice";
+      continue;
+    }
+    if (message.role === "assistant") {
+      markLatestUser();
+      latestUserIndex = -1;
+      hasRealtimeDelegation = false;
+      continue;
+    }
+    if (isRealtimeDelegationChatActivity(message)) {
+      hasRealtimeDelegation = true;
+    }
+  }
+  markLatestUser();
+  return next;
 }
 
 function timelineEntryKind(entry: JsonObject) {
@@ -4576,7 +7303,10 @@ function loadThreadNoteWorkspace(threadID: string): ThreadNoteWorkspace {
       id: String(note.id),
       title: normalizeThreadNoteTitle(note.title),
       fileName: String(note.fileName),
-      updatedAt: swiftDateToMs(note.updatedAt)
+      updatedAt: swiftDateToMs(note.updatedAt),
+      isArchived: note.isArchived === true,
+      archivedAt: storedArchiveDateToMs(note.archivedAt),
+      autoDeleteAfter: storedArchiveDateToMs(note.autoDeleteAfter) ?? null
     }));
   const selectedNoteID = notes.some((note) => note.id === manifest.selectedNoteID)
     ? manifest.selectedNoteID
@@ -4602,16 +7332,19 @@ function loadThreadNoteList(threads: ThreadItem[]): ThreadNoteListItem[] {
     for (const note of manifest.notes ?? []) {
       if (!note.id || !note.fileName) continue;
       const updatedAt = swiftDateToMs(note.updatedAt);
+      const noteArchived = note.isArchived === true;
       items.push({
         id: String(note.id),
         title: normalizeThreadNoteTitle(note.title),
-        subtitle: `${thread.title}${thread.isArchived ? " · Archived" : ""} · ${noteSubtitle(updatedAt)}`,
+        subtitle: `${thread.title}${thread.isArchived || noteArchived ? " · Archived" : ""}`,
         threadID: thread.id,
         threadTitle: thread.title,
         projectID: thread.projectID,
         projectName: thread.project,
         updatedAt,
-        isArchived: thread.isArchived,
+        isArchived: thread.isArchived || noteArchived,
+        archivedAt: storedArchiveDateToMs(note.archivedAt),
+        autoDeleteAfter: storedArchiveDateToMs(note.autoDeleteAfter) ?? null,
         active: manifest.selectedNoteID === note.id
       });
     }
@@ -4661,6 +7394,20 @@ function saveThreadNote(threadID: string, noteID: string | undefined, markdown: 
   return loadThreadNoteWorkspace(threadID);
 }
 
+function renameThreadNote(threadID: string, noteID: string, title: string): ThreadNoteWorkspace {
+  const manifest = readThreadNoteManifest(threadID);
+  const nextTitle = normalizeThreadNoteTitle(title);
+  let found = false;
+  const notes = (manifest.notes ?? []).map((note) => {
+    if (note.id !== noteID) return note;
+    found = true;
+    return { ...note, title: nextTitle, updatedAt: currentSwiftDate() };
+  });
+  if (!found) throw new Error("Thread note was not found.");
+  writeThreadNoteManifest(threadID, { ...manifest, selectedNoteID: noteID, notes });
+  return loadThreadNoteWorkspace(threadID);
+}
+
 function selectThreadNote(threadID: string, noteID: string): ThreadNoteWorkspace {
   const manifest = readThreadNoteManifest(threadID);
   const selectedNoteID = (manifest.notes ?? []).some((note) => note.id === noteID) ? noteID : manifest.selectedNoteID;
@@ -4668,14 +7415,1383 @@ function selectThreadNote(threadID: string, noteID: string): ThreadNoteWorkspace
   return loadThreadNoteWorkspace(threadID);
 }
 
+function archiveThreadNote(threadID: string, noteID: string): ThreadNoteWorkspace {
+  const manifest = readThreadNoteManifest(threadID);
+  const notes = (manifest.notes ?? []).map((note) => {
+    if (note.id !== noteID) return note;
+    return {
+      ...note,
+      isArchived: true,
+      archivedAt: currentSwiftDate(),
+      autoDeleteAfter: note.autoDeleteAfter ?? null,
+      updatedAt: currentSwiftDate()
+    };
+  });
+  const target = notes.find((note) => note.id === noteID);
+  if (!target) return loadThreadNoteWorkspace(threadID);
+  const nextSelectedID = manifest.selectedNoteID === noteID
+    ? (notes.find((note) => note.isArchived !== true)?.id ?? undefined)
+    : manifest.selectedNoteID;
+  writeThreadNoteManifest(threadID, { ...manifest, selectedNoteID: nextSelectedID, notes });
+  return loadThreadNoteWorkspace(threadID);
+}
+
+function restoreThreadNote(threadID: string, noteID: string): ThreadNoteWorkspace {
+  const manifest = readThreadNoteManifest(threadID);
+  const notes = (manifest.notes ?? []).map((note) => {
+    if (note.id !== noteID) return note;
+    const restored = { ...note, isArchived: false, updatedAt: currentSwiftDate() };
+    delete (restored as JsonObject).archivedAt;
+    delete (restored as JsonObject).autoDeleteAfter;
+    return restored;
+  });
+  writeThreadNoteManifest(threadID, { ...manifest, selectedNoteID: noteID, notes });
+  return loadThreadNoteWorkspace(threadID);
+}
+
+function deleteThreadNotePermanently(threadID: string, noteID: string): ThreadNoteWorkspace {
+  const manifest = readThreadNoteManifest(threadID);
+  const target = (manifest.notes ?? []).find((note) => note.id === noteID);
+  if (!target) return loadThreadNoteWorkspace(threadID);
+  const remaining = (manifest.notes ?? []).filter((note) => note.id !== noteID);
+  const fileName = typeof target.fileName === "string" ? target.fileName : `${noteID}.md`;
+  const filePath = path.join(threadNotesDirectory(threadID), fileName);
+  try {
+    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+  } catch {
+    // Ignore filesystem errors — manifest update below is the source of truth.
+  }
+  const nextSelectedID = manifest.selectedNoteID === noteID
+    ? (remaining[0]?.id ?? undefined)
+    : manifest.selectedNoteID;
+  writeThreadNoteManifest(threadID, { ...manifest, selectedNoteID: nextSelectedID, notes: remaining });
+  return loadThreadNoteWorkspace(threadID);
+}
+
+function deleteThreadNote(threadID: string, noteID: string): ThreadNoteWorkspace {
+  return archiveThreadNote(threadID, noteID);
+}
+
+const defaultPlannerTemplate = `# {{date}}
+
+> Focus:
+`;
+
+const plannerBacklogID = "backlog";
+
+const defaultPlannerBacklog = `# Backlog
+
+> Later items, follow-ups, and things that still need a date.
+
+## Tasks
+`;
+
+const legacyPlannerTemplates = [
+  `# {{date}}
+
+> **Focus**
+> Choose one clear outcome for today.
+
+## Top 3
+- [ ] First priority
+- [ ] Second priority
+- [ ] Third priority
+
+## Schedule
+- 09:00 -
+- 13:00 -
+
+## Tasks
+- [ ] Follow up on open work
+
+## Notes
+- Add quick notes here.
+
+## Journal
+What happened today?
+
+## Linked Notes
+- Link related notes here.
+
+## Done
+- [ ] Capture finished work
+`,
+  `# {{date}}
+
+> Focus:
+
+## Top 3
+- [ ]
+- [ ]
+- [ ]
+
+## Schedule
+-
+
+## Tasks
+- [ ]
+
+## Notes
+-
+
+## Journal
+What happened today?
+
+## Linked Notes
+-
+
+## Done
+- [ ]
+`
+];
+
+const defaultPlannerDesign = `---
+name: OpenAssist Daily Planner
+typography:
+  heading: "system"
+spacing:
+  section: 16
+rounded: 10
+---
+
+# Daily Planner Design
+
+Use calm spacing and clear section headings. Colors come from the active OpenAssist theme.
+`;
+
+function plannerRoot() {
+  return path.join(supportRoot(), "Planner");
+}
+
+function plannerDailyRoot() {
+  return path.join(plannerRoot(), "Daily");
+}
+
+function plannerBacklogPath() {
+  return path.join(plannerRoot(), "Backlog.md");
+}
+
+function plannerTemplatesRoot() {
+  return path.join(plannerRoot(), "Templates");
+}
+
+function plannerRecoveryRoot() {
+  return path.join(plannerRoot(), "Recovery");
+}
+
+function plannerDefaultTemplatePath() {
+  return path.join(plannerTemplatesRoot(), "default.md");
+}
+
+function plannerDesignPath() {
+  return path.join(plannerRoot(), "DESIGN.md");
+}
+
+function plannerTemplateFingerprint(template: string) {
+  return String(template ?? "").replace(/\r\n/g, "\n").trim();
+}
+
+function shouldReplacePlannerDefaultTemplate(template: string) {
+  const fingerprint = plannerTemplateFingerprint(template);
+  if (!fingerprint) return true;
+  return legacyPlannerTemplates.some((legacy) => plannerTemplateFingerprint(legacy) === fingerprint);
+}
+
+function pad2(value: number) {
+  return String(value).padStart(2, "0");
+}
+
+function plannerDayID(date = new Date()) {
+  return `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())}`;
+}
+
+function normalizePlannerDayID(value?: string | null) {
+  const raw = String(value ?? "").trim();
+  if (!raw) return plannerDayID();
+  const match = raw.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!match) return plannerDayID();
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const parsed = new Date(year, month - 1, day);
+  if (
+    parsed.getFullYear() !== year
+    || parsed.getMonth() !== month - 1
+    || parsed.getDate() !== day
+  ) {
+    return plannerDayID();
+  }
+  return raw;
+}
+
+function normalizeDailyItemDayID(value?: string | null, fallback?: string | null) {
+  const raw = String(value ?? fallback ?? "").trim();
+  if (raw.toLowerCase() === plannerBacklogID) return plannerBacklogID;
+  return normalizePlannerDayID(raw);
+}
+
+function plannerDateFromDayID(dayID: string) {
+  const normalized = normalizePlannerDayID(dayID);
+  const [year, month, day] = normalized.split("-").map((part) => Number(part));
+  return new Date(year, month - 1, day, 12, 0, 0, 0);
+}
+
+function plannerDayOffset(dayID: string, offset: number) {
+  const date = plannerDateFromDayID(dayID);
+  date.setDate(date.getDate() + offset);
+  return plannerDayID(date);
+}
+
+function plannerDayPath(dayID: string) {
+  const normalized = normalizePlannerDayID(dayID);
+  const [year, month] = normalized.split("-");
+  return path.join(plannerDailyRoot(), year, month, `${normalized}.md`);
+}
+
+function ensurePlannerScaffold() {
+  fs.mkdirSync(plannerDailyRoot(), { recursive: true });
+  fs.mkdirSync(plannerTemplatesRoot(), { recursive: true });
+  fs.mkdirSync(plannerRecoveryRoot(), { recursive: true });
+  if (!fs.existsSync(plannerBacklogPath())) {
+    fs.writeFileSync(plannerBacklogPath(), defaultPlannerBacklog, "utf8");
+  }
+  const templatePath = plannerDefaultTemplatePath();
+  if (!fs.existsSync(templatePath)) {
+    fs.writeFileSync(templatePath, defaultPlannerTemplate, "utf8");
+  } else {
+    const savedTemplate = fs.readFileSync(templatePath, "utf8").replace(/\r\n/g, "\n");
+    if (shouldReplacePlannerDefaultTemplate(savedTemplate)) {
+      fs.writeFileSync(templatePath, defaultPlannerTemplate, "utf8");
+    }
+  }
+  if (!fs.existsSync(plannerDesignPath())) {
+    fs.writeFileSync(plannerDesignPath(), defaultPlannerDesign, "utf8");
+  }
+}
+
+function renderPlannerTemplate(template: string, dayID: string) {
+  const date = plannerDateFromDayID(dayID);
+  const displayDate = date.toLocaleDateString(undefined, {
+    weekday: "long",
+    month: "long",
+    day: "numeric",
+    year: "numeric"
+  });
+  const weekday = date.toLocaleDateString(undefined, { weekday: "long" });
+  const month = date.toLocaleDateString(undefined, { month: "long" });
+  const replacements: Record<string, string> = {
+    date: displayDate,
+    isoDate: dayID,
+    weekday,
+    month,
+    yesterday: plannerDayOffset(dayID, -1),
+    tomorrow: plannerDayOffset(dayID, 1)
+  };
+  return template.replace(/\{\{\s*(date|isoDate|weekday|month|yesterday|tomorrow)\s*\}\}/g, (_match, key: string) => replacements[key] ?? "");
+}
+
+function plannerDayTitle(dayID: string) {
+  const today = plannerDayID();
+  if (dayID === today) return "Today";
+  const date = plannerDateFromDayID(dayID);
+  return date.toLocaleDateString(undefined, {
+    weekday: "short",
+    month: "short",
+    day: "numeric",
+    year: date.getFullYear() === new Date().getFullYear() ? undefined : "numeric"
+  });
+}
+
+function plannerDaySummary(dayID: string, activeDayID?: string): PlannerDaySummary {
+  const filePath = plannerDayPath(dayID);
+  const stat = fs.existsSync(filePath) ? fs.statSync(filePath) : undefined;
+  return {
+    id: dayID,
+    title: plannerDayTitle(dayID),
+    subtitle: dayID,
+    path: filePath,
+    updatedAt: stat?.mtimeMs,
+    active: activeDayID ? dayID === activeDayID : dayID === plannerDayID()
+  };
+}
+
+function plannerBacklogSummary(active = false): PlannerDaySummary {
+  const filePath = plannerBacklogPath();
+  const stat = fs.existsSync(filePath) ? fs.statSync(filePath) : undefined;
+  return {
+    id: plannerBacklogID,
+    title: "Backlog",
+    subtitle: "No date yet",
+    path: filePath,
+    updatedAt: stat?.mtimeMs,
+    active
+  };
+}
+
+function loadPlannerDay(dayID?: string): PlannerDayDetail {
+  ensurePlannerScaffold();
+  const normalizedDayID = normalizePlannerDayID(dayID);
+  const filePath = plannerDayPath(normalizedDayID);
+  if (!fs.existsSync(filePath)) {
+    const template = fs.existsSync(plannerDefaultTemplatePath())
+      ? fs.readFileSync(plannerDefaultTemplatePath(), "utf8").replace(/\r\n/g, "\n")
+      : defaultPlannerTemplate;
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    fs.writeFileSync(filePath, renderPlannerTemplate(template, normalizedDayID), "utf8");
+  }
+  const summary = plannerDaySummary(normalizedDayID, normalizedDayID);
+  return {
+    ...summary,
+    markdown: fs.readFileSync(filePath, "utf8").replace(/\r\n/g, "\n")
+  };
+}
+
+function loadPlannerBacklog(): PlannerBacklogDetail {
+  ensurePlannerScaffold();
+  const filePath = plannerBacklogPath();
+  if (!fs.existsSync(filePath)) {
+    fs.writeFileSync(filePath, defaultPlannerBacklog, "utf8");
+  }
+  return {
+    ...plannerBacklogSummary(true),
+    markdown: fs.readFileSync(filePath, "utf8").replace(/\r\n/g, "\n")
+  };
+}
+
+function listPlannerDays(limit = 90, activeDayID = plannerDayID()): PlannerDaySummary[] {
+  ensurePlannerScaffold();
+  const ids = new Set<string>([activeDayID, plannerDayID()]);
+  const dailyRoot = plannerDailyRoot();
+  if (fs.existsSync(dailyRoot)) {
+    for (const year of fs.readdirSync(dailyRoot)) {
+      const yearRoot = path.join(dailyRoot, year);
+      if (!fs.statSync(yearRoot).isDirectory()) continue;
+      for (const month of fs.readdirSync(yearRoot)) {
+        const monthRoot = path.join(yearRoot, month);
+        if (!fs.statSync(monthRoot).isDirectory()) continue;
+        for (const entry of fs.readdirSync(monthRoot)) {
+          const match = entry.match(/^(\d{4}-\d{2}-\d{2})\.md$/);
+          if (match) ids.add(match[1]);
+        }
+      }
+    }
+  }
+  return [...ids]
+    .sort((left, right) => right.localeCompare(left))
+    .slice(0, Math.max(1, limit))
+    .map((id) => plannerDaySummary(id, activeDayID));
+}
+
+function snapshotPlannerDay(dayID: string, previousMarkdown: string) {
+  if (!previousMarkdown.trim()) return;
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const filePath = path.join(plannerRecoveryRoot(), dayID, `${stamp}.md`);
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(filePath, previousMarkdown, "utf8");
+}
+
+function savePlannerDay(dayID: string | undefined, markdown: string): PlannerDayDetail {
+  ensurePlannerScaffold();
+  const normalizedDayID = normalizePlannerDayID(dayID);
+  const filePath = plannerDayPath(normalizedDayID);
+  const nextMarkdown = String(markdown ?? "").replace(/\r\n/g, "\n");
+  const previousMarkdown = fs.existsSync(filePath)
+    ? fs.readFileSync(filePath, "utf8").replace(/\r\n/g, "\n")
+    : "";
+  if (previousMarkdown !== nextMarkdown) snapshotPlannerDay(normalizedDayID, previousMarkdown);
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(filePath, nextMarkdown, "utf8");
+  return loadPlannerDay(normalizedDayID);
+}
+
+function savePlannerBacklog(markdown: string): PlannerBacklogDetail {
+  ensurePlannerScaffold();
+  const filePath = plannerBacklogPath();
+  const nextMarkdown = String(markdown ?? "").replace(/\r\n/g, "\n");
+  const previousMarkdown = fs.existsSync(filePath)
+    ? fs.readFileSync(filePath, "utf8").replace(/\r\n/g, "\n")
+    : "";
+  if (previousMarkdown !== nextMarkdown) snapshotPlannerDay(plannerBacklogID, previousMarkdown);
+  fs.writeFileSync(filePath, nextMarkdown, "utf8");
+  return loadPlannerBacklog();
+}
+
+function markdownTaskLike(text: string) {
+  return text
+    .split(/\n+/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .every((line) => /^[-*]\s+\[[ xX]\]\s+/.test(line) || /^[-*]\s+/.test(line));
+}
+
+function plannerSectionFor(mode: "move" | "copy" | "link", text: string) {
+  if (mode === "link") return "Linked Notes";
+  return markdownTaskLike(text) ? "Tasks" : "Notes";
+}
+
+function plannerMetadataComment(request: PlannerScheduleRequest, mode: "move" | "copy" | "link") {
+  const metadata: JsonObject = {
+    id: randomUUID().toLowerCase(),
+    mode,
+    createdAt: new Date().toISOString()
+  };
+  if (request.sourceTarget) metadata.sourceNote = buildNoteURL(request.sourceTarget);
+  if (request.sourceDayID) metadata.originalDate = request.sourceDayID;
+  return `<!-- oa-planner ${JSON.stringify(metadata)} -->`;
+}
+
+function buildNoteURL(target: NoteLinkTarget) {
+  const params = new URLSearchParams({
+    ownerKind: target.ownerKind,
+    ownerId: target.ownerId,
+    noteId: target.noteId
+  });
+  return `oa-note://open?${params.toString()}`;
+}
+
+function markdownLinkForTarget(title: string | undefined, target: NoteLinkTarget) {
+  const safeTitle = (title?.trim() || "Linked note").replace(/\]/g, "\\]");
+  return `[${safeTitle}](${buildNoteURL(target)})`;
+}
+
+function ensurePlannerSection(markdown: string, heading: string) {
+  const pattern = new RegExp(`(^|\\n)##\\s+${heading.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*\\n`, "i");
+  if (pattern.test(markdown)) return markdown;
+  const suffix = markdown.endsWith("\n") ? "" : "\n";
+  return `${markdown}${suffix}\n## ${heading}\n`;
+}
+
+function isEmptyPlannerPlaceholderLine(line: string) {
+  return /^[-*]\s*(?:\[[ xX]\]\s*)?$/.test(line.trim());
+}
+
+function cleanPlannerSectionBody(body: string) {
+  const cleaned = body
+    .split("\n")
+    .filter((line) => !isEmptyPlannerPlaceholderLine(line))
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n");
+  return cleaned.trim() ? cleaned.replace(/^\n+/, "\n").replace(/\n+$/, "\n") : "";
+}
+
+function appendToPlannerSection(markdown: string, heading: string, block: string) {
+  const source = ensurePlannerSection(markdown.replace(/\r\n/g, "\n"), heading);
+  const headingPattern = new RegExp(`(^|\\n)(##\\s+${heading.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*\\n)`, "i");
+  const match = headingPattern.exec(source);
+  if (!match || match.index < 0) return `${source.trimEnd()}\n\n## ${heading}\n${block.trim()}\n`;
+  const insertAt = match.index + match[0].length;
+  const before = source.slice(0, insertAt);
+  const after = source.slice(insertAt);
+  const nextHeading = after.search(/\n##\s+/);
+  const sectionBody = cleanPlannerSectionBody(nextHeading >= 0 ? after.slice(0, nextHeading) : after);
+  const rest = nextHeading >= 0 ? after.slice(nextHeading) : "";
+  // Keep one blank line between the new task and the previous one so each task
+  // stays a separate item in the editor (otherwise they merge and need manual fixing).
+  const spacer = sectionBody.trim() ? (sectionBody.endsWith("\n") ? "\n" : "\n\n") : "";
+  return `${before}${sectionBody}${spacer}${block.trim()}\n${rest}`;
+}
+
+function appendToPlannerSubsection(markdown: string, heading: string, subheading: string | undefined, block: string) {
+  if (!subheading) return appendToPlannerSection(markdown, heading, block);
+  const source = ensurePlannerSection(markdown.replace(/\r\n/g, "\n"), heading);
+  const headingPattern = new RegExp(`(^|\\n)(##\\s+${heading.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*\\n)`, "i");
+  const match = headingPattern.exec(source);
+  if (!match || match.index < 0) return appendToPlannerSection(source, heading, block);
+  const bodyStart = match.index + match[0].length;
+  const beforeBody = source.slice(0, bodyStart);
+  const afterHeading = source.slice(bodyStart);
+  const nextHeading = afterHeading.search(/\n##\s+/);
+  const body = nextHeading >= 0 ? afterHeading.slice(0, nextHeading) : afterHeading;
+  const rest = nextHeading >= 0 ? afterHeading.slice(nextHeading) : "";
+  const escapedSubheading = subheading.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const subheadingPattern = new RegExp(`(^|\\n)(###\\s+${escapedSubheading}\\s*\\n)`, "i");
+  const subheadingMatch = subheadingPattern.exec(body);
+  if (subheadingMatch) {
+    const subBodyStart = subheadingMatch.index + subheadingMatch[0].length;
+    const beforeSubBody = body.slice(0, subBodyStart);
+    const afterSubheading = body.slice(subBodyStart);
+    const nextSubheading = afterSubheading.search(/\n###\s+/);
+    const subBody = cleanPlannerSectionBody(nextSubheading >= 0 ? afterSubheading.slice(0, nextSubheading) : afterSubheading);
+    const afterSubBody = nextSubheading >= 0 ? afterSubheading.slice(nextSubheading) : "";
+    // Keep one blank line between the new task and the previous one so each task
+    // stays a separate item in the editor (otherwise they merge and need manual fixing).
+    const spacer = subBody.trim() ? (subBody.endsWith("\n") ? "\n" : "\n\n") : "";
+    return `${beforeBody}${beforeSubBody}${subBody}${spacer}${block.trim()}\n${afterSubBody}${rest}`;
+  }
+  const sectionBody = cleanPlannerSectionBody(body);
+  const spacer = sectionBody.trim() ? (sectionBody.endsWith("\n") ? "\n" : "\n\n") : "";
+  return `${beforeBody}${sectionBody}${spacer}### ${subheading}\n${block.trim()}\n${rest}`;
+}
+
+const dailyItemBlockPattern = /<!--\s*oa-daily-item\s+({[\s\S]*?})\s*-->[\s\S]*?<!--\s*\/oa-daily-item\s*-->/g;
+
+function normalizedDailyStatus(value: unknown, checked = false): DailyItemStatus {
+  const normalized = String(value ?? "").trim().toLowerCase();
+  if (normalized === "doing" || normalized === "in_progress" || normalized === "active") return "doing";
+  if (normalized === "done" || normalized === "complete" || normalized === "completed") return "done";
+  return checked ? "done" : "todo";
+}
+
+function cleanDailyText(value: unknown) {
+  return String(value ?? "").replace(/\r\n/g, "\n").trim();
+}
+
+function cleanDailyTagLabel(value: unknown) {
+  return cleanDailyText(value).replace(/^[@#]\s*/, "").replace(/\s+/g, " ");
+}
+
+function normalizeDailyArea(value: unknown) {
+  const normalized = cleanDailyText(value).replace(/\s+/g, " ").toLowerCase();
+  if (!normalized) return undefined;
+  if (["work", "job", "office", "client", "business"].includes(normalized)) return "Work";
+  if (["personal", "home", "life", "family", "errand", "errands"].includes(normalized)) return "Personal";
+  return undefined;
+}
+
+function inferDailyArea(input: { title?: unknown; detailsMarkdown?: unknown; projectID?: unknown; folderID?: unknown; scopeTags?: unknown }) {
+  const text = [
+    input.title,
+    input.detailsMarkdown,
+    input.projectID,
+    input.folderID,
+    ...(Array.isArray(input.scopeTags) ? input.scopeTags.map((tag) => JSON.stringify(tag)) : [])
+  ].map((value) => cleanDailyText(value)).join(" ").toLowerCase();
+  if (!text.trim()) return undefined;
+  if (/\b(home|house|family|personal|doctor|dentist|appointment|grocery|groceries|errand|errands|lawn|yard|quote|repair|service)\b/.test(text)) {
+    return "Personal";
+  }
+  if (/\b(work|client|project|repo|github|pull request|pr|ticket|bug|deploy|deployment|database|sql|dev|qa|story|stories|task assigned|assigned by|atoms|darkrunner|matter)\b/.test(text)) {
+    return "Work";
+  }
+  return undefined;
+}
+
+function dailyItemLineNumber(markdown: string, index: number) {
+  return markdown.slice(0, Math.max(0, index)).split("\n").length;
+}
+
+function dailyItemJSON(value: unknown): JsonObject {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as JsonObject : {};
+}
+
+function dailyScopeTagKey(tag: DailyItemScopeTag) {
+  return `${tag.marker}:${tag.kind}:${tag.id ?? cleanDailyTagLabel(tag.label).toLowerCase()}`;
+}
+
+function normalizeDailyScopeTag(value: unknown): DailyItemScopeTag | null {
+  const raw = dailyItemJSON(value);
+  const marker = raw.marker === "#" || raw.marker === "@" ? raw.marker : raw.kind === "folder" ? "#" : "@";
+  const rawKind = String(raw.kind ?? "").trim();
+  const kind: DailyItemScopeTag["kind"] =
+    rawKind === "project" || rawKind === "folder" || rawKind === "unresolved"
+      ? rawKind
+      : marker === "#" ? "folder" : "project";
+  const label = cleanDailyTagLabel(raw.label ?? raw.title ?? raw.name);
+  const id = cleanDailyText(raw.id);
+  if (!label && !id) return null;
+  return { marker, label: label || id, kind, id: id || undefined };
+}
+
+function normalizeDailyScopeTags(value: unknown): DailyItemScopeTag[] {
+  if (!Array.isArray(value)) return [];
+  const seen = new Set<string>();
+  const tags: DailyItemScopeTag[] = [];
+  for (const candidate of value) {
+    const tag = normalizeDailyScopeTag(candidate);
+    if (!tag) continue;
+    const key = dailyScopeTagKey(tag);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    tags.push(tag);
+  }
+  return tags;
+}
+
+function escapeDailyTagRegex(value: string) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function dailyTagNamePattern(label: string) {
+  return cleanDailyTagLabel(label)
+    .split(/\s+/)
+    .filter(Boolean)
+    .map(escapeDailyTagRegex)
+    .join("\\s+");
+}
+
+function dailyTagCandidates(projects = loadProjects().projects) {
+  return projects
+    .filter((project) => cleanDailyTagLabel(project.title))
+    .map((project) => {
+      const kind: DailyItemScopeTag["kind"] = project.kind === "folder" ? "folder" : "project";
+      return {
+        marker: kind === "folder" ? "#" as const : "@" as const,
+        kind,
+        id: project.id,
+        label: cleanDailyTagLabel(project.title)
+      };
+    })
+    .sort((left, right) => right.label.length - left.label.length);
+}
+
+function resolveDailyProjectTitle(projectID?: string) {
+  if (!projectID) return "";
+  const projects = loadProjects();
+  return projects.projects.find((project) => project.id.toLowerCase() === projectID.toLowerCase())?.title
+    ?? projects.projectNameByID.get(projectID)
+    ?? projects.projectNameByID.get(projectID.toUpperCase())
+    ?? projects.projectNameByID.get(projectID.toLowerCase())
+    ?? projectID;
+}
+
+function resolveDailyFolderTitle(folderID?: string) {
+  if (!folderID) return "";
+  return loadProjects().projects.find((project) =>
+    project.kind === "folder" && project.id.toLowerCase() === folderID.toLowerCase()
+  )?.title ?? folderID ?? "";
+}
+
+function scopeTagsFromDailyFields(projectID?: string, folderID?: string): DailyItemScopeTag[] {
+  const tags: DailyItemScopeTag[] = [];
+  const projectLabel = resolveDailyProjectTitle(projectID);
+  if (projectID && projectLabel) tags.push({ marker: "@", label: projectLabel, kind: "project", id: projectID });
+  const folderLabel = resolveDailyFolderTitle(folderID);
+  if (folderID && folderLabel) tags.push({ marker: "#", label: folderLabel, kind: "folder", id: folderID });
+  return tags;
+}
+
+function dedupeDailyScopeTags(tags: DailyItemScopeTag[]) {
+  const seen = new Set<string>();
+  const next: DailyItemScopeTag[] = [];
+  for (const tag of tags) {
+    const normalized = normalizeDailyScopeTag(tag);
+    if (!normalized) continue;
+    const key = dailyScopeTagKey(normalized);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    next.push(normalized);
+  }
+  return next;
+}
+
+function knownDailyTagAtStart(text: string, candidates: ReturnType<typeof dailyTagCandidates>) {
+  for (const candidate of candidates) {
+    const pattern = dailyTagNamePattern(candidate.label);
+    if (!pattern) continue;
+    const regex = new RegExp(`^${escapeDailyTagRegex(candidate.marker)}\\s*${pattern}(?=$|\\s)`, "i");
+    const match = text.match(regex);
+    if (!match) continue;
+    return {
+      tag: candidate,
+      title: text.slice(match[0].length).trim()
+    };
+  }
+  return null;
+}
+
+function knownDailyTagAtEnd(text: string, candidates: ReturnType<typeof dailyTagCandidates>) {
+  for (const candidate of candidates) {
+    const pattern = dailyTagNamePattern(candidate.label);
+    if (!pattern) continue;
+    const regex = new RegExp(`(?:^|\\s)${escapeDailyTagRegex(candidate.marker)}\\s*${pattern}\\s*$`, "i");
+    const match = text.match(regex);
+    if (!match) continue;
+    return {
+      tag: candidate,
+      title: text.slice(0, match.index).trim()
+    };
+  }
+  return null;
+}
+
+function unknownDailyTagAtStart(text: string) {
+  const match = text.match(/^([@#])([^\s]+)(?:\s+|$)/);
+  if (!match) return null;
+  const title = text.slice(match[0].length).trim();
+  if (!title) return null;
+  return {
+    tag: {
+      marker: match[1] as "@" | "#",
+      label: cleanDailyTagLabel(match[2]),
+      kind: "unresolved" as const
+    },
+    title
+  };
+}
+
+function unknownDailyTagAtEnd(text: string) {
+  const match = text.match(/(?:^|\s)([@#])([^\s]+)\s*$/);
+  if (!match || match.index === undefined) return null;
+  const title = text.slice(0, match.index).trim();
+  if (!title) return null;
+  return {
+    tag: {
+      marker: match[1] as "@" | "#",
+      label: cleanDailyTagLabel(match[2]),
+      kind: "unresolved" as const
+    },
+    title
+  };
+}
+
+function parseDailyTitleScope(value: unknown, candidates = dailyTagCandidates()) {
+  const originalTitle = cleanDailyText(value).replace(/\s+/g, " ");
+  let title = originalTitle;
+  const tags: DailyItemScopeTag[] = [];
+  const pushTag = (tag: DailyItemScopeTag) => {
+    tags.push(tag);
+  };
+  for (let index = 0; index < 6; index += 1) {
+    const start = knownDailyTagAtStart(title, candidates) ?? unknownDailyTagAtStart(title);
+    if (start) {
+      pushTag(start.tag);
+      title = start.title;
+      continue;
+    }
+    const end = knownDailyTagAtEnd(title, candidates) ?? unknownDailyTagAtEnd(title);
+    if (end) {
+      pushTag(end.tag);
+      title = end.title;
+      continue;
+    }
+    break;
+  }
+  return {
+    title: title || originalTitle,
+    scopeTags: dedupeDailyScopeTags(tags)
+  };
+}
+
+function projectIDFromScopeTags(tags: DailyItemScopeTag[]) {
+  return tags.find((tag) => tag.kind === "project" && tag.id)?.id;
+}
+
+function folderIDFromScopeTags(tags: DailyItemScopeTag[]) {
+  return tags.find((tag) => tag.kind === "folder" && tag.id)?.id;
+}
+
+function scopeTagsForDailyItem(item: Pick<DailyItem, "projectID" | "folderID" | "scopeTags">) {
+  const existing = normalizeDailyScopeTags(item.scopeTags);
+  return existing.length ? existing : scopeTagsFromDailyFields(item.projectID, item.folderID);
+}
+
+function dailyItemVisibleTitle(item: DailyItem) {
+  const tags = scopeTagsForDailyItem(item);
+  const suffix = tags.map((tag) => `${tag.marker}${tag.label}`).join(" ");
+  return [cleanDailyText(item.title), suffix].filter(Boolean).join(" ");
+}
+
+function dailyItemDedupeCore(value: unknown) {
+  return cleanDailyText(value)
+    .toLowerCase()
+    .replace(/\ba\.?\s*m\.?/g, "am")
+    .replace(/\bp\.?\s*m\.?/g, "pm")
+    .replace(/&/g, " and ")
+    .replace(/\bat\s+from\b/g, " from ")
+    .replace(/\b(?:at\s+)?(?:from\s+)?\d{1,2}(?::\d{2})?\s*(?:am|pm)?\s*(?:to|through|-)\s*\d{1,2}(?::\d{2})?\s*(?:am|pm)?\b/g, " ")
+    .replace(/\b(?:at|from)\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?\b/g, " ")
+    .replace(/[^a-z0-9@#]+/g, " ")
+    .replace(/\b(?:at|from)\b/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function dailyItemInputTitle(raw: JsonObject) {
+  return parseDailyTitleScope(raw.title ?? raw.text ?? raw.label ?? "").title;
+}
+
+function findSimilarDailyItem(items: DailyItem[], raw: JsonObject) {
+  if (cleanDailyText(raw.id)) return undefined;
+  const wanted = dailyItemDedupeCore(dailyItemInputTitle(raw));
+  if (!wanted) return undefined;
+  return items.find((item) => {
+    const titleCore = dailyItemDedupeCore(item.title);
+    const visibleCore = dailyItemDedupeCore(dailyItemVisibleTitle(item));
+    return titleCore === wanted || visibleCore === wanted;
+  });
+}
+
+function mergedDuplicateDailyInput(raw: JsonObject, existing: DailyItem) {
+  const incomingDetails = cleanDailyText(raw.detailsMarkdown ?? raw.details ?? raw.description);
+  const existingDetails = cleanDailyText(existing.detailsMarkdown);
+  const detailsMarkdown = incomingDetails
+    ? existingDetails && !existingDetails.toLowerCase().includes(incomingDetails.toLowerCase())
+      ? `${existingDetails}\n${incomingDetails}`
+      : existingDetails || incomingDetails
+    : existing.detailsMarkdown;
+  return {
+    ...raw,
+    id: existing.id,
+    title: existing.title,
+    area: raw.area ?? existing.area,
+    projectID: raw.projectID ?? existing.projectID,
+    folderID: raw.folderID ?? existing.folderID,
+    scopeTags: raw.scopeTags ?? existing.scopeTags,
+    detailsMarkdown,
+    steps: Array.isArray(raw.steps) ? raw.steps : existing.steps,
+    links: Array.isArray(raw.links) ? raw.links : existing.links
+  };
+}
+
+function normalizeDailyStep(value: unknown, index: number): DailyItemStep | null {
+  if (typeof value === "string") {
+    const text = cleanDailyText(value);
+    return text ? { id: randomUUID().toLowerCase(), text, checked: false } : null;
+  }
+  const raw = dailyItemJSON(value);
+  const text = cleanDailyText(raw.text ?? raw.title ?? raw.label);
+  if (!text) return null;
+  return {
+    id: cleanDailyText(raw.id) || `step-${index + 1}`,
+    text,
+    checked: raw.checked === true || raw.done === true
+  };
+}
+
+function normalizeDailyLinks(value: unknown): NoteLinkTarget[] {
+  if (!Array.isArray(value)) return [];
+  const seen = new Set<string>();
+  const links: NoteLinkTarget[] = [];
+  for (const candidate of value) {
+    const target = normalizeNoteLinkTarget(candidate);
+    if (!target) continue;
+    const key = noteLinkKey(target);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    links.push(target);
+  }
+  return links;
+}
+
+function projectTitleForDailyItem(projectID?: string) {
+  return resolveDailyProjectTitle(projectID);
+}
+
+function dailyItemMetadataForComment(item: DailyItem) {
+  const scopeTags = scopeTagsForDailyItem(item);
+  return {
+    id: item.id,
+    dayID: item.dayID,
+    title: item.title,
+    status: item.status,
+    checked: item.checked,
+    projectID: item.projectID,
+    folderID: item.folderID,
+    area: item.area,
+    scopeTags,
+    detailsMarkdown: item.detailsMarkdown,
+    steps: item.steps,
+    links: item.links,
+    createdAt: item.createdAt,
+    updatedAt: item.updatedAt,
+    order: item.order
+  };
+}
+
+function renderDailyItemBlock(item: DailyItem) {
+  const checked = item.checked || item.status === "done";
+  const lines = [
+    `<!-- oa-daily-item ${JSON.stringify(dailyItemMetadataForComment(item))} -->`,
+    `- [${checked ? "x" : " "}] ${dailyItemVisibleTitle(item)}`
+  ];
+  if (item.detailsMarkdown.trim()) {
+    lines.push("  - Details:");
+    for (const detailLine of item.detailsMarkdown.trim().split("\n")) {
+      lines.push(`    ${detailLine}`);
+    }
+  }
+  if (item.steps.length) {
+    lines.push("  - Steps:");
+    for (const step of item.steps) {
+      lines.push(`    - [${step.checked ? "x" : " "}] ${step.text}`);
+    }
+  }
+  if (item.links.length) {
+    lines.push("  - Links:");
+    for (const link of item.links) {
+      lines.push(`    - ${markdownLinkForTarget("Linked note", link)}`);
+    }
+  }
+  lines.push("<!-- /oa-daily-item -->");
+  return lines.join("\n");
+}
+
+function parseStructuredDailyItem(dayID: string, rawJSON: string, block: string, order: number, line: number): DailyItem | null {
+  let metadata: JsonObject;
+  try {
+    metadata = JSON.parse(rawJSON) as JsonObject;
+  } catch {
+    return null;
+  }
+  const visibleTask = block.match(/^\s*[-*]\s+\[([ xX])\]\s+(.+?)\s*$/m);
+  const visibleChecked = visibleTask ? visibleTask[1].toLowerCase() === "x" : metadata.checked === true;
+  const titleScope = parseDailyTitleScope(visibleTask?.[2] ?? metadata.title ?? "");
+  const metadataScopeTags = normalizeDailyScopeTags(metadata.scopeTags);
+  const metadataProjectID = cleanDailyText(metadata.projectID) || undefined;
+  const metadataFolderID = cleanDailyText(metadata.folderID) || undefined;
+  const scopeTags = titleScope.scopeTags.length
+    ? titleScope.scopeTags
+    : metadataScopeTags.length
+      ? metadataScopeTags
+      : scopeTagsFromDailyFields(metadataProjectID, metadataFolderID);
+  const projectID = projectIDFromScopeTags(scopeTags) ?? metadataProjectID;
+  const folderID = folderIDFromScopeTags(scopeTags) ?? metadataFolderID;
+  const title = titleScope.scopeTags.length ? titleScope.title : cleanDailyText(visibleTask?.[2] ?? metadata.title ?? "");
+  if (!title) return null;
+  const steps = Array.isArray(metadata.steps)
+    ? metadata.steps.map((step, index) => normalizeDailyStep(step, index)).filter((step): step is DailyItemStep => Boolean(step))
+    : [];
+  const now = new Date().toISOString();
+  return {
+    id: cleanDailyText(metadata.id) || randomUUID().toLowerCase(),
+    dayID: normalizeDailyItemDayID(cleanDailyText(metadata.dayID), dayID),
+    title,
+    status: normalizedDailyStatus(metadata.status, visibleChecked),
+    checked: visibleChecked,
+    projectID,
+    folderID,
+    projectName: resolveDailyProjectTitle(projectID) || undefined,
+    folderName: resolveDailyFolderTitle(folderID) || undefined,
+    area: normalizeDailyArea(metadata.area) || inferDailyArea({ title, detailsMarkdown: metadata.detailsMarkdown, projectID, folderID, scopeTags }),
+    scopeTags,
+    detailsMarkdown: cleanDailyText(metadata.detailsMarkdown),
+    steps,
+    links: normalizeDailyLinks(metadata.links),
+    createdAt: cleanDailyText(metadata.createdAt) || now,
+    updatedAt: cleanDailyText(metadata.updatedAt) || now,
+    order: Number.isFinite(Number(metadata.order)) ? Number(metadata.order) : order,
+    structured: true,
+    line
+  };
+}
+
+function parseDailyItemsFromMarkdown(dayID: string, markdown: string): DailyItem[] {
+  const source = String(markdown ?? "").replace(/\r\n/g, "\n");
+  const items: DailyItem[] = [];
+  const blockRanges: Array<{ start: number; end: number }> = [];
+  let match: RegExpExecArray | null;
+  dailyItemBlockPattern.lastIndex = 0;
+  while ((match = dailyItemBlockPattern.exec(source))) {
+    const item = parseStructuredDailyItem(dayID, match[1], match[0], items.length, dailyItemLineNumber(source, match.index));
+    if (item) items.push(item);
+    blockRanges.push({ start: match.index, end: match.index + match[0].length });
+  }
+  const isInsideStructuredBlock = (index: number) => blockRanges.some((range) => index >= range.start && index < range.end);
+  const linePattern = /^(\s*)[-*]\s+\[([ xX])\]\s+(.+?)\s*$/;
+  let offset = 0;
+  source.split("\n").forEach((line, index) => {
+    const start = offset;
+    offset += line.length + 1;
+    if (isInsideStructuredBlock(start)) return;
+    const task = line.match(linePattern);
+    if (!task) return;
+    const title = task[3].replace(/<!--[\s\S]*?-->/g, "").trim();
+    if (!title) return;
+    const checked = task[2].toLowerCase() === "x";
+    const titleScope = parseDailyTitleScope(title);
+    const projectID = projectIDFromScopeTags(titleScope.scopeTags);
+    const folderID = folderIDFromScopeTags(titleScope.scopeTags);
+    items.push({
+      id: `plain:${index + 1}`,
+      dayID,
+      title: titleScope.title,
+      status: checked ? "done" : "todo",
+      checked,
+      projectID,
+      folderID,
+      projectName: resolveDailyProjectTitle(projectID) || undefined,
+      folderName: resolveDailyFolderTitle(folderID) || undefined,
+      area: inferDailyArea({ title: titleScope.title, projectID, folderID, scopeTags: titleScope.scopeTags }),
+      scopeTags: titleScope.scopeTags,
+      detailsMarkdown: "",
+      steps: [],
+      links: [],
+      createdAt: "",
+      updatedAt: "",
+      order: items.length,
+      structured: false,
+      line: index + 1
+    });
+  });
+  return items.sort((left, right) => left.order - right.order || (left.line ?? 0) - (right.line ?? 0));
+}
+
+function listDailyItems(dayID?: string): DailyItem[] {
+  const day = loadPlannerDay(dayID);
+  return parseDailyItemsFromMarkdown(day.id, day.markdown);
+}
+
+function normalizeDailyItemInput(input: unknown, existing?: DailyItem): DailyItem {
+  const raw = dailyItemJSON(input);
+  const dayID = normalizeDailyItemDayID(cleanDailyText(raw.dayID), existing?.dayID);
+  const checked = raw.checked === true || raw.done === true || existing?.checked === true;
+  const status = normalizedDailyStatus(raw.status ?? existing?.status, checked);
+  const titleScope = parseDailyTitleScope(raw.title ?? existing?.title ?? "");
+  const title = titleScope.title;
+  if (!title) throw new Error("Daily item needs a title.");
+  const now = new Date().toISOString();
+  const stepsValue = Array.isArray(raw.steps) ? raw.steps : existing?.steps ?? [];
+  const hasProjectID = Object.prototype.hasOwnProperty.call(raw, "projectID");
+  const hasFolderID = Object.prototype.hasOwnProperty.call(raw, "folderID");
+  const hasScopeTags = Object.prototype.hasOwnProperty.call(raw, "scopeTags");
+  const rawProjectID = cleanDailyText(raw.projectID) || undefined;
+  const rawFolderID = cleanDailyText(raw.folderID) || undefined;
+  const rawScopeTags = normalizeDailyScopeTags(raw.scopeTags);
+  const fieldProjectID = hasProjectID ? rawProjectID : existing?.projectID;
+  const fieldFolderID = hasFolderID ? rawFolderID : existing?.folderID;
+  const fieldScopeTags = scopeTagsFromDailyFields(fieldProjectID, fieldFolderID);
+  const scopeTags = titleScope.scopeTags.length
+    ? titleScope.scopeTags
+    : hasScopeTags
+      ? rawScopeTags
+      : fieldScopeTags;
+  const projectID = titleScope.scopeTags.length
+    ? projectIDFromScopeTags(scopeTags)
+    : projectIDFromScopeTags(scopeTags) ?? fieldProjectID;
+  const folderID = titleScope.scopeTags.length
+    ? folderIDFromScopeTags(scopeTags)
+    : folderIDFromScopeTags(scopeTags) ?? fieldFolderID;
+  const area = normalizeDailyArea(raw.area)
+    || inferDailyArea({ title, detailsMarkdown: raw.detailsMarkdown ?? existing?.detailsMarkdown, projectID, folderID, scopeTags })
+    || normalizeDailyArea(existing?.area);
+  return {
+    id: cleanDailyText(raw.id) || (existing?.structured ? existing.id : "") || randomUUID().toLowerCase(),
+    dayID,
+    title,
+    status,
+    checked: raw.checked === true || status === "done",
+    projectID,
+    folderID,
+    projectName: resolveDailyProjectTitle(projectID) || undefined,
+    folderName: resolveDailyFolderTitle(folderID) || undefined,
+    area,
+    scopeTags,
+    detailsMarkdown: cleanDailyText(raw.detailsMarkdown ?? existing?.detailsMarkdown ?? ""),
+    steps: stepsValue.map((step, index) => normalizeDailyStep(step, index)).filter((step): step is DailyItemStep => Boolean(step)),
+    links: normalizeDailyLinks(raw.links ?? existing?.links ?? []),
+    createdAt: existing?.createdAt || cleanDailyText(raw.createdAt) || now,
+    updatedAt: now,
+    order: Number.isFinite(Number(raw.order)) ? Number(raw.order) : existing?.order ?? 0,
+    structured: true
+  };
+}
+
+function replaceStructuredDailyItem(markdown: string, item: DailyItem) {
+  let replaced = false;
+  dailyItemBlockPattern.lastIndex = 0;
+  const next = markdown.replace(dailyItemBlockPattern, (block: string, rawJSON: string) => {
+    const existing = parseStructuredDailyItem(item.dayID, rawJSON, block, 0, 0);
+    if (existing?.id !== item.id) return block;
+    replaced = true;
+    return renderDailyItemBlock(item);
+  });
+  return replaced ? next : appendToPlannerSubsection(markdown, "Tasks", item.area, renderDailyItemBlock(item));
+}
+
+function removePlainDailyItemLine(markdown: string, itemID: string) {
+  const lineNumber = Number(itemID.match(/^plain:(\d+)$/)?.[1] ?? 0);
+  if (!lineNumber) return markdown;
+  return markdown
+    .split("\n")
+    .filter((_line, index) => index !== lineNumber - 1)
+    .join("\n");
+}
+
+function setPlainDailyItemChecked(markdown: string, itemID: string, checked: boolean) {
+  const lineNumber = Number(itemID.match(/^plain:(\d+)$/)?.[1] ?? 0);
+  if (!lineNumber) return markdown;
+  const lines = markdown.split("\n");
+  const index = lineNumber - 1;
+  if (!lines[index]) return markdown;
+  lines[index] = lines[index].replace(/\[[ xX]\]/, `[${checked ? "x" : " "}]`);
+  return lines.join("\n");
+}
+
+function removeStructuredDailyItem(markdown: string, itemID: string) {
+  dailyItemBlockPattern.lastIndex = 0;
+  return markdown.replace(dailyItemBlockPattern, (block: string, rawJSON: string) => {
+    const existing = parseStructuredDailyItem(plannerBacklogID, rawJSON, block, 0, 0)
+      ?? parseStructuredDailyItem(plannerDayID(), rawJSON, block, 0, 0);
+    return existing?.id === itemID ? "" : block;
+  }).replace(/\n{3,}/g, "\n\n");
+}
+
+// Remove tasks from a day's markdown by their visible text. Used when MOVING
+// tasks to another day so the originals do not stay behind. Handles both plain
+// "- [ ]" lines and structured oa-daily-item blocks. Returns the new markdown
+// plus the texts that were actually matched and removed.
+function removePlannerTasksByText(dayID: string, markdown: string, texts: string[]) {
+  const wanted = new Set(texts.map((text) => cleanDailyText(text).toLowerCase()).filter(Boolean));
+  if (!wanted.size) return { markdown, removed: [] as string[] };
+  const removed: string[] = [];
+  let next = markdown;
+  // Re-parse after each removal because plain-line removal shifts line numbers.
+  for (let guard = 0; guard < wanted.size + texts.length + 1; guard += 1) {
+    const items = parseDailyItemsFromMarkdown(dayID, next);
+    const target = items.find((item) => wanted.has(dailyItemVisibleTitle(item).toLowerCase())
+      || wanted.has(cleanDailyText(item.title).toLowerCase()));
+    if (!target) break;
+    removed.push(dailyItemVisibleTitle(target));
+    wanted.delete(dailyItemVisibleTitle(target).toLowerCase());
+    wanted.delete(cleanDailyText(target.title).toLowerCase());
+    next = target.id.startsWith("plain:")
+      ? removePlainDailyItemLine(next, target.id)
+      : removeStructuredDailyItem(next, target.id);
+  }
+  return { markdown: next.replace(/\n{3,}/g, "\n\n"), removed };
+}
+
+function dailyMutationResult(day: PlannerDayDetail, item?: DailyItem | null): DailyItemMutationResult {
+  return {
+    day,
+    items: parseDailyItemsFromMarkdown(day.id, day.markdown),
+    item
+  };
+}
+
+function upsertDailyItem(input: unknown): DailyItemMutationResult {
+  const raw = dailyItemJSON(input);
+  const dayID = normalizePlannerDayID(cleanDailyText(raw.dayID));
+  const day = loadPlannerDay(dayID);
+  const items = parseDailyItemsFromMarkdown(day.id, day.markdown);
+  const rawID = cleanDailyText(raw.id);
+  const existingByID = items.find((item) => item.id === rawID);
+  const similarExisting = existingByID ? undefined : findSimilarDailyItem(items, raw);
+  const existing = existingByID ?? similarExisting;
+  const item = normalizeDailyItemInput(similarExisting ? mergedDuplicateDailyInput(raw, similarExisting) : raw, existing);
+  const sourceMarkdown = existing?.structured === false && existing.id ? removePlainDailyItemLine(day.markdown, existing.id) : day.markdown;
+  const savedDay = savePlannerDay(item.dayID, replaceStructuredDailyItem(sourceMarkdown, item));
+  emitPlannerDayChanged(savedDay.id);
+  return dailyMutationResult(savedDay, item);
+}
+
+function toggleDailyItem(dayID: string | undefined, itemID: string, checked: boolean): DailyItemMutationResult {
+  const normalizedDayID = normalizePlannerDayID(dayID);
+  const day = loadPlannerDay(normalizedDayID);
+  const existing = parseDailyItemsFromMarkdown(day.id, day.markdown).find((item) => item.id === itemID);
+  if (!existing) return dailyMutationResult(day, null);
+  if (existing.structured) {
+    const item = normalizeDailyItemInput({ ...existing, checked, status: checked ? "done" : "todo" }, existing);
+    const savedDay = savePlannerDay(normalizedDayID, replaceStructuredDailyItem(day.markdown, item));
+    emitPlannerDayChanged(savedDay.id);
+    return dailyMutationResult(savedDay, item);
+  }
+  const savedDay = savePlannerDay(normalizedDayID, setPlainDailyItemChecked(day.markdown, itemID, checked));
+  emitPlannerDayChanged(savedDay.id);
+  return dailyMutationResult(savedDay, { ...existing, checked, status: checked ? "done" : "todo" });
+}
+
+// Find a task in a planner day by its visible text. The AI knows the task
+// wording (e.g. "mortgage application"), not the internal id, so we match on
+// the title: first an exact match, then ignoring case, then a "contains" match.
+function findDailyItemByText(items: DailyItem[], query: string) {
+  const wanted = cleanDailyText(query).toLowerCase();
+  if (!wanted) return undefined;
+  const titleOf = (item: DailyItem) => dailyItemVisibleTitle(item).toLowerCase();
+  return items.find((item) => titleOf(item) === wanted)
+    ?? items.find((item) => cleanDailyText(item.title).toLowerCase() === wanted)
+    ?? items.find((item) => titleOf(item).includes(wanted));
+}
+
+// Mark a planner task done (or not done) by its text. Applies immediately,
+// like adding a task — no approval step. Reuses toggleDailyItem so it works
+// for both structured and plain `- [ ]` tasks.
+function completeDailyItem(dayID: string | undefined, query: string, checked = true): DailyItemMutationResult {
+  const normalizedDayID = normalizePlannerDayID(dayID);
+  const day = loadPlannerDay(normalizedDayID);
+  const items = parseDailyItemsFromMarkdown(day.id, day.markdown);
+  const match = findDailyItemByText(items, query);
+  if (!match) {
+    const available = items.map((item) => dailyItemVisibleTitle(item)).filter(Boolean);
+    throw new Error(`No task matching "${query}" was found on ${day.id}. Tasks on that day: ${available.length ? available.join("; ") : "none"}.`);
+  }
+  return toggleDailyItem(normalizedDayID, match.id, checked);
+}
+
+function deleteDailyItem(dayID: string | undefined, itemID: string): DailyItemMutationResult {
+  const normalizedDayID = normalizePlannerDayID(dayID);
+  const day = loadPlannerDay(normalizedDayID);
+  const nextMarkdown = itemID.startsWith("plain:")
+    ? removePlainDailyItemLine(day.markdown, itemID)
+    : removeStructuredDailyItem(day.markdown, itemID);
+  const savedDay = savePlannerDay(normalizedDayID, nextMarkdown);
+  emitPlannerDayChanged(savedDay.id);
+  return dailyMutationResult(savedDay, null);
+}
+
+function linkDailyItemNote(dayID: string | undefined, itemID: string, target: unknown): DailyItemMutationResult {
+  const normalizedDayID = normalizePlannerDayID(dayID);
+  const link = normalizeNoteLinkTarget(target);
+  if (!link) throw new Error("Daily item link target is invalid.");
+  const day = loadPlannerDay(normalizedDayID);
+  const existing = parseDailyItemsFromMarkdown(day.id, day.markdown).find((item) => item.id === itemID);
+  if (!existing) return dailyMutationResult(day, null);
+  const links = [...existing.links];
+  if (!links.some((candidate) => noteLinkKey(candidate) === noteLinkKey(link))) links.push(link);
+  return upsertDailyItem({ ...existing, dayID: normalizedDayID, links });
+}
+
+function listBacklogItems(): DailyItem[] {
+  const backlog = loadPlannerBacklog();
+  return parseDailyItemsFromMarkdown(plannerBacklogID, backlog.markdown);
+}
+
+function backlogMutationResult(
+  backlog: PlannerBacklogDetail,
+  item?: DailyItem | null,
+  scheduledDay?: PlannerDayDetail,
+  scheduledItems?: DailyItem[]
+): BacklogItemMutationResult {
+  return {
+    backlog,
+    items: parseDailyItemsFromMarkdown(plannerBacklogID, backlog.markdown),
+    item,
+    scheduledDay,
+    scheduledItems
+  };
+}
+
+function upsertBacklogItem(input: unknown): BacklogItemMutationResult {
+  const raw = dailyItemJSON(input);
+  const backlog = loadPlannerBacklog();
+  const items = parseDailyItemsFromMarkdown(plannerBacklogID, backlog.markdown);
+  const rawID = cleanDailyText(raw.id);
+  const existingByID = items.find((item) => item.id === rawID);
+  const similarExisting = existingByID ? undefined : findSimilarDailyItem(items, raw);
+  const existing = existingByID ?? similarExisting;
+  const item = normalizeDailyItemInput(
+    { ...(similarExisting ? mergedDuplicateDailyInput(raw, similarExisting) : raw), dayID: plannerBacklogID },
+    existing
+  );
+  const sourceMarkdown = existing?.structured === false && existing.id
+    ? removePlainDailyItemLine(backlog.markdown, existing.id)
+    : backlog.markdown;
+  const savedBacklog = savePlannerBacklog(replaceStructuredDailyItem(sourceMarkdown, item));
+  emitPlannerBacklogChanged();
+  return backlogMutationResult(savedBacklog, item);
+}
+
+function toggleBacklogItem(itemID: string, checked: boolean): BacklogItemMutationResult {
+  const backlog = loadPlannerBacklog();
+  const existing = parseDailyItemsFromMarkdown(plannerBacklogID, backlog.markdown).find((item) => item.id === itemID);
+  if (!existing) return backlogMutationResult(backlog, null);
+  if (existing.structured) {
+    const item = normalizeDailyItemInput({ ...existing, dayID: plannerBacklogID, checked, status: checked ? "done" : "todo" }, existing);
+    const savedBacklog = savePlannerBacklog(replaceStructuredDailyItem(backlog.markdown, item));
+    emitPlannerBacklogChanged();
+    return backlogMutationResult(savedBacklog, item);
+  }
+  const savedBacklog = savePlannerBacklog(setPlainDailyItemChecked(backlog.markdown, itemID, checked));
+  emitPlannerBacklogChanged();
+  return backlogMutationResult(savedBacklog, { ...existing, checked, status: checked ? "done" : "todo" });
+}
+
+function deleteBacklogItem(itemID: string): BacklogItemMutationResult {
+  const backlog = loadPlannerBacklog();
+  const nextMarkdown = itemID.startsWith("plain:")
+    ? removePlainDailyItemLine(backlog.markdown, itemID)
+    : removeStructuredDailyItem(backlog.markdown, itemID);
+  const savedBacklog = savePlannerBacklog(nextMarkdown);
+  emitPlannerBacklogChanged();
+  return backlogMutationResult(savedBacklog, null);
+}
+
+function moveDailyItemToBacklog(dayID: string | undefined, itemID: string): BacklogItemMutationResult {
+  const normalizedDayID = normalizePlannerDayID(dayID);
+  const day = loadPlannerDay(normalizedDayID);
+  const existing = parseDailyItemsFromMarkdown(day.id, day.markdown).find((item) => item.id === itemID);
+  if (!existing) return backlogMutationResult(loadPlannerBacklog(), null, day, parseDailyItemsFromMarkdown(day.id, day.markdown));
+  const title = dailyItemVisibleTitle(existing);
+  const carriedDetails = [
+    existing.detailsMarkdown,
+    existing.checked ? `Follow-up from completed planner item on ${day.id}.` : `Moved from ${day.id}.`
+  ].filter(Boolean).join("\n\n");
+  const backlogResult = upsertBacklogItem({
+    ...existing,
+    dayID: plannerBacklogID,
+    title,
+    checked: false,
+    status: "todo",
+    detailsMarkdown: carriedDetails
+  });
+  const nextDayMarkdown = existing.id.startsWith("plain:")
+    ? removePlainDailyItemLine(day.markdown, existing.id)
+    : removeStructuredDailyItem(day.markdown, existing.id);
+  const savedDay = savePlannerDay(day.id, nextDayMarkdown);
+  emitPlannerDayChanged(savedDay.id);
+  return {
+    ...backlogResult,
+    scheduledDay: savedDay,
+    scheduledItems: parseDailyItemsFromMarkdown(savedDay.id, savedDay.markdown)
+  };
+}
+
+function scheduleBacklogItem(itemID: string, targetDayID: string): BacklogItemMutationResult {
+  const normalizedDayID = normalizePlannerDayID(targetDayID);
+  const backlog = loadPlannerBacklog();
+  const existing = parseDailyItemsFromMarkdown(plannerBacklogID, backlog.markdown).find((item) => item.id === itemID);
+  if (!existing) return backlogMutationResult(backlog, null);
+  const scheduled = upsertDailyItem({
+    ...existing,
+    dayID: normalizedDayID,
+    checked: false,
+    status: "todo",
+    title: dailyItemVisibleTitle(existing)
+  });
+  const savedBacklog = savePlannerBacklog(
+    existing.id.startsWith("plain:")
+      ? removePlainDailyItemLine(backlog.markdown, existing.id)
+      : removeStructuredDailyItem(backlog.markdown, existing.id)
+  );
+  emitPlannerBacklogChanged();
+  return backlogMutationResult(savedBacklog, null, scheduled.day, scheduled.items);
+}
+
+function scheduleSelectionToPlanner(request: PlannerScheduleRequest): PlannerDayDetail {
+  const mode = request.mode === "move" || request.mode === "link" ? request.mode : "copy";
+  const targetDayID = normalizePlannerDayID(request.targetDayID);
+  const day = loadPlannerDay(targetDayID);
+  const selectedText = String(request.selectedText ?? "").trim();
+  if (mode === "link" && request.sourceTarget) {
+    return upsertDailyItem({
+      dayID: targetDayID,
+      title: request.sourceTitle || selectedText || "Linked note",
+      detailsMarkdown: selectedText,
+      links: [request.sourceTarget],
+      status: "todo",
+      checked: false
+    }).day;
+  }
+  const content = mode === "link" && request.sourceTarget
+    ? `- ${markdownLinkForTarget(request.sourceTitle, request.sourceTarget)}`
+    : selectedText;
+  if (!content.trim()) return day;
+  const section = plannerSectionFor(mode, content);
+  const metadata = plannerMetadataComment(request, mode);
+  const block = `${content}\n${metadata}`;
+  return savePlannerDay(targetDayID, appendToPlannerSection(day.markdown, section, block));
+}
+
 function loadThreadMemory(threadID: string) {
   const memoryPath = path.join(supportRoot(), "AssistantMemory", threadID, "memory.md");
   const exists = fs.existsSync(memoryPath);
+  const agentFilesPath = threadAgentFilesDisplayPath(threadID);
+  const session = findSession(threadID);
+  const linkedFolderPath = normalizeLinkedFolderPath(session?.linkedProjectFolderPath);
+  const agentFilesSection = [
+    "## Agent Files",
+    "",
+    `Generated files for this thread should be saved in \`${agentFilesPath}\`.`,
+    linkedFolderPath
+      ? `Linked workspace for read/context: \`${linkedFolderPath}\`. Only write there when the user clearly asks.`
+      : "No linked workspace is attached."
+  ].join("\n");
+  const memoryMarkdown = exists ? fs.readFileSync(memoryPath, "utf8").replace(/\r\n/g, "\n").trim() : "";
   return {
     threadID,
     exists,
     path: exists ? memoryPath : undefined,
-    markdown: exists ? fs.readFileSync(memoryPath, "utf8").replace(/\r\n/g, "\n") : ""
+    markdown: [memoryMarkdown, agentFilesSection].filter(Boolean).join("\n\n")
   };
 }
 
@@ -5140,12 +9256,320 @@ function projectContextForThread(threadID: string) {
   return { project, projectID: project?.id ?? projectID };
 }
 
+function agentFilesStorageProjectID(projectID?: string | null) {
+  const id = projectID?.trim();
+  return id || unassignedAgentFilesProjectID;
+}
+
+function agentFilesProjectRoot(projectID?: string | null) {
+  return path.join(projectStoreRoot(), agentFilesStorageProjectID(projectID), agentFilesDirectoryName);
+}
+
+function safeAgentFilesPathComponent(value: string, fallback = "thread") {
+  const slug = value
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 72)
+    .replace(/-+$/g, "");
+  return slug || fallback;
+}
+
+function agentFilesThreadSuffix(threadID: string) {
+  const compact = threadID.replace(/^openassist-/i, "").replace(/[^a-z0-9]/gi, "").toLowerCase();
+  return compact.slice(0, 8) || createHash("sha1").update(threadID).digest("hex").slice(0, 8);
+}
+
+function titleForAgentFiles(session: SessionSummary | undefined, seedTitle?: string) {
+  const title = normalizeTitle(session?.title, "");
+  if (title && !isGenericThreadTitle(title)) return title;
+  const latestUserMessage = normalizeTitle(session?.latestUserMessage, "");
+  if (latestUserMessage) return titleForPrompt(latestUserMessage);
+  const seed = normalizeTitle(seedTitle, "");
+  if (seed) return titleForPrompt(seed);
+  return "Thread";
+}
+
+function agentFilesThreadFolder(threadID: string, title: string) {
+  return `${safeAgentFilesPathComponent(title, "thread")}--${agentFilesThreadSuffix(threadID)}`;
+}
+
+function readAgentFilesManifest(folderPath: string) {
+  return readJSON<Partial<AgentFilesManifest>>(path.join(folderPath, agentFilesManifestName), {});
+}
+
+function writeAgentFilesManifest(folderPath: string, manifest: AgentFilesManifest) {
+  writeJSON(path.join(folderPath, agentFilesManifestName), manifest);
+}
+
+function linkedFolderPathForProject(projectID?: string | null) {
+  const id = projectID?.trim();
+  if (!id || id === unassignedAgentFilesProjectID) return undefined;
+  const { snapshot } = projectStoreSnapshot();
+  const project = projectRecord(snapshot, id);
+  return normalizeLinkedFolderPath(String(project?.linkedFolderPath ?? ""));
+}
+
+function agentFilesSearchProjectIDs(preferredProjectID?: string | null) {
+  const ids: string[] = [agentFilesStorageProjectID(preferredProjectID), unassignedAgentFilesProjectID];
+  try {
+    for (const entry of fs.readdirSync(projectStoreRoot(), { withFileTypes: true })) {
+      if (entry.isDirectory()) ids.push(entry.name);
+    }
+  } catch {
+    // No project storage exists yet.
+  }
+  return [...new Set(ids.map((id) => id.trim()).filter(Boolean))];
+}
+
+function findThreadAgentFilesDirectory(threadID: string, preferredProjectID?: string | null) {
+  const normalizedThreadID = threadID.trim().toLowerCase();
+  if (!normalizedThreadID) return null;
+  for (const projectID of agentFilesSearchProjectIDs(preferredProjectID)) {
+    const root = agentFilesProjectRoot(projectID === unassignedAgentFilesProjectID ? undefined : projectID);
+    let folders: fs.Dirent[] = [];
+    try {
+      folders = fs.readdirSync(root, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const folder of folders) {
+      if (!folder.isDirectory()) continue;
+      const folderPath = path.join(root, folder.name);
+      const manifest = readAgentFilesManifest(folderPath);
+      if (String(manifest.threadID ?? "").trim().toLowerCase() !== normalizedThreadID) continue;
+      return {
+        folderPath,
+        projectID: String(manifest.projectID ?? projectID),
+        manifest: manifest as AgentFilesManifest
+      };
+    }
+  }
+  return null;
+}
+
+function uniqueAgentFilesFolderPath(root: string, threadFolder: string, currentPath?: string) {
+  let candidate = path.join(root, threadFolder);
+  if (!fs.existsSync(candidate) || sameResolvedPath(candidate, currentPath)) return candidate;
+  for (let index = 2; index < 1000; index += 1) {
+    candidate = path.join(root, `${threadFolder}-${index}`);
+    if (!fs.existsSync(candidate) || sameResolvedPath(candidate, currentPath)) return candidate;
+  }
+  return path.join(root, `${threadFolder}-${Date.now().toString(36)}`);
+}
+
+function updateSessionAgentFilesWorkingDirectory(threadID: string, folderPath: string) {
+  const session = findSession(threadID);
+  if (!session) return;
+  session.cwd = folderPath;
+  session.effectiveCWD = folderPath;
+  session.updatedAt = currentSwiftDate();
+  updateSession(session);
+}
+
+function rewriteMovedPathValue(value: string, oldRoot: string, newRoot: string) {
+  const fileURLPrefix = "file://";
+  const hasFilePrefix = value.startsWith(fileURLPrefix);
+  const rawValue = hasFilePrefix ? value.slice(fileURLPrefix.length) : value;
+  if (rawValue !== oldRoot && !rawValue.startsWith(`${oldRoot}${path.sep}`)) return value;
+  const next = rawValue === oldRoot
+    ? newRoot
+    : path.join(newRoot, path.relative(oldRoot, rawValue));
+  return hasFilePrefix ? `${fileURLPrefix}${next}` : next;
+}
+
+function rewriteMovedPathsDeep(value: unknown, oldRoot: string, newRoot: string): { value: unknown; changed: boolean } {
+  if (typeof value === "string") {
+    const next = rewriteMovedPathValue(value, oldRoot, newRoot);
+    return { value: next, changed: next !== value };
+  }
+  if (Array.isArray(value)) {
+    let changed = false;
+    const next = value.map((item) => {
+      const result = rewriteMovedPathsDeep(item, oldRoot, newRoot);
+      changed = changed || result.changed;
+      return result.value;
+    });
+    return { value: next, changed };
+  }
+  if (value && typeof value === "object") {
+    let changed = false;
+    const next: JsonObject = {};
+    for (const [key, item] of Object.entries(value as JsonObject)) {
+      const result = rewriteMovedPathsDeep(item, oldRoot, newRoot);
+      changed = changed || result.changed;
+      next[key] = result.value;
+    }
+    return { value: next, changed };
+  }
+  return { value, changed: false };
+}
+
+function rewriteConversationArtifactPaths(threadID: string, oldRoot: string, newRoot: string) {
+  const snapshot = readConversationSnapshot(threadID);
+  const rewritten = rewriteMovedPathsDeep(snapshot, oldRoot, newRoot);
+  if (!rewritten.changed) return;
+  writeConversationSnapshot(threadID, rewritten.value as JsonObject);
+}
+
+function movedToMarkerPayload(threadID: string, fromPath: string, toPath: string) {
+  return {
+    threadID,
+    from: fromPath,
+    to: toPath,
+    movedAt: currentSwiftDate()
+  };
+}
+
+function moveThreadAgentFilesDirectory(threadID: string, nextProjectID?: string | null, titleHint?: string) {
+  const existing = findThreadAgentFilesDirectory(threadID);
+  if (!existing) return null;
+  const storageProjectID = agentFilesStorageProjectID(nextProjectID);
+  const session = findSession(threadID);
+  const title = titleForAgentFiles(session, titleHint);
+  const manifest = existing.manifest;
+  const threadFolder = String(manifest.threadFolder ?? "").trim() || agentFilesThreadFolder(threadID, title);
+  const targetRoot = agentFilesProjectRoot(storageProjectID === unassignedAgentFilesProjectID ? undefined : storageProjectID);
+  fs.mkdirSync(targetRoot, { recursive: true });
+  const targetPath = uniqueAgentFilesFolderPath(targetRoot, threadFolder, existing.folderPath);
+  const linkedFolderPath = linkedFolderPathForProject(storageProjectID);
+  const now = currentSwiftDate();
+
+  if (!sameResolvedPath(existing.folderPath, targetPath)) {
+    try {
+      fs.renameSync(existing.folderPath, targetPath);
+    } catch {
+      fs.cpSync(existing.folderPath, targetPath, { recursive: true });
+      fs.rmSync(existing.folderPath, { recursive: true, force: true });
+    }
+    fs.mkdirSync(existing.folderPath, { recursive: true });
+    writeJSON(path.join(existing.folderPath, agentFilesMovedToName), movedToMarkerPayload(threadID, existing.folderPath, targetPath));
+    rewriteConversationArtifactPaths(threadID, existing.folderPath, targetPath);
+  }
+
+  const previousLocations = [
+    ...new Set([
+      ...(Array.isArray(manifest.previousLocations) ? manifest.previousLocations.filter((item) => typeof item === "string") : []),
+      ...(sameResolvedPath(existing.folderPath, targetPath) ? [] : [existing.folderPath])
+    ])
+  ];
+  const nextManifest: AgentFilesManifest = {
+    threadID,
+    projectID: storageProjectID,
+    threadTitle: title,
+    threadFolder: path.basename(targetPath),
+    createdAt: Number(manifest.createdAt ?? now),
+    updatedAt: now,
+    previousLocations,
+    ...(linkedFolderPath ? { linkedFolderPath } : {})
+  };
+  writeAgentFilesManifest(targetPath, nextManifest);
+  updateSessionAgentFilesWorkingDirectory(threadID, targetPath);
+  return { path: targetPath, manifest: nextManifest };
+}
+
+function ensureThreadAgentFilesDirectory(threadID: string, titleHint?: string) {
+  const session = ensureOpenAssistSessionRecord(threadID);
+  const projectID = session.projectID ?? projectContextForThread(threadID).projectID;
+  const storageProjectID = agentFilesStorageProjectID(projectID);
+  const existing = findThreadAgentFilesDirectory(threadID, storageProjectID);
+  if (existing && agentFilesStorageProjectID(existing.manifest.projectID) !== storageProjectID) {
+    const moved = moveThreadAgentFilesDirectory(threadID, storageProjectID, titleHint);
+    if (moved) return moved;
+  }
+
+  const refreshedExisting = findThreadAgentFilesDirectory(threadID, storageProjectID);
+  const title = titleForAgentFiles(findSession(threadID) ?? session, titleHint);
+  const linkedFolderPath = linkedFolderPathForProject(storageProjectID);
+  const now = currentSwiftDate();
+  if (refreshedExisting) {
+    const manifest: AgentFilesManifest = {
+      threadID,
+      projectID: storageProjectID,
+      threadTitle: title,
+      threadFolder: String(refreshedExisting.manifest.threadFolder ?? path.basename(refreshedExisting.folderPath)),
+      createdAt: Number(refreshedExisting.manifest.createdAt ?? now),
+      updatedAt: now,
+      previousLocations: Array.isArray(refreshedExisting.manifest.previousLocations)
+        ? refreshedExisting.manifest.previousLocations.filter((item): item is string => typeof item === "string")
+        : [],
+      ...(linkedFolderPath ? { linkedFolderPath } : {})
+    };
+    writeAgentFilesManifest(refreshedExisting.folderPath, manifest);
+    updateSessionAgentFilesWorkingDirectory(threadID, refreshedExisting.folderPath);
+    return { path: refreshedExisting.folderPath, manifest };
+  }
+
+  const threadFolder = agentFilesThreadFolder(threadID, title);
+  const root = agentFilesProjectRoot(storageProjectID === unassignedAgentFilesProjectID ? undefined : storageProjectID);
+  fs.mkdirSync(root, { recursive: true });
+  const folderPath = uniqueAgentFilesFolderPath(root, threadFolder);
+  fs.mkdirSync(folderPath, { recursive: true });
+  const manifest: AgentFilesManifest = {
+    threadID,
+    projectID: storageProjectID,
+    threadTitle: title,
+    threadFolder: path.basename(folderPath),
+    createdAt: now,
+    updatedAt: now,
+    previousLocations: [],
+    ...(linkedFolderPath ? { linkedFolderPath } : {})
+  };
+  writeAgentFilesManifest(folderPath, manifest);
+  updateSessionAgentFilesWorkingDirectory(threadID, folderPath);
+  return { path: folderPath, manifest };
+}
+
+function threadAgentFilesDisplayPath(threadID: string) {
+  const existing = findThreadAgentFilesDirectory(threadID);
+  if (existing) return existing.folderPath;
+  const session = findSession(threadID);
+  const projectID = session?.projectID ?? projectContextForThread(threadID).projectID;
+  const title = titleForAgentFiles(session, session?.latestUserMessage);
+  const storageProjectID = agentFilesStorageProjectID(projectID);
+  return path.join(
+    agentFilesProjectRoot(storageProjectID === unassignedAgentFilesProjectID ? undefined : storageProjectID),
+    agentFilesThreadFolder(threadID, title)
+  );
+}
+
+function resolveMovedAgentFilesPath(filePath: string, depth = 0): string {
+  if (depth > 8 || fs.existsSync(filePath)) return filePath;
+  const support = supportRoot();
+  let current = path.dirname(filePath);
+  while (pathIsInside(current, support)) {
+    const markerPath = path.join(current, agentFilesMovedToName);
+    if (fs.existsSync(markerPath)) {
+      const marker = readJSON<{ to?: string; targetPath?: string; path?: string }>(markerPath, {});
+      const toPath = pluginString(marker.to, marker.targetPath, marker.path);
+      if (toPath) {
+        const relative = path.relative(current, filePath);
+        const nextPath = path.join(toPath, relative);
+        if (!sameResolvedPath(nextPath, filePath)) return resolveMovedAgentFilesPath(nextPath, depth + 1);
+      }
+    }
+    const parent = path.dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+  return filePath;
+}
+
+function threadAgentFilesPath(threadID: string) {
+  return {
+    ok: true,
+    path: ensureThreadAgentFilesDirectory(threadID).path
+  };
+}
+
 function ensureOpenAssistSessionRecord(threadID: string, backend?: AssistantBackend, modelID?: string) {
   const existing = findSession(threadID);
   if (existing) return existing;
   const { project, projectID } = projectContextForThread(threadID);
   const now = currentSwiftDate();
-  const cwd = project?.linkedFolderPath ?? undefined;
+  const linkedFolderPath = project?.linkedFolderPath ?? undefined;
   const session: SessionSummary = {
     id: threadID,
     title: "New Assistant Session",
@@ -5154,8 +9578,6 @@ function ensureOpenAssistSessionRecord(threadID: string, backend?: AssistantBack
     conversationPersistence: 2,
     providerBindingsByBackend: [],
     status: "idle",
-    cwd,
-    effectiveCWD: cwd,
     createdAt: now,
     updatedAt: now,
     latestTaskMode: "chat",
@@ -5167,7 +9589,7 @@ function ensureOpenAssistSessionRecord(threadID: string, backend?: AssistantBack
     isTemporary: false,
     projectID,
     projectName: project?.title,
-    linkedProjectFolderPath: cwd,
+    linkedProjectFolderPath: linkedFolderPath,
     projectFolderMissing: false,
     activeProvider: backend
   };
@@ -5212,6 +9634,89 @@ function normalizeProjectName(name: string) {
   return name.replace(/\s+/g, " ").trim();
 }
 
+function recoverableProjectNoteIDs() {
+  const notesRoot = path.join(projectStoreRoot(), "ProjectNotes");
+  try {
+    return new Set(
+      fs.readdirSync(notesRoot, { withFileTypes: true })
+        .filter((entry) => entry.isDirectory())
+        .map((entry) => entry.name.trim().toLowerCase())
+        .filter(Boolean)
+    );
+  } catch {
+    return new Set<string>();
+  }
+}
+
+function projectStoreBackupCandidates() {
+  const root = cleanupBackupsRoot();
+  try {
+    return fs.readdirSync(root, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => path.join(root, entry.name, "projects.before.json"))
+      .filter((filePath) => fs.existsSync(filePath))
+      .sort((a, b) => {
+        try {
+          return fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs;
+        } catch {
+          return 0;
+        }
+      });
+  } catch {
+    return [];
+  }
+}
+
+function recoverProjectStoreSnapshot(filePath: string, snapshot: JsonObject & {
+  version?: number;
+  projects?: JsonObject[];
+  threadAssignments?: Record<string, string>;
+  brainByProjectID?: Record<string, JsonObject>;
+}) {
+  if ((snapshot.projects ?? []).length > 0) return snapshot;
+
+  const noteProjectIDs = recoverableProjectNoteIDs();
+  if (!noteProjectIDs.size) return snapshot;
+
+  for (const backupPath of projectStoreBackupCandidates()) {
+    const backup = readJSON<JsonObject & {
+      version?: number;
+      projects?: JsonObject[];
+      threadAssignments?: Record<string, string>;
+      brainByProjectID?: Record<string, JsonObject>;
+    }>(backupPath, {});
+    const backupProjects = backup.projects ?? [];
+    if (!backupProjects.length) continue;
+    const backupProjectIDs = new Set(
+      backupProjects
+        .map((project) => String(project.id ?? "").trim().toLowerCase())
+        .filter(Boolean)
+    );
+    const hasNoteProject = [...noteProjectIDs].some((id) => backupProjectIDs.has(id));
+    if (!hasNoteProject) continue;
+
+    const backupFilePath = `${filePath}.empty-${new Date().toISOString().replace(/[:.]/g, "-")}.bak`;
+    try {
+      if (fs.existsSync(filePath)) fs.copyFileSync(filePath, backupFilePath);
+    } catch {
+      // Recovery should still proceed even if the empty snapshot backup fails.
+    }
+
+    snapshot.version = Math.max(Number(snapshot.version ?? 1), Number(backup.version ?? 1));
+    snapshot.projects = backupProjects;
+    snapshot.threadAssignments = Object.keys(snapshot.threadAssignments ?? {}).length
+      ? snapshot.threadAssignments
+      : (backup.threadAssignments ?? {});
+    snapshot.brainByProjectID = Object.keys(snapshot.brainByProjectID ?? {}).length
+      ? snapshot.brainByProjectID
+      : (backup.brainByProjectID ?? {});
+    saveProjectStoreSnapshot(filePath, snapshot);
+    return snapshot;
+  }
+
+  return snapshot;
+}
+
 function projectStoreSnapshot() {
   const filePath = path.join(projectStoreRoot(), "projects.json");
   const snapshot = readJSON<JsonObject & {
@@ -5223,7 +9728,7 @@ function projectStoreSnapshot() {
   snapshot.projects = snapshot.projects ?? [];
   snapshot.threadAssignments = snapshot.threadAssignments ?? {};
   snapshot.brainByProjectID = snapshot.brainByProjectID ?? {};
-  return { filePath, snapshot };
+  return { filePath, snapshot: recoverProjectStoreSnapshot(filePath, snapshot) };
 }
 
 function saveProjectStoreSnapshot(filePath: string, snapshot: JsonObject) {
@@ -5234,6 +9739,30 @@ function saveProjectStoreSnapshot(filePath: string, snapshot: JsonObject) {
 function projectRecord(snapshot: { projects?: JsonObject[] }, projectID: string) {
   const id = projectID.trim().toLowerCase();
   return (snapshot.projects ?? []).find((project) => String(project.id ?? "").trim().toLowerCase() === id);
+}
+
+function canonicalProjectFolderID(snapshot: { projects?: JsonObject[] }, folderID?: string | null) {
+  const id = folderID?.trim().toLowerCase();
+  if (!id) return undefined;
+  const folder = (snapshot.projects ?? []).find((project) =>
+    String(project.id ?? "").trim().toLowerCase() === id && String(project.kind ?? "") === "folder"
+  );
+  return folder ? String(folder.id ?? "") : undefined;
+}
+
+function normalizeLinkedFolderPath(folderPath?: string | null) {
+  const trimmed = folderPath?.trim();
+  if (!trimmed) return undefined;
+  const resolved = path.resolve(trimmed);
+  try {
+    return fs.realpathSync.native(resolved);
+  } catch {
+    return resolved;
+  }
+}
+
+function linkedFolderPathKey(folderPath?: string | null) {
+  return normalizeLinkedFolderPath(folderPath)?.toLowerCase() ?? "";
 }
 
 function loadedProjectItem(projectID: string) {
@@ -5263,16 +9792,45 @@ function updateProjectIcon(projectID: string, symbol?: string | null) {
   return loadedProjectItem(projectID);
 }
 
+function syncLinkedFolderForProjectSessions(projectID: string, projectName: string, previousFolderPath?: string, nextFolderPath?: string) {
+  const id = projectID.trim().toLowerCase();
+  const previousKey = linkedFolderPathKey(previousFolderPath);
+  const registry = loadSessionRegistry();
+  let changed = false;
+  const sessions = registry.sessions.map((session) => {
+    if (String(session.projectID ?? "").trim().toLowerCase() !== id) return session;
+    const nextSession: SessionSummary = { ...session, projectID, projectName };
+    if (nextFolderPath) {
+      nextSession.linkedProjectFolderPath = nextFolderPath;
+    } else {
+      delete nextSession.linkedProjectFolderPath;
+    }
+    if (previousKey && linkedFolderPathKey(nextSession.cwd) === previousKey) delete nextSession.cwd;
+    if (previousKey && linkedFolderPathKey(nextSession.effectiveCWD) === previousKey) delete nextSession.effectiveCWD;
+    nextSession.updatedAt = currentSwiftDate();
+    changed = true;
+    return nextSession;
+  });
+  if (changed) saveSessionRegistry(sessions);
+}
+
 function updateProjectLinkedFolder(projectID: string, folderPath?: string | null) {
   const { filePath, snapshot } = projectStoreSnapshot();
   const project = projectRecord(snapshot, projectID);
   if (!project) throw new Error("Project was not found.");
   if (String(project.kind ?? "project") !== "project") throw new Error("Only projects can link folders.");
-  const normalized = folderPath?.trim();
+  const previousFolderPath = normalizeLinkedFolderPath(String(project.linkedFolderPath ?? ""));
+  const normalized = normalizeLinkedFolderPath(folderPath);
   if (normalized) project.linkedFolderPath = normalized;
   else delete project.linkedFolderPath;
   project.updatedAt = currentSwiftDate();
   saveProjectStoreSnapshot(filePath, snapshot);
+  syncLinkedFolderForProjectSessions(
+    String(project.id ?? projectID),
+    normalizeTitle(String(project.name ?? ""), "Project"),
+    previousFolderPath,
+    normalized
+  );
   return loadedProjectItem(projectID);
 }
 
@@ -5326,7 +9884,21 @@ function deleteProject(projectID: string) {
   snapshot.projects = (snapshot.projects ?? []).filter((project) => !projectIDsToDelete.has(String(project.id ?? "").trim().toLowerCase()));
   const assignments = { ...(snapshot.threadAssignments ?? {}) };
   for (const [threadID, assignedProjectID] of Object.entries(assignments)) {
-    if (projectIDsToDelete.has(String(assignedProjectID).trim().toLowerCase())) delete assignments[threadID];
+    if (projectIDsToDelete.has(String(assignedProjectID).trim().toLowerCase())) {
+      const moved = moveThreadAgentFilesDirectory(threadID, null);
+      const session = findSession(threadID);
+      if (session) {
+        delete session.projectID;
+        delete session.projectName;
+        delete session.linkedProjectFolderPath;
+        if (moved) {
+          session.cwd = moved.path;
+          session.effectiveCWD = moved.path;
+        }
+        updateSession(session);
+      }
+      delete assignments[threadID];
+    }
   }
   snapshot.threadAssignments = assignments;
   for (const projectKey of Object.keys(snapshot.brainByProjectID ?? {})) {
@@ -5340,6 +9912,8 @@ function loadProjectMemory(projectID: string) {
   const { filePath, snapshot } = projectStoreSnapshot();
   const project = projectRecord(snapshot, projectID);
   const title = normalizeTitle(project?.name, "Project");
+  const linkedFolderPath = normalizeLinkedFolderPath(String(project?.linkedFolderPath ?? ""));
+  const agentFilesRoot = agentFilesProjectRoot(projectID);
   const brain = snapshot.brainByProjectID?.[projectID]
     ?? snapshot.brainByProjectID?.[projectID.toUpperCase()]
     ?? snapshot.brainByProjectID?.[projectID.toLowerCase()];
@@ -5354,6 +9928,13 @@ function loadProjectMemory(projectID: string) {
     `# ${title} Memory`,
     "",
     summary || "No project summary has been saved yet.",
+    "",
+    "## Agent Files",
+    "",
+    `Project thread files are saved under \`${agentFilesRoot}\`.`,
+    linkedFolderPath
+      ? `Linked workspace for read/context: \`${linkedFolderPath}\`. Only write there when the user clearly asks.`
+      : "No linked workspace is attached.",
     digestLines.length ? "\n## Chat Digests" : "",
     ...digestLines
   ].filter(Boolean).join("\n");
@@ -5402,20 +9983,10 @@ function uniqueProjectName(snapshot: { projects?: JsonObject[] }, name: string, 
 }
 
 function createProject(name: string, kind: "project" | "folder" = "project", parentID?: string | null) {
-  const filePath = path.join(projectStoreRoot(), "projects.json");
-  const snapshot = readJSON<JsonObject & {
-    version?: number;
-    projects?: JsonObject[];
-    threadAssignments?: Record<string, string>;
-    brainByProjectID?: Record<string, JsonObject>;
-  }>(filePath, {});
+  const { filePath, snapshot } = projectStoreSnapshot();
   const projects = snapshot.projects ?? [];
   const normalizedKind = kind === "folder" ? "folder" : "project";
-  const normalizedParentID = normalizedKind === "project"
-    && parentID
-    && projects.some((project) => String(project.id ?? "").toLowerCase() === parentID.toLowerCase() && project.kind === "folder")
-    ? parentID
-    : undefined;
+  const normalizedParentID = normalizedKind === "project" ? canonicalProjectFolderID(snapshot, parentID) : undefined;
   const projectID = randomUUID().toUpperCase();
   const now = currentSwiftDate();
   const project: JsonObject = {
@@ -5439,6 +10010,56 @@ function createProject(name: string, kind: "project" | "folder" = "project", par
   return projectItemFromSnapshot(project);
 }
 
+function createProjectFromFolder(folderPath: string, parentID?: string | null) {
+  const linkedFolderPath = normalizeLinkedFolderPath(folderPath);
+  if (!linkedFolderPath) throw new Error("Project folder is required.");
+  const folderStats = fs.statSync(linkedFolderPath);
+  if (!folderStats.isDirectory()) throw new Error("Choose a folder to open as a project.");
+
+  const { filePath, snapshot } = projectStoreSnapshot();
+  const projects = snapshot.projects ?? [];
+  const folderKey = linkedFolderPathKey(linkedFolderPath);
+  const normalizedParentID = canonicalProjectFolderID(snapshot, parentID);
+  const existingProject = projects.find((project) =>
+    String(project.kind ?? "project") === "project" && linkedFolderPathKey(String(project.linkedFolderPath ?? "")) === folderKey
+  );
+  if (existingProject) {
+    const previousFolderPath = normalizeLinkedFolderPath(String(existingProject.linkedFolderPath ?? ""));
+    existingProject.linkedFolderPath = linkedFolderPath;
+    if (normalizedParentID) existingProject.parentID = normalizedParentID;
+    existingProject.updatedAt = currentSwiftDate();
+    saveProjectStoreSnapshot(filePath, snapshot);
+    syncLinkedFolderForProjectSessions(
+      String(existingProject.id ?? ""),
+      normalizeTitle(String(existingProject.name ?? ""), "Project"),
+      previousFolderPath,
+      linkedFolderPath
+    );
+    return loadedProjectItem(String(existingProject.id ?? ""));
+  }
+
+  const projectID = randomUUID().toUpperCase();
+  const now = currentSwiftDate();
+  const project: JsonObject = {
+    id: projectID,
+    kind: "project",
+    name: uniqueProjectName(snapshot, path.basename(linkedFolderPath) || "Project", normalizedParentID),
+    isHidden: false,
+    createdAt: now,
+    updatedAt: now,
+    iconSymbolName: "folder.fill",
+    linkedFolderPath
+  };
+  if (normalizedParentID) project.parentID = normalizedParentID;
+  snapshot.version = Math.max(1, Number(snapshot.version ?? 1));
+  snapshot.projects = [...projects, project];
+  snapshot.threadAssignments = snapshot.threadAssignments ?? {};
+  snapshot.brainByProjectID = snapshot.brainByProjectID ?? {};
+  snapshot.brainByProjectID[projectID] = { projectSummary: "", processedThreadIDs: [], threadDigestsByThreadID: {} };
+  saveProjectStoreSnapshot(filePath, snapshot);
+  return projectItemFromSnapshot(project);
+}
+
 function createEmptyConversation(threadID: string) {
   writeConversationSnapshot(threadID, {
     threadID,
@@ -5457,7 +10078,7 @@ function createOpenAssistThread(projectID?: string, persistEmptyConversation = t
     : undefined;
   const threadID = makeOpenAssistThreadID();
   const now = currentSwiftDate();
-  const cwd = project?.linkedFolderPath ?? undefined;
+  const linkedFolderPath = project?.linkedFolderPath ?? undefined;
   const session: SessionSummary = {
     id: threadID,
     title: "New Assistant Session",
@@ -5466,8 +10087,6 @@ function createOpenAssistThread(projectID?: string, persistEmptyConversation = t
     conversationPersistence: isTemporary ? 0 : 2,
     providerBindingsByBackend: [],
     status: "idle",
-    cwd,
-    effectiveCWD: cwd,
     createdAt: now,
     updatedAt: now,
     latestTaskMode: "chat",
@@ -5478,7 +10097,7 @@ function createOpenAssistThread(projectID?: string, persistEmptyConversation = t
     isTemporary,
     projectID: project?.id,
     projectName: project?.title,
-    linkedProjectFolderPath: cwd,
+    linkedProjectFolderPath: linkedFolderPath,
     projectFolderMissing: false
   };
   updateSession(session);
@@ -5509,6 +10128,24 @@ function createOpenAssistThread(projectID?: string, persistEmptyConversation = t
 export function destroyTemporaryThread(threadID: string) {
   const session = findSession(threadID);
   const conversationPath = path.join(conversationStoreRoot(), threadID);
+  // Never discard a temporary thread that actually produced a conversation. A
+  // turn promotes the thread (isTemporary -> false) on the backend, but if the
+  // renderer asks to clean up using stale state we must not delete a chat that
+  // has real content (timeline/transcript/turns). This is what caused completed
+  // Computer Use results in temporary chats to vanish on navigation.
+  try {
+    const snapshot = readConversationSnapshot(threadID);
+    const hasContent =
+      (Array.isArray(snapshot.timeline) && snapshot.timeline.length > 0) ||
+      (Array.isArray(snapshot.transcript) && snapshot.transcript.length > 0) ||
+      (Array.isArray(snapshot.turns) && snapshot.turns.length > 0);
+    if (hasContent) {
+      if (session && session.isTemporary === true) promoteTemporarySession(threadID);
+      return { ok: false, kept: true };
+    }
+  } catch {
+    // If we cannot read the snapshot, fall through to the normal logic.
+  }
   if (!session || (session.isTemporary !== true && session.conversationPersistence !== 0)) {
     fs.rmSync(conversationPath, { recursive: true, force: true });
     removeProjectThreadAssignment(threadID);
@@ -5538,7 +10175,9 @@ function normalizedModelForBackend(backend: AssistantBackend, rawModelID?: unkno
   if (backend === "copilot") {
     return requested || "auto";
   }
-  return lowered.startsWith("gpt-") ? requested : readCodexDefaultModel();
+  // Codex backend: only GPT-5 / *-codex models are accepted. Reject anything else
+  // (e.g. a stale "gpt-4o") and fall back to the Codex default.
+  return codexSafeModel(requested);
 }
 
 export async function setThreadProvider(threadID: string, rawBackend: string, rawModelID?: string) {
@@ -5585,15 +10224,17 @@ function promoteTemporarySession(threadID: string) {
   const session = ensureOpenAssistSessionRecord(threadID);
   session.isTemporary = false;
   session.conversationPersistence = 2;
-  updateSession(session);
+  const updatedSession = updateSession(session);
   const conversationPath = path.join(conversationStoreRoot(), threadID, "conversation.json");
   if (!fs.existsSync(conversationPath)) createEmptyConversation(threadID);
   const projects = loadProjects();
-  return loadThreads(projects).find((thread) => thread.id.toLowerCase() === threadID.toLowerCase()) ?? null;
+  return loadThreads(projects).find((thread) => thread.id.toLowerCase() === threadID.toLowerCase())
+    ?? threadItemForCompletedSession(updatedSession);
 }
 
 function assignSessionToProject(threadID: string, projectID?: string | null) {
   const session = ensureOpenAssistSessionRecord(threadID);
+  const previousLinkedFolderPath = session.linkedProjectFolderPath;
   const loadedProjects = loadProjects();
   const project = projectID
     ? loadedProjects.projects.find((item) => item.id.toLowerCase() === projectID.toLowerCase() && item.kind !== "folder")
@@ -5602,8 +10243,6 @@ function assignSessionToProject(threadID: string, projectID?: string | null) {
   if (project) {
     session.projectID = project.id;
     session.projectName = project.title;
-    session.cwd = project.linkedFolderPath ?? session.cwd;
-    session.effectiveCWD = project.linkedFolderPath ?? session.effectiveCWD;
     if (project.linkedFolderPath) {
       session.linkedProjectFolderPath = project.linkedFolderPath;
     } else {
@@ -5616,28 +10255,98 @@ function assignSessionToProject(threadID: string, projectID?: string | null) {
     delete session.linkedProjectFolderPath;
     removeProjectThreadAssignment(threadID);
   }
+  if (previousLinkedFolderPath && linkedFolderPathKey(session.cwd) === linkedFolderPathKey(previousLinkedFolderPath)) delete session.cwd;
+  if (previousLinkedFolderPath && linkedFolderPathKey(session.effectiveCWD) === linkedFolderPathKey(previousLinkedFolderPath)) delete session.effectiveCWD;
   updateSession(session);
+  const moved = moveThreadAgentFilesDirectory(threadID, project?.id ?? null, session.title);
+  if (moved) {
+    session.cwd = moved.path;
+    session.effectiveCWD = moved.path;
+    updateSession(session);
+  }
   const projects = loadProjects();
   return loadThreads(projects).find((thread) => thread.id.toLowerCase() === threadID.toLowerCase()) ?? null;
 }
 
-function archiveSession(threadID: string) {
+function codexProviderThreadID(session: SessionSummary | undefined) {
+  return pluginString(providerBinding(session, "codex")?.providerSessionID)?.trim();
+}
+
+async function archiveCodexProviderThread(providerThreadID?: string) {
+  if (!providerThreadID) return { ok: false, reason: "missing-provider-thread" };
+  try {
+    await codexTransport.request("thread/archive", { threadId: providerThreadID }, undefined, 20_000);
+    return { ok: true };
+  } catch (error) {
+    bridgeDebugLog(`Codex provider archive failed thread=${providerThreadID}: ${error instanceof Error ? error.message : String(error)}`);
+    return { ok: false, reason: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+async function unarchiveCodexProviderThread(providerThreadID?: string) {
+  if (!providerThreadID) return { ok: false, reason: "missing-provider-thread" };
+  try {
+    await codexTransport.request("thread/unarchive", { threadId: providerThreadID }, undefined, 20_000);
+    return { ok: true };
+  } catch (error) {
+    bridgeDebugLog(`Codex provider unarchive failed thread=${providerThreadID}: ${error instanceof Error ? error.message : String(error)}`);
+    return { ok: false, reason: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+function looksLikeUnsupportedCodexMethod(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  return /method.*not.*found|unknown method|unsupported method|not implemented/i.test(message);
+}
+
+async function deleteCodexProviderThread(providerThreadID?: string) {
+  if (!providerThreadID) return { ok: false, used: "none", reason: "missing-provider-thread" };
+  let deleteReason: string | undefined;
+  try {
+    // Current Codex app-server bindings expose archive/unarchive, not hard
+    // delete. Keep this future-ready for newer builds that add thread/delete.
+    await codexTransport.request("thread/delete", { threadId: providerThreadID }, undefined, 20_000);
+    return { ok: true, used: "thread/delete" };
+  } catch (error) {
+    deleteReason = error instanceof Error ? error.message : String(error);
+    if (!looksLikeUnsupportedCodexMethod(error)) {
+      bridgeDebugLog(`Codex provider delete failed thread=${providerThreadID}: ${deleteReason}`);
+    }
+  }
+  const archived = await archiveCodexProviderThread(providerThreadID);
+  return {
+    ok: archived.ok,
+    used: "thread/archive",
+    reason: archived.reason ?? deleteReason
+  };
+}
+
+async function archiveSession(threadID: string) {
   const session = ensureOpenAssistSessionRecord(threadID);
+  const archivedAt = currentSwiftDate();
+  await archiveCodexProviderThread(codexProviderThreadID(session));
   session.isArchived = true;
+  session.archivedAt = archivedAt;
+  session.autoDeleteAfter = null;
   updateSession(session);
   const projects = loadProjects();
   return loadThreads(projects).find((thread) => thread.id.toLowerCase() === threadID.toLowerCase()) ?? null;
 }
 
-function unarchiveSession(threadID: string) {
+async function unarchiveSession(threadID: string) {
   const session = ensureOpenAssistSessionRecord(threadID);
+  await unarchiveCodexProviderThread(codexProviderThreadID(session));
   session.isArchived = false;
+  delete session.archivedAt;
+  delete session.autoDeleteAfter;
   updateSession(session);
   const projects = loadProjects();
   return loadThreads(projects).find((thread) => thread.id.toLowerCase() === threadID.toLowerCase()) ?? null;
 }
 
-function deleteSessionPermanently(threadID: string) {
+async function deleteSessionPermanently(threadID: string) {
+  const session = findSession(threadID);
+  await deleteCodexProviderThread(codexProviderThreadID(session));
   const registry = loadSessionRegistry();
   saveSessionRegistry(registry.sessions.filter((session) => session.id.toLowerCase() !== threadID.toLowerCase()));
   fs.rmSync(path.join(conversationStoreRoot(), threadID), { recursive: true, force: true });
@@ -5667,6 +10376,7 @@ function loadNotes(projects: LoadedProjects) {
     const manifest = readJSON<{ notes?: JsonObject[]; folders?: JsonObject[]; selectedNoteID?: string }>(manifestPath, {});
     const folderCounts = new Map<string, number>();
     for (const note of manifest.notes ?? []) {
+      if (note.isArchived === true) continue;
       const folderID = typeof note.folderID === "string" ? note.folderID : null;
       if (folderID) folderCounts.set(folderID, (folderCounts.get(folderID) ?? 0) + 1);
     }
@@ -5692,6 +10402,9 @@ function loadNotes(projects: LoadedProjects) {
         title: normalizeTitle(note.title, "Untitled note"),
         subtitle: noteSubtitle(updatedAt),
         updatedAt,
+        isArchived: note.isArchived === true,
+        archivedAt: storedArchiveDateToMs(note.archivedAt),
+        autoDeleteAfter: storedArchiveDateToMs(note.autoDeleteAfter) ?? null,
         active: manifest.selectedNoteID === id
       });
     }
@@ -5707,6 +10420,67 @@ function noteManifestPath(projectID: string) {
 
 function noteDirectoryPath(projectID: string) {
   return path.join(projectStoreRoot(), "ProjectNotes", projectID.toUpperCase(), "notes");
+}
+
+function projectNoteRecoveryDirectoryPath(projectID: string, noteID: string) {
+  return path.join(
+    projectStoreRoot(),
+    "ProjectNotesRecovery",
+    "history",
+    "project",
+    projectID.toUpperCase(),
+    noteID.toLowerCase()
+  );
+}
+
+function snapshotProjectNote(projectID: string, noteID: string, note: JsonObject, previousMarkdown: string) {
+  if (!previousMarkdown.trim()) return;
+  const snapshotID = randomUUID().toLowerCase();
+  const recoveryRoot = projectNoteRecoveryDirectoryPath(projectID, noteID);
+  const contentFileName = `${snapshotID}.md`;
+  const filePath = path.join(recoveryRoot, contentFileName);
+  fs.mkdirSync(recoveryRoot, { recursive: true });
+  fs.writeFileSync(filePath, previousMarkdown, "utf8");
+  const indexPath = path.join(recoveryRoot, "index.json");
+  const entries = readJSON<JsonObject[]>(indexPath, []);
+  const entry: JsonObject = {
+    id: snapshotID,
+    noteID,
+    ownerID: projectID.toUpperCase(),
+    ownerKind: "project",
+    title: normalizeTitle(note.title, "Untitled note"),
+    fileName: typeof note.fileName === "string" ? note.fileName : `${noteID}.md`,
+    contentFileName,
+    contentHash: createHash("sha256").update(previousMarkdown).digest("hex"),
+    preview: shortSearchText(previousMarkdown, 180),
+    createdAt: Number(note.createdAt ?? 0) || currentSwiftDate(),
+    updatedAt: Number(note.updatedAt ?? 0) || currentSwiftDate(),
+    savedAt: currentSwiftDate()
+  };
+  writeJSON(indexPath, [entry, ...entries].slice(0, 50));
+}
+
+function listProjectNoteHistory(projectID: string, noteID: string) {
+  const recoveryRoot = projectNoteRecoveryDirectoryPath(projectID, noteID);
+  const indexPath = path.join(recoveryRoot, "index.json");
+  const entries = readJSON<JsonObject[]>(indexPath, []);
+  return entries
+    .map((entry) => {
+      const id = String(entry.id ?? "");
+      const contentFileName = String(entry.contentFileName ?? "");
+      if (!id || !contentFileName || contentFileName.includes("/") || contentFileName.includes("\\")) return null;
+      const filePath = path.join(recoveryRoot, contentFileName);
+      if (!fs.existsSync(filePath)) return null;
+      const markdown = fs.readFileSync(filePath, "utf8").replace(/\r\n/g, "\n");
+      return {
+        id,
+        title: normalizeTitle(entry.title, "Untitled note"),
+        savedAtLabel: noteHistorySavedAtLabel(Number(entry.savedAt ?? entry.updatedAt)),
+        preview: normalizeTitle(entry.preview, shortSearchText(markdown, 180)),
+        markdown
+      };
+    })
+    .filter((entry): entry is NonNullable<typeof entry> => Boolean(entry));
 }
 
 function readNoteManifest(projectID: string) {
@@ -5746,6 +10520,8 @@ function createProjectNote(projectID: string) {
   const manifest = readNoteManifest(projectID);
   const noteID = randomUUID().toLowerCase();
   const now = currentSwiftDate();
+  const loadedProjects = loadProjects();
+  const projectName = loadedProjects.projectNameByID.get(projectID) ?? loadedProjects.projectNameByID.get(projectID.toUpperCase());
   const note: JsonObject = {
     id: noteID,
     title: "Untitled note",
@@ -5761,11 +10537,13 @@ function createProjectNote(projectID: string) {
   const noteItem: NoteItem = {
     id: noteID,
     title: "Untitled note",
-    subtitle: "Saved just now",
+    subtitle: noteSubtitle(Date.now()),
     projectID: projectID.toUpperCase(),
+    projectName,
     updatedAt: Date.now(),
     active: true
   };
+  scheduleRemoteAccessBroadcast();
   return {
     note: noteItem,
     detail: {
@@ -5775,6 +10553,19 @@ function createProjectNote(projectID: string) {
       path: path.join(noteDirectoryPath(projectID), `${noteID}.md`)
     } satisfies NoteDetail
   };
+}
+
+function renameProjectNote(projectID: string, noteID: string, title: string): NoteDetail {
+  const manifest = readNoteManifest(projectID);
+  const note = (manifest.notes ?? []).find((entry) => entry.id === noteID);
+  if (!note) throw new Error("Note was not found.");
+  note.title = normalizeTitle(title, "Untitled note");
+  note.updatedAt = currentSwiftDate();
+  manifest.selectedNoteID = noteID;
+  writeNoteManifest(projectID, manifest);
+  const detail = loadNote(projectID, noteID);
+  scheduleRemoteAccessBroadcast();
+  return detail;
 }
 
 function saveProjectNote(projectID: string, noteID: string, markdown: string): NoteDetail {
@@ -5788,13 +10579,2404 @@ function saveProjectNote(projectID: string, noteID: string, markdown: string): N
   const fileName = typeof note.fileName === "string" ? note.fileName : `${noteID}.md`;
   const filePath = path.join(noteDirectoryPath(projectID), fileName);
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  fs.writeFileSync(filePath, markdown.replace(/\r\n/g, "\n"), "utf8");
+  const nextMarkdown = markdown.replace(/\r\n/g, "\n");
+  const previousMarkdown = fs.existsSync(filePath) ? fs.readFileSync(filePath, "utf8").replace(/\r\n/g, "\n") : "";
+  if (previousMarkdown !== nextMarkdown) snapshotProjectNote(projectID, noteID, note, previousMarkdown);
+  fs.writeFileSync(filePath, nextMarkdown, "utf8");
+  scheduleRemoteAccessBroadcast();
   return {
     id: noteID,
     title: normalizeTitle(note.title, "Untitled note"),
-    markdown,
+    markdown: nextMarkdown,
     path: filePath
   };
+}
+
+function restoreProjectNoteHistory(projectID: string, noteID: string, historyID: string): NoteDetail {
+  const manifest = readNoteManifest(projectID);
+  const note = (manifest.notes ?? []).find((entry) => entry.id === noteID);
+  if (!note) throw new Error("Note was not found.");
+  const historyItem = listProjectNoteHistory(projectID, noteID).find((entry) => entry.id === historyID);
+  if (!historyItem) throw new Error("Saved version was not found.");
+  const fileName = typeof note.fileName === "string" ? note.fileName : `${noteID}.md`;
+  const filePath = path.join(noteDirectoryPath(projectID), fileName);
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  const previousMarkdown = fs.existsSync(filePath) ? fs.readFileSync(filePath, "utf8").replace(/\r\n/g, "\n") : "";
+  if (previousMarkdown !== historyItem.markdown) snapshotProjectNote(projectID, noteID, note, previousMarkdown);
+  fs.writeFileSync(filePath, historyItem.markdown, "utf8");
+  note.updatedAt = currentSwiftDate();
+  manifest.selectedNoteID = noteID;
+  writeNoteManifest(projectID, manifest);
+  scheduleRemoteAccessBroadcast();
+  return {
+    id: noteID,
+    title: normalizeTitle(note.title, "Untitled note"),
+    markdown: historyItem.markdown,
+    path: filePath
+  };
+}
+
+function archiveProjectNote(projectID: string, noteID: string): { projectID: string; archivedNoteID: string } {
+  const manifest = readNoteManifest(projectID);
+  const now = currentSwiftDate();
+  let found = false;
+  const notes = (manifest.notes ?? []).map((entry) => {
+    if (entry.id !== noteID) return entry;
+    found = true;
+    return {
+      ...entry,
+      isArchived: true,
+      archivedAt: now,
+      autoDeleteAfter: entry.autoDeleteAfter ?? null,
+      updatedAt: now
+    };
+  });
+  if (!found) return { projectID: projectID.toUpperCase(), archivedNoteID: noteID };
+  if (manifest.selectedNoteID === noteID) {
+    const nextNote = notes.find((entry) => entry.isArchived !== true);
+    manifest.selectedNoteID = nextNote ? String(nextNote.id ?? "") || undefined : undefined;
+  }
+  manifest.notes = notes;
+  writeNoteManifest(projectID, manifest);
+  scheduleRemoteAccessBroadcast();
+  return { projectID: projectID.toUpperCase(), archivedNoteID: noteID };
+}
+
+function restoreProjectNote(projectID: string, noteID: string): { projectID: string; restoredNoteID: string } {
+  const manifest = readNoteManifest(projectID);
+  const now = currentSwiftDate();
+  let found = false;
+  manifest.notes = (manifest.notes ?? []).map((entry) => {
+    if (entry.id !== noteID) return entry;
+    found = true;
+    const restored = { ...entry, isArchived: false, updatedAt: now };
+    delete (restored as JsonObject).archivedAt;
+    delete (restored as JsonObject).autoDeleteAfter;
+    return restored;
+  });
+  if (!found) return { projectID: projectID.toUpperCase(), restoredNoteID: noteID };
+  manifest.selectedNoteID = noteID;
+  writeNoteManifest(projectID, manifest);
+  scheduleRemoteAccessBroadcast();
+  return { projectID: projectID.toUpperCase(), restoredNoteID: noteID };
+}
+
+function deleteProjectNotePermanently(projectID: string, noteID: string): { projectID: string; deletedNoteID: string } {
+  const manifest = readNoteManifest(projectID);
+  const target = (manifest.notes ?? []).find((entry) => entry.id === noteID);
+  if (!target) return { projectID: projectID.toUpperCase(), deletedNoteID: noteID };
+  const remaining = (manifest.notes ?? []).filter((entry) => entry.id !== noteID);
+  const fileName = typeof target.fileName === "string" ? target.fileName : `${noteID}.md`;
+  const filePath = path.join(noteDirectoryPath(projectID), fileName);
+  try {
+    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+  } catch {
+    // Ignore filesystem errors — manifest update below is the source of truth.
+  }
+  if (manifest.selectedNoteID === noteID) {
+    manifest.selectedNoteID = remaining[0] ? String(remaining[0].id ?? "") || undefined : undefined;
+  }
+  manifest.notes = remaining;
+  writeNoteManifest(projectID, manifest);
+  scheduleRemoteAccessBroadcast();
+  return { projectID: projectID.toUpperCase(), deletedNoteID: noteID };
+}
+
+function deleteProjectNote(projectID: string, noteID: string): { projectID: string; archivedNoteID: string } {
+  return archiveProjectNote(projectID, noteID);
+}
+
+function projectIDsWithNoteManifests() {
+  const { snapshot } = projectStoreSnapshot();
+  return [...new Set((snapshot.projects ?? []).map((project) => String(project.id ?? "").toUpperCase()).filter(Boolean))];
+}
+
+function purgeExpiredArchivedProjectNotes(settings: Pick<SettingsSnapshot, "archiveAutoDeleteDays">) {
+  const now = Date.now();
+  for (const projectID of projectIDsWithNoteManifests()) {
+    const manifest = readNoteManifest(projectID);
+    let changed = false;
+    const remaining: JsonObject[] = [];
+    for (const entry of manifest.notes ?? []) {
+      if (shouldAutoDeleteArchivedRecord(entry, settings, now)) {
+        const fileName = typeof entry.fileName === "string" ? entry.fileName : "";
+        if (fileName) {
+          try { fs.unlinkSync(path.join(noteDirectoryPath(projectID), fileName)); } catch {}
+        }
+        changed = true;
+        continue;
+      }
+      remaining.push(entry);
+    }
+    if (!changed) continue;
+    if (!remaining.some((entry) => entry.id === manifest.selectedNoteID)) {
+      const nextNote = remaining.find((entry) => entry.isArchived !== true);
+      manifest.selectedNoteID = nextNote ? String(nextNote.id ?? "") || undefined : undefined;
+    }
+    manifest.notes = remaining;
+    writeNoteManifest(projectID, manifest);
+  }
+}
+
+function threadIDsWithNoteManifests() {
+  const ids = new Set(loadSessionRegistry().sessions.map((session) => session.id).filter(Boolean));
+  try {
+    for (const entry of fs.readdirSync(conversationStoreRoot(), { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      if (fs.existsSync(threadNoteManifestPath(entry.name))) ids.add(entry.name);
+    }
+  } catch {}
+  return [...ids];
+}
+
+function purgeExpiredArchivedThreadNotes(settings: Pick<SettingsSnapshot, "archiveAutoDeleteDays">) {
+  const now = Date.now();
+  for (const threadID of threadIDsWithNoteManifests()) {
+    const manifestPath = threadNoteManifestPath(threadID);
+    if (!fs.existsSync(manifestPath)) continue;
+    const manifest = readThreadNoteManifest(threadID);
+    let changed = false;
+    const remaining: JsonObject[] = [];
+    for (const note of manifest.notes ?? []) {
+      if (shouldAutoDeleteArchivedRecord(note as JsonObject, settings, now)) {
+        const fileName = typeof note.fileName === "string" ? note.fileName : "";
+        if (fileName) {
+          try { fs.unlinkSync(path.join(threadNotesDirectory(threadID), fileName)); } catch {}
+        }
+        changed = true;
+        continue;
+      }
+      remaining.push(note as JsonObject);
+    }
+    if (!changed) continue;
+    const selectedStillExists = remaining.some((note) => note.id === manifest.selectedNoteID);
+    const nextSelectedID = selectedStillExists
+      ? manifest.selectedNoteID
+      : String(remaining.find((note) => note.isArchived !== true)?.id ?? "") || undefined;
+    writeThreadNoteManifest(threadID, { ...manifest, selectedNoteID: nextSelectedID, notes: remaining });
+  }
+}
+
+async function purgeExpiredArchivedThreads(settings: Pick<SettingsSnapshot, "archiveAutoDeleteDays">) {
+  const now = Date.now();
+  const expired = loadSessionRegistry().sessions.filter((session) => shouldAutoDeleteArchivedRecord(session, settings, now));
+  for (const session of expired) {
+    try {
+      await deleteSessionPermanently(session.id);
+    } catch (error) {
+      bridgeDebugLog(`Archived thread auto-delete failed thread=${session.id}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+}
+
+async function purgeExpiredArchivedItems(settings: Pick<SettingsSnapshot, "archiveAutoDeleteDays">) {
+  purgeExpiredArchivedProjectNotes(settings);
+  purgeExpiredArchivedThreadNotes(settings);
+  await purgeExpiredArchivedThreads(settings);
+}
+
+function noteFolderItemFromManifest(projectID: string, folder: JsonObject, folderCounts: Map<string, number>): NoteFolderItem {
+  const id = String(folder.id ?? "");
+  return {
+    id,
+    name: normalizeTitle(folder.name, "Folder"),
+    projectID: projectID.toUpperCase(),
+    noteCount: folderCounts.get(id) ?? 0
+  };
+}
+
+function noteFolderCounts(manifest: { notes?: JsonObject[] }): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const note of manifest.notes ?? []) {
+    const folderID = typeof note.folderID === "string" ? note.folderID : null;
+    if (folderID) counts.set(folderID, (counts.get(folderID) ?? 0) + 1);
+  }
+  return counts;
+}
+
+function createProjectNoteFolder(projectID: string, name: string): NoteFolderItem {
+  const trimmed = name.trim();
+  if (!trimmed) throw new Error("Enter a folder name.");
+  const manifest = readNoteManifest(projectID);
+  const folders = manifest.folders ?? [];
+  // Match the Swift app: folder names are unique among top-level folders.
+  const clash = folders.some(
+    (folder) => normalizeTitle(folder.name, "Folder").toLowerCase() === trimmed.toLowerCase()
+  );
+  if (clash) throw new Error("A folder with that name already exists.");
+  const now = currentSwiftDate();
+  const folder: JsonObject = {
+    id: randomUUID().toLowerCase(),
+    name: trimmed,
+    parentFolderID: null,
+    createdAt: now,
+    updatedAt: now
+  };
+  manifest.folders = [...folders, folder];
+  writeNoteManifest(projectID, manifest);
+  return noteFolderItemFromManifest(projectID, folder, noteFolderCounts(manifest));
+}
+
+function renameProjectNoteFolder(projectID: string, folderID: string, name: string): NoteFolderItem {
+  const trimmed = name.trim();
+  if (!trimmed) throw new Error("Enter a folder name.");
+  const manifest = readNoteManifest(projectID);
+  const folders = manifest.folders ?? [];
+  const folder = folders.find((entry) => String(entry.id ?? "") === folderID);
+  if (!folder) throw new Error("Folder was not found.");
+  const clash = folders.some(
+    (entry) =>
+      String(entry.id ?? "") !== folderID &&
+      normalizeTitle(entry.name, "Folder").toLowerCase() === trimmed.toLowerCase()
+  );
+  if (clash) throw new Error("A folder with that name already exists.");
+  folder.name = trimmed;
+  folder.updatedAt = currentSwiftDate();
+  writeNoteManifest(projectID, manifest);
+  return noteFolderItemFromManifest(projectID, folder, noteFolderCounts(manifest));
+}
+
+function deleteProjectNoteFolder(projectID: string, folderID: string): { projectID: string; deletedFolderID: string } {
+  const manifest = readNoteManifest(projectID);
+  const folders = manifest.folders ?? [];
+  manifest.folders = folders.filter((entry) => String(entry.id ?? "") !== folderID);
+  // Detaching notes (rather than deleting them) keeps the notes themselves safe.
+  for (const note of manifest.notes ?? []) {
+    if (typeof note.folderID === "string" && note.folderID === folderID) note.folderID = null;
+  }
+  writeNoteManifest(projectID, manifest);
+  return { projectID: projectID.toUpperCase(), deletedFolderID: folderID };
+}
+
+function moveProjectNoteToFolder(projectID: string, noteID: string, folderID: string | null): { projectID: string; noteID: string; folderID: string | null } {
+  const manifest = readNoteManifest(projectID);
+  const note = (manifest.notes ?? []).find((entry) => String(entry.id ?? "") === noteID);
+  if (!note) throw new Error("Note was not found.");
+  if (folderID && !(manifest.folders ?? []).some((entry) => String(entry.id ?? "") === folderID)) {
+    throw new Error("Folder was not found.");
+  }
+  note.folderID = folderID;
+  note.updatedAt = currentSwiftDate();
+  writeNoteManifest(projectID, manifest);
+  return { projectID: projectID.toUpperCase(), noteID, folderID };
+}
+
+function normalizeNoteLinkTarget(target: unknown): NoteLinkTarget | null {
+  if (!target || typeof target !== "object") return null;
+  const raw = target as Record<string, unknown>;
+  const ownerKind = raw.ownerKind === "project" || raw.ownerKind === "thread" || raw.ownerKind === "planner"
+    ? raw.ownerKind
+    : undefined;
+  const ownerId = typeof raw.ownerId === "string" ? raw.ownerId.trim() : "";
+  const noteId = typeof raw.noteId === "string" ? raw.noteId.trim() : "";
+  if (!ownerKind || !ownerId || !noteId) return null;
+  return { ownerKind, ownerId, noteId };
+}
+
+function noteLinkKey(target: NoteLinkTarget) {
+  return `${target.ownerKind}:${target.ownerId.toLowerCase()}:${target.noteId.toLowerCase()}`;
+}
+
+function parseInternalNoteHref(href: string): NoteLinkTarget | null {
+  try {
+    const parsed = new URL(href.replace(/&amp;/g, "&"));
+    if (parsed.protocol !== "oa-note:" || parsed.hostname !== "open") return null;
+    const ownerKind = parsed.searchParams.get("ownerKind");
+    const ownerId = parsed.searchParams.get("ownerId")?.trim() ?? "";
+    const noteId = parsed.searchParams.get("noteId")?.trim() ?? "";
+    if ((ownerKind !== "project" && ownerKind !== "thread" && ownerKind !== "planner") || !ownerId || !noteId) return null;
+    return { ownerKind, ownerId, noteId };
+  } catch {
+    return null;
+  }
+}
+
+function extractInternalNoteLinks(markdown: string): NoteLinkTarget[] {
+  const links: NoteLinkTarget[] = [];
+  const matcher = /oa-note:\/\/open\?[^)\s>"']+/gi;
+  for (const match of markdown.matchAll(matcher)) {
+    const parsed = parseInternalNoteHref(match[0]);
+    if (parsed) links.push(parsed);
+  }
+  return links;
+}
+
+function safeMermaidLabel(value: string) {
+  return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, " ").slice(0, 90);
+}
+
+function relationForRecord(record: StoredNoteLinkRecord | undefined, target: NoteLinkTarget, occurrenceCount: number): NoteLinkRelation {
+  return {
+    ownerKind: target.ownerKind,
+    ownerId: target.ownerId,
+    noteId: target.noteId,
+    title: record?.title ?? "Missing note",
+    sourceLabel: record?.sourceLabel ?? "Not found",
+    occurrenceCount,
+    isMissing: !record
+  };
+}
+
+function scanStoredNoteLinkRecords(currentTarget: NoteLinkTarget, currentMarkdown?: string): StoredNoteLinkRecord[] {
+  const records: StoredNoteLinkRecord[] = [];
+  const currentKey = noteLinkKey(currentTarget);
+  const projects = loadProjects();
+
+  const addRecord = (record: StoredNoteLinkRecord) => {
+    records.push(record.key === currentKey && typeof currentMarkdown === "string"
+      ? { ...record, markdown: currentMarkdown.replace(/\r\n/g, "\n") }
+      : record);
+  };
+
+  const projectNotesRoot = path.join(projectStoreRoot(), "ProjectNotes");
+  if (fs.existsSync(projectNotesRoot)) {
+    for (const projectDir of fs.readdirSync(projectNotesRoot)) {
+      const ownerId = projectDir.toUpperCase();
+      if (projects.hiddenProjectIDs.has(ownerId.toLowerCase())) continue;
+      const sourceLabel = projects.projectNameByID.get(ownerId) ?? projects.projectNameByID.get(projectDir) ?? "Project notes";
+      const manifestPath = path.join(projectNotesRoot, projectDir, "notes", "manifest.json");
+      const notesDir = path.dirname(manifestPath);
+      const manifest = readJSON<{ notes?: JsonObject[] }>(manifestPath, {});
+      for (const note of manifest.notes ?? []) {
+        const noteId = String(note.id ?? "");
+        if (!noteId) continue;
+        const fileName = typeof note.fileName === "string" ? note.fileName : `${noteId}.md`;
+        const filePath = path.join(notesDir, fileName);
+        addRecord({
+          ownerKind: "project",
+          ownerId,
+          noteId,
+          key: noteLinkKey({ ownerKind: "project", ownerId, noteId }),
+          title: normalizeTitle(note.title, "Untitled note"),
+          sourceLabel,
+          markdown: fs.existsSync(filePath) ? fs.readFileSync(filePath, "utf8").replace(/\r\n/g, "\n") : ""
+        });
+      }
+    }
+  }
+
+  const conversationsRoot = conversationStoreRoot();
+  if (fs.existsSync(conversationsRoot)) {
+    for (const threadDir of fs.readdirSync(conversationsRoot)) {
+      const manifest = readThreadNoteManifest(threadDir);
+      if (!(manifest.notes ?? []).length) continue;
+      const sourceLabel = projects.threadTitles.get(threadDir) ?? "Thread notes";
+      const notesDir = threadNotesDirectory(threadDir);
+      for (const note of manifest.notes ?? []) {
+        const noteId = String(note.id ?? "");
+        if (!noteId || !note.fileName) continue;
+        const fileName = String(note.fileName);
+        const filePath = path.join(notesDir, fileName);
+        addRecord({
+          ownerKind: "thread",
+          ownerId: threadDir,
+          noteId,
+          key: noteLinkKey({ ownerKind: "thread", ownerId: threadDir, noteId }),
+          title: normalizeThreadNoteTitle(note.title),
+          sourceLabel,
+          markdown: fs.existsSync(filePath) ? fs.readFileSync(filePath, "utf8").replace(/\r\n/g, "\n") : ""
+        });
+      }
+    }
+  }
+
+  for (const day of listPlannerDays(365, plannerDayID())) {
+    const filePath = plannerDayPath(day.id);
+    addRecord({
+      ownerKind: "planner",
+      ownerId: "global",
+      noteId: day.id,
+      key: noteLinkKey({ ownerKind: "planner", ownerId: "global", noteId: day.id }),
+      title: day.title,
+      sourceLabel: "Planner",
+      markdown: fs.existsSync(filePath) ? fs.readFileSync(filePath, "utf8").replace(/\r\n/g, "\n") : ""
+    });
+  }
+
+  return records;
+}
+
+function buildNoteLinksSnapshot(target: NoteLinkTarget, currentMarkdown?: string): NoteLinksSnapshot {
+  const currentKey = noteLinkKey(target);
+  const records = scanStoredNoteLinkRecords(target, currentMarkdown);
+  const recordsByKey = new Map(records.map((record) => [record.key, record]));
+  const currentRecord = recordsByKey.get(currentKey) ?? {
+    ...target,
+    key: currentKey,
+    title: "Current note",
+    sourceLabel: "Current note",
+    markdown: typeof currentMarkdown === "string" ? currentMarkdown.replace(/\r\n/g, "\n") : ""
+  };
+
+  const outgoingCounts = new Map<string, { target: NoteLinkTarget; count: number }>();
+  for (const link of extractInternalNoteLinks(currentRecord.markdown)) {
+    const key = noteLinkKey(link);
+    const previous = outgoingCounts.get(key);
+    outgoingCounts.set(key, { target: link, count: (previous?.count ?? 0) + 1 });
+  }
+  const outgoingLinks = [...outgoingCounts.values()]
+    .map(({ target: linkedTarget, count }) => relationForRecord(recordsByKey.get(noteLinkKey(linkedTarget)), linkedTarget, count))
+    .sort((a, b) => a.title.localeCompare(b.title));
+
+  const backlinkCounts = new Map<string, { record: StoredNoteLinkRecord; count: number }>();
+  for (const record of records) {
+    if (record.key === currentKey) continue;
+    const count = extractInternalNoteLinks(record.markdown).filter((link) => noteLinkKey(link) === currentKey).length;
+    if (count > 0) backlinkCounts.set(record.key, { record, count });
+  }
+  const backlinks = [...backlinkCounts.values()]
+    .map(({ record, count }) => relationForRecord(record, record, count))
+    .sort((a, b) => a.title.localeCompare(b.title));
+
+  const nodeRecords = new Map<string, StoredNoteLinkRecord | (NoteLinkRelation & { key: string })>();
+  nodeRecords.set(currentKey, currentRecord);
+  for (const relation of outgoingLinks) {
+    const key = noteLinkKey(relation);
+    nodeRecords.set(key, { ...relation, key });
+  }
+  for (const relation of backlinks) {
+    const key = noteLinkKey(relation);
+    nodeRecords.set(key, { ...relation, key });
+  }
+
+  const nodeIDByKey = new Map<string, string>();
+  const nodes: NoteLinkGraphNode[] = [...nodeRecords.entries()].map(([key, record], index) => {
+    const id = `note_${index}`;
+    nodeIDByKey.set(key, id);
+    return {
+      id,
+      ownerKind: record.ownerKind,
+      ownerId: record.ownerId,
+      noteId: record.noteId,
+      title: record.title,
+      sourceLabel: record.sourceLabel,
+      isCurrent: key === currentKey,
+      isMissing: "isMissing" in record ? record.isMissing : false
+    };
+  });
+
+  const edges: NoteLinkGraphEdge[] = [
+    ...outgoingLinks.map((link) => ({
+      from: nodeIDByKey.get(currentKey) ?? "note_0",
+      to: nodeIDByKey.get(noteLinkKey(link)) ?? "note_0",
+      occurrenceCount: link.occurrenceCount
+    })),
+    ...backlinks.map((link) => ({
+      from: nodeIDByKey.get(noteLinkKey(link)) ?? "note_0",
+      to: nodeIDByKey.get(currentKey) ?? "note_0",
+      occurrenceCount: link.occurrenceCount
+    }))
+  ];
+
+  const mermaidLines = ["flowchart LR"];
+  for (const node of nodes) {
+    const label = node.isCurrent ? `${node.title} (current)` : node.title;
+    mermaidLines.push(`  ${node.id}["${safeMermaidLabel(label)}"]`);
+  }
+  for (const edge of edges) {
+    mermaidLines.push(`  ${edge.from} --> ${edge.to}`);
+  }
+
+  return {
+    outgoingLinks,
+    backlinks,
+    graph: edges.length
+      ? {
+        nodeCount: nodes.length,
+        edgeCount: edges.length,
+        mermaidCode: mermaidLines.join("\n"),
+        nodes,
+        edges
+      }
+      : null
+  };
+}
+
+function loadNoteLinks(target: unknown, currentMarkdown?: string): NoteLinksSnapshot {
+  const normalizedTarget = normalizeNoteLinkTarget(target);
+  if (!normalizedTarget) return { outgoingLinks: [], backlinks: [], graph: null };
+  return buildNoteLinksSnapshot(normalizedTarget, currentMarkdown);
+}
+
+type KnowledgeItemKind = "project_note" | "thread_note" | "planner_day" | "journal_day";
+
+type KnowledgeItem = {
+  id: string;
+  kind: KnowledgeItemKind;
+  title: string;
+  sourceLabel: string;
+  markdown: string;
+  target?: NoteLinkTarget;
+  dailyItems?: DailyItem[];
+  path?: string;
+  dayID?: string;
+  updatedAt?: number;
+};
+
+type KnowledgeSearchResult = {
+  id: string;
+  kind: KnowledgeItemKind;
+  title: string;
+  sourceLabel: string;
+  snippet: string;
+  score: number;
+  updatedAt?: number;
+};
+
+const knowledgeTimelineSourceTypes = [
+  "project_note",
+  "thread_note",
+  "planner_day",
+  "journal_day",
+  "thread_message",
+  "thread_activity",
+  "realtime_delegation",
+  "backlog_item",
+  "knowledge_request",
+  "artifact"
+] as const;
+
+type KnowledgeTimelineSourceType = typeof knowledgeTimelineSourceTypes[number];
+
+type KnowledgeTimelineDocument = {
+  id: string;
+  sourceType: KnowledgeTimelineSourceType;
+  sourceID: string;
+  title: string;
+  sourceLabel: string;
+  text: string;
+  threadID?: string;
+  projectID?: string;
+  dayID?: string;
+  path?: string;
+  role?: string;
+  createdAt?: number;
+  updatedAt?: number;
+  metadata?: JsonObject;
+};
+
+type KnowledgeTimelineSearchResult = {
+  id: string;
+  sourceType: KnowledgeTimelineSourceType;
+  sourceID: string;
+  title: string;
+  sourceLabel: string;
+  snippet: string;
+  threadID?: string;
+  projectID?: string;
+  dayID?: string;
+  path?: string;
+  role?: string;
+  createdAt?: number;
+  updatedAt?: number;
+  score?: number;
+  metadata?: JsonObject;
+};
+
+type KnowledgeTaskItem = {
+  id: string;
+  itemID: string;
+  kind: KnowledgeItemKind;
+  title: string;
+  sourceLabel: string;
+  text: string;
+  line: number;
+  dayID?: string;
+};
+
+type KnowledgePreview =
+  | { kind: "planner_append"; dayID: string; section: string; content: string }
+  | { kind: "planner_move"; fromDayID: string; dayID: string; section: string; content: string; removeTexts: string[] }
+  | { kind: "planner_backlog_move"; entries: { dayID: string; text: string }[] }
+  | { kind: "daily_item_upsert"; item: DailyItemInput }
+  | { kind: "daily_item_delete"; dayID: string; itemID: string }
+  | { kind: "replace_markdown"; itemID: string; markdown: string; previousMarkdown?: string; title?: string };
+
+type KnowledgeWriteRequest = {
+  id: string;
+  action: string;
+  source: "http" | "mcp" | "voice" | "app";
+  status: "pending" | "applied" | "rejected";
+  createdAt: string;
+  updatedAt: string;
+  goal: string;
+  payload: JsonObject;
+  preview?: KnowledgePreview;
+  appliedAt?: string;
+  rejectedAt?: string;
+};
+
+function knowledgeRoot() {
+  return path.join(supportRoot(), "Knowledge");
+}
+
+function knowledgeAccessTokenPath() {
+  return path.join(knowledgeRoot(), knowledgeAccessTokenFileName);
+}
+
+function knowledgeServerStatePath() {
+  return path.join(knowledgeRoot(), knowledgeServerStateFileName);
+}
+
+function knowledgeWriteRequestsPath() {
+  return path.join(knowledgeRoot(), "write-requests.json");
+}
+
+function knowledgeServerURL(port: string | number) {
+  const parsed = Number.parseInt(String(port), 10);
+  const safePort = Number.isInteger(parsed) && parsed > 0 ? parsed : Number(defaultKnowledgeServerPort);
+  return `http://127.0.0.1:${safePort}`;
+}
+
+function ensureKnowledgeAccessToken() {
+  const tokenPath = knowledgeAccessTokenPath();
+  if (fs.existsSync(tokenPath)) {
+    const existing = fs.readFileSync(tokenPath, "utf8").trim();
+    if (existing) return existing;
+  }
+  fs.mkdirSync(path.dirname(tokenPath), { recursive: true });
+  const token = `oa_knowledge_${randomUUID().replace(/-/g, "")}${randomUUID().replace(/-/g, "")}`;
+  fs.writeFileSync(tokenPath, `${token}\n`, { encoding: "utf8", mode: 0o600 });
+  try {
+    fs.chmodSync(tokenPath, 0o600);
+  } catch {
+    // Best effort. The file is still inside the app support directory.
+  }
+  return token;
+}
+
+function writeKnowledgeServerState(port: string | number, token: string, enabled: boolean) {
+  fs.mkdirSync(knowledgeRoot(), { recursive: true });
+  writeJSON(knowledgeServerStatePath(), {
+    enabled,
+    baseURL: knowledgeServerURL(port),
+    token,
+    mcpURL: `${knowledgeServerURL(port)}/mcp`,
+    updatedAt: new Date().toISOString()
+  });
+}
+
+function knowledgeItemID(target: NoteLinkTarget, kind: KnowledgeItemKind = target.ownerKind === "planner" ? "planner_day" : target.ownerKind === "thread" ? "thread_note" : "project_note") {
+  return `${kind}:${target.ownerKind}:${target.ownerId}:${target.noteId}`;
+}
+
+function parseKnowledgeItemID(id: string): { kind: KnowledgeItemKind; target?: NoteLinkTarget; dayID?: string } | null {
+  const parts = String(id ?? "").split(":");
+  const kind = parts[0] as KnowledgeItemKind;
+  if (!["project_note", "thread_note", "planner_day", "journal_day"].includes(kind)) return null;
+  if ((kind === "planner_day" || kind === "journal_day") && parts.length >= 4) {
+    return {
+      kind,
+      target: { ownerKind: "planner", ownerId: parts[2] || "global", noteId: parts.slice(3).join(":") },
+      dayID: parts.slice(3).join(":")
+    };
+  }
+  if (parts.length < 4) return null;
+  const ownerKind = parts[1] as NoteLinkOwnerKind;
+  if (ownerKind !== "project" && ownerKind !== "thread" && ownerKind !== "planner") return null;
+  return {
+    kind,
+    target: { ownerKind, ownerId: parts[2], noteId: parts.slice(3).join(":") }
+  };
+}
+
+function markdownSection(markdown: string, heading: string) {
+  const source = String(markdown ?? "").replace(/\r\n/g, "\n");
+  const escaped = heading.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = new RegExp(`(^|\\n)##\\s+${escaped}\\s*\\n`, "i").exec(source);
+  if (!match) return "";
+  const start = match.index + match[0].length;
+  const rest = source.slice(start);
+  const nextHeading = rest.search(/\n##\s+/);
+  return (nextHeading >= 0 ? rest.slice(0, nextHeading) : rest).trim();
+}
+
+function replaceMarkdownSection(markdown: string, heading: string, content: string) {
+  const source = ensurePlannerSection(String(markdown ?? "").replace(/\r\n/g, "\n"), heading);
+  const escaped = heading.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = new RegExp(`(^|\\n)(##\\s+${escaped}\\s*\\n)`, "i").exec(source);
+  if (!match) return `${source.trimEnd()}\n\n## ${heading}\n${content.trim()}\n`;
+  const start = match.index + match[0].length;
+  const rest = source.slice(start);
+  const nextHeading = rest.search(/\n##\s+/);
+  const after = nextHeading >= 0 ? rest.slice(nextHeading) : "";
+  return `${source.slice(0, start)}${content.trim()}\n${after}`;
+}
+
+function knowledgeSnippet(markdown: string, query: string) {
+  const text = String(markdown ?? "")
+    .replace(/```[\s\S]*?```/g, " ")
+    .replace(/[#>*_`[\]()!-]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!text) return "";
+  const normalizedQuery = query.trim().toLowerCase();
+  const index = normalizedQuery ? text.toLowerCase().indexOf(normalizedQuery) : -1;
+  const start = index >= 0 ? Math.max(0, index - 80) : 0;
+  return `${start > 0 ? "..." : ""}${text.slice(start, start + 220)}${start + 220 < text.length ? "..." : ""}`;
+}
+
+function knowledgeItems(): KnowledgeItem[] {
+  const records = scanStoredNoteLinkRecords({ ownerKind: "planner", ownerId: "global", noteId: plannerDayID() });
+  const items: KnowledgeItem[] = [];
+  for (const record of records) {
+    const kind: KnowledgeItemKind = record.ownerKind === "planner"
+      ? "planner_day"
+      : record.ownerKind === "thread"
+        ? "thread_note"
+        : "project_note";
+    const filePath = record.ownerKind === "planner"
+      ? plannerDayPath(record.noteId)
+      : record.ownerKind === "project"
+        ? (() => {
+          const manifest = readNoteManifest(record.ownerId);
+          const note = (manifest.notes ?? []).find((entry) => String(entry.id ?? "") === record.noteId);
+          const fileName = typeof note?.fileName === "string" ? note.fileName : `${record.noteId}.md`;
+          return path.join(noteDirectoryPath(record.ownerId), fileName);
+        })()
+        : path.join(threadNotesDirectory(record.ownerId), `${record.noteId}.md`);
+    const updatedAt = filePath && fs.existsSync(filePath) ? fs.statSync(filePath).mtimeMs : undefined;
+    const target = { ownerKind: record.ownerKind, ownerId: record.ownerId, noteId: record.noteId };
+    items.push({
+      id: knowledgeItemID(target, kind),
+      kind,
+      title: record.title,
+      sourceLabel: record.sourceLabel,
+      markdown: record.markdown,
+      target,
+      dailyItems: record.ownerKind === "planner" ? parseDailyItemsFromMarkdown(record.noteId, record.markdown) : undefined,
+      path: filePath,
+      dayID: record.ownerKind === "planner" ? record.noteId : undefined,
+      updatedAt
+    });
+    if (record.ownerKind === "planner") {
+      const journal = markdownSection(record.markdown, "Journal");
+      items.push({
+        id: `journal_day:planner:global:${record.noteId}`,
+        kind: "journal_day",
+        title: `${record.title} Journal`,
+        sourceLabel: "Planner Journal",
+        markdown: journal,
+        target,
+        path: filePath,
+        dayID: record.noteId,
+        updatedAt
+      });
+    }
+  }
+  return items;
+}
+
+function readKnowledgeItem(itemID: string) {
+  const parsed = parseKnowledgeItemID(itemID);
+  if (!parsed) throw new Error("Unknown knowledge item id.");
+  const item = knowledgeItems().find((candidate) => candidate.id === itemID);
+  if (!item) throw new Error("Knowledge item was not found.");
+  return item;
+}
+
+function searchKnowledge(query = "", limit = 20, source?: string): KnowledgeSearchResult[] {
+  const terms = query
+    .toLowerCase()
+    .split(/\s+/)
+    .map((term) => term.trim())
+    .filter(Boolean);
+  return knowledgeItems()
+    .filter((item) => !source || item.kind === source)
+    .map((item) => {
+      const haystack = `${item.title}\n${item.sourceLabel}\n${item.markdown}`.toLowerCase();
+      const score = terms.length
+        ? terms.reduce((total, term) => total + (haystack.includes(term) ? term.length : 0), 0)
+        : (item.updatedAt ?? 0) / 1_000_000_000;
+      return {
+        id: item.id,
+        kind: item.kind,
+        title: item.title,
+        sourceLabel: item.sourceLabel,
+        snippet: knowledgeSnippet(item.markdown, query),
+        score,
+        updatedAt: item.updatedAt
+      } satisfies KnowledgeSearchResult;
+    })
+    .filter((item) => terms.length === 0 || item.score > 0)
+    .sort((a, b) => b.score - a.score || (b.updatedAt ?? 0) - (a.updatedAt ?? 0))
+    .slice(0, Math.max(1, Math.min(100, limit)));
+}
+
+const knowledgeTimelineIndexVersion = 1;
+const knowledgeTimelineIndexMaxBuffer = 48 * 1024 * 1024;
+let knowledgeTimelineIndexFingerprint = "";
+
+function knowledgeTimelineIndexPath() {
+  return path.join(knowledgeRoot(), "timeline-search.sqlite");
+}
+
+function normalizeSearchText(value: unknown, maxLength = 12_000) {
+  let text = "";
+  if (typeof value === "string") {
+    text = value;
+  } else if (value != null) {
+    try {
+      text = JSON.stringify(value);
+    } catch {
+      text = String(value);
+    }
+  }
+  text = text
+    .replace(/\r\n/g, "\n")
+    .replace(/```[\s\S]*?```/g, (match) => match.replace(/[`\r]/g, " "))
+    .replace(/\s+\n/g, "\n")
+    .replace(/[ \t]+/g, " ")
+    .replace(/\n{4,}/g, "\n\n\n")
+    .trim();
+  return text.length > maxLength ? `${text.slice(0, maxLength).trimEnd()}...` : text;
+}
+
+function shortSearchText(value: unknown, maxLength = 900) {
+  const text = normalizeSearchText(value, maxLength).replace(/\s+/g, " ").trim();
+  return text.length > maxLength ? `${text.slice(0, maxLength).trimEnd()}...` : text;
+}
+
+function knowledgeTimelineID(prefix: string, ...parts: unknown[]) {
+  const hash = createHash("sha1")
+    .update(parts.map((part) => String(part ?? "")).join("\0"))
+    .digest("hex")
+    .slice(0, 20);
+  return `${prefix}:${hash}`;
+}
+
+function dateStringToMs(value: unknown, endOfDay = false) {
+  const text = String(value ?? "").trim();
+  if (!text) return undefined;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(text)) {
+    const date = plannerDateFromDayID(text);
+    if (endOfDay) date.setDate(date.getDate() + 1);
+    return date.getTime() - (endOfDay ? 1 : 0);
+  }
+  const parsed = Date.parse(text);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function sourceTypesFromValue(value: unknown): KnowledgeTimelineSourceType[] | undefined {
+  const raw = Array.isArray(value) ? value : typeof value === "string" && value.trim() ? [value] : [];
+  const allowed = new Set<string>(knowledgeTimelineSourceTypes);
+  const result = raw
+    .map((item) => String(item ?? "").trim())
+    .filter((item): item is KnowledgeTimelineSourceType => allowed.has(item));
+  return result.length ? result : undefined;
+}
+
+function timelineDocDate(doc: KnowledgeTimelineDocument | KnowledgeTimelineSearchResult) {
+  return doc.updatedAt ?? doc.createdAt ?? 0;
+}
+
+function pushKnowledgeTimelineDocument(target: KnowledgeTimelineDocument[], doc: KnowledgeTimelineDocument) {
+  const text = normalizeSearchText(doc.text);
+  if (!text && !doc.title.trim()) return;
+  target.push({
+    ...doc,
+    title: normalizeTitle(doc.title, "Untitled"),
+    sourceLabel: normalizeTitle(doc.sourceLabel, doc.sourceType),
+    text
+  });
+}
+
+function dailyItemSearchText(item: DailyItem) {
+  return [
+    dailyItemVisibleTitle(item),
+    item.area ? `Area: ${item.area}` : "",
+    item.projectName ? `Project: ${item.projectName}` : "",
+    item.folderName ? `Folder: ${item.folderName}` : "",
+    item.detailsMarkdown,
+    item.steps?.map((step) => `${step.checked ? "Done" : "Open"} step: ${step.text}`).join("\n") ?? "",
+    item.scopeTags?.map((tag) => `${tag.marker}${tag.label}`).join(" ") ?? "",
+    item.links?.map((link) => JSON.stringify(link)).join("\n") ?? ""
+  ].filter(Boolean).join("\n");
+}
+
+function knowledgeRequestSearchText(request: KnowledgeWriteRequest) {
+  return [
+    request.goal,
+    `Action: ${request.action}`,
+    `Status: ${request.status}`,
+    `Source: ${request.source}`,
+    request.payload ? `Payload: ${JSON.stringify(request.payload)}` : "",
+    request.preview ? `Preview: ${JSON.stringify(request.preview)}` : ""
+  ].filter(Boolean).join("\n");
+}
+
+function addArtifactTimelineDocuments(
+  docs: KnowledgeTimelineDocument[],
+  artifacts: MessageArtifact[],
+  context: {
+    threadID: string;
+    projectID?: string;
+    threadTitle: string;
+    parentID: string;
+    createdAt?: number;
+    updatedAt?: number;
+  }
+) {
+  for (const artifact of artifacts) {
+    const artifactPath = String(artifact.path ?? "").trim();
+    const name = normalizeTitle(artifact.name, artifactPath ? path.basename(artifactPath) : "Generated file");
+    pushKnowledgeTimelineDocument(docs, {
+      id: knowledgeTimelineID("artifact", context.threadID, context.parentID, artifactPath || name),
+      sourceType: "artifact",
+      sourceID: artifactPath || name,
+      title: name,
+      sourceLabel: `Artifact in ${context.threadTitle}`,
+      text: [
+        name,
+        artifactPath ? `Path: ${artifactPath}` : "",
+        artifact.mimeType ? `Type: ${artifact.mimeType}` : "",
+        typeof artifact.size === "number" ? `Size: ${artifact.size} bytes` : ""
+      ].filter(Boolean).join("\n"),
+      threadID: context.threadID,
+      projectID: context.projectID,
+      path: artifactPath || undefined,
+      createdAt: context.createdAt,
+      updatedAt: context.updatedAt,
+      metadata: { parentID: context.parentID, kind: artifact.kind }
+    });
+  }
+}
+
+function knowledgeTimelineDocuments(): KnowledgeTimelineDocument[] {
+  const docs: KnowledgeTimelineDocument[] = [];
+  const projects = loadProjects();
+  const assignmentsByLower = new Map(
+    Object.entries(projects.threadAssignments).map(([threadID, projectID]) => [threadID.toLowerCase(), projectID])
+  );
+  const registryByLower = new Map(loadSessionRegistry().sessions.map((session) => [session.id.toLowerCase(), session]));
+
+  for (const item of knowledgeItems()) {
+    const projectID = item.target?.ownerKind === "project" ? item.target.ownerId : undefined;
+    const threadID = item.target?.ownerKind === "thread" ? item.target.ownerId : undefined;
+    pushKnowledgeTimelineDocument(docs, {
+      id: item.id,
+      sourceType: item.kind,
+      sourceID: item.id,
+      title: item.title,
+      sourceLabel: item.sourceLabel,
+      text: item.markdown,
+      threadID,
+      projectID,
+      dayID: item.dayID,
+      path: item.path,
+      updatedAt: item.updatedAt,
+      metadata: { itemID: item.id, kind: item.kind }
+    });
+  }
+
+  for (const item of listBacklogItems()) {
+    pushKnowledgeTimelineDocument(docs, {
+      id: `backlog_item:${item.id}`,
+      sourceType: "backlog_item",
+      sourceID: item.id,
+      title: dailyItemVisibleTitle(item),
+      sourceLabel: "Backlog",
+      text: dailyItemSearchText(item),
+      dayID: plannerBacklogID,
+      createdAt: dateStringToMs(item.createdAt),
+      updatedAt: dateStringToMs(item.updatedAt),
+      metadata: { itemID: item.id, checked: item.checked, area: item.area }
+    });
+  }
+
+  for (const request of readKnowledgeRequests()) {
+    pushKnowledgeTimelineDocument(docs, {
+      id: `knowledge_request:${request.id}`,
+      sourceType: "knowledge_request",
+      sourceID: request.id,
+      title: normalizeTitle(request.goal, request.action),
+      sourceLabel: "Knowledge approval",
+      text: knowledgeRequestSearchText(request),
+      createdAt: dateStringToMs(request.createdAt),
+      updatedAt: dateStringToMs(request.updatedAt),
+      metadata: { requestID: request.id, action: request.action, status: request.status, source: request.source }
+    });
+  }
+
+  const root = conversationStoreRoot();
+  if (!fs.existsSync(root)) {
+    return dedupeKnowledgeTimelineDocuments(docs);
+  }
+
+  const dirs = fs.readdirSync(root)
+    .filter((dir) => fs.existsSync(path.join(root, dir, "conversation.json")));
+
+  for (const dir of dirs) {
+    const snapshot = readConversationSnapshot(dir);
+    const threadID = String(snapshot.threadID ?? dir);
+    const session = registryByLower.get(threadID.toLowerCase());
+    const projectID = assignmentsByLower.get(threadID.toLowerCase()) || session?.projectID;
+    const threadTitle = normalizeTitle(
+      session?.title && session.title !== "New Assistant Session" ? session.title : "",
+      normalizeTitle(
+        session?.latestUserMessage,
+        projects.threadTitles.get(threadID) || latestTranscriptText(snapshot.transcript, "user") || "Untitled chat"
+      )
+    );
+    const defaultUpdatedAt = swiftDateToMs(snapshot.updatedAt) ?? swiftDateToMs(session?.updatedAt) ?? Date.now();
+    const timeline = displayOrderedTimeline(snapshot.timeline ?? []);
+
+    if (timeline.length) {
+      timeline.forEach((entry, index) => {
+        const kind = timelineEntryKind(entry);
+        const displayID = timelineDisplayID(threadID, entry, index);
+        if (kind === "userMessage" || kind === "assistantFinal" || kind === "assistantProgress") {
+          const text = normalizeTitle(entry.text, "");
+          if (!text) return;
+          const role = kind === "userMessage" ? "user" : "assistant";
+          const createdAt = swiftDateToMs(entry.createdAt);
+          const updatedAt = swiftDateToMs(entry.updatedAt) ?? defaultUpdatedAt;
+          const artifacts = kind === "userMessage" ? [] : messageArtifactsFromStored(entry.artifacts);
+          pushKnowledgeTimelineDocument(docs, {
+            id: knowledgeTimelineID("thread_message", threadID, displayID, role),
+            sourceType: "thread_message",
+            sourceID: displayID,
+            title: threadTitle,
+            sourceLabel: `${role === "user" ? "User" : "Assistant"} message`,
+            text,
+            threadID,
+            projectID,
+            role,
+            createdAt,
+            updatedAt,
+            metadata: { threadID, timelineID: displayID, timelineKind: kind, index }
+          });
+          addArtifactTimelineDocuments(docs, artifacts, {
+            threadID,
+            projectID,
+            threadTitle,
+            parentID: displayID,
+            createdAt,
+            updatedAt
+          });
+          return;
+        }
+        if (kind !== "activity") return;
+        const activity = runtimeObject(entry.activity);
+        if (!activity) return;
+        const activityKind = firstRuntimeString(activity.kind, "tool");
+        const title = firstRuntimeString(activity.title, activity.friendlySummary, entry.title, "Tool work");
+        const detail = storedRuntimeString(activity.rawDetails, activity.detail, entry.text, activity.result, activity.output);
+        const normalizedTitle = title.replace(/\s+/g, " ").trim().toLowerCase();
+        if (normalizedTitle === "user message") return;
+        if (isRuntimeMessageItemType(activityKind)) return;
+        if ((activityKind === "reasoning" || normalizedTitle === "reasoning") && isGenericRuntimeDetail(detail || title)) return;
+        if (normalizedTitle === "agent message" && isGenericRuntimeDetail(detail)) return;
+        const createdAtValue = isStoredRealtimeDelegationEntry(entry)
+          ? activity.startedAt ?? activity.updatedAt ?? entry.createdAt
+          : entry.createdAt ?? activity.startedAt;
+        const createdAt = swiftDateToMs(createdAtValue);
+        const updatedAt = swiftDateToMs(entry.updatedAt ?? activity.updatedAt) ?? defaultUpdatedAt;
+        const sourceType: KnowledgeTimelineSourceType = isStoredRealtimeDelegationEntry(entry)
+          ? "realtime_delegation"
+          : "thread_activity";
+        pushKnowledgeTimelineDocument(docs, {
+          id: knowledgeTimelineID(sourceType, threadID, displayID, index),
+          sourceType,
+          sourceID: displayID,
+          title,
+          sourceLabel: sourceType === "realtime_delegation" ? `Realtime in ${threadTitle}` : `Activity in ${threadTitle}`,
+          text: [title, detail].filter(Boolean).join("\n"),
+          threadID,
+          projectID,
+          role: "activity",
+          createdAt,
+          updatedAt,
+          metadata: { threadID, timelineID: displayID, timelineKind: kind, activityKind, index }
+        });
+        const storedArtifacts = messageArtifactsFromStored(activity.artifacts);
+        const artifacts = storedArtifacts.length ? storedArtifacts : messageArtifactsFromText(detail);
+        addArtifactTimelineDocuments(docs, artifacts, {
+          threadID,
+          projectID,
+          threadTitle,
+          parentID: displayID,
+          createdAt,
+          updatedAt
+        });
+      });
+    } else {
+      (snapshot.transcript ?? []).forEach((entry, index) => {
+        if (entry.role !== "user" && entry.role !== "assistant") return;
+        const text = normalizeTitle(entry.text, "");
+        if (!text) return;
+        const role = String(entry.role);
+        const sourceID = String(entry.id ?? `${threadID}-transcript-${index}`);
+        pushKnowledgeTimelineDocument(docs, {
+          id: knowledgeTimelineID("thread_message", threadID, sourceID, role),
+          sourceType: "thread_message",
+          sourceID,
+          title: threadTitle,
+          sourceLabel: `${role === "user" ? "User" : "Assistant"} message`,
+          text,
+          threadID,
+          projectID,
+          role,
+          createdAt: swiftDateToMs(entry.createdAt),
+          updatedAt: swiftDateToMs(entry.updatedAt) ?? defaultUpdatedAt,
+          metadata: { threadID, transcriptID: sourceID, index }
+        });
+      });
+    }
+  }
+
+  return dedupeKnowledgeTimelineDocuments(docs);
+}
+
+function dedupeKnowledgeTimelineDocuments(docs: KnowledgeTimelineDocument[]) {
+  const seen = new Map<string, KnowledgeTimelineDocument>();
+  for (const doc of docs) {
+    if (!doc.id) continue;
+    const existing = seen.get(doc.id);
+    if (!existing || timelineDocDate(doc) > timelineDocDate(existing)) {
+      seen.set(doc.id, doc);
+    }
+  }
+  return [...seen.values()];
+}
+
+function knowledgeTimelineFingerprint(docs: KnowledgeTimelineDocument[]) {
+  const hash = createHash("sha1");
+  for (const doc of docs) {
+    hash.update(`${doc.id}:${doc.sourceType}:${doc.updatedAt ?? doc.createdAt ?? 0}:${doc.text.length}\n`);
+  }
+  return hash.digest("hex");
+}
+
+function runKnowledgeSQLite(database: string, sql: string) {
+  fs.mkdirSync(path.dirname(database), { recursive: true });
+  execFileSync("sqlite3", [database], {
+    input: sql,
+    encoding: "utf8",
+    maxBuffer: knowledgeTimelineIndexMaxBuffer
+  });
+}
+
+function queryKnowledgeSQLite<T>(database: string, sql: string): T[] {
+  const output = execFileSync("sqlite3", ["-json", database, sql], {
+    encoding: "utf8",
+    maxBuffer: knowledgeTimelineIndexMaxBuffer
+  });
+  const trimmed = output.trim();
+  return trimmed ? JSON.parse(trimmed) as T[] : [];
+}
+
+function ensureKnowledgeTimelineIndex(docs = knowledgeTimelineDocuments()) {
+  const database = knowledgeTimelineIndexPath();
+  const fingerprint = knowledgeTimelineFingerprint(docs);
+  if (fingerprint === knowledgeTimelineIndexFingerprint && fs.existsSync(database)) return database;
+  for (const filePath of [database, `${database}-wal`, `${database}-shm`]) {
+    try {
+      fs.rmSync(filePath, { force: true });
+    } catch {
+      // Rebuildable cache cleanup is best effort.
+    }
+  }
+
+  const schema = `
+PRAGMA journal_mode=WAL;
+CREATE TABLE IF NOT EXISTS timeline_meta (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS timeline_docs (
+  id TEXT PRIMARY KEY,
+  source_type TEXT NOT NULL,
+  source_id TEXT NOT NULL,
+  title TEXT NOT NULL,
+  source_label TEXT NOT NULL,
+  body TEXT NOT NULL,
+  thread_id TEXT,
+  project_id TEXT,
+  day_id TEXT,
+  path TEXT,
+  role TEXT,
+  created_at REAL,
+  updated_at REAL,
+  metadata_json TEXT
+);
+DELETE FROM timeline_docs;
+INSERT OR REPLACE INTO timeline_meta(key, value) VALUES ('version', ${sqliteText(String(knowledgeTimelineIndexVersion))});
+`;
+  runKnowledgeSQLite(database, schema);
+
+  for (let index = 0; index < docs.length; index += 150) {
+    const batch = docs.slice(index, index + 150);
+    const rows = batch.flatMap((doc) => {
+      const metadata = doc.metadata ? JSON.stringify(doc.metadata) : "";
+      return [
+        `INSERT OR REPLACE INTO timeline_docs(id, source_type, source_id, title, source_label, body, thread_id, project_id, day_id, path, role, created_at, updated_at, metadata_json) VALUES (` +
+          [
+            doc.id,
+            doc.sourceType,
+            doc.sourceID,
+            doc.title,
+            doc.sourceLabel,
+            doc.text,
+            doc.threadID ?? "",
+            doc.projectID ?? "",
+            doc.dayID ?? "",
+            doc.path ?? "",
+            doc.role ?? "",
+            Number.isFinite(doc.createdAt ?? Number.NaN) ? String(doc.createdAt) : "NULL",
+            Number.isFinite(doc.updatedAt ?? Number.NaN) ? String(doc.updatedAt) : "NULL",
+            metadata
+          ].map((value) => value === "NULL" ? value : sqliteText(String(value))).join(", ") +
+          `);`
+      ];
+    }).join("\n");
+    runKnowledgeSQLite(database, `BEGIN;\n${rows}\nCOMMIT;`);
+  }
+
+  knowledgeTimelineIndexFingerprint = fingerprint;
+  return database;
+}
+
+function timelineSearchTokens(query: string) {
+  return query
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}@#._-]+/gu, " ")
+    .split(/\s+/)
+    .map((token) => token.trim().replace(/^[-_.#@]+|[-_.#@]+$/g, ""))
+    .filter((token) => token.length >= 2)
+    .slice(0, 14);
+}
+
+function knowledgeTimelineResultFromRow(row: Record<string, unknown>): KnowledgeTimelineSearchResult {
+  const metadataText = typeof row.metadata_json === "string" ? row.metadata_json : "";
+  let metadata: JsonObject | undefined;
+  try {
+    metadata = metadataText ? jsonObject(JSON.parse(metadataText)) : undefined;
+  } catch {
+    metadata = undefined;
+  }
+  return {
+    id: String(row.id ?? ""),
+    sourceType: String(row.source_type ?? "thread_message") as KnowledgeTimelineSourceType,
+    sourceID: String(row.source_id ?? ""),
+    title: String(row.title ?? ""),
+    sourceLabel: String(row.source_label ?? ""),
+    snippet: String(row.snippet ?? ""),
+    threadID: String(row.thread_id ?? "") || undefined,
+    projectID: String(row.project_id ?? "") || undefined,
+    dayID: String(row.day_id ?? "") || undefined,
+    path: String(row.path ?? "") || undefined,
+    role: String(row.role ?? "") || undefined,
+    createdAt: Number.isFinite(Number(row.created_at)) ? Number(row.created_at) : undefined,
+    updatedAt: Number.isFinite(Number(row.updated_at)) ? Number(row.updated_at) : undefined,
+    score: Number.isFinite(Number(row.rank)) ? Number(row.rank) : undefined,
+    metadata
+  };
+}
+
+function searchKnowledgeTimelineInMemory(
+  query: string,
+  options: { sourceTypes?: KnowledgeTimelineSourceType[]; fromDate?: string; toDate?: string; limit?: number } = {},
+  docs = knowledgeTimelineDocuments()
+) {
+  const terms = query
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}@#._-]+/gu, " ")
+    .split(/\s+/)
+    .map((term) => term.trim())
+    .filter(Boolean);
+  const sourceSet = options.sourceTypes?.length ? new Set(options.sourceTypes) : null;
+  const fromMs = dateStringToMs(options.fromDate);
+  const toMs = dateStringToMs(options.toDate, true);
+  return docs
+    .filter((doc) => !sourceSet || sourceSet.has(doc.sourceType))
+    .filter((doc) => fromMs === undefined || timelineDocDate(doc) >= fromMs)
+    .filter((doc) => toMs === undefined || timelineDocDate(doc) <= toMs)
+    .map((doc) => {
+      const haystack = `${doc.title}\n${doc.sourceLabel}\n${doc.text}`.toLowerCase();
+      const score = terms.length
+        ? terms.reduce((total, term) => total + (haystack.includes(term) ? term.length : 0), 0)
+        : timelineDocDate(doc) / 1_000_000;
+      return {
+        id: doc.id,
+        sourceType: doc.sourceType,
+        sourceID: doc.sourceID,
+        title: doc.title,
+        sourceLabel: doc.sourceLabel,
+        snippet: knowledgeSnippet(doc.text, query),
+        threadID: doc.threadID,
+        projectID: doc.projectID,
+        dayID: doc.dayID,
+        path: doc.path,
+        role: doc.role,
+        createdAt: doc.createdAt,
+        updatedAt: doc.updatedAt,
+        score,
+        metadata: doc.metadata
+      } satisfies KnowledgeTimelineSearchResult;
+    })
+    .filter((doc) => terms.length === 0 || (doc.score ?? 0) > 0)
+    .sort((a, b) => (b.score ?? 0) - (a.score ?? 0) || timelineDocDate(b) - timelineDocDate(a))
+    .slice(0, Math.max(1, Math.min(25, Math.floor(options.limit ?? 5))));
+}
+
+function searchKnowledgeTimeline(query = "", options: {
+  sourceTypes?: KnowledgeTimelineSourceType[];
+  fromDate?: string;
+  toDate?: string;
+  limit?: number;
+} = {}): KnowledgeTimelineSearchResult[] {
+  const docs = knowledgeTimelineDocuments();
+  const limit = Math.max(1, Math.min(25, Math.floor(options.limit ?? 5)));
+  const tokens = [...new Set(timelineSearchTokens(query))];
+  try {
+    const database = ensureKnowledgeTimelineIndex(docs);
+    const filters: string[] = [];
+    if (options.sourceTypes?.length) {
+      filters.push(`d.source_type IN (${options.sourceTypes.map((source) => sqliteText(source)).join(", ")})`);
+    }
+    const fromMs = dateStringToMs(options.fromDate);
+    const toMs = dateStringToMs(options.toDate, true);
+    if (fromMs !== undefined) filters.push(`COALESCE(d.updated_at, d.created_at, 0) >= ${fromMs}`);
+    if (toMs !== undefined) filters.push(`COALESCE(d.updated_at, d.created_at, 0) <= ${toMs}`);
+    const filterSQL = filters.length ? `WHERE ${filters.join(" AND ")}` : "";
+    if (!tokens.length) {
+      const sql = `
+SELECT d.id, d.source_type, d.source_id, d.title, d.source_label, d.thread_id, d.project_id, d.day_id, d.path, d.role, d.created_at, d.updated_at, d.metadata_json,
+       substr(d.title || ' — ' || d.source_label, 1, 260) AS snippet,
+       0 AS rank
+FROM timeline_docs d
+${filterSQL}
+ORDER BY COALESCE(d.updated_at, d.created_at, 0) DESC
+LIMIT ${limit};`;
+      return queryKnowledgeSQLite<Record<string, unknown>>(database, sql).map(knowledgeTimelineResultFromRow);
+    }
+    const termFilters = tokens.map((token) => {
+      const pattern = sqliteText(`%${token.replace(/[%_]/g, "\\$&")}%`);
+      return `(lower(d.title) LIKE ${pattern} ESCAPE '\\' OR lower(d.source_label) LIKE ${pattern} ESCAPE '\\' OR lower(d.body) LIKE ${pattern} ESCAPE '\\')`;
+    });
+    const scoreSQL = tokens.map((token) => {
+      const pattern = sqliteText(`%${token.replace(/[%_]/g, "\\$&")}%`);
+      return `(CASE WHEN lower(d.title) LIKE ${pattern} ESCAPE '\\' THEN 12 ELSE 0 END + CASE WHEN lower(d.source_label) LIKE ${pattern} ESCAPE '\\' THEN 6 ELSE 0 END + CASE WHEN lower(d.body) LIKE ${pattern} ESCAPE '\\' THEN 1 ELSE 0 END)`;
+    }).join(" + ");
+    const where = [...filters, `(${termFilters.join(" OR ")})`].join(" AND ");
+    const sql = `
+SELECT d.id, d.source_type, d.source_id, d.title, d.source_label, d.thread_id, d.project_id, d.day_id, d.path, d.role, d.created_at, d.updated_at, d.metadata_json,
+       substr(d.body, 1, 360) AS snippet,
+       (${scoreSQL}) AS rank
+FROM timeline_docs d
+WHERE ${where}
+ORDER BY rank DESC, COALESCE(d.updated_at, d.created_at, 0) DESC
+LIMIT ${limit};`;
+    return queryKnowledgeSQLite<Record<string, unknown>>(database, sql).map(knowledgeTimelineResultFromRow);
+  } catch (error) {
+    bridgeDebugLog(`Search Everything SQLite fallback: ${error instanceof Error ? error.message : String(error)}`);
+    return searchKnowledgeTimelineInMemory(query, options, docs);
+  }
+}
+
+function readKnowledgeTimelineResult(resultID: string, window = 2) {
+  const docs = knowledgeTimelineDocuments();
+  const item = docs.find((doc) => doc.id === resultID || doc.sourceID === resultID);
+  if (!item) throw new Error("Search result was not found.");
+  const surrounding = item.threadID
+    ? docs
+      .filter((doc) => doc.threadID === item.threadID && (doc.sourceType === "thread_message" || doc.sourceType === "realtime_delegation" || doc.sourceType === "thread_activity"))
+      .sort((a, b) => timelineDocDate(a) - timelineDocDate(b))
+    : [];
+  const itemIndex = surrounding.findIndex((doc) => doc.id === item.id);
+  const contextWindow = Math.max(0, Math.min(5, Math.floor(window)));
+  const nearby = itemIndex >= 0
+    ? surrounding.slice(Math.max(0, itemIndex - contextWindow), itemIndex + contextWindow + 1)
+    : [];
+  return {
+    item: {
+      ...item,
+      text: normalizeSearchText(item.text, 6_000)
+    },
+    surrounding: nearby.map((doc) => ({
+      id: doc.id,
+      sourceType: doc.sourceType,
+      title: doc.title,
+      sourceLabel: doc.sourceLabel,
+      role: doc.role,
+      createdAt: doc.createdAt,
+      updatedAt: doc.updatedAt,
+      text: normalizeSearchText(doc.text, doc.id === item.id ? 2_000 : 1_000)
+    }))
+  };
+}
+
+function looksLikeSearchEverythingQuestion(prompt: string) {
+  const normalized = prompt.toLowerCase().replace(/\s+/g, " ").trim();
+  if (!normalized) return false;
+  return /\b(search everything|search all|timeline|history|memory|remember|previous|earlier|last time|old conversation|where did|when did|what did we|what did you|what was the|what were we|find where|mentioned|talked about|discussed|decided|worked on)\b/.test(normalized);
+}
+
+function voiceSearchEverythingSummary(prompt: string) {
+  const results = searchKnowledgeTimeline(prompt, { limit: 3 });
+  if (!results.length) return "I could not find a matching saved note, planner item, or previous thread.";
+  const lines = results.map((result, index) => {
+    const label = result.sourceLabel || result.sourceType;
+    const snippet = shortSearchText(result.snippet || result.title, 180);
+    return `${index + 1}. ${label}: ${snippet}`;
+  });
+  return `I found ${results.length} likely match${results.length === 1 ? "" : "es"}:\n${lines.join("\n")}`;
+}
+
+function listOpenKnowledgeTasks(limit = 100): KnowledgeTaskItem[] {
+  const tasks: KnowledgeTaskItem[] = [];
+  for (const item of knowledgeItems()) {
+    const lines = item.markdown.split(/\n/);
+    lines.forEach((line, index) => {
+      const match = line.match(/^\s*[-*]\s+\[\s\]\s+(.+?)\s*$/);
+      if (!match) return;
+      tasks.push({
+        id: `${item.id}:line:${index + 1}`,
+        itemID: item.id,
+        kind: item.kind,
+        title: item.title,
+        sourceLabel: item.sourceLabel,
+        text: match[1],
+        line: index + 1,
+        dayID: item.dayID
+      });
+    });
+  }
+  return tasks.slice(0, Math.max(1, Math.min(500, limit)));
+}
+
+function readKnowledgeRequests() {
+  return readJSON<KnowledgeWriteRequest[]>(knowledgeWriteRequestsPath(), []);
+}
+
+function writeKnowledgeRequests(requests: KnowledgeWriteRequest[]) {
+  writeJSON(knowledgeWriteRequestsPath(), requests);
+}
+
+const knowledgePendingRequestTTLms = 2 * 24 * 60 * 60 * 1000;
+const knowledgeSettledRequestTTLms = 30 * 24 * 60 * 60 * 1000;
+const knowledgeSettledRequestMax = 300;
+
+function knowledgeRequestTimeMs(...values: Array<string | undefined>) {
+  for (const value of values) {
+    if (!value) continue;
+    const parsed = Date.parse(value);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return undefined;
+}
+
+function plannerDayIDFromKnowledgePayload(payload: JsonObject, fallbackText = "") {
+  const directCandidates = [
+    payload.fromDayID,
+    payload.sourceDayID,
+    payload.sourceDate,
+    payload.dayID,
+    payload.plannerDayID,
+    payload.date
+  ];
+  for (const candidate of directCandidates) {
+    const raw = typeof candidate === "string" ? candidate.trim() : "";
+    if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return normalizePlannerDayID(raw);
+  }
+  const searchable = [
+    payload.goal,
+    payload.reason,
+    payload.description,
+    payload.text,
+    fallbackText
+  ].map((value) => String(value ?? "")).join(" ");
+  const match = searchable.match(/\b(\d{4}-\d{2}-\d{2})\b/);
+  return match ? normalizePlannerDayID(match[1]) : undefined;
+}
+
+function dailyItemDeletePreviewFromPayload(payload: JsonObject, fallbackText = ""): KnowledgePreview | undefined {
+  const itemID = String(payload.itemID ?? payload.dailyItemID ?? payload.taskID ?? "").trim();
+  if (!itemID || parseKnowledgeItemID(itemID)) return undefined;
+  const markdown = typeof payload.markdown === "string" ? payload.markdown.trim() : undefined;
+  const intentText = [
+    payload.goal,
+    payload.reason,
+    payload.description,
+    fallbackText
+  ].map((value) => String(value ?? "")).join(" ");
+  const looksLikeDelete = markdown === "" || /\b(remove|delete|moved?|carry|clear)\b/i.test(intentText);
+  if (!looksLikeDelete) return undefined;
+  const dayID = plannerDayIDFromKnowledgePayload(payload, fallbackText);
+  if (!dayID) return undefined;
+  return { kind: "daily_item_delete", dayID, itemID };
+}
+
+function settleNonApplyableKnowledgeRequests(requests: KnowledgeWriteRequest[]) {
+  let changed = false;
+  const now = new Date().toISOString();
+  const nowMs = Date.parse(now);
+  for (const request of requests) {
+    if (request.status !== "pending") continue;
+    const requestMs = knowledgeRequestTimeMs(request.createdAt, request.updatedAt);
+    if (requestMs && nowMs - requestMs > knowledgePendingRequestTTLms) {
+      request.status = "rejected";
+      request.updatedAt = now;
+      request.rejectedAt = now;
+      request.payload = {
+        ...request.payload,
+        expiredAt: now,
+        rejectedReason: "Expired after 2 days without approval."
+      };
+      changed = true;
+      continue;
+    }
+    if (request.preview?.kind === "replace_markdown" && !parseKnowledgeItemID(request.preview.itemID)) {
+      const dailyItemDeletePreview = dailyItemDeletePreviewFromPayload(request.payload, request.goal);
+      if (dailyItemDeletePreview) {
+        request.preview = dailyItemDeletePreview;
+        request.updatedAt = now;
+        changed = true;
+        continue;
+      }
+      request.status = "rejected";
+      request.updatedAt = now;
+      request.rejectedAt = now;
+      request.payload = {
+        ...request.payload,
+        rejectedReason: "Patch target was not a knowledge item or planner item."
+      };
+      changed = true;
+      continue;
+    }
+    if (request.preview) continue;
+    request.status = "rejected";
+    request.updatedAt = now;
+    request.rejectedAt = now;
+    request.payload = {
+      ...request.payload,
+      rejectedReason: "No apply-ready preview could be created."
+    };
+    changed = true;
+  }
+  const settledCutoffMs = nowMs - knowledgeSettledRequestTTLms;
+  const settledByRecent = requests
+    .filter((request) => request.status !== "pending")
+    .sort((a, b) =>
+      (knowledgeRequestTimeMs(b.updatedAt, b.appliedAt, b.rejectedAt, b.createdAt) ?? 0)
+      - (knowledgeRequestTimeMs(a.updatedAt, a.appliedAt, a.rejectedAt, a.createdAt) ?? 0)
+    );
+  const settledToKeep = new Set(settledByRecent
+    .filter((request, index) => {
+      const requestMs = knowledgeRequestTimeMs(request.updatedAt, request.appliedAt, request.rejectedAt, request.createdAt) ?? nowMs;
+      return index < knowledgeSettledRequestMax && requestMs >= settledCutoffMs;
+    })
+    .map((request) => request.id));
+  const cleanedRequests = requests.filter((request) => request.status === "pending" || settledToKeep.has(request.id));
+  if (cleanedRequests.length !== requests.length) changed = true;
+  if (changed) writeKnowledgeRequests(cleanedRequests);
+  return cleanedRequests;
+}
+
+function listKnowledgeWriteRequests(status?: KnowledgeWriteRequest["status"]) {
+  return settleNonApplyableKnowledgeRequests(readKnowledgeRequests())
+    .filter((request) => !status || request.status === status)
+    .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+}
+
+function dailyItemTitleFromPlannerAppend(text: string) {
+  const lines = String(text ?? "")
+    .replace(/\r\n/g, "\n")
+    .split("\n")
+    .map((line) => line.replace(/<!--[\s\S]*?-->/g, "").trim())
+    .filter(Boolean);
+  if (lines.length !== 1) return "";
+  const taskLine = lines[0].match(/^[-*]\s+(?:\[[ xX]\]\s*)?(.+)$/);
+  const title = cleanDailyText(taskLine?.[1] ?? lines[0]);
+  if (!title || title.startsWith("#")) return "";
+  return title;
+}
+
+function plannerAppendPreviewFromPayload(action: string, payload: JsonObject): KnowledgePreview | undefined {
+  const text = String(payload.text ?? payload.content ?? "").trim();
+  if (!text) return undefined;
+  const dayID = normalizePlannerDayID(String(payload.dayID ?? payload.targetDayID ?? ""));
+  const section = String(payload.section ?? (action.includes("link") ? "Linked Notes" : markdownTaskLike(text) ? "Tasks" : "Notes")).trim() || "Notes";
+  if (section.toLowerCase() === "tasks") {
+    const title = dailyItemTitleFromPlannerAppend(text);
+    if (title) {
+      const detailsMarkdown = String(payload.detailsMarkdown ?? payload.details ?? payload.description ?? "").trim();
+      return {
+        kind: "daily_item_upsert",
+        item: {
+          dayID,
+          title,
+          area: normalizeDailyArea(payload.area) || inferDailyArea({ title, detailsMarkdown }),
+          detailsMarkdown,
+          steps: Array.isArray(payload.steps) ? payload.steps as DailyItemStep[] : [],
+          links: normalizeDailyLinks(payload.links),
+          status: "todo",
+          checked: false
+        }
+      };
+    }
+  }
+  return { kind: "planner_append", dayID, section, content: text };
+}
+
+function plannerBacklogMoveEntriesFromPayload(payload: JsonObject): { dayID: string; text: string }[] {
+  const todayID = plannerDayID();
+  const includeToday = payload.includeToday === true;
+  const fromDayIDRaw = String(payload.fromDayID ?? payload.dayID ?? "").trim();
+  const beforeDayID = normalizePlannerDayID(String(payload.beforeDayID ?? todayID));
+  const fromDayID = fromDayIDRaw ? normalizePlannerDayID(fromDayIDRaw) : "";
+  const seen = new Set<string>();
+  const entries: { dayID: string; text: string }[] = [];
+
+  for (const task of listOpenKnowledgeTasks(500)) {
+    if (task.kind !== "planner_day" || !task.dayID) continue;
+    if (task.dayID.toLowerCase() === plannerBacklogID) continue;
+    if (fromDayID) {
+      if (task.dayID !== fromDayID) continue;
+    } else if (includeToday) {
+      if (task.dayID > beforeDayID) continue;
+    } else if (task.dayID >= beforeDayID) {
+      continue;
+    }
+    const text = cleanDailyText(task.text);
+    if (!text) continue;
+    const key = `${task.dayID}:${text.toLowerCase()}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    entries.push({ dayID: task.dayID, text });
+  }
+
+  return entries;
+}
+
+function knowledgePreviewForRequest(action: string, payload: JsonObject): KnowledgePreview | undefined {
+  if (action === "request_daily_item") {
+    const title = String(payload.title ?? payload.text ?? "").trim();
+    if (!title) return undefined;
+    const detailsMarkdown = String(payload.detailsMarkdown ?? payload.details ?? payload.description ?? "").trim();
+    const projectID = typeof payload.projectID === "string" ? payload.projectID : undefined;
+    const folderID = typeof payload.folderID === "string" ? payload.folderID : undefined;
+    const scopeTags = Array.isArray(payload.scopeTags) ? payload.scopeTags : undefined;
+    const area = normalizeDailyArea(payload.area)
+      || inferDailyArea({ title, detailsMarkdown, projectID, folderID, scopeTags });
+    return {
+      kind: "daily_item_upsert",
+      item: {
+        dayID: normalizePlannerDayID(String(payload.dayID ?? payload.targetDayID ?? payload.date ?? "")),
+        title,
+        projectID,
+        folderID,
+        area,
+        scopeTags: normalizeDailyScopeTags(scopeTags),
+        detailsMarkdown,
+        steps: Array.isArray(payload.steps) ? payload.steps as DailyItemStep[] : [],
+        links: normalizeDailyLinks(payload.links),
+        status: "todo",
+        checked: false
+      }
+    };
+  }
+  if (action === "request_add" || action === "request_patch" || action === "request_organize") {
+    if (typeof payload.itemID === "string" && typeof payload.markdown === "string") {
+      const dailyItemDeletePreview = dailyItemDeletePreviewFromPayload(payload);
+      if (dailyItemDeletePreview) return dailyItemDeletePreview;
+      const preview: KnowledgePreview = {
+        kind: "replace_markdown",
+        itemID: payload.itemID,
+        markdown: payload.markdown.replace(/\r\n/g, "\n")
+      };
+      try {
+        const item = readKnowledgeItem(payload.itemID);
+        preview.previousMarkdown = item.markdown.replace(/\r\n/g, "\n");
+        preview.title = item.title;
+      } catch {
+        // Keep the preview actionable even if the source item is temporarily unavailable.
+      }
+      return preview;
+    }
+    if (action === "request_organize") {
+      // organize without apply-ready markdown cannot be previewed
+      return undefined;
+    }
+    return plannerAppendPreviewFromPayload(action, payload);
+  }
+  if (action === "request_move_to_backlog") {
+    const entries = plannerBacklogMoveEntriesFromPayload(payload);
+    if (!entries.length) return undefined;
+    return { kind: "planner_backlog_move", entries };
+  }
+  if (action === "request_carry_forward") {
+    const targetRaw = String(payload.targetDayID ?? payload.toDayID ?? "").trim();
+    if (targetRaw.toLowerCase() === plannerBacklogID) {
+      throw new Error("Use request_move_to_backlog to move tasks to the Backlog. carry_forward only moves unfinished tasks between planner days.");
+    }
+    const fromDayID = normalizePlannerDayID(String(payload.fromDayID ?? payload.dayID ?? plannerDayID()));
+    const targetDayID = normalizePlannerDayID(String(payload.targetDayID ?? payload.toDayID ?? plannerDayOffset(fromDayID, 1)));
+    const openTexts = listOpenKnowledgeTasks(200)
+      .filter((task) => task.dayID === fromDayID)
+      .map((task) => cleanDailyText(task.text))
+      .filter(Boolean);
+    if (!openTexts.length) return undefined;
+    const content = openTexts.map((text) => `- [ ] ${text}`).join("\n");
+    // A move adds the tasks to the target day AND removes them from the source
+    // day, so the task only lives in one place (a true move, not a copy).
+    return { kind: "planner_move", fromDayID, dayID: targetDayID, section: "Tasks", content, removeTexts: openTexts };
+  }
+  return undefined;
+}
+
+// Plain "add" actions do not need approval: adding a brand-new task or daily
+// item cannot overwrite or destroy existing content, so we apply it right away.
+// Anything that moves, organizes, edits, or replaces existing content still
+// goes through the approval inbox.
+function knowledgeActionAppliesWithoutApproval(action: string) {
+  return action === "request_daily_item";
+}
+
+function createKnowledgeWriteRequest(action: string, payload: JsonObject, source: KnowledgeWriteRequest["source"]) {
+  const settingsPayload = payload && typeof payload === "object" && !Array.isArray(payload) ? payload : {};
+  const now = new Date().toISOString();
+  const preview = knowledgePreviewForRequest(action, settingsPayload);
+  if (!preview) {
+    const isOrganize = action === "request_organize";
+    throw new Error(
+      isOrganize
+        ? "oa_request_organize requires itemID and markdown. Pattern: (1) read the note, (2) call oa_note_style_guide, (3) write exact replacement markdown, (4) call oa_request_organize with itemID and markdown."
+        : "OpenAssist could not create an apply-ready preview. For planner tasks use oa_request_daily_item; for edits use oa_request_add or oa_request_patch with exact markdown."
+    );
+  }
+  const request: KnowledgeWriteRequest = {
+    id: randomUUID().toLowerCase(),
+    action,
+    source,
+    status: "pending",
+    createdAt: now,
+    updatedAt: now,
+    goal: String(settingsPayload.goal ?? settingsPayload.description ?? action).trim() || action,
+    payload: settingsPayload,
+    preview
+  };
+  const requests = readKnowledgeRequests();
+  requests.push(request);
+  writeKnowledgeRequests(requests);
+  emitKnowledgeRequestsChanged();
+  if (knowledgeActionAppliesWithoutApproval(action)) {
+    return applyKnowledgePreview(request.id);
+  }
+  return request;
+}
+
+const plannerMonthNames: Record<string, number> = {
+  jan: 1,
+  january: 1,
+  feb: 2,
+  february: 2,
+  mar: 3,
+  march: 3,
+  apr: 4,
+  april: 4,
+  may: 5,
+  jun: 6,
+  june: 6,
+  jul: 7,
+  july: 7,
+  aug: 8,
+  august: 8,
+  sep: 9,
+  sept: 9,
+  september: 9,
+  oct: 10,
+  october: 10,
+  nov: 11,
+  november: 11,
+  dec: 12,
+  december: 12
+};
+
+const plannerWeekdayIndexes: Record<string, number> = {
+  sunday: 0,
+  monday: 1,
+  tuesday: 2,
+  wednesday: 3,
+  thursday: 4,
+  friday: 5,
+  saturday: 6
+};
+
+function plannerDayFromParts(year: number, month: number, day: number) {
+  return normalizePlannerDayID(`${year}-${pad2(month)}-${pad2(day)}`);
+}
+
+function nextPlannerWeekdayDayID(weekday: number) {
+  const today = plannerDateFromDayID(plannerDayID());
+  const offset = (weekday - today.getDay() + 7) % 7;
+  today.setDate(today.getDate() + offset);
+  return plannerDayID(today);
+}
+
+function parsePlannerDayIDFromPrompt(prompt: string) {
+  const source = prompt.replace(/\s+/g, " ");
+  const isoMatch = source.match(/\b(20\d{2})-(\d{2})-(\d{2})\b/);
+  if (isoMatch) return normalizePlannerDayID(isoMatch[0]);
+
+  const lower = source.toLowerCase();
+  const monthMatch = lower.match(/\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t|tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+(\d{1,2})(?:st|nd|rd|th)?(?:,\s*(20\d{2}))?\b/);
+  if (monthMatch) {
+    const month = plannerMonthNames[monthMatch[1]];
+    const day = Number(monthMatch[2]);
+    const year = monthMatch[3] ? Number(monthMatch[3]) : plannerDateFromDayID(plannerDayID()).getFullYear();
+    return plannerDayFromParts(year, month, day);
+  }
+
+  const weekdayMatch = lower.match(/\b(sunday|monday|tuesday|wednesday|thursday|friday|saturday)\b/);
+  if (weekdayMatch) return nextPlannerWeekdayDayID(plannerWeekdayIndexes[weekdayMatch[1]]);
+
+  if (/\b(day after tomorrow|day after today)\b/.test(lower)) return plannerDayOffset(plannerDayID(), 2);
+  if (/\btomorrow\b/.test(lower)) return plannerDayOffset(plannerDayID(), 1);
+  if (/\btoday\b/.test(lower)) return plannerDayID();
+
+  return "";
+}
+
+function parsePlannerTaskTime(prompt: string) {
+  const match = prompt.match(/\b(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b/i);
+  if (!match) return "";
+  const hour = Number(match[1]);
+  const minute = match[2] ?? "00";
+  const suffix = match[3].toUpperCase();
+  if (!Number.isFinite(hour) || hour < 1 || hour > 12) return "";
+  return `${hour}:${minute.padStart(2, "0")} ${suffix}`;
+}
+
+function stripPlannerDatePhrases(text: string) {
+  return text
+    .replace(/\b(?:for|on|by|this|next)?\s*(?:today|tomorrow|day after tomorrow|day after today|yesterday)\b/gi, " ")
+    .replace(/\b(?:for|on|by|this|next)?\s*(?:sunday|monday|tuesday|wednesday|thursday|friday|saturday)\b/gi, " ")
+    .replace(/\b(?:for|on|by)?\s*(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t|tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+\d{1,2}(?:st|nd|rd|th)?(?:,\s*20\d{2})?\b/gi, " ")
+    .replace(/\b20\d{2}-\d{2}-\d{2}\b/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function normalizePlannerTaskTitle(raw: string) {
+  const cleaned = String(raw ?? "")
+    .trim()
+    .replace(/\s+/g, " ")
+    .replace(/[.。!?]+$/g, "")
+    .replace(/^please\s+/i, "");
+  if (!cleaned) return "";
+  return cleaned.charAt(0).toUpperCase() + cleaned.slice(1);
+}
+
+function parsePlannerTaskTitle(prompt: string, timeLabel: string) {
+  const afterColon = prompt.match(/:\s*([^:]+?)\s*$/);
+  if (afterColon?.[1]?.trim()) return normalizePlannerTaskTitle(afterColon[1]);
+
+  if (timeLabel) {
+    const escaped = timeLabel.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/\s+/g, "\\s*");
+    const afterTime = new RegExp(`${escaped}\\s+(.+?)\\s*$`, "i").exec(prompt);
+    if (afterTime?.[1]?.trim()) return normalizePlannerTaskTitle(afterTime[1]);
+  }
+
+  const quoted = prompt.match(/["“]([^"”]+)["”]/);
+  if (quoted?.[1]?.trim()) return normalizePlannerTaskTitle(quoted[1]);
+
+  const toAction = prompt.match(/\bto\s+((?:meet|call|email|text|message|visit|ask|pay|buy|send|finish|review|check|do|go|attend|follow\s*up|follow-up)\b.+?)\s*$/i);
+  if (toAction?.[1]?.trim()) return normalizePlannerTaskTitle(toAction[1]);
+
+  const afterAdd = prompt.match(/\b(?:add|create|schedule|put)\s+(.+?)\s*$/i);
+  if (afterAdd?.[1]?.trim()) return normalizePlannerTaskTitle(stripPlannerDatePhrases(afterAdd[1]));
+
+  const reminder = prompt.match(/\bremind(?:\s+me)?(?:\s+to)?\s+(.+?)\s*$/i);
+  if (reminder?.[1]?.trim()) return normalizePlannerTaskTitle(stripPlannerDatePhrases(reminder[1]));
+
+  return "";
+}
+
+function directPlannerTaskRequestFromPrompt(prompt: string) {
+  const trimmed = prompt.trim();
+  if (!trimmed) return null;
+  const lowered = trimmed.toLowerCase();
+  if (!/\b(add|create|schedule|put|remind|reminder|reminders)\b/.test(lowered)) return null;
+  if (!/\b(today|tomorrow|day after tomorrow|day after today|yesterday|sunday|monday|tuesday|wednesday|thursday|friday|saturday|today planner|today general|planner|daily|to-?do|todo|task|tasks|reminder|reminders)\b/.test(lowered)) return null;
+
+  const dayID = parsePlannerDayIDFromPrompt(trimmed);
+  if (!dayID) return null;
+  const timeLabel = parsePlannerTaskTime(trimmed);
+  const title = parsePlannerTaskTitle(trimmed, timeLabel);
+  if (!title) return null;
+
+  const payload: JsonObject = {
+    dayID,
+    title,
+    area: inferDailyArea({ title }),
+    goal: `Add planner task for ${formattedPlannerDay(dayID)}: ${title}`
+  };
+  if (timeLabel) {
+    payload.detailsMarkdown = `Time: ${timeLabel}`;
+  }
+  return { dayID, title, timeLabel, payload };
+}
+
+function createDirectKnowledgePlannerRequest(prompt: string, settings: SettingsSnapshot, source: KnowledgeWriteRequest["source"] = "app") {
+  if (!settings.knowledgeAccessEnabled || !settings.knowledgeOrganizerEnabled) return null;
+  const parsed = directPlannerTaskRequestFromPrompt(prompt);
+  if (!parsed) return null;
+  const request = createKnowledgeWriteRequest("request_daily_item", parsed.payload, source);
+  const timeText = parsed.timeLabel ? ` at ${parsed.timeLabel}` : "";
+  const applied = request.status === "applied";
+  return {
+    request,
+    responseText: applied
+      ? `Added to ${formattedPlannerDay(parsed.dayID)}${timeText}: ${parsed.title}.`
+      : [
+          `Created a pending planner request for ${formattedPlannerDay(parsed.dayID)}${timeText}: ${parsed.title}.`,
+          "Use Apply in Knowledge Approval to add it to that planner day."
+        ].join("\n\n")
+  };
+}
+
+function voiceListText(items: DailyItem[], limit = 6) {
+  return items
+    .slice(0, limit)
+    .map((item, index) => `${index + 1}. ${dailyItemVisibleTitle(item)}`)
+    .join("\n");
+}
+
+function directBacklogItemRequestFromPrompt(prompt: string) {
+  const trimmed = prompt.trim();
+  if (!trimmed) return null;
+  const lowered = trimmed.toLowerCase();
+  if (!/\b(add|create|put|save|remember)\b/.test(lowered)) return null;
+  if (!/\b(backlog|later|follow-?up|someday|when i have time)\b/.test(lowered)) return null;
+  const titleSource = trimmed
+    .replace(/\b(?:add|create|put|save|remember)\b/ig, " ")
+    .replace(/\b(?:to|in|into|on|for|the|my|openassist)\b/ig, " ")
+    .replace(/\b(?:backlog|later|follow-?up|someday|when i have time)\b/ig, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  const title = normalizePlannerTaskTitle(titleSource);
+  if (!title || title.split(/\s+/).length < 2) return null;
+  return {
+    title,
+    payload: {
+      title,
+      area: inferDailyArea({ title }),
+      goal: `Add backlog item: ${title}`
+    } as JsonObject
+  };
+}
+
+function createDirectKnowledgeVoiceResponse(prompt: string, settings: SettingsSnapshot, source: KnowledgeWriteRequest["source"] = "voice") {
+  if (!settings.knowledgeAccessEnabled) return null;
+  const trimmed = prompt.replace(/\s+/g, " ").trim();
+  if (!trimmed) return null;
+  const lowered = trimmed.toLowerCase();
+  const allowWrites = settings.knowledgeOrganizerEnabled;
+
+  if (allowWrites) {
+    const plannerRequest = createDirectKnowledgePlannerRequest(trimmed, settings, source);
+    if (plannerRequest) return { route: "daily_item_add", responseText: plannerRequest.responseText };
+
+    const backlogRequest = directBacklogItemRequestFromPrompt(trimmed);
+    if (backlogRequest) {
+      const result = knowledgeToolResult("knowledge_request_backlog_item", backlogRequest.payload, source) as { item?: DailyItem };
+      return {
+        route: "backlog_item_add",
+        responseText: `Added to Backlog: ${dailyItemVisibleTitle(result.item ?? { title: backlogRequest.title } as DailyItem)}.`
+      };
+    }
+  }
+
+  const mentionsBacklog = /\b(backlog|later|follow-?ups?|someday)\b/.test(lowered);
+  if (mentionsBacklog && /\b(what|which|list|show|read|open|any|how many|do we have|items?)\b/.test(lowered)) {
+    const items = listBacklogItems().filter((item) => !item.checked);
+    return {
+      route: "backlog_items",
+      responseText: items.length
+        ? `You have ${items.length} backlog item${items.length === 1 ? "" : "s"}:\n${voiceListText(items)}`
+        : "Your Backlog has no open items."
+    };
+  }
+
+  const mentionsPlannerTasks = /\b(today|tomorrow|yesterday|planner|daily|to-?do|tasks?|items?|reminders?|open)\b/.test(lowered);
+  if (mentionsPlannerTasks && /\b(what|which|list|show|read|open|unfinished|any|how many|do we have|check)\b/.test(lowered)) {
+    const dayID = parsePlannerDayIDFromPrompt(trimmed) || plannerDayID();
+    const items = listDailyItems(dayID).filter((item) => !item.checked);
+    return {
+      route: "daily_items",
+      responseText: items.length
+        ? `You have ${items.length} open item${items.length === 1 ? "" : "s"} for ${formattedPlannerDay(dayID)}:\n${voiceListText(items)}`
+        : `You have no open items for ${formattedPlannerDay(dayID)}.`
+    };
+  }
+
+  if (looksLikeSearchEverythingQuestion(trimmed)) {
+    return {
+      route: "search_everything",
+      responseText: voiceSearchEverythingSummary(trimmed)
+    };
+  }
+
+  if (allowWrites && /\b(done|complete|completed|finished|mark)\b/.test(lowered) && /\b(task|item|todo|to-do|reminder)\b/.test(lowered)) {
+    const dayID = parsePlannerDayIDFromPrompt(trimmed) || plannerDayID();
+    const query = stripPlannerDatePhrases(trimmed)
+      .replace(/\b(mark|as|done|complete|completed|finished|task|item|todo|to-do|reminder)\b/gi, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (query) {
+      const result = completeDailyItem(dayID, query, true);
+      return {
+        route: "daily_item_complete",
+        responseText: `Marked done: ${dailyItemVisibleTitle(result.item ?? { title: query } as DailyItem)}.`
+      };
+    }
+  }
+
+  return null;
+}
+
+async function handleLocalVoiceDirectKnowledge(input: { transcript?: string; taskText?: string }) {
+  const settings = await loadSettings();
+  if (settings.realtimeDelegationMode === "alwaysDelegate") return { handled: false, reason: "always delegate mode" };
+  if (settings.realtimeDelegationMode === "neverDelegate") {
+    const response = createDirectKnowledgeVoiceResponse(input.taskText || input.transcript || "", settings, "voice");
+    return response
+      ? { handled: true, route: response.route, responseText: response.responseText }
+      : { handled: true, route: "direct_only", responseText: "I can answer directly, but this needs the agent. Delegation is turned off." };
+  }
+  const response = createDirectKnowledgeVoiceResponse(input.taskText || input.transcript || "", settings, "voice");
+  return response
+    ? { handled: true, route: response.route, responseText: response.responseText }
+    : { handled: false, reason: "no direct knowledge route" };
+}
+
+function relevantKnowledgeContextForPrompt(prompt: string, settings: SettingsSnapshot) {
+  if (!settings.knowledgeAccessEnabled || !settings.knowledgeAgentAccessEnabled) return "";
+  const lowered = prompt.toLowerCase();
+  const relevant = /\b(my notes|notes?|today|tomorrow|day after tomorrow|day after today|planner|journal|to-?do|tasks?|daily|remind|reminder|reminders|backlog|follow-?ups?|later)\b/.test(lowered);
+  const timelineRelevant = looksLikeSearchEverythingQuestion(prompt);
+  if (!relevant && !timelineRelevant) return "";
+
+  const lines = [
+    "OpenAssist Knowledge snapshot:",
+    `- Local today: ${formattedPlannerDay(plannerDayID())} (${plannerDayID()})`
+  ];
+  if (timelineRelevant) {
+    const results = searchKnowledgeTimeline(prompt, { limit: 5 });
+    if (results.length) {
+      lines.push("- Search Everything hits:");
+      results.forEach((result, index) => {
+        const when = timelineDocDate(result) ? new Date(timelineDocDate(result)).toLocaleString() : "";
+        lines.push(`${index + 1}. ${result.sourceType} | ${result.title} | ${result.sourceLabel}${when ? ` | ${when}` : ""} | id=${result.id}`);
+        lines.push(`   ${shortSearchText(result.snippet, 420)}`);
+      });
+      lines.push("For exact details, use the Search Everything read tool when available instead of asking for the whole thread.");
+    }
+  }
+  const dayID = parsePlannerDayIDFromPrompt(prompt);
+  if (dayID && /\b(today|tomorrow|planner|journal|daily|to-?do|tasks?|remind|reminder|reminders)\b/.test(lowered)) {
+    try {
+      const item = readKnowledgeItem(`planner_day:planner:global:${dayID}`);
+      lines.push(`- Planner day ${dayID}:`);
+      lines.push(item.markdown.slice(0, 3500));
+    } catch {
+      lines.push(`- Planner day ${dayID}: no saved planner day found.`);
+    }
+    try {
+      const dailyItems = listDailyItems(dayID);
+      if (dailyItems.length) {
+        lines.push(`- Structured items for ${dayID}: ${JSON.stringify(dailyItems.slice(0, 20), null, 2)}`);
+      }
+    } catch {
+      // Snapshot context is best effort.
+    }
+  }
+  if (/\b(open tasks?|unfinished|to-?do|todo|tasks?)\b/.test(lowered)) {
+    const tasks = listOpenKnowledgeTasks(50);
+    if (tasks.length) {
+      lines.push(`- Open tasks: ${JSON.stringify(tasks.slice(0, 30), null, 2)}`);
+    }
+  }
+  if (/\b(backlog|follow-?ups?|later)\b/.test(lowered)) {
+    const backlogItems = listBacklogItems();
+    if (backlogItems.length) {
+      lines.push(`- Backlog items: ${JSON.stringify(backlogItems.slice(0, 30), null, 2)}`);
+    } else {
+      lines.push("- Backlog items: none.");
+    }
+  }
+  if (/\b(notes?|search|find)\b/.test(lowered)) {
+    const results = searchKnowledge(prompt, 8);
+    if (results.length) {
+      lines.push(`- Related notes/planner results: ${JSON.stringify(results, null, 2)}`);
+    }
+  }
+  lines.push("Use this snapshot only as context. For edits, say OpenAssist must create or apply a pending approval request.");
+  return lines.join("\n");
+}
+
+function applyKnowledgePreview(requestID: string) {
+  const requests = readKnowledgeRequests();
+  const request = requests.find((candidate) => candidate.id === requestID);
+  if (!request) throw new Error("Knowledge request was not found.");
+  if (request.status === "applied") return request;
+  if (request.status === "rejected") throw new Error("This request was already rejected.");
+  if (!request.preview) throw new Error("This request does not have an apply-ready preview yet.");
+  let changedPlannerDayID = "";
+  let changedSourceDayID = "";
+  const changedPlannerDayIDs = new Set<string>();
+  if (request.preview.kind === "planner_append") {
+    const day = loadPlannerDay(request.preview.dayID);
+    savePlannerDay(
+      request.preview.dayID,
+      appendToPlannerSection(day.markdown, request.preview.section, request.preview.content)
+    );
+    changedPlannerDayID = request.preview.dayID;
+  } else if (request.preview.kind === "planner_move") {
+    // Add the tasks to the target day...
+    const targetDay = loadPlannerDay(request.preview.dayID);
+    savePlannerDay(
+      request.preview.dayID,
+      appendToPlannerSection(targetDay.markdown, request.preview.section, request.preview.content)
+    );
+    changedPlannerDayID = request.preview.dayID;
+    // ...then remove them from the source day so the move is complete.
+    if (request.preview.fromDayID && request.preview.fromDayID !== request.preview.dayID) {
+      const sourceDay = loadPlannerDay(request.preview.fromDayID);
+      const { markdown: nextSourceMarkdown } = removePlannerTasksByText(sourceDay.id, sourceDay.markdown, request.preview.removeTexts);
+      if (nextSourceMarkdown !== sourceDay.markdown) {
+        savePlannerDay(request.preview.fromDayID, nextSourceMarkdown);
+        changedSourceDayID = request.preview.fromDayID;
+      }
+    }
+  } else if (request.preview.kind === "planner_backlog_move") {
+    for (const entry of request.preview.entries) {
+      upsertBacklogItem({
+        title: entry.text,
+        dayID: plannerBacklogID,
+        detailsMarkdown: `Moved from ${entry.dayID}.`
+      });
+      const day = loadPlannerDay(entry.dayID);
+      const { markdown: nextMarkdown } = removePlannerTasksByText(day.id, day.markdown, [entry.text]);
+      if (nextMarkdown !== day.markdown) {
+        savePlannerDay(entry.dayID, nextMarkdown);
+        changedPlannerDayIDs.add(entry.dayID);
+      }
+    }
+    emitPlannerBacklogChanged();
+  } else if (request.preview.kind === "daily_item_upsert") {
+    upsertDailyItem(request.preview.item);
+    changedPlannerDayID = normalizePlannerDayID(String(request.preview.item.dayID ?? ""));
+  } else if (request.preview.kind === "daily_item_delete") {
+    deleteDailyItem(request.preview.dayID, request.preview.itemID);
+    changedPlannerDayID = request.preview.dayID;
+  } else if (request.preview.kind === "replace_markdown") {
+    const item = readKnowledgeItem(request.preview.itemID);
+    if (item.kind === "project_note" && item.target) {
+      saveProjectNote(item.target.ownerId, item.target.noteId, request.preview.markdown);
+    } else if (item.kind === "planner_day" && item.dayID) {
+      savePlannerDay(item.dayID, request.preview.markdown);
+      changedPlannerDayID = item.dayID;
+    } else if (item.kind === "journal_day" && item.dayID) {
+      const day = loadPlannerDay(item.dayID);
+      savePlannerDay(item.dayID, replaceMarkdownSection(day.markdown, "Journal", request.preview.markdown));
+      changedPlannerDayID = item.dayID;
+    } else {
+      throw new Error("This knowledge item cannot be replaced yet.");
+    }
+  }
+  const now = new Date().toISOString();
+  request.status = "applied";
+  request.updatedAt = now;
+  request.appliedAt = now;
+  writeKnowledgeRequests(requests);
+  emitKnowledgeRequestsChanged();
+  if (changedPlannerDayID) emitPlannerDayChanged(changedPlannerDayID);
+  if (changedSourceDayID && changedSourceDayID !== changedPlannerDayID) emitPlannerDayChanged(changedSourceDayID);
+  for (const dayID of changedPlannerDayIDs) {
+    if (dayID !== changedPlannerDayID && dayID !== changedSourceDayID) {
+      emitPlannerDayChanged(dayID);
+    }
+  }
+  return request;
+}
+
+function rejectKnowledgeRequest(requestID: string) {
+  const requests = readKnowledgeRequests();
+  const request = requests.find((candidate) => candidate.id === requestID);
+  if (!request) throw new Error("Knowledge request was not found.");
+  if (request.status === "applied") throw new Error("This request was already applied.");
+  if (request.status === "rejected") return request;
+  const now = new Date().toISOString();
+  request.status = "rejected";
+  request.updatedAt = now;
+  request.rejectedAt = now;
+  writeKnowledgeRequests(requests);
+  emitKnowledgeRequestsChanged();
+  return request;
+}
+
+function knowledgeBacklinks(itemID: string) {
+  const item = readKnowledgeItem(itemID);
+  return item.target ? loadNoteLinks(item.target, item.markdown) : { outgoingLinks: [], backlinks: [], graph: null };
+}
+
+function knowledgeToolResult(action: string, args: JsonObject, source: KnowledgeWriteRequest["source"] = "mcp") {
+  switch (action) {
+    case "oa_search":
+    case "knowledge_search":
+      return { results: searchKnowledge(String(args.query ?? ""), Number(args.limit ?? 20), typeof args.source === "string" ? args.source : undefined) };
+    case "oa_search_everything":
+    case "knowledge_search_everything":
+      return {
+        results: searchKnowledgeTimeline(String(args.query ?? ""), {
+          sourceTypes: sourceTypesFromValue(args.sourceTypes ?? args.sources ?? args.source),
+          fromDate: typeof args.fromDate === "string" ? args.fromDate : undefined,
+          toDate: typeof args.toDate === "string" ? args.toDate : undefined,
+          limit: Number(args.limit ?? 5)
+        })
+      };
+    case "oa_read_search_result":
+    case "knowledge_read_search_result":
+      return readKnowledgeTimelineResult(String(args.resultID ?? args.id ?? ""), Number(args.window ?? 2));
+    case "oa_read":
+    case "knowledge_read":
+      return readKnowledgeItem(String(args.itemID ?? args.id ?? ""));
+    case "oa_read_today":
+    case "knowledge_read_today":
+      return readKnowledgeItem(`planner_day:planner:global:${normalizePlannerDayID(String(args.dayID ?? args.date ?? ""))}`);
+    case "oa_list_daily_items":
+    case "knowledge_daily_items":
+      return { items: listDailyItems(normalizePlannerDayID(String(args.dayID ?? args.date ?? ""))) };
+    case "oa_list_backlog_items":
+    case "knowledge_backlog_items":
+      return { items: listBacklogItems() };
+    case "oa_read_journal":
+    case "knowledge_read_journal":
+      return readKnowledgeItem(`journal_day:planner:global:${normalizePlannerDayID(String(args.dayID ?? args.date ?? ""))}`);
+    case "oa_list_open_tasks":
+    case "knowledge_open_tasks":
+      return { tasks: listOpenKnowledgeTasks(Number(args.limit ?? 100)) };
+    case "oa_complete_daily_item":
+    case "knowledge_complete_daily_item": {
+      const checked = args.checked === false || args.done === false || args.uncheck === true ? false : true;
+      const result = completeDailyItem(
+        normalizePlannerDayID(String(args.dayID ?? args.date ?? "")),
+        String(args.title ?? args.text ?? args.query ?? args.task ?? ""),
+        checked
+      );
+      return { item: result.item, checked, dayID: result.day.id };
+    }
+    case "oa_backlinks":
+      return knowledgeBacklinks(String(args.itemID ?? args.id ?? ""));
+    case "oa_request_backlog_item":
+    case "knowledge_request_backlog_item": {
+      const result = upsertBacklogItem({ ...args, dayID: plannerBacklogID });
+      return { status: "applied", item: result.item, items: result.items };
+    }
+    case "oa_note_style_guide":
+    case "knowledge_note_style_guide":
+      return { guide: openAssistNoteStyleGuide() };
+    case "oa_request_add":
+    case "oa_request_patch":
+    case "oa_request_organize":
+    case "oa_request_carry_forward":
+    case "knowledge_request_carry_forward":
+    case "oa_request_move_to_backlog":
+    case "knowledge_request_move_to_backlog":
+    case "oa_request_daily_item":
+    case "knowledge_request_daily_item":
+    case "knowledge_request_organize":
+      return {
+        request: createKnowledgeWriteRequest(
+          action === "oa_request_add" ? "request_add"
+              : action === "oa_request_patch" ? "request_patch"
+              : action === "oa_request_carry_forward" || action === "knowledge_request_carry_forward" ? "request_carry_forward"
+                : action === "oa_request_move_to_backlog" || action === "knowledge_request_move_to_backlog" ? "request_move_to_backlog"
+                : action === "oa_request_daily_item" || action === "knowledge_request_daily_item" ? "request_daily_item"
+                : "request_organize",
+          args,
+          source
+        )
+      };
+    default:
+      throw new Error(`Unknown knowledge action: ${action}`);
+  }
+}
+
+type RealtimeFocusTarget =
+  | { scope: "project"; projectID: string; noteID: string }
+  | { scope: "thread"; threadID: string; noteID: string; projectID?: string }
+  | { scope: "planner"; dayID: string };
+
+type RealtimeVisualFocus = {
+  target: RealtimeFocusTarget;
+  itemID?: string;
+  label: string;
+};
+
+function realtimeFocusTargetFromNoteLink(target?: NoteLinkTarget | null): RealtimeFocusTarget | null {
+  if (!target) return null;
+  if (target.ownerKind === "project") return { scope: "project", projectID: target.ownerId, noteID: target.noteId };
+  if (target.ownerKind === "thread") return { scope: "thread", threadID: target.ownerId, noteID: target.noteId };
+  if (target.ownerKind === "planner") return { scope: "planner", dayID: target.noteId };
+  return null;
+}
+
+function realtimeFocusTargetFromKnowledgeID(id?: string | null): RealtimeFocusTarget | null {
+  const parsed = parseKnowledgeItemID(String(id ?? ""));
+  if (!parsed) return null;
+  if (parsed.dayID) return { scope: "planner", dayID: parsed.dayID };
+  return realtimeFocusTargetFromNoteLink(parsed.target ?? null);
+}
+
+// Map a completed realtime knowledge read/list to a concrete UI target so the
+// renderer can navigate there and flash it. Returns null when the tool result
+// does not point at a single navigable note, planner day, or daily item.
+function realtimeVisualFocusFromKnowledge(toolName: string, args?: JsonObject, result?: unknown): RealtimeVisualFocus | null {
+  const action = String(toolName ?? "").trim().replace(/^oa_/, "").replace(/^knowledge_/, "");
+  const safeArgs: JsonObject = args && typeof args === "object" && !Array.isArray(args) ? args as JsonObject : {};
+  const safeResult: JsonObject | undefined = result && typeof result === "object" && !Array.isArray(result) ? result as JsonObject : undefined;
+  const argDayID = () => normalizePlannerDayID(String(safeArgs.dayID ?? safeArgs.date ?? ""));
+
+  switch (action) {
+    case "read_today":
+      return { target: { scope: "planner", dayID: argDayID() }, label: "Reading Today" };
+    case "read_journal":
+      return { target: { scope: "planner", dayID: argDayID() }, label: "Reading journal" };
+    case "daily_items":
+    case "list_daily_items":
+      return { target: { scope: "planner", dayID: argDayID() }, label: "Reading today's list" };
+    case "backlog_items":
+    case "list_backlog_items":
+      return { target: { scope: "planner", dayID: plannerBacklogID }, label: "Reading backlog" };
+    case "complete_daily_item": {
+      const item = safeResult?.item as DailyItem | undefined;
+      const dayID = normalizePlannerDayID(String(safeResult?.dayID ?? safeArgs.dayID ?? safeArgs.date ?? ""));
+      return { target: { scope: "planner", dayID }, itemID: item?.id, label: "Updating task" };
+    }
+    case "read": {
+      const item = safeResult as { id?: string; target?: NoteLinkTarget } | undefined;
+      const target = realtimeFocusTargetFromNoteLink(item?.target)
+        ?? realtimeFocusTargetFromKnowledgeID(item?.id)
+        ?? realtimeFocusTargetFromKnowledgeID(String(safeArgs.itemID ?? safeArgs.id ?? ""));
+      return target ? { target, label: "Reading note" } : null;
+    }
+    case "read_search_result": {
+      const item = safeResult?.item as { id?: string; sourceID?: string; dayID?: string; sourceType?: string } | undefined;
+      const plannerFromDoc = item?.dayID && (item.sourceType === "planner_day" || item.sourceType === "journal_day")
+        ? { scope: "planner" as const, dayID: normalizePlannerDayID(item.dayID) }
+        : null;
+      const target = realtimeFocusTargetFromKnowledgeID(item?.id)
+        ?? realtimeFocusTargetFromKnowledgeID(item?.sourceID)
+        ?? plannerFromDoc;
+      return target ? { target, label: "Reading note" } : null;
+    }
+    default:
+      return null;
+  }
 }
 
 function noteImageMimeType(filePath: string) {
@@ -5835,6 +13017,30 @@ function readNoteImageDataURL(notePath: string, imageSrc: string) {
   const stat = fs.statSync(candidatePath);
   if (!stat.isFile()) return null;
   return `data:${noteImageMimeType(candidatePath)};base64,${fs.readFileSync(candidatePath).toString("base64")}`;
+}
+
+// The remote (phone) client cannot reach a note's on-disk .assets/ files, so it
+// can never load relative image paths. For the one note the user has opened, we
+// rewrite each `![alt](relative-path "caption")` so the path becomes a base64
+// `data:` URL the mobile <Image> renders directly. Already-absolute/remote/data
+// sources are left untouched. Guard the total inlined size so a note full of
+// large images can't bloat the snapshot (and the SSE stream); images beyond the
+// budget keep their original path (mobile shows a broken-image placeholder).
+const MAX_INLINE_NOTE_IMAGE_BYTES = 12_000_000; // ~12 MB total per note
+
+function inlineNoteMarkdownImages(markdown: string, notePath: string | undefined): string {
+  if (!notePath || !markdown || !markdown.includes("![")) return markdown;
+  let usedBytes = 0;
+  return markdown.replace(/(!\[[^\]]*\]\()\s*([^)\s]+)((?:\s+"[^"]*")?\s*\))/g, (match, prefix, src, suffix) => {
+    if (/^(https?:|data:|blob:)/i.test(src)) return match;
+    if (usedBytes >= MAX_INLINE_NOTE_IMAGE_BYTES) return match;
+    const dataURL = readNoteImageDataURL(notePath, src);
+    if (!dataURL || !dataURL.startsWith("data:")) return match;
+    // base64 length ≈ 4/3 of the byte size; this is the transferred cost.
+    usedBytes += dataURL.length;
+    if (usedBytes > MAX_INLINE_NOTE_IMAGE_BYTES) return match;
+    return `${prefix}${dataURL}${suffix}`;
+  });
 }
 
 async function loadAutomations(): Promise<AutomationItem[]> {
@@ -7008,17 +14214,241 @@ function titleFromSkill(id: string, name?: unknown) {
     .join(" ");
 }
 
-async function loadSettings(): Promise<SettingsSnapshot> {
-  const readInfoPlist = async (key: string, fallback: string) => {
-    const plist = path.join(openAssistRepoRoot(), "dist/Open Assist.app/Contents/Info.plist");
-    if (!fs.existsSync(plist)) return fallback;
-    try {
-      const { stdout } = await execFileAsync("/usr/bin/plutil", ["-extract", key, "raw", "-o", "-", plist]);
-      return stdout.trim() || fallback;
-    } catch {
-      return fallback;
+type RemoteAccessNetworkMode = "localOnly" | "localNetwork" | "tailscale";
+const tailscaleMacDownloadURL = "https://tailscale.com/download/mac";
+const tailscaleAppCandidates = [
+  "/Applications/Tailscale.app",
+  path.join(os.homedir(), "Applications", "Tailscale.app")
+];
+const tailscaleCLICandidates = [
+  "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
+  path.join(os.homedir(), "Applications", "Tailscale.app", "Contents", "MacOS", "Tailscale"),
+  "/usr/local/bin/tailscale",
+  "/opt/homebrew/bin/tailscale"
+];
+const systemCloudflaredCandidates = [
+  "/opt/homebrew/bin/cloudflared",
+  "/usr/local/bin/cloudflared",
+  "/usr/bin/cloudflared"
+];
+let cloudflaredInstallInFlight: Promise<string> | null = null;
+
+function cloudflaredRuntimeRoot() {
+  return path.join(remoteAccessRoot(), "cloudflared");
+}
+
+function managedCloudflaredPath() {
+  return path.join(cloudflaredRuntimeRoot(), "cloudflared");
+}
+
+function cloudflaredDownloadURL() {
+  const arch = os.arch() === "arm64" ? "arm64" : "amd64";
+  return `https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-${arch}.tgz`;
+}
+
+function cloudflaredExecutablePath() {
+  return firstExistingPath([managedCloudflaredPath(), ...systemCloudflaredCandidates]);
+}
+
+function normalizeRemoteAccessPublicURL(value: unknown) {
+  const trimmed = String(value ?? "").trim();
+  if (!trimmed) return "";
+  try {
+    const url = new URL(trimmed.includes("://") ? trimmed : `https://${trimmed}`);
+    url.pathname = "";
+    url.search = "";
+    url.hash = "";
+    return url.toString().replace(/\/+$/, "");
+  } catch {
+    return "";
+  }
+}
+
+function isQuickCloudflareURL(value: unknown) {
+  try {
+    return new URL(normalizeRemoteAccessPublicURL(value)).hostname.endsWith(".trycloudflare.com");
+  } catch {
+    return false;
+  }
+}
+
+function yamlSingleQuote(value: string) {
+  return `'${value.replace(/'/g, "''")}'`;
+}
+
+function safeCloudflaredConfigStem(value: string) {
+  return value.trim().replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "openassist";
+}
+
+function writeNamedCloudflaredConfig(input: {
+  publicURL: string;
+  targetURL: string;
+  tunnelName: string;
+  credentialsFile?: string;
+}) {
+  const hostname = new URL(input.publicURL).hostname;
+  const configPath = path.join(cloudflaredRuntimeRoot(), `${safeCloudflaredConfigStem(input.tunnelName)}.yml`);
+  const credentialsFile = String(input.credentialsFile ?? "").trim();
+  const lines = [
+    `tunnel: ${input.tunnelName}`,
+    ...(credentialsFile ? [`credentials-file: ${yamlSingleQuote(credentialsFile)}`] : []),
+    "ingress:",
+    `  - hostname: ${hostname}`,
+    `    service: ${input.targetURL}`,
+    "  - service: http_status:404"
+  ];
+  fs.mkdirSync(cloudflaredRuntimeRoot(), { recursive: true });
+  fs.writeFileSync(configPath, `${lines.join("\n")}\n`, "utf8");
+  return configPath;
+}
+
+async function installCloudflaredHelper() {
+  const existing = cloudflaredExecutablePath();
+  if (existing) return existing;
+  if (cloudflaredInstallInFlight) return cloudflaredInstallInFlight;
+  cloudflaredInstallInFlight = (async () => {
+    const root = cloudflaredRuntimeRoot();
+    fs.mkdirSync(root, { recursive: true });
+    const archivePath = path.join(root, "cloudflared.tgz");
+    await execFileAsync("/usr/bin/curl", ["-fsSL", cloudflaredDownloadURL(), "-o", archivePath], { timeout: 120_000 });
+    await execFileAsync("/usr/bin/tar", ["-xzf", archivePath, "-C", root], { timeout: 30_000 });
+    const extractedPath = fs.readdirSync(root)
+      .map((name) => path.join(root, name))
+      .find((candidate) => path.basename(candidate) === "cloudflared" && fs.statSync(candidate).isFile());
+    if (!extractedPath) throw new Error("Cloudflare tunnel helper download did not include cloudflared.");
+    if (extractedPath !== managedCloudflaredPath()) {
+      fs.copyFileSync(extractedPath, managedCloudflaredPath());
     }
+    fs.chmodSync(managedCloudflaredPath(), 0o755);
+    fs.rmSync(archivePath, { force: true });
+    return managedCloudflaredPath();
+  })().finally(() => {
+    cloudflaredInstallInFlight = null;
+  });
+  return cloudflaredInstallInFlight;
+}
+
+function normalizeRemoteAccessNetworkMode(value: unknown): RemoteAccessNetworkMode {
+  if (value === "localNetwork" || value === "easyQR") return "localNetwork";
+  return value === "tailscale" ? "tailscale" : "localOnly";
+}
+
+function normalizedRemoteAccessPort(value: unknown) {
+  const port = Number.parseInt(String(value ?? "45831"), 10);
+  if (!Number.isInteger(port) || port < 1024 || port > 65535) return 45831;
+  return port;
+}
+
+function remoteAccessBaseURLFromHost(rawHost: string, rawPort: unknown) {
+  const host = rawHost.trim();
+  if (!host) return "";
+  const port = normalizedRemoteAccessPort(rawPort);
+  const valueWithScheme = host.includes("://") ? host : `http://${host}`;
+  try {
+    const url = new URL(valueWithScheme);
+    if (!url.hostname) return "";
+    if (!url.port) url.port = String(port);
+    url.pathname = "";
+    url.search = "";
+    url.hash = "";
+    return url.toString().replace(/\/+$/, "");
+  } catch {
+    return "";
+  }
+}
+
+function isTailscaleIPv4Address(value: string) {
+  const segments = value.split(".");
+  if (segments.length !== 4) return false;
+  const parts = segments.map((part) => Number(part));
+  if (!parts.every((part) => Number.isInteger(part) && part >= 0 && part <= 255)) return false;
+  return parts[0] === 100 && parts[1] >= 64 && parts[1] <= 127;
+}
+
+function isPrivateIPv4Address(value: string) {
+  const segments = value.split(".");
+  if (segments.length !== 4) return false;
+  const parts = segments.map((part) => Number(part));
+  if (!parts.every((part) => Number.isInteger(part) && part >= 0 && part <= 255)) return false;
+  return parts[0] === 10
+    || (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31)
+    || (parts[0] === 192 && parts[1] === 168)
+    || (parts[0] === 169 && parts[1] === 254);
+}
+
+function detectedLocalNetworkAddress() {
+  for (const entries of Object.values(os.networkInterfaces())) {
+    for (const entry of entries ?? []) {
+      if (entry.family === "IPv4" && !entry.internal && isPrivateIPv4Address(entry.address)) {
+        return entry.address;
+      }
+    }
+  }
+  return "";
+}
+
+function detectedTailscaleNetworkAddress() {
+  for (const entries of Object.values(os.networkInterfaces())) {
+    for (const entry of entries ?? []) {
+      if (entry.family === "IPv4" && !entry.internal && isTailscaleIPv4Address(entry.address)) {
+        return entry.address;
+      }
+    }
+  }
+  return "";
+}
+
+function firstExistingPath(candidates: string[]) {
+  return candidates.find((candidate) => fs.existsSync(candidate)) ?? "";
+}
+
+async function detectedTailscaleCLIAddress(cliPath: string) {
+  if (!cliPath) return "";
+  try {
+    const { stdout } = await execFileAsync(cliPath, ["ip", "-4"], { timeout: 1200 });
+    return stdout
+      .split(/\s+/)
+      .map((value) => value.trim())
+      .find(isTailscaleIPv4Address) ?? "";
+  } catch {
+    return "";
+  }
+}
+
+async function remoteAccessTailscaleStatusSnapshot() {
+  const appPath = firstExistingPath(tailscaleAppCandidates);
+  const cliPath = firstExistingPath(tailscaleCLICandidates);
+  const detectedHost = detectedTailscaleNetworkAddress() || await detectedTailscaleCLIAddress(cliPath);
+  const installed = Boolean(appPath || cliPath);
+  const running = Boolean(detectedHost);
+  return {
+    installed,
+    running,
+    appPath,
+    detectedHost,
+    installURL: tailscaleMacDownloadURL,
+    statusMessage: running
+      ? `Connected as ${detectedHost}.`
+      : installed
+        ? "Installed but not connected. Open Tailscale, use Login or Reconnect, then check again."
+        : "Not installed. Install Tailscale, then sign in."
   };
+}
+
+async function readOpenAssistInfoPlist(key: string, fallback: string) {
+  const plist = path.join(openAssistRepoRoot(), "dist/Open Assist.app/Contents/Info.plist");
+  if (!fs.existsSync(plist)) return fallback;
+  try {
+    const { stdout } = await execFileAsync("/usr/bin/plutil", ["-extract", key, "raw", "-o", "-", plist]);
+    return stdout.trim() || fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+async function loadSettings(): Promise<SettingsSnapshot> {
+  await ensureLiquidGlassDefaultMigrated();
+  const readInfoPlist = readOpenAssistInfoPlist;
   const assistantBackendRaw = await readDefault("OpenAssist.assistantBackend", "codex");
   const normalizedBackend = normalizeBackend(assistantBackendRaw);
   const assistantBackend = isRuntimeBackend(normalizedBackend) ? normalizedBackend : "codex";
@@ -7039,6 +14469,15 @@ async function loadSettings(): Promise<SettingsSnapshot> {
     ? await hasKeychainPassword(cloudTranscriptionKeychainAccount(cloudTranscriptionProvider))
     : false;
   const realtimeOpenAIAPIKey = await resolveRealtimeOpenAIAPIKey();
+  const realtimeGeminiAPIKey = await resolveRealtimeGeminiAPIKey();
+  const storedRealtimeVoiceProvider = await readDefault("OpenAssist.realtimeVoice.provider", "");
+  const realtimeVoiceProvider = storedRealtimeVoiceProvider === "geminiLive"
+    ? "geminiLive"
+    : storedRealtimeVoiceProvider === "openaiRealtime"
+      ? "openaiRealtime"
+      : realtimeGeminiAPIKey.configured
+        ? "geminiLive"
+        : defaultRealtimeVoiceProvider;
   const assistantPreferredModel = await readDefault("OpenAssist.assistantPreferredModelID", readCodexDefaultModel());
   const availableAssistantBackends: RuntimeAssistantBackend[] = await selectableAssistantBackends(assistantBackend);
   const runtimeSetup = await runtimeSetupSnapshot(assistantBackend, availableAssistantBackends);
@@ -7072,6 +14511,23 @@ async function loadSettings(): Promise<SettingsSnapshot> {
       await readNumberDefault("OpenAssist.dictationFeedbackVolume", defaultDictationFeedbackVolume)
     )
   );
+  const knowledgeAccessEnabled = await readBoolDefault("OpenAssist.knowledgeAccess.enabled", true);
+  const knowledgeServerPort = await readDefault("OpenAssist.knowledgeAccess.port", defaultKnowledgeServerPort);
+  const knowledgeTokenConfigured = knowledgeAccessEnabled
+    ? Boolean(ensureKnowledgeAccessToken())
+    : fs.existsSync(knowledgeAccessTokenPath());
+  const remoteAccessPort = await readDefault("OpenAssist.remoteAccess.port", "45831");
+  const remoteAccessNetworkMode = normalizeRemoteAccessNetworkMode(
+    await readDefault("OpenAssist.remoteAccess.networkMode", "localNetwork")
+  );
+  const remoteAccessTailscaleHost = (await readDefault("OpenAssist.remoteAccess.tailscaleHost", "")).trim();
+  const remoteAccessTailscaleStatus = await remoteAccessTailscaleStatusSnapshot();
+  const remoteAccessRuntime = remoteAccessServerRuntimeSnapshot({
+    port: remoteAccessPort,
+    networkMode: remoteAccessNetworkMode,
+    tailscaleHost: remoteAccessTailscaleHost,
+    publicURL: easyRemoteTunnel.currentURL()
+  });
   return {
     appVersion: await readInfoPlist("CFBundleShortVersionString", "1.0.7"),
     buildNumber: await readInfoPlist("CFBundleVersion", "69"),
@@ -7084,7 +14540,7 @@ async function loadSettings(): Promise<SettingsSnapshot> {
     compactEdge: await readDefault("OpenAssist.assistantCompactSidebarEdge", "right"),
     themeMode: await readDefault("OpenAssist.themeMode", "System"),
     colorTheme: await readDefault("OpenAssist.colorTheme", "Ocean"),
-    appChromeStyle: await readDefault("OpenAssist.appChromeStyle", "Glass (High Contrast)"),
+    appChromeStyle: await readDefault("OpenAssist.appChromeStyle", liquidGlassChromeStyle),
     lightThemeAccent: await readDefault("OpenAssist.lightTheme.accent", "#0169CC"),
     lightThemeBackground: await readDefault("OpenAssist.lightTheme.background", "#FFFFFF"),
     lightThemeForeground: await readDefault("OpenAssist.lightTheme.foreground", "#0D0D0D"),
@@ -7108,6 +14564,7 @@ async function loadSettings(): Promise<SettingsSnapshot> {
     darkThemeDiffRemoved: await readDefault("OpenAssist.darkTheme.diffRemoved", "#fa423e"),
     darkThemeSkill: await readDefault("OpenAssist.darkTheme.skill", "#ad7bf9"),
     pointerCursors: await readBoolDefault("OpenAssist.usePointerCursors", false),
+    fontSmoothing: await readBoolDefault("OpenAssist.fontSmoothing", true),
     reduceMotionMode: await readDefault("OpenAssist.reduceMotionMode", "System"),
     uiFontSize: await readDefault("OpenAssist.uiFontSize", "13"),
     codeFontSize: await readDefault("OpenAssist.codeFontSize", "12"),
@@ -7121,10 +14578,31 @@ async function loadSettings(): Promise<SettingsSnapshot> {
     realtimeMaskedOpenAIAPIKey: realtimeOpenAIAPIKey.label,
     realtimeOpenAIModel: await readDefault("OpenAssist.realtimeVoice.openAIModel", defaultRealtimeOpenAIModel),
     realtimeOpenAIVoice: await readDefault("OpenAssist.realtimeVoice.openAIVoice", defaultRealtimeOpenAIVoice),
+    realtimeVoiceProvider,
+    realtimeGeminiAPIKeyConfigured: realtimeGeminiAPIKey.configured,
+    realtimeMaskedGeminiAPIKey: realtimeGeminiAPIKey.label,
+    realtimeGeminiModel: await readDefault("OpenAssist.realtimeVoice.geminiModel", defaultRealtimeGeminiModel),
+    realtimeGeminiVoice: await readDefault("OpenAssist.realtimeVoice.geminiVoice", defaultRealtimeGeminiVoice),
+    liveVoiceMode: await readDefault("OpenAssist.liveVoice.mode", defaultLiveVoiceMode),
+    todayWakeWordEnabled: await readBoolDefault("OpenAssist.todayWakeWord.enabled", false),
+    todayWakeWordPhrase: await readDefault("OpenAssist.todayWakeWord.phrase", "Hey Open Assist"),
+    realtimeDelegationMode: normalizeRealtimeDelegationMode(await readDefault("OpenAssist.realtimeVoice.delegationMode", "autoHardTasksOnly")),
+    localVoiceModel: await readDefault("OpenAssist.localVoice.model", defaultLocalVoiceModel),
+    speechOutputRewriteModel: await readDefault("OpenAssist.speechOutputRewrite.model", defaultSpeechOutputRewriteModel),
     assistantVoiceOutputEnabled: await readBoolDefault("OpenAssist.assistantVoiceOutputEnabled", false),
     computerUseEnabled: await readBoolDefault("OpenAssist.assistantComputerUseEnabled", false),
     memoryEnabled: await readBoolDefault("OpenAssist.assistantMemoryEnabled", true),
+    knowledgeAccessEnabled,
+    knowledgeExternalAccessEnabled: await readBoolDefault("OpenAssist.knowledgeAccess.externalEnabled", false),
+    knowledgeAgentAccessEnabled: await readBoolDefault("OpenAssist.knowledgeAccess.agentEnabled", true),
+    knowledgeRealtimeVoiceAccessEnabled: await readBoolDefault("OpenAssist.knowledgeAccess.realtimeVoiceEnabled", true),
+    knowledgeOrganizerEnabled: await readBoolDefault("OpenAssist.knowledgeAccess.organizerEnabled", true),
+    knowledgeServerPort,
+    knowledgeServerURL: knowledgeServerURL(knowledgeServerPort),
+    knowledgeTokenConfigured,
+    knowledgePendingRequestCount: listKnowledgeWriteRequests("pending").length,
     assistantTrackCodeChangesInGitRepos: await readBoolDefault("OpenAssist.assistantTrackCodeChangesInGitRepos", true),
+    archiveAutoDeleteDays: (await readNumberDefault("OpenAssist.archiveAutoDeleteDays", 0)) || null,
     automationAPIPort: await readDefault("OpenAssist.automationAPIPort", "45831"),
     browserProfile: await readDefault("OpenAssist.browserSelectedProfileID", "Default"),
     holdToTalkShortcut,
@@ -7150,8 +14628,15 @@ async function loadSettings(): Promise<SettingsSnapshot> {
     whisperUseCoreML: await readBoolDefault("OpenAssist.whisperUseCoreML", true),
     whisperInstalledModels,
     whisperModelInstalled: fs.existsSync(whisperModelPath(whisperModel)),
-    voiceEngine: await readDefault("OpenAssist.assistantVoiceEngine", "humeOctave"),
+    voiceEngine: await readAssistantVoiceEngineSetting(),
     kokoroVoice: safeKokoroVoiceID(await readDefault("OpenAssist.assistantKokoroVoiceID", defaultKokoroVoiceID)),
+    pocketTTSVoice: safePocketTTSVoiceID(await readDefault("OpenAssist.assistantPocketTTSVoiceID", defaultPocketTTSVoiceID)),
+    openAITTSModel: safeOpenAITTSModel(await readDefault("OpenAssist.assistantOpenAITTSModel", defaultOpenAITTSModel)),
+    openAITTSVoice: safeOpenAITTSVoice(await readDefault("OpenAssist.assistantOpenAITTSVoice", defaultOpenAITTSVoice)),
+    noteCleanupModel: (await readDefault("OpenAssist.noteCleanupModel", "")).trim(),
+    noteCleanupReasoningEffort: (await readDefault("OpenAssist.noteCleanupReasoningEffort", "")).trim(),
+    geminiTTSModel: safeGeminiTTSModel(await readDefault("OpenAssist.assistantGeminiTTSModel", defaultGeminiTTSModel)),
+    geminiTTSVoice: safeGeminiTTSVoice(await readDefault("OpenAssist.assistantGeminiTTSVoice", defaultGeminiTTSVoice)),
     kokoroModelInstalled: kokoroInstalled(),
     kokoroModelPath: kokoroVoiceDirectory(),
     kokoroModelDetail: kokoroInstalled()
@@ -7170,8 +14655,28 @@ async function loadSettings(): Promise<SettingsSnapshot> {
     telegramSelectedSessionID: await readDefault("OpenAssist.telegramSelectedSessionID", ""),
     telegramBotUsername: await readDefault("OpenAssist.telegramBotUsername", ""),
     remoteAccessEnabled: await readBoolDefault("OpenAssist.remoteAccess.enabled", false),
-    remoteAccessPort: await readDefault("OpenAssist.remoteAccess.port", "45831"),
-    remoteAccessPublicURL: await readDefault("OpenAssist.remoteAccess.namedTunnelPublicURL", ""),
+    remoteAccessPort,
+    remoteAccessPublicURL: normalizeRemoteAccessPublicURL(await readDefault("OpenAssist.remoteAccess.namedTunnelPublicURL", "")),
+    remoteAccessNetworkMode,
+    remoteAccessTailscaleHost,
+    remoteAccessLocalNetworkURL: remoteAccessLocalNetworkURL({ port: remoteAccessPort, networkMode: remoteAccessNetworkMode, tailscaleHost: remoteAccessTailscaleHost }),
+    remoteAccessTailscaleURL: remoteAccessRuntime.tailscaleURL,
+    remoteAccessEasyTunnelURL: remoteAccessRuntime.easyTunnelURL,
+    remoteAccessEasyTunnelRunning: remoteAccessRuntime.easyTunnelRunning,
+    remoteAccessEasyTunnelStatusMessage: remoteAccessRuntime.easyTunnelStatusMessage,
+    remoteAccessTunnelHelperInstalled: remoteAccessRuntime.tunnelHelperInstalled,
+    remoteAccessTunnelHelperInstalling: remoteAccessRuntime.tunnelHelperInstalling,
+    remoteAccessTailscaleInstalled: remoteAccessTailscaleStatus.installed,
+    remoteAccessTailscaleRunning: remoteAccessTailscaleStatus.running,
+    remoteAccessDetectedTailscaleHost: remoteAccessTailscaleStatus.detectedHost,
+    remoteAccessTailscaleAppPath: remoteAccessTailscaleStatus.appPath,
+    remoteAccessTailscaleInstallURL: remoteAccessTailscaleStatus.installURL,
+    remoteAccessTailscaleStatusMessage: remoteAccessTailscaleStatus.statusMessage,
+    remoteAccessPairingCode: remoteAccessRuntime.pairingCode,
+    remoteAccessPairingURL: remoteAccessRuntime.pairingURL,
+    remoteAccessPairingExpiresAt: remoteAccessRuntime.pairingExpiresAt,
+    remoteAccessServerRunning: remoteAccessRuntime.serverRunning,
+    remoteAccessDeviceCount: remoteAccessRuntime.deviceCount,
     localAIRuntimeVersion: await readDefault("OpenAssist.localAIRuntimeVersion", "Unknown"),
     promptRewriteProvider,
     promptRewriteModel,
@@ -7215,12 +14720,30 @@ const writableSettingKeys: Record<SettingsUpdateKey, { defaultsKey: string; type
   realtimeVoiceEnabled: { defaultsKey: "OpenAssist.realtimeVoice.enabled", type: "bool" },
   realtimeOpenAIModel: { defaultsKey: "OpenAssist.realtimeVoice.openAIModel", type: "string" },
   realtimeOpenAIVoice: { defaultsKey: "OpenAssist.realtimeVoice.openAIVoice", type: "string" },
+  realtimeVoiceProvider: { defaultsKey: "OpenAssist.realtimeVoice.provider", type: "string" },
+  realtimeGeminiModel: { defaultsKey: "OpenAssist.realtimeVoice.geminiModel", type: "string" },
+  realtimeGeminiVoice: { defaultsKey: "OpenAssist.realtimeVoice.geminiVoice", type: "string" },
+  liveVoiceMode: { defaultsKey: "OpenAssist.liveVoice.mode", type: "string" },
+  todayWakeWordEnabled: { defaultsKey: "OpenAssist.todayWakeWord.enabled", type: "bool" },
+  todayWakeWordPhrase: { defaultsKey: "OpenAssist.todayWakeWord.phrase", type: "string" },
+  realtimeDelegationMode: { defaultsKey: "OpenAssist.realtimeVoice.delegationMode", type: "string" },
+  localVoiceModel: { defaultsKey: "OpenAssist.localVoice.model", type: "string" },
+  speechOutputRewriteModel: { defaultsKey: "OpenAssist.speechOutputRewrite.model", type: "string" },
   assistantVoiceOutputEnabled: { defaultsKey: "OpenAssist.assistantVoiceOutputEnabled", type: "bool" },
   computerUseEnabled: { defaultsKey: "OpenAssist.assistantComputerUseEnabled", type: "bool" },
   memoryEnabled: { defaultsKey: "OpenAssist.assistantMemoryEnabled", type: "bool" },
+  knowledgeAccessEnabled: { defaultsKey: "OpenAssist.knowledgeAccess.enabled", type: "bool" },
+  knowledgeExternalAccessEnabled: { defaultsKey: "OpenAssist.knowledgeAccess.externalEnabled", type: "bool" },
+  knowledgeAgentAccessEnabled: { defaultsKey: "OpenAssist.knowledgeAccess.agentEnabled", type: "bool" },
+  knowledgeRealtimeVoiceAccessEnabled: { defaultsKey: "OpenAssist.knowledgeAccess.realtimeVoiceEnabled", type: "bool" },
+  knowledgeOrganizerEnabled: { defaultsKey: "OpenAssist.knowledgeAccess.organizerEnabled", type: "bool" },
+  knowledgeServerPort: { defaultsKey: "OpenAssist.knowledgeAccess.port", type: "string" },
   assistantTrackCodeChangesInGitRepos: { defaultsKey: "OpenAssist.assistantTrackCodeChangesInGitRepos", type: "bool" },
+  archiveAutoDeleteDays: { defaultsKey: "OpenAssist.archiveAutoDeleteDays", type: "number" },
   telegramEnabled: { defaultsKey: "OpenAssist.telegramRemoteEnabled", type: "bool" },
   remoteAccessEnabled: { defaultsKey: "OpenAssist.remoteAccess.enabled", type: "bool" },
+  remoteAccessNetworkMode: { defaultsKey: "OpenAssist.remoteAccess.networkMode", type: "string" },
+  remoteAccessTailscaleHost: { defaultsKey: "OpenAssist.remoteAccess.tailscaleHost", type: "string" },
   compactStyle: { defaultsKey: "OpenAssist.assistantCompactPresentationStyle", type: "string" },
   compactEdge: { defaultsKey: "OpenAssist.assistantCompactSidebarEdge", type: "string" },
   assistantBackend: { defaultsKey: "OpenAssist.assistantBackend", type: "string" },
@@ -7251,6 +14774,7 @@ const writableSettingKeys: Record<SettingsUpdateKey, { defaultsKey: string; type
   darkThemeDiffRemoved: { defaultsKey: "OpenAssist.darkTheme.diffRemoved", type: "string" },
   darkThemeSkill: { defaultsKey: "OpenAssist.darkTheme.skill", type: "string" },
   pointerCursors: { defaultsKey: "OpenAssist.usePointerCursors", type: "bool" },
+  fontSmoothing: { defaultsKey: "OpenAssist.fontSmoothing", type: "bool" },
   reduceMotionMode: { defaultsKey: "OpenAssist.reduceMotionMode", type: "string" },
   uiFontSize: { defaultsKey: "OpenAssist.uiFontSize", type: "string" },
   codeFontSize: { defaultsKey: "OpenAssist.codeFontSize", type: "string" },
@@ -7271,6 +14795,13 @@ const writableSettingKeys: Record<SettingsUpdateKey, { defaultsKey: string; type
   selectedMicrophoneUID: { defaultsKey: "OpenAssist.selectedMicrophoneUID", type: "string" },
   voiceEngine: { defaultsKey: "OpenAssist.assistantVoiceEngine", type: "string" },
   kokoroVoice: { defaultsKey: "OpenAssist.assistantKokoroVoiceID", type: "string" },
+  pocketTTSVoice: { defaultsKey: "OpenAssist.assistantPocketTTSVoiceID", type: "string" },
+  openAITTSModel: { defaultsKey: "OpenAssist.assistantOpenAITTSModel", type: "string" },
+  openAITTSVoice: { defaultsKey: "OpenAssist.assistantOpenAITTSVoice", type: "string" },
+  noteCleanupModel: { defaultsKey: "OpenAssist.noteCleanupModel", type: "string" },
+  noteCleanupReasoningEffort: { defaultsKey: "OpenAssist.noteCleanupReasoningEffort", type: "string" },
+  geminiTTSModel: { defaultsKey: "OpenAssist.assistantGeminiTTSModel", type: "string" },
+  geminiTTSVoice: { defaultsKey: "OpenAssist.assistantGeminiTTSVoice", type: "string" },
   whisperModel: { defaultsKey: "OpenAssist.selectedWhisperModelID", type: "string" },
   whisperUseCoreML: { defaultsKey: "OpenAssist.whisperUseCoreML", type: "bool" },
   transcriptionEngine: { defaultsKey: "OpenAssist.transcriptionEngine", type: "string" }
@@ -7299,7 +14830,12 @@ const shortcutTargetDefaultsKeys = {
   }
 } as const;
 
-async function updateSetting(key: SettingsUpdateKey, value: boolean | string | number) {
+type SettingsUpdatePatch = {
+  key: SettingsUpdateKey;
+  value: boolean | string | number;
+};
+
+async function writeSettingValue(key: SettingsUpdateKey, value: boolean | string | number) {
   const setting = writableSettingKeys[key];
   if (!setting) throw new Error(`Unsupported setting: ${key}`);
   if (setting.type === "bool") {
@@ -7337,6 +14873,38 @@ async function updateSetting(key: SettingsUpdateKey, value: boolean | string | n
         throw new Error("Transcription engine must match a native OpenAssist engine.");
       }
       await writeStringDefault(setting.defaultsKey, nextEngine);
+    } else if (key === "liveVoiceMode") {
+      const nextMode = String(value);
+      if (nextMode !== "openaiRealtime" && nextMode !== "localVoiceAgent") {
+        throw new Error("Realtime conversation mode must be OpenAI Realtime or Local Voice Agent.");
+      }
+      await writeStringDefault(setting.defaultsKey, nextMode);
+    } else if (key === "todayWakeWordPhrase") {
+      const nextPhrase = String(value).replace(/\s+/g, " ").trim();
+      if (!nextPhrase) {
+        throw new Error("Wake phrase cannot be empty.");
+      }
+      await writeStringDefault(setting.defaultsKey, nextPhrase.slice(0, 80));
+    } else if (key === "realtimeDelegationMode") {
+      await writeStringDefault(setting.defaultsKey, normalizeRealtimeDelegationMode(value));
+    } else if (key === "localVoiceModel" || key === "speechOutputRewriteModel") {
+      const nextModel = String(value).trim();
+      await writeStringDefault(
+        setting.defaultsKey,
+        nextModel || (key === "localVoiceModel" ? defaultLocalVoiceModel : defaultSpeechOutputRewriteModel)
+      );
+    } else if (key === "voiceEngine") {
+      await writeStringDefault(setting.defaultsKey, safeAssistantVoiceEngine(value));
+    } else if (key === "pocketTTSVoice") {
+      await writeStringDefault(setting.defaultsKey, safePocketTTSVoiceID(String(value)));
+    } else if (key === "openAITTSModel") {
+      await writeStringDefault(setting.defaultsKey, safeOpenAITTSModel(value));
+    } else if (key === "openAITTSVoice") {
+      await writeStringDefault(setting.defaultsKey, safeOpenAITTSVoice(value));
+    } else if (key === "geminiTTSModel") {
+      await writeStringDefault(setting.defaultsKey, safeGeminiTTSModel(value));
+    } else if (key === "geminiTTSVoice") {
+      await writeStringDefault(setting.defaultsKey, safeGeminiTTSVoice(value));
     } else if (
       key === "dictationStartSoundName"
       || key === "dictationStopSoundName"
@@ -7355,6 +14923,19 @@ async function updateSetting(key: SettingsUpdateKey, value: boolean | string | n
         throw new Error("Whisper model must match a native OpenAssist model.");
       }
       await writeStringDefault(setting.defaultsKey, nextModel);
+    } else if (key === "appChromeStyle") {
+      await writeStringDefault(setting.defaultsKey, String(value));
+      await writeBoolDefault(liquidGlassDefaultMigrationKey, true);
+    } else if (key === "knowledgeServerPort") {
+      const port = Number.parseInt(String(value), 10);
+      if (!Number.isInteger(port) || port < 1024 || port > 65535) {
+        throw new Error("Knowledge Access port must be between 1024 and 65535.");
+      }
+      await writeStringDefault(setting.defaultsKey, String(port));
+    } else if (key === "remoteAccessNetworkMode") {
+      await writeStringDefault(setting.defaultsKey, normalizeRemoteAccessNetworkMode(value));
+    } else if (key === "remoteAccessTailscaleHost") {
+      await writeStringDefault(setting.defaultsKey, String(value).trim());
     } else {
       await writeStringDefault(setting.defaultsKey, String(value));
     }
@@ -7366,7 +14947,37 @@ async function updateSetting(key: SettingsUpdateKey, value: boolean | string | n
       }
     }
   }
-  return loadSettings();
+}
+
+async function finalizeSettingsUpdate(keys: SettingsUpdateKey[]) {
+  const nextSettings = await loadSettings();
+  if (keys.some((key) => key.startsWith("knowledge"))) {
+    await ensureKnowledgeServerForSettings(nextSettings).catch((error) => {
+      bridgeDebugLog(`Knowledge Access restart failed after setting update: ${error instanceof Error ? error.message : String(error)}`);
+    });
+  }
+  if (keys.some((key) => key.startsWith("remoteAccess"))) {
+    await ensureRemoteAccessServerForSettings(nextSettings).catch((error) => {
+      bridgeDebugLog(`Remote Access restart failed after setting update: ${error instanceof Error ? error.message : String(error)}`);
+    });
+  }
+  return nextSettings;
+}
+
+async function updateSetting(key: SettingsUpdateKey, value: boolean | string | number) {
+  await writeSettingValue(key, value);
+  return finalizeSettingsUpdate([key]);
+}
+
+async function updateSettings(updates: SettingsUpdatePatch[]) {
+  if (!Array.isArray(updates)) throw new Error("Settings updates must be a list.");
+  const changedKeys: SettingsUpdateKey[] = [];
+  for (const update of updates) {
+    if (!update || typeof update !== "object") throw new Error("Invalid settings update.");
+    await writeSettingValue(update.key, update.value);
+    changedKeys.push(update.key);
+  }
+  return finalizeSettingsUpdate(changedKeys);
 }
 
 async function updateShortcut(
@@ -7489,9 +15100,11 @@ async function clearCloudTranscriptionAPIKey(provider: string) {
 
 async function saveRealtimeOpenAIAPIKey(rawValue: string) {
   await storeKeychainPassword(realtimeOpenAIAPIKeychainAccount, rawValue);
+  await writeStringDefault("OpenAssist.realtimeVoice.provider", "openaiRealtime");
   const settings = await loadSettings();
   return {
     ...settings,
+    realtimeVoiceProvider: "openaiRealtime",
     realtimeOpenAIAPIKeyConfigured: true,
     realtimeDedicatedOpenAIAPIKeyConfigured: true,
     realtimeOpenAIAPIKeySource: "dedicated" as const,
@@ -7509,6 +15122,28 @@ async function clearRealtimeOpenAIAPIKey() {
     realtimeDedicatedOpenAIAPIKeyConfigured: realtimeOpenAIAPIKey.dedicatedConfigured,
     realtimeOpenAIAPIKeySource: realtimeOpenAIAPIKey.source,
     realtimeMaskedOpenAIAPIKey: realtimeOpenAIAPIKey.label
+  };
+}
+
+async function saveRealtimeGeminiAPIKey(rawValue: string) {
+  await storeKeychainPassword(googleAIStudioAPIKeychainAccount, rawValue);
+  await writeStringDefault("OpenAssist.realtimeVoice.provider", "geminiLive");
+  const settings = await loadSettings();
+  return {
+    ...settings,
+    realtimeVoiceProvider: "geminiLive",
+    realtimeGeminiAPIKeyConfigured: true,
+    realtimeMaskedGeminiAPIKey: "Using saved Google AI key"
+  };
+}
+
+async function clearRealtimeGeminiAPIKey() {
+  await deleteKeychainPassword(googleAIStudioAPIKeychainAccount);
+  const settings = await loadSettings();
+  return {
+    ...settings,
+    realtimeGeminiAPIKeyConfigured: false,
+    realtimeMaskedGeminiAPIKey: keychainStatus(false, true)
   };
 }
 
@@ -7539,12 +15174,99 @@ async function speakWithMacOS(text: string) {
     beginAssistantSpeechRun();
     const child = spawn("/usr/bin/say", [text], { stdio: "ignore" });
     assistantSpeechProcess = child;
-    child.once("error", reject);
+    child.once("error", (error) => {
+      if (assistantSpeechProcess === child) {
+        assistantSpeechProcess = null;
+        assistantSpeechProcessPaused = false;
+      }
+      reject(error);
+    });
     child.once("exit", (code) => {
       if (assistantSpeechProcess === child) assistantSpeechProcess = null;
       code === 0 || code === null ? resolve() : reject(new Error(`Speech playback exited with code ${code}.`));
     });
   });
+}
+
+async function generateAssistantSpeechAudioFile(
+  rawText: string,
+  settings: SettingsSnapshot,
+  options: { engine?: string; voice?: string; model?: string } = {}
+) {
+  const text = await rewriteSpeechTextForTTS(assistantSpeechText(rawText), settings);
+  if (!text) throw new Error("No assistant text to speak.");
+  const engine = await resolvedAssistantVoiceEngine(settings, options.engine);
+  const runID = beginAssistantSpeechRun();
+  if (engine === "openaiTTS") {
+    const nextSettings = {
+      ...settings,
+      openAITTSModel: options.model || settings.openAITTSModel,
+      openAITTSVoice: options.voice || settings.openAITTSVoice
+    };
+    const result = await generateOpenAITTSAudioFile(text, nextSettings);
+    return { ...result, label: assistantVoiceEngineLabel(engine, result.model, result.voice) };
+  }
+  if (engine === "geminiTTS") {
+    const nextSettings = {
+      ...settings,
+      geminiTTSModel: options.model || settings.geminiTTSModel,
+      geminiTTSVoice: options.voice || settings.geminiTTSVoice
+    };
+    const result = await generateGeminiTTSAudioFile(text, nextSettings);
+    return { ...result, label: assistantVoiceEngineLabel(engine, result.model, result.voice) };
+  }
+  if (engine === "pocketTTS") {
+    const voice = safePocketTTSVoiceID(options.voice || settings.pocketTTSVoice || defaultPocketTTSVoiceID);
+    fs.mkdirSync(pocketTTSCacheDirectory(), { recursive: true });
+    const cachedPath = cachedPocketTTSAudioPath(text, voice) || path.join(pocketTTSCacheDirectory(), `assistant-reply-${Date.now()}-0.wav`);
+    const outputPath = fs.existsSync(cachedPath) ? cachedPath : await generatePocketTTSAudioFile(text, voice, cachedPath, runID);
+    if (!outputPath) throw new Error("Pocket TTS voice output was stopped.");
+    return { path: outputPath, mimeType: "audio/wav", engine, model: "pocket-tts", voice, label: assistantVoiceEngineLabel(engine, "pocket-tts", voice) };
+  }
+  if (engine === "kokoroLocal") {
+    if (!kokoroInstalled()) throw new Error("Kokoro Local Voice is not installed yet. Install it from Voice Reply Output settings.");
+    const voice = safeKokoroVoiceID(options.voice || settings.kokoroVoice || defaultKokoroVoiceID);
+    fs.mkdirSync(cloudTTSCacheDirectory(), { recursive: true });
+    const cachedPath = cloudTTSCachePath("kokoroLocal", "kokoro-local", voice, text, "wav");
+    if (!fs.existsSync(cachedPath)) {
+      await runKokoroWorkerRequest({
+        type: "generate",
+        text,
+        voiceID: voice,
+        outputPath: cachedPath
+      });
+      if (runID !== assistantSpeechRunID) {
+        if (fs.existsSync(cachedPath)) fs.unlinkSync(cachedPath);
+        throw new Error("Kokoro voice output was stopped.");
+      }
+    }
+    return { path: cachedPath, mimeType: "audio/wav", engine, model: "kokoro-local", voice, label: assistantVoiceEngineLabel(engine, "kokoro-local", voice) };
+  }
+  const result = await generateMacOSTTSAudioFile(text);
+  return { ...result, label: assistantVoiceEngineLabel(engine, result.model, result.voice) };
+}
+
+async function prepareReadAloudAudio(rawText: string, options: { engine?: string; voice?: string; model?: string } = {}) {
+  try {
+    const settings = await loadSettings();
+    const result = await generateAssistantSpeechAudioFile(rawText, settings, options);
+    const audioDataURL = audioDataURLFromFile(result.path, result.mimeType);
+    return {
+      ok: true,
+      audioDataURL,
+      mimeType: result.mimeType,
+      engine: result.engine,
+      model: result.model,
+      voice: result.voice,
+      label: result.label
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      error: error instanceof Error ? error.message : "Could not prepare read aloud audio.",
+      fallbackAvailable: true
+    };
+  }
 }
 
 async function speakWithKokoroLocal(text: string, voiceID: string) {
@@ -7600,33 +15322,391 @@ async function speakWithKokoroLocal(text: string, voiceID: string) {
   return { ok: true, skipped: true, reason: "Assistant voice output was stopped." };
 }
 
-async function speakAssistantResponse(rawText: string, options: { force?: boolean } = {}) {
+async function prewarmPocketTTSVoice(voiceID = defaultPocketTTSVoiceID) {
+  const startedAt = Date.now();
+  fs.mkdirSync(pocketTTSOutputDirectory(), { recursive: true });
+  fs.mkdirSync(pocketTTSCacheDirectory(), { recursive: true });
+  await ensurePocketTTSServer(assistantSpeechRunID);
+  let generated = 0;
+  for (const phrase of pocketTTSPrewarmPhrases) {
+    const outputPath = cachedPocketTTSAudioPath(phrase, voiceID);
+    if (!outputPath || fs.existsSync(outputPath)) continue;
+    await generatePocketTTSAudioFileWithServer(phrase, voiceID, outputPath, assistantSpeechRunID);
+    generated += 1;
+  }
+  assistantVoiceLog(
+    `pocket tts prewarm completed voice=${safePocketTTSVoiceID(voiceID)} generated=${generated} elapsedMs=${Date.now() - startedAt}`
+  );
+}
+
+function idleNoteReadAloudState(): NoteReadAloudState {
+  return {
+    status: "idle",
+    currentSegment: 0,
+    totalSegments: 0
+  };
+}
+
+function noteReadAloudProgressLabel(session: NoteReadAloudSession) {
+  if (session.status === "finished") return "Finished";
+  if (session.status === "error") return "Read aloud failed";
+  if (session.status === "idle") return undefined;
+  const current = Math.max(1, Math.min(session.currentSegment, session.totalSegments));
+  const prefix = session.status === "paused" ? "Paused" : "Reading";
+  return `${prefix} ${current}/${session.totalSegments}`;
+}
+
+function noteReadAloudPublicState(session: NoteReadAloudSession | null = noteReadAloudSession): NoteReadAloudState {
+  if (!session) return idleNoteReadAloudState();
+  return {
+    status: session.status,
+    source: session.source,
+    title: session.title,
+    targetID: session.targetID,
+    currentSegment: session.currentSegment,
+    totalSegments: session.totalSegments,
+    progressLabel: noteReadAloudProgressLabel(session),
+    error: session.error,
+    engine: session.engine,
+    voice: session.voice
+  };
+}
+
+function emitNoteReadAloudState(state = noteReadAloudPublicState()) {
+  if (!noteReadAloudStateEmitter) return;
+  try {
+    noteReadAloudStateEmitter(state);
+  } catch (error) {
+    assistantVoiceLog(`note read aloud state emit failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+function noteReadAloudVoiceForEngine(settings: SettingsSnapshot, engine: AssistantVoiceEngine) {
+  if (engine === "openaiTTS") return settings.openAITTSVoice || defaultOpenAITTSVoice;
+  if (engine === "geminiTTS") return settings.geminiTTSVoice || defaultGeminiTTSVoice;
+  if (engine === "pocketTTS") return settings.pocketTTSVoice || defaultPocketTTSVoiceID;
+  if (engine === "kokoroLocal") return settings.kokoroVoice || defaultKokoroVoiceID;
+  return undefined;
+}
+
+async function resolvedAssistantVoiceEngine(settings: SettingsSnapshot, requestedEngine?: string): Promise<AssistantVoiceEngine> {
+  const engine = safeAssistantVoiceEngine(requestedEngine || settings.voiceEngine);
+  if (engine !== "autoCloudTTS") return engine;
+  const openAIKey = await resolveRealtimeOpenAIAPIKey();
+  if (openAIKey.apiKey) return "openaiTTS";
+  const geminiKey = await resolveRealtimeGeminiAPIKey();
+  if (geminiKey.apiKey) return "geminiTTS";
+  return "pocketTTS";
+}
+
+function assistantVoiceEngineLabel(engine: AssistantVoiceEngine, model?: string, voice?: string) {
+  if (engine === "openaiTTS") return `OpenAI TTS${voice ? ` · ${voice}` : ""}${model ? ` · ${model}` : ""}`;
+  if (engine === "geminiTTS") return `Gemini TTS${voice ? ` · ${voice}` : ""}${model ? ` · ${model}` : ""}`;
+  if (engine === "pocketTTS") return `Pocket TTS${voice ? ` · ${voice}` : ""}`;
+  if (engine === "kokoroLocal") return `Kokoro${voice ? ` · ${voice}` : ""}`;
+  return "macOS Voice";
+}
+
+function noteReadAloudStillCurrent(session: NoteReadAloudSession) {
+  return noteReadAloudSession === session
+    && session.id === noteReadAloudRunID
+    && session.speechRunID === assistantSpeechRunID;
+}
+
+async function speakMacOSReadAloudSegment(text: string, runID: number) {
+  await new Promise<void>((resolve, reject) => {
+    if (runID !== assistantSpeechRunID) {
+      resolve();
+      return;
+    }
+    stopAssistantSpeechProcess();
+    const child = spawn("/usr/bin/say", [text], { stdio: "ignore" });
+    assistantSpeechProcess = child;
+    child.once("error", reject);
+    child.once("exit", (code) => {
+      if (assistantSpeechProcess === child) {
+        assistantSpeechProcess = null;
+        assistantSpeechProcessPaused = false;
+      }
+      code === 0 || code === null ? resolve() : reject(new Error(`Speech playback exited with code ${code}.`));
+    });
+  });
+}
+
+function resumeNoteReadAloudWaiters(session: NoteReadAloudSession) {
+  const waiters = session.pauseWaiters ?? [];
+  session.pauseWaiters = [];
+  waiters.forEach((resolve) => resolve());
+}
+
+async function waitForNoteReadAloudResume(session: NoteReadAloudSession) {
+  while (noteReadAloudStillCurrent(session) && session.status === "paused") {
+    await new Promise<void>((resolve) => {
+      session.pauseWaiters = [...(session.pauseWaiters ?? []), resolve];
+    });
+  }
+  return noteReadAloudStillCurrent(session);
+}
+
+async function playNoteReadAloudSegment(
+  session: NoteReadAloudSession,
+  settings: SettingsSnapshot,
+  segmentText: string,
+  segmentIndex: number
+): Promise<NoteReadAloudSegmentResult> {
+  const runID = session.speechRunID;
+  const text = assistantSpeechText(segmentText);
+  if (!text) return { ok: true, skipped: true };
+  if (!noteReadAloudStillCurrent(session)) return { ok: true, stopped: true };
+  if (session.status === "paused" && !(await waitForNoteReadAloudResume(session))) return { ok: true, stopped: true };
+  if (session.engine === "macos") {
+    await speakMacOSReadAloudSegment(text, runID);
+    return { ok: true, stopped: runID !== assistantSpeechRunID };
+  }
+  const spokenText = await rewriteSpeechTextForTTS(text, settings);
+  if (!spokenText) return { ok: true, skipped: true };
+  if (!noteReadAloudStillCurrent(session)) return { ok: true, stopped: true };
+  if (session.status === "paused" && !(await waitForNoteReadAloudResume(session))) return { ok: true, stopped: true };
+  if (session.engine === "pocketTTS") {
+    const voiceID = safePocketTTSVoiceID(session.voice || settings.pocketTTSVoice || defaultPocketTTSVoiceID);
+    fs.mkdirSync(pocketTTSOutputDirectory(), { recursive: true });
+    const outputPath = path.join(pocketTTSOutputDirectory(), `assistant-reply-${Date.now()}-${segmentIndex}.wav`);
+    const generatedPath = await generatePocketTTSAudioFile(spokenText, voiceID, outputPath, runID);
+    if (!generatedPath || !noteReadAloudStillCurrent(session)) {
+      if (generatedPath) removeGeneratedAssistantVoiceFile(generatedPath);
+      return { ok: true, stopped: true };
+    }
+    if (session.status === "paused" && !(await waitForNoteReadAloudResume(session))) {
+      removeGeneratedAssistantVoiceFile(generatedPath);
+      return { ok: true, stopped: true };
+    }
+    try {
+      await playAudioFile(generatedPath, { deleteAfterPlayback: true });
+    } catch (error) {
+      if (!noteReadAloudStillCurrent(session)) {
+        removeGeneratedAssistantVoiceFile(generatedPath);
+        return { ok: true, stopped: true };
+      }
+      throw error;
+    }
+    return { ok: true, stopped: runID !== assistantSpeechRunID };
+  }
+  if (session.engine === "openaiTTS" || session.engine === "geminiTTS") {
+    const cloudSettings = session.engine === "openaiTTS"
+      ? { ...settings, openAITTSVoice: session.voice || settings.openAITTSVoice }
+      : { ...settings, geminiTTSVoice: session.voice || settings.geminiTTSVoice };
+    const generated = session.engine === "openaiTTS"
+      ? await generateOpenAITTSAudioFile(spokenText, cloudSettings)
+      : await generateGeminiTTSAudioFile(spokenText, cloudSettings);
+    if (!noteReadAloudStillCurrent(session)) return { ok: true, stopped: true };
+    if (session.status === "paused" && !(await waitForNoteReadAloudResume(session))) return { ok: true, stopped: true };
+    await playAudioFile(generated.path, { deleteAfterPlayback: false });
+    return { ok: true, stopped: runID !== assistantSpeechRunID };
+  }
+  if (!kokoroInstalled()) {
+    return { ok: false, error: "Kokoro Local Voice is not installed yet. Install it from Voice Reply Output settings." };
+  }
+  const voiceID = safeKokoroVoiceID(session.voice || settings.kokoroVoice || defaultKokoroVoiceID);
+  fs.mkdirSync(kokoroOutputDirectory(), { recursive: true });
+  const outputPaths = await generateKokoroAudioFilesForSegment(spokenText, voiceID, kokoroOutputDirectory(), runID, segmentIndex);
+  if (!noteReadAloudStillCurrent(session)) {
+    outputPaths.forEach(removeGeneratedAssistantVoiceFile);
+    return { ok: true, stopped: true };
+  }
+  for (const outputPath of outputPaths) {
+    if (!noteReadAloudStillCurrent(session)) {
+      outputPaths.forEach(removeGeneratedAssistantVoiceFile);
+      return { ok: true, stopped: true };
+    }
+    if (session.status === "paused" && !(await waitForNoteReadAloudResume(session))) {
+      outputPaths.forEach(removeGeneratedAssistantVoiceFile);
+      return { ok: true, stopped: true };
+    }
+    try {
+      await playAudioFile(outputPath, { deleteAfterPlayback: true });
+    } catch (error) {
+      if (!noteReadAloudStillCurrent(session)) {
+        removeGeneratedAssistantVoiceFile(outputPath);
+        return { ok: true, stopped: true };
+      }
+      throw error;
+    }
+  }
+  return { ok: true, stopped: runID !== assistantSpeechRunID };
+}
+
+async function runNoteReadAloudSession(session: NoteReadAloudSession) {
+  if (session.runnerActive) return;
+  session.runnerActive = true;
+  const settings = await loadSettings();
+  try {
+    while (noteReadAloudSession === session && session.id === noteReadAloudRunID) {
+      const index = Math.max(0, Math.min(session.currentSegment - 1, session.segments.length - 1));
+      if (index >= session.segments.length) break;
+      if (noteReadAloudSession === session && noteReadAloudSession.status === "paused") {
+        emitNoteReadAloudState(noteReadAloudPublicState(session));
+        return;
+      }
+      session.status = "preparing";
+      session.currentSegment = index + 1;
+      emitNoteReadAloudState(noteReadAloudPublicState(session));
+      try {
+        session.status = "playing";
+        emitNoteReadAloudState(noteReadAloudPublicState(session));
+        const result = await playNoteReadAloudSegment(session, settings, session.segments[index], index);
+        if (noteReadAloudSession !== session || session.id !== noteReadAloudRunID) return;
+        if (noteReadAloudSession.status === "paused") {
+          emitNoteReadAloudState(noteReadAloudPublicState(session));
+          return;
+        }
+        if (result.stopped) return;
+        if (!result.ok) {
+          session.status = "error";
+          session.error = result.error || "Read aloud failed.";
+          emitNoteReadAloudState(noteReadAloudPublicState(session));
+          return;
+        }
+        session.currentSegment = index + 2;
+        if (session.currentSegment > session.totalSegments) break;
+        emitNoteReadAloudState(noteReadAloudPublicState(session));
+      } catch (error) {
+        if (noteReadAloudSession !== session || session.id !== noteReadAloudRunID) return;
+        if (noteReadAloudSession.status === "paused") {
+          emitNoteReadAloudState(noteReadAloudPublicState(session));
+          return;
+        }
+        session.status = "error";
+        session.error = error instanceof Error ? error.message : "Read aloud failed.";
+        emitNoteReadAloudState(noteReadAloudPublicState(session));
+        return;
+      }
+    }
+  } finally {
+    session.runnerActive = false;
+  }
+  if (noteReadAloudSession !== session || session.id !== noteReadAloudRunID) return;
+  session.status = "finished";
+  session.currentSegment = session.totalSegments;
+  emitNoteReadAloudState(noteReadAloudPublicState(session));
+  cleanupGeneratedAssistantVoiceFiles();
+}
+
+async function startNoteReadAloud(request: NoteReadAloudRequest, emitState?: NoteReadAloudEmitter) {
+  noteReadAloudStateEmitter = emitState ?? noteReadAloudStateEmitter;
+  const runID = ++noteReadAloudRunID;
+  noteReadAloudSession = null;
+  stopAssistantSpeech();
+  cleanupGeneratedAssistantVoiceFiles();
+  const settings = await loadSettings();
+  const text = assistantSpeechText(String(request?.text ?? ""));
+  if (!text) {
+    noteReadAloudSession = {
+      id: runID,
+      speechRunID: assistantSpeechRunID,
+      status: "error",
+      source: request?.source || "whole-note",
+      title: request?.title,
+      targetID: request?.targetID,
+      currentSegment: 0,
+      totalSegments: 0,
+      progressLabel: "No text to read",
+      error: "No note text to read.",
+      segments: [],
+      engine: await resolvedAssistantVoiceEngine(settings)
+    };
+    emitNoteReadAloudState(noteReadAloudPublicState(noteReadAloudSession));
+    return noteReadAloudPublicState(noteReadAloudSession);
+  }
+  const engine = await resolvedAssistantVoiceEngine(settings);
+  const segments = splitAssistantSpeechSegments(text, Math.max(420, Math.floor(assistantSpeechChunkCharacters * 0.58)));
+  const session: NoteReadAloudSession = {
+    id: runID,
+    speechRunID: beginAssistantSpeechRun(),
+    status: "preparing",
+    source: request?.source || "whole-note",
+    title: request?.title,
+    targetID: request?.targetID,
+    currentSegment: 1,
+    totalSegments: segments.length,
+    segments,
+    engine,
+    voice: noteReadAloudVoiceForEngine(settings, engine)
+  };
+  noteReadAloudSession = session;
+  emitNoteReadAloudState(noteReadAloudPublicState(session));
+  void runNoteReadAloudSession(session);
+  return noteReadAloudPublicState(session);
+}
+
+function pauseNoteReadAloud() {
+  if (!noteReadAloudSession || !["preparing", "playing"].includes(noteReadAloudSession.status)) {
+    return noteReadAloudPublicState();
+  }
+  if (noteReadAloudSession.source !== "whole-note") {
+    return stopNoteReadAloud();
+  }
+  noteReadAloudSession.status = "paused";
+  pauseAssistantSpeechProcess();
+  emitNoteReadAloudState(noteReadAloudPublicState(noteReadAloudSession));
+  return noteReadAloudPublicState(noteReadAloudSession);
+}
+
+function resumeNoteReadAloud() {
+  const session = noteReadAloudSession;
+  if (!session || session.status !== "paused" || session.source !== "whole-note") return noteReadAloudPublicState();
+  const resumedPlayback = resumeAssistantSpeechProcess();
+  session.status = resumedPlayback ? "playing" : "preparing";
+  resumeNoteReadAloudWaiters(session);
+  emitNoteReadAloudState(noteReadAloudPublicState(session));
+  if (!session.runnerActive) void runNoteReadAloudSession(session);
+  return noteReadAloudPublicState(session);
+}
+
+function stopNoteReadAloud() {
+  if (noteReadAloudSession) resumeNoteReadAloudWaiters(noteReadAloudSession);
+  noteReadAloudRunID += 1;
+  noteReadAloudSession = null;
+  stopAssistantSpeech();
+  cleanupGeneratedAssistantVoiceFiles();
+  emitNoteReadAloudState(idleNoteReadAloudState());
+  return idleNoteReadAloudState();
+}
+
+async function speakAssistantResponse(rawText: string, options: { force?: boolean; engine?: string; voice?: string } = {}) {
   const settings = await loadSettings();
   if (!options.force && !settings.assistantVoiceOutputEnabled) {
     return { ok: true, skipped: true, reason: "Assistant reply voice output is off." };
   }
   const text = assistantSpeechText(rawText);
   if (!text) return { ok: true, skipped: true, reason: "No assistant text to speak." };
-  if (settings.voiceEngine === "macos") {
+  const voiceEngine = await resolvedAssistantVoiceEngine(settings, options.engine);
+  if (voiceEngine === "macos") {
     await speakWithMacOS(text);
     return { ok: true, engine: "macos" };
   }
-  if (settings.voiceEngine !== "kokoroLocal") {
-    return {
-      ok: true,
-      skipped: true,
-      reason: "Select Kokoro Local or macOS as the assistant voice engine to play replies."
-    };
+  if (voiceEngine === "openaiTTS" || voiceEngine === "geminiTTS") {
+    const result = await generateAssistantSpeechAudioFile(text, settings, { engine: voiceEngine, voice: options.voice });
+    await playAudioFile(result.path, { deleteAfterPlayback: false });
+    return { ok: true, engine: voiceEngine, voice: result.voice, model: result.model, path: result.path };
+  }
+  if (voiceEngine === "pocketTTS") {
+    return speakWithPocketTTS(text, options.voice || settings.pocketTTSVoice || defaultPocketTTSVoiceID, settings);
   }
   if (!kokoroInstalled()) {
     return { ok: false, error: "Kokoro Local Voice is not installed yet. Install it from Voice Reply Output settings." };
   }
-  return speakWithKokoroLocal(text, settings.kokoroVoice || defaultKokoroVoiceID);
+  const rewrittenText = await rewriteSpeechTextForTTS(text, settings);
+  return speakWithKokoroLocal(rewrittenText, safeKokoroVoiceID(options.voice || settings.kokoroVoice || defaultKokoroVoiceID));
 }
 
-async function prewarmAssistantVoiceOutput() {
+async function prewarmAssistantVoiceOutput(options: { engine?: string; voice?: string } = {}) {
   const settings = await loadSettings();
-  if (settings.voiceEngine !== "kokoroLocal" || !kokoroInstalled()) {
+  const requestedEngine = safeAssistantVoiceEngine(options.engine || settings.voiceEngine);
+  if (requestedEngine === "pocketTTS" || settings.liveVoiceMode === "localVoiceAgent") {
+    await prewarmPocketTTSVoice(options.voice || settings.pocketTTSVoice || defaultPocketTTSVoiceID);
+    return { ok: true };
+  }
+  if (requestedEngine !== "kokoroLocal" || !kokoroInstalled()) {
     return { ok: true, skipped: true };
   }
   await prewarmKokoroWorker();
@@ -7634,8 +15714,12 @@ async function prewarmAssistantVoiceOutput() {
 }
 
 function stopAssistantVoiceOutput() {
+  if (noteReadAloudSession) resumeNoteReadAloudWaiters(noteReadAloudSession);
+  noteReadAloudRunID += noteReadAloudSession ? 1 : 0;
+  noteReadAloudSession = null;
   stopAssistantSpeech();
   cleanupGeneratedAssistantVoiceFiles();
+  emitNoteReadAloudState(idleNoteReadAloudState());
   return { ok: true };
 }
 
@@ -7696,26 +15780,121 @@ async function testTelegramConnection(rawToken?: string) {
   }
 }
 
+// In-flight cache for loadOpenAssistAppState: React StrictMode in dev runs
+// the bootstrap effect twice, and the second call used to do everything over
+// again — doubling the perceived cold start. We dedupe by returning the same
+// promise if a load is in progress (or finished within the last 2 s).
+let loadAppStateInflight: Promise<OpenAssistAppState> | null = null;
+let loadAppStateCachedAt = 0;
+let loadAppStateCachedResult: OpenAssistAppState | null = null;
+
 export async function loadOpenAssistAppState(): Promise<OpenAssistAppState> {
-  cleanupEmptyConversationThreads();
+  const now = Date.now();
+  if (loadAppStateCachedResult && now - loadAppStateCachedAt < 2_000) {
+    return loadAppStateCachedResult;
+  }
+  if (loadAppStateInflight) return loadAppStateInflight;
+  loadAppStateInflight = (async () => {
+    try {
+      return await loadOpenAssistAppStateImpl();
+    } finally {
+      loadAppStateInflight = null;
+    }
+  })();
+  const result = await loadAppStateInflight;
+  loadAppStateCachedResult = result;
+  loadAppStateCachedAt = Date.now();
+  return result;
+}
+
+export async function loadOpenAssistSettingsAppState(): Promise<OpenAssistAppState> {
+  const settings = await loadSettings();
+  void ensureRemoteAccessServerForSettings(settings).catch((error) => {
+    bridgeDebugLog(`Remote Access startup failed for settings window: ${error instanceof Error ? error.message : String(error)}`);
+  });
+  return {
+    projects: [],
+    hiddenProjects: [],
+    threads: [],
+    notes: [],
+    threadNotes: [],
+    noteFolders: [],
+    plannerDays: [],
+    plannerBacklog: null,
+    backlogItems: [],
+    automations: [],
+    skills: [],
+    plugins: [],
+    settings,
+    usage: null,
+    usageByBackend: usageSnapshotsByBackend()
+  };
+}
+
+async function loadOpenAssistAppStateImpl(): Promise<OpenAssistAppState> {
+  const _ts = Date.now();
+  const _step = (name: string, startedAt: number) => {
+    const dt = Date.now() - startedAt;
+    if (dt >= 25) bridgeDebugLog(`loadAppState step ${name}=${dt}ms`);
+    return Date.now();
+  };
+  let _t = _ts;
+
+  // Settings is awaited first — it's a critical-path dependency for the
+  // renderer's initial paint (theme, fonts, sidebar pinned state, etc.).
+  // Thanks to the defaults bulk cache this is now ~30 ms instead of 1.3 s.
+  const settings = await loadSettings();
+  void ensureRemoteAccessServerForSettings(settings).catch((error) => {
+    bridgeDebugLog(`Remote Access startup failed: ${error instanceof Error ? error.message : String(error)}`);
+  });
+  void purgeExpiredArchivedItems(settings).catch((error) => {
+    bridgeDebugLog(`Archived item cleanup failed: ${error instanceof Error ? error.message : String(error)}`);
+  });
+  _t = _step("loadSettings", _t);
+
   const loadedProjects = loadProjects();
-  const threads = loadThreads(loadedProjects);
+  _t = _step("loadProjects", _t);
+
+  // Cap initial thread list to the 10 most recent. The sidebar shows these
+  // immediately; the rest stream in via a background event later. Per-thread
+  // message bodies were never loaded here — that's loadThreadMessages on
+  // click.
+  const threads = loadThreads(loadedProjects, { limit: 10 });
+  _t = _step("loadThreads", _t);
+
   const { notes, noteFolders } = loadNotes(loadedProjects);
+  _t = _step("loadNotes", _t);
+
   const threadNotes = loadThreadNoteList(threads);
-  const automations = await loadAutomations();
+  _t = _step("loadThreadNoteList", _t);
+
+  const plannerDays = listPlannerDays();
+  _t = _step("listPlannerDays", _t);
+  const plannerBacklog = loadPlannerBacklog();
+  const backlogItems = parseDailyItemsFromMarkdown(plannerBacklogID, plannerBacklog.markdown);
+  _t = _step("loadPlannerBacklog", _t);
+
   const activeThreadID = threads[0]?.id;
   const skills = loadSkills(activeThreadID);
-  const plugins = await loadPlugins();
-  const settings = await loadSettings();
+  _t = _step("loadSkills", _t);
+
+  // The four slowest pieces — plugin discovery (5-10 s, hits codexTransport),
+  // automation list (async I/O), usage refresh for the active backend (5-7 s,
+  // hits the cloud), and Knowledge MCP server warm-up — are deferred to a
+  // background pass right after we return. The renderer subscribes to the
+  // resulting events via window.openAssistElectron.onAppStateBackgroundReady
+  // and merges them in.
+  void runAppStateBackgroundPass({ settings, activeThreadID, threads });
+
   const activeNote = notes.find((note) => note.active) ?? notes[0];
   const activeThread = activeThreadID ? threads.find((thread) => thread.id === activeThreadID) : undefined;
   const normalizedUsageBackend = normalizeBackend(activeThread?.activeProvider ?? settings.assistantBackend);
   const usageBackend: RuntimeAssistantBackend = isRuntimeBackend(normalizedUsageBackend) ? normalizedUsageBackend : "codex";
-  await refreshUsageForBackend(usageBackend, {
-    threadID: activeThreadID,
-    modelID: activeThread?.modelID ?? modelForBackend(usageBackend, settings, activeThread as SessionSummary | undefined)
-  });
+  // Don't await refreshUsageForBackend here — runAppStateBackgroundPass
+  // handles it. Return whatever cached snapshot we already have (may be
+  // empty on the very first launch).
   const usageByBackend = usageSnapshotsByBackend();
+  bridgeDebugLog(`loadAppState TOTAL=${Date.now() - _ts}ms threads=${threads.length} notes=${notes.length} (background pass scheduled)`);
   return {
     projects: loadedProjects.projects,
     hiddenProjects: loadedProjects.hiddenProjects,
@@ -7723,9 +15902,15 @@ export async function loadOpenAssistAppState(): Promise<OpenAssistAppState> {
     notes,
     threadNotes,
     noteFolders,
-    automations,
+    plannerDays,
+    plannerBacklog,
+    backlogItems,
+    // automations + plugins land via the background pass and are merged in
+    // the renderer. Returning empty here keeps the schema satisfied and
+    // matches the "nothing yet" UI state used elsewhere.
+    automations: [],
     skills,
-    plugins,
+    plugins: [],
     settings,
     usage: usageByBackend[usageBackend] ?? null,
     usageByBackend,
@@ -7735,18 +15920,2915 @@ export async function loadOpenAssistAppState(): Promise<OpenAssistAppState> {
   };
 }
 
+// Background pass: runs after we've already returned the initial state.
+// Each phase emits an IPC event on success so the renderer can merge the new
+// data without blocking. cleanupEmptyConversationThreads also moves here.
+async function runAppStateBackgroundPass(args: {
+  settings: SettingsSnapshot;
+  activeThreadID: string | undefined;
+  threads: ThreadItem[];
+}): Promise<void> {
+  const { settings, activeThreadID, threads } = args;
+  // Yield once so the renderer can paint the initial state before we start
+  // hitting disk + the cloud again.
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  try {
+    cleanupEmptyConversationThreads();
+  } catch (error) {
+    bridgeDebugLog(`background cleanupEmptyConversationThreads failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+
+  // Load the rest of the thread list (beyond the initial 10) and broadcast.
+  try {
+    const projects = loadProjects();
+    const fullThreads = loadThreads(projects);
+    emitAppStateBackgroundUpdate({ type: "threads", threads: fullThreads });
+  } catch (error) {
+    bridgeDebugLog(`background loadThreads failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+
+  // Knowledge MCP server warm-up — has its own catch already.
+  ensureKnowledgeServerForSettings(settings).catch((error) => {
+    bridgeDebugLog(`Knowledge Access startup failed: ${error instanceof Error ? error.message : String(error)}`);
+  });
+
+  // Automations (fast-ish).
+  try {
+    const automations = await loadAutomations();
+    emitAppStateBackgroundUpdate({ type: "automations", automations });
+  } catch (error) {
+    bridgeDebugLog(`background loadAutomations failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+
+  // Plugins (slowest — 5-10 s via codexTransport). Fire-and-forget; renderer
+  // merges them when the plugin picker is opened or when the event arrives.
+  try {
+    const plugins = await loadPlugins();
+    emitAppStateBackgroundUpdate({ type: "plugins", plugins });
+  } catch (error) {
+    bridgeDebugLog(`background loadPlugins failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+
+  // Usage refresh — needs the active backend (which depends on settings).
+  try {
+    const activeThread = activeThreadID ? threads.find((thread) => thread.id === activeThreadID) : undefined;
+    const normalizedUsageBackend = normalizeBackend(activeThread?.activeProvider ?? settings.assistantBackend);
+    const usageBackend: RuntimeAssistantBackend = isRuntimeBackend(normalizedUsageBackend) ? normalizedUsageBackend : "codex";
+    await refreshUsageForBackend(usageBackend, {
+      threadID: activeThreadID,
+      modelID: activeThread?.modelID ?? modelForBackend(usageBackend, settings, activeThread as SessionSummary | undefined)
+    });
+    const usageByBackend = usageSnapshotsByBackend();
+    emitAppStateBackgroundUpdate({
+      type: "usage",
+      usageBackend,
+      usage: usageByBackend[usageBackend] ?? null,
+      usageByBackend
+    });
+  } catch (error) {
+    bridgeDebugLog(`background refreshUsageForBackend failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+type AppStateBackgroundUpdate =
+  | { type: "threads"; threads: ThreadItem[] }
+  | { type: "automations"; automations: AutomationItem[] }
+  | { type: "plugins"; plugins: PluginItem[] }
+  | { type: "knowledgeRequests"; requests: KnowledgeWriteRequest[] }
+  | { type: "plannerDays"; plannerDays: PlannerDaySummary[]; activeDayID?: string }
+  | { type: "plannerDay"; day: PlannerDayDetail; items: DailyItem[] }
+  | { type: "plannerBacklog"; backlog: PlannerBacklogDetail; items: DailyItem[] }
+  | { type: "usage"; usageBackend: RuntimeAssistantBackend; usage: ProviderUsageSnapshot | null; usageByBackend: Partial<Record<RuntimeAssistantBackend, ProviderUsageSnapshot | null>> };
+
+let appStateBackgroundUpdateListener: ((update: AppStateBackgroundUpdate) => void) | null = null;
+export function setAppStateBackgroundUpdateListener(
+  listener: ((update: AppStateBackgroundUpdate) => void) | null
+) {
+  appStateBackgroundUpdateListener = listener;
+}
+function emitAppStateBackgroundUpdate(update: AppStateBackgroundUpdate) {
+  appStateBackgroundUpdateListener?.(update);
+}
+
+function emitKnowledgeRequestsChanged() {
+  emitAppStateBackgroundUpdate({ type: "knowledgeRequests", requests: listKnowledgeWriteRequests("pending") });
+}
+
+function emitPlannerDaysChanged(activeDayID = plannerDayID()) {
+  emitAppStateBackgroundUpdate({ type: "plannerDays", plannerDays: listPlannerDays(90, activeDayID), activeDayID });
+}
+
+function emitPlannerDayChanged(dayID: string) {
+  const day = loadPlannerDay(dayID);
+  emitAppStateBackgroundUpdate({ type: "plannerDay", day, items: parseDailyItemsFromMarkdown(day.id, day.markdown) });
+  emitPlannerDaysChanged(day.id);
+}
+
+function emitPlannerBacklogChanged() {
+  const backlog = loadPlannerBacklog();
+  emitAppStateBackgroundUpdate({ type: "plannerBacklog", backlog, items: parseDailyItemsFromMarkdown(plannerBacklogID, backlog.markdown) });
+}
+
+const knowledgeMCPTools = [
+  {
+    name: "oa_search",
+    description: "Search OpenAssist notes, Today planner days, and daily journal entries.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string" },
+        source: { type: "string", enum: ["project_note", "thread_note", "planner_day", "journal_day"] },
+        limit: { type: "number" }
+      },
+      required: ["query"],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "oa_search_everything",
+    description: "Search across OpenAssist chat threads, realtime turns, notes, planner days, backlog, approvals, and artifact metadata. Use this for questions like \"when did we\", \"where did I mention\", \"what did we decide\", or \"find the earlier discussion\". Returns small snippets only.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string" },
+        sourceTypes: {
+          type: "array",
+          items: { type: "string", enum: [...knowledgeTimelineSourceTypes] }
+        },
+        fromDate: { type: "string" },
+        toDate: { type: "string" },
+        limit: { type: "number" }
+      },
+      required: ["query"],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "oa_read_search_result",
+    description: "Read one Search Everything result by id, with a small nearby thread window when available. Use after oa_search_everything, not for broad loading.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        resultID: { type: "string" },
+        window: { type: "number" }
+      },
+      required: ["resultID"],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "oa_read",
+    description: "Read a knowledge item by id returned from oa_search.",
+    inputSchema: {
+      type: "object",
+      properties: { itemID: { type: "string" } },
+      required: ["itemID"],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "oa_read_today",
+    description: "Read today's planner day, or a specific planner date.",
+    inputSchema: {
+      type: "object",
+      properties: { dayID: { type: "string" }, date: { type: "string" } },
+      required: [],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "oa_list_daily_items",
+    description: "List structured Today/daily items for a planner date, including inline @project and #folder tags, resolved project/folder names, details, steps, and linked notes.",
+    inputSchema: {
+      type: "object",
+      properties: { dayID: { type: "string" }, date: { type: "string" } },
+      required: [],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "oa_list_backlog_items",
+    description: "List unscheduled backlog items and follow-ups that do not have a planner date yet.",
+    inputSchema: {
+      type: "object",
+      properties: {},
+      required: [],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "oa_read_journal",
+    description: "Read the Journal section for today, or a specific planner date.",
+    inputSchema: {
+      type: "object",
+      properties: { dayID: { type: "string" }, date: { type: "string" } },
+      required: [],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "oa_list_open_tasks",
+    description: "List unfinished markdown tasks across notes and planner days.",
+    inputSchema: {
+      type: "object",
+      properties: { limit: { type: "number" } },
+      required: [],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "oa_backlinks",
+    description: "Show outgoing links and backlinks for a knowledge item.",
+    inputSchema: {
+      type: "object",
+      properties: { itemID: { type: "string" } },
+      required: ["itemID"],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "oa_request_add",
+    description: "Request a raw markdown add to planner/notes. For planner tasks, reminders, or to-dos, use oa_request_daily_item instead. This creates a pending preview and does not auto-write.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        goal: { type: "string" },
+        dayID: { type: "string" },
+        targetDayID: { type: "string" },
+        section: { type: "string" },
+        text: { type: "string" },
+        content: { type: "string" }
+      },
+      required: ["text"],
+      additionalProperties: true
+    }
+  },
+  {
+    name: "oa_request_daily_item",
+    description: "Add one structured planner task, reminder, or to-do. Set area to Work or Personal. Keep title short; put time, date notes, and extra context in detailsMarkdown. Prefer inline @Project and #Folder tags in the title instead of separate project/folder fields. Ask the user if the category is unclear. Adding is applied immediately (no approval needed); the result has status \"applied\".",
+    inputSchema: {
+      type: "object",
+      properties: {
+        dayID: { type: "string" },
+        title: { type: "string" },
+        projectID: { type: "string" },
+        folderID: { type: "string" },
+        area: { type: "string", enum: ["Work", "Personal"] },
+        scopeTags: { type: "array" },
+        detailsMarkdown: { type: "string" },
+        steps: { type: "array" },
+        links: { type: "array" },
+        goal: { type: "string" }
+      },
+      required: ["title"],
+      additionalProperties: true
+    }
+  },
+  {
+    name: "oa_request_backlog_item",
+    description: "Add one task or follow-up to the OpenAssist backlog when the user wants to do it later but has not picked a date. Keep title short; put time, date notes, and extra context in detailsMarkdown. Prefer inline @Project and #Folder tags in the title. Applied immediately, no approval needed.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        title: { type: "string" },
+        projectID: { type: "string" },
+        folderID: { type: "string" },
+        area: { type: "string", enum: ["Work", "Personal"] },
+        scopeTags: { type: "array" },
+        detailsMarkdown: { type: "string" },
+        steps: { type: "array" },
+        links: { type: "array" },
+        goal: { type: "string" }
+      },
+      required: ["title"],
+      additionalProperties: true
+    }
+  },
+  {
+    name: "oa_note_style_guide",
+    description: "Return the OpenAssist note formatting guide: callout kinds, 2/3-column layouts, images, and when not to use rich blocks. Call this before organizing a note so you can produce apply-ready markdown using the correct OpenAssist syntax.",
+    inputSchema: {
+      type: "object",
+      properties: {},
+      required: [],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "oa_request_patch",
+    description: "Request a markdown replacement or append preview for a note or planner item. Requires itemID + exact replacement markdown. Call oa_note_style_guide first when organizing for readability. This does not auto-write — it creates an approval preview.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        goal: { type: "string" },
+        itemID: { type: "string" },
+        markdown: { type: "string" },
+        dayID: { type: "string" },
+        section: { type: "string" },
+        text: { type: "string" }
+      },
+      required: [],
+      additionalProperties: true
+    }
+  },
+  {
+    name: "oa_request_organize",
+    description: "Request a note organization preview. You MUST supply itemID and the full replacement markdown to make this actionable. Pattern: (1) read the note with oa_read, (2) call oa_note_style_guide to learn supported blocks, (3) produce exact replacement markdown, (4) call this tool with itemID + markdown. For planner tasks prefer oa_request_daily_item.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        goal: { type: "string" },
+        itemID: { type: "string", description: "The note or item ID to organize." },
+        markdown: { type: "string", description: "The full replacement markdown content using OpenAssist-supported blocks." },
+        scope: { type: "string" },
+        query: { type: "string" }
+      },
+      required: ["goal"],
+      additionalProperties: true
+    }
+  },
+  {
+    name: "oa_request_carry_forward",
+    description: "Request a preview that MOVES unfinished tasks from one planner day to another planner day. Not for Backlog. Needs approval before it is applied.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        fromDayID: { type: "string" },
+        targetDayID: { type: "string" },
+        goal: { type: "string" }
+      },
+      required: [],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "oa_request_move_to_backlog",
+    description: "Request a preview that MOVES unfinished planner tasks to the Backlog: adds each task to Backlog and removes it from its source planner day. Use for 'move older unfinished tasks to backlog'. Needs approval before it is applied.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        fromDayID: { type: "string" },
+        beforeDayID: { type: "string" },
+        includeToday: { type: "boolean" },
+        goal: { type: "string" }
+      },
+      required: [],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "oa_complete_daily_item",
+    description: "Mark a planner task or daily item as done by its text (title). Applied immediately, no approval needed. Set checked to false to mark it not done again. Use oa_list_daily_items first if you are unsure of the exact wording.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        dayID: { type: "string" },
+        title: { type: "string", description: "The task text to match, e.g. \"mortgage application\"." },
+        checked: { type: "boolean", description: "true to mark done (default), false to mark not done." }
+      },
+      required: ["title"],
+      additionalProperties: true
+    }
+  }
+] as const;
+
+function jsonResponse(res: http.ServerResponse, status: number, body: unknown) {
+  res.writeHead(status, { "content-type": "application/json" });
+  res.end(JSON.stringify(body));
+}
+
+async function readRequestJSON(req: http.IncomingMessage) {
+  const chunks: Buffer[] = [];
+  for await (const chunk of req) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  const text = Buffer.concat(chunks).toString("utf8").trim();
+  if (!text) return {};
+  return JSON.parse(text) as unknown;
+}
+
+function requestBearerToken(req: http.IncomingMessage) {
+  const header = String(req.headers.authorization ?? "");
+  const match = header.match(/^Bearer\s+(.+)$/i);
+  if (match) return match[1].trim();
+  try {
+    const url = new URL(req.url ?? "/", "http://127.0.0.1");
+    return url.searchParams.get("token")?.trim() ?? "";
+  } catch {
+    return "";
+  }
+}
+
+function requestPairingCode(req: http.IncomingMessage) {
+  const header = String(req.headers["x-openassist-pairing-code"] ?? "").trim();
+  if (header) return header;
+  try {
+    const url = new URL(req.url ?? "/", "http://127.0.0.1");
+    return url.searchParams.get("pairingCode")?.trim() ?? "";
+  } catch {
+    return "";
+  }
+}
+
+function knowledgeMCPToolResponse(result: unknown) {
+  return {
+    content: [
+      {
+        type: "text",
+        text: typeof result === "string" ? result : JSON.stringify(result, null, 2)
+      }
+    ]
+  };
+}
+
+type RemoteAccessRuntimeSettings = {
+  port: string;
+  networkMode: RemoteAccessNetworkMode;
+  tailscaleHost: string;
+  publicURL?: string;
+};
+
+type RemoteAccessServerSettings = {
+  remoteAccessEnabled: boolean;
+  remoteAccessPort: string;
+  remoteAccessNetworkMode: RemoteAccessNetworkMode;
+  remoteAccessTailscaleHost: string;
+  remoteAccessPublicURL: string;
+};
+
+type RemoteAccessSnapshotSettings = RemoteAccessServerSettings & Partial<SettingsSnapshot> & {
+  appVersion: string;
+  buildNumber: string;
+  assistantRuntimeStatus: string;
+  assistantRuntimeDetail: string;
+  availableAssistantBackends: string[];
+};
+
+// Snapshot broadcasts run every ~100ms while a phone is connected; backend
+// detection forks a `which` per backend, so cache the result briefly.
+let selectableBackendsCache: { key: string; expiresAt: number; value: RuntimeAssistantBackend[] } | null = null;
+
+// Same reasoning as the backend cache: model lists (some need network/CLI calls)
+// barely change during a turn, so don't recompute them on every streaming
+// snapshot.
+const providerModelsCache = new Map<string, { expiresAt: number; value: ProviderModelOption[] }>();
+
+async function cachedProviderModels(backend: string): Promise<ProviderModelOption[]> {
+  const now = Date.now();
+  const cached = providerModelsCache.get(backend);
+  if (cached && cached.expiresAt > now) return cached.value;
+  const value = await listProviderModels(backend).catch(() => [] as ProviderModelOption[]);
+  providerModelsCache.set(backend, { expiresAt: now + 60_000, value });
+  return value;
+}
+
+async function cachedSelectableAssistantBackends(preferred: RuntimeAssistantBackend): Promise<RuntimeAssistantBackend[]> {
+  const now = Date.now();
+  if (selectableBackendsCache && selectableBackendsCache.key === preferred && selectableBackendsCache.expiresAt > now) {
+    return selectableBackendsCache.value;
+  }
+  const value = await selectableAssistantBackends(preferred).catch(() => [preferred]);
+  selectableBackendsCache = { key: preferred, expiresAt: now + 60_000, value };
+  return value;
+}
+
+async function loadRemoteAccessSettings(): Promise<RemoteAccessSnapshotSettings> {
+  await ensureLiquidGlassDefaultMigrated();
+  const assistantBackendRaw = normalizeBackend(await readDefault("OpenAssist.assistantBackend", "codex"));
+  const assistantBackend = isRuntimeBackend(assistantBackendRaw) ? assistantBackendRaw : "codex";
+  const availableAssistantBackends = await cachedSelectableAssistantBackends(assistantBackend);
+  const remoteAccessPort = await readDefault("OpenAssist.remoteAccess.port", "45832");
+  const remoteAccessNetworkMode = normalizeRemoteAccessNetworkMode(
+    await readDefault("OpenAssist.remoteAccess.networkMode", "localOnly")
+  );
+  return {
+    appVersion: await readOpenAssistInfoPlist("CFBundleShortVersionString", "1.0.7"),
+    buildNumber: await readOpenAssistInfoPlist("CFBundleVersion", "69"),
+    assistantRuntimeStatus: "Ready",
+    assistantRuntimeDetail: "Remote Access is running.",
+    availableAssistantBackends,
+    remoteAccessEnabled: await readBoolDefault("OpenAssist.remoteAccess.enabled", false),
+    remoteAccessPort,
+    remoteAccessPublicURL: normalizeRemoteAccessPublicURL(
+      await readDefault("OpenAssist.remoteAccess.namedTunnelPublicURL", "")
+    ),
+    remoteAccessNetworkMode,
+    remoteAccessTailscaleHost: (await readDefault("OpenAssist.remoteAccess.tailscaleHost", "")).trim()
+  };
+}
+
+type RemoteAccessPairedDeviceRecord = {
+  id: string;
+  name: string;
+  tokenHash: string;
+  createdAt: string;
+  lastSeenAt?: string;
+  userAgent?: string;
+};
+
+function normalizedRemoteAccessDeviceKey(device: Pick<RemoteAccessPairedDeviceRecord, "name">) {
+  return String(device.name ?? "")
+    .trim()
+    .replace(/\s+/g, " ")
+    .toLowerCase() || "mobile remote";
+}
+
+function remoteAccessDeviceActivityTime(device: RemoteAccessPairedDeviceRecord) {
+  const lastSeen = device.lastSeenAt ? Date.parse(device.lastSeenAt) : Number.NaN;
+  if (Number.isFinite(lastSeen)) return lastSeen;
+  const created = Date.parse(device.createdAt);
+  return Number.isFinite(created) ? created : 0;
+}
+
+function dedupeRemoteAccessDevices(devices: RemoteAccessPairedDeviceRecord[]) {
+  const newestByDevice = new Map<string, RemoteAccessPairedDeviceRecord>();
+  for (const device of devices) {
+    const key = normalizedRemoteAccessDeviceKey(device);
+    const existing = newestByDevice.get(key);
+    if (!existing || remoteAccessDeviceActivityTime(device) > remoteAccessDeviceActivityTime(existing)) {
+      newestByDevice.set(key, device);
+    }
+  }
+  return [...newestByDevice.values()].sort((left, right) => remoteAccessDeviceActivityTime(right) - remoteAccessDeviceActivityTime(left));
+}
+
+type RemoteAccessPairingChallenge = {
+  code: string;
+  createdAt: number;
+  expiresAt: number;
+  suggestedURL: string;
+};
+
+type RemoteAccessSubscriber = {
+  id: string;
+  deviceID: string;
+  res: http.ServerResponse;
+};
+
+const remoteAccessPairingLifetimeMs = 5 * 60 * 1000;
+const remoteSelectedSessionIDsByDeviceID = new Map<string, string>();
+const remoteSelectedNoteByDeviceID = new Map<string, { projectID: string; noteID: string }>();
+const remoteSelectedThreadNoteByDeviceID = new Map<string, { threadID: string; noteID: string }>();
+type RemotePlannerSelection = { view: "day" | "backlog"; dayID: string };
+const remoteSelectedPlannerByDeviceID = new Map<string, RemotePlannerSelection>();
+let remoteAccessBroadcastHook: (() => void) | null = null;
+
+function remotePlannerSelectionForDevice(deviceID?: string | null): RemotePlannerSelection {
+  const today = plannerDayID();
+  if (!deviceID) return { view: "day", dayID: today };
+  return remoteSelectedPlannerByDeviceID.get(deviceID) ?? { view: "day", dayID: today };
+}
+
+function remoteAccessDailyItem(item: DailyItem) {
+  return {
+    id: item.id,
+    dayID: item.dayID,
+    title: item.title,
+    status: item.status,
+    checked: item.checked,
+    projectID: item.projectID ?? null,
+    folderID: item.folderID ?? null,
+    projectName: item.projectName ?? null,
+    folderName: item.folderName ?? null,
+    area: item.area ?? null,
+    detailsMarkdown: item.detailsMarkdown,
+    steps: item.steps.map((step) => ({
+      id: step.id,
+      text: step.text,
+      checked: step.checked
+    })),
+    structured: item.structured === true,
+    order: item.order
+  };
+}
+
+function remoteAccessPlannerDayDetail(detail: PlannerDayDetail | PlannerBacklogDetail, active = false) {
+  return {
+    id: detail.id,
+    title: detail.title,
+    subtitle: detail.subtitle,
+    updatedAt: detail.updatedAt ?? null,
+    active,
+    markdown: detail.markdown
+  };
+}
+
+function scheduleRemoteAccessBroadcast() {
+  remoteAccessBroadcastHook?.();
+}
+
+function remoteAccessActiveNoteForDevice(deviceID: string | null | undefined, notes: NoteItem[]) {
+  if (deviceID) {
+    const selected = remoteSelectedNoteByDeviceID.get(deviceID);
+    if (selected) {
+      const match = notes.find((note) =>
+        note.id.toLowerCase() === selected.noteID.toLowerCase()
+        && note.projectID.toUpperCase() === selected.projectID.toUpperCase()
+      );
+      if (match) return match;
+    }
+  }
+  return notes.find((note) => note.active) ?? notes[0] ?? null;
+}
+
+function remoteAccessActiveThreadNoteForDevice(deviceID: string | null | undefined) {
+  if (!deviceID) return null;
+  const selected = remoteSelectedThreadNoteByDeviceID.get(deviceID);
+  if (!selected) return null;
+  try {
+    const workspace = selectThreadNote(selected.threadID, selected.noteID);
+    const note = workspace.selectedNote;
+    if (!note) return null;
+    const thread = loadThreads(loadProjects(), { limit: 200 }).find((entry) => entry.id === selected.threadID);
+    return {
+      id: note.id,
+      title: note.title,
+      subtitle: noteSubtitle(note.updatedAt),
+      threadID: selected.threadID,
+      threadTitle: thread?.title ?? workspace.threadID,
+      projectID: thread?.projectID ?? null,
+      projectName: thread?.project ?? null,
+      updatedAt: swiftDateToMs(note.updatedAt) ?? null,
+      active: true,
+      markdown: inlineNoteMarkdownImages(note.markdown, note.path)
+    };
+  } catch (error) {
+    bridgeDebugLog(`Remote access active thread note snapshot failed: ${error instanceof Error ? error.message : String(error)}`);
+    return null;
+  }
+}
+
+const remoteActiveRunsByDeviceID = new Map<string, { clientRunID: string; sessionID: string; deviceName: string; acquiredAt: string; prompt?: string }>();
+const remoteSelectedPluginIDsByDeviceSessionKey = new Map<string, string[]>();
+const remotePermissionResults = new Map<string, unknown>();
+
+function remoteDeviceSessionKey(deviceID?: string | null, sessionID?: string | null) {
+  return `${String(deviceID ?? "").toLowerCase()}::${String(sessionID ?? "").toLowerCase()}`;
+}
+
+function remoteStringArray(value: unknown) {
+  return Array.isArray(value)
+    ? Array.from(new Set(value.map((item) => String(item ?? "").trim()).filter(Boolean)))
+    : [];
+}
+
+function remoteSelectedPluginIDs(deviceID?: string | null, sessionID?: string | null) {
+  if (!deviceID || !sessionID) return [];
+  return remoteSelectedPluginIDsByDeviceSessionKey.get(remoteDeviceSessionKey(deviceID, sessionID)) ?? [];
+}
+
+function setRemoteSelectedPluginIDs(deviceID: string, sessionID: string, pluginIDs: string[]) {
+  remoteSelectedPluginIDsByDeviceSessionKey.set(remoteDeviceSessionKey(deviceID, sessionID), pluginIDs);
+}
+
+function remoteAccessRoot() {
+  return path.join(supportRoot(), "RemoteAccess");
+}
+
+function remoteAccessDevicesPath() {
+  return path.join(remoteAccessRoot(), "paired-devices.json");
+}
+
+function remoteAccessMachineIDPath() {
+  return path.join(remoteAccessRoot(), "machine-id.json");
+}
+
+function remoteAccessMachineID() {
+  const stored = readJSON<{ machineID?: string }>(remoteAccessMachineIDPath(), {}).machineID?.trim();
+  if (stored) return stored;
+  const machineID = randomUUID().toLowerCase();
+  writeJSON(remoteAccessMachineIDPath(), { machineID });
+  return machineID;
+}
+
+function readRemoteAccessDevices() {
+  const storedDevices = readJSON<RemoteAccessPairedDeviceRecord[]>(remoteAccessDevicesPath(), []);
+  const devices = dedupeRemoteAccessDevices(storedDevices);
+  if (JSON.stringify(devices) !== JSON.stringify(storedDevices)) {
+    writeJSON(remoteAccessDevicesPath(), devices);
+  }
+  return devices;
+}
+
+function writeRemoteAccessDevices(devices: RemoteAccessPairedDeviceRecord[]) {
+  writeJSON(remoteAccessDevicesPath(), dedupeRemoteAccessDevices(devices));
+}
+
+function sha256Hex(value: string) {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function constantTimeStringEquals(left: string, right: string) {
+  const leftBuffer = Buffer.from(left);
+  const rightBuffer = Buffer.from(right);
+  return leftBuffer.length === rightBuffer.length && timingSafeEqual(leftBuffer, rightBuffer);
+}
+
+function remoteAccessSecureToken(prefix: string, byteCount: number) {
+  return `${prefix}${randomBytes(Math.max(1, byteCount)).toString("base64url")}`;
+}
+
+function normalizeRemoteSocketAddress(value?: string | null) {
+  const trimmed = String(value ?? "").trim().toLowerCase();
+  if (!trimmed) return "";
+  if (trimmed.startsWith("::ffff:")) return trimmed.slice("::ffff:".length);
+  return trimmed.replace(/^\[|\]$/g, "");
+}
+
+function isLoopbackAddress(value: string) {
+  return value === "127.0.0.1" || value === "::1" || value === "localhost";
+}
+
+function remoteAccessLocalURL(settings: RemoteAccessRuntimeSettings) {
+  return `http://127.0.0.1:${normalizedRemoteAccessPort(settings.port)}`;
+}
+
+function remoteAccessLocalNetworkURL(settings: RemoteAccessRuntimeSettings) {
+  if (settings.networkMode !== "localNetwork") return "";
+  const address = detectedLocalNetworkAddress();
+  return address ? `http://${address}:${normalizedRemoteAccessPort(settings.port)}` : "";
+}
+
+function remoteAccessTailscaleURL(settings: RemoteAccessRuntimeSettings) {
+  return settings.networkMode === "tailscale"
+    ? remoteAccessBaseURLFromHost(settings.tailscaleHost, settings.port)
+    : "";
+}
+
+function remoteAccessPreferredURL(settings: RemoteAccessRuntimeSettings) {
+  return String(settings.publicURL ?? "").trim()
+    || remoteAccessTailscaleURL(settings)
+    || remoteAccessLocalNetworkURL(settings)
+    || remoteAccessLocalURL(settings);
+}
+
+function remoteAccessServerRuntimeSnapshot(settings: RemoteAccessRuntimeSettings) {
+  const challenge = remoteAccessServer?.activeChallenge();
+  const localNetworkURL = remoteAccessLocalNetworkURL(settings);
+  const tailscaleURL = remoteAccessTailscaleURL(settings);
+  const tunnel = easyRemoteTunnel.snapshot();
+  return {
+    localNetworkURL,
+    tailscaleURL,
+    easyTunnelURL: tunnel.url,
+    easyTunnelRunning: tunnel.running,
+    easyTunnelStatusMessage: tunnel.statusMessage,
+    tunnelHelperInstalled: tunnel.installed,
+    tunnelHelperInstalling: tunnel.installing,
+    pairingCode: challenge?.code ?? "",
+    pairingURL: challenge?.suggestedURL ?? "",
+    pairingExpiresAt: challenge?.expiresAt ?? null,
+    serverRunning: remoteAccessServer?.isRunning() ?? false,
+    deviceCount: readRemoteAccessDevices().length
+  };
+}
+
+function remoteAccessAppearanceSnapshot(settings: Partial<SettingsSnapshot>) {
+  const normalizedMode = String(settings.themeMode || "System").trim().toLowerCase();
+  const themeMode = normalizedMode === "light" ? "light" : "dark";
+  const prefix = themeMode === "light" ? "lightTheme" : "darkTheme";
+  const readString = (key: keyof SettingsSnapshot, fallback: string) => String(settings[key] || fallback);
+  const contrast = Number(readString(`${prefix}Contrast` as keyof SettingsSnapshot, themeMode === "light" ? "47" : "63")) || 63;
+
+  return {
+    themeMode,
+    colorTheme: String(settings.colorTheme || "Ocean"),
+    chromeStyle: String(settings.appChromeStyle || "Liquid Glass"),
+    accent: readString(`${prefix}Accent` as keyof SettingsSnapshot, themeMode === "light" ? "#0969DA" : "#F9861A"),
+    background: readString(`${prefix}Background` as keyof SettingsSnapshot, themeMode === "light" ? "#FFFFFF" : "#0F0F11"),
+    foreground: readString(`${prefix}Foreground` as keyof SettingsSnapshot, themeMode === "light" ? "#1F2328" : "#E3E4E6"),
+    uiFont: readString(`${prefix}UIFont` as keyof SettingsSnapshot, ""),
+    codeFont: readString(`${prefix}CodeFont` as keyof SettingsSnapshot, ""),
+    translucentSidebar: Boolean(settings[`${prefix}TranslucentSidebar` as keyof SettingsSnapshot]),
+    contrast: Math.min(100, Math.max(0, contrast)),
+    diffAdded: readString(`${prefix}DiffAdded` as keyof SettingsSnapshot, themeMode === "light" ? "#1A7F37" : "#40C977"),
+    diffRemoved: readString(`${prefix}DiffRemoved` as keyof SettingsSnapshot, themeMode === "light" ? "#CF222E" : "#FA423E"),
+    skill: readString(`${prefix}Skill` as keyof SettingsSnapshot, themeMode === "light" ? "#8250DF" : "#AD7BF9")
+  };
+}
+
+function makeRemoteAccessPairingURL(settings: RemoteAccessRuntimeSettings, code: string) {
+  const base = remoteAccessPreferredURL(settings);
+  if (!base) return "";
+  const url = new URL(base);
+  if (String(settings.publicURL ?? "").trim()) {
+    url.searchParams.set("connectionMode", "cloudflare");
+  }
+  if (settings.networkMode === "tailscale" && remoteAccessTailscaleURL(settings)) {
+    url.searchParams.set("connectionMode", "tailscale");
+  } else if (settings.networkMode === "localNetwork" && remoteAccessLocalNetworkURL(settings)) {
+    url.searchParams.set("connectionMode", "local");
+  }
+  url.searchParams.set("pairingCode", code);
+  return url.toString();
+}
+
+class OpenAssistQuickTunnel {
+  private process?: ReturnType<typeof spawn>;
+  private url = "";
+  private starting = false;
+  private lastError = "";
+  private mode: "quick" | "named" | "" = "";
+
+  currentURL() {
+    return this.url;
+  }
+
+  isRunning() {
+    return Boolean(this.process && this.url);
+  }
+
+  snapshot() {
+    const installed = Boolean(cloudflaredExecutablePath());
+    const installing = Boolean(cloudflaredInstallInFlight) || this.starting;
+    return {
+      installed,
+      installing,
+      running: this.isRunning(),
+      url: this.url,
+      statusMessage: this.url
+        ? this.mode === "named"
+          ? "Easy QR is using your stable Cloudflare URL."
+          : "Easy QR is live outside your network."
+        : this.lastError
+          ? this.lastError
+          : installed
+            ? "Ready to start Easy QR."
+            : "Tunnel helper will install when you start Easy QR."
+    };
+  }
+
+  async start(targetURL: string, options: { publicURL?: string; tunnelName?: string; credentialsFile?: string } = {}) {
+    const publicURL = normalizeRemoteAccessPublicURL(options.publicURL);
+    const tunnelName = String(options.tunnelName ?? "").trim();
+    if (publicURL && tunnelName) {
+      return this.startNamed(targetURL, publicURL, tunnelName, options.credentialsFile);
+    }
+    return this.startQuick(targetURL);
+  }
+
+  private async startQuick(targetURL: string) {
+    if (this.isRunning()) return this.url;
+    this.stop();
+    this.starting = true;
+    this.lastError = "";
+    this.mode = "quick";
+    try {
+      const executable = await installCloudflaredHelper();
+      const child = spawn(executable, ["tunnel", "--url", targetURL], {
+        cwd: cloudflaredRuntimeRoot(),
+        env: { ...process.env, HOME: cloudflaredRuntimeRoot() },
+        stdio: ["ignore", "pipe", "pipe"]
+      });
+      this.process = child;
+      const url = await new Promise<string>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("Cloudflare tunnel did not return a URL yet.")), 30_000);
+        const readOutput = (chunk: Buffer) => {
+          const text = chunk.toString("utf8");
+          const match = text.match(/https:\/\/[a-zA-Z0-9-]+\.trycloudflare\.com/);
+          if (!match) return;
+          this.url = match[0];
+          clearTimeout(timer);
+          resolve(match[0]);
+        };
+        child.stdout?.on("data", readOutput);
+        child.stderr?.on("data", readOutput);
+        child.once("error", (error) => {
+          clearTimeout(timer);
+          reject(error);
+        });
+        child.once("exit", (code) => {
+          if (this.process === child) {
+            this.process = undefined;
+            this.url = "";
+          }
+          clearTimeout(timer);
+          if (!this.url) reject(new Error(`Cloudflare tunnel stopped${code === null ? "" : ` with code ${code}`}.`));
+        });
+      });
+      this.url = url;
+      return url;
+    } catch (error) {
+      this.stop();
+      this.lastError = error instanceof Error ? error.message : "Could not start Easy QR.";
+      throw error;
+    } finally {
+      this.starting = false;
+    }
+  }
+
+  private async startNamed(targetURL: string, publicURL: string, tunnelName: string, credentialsFile?: string) {
+    if (this.isRunning() && this.url === publicURL) return this.url;
+    this.stop();
+    this.starting = true;
+    this.lastError = "";
+    this.mode = "named";
+    try {
+      const executable = await installCloudflaredHelper();
+      const configPath = writeNamedCloudflaredConfig({ publicURL, targetURL, tunnelName, credentialsFile });
+      const child = spawn(executable, ["tunnel", "--config", configPath, "--no-autoupdate", "run"], {
+        cwd: cloudflaredRuntimeRoot(),
+        env: { ...process.env },
+        stdio: ["ignore", "pipe", "pipe"]
+      });
+      this.process = child;
+      const url = await new Promise<string>((resolve, reject) => {
+        let settled = false;
+        let output = "";
+        const timer = setTimeout(() => {
+          settled = true;
+          resolve(publicURL);
+        }, 3000);
+        const readOutput = (chunk: Buffer) => {
+          output += chunk.toString("utf8");
+        };
+        const rejectStartup = (error: Error) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          reject(error);
+        };
+        child.stdout?.on("data", readOutput);
+        child.stderr?.on("data", readOutput);
+        child.once("error", (error) => rejectStartup(error));
+        child.once("exit", (code) => {
+          if (this.process === child) {
+            this.process = undefined;
+            this.url = "";
+            this.mode = "";
+          }
+          if (settled) return;
+          const detail = output.trim().split(/\n/).slice(-3).join(" ").trim();
+          rejectStartup(new Error(detail || `Cloudflare named tunnel stopped${code === null ? "" : ` with code ${code}`}.`));
+        });
+      });
+      this.url = url;
+      return url;
+    } catch (error) {
+      this.stop();
+      const message = error instanceof Error ? error.message : "Could not start Easy QR.";
+      this.lastError = `Could not start named Cloudflare tunnel. ${message}`;
+      throw error;
+    } finally {
+      this.starting = false;
+    }
+  }
+
+  stop() {
+    if (this.process) {
+      this.process.kill();
+      this.process = undefined;
+    }
+    this.url = "";
+    this.mode = "";
+  }
+}
+
+const easyRemoteTunnel = new OpenAssistQuickTunnel();
+
+// Persisted activity/approval messages keep their "running"/unresolved state on
+// disk when a turn dies (stop, crash, app restart), so the phone must only be
+// shown live work that is backed by an actual in-flight provider run.
+function threadHasLiveProviderRun(threadID: string) {
+  const normalized = threadID.trim().toLowerCase();
+  if (!normalized) return false;
+  for (const run of activeProviderRuns.values()) {
+    if (run.openAssistThreadID?.trim().toLowerCase() === normalized) return true;
+  }
+  return false;
+}
+
+function remoteAccessSession(thread: ThreadItem, session = findSession(thread.id)) {
+  return {
+    id: thread.id,
+    title: thread.title,
+    projectID: thread.projectID ?? null,
+    projectName: thread.project ?? null,
+    backend: thread.activeProvider ?? null,
+    modelID: thread.modelID ?? null,
+    interactionMode: session?.latestInteractionMode ?? null,
+    reasoningEffort: session?.latestReasoningEffort ?? null,
+    permissionMode: session?.latestPermissionMode ?? null,
+    isTemporary: thread.isTemporary === true,
+    hasActiveTurn: thread.isRunning === true || threadHasLiveProviderRun(thread.id),
+    updatedAt: thread.updatedAt ? new Date(thread.updatedAt).toISOString() : null
+  };
+}
+
+function remoteAccessTranscriptEntry(message: ChatMessage, hasLiveRun = true) {
+  return {
+    id: message.id,
+    role: message.role,
+    text: message.text,
+    createdAt: new Date(message.createdAt ?? Date.now()).toISOString(),
+    isStreaming: hasLiveRun && message.status === "running",
+    providerBackend: message.provider ?? null,
+    providerModelID: null,
+    selectedPluginIDs: []
+  };
+}
+
+function remoteAccessToolCall(message: ChatMessage) {
+  return {
+    id: message.id,
+    title: message.activityTitle || message.text || "Activity",
+    status: message.activityStatus || message.status || "completed",
+    detail: message.activityDetail || null
+  };
+}
+
+async function remoteAccessPendingPermission(message: ChatMessage | undefined) {
+  if (!message?.approvalRequestID || message.approvalResolved) return null;
+  const options = (message.approvalOptions ?? []).map((option, index) => {
+    const id = String(option.id || `option-${index}`);
+    remotePermissionResults.set(`${message.approvalRequestID}:${id}`, option.result);
+    return {
+      id,
+      title: option.label,
+      kind: option.tone ?? null,
+      isDefault: index === 0
+    };
+  });
+  return {
+    id: message.approvalRequestID,
+    toolTitle: message.activityTitle || "Permission",
+    toolKind: message.approvalKind ?? null,
+    rationale: message.approvalPrompt ?? message.activityDetail ?? null,
+    rawPayloadSummary: message.text ?? null,
+    requiresDesktopAppConfirmation: false,
+    options,
+    questions: []
+  };
+}
+
+async function remoteAccessSessionDetail(threadID: string, deviceID?: string | null) {
+  const detail = await loadThreadMessages(threadID, { turnLimit: 20 });
+  const messages = detail.messages ?? [];
+  const deviceRun = deviceID ? remoteActiveRunsByDeviceID.get(deviceID) : undefined;
+  const session = findSession(threadID);
+  const loadedProjects = loadProjects();
+  const thread = loadThreads(loadedProjects).find((candidate) => candidate.id.toLowerCase() === threadID.toLowerCase());
+  const hasLiveRun = threadHasLiveProviderRun(threadID);
+  const transcript = messages
+    .filter((message) => message.role === "user" || message.role === "assistant")
+    .map((message) => remoteAccessTranscriptEntry(message, hasLiveRun));
+  const activityMessages = messages.filter((message) => message.role === "activity");
+  const activeToolCalls = hasLiveRun
+    ? activityMessages
+        .filter((message) => message.status === "running" || message.activityStatus === "running" || message.activityStatus === "waiting")
+        .map(remoteAccessToolCall)
+    : [];
+  const recentToolCalls = activityMessages.slice(-8).map(remoteAccessToolCall);
+  const pendingPermission = hasLiveRun
+    ? await remoteAccessPendingPermission(
+        [...activityMessages].reverse().find((message) => Boolean(message.approvalRequestID) && !message.approvalResolved)
+      )
+    : null;
+  return {
+    session: remoteAccessSession(thread ?? {
+      id: threadID,
+      title: detail.title || session?.title || "Untitled chat",
+      age: "",
+      updatedAt: swiftDateToMs(session?.updatedAt),
+      activeProvider: normalizeBackend(String(session?.activeProvider ?? "codex")),
+      modelID: pluginString(session?.modelID, session?.latestModel),
+      isTemporary: session?.isTemporary === true
+    }, session),
+    transcript,
+    activeToolCalls,
+    recentToolCalls,
+    pendingPermission,
+    selectedPluginIDs: remoteSelectedPluginIDs(deviceID, threadID),
+    // Echo the in-flight prompt so the phone shows the message it just sent.
+    // The user turn is only persisted to the transcript when the run finishes.
+    pendingOutgoingMessage: deviceRun?.sessionID === threadID ? deviceRun.prompt ?? null : null,
+    activeTurnID: activeToolCalls[0]?.id ?? null,
+    awaitingAssistantStart: Boolean(deviceRun && deviceRun.sessionID === threadID),
+    queuedPromptCount: 0
+  };
+}
+
+async function makeRemoteAccessSnapshot(deviceID?: string | null) {
+  const settings = await loadRemoteAccessSettings();
+  const loadedProjects = loadProjects();
+  const threads = loadThreads(loadedProjects, { limit: 40 }).filter((thread) => thread.isArchived !== true);
+  const { notes } = loadNotes(loadedProjects);
+  const threadNotes = loadThreadNoteList(threads);
+  const plannerSelection = remotePlannerSelectionForDevice(deviceID);
+  const todayID = plannerDayID();
+  const selectedDayID = normalizePlannerDayID(plannerSelection.view === "backlog" ? todayID : plannerSelection.dayID);
+  const plannerDays = listPlannerDays(14, selectedDayID);
+  const activeNoteSummary = remoteAccessActiveNoteForDevice(deviceID, notes);
+  const activeNoteDetail = activeNoteSummary
+    ? (() => {
+        try {
+          const detail = loadNote(activeNoteSummary.projectID, activeNoteSummary.id);
+          return {
+            id: activeNoteSummary.id,
+            title: detail.title,
+            subtitle: activeNoteSummary.subtitle,
+            projectID: activeNoteSummary.projectID,
+            projectName: activeNoteSummary.projectName ?? null,
+            folderID: activeNoteSummary.folderID ?? null,
+            updatedAt: activeNoteSummary.updatedAt ?? null,
+            active: true,
+            markdown: inlineNoteMarkdownImages(detail.markdown, detail.path)
+          };
+        } catch (error) {
+          bridgeDebugLog(`Remote access active note snapshot failed: ${error instanceof Error ? error.message : String(error)}`);
+          return null;
+        }
+      })()
+    : null;
+  const todayPlannerDayDetail = (() => {
+    try {
+      return remoteAccessPlannerDayDetail(loadPlannerDay(todayID), todayID === selectedDayID && plannerSelection.view === "day");
+    } catch (error) {
+      bridgeDebugLog(`Remote access today planner snapshot failed: ${error instanceof Error ? error.message : String(error)}`);
+      return null;
+    }
+  })();
+  const todayDailyItems = todayPlannerDayDetail
+    ? listDailyItems(todayID).map(remoteAccessDailyItem)
+    : [];
+  const activePlannerDayDetail = plannerSelection.view === "day"
+    ? (() => {
+        try {
+          return remoteAccessPlannerDayDetail(loadPlannerDay(selectedDayID), true);
+        } catch (error) {
+          bridgeDebugLog(`Remote access planner day snapshot failed: ${error instanceof Error ? error.message : String(error)}`);
+          return null;
+        }
+      })()
+    : null;
+  const dailyItems = activePlannerDayDetail
+    ? listDailyItems(selectedDayID).map(remoteAccessDailyItem)
+    : [];
+  const plannerBacklogDetail = (() => {
+    try {
+      return remoteAccessPlannerDayDetail(loadPlannerBacklog(), plannerSelection.view === "backlog");
+    } catch (error) {
+      bridgeDebugLog(`Remote access planner backlog snapshot failed: ${error instanceof Error ? error.message : String(error)}`);
+      return null;
+    }
+  })();
+  const backlogItems = plannerBacklogDetail
+    ? listBacklogItems().map(remoteAccessDailyItem)
+    : [];
+  const threadCountByProjectID = new Map<string, number>();
+  for (const thread of threads) {
+    const projectID = String(thread.projectID ?? "").trim();
+    if (projectID) threadCountByProjectID.set(projectID, (threadCountByProjectID.get(projectID) ?? 0) + 1);
+  }
+  const selectedSessionID = (deviceID ? remoteSelectedSessionIDsByDeviceID.get(deviceID) : undefined) || threads[0]?.id || "";
+  const selectedSession = selectedSessionID ? await remoteAccessSessionDetail(selectedSessionID, deviceID).catch(() => null) : null;
+  const selectedBackend = normalizeBackend(String(selectedSession?.session?.backend ?? settings.availableAssistantBackends[0] ?? "codex"));
+  const selectedBackendModels = await cachedProviderModels(selectedBackend);
+  const sessionByID = new Map(loadSessionRegistry().sessions.map((session) => [session.id.toLowerCase(), session]));
+  const pairedDevice = deviceID
+    ? readRemoteAccessDevices().find((device) => device.id === deviceID)
+    : undefined;
+  const activeRun = deviceID ? remoteActiveRunsByDeviceID.get(deviceID) : undefined;
+  const networkMode = normalizeRemoteAccessNetworkMode(settings.remoteAccessNetworkMode);
+  const easyTunnelURL = easyRemoteTunnel.currentURL();
+  const remotePublicURL = normalizeRemoteAccessPublicURL(easyTunnelURL || settings.remoteAccessPublicURL);
+  const runtimeSettings = {
+    port: settings.remoteAccessPort,
+    networkMode,
+    tailscaleHost: settings.remoteAccessTailscaleHost,
+    publicURL: remotePublicURL
+  };
+  return {
+    machine: {
+      machineID: remoteAccessMachineID(),
+      displayName: os.hostname(),
+      hostName: os.hostname(),
+      appVersion: `${settings.appVersion} (${settings.buildNumber})`,
+      operatingSystem: `${os.type()} ${os.release()}`,
+      localBaseURL: remoteAccessLocalURL(runtimeSettings),
+      tailscaleBaseURL: remoteAccessTailscaleURL(runtimeSettings) || null,
+      publicBaseURL: remotePublicURL || null
+    },
+    status: {
+      runtimeAvailability: settings.assistantRuntimeStatus,
+      runtimeSummary: settings.assistantRuntimeStatus,
+      runtimeDetail: settings.assistantRuntimeDetail,
+      helperState: remoteAccessServer.isRunning() ? "Running" : settings.remoteAccessEnabled ? "Stopped" : "Disabled",
+      helperMessage: easyTunnelURL
+        ? "Easy QR is available outside your network."
+        : networkMode === "tailscale"
+          ? "Tailscale Direct is private to your tailnet."
+          : null,
+      tunnel: {
+        mode: remotePublicURL ? "named" : "disabled",
+        transport: "auto",
+        configured: Boolean(remotePublicURL),
+        isRunning: Boolean(easyTunnelURL),
+        publicURL: remotePublicURL || null,
+        warning: easyTunnelURL && isQuickCloudflareURL(easyTunnelURL) ? "Quick Tunnel URLs change whenever the tunnel restarts." : null,
+        detail: easyTunnelURL
+          ? isQuickCloudflareURL(easyTunnelURL)
+            ? "Forwarding through a temporary Cloudflare URL."
+            : "Forwarding through your stable Cloudflare URL."
+          : networkMode === "localNetwork"
+            ? "Listening for same-Wi-Fi devices."
+            : networkMode === "tailscale"
+              ? "Listening for loopback and Tailscale 100.x.y.z peers."
+              : "Listening on this Mac only."
+      },
+      usage: null
+    },
+    pairedDevice: pairedDevice ? {
+      id: pairedDevice.id,
+      name: pairedDevice.name,
+      createdAt: pairedDevice.createdAt,
+      lastSeenAt: pairedDevice.lastSeenAt ?? null,
+      userAgent: pairedDevice.userAgent ?? null,
+      isCurrent: true
+    } : null,
+    sessions: threads.map((thread) => remoteAccessSession(thread, sessionByID.get(thread.id.toLowerCase()))),
+    selectedSessionID: selectedSessionID || null,
+    selectedSession,
+    remoteControl: activeRun ? {
+      sessionID: activeRun.sessionID,
+      deviceID: deviceID ?? "",
+      deviceName: activeRun.deviceName,
+      acquiredAt: activeRun.acquiredAt,
+      activeTurnID: activeRun.clientRunID
+    } : null,
+    availableBackends: (settings.availableAssistantBackends ?? []).map((backend) => ({ id: backend, displayName: providerLabel(backend) })),
+    availableModels: selectedBackendModels
+      .filter((model) => model.hidden !== true && model.disabled !== true)
+      .map((model) => ({
+        id: model.id,
+        displayName: model.displayName,
+        description: model.description ?? "",
+        isDefault: model.isDefault === true,
+        inputModalities: model.inputModalities ?? [],
+        supportedReasoningEfforts: model.supportedReasoningEfforts ?? []
+      })),
+    installedPlugins: [],
+    projects: loadedProjects.projects
+      .filter((project) => project.kind !== "folder")
+      .map((project) => ({
+        id: project.id,
+        name: project.title,
+        kind: project.kind ?? "project",
+        parentID: project.parentID ?? null,
+        sessionCount: threadCountByProjectID.get(project.id) ?? 0,
+        noteCount: loadedProjects.projectNotesByID.get(project.id) ?? 0
+      })),
+    notes: notes.slice(0, 40).map((note) => ({
+      id: note.id,
+      title: note.title,
+      subtitle: note.subtitle,
+      projectID: note.projectID,
+      projectName: note.projectName ?? null,
+      folderID: note.folderID ?? null,
+      updatedAt: note.updatedAt ?? null,
+      active: note.active === true
+    })),
+    activeNote: activeNoteDetail,
+    threadNotes: threadNotes.slice(0, 80).map((note) => ({
+      id: note.id,
+      title: note.title,
+      subtitle: note.subtitle,
+      threadID: note.threadID,
+      threadTitle: note.threadTitle,
+      projectID: note.projectID ?? null,
+      projectName: note.projectName ?? null,
+      updatedAt: note.updatedAt ?? null,
+      isArchived: note.isArchived === true,
+      active: note.active === true
+    })),
+    activeThreadNote: remoteAccessActiveThreadNoteForDevice(deviceID),
+    plannerDays: plannerDays.map((day) => ({
+      id: day.id,
+      title: day.title,
+      subtitle: day.subtitle,
+      updatedAt: day.updatedAt ?? null,
+      active: day.active === true
+    })),
+    activePlannerDay: activePlannerDayDetail,
+    todayPlannerDay: todayPlannerDayDetail,
+    todayDailyItems,
+    plannerViewMode: plannerSelection.view,
+    plannerBacklog: plannerBacklogDetail,
+    backlogItems,
+    dailyItems,
+    appearance: remoteAccessAppearanceSnapshot(settings)
+  };
+}
+
+type VoiceResultItem = {
+  id: string;
+  kind: string;
+  title: string;
+  sourceLabel?: string;
+  snippet?: string;
+};
+
+type VoiceOpenTarget =
+  | { kind: "note"; projectID: string; noteID: string }
+  | { kind: "threadNote"; threadID: string; noteID: string }
+  | { kind: "thread"; sessionID: string };
+
+type VoicePendingConfirmation = {
+  confirmToken: string;
+  summary: string;
+  tool: string;
+  args: JsonObject;
+};
+
+type VoiceCommandResult = {
+  tool: string;
+  spokenAnswer: string;
+  results?: VoiceResultItem[];
+  openTarget?: VoiceOpenTarget;
+  pendingConfirmation?: VoicePendingConfirmation;
+  /** Open backlog count, included by day-reading tools so the assistant sees the full picture. */
+  backlogOpenCount?: number;
+};
+
+type VoicePendingOperation = {
+  deviceID: string;
+  tool: string;
+  args: JsonObject;
+  createdAt: number;
+};
+
+const VOICE_PENDING_TTL_MS = 2 * 60 * 1000;
+const voicePendingOperations = new Map<string, VoicePendingOperation>();
+
+function prunedVoicePendingOperations(now: number) {
+  for (const [token, op] of voicePendingOperations) {
+    if (now - op.createdAt > VOICE_PENDING_TTL_MS) voicePendingOperations.delete(token);
+  }
+}
+
+/** Tools that always require a second confirming call before they act. */
+const VOICE_DESTRUCTIVE_TOOLS = new Set([
+  "delete_note",
+  "archive_note",
+  "delete_today_item",
+  "delete_planner_item",
+  "delete_backlog_item",
+  "schedule_backlog_item",
+  "move_planner_item",
+  "move_planner_item_to_backlog",
+  "delete_session"
+]);
+
+function voiceResultsFromSearch(results: KnowledgeSearchResult[], limit = 8): VoiceResultItem[] {
+  return results.slice(0, limit).map((result) => ({
+    id: result.id,
+    kind: result.kind,
+    title: result.title,
+    sourceLabel: result.sourceLabel,
+    snippet: result.snippet
+  }));
+}
+
+function voiceResultsFromTimeline(results: KnowledgeTimelineSearchResult[], limit = 8): VoiceResultItem[] {
+  return results.slice(0, limit).map((result) => ({
+    id: result.id,
+    kind: result.sourceType,
+    title: result.title,
+    sourceLabel: result.sourceLabel,
+    snippet: result.snippet
+  }));
+}
+
+function voiceCountPhrase(count: number, singular: string, plural = `${singular}s`) {
+  return `${count} ${count === 1 ? singular : plural}`;
+}
+
+function voicePlannerDayID(args: JsonObject, fallbackText = "") {
+  const direct = String(args.dayID ?? args.targetDayID ?? "").trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(direct)) return normalizePlannerDayID(direct);
+
+  const dateText = [
+    args.date,
+    args.when,
+    args.day,
+    args.due,
+    args.dueDate,
+    fallbackText
+  ].map((value) => String(value ?? "").trim()).filter(Boolean).join(" ");
+
+  return parsePlannerDayIDFromPrompt(dateText) || normalizePlannerDayID("");
+}
+
+function voicePlannerSourceDayID(args: JsonObject, fallbackText = "") {
+  const direct = String(args.fromDayID ?? args.sourceDayID ?? args.dayID ?? "").trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(direct)) return normalizePlannerDayID(direct);
+
+  const dateText = [
+    args.fromDate,
+    args.sourceDate,
+    args.date,
+    fallbackText
+  ].map((value) => String(value ?? "").trim()).filter(Boolean).join(" ");
+
+  return parsePlannerDayIDFromPrompt(dateText) || normalizePlannerDayID("");
+}
+
+function voicePlannerTargetDayID(args: JsonObject, fallbackText = "") {
+  const direct = String(args.targetDayID ?? args.toDayID ?? args.destinationDayID ?? "").trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(direct)) return normalizePlannerDayID(direct);
+
+  const dateText = [
+    args.targetDate,
+    args.toDate,
+    args.destinationDate,
+    args.when,
+    fallbackText
+  ].map((value) => String(value ?? "").trim()).filter(Boolean).join(" ");
+
+  return parsePlannerDayIDFromPrompt(dateText) || normalizePlannerDayID("");
+}
+
+function voicePlannerTaskTitle(args: JsonObject) {
+  const rawTitle = String(args.title ?? args.text ?? args.task ?? "").trim();
+  return stripPlannerDatePhrases(rawTitle) || rawTitle;
+}
+
+function voicePlannerRawTaskText(args: JsonObject) {
+  return String(args.title ?? args.text ?? args.task ?? args.query ?? "").trim();
+}
+
+function voicePlannerTaskQuery(args: JsonObject) {
+  const rawQuery = String(args.query ?? args.title ?? args.text ?? args.task ?? "").trim();
+  return stripPlannerDatePhrases(rawQuery) || rawQuery;
+}
+
+/**
+ * Execute one structured tool call sent by the phone's Gemini Live session.
+ * The phone owns the voice conversation; this only runs the requested tool against
+ * OpenAssist knowledge/assistant helpers and returns a structured, speakable result.
+ */
+async function runVoiceTool(device: RemoteAccessPairedDeviceRecord, payload: JsonObject): Promise<VoiceCommandResult> {
+  const now = Date.now();
+  prunedVoicePendingOperations(now);
+
+  const tool = String(payload.tool ?? "").trim();
+  if (!tool) throw new Error("Voice command is missing a tool name.");
+  const args = jsonObject(payload.args) ?? {};
+  const context = jsonObject(payload.context) ?? {};
+  const confirmToken = String(payload.confirmToken ?? "").trim();
+
+  // Destructive tools never act on the first call: the first call returns a
+  // pending confirmation; the phone must call again with the matching token.
+  if (VOICE_DESTRUCTIVE_TOOLS.has(tool)) {
+    if (confirmToken) {
+      const pending = voicePendingOperations.get(confirmToken);
+      if (!pending || pending.deviceID !== device.id || pending.tool !== tool) {
+        throw new Error("This confirmation expired. Please ask again.");
+      }
+      voicePendingOperations.delete(confirmToken);
+      return runConfirmedVoiceTool(device, tool, pending.args);
+    }
+    const token = randomUUID().toLowerCase();
+    voicePendingOperations.set(token, { deviceID: device.id, tool, args, createdAt: now });
+    return {
+      tool,
+      spokenAnswer: voiceDestructiveSummary(tool, args),
+      pendingConfirmation: { confirmToken: token, summary: voiceDestructiveSummary(tool, args), tool, args }
+    };
+  }
+
+  switch (tool) {
+    case "search_notes": {
+      const query = String(args.query ?? "").trim();
+      const notes = searchKnowledge(query, Number(args.limit ?? 20)).filter((item) => item.kind === "project_note" || item.kind === "thread_note");
+      return {
+        tool,
+        spokenAnswer: notes.length ? `I found ${voiceCountPhrase(notes.length, "note")} about “${query}”.` : `I didn't find any notes about “${query}”.`,
+        results: voiceResultsFromSearch(notes)
+      };
+    }
+    case "search_projects": {
+      const query = String(args.query ?? "").trim().toLowerCase();
+      const { snapshot } = projectStoreSnapshot();
+      const projects = (snapshot.projects ?? [])
+        .map((project) => ({ id: String(project.id ?? ""), name: normalizeTitle(project.name, "Project"), kind: String(project.kind ?? "project") }))
+        .filter((project) => project.id && project.kind !== "folder" && (!query || project.name.toLowerCase().includes(query)))
+        .slice(0, 8);
+      return {
+        tool,
+        spokenAnswer: projects.length ? `I found ${voiceCountPhrase(projects.length, "project")} matching “${query}”.` : `I didn't find any projects matching “${query}”.`,
+        results: projects.map((project) => ({ id: project.id, kind: "project", title: project.name }))
+      };
+    }
+    case "search_threads": {
+      const query = String(args.query ?? "").trim();
+      const hits = searchKnowledgeTimeline(query, { sourceTypes: ["thread_message"], limit: Number(args.limit ?? 8) });
+      return {
+        tool,
+        spokenAnswer: hits.length ? `I found ${voiceCountPhrase(hits.length, "thread message", "thread messages")} about “${query}”.` : `I didn't find any threads about “${query}”.`,
+        results: voiceResultsFromTimeline(hits)
+      };
+    }
+    case "search_everything": {
+      const query = String(args.query ?? "").trim();
+      const hits = searchKnowledgeTimeline(query, {
+        sourceTypes: sourceTypesFromValue(args.sourceTypes ?? args.sources ?? args.source),
+        fromDate: typeof args.fromDate === "string" ? args.fromDate : undefined,
+        toDate: typeof args.toDate === "string" ? args.toDate : undefined,
+        limit: Number(args.limit ?? 8)
+      });
+      return {
+        tool,
+        spokenAnswer: hits.length ? `I found ${voiceCountPhrase(hits.length, "result")} for “${query}”.` : `I didn't find anything for “${query}”.`,
+        results: voiceResultsFromTimeline(hits)
+      };
+    }
+    case "open_note": {
+      const target = resolveVoiceNoteTarget(args, context);
+      if (target.kind === "note") {
+        loadNote(target.projectID, target.noteID);
+        remoteSelectedNoteByDeviceID.set(device.id, { projectID: target.projectID.toUpperCase(), noteID: target.noteID });
+        remoteSelectedThreadNoteByDeviceID.delete(device.id);
+      } else {
+        selectThreadNote(target.threadID, target.noteID);
+        remoteSelectedThreadNoteByDeviceID.set(device.id, { threadID: target.threadID, noteID: target.noteID });
+        remoteSelectedNoteByDeviceID.delete(device.id);
+      }
+      return { tool, spokenAnswer: "Opening the note.", openTarget: target };
+    }
+    case "open_thread": {
+      const sessionID = String(args.threadID ?? args.sessionID ?? args.id ?? context.threadID ?? "").trim();
+      if (!sessionID || !findSession(sessionID)) throw new Error("I couldn't find that thread.");
+      remoteSelectedSessionIDsByDeviceID.set(device.id, sessionID);
+      return { tool, spokenAnswer: "Opening the thread.", openTarget: { kind: "thread", sessionID } };
+    }
+    case "read_today":
+    case "read_planner_day": {
+      const dayID = voicePlannerDayID(args);
+      // Never throw for a day whose planner file doesn't exist yet (e.g. a future date):
+      // readKnowledgeItem can throw, so fall back to loadPlannerDay, which always succeeds.
+      let markdown = "";
+      try {
+        markdown = readKnowledgeItem(`planner_day:planner:global:${dayID}`).markdown;
+      } catch {
+        markdown = loadPlannerDay(dayID).markdown;
+      }
+      const items = listDailyItems(dayID).filter((entry) => !entry.checked);
+      const backlogOpen = listBacklogItems().filter((entry) => !entry.checked);
+      const dayLine = items.length
+        ? `You have ${voiceCountPhrase(items.length, "open item")} for ${formattedPlannerDay(dayID)}:\n${voiceListText(items)}`
+        : `You have no open items scheduled for ${formattedPlannerDay(dayID)}.`;
+      const backlogHint = items.length === 0 && backlogOpen.length
+        ? ` You do have ${voiceCountPhrase(backlogOpen.length, "unscheduled item")} in your backlog: ${voiceListText(backlogOpen)}`
+        : "";
+      return {
+        tool,
+        spokenAnswer: `${dayLine}${backlogHint}`,
+        backlogOpenCount: backlogOpen.length,
+        results: [{ id: `planner_day:planner:global:${dayID}`, kind: "planner_day", title: formattedPlannerDay(dayID), snippet: shortSearchText(markdown, 600) }]
+      };
+    }
+    case "list_today_items":
+    case "list_planner_items": {
+      const dayID = voicePlannerDayID(args);
+      const items = listDailyItems(dayID);
+      const open = items.filter((entry) => !entry.checked);
+      // Also surface the open backlog count so the assistant has the full picture when
+      // the day is empty (the user's tasks may be unscheduled in the backlog).
+      const backlogOpen = listBacklogItems().filter((entry) => !entry.checked);
+      const dayLine = open.length
+        ? `You have ${voiceCountPhrase(open.length, "open item")} for ${formattedPlannerDay(dayID)}:\n${voiceListText(open)}`
+        : `You have no open items scheduled for ${formattedPlannerDay(dayID)}.`;
+      const backlogHint = open.length === 0 && backlogOpen.length
+        ? ` You do have ${voiceCountPhrase(backlogOpen.length, "unscheduled item")} in your backlog: ${voiceListText(backlogOpen)}`
+        : "";
+      return {
+        tool,
+        spokenAnswer: `${dayLine}${backlogHint}`,
+        backlogOpenCount: backlogOpen.length,
+        results: items.map((entry) => ({ id: entry.id, kind: "daily_item", title: dailyItemVisibleTitle(entry), snippet: entry.checked ? "done" : "open" }))
+      };
+    }
+    case "list_backlog_items": {
+      const items = listBacklogItems();
+      const open = items.filter((entry) => !entry.checked);
+      return {
+        tool,
+        spokenAnswer: open.length ? `You have ${voiceCountPhrase(open.length, "backlog item")}:\n${voiceListText(open)}` : "Your backlog has no open items.",
+        results: items.map((entry) => ({ id: entry.id, kind: "backlog_item", title: dailyItemVisibleTitle(entry), snippet: entry.checked ? "done" : "open" }))
+      };
+    }
+    case "add_today_item":
+    case "add_planner_item": {
+      const rawTitle = voicePlannerRawTaskText(args);
+      const title = voicePlannerTaskTitle(args);
+      if (!title) throw new Error("What should I add?");
+      const dayID = voicePlannerDayID(args, rawTitle);
+      const result = upsertDailyItem({ title, dayID, detailsMarkdown: typeof args.detailsMarkdown === "string" ? args.detailsMarkdown : undefined });
+      remoteSelectedPlannerByDeviceID.set(device.id, { view: "day", dayID: result.day.id });
+      const dayLabel = result.day.id === plannerDayID() ? "Today" : result.day.title || result.day.id;
+      return { tool, spokenAnswer: `Added to ${dayLabel}: ${dailyItemVisibleTitle(result.item ?? { title } as DailyItem)}.` };
+    }
+    case "add_backlog_item": {
+      const title = String(args.title ?? args.text ?? "").trim();
+      if (!title) throw new Error("What should I add to the backlog?");
+      const result = upsertBacklogItem({ title, detailsMarkdown: typeof args.detailsMarkdown === "string" ? args.detailsMarkdown : undefined });
+      remoteSelectedPlannerByDeviceID.set(device.id, { view: "backlog", dayID: plannerDayID() });
+      return { tool, spokenAnswer: `Added to Backlog: ${dailyItemVisibleTitle(result.item ?? { title } as DailyItem)}.` };
+    }
+    case "complete_today_item":
+    case "complete_planner_item": {
+      const query = voicePlannerTaskQuery(args);
+      if (!query) throw new Error("Which item should I mark done?");
+      const dayID = voicePlannerDayID(args, query);
+      const checked = args.checked === false || args.done === false || args.uncheck === true ? false : true;
+      const result = completeDailyItem(dayID, query, checked);
+      remoteSelectedPlannerByDeviceID.set(device.id, { view: "day", dayID: result.day.id });
+      return { tool, spokenAnswer: `${checked ? "Marked done" : "Reopened"}: ${dailyItemVisibleTitle(result.item ?? { title: query } as DailyItem)}.` };
+    }
+    case "append_to_note": {
+      // v1: never edit silently — always return a preview the phone confirms.
+      if (confirmToken) {
+        const pending = voicePendingOperations.get(confirmToken);
+        if (!pending || pending.deviceID !== device.id || pending.tool !== "append_to_note") {
+          throw new Error("This confirmation expired. Please ask again.");
+        }
+        voicePendingOperations.delete(confirmToken);
+        return applyVoiceAppendToNote(device, pending.args);
+      }
+      const target = resolveVoiceNoteTarget(args, context);
+      if (target.kind !== "note") throw new Error("I can only append to project notes right now.");
+      const text = String(args.text ?? args.markdown ?? "").trim();
+      if (!text) throw new Error("What should I add to the note?");
+      const token = randomUUID().toLowerCase();
+      voicePendingOperations.set(token, { deviceID: device.id, tool, args: { ...args, ...target }, createdAt: now });
+      return {
+        tool,
+        spokenAnswer: "Here is what I'll add to the note. Confirm to save it.",
+        pendingConfirmation: { confirmToken: token, summary: `Add to note:\n${text}`, tool, args: { ...args, ...target } }
+      };
+    }
+    case "get_delegated_task_status": {
+      const active = remoteActiveRunsByDeviceID.get(device.id);
+      if (active) {
+        return {
+          tool,
+          spokenAnswer: "The Mac assistant is still working on that delegated task.",
+          openTarget: { kind: "thread", sessionID: active.sessionID }
+        };
+      }
+      const selectedSessionID = remoteSelectedSessionIDsByDeviceID.get(device.id) ?? "";
+      return selectedSessionID
+        ? { tool, spokenAnswer: "No Mac assistant task is currently running.", openTarget: { kind: "thread", sessionID: selectedSessionID } }
+        : { tool, spokenAnswer: "No Mac assistant task is currently running." };
+    }
+    case "background_agent":
+    case "ask_assistant": {
+      const prompt = String(args.prompt ?? args.task ?? args.text ?? "").trim();
+      if (!prompt) throw new Error("What would you like me to do?");
+      const contextSessionID = String(context.threadID ?? "").trim();
+      const selectedSessionID = remoteSelectedSessionIDsByDeviceID.get(device.id) ?? "";
+      const targetSessionID = contextSessionID || selectedSessionID || createOpenAssistThread(undefined, true).thread.id;
+      remoteSelectedSessionIDsByDeviceID.set(device.id, targetSessionID);
+      const targetSession = findSession(targetSessionID);
+      const reasoningEffort = typeof args.reasoningEffort === "string" ? args.reasoningEffort : targetSession?.latestReasoningEffort;
+      const interactionMode = typeof args.interactionMode === "string" ? args.interactionMode : targetSession?.latestInteractionMode ?? "agentic";
+      const permissionMode = typeof args.permissionMode === "string" ? args.permissionMode : targetSession?.latestPermissionMode ?? "fullAccess";
+      const clientRunID = `voice-${randomUUID().toLowerCase()}`;
+      remoteActiveRunsByDeviceID.set(device.id, { clientRunID, sessionID: targetSessionID, deviceName: device.name, acquiredAt: new Date().toISOString() });
+      void sendCodexMessage(
+        prompt,
+        targetSessionID,
+        remoteSelectedPluginIDs(device.id, targetSessionID),
+        "",
+        reasoningEffort,
+        interactionMode,
+        permissionMode,
+        [],
+        clientRunID,
+        [],
+        () => remoteAccessServer.broadcastSoon()
+      )
+        .catch((error) => bridgeDebugLog(`Voice ask_assistant failed: ${error instanceof Error ? error.stack ?? error.message : String(error)}`))
+        .finally(() => {
+          remoteActiveRunsByDeviceID.delete(device.id);
+          remoteAccessServer.broadcastSoon();
+          notifyThreadsChanged();
+        });
+      return { tool, spokenAnswer: "I'm handing that to the Mac assistant now.", openTarget: { kind: "thread", sessionID: targetSessionID } };
+    }
+    case "confirm_append_to_note": {
+      if (!confirmToken) throw new Error("This confirmation expired. Please ask again.");
+      const pending = voicePendingOperations.get(confirmToken);
+      if (!pending || pending.deviceID !== device.id || pending.tool !== "append_to_note") {
+        throw new Error("This confirmation expired. Please ask again.");
+      }
+      voicePendingOperations.delete(confirmToken);
+      return applyVoiceAppendToNote(device, pending.args);
+    }
+    default:
+      throw new Error(`I can't do “${tool}” yet.`);
+  }
+}
+
+function voiceDestructiveSummary(tool: string, args: JsonObject) {
+  const label = String(args.title ?? args.text ?? args.query ?? args.id ?? "this item").trim() || "this item";
+  switch (tool) {
+    case "delete_note":
+      return `Delete the note “${label}”? This can't be undone.`;
+    case "archive_note":
+      return `Archive the note “${label}”?`;
+    case "delete_today_item":
+    case "delete_planner_item":
+      return `Delete the planner item “${label}”?`;
+    case "delete_backlog_item":
+      return `Delete the backlog item “${label}”?`;
+    case "schedule_backlog_item":
+      return `Move the backlog item “${label}” onto the planner?`;
+    case "move_planner_item":
+      return `Move the planner item “${label}” to another day?`;
+    case "move_planner_item_to_backlog":
+      return `Move the planner item “${label}” back to the backlog?`;
+    case "delete_session":
+      return `Delete the thread “${label}”? This can't be undone.`;
+    default:
+      return `Confirm: ${tool} (${label})?`;
+  }
+}
+
+/** Resolve a note reference (knowledge id, or projectID+noteID, or current screen context) into an open target. */
+function resolveVoiceNoteTarget(args: JsonObject, context: JsonObject): Extract<VoiceOpenTarget, { kind: "note" | "threadNote" }> {
+  const rawID = String(args.itemID ?? args.id ?? args.noteID ?? "").trim();
+  if (rawID.includes(":")) {
+    const parsed = parseKnowledgeItemID(rawID);
+    if (parsed?.target?.ownerKind === "project") return { kind: "note", projectID: parsed.target.ownerId, noteID: parsed.target.noteId };
+    if (parsed?.target?.ownerKind === "thread") return { kind: "threadNote", threadID: parsed.target.ownerId, noteID: parsed.target.noteId };
+  }
+  const projectID = String(args.projectID ?? context.projectID ?? "").trim();
+  const noteID = (String(args.noteID ?? "").trim() || rawID || String(context.noteID ?? "").trim());
+  const threadID = String(args.threadID ?? context.threadID ?? "").trim();
+  if (threadID && noteID) return { kind: "threadNote", threadID, noteID };
+  if (projectID && noteID) return { kind: "note", projectID, noteID };
+  throw new Error("I couldn't tell which note you mean.");
+}
+
+function applyVoiceAppendToNote(device: RemoteAccessPairedDeviceRecord, args: JsonObject): VoiceCommandResult {
+  const text = String(args.text ?? args.markdown ?? "").trim();
+  const target = resolveVoiceNoteTarget(args, args);
+  if (target.kind !== "note") throw new Error("I can only append to project notes right now.");
+  const detail = loadNote(target.projectID, target.noteID);
+  const nextMarkdown = `${String(detail.markdown ?? "").trimEnd()}\n\n${text}\n`;
+  saveProjectNote(target.projectID, target.noteID, nextMarkdown);
+  loadNote(target.projectID, target.noteID);
+  remoteSelectedNoteByDeviceID.set(device.id, { projectID: target.projectID.toUpperCase(), noteID: target.noteID });
+  remoteSelectedThreadNoteByDeviceID.delete(device.id);
+  return { tool: "append_to_note", spokenAnswer: "Saved to the note.", openTarget: target };
+}
+
+function runConfirmedVoiceTool(device: RemoteAccessPairedDeviceRecord, tool: string, args: JsonObject): VoiceCommandResult {
+  switch (tool) {
+    case "delete_today_item":
+    case "delete_planner_item": {
+      const query = voicePlannerTaskQuery(args);
+      const dayID = voicePlannerDayID(args, query);
+      const day = loadPlannerDay(dayID);
+      const itemID = String(args.itemID ?? args.id ?? "").trim()
+        || (query ? findDailyItemByText(parseDailyItemsFromMarkdown(day.id, day.markdown), query)?.id ?? "" : "");
+      if (!itemID) throw new Error("I couldn't find that item.");
+      deleteDailyItem(dayID, itemID);
+      remoteSelectedPlannerByDeviceID.set(device.id, { view: "day", dayID });
+      return { tool, spokenAnswer: "Deleted the planner item." };
+    }
+    case "delete_backlog_item": {
+      const query = voicePlannerTaskQuery(args);
+      const itemID = String(args.itemID ?? args.id ?? "").trim()
+        || (query ? findDailyItemByText(listBacklogItems(), query)?.id ?? "" : "");
+      if (!itemID) throw new Error("I couldn't find that backlog item.");
+      deleteBacklogItem(itemID);
+      remoteSelectedPlannerByDeviceID.set(device.id, { view: "backlog", dayID: plannerDayID() });
+      return { tool, spokenAnswer: "Deleted the backlog item." };
+    }
+    case "schedule_backlog_item": {
+      const query = voicePlannerTaskQuery(args);
+      const targetDayID = voicePlannerTargetDayID(args, String(args.targetDate ?? args.date ?? ""));
+      const itemID = String(args.itemID ?? args.id ?? "").trim()
+        || (query ? findDailyItemByText(listBacklogItems(), query)?.id ?? "" : "");
+      if (!itemID) throw new Error("I couldn't find that backlog item.");
+      const result = scheduleBacklogItem(itemID, targetDayID);
+      const scheduledDayID = result.scheduledDay?.id ?? targetDayID;
+      remoteSelectedPlannerByDeviceID.set(device.id, { view: "day", dayID: scheduledDayID });
+      return { tool, spokenAnswer: `Moved the backlog item to ${formattedPlannerDay(scheduledDayID)}.` };
+    }
+    case "move_planner_item": {
+      const query = voicePlannerTaskQuery(args);
+      const fromDayID = voicePlannerSourceDayID(args, query);
+      const targetDayID = voicePlannerTargetDayID(args, String(args.targetDate ?? args.date ?? ""));
+      if (fromDayID === targetDayID) throw new Error("That item is already on that day.");
+      const sourceDay = loadPlannerDay(fromDayID);
+      const sourceItems = parseDailyItemsFromMarkdown(sourceDay.id, sourceDay.markdown);
+      const existing = String(args.itemID ?? args.id ?? "").trim()
+        ? sourceItems.find((item) => item.id === String(args.itemID ?? args.id ?? "").trim())
+        : query ? findDailyItemByText(sourceItems, query) : undefined;
+      if (!existing) throw new Error("I couldn't find that planner item.");
+      const title = dailyItemVisibleTitle(existing);
+      upsertDailyItem({
+        ...existing,
+        dayID: targetDayID,
+        checked: false,
+        status: "todo",
+        title
+      });
+      deleteDailyItem(fromDayID, existing.id);
+      remoteSelectedPlannerByDeviceID.set(device.id, { view: "day", dayID: targetDayID });
+      return { tool, spokenAnswer: `Moved “${title}” to ${formattedPlannerDay(targetDayID)}.` };
+    }
+    case "move_planner_item_to_backlog": {
+      const query = voicePlannerTaskQuery(args);
+      const fromDayID = voicePlannerSourceDayID(args, query);
+      const sourceDay = loadPlannerDay(fromDayID);
+      const sourceItems = parseDailyItemsFromMarkdown(sourceDay.id, sourceDay.markdown);
+      const itemID = String(args.itemID ?? args.id ?? "").trim()
+        || (query ? findDailyItemByText(sourceItems, query)?.id ?? "" : "");
+      if (!itemID) throw new Error("I couldn't find that planner item.");
+      moveDailyItemToBacklog(fromDayID, itemID);
+      remoteSelectedPlannerByDeviceID.set(device.id, { view: "backlog", dayID: plannerDayID() });
+      return { tool, spokenAnswer: "Moved the planner item to the backlog." };
+    }
+    case "delete_session": {
+      const sessionID = String(args.sessionID ?? args.threadID ?? args.id ?? "").trim();
+      if (!sessionID) throw new Error("I couldn't find that thread.");
+      void deleteSessionPermanently(sessionID).then(() => notifyThreadsChanged());
+      return { tool, spokenAnswer: "Deleted the thread." };
+    }
+    case "delete_note":
+    case "archive_note":
+      // v1 keeps file-level note delete/archive on the Mac source of truth only.
+      throw new Error("Deleting or archiving notes from voice isn't enabled yet. Please do it on the Mac.");
+    default:
+      throw new Error(`I can't confirm “${tool}” yet.`);
+  }
+}
+
+class OpenAssistRemoteAccessServer {
+  private server?: http.Server;
+  private currentPort = 0;
+  private currentNetworkMode: RemoteAccessNetworkMode = "localOnly";
+  private challenge?: RemoteAccessPairingChallenge;
+  private subscribers = new Map<string, RemoteAccessSubscriber>();
+  private broadcastTimer: ReturnType<typeof setTimeout> | null = null;
+  private broadcastInFlight = false;
+  private broadcastQueued = false;
+
+  isRunning() {
+    return Boolean(this.server?.listening);
+  }
+
+  activeChallenge() {
+    if (this.challenge && this.challenge.expiresAt <= Date.now()) this.challenge = undefined;
+    return this.challenge;
+  }
+
+  rotatePairingChallenge(settings: RemoteAccessServerSettings) {
+    const runtimeSettings = {
+      port: settings.remoteAccessPort,
+      networkMode: normalizeRemoteAccessNetworkMode(settings.remoteAccessNetworkMode),
+      tailscaleHost: settings.remoteAccessTailscaleHost,
+      publicURL: easyRemoteTunnel.currentURL() || settings.remoteAccessPublicURL
+    };
+    const code = remoteAccessSecureToken("oa_pair_", 12);
+    this.challenge = {
+      code,
+      createdAt: Date.now(),
+      expiresAt: Date.now() + remoteAccessPairingLifetimeMs,
+      suggestedURL: makeRemoteAccessPairingURL(runtimeSettings, code)
+    };
+    return this.challenge;
+  }
+
+  clearPairingChallenge() {
+    this.challenge = undefined;
+  }
+
+  async ensureStarted(settings: RemoteAccessServerSettings) {
+    if (!settings.remoteAccessEnabled) {
+      this.stop();
+      return null;
+    }
+    const port = normalizedRemoteAccessPort(settings.remoteAccessPort);
+    const networkMode = normalizeRemoteAccessNetworkMode(settings.remoteAccessNetworkMode);
+    if (this.server && this.currentPort === port && this.currentNetworkMode === networkMode) {
+      return {
+        baseURL: remoteAccessPreferredURL({
+          port: String(port),
+          networkMode,
+          tailscaleHost: settings.remoteAccessTailscaleHost,
+          publicURL: normalizeRemoteAccessPublicURL(easyRemoteTunnel.currentURL() || settings.remoteAccessPublicURL)
+        })
+      };
+    }
+    this.stop();
+    const server = http.createServer((req, res) => {
+      void this.handle(req, res).catch((error) => {
+        bridgeDebugLog(`Remote Access request failed: ${error instanceof Error ? error.stack ?? error.message : String(error)}`);
+        jsonResponse(res, 500, { error: error instanceof Error ? error.message : "Remote Access failed." });
+      });
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(port, networkMode === "localOnly" ? "127.0.0.1" : "0.0.0.0", () => resolve());
+    });
+    this.server = server;
+    this.currentPort = port;
+    this.currentNetworkMode = networkMode;
+    return {
+      baseURL: remoteAccessPreferredURL({
+        port: String(port),
+        networkMode,
+        tailscaleHost: settings.remoteAccessTailscaleHost,
+        publicURL: normalizeRemoteAccessPublicURL(easyRemoteTunnel.currentURL() || settings.remoteAccessPublicURL)
+      })
+    };
+  }
+
+  stop() {
+    for (const subscriber of this.subscribers.values()) {
+      subscriber.res.end();
+    }
+    this.subscribers.clear();
+    this.server?.close();
+    this.server = undefined;
+    this.currentPort = 0;
+  }
+
+  // Provider streaming fires this on every token delta. Building a snapshot reads
+  // threads, notes, projects, planner days and thread messages from disk, so a
+  // per-event rebuild floods the event loop (Mac lag) and the SSE stream (phone
+  // hang). Collapse every burst into a single trailing rebuild, and never run two
+  // at once — if calls arrive while one is building, run exactly one more after.
+  broadcastSoon() {
+    if (!this.subscribers.size) return;
+    if (this.broadcastInFlight) {
+      this.broadcastQueued = true;
+      return;
+    }
+    if (this.broadcastTimer) return;
+    this.broadcastTimer = setTimeout(() => {
+      this.broadcastTimer = null;
+      void this.runBroadcast();
+    }, 150);
+  }
+
+  private async runBroadcast() {
+    this.broadcastInFlight = true;
+    try {
+      await this.broadcastSnapshot();
+    } finally {
+      this.broadcastInFlight = false;
+      if (this.broadcastQueued) {
+        this.broadcastQueued = false;
+        this.broadcastSoon();
+      }
+    }
+  }
+
+  private requestAllowed(req: http.IncomingMessage, settings: RemoteAccessServerSettings) {
+    const address = normalizeRemoteSocketAddress(req.socket.remoteAddress);
+    if (isLoopbackAddress(address)) return true;
+    const networkMode = normalizeRemoteAccessNetworkMode(settings.remoteAccessNetworkMode);
+    if (networkMode === "localNetwork") return isPrivateIPv4Address(address);
+    if (networkMode === "tailscale") return isTailscaleIPv4Address(address);
+    return false;
+  }
+
+  private authorize(req: http.IncomingMessage) {
+    const token = requestBearerToken(req);
+    if (!token) return null;
+    const tokenHash = sha256Hex(token);
+    const devices = readRemoteAccessDevices();
+    const index = devices.findIndex((device) => constantTimeStringEquals(device.tokenHash, tokenHash));
+    if (index < 0) return null;
+    devices[index] = { ...devices[index], lastSeenAt: new Date().toISOString() };
+    writeRemoteAccessDevices(devices);
+    return devices[index];
+  }
+
+  private acceptsPairingCode(req: http.IncomingMessage) {
+    const challenge = this.activeChallenge();
+    if (!challenge) return false;
+    return constantTimeStringEquals(challenge.code, requestPairingCode(req));
+  }
+
+  private async handle(req: http.IncomingMessage, res: http.ServerResponse) {
+    const settings = await loadRemoteAccessSettings();
+    if (!settings.remoteAccessEnabled) {
+      jsonResponse(res, 503, { error: "Remote Access is turned off." });
+      return;
+    }
+    if (!this.requestAllowed(req, settings)) {
+      jsonResponse(res, 403, { error: "Remote Access only allows this Mac or Tailscale devices." });
+      return;
+    }
+    const url = new URL(req.url ?? "/", `http://${req.headers.host || "127.0.0.1"}`);
+    if (req.method === "GET" && url.pathname === "/") {
+      res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+      res.end("<!doctype html><title>Remote Access Locked</title><h1>Remote Access is locked.</h1>");
+      return;
+    }
+    if (req.method === "GET" && url.pathname === "/remote/v1/health") {
+      const revealDetails = Boolean(this.authorize(req) || this.acceptsPairingCode(req));
+      if (!revealDetails) {
+        jsonResponse(res, 200, {
+          ok: true,
+          helperState: "Locked",
+          helperMessage: "Pair with the current code from the Mac to continue.",
+          machineID: null,
+          machineName: null,
+          appVersion: null,
+          localBaseURL: null,
+          tailscaleBaseURL: null,
+          publicBaseURL: null,
+          networkMode: null,
+          tunnelMode: null,
+          adminPasswordRequired: false,
+          pairingRequired: true
+        });
+        return;
+      }
+
+      const easyTunnelURL = easyRemoteTunnel.currentURL();
+      const remotePublicURL = normalizeRemoteAccessPublicURL(easyTunnelURL || settings.remoteAccessPublicURL);
+      const runtimeSettings = {
+        port: settings.remoteAccessPort,
+        networkMode: normalizeRemoteAccessNetworkMode(settings.remoteAccessNetworkMode),
+        tailscaleHost: settings.remoteAccessTailscaleHost,
+        publicURL: remotePublicURL
+      };
+      jsonResponse(res, 200, {
+        ok: true,
+        helperState: this.isRunning() ? "Running" : "Stopped",
+        helperMessage: easyTunnelURL
+          ? "Easy QR is enabled."
+          : settings.remoteAccessNetworkMode === "tailscale"
+            ? "Tailscale Direct is enabled."
+            : null,
+        machineID: remoteAccessMachineID(),
+        machineName: os.hostname(),
+        appVersion: `${settings.appVersion} (${settings.buildNumber})`,
+        localBaseURL: remoteAccessLocalURL(runtimeSettings),
+        tailscaleBaseURL: remoteAccessTailscaleURL(runtimeSettings) || null,
+        publicBaseURL: remotePublicURL || null,
+        networkMode: settings.remoteAccessNetworkMode,
+        tunnelMode: remotePublicURL ? "named" : "disabled",
+        adminPasswordRequired: false,
+        pairingRequired: false
+      });
+      return;
+    }
+    if (req.method === "POST" && url.pathname === "/remote/v1/pair/claim") {
+      const body = jsonObject(await readRequestJSON(req)) ?? {};
+      const hadExpiredChallenge = Boolean(this.challenge && this.challenge.expiresAt <= Date.now());
+      const challenge = this.activeChallenge();
+      const code = String(body.code ?? "").trim();
+      if (!challenge) {
+        jsonResponse(res, 200, {
+          ok: false,
+          error: hadExpiredChallenge
+            ? "That pairing code expired. Click Generate New Code on the Mac, then scan the new QR."
+            : "There is no active pairing code. Click Generate New Code on the Mac, then scan the QR."
+        });
+        return;
+      }
+      if (!constantTimeStringEquals(challenge.code, code)) {
+        jsonResponse(res, 200, { ok: false, error: "That pairing code is invalid. Scan the latest QR from the Mac." });
+        return;
+      }
+      const deviceToken = `oa_dev_${randomUUID().toLowerCase()}`;
+      const device: RemoteAccessPairedDeviceRecord = {
+        id: randomUUID().toLowerCase(),
+        name: String(body.deviceName ?? "Mobile Remote").trim() || "Mobile Remote",
+        tokenHash: sha256Hex(deviceToken),
+        createdAt: new Date().toISOString(),
+        lastSeenAt: new Date().toISOString(),
+        userAgent: String(req.headers["user-agent"] ?? "").trim() || undefined
+      };
+      writeRemoteAccessDevices([device, ...readRemoteAccessDevices().filter((entry) => entry.id !== device.id)]);
+      this.clearPairingChallenge();
+      const snapshot = await makeRemoteAccessSnapshot(device.id);
+      jsonResponse(res, 200, {
+        ok: true,
+        machineID: remoteAccessMachineID(),
+        deviceToken,
+        snapshot,
+        error: null
+      });
+      this.broadcastSoon();
+      return;
+    }
+    const device = this.authorize(req);
+    if (!device) {
+      jsonResponse(res, 401, { error: "Missing or invalid bearer token." });
+      return;
+    }
+    if (req.method === "GET" && url.pathname === "/remote/v1/state") {
+      jsonResponse(res, 200, await makeRemoteAccessSnapshot(device.id));
+      return;
+    }
+    if (req.method === "GET" && url.pathname === "/remote/v1/events") {
+      this.addSubscriber(device, res);
+      return;
+    }
+    if (req.method === "POST" && url.pathname === "/remote/v1/actions") {
+      const body = jsonObject(await readRequestJSON(req)) ?? {};
+      const response = await this.handleAction(device, body);
+      jsonResponse(res, response.ok ? 200 : 422, response);
+      this.broadcastSoon();
+      return;
+    }
+    jsonResponse(res, 404, { error: "Endpoint not found." });
+  }
+
+  private addSubscriber(device: RemoteAccessPairedDeviceRecord, res: http.ServerResponse) {
+    const id = randomUUID().toLowerCase();
+    res.writeHead(200, {
+      "content-type": "text/event-stream; charset=utf-8",
+      "cache-control": "no-store",
+      connection: "keep-alive"
+    });
+    const subscriber = { id, deviceID: device.id, res };
+    this.subscribers.set(id, subscriber);
+    res.on("close", () => this.subscribers.delete(id));
+    void makeRemoteAccessSnapshot(device.id).then((snapshot) => {
+      this.sendEvent(subscriber, "snapshot", snapshot);
+    });
+  }
+
+  private sendEvent(subscriber: RemoteAccessSubscriber, type: string, snapshot: unknown) {
+    subscriber.res.write(`data: ${JSON.stringify({ sequence: Date.now(), type, snapshot })}\n\n`);
+  }
+
+  private async broadcastSnapshot() {
+    for (const subscriber of this.subscribers.values()) {
+      const snapshot = await makeRemoteAccessSnapshot(subscriber.deviceID).catch(() => null);
+      if (snapshot) this.sendEvent(subscriber, "snapshot", snapshot);
+    }
+  }
+
+  private async handleAction(device: RemoteAccessPairedDeviceRecord, body: JsonObject) {
+    const type = String(body.type ?? "");
+    const payload = jsonObject(body.payload) ?? {};
+    const sessionID = String(body.sessionID ?? payload.sessionID ?? remoteSelectedSessionIDsByDeviceID.get(device.id) ?? "").trim();
+    try {
+      if (type === "selectSession") {
+        if (sessionID) remoteSelectedSessionIDsByDeviceID.set(device.id, sessionID);
+      } else if (type === "selectNote") {
+        const projectID = String(payload.projectID ?? "").trim();
+        const noteID = String(payload.noteID ?? "").trim();
+        if (!projectID || !noteID) throw new Error("Note was not found.");
+        loadNote(projectID, noteID);
+        remoteSelectedNoteByDeviceID.set(device.id, { projectID: projectID.toUpperCase(), noteID });
+        remoteSelectedThreadNoteByDeviceID.delete(device.id);
+      } else if (type === "selectThreadNote") {
+        const threadID = String(payload.threadID ?? "").trim();
+        const noteID = String(payload.noteID ?? "").trim();
+        if (!threadID || !noteID) throw new Error("Thread note was not found.");
+        selectThreadNote(threadID, noteID);
+        remoteSelectedThreadNoteByDeviceID.set(device.id, { threadID, noteID });
+        remoteSelectedNoteByDeviceID.delete(device.id);
+      } else if (type === "newSession") {
+        const created = createOpenAssistThread(typeof payload.projectID === "string" ? payload.projectID : undefined, true, payload.temporary === true);
+        remoteSelectedSessionIDsByDeviceID.set(device.id, created.thread.id);
+        notifyThreadsChanged();
+      } else if (type === "deleteSession") {
+        if (sessionID) await deleteSessionPermanently(sessionID);
+        notifyThreadsChanged();
+      } else if (type === "chooseBackend") {
+        if (sessionID && typeof payload.backend === "string") await setThreadProvider(sessionID, payload.backend);
+      } else if (type === "chooseModel") {
+        const current = sessionID ? findSession(sessionID) : undefined;
+        if (sessionID && typeof payload.modelID === "string") {
+          await setThreadProvider(sessionID, String(current?.activeProvider ?? "codex"), payload.modelID);
+        }
+      } else if (type === "setMode") {
+        if (sessionID && typeof payload.mode === "string") {
+          const session = ensureOpenAssistSessionRecord(sessionID);
+          session.latestInteractionMode = normalizeCodexInteractionMode(payload.mode);
+          updateSession(session);
+        }
+      } else if (type === "setReasoningEffort") {
+        if (sessionID && typeof payload.reasoningEffort === "string") {
+          const session = ensureOpenAssistSessionRecord(sessionID);
+          session.latestReasoningEffort = normalizeCodexReasoningEffort(payload.reasoningEffort) ?? session.latestReasoningEffort ?? "high";
+          updateSession(session);
+        }
+      } else if (type === "setPermissionMode") {
+        if (sessionID && typeof payload.permissionMode === "string") {
+          const session = ensureOpenAssistSessionRecord(sessionID);
+          session.latestPermissionMode = normalizeCodexPermissionMode(payload.permissionMode);
+          updateSession(session);
+        }
+      } else if (type === "applyPlugins") {
+        if (sessionID) {
+          setRemoteSelectedPluginIDs(device.id, sessionID, remoteStringArray(payload.pluginIDs));
+        }
+      } else if (type === "sendPrompt") {
+        const prompt = String(payload.prompt ?? "").trim();
+        if (!prompt) throw new Error("Prompt is empty.");
+        const targetSessionID = sessionID || createOpenAssistThread(undefined, true).thread.id;
+        remoteSelectedSessionIDsByDeviceID.set(device.id, targetSessionID);
+        const targetSession = findSession(targetSessionID);
+        const clientRunID = String(body.id ?? `remote-${randomUUID().toLowerCase()}`);
+        const selectedPluginIDs = Array.isArray(payload.selectedPluginIDs)
+          ? remoteStringArray(payload.selectedPluginIDs)
+          : remoteSelectedPluginIDs(device.id, targetSessionID);
+        remoteActiveRunsByDeviceID.set(device.id, {
+          clientRunID,
+          sessionID: targetSessionID,
+          deviceName: device.name,
+          acquiredAt: new Date().toISOString(),
+          prompt
+        });
+        void sendCodexMessage(
+          prompt,
+          targetSessionID,
+          selectedPluginIDs,
+          "",
+          typeof payload.reasoningEffort === "string" ? payload.reasoningEffort : targetSession?.latestReasoningEffort,
+          typeof payload.interactionMode === "string" ? payload.interactionMode : targetSession?.latestInteractionMode,
+          typeof payload.permissionMode === "string" ? payload.permissionMode : targetSession?.latestPermissionMode ?? "fullAccess",
+          [],
+          clientRunID,
+          [],
+          (_event: ProviderRunEvent) => this.broadcastSoon()
+        ).catch((error) => {
+          bridgeDebugLog(`Remote Access send failed: ${error instanceof Error ? error.stack ?? error.message : String(error)}`);
+        }).finally(() => {
+          remoteActiveRunsByDeviceID.delete(device.id);
+          this.broadcastSoon();
+          notifyThreadsChanged();
+        });
+      } else if (type === "stopTurn") {
+        const active = remoteActiveRunsByDeviceID.get(device.id);
+        if (active) {
+          await stopProviderRun(active.clientRunID);
+          remoteActiveRunsByDeviceID.delete(device.id);
+        }
+      } else if (type === "resolvePermission") {
+        const requestID = payload.requestID as JsonRequestID | undefined;
+        const optionID = String(payload.optionID ?? "");
+        if (requestID !== undefined) {
+          await respondToProviderRequest(requestID, remotePermissionResults.get(`${requestID}:${optionID}`) ?? { optionID });
+        }
+      } else if (type === "cancelPermission") {
+        const requestID = payload.requestID as JsonRequestID | undefined;
+        if (requestID !== undefined) await respondToProviderRequest(requestID, { deny: true });
+      } else if (type === "selectPlannerDay") {
+        const dayID = normalizePlannerDayID(String(payload.dayID ?? ""));
+        loadPlannerDay(dayID);
+        remoteSelectedPlannerByDeviceID.set(device.id, { view: "day", dayID });
+      } else if (type === "selectPlannerBacklog") {
+        loadPlannerBacklog();
+        remoteSelectedPlannerByDeviceID.set(device.id, { view: "backlog", dayID: plannerDayID() });
+      } else if (type === "savePlannerDay") {
+        const dayID = normalizePlannerDayID(String(payload.dayID ?? ""));
+        const markdown = String(payload.markdown ?? "");
+        savePlannerDay(dayID, markdown);
+        remoteSelectedPlannerByDeviceID.set(device.id, { view: "day", dayID });
+        emitPlannerDayChanged(dayID);
+      } else if (type === "savePlannerBacklog") {
+        const markdown = String(payload.markdown ?? "");
+        savePlannerBacklog(markdown);
+        remoteSelectedPlannerByDeviceID.set(device.id, { view: "backlog", dayID: plannerDayID() });
+        emitPlannerBacklogChanged();
+      } else if (type === "toggleDailyItem") {
+        const dayID = normalizePlannerDayID(String(payload.dayID ?? ""));
+        const itemID = String(payload.itemID ?? "").trim();
+        if (!itemID) throw new Error("Daily item was not found.");
+        toggleDailyItem(dayID, itemID, payload.checked === true);
+        remoteSelectedPlannerByDeviceID.set(device.id, { view: "day", dayID });
+      } else if (type === "upsertDailyItem") {
+        const result = upsertDailyItem(payload.item ?? payload);
+        remoteSelectedPlannerByDeviceID.set(device.id, { view: "day", dayID: result.day.id });
+      } else if (type === "deleteDailyItem") {
+        const dayID = normalizePlannerDayID(String(payload.dayID ?? ""));
+        const itemID = String(payload.itemID ?? "").trim();
+        if (!itemID) throw new Error("Daily item was not found.");
+        deleteDailyItem(dayID, itemID);
+        remoteSelectedPlannerByDeviceID.set(device.id, { view: "day", dayID });
+      } else if (type === "toggleBacklogItem") {
+        const itemID = String(payload.itemID ?? "").trim();
+        if (!itemID) throw new Error("Backlog item was not found.");
+        toggleBacklogItem(itemID, payload.checked === true);
+        remoteSelectedPlannerByDeviceID.set(device.id, { view: "backlog", dayID: plannerDayID() });
+      } else if (type === "upsertBacklogItem") {
+        upsertBacklogItem(payload.item ?? payload);
+        remoteSelectedPlannerByDeviceID.set(device.id, { view: "backlog", dayID: plannerDayID() });
+      } else if (type === "deleteBacklogItem") {
+        const itemID = String(payload.itemID ?? "").trim();
+        if (!itemID) throw new Error("Backlog item was not found.");
+        deleteBacklogItem(itemID);
+        remoteSelectedPlannerByDeviceID.set(device.id, { view: "backlog", dayID: plannerDayID() });
+      } else if (type === "scheduleBacklogItem") {
+        const itemID = String(payload.itemID ?? "").trim();
+        const targetDayID = normalizePlannerDayID(String(payload.targetDayID ?? ""));
+        if (!itemID) throw new Error("Backlog item was not found.");
+        scheduleBacklogItem(itemID, targetDayID);
+        remoteSelectedPlannerByDeviceID.set(device.id, { view: "day", dayID: targetDayID });
+      } else if (type === "voiceCommand") {
+        const voice = await runVoiceTool(device, payload);
+        return { id: String(body.id ?? ""), ok: true, snapshot: await makeRemoteAccessSnapshot(device.id), error: null, voice };
+      }
+      return { id: String(body.id ?? ""), ok: true, snapshot: await makeRemoteAccessSnapshot(device.id), error: null };
+    } catch (error) {
+      return {
+        id: String(body.id ?? ""),
+        ok: false,
+        snapshot: await makeRemoteAccessSnapshot(device.id).catch(() => null),
+        error: error instanceof Error ? error.message : "Remote action failed."
+      };
+    }
+  }
+}
+
+const remoteAccessServer = new OpenAssistRemoteAccessServer();
+remoteAccessBroadcastHook = () => remoteAccessServer.broadcastSoon();
+
+async function ensureRemoteAccessServerForSettings(settings?: RemoteAccessServerSettings) {
+  return remoteAccessServer.ensureStarted(settings ?? await loadRemoteAccessSettings());
+}
+
+async function rotateRemoteAccessPairingCode() {
+  const settings = await loadRemoteAccessSettings();
+  remoteAccessServer.rotatePairingChallenge(settings);
+  await ensureRemoteAccessServerForSettings(settings);
+  return loadSettings();
+}
+
+async function clearRemoteAccessPairingCode() {
+  remoteAccessServer.clearPairingChallenge();
+  return loadSettings();
+}
+
+async function startRemoteAccessEasyQR() {
+  await writeBoolDefault("OpenAssist.remoteAccess.enabled", true);
+  await writeStringDefault("OpenAssist.remoteAccess.networkMode", "localOnly");
+  const settings = await loadRemoteAccessSettings();
+  await ensureRemoteAccessServerForSettings(settings);
+  const port = normalizedRemoteAccessPort(settings.remoteAccessPort);
+  const publicURL = normalizeRemoteAccessPublicURL(
+    settings.remoteAccessPublicURL || await readDefault("OpenAssist.remoteAccess.namedTunnelPublicURL", "")
+  );
+  const tunnelName = String(await readDefault("OpenAssist.remoteAccess.namedTunnelName", "openassist")).trim();
+  const credentialsFile = String(await readDefault("OpenAssist.remoteAccess.namedTunnelCredentialsFile", "")).trim();
+  await easyRemoteTunnel.start(`http://127.0.0.1:${port}`, { publicURL, tunnelName, credentialsFile });
+  const nextSettings = await loadRemoteAccessSettings();
+  remoteAccessServer.rotatePairingChallenge(nextSettings);
+  return loadSettings();
+}
+
+async function stopRemoteAccessEasyQR() {
+  easyRemoteTunnel.stop();
+  remoteAccessServer.clearPairingChallenge();
+  return loadSettings();
+}
+
+async function openTailscaleApp() {
+  const status = await remoteAccessTailscaleStatusSnapshot();
+  if (!status.installed) {
+    return { ok: false, installURL: tailscaleMacDownloadURL, error: "Tailscale is not installed." };
+  }
+  try {
+    if (status.appPath) {
+      await execFileAsync("/usr/bin/open", [status.appPath], { timeout: 3000 });
+    } else {
+      await execFileAsync("/usr/bin/open", ["-a", "Tailscale"], { timeout: 3000 });
+    }
+    return { ok: true, installURL: tailscaleMacDownloadURL };
+  } catch (error) {
+    return {
+      ok: false,
+      installURL: tailscaleMacDownloadURL,
+      error: error instanceof Error ? error.message : "Could not open Tailscale."
+    };
+  }
+}
+
+class OpenAssistKnowledgeServer {
+  private server?: http.Server;
+  private currentPort = "";
+  private currentToken = "";
+
+  async ensureStarted(settings: SettingsSnapshot) {
+    if (!settings.knowledgeAccessEnabled) {
+      this.stop();
+      writeKnowledgeServerState(settings.knowledgeServerPort || defaultKnowledgeServerPort, "", false);
+      return null;
+    }
+    const port = String(settings.knowledgeServerPort || defaultKnowledgeServerPort);
+    const token = ensureKnowledgeAccessToken();
+    if (this.server && this.currentPort === port) {
+      writeKnowledgeServerState(port, token, true);
+      return { baseURL: knowledgeServerURL(port), token };
+    }
+    this.stop();
+    const server = http.createServer((req, res) => {
+      void this.handle(req, res).catch((error) => {
+        bridgeDebugLog(`Knowledge Access request failed: ${error instanceof Error ? error.stack ?? error.message : String(error)}`);
+        jsonResponse(res, 500, { error: error instanceof Error ? error.message : "Knowledge Access failed." });
+      });
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(Number.parseInt(port, 10), "127.0.0.1", () => resolve());
+    });
+    this.server = server;
+    this.currentPort = port;
+    this.currentToken = token;
+    writeKnowledgeServerState(port, token, true);
+    return { baseURL: knowledgeServerURL(port), token };
+  }
+
+  stop() {
+    if (!this.server) return;
+    this.server.close();
+    this.server = undefined;
+    this.currentPort = "";
+  }
+
+  private async authorize(req: http.IncomingMessage, settings: SettingsSnapshot) {
+    if (!settings.knowledgeAccessEnabled) return false;
+    const token = this.currentToken || ensureKnowledgeAccessToken();
+    return Boolean(token && requestBearerToken(req) === token);
+  }
+
+  private async handle(req: http.IncomingMessage, res: http.ServerResponse) {
+    const settings = await loadSettings();
+    const url = new URL(req.url ?? "/", `http://${req.headers.host || "127.0.0.1"}`);
+    if (url.pathname === "/v1/health") {
+      jsonResponse(res, 200, {
+        ok: Boolean(settings.knowledgeAccessEnabled),
+        service: "openassist-knowledge",
+        externalAccessEnabled: settings.knowledgeExternalAccessEnabled,
+        agentAccessEnabled: settings.knowledgeAgentAccessEnabled,
+        realtimeVoiceAccessEnabled: settings.knowledgeRealtimeVoiceAccessEnabled,
+        pendingRequestCount: settings.knowledgePendingRequestCount
+      });
+      return;
+    }
+    if (!(await this.authorize(req, settings))) {
+      jsonResponse(res, 401, { error: "Missing or invalid Knowledge Access token." });
+      return;
+    }
+    if (url.pathname === "/mcp") {
+      await this.handleMCP(req, res, settings);
+      return;
+    }
+    if (!settings.knowledgeExternalAccessEnabled) {
+      jsonResponse(res, 403, { error: "External Knowledge HTTP access is turned off in Settings." });
+      return;
+    }
+    if (req.method === "POST" && url.pathname === "/v1/search") {
+      const body = jsonObject(await readRequestJSON(req)) ?? {};
+      jsonResponse(res, 200, { results: searchKnowledge(String(body.query ?? ""), Number(body.limit ?? 20), typeof body.source === "string" ? body.source : undefined) });
+      return;
+    }
+    if (req.method === "POST" && url.pathname === "/v1/search-everything") {
+      const body = jsonObject(await readRequestJSON(req)) ?? {};
+      jsonResponse(res, 200, {
+        results: searchKnowledgeTimeline(String(body.query ?? ""), {
+          sourceTypes: sourceTypesFromValue(body.sourceTypes ?? body.sources ?? body.source),
+          fromDate: typeof body.fromDate === "string" ? body.fromDate : undefined,
+          toDate: typeof body.toDate === "string" ? body.toDate : undefined,
+          limit: Number(body.limit ?? 5)
+        })
+      });
+      return;
+    }
+    if (req.method === "GET" && url.pathname.startsWith("/v1/search-results/")) {
+      const resultID = decodeURIComponent(url.pathname.replace(/^\/v1\/search-results\//, ""));
+      jsonResponse(res, 200, readKnowledgeTimelineResult(resultID, Number(url.searchParams.get("window") ?? 2)));
+      return;
+    }
+    if (req.method === "GET" && url.pathname.startsWith("/v1/items/")) {
+      jsonResponse(res, 200, readKnowledgeItem(decodeURIComponent(url.pathname.replace(/^\/v1\/items\//, ""))));
+      return;
+    }
+    if (req.method === "GET" && url.pathname.startsWith("/v1/planner/days/")) {
+      const dailyItemsMatch = url.pathname.match(/^\/v1\/planner\/days\/([^/]+)\/items$/);
+      if (dailyItemsMatch) {
+        const dayID = normalizePlannerDayID(decodeURIComponent(dailyItemsMatch[1]));
+        jsonResponse(res, 200, { items: listDailyItems(dayID) });
+        return;
+      }
+      const dayID = normalizePlannerDayID(decodeURIComponent(url.pathname.replace(/^\/v1\/planner\/days\//, "")));
+      jsonResponse(res, 200, readKnowledgeItem(`planner_day:planner:global:${dayID}`));
+      return;
+    }
+    if (req.method === "POST" && url.pathname.match(/^\/v1\/planner\/days\/([^/]+)\/items$/)) {
+      if (!settings.knowledgeOrganizerEnabled) {
+        jsonResponse(res, 403, { error: "Knowledge organizer requests are turned off in Settings." });
+        return;
+      }
+      const match = url.pathname.match(/^\/v1\/planner\/days\/([^/]+)\/items$/);
+      const dayID = normalizePlannerDayID(decodeURIComponent(match?.[1] ?? ""));
+      const body = jsonObject(await readRequestJSON(req)) ?? {};
+      jsonResponse(res, 200, { request: createKnowledgeWriteRequest("request_daily_item", { ...body, dayID }, "http") });
+      return;
+    }
+    if (req.method === "GET" && url.pathname.startsWith("/v1/journal/days/")) {
+      const dayID = normalizePlannerDayID(decodeURIComponent(url.pathname.replace(/^\/v1\/journal\/days\//, "")));
+      jsonResponse(res, 200, readKnowledgeItem(`journal_day:planner:global:${dayID}`));
+      return;
+    }
+    if (req.method === "GET" && url.pathname === "/v1/tasks/open") {
+      jsonResponse(res, 200, { tasks: listOpenKnowledgeTasks(Number(url.searchParams.get("limit") ?? 100)) });
+      return;
+    }
+    if (req.method === "POST" && url.pathname === "/v1/write-requests") {
+      if (!settings.knowledgeOrganizerEnabled) {
+        jsonResponse(res, 403, { error: "Knowledge organizer requests are turned off in Settings." });
+        return;
+      }
+      const body = jsonObject(await readRequestJSON(req)) ?? {};
+      const action = String(body.action ?? "request_organize");
+      const payload = jsonObject(body.payload) ?? body;
+      jsonResponse(res, 200, { request: createKnowledgeWriteRequest(action, payload, "http") });
+      return;
+    }
+    if (req.method === "GET" && url.pathname.startsWith("/v1/write-requests/")) {
+      const requestID = decodeURIComponent(url.pathname.replace(/^\/v1\/write-requests\//, ""));
+      const request = readKnowledgeRequests().find((candidate) => candidate.id === requestID);
+      jsonResponse(res, request ? 200 : 404, request ?? { error: "Knowledge request was not found." });
+      return;
+    }
+    if (req.method === "POST" && url.pathname.startsWith("/v1/previews/") && url.pathname.endsWith("/apply")) {
+      const requestID = decodeURIComponent(url.pathname.replace(/^\/v1\/previews\//, "").replace(/\/apply$/, ""));
+      jsonResponse(res, 200, { request: applyKnowledgePreview(requestID) });
+      return;
+    }
+    jsonResponse(res, 404, { error: "Unknown Knowledge Access endpoint." });
+  }
+
+  private async handleMCP(req: http.IncomingMessage, res: http.ServerResponse, settings: SettingsSnapshot) {
+    if (!settings.knowledgeAgentAccessEnabled) {
+      jsonResponse(res, 403, { error: "Knowledge agent tools are turned off in Settings." });
+      return;
+    }
+    if (req.method === "GET") {
+      res.writeHead(200, {
+        "content-type": "text/event-stream",
+        "cache-control": "no-cache",
+        connection: "keep-alive"
+      });
+      res.write(`event: endpoint\ndata: ${JSON.stringify({ endpoint: "/mcp" })}\n\n`);
+      return;
+    }
+    if (req.method !== "POST") {
+      jsonResponse(res, 405, { error: "Use POST for MCP JSON-RPC." });
+      return;
+    }
+    const request = jsonObject(await readRequestJSON(req)) ?? {};
+    const id = request.id as JsonRequestID | undefined;
+    const method = String(request.method ?? "");
+    const params = jsonObject(request.params) ?? {};
+    const reply = (result: unknown) => jsonResponse(res, 200, { jsonrpc: "2.0", id: id ?? null, result });
+    try {
+      if (method === "initialize") {
+        reply({
+          protocolVersion: "2025-06-18",
+          capabilities: { tools: {}, resources: {} },
+          serverInfo: { name: "openassist-knowledge", version: "0.1.0" }
+        });
+        return;
+      }
+      if (method === "notifications/initialized") {
+        jsonResponse(res, 202, {});
+        return;
+      }
+      if (method === "tools/list") {
+        reply({ tools: knowledgeMCPTools });
+        return;
+      }
+      if (method === "tools/call") {
+        const name = String(params.name ?? "");
+        const args = jsonObject(params.arguments) ?? {};
+        if (name.startsWith("oa_request") && !settings.knowledgeOrganizerEnabled) {
+          throw new Error("Knowledge organizer requests are turned off in Settings.");
+        }
+        reply(knowledgeMCPToolResponse(knowledgeToolResult(name, args, "mcp")));
+        return;
+      }
+      if (method === "resources/list") {
+        reply({
+          resources: searchKnowledge("", 50).map((item) => ({
+            uri: `openassist://knowledge/${encodeURIComponent(item.id)}`,
+            name: item.title,
+            description: item.sourceLabel,
+            mimeType: "text/markdown"
+          }))
+        });
+        return;
+      }
+      if (method === "resources/read") {
+        const uri = String(params.uri ?? "");
+        const match = uri.match(/^openassist:\/\/knowledge\/(.+)$/);
+        const item = readKnowledgeItem(decodeURIComponent(match?.[1] ?? ""));
+        reply({
+          contents: [
+            {
+              uri,
+              mimeType: "text/markdown",
+              text: item.markdown
+            }
+          ]
+        });
+        return;
+      }
+      reply({});
+    } catch (error) {
+      jsonResponse(res, 200, {
+        jsonrpc: "2.0",
+        id: id ?? null,
+        error: {
+          code: -32000,
+          message: error instanceof Error ? error.message : "Knowledge MCP call failed."
+        }
+      });
+    }
+  }
+}
+
+const knowledgeServer = new OpenAssistKnowledgeServer();
+
+async function ensureKnowledgeServerForSettings(settings?: SettingsSnapshot) {
+  return knowledgeServer.ensureStarted(settings ?? await loadSettings());
+}
+
+function knowledgeMCPServerConfig(access: KnowledgeRuntimeAccess) {
+  return {
+    mcpServers: {
+      openassist_knowledge: {
+        type: "http",
+        url: `${access.baseURL}/mcp`,
+        tools: ["*"],
+        headers: {
+          Authorization: `Bearer ${access.token}`
+        }
+      }
+    }
+  };
+}
+
+function temporaryKnowledgeMCPConfig(access: KnowledgeRuntimeAccess, prefix: string) {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), `openassist-${prefix}-knowledge-`));
+  const filePath = path.join(directory, "mcp.json");
+  fs.writeFileSync(filePath, JSON.stringify(knowledgeMCPServerConfig(access), null, 2), { encoding: "utf8", mode: 0o600 });
+  try {
+    fs.chmodSync(filePath, 0o600);
+  } catch {
+    // Best effort; the file is temporary and removed after the provider run.
+  }
+  return {
+    filePath,
+    cleanup: () => {
+      try {
+        fs.rmSync(directory, { recursive: true, force: true });
+      } catch {
+        // Temporary file cleanup is best effort.
+      }
+    }
+  };
+}
+
+// Computer Use is locked to OpenAI-signed clients (the helper's XPC service only
+// answers callers whose responsible process is com.openai.* / Team 2DC432GLL2).
+// Non-Codex backends (Copilot, Claude) therefore cannot drive the helper
+// directly. Instead we expose `codex mcp-server` as an MCP server to them: the
+// OpenAI-signed codex binary becomes the responsible process, so Computer Use
+// works through it. The other model gets a `codex` tool it can delegate to.
+// See docs/computer-use-troubleshooting.md.
+const codexProxyMCPServerName = "codex_computer_use";
+
+function codexComputerUseProxyEnv(): Record<string, string> {
+  // Pass the env vars codex needs (originator gate + unbuffered IO) and PATH/HOME
+  // so the spawned `codex mcp-server` can run. We deliberately do NOT dump the
+  // entire process env into the temp config file (it can contain API keys); MCP
+  // clients merge this `env` on top of the inherited environment.
+  const env: Record<string, string> = {
+    CODEX_INTERNAL_ORIGINATOR_OVERRIDE: process.env.CODEX_INTERNAL_ORIGINATOR_OVERRIDE ?? "Codex",
+    NSUnbufferedIO: "YES",
+    PYTHONUNBUFFERED: "1",
+    STDBUF: "L",
+    // Augmented PATH (adds ~/.npm-global/bin, ~/.local/bin, homebrew) so the
+    // Finder-launched app's stripped PATH doesn't break the spawned codex.
+    PATH: assistantPATH()
+  };
+  if (process.env.HOME) env.HOME = process.env.HOME;
+  return env;
+}
+
+// Build the temp MCP config that exposes `codex mcp-server` to a CLI backend.
+// When captureEventsTo is provided, the config points `command` at a small
+// wrapper script that transparently relays stdio to/from codex while teeing the
+// server's stdout (which carries codex/event step notifications) to a log file
+// the app tails — giving us live per-step visibility (open app, screenshot,
+// click) for Claude/Copilot, mirroring Codex's own UI. See
+// docs/computer-use-troubleshooting.md.
+function temporaryCodexComputerUseMCPConfig(prefix: string, captureEventsTo?: string) {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), `openassist-${prefix}-computeruse-`));
+  const env = codexComputerUseProxyEnv();
+  let command = resolveCodexExecutable();
+  let args = ["mcp-server"];
+  if (captureEventsTo) {
+    const wrapperPath = path.join(directory, "codex-cu-wrapper.sh");
+    // `tee` copies codex's stdout to the event log while still passing it back
+    // to the MCP client over stdout. stderr is dropped (noise).
+    const wrapper = [
+      "#!/bin/bash",
+      `exec ${JSON.stringify(resolveCodexExecutable())} mcp-server 2>/dev/null > >(tee -a ${JSON.stringify(captureEventsTo)})`,
+      ""
+    ].join("\n");
+    fs.writeFileSync(wrapperPath, wrapper, { encoding: "utf8", mode: 0o700 });
+    try { fs.chmodSync(wrapperPath, 0o700); } catch { /* best effort */ }
+    command = "/bin/bash";
+    args = [wrapperPath];
+  }
+  const config = {
+    mcpServers: {
+      [codexProxyMCPServerName]: { type: "stdio", command, args, env }
+    }
+  };
+  const filePath = path.join(directory, "mcp.json");
+  fs.writeFileSync(filePath, JSON.stringify(config, null, 2), { encoding: "utf8", mode: 0o600 });
+  try {
+    fs.chmodSync(filePath, 0o600);
+  } catch {
+    // Best effort; the file is temporary and removed after the provider run.
+  }
+  return {
+    filePath,
+    cleanup: () => {
+      try {
+        fs.rmSync(directory, { recursive: true, force: true });
+      } catch {
+        // Temporary file cleanup is best effort.
+      }
+    }
+  };
+}
+
+// Mirror of codexComputerUseProxyMCPServerConfig for the Copilot path which
+// merges configs differently. Returns just the server entry.
+function codexComputerUseProxyMCPServerConfig() {
+  return {
+    mcpServers: {
+      [codexProxyMCPServerName]: {
+        type: "stdio",
+        command: resolveCodexExecutable(),
+        args: ["mcp-server"],
+        env: codexComputerUseProxyEnv()
+      }
+    }
+  };
+}
+
+// The codex mcp-server exposes `codex` and `codex-reply` tools. Allow both so
+// the backend can start and continue a delegated Computer Use session.
+function codexProxyAllowedToolNames() {
+  return [
+    `mcp__${codexProxyMCPServerName}__codex`,
+    `mcp__${codexProxyMCPServerName}__codex-reply`
+  ];
+}
+
+function claudeKnowledgeAllowedTools() {
+  return knowledgeMCPTools
+    .map((tool) => `mcp__openassist_knowledge__${tool.name}`)
+    .join(",");
+}
+
+function formattedPlannerDay(dayID: string) {
+  return new Intl.DateTimeFormat("en-US", {
+    weekday: "long",
+    month: "long",
+    day: "numeric",
+    year: "numeric"
+  }).format(plannerDateFromDayID(dayID));
+}
+
+function userLocalTimezoneName() {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || "system local time";
+  } catch {
+    return "system local time";
+  }
+}
+
+function formattedLocalDateTime(date = new Date()) {
+  return new Intl.DateTimeFormat("en-US", {
+    weekday: "long",
+    month: "long",
+    day: "numeric",
+    year: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    timeZoneName: "short"
+  }).format(date);
+}
+
+function openAssistLocalDateInstructions() {
+  const today = plannerDayID();
+  const tomorrow = plannerDayOffset(today, 1);
+  const dayAfterTomorrow = plannerDayOffset(today, 2);
+  return [
+    `Current local date/time: ${formattedLocalDateTime()} (${userLocalTimezoneName()}).`,
+    `Today dayID: ${today}. Tomorrow dayID: ${tomorrow}. Day after tomorrow dayID: ${dayAfterTomorrow}.`,
+    "Always use this local date for Today, tomorrow, and weekday math. Do not use UTC or an ISO timestamp to decide the user's day."
+  ].join("\n");
+}
+
+function openAssistKnowledgeAgentInstructions(providerName = "the agent") {
+  const today = plannerDayID();
+  const tomorrow = plannerDayOffset(today, 1);
+  const dayAfterTomorrow = plannerDayOffset(today, 2);
+  return [
+    "# OpenAssist Knowledge",
+    "",
+    openAssistLocalDateInstructions(),
+    `Current local date: ${formattedPlannerDay(today)} (${today}).`,
+    `Tomorrow: ${formattedPlannerDay(tomorrow)} (${tomorrow}). Day after tomorrow: ${formattedPlannerDay(dayAfterTomorrow)} (${dayAfterTomorrow}).`,
+    "OpenAssist has an in-app Notes system and a Today planner. This is not Apple Calendar, Apple Reminders, or an external planner app.",
+    `When the user asks about "my notes", "Today", "planner", "journal", "tomorrow", "day after tomorrow", "daily to-do list", "tasks", or "reminders", ${providerName} should use the OpenAssist Knowledge tools.`,
+    "Use `oa_read_today` for a planner day, `oa_list_daily_items` for structured Today items, `oa_list_backlog_items` for unscheduled later/follow-up tasks, `oa_search` / `oa_read` for notes, `oa_read_journal` for journal sections, and `oa_list_open_tasks` for unfinished tasks.",
+    "For memory/history questions like `when did we`, `where did I mention`, `what did we decide`, `what happened in an earlier thread`, or `find the previous discussion`, use `oa_search_everything` first. It returns small snippets across threads, realtime turns, notes, planner, backlog, approvals, and artifacts. Use `oa_read_search_result` only for the one result you need.",
+    "If the user asks to add a reminder, task, or to-do inside OpenAssist, create a Today planner request. Do not say you lack planner access.",
+    "For adding a planner task or daily item, use `oa_request_daily_item` with the correct `dayID`. Set `area` to exactly `Work` or `Personal` so the planner separates the task under the right heading.",
+    "If the user wants to do something later, needs follow-up, or has not picked a date, use `oa_request_backlog_item` instead of forcing it into Today.",
+    "To mark a task as done (or not done), use `oa_complete_daily_item` with the task text and the `dayID`. It is applied immediately, no approval needed. If unsure of the exact wording, call `oa_list_daily_items` first.",
+    "Work means job, client, coding, project, meeting, ticket, repo, or business tasks. Personal means home, family, errands, appointments, calls, service/repair, bills, or shopping.",
+    "If you are not sure whether a task is Work or Personal, ask one short clarification question before creating the planner request.",
+    "Put project/folder scope in the title with simple inline tags: @Project for projects and #Folder for folders. For example, `title: \"Ask Levi about Darkrunner stuff @OpenAssist\", area: \"Work\"`.",
+    "For notes/planner edits or organizing, create a request/preview with `oa_request_add`, `oa_request_patch`, `oa_request_organize`, `oa_request_daily_item`, `oa_request_carry_forward`, or `oa_request_move_to_backlog`. Do not create organize-only requests that have no exact preview.",
+    "OpenAssist notes support rich formatting blocks beyond plain markdown. When organizing a note for better readability, follow this pattern: (1) read the note with `oa_read`, (2) call `oa_note_style_guide` to learn supported block syntax (callouts, column layouts, etc.), (3) produce exact replacement markdown using those blocks, (4) submit with `oa_request_organize` including `itemID` and the full `markdown`. This creates an approval preview the user can accept.",
+    "Supported note blocks include: callouts (`::: decision`, `::: warning`, `::: info`, `::: success`, `::: next`, `::: comment`) and 2/3-column table layouts. Always call `oa_note_style_guide` before writing organized markdown to get the exact syntax.",
+    "After creating an organize/edit preview, tell the user it is ready in the Knowledge Approval inbox and that they can use Show changes to review the before/after diff before applying it.",
+    "Adding a new task or daily item is applied immediately: when the tool result has status \"applied\", say it was added. When the tool result has status \"pending\" (moves, edits, or organizing), say it is waiting for approval. Never claim something was added while it is still pending.",
+    "Read only what you need. Do not dump all notes into the answer."
+  ].join("\n");
+}
+
+function realtimeKnowledgeProvider(settings: SettingsSnapshot) {
+  if (!settings.knowledgeAccessEnabled || !settings.knowledgeRealtimeVoiceAccessEnabled) return undefined;
+  return {
+    enabled: true,
+    call: async (name: string, args: JsonObject) => knowledgeToolResult(name, args, "voice")
+  };
+}
+
+function loadKnowledgeStatus() {
+  const token = ensureKnowledgeAccessToken();
+  const state = readJSON<JsonObject>(knowledgeServerStatePath(), {});
+  return {
+    tokenConfigured: Boolean(token),
+    server: state,
+    pendingRequests: listKnowledgeWriteRequests("pending")
+  };
+}
+
 const codexRealtimeProxy = new CodexRealtimeProxy((message) => bridgeDebugLog(message));
 
-async function configureCodexRealtimeProxy(settings?: SettingsSnapshot) {
+async function configureCodexRealtimeProxy(
+  settings?: SettingsSnapshot,
+  handoff?: RealtimeProxyConfig["handoff"],
+  delegatedStatus?: RealtimeProxyConfig["delegatedStatus"],
+  directWork?: RealtimeProxyConfig["directWork"],
+  connection?: RealtimeProxyConfig["connection"]
+) {
   const snapshot = settings ?? await loadSettings();
-  const realtimeOpenAIAPIKey = await resolveRealtimeOpenAIAPIKey();
+  const provider = snapshot.realtimeVoiceProvider === "geminiLive" ? "geminiLive" : "openaiRealtime";
+  const realtimeAPIKey = provider === "geminiLive"
+    ? await resolveRealtimeGeminiAPIKey()
+    : await resolveRealtimeOpenAIAPIKey();
   codexRealtimeProxy.configure({
-    apiKey: realtimeOpenAIAPIKey.apiKey,
-    model: snapshot.realtimeOpenAIModel || defaultRealtimeOpenAIModel,
-    voice: snapshot.realtimeOpenAIVoice || defaultRealtimeOpenAIVoice,
+    provider,
+    apiKey: realtimeAPIKey.apiKey,
+    model: provider === "geminiLive"
+      ? snapshot.realtimeGeminiModel || defaultRealtimeGeminiModel
+      : snapshot.realtimeOpenAIModel || defaultRealtimeOpenAIModel,
+    voice: provider === "geminiLive"
+      ? snapshot.realtimeGeminiVoice || defaultRealtimeGeminiVoice
+      : snapshot.realtimeOpenAIVoice || defaultRealtimeOpenAIVoice,
     organizationID: process.env.OPENAI_ORG_ID,
     projectID: process.env.OPENAI_PROJECT_ID,
-    safetyIdentifier: process.env.OPENAI_SAFETY_IDENTIFIER
+    safetyIdentifier: process.env.OPENAI_SAFETY_IDENTIFIER,
+    handoff,
+    delegatedStatus,
+    directWork,
+    connection,
+    knowledge: realtimeKnowledgeProvider(snapshot),
+    directKnowledgeRequest: {
+      run: async ({ prompt }) => createDirectKnowledgeVoiceResponse(prompt, snapshot, "voice")?.responseText
+    },
+    delegationRouter: realtimeDelegationRouter(snapshot),
+    delegationMode: snapshot.realtimeDelegationMode
   });
   return codexRealtimeProxy.ensureStarted();
 }
@@ -7775,7 +18857,9 @@ class CodexAppServerTransport extends EventEmitter {
       bridgeDebugLog(`OpenAssist Codex app-server pre-start cleanup failed: ${error instanceof Error ? error.stack ?? error.message : String(error)}`);
     });
     const codexExecutable = resolveCodexExecutable();
-    const realtimeProxyBaseURL = await configureCodexRealtimeProxy();
+    const settings = await loadSettings();
+    const realtimeProxyBaseURL = await configureCodexRealtimeProxy(settings);
+    const knowledgeAccess = await ensureKnowledgeServerForSettings(settings);
     const appServerArgs = [
       "app-server",
       "--analytics-default-enabled",
@@ -7796,9 +18880,18 @@ class CodexAppServerTransport extends EventEmitter {
       "-c",
       "notify=[]"
     ];
+    if (knowledgeAccess && settings.knowledgeAgentAccessEnabled) {
+      appServerArgs.push(
+        "-c",
+        `mcp_servers.openassist_knowledge.url=${JSON.stringify(`${knowledgeAccess.baseURL}/mcp`)}`,
+        "-c",
+        "mcp_servers.openassist_knowledge.bearer_token_env_var=\"OPENASSIST_KNOWLEDGE_TOKEN\""
+      );
+    }
     const appServerEnv = {
       ...process.env,
       OPENAI_API_KEY: process.env.LOCAL_REALTIME_CODEX_PLACEHOLDER_API_KEY?.trim() || codexRealtimePlaceholderAPIKey,
+      ...(knowledgeAccess ? { OPENASSIST_KNOWLEDGE_TOKEN: knowledgeAccess.token } : {}),
       // Match Codex.app's own environment so the Computer Use MCP plugin (and
       // any other curated/bundled plugins that gate on the originator) treat
       // us as the official Codex client. Without this, SkyComputerUseClient
@@ -7877,6 +18970,9 @@ class CodexAppServerTransport extends EventEmitter {
       || method === "turn/interrupt"
       || method === "thread/start"
       || method === "thread/resume"
+      || method === "thread/archive"
+      || method === "thread/unarchive"
+      || method === "thread/delete"
       || method === "thread/realtime/start";
     const startMs = Date.now();
     if (isInterestingMethod) {
@@ -8020,12 +19116,36 @@ type ActiveRealtimeSession = {
   openAssistThreadID: string;
   providerThreadID: string;
   provider: string;
+  providerBackend: AssistantBackend;
   currentTurnID?: string;
+  delegationPending?: boolean;
+  realtimeTransportClosed?: boolean;
   onNotification: (method: string, params: JsonObject, requestID?: JsonRequestID) => void;
   eventSink?: (event: { type: string; payload?: unknown }) => void;
 };
 
 let activeRealtimeSession: ActiveRealtimeSession | null = null;
+// TEMP DIAGNOSTIC (realtime audio-flow debugging): counts audio chunks forwarded to
+// Codex so we can confirm in electron-debug.log that audio reaches the upstream.
+const realtimeAudioDiag = { sends: 0, ok: 0, fail: 0, bytes: 0, lastLogAt: 0 };
+
+function formatRealtimeStatusElapsed(ms: number) {
+  const totalSeconds = Math.max(0, Math.round(ms / 1000));
+  if (totalSeconds < 5) return "a few seconds";
+  if (totalSeconds < 60) return `${totalSeconds} seconds`;
+  const totalMinutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  if (totalMinutes < 60) return seconds ? `${totalMinutes} min ${seconds} sec` : `${totalMinutes} min`;
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  return minutes ? `${hours} hr ${minutes} min` : `${hours} hr`;
+}
+
+function compactRealtimeStatus(value: string, maxLength = 700) {
+  const text = String(value || "").replace(/\s+/g, " ").trim();
+  if (text.length <= maxLength) return text;
+  return `${text.slice(0, Math.max(0, maxLength - 1)).trim()}…`;
+}
 
 async function interruptCodexRun(run: ActiveProviderRun, timeoutMs = 15_000) {
   if (run.backend !== "codex" || !run.providerThreadID || !run.turnID) return;
@@ -8036,6 +19156,26 @@ async function interruptCodexRun(run: ActiveProviderRun, timeoutMs = 15_000) {
 }
 
 async function restartCodexAfterStoppedRunIfNeeded(run: ActiveProviderRun, interruptError?: string) {
+  // If this run used Computer Use, force-kill any Computer Use helper that may
+  // still be alive after the turn was stopped. For Claude/Copilot the helper is
+  // a descendant of the killed CLI process and usually dies with the tree, but
+  // it can re-parent to /Applications/Codex.app and survive — this sweep is the
+  // safety net so Stop reliably halts on-screen Computer Use for ALL backends.
+  // We kill regardless of age (unlike the periodic stale cleanup) because the
+  // user explicitly asked to stop.
+  if (shouldPreferCodexComputerUsePlugin(run.pluginIDs)) {
+    try {
+      const helpers = (await processSnapshot())
+        .map((entry) => ({ ...entry, kind: computerUseHelperKind(entry.command) }))
+        .filter((entry) => Boolean(entry.kind));
+      for (const helper of helpers) {
+        if (isProcessAlive(helper.pid)) killProcessQuietly(helper.pid, "SIGKILL");
+      }
+      if (helpers.length) bridgeDebugLog(`Stop: killed ${helpers.length} Computer Use helper(s) after user stopped the turn`);
+    } catch (error) {
+      bridgeDebugLog(`Computer Use helper sweep after stop failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
   if (run.backend !== "codex") return { restarted: false };
   const usesOfficialComputerUse = shouldPreferCodexComputerUsePlugin(run.pluginIDs);
   if (!usesOfficialComputerUse && !interruptError) {
@@ -8134,8 +19274,14 @@ function liveVoiceStartTimeout<T>(promise: Promise<T>) {
 async function stopActiveRealtimeSession(reason = "stopped") {
   const active = activeRealtimeSession;
   if (!active) return { ok: true };
-  activeRealtimeSession = null;
-  codexTransport.off("notification", active.onNotification);
+  const hasDelegatedWork = Boolean(active.currentTurnID || active.delegationPending);
+  if (hasDelegatedWork) {
+    active.realtimeTransportClosed = true;
+    bridgeDebugLog(`[realtime.voice] closing realtime transport while delegated turn continues providerTurn=${active.currentTurnID || "pending"}`);
+  } else {
+    activeRealtimeSession = null;
+    codexTransport.off("notification", active.onNotification);
+  }
   try {
     await codexTransport.request("thread/realtime/stop", {
       threadId: active.providerThreadID
@@ -8148,6 +19294,9 @@ async function stopActiveRealtimeSession(reason = "stopped") {
     payload: {
       threadId: active.openAssistThreadID,
       providerThreadId: active.providerThreadID,
+      providerTurnId: active.currentTurnID,
+      provider: active.provider,
+      delegationActive: hasDelegatedWork,
       reason
     }
   });
@@ -8157,7 +19306,47 @@ async function stopActiveRealtimeSession(reason = "stopped") {
 async function stopCodexRealtimeDelegation() {
   const active = activeRealtimeSession;
   if (!active?.providerThreadID || !active.currentTurnID) {
-    return { ok: false, error: "No delegated Codex task is running." };
+    return { ok: false, error: "No delegated task is running." };
+  }
+  if (active.providerBackend !== "codex") {
+    const result = await stopProviderRun(active.currentTurnID);
+    const now = Date.now();
+    const activity: ChatMessage = {
+      id: `activity-realtime-delegation-${active.currentTurnID}`,
+      role: "activity",
+      provider: active.provider,
+      text: `${active.provider} delegated task was stopped.`,
+      status: "completed",
+      activityTitle: "Delegated task",
+      activityKind: "realtimeDelegation",
+      activityStatus: result.ok ? "completed" : "failed",
+      activityDetail: result.ok ? `${active.provider} delegated task was stopped.` : result.error,
+      createdAt: now,
+      updatedAt: now
+    };
+    upsertRuntimeActivity(active.openAssistThreadID, activity, active.currentTurnID);
+    active.eventSink?.({
+      type: "thread/realtime/activity",
+      payload: {
+        threadId: active.openAssistThreadID,
+        providerThreadId: active.providerThreadID,
+        providerTurnId: active.currentTurnID,
+        provider: active.provider,
+        activity
+      }
+    });
+    active.eventSink?.({
+      type: result.ok ? "thread/realtime/delegation/stopped" : "thread/realtime/delegation/failed",
+      payload: {
+        threadId: active.openAssistThreadID,
+        providerThreadId: active.providerThreadID,
+        providerTurnId: active.currentTurnID,
+        provider: active.provider,
+        error: result.error || ""
+      }
+    });
+    if (result.ok) active.currentTurnID = undefined;
+    return result;
   }
   try {
     await codexTransport.request("turn/interrupt", {
@@ -8169,12 +19358,12 @@ async function stopCodexRealtimeDelegation() {
       id: `activity-realtime-delegation-${active.currentTurnID}`,
       role: "activity",
       provider: active.provider,
-      text: "Codex delegated task was stopped.",
+      text: `${active.provider} delegated task was stopped.`,
       status: "completed",
       activityTitle: "Delegated task",
       activityKind: "realtimeDelegation",
       activityStatus: "completed",
-      activityDetail: "Codex delegated task was stopped.",
+      activityDetail: `${active.provider} delegated task was stopped.`,
       createdAt: now,
       updatedAt: now
     };
@@ -8185,6 +19374,7 @@ async function stopCodexRealtimeDelegation() {
         threadId: active.openAssistThreadID,
         providerThreadId: active.providerThreadID,
         providerTurnId: active.currentTurnID,
+        provider: active.provider,
         activity
       }
     });
@@ -8193,12 +19383,14 @@ async function stopCodexRealtimeDelegation() {
       payload: {
         threadId: active.openAssistThreadID,
         providerThreadId: active.providerThreadID,
-        providerTurnId: active.currentTurnID
+        providerTurnId: active.currentTurnID,
+        provider: active.provider
       }
     });
+    active.currentTurnID = undefined;
     return { ok: true };
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Could not stop the delegated Codex task.";
+    const message = error instanceof Error ? error.message : "Could not stop the delegated task.";
     bridgeDebugLog(`Codex realtime delegation stop failed: ${message}`);
     return { ok: false, error: message };
   }
@@ -8213,6 +19405,7 @@ async function startCodexRealtimeVoice(
     reasoningEffort?: string;
     pluginIDs?: string[];
     skillIDs?: string[];
+    contextHint?: string;
   } = {},
   eventSink?: (event: { type: string; payload?: unknown }) => void
 ) {
@@ -8223,13 +19416,14 @@ async function startCodexRealtimeVoice(
     bridgeDebugLog("[realtime.voice] start blocked: setting disabled");
     return { ok: false, error: "Realtime Voice is turned off in Settings." };
   }
-  if (!settings.realtimeOpenAIAPIKeyConfigured) {
-    bridgeDebugLog("[realtime.voice] start blocked: missing realtime API key");
-    return { ok: false, error: "Add an OpenAI API key in Settings > Voice & Dictation." };
+  const realtimeVoiceProvider = settings.realtimeVoiceProvider === "geminiLive" ? "geminiLive" : "openaiRealtime";
+  if (realtimeVoiceProvider === "geminiLive" && !settings.realtimeGeminiAPIKeyConfigured) {
+    bridgeDebugLog("[realtime.voice] start blocked: missing Gemini realtime API key");
+    return { ok: false, error: "Add a Google Gemini API key in Settings > Voice & Dictation." };
   }
-  if (options.provider && normalizeBackend(options.provider) !== "codex") {
-    bridgeDebugLog(`[realtime.voice] start blocked: unsupported provider=${options.provider}`);
-    return { ok: false, error: "Realtime Voice works with the Codex provider only." };
+  if (realtimeVoiceProvider === "openaiRealtime" && !settings.realtimeOpenAIAPIKeyConfigured) {
+    bridgeDebugLog("[realtime.voice] start blocked: missing OpenAI realtime API key");
+    return { ok: false, error: "Add an OpenAI API key in Settings > Voice & Dictation." };
   }
 
   let openAssistThreadID = options.threadID?.startsWith("openassist-")
@@ -8241,36 +19435,44 @@ async function startCodexRealtimeVoice(
     openAssistThreadID = created.id;
     session = created;
   }
+  if (session.isTemporary === true || session.conversationPersistence === 0) {
+    promoteTemporarySession(openAssistThreadID);
+    session = findSession(openAssistThreadID) ?? { ...session, isTemporary: false, conversationPersistence: 2 };
+    bridgeDebugLog(`[realtime.voice] promoted temporary thread for realtime thread=${openAssistThreadID}`);
+  }
+  const conversationPath = path.join(conversationStoreRoot(), openAssistThreadID, "conversation.json");
+  if (!fs.existsSync(conversationPath)) createEmptyConversation(openAssistThreadID);
 
-  const backend = normalizeBackend(String(session.activeProvider ?? settings.assistantBackend ?? "codex"));
-  if (backend !== "codex") {
-    bridgeDebugLog(`[realtime.voice] start blocked: active backend=${backend}`);
-    return { ok: false, error: "Realtime Voice works with the Codex provider only." };
+  const backend = normalizeBackend(String(options.provider ?? session.activeProvider ?? settings.assistantBackend ?? "codex"));
+  if (!isRuntimeBackend(backend)) {
+    return { ok: false, error: "Realtime Voice needs Codex, Claude, Copilot, Antigravity, or Ollama." };
+  }
+  const providerDisplayName = providerLabel(backend);
+  if (session.activeProvider !== backend) {
+    const selectedModelID = modelForBackend(backend, settings, session);
+    session.activeProvider = backend;
+    session.modelID = selectedModelID;
+    session.latestModel = selectedModelID;
+    session = updateSession(session);
   }
 
-  try {
-    const proxyURL = await liveVoiceStartTimeout(configureCodexRealtimeProxy(settings));
-    bridgeDebugLog(`[realtime.voice] proxy ready url=${proxyURL}`);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "Live Voice proxy failed to start.";
-    bridgeDebugLog(`[realtime.voice] proxy start failed: ${message}`);
-    return { ok: false, error: message };
-  }
   await stopActiveRealtimeSession("replaced");
 
-  const modelID = modelForBackend("codex", settings, session);
-  bridgeDebugLog(`[realtime.voice] ensuring Codex provider session thread=${openAssistThreadID} model=${modelID}`);
+  const modelID = modelForBackend(backend, settings, session);
+  const realtimeCodexModelID = modelForBackend("codex", settings, session);
+  bridgeDebugLog(`[realtime.voice] ensuring Codex realtime transport thread=${openAssistThreadID} provider=${providerDisplayName} model=${realtimeCodexModelID}`);
   const normalizedToolSelection = await normalizeCodexToolSelection(options.pluginIDs ?? [], options.skillIDs ?? []);
   const realtimeRuntimeOptions: CodexRuntimeOptions = {
     interactionMode: options.interactionMode ?? session.latestInteractionMode ?? "agentic",
     permissionMode: options.permissionMode ?? session.latestPermissionMode ?? "fullAccess",
     reasoningEffort: normalizeCodexReasoningEffort(options.reasoningEffort ?? session.latestReasoningEffort),
-    pluginIDs: normalizedToolSelection.pluginIDs
+    pluginIDs: normalizedToolSelection.pluginIDs,
+    knowledgeAccessEnabled: settings.knowledgeAccessEnabled && settings.knowledgeAgentAccessEnabled
   };
   let providerThreadID: string;
   let insertedSystemMessage = false;
   try {
-    if (shouldPreferCodexComputerUsePlugin(realtimeRuntimeOptions.pluginIDs)) {
+    if (backend === "codex" && shouldPreferCodexComputerUsePlugin(realtimeRuntimeOptions.pluginIDs)) {
       const didResetActiveComputerUse = await resetCodexIfComputerUseAlreadyActive("Reset stale active Computer Use tool before starting Live Voice");
       if (didResetActiveComputerUse) {
         bridgeDebugLog("[realtime.voice] reset active Computer Use before realtime start");
@@ -8283,9 +19485,18 @@ async function startCodexRealtimeVoice(
         bridgeDebugLog(`[realtime.voice] Computer Use stale helper cleanup failed: ${error instanceof Error ? error.message : String(error)}`);
       });
     }
-    const providerSession = await liveVoiceStartTimeout(ensureCodexProviderSession(openAssistThreadID, modelID, realtimeRuntimeOptions));
+    const providerSession = await liveVoiceStartTimeout(ensureCodexProviderSession(openAssistThreadID, realtimeCodexModelID, realtimeRuntimeOptions));
     providerThreadID = providerSession.providerSessionID;
     insertedSystemMessage = providerSession.insertedSystemMessage;
+    if (backend !== "codex") {
+      const restoredSession = findSession(openAssistThreadID);
+      if (restoredSession) {
+        restoredSession.activeProvider = backend;
+        restoredSession.modelID = modelID;
+        restoredSession.latestModel = modelID;
+        session = updateSession(restoredSession);
+      }
+    }
   } catch (error) {
     const message = error instanceof Error ? error.message : "Could not create the Codex realtime thread.";
     bridgeDebugLog(`[realtime.voice] provider session failed thread=${openAssistThreadID}: ${message}`);
@@ -8308,6 +19519,10 @@ async function startCodexRealtimeVoice(
   let lastUserTranscript = "";
   let delegationPrompt = "";
   let responseText = "";
+  let delegationStartedAt = 0;
+  let latestDelegationStatus = "";
+  let latestDelegationStatusAt = 0;
+  const hasDelegatedTurnInFlight = () => Boolean(activeRealtimeSession?.currentTurnID || delegationPrompt);
   const makeRealtimeProviderTurnID = () => `codex-realtime-turn-${randomUUID().toLowerCase()}`;
   const isReusableCodexRealtimeTurnID = (turnID: string) => /^auto-compact-\d+$/i.test(turnID.trim());
   let providerTurnID = makeRealtimeProviderTurnID();
@@ -8337,24 +19552,75 @@ async function startCodexRealtimeVoice(
     return Boolean(tracked && isCommentaryPhase(tracked));
   };
   const completedTurnIDs = new Set<string>();
+  const currentDelegationPrompt = () => lastUserTranscript || delegationPrompt;
+  const rememberDelegationStatus = (detail: string) => {
+    const clean = compactRealtimeStatus(detail, 700);
+    if (!clean) return;
+    latestDelegationStatus = clean;
+    latestDelegationStatusAt = Date.now();
+  };
+  const currentRealtimeDelegationStatus = () => {
+    const active = activeRealtimeSession;
+    const hasActiveDelegation = active?.providerThreadID === providerThreadID
+      && Boolean(active.currentTurnID || active.delegationPending);
+    if (!hasActiveDelegation) {
+      return "No delegated task is running right now.";
+    }
+    const provider = active.provider || providerDisplayName;
+    const prompt = compactRealtimeStatus(currentDelegationPrompt() || delegationPrompt || "Realtime voice task", 360);
+    const now = Date.now();
+    const elapsed = delegationStartedAt ? formatRealtimeStatusElapsed(now - delegationStartedAt) : "";
+    const state = active.delegationPending && !active.currentTurnID ? "starting" : "still working";
+    const lines = [
+      `${provider} is ${state}${elapsed ? ` for ${elapsed}` : ""}.`,
+      prompt ? `Task: ${prompt}` : ""
+    ];
+    const activeComputerUse = activeComputerUseToolCallDetails()
+      .sort((a, b) => b.elapsedMs - a.elapsedMs)[0];
+    if (activeComputerUse) {
+      const toolElapsed = formatRealtimeStatusElapsed(activeComputerUse.elapsedMs);
+      const toolName = humanizeRuntimeName(activeComputerUse.toolName || "Computer Use");
+      const args = compactRealtimeStatus(activeComputerUse.args || "", 220);
+      lines.push(`Current tool: ${toolName}${args ? ` ${args}` : ""}. It has been on this tool for ${toolElapsed}.`);
+      if (activeComputerUse.elapsedMs > 120_000) {
+        lines.push("This looks stuck because Computer Use has not returned yet. You can stop the run and try again.");
+      }
+    } else if (latestDelegationStatus) {
+      lines.push(`Latest update: ${latestDelegationStatus}`);
+      if (latestDelegationStatusAt && now - latestDelegationStatusAt > 120_000) {
+        lines.push(`No new progress update for ${formatRealtimeStatusElapsed(now - latestDelegationStatusAt)}. It may be stuck.`);
+      }
+    } else {
+      lines.push("No detailed progress update has arrived yet.");
+    }
+    if (active.realtimeTransportClosed) {
+      lines.push("Realtime voice is closed, but the delegated Codex turn is still being watched.");
+    }
+    return lines.filter(Boolean).join("\n");
+  };
   const emitDelegationRefresh = (type: string, extra: JsonObject = {}) => {
+    const eventProvider = activeRealtimeSession?.provider ?? providerDisplayName;
     eventSink?.({
       type,
       payload: {
         threadId: openAssistThreadID,
         providerThreadId: providerThreadID,
         providerTurnId: providerTurnID,
+        provider: eventProvider,
+        realtimeTransportClosed: activeRealtimeSession?.realtimeTransportClosed === true,
         ...extra
       }
     });
   };
   const emitRealtimeActivity = (activity: ChatMessage) => {
+    const eventProvider = activeRealtimeSession?.provider ?? providerDisplayName;
     eventSink?.({
       type: "thread/realtime/activity",
       payload: {
         threadId: openAssistThreadID,
         providerThreadId: providerThreadID,
         providerTurnId: providerTurnID,
+        provider: eventProvider,
         activity
       }
     });
@@ -8386,11 +19652,12 @@ async function startCodexRealtimeVoice(
   };
   const realtimeDelegationActivity = (status: ChatMessage["activityStatus"], detail?: string): ChatMessage => {
     const now = Date.now();
-    const text = detail?.trim() || "Codex is handling the voice task.";
+    const activityProvider = activeRealtimeSession?.provider ?? providerDisplayName;
+    const text = detail?.trim() || `${activityProvider} is handling the voice task.`;
     return {
       id: `activity-realtime-delegation-${providerTurnID}`,
       role: "activity",
-      provider: "Codex",
+      provider: activityProvider,
       text,
       status: status === "completed" || status === "failed" ? "completed" : "running",
       activityTitle: "Delegated task",
@@ -8401,7 +19668,6 @@ async function startCodexRealtimeVoice(
       updatedAt: now
     };
   };
-  const currentDelegationPrompt = () => lastUserTranscript || delegationPrompt;
   const refreshRealtimeDelegationPrompt = () => {
     const prompt = currentDelegationPrompt();
     const active = activeRealtimeSession;
@@ -8450,6 +19716,7 @@ async function startCodexRealtimeVoice(
       prompt,
       responseText: finalText,
       insertedSystemMessage,
+      userSource: "realtimeVoice",
       reasoningEffort: realtimeRuntimeOptions.reasoningEffort,
       interactionMode: realtimeRuntimeOptions.interactionMode,
       permissionMode: realtimeRuntimeOptions.permissionMode
@@ -8467,7 +19734,27 @@ async function startCodexRealtimeVoice(
     if (notificationThreadID && notificationThreadID !== providerThreadID) return;
 
     if (method.startsWith("thread/realtime/")) {
-      const payload = realtimeEventPayload(method, params, providerThreadID, openAssistThreadID);
+      const payload: JsonObject = realtimeEventPayload(method, params, providerThreadID, openAssistThreadID);
+      if ((method === "thread/realtime/closed" || method === "thread/realtime/error")
+        && activeRealtimeSession?.providerThreadID === providerThreadID
+        && hasDelegatedTurnInFlight()) {
+        payload.delegationActive = true;
+        if (activeRealtimeSession.currentTurnID) payload.providerTurnId = activeRealtimeSession.currentTurnID;
+      }
+      let itemDelegationPrompt = "";
+      if (method === "thread/realtime/itemAdded") {
+        itemDelegationPrompt = realtimeDelegationPromptFromItem(params);
+        if (itemDelegationPrompt) {
+          delegationPrompt = itemDelegationPrompt;
+          if (!delegationStartedAt) delegationStartedAt = Date.now();
+          rememberDelegationStatus(`Delegated task requested: ${itemDelegationPrompt}`);
+          payload.delegationActive = true;
+          payload.prompt = itemDelegationPrompt;
+          if (activeRealtimeSession?.providerThreadID === providerThreadID) {
+            activeRealtimeSession.delegationPending = true;
+          }
+        }
+      }
       eventSink?.({ type: method, payload });
       if (method === "thread/realtime/transcript/done") {
         const role = firstRuntimeString(params.role).toLowerCase();
@@ -8478,9 +19765,8 @@ async function startCodexRealtimeVoice(
         }
       }
       if (method === "thread/realtime/itemAdded") {
-        const prompt = realtimeDelegationPromptFromItem(params);
+        const prompt = itemDelegationPrompt;
         if (prompt) {
-          delegationPrompt = prompt;
           refreshRealtimeDelegationPrompt();
         }
       }
@@ -8490,8 +19776,15 @@ async function startCodexRealtimeVoice(
         rejectStart?.(new Error(message));
         const active = activeRealtimeSession;
         if (active?.providerThreadID === providerThreadID) {
-          activeRealtimeSession = null;
-          codexTransport.off("notification", active.onNotification);
+          if (active.currentTurnID || delegationPrompt) {
+            active.realtimeTransportClosed = true;
+            bridgeDebugLog(
+              `[realtime.voice] keeping delegated turn listener after realtime close providerTurn=${active.currentTurnID || "pending"}`
+            );
+          } else {
+            activeRealtimeSession = null;
+            codexTransport.off("notification", active.onNotification);
+          }
         }
       }
       if (requestID != null) {
@@ -8512,14 +19805,17 @@ async function startCodexRealtimeVoice(
         : makeRealtimeProviderTurnID();
       if (activeRealtimeSession?.providerThreadID === providerThreadID) {
         activeRealtimeSession.currentTurnID = providerTurnID;
+        activeRealtimeSession.delegationPending = false;
       }
       activityTurnIDs = new Set<string>([providerTurnID]);
       activityDetailBuffers.clear();
       itemPhases.clear();
       responseText = "";
       didGenerateImage = false;
+      delegationStartedAt = Date.now();
       bridgeDebugLog(`[realtime.voice] delegated Codex turn started providerTurn=${providerTurnID}`);
       const prompt = currentDelegationPrompt();
+      rememberDelegationStatus(prompt || "Codex is starting the voice task.");
       const activity = realtimeDelegationActivity("running", prompt || "Codex is starting the voice task.");
       upsertRuntimeActivity(openAssistThreadID, activity, providerTurnID);
       emitRealtimeActivity(activity);
@@ -8539,6 +19835,7 @@ async function startCodexRealtimeVoice(
         if (commentaryActivity) {
           upsertRuntimeActivity(openAssistThreadID, commentaryActivity, providerTurnID);
           emitRealtimeActivity(commentaryActivity);
+          rememberDelegationStatus(commentaryActivity.activityDetail || commentaryActivity.text || commentaryActivity.activityTitle || "");
         }
       } else {
         responseText += params.delta;
@@ -8553,6 +19850,7 @@ async function startCodexRealtimeVoice(
       if (!storedActivity) return;
       upsertRuntimeActivity(openAssistThreadID, storedActivity, providerTurnID);
       emitRealtimeActivity(storedActivity);
+      rememberDelegationStatus(storedActivity.activityDetail || storedActivity.text || storedActivity.activityTitle || "");
     }
     if (method === "turn/completed" || method === "turn/failed") {
       const failed = method === "turn/failed";
@@ -8563,24 +19861,260 @@ async function startCodexRealtimeVoice(
       upsertRuntimeActivity(openAssistThreadID, finalActivity, providerTurnID);
       emitRealtimeActivity(finalActivity);
       persistRealtimeDelegation(failed, error);
-      if (activeRealtimeSession?.providerThreadID === providerThreadID && activeRealtimeSession.currentTurnID === providerTurnID) {
-        activeRealtimeSession.currentTurnID = undefined;
+      const active = activeRealtimeSession;
+      if (active?.providerThreadID === providerThreadID && active.currentTurnID === providerTurnID) {
+        active.currentTurnID = undefined;
+        active.delegationPending = false;
+        if (active.realtimeTransportClosed) cleanupRealtimeStart();
+      } else {
+        codexTransport.off("notification", onNotification);
       }
     }
   };
 
+  const externalRealtimeHandoff: RealtimeProxyConfig["handoff"] | undefined = backend === "codex"
+    ? undefined
+      : {
+        agentLabel: providerDisplayName,
+        run: async ({ callID, prompt }) => {
+          const promptText = prompt.trim() || "Continue the user's requested task.";
+          const latestSettings = await loadSettings();
+          const latestSession = findSession(openAssistThreadID) ?? session;
+          const currentBackend = normalizeBackend(String(latestSession?.activeProvider ?? latestSettings.assistantBackend ?? backend));
+          const currentProviderLabel = providerLabel(currentBackend);
+          const providerRunID = `realtime-${currentBackend}-${callID || randomUUID().toLowerCase()}`;
+          providerTurnID = providerRunID;
+          activityTurnIDs = new Set<string>([providerRunID]);
+          const active = activeRealtimeSession;
+          if (active?.providerThreadID === providerThreadID) {
+            active.currentTurnID = providerRunID;
+            active.providerBackend = currentBackend;
+            active.provider = currentProviderLabel;
+          }
+          delegationStartedAt = Date.now();
+          latestDelegationStatus = "";
+          latestDelegationStatusAt = 0;
+          rememberDelegationStatus(promptText);
+          const startedActivity = realtimeDelegationActivity("running", promptText);
+          upsertRuntimeActivity(openAssistThreadID, startedActivity, providerRunID);
+          emitRealtimeActivity(startedActivity);
+          emitDelegationRefresh("thread/realtime/delegation/started", { prompt: promptText });
+
+          const providerEventSink = (providerEvent: ProviderRunEvent) => {
+            if (providerEvent.type === "activity") {
+              const title = String(providerEvent.activity.activityTitle || "").trim().toLowerCase();
+              const detail = String(providerEvent.activity.text || providerEvent.activity.activityDetail || "").trim();
+              if (title === currentProviderLabel.toLowerCase() && /^Running .+\.\.\.$/i.test(detail)) {
+                return;
+              }
+              upsertRuntimeActivity(openAssistThreadID, providerEvent.activity, providerRunID);
+              emitRealtimeActivity(providerEvent.activity);
+              rememberDelegationStatus(detail || providerEvent.activity.activityTitle || "");
+              return;
+            }
+            if (providerEvent.type !== "status") return;
+            if (/^Loading .+ provider\.\.\.$/i.test(providerEvent.text.trim())) return;
+            const statusActivity = realtimeDelegationActivity("running", providerEvent.text);
+            upsertRuntimeActivity(openAssistThreadID, statusActivity, providerRunID);
+            emitRealtimeActivity(statusActivity);
+            rememberDelegationStatus(providerEvent.text);
+          };
+
+          try {
+	            const result = await sendCodexMessage(
+              promptText,
+              openAssistThreadID,
+              [],
+              "",
+              options.reasoningEffort ?? latestSession?.latestReasoningEffort,
+              options.interactionMode ?? latestSession?.latestInteractionMode,
+              options.permissionMode ?? latestSession?.latestPermissionMode,
+              [],
+              providerRunID,
+              undefined,
+              providerEventSink
+            );
+            const responseText = result?.assistant?.text?.trim() || `${currentProviderLabel} finished the task.`;
+            const finalActivity = realtimeDelegationActivity("completed", promptText);
+            upsertRuntimeActivity(openAssistThreadID, finalActivity, providerRunID);
+            emitRealtimeActivity(finalActivity);
+            emitDelegationRefresh("thread/realtime/delegation/completed", {
+              prompt: promptText,
+              failed: false,
+              responseText
+            });
+            const latestActive = activeRealtimeSession;
+            if (latestActive?.providerThreadID === providerThreadID && latestActive.currentTurnID === providerRunID) {
+              latestActive.currentTurnID = undefined;
+              latestActive.delegationPending = false;
+              if (latestActive.realtimeTransportClosed) cleanupRealtimeStart();
+            } else {
+              codexTransport.off("notification", onNotification);
+            }
+            return responseText;
+          } catch (error) {
+            const message = error instanceof Error ? error.message : `${currentProviderLabel} failed.`;
+            const failedActivity = realtimeDelegationActivity("failed", message);
+            upsertRuntimeActivity(openAssistThreadID, failedActivity, providerRunID);
+            emitRealtimeActivity(failedActivity);
+            emitDelegationRefresh("thread/realtime/delegation/failed", {
+              prompt: promptText,
+              failed: true,
+              error: message
+            });
+            const latestActive = activeRealtimeSession;
+            if (latestActive?.providerThreadID === providerThreadID && latestActive.currentTurnID === providerRunID) {
+              latestActive.currentTurnID = undefined;
+              latestActive.delegationPending = false;
+              if (latestActive.realtimeTransportClosed) cleanupRealtimeStart();
+            } else {
+              codexTransport.off("notification", onNotification);
+            }
+            throw error;
+          }
+        }
+      };
+
   activeRealtimeSession = {
     openAssistThreadID,
     providerThreadID,
-    provider: "Codex",
+    provider: providerDisplayName,
+    providerBackend: backend,
     onNotification,
     eventSink
   };
   codexTransport.on("notification", onNotification);
 
+  const realtimeDelegatedStatus: RealtimeProxyConfig["delegatedStatus"] = {
+    current: () => currentRealtimeDelegationStatus()
+  };
+  const directRealtimeWork: RealtimeProxyConfig["directWork"] = {
+    onEvent: (work) => {
+      const now = Date.now();
+      const directTurnID = `realtime-direct-${work.callID}`;
+      const toolLabel = humanizeRuntimeName(work.toolName.replace(/^knowledge_/, "knowledge_"));
+      const detail = compactRealtimeStatus(work.detail || work.error || toolLabel, 700);
+      const prompt = compactRealtimeStatus(work.prompt || currentDelegationPrompt() || detail || "Realtime voice request", 360);
+      bridgeDebugLog(
+        `[realtime.voice] direct work ${work.status} tool=${work.toolName} call=${work.callID} prompt=${prompt.slice(0, 140)} detail=${detail.slice(0, 140)}`
+      );
+      const activity: ChatMessage = {
+        id: `activity-realtime-direct-${work.callID}`,
+        role: "activity",
+        provider: "Realtime",
+        text: detail || toolLabel,
+        status: work.status === "running" ? "running" : "completed",
+        activityTitle: "Realtime task",
+        activityKind: "realtimeDelegation",
+        activityStatus: work.status,
+        activityDetail: detail || toolLabel,
+        createdAt: now,
+        updatedAt: now
+      };
+      eventSink?.({
+        type: "thread/realtime/activity",
+        payload: {
+          threadId: openAssistThreadID,
+          providerThreadId: providerThreadID,
+          providerTurnId: directTurnID,
+          provider: "Realtime",
+          prompt,
+          activity
+        }
+      });
+      if (work.status === "completed") {
+        const focus = realtimeVisualFocusFromKnowledge(work.toolName, work.args, work.result);
+        if (focus) {
+          eventSink?.({
+            type: "thread/realtime/visualFocus",
+            payload: {
+              threadId: openAssistThreadID,
+              providerThreadId: providerThreadID,
+              providerTurnId: directTurnID,
+              provider: "Realtime",
+              callID: work.callID,
+              focus
+            }
+          });
+        }
+      }
+      eventSink?.({
+        type: work.status === "running"
+          ? "thread/realtime/delegation/started"
+          : work.status === "failed"
+            ? "thread/realtime/delegation/failed"
+            : "thread/realtime/delegation/completed",
+        payload: {
+          threadId: openAssistThreadID,
+          providerThreadId: providerThreadID,
+          providerTurnId: directTurnID,
+          provider: "Realtime",
+          prompt,
+          responseText: work.status === "completed" ? detail : "",
+          error: work.error || "",
+          realtimeDirectWork: true
+        }
+      });
+    }
+  };
+  const realtimeConnectionEvents: RealtimeProxyConfig["connection"] = {
+    onEvent: (connectionEvent) => {
+      const reason = connectionEvent.reason || connectionEvent.message || "";
+      bridgeDebugLog(
+        `[realtime.voice] proxy ${connectionEvent.type}${connectionEvent.attempt ? ` attempt=${connectionEvent.attempt}` : ""}${connectionEvent.delayMs ? ` delayMs=${connectionEvent.delayMs}` : ""}${reason ? ` reason=${reason}` : ""}`
+      );
+      if (connectionEvent.type === "upstream_reconnect_failed") {
+        const active = activeRealtimeSession;
+        if (active?.providerThreadID !== providerThreadID) return;
+        eventSink?.({
+          type: "thread/realtime/error",
+          payload: {
+            threadId: openAssistThreadID,
+            providerThreadId: providerThreadID,
+            provider: active.provider,
+            message: connectionEvent.message || "Live Voice reconnect failed.",
+            delegationActive: Boolean(active.currentTurnID || active.delegationPending),
+            realtimeTransportClosed: active.realtimeTransportClosed === true
+          }
+        });
+        return;
+      }
+      if (connectionEvent.type !== "client_closed") return;
+      const active = activeRealtimeSession;
+      if (active?.providerThreadID !== providerThreadID) return;
+      const hasWork = hasDelegatedTurnInFlight();
+      if (hasWork) {
+        active.realtimeTransportClosed = true;
+      } else {
+        cleanupRealtimeStart();
+      }
+      eventSink?.({
+        type: "thread/realtime/closed",
+        payload: {
+          threadId: openAssistThreadID,
+          providerThreadId: providerThreadID,
+          providerTurnId: active.currentTurnID,
+          provider: active.provider,
+          delegationActive: hasWork,
+          realtimeTransportClosed: hasWork,
+          reason: reason || "Realtime socket closed"
+        }
+      });
+    }
+  };
+
   try {
+    if (externalRealtimeHandoff) {
+      const proxyURL = await configureCodexRealtimeProxy(settings, externalRealtimeHandoff, realtimeDelegatedStatus, directRealtimeWork, realtimeConnectionEvents);
+      bridgeDebugLog(`[realtime.voice] proxy ready url=${proxyURL} handoff=${providerDisplayName}`);
+    } else {
+      const proxyURL = await configureCodexRealtimeProxy(settings, undefined, realtimeDelegatedStatus, directRealtimeWork, realtimeConnectionEvents);
+      bridgeDebugLog(`[realtime.voice] proxy ready url=${proxyURL} handoff=Codex`);
+    }
     const realtimeStartPrompt = [
-      "Start a live voice session for this OpenAssist Codex thread.",
+      `Start a live voice session for this OpenAssist ${providerDisplayName} thread.`,
+      openAssistLocalDateInstructions(),
+      typeof options.contextHint === "string" ? options.contextHint.trim().slice(0, 2400) : "",
       await pluginSelectionGuidanceText(realtimeRuntimeOptions.pluginIDs ?? [])
     ].filter(Boolean).join("\n\n");
     bridgeDebugLog(`[realtime.voice] sending thread/realtime/start providerThread=${providerThreadID}`);
@@ -8589,6 +20123,8 @@ async function startCodexRealtimeVoice(
         threadId: providerThreadID,
         outputModality: "audio",
         transport: { type: "websocket" },
+        // Codex validates this field against OpenAI voice IDs. The proxy still uses
+        // the selected Gemini voice from configureCodexRealtimeProxy().
         voice: settings.realtimeOpenAIVoice || defaultRealtimeOpenAIVoice,
         prompt: realtimeStartPrompt
       }, undefined, codexRealtimeStartTimeoutMs),
@@ -8596,6 +20132,7 @@ async function startCodexRealtimeVoice(
     ]));
     cleanupStartFailure();
     bridgeDebugLog(`[realtime.voice] start succeeded thread=${openAssistThreadID} providerThread=${providerThreadID}`);
+    const thread = threadItemForCompletedSession(session);
     eventSink?.({
       type: "thread/realtime/started",
       payload: {
@@ -8604,7 +20141,7 @@ async function startCodexRealtimeVoice(
         version: "v2"
       }
     });
-    return { ok: true, threadId: openAssistThreadID, providerThreadId: providerThreadID };
+    return { ok: true, threadId: openAssistThreadID, providerThreadId: providerThreadID, thread };
   } catch (error) {
     cleanupStartFailure();
     cleanupRealtimeStart();
@@ -8623,16 +20160,33 @@ async function appendCodexRealtimeAudio(audio: RealtimeAudioChunk) {
   if (!audio?.data || typeof audio.data !== "string") {
     return { ok: false, error: "Realtime audio chunk is empty." };
   }
-  await codexTransport.request("thread/realtime/appendAudio", {
-    threadId: active.providerThreadID,
-    audio: {
-      data: audio.data,
-      sampleRate: Number(audio.sampleRate) || 24000,
-      numChannels: Number(audio.numChannels) || 1,
-      samplesPerChannel: audio.samplesPerChannel == null ? null : Number(audio.samplesPerChannel),
-      itemId: audio.itemId ?? null
+  // TEMP DIAGNOSTIC: count + throttled-log forwarded audio so we can verify in
+  // electron-debug.log that mic audio reaches Codex (and the upstream realtime API).
+  realtimeAudioDiag.sends += 1;
+  realtimeAudioDiag.bytes += Math.round((audio.data.length * 3) / 4);
+  try {
+    await codexTransport.request("thread/realtime/appendAudio", {
+      threadId: active.providerThreadID,
+      audio: {
+        data: audio.data,
+        sampleRate: Number(audio.sampleRate) || 24000,
+        numChannels: Number(audio.numChannels) || 1,
+        samplesPerChannel: audio.samplesPerChannel == null ? null : Number(audio.samplesPerChannel),
+        itemId: audio.itemId ?? null
+      }
+    }, undefined, 10_000);
+    realtimeAudioDiag.ok += 1;
+  } catch (error) {
+    realtimeAudioDiag.fail += 1;
+    bridgeDebugLog(`[realtime.audio-diag] appendAudio to Codex FAILED: ${error instanceof Error ? error.message : String(error)}`);
+    throw error;
+  } finally {
+    const now = Date.now();
+    if (now - realtimeAudioDiag.lastLogAt >= 1000) {
+      bridgeDebugLog(`[realtime.audio-diag] forwarded sends=${realtimeAudioDiag.sends} ok=${realtimeAudioDiag.ok} fail=${realtimeAudioDiag.fail} kb=${Math.round(realtimeAudioDiag.bytes / 1024)} turn=${active.currentTurnID || "none"} transportClosed=${String(Boolean(active.realtimeTransportClosed))}`);
+      realtimeAudioDiag.lastLogAt = now;
     }
-  }, undefined, 10_000);
+  }
   return { ok: true };
 }
 
@@ -8646,6 +20200,31 @@ async function appendCodexRealtimeText(text: string) {
     text: trimmed
   }, undefined, 15_000);
   return { ok: true };
+}
+
+async function appendCodexRealtimeImages(input: unknown) {
+  const active = activeRealtimeSession;
+  if (!active) return { ok: false, error: "Realtime Voice is not running." };
+  const object = jsonObject(input) ?? {};
+  const rawImages = Array.isArray(object.images) ? object.images : Array.isArray(input) ? input : [];
+  const images = composerImageAttachmentsOf(normalizeComposerImageAttachments(rawImages));
+  if (!images.length) return { ok: false, error: "No image context to send." };
+  const text = firstRawRuntimeString(object.text)
+    || [
+      "The user shared image context in the current OpenAssist thread.",
+      "Use these images if the user says this, image, screenshot, diagram, photo, attachment, or asks you to read/look at something.",
+      "Do not respond just because this context arrived; wait for the user's voice request."
+    ].join(" ");
+  const context: RealtimeVisualContext = {
+    text,
+    createResponse: object.createResponse === true,
+    images: images.map((image) => ({
+      dataURL: image.dataURL,
+      mimeType: image.mimeType,
+      name: image.name
+    }))
+  };
+  return codexRealtimeProxy.appendVisualContext(context);
 }
 
 async function stopCodexRealtimeVoice() {
@@ -9226,11 +20805,19 @@ function threadItemForCompletedSession(session: SessionSummary) {
 
 function modelForBackend(backend: AssistantBackend, settings: SettingsSnapshot, session?: SessionSummary) {
   const binding = providerBinding(session, backend);
+  if (backend === "ollamaLocal") {
+    return normalizedModelForBackend(backend, pluginString(
+      settings.promptRewriteModel,
+      binding?.latestModelID,
+      session?.modelID,
+      session?.latestModel
+    ));
+  }
   const requested = pluginString(
     binding?.latestModelID,
     session?.modelID,
     session?.latestModel,
-    backend === "ollamaLocal" ? settings.promptRewriteModel : settings.model
+    settings.model
   );
   return normalizedModelForBackend(backend, requested);
 }
@@ -9248,18 +20835,28 @@ function transcriptEntry(role: "system" | "user" | "assistant", text: string, ba
   };
 }
 
-function timelineUserMessage(threadID: string, text: string, createdAt: number): JsonObject {
-  return {
+function timelineUserMessage(
+  threadID: string,
+  text: string,
+  createdAt: number,
+  attachments: ComposerImageAttachment[] = [],
+  source = "runtime"
+): JsonObject {
+  const entry: JsonObject = {
     id: makeID(),
     kind: "userMessage",
     sessionID: threadID,
-    source: "runtime",
+    source,
     text,
     emphasis: false,
     isStreaming: false,
     createdAt,
     updatedAt: createdAt
   };
+  if (attachments.length) {
+    entry.attachments = persistComposerMessageAttachments(threadID, attachments);
+  }
+  return entry;
 }
 
 function timelineAssistantFinal(
@@ -9271,13 +20868,14 @@ function timelineAssistantFinal(
   createdAt: number,
   id = `assistant-final-${makeID()}`,
   checkpointReferences: string[] = [],
-  artifacts: MessageArtifact[] = []
+  artifacts: MessageArtifact[] = [],
+  source = "runtime"
 ): JsonObject {
   return {
     id,
     kind: "assistantFinal",
     sessionID: threadID,
-    source: "runtime",
+    source,
     text,
     emphasis: false,
     isStreaming: false,
@@ -9289,6 +20887,16 @@ function timelineAssistantFinal(
     createdAt,
     updatedAt: createdAt
   };
+}
+
+const RUNTIME_DETAIL_MAX_CHARS = 12_000;
+const RUNTIME_DETAIL_TRUNCATED_SUFFIX = "\n\n... output shortened in Open Assist.";
+
+function truncateRuntimeDetailText(value: string, maxLength = RUNTIME_DETAIL_MAX_CHARS) {
+  if (value.length <= maxLength) return value;
+  const suffix = RUNTIME_DETAIL_TRUNCATED_SUFFIX;
+  const room = Math.max(0, maxLength - suffix.length);
+  return `${value.slice(0, room).trimEnd()}${suffix}`;
 }
 
 function compactRuntimeDetail(value: unknown, maxLength = 320) {
@@ -9329,8 +20937,8 @@ function storedRuntimeString(...values: unknown[]) {
   for (const value of values) {
     const text = typeof value === "string"
       ? value.trim()
-      : compactRuntimeDetail(value, 12_000);
-    if (text) return text.length > 12_000 ? `${text.slice(0, 11_999).trimEnd()}...` : text;
+      : compactRuntimeDetail(value, RUNTIME_DETAIL_MAX_CHARS);
+    if (text) return truncateRuntimeDetailText(text);
   }
   return "";
 }
@@ -9499,7 +21107,7 @@ function normalizeArtifactPath(rawPath: string) {
 }
 
 function messageArtifactFromPath(rawPath: string): MessageArtifact | null {
-  const filePath = normalizeArtifactPath(rawPath);
+  const filePath = resolveMovedAgentFilesPath(normalizeArtifactPath(rawPath));
   if (!fs.existsSync(filePath)) return null;
   const stat = fs.statSync(filePath);
   if (!stat.isFile()) return null;
@@ -9716,17 +21324,18 @@ function runtimeToolImageFields(params: JsonObject, item: JsonObject): Pick<Chat
   return found;
 }
 
-function appendRuntimeDelta(existing: string, delta: string) {
+function appendRuntimeDelta(existing: string, delta: string, maxLength = RUNTIME_DETAIL_MAX_CHARS) {
   const nextDelta = String(delta ?? "");
   if (!nextDelta) return existing;
-  if (!existing) return nextDelta;
+  if (existing.includes(RUNTIME_DETAIL_TRUNCATED_SUFFIX)) return existing;
+  if (!existing) return truncateRuntimeDetailText(nextDelta, maxLength);
   if (existing.includes(nextDelta)) return existing;
-  if (nextDelta.includes(existing)) return nextDelta;
+  if (nextDelta.includes(existing)) return truncateRuntimeDetailText(nextDelta, maxLength);
   const needsSpace = !/\s$/.test(existing)
     && !/^\s/.test(nextDelta)
     && /[A-Za-z0-9)`\]]$/.test(existing)
     && /^[A-Za-z0-9`([]/.test(nextDelta);
-  return `${existing}${needsSpace ? " " : ""}${nextDelta}`;
+  return truncateRuntimeDetailText(`${existing}${needsSpace ? " " : ""}${nextDelta}`, maxLength);
 }
 
 function runtimeItemPayload(params: JsonObject) {
@@ -10246,6 +21855,8 @@ function persistCompletedTurn({
   assistantMessageID,
   checkpointReferences = [],
   assistantArtifacts = [],
+  userAttachments = [],
+  userSource = "runtime",
   reasoningEffort,
   interactionMode,
   permissionMode
@@ -10262,6 +21873,8 @@ function persistCompletedTurn({
   assistantMessageID?: string;
   checkpointReferences?: string[];
   assistantArtifacts?: MessageArtifact[];
+  userAttachments?: ComposerImageAttachment[];
+  userSource?: string;
   reasoningEffort?: string;
   interactionMode?: string;
   permissionMode?: string;
@@ -10286,7 +21899,7 @@ function persistCompletedTurn({
   const userCreatedAt = firstActivityCreatedAt ? Math.max(0, firstActivityCreatedAt - 0.000001) : currentSwiftDate();
   const assistantCreatedAt = currentSwiftDate();
   const finalizedTurnActivities = currentTurnActivities.map((entry) => finalizedTimelineActivity(entry, assistantCreatedAt));
-  const userTimeline = timelineUserMessage(threadID, prompt, userCreatedAt);
+  const userTimeline = timelineUserMessage(threadID, prompt, userCreatedAt, isTransient ? [] : userAttachments, userSource);
   const turnCheckpointReferences = [...checkpointReferences];
   const assistantTimeline = timelineAssistantFinal(
     threadID,
@@ -10297,7 +21910,8 @@ function persistCompletedTurn({
     assistantCreatedAt,
     assistantMessageID,
     turnCheckpointReferences,
-    assistantArtifacts
+    assistantArtifacts,
+    userSource
   );
   timeline.length = 0;
   timeline.push(...timelineWithoutTurnActivities, userTimeline, ...finalizedTurnActivities, assistantTimeline);
@@ -10344,42 +21958,974 @@ function persistCompletedTurn({
   };
 }
 
+function errorMessage(error: unknown) {
+  return error instanceof Error ? error.message : String(error ?? "");
+}
+
+function isMissingCodexRolloutError(error: unknown) {
+  const message = errorMessage(error);
+  return /no rollout found for thread id/i.test(message);
+}
+
 async function ensureCodexProviderSession(threadID: string, modelID: string, options: CodexRuntimeOptions = {}) {
   const session = findSession(threadID) ?? ensureOpenAssistSessionRecord(threadID, "codex", modelID);
   const existing = providerBinding(session, "codex")?.providerSessionID;
+  const startFreshProviderSession = async () => {
+    const started = await codexTransport.request("thread/start", codexThreadStartParams(session, modelID, options)) as JsonObject;
+    const thread = started.thread as JsonObject | undefined;
+    const providerSessionID = String(thread?.id ?? "");
+    if (!providerSessionID) throw new Error("Codex did not return a thread id.");
+    updateProviderBinding(threadID, "codex", providerSessionID, modelID);
+    return { providerSessionID, insertedSystemMessage: true };
+  };
   if (typeof existing === "string" && existing.trim()) {
-    await codexTransport.request("thread/resume", codexThreadResumeParams(existing, session, modelID, options));
-    updateProviderBinding(threadID, "codex", existing, modelID);
-    return { providerSessionID: existing, insertedSystemMessage: false };
+    const existingProviderSessionID = existing.trim();
+    try {
+      await codexTransport.request("thread/resume", codexThreadResumeParams(existingProviderSessionID, session, modelID, options));
+      updateProviderBinding(threadID, "codex", existingProviderSessionID, modelID);
+      return { providerSessionID: existingProviderSessionID, insertedSystemMessage: false };
+    } catch (error) {
+      if (!isMissingCodexRolloutError(error)) throw error;
+      bridgeDebugLog(
+        `[codex.provider] stale Codex provider thread=${existingProviderSessionID} for OpenAssist thread=${threadID}; starting fresh provider session after resume failed: ${errorMessage(error)}`
+      );
+    }
   }
-  const started = await codexTransport.request("thread/start", codexThreadStartParams(session, modelID, options)) as JsonObject;
-  const thread = started.thread as JsonObject | undefined;
-  const providerSessionID = String(thread?.id ?? "");
-  if (!providerSessionID) throw new Error("Codex did not return a thread id.");
-  updateProviderBinding(threadID, "codex", providerSessionID, modelID);
-  return { providerSessionID, insertedSystemMessage: true };
+  return startFreshProviderSession();
 }
 
-async function sendOllamaMessage(threadID: string, prompt: string, modelID: string) {
-  const snapshot = readConversationSnapshot(threadID);
-  const messages = (snapshot.transcript ?? [])
-    .filter((entry) => entry.role === "user" || entry.role === "assistant")
-    .map((entry) => ({ role: entry.role === "assistant" ? "assistant" : "user", content: String(entry.text ?? "") }))
-    .filter((entry) => entry.content);
-  messages.push({ role: "user", content: prompt });
-  const response = await fetch("http://127.0.0.1:11434/api/chat", {
+type OllamaToolContext = {
+  threadID: string;
+  providerTurnID: string;
+  agentFilesPath: string;
+  settings: SettingsSnapshot;
+  permissionMode?: string;
+  activeRun?: ActiveProviderRun;
+  emitActivity?: (activity: ChatMessage) => void;
+};
+
+type OllamaMessage = {
+  role: "system" | "user" | "assistant" | "tool";
+  content: string;
+  name?: string;
+  tool_name?: string;
+  tool_calls?: unknown[];
+};
+
+const ollamaAgentFileTools = [
+  {
+    name: "oa_agent_files_list",
+    description: "List files in this thread's OpenAssist Agent Files folder. Use this for saved reports, dashboards, notes, JSON, CSV, HTML, images, and analysis outputs.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Relative folder path inside Agent Files. Defaults to the root." },
+        limit: { type: "number" }
+      },
+      required: [],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "oa_agent_files_read",
+    description: "Read a text file from this thread's OpenAssist Agent Files folder.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Relative file path inside Agent Files." }
+      },
+      required: ["path"],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "oa_agent_files_write",
+    description: "Write a generated file into this thread's OpenAssist Agent Files folder. Do not write linked repo files unless the user clearly asked for repo changes.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Relative file path inside Agent Files." },
+        content: { type: "string" }
+      },
+      required: ["path", "content"],
+      additionalProperties: false
+    }
+  }
+] as const;
+
+const ollamaUtilityTools = [
+  {
+    name: "oa_run_shell",
+    description: "Run one shell command from the thread Agent Files folder. Use only for work that really needs local command output. Generated outputs should be saved in Agent Files.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        command: { type: "string" },
+        timeoutMs: { type: "number" }
+      },
+      required: ["command"],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "oa_delegate_to_codex",
+    description: "Use when the task needs Codex/provider tools that Ollama does not directly have, such as browser/computer actions, complex repo edits, or unclear destructive changes.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        reason: { type: "string" },
+        task: { type: "string" }
+      },
+      required: ["reason"],
+      additionalProperties: false
+    }
+  }
+] as const;
+
+function canonicalOllamaToolName(name: string) {
+  const normalized = name.trim().replace(/[\s.-]+/g, "_").toLowerCase();
+  switch (normalized) {
+    case "search":
+    case "search_notes":
+    case "knowledge_search":
+      return "oa_search";
+    case "search_everything":
+    case "search_history":
+    case "search_threads":
+    case "knowledge_search_everything":
+      return "oa_search_everything";
+    case "read_search_result":
+    case "open_search_result":
+      return "oa_read_search_result";
+    case "read":
+    case "read_note":
+    case "knowledge_read":
+      return "oa_read";
+    case "read_today":
+    case "get_today":
+    case "today":
+      return "oa_read_today";
+    case "list_daily_items":
+    case "list_today_items":
+    case "daily_items":
+    case "today_items":
+      return "oa_list_daily_items";
+    case "list_backlog_items":
+    case "backlog_items":
+    case "list_backlog":
+      return "oa_list_backlog_items";
+    case "read_journal":
+    case "journal":
+      return "oa_read_journal";
+    case "list_open_tasks":
+    case "open_tasks":
+    case "unfinished_tasks":
+      return "oa_list_open_tasks";
+    case "backlinks":
+    case "list_backlinks":
+      return "oa_backlinks";
+    case "request_add":
+    case "add_note":
+    case "add_to_note":
+      return "oa_request_add";
+    case "request_daily_item":
+    case "add_daily_item":
+    case "add_task":
+    case "create_task":
+    case "create_daily_item":
+      return "oa_request_daily_item";
+    case "request_backlog_item":
+    case "add_backlog_item":
+    case "create_backlog_item":
+      return "oa_request_backlog_item";
+    case "request_patch":
+    case "patch_note":
+    case "update_note":
+      return "oa_request_patch";
+    case "request_organize":
+    case "organize_note":
+    case "organize":
+      return "oa_request_organize";
+    case "request_carry_forward":
+    case "carry_forward":
+      return "oa_request_carry_forward";
+    case "request_move_to_backlog":
+    case "move_to_backlog":
+    case "backlog_move":
+      return "oa_request_move_to_backlog";
+    case "complete_daily_item":
+    case "mark_done":
+    case "mark_task_done":
+      return "oa_complete_daily_item";
+    case "shell":
+    case "bash":
+    case "run_shell":
+    case "shell_execute":
+    case "execute_shell":
+    case "terminal":
+    case "terminal_execute":
+      return "oa_run_shell";
+    case "delegate":
+    case "delegate_to_codex":
+    case "codex_delegate":
+      return "oa_delegate_to_codex";
+    case "agent_files_list":
+    case "files_list":
+    case "list_files":
+      return "oa_agent_files_list";
+    case "agent_files_read":
+    case "files_read":
+    case "read_file":
+      return "oa_agent_files_read";
+    case "agent_files_write":
+    case "files_write":
+    case "write_file":
+      return "oa_agent_files_write";
+    default:
+      return normalized;
+  }
+}
+
+function ollamaToolIsMutating(name: string) {
+  const normalizedName = canonicalOllamaToolName(name);
+  return normalizedName.startsWith("oa_request")
+    || normalizedName.startsWith("knowledge_request")
+    || normalizedName === "oa_complete_daily_item"
+    || normalizedName === "knowledge_complete_daily_item"
+    || normalizedName === "oa_agent_files_write"
+    || normalizedName === "oa_run_shell";
+}
+
+function stableToolValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(stableToolValue);
+  const object = jsonObject(value);
+  if (!object) return value;
+  return Object.fromEntries(
+    Object.keys(object)
+      .sort()
+      .map((key) => [key, stableToolValue(object[key])])
+  );
+}
+
+function stableToolKey(name: string, args: JsonObject) {
+  const normalizedName = canonicalOllamaToolName(name);
+  if (normalizedName === "oa_request_daily_item" || normalizedName === "knowledge_request_daily_item") {
+    return [
+      normalizedName,
+      normalizePlannerDayID(String(args.dayID ?? args.date ?? "")),
+      dailyItemDedupeCore(args.title ?? args.text ?? args.task ?? ""),
+      cleanDailyText(args.area ?? ""),
+      cleanDailyText(args.detailsMarkdown ?? args.details ?? "")
+    ].join("|");
+  }
+  if (normalizedName === "oa_request_backlog_item" || normalizedName === "knowledge_request_backlog_item") {
+    return [
+      normalizedName,
+      dailyItemDedupeCore(args.title ?? args.text ?? args.task ?? ""),
+      cleanDailyText(args.area ?? ""),
+      cleanDailyText(args.detailsMarkdown ?? args.details ?? "")
+    ].join("|");
+  }
+  if (normalizedName === "oa_complete_daily_item" || normalizedName === "knowledge_complete_daily_item") {
+    return [
+      normalizedName,
+      normalizePlannerDayID(String(args.dayID ?? args.date ?? "")),
+      dailyItemDedupeCore(args.title ?? args.text ?? args.query ?? args.task ?? ""),
+      args.checked === false || args.done === false || args.uncheck === true ? "unchecked" : "checked"
+    ].join("|");
+  }
+  return `${normalizedName}:${JSON.stringify(stableToolValue(args))}`;
+}
+
+function ollamaToolSpecs(settings: SettingsSnapshot, permissionMode?: string) {
+  const tools: Array<{ name: string; description: string; inputSchema: JsonObject }> = [];
+  if (settings.knowledgeAccessEnabled && settings.knowledgeAgentAccessEnabled) {
+    tools.push(
+      ...knowledgeMCPTools
+        .filter((tool) => settings.knowledgeOrganizerEnabled || !ollamaToolIsMutating(tool.name))
+        .map((tool) => ({
+          name: tool.name,
+          description: tool.description,
+          inputSchema: tool.inputSchema as JsonObject
+        }))
+    );
+  }
+  tools.push(...ollamaAgentFileTools.map((tool) => ({
+    name: tool.name,
+    description: tool.description,
+    inputSchema: tool.inputSchema as JsonObject
+  })));
+  if (normalizeCodexPermissionMode(permissionMode) === "fullAccess") {
+    tools.push(ollamaUtilityTools[0] as { name: string; description: string; inputSchema: JsonObject });
+  }
+  tools.push(ollamaUtilityTools[1] as { name: string; description: string; inputSchema: JsonObject });
+  return tools.map((tool) => ({
+    type: "function",
+    function: {
+      name: tool.name,
+      description: tool.description,
+      parameters: tool.inputSchema
+    }
+  }));
+}
+
+function stripOllamaStoragePrompt(value: string) {
+  const text = value.trim();
+  if (!text.startsWith("OpenAssist storage rules:")) return text;
+  const marker = "\n\nUser task:\n";
+  const markerIndex = text.indexOf(marker);
+  return markerIndex >= 0 ? text.slice(markerIndex + marker.length).trim() : text;
+}
+
+function currentUserTaskText(value: string) {
+  const text = stripOllamaStoragePrompt(value);
+  const marker = "\n\nUser task:\n";
+  const markerIndex = text.lastIndexOf(marker);
+  return markerIndex >= 0 ? text.slice(markerIndex + marker.length).trim() : text.trim();
+}
+
+function ollamaPromptNeedsTools(prompt: string, settings: SettingsSnapshot, permissionMode?: string) {
+  const normalized = prompt.toLowerCase();
+  const knowledgeEnabled = settings.knowledgeAccessEnabled && settings.knowledgeAgentAccessEnabled;
+  const mentionsKnowledge = /\b(note|notes|today|planner|journal|backlog|task|todo|reminder|remember|approval|request id|thread|project|when did|where did|what did we|find.*discussion|search.*openassist|mark .*done|complete .*task|carry forward)\b/.test(normalized);
+  const wantsKnowledgeMutation = /\b(add|create|schedule|move|organize|clean up|fix|patch|update|delete|mark|complete|carry forward)\b/.test(normalized)
+    && /\b(note|today|planner|backlog|task|todo|reminder|journal)\b/.test(normalized);
+  const wantsFiles = /\b(agent files|save .*file|write .*file|create .*file|report|dashboard|csv|json|html|artifact|export|downloads?|folder|directory|latest files?|what'?s in|contents?)\b/.test(normalized);
+  const wantsShellOrDelegation = /\b(shell|terminal|command|run |build|test|install|repo|code|browser|computer use|screenshot|edit file|source file|downloads?|folder|directory|latest files?|csv|pdf|png|jpe?g|mp4)\b/.test(normalized);
+  return (knowledgeEnabled && (mentionsKnowledge || wantsKnowledgeMutation)) || wantsFiles || wantsShellOrDelegation || normalizeCodexPermissionMode(permissionMode) === "fullAccess" && /\b(run|command|shell|terminal)\b/.test(normalized);
+}
+
+function ollamaToolName(tool: unknown) {
+  const object = jsonObject(tool) ?? {};
+  const fn = jsonObject(object.function) ?? {};
+  return String(fn.name ?? "");
+}
+
+function filterOllamaToolsForPrompt(
+  tools: ReturnType<typeof ollamaToolSpecs>,
+  prompt: string,
+  permissionMode?: string
+) {
+  const normalized = prompt.toLowerCase();
+  const names = new Set<string>();
+  const add = (...items: string[]) => items.forEach((item) => names.add(item));
+
+  if (/\b(search|find|when did|where did|what did we|remember|decision|discussion|history|earlier|previous|thread|note|notes|project)\b/.test(normalized)) {
+    add("oa_search", "oa_search_everything", "oa_read_search_result", "oa_read", "oa_backlinks");
+  }
+  if (/\b(today|planner|journal|daily|task|todo|reminder|backlog|open task|unfinished|done|complete|carry forward)\b/.test(normalized)) {
+    add("oa_read_today", "oa_list_daily_items", "oa_list_backlog_items", "oa_read_journal", "oa_list_open_tasks");
+  }
+  if (/\b(add|create|schedule|move|organize|clean up|fix|patch|update|mark|complete|carry forward)\b/.test(normalized)
+      && /\b(note|today|planner|backlog|task|todo|reminder|journal|checkbox|checklist)\b/.test(normalized)) {
+    add("oa_request_add", "oa_request_daily_item", "oa_request_backlog_item", "oa_request_patch", "oa_request_organize", "oa_request_carry_forward", "oa_request_move_to_backlog", "oa_complete_daily_item");
+  }
+  if (/\b(agent files|save|write|file|report|dashboard|csv|json|html|artifact|export)\b/.test(normalized)) {
+    add("oa_agent_files_list", "oa_agent_files_read", "oa_agent_files_write");
+  }
+  if (/\b(shell|terminal|command|run |build|test|install|downloads?|folder|directory|latest files?|what'?s in|contents?|csv|pdf|png|jpe?g|mp4)\b/.test(normalized) && normalizeCodexPermissionMode(permissionMode) === "fullAccess") {
+    add("oa_run_shell");
+  }
+  if (/\b(repo|code|browser|computer use|screenshot|edit file|source file|delegate|shell|terminal|command|run |build|test|install)\b/.test(normalized)) {
+    add("oa_delegate_to_codex");
+  }
+
+  if (!names.size) return tools;
+  const filtered = tools.filter((tool) => names.has(ollamaToolName(tool)));
+  return filtered.length ? filtered : tools;
+}
+
+function ollamaToolCallName(call: unknown) {
+  const object = jsonObject(call) ?? {};
+  const fn = jsonObject(object.function) ?? {};
+  return firstRuntimeString(fn.name, object.name, object.tool, object.tool_name);
+}
+
+function ollamaToolCallArgs(call: unknown): JsonObject {
+  const object = jsonObject(call) ?? {};
+  const fn = jsonObject(object.function) ?? {};
+  const raw = fn.arguments ?? object.arguments ?? object.args ?? object.input ?? {};
+  if (typeof raw === "string") {
+    try {
+      return jsonObject(JSON.parse(raw)) ?? {};
+    } catch {
+      return { value: raw };
+    }
+  }
+  return jsonObject(raw) ?? {};
+}
+
+function safeAgentFilesToolPath(root: string, rawPath: unknown, fallback = ".") {
+  const raw = String(rawPath ?? fallback).trim() || fallback;
+  const target = path.isAbsolute(raw) ? path.resolve(raw) : path.resolve(root, raw);
+  if (!pathIsInside(target, root)) {
+    throw new Error("That path is outside this thread's Agent Files folder.");
+  }
+  return target;
+}
+
+function ollamaToolResultText(result: unknown) {
+  const text = typeof result === "string" ? result : JSON.stringify(result, null, 2);
+  return truncateRuntimeDetailText(text, 12_000);
+}
+
+function ollamaToolActivity(
+  context: OllamaToolContext,
+  toolName: string,
+  args: JsonObject,
+  status: ChatMessage["activityStatus"],
+  result?: unknown
+) {
+  const title = toolName === "oa_run_shell"
+    ? "Ollama Shell"
+    : toolName.startsWith("oa_agent_files")
+      ? `Agent Files: ${humanizeRuntimeName(toolName.replace(/^oa_agent_files_/, ""))}`
+      : `OpenAssist: ${humanizeRuntimeName(toolName.replace(/^oa_/, ""))}`;
+  const detail = result == null
+    ? compactRuntimeDetail(args, 700)
+    : ollamaToolResultText(result);
+  const activity: ChatMessage = {
+    id: `activity-ollama-${context.providerTurnID}-${createHash("sha1").update(`${toolName}:${JSON.stringify(stableToolValue(args))}`).digest("hex").slice(0, 12)}`,
+    role: "activity",
+    text: detail,
+    provider: providerLabel("ollamaLocal"),
+    status: status === "completed" || status === "failed" ? "completed" : "running",
+    activityTitle: title,
+    activityKind: toolName.startsWith("oa_") ? "mcpToolCall" : "tool",
+    activityStatus: status,
+    activityDetail: detail,
+    createdAt: Date.now(),
+    updatedAt: Date.now()
+  };
+  context.emitActivity?.(activity);
+  upsertRuntimeActivity(context.threadID, activity, context.providerTurnID);
+}
+
+// Streams the model's reasoning trace into a single, mergeable "Thinking"
+// activity so the UI can render a live, collapsible thought block (like the
+// Ollama app's "Thought for Ns"). Throttled to avoid flooding the IPC channel.
+function makeOllamaReasoningEmitter(
+  threadID: string,
+  providerTurnID: string,
+  emitActivity?: (activity: ChatMessage) => void
+) {
+  const startedAt = Date.now();
+  let accumulated = "";
+  let lastEmit = 0;
+  const flush = (done: boolean) => {
+    const text = accumulated.trim();
+    if (!text) return;
+    const now = Date.now();
+    if (!done && now - lastEmit < 120) return;
+    lastEmit = now;
+    const activity: ChatMessage = {
+      id: `activity-ollama-reasoning-${providerTurnID}`,
+      role: "activity",
+      text,
+      provider: providerLabel("ollamaLocal"),
+      status: done ? "completed" : "running",
+      activityTitle: "Thinking",
+      activityKind: "reasoning",
+      activityStatus: done ? "completed" : "running",
+      activityDetail: text,
+      createdAt: startedAt,
+      updatedAt: now
+    };
+    emitActivity?.(activity);
+    upsertRuntimeActivity(threadID, activity, providerTurnID);
+  };
+  return {
+    onThinking: (delta: string) => {
+      accumulated += delta;
+      flush(false);
+    },
+    finish: () => flush(true)
+  };
+}
+
+function ollamaAgentInstructions(settings: SettingsSnapshot, agentFilesPath: string, permissionMode?: string) {
+  return [
+    "# OpenAssist Ollama Agent",
+    "",
+    openAssistKnowledgeAgentInstructions("Ollama"),
+    "",
+    "Use tools when the answer depends on OpenAssist notes, Today, Backlog, saved thread files, or local command output.",
+    "Tool names are exact. For shell/local filesystem inspection, call `oa_run_shell` with `{ \"command\": \"...\" }`; do not invent names like `shell_execute`.",
+    "Do not call the same write/add/complete tool twice for one user request. If a tool result says `duplicate_ignored`, stop repeating it and answer from the result you already have.",
+    "For simple planner and backlog tasks, use OpenAssist tools directly instead of delegating to Codex.",
+    "For generated reports, dashboards, CSV, JSON, HTML, notes, or analysis outputs, save them in this thread's Agent Files folder.",
+    `Agent Files folder: ${agentFilesPath}`,
+    "Linked repos are read/context unless the user clearly asks to change repo files, for example `create docs/summary.md in the repo`.",
+    normalizeCodexPermissionMode(permissionMode) === "fullAccess"
+      ? "You may use the shell tool for local inspection or generation when needed."
+      : "Shell commands are not available in this permission mode. If a task needs shell, browser, computer use, or complex repo edits, explain that it needs Codex/provider delegation.",
+    settings.knowledgeAccessEnabled && settings.knowledgeAgentAccessEnabled
+      ? "OpenAssist Knowledge tools are available."
+      : "OpenAssist Knowledge tools are turned off in Settings."
+  ].join("\n");
+}
+
+async function runOllamaTool(
+  name: string,
+  args: JsonObject,
+  context: OllamaToolContext,
+  executedMutations: Set<string>
+) {
+  const normalizedName = canonicalOllamaToolName(name);
+  if (!normalizedName) throw new Error("Ollama requested a tool without a name.");
+  if (ollamaToolIsMutating(normalizedName)) {
+    const mutationKey = stableToolKey(normalizedName, args);
+    if (executedMutations.has(mutationKey)) {
+      return {
+        status: "duplicate_ignored",
+        message: "This write/add tool already ran for this user request. Do not call it again.",
+        tool: normalizedName
+      };
+    }
+    executedMutations.add(mutationKey);
+  }
+  if (normalizedName.startsWith("oa_request")
+      || normalizedName.startsWith("knowledge_request")
+      || normalizedName === "oa_complete_daily_item"
+      || normalizedName === "knowledge_complete_daily_item") {
+    if (!context.settings.knowledgeAccessEnabled || !context.settings.knowledgeAgentAccessEnabled) {
+      throw new Error("OpenAssist Knowledge tools are turned off in Settings.");
+    }
+    if (!context.settings.knowledgeOrganizerEnabled) {
+      throw new Error("OpenAssist Knowledge organizer writes are turned off in Settings.");
+    }
+  }
+  if ((normalizedName.startsWith("oa_") && knowledgeMCPTools.some((tool) => tool.name === normalizedName))
+      || normalizedName.startsWith("knowledge_")) {
+    return knowledgeToolResult(normalizedName, args, "mcp");
+  }
+  if (normalizedName === "oa_agent_files_list") {
+    const folderPath = safeAgentFilesToolPath(context.agentFilesPath, args.path, ".");
+    if (!fs.existsSync(folderPath)) return { path: folderPath, entries: [] };
+    if (!fs.statSync(folderPath).isDirectory()) throw new Error("Agent Files list path must be a folder.");
+    const limit = Math.max(1, Math.min(Number(args.limit ?? 100) || 100, 250));
+    const entries = fs.readdirSync(folderPath, { withFileTypes: true }).slice(0, limit).map((entry) => {
+      const entryPath = path.join(folderPath, entry.name);
+      const stat = fs.statSync(entryPath);
+      return {
+        name: entry.name,
+        path: path.relative(context.agentFilesPath, entryPath) || entry.name,
+        type: entry.isDirectory() ? "folder" : "file",
+        size: entry.isFile() ? stat.size : undefined,
+        updatedAt: stat.mtime.toISOString()
+      };
+    });
+    return { path: path.relative(context.agentFilesPath, folderPath) || ".", entries };
+  }
+  if (normalizedName === "oa_agent_files_read") {
+    const filePath = safeAgentFilesToolPath(context.agentFilesPath, args.path, "");
+    if (!fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) throw new Error("Agent Files read path is not a file.");
+    const stat = fs.statSync(filePath);
+    if (stat.size > 300_000) throw new Error("This file is too large for Ollama to read directly.");
+    return {
+      path: path.relative(context.agentFilesPath, filePath),
+      content: fs.readFileSync(filePath, "utf8")
+    };
+  }
+  if (normalizedName === "oa_agent_files_write") {
+    const filePath = safeAgentFilesToolPath(context.agentFilesPath, args.path, "");
+    const baseName = path.basename(filePath).toLowerCase();
+    if (baseName === "manifest.json" || baseName === agentFilesMovedToName.toLowerCase()) {
+      throw new Error("Agent Files system metadata cannot be overwritten.");
+    }
+    const content = String(args.content ?? "");
+    if (Buffer.byteLength(content, "utf8") > 2_000_000) throw new Error("The file content is too large to write from Ollama.");
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    fs.writeFileSync(filePath, content, "utf8");
+    return {
+      status: "written",
+      path: path.relative(context.agentFilesPath, filePath),
+      bytes: Buffer.byteLength(content, "utf8")
+    };
+  }
+  if (normalizedName === "oa_run_shell") {
+    if (normalizeCodexPermissionMode(context.permissionMode) !== "fullAccess") {
+      return {
+        status: "delegation_required",
+        message: "Shell is only available when the thread is in Full access. Use Codex/provider delegation for this task."
+      };
+    }
+    const command = String(args.command ?? "").trim();
+    if (!command) throw new Error("Shell command is empty.");
+    if (command.length > 4_000) throw new Error("Shell command is too long.");
+    const timeoutMs = Math.max(1_000, Math.min(Number(args.timeoutMs ?? 60_000) || 60_000, 180_000));
+    const result = await execCaptured("zsh", ["-lc", command], context.agentFilesPath, timeoutMs, context.activeRun);
+    return {
+      status: "completed",
+      cwd: context.agentFilesPath,
+      stdout: truncateRuntimeDetailText(result.stdout, 8_000),
+      stderr: truncateRuntimeDetailText(result.stderr, 4_000)
+    };
+  }
+  if (normalizedName === "oa_delegate_to_codex") {
+    return {
+      status: "delegation_required",
+      reason: String(args.reason ?? ""),
+      task: String(args.task ?? ""),
+      message: "This task needs Codex/provider delegation. Tell the user briefly what needs to be delegated."
+    };
+  }
+  throw new Error(`Unknown Ollama tool: ${normalizedName}`);
+}
+
+type OllamaThinkLevel = boolean | "low" | "medium" | "high";
+
+type OllamaStreamHandlers = {
+  think?: OllamaThinkLevel;
+  onContent?: (delta: string) => void;
+  onThinking?: (delta: string) => void;
+};
+
+// Parses Ollama's newline-delimited JSON stream (one JSON object per line),
+// pushing `content`/`thinking` deltas to the handlers as they arrive and
+// returning a payload shaped like the non-streaming /api/chat response.
+async function readOllamaStreamPayload(
+  response: Response,
+  handlers: OllamaStreamHandlers | undefined,
+  onActivity: () => void
+): Promise<JsonObject> {
+  const body = response.body as ReadableStream<Uint8Array> | null;
+  if (!body || typeof body.getReader !== "function") {
+    return await response.json() as JsonObject;
+  }
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let content = "";
+  let thinking = "";
+  const toolCalls: unknown[] = [];
+  let last: JsonObject = {};
+  const handleLine = (line: string) => {
+    const trimmed = line.trim();
+    if (!trimmed) return;
+    let parsed: JsonObject;
+    try {
+      parsed = JSON.parse(trimmed) as JsonObject;
+    } catch {
+      return;
+    }
+    last = parsed;
+    const message = jsonObject(parsed.message) ?? {};
+    const deltaThinking = typeof message.thinking === "string" ? message.thinking : "";
+    const deltaContent = typeof message.content === "string" ? message.content : "";
+    if (deltaThinking) {
+      thinking += deltaThinking;
+      handlers?.onThinking?.(deltaThinking);
+    }
+    if (deltaContent) {
+      content += deltaContent;
+      handlers?.onContent?.(deltaContent);
+    }
+    if (Array.isArray(message.tool_calls)) {
+      for (const call of message.tool_calls) toolCalls.push(call);
+    }
+  };
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      onActivity();
+      buffer += decoder.decode(value, { stream: true });
+      let newlineIndex = buffer.indexOf("\n");
+      while (newlineIndex !== -1) {
+        handleLine(buffer.slice(0, newlineIndex));
+        buffer = buffer.slice(newlineIndex + 1);
+        newlineIndex = buffer.indexOf("\n");
+      }
+    }
+    if (buffer.trim()) handleLine(buffer);
+  } finally {
+    try { reader.releaseLock(); } catch { /* ignore */ }
+  }
+  const message: JsonObject = { role: "assistant", content };
+  if (thinking) message.thinking = thinking;
+  if (toolCalls.length) message.tool_calls = toolCalls;
+  return { ...last, message } as JsonObject;
+}
+
+async function ollamaChat(
+  modelID: string,
+  messages: OllamaMessage[],
+  tools: unknown[],
+  stopPromise?: Promise<never>,
+  streamHandlers?: OllamaStreamHandlers
+) {
+  const controller = new AbortController();
+  // Idle timeout: the timer is reset on every streamed chunk, so long but
+  // steadily-progressing generations are not cut off, while a truly stuck
+  // server still fails after this many ms of silence.
+  const idleTimeoutMs = 120_000;
+  let timedOut = false;
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  let rejectTimeout: ((error: Error) => void) | undefined;
+  const timeoutError = () => new Error(`Ollama did not produce any output within ${Math.round(idleTimeoutMs / 1000)} seconds. The local model may be overloaded or too large for this Mac. Try a smaller model, stop/restart the Ollama server, or reduce the context size.`);
+  const armOllamaTimeout = () => {
+    if (timeout) clearTimeout(timeout);
+    timeout = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+      rejectTimeout?.(timeoutError());
+    }, idleTimeoutMs);
+  };
+  const clearOllamaTimeout = () => {
+    if (timeout) clearTimeout(timeout);
+    timeout = undefined;
+  };
+  const requestedModelID = modelID || defaultLocalVoiceModel;
+  let selectedModelID = requestedModelID;
+  try {
+    selectedModelID = await resolveAvailableOllamaModelID(requestedModelID);
+  } catch (error) {
+    if (error instanceof Error && /No Ollama models are installed|No usable Ollama model/.test(error.message)) throw error;
+  }
+  markOllamaModelUsed(selectedModelID);
+  const streaming = Boolean(streamHandlers);
+  const timeoutPromise = new Promise<never>((_resolve, reject) => {
+    rejectTimeout = reject;
+    armOllamaTimeout();
+  });
+  const raceExternal = <T,>(promise: Promise<T>): Promise<T> => Promise.race([
+    promise,
+    timeoutPromise,
+    ...(stopPromise ? [
+      stopPromise.catch((error) => {
+        controller.abort();
+        throw error;
+      })
+    ] : [])
+  ]) as Promise<T>;
+  const sendRequest = (nextModelID: string, think: OllamaThinkLevel) => fetch("http://127.0.0.1:11434/api/chat", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ model: modelID || "gemma4:e2b", messages, stream: false })
+    signal: controller.signal,
+    body: JSON.stringify({
+      model: nextModelID || defaultLocalVoiceModel,
+      messages,
+      tools,
+      stream: streaming,
+      think,
+      keep_alive: "5m",
+      options: {
+        num_ctx: 8192
+      }
+    })
   });
-  if (!response.ok) throw new Error(`Ollama returned ${response.status}.`);
-  const payload = await response.json() as JsonObject;
-  const message = payload.message as JsonObject | undefined;
-  return String(message?.content ?? "").trim() || "Ollama completed without a text response.";
+  const parseResponse = (response: Response): Promise<JsonObject> => raceExternal(
+    streaming
+      ? readOllamaStreamPayload(response, streamHandlers, armOllamaTimeout)
+      : response.json() as Promise<JsonObject>
+  );
+
+  let thinkValue: OllamaThinkLevel = streamHandlers?.think ?? false;
+  let activeModelID = selectedModelID;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    let response: Response;
+    try {
+      response = await raceExternal(sendRequest(activeModelID, thinkValue));
+    } catch (error) {
+      clearOllamaTimeout();
+      if (error instanceof ProviderRunStoppedError) throw error;
+      if (error instanceof Error && /^Ollama did not produce/i.test(error.message)) throw error;
+      if (error instanceof Error && error.name === "AbortError" && timedOut) throw timeoutError();
+      if (error instanceof Error && error.name === "AbortError") throw error;
+      const detail = error instanceof Error && error.message ? ` (${error.message})` : "";
+      throw new Error(`Ollama is not running or is not reachable at 127.0.0.1:11434. Start it with \`ollama serve\`, then try again.${detail}`);
+    }
+    if (response.ok) {
+      try {
+        const payload = await parseResponse(response);
+        markOllamaModelUsed(activeModelID);
+        clearOllamaTimeout();
+        return payload;
+      } catch (error) {
+        clearOllamaTimeout();
+        throw error;
+      }
+    }
+    const detail = await response.text().catch(() => "");
+    // Some models reject `think`; transparently retry once without it.
+    if (thinkValue && /does not support thinking|thinking is not supported|unknown field.*think|invalid.*think/i.test(detail)) {
+      bridgeDebugLog(`[ollama] model ${activeModelID} does not support thinking; retrying without it`);
+      thinkValue = false;
+      armOllamaTimeout();
+      continue;
+    }
+    if (response.status === 404 && activeModelID !== defaultLocalVoiceModel && /model.+not found/i.test(detail)) {
+      bridgeDebugLog(`[ollama] model ${activeModelID} not found; retrying with ${defaultLocalVoiceModel}`);
+      activeModelID = await resolveAvailableOllamaModelID(defaultLocalVoiceModel).catch(() => defaultLocalVoiceModel);
+      armOllamaTimeout();
+      continue;
+    }
+    clearOllamaTimeout();
+    throw new Error(`Ollama returned ${response.status}${detail ? `: ${shortSearchText(detail, 300)}` : ""}.`);
+  }
+  clearOllamaTimeout();
+  throw new Error("Ollama could not complete the request.");
+}
+
+async function sendOllamaMessage(
+  threadID: string,
+  prompt: string,
+  modelID: string,
+  settings: SettingsSnapshot,
+  options: {
+    providerTurnID: string;
+    agentFilesPath: string;
+    permissionMode?: string;
+    activeRun?: ActiveProviderRun;
+    stopPromise?: Promise<never>;
+    emitActivity?: (activity: ChatMessage) => void;
+    emitDelta?: (delta: string) => void;
+  }
+) {
+  const promptForModel = stripOllamaStoragePrompt(prompt);
+  const currentPrompt = currentUserTaskText(promptForModel);
+  if (isSimpleChatPrompt(currentPrompt)) {
+    // Greetings stay snappy: stream the reply, but skip thinking entirely.
+    const payload = await ollamaChat(modelID, [
+      {
+        role: "system",
+        content: "The user sent a brief greeting or acknowledgement. Reply with one short friendly message and ask how you can help. Do not use tools."
+      },
+      { role: "user", content: currentPrompt }
+    ], [], options.stopPromise, {
+      think: false,
+      onContent: options.emitDelta
+    });
+    const message = jsonObject(payload.message) ?? {};
+    return String(message.content ?? "").trim() || "Hi! How can I help?";
+  }
+
+  const snapshot = readConversationSnapshot(threadID);
+  const recentMessages: OllamaMessage[] = (snapshot.transcript ?? [])
+    .filter((entry) => entry.role === "user" || entry.role === "assistant")
+    .map((entry): OllamaMessage => ({ role: entry.role === "assistant" ? "assistant" : "user", content: String(entry.text ?? "") }))
+    .filter((entry) => entry.content)
+    .slice(-6);
+
+  if (!ollamaPromptNeedsTools(currentPrompt, settings, options.permissionMode)) {
+    // Normal chat lane: let the model think and stream both the reasoning
+    // trace and the answer, matching the Ollama app's low-latency feel.
+    const reasoning = makeOllamaReasoningEmitter(threadID, options.providerTurnID, options.emitActivity);
+    try {
+      const payload = await ollamaChat(modelID, [
+        {
+          role: "system",
+          content: "You are OpenAssist. Answer directly and briefly unless the user asks for detail. Do not claim to use notes, files, shell, browser, or tools in this fast chat lane."
+        },
+        ...recentMessages,
+        { role: "user", content: promptForModel }
+      ], [], options.stopPromise, {
+        think: true,
+        onContent: options.emitDelta,
+        onThinking: reasoning.onThinking
+      });
+      const message = jsonObject(payload.message) ?? {};
+      return String(message.content ?? "").trim() || "Ollama completed without a text response.";
+    } finally {
+      reasoning.finish();
+    }
+  }
+
+  const messages: OllamaMessage[] = [...recentMessages];
+  messages.unshift({
+    role: "system",
+    content: ollamaAgentInstructions(settings, options.agentFilesPath, options.permissionMode)
+  });
+  const knowledgeContext = relevantKnowledgeContextForPrompt(currentPrompt, settings);
+  if (knowledgeContext) {
+    messages.push({
+      role: "system",
+      content: knowledgeContext
+    });
+  }
+  messages.push({ role: "user", content: promptForModel });
+  const tools = filterOllamaToolsForPrompt(
+    ollamaToolSpecs(settings, options.permissionMode),
+    currentPrompt,
+    options.permissionMode
+  );
+  const executedMutations = new Set<string>();
+  let lastText = "";
+  const context: OllamaToolContext = {
+    threadID,
+    providerTurnID: options.providerTurnID,
+    agentFilesPath: options.agentFilesPath,
+    settings,
+    permissionMode: options.permissionMode,
+    activeRun: options.activeRun,
+    emitActivity: options.emitActivity
+  };
+  // Stream the reasoning trace across the whole tool loop. Content is not
+  // streamed here because intermediate steps would otherwise concatenate into
+  // the final answer; the final text is returned and rendered on completion.
+  const reasoning = makeOllamaReasoningEmitter(threadID, options.providerTurnID, options.emitActivity);
+
+  for (let step = 0; step < 8; step += 1) {
+    if (options.activeRun?.stopped) {
+      reasoning.finish();
+      throw new ProviderRunStoppedError(options.activeRun.provider);
+    }
+    const payload = await ollamaChat(modelID, messages, tools, options.stopPromise, {
+      think: true,
+      onThinking: reasoning.onThinking
+    });
+    const message = jsonObject(payload.message) ?? {};
+    const content = String(message.content ?? "").trim();
+    if (content) lastText = content;
+    const toolCalls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
+    if (!toolCalls.length) {
+      reasoning.finish();
+      return lastText || "Ollama completed without a text response.";
+    }
+
+    messages.push({
+      role: "assistant",
+      content,
+      tool_calls: toolCalls
+    });
+
+    for (const toolCall of toolCalls) {
+      const rawToolName = ollamaToolCallName(toolCall);
+      const toolName = canonicalOllamaToolName(rawToolName);
+      const args = ollamaToolCallArgs(toolCall);
+      ollamaToolActivity(context, toolName || "tool", args, "running");
+      try {
+        const result = await runOllamaTool(toolName, args, context, executedMutations);
+        ollamaToolActivity(context, toolName, args, "completed", result);
+        messages.push({
+          role: "tool",
+          name: toolName,
+          tool_name: toolName,
+          content: ollamaToolResultText(result)
+        });
+      } catch (error) {
+        const result = { error: error instanceof Error ? error.message : String(error) };
+        ollamaToolActivity(context, toolName || "tool", args, "failed", result);
+        messages.push({
+          role: "tool",
+          name: toolName || "tool",
+          tool_name: toolName || "tool",
+          content: ollamaToolResultText(result)
+        });
+      }
+    }
+  }
+
+  reasoning.finish();
+  return lastText || "I used the available tools, but Ollama did not provide a final response.";
 }
 
 function providerWorkingDirectory(session: SessionSummary | undefined) {
-  return sessionWorkingDirectory(session) || openAssistRepoRoot();
+  if (session?.id) return ensureThreadAgentFilesDirectory(session.id, session.latestUserMessage).path;
+  const scratch = path.join(agentFilesProjectRoot(undefined), "_scratch");
+  fs.mkdirSync(scratch, { recursive: true });
+  return scratch;
 }
 
 function ensureCLIProviderSession(threadID: string, backend: Exclude<AssistantBackend, "codex" | "ollamaLocal">, modelID: string) {
@@ -10640,11 +23186,17 @@ async function sendCopilotMessage(
   session: SessionSummary | undefined,
   prompt: string,
   modelID: string,
-  run?: ActiveProviderRun
+  run?: ActiveProviderRun,
+  knowledgeAccess?: KnowledgeRuntimeAccess | null,
+  pluginIDs: string[] = []
 ) {
+  const wantsComputerUse = shouldPreferCodexComputerUsePlugin(pluginIDs);
+  const promptText = knowledgeAccess
+    ? `${openAssistKnowledgeAgentInstructions("Copilot")}\n\nUser task:\n${prompt}`
+    : prompt;
   const args = [
     "--prompt",
-    prompt,
+    promptText,
     "--silent",
     "--stream",
     "off",
@@ -10653,8 +23205,32 @@ async function sendCopilotMessage(
     `--resume=${providerSessionID}`
   ];
   if (modelID && modelID !== "default") args.push("--model", modelID);
-  const { stdout, stderr } = await execCaptured("copilot", args, providerWorkingDirectory(session), undefined, run);
-  return providerCLIText(stdout, stderr) || "GitHub Copilot completed without a text response.";
+  const tempConfig = knowledgeAccess ? temporaryKnowledgeMCPConfig(knowledgeAccess, "copilot") : null;
+  if (tempConfig) {
+    args.push(
+      "--additional-mcp-config",
+      `@${tempConfig.filePath}`,
+      "--allow-tool",
+      "openassist_knowledge"
+    );
+  }
+  // Attach Computer Use via the codex mcp-server proxy when @computer-use is on.
+  const computerUseConfig = wantsComputerUse ? temporaryCodexComputerUseMCPConfig("copilot") : null;
+  if (computerUseConfig) {
+    args.push(
+      "--additional-mcp-config",
+      `@${computerUseConfig.filePath}`,
+      "--allow-tool",
+      codexProxyMCPServerName
+    );
+  }
+  try {
+    const { stdout, stderr } = await execCaptured("copilot", args, providerWorkingDirectory(session), undefined, run);
+    return providerCLIText(stdout, stderr) || "GitHub Copilot completed without a text response.";
+  } finally {
+    tempConfig?.cleanup();
+    computerUseConfig?.cleanup();
+  }
 }
 
 async function sendClaudeCodeMessage(
@@ -10663,21 +23239,295 @@ async function sendClaudeCodeMessage(
   prompt: string,
   modelID: string,
   isNewSession: boolean,
-  run?: ActiveProviderRun
+  run?: ActiveProviderRun,
+  knowledgeAccess?: KnowledgeRuntimeAccess | null,
+  pluginIDs: string[] = [],
+  hooks?: { emitActivity?: (activity: ChatMessage) => void; emitStatus?: (text: string) => void }
 ) {
+  const wantsComputerUse = shouldPreferCodexComputerUsePlugin(pluginIDs);
   const args = [
     "-p",
     prompt,
+    // When Computer Use is active, stream events so we can surface live
+    // "Computer Use" status while Claude delegates to the codex proxy. Otherwise
+    // the single-shot json result is enough.
     "--output-format",
-    "json",
+    wantsComputerUse ? "stream-json" : "json",
     "--permission-mode",
     "default"
   ];
+  if (wantsComputerUse) args.push("--include-partial-messages", "--verbose");
   if (isNewSession) args.push("--session-id", providerSessionID);
   else args.push("--resume", providerSessionID);
   if (modelID && modelID !== "default") args.push("--model", modelID);
-  const { stdout, stderr } = await execCaptured("claude", args, providerWorkingDirectory(session), undefined, run);
-  return providerCLIText(stdout, stderr) || "Claude Code completed without a text response.";
+  // Claude takes a single --mcp-config, so merge knowledge + computer-use into
+  // one temp config when both are wanted.
+  const mcpServers: Record<string, unknown> = {};
+  const cleanups: Array<() => void> = [];
+  const allowedTools: string[] = [];
+  // knowledgeMCPServerConfig / codexComputerUseProxyMCPServerConfig both return
+  // { mcpServers: {...} }; merge whichever are wanted into one config.
+  if (knowledgeAccess) {
+    Object.assign(mcpServers, knowledgeMCPServerConfig(knowledgeAccess).mcpServers);
+    allowedTools.push(...claudeKnowledgeAllowedTools().split(","));
+  }
+  // Per-turn event log so we can show the real Computer Use steps (open app,
+  // screenshot, click) instead of an opaque "working" spinner. The proxy config
+  // routes codex mcp-server through a wrapper that tees codex/event here.
+  let computerUseEventLog: string | null = null;
+  if (wantsComputerUse) {
+    const eventDir = fs.mkdtempSync(path.join(os.tmpdir(), "openassist-claude-cu-events-"));
+    computerUseEventLog = path.join(eventDir, "events.log");
+    fs.writeFileSync(computerUseEventLog, "", { encoding: "utf8", mode: 0o600 });
+    cleanups.push(() => { try { fs.rmSync(eventDir, { recursive: true, force: true }); } catch { /* best effort */ } });
+    const proxyConfig = temporaryCodexComputerUseMCPConfig("claude-proxy", computerUseEventLog);
+    // Merge the proxy server entry (built with the event-capturing wrapper) into
+    // the combined config below.
+    try {
+      const parsed = JSON.parse(fs.readFileSync(proxyConfig.filePath, "utf8")) as { mcpServers?: Record<string, unknown> };
+      Object.assign(mcpServers, parsed.mcpServers ?? {});
+    } catch { /* fall back to non-captured config */ Object.assign(mcpServers, codexComputerUseProxyMCPServerConfig().mcpServers); }
+    cleanups.push(proxyConfig.cleanup);
+    allowedTools.push(...codexProxyAllowedToolNames());
+  }
+  let mergedConfigPath: string | null = null;
+  if (Object.keys(mcpServers).length > 0) {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "openassist-claude-mcp-"));
+    mergedConfigPath = path.join(directory, "mcp.json");
+    fs.writeFileSync(mergedConfigPath, JSON.stringify({ mcpServers }, null, 2), { encoding: "utf8", mode: 0o600 });
+    cleanups.push(() => { try { fs.rmSync(directory, { recursive: true, force: true }); } catch { /* best effort */ } });
+    args.push("--mcp-config", mergedConfigPath, "--allowedTools", allowedTools.join(","));
+    if (knowledgeAccess) {
+      args.push("--append-system-prompt", openAssistKnowledgeAgentInstructions("Claude"));
+    }
+    // For Computer Use, use ONLY our MCP config. Claude's own globally-configured
+    // MCP servers (e.g. claude.ai / Microsoft 365) flood the tool list, which
+    // makes Claude DEFER all MCP tools — it then has to ToolSearch for the codex
+    // tool before every call (slow and flaky). Strict config keeps just our
+    // knowledge + computer-use servers so the codex tool is directly callable.
+    if (wantsComputerUse) {
+      args.push("--strict-mcp-config");
+    }
+  }
+  // Live Computer Use status: parse the stream-json events as they arrive and
+  // surface a "Computer Use" activity when Claude calls the codex proxy tool.
+  const computerUseActivityID = `activity-claude-cu-${Date.now()}`;
+  let emittedComputerUseStart = false;
+  let streamBuffer = "";
+  const computerUseActivity = (status: ChatMessage["activityStatus"], detail: string): ChatMessage => ({
+    id: computerUseActivityID,
+    role: "activity",
+    text: detail,
+    provider: "Claude",
+    status: status === "completed" ? "completed" : "running",
+    activityTitle: "Computer Use",
+    activityKind: "tool",
+    activityStatus: status,
+    activityDetail: detail,
+    createdAt: Date.now(),
+    updatedAt: Date.now()
+  });
+  const handleStreamEvent = (event: JsonObject) => {
+    const blocks = [
+      ...(Array.isArray((event.message as JsonObject | undefined)?.content) ? (event.message as JsonObject).content as JsonObject[] : []),
+      ...(event.content_block ? [event.content_block as JsonObject] : []),
+      ...(event.type === "tool_use" || event.type === "tool_result" ? [event] : [])
+    ];
+    for (const block of blocks) {
+      const name = String(block.name ?? "");
+      if (block.type === "tool_use" && name.startsWith("mcp__codex_computer_use__")) {
+        if (!emittedComputerUseStart) {
+          emittedComputerUseStart = true;
+          hooks?.emitStatus?.("Using Computer Use…");
+          hooks?.emitActivity?.(computerUseActivity("running", "Delegating to Computer Use (opening apps, reading the screen)…"));
+        }
+      }
+    }
+  };
+  const onOutput: CapturedOutputHandler = (source, chunk) => {
+    if (source !== "stdout") return;
+    streamBuffer += chunk;
+    let newlineIndex: number;
+    while ((newlineIndex = streamBuffer.indexOf("\n")) >= 0) {
+      const line = streamBuffer.slice(0, newlineIndex).trim();
+      streamBuffer = streamBuffer.slice(newlineIndex + 1);
+      if (!line.startsWith("{")) continue;
+      try {
+        handleStreamEvent(JSON.parse(line) as JsonObject);
+      } catch {
+        // Partial / non-JSON progress lines are expected; skip.
+      }
+    }
+  };
+  // Tail the codex/event log (teed by the proxy wrapper) and surface each real
+  // Computer Use step as a sub-activity, so the user sees what's happening (e.g.
+  // "Computer Use: get_app_state (Brave Browser)") instead of an opaque spinner.
+  let eventTailTimer: ReturnType<typeof setInterval> | null = null;
+  let eventReadOffset = 0;
+  let eventLineBuffer = "";
+  let stepIndex = 0;
+  const computerUseToolCallStarts = new Map<string, number>();
+  // A step is either Codex's narration (shown as reasoning TEXT, like Codex's
+  // own UI) or an actual Computer Use tool call (shown as a tool-call row).
+  type ComputerUseStep = { kind: "text" | "tool"; title: string; detail: string };
+  const emitComputerUseStep = (step: ComputerUseStep) => {
+    if (!emittedComputerUseStart) {
+      emittedComputerUseStart = true;
+      hooks?.emitStatus?.("Using Computer Use…");
+    }
+    stepIndex += 1;
+    hooks?.emitActivity?.({
+      id: `${computerUseActivityID}-step-${stepIndex}`,
+      role: "activity",
+      text: step.detail,
+      provider: "Claude",
+      status: "running",
+      activityTitle: step.title,
+      // Narration renders as reasoning text; real tool calls render as tool rows.
+      activityKind: step.kind === "text" ? "reasoning" : "mcpToolCall",
+      activityStatus: "running",
+      activityDetail: step.detail,
+      createdAt: Date.now(),
+      updatedAt: Date.now()
+    });
+  };
+  const describeCodexEvent = (msg: JsonObject): ComputerUseStep | null => {
+    const type = String(msg.type ?? "");
+    if (type === "mcp_tool_call_begin") {
+      const inv = (msg.invocation ?? {}) as JsonObject;
+      const tool = String(inv.tool ?? "");
+      if (!tool) return null;
+      const args = (inv.arguments ?? {}) as JsonObject;
+      const appArg = args.app;
+      // Title = the tool name (list_apps, get_app_state, click…); detail = args.
+      const detailParts: string[] = [];
+      if (appArg) detailParts.push(String(appArg));
+      if (typeof args.element_index === "string" || typeof args.element_index === "number") {
+        detailParts.push(`element ${String(args.element_index)}`);
+      }
+      if (typeof args.text === "string" && args.text) detailParts.push(`"${String(args.text).slice(0, 40)}"`);
+      return { kind: "tool", title: tool, detail: detailParts.join(" · ") || tool };
+    }
+    if (type === "agent_message" && typeof msg.message === "string") {
+      const text = msg.message.replace(/\s+/g, " ").trim();
+      if (!text) return null;
+      return { kind: "text", title: "Computer Use", detail: text.slice(0, 240) };
+    }
+    if (type === "task_started") return { kind: "text", title: "Computer Use", detail: "Started the Computer Use task." };
+    if (type === "task_complete") return { kind: "text", title: "Computer Use", detail: "Finished the Computer Use task." };
+    return null;
+  };
+  const pollEventLog = () => {
+    if (!computerUseEventLog) return;
+    let contents = "";
+    try {
+      const stat = fs.statSync(computerUseEventLog);
+      if (stat.size <= eventReadOffset) return;
+      const fd = fs.openSync(computerUseEventLog, "r");
+      try {
+        const buffer = Buffer.alloc(stat.size - eventReadOffset);
+        fs.readSync(fd, buffer, 0, buffer.length, eventReadOffset);
+        contents = buffer.toString("utf8");
+        eventReadOffset = stat.size;
+      } finally {
+        fs.closeSync(fd);
+      }
+    } catch {
+      return;
+    }
+    eventLineBuffer += contents;
+    let nl: number;
+    while ((nl = eventLineBuffer.indexOf("\n")) >= 0) {
+      const line = eventLineBuffer.slice(0, nl).trim();
+      eventLineBuffer = eventLineBuffer.slice(nl + 1);
+      if (!line.includes("codex/event")) continue;
+      try {
+        const parsed = JSON.parse(line) as JsonObject;
+        const msg = (parsed.params as JsonObject | undefined)?.msg as JsonObject | undefined;
+        if (!msg) continue;
+        // TEMP DEBUG: trace tool-call begin/end timing to find what stalls.
+        const mtype = String(msg.type ?? "");
+        if (mtype === "mcp_tool_call_begin") {
+          const inv = (msg.invocation ?? {}) as JsonObject;
+          const cid = String(msg.call_id ?? "");
+          computerUseToolCallStarts.set(cid, Date.now());
+          bridgeDebugLog(`[cu-trace] BEGIN tool=${String(inv.tool ?? "")} call=${cid} args=${JSON.stringify(inv.arguments ?? {}).slice(0, 120)}`);
+        } else if (mtype === "mcp_tool_call_end") {
+          const cid = String(msg.call_id ?? "");
+          const started = computerUseToolCallStarts.get(cid);
+          const dur = started ? `${Date.now() - started}ms` : "?";
+          const result = JSON.stringify((msg as JsonObject).result ?? (msg as JsonObject).error ?? "").slice(0, 160);
+          bridgeDebugLog(`[cu-trace] END call=${cid} dur=${dur} result=${result}`);
+          computerUseToolCallStarts.delete(cid);
+        } else if (mtype === "task_started" || mtype === "task_complete" || mtype === "error" || mtype === "stream_error") {
+          bridgeDebugLog(`[cu-trace] ${mtype} ${JSON.stringify(msg).slice(0, 200)}`);
+        }
+        const step = describeCodexEvent(msg);
+        if (step) emitComputerUseStep(step);
+      } catch {
+        // partial line; will be completed on next poll
+      }
+    }
+  };
+  if (wantsComputerUse && computerUseEventLog) {
+    eventTailTimer = setInterval(pollEventLog, 700);
+  }
+  try {
+    // A Computer Use turn delegates a full Codex agentic run (open apps, take
+    // screenshots, click, verify) which routinely exceeds the default 180s and
+    // would otherwise fail with "claude timed out" even though Codex finished.
+    // Give those turns a generous 10-minute ceiling.
+    const claudeTimeoutMs = wantsComputerUse ? 600_000 : undefined;
+    const { stdout, stderr } = await execCaptured(
+      "claude",
+      args,
+      providerWorkingDirectory(session),
+      claudeTimeoutMs,
+      run,
+      undefined,
+      wantsComputerUse ? onOutput : undefined
+    );
+    if (emittedComputerUseStart) {
+      hooks?.emitActivity?.(computerUseActivity("completed", "Computer Use finished."));
+    }
+    if (wantsComputerUse) {
+      // stream-json emits a final {"type":"result", "result": "..."} line; prefer
+      // it, else fall back to the generic extractor.
+      const finalText = claudeStreamJSONResultText(stdout);
+      return finalText || providerCLIText(stdout, stderr) || "Claude Code completed without a text response.";
+    }
+    return providerCLIText(stdout, stderr) || "Claude Code completed without a text response.";
+  } catch (error) {
+    if (emittedComputerUseStart) {
+      hooks?.emitActivity?.(computerUseActivity("failed", "Computer Use did not finish."));
+    }
+    throw error;
+  } finally {
+    if (eventTailTimer) {
+      pollEventLog(); // flush any final events
+      clearInterval(eventTailTimer);
+      eventTailTimer = null;
+    }
+    for (const cleanup of cleanups) cleanup();
+  }
+}
+
+// stream-json output ends with a {"type":"result","result":"..."} line; pull the
+// assistant's final text from it.
+function claudeStreamJSONResultText(stdout: string): string {
+  for (const line of stdout.split(/\r?\n/).reverse()) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("{")) continue;
+    try {
+      const parsed = JSON.parse(trimmed) as JsonObject;
+      if (parsed.type === "result" && typeof parsed.result === "string") {
+        return parsed.result.trim();
+      }
+    } catch {
+      // keep scanning
+    }
+  }
+  return "";
 }
 
 function promptWithSessionInstructions(prompt: string, sessionInstructions?: string) {
@@ -10743,15 +23593,18 @@ function antigravityImageQualityGuidance(prompt: string) {
   ].join("\n");
 }
 
-function antigravityPrompt(threadID: string, prompt: string, cwd: string) {
+function antigravityPrompt(threadID: string, prompt: string, cwd: string, settings: SettingsSnapshot) {
   const currentTask = prompt.trim();
   const imageQualityGuidance = antigravityImageQualityGuidance(currentTask);
+  const knowledgeContext = relevantKnowledgeContextForPrompt(currentTask, settings);
   const header = [
     "OpenAssist is sending one user task to Antigravity.",
     `Workspace: ${cwd}`,
     "Reply only to the current user task.",
     "If the current task is a greeting, reply briefly and ask how you can help.",
     "Do not inspect repo files or run commands unless the current user task clearly asks for that.",
+    knowledgeContext ? openAssistKnowledgeAgentInstructions("Antigravity") : "",
+    knowledgeContext,
     imageQualityGuidance
   ].filter(Boolean).join("\n");
 
@@ -11195,6 +24048,7 @@ async function sendAntigravityMessage(
   threadID: string,
   prompt: string,
   providerTurnID: string,
+  settings: SettingsSnapshot,
   run?: ActiveProviderRun,
   callbacks?: AntigravityProgressCallbacks
 ) {
@@ -11203,7 +24057,7 @@ async function sendAntigravityMessage(
     throw new Error(`Antigravity CLI is not installed yet. Install it with: ${antigravityCLIInstallCommand}`);
   }
   const cwd = providerWorkingDirectory(session);
-  const promptWithContext = antigravityPrompt(threadID, prompt, cwd);
+  const promptWithContext = antigravityPrompt(threadID, prompt, cwd, settings);
   const logPath = antigravityProgressLogPath(providerTurnID);
   try {
     fs.rmSync(logPath, { force: true });
@@ -11344,12 +24198,15 @@ export async function sendCodexMessage(
   const normalized = prompt.trim();
   const imageAttachments = normalizeComposerImageAttachments(attachments);
   if (!normalized && !imageAttachments.length) throw new Error("Message is empty.");
+  const inlineImageAttachments = composerImageAttachmentsOf(imageAttachments);
+  const fileAttachments = composerFileAttachmentsOf(imageAttachments);
   const normalizedToolSelection = await normalizeCodexToolSelection(pluginIDs, skillIDs);
   pluginIDs = normalizedToolSelection.pluginIDs;
   skillIDs = normalizedToolSelection.skillIDs;
-  const providerPrompt = normalized || "Please analyze the attached image.";
+  const providerPrompt = normalized
+    || (inlineImageAttachments.length ? "Please analyze the attached image." : "Please look at the attached file.");
   let runtimePrompt = promptWithSessionInstructions(providerPrompt, sessionInstructions);
-  const visibleUserText = normalized || (imageAttachments.length === 1 ? "Attached image" : `${imageAttachments.length} attached images`);
+  const visibleUserText = normalized || composerAttachmentSummaryText(imageAttachments);
   const codexReasoningEffort = normalizeCodexReasoningEffort(reasoningEffort);
   const settings = await loadSettings();
   let openAssistThreadID = threadID?.startsWith("openassist-")
@@ -11363,11 +24220,20 @@ export async function sendCodexMessage(
   }
   const backend = normalizeBackend(String(session.activeProvider ?? settings.assistantBackend ?? "codex"));
   const modelID = modelForBackend(backend, settings, session);
-  if (backend !== "codex" && imageAttachments.length) {
+  // File attachments are never sent inline to the model, so they are written to
+  // disk for every backend (including codex) and their paths are added to the
+  // prompt so the agent can open and work on them.
+  if (fileAttachments.length) {
+    const fileAttachmentContext = await materializeComposerFileAttachments(openAssistThreadID, imageAttachments);
+    runtimePrompt = [runtimePrompt, fileAttachmentContext].filter(Boolean).join("\n\n");
+  }
+  // Image attachments can be sent inline to codex, but for other backends they
+  // are written to disk and referenced by path instead.
+  if (backend !== "codex" && inlineImageAttachments.length) {
     const imageAttachmentContext = await materializeComposerImageAttachments(openAssistThreadID, imageAttachments);
     runtimePrompt = [runtimePrompt, imageAttachmentContext].filter(Boolean).join("\n\n");
   }
-  const supportsStopping = backend === "codex" || backend === "copilot" || backend === "claudeCode" || backend === "antigravityCLI";
+  const supportsStopping = backend === "codex" || backend === "copilot" || backend === "claudeCode" || backend === "antigravityCLI" || backend === "ollamaLocal";
   const activeRun: ActiveProviderRun | undefined = clientRunID && supportsStopping
     ? {
         backend,
@@ -11395,21 +24261,80 @@ export async function sendCodexMessage(
   if (activeRun) {
     activeRun.emitStatus = (text: string) => emitRunEvent({ type: "status", text });
   }
+
+  if (!imageAttachments.length) {
+    const directKnowledgeRequest = createDirectKnowledgePlannerRequest(providerPrompt, settings);
+    if (directKnowledgeRequest) {
+      const providerTurnID = `knowledge-turn-${randomUUID().toLowerCase()}`;
+      const assistantMessageID = `assistant-final-${makeID()}`;
+      const completedTurn = persistCompletedTurn({
+        threadID: openAssistThreadID,
+        backend,
+        providerSessionID: pluginString(providerBinding(session, backend)?.providerSessionID) ?? openAssistThreadID,
+        providerTurnID,
+        modelID,
+        prompt: providerPrompt,
+        responseText: directKnowledgeRequest.responseText,
+        insertedSystemMessage: false,
+        assistantMessageID,
+        checkpointReferences: [],
+        reasoningEffort: codexReasoningEffort,
+        interactionMode,
+        permissionMode
+      });
+      emitRunEvent({ type: "completed" });
+      if (clientRunID) activeProviderRuns.delete(clientRunID);
+      return {
+        threadID: openAssistThreadID,
+        title: completedTurn.title,
+        thread: completedTurn.thread,
+        user: { id: `user-${Date.now()}`, role: "user", text: visibleUserText, attachments: imageAttachments } satisfies ChatMessage,
+        assistant: {
+          id: assistantMessageID,
+          role: "assistant",
+          text: directKnowledgeRequest.responseText,
+          provider: providerLabel(backend),
+          turnID: providerTurnID
+        } satisfies ChatMessage
+      };
+    }
+  }
+
+  const agentFiles = ensureThreadAgentFilesDirectory(openAssistThreadID, providerPrompt);
+  session = findSession(openAssistThreadID) ?? session;
+  runtimePrompt = promptWithAgentFilesContext(runtimePrompt, session, agentFiles.path);
+
   emitRunEvent({ type: "status", text: `Loading ${providerLabel(backend)} provider...` });
   if (backend === "ollamaLocal") {
     const existing = providerBinding(session, "ollamaLocal")?.providerSessionID;
     updateProviderBinding(openAssistThreadID, "ollamaLocal", openAssistThreadID, modelID);
     await beginTrackedCodeCheckpointIfNeeded(openAssistThreadID, interactionMode, settings);
     const providerTurnID = `ollama-turn-${randomUUID().toLowerCase()}`;
+    if (activeRun) activeRun.turnID = providerTurnID;
     let responseText = "";
+    const emitOllamaActivity = (activity: ChatMessage) => {
+      emitRunEvent({ type: "activity", activity });
+    };
+    const emitOllamaDelta = (delta: string) => {
+      emitRunEvent({ type: "assistant-delta", delta });
+    };
     try {
-      responseText = await sendOllamaMessage(openAssistThreadID, runtimePrompt, modelID);
+      responseText = await sendOllamaMessage(openAssistThreadID, runtimePrompt, modelID, settings, {
+        providerTurnID,
+        agentFilesPath: agentFiles.path,
+        permissionMode,
+        activeRun,
+        stopPromise,
+        emitActivity: emitOllamaActivity,
+        emitDelta: emitOllamaDelta
+      });
     } catch (error) {
       await finalizeTrackedCodeCheckpointIfNeeded({
         threadID: openAssistThreadID,
         turnID: providerTurnID,
         turnStatus: "failed"
       });
+      if (clientRunID) activeProviderRuns.delete(clientRunID);
       throw error;
     }
     const assistantMessageID = `assistant-final-${makeID()}`;
@@ -11430,11 +24355,13 @@ export async function sendCodexMessage(
       insertedSystemMessage: !(typeof existing === "string" && existing.trim()),
       assistantMessageID,
       checkpointReferences: finalizedCheckpoint ? [finalizedCheckpoint.checkpoint.id] : [],
+      userAttachments: imageAttachments,
       reasoningEffort: codexReasoningEffort,
       interactionMode,
       permissionMode
     });
     emitRunEvent({ type: "completed" });
+    if (clientRunID) activeProviderRuns.delete(clientRunID);
     return {
       threadID: openAssistThreadID,
       title: completedTurn.title,
@@ -11476,16 +24403,25 @@ export async function sendCodexMessage(
     const providerTurnID = `${providerTurnPrefix}-turn-${randomUUID().toLowerCase()}`;
     let responseText = "";
     let assistantArtifacts: MessageArtifact[] = [];
+    const cliKnowledgeAccess = settings.knowledgeAccessEnabled && settings.knowledgeAgentAccessEnabled
+      ? await ensureKnowledgeServerForSettings(settings).catch((error) => {
+        bridgeDebugLog(`Knowledge Access unavailable for ${providerLabel(backend)}: ${error instanceof Error ? error.message : String(error)}`);
+        return null;
+      })
+      : null;
     try {
       await beginTrackedCodeCheckpointIfNeeded(openAssistThreadID, interactionMode, settings);
       if (backend === "copilot") {
         responseText = await Promise.race([
-          sendCopilotMessage(providerSession.providerSessionID, session, runtimePrompt, modelID, activeRun),
+          sendCopilotMessage(providerSession.providerSessionID, session, runtimePrompt, modelID, activeRun, cliKnowledgeAccess, pluginIDs),
           stopPromise
         ]);
       } else if (backend === "claudeCode") {
         responseText = await Promise.race([
-          sendClaudeCodeMessage(providerSession.providerSessionID, session, runtimePrompt, modelID, providerSession.insertedSystemMessage, activeRun),
+          sendClaudeCodeMessage(providerSession.providerSessionID, session, runtimePrompt, modelID, providerSession.insertedSystemMessage, activeRun, cliKnowledgeAccess, pluginIDs, {
+            emitActivity: (activity) => emitRunEvent({ type: "activity", activity }),
+            emitStatus: (text) => emitRunEvent({ type: "status", text })
+          }),
           stopPromise
         ]);
       } else {
@@ -11493,7 +24429,7 @@ export async function sendCodexMessage(
           emitRunEvent({ type: "activity", activity });
         };
         const antigravityResult = await Promise.race([
-          sendAntigravityMessage(session, openAssistThreadID, runtimePrompt, providerTurnID, activeRun, {
+          sendAntigravityMessage(session, openAssistThreadID, runtimePrompt, providerTurnID, settings, activeRun, {
             emitActivity: emitAntigravityActivity,
             emitStatus: (text) => emitRunEvent({ type: "status", text })
           }),
@@ -11530,6 +24466,7 @@ export async function sendCodexMessage(
       assistantMessageID,
       checkpointReferences: finalizedCheckpoint ? [finalizedCheckpoint.checkpoint.id] : [],
       assistantArtifacts,
+      userAttachments: imageAttachments,
       reasoningEffort: codexReasoningEffort,
       interactionMode,
       permissionMode
@@ -11562,7 +24499,8 @@ export async function sendCodexMessage(
     permissionMode,
     reasoningEffort: codexReasoningEffort,
     pluginIDs,
-    sessionInstructions
+    sessionInstructions,
+    knowledgeAccessEnabled: settings.knowledgeAccessEnabled && settings.knowledgeAgentAccessEnabled
   };
   if (shouldPreferCodexComputerUsePlugin(pluginIDs)) {
     emitRunEvent({ type: "status", text: "Preparing Computer Use..." });
@@ -11571,9 +24509,13 @@ export async function sendCodexMessage(
       if (didResetActiveComputerUse) {
         emitRunEvent({ type: "status", text: "Reset stale Computer Use work. Starting clean..." });
       }
-      const didResetExistingHelper = await resetCodexIfCurrentComputerUseHelperExists("Reset existing Computer Use helper before starting a new turn");
+      // Restart Codex only if an attached helper is actually stuck/old. The
+      // function now ignores healthy, recently-attached helpers so we never
+      // kill the live helper mid-turn ("Transport closed"). See
+      // docs/computer-use-troubleshooting.md.
+      const didResetExistingHelper = await resetCodexIfCurrentComputerUseHelperExists("Reset stuck Computer Use helper before starting a new turn");
       if (didResetExistingHelper) {
-        emitRunEvent({ type: "status", text: "Reset existing Computer Use helper. Starting clean..." });
+        emitRunEvent({ type: "status", text: "Reset a stuck Computer Use helper. Starting clean..." });
       }
       const cleanup = await cleanupStaleComputerUseHelpers(codexTransport.currentPID());
       if (cleanup.killed.length) {
@@ -11595,6 +24537,7 @@ export async function sendCodexMessage(
   let didObserveComputerUseToolFailure = false;
   const activityTurnIDs = new Set<string>([providerTurnID]);
   const activityDetailBuffers = new Map<string, string>();
+  const activityEmitTimes = new Map<string, number>();
   const itemPhases = new Map<string, string>();
   const isCommentaryPhase = (phase: string) =>
     phase === "commentary" || phase === "prework" || phase === "creating";
@@ -11663,6 +24606,19 @@ export async function sendCodexMessage(
       updatedAt: now
     }, method);
   };
+  const emitAndPersistActivity = (activity: ChatMessage, method: string) => {
+    const isDelta = method.toLowerCase().includes("delta");
+    if (isDelta && activity.activityStatus !== "completed" && activity.activityStatus !== "failed") {
+      const now = Date.now();
+      const last = activityEmitTimes.get(activity.id) ?? 0;
+      if (now - last < 180) return;
+      activityEmitTimes.set(activity.id, now);
+    } else {
+      activityEmitTimes.set(activity.id, Date.now());
+    }
+    emitRunEvent({ type: "activity", activity });
+    upsertRuntimeActivity(openAssistThreadID, activity, providerTurnID);
+  };
   emitRunEvent({ type: "status", text: "Codex is working..." });
   const onNotification = (method: string, params: JsonObject, requestID?: JsonRequestID) => {
     recordUsageNotification("codex", method, params);
@@ -11682,8 +24638,7 @@ export async function sendCodexMessage(
       if (isDeltaForCommentary(params)) {
         const commentaryActivity = commentaryActivityFromDelta(method, params);
         if (commentaryActivity) {
-          emitRunEvent({ type: "activity", activity: commentaryActivity });
-          upsertRuntimeActivity(openAssistThreadID, commentaryActivity, providerTurnID);
+          emitAndPersistActivity(commentaryActivity, method);
         }
       } else {
         responseText += params.delta;
@@ -11697,8 +24652,7 @@ export async function sendCodexMessage(
       }
       const storedActivity = bufferedActivity(activity, method);
       if (!storedActivity) return;
-      emitRunEvent({ type: "activity", activity: storedActivity });
-      upsertRuntimeActivity(openAssistThreadID, storedActivity, providerTurnID);
+      emitAndPersistActivity(storedActivity, method);
     }
   };
   codexTransport.on("notification", onNotification);
@@ -11770,6 +24724,7 @@ export async function sendCodexMessage(
     insertedSystemMessage: providerSession.insertedSystemMessage,
     assistantMessageID,
     checkpointReferences: finalizedCheckpoint ? [finalizedCheckpoint.checkpoint.id] : [],
+    userAttachments: imageAttachments,
     reasoningEffort: codexReasoningEffort,
     interactionMode,
     permissionMode
@@ -11919,67 +24874,139 @@ function waitForTurnComplete() {
 
 export {
   analyzeScreenWithCodex,
+  archiveProjectNote,
   archiveSession,
+  archiveThreadNote,
   assignSessionToProject,
+  cleanupNoteWithCodex,
   createOpenAssistThread as createAssistantThread,
   createProject,
+  createProjectFromFolder,
   createProjectNote,
+  createProjectNoteFolder,
   createSkill,
   createThreadNote,
   deleteProject,
+  deleteProjectNote,
+  deleteProjectNotePermanently,
+  deleteProjectNoteFolder,
+  moveProjectNoteToFolder,
+  renameProjectNoteFolder,
   deleteSessionPermanently,
+  deleteThreadNote,
+  deleteThreadNotePermanently,
   hideProject,
   unhideProject,
   installKokoroVoiceModel,
   importSkillFolder,
   importSkillFromGitHub,
   loadCodeTrackingState,
+  loadKnowledgeStatus,
   loadProjectMemory,
+  loadPlannerDay,
+  loadPlannerBacklog,
+  listDailyItems,
+  listBacklogItems,
+  listPlannerDays,
   loadThreadMessages,
   loadThreadMemory,
+  threadAgentFilesPath,
   loadThreadNoteWorkspace,
   loadNote,
+  loadNoteLinks,
   readNoteImageDataURL,
   moveProjectToFolder,
   promoteTemporarySession,
   renameProject,
+  renameProjectNote,
   renameSession,
+  renameThreadNote,
   openCodeReview,
   createScheduledJob,
   saveThreadNote,
+  savePlannerDay,
+  scheduleSelectionToPlanner,
+  startRemoteAccessEasyQR,
+  stopRemoteAccessEasyQR,
+  upsertBacklogItem,
+  toggleBacklogItem,
+  deleteBacklogItem,
+  moveDailyItemToBacklog,
+  scheduleBacklogItem,
+  upsertDailyItem,
+  toggleDailyItem,
+  deleteDailyItem,
+  linkDailyItemNote,
   saveProjectNote,
   selectThreadNote,
+  listKnowledgeWriteRequests,
+  applyKnowledgePreview,
+  rejectKnowledgeRequest,
   approveTelegramPairing,
+  clearRemoteAccessPairingCode,
   clearCloudTranscriptionAPIKey,
   clearPromptRewriteAPIKey,
+  clearRealtimeGeminiAPIKey,
   clearTelegramBotToken,
   declineTelegramPairing,
   forgetTelegramPairing,
-  appendCodexRealtimeAudio,
-  appendCodexRealtimeText,
+  openTailscaleApp,
+  rotateRemoteAccessPairingCode,
+	  appendCodexRealtimeAudio,
+	  appendCodexRealtimeImages,
+	  appendCodexRealtimeText,
   saveCloudTranscriptionAPIKey,
   savePromptRewriteAPIKey,
+  saveRealtimeGeminiAPIKey,
   saveRealtimeOpenAIAPIKey,
   saveTelegramBotToken,
   stopCodexRealtimeVoice,
   testTelegramConnection,
   clearRealtimeOpenAIAPIKey,
+  classifyLocalVoiceTranscript,
+  handleLocalVoiceDirectKnowledge,
   cloudVoiceInputReadiness,
   listCodexRealtimeVoices,
   prewarmCodexTranscriptionAuthContext,
   prewarmAssistantVoiceOutput,
+  prepareReadAloudAudio,
   speakAssistantResponse,
+  startNoteReadAloud,
+  pauseNoteReadAloud,
+  pullOllamaModel,
+  listOllamaCatalogModels,
+  refreshOllamaWebsiteCatalog,
+  getOllamaRuntimeStatusForBridge as getOllamaRuntimeStatus,
+  openOllamaDownloadPage,
+  startOllamaRuntimeForBridge as startOllamaRuntime,
+  stopOllamaRuntimeForBridge as stopOllamaRuntime,
+  updateOllamaRuntimeForBridge as updateOllamaRuntime,
+  resumeNoteReadAloud,
+  stopNoteReadAloud,
   startCodexRealtimeVoice,
   stopAssistantVoiceOutput,
   stopCodexRealtimeDelegation,
   transcribeAudioFile,
   toggleScheduledJob,
   unarchiveSession,
-  updateProjectIcon,
-  updateProjectLinkedFolder,
+  deleteOllamaModel,
+  unloadOllamaModelsUsedThisSession,
+	  updateProjectIcon,
+	  updateProjectLinkedFolder,
   updateSetting,
+  updateSettings,
   updateShortcut,
+  listProjectNoteHistory,
+  restoreProjectNoteHistory,
+  restoreProjectNote,
+  restoreThreadNote,
   restoreCodeCheckpoint,
   voiceInputConfiguration,
   writeThreadSkillBinding as toggleThreadSkill
+};
+
+export const __noteStyleTestHooks = {
+  openAssistNoteStyleGuide,
+  knowledgePreviewForRequest,
+  knowledgeMCPTools
 };

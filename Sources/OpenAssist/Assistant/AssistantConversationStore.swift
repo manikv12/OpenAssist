@@ -96,6 +96,7 @@ struct AssistantConversationThreadSummary: Identifiable, Equatable, Sendable {
 enum AssistantNoteOwnerKind: String, Codable, Equatable, Hashable, Sendable {
     case thread
     case project
+    case planner
 }
 
 struct AssistantNoteSummary: Codable, Equatable, Sendable, Identifiable {

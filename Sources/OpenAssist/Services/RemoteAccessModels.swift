@@ -329,15 +329,16 @@ struct RemoteAccessPairClaimResponse: Codable, Equatable, Sendable {
 
 struct RemoteAccessHealthResponse: Codable, Equatable, Sendable {
     let ok: Bool
-    let helperState: String
+    let helperState: String?
     let helperMessage: String?
-    let machineID: String
-    let machineName: String
-    let appVersion: String
-    let localBaseURL: String
+    let machineID: String?
+    let machineName: String?
+    let appVersion: String?
+    let localBaseURL: String?
     let publicBaseURL: String?
-    let tunnelMode: String
+    let tunnelMode: String?
     let adminPasswordRequired: Bool
+    let pairingRequired: Bool
 }
 
 struct RemoteAccessPairedDeviceRecord: Codable, Equatable, Identifiable, Sendable {

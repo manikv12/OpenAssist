@@ -4,9 +4,125 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Open Assist</title>
+    <style>
+      html, body, #root {
+        margin: 0;
+        padding: 0;
+        height: 100%;
+        background: #0c0e12;
+      }
+      body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; color: #e6edf3; }
+      #initial-splash {
+        position: fixed;
+        inset: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background:
+          radial-gradient(circle at 50% 42%, rgba(28, 32, 40, 0.55), rgba(8, 9, 12, 0.92) 72%),
+          #0a0c10;
+        z-index: 9999;
+        -webkit-app-region: drag;
+        overflow: hidden;
+        opacity: 1;
+        transition: opacity 280ms ease;
+      }
+      #initial-splash[data-hidden="true"] { opacity: 0; pointer-events: none; }
+      #initial-splash .initial-splash-glow {
+        position: absolute;
+        top: 50%;
+        left: 50%;
+        width: 520px;
+        height: 520px;
+        transform: translate(-50%, -54%);
+        background: radial-gradient(circle at center,
+          rgba(201, 169, 120, 0.28) 0%,
+          rgba(201, 169, 120, 0.10) 30%,
+          transparent 62%);
+        filter: blur(40px);
+        pointer-events: none;
+        animation: initial-splash-glow 3.6s ease-in-out infinite;
+      }
+      #initial-splash .initial-splash-content {
+        position: relative;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 22px;
+      }
+      #initial-splash .initial-splash-logo {
+        width: 104px;
+        height: 104px;
+        border-radius: 24px;
+        display: block;
+        user-select: none;
+        -webkit-user-drag: none;
+        filter:
+          drop-shadow(0 22px 44px rgba(0, 0, 0, 0.55))
+          drop-shadow(0 2px 6px rgba(0, 0, 0, 0.35));
+        animation: initial-splash-breathe 3.6s ease-in-out infinite;
+      }
+      #initial-splash .initial-splash-name {
+        font-size: 17px;
+        font-weight: 500;
+        letter-spacing: 0.32em;
+        text-transform: uppercase;
+        color: rgba(230, 237, 243, 0.92);
+        text-shadow: 0 1px 2px rgba(0, 0, 0, 0.35);
+        padding-left: 0.32em;
+      }
+      #initial-splash .initial-splash-status {
+        margin-top: -8px;
+        color: rgba(230, 237, 243, 0.58);
+        font-size: 12px;
+        font-weight: 560;
+        letter-spacing: 0.02em;
+      }
+      #initial-splash .initial-splash-progress {
+        width: 168px;
+        height: 2px;
+        border-radius: 2px;
+        position: relative;
+        overflow: hidden;
+        background: rgba(230, 237, 243, 0.10);
+        margin-top: 6px;
+      }
+      #initial-splash .initial-splash-progress::after {
+        content: "";
+        position: absolute;
+        top: 0;
+        bottom: 0;
+        left: -34%;
+        width: 34%;
+        border-radius: 2px;
+        background: linear-gradient(90deg, transparent 0%, rgba(230, 237, 243, 0.78) 50%, transparent 100%);
+        animation: initial-splash-sweep 1.4s cubic-bezier(0.55, 0.08, 0.45, 0.92) infinite;
+      }
+      @keyframes initial-splash-glow {
+        0%, 100% { opacity: 0.85; transform: translate(-50%, -54%) scale(1); }
+        50%      { opacity: 1;    transform: translate(-50%, -54%) scale(1.06); }
+      }
+      @keyframes initial-splash-breathe {
+        0%, 100% { transform: scale(1); }
+        50%      { transform: scale(1.025); }
+      }
+      @keyframes initial-splash-sweep {
+        0%   { left: -34%; }
+        100% { left: 100%; }
+      }
+    </style>
   </head>
   <body>
     <div id="root"></div>
+    <div id="initial-splash" aria-hidden="true">
+      <div class="initial-splash-glow"></div>
+      <div class="initial-splash-content">
+        <img class="initial-splash-logo" src="./AppLogo.png" alt="" draggable="false" />
+        <div class="initial-splash-name">Open Assist</div>
+        <div class="initial-splash-status">Loading workspace...</div>
+        <div class="initial-splash-progress"></div>
+      </div>
+    </div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

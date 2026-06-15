@@ -1,14 +1,35 @@
-import { contextBridge, ipcRenderer } from "electron";
+import { contextBridge, ipcRenderer, webFrame } from "electron";
 
 contextBridge.exposeInMainWorld("openAssistElectron", {
   platform: process.platform,
   openExternal: (url: string) => ipcRenderer.invoke("open-external", url),
+  // Dev-only perf snapshot. The main-process handler is gated on
+  // OPENASSIST_ELECTRON_REMOTE_DEBUG=1 and returns { error: "disabled" }
+  // otherwise — safe to expose unconditionally.
+  __perfSnapshot: () => ipcRenderer.invoke("openassist:__perf-snapshot"),
   getMacOSPermissions: () => ipcRenderer.invoke("openassist:get-macos-permissions"),
   requestMacOSPermission: (kind: string) => ipcRenderer.invoke("openassist:request-macos-permission", kind),
+  getComputerUseActivity: () => ipcRenderer.invoke("openassist:get-computer-use-activity"),
+  forceStopComputerUse: () => ipcRenderer.invoke("openassist:force-stop-computer-use"),
   openTarget: (target: string, workspaceRootPath?: string | null) => ipcRenderer.invoke("openassist:open-target", target, workspaceRootPath),
   workspaceLaunchTargets: () => ipcRenderer.invoke("openassist:workspace-launch-targets"),
   readClipboardText: () => ipcRenderer.invoke("openassist:read-clipboard-text"),
   writeClipboardText: (text: string) => ipcRenderer.invoke("openassist:write-clipboard-text", text),
+  getSpellcheckContext: () => ipcRenderer.invoke("openassist:get-spellcheck-context"),
+  spellcheckWord: (word: string) => {
+    const misspelledWord = String(word ?? "").trim();
+    if (!misspelledWord) return null;
+    const suggestions = Array.from(new Set(webFrame.getWordSuggestions(misspelledWord).map((suggestion) => suggestion.trim()).filter(Boolean)));
+    const isMisspelled = suggestions.length > 0 || webFrame.isWordMisspelled(misspelledWord);
+    if (!isMisspelled) return null;
+    return {
+      misspelledWord,
+      suggestions: suggestions.slice(0, 8),
+      isEditable: true,
+      createdAt: Date.now()
+    };
+  },
+  replaceMisspelling: (text: string) => ipcRenderer.invoke("openassist:replace-misspelling", text),
   insertTranscriptText: (text: string) => ipcRenderer.invoke("openassist:insert-transcript-text", text),
   addTranscriptHistory: (text: string) => ipcRenderer.invoke("openassist:add-transcript-history", text),
   loadTranscriptHistory: () => ipcRenderer.invoke("openassist:load-transcript-history"),
@@ -26,8 +47,30 @@ contextBridge.exposeInMainWorld("openAssistElectron", {
   },
   menuBarAction: (action: string) => ipcRenderer.invoke("openassist:menu-bar-action", action),
   loadAppState: () => ipcRenderer.invoke("openassist:load-app-state"),
+  loadSettingsAppState: () => ipcRenderer.invoke("openassist:load-settings-app-state"),
   listProviderModels: (backend: string) => ipcRenderer.invoke("openassist:list-provider-models", backend),
+  listOllamaCatalogModels: () => ipcRenderer.invoke("openassist:list-ollama-catalog-models"),
+  refreshOllamaWebsiteCatalog: () => ipcRenderer.invoke("openassist:refresh-ollama-website-catalog"),
+  pullOllamaModel: (modelID: string) => ipcRenderer.invoke("openassist:pull-ollama-model", modelID),
+  deleteOllamaModel: (modelID: string) => ipcRenderer.invoke("openassist:delete-ollama-model", modelID),
+  getOllamaRuntimeStatus: () => ipcRenderer.invoke("openassist:get-ollama-runtime-status"),
+  startOllamaRuntime: () => ipcRenderer.invoke("openassist:start-ollama-runtime"),
+  stopOllamaRuntime: () => ipcRenderer.invoke("openassist:stop-ollama-runtime"),
+  openOllamaDownloadPage: () => ipcRenderer.invoke("openassist:open-ollama-download"),
+  updateOllamaRuntime: () => ipcRenderer.invoke("openassist:update-ollama-runtime"),
+  onOllamaRuntimeUpdateProgress: (callback: (progress: unknown) => void) => {
+    const listener = (_event: unknown, payload: unknown) => callback(payload);
+    ipcRenderer.on("openassist:ollama-runtime-update-progress", listener);
+    return () => ipcRenderer.off("openassist:ollama-runtime-update-progress", listener);
+  },
+  onOllamaModelDownloadProgress: (callback: (progress: unknown) => void) => {
+    const listener = (_event: unknown, payload: unknown) => callback(payload);
+    ipcRenderer.on("openassist:ollama-model-download-progress", listener);
+    return () => ipcRenderer.off("openassist:ollama-model-download-progress", listener);
+  },
   loadThread: (threadID: string) => ipcRenderer.invoke("openassist:load-thread", threadID),
+  loadOlderThreadMessages: (threadID: string, beforeMessageID: string, turnLimit?: number) =>
+    ipcRenderer.invoke("openassist:load-thread-messages-before", threadID, beforeMessageID, turnLimit),
   loadCodeTrackingState: (threadID: string) => ipcRenderer.invoke("openassist:load-code-tracking-state", threadID),
   openCodeReview: (threadID: string, checkpointID?: string) => ipcRenderer.invoke("openassist:open-code-review", threadID, checkpointID),
   restoreCodeCheckpoint: (threadID: string, checkpointID: string) =>
@@ -36,8 +79,34 @@ contextBridge.exposeInMainWorld("openAssistElectron", {
   createThreadNote: (threadID: string, title?: string) => ipcRenderer.invoke("openassist:create-thread-note", threadID, title),
   saveThreadNote: (threadID: string, noteID: string | undefined, markdown: string) =>
     ipcRenderer.invoke("openassist:save-thread-note", threadID, noteID, markdown),
+  renameThreadNote: (threadID: string, noteID: string, title: string) =>
+    ipcRenderer.invoke("openassist:rename-thread-note", threadID, noteID, title),
   selectThreadNote: (threadID: string, noteID: string) => ipcRenderer.invoke("openassist:select-thread-note", threadID, noteID),
+  loadPlannerDay: (dayID?: string) => ipcRenderer.invoke("openassist:load-planner-day", dayID),
+  loadPlannerBacklog: () => ipcRenderer.invoke("openassist:load-planner-backlog"),
+  listPlannerDays: (limit?: number, activeDayID?: string) => ipcRenderer.invoke("openassist:list-planner-days", limit, activeDayID),
+  savePlannerDay: (dayID: string | undefined, markdown: string) =>
+    ipcRenderer.invoke("openassist:save-planner-day", dayID, markdown),
+  scheduleSelectionToPlanner: (request: unknown) => ipcRenderer.invoke("openassist:schedule-selection-to-planner", request),
+  listDailyItems: (dayID?: string) => ipcRenderer.invoke("openassist:list-daily-items", dayID),
+  listBacklogItems: () => ipcRenderer.invoke("openassist:list-backlog-items"),
+  upsertDailyItem: (item: unknown) => ipcRenderer.invoke("openassist:upsert-daily-item", item),
+  toggleDailyItem: (dayID: string | undefined, itemID: string, checked: boolean) =>
+    ipcRenderer.invoke("openassist:toggle-daily-item", dayID, itemID, checked),
+  deleteDailyItem: (dayID: string | undefined, itemID: string) =>
+    ipcRenderer.invoke("openassist:delete-daily-item", dayID, itemID),
+  linkDailyItemNote: (dayID: string | undefined, itemID: string, target: unknown) =>
+    ipcRenderer.invoke("openassist:link-daily-item-note", dayID, itemID, target),
+  upsertBacklogItem: (item: unknown) => ipcRenderer.invoke("openassist:upsert-backlog-item", item),
+  toggleBacklogItem: (itemID: string, checked: boolean) =>
+    ipcRenderer.invoke("openassist:toggle-backlog-item", itemID, checked),
+  deleteBacklogItem: (itemID: string) => ipcRenderer.invoke("openassist:delete-backlog-item", itemID),
+  moveDailyItemToBacklog: (dayID: string | undefined, itemID: string) =>
+    ipcRenderer.invoke("openassist:move-daily-item-to-backlog", dayID, itemID),
+  scheduleBacklogItem: (itemID: string, targetDayID: string) =>
+    ipcRenderer.invoke("openassist:schedule-backlog-item", itemID, targetDayID),
   loadThreadMemory: (threadID: string) => ipcRenderer.invoke("openassist:load-thread-memory", threadID),
+  threadAgentFilesPath: (threadID: string) => ipcRenderer.invoke("openassist:thread-agent-files-path", threadID),
   setThreadProvider: (threadID: string, backend: string, modelID?: string) =>
     ipcRenderer.invoke("openassist:set-thread-provider", threadID, backend, modelID),
   createThread: (projectID?: string, isTemporary?: boolean) => ipcRenderer.invoke("openassist:create-thread", projectID, isTemporary),
@@ -47,6 +116,7 @@ contextBridge.exposeInMainWorld("openAssistElectron", {
   renameProject: (projectID: string, name: string) => ipcRenderer.invoke("openassist:rename-project", projectID, name),
   updateProjectIcon: (projectID: string, symbol?: string | null) => ipcRenderer.invoke("openassist:update-project-icon", projectID, symbol),
   chooseProjectFolder: (projectID: string) => ipcRenderer.invoke("openassist:choose-project-folder", projectID),
+  openProjectFolder: (parentID?: string | null) => ipcRenderer.invoke("openassist:open-project-folder", parentID),
   removeProjectFolderLink: (projectID: string) => ipcRenderer.invoke("openassist:remove-project-folder-link", projectID),
   moveProjectToFolder: (projectID: string, folderID?: string | null) =>
     ipcRenderer.invoke("openassist:move-project-to-folder", projectID, folderID),
@@ -62,10 +132,42 @@ contextBridge.exposeInMainWorld("openAssistElectron", {
   unarchiveSession: (threadID: string) => ipcRenderer.invoke("openassist:unarchive-session", threadID),
   deleteSessionPermanently: (threadID: string) => ipcRenderer.invoke("openassist:delete-session-permanently", threadID),
   loadNote: (projectID: string, noteID: string) => ipcRenderer.invoke("openassist:load-note", projectID, noteID),
+  loadNoteLinks: (target: unknown, currentMarkdown?: string) => ipcRenderer.invoke("openassist:load-note-links", target, currentMarkdown),
   readNoteImageDataURL: (notePath: string, imageSrc: string) => ipcRenderer.invoke("openassist:read-note-image", notePath, imageSrc),
+  cleanupNoteWithCodex: (request: unknown) => ipcRenderer.invoke("openassist:cleanup-note-with-codex", request),
+  openMarkdownFileForImport: () => ipcRenderer.invoke("openassist:open-markdown-file-for-import"),
   createNote: (projectID: string) => ipcRenderer.invoke("openassist:create-note", projectID),
+  renameNote: (projectID: string, noteID: string, title: string) =>
+    ipcRenderer.invoke("openassist:rename-note", projectID, noteID, title),
   saveNote: (projectID: string, noteID: string, markdown: string) =>
     ipcRenderer.invoke("openassist:save-note", projectID, noteID, markdown),
+  listNoteHistory: (projectID: string, noteID: string) => ipcRenderer.invoke("openassist:list-note-history", projectID, noteID),
+  restoreNoteHistory: (projectID: string, noteID: string, historyID: string) =>
+    ipcRenderer.invoke("openassist:restore-note-history", projectID, noteID, historyID),
+  deleteNote: (projectID: string, noteID: string) =>
+    ipcRenderer.invoke("openassist:delete-note", projectID, noteID),
+  archiveNote: (projectID: string, noteID: string) =>
+    ipcRenderer.invoke("openassist:archive-note", projectID, noteID),
+  restoreNote: (projectID: string, noteID: string) =>
+    ipcRenderer.invoke("openassist:restore-note", projectID, noteID),
+  deleteNotePermanently: (projectID: string, noteID: string) =>
+    ipcRenderer.invoke("openassist:delete-note-permanently", projectID, noteID),
+  createNoteFolder: (projectID: string, name: string) =>
+    ipcRenderer.invoke("openassist:create-note-folder", projectID, name),
+  renameNoteFolder: (projectID: string, folderID: string, name: string) =>
+    ipcRenderer.invoke("openassist:rename-note-folder", projectID, folderID, name),
+  deleteNoteFolder: (projectID: string, folderID: string) =>
+    ipcRenderer.invoke("openassist:delete-note-folder", projectID, folderID),
+  moveNoteToFolder: (projectID: string, noteID: string, folderID: string | null) =>
+    ipcRenderer.invoke("openassist:move-note-to-folder", projectID, noteID, folderID),
+  deleteThreadNote: (threadID: string, noteID: string) =>
+    ipcRenderer.invoke("openassist:delete-thread-note", threadID, noteID),
+  archiveThreadNote: (threadID: string, noteID: string) =>
+    ipcRenderer.invoke("openassist:archive-thread-note", threadID, noteID),
+  restoreThreadNote: (threadID: string, noteID: string) =>
+    ipcRenderer.invoke("openassist:restore-thread-note", threadID, noteID),
+  deleteThreadNotePermanently: (threadID: string, noteID: string) =>
+    ipcRenderer.invoke("openassist:delete-thread-note-permanently", threadID, noteID),
   toggleSkill: (threadID: string, skillID: string, attached: boolean) =>
     ipcRenderer.invoke("openassist:toggle-skill", threadID, skillID, attached),
   importSkillFolder: () => ipcRenderer.invoke("openassist:import-skill-folder"),
@@ -77,6 +179,17 @@ contextBridge.exposeInMainWorld("openAssistElectron", {
     ipcRenderer.invoke("openassist:toggle-scheduled-job", jobID, enabled),
   updateSetting: (key: string, value: boolean | string | number) =>
     ipcRenderer.invoke("openassist:update-setting", key, value),
+  updateSettings: (updates: Array<{ key: string; value: boolean | string | number }>) =>
+    ipcRenderer.invoke("openassist:update-settings", updates),
+  previewColorTheme: (theme: string | null) =>
+    ipcRenderer.invoke("openassist:preview-color-theme", theme),
+  knowledgeStatus: () => ipcRenderer.invoke("openassist:knowledge-status"),
+  listKnowledgeRequests: (status?: "pending" | "applied" | "rejected") =>
+    ipcRenderer.invoke("openassist:list-knowledge-requests", status),
+  applyKnowledgePreview: (requestID: string) =>
+    ipcRenderer.invoke("openassist:apply-knowledge-preview", requestID),
+  rejectKnowledgeRequest: (requestID: string) =>
+    ipcRenderer.invoke("openassist:reject-knowledge-request", requestID),
   updateShortcut: (target: string, keyCode: number, modifiers: number) =>
     ipcRenderer.invoke("openassist:update-shortcut", target, keyCode, modifiers),
   savePromptRewriteAPIKey: (provider: string, token: string) =>
@@ -91,12 +204,21 @@ contextBridge.exposeInMainWorld("openAssistElectron", {
     ipcRenderer.invoke("openassist:save-realtime-openai-api-key", token),
   clearRealtimeOpenAIAPIKey: () =>
     ipcRenderer.invoke("openassist:clear-realtime-openai-api-key"),
+  saveRealtimeGeminiAPIKey: (token: string) =>
+    ipcRenderer.invoke("openassist:save-realtime-gemini-api-key", token),
+  clearRealtimeGeminiAPIKey: () =>
+    ipcRenderer.invoke("openassist:clear-realtime-gemini-api-key"),
   saveTelegramBotToken: (token: string) => ipcRenderer.invoke("openassist:save-telegram-bot-token", token),
   clearTelegramBotToken: () => ipcRenderer.invoke("openassist:clear-telegram-bot-token"),
   approveTelegramPairing: () => ipcRenderer.invoke("openassist:approve-telegram-pairing"),
   declineTelegramPairing: () => ipcRenderer.invoke("openassist:decline-telegram-pairing"),
   forgetTelegramPairing: () => ipcRenderer.invoke("openassist:forget-telegram-pairing"),
   testTelegramConnection: (token?: string) => ipcRenderer.invoke("openassist:test-telegram-connection", token),
+  rotateRemoteAccessPairingCode: () => ipcRenderer.invoke("openassist:rotate-remote-access-pairing-code"),
+  clearRemoteAccessPairingCode: () => ipcRenderer.invoke("openassist:clear-remote-access-pairing-code"),
+  openTailscaleApp: () => ipcRenderer.invoke("openassist:open-tailscale-app"),
+  startRemoteAccessEasyQR: () => ipcRenderer.invoke("openassist:start-remote-access-easy-qr"),
+  stopRemoteAccessEasyQR: () => ipcRenderer.invoke("openassist:stop-remote-access-easy-qr"),
   sendMessage: (prompt: string, threadID?: string, pluginIDs?: string[], sessionInstructions?: string, reasoningEffort?: string, interactionMode?: string, permissionMode?: string, skillIDs?: string[], clientRunID?: string, attachments?: unknown[]) =>
     ipcRenderer.invoke("openassist:send-message", prompt, threadID, pluginIDs, sessionInstructions, reasoningEffort, interactionMode, permissionMode, skillIDs, clientRunID, attachments),
   codexRuntimeParityProbe: (options?: unknown) => ipcRenderer.invoke("openassist:codex-runtime-parity-probe", options),
@@ -105,8 +227,31 @@ contextBridge.exposeInMainWorld("openAssistElectron", {
     ipcRenderer.invoke("openassist:respond-provider-request", requestID, result),
   installKokoroVoiceModel: (voiceID?: string) =>
     ipcRenderer.invoke("openassist:install-kokoro-voice-model", voiceID),
-  speakAssistantResponse: (text: string, options?: { force?: boolean }) =>
+  speakAssistantResponse: (text: string, options?: { force?: boolean; engine?: string; voice?: string }) =>
     ipcRenderer.invoke("openassist:speak-assistant-response", text, options),
+  prepareReadAloudAudio: (text: string, options?: { engine?: string; voice?: string; model?: string }) =>
+    ipcRenderer.invoke("openassist:prepare-read-aloud-audio", text, options),
+  startNoteReadAloud: (request: { text: string; source?: "selection" | "whole-note" | "message"; title?: string; targetID?: string }) =>
+    ipcRenderer.invoke("openassist:start-note-read-aloud", request),
+  pauseNoteReadAloud: () => ipcRenderer.invoke("openassist:pause-note-read-aloud"),
+  resumeNoteReadAloud: () => ipcRenderer.invoke("openassist:resume-note-read-aloud"),
+  stopNoteReadAloud: () => ipcRenderer.invoke("openassist:stop-note-read-aloud"),
+  onNoteReadAloudState: (callback: (state: unknown) => void) => {
+    const listener = (_event: unknown, payload: unknown) => callback(payload);
+    ipcRenderer.on("openassist:note-read-aloud-state", listener);
+    return () => ipcRenderer.off("openassist:note-read-aloud-state", listener);
+  },
+  startWakeWordForToday: (options?: { phrase?: string; autoDetectMicrophone?: boolean; selectedMicrophoneUID?: string }) =>
+    ipcRenderer.invoke("openassist:start-wake-word-for-today", options),
+  stopWakeWordForToday: (reason?: string) => ipcRenderer.invoke("openassist:stop-wake-word-for-today", reason),
+  getWakeWordStatus: () => ipcRenderer.invoke("openassist:get-wake-word-status"),
+  onWakeWordStatus: (callback: (status: unknown) => void) => {
+    const listener = (_event: unknown, payload: unknown) => callback(payload);
+    ipcRenderer.on("openassist:wake-word-status", listener);
+    return () => ipcRenderer.off("openassist:wake-word-status", listener);
+  },
+  prewarmAssistantVoiceOutput: (options?: { engine?: string; voice?: string }) =>
+    ipcRenderer.invoke("openassist:prewarm-assistant-voice-output", options),
   stopAssistantVoiceOutput: () => ipcRenderer.invoke("openassist:stop-assistant-voice-output"),
   onProviderEvent: (callback: (event: unknown) => void) => {
     const listener = (_event: unknown, payload: unknown) => callback(payload);
@@ -123,8 +268,31 @@ contextBridge.exposeInMainWorld("openAssistElectron", {
     selectedMicrophoneUID?: string;
     whisperModel?: string;
     whisperUseCoreML?: boolean;
+    floatingHUDEnabled?: boolean;
+    waveformTheme?: string;
+    colorTheme?: string;
+    appChromeStyle?: string;
   }) => ipcRenderer.invoke("openassist:start-voice-input", options),
   stopVoiceInput: () => ipcRenderer.invoke("openassist:stop-voice-input"),
+  localVoiceTranscribe: (input: {
+    audioBase64?: string;
+    fileName?: string;
+    mimeType?: string;
+    transcriptionEngine?: string;
+    cloudTranscriptionProvider?: string;
+    cloudTranscriptionAPIKeyConfigured?: boolean;
+    whisperModel?: string;
+    whisperUseCoreML?: boolean;
+  }) => ipcRenderer.invoke("openassist:local-voice-transcribe", input),
+  classifyLocalVoiceTranscript: (input: {
+    transcript: string;
+    lastUserTask?: string;
+    agentRunning?: boolean;
+    surface?: string;
+    voiceState?: string;
+  }) => ipcRenderer.invoke("openassist:local-voice-classify", input),
+  handleLocalVoiceDirectKnowledge: (input: { transcript?: string; taskText?: string }) =>
+    ipcRenderer.invoke("openassist:local-voice-direct-knowledge", input),
   updateVoiceHUD: (payload: {
     visible?: boolean;
     status?: string;
@@ -156,6 +324,8 @@ contextBridge.exposeInMainWorld("openAssistElectron", {
     ipcRenderer.invoke("openassist:save-image", dataURL, defaultName),
   openLocalPath: (filePath: string) =>
     ipcRenderer.invoke("openassist:open-local-path", filePath),
+  getLocalFilePreview: (filePath: string) =>
+    ipcRenderer.invoke("openassist:get-local-file-preview", filePath),
   revealLocalPath: (filePath: string) =>
     ipcRenderer.invoke("openassist:reveal-local-path", filePath),
   setScreenAnalysisFrameVisible: (visible: boolean) =>
@@ -168,14 +338,24 @@ contextBridge.exposeInMainWorld("openAssistElectron", {
     ipcRenderer.invoke("openassist:list-screen-snip-presets"),
   setScreenSnipTheme: (theme: string) =>
     ipcRenderer.invoke("openassist:set-screen-snip-theme", theme),
+  onScreenSnipThemeChanged: (callback: (payload: { selected: string; colors: string[] }) => void) => {
+    const listener = (_event: unknown, payload: { selected: string; colors: string[] }) => callback(payload);
+    ipcRenderer.on("openassist:screen-snip-theme-changed", listener);
+    return () => ipcRenderer.removeListener("openassist:screen-snip-theme-changed", listener);
+  },
   completeScreenSelection: (rect: { x: number; y: number; width: number; height: number }) =>
     ipcRenderer.invoke("openassist:complete-screen-selection", rect),
   cancelScreenSelection: () =>
     ipcRenderer.invoke("openassist:cancel-screen-selection"),
   setScreenAnalysisFrameInteractive: (interactive: boolean) =>
     ipcRenderer.invoke("openassist:set-screen-analysis-frame-interactive", interactive),
-  setWindowMode: (mode: "full" | "sidebar", sidebarOpen?: boolean, sidebarEdge?: "left" | "right") =>
-    ipcRenderer.invoke("openassist:set-window-mode", mode, sidebarOpen, sidebarEdge),
+  setWindowMode: (
+    mode: "full" | "sidebar" | "notch",
+    sidebarOpen?: boolean,
+    sidebarEdge?: "left" | "right",
+    notchDockRevealed?: boolean
+  ) =>
+    ipcRenderer.invoke("openassist:set-window-mode", mode, sidebarOpen, sidebarEdge, notchDockRevealed),
   hideWindow: () => ipcRenderer.invoke("openassist:hide-window"),
   setSidebarPinned: (pinned: boolean) => ipcRenderer.invoke("openassist:set-sidebar-pinned", pinned),
   onSidebarShortcutToggle: (callback: () => void) => {
@@ -197,6 +377,11 @@ contextBridge.exposeInMainWorld("openAssistElectron", {
     ipcRenderer.on("openassist:voice-shortcut", listener);
     return () => ipcRenderer.removeListener("openassist:voice-shortcut", listener);
   },
+  onNavigationCommand: (callback: (direction: "back" | "forward") => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, direction: "back" | "forward") => callback(direction);
+    ipcRenderer.on("openassist:navigation-command", listener);
+    return () => ipcRenderer.removeListener("openassist:navigation-command", listener);
+  },
   onMenuBarCommand: (callback: (command: string) => void) => {
     const listener = (_event: Electron.IpcRendererEvent, command: string) => callback(command);
     ipcRenderer.on("openassist:menu-bar-command", listener);
@@ -206,6 +391,25 @@ contextBridge.exposeInMainWorld("openAssistElectron", {
     const listener = () => callback();
     ipcRenderer.on("openassist:threads-updated", listener);
     return () => ipcRenderer.removeListener("openassist:threads-updated", listener);
+  },
+  // Background app-state updates (plugins, automations, full thread list,
+  // usage) arrive here after the initial loadAppState returned a fast shell.
+  // The callback receives a typed union; the renderer is responsible for
+  // merging each shape into appState.
+  onAppStateBackgroundUpdate: (callback: (update: unknown) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, update: unknown) => callback(update);
+    ipcRenderer.on("openassist:app-state-background-update", listener);
+    return () => ipcRenderer.removeListener("openassist:app-state-background-update", listener);
+  },
+  onSettingsUpdated: (callback: (settings: unknown) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, settings: unknown) => callback(settings);
+    ipcRenderer.on("openassist:settings-updated", listener);
+    return () => ipcRenderer.removeListener("openassist:settings-updated", listener);
+  },
+  onColorThemePreview: (callback: (theme: string | null) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, theme: string | null) => callback(theme);
+    ipcRenderer.on("openassist:color-theme-preview", listener);
+    return () => ipcRenderer.removeListener("openassist:color-theme-preview", listener);
   }
 });
 
@@ -219,6 +423,7 @@ contextBridge.exposeInMainWorld("openAssistRealtime", {
     reasoningEffort?: string;
     pluginIDs?: string[];
     skillIDs?: string[];
+    contextHint?: string;
   }) =>
     ipcRenderer.invoke("openassist:realtime-start", options),
   appendAudio: (chunk: {
@@ -229,6 +434,7 @@ contextBridge.exposeInMainWorld("openAssistRealtime", {
     itemId: string | null;
   }) => ipcRenderer.invoke("openassist:realtime-append-audio", chunk),
   appendText: (text: string) => ipcRenderer.invoke("openassist:realtime-append-text", text),
+  appendImages: (input: unknown) => ipcRenderer.invoke("openassist:realtime-append-images", input),
   stop: () => ipcRenderer.invoke("openassist:realtime-stop"),
   stopDelegation: () => ipcRenderer.invoke("openassist:realtime-stop-delegation"),
   listVoices: () => ipcRenderer.invoke("openassist:realtime-list-voices"),
