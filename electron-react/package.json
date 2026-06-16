@@ -40,7 +40,7 @@
     "@google/genai": "^2.6.0",
     "@huggingface/transformers": "^3.8.1",
     "@liquid-dom/react": "^0.1.0",
-    "@tiptap/extension-code-block-lowlight": "^3.23.6",
+    "@tiptap/extension-code-block-lowlight": "3.23.4",
     "@tiptap/extension-image": "^3.23.4",
     "@tiptap/extension-placeholder": "^3.23.4",
     "@tiptap/extension-table": "^3.23.4",
