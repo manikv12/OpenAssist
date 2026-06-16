@@ -6,6 +6,7 @@ enum AssistantCommandEnvironment {
             homeDirectory.appendingPathComponent(".npm-global/bin", isDirectory: true).path,
             homeDirectory.appendingPathComponent(".local/bin", isDirectory: true).path,
             homeDirectory.appendingPathComponent(".bun/bin", isDirectory: true).path,
+            homeDirectory.appendingPathComponent("Library/Application Support/Antigravity/bin", isDirectory: true).path,
             "/opt/homebrew/bin",
             "/opt/homebrew/sbin",
             "/usr/local/bin",
@@ -187,6 +188,14 @@ struct CodexInstallSupport {
             } else {
                 primaryTitle = "Install Claude Code"
                 primaryDetail = "Open Assist needs Claude Code CLI before the assistant can use Claude Code."
+            }
+        case .antigravityCLI:
+            if resolvedRuntime != nil {
+                primaryTitle = "Google Antigravity is installed"
+                primaryDetail = "Antigravity CLI is available on this Mac. Open Assist can run Antigravity in print mode, use the current workspace, and show replies back in the assistant timeline."
+            } else {
+                primaryTitle = "Install Antigravity CLI"
+                primaryDetail = "Open Assist needs Antigravity CLI before the assistant can use Antigravity."
             }
         case .ollamaLocal:
             primaryTitle = "Set up Ollama (Local)"

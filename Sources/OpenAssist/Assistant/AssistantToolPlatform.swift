@@ -55,6 +55,18 @@ struct ClaudeCodeBackendAdapter: AssistantBackendAdapter {
     )
 }
 
+struct AntigravityCLIBackendAdapter: AssistantBackendAdapter {
+    let backend: AssistantRuntimeBackend = .antigravityCLI
+    let capabilities = AssistantBackendCapabilities(
+        supportsStructuredToolCalls: false,
+        supportsImageInput: false,
+        maxPracticalToolCount: nil,
+        supportsLongToolOutputs: true,
+        supportsContinuation: true,
+        preferredToolSurface: .granular
+    )
+}
+
 struct OllamaLocalBackendAdapter: AssistantBackendAdapter {
     let backend: AssistantRuntimeBackend = .ollamaLocal
     let capabilities = AssistantBackendCapabilities(
@@ -76,6 +88,8 @@ enum AssistantBackendAdapterRegistry {
             return CopilotBackendAdapter()
         case .claudeCode:
             return ClaudeCodeBackendAdapter()
+        case .antigravityCLI:
+            return AntigravityCLIBackendAdapter()
         case .ollamaLocal:
             return OllamaLocalBackendAdapter()
         }
@@ -114,6 +128,7 @@ struct AssistantHostCapabilities: Equatable {
 
 enum AssistantToolExecutionKind {
     case assistantNotes
+    case assistantPlanner
     case browserUse
     case appAction
     case computerUse
@@ -190,6 +205,25 @@ enum AssistantToolCatalog {
                 },
                 requiresExplicitConfirmation: { arguments in
                     (try? AssistantNotesToolService.parseRequest(from: arguments).action) == .applyPreview
+                }
+            ),
+            AssistantToolDescriptor(
+                name: AssistantPlannerToolDefinition.name,
+                aliases: [],
+                toolKind: AssistantPlannerToolDefinition.toolKind,
+                displayName: "Assistant Planner",
+                description: AssistantPlannerToolDefinition.description,
+                inputSchema: AssistantPlannerToolDefinition.inputSchema,
+                modes: [.plan, .agentic],
+                surfaceStyles: [.compact, .granular],
+                permissionLeadText: "Assistant Planner reads local planner day files, prepares planner changes as previews, and only saves when you confirm an apply action.",
+                executionKind: .assistantPlanner,
+                availability: { true },
+                summaryProvider: { arguments in
+                    (try? AssistantPlannerToolService.parseRequest(from: arguments).summaryLine) ?? "Use daily planner"
+                },
+                requiresExplicitConfirmation: { arguments in
+                    (try? AssistantPlannerToolService.parseRequest(from: arguments).action) == .applyPreview
                 }
             ),
             AssistantToolDescriptor(
@@ -764,6 +798,7 @@ struct AssistantToolExecutionContext {
     let attachments: [AssistantAttachment]
     let sessionID: String?
     let assistantNotesContext: AssistantNotesRuntimeContext?
+    let assistantPlannerContext: AssistantPlannerRuntimeContext?
     let preferredModelID: String?
     let browserLoginResume: Bool
     let interactionMode: AssistantInteractionMode
@@ -772,6 +807,7 @@ struct AssistantToolExecutionContext {
 @MainActor
 final class AssistantToolExecutor {
     private let assistantNotesService: AssistantNotesToolService
+    private let assistantPlannerService: AssistantPlannerToolService
     private let browserUseService: AssistantBrowserUseService
     private let appActionService: AssistantAppActionService
     private let computerUseService: AssistantComputerUseService
@@ -784,6 +820,7 @@ final class AssistantToolExecutor {
 
     init(
         assistantNotesService: AssistantNotesToolService,
+        assistantPlannerService: AssistantPlannerToolService,
         browserUseService: AssistantBrowserUseService,
         appActionService: AssistantAppActionService,
         computerUseService: AssistantComputerUseService,
@@ -795,6 +832,7 @@ final class AssistantToolExecutor {
         surfaceCompiler: AssistantToolSurfaceCompiler
     ) {
         self.assistantNotesService = assistantNotesService
+        self.assistantPlannerService = assistantPlannerService
         self.browserUseService = browserUseService
         self.appActionService = appActionService
         self.computerUseService = computerUseService
@@ -838,6 +876,12 @@ final class AssistantToolExecutor {
                 sessionID: context.sessionID,
                 runtimeContext: context.assistantNotesContext,
                 preferredModelID: context.preferredModelID,
+                interactionMode: context.interactionMode
+            )
+        case .assistantPlanner:
+            return await assistantPlannerService.run(
+                arguments: context.arguments,
+                runtimeContext: context.assistantPlannerContext,
                 interactionMode: context.interactionMode
             )
         case .browserUse:
@@ -954,6 +998,8 @@ final class AssistantToolExecutor {
         switch descriptor.executionKind {
         case .assistantNotes:
             return "Reading project notes and preparing note changes"
+        case .assistantPlanner:
+            return "Reading planner days and preparing planner changes"
         case .browserUse:
             return browserLoginResume ? "Checking the browser after sign-in" : "Using the selected browser profile"
         case .appAction:

@@ -16,6 +16,124 @@ final class RemoteAccessCoordinatorTests: XCTestCase {
         XCTAssertEqual(coordinator.namedTunnelPublicURL, "")
     }
 
+    func testHealthWithoutAuthDoesNotRevealMachineDetails() async throws {
+        let coordinator = RemoteAccessCoordinator(
+            defaults: makeDefaults(),
+            bridge: TestRemoteAccessBridge(),
+            tunnelProvider: TestTunnelProvider(),
+            secretStore: TestRemoteAccessSecretStore()
+        )
+        coordinator.installPairingChallenge(
+            RemoteAccessPairingChallenge(
+                code: "pair-health",
+                expiresAt: Date().addingTimeInterval(60),
+                createdAt: Date(),
+                suggestedURL: nil
+            )
+        )
+
+        let health = try await decodeResponse(
+            RemoteAccessHealthResponse.self,
+            from: coordinator.route(makeRequest(method: "GET", path: "/remote/v1/health"))
+        )
+
+        XCTAssertTrue(health.ok)
+        XCTAssertTrue(health.pairingRequired)
+        XCTAssertEqual(health.helperState, "Locked")
+        XCTAssertNil(health.machineID)
+        XCTAssertNil(health.machineName)
+        XCTAssertNil(health.appVersion)
+        XCTAssertNil(health.localBaseURL)
+        XCTAssertNil(health.publicBaseURL)
+    }
+
+    func testHealthWithCurrentPairingCodeRevealsMachineDetails() async throws {
+        let coordinator = RemoteAccessCoordinator(
+            defaults: makeDefaults(),
+            bridge: TestRemoteAccessBridge(),
+            tunnelProvider: TestTunnelProvider(),
+            secretStore: TestRemoteAccessSecretStore()
+        )
+        coordinator.installPairingChallenge(
+            RemoteAccessPairingChallenge(
+                code: "pair-health",
+                expiresAt: Date().addingTimeInterval(60),
+                createdAt: Date(),
+                suggestedURL: nil
+            )
+        )
+
+        let health = try await decodeResponse(
+            RemoteAccessHealthResponse.self,
+            from: coordinator.route(
+                makeRequest(
+                    method: "GET",
+                    path: "/remote/v1/health",
+                    headers: ["x-openassist-pairing-code": "pair-health"]
+                )
+            )
+        )
+
+        XCTAssertTrue(health.ok)
+        XCTAssertFalse(health.pairingRequired)
+        XCTAssertEqual(health.machineID, coordinator.machineID)
+        XCTAssertNotNil(health.machineName)
+        XCTAssertNotNil(health.appVersion)
+        XCTAssertEqual(health.localBaseURL, "http://127.0.0.1:\(RemoteAccessCoordinator.defaultPort)")
+    }
+
+    func testHealthWithDeviceTokenRevealsMachineDetails() async throws {
+        let coordinator = RemoteAccessCoordinator(
+            defaults: makeDefaults(),
+            bridge: TestRemoteAccessBridge(),
+            tunnelProvider: TestTunnelProvider(),
+            secretStore: TestRemoteAccessSecretStore()
+        )
+        let token = try await pairDevice(
+            named: "Health Phone",
+            code: "pair-health-token",
+            coordinator: coordinator
+        )
+
+        let health = try await decodeResponse(
+            RemoteAccessHealthResponse.self,
+            from: coordinator.route(
+                makeRequest(
+                    method: "GET",
+                    path: "/remote/v1/health",
+                    headers: ["authorization": "Bearer \(token)"]
+                )
+            )
+        )
+
+        XCTAssertTrue(health.ok)
+        XCTAssertFalse(health.pairingRequired)
+        XCTAssertEqual(health.machineID, coordinator.machineID)
+        XCTAssertNotNil(health.machineName)
+    }
+
+    func testPairingCodeCanBeRegenerated() {
+        let coordinator = RemoteAccessCoordinator(
+            defaults: makeDefaults(),
+            bridge: TestRemoteAccessBridge(),
+            tunnelProvider: TestTunnelProvider(),
+            secretStore: TestRemoteAccessSecretStore()
+        )
+        coordinator.installPairingChallenge(
+            RemoteAccessPairingChallenge(
+                code: "old-code",
+                expiresAt: Date().addingTimeInterval(60),
+                createdAt: Date(),
+                suggestedURL: nil
+            )
+        )
+
+        coordinator.rotatePairingChallenge()
+
+        XCTAssertNotEqual(coordinator.activePairingChallenge?.code, "old-code")
+        XCTAssertTrue(coordinator.activePairingChallenge?.code.hasPrefix("oa_pair_") ?? false)
+    }
+
     func testPairClaimSucceedsOnceAndReturnsDeviceToken() async throws {
         let defaults = makeDefaults()
         let coordinator = RemoteAccessCoordinator(
@@ -64,6 +182,73 @@ final class RemoteAccessCoordinatorTests: XCTestCase {
 
         XCTAssertFalse(secondResponse.ok)
         XCTAssertEqual(secondResponse.error, "There is no active pairing code.")
+    }
+
+    func testPairClaimReplacesOlderRecordForSameDeviceName() async throws {
+        let defaults = makeDefaults()
+        let coordinator = RemoteAccessCoordinator(
+            defaults: defaults,
+            bridge: TestRemoteAccessBridge(),
+            tunnelProvider: TestTunnelProvider(),
+            secretStore: TestRemoteAccessSecretStore()
+        )
+        coordinator.installPairingChallenge(
+            RemoteAccessPairingChallenge(
+                code: "first-code",
+                expiresAt: Date().addingTimeInterval(60),
+                createdAt: Date(),
+                suggestedURL: nil
+            )
+        )
+
+        let firstResponse = try await decodeResponse(
+            RemoteAccessPairClaimResponse.self,
+            from: coordinator.route(
+                makeRequest(
+                    method: "POST",
+                    path: "/remote/v1/pair/claim",
+                    headers: ["content-type": "application/json", "user-agent": "Expo/1017756"],
+                    body: RemoteAccessPairClaimRequest(code: "first-code", deviceName: "My iPhone", adminPassword: nil)
+                )
+            )
+        )
+        XCTAssertTrue(firstResponse.ok)
+
+        coordinator.installPairingChallenge(
+            RemoteAccessPairingChallenge(
+                code: "second-code",
+                expiresAt: Date().addingTimeInterval(60),
+                createdAt: Date().addingTimeInterval(1),
+                suggestedURL: nil
+            )
+        )
+        let secondResponse = try await decodeResponse(
+            RemoteAccessPairClaimResponse.self,
+            from: coordinator.route(
+                makeRequest(
+                    method: "POST",
+                    path: "/remote/v1/pair/claim",
+                    headers: ["content-type": "application/json", "user-agent": "OpenAssistRemote/1"],
+                    body: RemoteAccessPairClaimRequest(code: "second-code", deviceName: " my   iphone ", adminPassword: nil)
+                )
+            )
+        )
+
+        XCTAssertTrue(secondResponse.ok)
+        XCTAssertEqual(coordinator.pairedDevices.count, 1)
+        XCTAssertEqual(coordinator.pairedDevices.first?.userAgent, "OpenAssistRemote/1")
+
+        let oldTokenState = await coordinator.route(
+            makeRequest(
+                method: "GET",
+                path: "/remote/v1/state",
+                headers: ["authorization": "Bearer \(firstResponse.deviceToken ?? "")"]
+            )
+        )
+        guard case .response(let oldTokenResponse) = oldTokenState else {
+            return XCTFail("Expected a normal HTTP response.")
+        }
+        XCTAssertEqual(oldTokenResponse.statusCode, 401)
     }
 
     func testPairClaimRejectsExpiredCodes() async throws {

@@ -135,6 +135,38 @@ final class CodexInstallSupportTests: XCTestCase {
         )
     }
 
+    func testInspectShowsAntigravityGuidanceWhenAntigravityIsInstalled() async {
+        let support = CodexInstallSupport(
+            runner: WhichCommandRunner(
+                locations: [
+                    "agy": "/Users/test/.local/bin/agy"
+                ]
+            ),
+            searchPathsOverride: [],
+            allowShellLookup: false
+        )
+
+        let guidance = await support.inspect(backend: .antigravityCLI)
+
+        XCTAssertEqual(guidance.backend, .antigravityCLI)
+        XCTAssertTrue(guidance.codexDetected)
+        XCTAssertEqual(guidance.codexPath, "/Users/test/.local/bin/agy")
+        XCTAssertEqual(guidance.primaryTitle, "Google Antigravity is installed")
+        XCTAssertEqual(
+            guidance.primaryDetail,
+            "Antigravity CLI is available on this Mac. Open Assist can run Antigravity in print mode, use the current workspace, and show replies back in the assistant timeline."
+        )
+        XCTAssertEqual(
+            guidance.installCommands,
+            ["curl -fsSL https://antigravity.google/cli/install.sh | bash"]
+        )
+        XCTAssertEqual(guidance.loginCommands, ["agy"])
+        XCTAssertEqual(
+            guidance.docsURL?.absoluteString,
+            "https://antigravity.google/docs/cli-getting-started"
+        )
+    }
+
     func testInspectShowsOllamaGuidanceWhenRuntimeIsMissing() async {
         let support = CodexInstallSupport(
             runner: WhichCommandRunner(locations: [:]),

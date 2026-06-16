@@ -732,6 +732,32 @@ struct AssistantChatWebThreadNoteSourceDescriptor: Equatable {
     }
 }
 
+struct AssistantChatWebPlannerStyleTokens: Equatable {
+    let colors: [String: String]
+    let typography: [String: [String: String]]
+    let spacing: [String: String]
+    let rounded: [String: String]
+    let warning: String?
+
+    init(tokens: AssistantPlannerStyleTokens) {
+        self.colors = tokens.colors
+        self.typography = tokens.typography
+        self.spacing = tokens.spacing
+        self.rounded = tokens.rounded
+        self.warning = tokens.warning
+    }
+
+    func toJSON() -> [String: Any] {
+        [
+            "colors": colors,
+            "typography": typography,
+            "spacing": spacing,
+            "rounded": rounded,
+            "warning": warning ?? NSNull(),
+        ]
+    }
+}
+
 struct AssistantChatWebThreadNoteState: Equatable {
     let threadID: String?
     let ownerKind: String?
@@ -763,6 +789,7 @@ struct AssistantChatWebThreadNoteState: Equatable {
     let canEdit: Bool
     let placeholder: String
     let sourceDescriptor: AssistantChatWebThreadNoteSourceDescriptor?
+    let plannerStyleTokens: AssistantChatWebPlannerStyleTokens?
     let aiDraftPreview: AssistantChatWebThreadNoteAIPreview?
     let projectNoteTransferPreview: AssistantChatWebProjectNoteTransferPreview?
     let projectNoteTransferOutcome: AssistantChatWebProjectNoteTransferOutcome?
@@ -806,6 +833,7 @@ struct AssistantChatWebThreadNoteState: Equatable {
         canEdit: Bool,
         placeholder: String,
         sourceDescriptor: AssistantChatWebThreadNoteSourceDescriptor? = nil,
+        plannerStyleTokens: AssistantChatWebPlannerStyleTokens? = nil,
         aiDraftPreview: AssistantChatWebThreadNoteAIPreview?,
         projectNoteTransferPreview: AssistantChatWebProjectNoteTransferPreview?,
         projectNoteTransferOutcome: AssistantChatWebProjectNoteTransferOutcome?,
@@ -848,6 +876,7 @@ struct AssistantChatWebThreadNoteState: Equatable {
         self.canEdit = canEdit
         self.placeholder = placeholder
         self.sourceDescriptor = sourceDescriptor
+        self.plannerStyleTokens = plannerStyleTokens
         self.aiDraftPreview = aiDraftPreview
         self.projectNoteTransferPreview = projectNoteTransferPreview
         self.projectNoteTransferOutcome = projectNoteTransferOutcome
@@ -893,6 +922,7 @@ struct AssistantChatWebThreadNoteState: Equatable {
             "canEdit": canEdit,
             "placeholder": placeholder,
             "sourceDescriptor": sourceDescriptor?.toJSON() ?? NSNull(),
+            "plannerStyleTokens": plannerStyleTokens?.toJSON() ?? NSNull(),
             "outgoingLinks": outgoingLinks.map { $0.toJSON() },
             "backlinks": backlinks.map { $0.toJSON() },
             "graph": graph?.toJSON() ?? NSNull(),
@@ -1169,6 +1199,8 @@ struct AssistantChatWebThreadNoteCommand {
     let isExpanded: Bool?
     let viewMode: String?
     let selectedText: String?
+    let plannerScheduleMode: String?
+    let targetDayID: String?
     let requestKind: String?
     let draftMode: String?
     let currentDraftMarkdown: String?
@@ -1213,6 +1245,8 @@ struct AssistantChatWebThreadNoteCommand {
         isExpanded: Bool?,
         viewMode: String?,
         selectedText: String?,
+        plannerScheduleMode: String?,
+        targetDayID: String?,
         requestKind: String?,
         draftMode: String?,
         currentDraftMarkdown: String?,
@@ -1256,6 +1290,8 @@ struct AssistantChatWebThreadNoteCommand {
         self.isExpanded = isExpanded
         self.viewMode = viewMode
         self.selectedText = selectedText
+        self.plannerScheduleMode = plannerScheduleMode
+        self.targetDayID = targetDayID
         self.requestKind = requestKind
         self.draftMode = draftMode
         self.currentDraftMarkdown = currentDraftMarkdown
@@ -1317,6 +1353,12 @@ struct AssistantChatWebThreadNoteCommand {
         self.isExpanded = payload["isExpanded"] as? Bool
         self.viewMode = payload["viewMode"] as? String
         self.selectedText = payload["selectedText"] as? String
+        self.plannerScheduleMode = (payload["plannerScheduleMode"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .assistantNonEmpty
+        self.targetDayID = (payload["targetDayId"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .assistantNonEmpty
         self.requestKind = payload["requestKind"] as? String
         self.draftMode = payload["draftMode"] as? String
         self.currentDraftMarkdown = payload["currentDraftMarkdown"] as? String
@@ -2003,6 +2045,8 @@ final class AssistantChatWebCoordinator: NSObject, WKScriptMessageHandler {
                 isExpanded: nil,
                 viewMode: nil,
                 selectedText: nil,
+                plannerScheduleMode: nil,
+                targetDayID: nil,
                 requestKind: nil,
                 draftMode: nil,
                 currentDraftMarkdown: nil,

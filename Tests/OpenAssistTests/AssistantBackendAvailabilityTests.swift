@@ -8,6 +8,7 @@ final class AssistantBackendAvailabilityTests: XCTestCase {
             .codex: makeGuidance(for: .codex, detected: true),
             .copilot: makeGuidance(for: .copilot, detected: false),
             .claudeCode: makeGuidance(for: .claudeCode, detected: false),
+            .antigravityCLI: makeGuidance(for: .antigravityCLI, detected: false),
             .ollamaLocal: makeGuidance(for: .ollamaLocal, detected: false)
         ]
 
@@ -24,6 +25,7 @@ final class AssistantBackendAvailabilityTests: XCTestCase {
             .codex: makeGuidance(for: .codex, detected: true),
             .copilot: makeGuidance(for: .copilot, detected: false),
             .claudeCode: makeGuidance(for: .claudeCode, detected: false),
+            .antigravityCLI: makeGuidance(for: .antigravityCLI, detected: false),
             .ollamaLocal: makeGuidance(for: .ollamaLocal, detected: false)
         ]
 
@@ -40,6 +42,7 @@ final class AssistantBackendAvailabilityTests: XCTestCase {
             .codex: makeGuidance(for: .codex, detected: false),
             .copilot: makeGuidance(for: .copilot, detected: false),
             .claudeCode: makeGuidance(for: .claudeCode, detected: false),
+            .antigravityCLI: makeGuidance(for: .antigravityCLI, detected: false),
             .ollamaLocal: makeGuidance(for: .ollamaLocal, detected: false)
         ]
 
@@ -56,6 +59,7 @@ final class AssistantBackendAvailabilityTests: XCTestCase {
             .codex: makeGuidance(for: .codex, detected: true),
             .copilot: makeGuidance(for: .copilot, detected: false),
             .claudeCode: makeGuidance(for: .claudeCode, detected: true),
+            .antigravityCLI: makeGuidance(for: .antigravityCLI, detected: false),
             .ollamaLocal: makeGuidance(for: .ollamaLocal, detected: false)
         ]
 
@@ -67,11 +71,29 @@ final class AssistantBackendAvailabilityTests: XCTestCase {
         XCTAssertEqual(backend, .claudeCode)
     }
 
+    func testResolvedDefaultAssistantBackendKeepsAntigravityWhenInstalled() {
+        let guidanceByBackend: [AssistantRuntimeBackend: AssistantInstallGuidance] = [
+            .codex: makeGuidance(for: .codex, detected: true),
+            .copilot: makeGuidance(for: .copilot, detected: false),
+            .claudeCode: makeGuidance(for: .claudeCode, detected: false),
+            .antigravityCLI: makeGuidance(for: .antigravityCLI, detected: true),
+            .ollamaLocal: makeGuidance(for: .ollamaLocal, detected: false)
+        ]
+
+        let backend = AssistantStore.resolvedDefaultAssistantBackend(
+            preferred: .antigravityCLI,
+            guidanceByBackend: guidanceByBackend
+        )
+
+        XCTAssertEqual(backend, .antigravityCLI)
+    }
+
     func testResolvedDefaultAssistantBackendKeepsOllamaWhenUserPrefersLocal() {
         let guidanceByBackend: [AssistantRuntimeBackend: AssistantInstallGuidance] = [
             .codex: makeGuidance(for: .codex, detected: true),
             .copilot: makeGuidance(for: .copilot, detected: false),
             .claudeCode: makeGuidance(for: .claudeCode, detected: false),
+            .antigravityCLI: makeGuidance(for: .antigravityCLI, detected: false),
             .ollamaLocal: makeGuidance(for: .ollamaLocal, detected: false)
         ]
 
@@ -88,6 +110,7 @@ final class AssistantBackendAvailabilityTests: XCTestCase {
             .codex: makeGuidance(for: .codex, detected: false),
             .copilot: makeGuidance(for: .copilot, detected: false),
             .claudeCode: makeGuidance(for: .claudeCode, detected: false),
+            .antigravityCLI: makeGuidance(for: .antigravityCLI, detected: false),
             .ollamaLocal: makeGuidance(for: .ollamaLocal, detected: false)
         ]
 

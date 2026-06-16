@@ -6,6 +6,10 @@
   <string>public.app-category.productivity</string>
   <key>NSAppleEventsUsageDescription</key>
   <string>Open Assist uses Apple Events only when you ask it to control another Mac app.</string>
+  <key>NSAccessibilityUsageDescription</key>
+  <string>Open Assist uses Accessibility so Computer Use can read app windows and operate UI when you ask it to.</string>
+  <key>NSScreenCaptureUsageDescription</key>
+  <string>Open Assist uses Screen Recording so Computer Use can see app state and take screenshots when you ask it to.</string>
   <key>NSMicrophoneUsageDescription</key>
   <string>Open Assist uses the microphone for dictation and realtime voice conversations.</string>
   <key>NSSpeechRecognitionUsageDescription</key>

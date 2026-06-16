@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useMemo, type CSSProperties } from "react";
+import { memo, useCallback, useEffect, useMemo, type CSSProperties, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { Components } from "react-markdown";
@@ -66,6 +66,35 @@ const codeTheme: Record<string, CSSProperties> = {
 };
 
 const remarkPlugins = [remarkGfm];
+
+function plainTextFromReactNode(node: ReactNode): string {
+  if (node == null || typeof node === "boolean") return "";
+  if (typeof node === "string" || typeof node === "number") return String(node);
+  if (Array.isArray(node)) return node.map(plainTextFromReactNode).join("");
+  if (typeof node === "object" && "props" in node) {
+    return plainTextFromReactNode((node as { props?: { children?: ReactNode } }).props?.children);
+  }
+  return "";
+}
+
+function noteHeadingKind(title: string) {
+  const normalized = title.trim().toLowerCase();
+  if (/status|progress|health|current/.test(normalized)) return "status";
+  if (/goal|objective/.test(normalized)) return "goals";
+  if (/branch|repo|migration|release/.test(normalized)) return "branch";
+  if (/registry|container|image|artifact|package/.test(normalized)) return "package";
+  if (/pipeline|agent|runner|pool|workflow/.test(normalized)) return "workflow";
+  if (/role|permission|credential|identity|oidc|breach|security/.test(normalized)) return "security";
+  if (/component|architecture|system|module/.test(normalized)) return "components";
+  if (/to\s*do|todo|task|checklist/.test(normalized)) return "tasks";
+  if (/decision|choice|tradeoff/.test(normalized)) return "decision";
+  if (/example|endpoint|api|code|implementation/.test(normalized)) return "code";
+  if (/response|output|result|data|table/.test(normalized)) return "table";
+  if (/infra|infrastructure|deployment|environment|subscription|vmss|virtual machine|scale set/.test(normalized)) return "components";
+  if (/next|done|complete|ship/.test(normalized)) return "done";
+  if (/note|summary|context/.test(normalized)) return "notes";
+  return "note";
+}
 
 function MarkdownContentInner({
   markdown,
@@ -187,6 +216,60 @@ function MarkdownContentInner({
           title={normalizedTitle}
           style={maxWidthStyle}
         />
+      );
+    },
+
+    table: ({ children, className, node: _node, ...props }) => (
+      <div className="markdown-table-wrap">
+        <table {...props} className={className}>
+          {children}
+        </table>
+      </div>
+    ),
+
+    h2: ({ children, className, node: _node, ...props }) => {
+      const kind = noteHeadingKind(plainTextFromReactNode(children));
+      return (
+        <h2
+          {...props}
+          className={`markdown-note-heading ${className ?? ""}`.trim()}
+          data-heading-kind={kind}
+        >
+          <span className="markdown-note-heading-icon" aria-hidden="true" />
+          <span>{children}</span>
+        </h2>
+      );
+    },
+
+    h3: ({ children, className, node: _node, ...props }) => {
+      const kind = noteHeadingKind(plainTextFromReactNode(children));
+      return (
+        <h3
+          {...props}
+          className={`markdown-note-heading markdown-note-heading-sub ${className ?? ""}`.trim()}
+          data-heading-kind={kind}
+        >
+          <span className="markdown-note-heading-icon" aria-hidden="true" />
+          <span>{children}</span>
+        </h3>
+      );
+    },
+
+    li: ({ children, className, node: _node, ...props }) => {
+      const emptyTask = plainTextFromReactNode(children).trim().match(/^\[( |x|X)\]$/);
+      if (emptyTask) {
+        return (
+          <li {...props} className={`markdown-empty-task ${className ?? ""}`.trim()}>
+            <input type="checkbox" checked={emptyTask[1].toLowerCase() === "x"} readOnly disabled />
+            <span aria-hidden="true" />
+          </li>
+        );
+      }
+
+      return (
+        <li {...props} className={className}>
+          {children}
+        </li>
       );
     },
   };

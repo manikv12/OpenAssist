@@ -154,6 +154,7 @@ export const ChevronRight = createIcon("0 0 20 20", [
 
 export const ChevronDown = rotateIcon(ChevronRight, 90);
 export const ChevronLeft = rotateIcon(ChevronRight, 180);
+export const ChevronUp = rotateIcon(ChevronRight, 270);
 
 export const MoreHorizontalIcon = createIcon("0 0 21 21", [
   { d: "M15.6981 9.04712C16.5255 9.04712 17.1959 9.71781 17.1961 10.5452C17.1961 11.3727 16.5256 12.0442 15.6981 12.0442C14.8706 12.0442 14.2 11.3727 14.2 10.5452C14.2002 9.71781 14.8707 9.04712 15.6981 9.04712Z" },
@@ -194,6 +195,35 @@ export const SidebarOpen: CodexIconComponent = ({
   </svg>
 );
 
+export const NotePage: CodexIconComponent = ({
+  size = 20,
+  strokeWidth = 1.5,
+  absoluteStrokeWidth: _absoluteStrokeWidth,
+  children,
+  ...props
+}: CodexIconProps) => (
+  <svg width={size} height={size} viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" {...props}>
+    <path
+      d="M6 22a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h8a2.4 2.4 0 0 1 1.704.706l3.588 3.588A2.4 2.4 0 0 1 20 8v12a2 2 0 0 1-2 2z"
+      stroke="currentColor"
+      strokeWidth={strokeWidth}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    />
+    <path
+      d="M14 2v5a1 1 0 0 0 1 1h5"
+      stroke="currentColor"
+      strokeWidth={strokeWidth}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    />
+    <path d="M10 9H8" stroke="currentColor" strokeWidth={strokeWidth} strokeLinecap="round" strokeLinejoin="round" />
+    <path d="M16 13H8" stroke="currentColor" strokeWidth={strokeWidth} strokeLinecap="round" strokeLinejoin="round" />
+    <path d="M16 17H8" stroke="currentColor" strokeWidth={strokeWidth} strokeLinecap="round" strokeLinejoin="round" />
+    {children}
+  </svg>
+);
+
 export const MessageSquarePlus = Pencil;
 export const FolderPlus = Plus;
-export const NotebookTabs = Pencil;
+export const NotebookTabs = NotePage;

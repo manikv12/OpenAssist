@@ -3,6 +3,7 @@ import Foundation
 enum AssistantGemma4ModelRecommendation: String, CaseIterable, Sendable {
     case e2b = "gemma4:e2b"
     case e4b = "gemma4:e4b"
+    case a12b = "gemma4:12b"
     case a26b = "gemma4:26b"
     case a31b = "gemma4:31b"
 
@@ -12,6 +13,8 @@ enum AssistantGemma4ModelRecommendation: String, CaseIterable, Sendable {
             return "Gemma 4 E2B"
         case .e4b:
             return "Gemma 4 E4B"
+        case .a12b:
+            return "Gemma 4 12B"
         case .a26b:
             return "Gemma 4 26B"
         case .a31b:
@@ -25,6 +28,8 @@ enum AssistantGemma4ModelRecommendation: String, CaseIterable, Sendable {
             return "Small"
         case .e4b:
             return "Balanced"
+        case .a12b:
+            return "~7.6 GB"
         case .a26b:
             return "Large"
         case .a31b:
@@ -38,6 +43,8 @@ enum AssistantGemma4ModelRecommendation: String, CaseIterable, Sendable {
             return "Very Fast"
         case .e4b:
             return "Fast"
+        case .a12b:
+            return "Balanced"
         case .a26b:
             return "Balanced"
         case .a31b:
@@ -51,6 +58,8 @@ enum AssistantGemma4ModelRecommendation: String, CaseIterable, Sendable {
             return "Best for smaller Macs or when you want the lightest local Gemma 4 option."
         case .e4b:
             return "Best default starting point for most Macs."
+        case .a12b:
+            return "Stronger quality than E4B while still fitting most 16–24 GB Macs."
         case .a26b:
             return "Better quality for machines with plenty of unified memory."
         case .a31b:
@@ -94,7 +103,7 @@ enum AssistantGemma4ModelRecommendation: String, CaseIterable, Sendable {
 
 enum AssistantGemma4ModelCatalog {
     private static var baseCatalog: [AssistantGemma4ModelRecommendation] {
-        [.e2b, .e4b, .a26b, .a31b]
+        [.e2b, .e4b, .a12b, .a26b, .a31b]
     }
 
     static func recommendedModel(

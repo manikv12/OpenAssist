@@ -239,4 +239,22 @@ final class ClaudeCodeRuntimeParsingTests: XCTestCase {
         XCTAssertEqual(CodexAssistantRuntime.claudeCodePermissionMode(for: .agentic), "default")
         XCTAssertEqual(CodexAssistantRuntime.claudeCodePermissionMode(for: .conversational), "default")
     }
+
+    func testAntigravityPrintArgumentsUseSandboxAndWorkspace() {
+        let arguments = CodexAssistantRuntime.antigravityCLIArguments(
+            prompt: "Fix the failing test",
+            workingDirectory: "/tmp/project"
+        )
+
+        XCTAssertEqual(arguments, [
+            "--print",
+            "--sandbox",
+            "--print-timeout",
+            "20m",
+            "--add-dir",
+            "/tmp/project",
+            "Fix the failing test"
+        ])
+        XCTAssertFalse(arguments.contains("--dangerously-skip-permissions"))
+    }
 }

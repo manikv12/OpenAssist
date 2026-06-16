@@ -56,6 +56,7 @@ final class AssistantNoteProtectionSupportTests: XCTestCase {
     func testBackupControllerSkipsUnchangedBackupsAndRestoresPreviousSet() throws {
         let projectRoot = try makeTemporaryDirectory(named: "assistant-notes-backup-project-root")
         let conversationRoot = try makeTemporaryDirectory(named: "assistant-notes-backup-thread-root")
+        let plannerRoot = try makeTemporaryDirectory(named: "assistant-notes-backup-planner-root")
         let backupRoot = try makeTemporaryDirectory(named: "assistant-notes-backup-target")
         let settings = SettingsStore.shared
         let originalFolderPath = settings.assistantNotesBackupFolderPath
@@ -100,7 +101,8 @@ final class AssistantNoteProtectionSupportTests: XCTestCase {
             fileManager: .default,
             settings: settings,
             projectRootURL: projectRoot,
-            conversationRootURL: conversationRoot
+            conversationRootURL: conversationRoot,
+            plannerRootURL: plannerRoot
         )
         let firstDate = Date(timeIntervalSince1970: 20_000)
 
@@ -144,6 +146,7 @@ final class AssistantNoteProtectionSupportTests: XCTestCase {
     func testBackupControllerPrunesBackupSetsUsingDailyAndWeeklyRetention() throws {
         let projectRoot = try makeTemporaryDirectory(named: "assistant-notes-backup-prune-project-root")
         let conversationRoot = try makeTemporaryDirectory(named: "assistant-notes-backup-prune-thread-root")
+        let plannerRoot = try makeTemporaryDirectory(named: "assistant-notes-backup-prune-planner-root")
         let backupRoot = try makeTemporaryDirectory(named: "assistant-notes-backup-prune-target")
         let settings = SettingsStore.shared
         let originalFolderPath = settings.assistantNotesBackupFolderPath
@@ -167,7 +170,8 @@ final class AssistantNoteProtectionSupportTests: XCTestCase {
             fileManager: .default,
             settings: settings,
             projectRootURL: projectRoot,
-            conversationRootURL: conversationRoot
+            conversationRootURL: conversationRoot,
+            plannerRootURL: plannerRoot
         )
         let calendar = Calendar(identifier: .gregorian)
         let baseDate = calendar.date(
@@ -198,6 +202,67 @@ final class AssistantNoteProtectionSupportTests: XCTestCase {
             AssistantNoteProtectionDefaults.dailyBackupRetentionCount
                 + AssistantNoteProtectionDefaults.weeklyBackupRetentionCount
         )
+    }
+
+    @MainActor
+    func testBackupControllerIncludesPlannerFilesInRestore() throws {
+        let projectRoot = try makeTemporaryDirectory(named: "assistant-notes-backup-planner-project-root")
+        let conversationRoot = try makeTemporaryDirectory(named: "assistant-notes-backup-planner-thread-root")
+        let plannerRoot = try makeTemporaryDirectory(named: "assistant-notes-backup-planner-live-root")
+        let backupRoot = try makeTemporaryDirectory(named: "assistant-notes-backup-planner-target")
+        let settings = SettingsStore.shared
+        let originalFolderPath = settings.assistantNotesBackupFolderPath
+        let originalLastSuccessfulBackupEpoch = settings.assistantNotesLastSuccessfulBackupEpoch
+        defer {
+            settings.assistantNotesBackupFolderPath = originalFolderPath
+            settings.assistantNotesLastSuccessfulBackupEpoch = originalLastSuccessfulBackupEpoch
+        }
+
+        settings.assistantNotesBackupFolderPath = backupRoot.path
+        settings.assistantNotesLastSuccessfulBackupEpoch = 0
+
+        let plannerDayURL = plannerRoot
+            .appendingPathComponent("Daily", isDirectory: true)
+            .appendingPathComponent("2026", isDirectory: true)
+            .appendingPathComponent("05", isDirectory: true)
+            .appendingPathComponent("2026-05-24.md", isDirectory: false)
+        let templateURL = plannerRoot
+            .appendingPathComponent("Templates", isDirectory: true)
+            .appendingPathComponent("default.md", isDirectory: false)
+        let designURL = plannerRoot.appendingPathComponent("DESIGN.md", isDirectory: false)
+        let recoveryURL = plannerRoot
+            .appendingPathComponent("Recovery", isDirectory: true)
+            .appendingPathComponent("history.json", isDirectory: false)
+
+        try writeFile("planner-v1", to: plannerDayURL)
+        try writeFile("template-v1", to: templateURL)
+        try writeFile("design-v1", to: designURL)
+        try writeFile("recovery-v1", to: recoveryURL)
+
+        let controller = AssistantNotesBackupController(
+            fileManager: .default,
+            settings: settings,
+            projectRootURL: projectRoot,
+            conversationRootURL: conversationRoot,
+            plannerRootURL: plannerRoot
+        )
+        let backupDate = Date(timeIntervalSince1970: 40_000)
+        let backup = try XCTUnwrap(controller.runManualBackup(referenceDate: backupDate))
+
+        try writeFile("planner-live", to: plannerDayURL)
+        try writeFile("template-live", to: templateURL)
+        try writeFile("design-live", to: designURL)
+        try writeFile("recovery-live", to: recoveryURL)
+
+        _ = try controller.restoreBackupSet(
+            id: backup.id,
+            referenceDate: backupDate.addingTimeInterval(60 * 60)
+        )
+
+        XCTAssertEqual(try String(contentsOf: plannerDayURL, encoding: .utf8), "planner-v1")
+        XCTAssertEqual(try String(contentsOf: templateURL, encoding: .utf8), "template-v1")
+        XCTAssertEqual(try String(contentsOf: designURL, encoding: .utf8), "design-v1")
+        XCTAssertEqual(try String(contentsOf: recoveryURL, encoding: .utf8), "recovery-v1")
     }
 
     private func makeTemporaryDirectory(named name: String) throws -> URL {

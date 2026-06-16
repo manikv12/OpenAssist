@@ -5,6 +5,7 @@ import UniformTypeIdentifiers
 
 private enum AssistantSidebarPane {
     case threads
+    case planner
     case notes
     case archived
     case automations
@@ -271,6 +272,8 @@ private struct AssistantNoteOwnerKey: Hashable {
             return "Thread notes"
         case .project:
             return "Project notes"
+        case .planner:
+            return "Planner"
         }
     }
 }
@@ -344,6 +347,8 @@ extension AssistantSidebarPane {
         switch self {
         case .threads:
             return "threads"
+        case .planner:
+            return "planner"
         case .notes:
             return "notes"
         case .archived:
@@ -361,6 +366,8 @@ extension AssistantSidebarPane {
         switch shellID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
         case "threads":
             self = .threads
+        case "planner", "today":
+            self = .planner
         case "notes":
             self = .notes
         case "archived":
@@ -983,6 +990,7 @@ struct AssistantWindowView: View {
     @State private var selectedNoteOwnerByThreadID: [String: AssistantNoteOwnerKey] = [:]
     @State private var selectedNotesProjectID: String?
     @State private var selectedNotesScope: AssistantNotesScope = .project
+    @State private var selectedPlannerDayID: String?
     @AppStorage("assistantNotesAssistantOverlayOpen") private var isNotesAssistantPanelOpen = false
     @AppStorage("assistantNotesAssistantOverlayExpanded") private
         var isNotesAssistantPanelExpanded =
@@ -1584,6 +1592,18 @@ struct AssistantWindowView: View {
         selectedSidebarPane == .notes
     }
 
+    private var isPlannerPaneActive: Bool {
+        selectedSidebarPane == .planner
+    }
+
+    private var currentPlannerDayID: String {
+        selectedPlannerDayID ?? assistant.currentPlannerDayID()
+    }
+
+    private var currentPlannerOwner: AssistantNoteOwnerKey {
+        AssistantNoteOwnerKey(kind: .planner, id: AssistantPlannerStore.ownerID)
+    }
+
     private var isProjectNotesFocusMode: Bool {
         selectedSidebarPane == .threads && currentProjectNotesProject != nil
     }
@@ -1636,6 +1656,8 @@ struct AssistantWindowView: View {
             return assistantProject(for: owner.id)
         case .thread:
             return projectForThreadNotes(threadID: owner.id)
+        case .planner:
+            return nil
         }
     }
 
@@ -1810,6 +1832,10 @@ struct AssistantWindowView: View {
     }
 
     private var currentThreadNoteOwner: AssistantNoteOwnerKey? {
+        if isPlannerPaneActive {
+            return currentPlannerOwner
+        }
+
         if isNotesPaneActive,
             let project = selectedNotesProject,
             let currentTarget = currentNotesSelectionTarget(
@@ -1848,6 +1874,8 @@ struct AssistantWindowView: View {
                 $0.id.trimmingCharacters(in: .whitespacesAndNewlines)
                     .caseInsensitiveCompare(owner.id) == .orderedSame
             })?.name ?? "Project"
+        case .planner:
+            return "Daily Planner"
         }
     }
 
@@ -1856,6 +1884,9 @@ struct AssistantWindowView: View {
         case .project:
             return
                 "Write shared decisions, constraints, architecture notes, and next steps for this project. Type / for Markdown blocks."
+        case .planner:
+            return
+                "Plan the day with Markdown tasks, notes, and note links. Type / for Markdown blocks."
         case .thread, .none:
             return
                 "Write decisions, next steps, constraints, and follow-ups for this thread. Type / for Markdown blocks."
@@ -1863,6 +1894,10 @@ struct AssistantWindowView: View {
     }
 
     private func noteNavigationContextKey(for threadID: String?) -> String? {
+        if isPlannerPaneActive {
+            return "planner::global"
+        }
+
         if isNotesPaneActive,
             let project = selectedNotesProject
         {
@@ -1954,6 +1989,8 @@ struct AssistantWindowView: View {
             return assistant.loadThreadStoredNotes(threadID: owner.id)
         case .project:
             return assistant.loadProjectStoredNotes(projectID: owner.id)
+        case .planner:
+            return assistant.loadPlannerStoredNotes()
         }
     }
 
@@ -1970,7 +2007,16 @@ struct AssistantWindowView: View {
         if isNotesPaneActive,
             let project = selectedNotesProject
         {
-            storedNotes = notesUniverse(for: project).allNotes
+            storedNotes = notesUniverse(for: project).allNotes + assistant.loadPlannerStoredNotes()
+        } else if isPlannerPaneActive {
+            storedNotes =
+                assistant.loadPlannerStoredNotes()
+                + assistant.visibleProjects.flatMap { project in
+                    assistant.loadProjectStoredNotes(projectID: project.id)
+                }
+                + assistant.sessions.flatMap { session in
+                    assistant.loadThreadStoredNotes(threadID: session.id)
+                }
         } else {
             let availableOwners = availableNoteOwners(for: selectedThreadNoteID)
             storedNotes = availableOwners.flatMap(loadStoredNotes(for:))
@@ -2015,6 +2061,8 @@ struct AssistantWindowView: View {
             versions = assistant.threadNoteHistoryVersions(threadID: owner.id, noteID: noteID)
         case .project:
             versions = assistant.projectNoteHistoryVersions(projectID: owner.id, noteID: noteID)
+        case .planner:
+            versions = assistant.plannerHistoryVersions(dayID: noteID)
         }
 
         return versions.map {
@@ -2039,6 +2087,8 @@ struct AssistantWindowView: View {
             deletedNotes = assistant.recentlyDeletedThreadNotes(threadID: owner.id)
         case .project:
             deletedNotes = assistant.recentlyDeletedProjectNotes(projectID: owner.id)
+        case .planner:
+            deletedNotes = []
         }
 
         return deletedNotes.map {
@@ -2060,6 +2110,8 @@ struct AssistantWindowView: View {
             return assistant.loadThreadNotesWorkspace(threadID: owner.id)
         case .project:
             return assistant.loadProjectNotesWorkspace(projectID: owner.id)
+        case .planner:
+            return assistant.loadPlannerWorkspace(dayID: currentPlannerDayID)
         }
     }
 
@@ -2114,6 +2166,8 @@ struct AssistantWindowView: View {
                 noteID: noteID,
                 relativePath: relativePath
             )
+        case .planner:
+            return nil
         }
     }
 
@@ -2592,6 +2646,13 @@ struct AssistantWindowView: View {
         if isNotesPaneActive, notesWorkspaceExternalMarkdownFile != nil {
             return nil
         }
+        if isPlannerPaneActive {
+            return AssistantNoteLinkTarget(
+                ownerKind: .planner,
+                ownerID: AssistantPlannerStore.ownerID,
+                noteID: currentPlannerDayID
+            )
+        }
         if isNotesPaneActive,
             let project = selectedNotesProject
         {
@@ -2613,6 +2674,9 @@ struct AssistantWindowView: View {
     private var currentDisplayedNoteTitle: String? {
         if let externalFile = isNotesPaneActive ? notesWorkspaceExternalMarkdownFile : nil {
             return externalFile.fileName
+        }
+        if isPlannerPaneActive {
+            return currentThreadNoteManifest.selectedNote?.title ?? currentPlannerDayID
         }
         if isNotesPaneActive,
             let project = selectedNotesProject,
@@ -2856,6 +2920,9 @@ struct AssistantWindowView: View {
         if isNotesPaneActive {
             return notesWorkspaceThreadNoteState(for: selectedNotesProject)
         }
+        if isPlannerPaneActive {
+            return plannerThreadNoteState()
+        }
 
         let threadID = currentProjectNotesProject == nil ? selectedThreadNoteID : nil
         let owner = currentThreadNoteOwner
@@ -2971,6 +3038,139 @@ struct AssistantWindowView: View {
         )
     }
 
+    private func plannerThreadNoteState() -> AssistantChatWebThreadNoteState {
+        let owner = currentPlannerOwner
+        let manifest = noteManifest(for: owner)
+        let selectedNote = manifest.selectedNote
+        let selectedNoteID = selectedNote?.id ?? currentPlannerDayID
+        let text = noteDraftText(for: owner, noteID: selectedNoteID)
+        let relationships = currentThreadNoteRelationshipSnapshot()
+        let navigationStack = currentThreadNoteNavigationStack()
+        let historyVersions = chatWebHistoryItems(for: owner, noteID: selectedNoteID)
+        let styleTokens = assistant.plannerStyleTokens()
+        let savedAt =
+            noteLastSavedAtByOwnerKey[owner.storageKey]?[selectedNoteID]
+            ?? selectedNote?.updatedAt
+        let isSaving = threadNoteSavingNoteKeys.contains(
+            threadNoteStorageKey(owner: owner, noteID: selectedNoteID)
+        )
+        let plannerSource = AssistantChatWebThreadNoteSource(
+            ownerKind: owner.kind.rawValue,
+            ownerID: owner.id,
+            ownerTitle: "Daily Planner",
+            sourceLabel: owner.displaySourceLabel
+        )
+        let noteSources =
+            assistant.visibleProjects.map { project in
+                AssistantChatWebThreadNoteSource(
+                    ownerKind: AssistantNoteOwnerKind.project.rawValue,
+                    ownerID: project.id,
+                    ownerTitle: project.name,
+                    sourceLabel: "Project notes"
+                )
+            }
+            + assistant.sessions.map { session in
+                AssistantChatWebThreadNoteSource(
+                    ownerKind: AssistantNoteOwnerKind.thread.rawValue,
+                    ownerID: session.id,
+                    ownerTitle: session.title,
+                    sourceLabel: "Thread notes"
+                )
+            }
+        let plannerNotes = manifest.orderedNotes.map { note in
+            AssistantChatWebThreadNoteItem(
+                id: note.id,
+                title: note.title,
+                noteType: note.noteType.rawValue,
+                updatedAtLabel: threadNoteSavedLabel(
+                    for: noteLastSavedAtByOwnerKey[owner.storageKey]?[note.id]
+                        ?? note.updatedAt
+                ),
+                ownerKind: owner.kind.rawValue,
+                ownerID: owner.id,
+                sourceLabel: owner.displaySourceLabel
+            )
+        }
+        let linkedNotes =
+            assistant.visibleProjects.flatMap { project in
+                assistant.loadProjectStoredNotes(projectID: project.id).map { note in
+                    AssistantChatWebThreadNoteItem(
+                        id: note.noteID,
+                        title: note.title,
+                        noteType: note.noteType.rawValue,
+                        updatedAtLabel: threadNoteSavedLabel(for: note.updatedAt),
+                        ownerKind: note.ownerKind.rawValue,
+                        ownerID: note.ownerID,
+                        sourceLabel: "Project notes"
+                    )
+                }
+            }
+            + assistant.sessions.flatMap { session in
+                assistant.loadThreadStoredNotes(threadID: session.id).map { note in
+                    AssistantChatWebThreadNoteItem(
+                        id: note.noteID,
+                        title: note.title,
+                        noteType: note.noteType.rawValue,
+                        updatedAtLabel: threadNoteSavedLabel(for: note.updatedAt),
+                        ownerKind: note.ownerKind.rawValue,
+                        ownerID: note.ownerID,
+                        sourceLabel: "Thread notes"
+                    )
+                }
+            }
+
+        return AssistantChatWebThreadNoteState(
+            threadID: nil,
+            ownerKind: owner.kind.rawValue,
+            ownerID: owner.id,
+            ownerTitle: "Daily Planner",
+            presentation: "notesWorkspace",
+            notesScope: "planner",
+            workspaceProjectID: nil,
+            workspaceProjectTitle: "Daily Planner",
+            workspaceOwnerSubtitle: styleTokens.warning ?? "Planner day \(selectedNoteID)",
+            canCreateNote: false,
+            owningThreadID: nil,
+            owningThreadTitle: nil,
+            availableSources: [plannerSource] + noteSources,
+            notes: plannerNotes + linkedNotes,
+            selectedNoteID: selectedNoteID,
+            selectedNoteTitle: selectedNote?.title ?? selectedNoteID,
+            text: text,
+            isOpen: true,
+            isExpanded: true,
+            viewMode: threadNoteViewMode,
+            hasAnyNotes: true,
+            isSaving: isSaving,
+            isGeneratingAIDraft: threadNoteGeneratingAIDraftOwnerKeys.contains(owner.storageKey),
+            isGeneratingProjectTransferPreview: false,
+            isGeneratingBatchNotePlanPreview: false,
+            aiDraftMode: threadNoteAIDraftModeByOwnerKey[owner.storageKey],
+            lastSavedAtLabel: threadNoteSavedLabel(for: savedAt),
+            canEdit: true,
+            placeholder: notePlaceholder(for: owner),
+            sourceDescriptor: nil,
+            plannerStyleTokens: AssistantChatWebPlannerStyleTokens(tokens: styleTokens),
+            aiDraftPreview: threadNoteAIDraftPreviewByOwnerKey[owner.storageKey],
+            projectNoteTransferPreview: nil,
+            projectNoteTransferOutcome: nil,
+            batchNotePlanPreview: nil,
+            outgoingLinks: chatWebRelationshipItems(from: relationships.outgoingLinks),
+            backlinks: chatWebRelationshipItems(from: relationships.backlinks),
+            graph: relationships.graph.map {
+                AssistantChatWebThreadNoteGraph(
+                    mermaidCode: $0.mermaidCode,
+                    nodeCount: $0.nodeCount,
+                    edgeCount: $0.edgeCount
+                )
+            },
+            canNavigateBack: !navigationStack.isEmpty,
+            previousLinkedNoteTitle: navigationStack.last?.title,
+            historyVersions: historyVersions,
+            recentlyDeletedNotes: []
+        )
+    }
+
     private func notesWorkspaceThreadNoteState(
         for project: AssistantProject?
     ) -> AssistantChatWebThreadNoteState {
@@ -2986,6 +3186,14 @@ struct AssistantWindowView: View {
                             ownerID: universe.projectOwner.id,
                             ownerTitle: project.name,
                             sourceLabel: universe.projectOwner.displaySourceLabel
+                        )
+                    ]
+                    + [
+                        AssistantChatWebThreadNoteSource(
+                            ownerKind: AssistantNoteOwnerKind.planner.rawValue,
+                            ownerID: AssistantPlannerStore.ownerID,
+                            ownerTitle: "Daily Planner",
+                            sourceLabel: "Planner"
                         )
                     ]
                     + universe.threadSources
@@ -3020,6 +3228,17 @@ struct AssistantWindowView: View {
                             ownerKind: note.ownerKind.rawValue,
                             ownerID: note.ownerID,
                             sourceLabel: "Thread notes"
+                        )
+                    }
+                    + assistant.loadPlannerStoredNotes().map { note in
+                        AssistantChatWebThreadNoteItem(
+                            id: note.noteID,
+                            title: note.title,
+                            noteType: note.noteType.rawValue,
+                            updatedAtLabel: threadNoteSavedLabel(for: note.updatedAt),
+                            ownerKind: note.ownerKind.rawValue,
+                            ownerID: note.ownerID,
+                            sourceLabel: "Planner"
                         )
                     }
             } else {
@@ -3159,6 +3378,14 @@ struct AssistantWindowView: View {
                     sourceLabel: universe.projectOwner.displaySourceLabel
                 )
             ]
+            + [
+                AssistantChatWebThreadNoteSource(
+                    ownerKind: AssistantNoteOwnerKind.planner.rawValue,
+                    ownerID: AssistantPlannerStore.ownerID,
+                    ownerTitle: "Daily Planner",
+                    sourceLabel: "Planner"
+                )
+            ]
             + universe.threadSources
             .filter { !$0.notes.isEmpty }
             .map { source in
@@ -3191,6 +3418,17 @@ struct AssistantWindowView: View {
                     ownerKind: note.ownerKind.rawValue,
                     ownerID: note.ownerID,
                     sourceLabel: "Thread notes"
+                )
+            }
+            + assistant.loadPlannerStoredNotes().map { note in
+                AssistantChatWebThreadNoteItem(
+                    id: note.noteID,
+                    title: note.title,
+                    noteType: note.noteType.rawValue,
+                    updatedAtLabel: threadNoteSavedLabel(for: note.updatedAt),
+                    ownerKind: note.ownerKind.rawValue,
+                    ownerID: note.ownerID,
+                    sourceLabel: "Planner"
                 )
             }
 
@@ -4662,6 +4900,8 @@ struct AssistantWindowView: View {
             createdWorkspace = assistant.createThreadNote(threadID: owner.id)
         case .project:
             createdWorkspace = assistant.createProjectNote(projectID: owner.id, title: nil)
+        case .planner:
+            createdWorkspace = assistant.loadPlannerWorkspace(dayID: currentPlannerDayID)
         }
         guard let createdWorkspace else {
             return existingWorkspace
@@ -4685,6 +4925,10 @@ struct AssistantWindowView: View {
             let ownerID = command.ownerID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
         {
             return AssistantNoteOwnerKey(kind: ownerKind, id: ownerID)
+        }
+
+        if isPlannerPaneActive {
+            return currentPlannerOwner
         }
 
         if isNotesPaneActive,
@@ -4879,6 +5123,12 @@ struct AssistantWindowView: View {
                 text: persistedDraftText,
                 forceHistorySnapshot: forceHistorySnapshot
             )
+        case .planner:
+            saveResult = assistant.savePlannerDayResult(
+                dayID: resolvedNoteID,
+                text: persistedDraftText,
+                forceHistorySnapshot: forceHistorySnapshot
+            )
         }
 
         switch saveResult {
@@ -4962,6 +5212,9 @@ struct AssistantWindowView: View {
                 projectID: owner.id,
                 noteID: noteID
             )
+        case .planner:
+            selectedPlannerDayID = noteID
+            return assistant.selectPlannerDay(dayID: noteID)
         }
     }
 
@@ -4970,6 +5223,36 @@ struct AssistantWindowView: View {
         noteID: String,
         resolvedThreadID: String?
     ) {
+        if owner.kind == .planner {
+            persistThreadNoteIfNeeded(for: currentThreadNoteOwner)
+            selectedSidebarPane = .planner
+            selectedPlannerDayID = noteID
+            if let workspace = assistant.selectPlannerDay(dayID: noteID) {
+                applyThreadNoteWorkspace(workspace)
+            }
+            isThreadNoteOpen = true
+            syncAssistantNotesRuntimeContext()
+            return
+        }
+
+        if isPlannerPaneActive, let project = notesProject(for: owner) {
+            persistThreadNoteIfNeeded(for: currentThreadNoteOwner)
+            selectedSidebarPane = .notes
+            selectedNotesProjectID = project.id
+            selectedNotesScope = owner.kind == .project ? .project : .thread
+            rememberNotesSelectionTarget(
+                AssistantNoteLinkTarget(ownerKind: owner.kind, ownerID: owner.id, noteID: noteID),
+                projectID: project.id,
+                scope: selectedNotesScope
+            )
+            if let workspace = selectNotesWorkspace(for: owner, noteID: noteID) {
+                applyThreadNoteWorkspace(workspace)
+            }
+            isThreadNoteOpen = true
+            syncAssistantNotesRuntimeContext()
+            return
+        }
+
         if currentDisplayedNoteTarget
             == AssistantNoteLinkTarget(
                 ownerKind: owner.kind,
@@ -5167,6 +5450,8 @@ struct AssistantWindowView: View {
                     noteID: resolvedNoteID,
                     attachment: attachment
                 )
+            case .planner:
+                savedAsset = nil
             }
 
             guard let savedAsset,
@@ -5265,6 +5550,8 @@ struct AssistantWindowView: View {
                     noteID: resolvedNoteID,
                     attachment: attachment
                 )
+            case .planner:
+                savedAsset = nil
             }
 
             guard let savedAsset,
@@ -5527,6 +5814,8 @@ struct AssistantWindowView: View {
                 workspace = assistant.createThreadNote(threadID: resolvedOwner.id)
             case .project:
                 workspace = assistant.createProjectNote(projectID: resolvedOwner.id, title: nil)
+            case .planner:
+                workspace = assistant.loadPlannerWorkspace(dayID: currentPlannerDayID)
             }
             guard let workspace else { return }
             applyThreadNoteWorkspace(workspace)
@@ -5567,6 +5856,8 @@ struct AssistantWindowView: View {
                     noteID: resolvedNoteID,
                     title: title
                 )
+            case .planner:
+                workspace = assistant.loadPlannerWorkspace(dayID: resolvedNoteID)
             }
             guard let workspace else { return }
             applyThreadNoteWorkspace(workspace)
@@ -5599,6 +5890,8 @@ struct AssistantWindowView: View {
                     projectID: resolvedOwner.id,
                     noteID: resolvedNoteID
                 )
+            case .planner:
+                workspace = assistant.loadPlannerWorkspace(dayID: resolvedNoteID)
             }
             guard let workspace else { return }
             removeNoteFromNavigationStacks(owner: resolvedOwner, noteID: resolvedNoteID)
@@ -5701,6 +5994,11 @@ struct AssistantWindowView: View {
                     noteID: resolvedNoteID,
                     versionID: historyVersionID
                 )
+            case .planner:
+                workspace = assistant.restorePlannerHistoryVersion(
+                    dayID: resolvedNoteID,
+                    versionID: historyVersionID
+                )
             }
             guard let workspace else { return }
             applyThreadNoteWorkspace(workspace)
@@ -5726,6 +6024,11 @@ struct AssistantWindowView: View {
                     noteID: resolvedNoteID,
                     versionID: historyVersionID
                 )
+            case .planner:
+                workspace = assistant.deletePlannerHistoryVersion(
+                    dayID: resolvedNoteID,
+                    versionID: historyVersionID
+                )
             }
             guard let workspace else { return }
             applyThreadNoteWorkspace(workspace)
@@ -5745,6 +6048,8 @@ struct AssistantWindowView: View {
                     projectID: resolvedOwner.id,
                     deletedNoteID: deletedNoteID
                 )
+            case .planner:
+                workspace = nil
             }
             guard let workspace else { return }
             applyThreadNoteWorkspace(workspace)
@@ -5766,6 +6071,8 @@ struct AssistantWindowView: View {
                     projectID: resolvedOwner.id,
                     deletedNoteID: deletedNoteID
                 )
+            case .planner:
+                break
             }
         case "appendSelection":
             guard let resolvedOwner,
@@ -5783,6 +6090,17 @@ struct AssistantWindowView: View {
                     projectID: resolvedOwner.id,
                     text: text
                 )
+            case .planner:
+                let request = AssistantPlannerScheduleRequest(
+                    mode: .copy,
+                    targetDayID: currentPlannerDayID,
+                    selectedMarkdown: text,
+                    sourceTarget: nil,
+                    sourceTitle: nil,
+                    sourceTextAfterMove: nil,
+                    originalDayID: nil
+                )
+                workspace = assistant.appendToPlanner(request)
             }
             guard let workspace else { return }
             applyThreadNoteWorkspace(workspace)
@@ -5880,6 +6198,67 @@ struct AssistantWindowView: View {
         case "cancelProjectNoteTransferPreview":
             guard let resolvedOwner else { return }
             clearThreadNoteProjectTransferState(for: resolvedOwner)
+        case "scheduleSelectionToPlanner":
+            guard let resolvedOwner,
+                let resolvedNoteID,
+                let selectedMarkdown = command.selectedText?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .nonEmpty,
+                let targetDayID = command.targetDayID?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .nonEmpty,
+                let modeRaw = command.plannerScheduleMode?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .lowercased(),
+                let mode = AssistantPlannerScheduleMode(rawValue: modeRaw)
+            else {
+                return
+            }
+
+            let sourceTarget = AssistantNoteLinkTarget(
+                ownerKind: resolvedOwner.kind,
+                ownerID: resolvedOwner.id,
+                noteID: resolvedNoteID
+            )
+            let request = AssistantPlannerScheduleRequest(
+                mode: mode,
+                targetDayID: targetDayID,
+                selectedMarkdown: selectedMarkdown,
+                sourceTarget: sourceTarget,
+                sourceTitle: command.sourceNoteTitle ?? currentDisplayedNoteTitle,
+                sourceTextAfterMove: command.sourceTextAfterMove,
+                originalDayID: resolvedOwner.kind == .planner ? resolvedNoteID : nil
+            )
+            let targetWorkspace = assistant.appendToPlanner(request)
+            if mode == .move,
+                resolvedOwner.kind == .planner,
+                let sourceTextAfterMove = command.sourceTextAfterMove
+            {
+                noteDraftStore.setDraft(
+                    sourceTextAfterMove,
+                    ownerKey: resolvedOwner.storageKey,
+                    noteID: resolvedNoteID,
+                    revision: command.draftRevision
+                )
+                let sourceWorkspace = assistant.savePlannerDay(
+                    dayID: resolvedNoteID,
+                    text: sourceTextAfterMove,
+                    forceHistorySnapshot: true
+                )
+                if let sourceWorkspace {
+                    applyThreadNoteWorkspace(sourceWorkspace)
+                } else if let targetWorkspace, targetDayID == currentPlannerDayID {
+                    applyThreadNoteWorkspace(targetWorkspace)
+                }
+                noteDraftStore.clearPersistedDraftIfCurrent(
+                    ownerKey: resolvedOwner.storageKey,
+                    noteID: resolvedNoteID,
+                    expectedText: sourceTextAfterMove,
+                    savedRevision: command.draftRevision
+                )
+            } else if targetDayID == currentPlannerDayID, let targetWorkspace {
+                applyThreadNoteWorkspace(targetWorkspace)
+            }
         case "requestBatchNotePlanPreview":
             guard
                 let projectID = command.targetProjectID?
@@ -6270,6 +6649,9 @@ struct AssistantWindowView: View {
                         projectID: owner.id,
                         noteID: selectedNoteID
                     )
+                case .planner:
+                    selectedPlannerDayID = selectedNoteID
+                    updatedWorkspace = assistant.selectPlannerDay(dayID: selectedNoteID)
                 }
                 guard let updatedWorkspace else { return }
                 updateSelectedNoteOwner(owner, threadID: threadID)
@@ -6687,6 +7069,52 @@ struct AssistantWindowView: View {
 
     private func syncAssistantNotesRuntimeContext() {
         assistant.setNotesWorkspaceRuntimeContext(notesAssistantRuntimeContext)
+        assistant.setPlannerRuntimeContext(plannerRuntimeContextForOpenPlanner)
+    }
+
+    private var plannerRuntimeContextForOpenPlanner: AssistantPlannerRuntimeContext? {
+        guard isPlannerPaneActive else { return nil }
+        let selectedDayID = currentDisplayedNoteTarget?.noteID ?? currentPlannerDayID
+        let linkedTitles = currentThreadNoteRelationshipSnapshot().outgoingLinks
+            .filter { !$0.isMissing }
+            .map(\.title)
+        return AssistantPlannerRuntimeContext(
+            currentDayID: assistant.currentPlannerDayID(),
+            selectedDayID: selectedDayID,
+            selectedDayTitle: currentDisplayedNoteTitle,
+            linkedNoteTitles: Array(linkedTitles.prefix(12))
+        )
+    }
+
+    private func preparePlannerWorkspaceIfNeeded() {
+        let dayID = currentPlannerDayID
+        selectedPlannerDayID = dayID
+        guard let workspace = assistant.loadPlannerWorkspace(dayID: dayID) else { return }
+        applyThreadNoteWorkspace(workspace)
+        threadNoteViewMode = "edit"
+        isThreadNoteOpen = true
+        syncAssistantNotesRuntimeContext()
+    }
+
+    private func selectPlannerDay(_ dayID: String) {
+        persistThreadNoteIfNeeded(for: currentPlannerOwner, noteID: currentPlannerDayID)
+        selectedPlannerDayID = dayID
+        guard let workspace = assistant.selectPlannerDay(dayID: dayID) else { return }
+        applyThreadNoteWorkspace(workspace)
+        clearThreadNoteNavigationStack(for: nil)
+        clearThreadNoteAIDraftState(for: currentPlannerOwner)
+        syncAssistantNotesRuntimeContext()
+    }
+
+    private func selectPlannerDate(_ date: Date) {
+        selectPlannerDay(assistant.currentPlannerDayID(for: date))
+    }
+
+    private func movePlannerDay(by days: Int) {
+        let currentDate = assistant.plannerDate(from: currentPlannerDayID) ?? Date()
+        let nextDate = Calendar.autoupdatingCurrent.date(byAdding: .day, value: days, to: currentDate)
+            ?? currentDate
+        selectPlannerDate(nextDate)
     }
 
     private func syncNotesAssistantConversationBinding() {
@@ -7419,6 +7847,9 @@ struct AssistantWindowView: View {
                     id: AssistantSidebarPane.threads.shellID, label: "Threads",
                     symbol: "bubble.left.and.bubble.right"),
                 .init(
+                    id: AssistantSidebarPane.planner.shellID, label: "Today",
+                    symbol: "calendar"),
+                .init(
                     id: AssistantSidebarPane.notes.shellID, label: "Notes",
                     symbol: "note.text"),
                 .init(
@@ -7465,10 +7896,12 @@ struct AssistantWindowView: View {
 
     private var sidebarSelectedProjectID: String? {
         switch selectedSidebarPane {
+        case .threads:
+            return assistant.selectedProjectFilterID
         case .notes:
             return selectedNotesProject?.id
         default:
-            return assistant.selectedProjectFilterID
+            return nil
         }
     }
 
@@ -9338,7 +9771,7 @@ struct AssistantWindowView: View {
             }
             selectionTracker.clearSelection()
             AssistantSelectionActionHUDManager.shared.hide()
-            if selectedSidebarPane != .archived && selectedSidebarPane != .notes {
+            if selectedSidebarPane != .archived && selectedSidebarPane != .notes && selectedSidebarPane != .planner {
                 selectedSidebarPane = .threads
             }
             resetVisibleHistoryWindow()
@@ -9373,6 +9806,8 @@ struct AssistantWindowView: View {
             } else {
                 chatDetail(layout: layout)
             }
+        case .planner:
+            plannerDetail(layout: layout)
         case .notes:
             notesWorkspaceDetail(layout: layout)
         case .archived:
@@ -9994,6 +10429,167 @@ struct AssistantWindowView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color.clear)
         .ignoresSafeArea(edges: .top)
+    }
+
+    private func plannerDetail(layout: ChatLayoutMetrics) -> some View {
+        VStack(spacing: 0) {
+            plannerTopBar(layout: layout)
+                .zIndex(1)
+
+            plannerEditorCanvas()
+        }
+        .onAppear {
+            preparePlannerWorkspaceIfNeeded()
+        }
+        .onChange(of: selectedPlannerDayID) { _ in
+            syncAssistantNotesRuntimeContext()
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color.clear)
+        .ignoresSafeArea(edges: .top)
+    }
+
+    private func plannerTopBar(layout: ChatLayoutMetrics) -> some View {
+        let sideControlWidth: CGFloat = isCompactSidebarPresentation ? 184 : 220
+        let titleHorizontalPadding: CGFloat = isCompactSidebarPresentation ? 10 : 16
+        let selectedDate = assistant.plannerDate(from: currentPlannerDayID) ?? Date()
+
+        return HStack(spacing: 0) {
+            HStack(spacing: 6) {
+                workspaceLaunchControl
+            }
+            .frame(width: sideControlWidth, alignment: .leading)
+
+            Spacer(minLength: 0)
+
+            HStack(spacing: 10) {
+                Text("Today")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(AppVisualTheme.foreground(0.88))
+
+                Text(currentDisplayedNoteTitle ?? currentPlannerDayID)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(AppVisualTheme.foreground(0.56))
+                    .lineLimit(1)
+            }
+            .frame(maxWidth: layout.topBarMaxWidth, alignment: .center)
+            .padding(.horizontal, titleHorizontalPadding)
+
+            Spacer(minLength: 0)
+
+            HStack(spacing: 6) {
+                Button {
+                    selectPlannerDate(Date())
+                } label: {
+                    topBarIconButton(symbol: "calendar.badge.clock")
+                }
+                .buttonStyle(.plain)
+                .help("Open today")
+
+                Button {
+                    movePlannerDay(by: -1)
+                } label: {
+                    topBarIconButton(symbol: "chevron.left")
+                }
+                .buttonStyle(.plain)
+                .help("Previous day")
+
+                Button {
+                    movePlannerDay(by: 1)
+                } label: {
+                    topBarIconButton(symbol: "chevron.right")
+                }
+                .buttonStyle(.plain)
+                .help("Next day")
+
+                DatePicker(
+                    "",
+                    selection: Binding(
+                        get: { selectedDate },
+                        set: { selectPlannerDate($0) }
+                    ),
+                    displayedComponents: .date
+                )
+                .datePickerStyle(.compact)
+                .labelsHidden()
+                .frame(width: 104)
+                .help("Pick planner date")
+            }
+            .frame(width: sideControlWidth, alignment: .trailing)
+        }
+        .frame(maxWidth: .infinity, alignment: .center)
+        .padding(.horizontal, titleHorizontalPadding)
+        .padding(.vertical, 5)
+        .overlay(
+            Rectangle()
+                .fill(AppVisualTheme.surfaceFill(0.06))
+                .frame(height: 0.5),
+            alignment: .bottom
+        )
+        .background {
+            Color.clear
+                .contentShape(Rectangle())
+                .onTapGesture(count: 2, perform: toggleKeyWindowFullScreen)
+        }
+    }
+
+    private func plannerEditorCanvas() -> some View {
+        AssistantChatWebView(
+            messages: [],
+            runtimePanel: nil,
+            reviewPanel: nil,
+            rewindState: nil,
+            threadNoteState: chatWebThreadNoteState,
+            activeWorkState: nil,
+            activeTurnState: nil,
+            showTypingIndicator: false,
+            typingTitle: "",
+            typingDetail: "",
+            textScale: CGFloat(chatTextScale),
+            canLoadOlderHistory: false,
+            accentColor: AppVisualTheme.assistantWebAccentTint,
+            onScrollStateChanged: { isPinned, isScrolledUp in
+                autoScrollPinnedToBottom = isPinned
+                userHasScrolledUp = isScrolledUp
+            },
+            onLoadOlderHistory: {},
+            onLoadActivityDetails: { _ in },
+            onCollapseActivityDetails: { _ in },
+            onSelectRuntimeBackend: { backendID in
+                guard let backend = AssistantRuntimeBackend(rawValue: backendID) else { return }
+                assistant.selectAssistantBackend(backend)
+            },
+            onOpenRuntimeSettings: {
+                NotificationCenter.default.post(
+                    name: .openAssistOpenSettings,
+                    object: SettingsRoute(section: .assistant, subsection: .assistantSetup))
+            },
+            onUndoMessage: { _ in },
+            onEditMessage: { _ in },
+            onUndoCodeCheckpoint: {},
+            onRedoHistoryMutation: {},
+            onRestoreCodeCheckpoint: { _ in },
+            onCloseCodeReviewPanel: {},
+            onThreadNoteCommand: { command, sourceContainer in
+                handleThreadNoteCommand(command, sourceContainer: sourceContainer)
+            },
+            noteAssetResolver: resolveWebNoteAssetURL,
+            onTextSelected: { selectedText, messageID, parentText, screenRect in
+                handleWebViewTextSelection(
+                    selectedText: selectedText,
+                    messageID: messageID,
+                    parentText: parentText,
+                    screenRect: screenRect
+                )
+            },
+            onContainerReady: { container in
+                if threadNoteWebContainer !== container {
+                    threadNoteWebContainer = container
+                }
+            }
+        )
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .clipped()
     }
 
     private func notesWorkspaceDetail(layout: ChatLayoutMetrics) -> some View {
@@ -13547,6 +14143,17 @@ struct AssistantWindowView: View {
                 projectID: owner.id,
                 text: textToAppend
             )
+        case .planner:
+            let request = AssistantPlannerScheduleRequest(
+                mode: .copy,
+                targetDayID: currentPlannerDayID,
+                selectedMarkdown: textToAppend,
+                sourceTarget: nil,
+                sourceTitle: nil,
+                sourceTextAfterMove: nil,
+                originalDayID: nil
+            )
+            workspace = assistant.appendToPlanner(request)
         }
         guard let workspace else { return }
 
@@ -16077,26 +16684,40 @@ struct AssistantWindowView: View {
 
     private static let providerMarkImageCache = NSCache<NSString, NSImage>()
 
-    private func providerMarkImage(for backend: AssistantRuntimeBackend) -> NSImage? {
-        let fileName: String
+    private func providerMarkAsset(
+        for backend: AssistantRuntimeBackend
+    ) -> (fileName: String, fileExtension: String, rendersAsTemplate: Bool) {
         switch backend {
-        case .codex: fileName = "provider-mark-codex"
-        case .copilot: fileName = "provider-mark-copilot"
-        case .claudeCode: fileName = "provider-mark-claude"
-        case .ollamaLocal: fileName = "provider-mark-ollama"
+        case .codex:
+            return ("provider-mark-codex", "pdf", true)
+        case .copilot:
+            return ("provider-mark-copilot", "pdf", true)
+        case .claudeCode:
+            return ("provider-mark-claude", "pdf", true)
+        case .antigravityCLI:
+            return ("provider-mark-antigravity", "png", false)
+        case .ollamaLocal:
+            return ("provider-mark-ollama", "pdf", true)
         }
+    }
 
-        if let cached = Self.providerMarkImageCache.object(forKey: fileName as NSString) {
+    private func providerMarkImage(for backend: AssistantRuntimeBackend) -> NSImage? {
+        let asset = providerMarkAsset(for: backend)
+        let cacheKey = "\(asset.fileName).\(asset.fileExtension)"
+
+        if let cached = Self.providerMarkImageCache.object(forKey: cacheKey as NSString) {
             return cached
         }
-        guard let url = Bundle.main.url(forResource: fileName, withExtension: "pdf"),
+        guard let url = Bundle.main.url(
+            forResource: asset.fileName,
+            withExtension: asset.fileExtension
+        ),
               let image = NSImage(contentsOf: url) else {
             return nil
         }
-        // Render the PDF as a template so SwiftUI's foreground style tints it
-        // with the provider brand color rather than rendering the raw black ink.
-        image.isTemplate = true
-        Self.providerMarkImageCache.setObject(image, forKey: fileName as NSString)
+        // Template assets use the provider color; Antigravity keeps its official multicolor mark.
+        image.isTemplate = asset.rendersAsTemplate
+        Self.providerMarkImageCache.setObject(image, forKey: cacheKey as NSString)
         return image
     }
 
@@ -16106,13 +16727,22 @@ struct AssistantWindowView: View {
         size: CGFloat
     ) -> some View {
         if let nsImage = providerMarkImage(for: backend) {
-            Image(nsImage: nsImage)
-                .resizable()
-                .renderingMode(.template)
-                .interpolation(.high)
-                .aspectRatio(contentMode: .fit)
-                .frame(width: size, height: size)
-                .foregroundStyle(providerBrandColor(for: backend))
+            if providerMarkAsset(for: backend).rendersAsTemplate {
+                Image(nsImage: nsImage)
+                    .resizable()
+                    .renderingMode(.template)
+                    .interpolation(.high)
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: size, height: size)
+                    .foregroundStyle(providerBrandColor(for: backend))
+            } else {
+                Image(nsImage: nsImage)
+                    .resizable()
+                    .renderingMode(.original)
+                    .interpolation(.high)
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: size, height: size)
+            }
         } else {
             // Fallback to the original colored dot if the asset is missing.
             Circle()

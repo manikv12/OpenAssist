@@ -203,6 +203,8 @@ final class AssistantNoteLinkSupportTests: XCTestCase {
             return "Thread notes"
         case .project:
             return "Project notes"
+        case .planner:
+            return "Planner"
         }
     }
 }

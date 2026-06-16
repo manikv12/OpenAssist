@@ -320,7 +320,7 @@ enum SettingsSubsection: String, CaseIterable, Identifiable, Sendable {
         case .integrationRemoteAccess:
             return "Remote Access"
         case .generalNotesBackup:
-            return "Notes Backup"
+            return "Notes & Planner Backup"
         case .generalAppInfo:
             return "App Info"
         case .generalDiagnostics:
@@ -749,9 +749,9 @@ enum SettingsNavigationModel {
         ),
         .init(
             destination: SettingsRoute(section: .general, subsection: .generalNotesBackup),
-            title: "Notes backup",
-            detail: "Choose the notes backup folder, back up now, or restore an older backup",
-            keywords: ["notes backup", "backup", "restore", "history"]
+            title: "Notes & Planner backup",
+            detail: "Choose the notes and planner backup folder, back up now, or restore an older backup",
+            keywords: ["notes backup", "planner backup", "backup", "restore", "history"]
         ),
         .init(
             destination: SettingsRoute(section: .general, subsection: .generalAppInfo),
