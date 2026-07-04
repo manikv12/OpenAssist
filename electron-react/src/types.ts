@@ -8,6 +8,7 @@ export type ProjectItem = {
   kind?: "folder" | "project";
   parentID?: string | null;
   linkedFolderPath?: string | null;
+  peerLinkedFolders?: Array<{ machineID?: string; machineName?: string; path?: string }>;
   area?: string;
   color?: string;
   plannerOnly?: boolean;
@@ -760,6 +761,8 @@ export type SettingsSnapshot = {
   remoteAccessPairingExpiresAt: number | null;
   remoteAccessServerRunning: boolean;
   remoteAccessDeviceCount: number;
+  remoteAccessSyncPeerCount: number;
+  remoteAccessSyncPeers: MacSyncPeerStatus[];
   localAIRuntimeVersion: string;
   promptRewriteProvider: string;
   promptRewriteModel: string;
@@ -778,6 +781,20 @@ export type SettingsSnapshot = {
   dictationCorrectionLearnedSoundName: string;
   dictationFeedbackVolume: number;
   assistantTextScale: string;
+};
+
+export type MacSyncPeerStatus = {
+  id: string;
+  machineID: string;
+  name: string;
+  localBaseURL?: string;
+  tunnelBaseURL?: string;
+  lastSuccessfulBaseURL?: string;
+  lastRemoteCursor?: string;
+  lastLocalCursor?: string;
+  lastSyncedAt?: string;
+  lastError?: string;
+  syncing: boolean;
 };
 
 export type UsageWindowSnapshot = {

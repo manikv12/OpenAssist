@@ -410,6 +410,11 @@ interface Window {
     startRemoteAccessEasyQR: () => Promise<import("./types").SettingsSnapshot>;
     stopRemoteAccessEasyQR: () => Promise<import("./types").SettingsSnapshot>;
     getRemoteAccessStatus: () => Promise<Partial<import("./types").SettingsSnapshot>>;
+    pairMacSyncPeer: (pairingURL: string) => Promise<{ ok: boolean; peer?: import("./types").MacSyncPeerStatus; peers?: import("./types").MacSyncPeerStatus[]; error?: string }>;
+    getMacSyncStatus: () => Promise<{ ok: boolean; peers: import("./types").MacSyncPeerStatus[] }>;
+    syncMacSyncPeer: (peerID: string) => Promise<{ ok: boolean; peer?: import("./types").MacSyncPeerStatus; error?: string; pulled?: number; pushed?: number; staleCount?: number; conflictCount?: number }>;
+    syncAllMacSyncPeers: () => Promise<{ ok: boolean; peers: import("./types").MacSyncPeerStatus[]; results?: unknown[] }>;
+    revokeMacSyncPeer: (peerID: string) => Promise<{ ok: boolean; peers: import("./types").MacSyncPeerStatus[] }>;
     sendMessage: (
       prompt: string,
       threadID?: string,

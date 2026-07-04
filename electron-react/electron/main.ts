@@ -10993,6 +10993,21 @@ app.whenReady().then(() => {
   ipcMain.handle("openassist:get-remote-access-status", async () =>
     (await openAssistBridge()).getRemoteAccessStatus()
   );
+  ipcMain.handle("openassist:pair-mac-sync-peer", async (_event, pairingURL: string) =>
+    (await openAssistBridge()).pairMacSyncPeer(pairingURL)
+  );
+  ipcMain.handle("openassist:get-mac-sync-status", async () =>
+    (await openAssistBridge()).getMacSyncStatus()
+  );
+  ipcMain.handle("openassist:sync-mac-sync-peer", async (_event, peerID: string) =>
+    (await openAssistBridge()).syncMacSyncPeer(peerID)
+  );
+  ipcMain.handle("openassist:sync-all-mac-sync-peers", async () =>
+    (await openAssistBridge()).syncAllMacSyncPeers()
+  );
+  ipcMain.handle("openassist:revoke-mac-sync-peer", async (_event, peerID: string) =>
+    (await openAssistBridge()).revokeMacSyncPeer(peerID)
+  );
   ipcMain.handle("openassist:send-message", async (
     event,
     prompt: string,

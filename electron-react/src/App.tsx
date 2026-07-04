@@ -1625,7 +1625,9 @@ function normalizeRendererSettings(settings: SettingsSnapshot): SettingsSnapshot
     remoteAccessPairingURL: settings.remoteAccessPairingURL ?? "",
     remoteAccessPairingExpiresAt: settings.remoteAccessPairingExpiresAt ?? null,
     remoteAccessServerRunning: Boolean(settings.remoteAccessServerRunning),
-    remoteAccessDeviceCount: settings.remoteAccessDeviceCount ?? 0
+    remoteAccessDeviceCount: settings.remoteAccessDeviceCount ?? 0,
+    remoteAccessSyncPeerCount: settings.remoteAccessSyncPeerCount ?? 0,
+    remoteAccessSyncPeers: settings.remoteAccessSyncPeers ?? []
   };
 }
 
@@ -22972,6 +22974,8 @@ function SettingsContent({
   const [remoteAccessActionMessage, setRemoteAccessActionMessage] = useState<string | undefined>(undefined);
   const [remoteAccessQRDataURL, setRemoteAccessQRDataURL] = useState("");
   const [remoteAccessEasyQRBusy, setRemoteAccessEasyQRBusy] = useState(false);
+  const [macSyncPairingURL, setMacSyncPairingURL] = useState("");
+  const [macSyncBusyID, setMacSyncBusyID] = useState<string | undefined>(undefined);
   const [appearanceStatus, setAppearanceStatus] = useState("");
   const [pendingColorTheme, setPendingColorTheme] = useState<string | null>(null);
   const [isSavingTheme, setIsSavingTheme] = useState(false);
@@ -25914,6 +25918,115 @@ function SettingsContent({
           <SelectRow label="Server" value={settings?.remoteAccessServerRunning ? "Running" : settings?.remoteAccessEnabled ? "Starting or stopped" : "Off"} />
           {settings?.remoteAccessEasyTunnelURL && <SelectRow label="Easy QR URL" value={settings.remoteAccessEasyTunnelURL} />}
           <SelectRow label="Paired devices" value={String(settings?.remoteAccessDeviceCount ?? 0)} />
+          <div className="settings-divider" />
+          <div className="card-heading compact">
+            <RefreshCw size={18} />
+            <span>
+              <strong>Mac Sync</strong>
+              <small>Pair once, then notes, planner, backlog, and lists reconnect automatically.</small>
+            </span>
+          </div>
+          <label className="settings-field">
+            <span>Pairing URL from another Mac</span>
+            <input
+              value={macSyncPairingURL}
+              onChange={(event) => setMacSyncPairingURL(event.target.value)}
+              placeholder="Paste the other Mac pairing URL"
+            />
+          </label>
+          <div className="inline-actions">
+            <button
+              className="gold-action"
+              disabled={macSyncBusyID === "pair" || !macSyncPairingURL.trim()}
+              onClick={() => {
+                setMacSyncBusyID("pair");
+                setRemoteAccessActionMessage("Pairing Mac...");
+                void window.openAssistElectron?.pairMacSyncPeer?.(macSyncPairingURL.trim())
+                  .then((result) => {
+                    if (result?.ok) {
+                      setMacSyncPairingURL("");
+                      setRemoteAccessActionMessage("Mac paired. Sync will reconnect automatically.");
+                      onRefresh();
+                    } else {
+                      setRemoteAccessActionMessage(result?.error || "Could not pair Mac.");
+                    }
+                  })
+                  .catch((error) => setRemoteAccessActionMessage(error instanceof Error ? error.message : "Could not pair Mac."))
+                  .finally(() => setMacSyncBusyID(undefined));
+              }}
+            >
+              {macSyncBusyID === "pair" ? "Pairing..." : "Pair Mac"}
+            </button>
+            <button
+              disabled={macSyncBusyID === "all" || !(settings?.remoteAccessSyncPeers?.length)}
+              onClick={() => {
+                setMacSyncBusyID("all");
+                setRemoteAccessActionMessage("Syncing paired Macs...");
+                void window.openAssistElectron?.syncAllMacSyncPeers?.()
+                  .then((result) => {
+                    const count = result?.peers?.length ?? 0;
+                    setRemoteAccessActionMessage(count ? `Sync checked ${count} paired Mac${count === 1 ? "" : "s"}.` : "No paired Macs yet.");
+                    onRefresh();
+                  })
+                  .catch((error) => setRemoteAccessActionMessage(error instanceof Error ? error.message : "Could not sync paired Macs."))
+                  .finally(() => setMacSyncBusyID(undefined));
+              }}
+            >
+              {macSyncBusyID === "all" ? "Syncing..." : "Sync Now"}
+            </button>
+          </div>
+          <p className="ready-line">
+            Quick Tunnel links can change after restart. Use a Named Tunnel for stable sync when Macs are apart.
+          </p>
+          {(settings?.remoteAccessSyncPeers ?? []).length ? (
+            <div className="telegram-pairing-box">
+              {(settings?.remoteAccessSyncPeers ?? []).map((peer) => (
+                <div key={peer.id} className="remote-peer-row">
+                  <span>
+                    <strong>{peer.name || "Peer Mac"}</strong>
+                    <small>
+                      {peer.syncing ? "Syncing" : peer.lastSyncedAt ? `Last synced ${new Date(peer.lastSyncedAt).toLocaleString()}` : "Not synced yet"}
+                    </small>
+                    {peer.lastError ? <small>{peer.lastError}</small> : null}
+                    {peer.lastSuccessfulBaseURL ? <small>{peer.lastSuccessfulBaseURL}</small> : null}
+                  </span>
+                  <div className="inline-actions">
+                    <button
+                      disabled={macSyncBusyID === peer.id}
+                      onClick={() => {
+                        setMacSyncBusyID(peer.id);
+                        setRemoteAccessActionMessage(`Syncing ${peer.name || "peer Mac"}...`);
+                        void window.openAssistElectron?.syncMacSyncPeer?.(peer.id)
+                          .then((result) => {
+                            setRemoteAccessActionMessage(result?.ok ? `Synced ${peer.name || "peer Mac"}.` : (result?.error || "Sync failed."));
+                            onRefresh();
+                          })
+                          .catch((error) => setRemoteAccessActionMessage(error instanceof Error ? error.message : "Sync failed."))
+                          .finally(() => setMacSyncBusyID(undefined));
+                      }}
+                    >
+                      {macSyncBusyID === peer.id ? "Syncing..." : "Sync"}
+                    </button>
+                    <button
+                      onClick={() => {
+                        const confirmed = window.confirm(`Remove Mac sync peer "${peer.name || "Peer Mac"}"?`);
+                        if (!confirmed) return;
+                        void window.openAssistElectron?.revokeMacSyncPeer?.(peer.id)
+                          .then(() => {
+                            setRemoteAccessActionMessage("Mac sync peer removed.");
+                            onRefresh();
+                          });
+                      }}
+                    >
+                      Revoke
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className="empty-inline">No peer Macs are paired yet.</p>
+          )}
           <div className="inline-actions">
             <button
               onClick={() => void window.openAssistElectron?.openExternal(`http://127.0.0.1:${settings?.remoteAccessPort || "45831"}`)}
@@ -28516,7 +28629,32 @@ function AppInner() {
   );
   const [systemThemeMode, setSystemThemeMode] = useState<"dark" | "light">(readSystemThemeMode);
   const [connectorSyncActivity, setConnectorSyncActivity] = useState<ConnectorSyncProgress | null>(null);
+  const [threadFolderWarning, setThreadFolderWarning] = useState<{
+    project: ProjectItem;
+    peerFolder: { machineID?: string; machineName?: string; path?: string };
+  } | null>(null);
   const connectorSyncClearTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const threadFolderWarningResolverRef = useRef<((choice: "link" | "start" | "cancel") => void) | null>(null);
+
+  const resolveThreadFolderWarning = (choice: "link" | "start" | "cancel") => {
+    threadFolderWarningResolverRef.current?.(choice);
+    threadFolderWarningResolverRef.current = null;
+    setThreadFolderWarning(null);
+  };
+
+  const askThreadFolderWarning = (
+    project: ProjectItem,
+    peerFolder: { machineID?: string; machineName?: string; path?: string }
+  ) => new Promise<"link" | "start" | "cancel">((resolve) => {
+    threadFolderWarningResolverRef.current?.("cancel");
+    threadFolderWarningResolverRef.current = resolve;
+    setThreadFolderWarning({ project, peerFolder });
+  });
+
+  useEffect(() => () => {
+    threadFolderWarningResolverRef.current?.("cancel");
+    threadFolderWarningResolverRef.current = null;
+  }, []);
 
   useEffect(() => {
     window.localStorage.setItem(SIDEBAR_WIDTH_KEY, String(sidebarWidth));
@@ -28740,6 +28878,8 @@ function AppInner() {
       remoteAccessPairingExpiresAt: null,
       remoteAccessServerRunning: false,
       remoteAccessDeviceCount: 0,
+      remoteAccessSyncPeerCount: 0,
+      remoteAccessSyncPeers: [],
       localAIRuntimeVersion: "Unknown",
       promptRewriteProvider: "Ollama (Local)",
       promptRewriteModel: "llama3.1",
@@ -32472,6 +32612,17 @@ function AppInner() {
     await cleanupTemporaryThread(selectedThreadID);
     const selectedProject = appState.projects.find((project) => sameID(project.id, selectedProjectID));
     const targetProjectID = selectedProject?.kind === "folder" ? undefined : selectedProjectID;
+    if (targetProjectID && selectedProject && !selectedProject.linkedFolderPath?.trim()) {
+      const peerFolder = (selectedProject.peerLinkedFolders ?? []).find((hint) => hint?.path?.trim());
+      if (peerFolder?.path) {
+        const choice = await askThreadFolderWarning(selectedProject, peerFolder);
+        if (choice === "link") {
+          await linkProjectFolderFromMenu(selectedProject);
+          return;
+        }
+        if (choice !== "start") return;
+      }
+    }
     const result = await window.openAssistElectron?.createThread(targetProjectID, isTemporary);
     if (!result) return;
     setShowArchivedThreads(false);
@@ -35227,7 +35378,45 @@ function AppInner() {
           onSubmit={submitNoteRename}
         />
       )}
-	      {!compact && (
+      {threadFolderWarning && (
+        <div className="thread-folder-warning-overlay" role="presentation" onMouseDown={() => resolveThreadFolderWarning("cancel")}>
+          <section
+            className="thread-folder-warning-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="thread-folder-warning-title"
+            onMouseDown={(event) => event.stopPropagation()}
+          >
+            <header>
+              <span className="thread-folder-warning-icon"><Folder size={18} /></span>
+              <div>
+                <strong id="thread-folder-warning-title">Link folder on this Mac?</strong>
+                <small>This project has a folder on another Mac, but not here.</small>
+              </div>
+              <button type="button" aria-label="Cancel" onClick={() => resolveThreadFolderWarning("cancel")}>
+                <X size={15} />
+              </button>
+            </header>
+            <p>
+              On "{threadFolderWarning.peerFolder.machineName || "another Mac"}" it is linked to:
+            </p>
+            <code>{threadFolderWarning.peerFolder.path}</code>
+            <footer>
+              <button type="button" className="gold-action" onClick={() => resolveThreadFolderWarning("link")}>
+                <Folder size={14} />
+                Link a folder
+              </button>
+              <button type="button" onClick={() => resolveThreadFolderWarning("start")}>
+                Start without folder
+              </button>
+              <button type="button" onClick={() => resolveThreadFolderWarning("cancel")}>
+                Cancel
+              </button>
+            </footer>
+          </section>
+        </div>
+      )}
+		      {!compact && (
         <div className="sidebar-expand-button-layer">
           <button
             type="button"

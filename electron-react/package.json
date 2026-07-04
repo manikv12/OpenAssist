@@ -38,6 +38,7 @@
     "verify:note-style-tools": "node scripts/verify-note-style-tools.mjs",
     "verify:connectors": "npm run build && node scripts/verify-connectors.mjs",
     "verify:planner-categories": "node scripts/verify-planner-categories.mjs",
+    "verify:mac-sync": "node scripts/verify-mac-sync.mjs",
     "verify:insertion": "node scripts/verify-insertion-smoke.mjs",
     "capture:native": "node scripts/capture-native-reference.mjs",
     "capture:running": "node scripts/capture-running-window.mjs",
