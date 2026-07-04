@@ -877,7 +877,7 @@ try {
     );
     await openSettingsSection("Keyboard Shortcuts");
     await waitFor(() => document.querySelector("[data-shortcut-target]"), "keyboard shortcut settings");
-    const voiceShortcutRowsWorked = ["Hold-to-talk shortcut", "Continuous toggle shortcut", "Agent voice shortcut", "Compact assistant shortcut"]
+    const voiceShortcutRowsWorked = ["Hold-to-talk shortcut", "Continuous toggle shortcut", "Live Voice shortcut", "Compact assistant shortcut"]
       .every((label) => Array.from(document.querySelectorAll(".shortcut-recorder-label")).some((node) => node.textContent.trim() === label))
       && document.querySelectorAll("[data-shortcut-target]").length >= 4
       && !document.querySelector(".settings-content")?.innerText.includes("Key 65535")

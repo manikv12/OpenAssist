@@ -1,6 +1,6 @@
 import { spawn, execFile, execFileSync } from "node:child_process";
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
-import { app, safeStorage, shell } from "electron";
+import { app, Notification, safeStorage, shell } from "electron";
 import { EventEmitter } from "node:events";
 import fs from "node:fs";
 import http from "node:http";
@@ -47,12 +47,50 @@ import {
   fetchOllamaWebsiteModelOptions,
   websiteCatalogStatusMessage
 } from "./ollamaWebsiteModelCatalog.js";
+import {
+  addAppleCalendarEvent,
+  addAppleReminder,
+  completeAppleReminder,
+  listAppleCalendarEvents,
+  listAppleReminders,
+  loadConnectorSnapshot,
+  searchGmailMetadata,
+  searchLocalMessages,
+  syncGmailMetadataToReviewInbox,
+  type ConnectorItem,
+  type GmailSearchOptions,
+  type GmailSyncOptions,
+  type LocalMessagesSearchOptions
+} from "./connectors.js";
 
 const execFileAsync = promisify(execFile);
 const macAbsoluteEpochOffset = 978_307_200;
 const secureCredentialsFileName = "electron-secure-credentials.json";
 const transcriptionRequestTimeoutMs = 35_000;
 const gitCheckpointService = new GitCheckpointService();
+const maxDebugLogBytes = 8 * 1024 * 1024;
+const maxDebugLogBackups = 4;
+const realtimeAudioDiagLogIntervalMs = 10_000;
+const plannerRecoveryMaxSnapshotsPerBucket = 20;
+const plannerRecoveryMinSnapshotsPerBucket = 5;
+const plannerRecoveryMaxAgeMs = 45 * 24 * 60 * 60 * 1000;
+// Stateless fallback replay (Antigravity first turns / resume failures) —
+// keep it slim, this rides on every affected message.
+const recentContextMaxMessages = 4;
+const recentContextMaxCharsPerMessage = 800;
+// Ollama runs locally: history costs no bandwidth/tokens and the server's KV
+// cache makes a repeated prefix cheap, so it gets a much deeper replay for
+// real conversational continuity (bounded to fit the 8192 num_ctx).
+const ollamaRecentContextMaxMessages = 12;
+const ollamaRecentContextMaxCharsPerMessage = 1_500;
+const defaultSparkRecallModel = "gpt-5.3-codex-spark";
+const codexModelListCacheMs = 5 * 60 * 1000;
+const sparkRecallResultLimit = 80;
+const personalRecallFileCacheMs = 30_000;
+const personalRecallMaxPreviewBytes = 256 * 1024;
+const personalRecallMaxSessionPreviewBytes = 128 * 1024;
+
+let codexModelListCache: { expiresAt: number; ids: string[] } | null = null;
 
 let threadsChangedListener: (() => void) | null = null;
 export function setThreadsChangedListener(listener: (() => void) | null) {
@@ -66,6 +104,32 @@ function notifyThreadsChanged() {
     bridgeDebugLog(`threads-changed broadcast failed: ${error instanceof Error ? error.message : String(error)}`);
   }
 }
+type ConnectorSyncProgress = {
+  id: string;
+  provider: "google" | "apple" | "local";
+  serviceID: string;
+  accountID?: string;
+  accountLabel?: string;
+  status: "running" | "completed" | "failed";
+  message: string;
+  importedCount?: number;
+  reviewCount?: number;
+  itemTitles?: string[];
+  startedAt?: string;
+  finishedAt?: string;
+  error?: string;
+};
+let connectorSyncProgressListener: ((progress: ConnectorSyncProgress) => void) | null = null;
+export function setConnectorSyncProgressListener(listener: ((progress: ConnectorSyncProgress) => void) | null) {
+  connectorSyncProgressListener = listener;
+}
+function emitConnectorSyncProgress(progress: ConnectorSyncProgress) {
+  try {
+    connectorSyncProgressListener?.(progress);
+  } catch (error) {
+    bridgeDebugLog(`connector sync progress broadcast failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
 const pendingCodeCheckpointBaselinesBySessionID = new Map<string, {
   sessionID: string;
   checkpointID: string;
@@ -77,6 +141,7 @@ type KokoroVoiceID = NonNullable<import("kokoro-js").GenerateOptions["voice"]>;
 
 type JsonObject = Record<string, unknown>;
 type JsonRequestID = string | number;
+type KnowledgeExternalAccessMode = "simple" | "advanced" | "full";
 type NoteAICleanupMode = "cleanup" | "summarize" | "decisions" | "custom";
 type NoteAICleanupScope = "selection" | "whole-note";
 type NoteAICleanupRequest = {
@@ -400,7 +465,11 @@ type ProjectItem = {
   kind?: "folder" | "project";
   parentID?: string | null;
   linkedFolderPath?: string | null;
+  area?: string;
+  color?: string;
+  plannerOnly?: boolean;
   hidden?: boolean;
+  isArchived?: boolean;
   active?: boolean;
 };
 
@@ -467,6 +536,24 @@ type MessageArtifact = {
   size?: number;
   width?: number;
   height?: number;
+};
+
+type CodexImageGenerationMode = "auto" | "new_image" | "edit_reference";
+
+type CodexImageGenerationRequest = {
+  prompt?: string;
+  mode?: CodexImageGenerationMode;
+  referenceArtifactIds?: string[];
+  referenceImagePaths?: string[];
+  useLatestImage?: boolean;
+};
+
+type CodexImageGenerationResult = {
+  ok: boolean;
+  artifact?: MessageArtifact;
+  revisedPrompt?: string;
+  summary: string;
+  error?: string;
 };
 
 type ComposerImageAttachment = {
@@ -546,6 +633,8 @@ type NoteItem = {
   projectID: string;
   projectName?: string;
   folderID?: string | null;
+  area?: string;
+  tags?: string[];
   updatedAt?: number;
   isArchived?: boolean;
   archivedAt?: number;
@@ -572,6 +661,7 @@ type NoteFolderItem = {
   id: string;
   name: string;
   projectID: string;
+  parentFolderID: string | null;
   noteCount: number;
 };
 
@@ -680,6 +770,7 @@ type SettingsSnapshot = {
   memoryEnabled: boolean;
   knowledgeAccessEnabled: boolean;
   knowledgeExternalAccessEnabled: boolean;
+  knowledgeExternalAccessMode: KnowledgeExternalAccessMode;
   knowledgeAgentAccessEnabled: boolean;
   knowledgeRealtimeVoiceAccessEnabled: boolean;
   knowledgeOrganizerEnabled: boolean;
@@ -741,7 +832,7 @@ type SettingsSnapshot = {
   remoteAccessEnabled: boolean;
   remoteAccessPort: string;
   remoteAccessPublicURL: string;
-  remoteAccessNetworkMode: "localOnly" | "localNetwork" | "tailscale";
+  remoteAccessNetworkMode: "localOnly" | "localNetwork";
   remoteAccessTailscaleHost: string;
   remoteAccessLocalNetworkURL: string;
   remoteAccessTailscaleURL: string;
@@ -834,6 +925,7 @@ type SettingsUpdateKey =
   | "memoryEnabled"
   | "knowledgeAccessEnabled"
   | "knowledgeExternalAccessEnabled"
+  | "knowledgeExternalAccessMode"
   | "knowledgeAgentAccessEnabled"
   | "knowledgeRealtimeVoiceAccessEnabled"
   | "knowledgeOrganizerEnabled"
@@ -843,7 +935,6 @@ type SettingsUpdateKey =
   | "telegramEnabled"
   | "remoteAccessEnabled"
   | "remoteAccessNetworkMode"
-  | "remoteAccessTailscaleHost"
   | "compactStyle"
   | "compactEdge"
   | "assistantBackend"
@@ -915,6 +1006,9 @@ export type OpenAssistAppState = {
   noteFolders: NoteFolderItem[];
   plannerDays: PlannerDaySummary[];
   plannerBacklog?: PlannerBacklogDetail | null;
+  plannerCategories?: PlannerCategory[];
+  plannerLists?: ProjectItem[];
+  plannerSmartLists?: PlannerSmartListSummary[];
   backlogItems?: DailyItem[];
   automations: AutomationItem[];
   skills: SkillItem[];
@@ -961,6 +1055,8 @@ export type NoteDetail = {
   title: string;
   markdown: string;
   path?: string;
+  area?: string;
+  tags?: string[];
 };
 
 type NoteLinkOwnerKind = "project" | "thread" | "planner";
@@ -1011,6 +1107,7 @@ type StoredNoteLinkRecord = NoteLinkTarget & {
   title: string;
   sourceLabel: string;
   markdown: string;
+  metadata?: JsonObject;
 };
 
 type PlannerDaySummary = {
@@ -1030,6 +1127,17 @@ type PlannerBacklogDetail = PlannerDaySummary & {
   markdown: string;
 };
 
+type PlannerCategory = {
+  id: string;
+  name: string;
+  color?: string;
+  icon?: string;
+  createdAt: string;
+  updatedAt: string;
+  order: number;
+  hidden?: boolean;
+};
+
 type DailyItemStatus = "todo" | "doing" | "done";
 
 type DailyItemStep = {
@@ -1041,7 +1149,7 @@ type DailyItemStep = {
 type DailyItemScopeTag = {
   marker: "@" | "#";
   label: string;
-  kind: "project" | "folder" | "unresolved";
+  kind: "category" | "project" | "folder" | "unresolved";
   id?: string;
 };
 
@@ -1056,10 +1164,15 @@ type DailyItem = {
   projectName?: string;
   folderName?: string;
   area?: string;
+  section?: string;
+  tags?: string[];
   scopeTags?: DailyItemScopeTag[];
   detailsMarkdown: string;
   steps: DailyItemStep[];
   links: NoteLinkTarget[];
+  reminderAt?: string | null;
+  reminderTimezone?: string | null;
+  reminderDeliveredAt?: string | null;
   createdAt: string;
   updatedAt: string;
   order: number;
@@ -1085,6 +1198,13 @@ type BacklogItemMutationResult = {
   item?: DailyItem | null;
   scheduledDay?: PlannerDayDetail;
   scheduledItems?: DailyItem[];
+};
+
+type PlannerSmartListSummary = {
+  id: string;
+  title: string;
+  subtitle: string;
+  count: number;
 };
 
 type PlannerScheduleRequest = {
@@ -1127,6 +1247,7 @@ type SessionSummary = JsonObject & {
 type LoadedProjects = {
   projects: ProjectItem[];
   hiddenProjects: ProjectItem[];
+  plannerLists: ProjectItem[];
   hiddenProjectIDs: Set<string>;
   projectNameByID: Map<string, string>;
   projectNotesByID: Map<string, number>;
@@ -1157,8 +1278,7 @@ function supportRoot() {
 function assistantVoiceLog(message: string) {
   try {
     const logRoot = path.join(os.homedir(), "Library/Logs/OpenAssist");
-    fs.mkdirSync(logRoot, { recursive: true });
-    fs.appendFileSync(path.join(logRoot, "assistant-voice.log"), `[${new Date().toISOString()}] ${message}\n`, "utf8");
+    appendBoundedLog(path.join(logRoot, "assistant-voice.log"), `[${new Date().toISOString()}] ${message}\n`);
   } catch {
     // Voice logging should never interrupt speech.
   }
@@ -1198,11 +1318,42 @@ function resolveCodexExecutable() {
 function bridgeDebugLog(message: string) {
   try {
     const logRoot = app?.isReady?.() ? app.getPath("userData") : supportRoot();
-    fs.mkdirSync(logRoot, { recursive: true });
-    fs.appendFileSync(path.join(logRoot, "electron-debug.log"), `[${new Date().toISOString()}] ${message}\n`, "utf8");
+    appendBoundedLog(path.join(logRoot, "electron-debug.log"), `[${new Date().toISOString()}] ${message}\n`);
   } catch {
     // Debug logging must never break the provider bridge.
   }
+}
+
+// Verbose per-event tracing (every codex request / tool call / turn phase and
+// each loadAppState step). It is high-volume and only useful when actively
+// debugging, so it is off unless OPENASSIST_VERBOSE_LOG=1. Errors and one-off
+// lifecycle events keep using bridgeDebugLog directly.
+const verboseBridgeLoggingEnabled = process.env.OPENASSIST_VERBOSE_LOG === "1";
+function bridgeVerboseLog(message: string) {
+  if (verboseBridgeLoggingEnabled) bridgeDebugLog(message);
+}
+
+function rotatedLogPath(filePath: string, index: number) {
+  const ext = path.extname(filePath);
+  const base = ext ? filePath.slice(0, -ext.length) : filePath;
+  return `${base}.${index}${ext}`;
+}
+
+function rotateLogIfNeeded(filePath: string, maxBytes = maxDebugLogBytes, backups = maxDebugLogBackups) {
+  const stat = fs.existsSync(filePath) ? fs.statSync(filePath) : null;
+  if (!stat || stat.size < maxBytes) return;
+  fs.rmSync(rotatedLogPath(filePath, backups), { force: true });
+  for (let index = backups - 1; index >= 1; index -= 1) {
+    const source = rotatedLogPath(filePath, index);
+    if (fs.existsSync(source)) fs.renameSync(source, rotatedLogPath(filePath, index + 1));
+  }
+  fs.renameSync(filePath, rotatedLogPath(filePath, 1));
+}
+
+function appendBoundedLog(filePath: string, line: string) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  rotateLogIfNeeded(filePath);
+  fs.appendFileSync(filePath, line, "utf8");
 }
 
 function delay(ms: number) {
@@ -1326,6 +1477,49 @@ function isCodexAppServerCommand(command: string) {
   return /\bcodex(?:\s+|\S*\/codex\s+)app-server\b/.test(command);
 }
 
+// Computer Use helper processes are NOT all ours. The standalone Codex.app (and
+// IDE extensions) spawn the exact same SkyComputerUseClient/SkyComputerUseService
+// binaries for their own sessions — e.g. Codex.app's "locked use" keeps a helper
+// attached for hours. Killing those breaks Computer Use inside Codex.app itself
+// ("Transport closed" there), so every automatic cleanup must first prove a
+// helper is actually ours or truly ownerless.
+//   "ours"     — its parent chain reaches this OpenAssist process.
+//   "orphaned" — its owning app died: the topmost living ancestor below launchd
+//                is itself a helper / codex app-server (re-parented tree).
+//   "foreign"  — owned by another live app (Codex.app, VS Code, …). Hands off.
+function classifyComputerUseHelperOwnership(
+  entry: { pid: number; ppid: number; command: string },
+  snapshotByPID: Map<number, { pid: number; ppid: number; command: string }>
+): "ours" | "orphaned" | "foreign" {
+  let current = entry;
+  for (let depth = 0; depth < 64; depth += 1) {
+    if (current.pid === process.pid) return "ours";
+    const parent = current.ppid > 1 ? snapshotByPID.get(current.ppid) : undefined;
+    if (!parent) {
+      const helperTreeRoot = Boolean(computerUseHelperKind(current.command)) || isCodexAppServerCommand(current.command);
+      return helperTreeRoot ? "orphaned" : "foreign";
+    }
+    current = parent;
+  }
+  return "foreign";
+}
+
+// Automatic cleanups may only touch helpers we own or true orphans, and never
+// the shared SkyComputerUseService (an on-demand service reused by Codex.app;
+// it idles cheaply and relaunches when needed). The explicit Settings
+// "Force stop" keeps its wider reach via getComputerUseActivity.
+function isAutomaticallyKillableComputerUseHelper(
+  entry: { pid: number; ppid: number; command: string; kind: ReturnType<typeof computerUseHelperKind> },
+  snapshotByPID: Map<number, { pid: number; ppid: number; command: string }>
+) {
+  if (entry.kind === "service") return false;
+  return classifyComputerUseHelperOwnership(entry, snapshotByPID) !== "foreign";
+}
+
+function processSnapshotByPID(snapshot: Awaited<ReturnType<typeof processSnapshot>>) {
+  return new Map(snapshot.map((entry) => [entry.pid, entry]));
+}
+
 async function cleanupOpenAssistOwnedCodexAppServers(currentAppServerPID?: number, reason = "OpenAssist Codex app-server cleanup") {
   const protectedPIDs = new Set<number>();
   if (currentAppServerPID && Number.isFinite(currentAppServerPID)) {
@@ -1367,9 +1561,12 @@ async function cleanupStaleComputerUseHelpers(currentAppServerPID?: number, opti
   if (currentAppServerPID && Number.isFinite(currentAppServerPID)) {
     protectedPIDs.add(currentAppServerPID);
   }
-  const staleHelpers = (await processSnapshot())
+  const snapshot = await processSnapshot();
+  const snapshotByPID = processSnapshotByPID(snapshot);
+  const staleHelpers = snapshot
     .map((entry) => ({ ...entry, kind: computerUseHelperKind(entry.command) }))
     .filter((entry) => Boolean(entry.kind))
+    .filter((entry) => isAutomaticallyKillableComputerUseHelper(entry, snapshotByPID))
     .filter((entry) => !protectedPIDs.has(entry.pid) && !protectedPIDs.has(entry.ppid))
     .filter((entry) => entry.elapsedSeconds >= staleComputerUseHelperThresholdSeconds(entry.kind));
   if (!staleHelpers.length) {
@@ -1395,9 +1592,14 @@ async function cleanupStaleComputerUseHelpers(currentAppServerPID?: number, opti
 // "Computer Use is active" and offer a force-stop (useful after a crash leaves an
 // orphaned helper). See docs/computer-use-troubleshooting.md.
 export async function getComputerUseActivity() {
-  const helpers = (await processSnapshot())
+  const snapshot = await processSnapshot();
+  const snapshotByPID = processSnapshotByPID(snapshot);
+  // Foreign helpers (Codex.app's own sessions, e.g. locked use) are excluded:
+  // they are not OpenAssist activity, and Force stop must not kill them.
+  const helpers = snapshot
     .map((entry) => ({ ...entry, kind: computerUseHelperKind(entry.command) }))
     .filter((entry) => Boolean(entry.kind))
+    .filter((entry) => classifyComputerUseHelperOwnership(entry, snapshotByPID) !== "foreign")
     .map((entry) => ({
       pid: entry.pid,
       kind: entry.kind as string,
@@ -1415,9 +1617,16 @@ export async function getComputerUseActivity() {
 // which makes turns hang on "Transport closed"). No Codex restart here — Codex
 // is not running yet at startup. See docs/computer-use-troubleshooting.md.
 export async function cleanupOrphanedComputerUseHelpersOnStartup() {
-  const orphans = (await processSnapshot())
+  const snapshot = await processSnapshot();
+  const snapshotByPID = processSnapshotByPID(snapshot);
+  const helpers = snapshot
     .map((entry) => ({ ...entry, kind: computerUseHelperKind(entry.command) }))
     .filter((entry) => Boolean(entry.kind));
+  const orphans = helpers.filter((entry) => isAutomaticallyKillableComputerUseHelper(entry, snapshotByPID));
+  const skipped = helpers.length - orphans.length;
+  if (skipped > 0) {
+    bridgeDebugLog(`Startup: leaving ${skipped} Computer Use helper(s) alone (owned by another app, e.g. Codex.app locked use, or the shared service).`);
+  }
   if (!orphans.length) return { killed: [] as number[] };
   bridgeDebugLog(`Startup: killing ${orphans.length} orphaned Computer Use helper(s) details=${orphans.map((entry) => `${entry.pid}:${entry.kind}:${entry.elapsedSeconds}s`).join(",")}`);
   const killed: number[] = [];
@@ -1765,6 +1974,28 @@ const codexComputerUsePluginIDs = new Set([
 ]);
 
 const codexPreferredComputerUsePluginID = "computer-use@openai-bundled";
+const codexImageWorkerMentionSkillID = "openassist:codex-image-worker";
+const codexImageWorkerMentionSlugs = new Set([
+  "codex-image",
+  "imagegen",
+  "codex-image-worker",
+  codexImageWorkerMentionSkillID
+]);
+
+function isCodexImageWorkerSelectionID(value: string) {
+  const normalized = normalizedSkillID(value).replace(/^@+/, "");
+  return codexImageWorkerMentionSlugs.has(normalized);
+}
+
+function promptHasCodexImageWorkerMention(value: string) {
+  return /(?:^|\s)@(codex-image|imagegen|codex-image-worker)\b/i.test(value);
+}
+
+function hasCodexImageWorkerSelection(pluginIDs: string[] = [], skillIDs: string[] = [], prompt = "") {
+  return promptHasCodexImageWorkerMention(prompt)
+    || pluginIDs.some(isCodexImageWorkerSelectionID)
+    || skillIDs.some(isCodexImageWorkerSelectionID);
+}
 
 function canonicalizeCodexPluginID(raw: string): string {
   const normalized = raw.trim().toLowerCase();
@@ -1798,9 +2029,12 @@ function pluginBackedSkillPluginName(skillID: string) {
 }
 
 async function normalizeCodexToolSelection(pluginIDs: string[] = [], skillIDs: string[] = []) {
+  const nextRawSkillIDs = skillIDs.filter((skillID) => typeof skillID === "string" && !isCodexImageWorkerSelectionID(skillID));
   const canonicalPluginIDs = canonicalizeCodexPluginIDs(pluginIDs);
-  const pluginSkillIDs = skillIDs.filter((id) => typeof id === "string" && pluginBackedSkillPluginName(id));
-  if (!pluginSkillIDs.length) return { pluginIDs: canonicalPluginIDs, skillIDs };
+  const pluginSkillIDs = nextRawSkillIDs.filter((id) => typeof id === "string" && pluginBackedSkillPluginName(id));
+  if (!pluginSkillIDs.length) {
+    return { pluginIDs: canonicalPluginIDs, skillIDs: nextRawSkillIDs };
+  }
 
   const pluginByName = new Map<string, string>();
   try {
@@ -1827,7 +2061,7 @@ async function normalizeCodexToolSelection(pluginIDs: string[] = [], skillIDs: s
 
   const nextSkillIDs: string[] = [];
   const seenSkillIDs = new Set<string>();
-  for (const skillID of skillIDs) {
+  for (const skillID of nextRawSkillIDs) {
     const pluginName = pluginBackedSkillPluginName(skillID);
     const pluginID = pluginName ? pluginByName.get(pluginName) : undefined;
     if (pluginID) {
@@ -2047,7 +2281,13 @@ function codexThreadStartParams(session: SessionSummary | undefined, modelID: st
   return params;
 }
 
-function codexThreadResumeParams(threadID: string, session: SessionSummary | undefined, modelID: string, options: CodexRuntimeOptions = {}) {
+function codexThreadResumeParams(
+  threadID: string,
+  session: SessionSummary | undefined,
+  modelID: string,
+  options: CodexRuntimeOptions = {},
+  omitDeveloperInstructions = false
+) {
   const startParams = codexThreadStartParams(session, modelID, options);
   const params: JsonObject = {
     threadId: threadID,
@@ -2060,7 +2300,13 @@ function codexThreadResumeParams(threadID: string, session: SessionSummary | und
   }
   if (startParams.cwd) params.cwd = startParams.cwd;
   if (startParams.model) params.model = startParams.model;
-  if (startParams.developerInstructions) params.developerInstructions = startParams.developerInstructions;
+  // The Codex session already holds the developer instructions from when they
+  // were last sent — re-sending the identical block on every resume added
+  // ~6KB per turn for nothing. The caller compares hashes and omits them when
+  // unchanged (see ensureCodexProviderSession).
+  if (!omitDeveloperInstructions && startParams.developerInstructions) {
+    params.developerInstructions = startParams.developerInstructions;
+  }
   return params;
 }
 
@@ -2092,6 +2338,12 @@ function readJSON<T>(filePath: string, fallback: T): T {
   } catch {
     return fallback;
   }
+}
+
+function normalizeKnowledgeExternalAccessMode(value: unknown): KnowledgeExternalAccessMode {
+  const normalized = String(value ?? "").trim().toLowerCase();
+  if (normalized === "advanced" || normalized === "full") return normalized;
+  return "simple";
 }
 
 // Bulk-cache for `defaults` reads.
@@ -3225,6 +3477,19 @@ function pocketTTSCommandCandidates() {
   ].filter(Boolean) as string[];
 }
 
+// Pocket TTS pulls in scipy. The cp310 wheel for scipy 1.15.3 (the only cp310
+// scipy release) ships a _propack native extension that fails to load on
+// Apple silicon under newer macOS with "section '__DATA/__thread_bss' has a
+// zero-fill section type, but offset field is not zero". That import is hit on
+// every `import scipy.io.wavfile`, so the server crashes (exit 1) on start.
+// scipy >= 1.16 has no cp310 wheel at all, so the only working path is to run
+// Pocket TTS under Python >= 3.11, where uv resolves a scipy wheel that loads.
+// See ~/Library/Logs/OpenAssist/assistant-voice.log for the recurring crashes.
+function pocketTTSUvxFlags() {
+  const python = (process.env.OPENASSIST_POCKET_TTS_PYTHON?.trim() || "3.11");
+  return ["--python", python];
+}
+
 function normalizedPocketTTSCachePhrase(text: string) {
   const normalized = text.replace(/\s+/g, " ").trim().toLowerCase();
   return pocketTTSPrewarmPhrases.find((phrase) => phrase.toLowerCase() === normalized);
@@ -3278,6 +3543,7 @@ async function waitForPocketTTSServer(baseURL: string, child: ReturnType<typeof 
 
 async function spawnPocketTTSServer(command: string) {
   const args = [
+    ...pocketTTSUvxFlags(),
     "pocket-tts",
     "serve",
     "--host",
@@ -3370,6 +3636,7 @@ async function generatePocketTTSAudioFileWithServer(text: string, voiceID: strin
 
 function generatePocketTTSAudioFileWithCLI(text: string, voiceID: string, outputPath: string, runID: number) {
   const args = [
+    ...pocketTTSUvxFlags(),
     "pocket-tts",
     "generate",
     "--quiet",
@@ -4275,8 +4542,9 @@ function screenAnalysisImageResultFromFields(fields: Pick<ChatMessage, "imageDat
   };
 }
 
-function waitForCodexThreadTurnComplete(providerThreadID: string, getTurnID: () => string) {
-  return new Promise<{ turnID?: string; failed?: boolean; error?: string }>((resolve) => {
+function waitForCodexThreadTurnComplete(providerThreadID: string, getTurnID: () => string, timeoutMs?: number) {
+  return new Promise<{ turnID?: string; failed?: boolean; error?: string; timedOut?: boolean }>((resolve) => {
+    let timer: NodeJS.Timeout | undefined;
     const done = (method: string, params: JsonObject) => {
       if (method !== "turn/completed" && method !== "turn/failed") return;
       const incomingThreadID = firstRuntimeString(params.threadId, params.threadID);
@@ -4285,6 +4553,7 @@ function waitForCodexThreadTurnComplete(providerThreadID: string, getTurnID: () 
       const incomingTurnID = firstRuntimeString(params.turnId, params.turnID, turn?.id);
       const expectedTurnID = getTurnID();
       if (expectedTurnID && incomingTurnID && incomingTurnID !== expectedTurnID) return;
+      if (timer) clearTimeout(timer);
       codexTransport.off("notification", done);
       resolve({
         turnID: incomingTurnID || expectedTurnID,
@@ -4293,18 +4562,33 @@ function waitForCodexThreadTurnComplete(providerThreadID: string, getTurnID: () 
       });
     };
     codexTransport.on("notification", done);
+    // Without a deadline a dead thread (app-server restart, crashed turn) would
+    // leave this listener on codexTransport forever.
+    if (timeoutMs && timeoutMs > 0) {
+      timer = setTimeout(() => {
+        codexTransport.off("notification", done);
+        resolve({ turnID: getTurnID(), failed: true, timedOut: true, error: "Timed out waiting for the Codex turn to complete." });
+      }, timeoutMs);
+      timer.unref?.();
+    }
   });
 }
 
-async function analyzeScreenWithCodexImageGeneration(
-  imageBuffer: Buffer,
-  promptText: string,
-  referenceImages: Array<{ name: string; data: Buffer; mimeType: string }> = [],
-  callback: (text: string) => void
-): Promise<{
+async function runCodexImageGenerationJob({
+  promptText,
+  referenceImages = [],
+  serviceName = "OpenAssist Codex Image Worker",
+  callback,
+  extraInputItems = []
+}: {
+  promptText: string;
+  referenceImages?: Array<{ name: string; data: Buffer; mimeType: string }>;
+  serviceName?: string;
+  callback?: (text: string) => void;
+  extraInputItems?: JsonObject[];
+}): Promise<{
   text: string;
   images: Array<{ dataURL: string; mimeType: string; name: string; prompt?: string }>;
-  tools: { webSearch: boolean; imageGeneration: boolean };
 }> {
   const settings = await loadSettings();
   const model = normalizedModelForBackend("codex", settings.noteCleanupModel || settings.model || readCodexDefaultModel());
@@ -4314,30 +4598,32 @@ async function analyzeScreenWithCodexImageGeneration(
     cwd: openAssistRepoRoot(),
     model,
     personality: "friendly",
-    serviceName: "Open Assist Screen Analysis",
+    serviceName,
     ephemeral: true,
     experimentalRawEvents: false,
-    persistExtendedHistory: true
+    persistExtendedHistory: false
   }) as JsonObject;
   const thread = runtimeObject(started.thread);
   const providerThreadID = firstRuntimeString(thread?.id);
-  if (!providerThreadID) throw new Error("Codex did not return a screen-analysis thread id.");
+  if (!providerThreadID) throw new Error("Codex did not return an image-worker thread id.");
 
-  const primaryImageURL = `data:image/png;base64,${imageBuffer.toString("base64")}`;
   const input: JsonObject[] = dedupeInputItems([
-    ...imageGenerationSkillPromptItems(promptText),
+    ...imageGenerationSkillPromptItems(promptText, true),
+    ...extraInputItems,
     {
       type: "text",
       text: [
         "Generate an actual image for the user's request.",
         "Do not only write a prompt or describe what should be generated.",
-        "Use the attached screenshot only as visual/context reference when helpful.",
+        referenceImages.length
+          ? "Use the attached reference image(s) as the base, style, or visual context when the request asks for it."
+          : "Create the image from the user's request when no reference image is needed.",
+        "Return the generated image artifact.",
         "",
         `User request: ${promptText}`
       ].join("\n"),
       text_elements: []
     },
-    { type: "image", url: primaryImageURL },
     ...referenceImages.flatMap((image, index) => [
       {
         type: "text",
@@ -4362,9 +4648,9 @@ async function analyzeScreenWithCodexImageGeneration(
     if (imageKeys.has(key)) return;
     imageKeys.add(key);
     images.push(result);
-    callback("Generated image is ready.");
+    callback?.("Generated image is ready.");
   };
-  const onNotification = (method: string, params: JsonObject, requestID?: JsonRequestID) => {
+  const onNotification = (method: string, params: JsonObject) => {
     const turn = runtimeObject(params.turn);
     const notificationTurnID = firstRuntimeString(params.turnId, params.turnID, turn?.id);
     if (notificationTurnID) providerTurnID = notificationTurnID;
@@ -4372,7 +4658,7 @@ async function analyzeScreenWithCodexImageGeneration(
       const channel = String(params.channel ?? "").toLowerCase();
       if (channel !== "commentary") {
         responseText += params.delta;
-        callback(responseText);
+        callback?.(responseText);
       }
     }
     const item = runtimeItemPayload(params);
@@ -4381,10 +4667,10 @@ async function analyzeScreenWithCodexImageGeneration(
     }
   };
 
-  callback("Generating image...");
+  callback?.("Generating image...");
   codexTransport.on("notification", onNotification);
   try {
-    const turnComplete = waitForCodexThreadTurnComplete(providerThreadID, () => providerTurnID);
+    const turnComplete = waitForCodexThreadTurnComplete(providerThreadID, () => providerTurnID, 600_000);
     const startedTurn = await codexTransport.request("turn/start", {
       threadId: providerThreadID,
       input,
@@ -4403,7 +4689,43 @@ async function analyzeScreenWithCodexImageGeneration(
 
   return {
     text: responseText.trim() || (images.length ? "Generated image is ready." : "Image generation finished, but no image came back."),
-    images,
+    images
+  };
+}
+
+async function analyzeScreenWithCodexImageGeneration(
+  imageBuffer: Buffer,
+  promptText: string,
+  referenceImages: Array<{ name: string; data: Buffer; mimeType: string }> = [],
+  callback: (text: string) => void,
+  conversationHistory: Array<{ role: "user" | "assistant"; text: string }> = [],
+  skillIDs: string[] = []
+): Promise<{
+  text: string;
+  images: Array<{ dataURL: string; mimeType: string; name: string; prompt?: string }>;
+  tools: { webSearch: boolean; imageGeneration: boolean };
+}> {
+  // Fold prior turns into the prompt so follow-ups like "now make it blue"
+  // keep their meaning; the worker API itself is single-shot.
+  const historyContext = conversationHistory.length
+    ? "Earlier conversation about this screen:\n"
+      + conversationHistory.map((turn) => `${turn.role === "assistant" ? "Assistant" : "User"}: ${turn.text.slice(0, 500)}`).join("\n")
+      + "\n\nCurrent request: "
+    : "";
+  const finalResult = await runCodexImageGenerationJob({
+    promptText: historyContext ? `${historyContext}${promptText}` : promptText,
+    referenceImages: [
+      { name: "Selected screen area", data: imageBuffer, mimeType: "image/png" },
+      ...referenceImages
+    ],
+    serviceName: "Open Assist Screen Analysis",
+    callback,
+    extraInputItems: await selectedSkillPromptItems(skillIDs)
+  });
+
+  return {
+    text: finalResult.text,
+    images: finalResult.images,
     tools: {
       webSearch: false,
       imageGeneration: true
@@ -4415,7 +4737,9 @@ async function analyzeScreenWithCodex(
   imageBuffer: Buffer,
   instruction: string | undefined,
   referenceImages: Array<{ name: string; data: Buffer; mimeType: string }> = [],
-  callback: (text: string) => void
+  callback: (text: string) => void,
+  conversationHistory: Array<{ role: "user" | "assistant"; text: string }> = [],
+  skillIDs: string[] = []
 ): Promise<{
   text: string;
   images: Array<{ dataURL: string; mimeType: string; name: string; prompt?: string }>;
@@ -4425,7 +4749,7 @@ async function analyzeScreenWithCodex(
     ? instruction.trim()
     : "Explain what is on my screen or answer any visible questions or problems.";
   if (promptWantsImageGeneration(promptText)) {
-    return analyzeScreenWithCodexImageGeneration(imageBuffer, promptText, referenceImages, callback);
+    return analyzeScreenWithCodexImageGeneration(imageBuffer, promptText, referenceImages, callback, conversationHistory, skillIDs);
   }
 
   const auth = await resolveCodexTranscriptionAuthContext();
@@ -4454,6 +4778,32 @@ async function analyzeScreenWithCodex(
   if (wantsWebSearch) tools.push({ type: "web_search" });
   const analysisInstructions = "You are a helpful assistant. Analyze the screenshot provided by the user and answer their question directly, clearly, and concisely. Reply in plain text. Do not use Markdown formatting symbols unless the user explicitly asks for Markdown. If web_search is available and the user asks for current, online, latest, search, source, or verification work, use it.";
 
+  // Selected skills: this path talks straight to the codex/responses HTTP API
+  // (no Codex transport, so no native skill items) — inline each SKILL.md as
+  // system context instead.
+  const skillMessages = (await selectedSkillPromptItems(skillIDs)).flatMap((item) => {
+    try {
+      const markdown = fs.readFileSync(String(item.path), "utf8").slice(0, 6000);
+      return [{
+        role: "system",
+        content: [
+          { type: "input_text", text: `Apply the user's skill "${item.name}" when it is relevant to the request:\n\n${markdown}` }
+        ]
+      }];
+    } catch {
+      return [];
+    }
+  });
+
+  // Prior turns about this same screenshot (text only — the image itself is
+  // re-attached to the current question below) so follow-ups have context.
+  const historyMessages = conversationHistory.map((turn) => ({
+    role: turn.role,
+    content: [
+      { type: turn.role === "assistant" ? "output_text" : "input_text", text: turn.text }
+    ]
+  }));
+
   const payload: JsonObject = {
     model: model,
     store: false,
@@ -4466,6 +4816,8 @@ async function analyzeScreenWithCodex(
           { type: "input_text", text: analysisInstructions }
         ]
       },
+      ...skillMessages,
+      ...historyMessages,
       {
         role: "user",
         content: [
@@ -4481,7 +4833,10 @@ async function analyzeScreenWithCodex(
     payload.tools = tools;
     payload.tool_choice = "auto";
   }
-  const screenReasoningEffort = normalizeCodexReasoningEffort(settings.noteCleanupReasoningEffort);
+  // The HUD is meant for quick answers; cap inherited reasoning effort so a
+  // "high" note-cleanup setting doesn't make the panel feel stalled.
+  const inheritedEffort = normalizeCodexReasoningEffort(settings.noteCleanupReasoningEffort);
+  const screenReasoningEffort = inheritedEffort === "high" ? "medium" : inheritedEffort;
   if (screenReasoningEffort) {
     payload.reasoning = { effort: screenReasoningEffort };
   }
@@ -4766,14 +5121,30 @@ function openAssistNoteStyleGuide(): string {
     "Only use multiple callouts when mode is decisions/extraction. In all other cases use ≤ 2 total per note.",
     "Never put an implementation plan, large table, or whole section inside a callout.",
     "",
+    "## Collapsible sections",
+    "Use to keep long, multi-area notes scannable: each area collapses to a single tappable row so the reader expands one at a time.",
+    "Heading form (preferred for sections): add the marker to the heading line.",
+    "",
+    "## Area name <!-- oa:collapsible -->",
+    "",
+    "Body markdown here (lists, checklists, tables). Collapses until the next heading of the same or higher level.",
+    "",
+    "Block form (for a standalone detail): ",
+    "",
+    "<!-- oa:collapsible title=\"Details\" -->",
+    "Body markdown here.",
+    "<!-- /oa:collapsible -->",
+    "",
+    "Keep interactive checklists (- [ ] items) at full width inside the section; do not put checkboxes inside table cells (they stop being tickable).",
+    "",
     "## 2-column layout (Main / Details)",
-    "Use for comparing two perspectives or splitting overview from details.",
+    "Use for comparing two perspectives, comparing options side by side, or making use of empty horizontal space for compact reference facts.",
     "",
     "| Main | Details |",
     "| --- | --- |",
     "| First main point<br>Second main point | Detail A<br>Detail B |",
     "",
-    "Use <br> to put multiple lines inside a single cell.",
+    "Use <br> to put multiple lines inside a single cell. Columns are best for read-only facts; they stack on narrow widths.",
     "",
     "## 3-column layout (Now / Next / Later)",
     "Use for roadmaps, priority stacks, or timeline breakdowns.",
@@ -4781,6 +5152,15 @@ function openAssistNoteStyleGuide(): string {
     "| Now | Next | Later |",
     "| --- | --- | --- |",
     "| Doing this now | Planned next | Future idea |",
+    "",
+    "## Structuring long reference notes",
+    "When a note covers multiple areas/items (checklists, specs, comparisons, on-site references):",
+    "- Put one short intro line at the top, then a clear heading per area.",
+    "- Prefer 2/3-column layouts to make great use of horizontal space: compare options side by side, or place saved/reference facts next to the fit/decision fields. This is the default for getting clean, compact sections.",
+    "- Keep the interactive checklist (- [ ] items) at full width below the columns; never put checkboxes inside table cells (they stop being tickable).",
+    "- Move derived/computed fields (for example 'maximum size that fits' or a final yes/no decision) into a short decision block instead of mixing them into the raw checklist.",
+    "- For fields the user fills in on-site, avoid inline blanks like '____ inches' (hard to tap/edit on phone). Put values in an empty 'Actual'/'Value' table cell the user taps to type, and make yes/no decisions checkboxes (- [ ] Fits) instead of typed 'yes / no' text. Example: a | Measurement | Saved | Actual | table with empty Actual cells.",
+    "- Collapsible sections are optional and only for very long notes; prefer clean headings and columns first.",
     "",
     "## Images and links",
     "Use standard Markdown: ![alt](url) for images, [text](url) for links.",
@@ -5308,6 +5688,28 @@ async function cloudVoiceInputReadiness() {
   }
 
   return { ok: true };
+}
+
+// Opens the TCP+TLS connection to the cloud transcription provider ahead of
+// the actual upload. Dictations are usually minutes apart, so every upload
+// paid a cold handshake (~200-400ms). Called fire-and-forget when dictation
+// stops (and starts); the real request follows within a second and reuses the
+// pooled connection.
+let lastCloudTranscriptionPrewarmAt = 0;
+async function prewarmCloudTranscriptionConnection() {
+  if (Date.now() - lastCloudTranscriptionPrewarmAt < 10_000) return;
+  lastCloudTranscriptionPrewarmAt = Date.now();
+  try {
+    const settings = await loadSettings();
+    if (settings.transcriptionEngine !== "Cloud Providers") return;
+    const provider = settings.cloudTranscriptionProvider;
+    if (!provider || provider === "ChatGPT / Codex Session") return;
+    const baseURL = settings.cloudTranscriptionBaseURL || cloudTranscriptionDefaultBaseURL(provider);
+    const origin = new URL(baseURL).origin;
+    await fetchWithTimeout(origin, { method: "HEAD" }, 3000, "Transcription connection prewarm timed out.");
+  } catch {
+    // Best-effort: the transcription request itself surfaces real errors.
+  }
 }
 
 async function transcribeAudioFile(input: AudioTranscriptionFile) {
@@ -6660,6 +7062,10 @@ function iconForProject(rawIcon: unknown, kind?: string, linkedFolderPath?: unkn
   return "book.closed.fill";
 }
 
+function projectRecordPlannerOnly(project: JsonObject) {
+  return project.plannerOnly === true;
+}
+
 function loadProjects(): LoadedProjects {
   const { snapshot } = projectStoreSnapshot();
   const projectNotesByID = new Map<string, number>();
@@ -6732,11 +7138,20 @@ function loadProjects(): LoadedProjects {
     })
     .map(itemForProject);
   const hiddenProjects: ProjectItem[] = (snapshot.projects ?? [])
-    .filter((project) => project.isHidden === true)
+    .filter((project) => project.isHidden === true && !projectRecordPlannerOnly(project))
+    .map(itemForProject);
+  const plannerLists: ProjectItem[] = (snapshot.projects ?? [])
+    .filter((project) => {
+      const id = String(project.id ?? "").trim().toLowerCase();
+      if (!id) return false;
+      if (project.isHidden === true) return false;
+      const parentID = String(project.parentID ?? "").trim().toLowerCase();
+      return !parentID || !hiddenProjectIDs.has(parentID);
+    })
     .map(itemForProject);
 
   if (projects.length) projects[0].active = true;
-  return { projects, hiddenProjects, hiddenProjectIDs, projectNameByID, projectNotesByID, threadAssignments: assignments, threadTitles };
+  return { projects, hiddenProjects, plannerLists, hiddenProjectIDs, projectNameByID, projectNotesByID, threadAssignments: assignments, threadTitles };
 }
 
 function latestTranscriptText(transcript: JsonObject[] | undefined, role: "user" | "assistant") {
@@ -6791,6 +7206,12 @@ function cleanupEmptyConversationThreads() {
     const snapshot = readJSON<{ threadID?: string; transcript?: JsonObject[] }>(filePath, {});
     const threadID = snapshot.threadID ?? dir;
     if (activeRealtimeThreadID && threadID.toLowerCase() === activeRealtimeThreadID) continue;
+    if (threadHasLiveProviderRun(threadID)) continue;
+    const session = findSession(threadID);
+    if (sessionHasRecordedConversation(session)) {
+      ensureConversationFromSessionSummary(session as SessionSummary);
+      continue;
+    }
     if (conversationHasVisibleMessages(snapshot) || conversationHasThreadNotes(threadID)) continue;
     fs.rmSync(path.join(root, dir), { recursive: true, force: true });
     removeProjectThreadAssignment(threadID);
@@ -7486,6 +7907,8 @@ const defaultPlannerBacklog = `# Backlog
 ## Tasks
 `;
 
+const defaultPlannerCategoryNames = ["Work", "Business", "Personal", "Home"];
+
 const legacyPlannerTemplates = [
   `# {{date}}
 
@@ -7587,6 +8010,140 @@ function plannerDesignPath() {
   return path.join(plannerRoot(), "DESIGN.md");
 }
 
+function plannerCategoriesPath() {
+  return path.join(plannerRoot(), "Categories.json");
+}
+
+function plannerCategoryID(name: string) {
+  return cleanDailyText(name)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    || `category-${Date.now()}`;
+}
+
+function defaultPlannerCategories(): PlannerCategory[] {
+  const now = new Date().toISOString();
+  return defaultPlannerCategoryNames.map((name, index) => ({
+    id: plannerCategoryID(name),
+    name,
+    icon: name === "Work" ? "briefcase" : name === "Business" ? "store" : name === "Home" ? "house" : "home",
+    color: name === "Work" ? "#8BB7FF" : name === "Business" ? "#7ED6A5" : name === "Home" ? "#F2B36D" : "#BFA2FF",
+    createdAt: now,
+    updatedAt: now,
+    order: index
+  }));
+}
+
+function normalizePlannerCategoryName(value: unknown) {
+  return cleanDailyText(value).replace(/\s+/g, " ");
+}
+
+function normalizePlannerCategoryRecord(value: unknown, fallbackOrder = 0): PlannerCategory | null {
+  const raw = dailyItemJSON(value);
+  const name = normalizePlannerCategoryName(raw.name ?? raw.title ?? raw.id);
+  if (!name) return null;
+  const id = cleanDailyText(raw.id) || plannerCategoryID(name);
+  const now = new Date().toISOString();
+  return {
+    id,
+    name,
+    color: cleanDailyText(raw.color) || undefined,
+    icon: cleanDailyText(raw.icon) || undefined,
+    createdAt: cleanDailyText(raw.createdAt) || now,
+    updatedAt: cleanDailyText(raw.updatedAt) || now,
+    order: Number.isFinite(Number(raw.order)) ? Number(raw.order) : fallbackOrder,
+    hidden: raw.hidden === true
+  };
+}
+
+function normalizePlannerCategories(value: unknown): PlannerCategory[] {
+  const rawCategories = (value as { categories?: unknown[] } | null)?.categories;
+  const entries = Array.isArray(value)
+    ? value
+    : Array.isArray(rawCategories)
+      ? rawCategories
+      : [];
+  const seen = new Set<string>();
+  const categories: PlannerCategory[] = [];
+  for (const [index, entry] of entries.entries()) {
+    const category = normalizePlannerCategoryRecord(entry, index);
+    if (!category) continue;
+    const key = category.name.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    categories.push(category);
+  }
+  for (const category of defaultPlannerCategories()) {
+    const key = category.name.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    categories.push({ ...category, order: categories.length });
+  }
+  return categories.sort((left, right) => left.order - right.order || left.name.localeCompare(right.name));
+}
+
+function loadPlannerCategories(includeHidden = false): PlannerCategory[] {
+  ensurePlannerScaffold();
+  const filePath = plannerCategoriesPath();
+  const loaded = fs.existsSync(filePath)
+    ? readJSON<{ categories?: unknown[] }>(filePath, { categories: [] })
+    : { categories: defaultPlannerCategories() };
+  const categories = normalizePlannerCategories(loaded);
+  if (!fs.existsSync(filePath)) writeJSON(filePath, { version: 1, categories });
+  return includeHidden ? categories : categories.filter((category) => category.hidden !== true);
+}
+
+function savePlannerCategories(categories: PlannerCategory[]) {
+  const normalized = normalizePlannerCategories(categories);
+  writeJSON(plannerCategoriesPath(), { version: 1, categories: normalized });
+  emitPlannerCategoriesChanged();
+  return normalized.filter((category) => category.hidden !== true);
+}
+
+function upsertPlannerCategory(input: Partial<PlannerCategory> & { name?: string }) {
+  const name = normalizePlannerCategoryName(input.name);
+  if (!name) throw new Error("Category name is required.");
+  const categories = loadPlannerCategories(true);
+  const now = new Date().toISOString();
+  const inputID = cleanDailyText(input.id);
+  const existingByID = inputID
+    ? categories.find((category) => category.id.toLowerCase() === inputID.toLowerCase())
+    : undefined;
+  const existingByName = categories.find((category) => category.name.toLowerCase() === name.toLowerCase());
+  const existing = existingByID ?? existingByName;
+  if (existing && existing.name !== name) {
+    renamePlannerCategoryAreaReferences(existing.name, name);
+  }
+  const next: PlannerCategory = {
+    id: existing?.id ?? (cleanDailyText(input.id) || plannerCategoryID(name)),
+    name,
+    color: normalizePlannerCategoryName(input.color) || existing?.color,
+    icon: normalizePlannerCategoryName(input.icon) || existing?.icon,
+    createdAt: existing?.createdAt ?? now,
+    updatedAt: now,
+    order: Number.isFinite(Number(input.order)) ? Number(input.order) : (existing?.order ?? categories.length),
+    hidden: input.hidden === true ? true : input.hidden === false ? false : existing?.hidden
+  };
+  const updated = existing
+    ? categories.map((category) => category.id === existing.id ? next : category)
+    : [...categories, next];
+  return { category: next, categories: savePlannerCategories(updated) };
+}
+
+function deletePlannerCategory(categoryID: string) {
+  const key = cleanDailyText(categoryID).toLowerCase();
+  if (!key) throw new Error("Category id is required.");
+  const categories = loadPlannerCategories(true);
+  const existing = categories.find((category) => category.id.toLowerCase() === key || category.name.toLowerCase() === key);
+  if (!existing) return loadPlannerCategories();
+  if (defaultPlannerCategoryNames.some((name) => name.toLowerCase() === existing.name.toLowerCase())) {
+    const hidden = categories.map((category) => category.id === existing.id ? { ...category, hidden: true, updatedAt: new Date().toISOString() } : category);
+    return savePlannerCategories(hidden);
+  }
+  return savePlannerCategories(categories.filter((category) => category.id !== existing.id));
+}
+
 function plannerTemplateFingerprint(template: string) {
   return String(template ?? "").replace(/\r\n/g, "\n").trim();
 }
@@ -7628,6 +8185,32 @@ function normalizeDailyItemDayID(value?: string | null, fallback?: string | null
   const raw = String(value ?? fallback ?? "").trim();
   if (raw.toLowerCase() === plannerBacklogID) return plannerBacklogID;
   return normalizePlannerDayID(raw);
+}
+
+// Strict day resolution for tool/voice WRITE paths. Empty input keeps the
+// "today" default, but a non-empty value that cannot be resolved to a real day
+// throws instead of silently coercing to today (which would file the task on the
+// wrong day while telling the model it succeeded). Understands "backlog", strict
+// ISO dates, and natural-language ("tomorrow", "Monday", "June 20").
+function resolvePlannerDayIDForWrite(value?: string | null, fallback?: string | null): string {
+  const raw = String(value ?? "").trim();
+  if (!raw) {
+    if (fallback) return normalizeDailyItemDayID(fallback);
+    return plannerDayID();
+  }
+  if (raw.toLowerCase() === plannerBacklogID) return plannerBacklogID;
+  const iso = raw.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (iso) {
+    const normalized = normalizePlannerDayID(raw);
+    // normalizePlannerDayID returns today for calendar-invalid ISO strings; detect that.
+    if (normalized !== raw) {
+      throw new Error(`"${raw}" is not a valid date. Use YYYY-MM-DD.`);
+    }
+    return normalized;
+  }
+  const parsed = parsePlannerDayIDFromPrompt(raw);
+  if (parsed) return parsed;
+  throw new Error(`I couldn't understand the date "${raw}". Use YYYY-MM-DD, "today", "tomorrow", a weekday, or "backlog".`);
 }
 
 function plannerDateFromDayID(dayID: string) {
@@ -7788,6 +8371,40 @@ function snapshotPlannerDay(dayID: string, previousMarkdown: string) {
   const filePath = path.join(plannerRecoveryRoot(), dayID, `${stamp}.md`);
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   fs.writeFileSync(filePath, previousMarkdown, "utf8");
+  prunePlannerRecoveryBucket(dayID);
+}
+
+function prunePlannerRecoveryBucket(dayID: string) {
+  const bucketPath = path.join(plannerRecoveryRoot(), dayID);
+  if (!fs.existsSync(bucketPath)) return;
+  const now = Date.now();
+  const entries = fs.readdirSync(bucketPath)
+    .filter((fileName) => fileName.endsWith(".md"))
+    .map((fileName) => {
+      const filePath = path.join(bucketPath, fileName);
+      const stat = fs.statSync(filePath);
+      return { filePath, mtimeMs: stat.mtimeMs };
+    })
+    .sort((left, right) => right.mtimeMs - left.mtimeMs);
+  for (const [index, entry] of entries.entries()) {
+    const isRecentEnough = now - entry.mtimeMs <= plannerRecoveryMaxAgeMs;
+    const keep = index < plannerRecoveryMaxSnapshotsPerBucket
+      && (isRecentEnough || index < plannerRecoveryMinSnapshotsPerBucket);
+    if (!keep) fs.rmSync(entry.filePath, { force: true });
+  }
+  try {
+    if (fs.readdirSync(bucketPath).length === 0) fs.rmdirSync(bucketPath);
+  } catch {
+    // Best effort cleanup only.
+  }
+}
+
+function prunePlannerRecoverySnapshots() {
+  const root = plannerRecoveryRoot();
+  if (!fs.existsSync(root)) return;
+  for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
+    if (entry.isDirectory()) prunePlannerRecoveryBucket(entry.name);
+  }
 }
 
 function savePlannerDay(dayID: string | undefined, markdown: string): PlannerDayDetail {
@@ -7923,7 +8540,32 @@ function appendToPlannerSubsection(markdown: string, heading: string, subheading
   return `${beforeBody}${sectionBody}${spacer}### ${subheading}\n${block.trim()}\n${rest}`;
 }
 
-const dailyItemBlockPattern = /<!--\s*oa-daily-item\s+({[\s\S]*?})\s*-->[\s\S]*?<!--\s*\/oa-daily-item\s*-->/g;
+// A block runs from its opener to ITS closer — but when the editor stripped the
+// closing comment, stop at the next opener (or end of file) instead of lazily
+// swallowing the neighbouring task's block (which made unrelated updates delete
+// the next task).
+const dailyItemBlockPattern = /<!--\s*oa-daily-item\s+({[\s\S]*?})\s*-->(?:(?!<!--\s*\/?oa-daily-item)[\s\S])*?(?:<!--\s*\/oa-daily-item\s*-->|(?=<!--\s*oa-daily-item)|$)/g;
+
+function plannerTaskSubheadingAtOffset(markdown: string, offset: number) {
+  const source = String(markdown ?? "").replace(/\r\n/g, "\n");
+  const lines = source.split("\n");
+  let cursor = 0;
+  let insideTasks = false;
+  let currentSubheading: string | undefined;
+  for (const line of lines) {
+    if (cursor >= offset) break;
+    const heading = line.match(/^##\s+(.+?)\s*$/);
+    if (heading) {
+      insideTasks = cleanDailyText(heading[1]).toLowerCase() === "tasks";
+      currentSubheading = undefined;
+    } else if (insideTasks) {
+      const subheading = line.match(/^###\s+(.+?)\s*$/);
+      if (subheading) currentSubheading = normalizeDailyArea(subheading[1]) ?? cleanDailyTagLabel(subheading[1]);
+    }
+    cursor += line.length + 1;
+  }
+  return insideTasks ? currentSubheading : undefined;
+}
 
 function normalizedDailyStatus(value: unknown, checked = false): DailyItemStatus {
   const normalized = String(value ?? "").trim().toLowerCase();
@@ -7940,15 +8582,114 @@ function cleanDailyTagLabel(value: unknown) {
   return cleanDailyText(value).replace(/^[@#]\s*/, "").replace(/\s+/g, " ");
 }
 
+function normalizeDailySection(value: unknown) {
+  const text = cleanDailyTagLabel(value);
+  return text || undefined;
+}
+
+function normalizeDailyTagLabels(value: unknown): string[] {
+  const rawValues = Array.isArray(value)
+    ? value
+    : typeof value === "string"
+      ? value.split(/[,\n]/)
+      : [];
+  const seen = new Set<string>();
+  const tags: string[] = [];
+  for (const raw of rawValues) {
+    const label = cleanDailyTagLabel(raw);
+    if (!label) continue;
+    const key = label.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    tags.push(label);
+  }
+  return tags;
+}
+
+function dailyFreeTagKey(value: unknown) {
+  return cleanDailyTagLabel(value).toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
+function dailyItemHasFreeTag(item: Pick<DailyItem, "tags">, tag: string) {
+  const wanted = dailyFreeTagKey(tag);
+  return Boolean(wanted && (item.tags ?? []).some((candidate) => dailyFreeTagKey(candidate) === wanted));
+}
+
 function normalizeDailyArea(value: unknown) {
-  const normalized = cleanDailyText(value).replace(/\s+/g, " ").toLowerCase();
+  const text = cleanDailyText(value).replace(/\s+/g, " ");
+  const normalized = text.toLowerCase();
   if (!normalized) return undefined;
-  if (["work", "job", "office", "client", "business"].includes(normalized)) return "Work";
-  if (["personal", "home", "life", "family", "errand", "errands"].includes(normalized)) return "Personal";
+  const categories = loadPlannerCategories(true);
+  const match = categories.find((category) =>
+    category.id.toLowerCase() === normalized
+    || category.name.toLowerCase() === normalized
+  );
+  if (match) return match.name;
+  // Fuzzy pass against the user's REAL categories before the fixed aliases:
+  // "errand" must resolve to an existing "Errands" category, not flip to the
+  // hard-coded Personal bucket. Canonical "work"/"personal" stay exact.
+  if (normalized !== "work" && normalized !== "personal") {
+    const fuzzy = categories.filter((category) => {
+      const name = category.name.toLowerCase();
+      return name === `${normalized}s`
+        || `${name}s` === normalized
+        || ` ${name} `.includes(` ${normalized} `)
+        || ` ${normalized} `.includes(` ${name} `);
+    });
+    if (fuzzy.length === 1) return fuzzy[0].name;
+  }
+  if (["work", "job", "office", "client"].includes(normalized)) return "Work";
+  if (["business", "shop", "store", "company"].includes(normalized)) {
+    return categories.find((category) => category.name.toLowerCase() === "business")?.name ?? text;
+  }
+  if (["home", "house"].includes(normalized)) {
+    return categories.find((category) => category.name.toLowerCase() === "home")?.name ?? text;
+  }
+  if (["personal", "life", "family", "errand", "errands"].includes(normalized)) return "Personal";
+  if (normalized === "business") {
+    return categories.find((category) => category.name.toLowerCase() === "business")?.name;
+  }
+  return text;
+}
+
+function projectAreaFromScope(input: { projectID?: unknown; folderID?: unknown; scopeTags?: unknown }) {
+  const projects = loadProjects().plannerLists;
+  const byID = new Map(projects.map((project) => [project.id.toLowerCase(), project]));
+  const byTitle = new Map(projects.map((project) => [project.title.toLowerCase(), project]));
+  const areaForProject = (project?: ProjectItem) => {
+    const visited = new Set<string>();
+    let current = project;
+    while (current) {
+      const area = normalizeDailyArea(current.area);
+      if (area) return area;
+      const parentKey = cleanDailyText(current.parentID).toLowerCase();
+      if (!parentKey || visited.has(parentKey)) return undefined;
+      visited.add(parentKey);
+      current = byID.get(parentKey);
+    }
+    return undefined;
+  };
+  const scopeTagCandidates = Array.isArray(input.scopeTags)
+    ? normalizeDailyScopeTags(input.scopeTags)
+        .filter((tag) => tag.kind === "project" || tag.kind === "folder")
+        .flatMap((tag) => [tag.id ?? "", tag.label])
+    : [];
+  const candidates = [
+    cleanDailyText(input.projectID),
+    cleanDailyText(input.folderID),
+    ...scopeTagCandidates
+  ].map((value) => value.toLowerCase()).filter(Boolean);
+  for (const candidate of candidates) {
+    const project = byID.get(candidate) ?? byTitle.get(candidate);
+    const area = areaForProject(project);
+    if (area) return area;
+  }
   return undefined;
 }
 
 function inferDailyArea(input: { title?: unknown; detailsMarkdown?: unknown; projectID?: unknown; folderID?: unknown; scopeTags?: unknown }) {
+  const scopedArea = projectAreaFromScope(input);
+  if (scopedArea) return scopedArea;
   const text = [
     input.title,
     input.detailsMarkdown,
@@ -7980,12 +8721,16 @@ function dailyScopeTagKey(tag: DailyItemScopeTag) {
 
 function normalizeDailyScopeTag(value: unknown): DailyItemScopeTag | null {
   const raw = dailyItemJSON(value);
-  const marker = raw.marker === "#" || raw.marker === "@" ? raw.marker : raw.kind === "folder" ? "#" : "@";
   const rawKind = String(raw.kind ?? "").trim();
+  const marker = raw.marker === "#" || raw.marker === "@"
+    ? raw.marker
+    : rawKind === "category"
+      ? "#"
+      : "@";
   const kind: DailyItemScopeTag["kind"] =
-    rawKind === "project" || rawKind === "folder" || rawKind === "unresolved"
+    rawKind === "category" || rawKind === "project" || rawKind === "folder" || rawKind === "unresolved"
       ? rawKind
-      : marker === "#" ? "folder" : "project";
+      : marker === "#" ? "category" : "project";
   const label = cleanDailyTagLabel(raw.label ?? raw.title ?? raw.name);
   const id = cleanDailyText(raw.id);
   if (!label && !id) return null;
@@ -8019,25 +8764,34 @@ function dailyTagNamePattern(label: string) {
     .join("\\s+");
 }
 
-function dailyTagCandidates(projects = loadProjects().projects) {
-  return projects
+function dailyTagCandidates(projects = loadProjects().plannerLists) {
+  const categories = loadPlannerCategories(true)
+    .filter((category) => category.hidden !== true && cleanDailyTagLabel(category.name))
+    .map((category) => ({
+      marker: "#" as const,
+      kind: "category" as const,
+      id: category.id,
+      label: cleanDailyTagLabel(category.name)
+    }));
+  const lists = projects
     .filter((project) => cleanDailyTagLabel(project.title))
     .map((project) => {
       const kind: DailyItemScopeTag["kind"] = project.kind === "folder" ? "folder" : "project";
       return {
-        marker: kind === "folder" ? "#" as const : "@" as const,
+        marker: "@" as const,
         kind,
         id: project.id,
         label: cleanDailyTagLabel(project.title)
       };
-    })
+    });
+  return [...categories, ...lists]
     .sort((left, right) => right.label.length - left.label.length);
 }
 
 function resolveDailyProjectTitle(projectID?: string) {
   if (!projectID) return "";
   const projects = loadProjects();
-  return projects.projects.find((project) => project.id.toLowerCase() === projectID.toLowerCase())?.title
+  return projects.plannerLists.find((project) => project.id.toLowerCase() === projectID.toLowerCase())?.title
     ?? projects.projectNameByID.get(projectID)
     ?? projects.projectNameByID.get(projectID.toUpperCase())
     ?? projects.projectNameByID.get(projectID.toLowerCase())
@@ -8046,7 +8800,7 @@ function resolveDailyProjectTitle(projectID?: string) {
 
 function resolveDailyFolderTitle(folderID?: string) {
   if (!folderID) return "";
-  return loadProjects().projects.find((project) =>
+  return loadProjects().plannerLists.find((project) =>
     project.kind === "folder" && project.id.toLowerCase() === folderID.toLowerCase()
   )?.title ?? folderID ?? "";
 }
@@ -8056,7 +8810,7 @@ function scopeTagsFromDailyFields(projectID?: string, folderID?: string): DailyI
   const projectLabel = resolveDailyProjectTitle(projectID);
   if (projectID && projectLabel) tags.push({ marker: "@", label: projectLabel, kind: "project", id: projectID });
   const folderLabel = resolveDailyFolderTitle(folderID);
-  if (folderID && folderLabel) tags.push({ marker: "#", label: folderLabel, kind: "folder", id: folderID });
+  if (folderID && folderLabel) tags.push({ marker: "@", label: folderLabel, kind: "folder", id: folderID });
   return tags;
 }
 
@@ -8109,11 +8863,12 @@ function unknownDailyTagAtStart(text: string) {
   if (!match) return null;
   const title = text.slice(match[0].length).trim();
   if (!title) return null;
+  const marker = match[1] as "@" | "#";
   return {
     tag: {
-      marker: match[1] as "@" | "#",
+      marker,
       label: cleanDailyTagLabel(match[2]),
-      kind: "unresolved" as const
+      kind: marker === "#" ? "category" as const : "unresolved" as const
     },
     title
   };
@@ -8124,11 +8879,16 @@ function unknownDailyTagAtEnd(text: string) {
   if (!match || match.index === undefined) return null;
   const title = text.slice(0, match.index).trim();
   if (!title) return null;
+  const marker = match[1] as "@" | "#";
+  const label = cleanDailyTagLabel(match[2]);
+  // "#482" at the end of "review PR #482" is an issue number, not a category —
+  // never strip it into a bogus numeric heading.
+  if (!label || /^\d+$/.test(label)) return null;
   return {
     tag: {
-      marker: match[1] as "@" | "#",
-      label: cleanDailyTagLabel(match[2]),
-      kind: "unresolved" as const
+      marker,
+      label,
+      kind: marker === "#" ? "category" as const : "unresolved" as const
     },
     title
   };
@@ -8170,8 +8930,17 @@ function folderIDFromScopeTags(tags: DailyItemScopeTag[]) {
   return tags.find((tag) => tag.kind === "folder" && tag.id)?.id;
 }
 
+function areaFromScopeTags(tags: DailyItemScopeTag[]) {
+  const categoryTag = tags.find((tag) => tag.kind === "category" || tag.marker === "#");
+  return normalizeDailyArea(categoryTag?.label ?? categoryTag?.id);
+}
+
+function plannerListScopeTags(tags: DailyItemScopeTag[]) {
+  return tags.filter((tag) => tag.kind === "project" || tag.kind === "folder" || tag.kind === "unresolved");
+}
+
 function scopeTagsForDailyItem(item: Pick<DailyItem, "projectID" | "folderID" | "scopeTags">) {
-  const existing = normalizeDailyScopeTags(item.scopeTags);
+  const existing = plannerListScopeTags(normalizeDailyScopeTags(item.scopeTags));
   return existing.length ? existing : scopeTagsFromDailyFields(item.projectID, item.folderID);
 }
 
@@ -8196,40 +8965,169 @@ function dailyItemDedupeCore(value: unknown) {
     .trim();
 }
 
+const dailyItemSimilarityStopwords = new Set([
+  "a", "an", "and", "are", "at", "by", "for", "from", "in", "into", "is", "it", "of", "on", "or", "the", "to", "with",
+  "task", "todo", "item", "check", "measure", "measurement", "measurements"
+]);
+
+function dailyItemSimilarityTokens(value: unknown) {
+  return dailyItemDedupeCore(value)
+    .split(/\s+/)
+    .map((token) => token.trim())
+    .filter((token) => token.length >= 3 && !dailyItemSimilarityStopwords.has(token));
+}
+
+function dailyItemSimilarityScore(left: unknown, right: unknown) {
+  const leftTokens = new Set(dailyItemSimilarityTokens(left));
+  const rightTokens = new Set(dailyItemSimilarityTokens(right));
+  if (!leftTokens.size || !rightTokens.size) return 0;
+  const shared = [...leftTokens].filter((token) => rightTokens.has(token)).length;
+  const smaller = Math.min(leftTokens.size, rightTokens.size);
+  return smaller ? shared / smaller : 0;
+}
+
+function dailyItemLooksSimilar(left: unknown, right: unknown) {
+  const leftCore = dailyItemDedupeCore(left);
+  const rightCore = dailyItemDedupeCore(right);
+  if (!leftCore || !rightCore) return false;
+  if (leftCore === rightCore) return true;
+  if ((leftCore.includes(rightCore) || rightCore.includes(leftCore)) && Math.min(leftCore.length, rightCore.length) >= 10) return true;
+  const sharedTokens = dailyItemSimilarityTokens(left).filter((token) => new Set(dailyItemSimilarityTokens(right)).has(token));
+  return sharedTokens.length >= 2 && dailyItemSimilarityScore(left, right) >= 0.8;
+}
+
 function dailyItemInputTitle(raw: JsonObject) {
   return parseDailyTitleScope(raw.title ?? raw.text ?? raw.label ?? "").title;
+}
+
+type PlannerListResolution =
+  | { status: "none" }
+  | { status: "ok"; list: ProjectItem }
+  | { status: "not_found"; query: string }
+  | { status: "ambiguous"; query: string; candidates: ProjectItem[] };
+
+function resolvePlannerListFromDailyInput(raw: JsonObject): PlannerListResolution {
+  const listValue = dailyItemJSON(raw.list);
+  const rawID = cleanDailyText(
+    raw.listID
+      ?? raw.listId
+      ?? raw.listProjectID
+      ?? listValue.id
+      ?? ""
+  ).toLowerCase();
+  const rawName = cleanDailyText(
+    raw.listName
+      ?? raw.listTitle
+      ?? raw.listLabel
+      ?? listValue.name
+      ?? listValue.title
+      ?? (typeof raw.list === "string" ? raw.list : "")
+  ).toLowerCase();
+  if (!rawID && !rawName) return { status: "none" };
+  const lists = loadProjects().plannerLists;
+  const exact = lists.find((project) =>
+    (rawID && project.id.toLowerCase() === rawID)
+    || (rawName && project.title.toLowerCase() === rawName)
+  );
+  if (exact) return { status: "ok", list: exact };
+  // An ID was given but matched nothing — that is a hard miss.
+  if (rawID && !rawName) return { status: "not_found", query: rawID };
+  // Forgiving fallback: the model often says the List name with extra words
+  // ("New Home Stuff list", "the New Home Stuff"). Strip filler and match on the
+  // normalized name so the item still lands in the right List instead of silently
+  // dropping to the bare Category.
+  const wanted = normalizePlannerListName(rawName);
+  if (!wanted) return { status: "not_found", query: rawName };
+  const wantedPadded = ` ${wanted} `;
+  const normalizedMatches = lists.filter((project) => {
+    const candidate = normalizePlannerListName(project.title);
+    if (!candidate) return false;
+    if (candidate === wanted) return true;
+    // Whole-word containment only: "home" may match "new home stuff", but
+    // "work" must NOT match "workout".
+    const candidatePadded = ` ${candidate} `;
+    return candidatePadded.includes(wantedPadded) || wantedPadded.includes(candidatePadded);
+  });
+  if (normalizedMatches.length === 1) return { status: "ok", list: normalizedMatches[0] };
+  if (normalizedMatches.length === 0) return { status: "not_found", query: rawName };
+  // Two or more Lists collide on the normalized name — do not guess.
+  return { status: "ambiguous", query: rawName, candidates: normalizedMatches };
+}
+
+// Throws a descriptive error when a List/folder was explicitly named in the input
+// but could not be resolved to exactly one real List, so the model is told the
+// placement failed instead of silently filing under the bare Category.
+function assertPlannerListResolved(resolution: PlannerListResolution) {
+  if (resolution.status === "not_found") {
+    const known = loadProjects().plannerLists.map((project) => project.title);
+    const hint = known.length ? ` Known lists: ${known.join(", ")}.` : "";
+    throw new Error(`I couldn't find a list called "${resolution.query}".${hint} Please pick an existing list or say the exact name.`);
+  }
+  if (resolution.status === "ambiguous") {
+    const names = resolution.candidates.map((project) => project.title).join(", ");
+    throw new Error(`"${resolution.query}" matches more than one list (${names}). Which one did you mean?`);
+  }
+}
+
+function plannerListFromDailyInput(raw: JsonObject) {
+  const resolution = resolvePlannerListFromDailyInput(raw);
+  return resolution.status === "ok" ? resolution.list : undefined;
+}
+
+function normalizePlannerListName(value: string) {
+  return value
+    .toLowerCase()
+    .replace(/^(the|my|our)\s+/i, "")
+    .replace(/\s+(list|category|section|folder)$/i, "")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
 }
 
 function findSimilarDailyItem(items: DailyItem[], raw: JsonObject) {
   if (cleanDailyText(raw.id)) return undefined;
   const wanted = dailyItemDedupeCore(dailyItemInputTitle(raw));
   if (!wanted) return undefined;
-  return items.find((item) => {
-    const titleCore = dailyItemDedupeCore(item.title);
-    const visibleCore = dailyItemDedupeCore(dailyItemVisibleTitle(item));
-    return titleCore === wanted || visibleCore === wanted;
-  });
+  const matches = items.filter((item) =>
+    dailyItemLooksSimilar(dailyItemVisibleTitle(item), wanted)
+    || dailyItemLooksSimilar(item.title, wanted)
+  );
+  return matches.length === 1 ? matches[0] : undefined;
 }
 
 function mergedDuplicateDailyInput(raw: JsonObject, existing: DailyItem) {
   const incomingDetails = cleanDailyText(raw.detailsMarkdown ?? raw.details ?? raw.description);
   const existingDetails = cleanDailyText(existing.detailsMarkdown);
-  const detailsMarkdown = incomingDetails
+  const detailsMode = cleanDailyText(raw.detailsMode ?? raw.detailMode).toLowerCase();
+  const replaceDetails = raw.replaceDetails === true || detailsMode === "replace" || detailsMode === "overwrite";
+  const detailsMarkdown = replaceDetails
+    ? incomingDetails
+    : incomingDetails
     ? existingDetails && !existingDetails.toLowerCase().includes(incomingDetails.toLowerCase())
       ? `${existingDetails}\n${incomingDetails}`
       : existingDetails || incomingDetails
     : existing.detailsMarkdown;
+  const links = normalizeDailyLinks([
+    ...existing.links,
+    ...(Array.isArray(raw.links) ? raw.links : [])
+  ]);
   return {
     ...raw,
-    id: existing.id,
-    title: existing.title,
+    // Plain-line ids ("plain:12") are line numbers, only valid for reads on the
+    // source file; persisting one into a structured block makes later deletes
+    // remove whatever ends up on that line. Let a fresh UUID be generated.
+    id: existing.id.startsWith("plain:") ? undefined : existing.id,
+    // Keep the INCOMING title: merging "add X" into a similar task Y must not
+    // silently keep Y's wording while telling the model X was added.
+    title: dailyItemInputTitle(raw) ? raw.title : existing.title,
     area: raw.area ?? existing.area,
+    section: raw.section ?? existing.section,
+    tags: raw.tags ?? existing.tags,
     projectID: raw.projectID ?? existing.projectID,
     folderID: raw.folderID ?? existing.folderID,
     scopeTags: raw.scopeTags ?? existing.scopeTags,
     detailsMarkdown,
     steps: Array.isArray(raw.steps) ? raw.steps : existing.steps,
-    links: Array.isArray(raw.links) ? raw.links : existing.links
+    links
   };
 }
 
@@ -8278,14 +9176,27 @@ function dailyItemMetadataForComment(item: DailyItem) {
     projectID: item.projectID,
     folderID: item.folderID,
     area: item.area,
+    section: item.section,
+    tags: normalizeDailyTagLabels(item.tags),
     scopeTags,
     detailsMarkdown: item.detailsMarkdown,
     steps: item.steps,
     links: item.links,
+    reminderAt: item.reminderAt ?? null,
+    reminderTimezone: item.reminderTimezone ?? null,
+    reminderDeliveredAt: item.reminderDeliveredAt ?? null,
     createdAt: item.createdAt,
     updatedAt: item.updatedAt,
     order: item.order
   };
+}
+
+function normalizeReminderDate(value: unknown) {
+  const text = cleanDailyText(value);
+  if (!text) return null;
+  const date = new Date(text);
+  if (!Number.isFinite(date.getTime())) return null;
+  return date.toISOString();
 }
 
 function renderDailyItemBlock(item: DailyItem) {
@@ -8316,7 +9227,7 @@ function renderDailyItemBlock(item: DailyItem) {
   return lines.join("\n");
 }
 
-function parseStructuredDailyItem(dayID: string, rawJSON: string, block: string, order: number, line: number): DailyItem | null {
+function parseStructuredDailyItem(dayID: string, rawJSON: string, block: string, order: number, line: number, inheritedArea?: string): DailyItem | null {
   let metadata: JsonObject;
   try {
     metadata = JSON.parse(rawJSON) as JsonObject;
@@ -8334,8 +9245,9 @@ function parseStructuredDailyItem(dayID: string, rawJSON: string, block: string,
     : metadataScopeTags.length
       ? metadataScopeTags
       : scopeTagsFromDailyFields(metadataProjectID, metadataFolderID);
-  const projectID = projectIDFromScopeTags(scopeTags) ?? metadataProjectID;
-  const folderID = folderIDFromScopeTags(scopeTags) ?? metadataFolderID;
+  const listScopeTags = plannerListScopeTags(scopeTags);
+  const projectID = projectIDFromScopeTags(listScopeTags) ?? metadataProjectID;
+  const folderID = folderIDFromScopeTags(listScopeTags) ?? metadataFolderID;
   const title = titleScope.scopeTags.length ? titleScope.title : cleanDailyText(visibleTask?.[2] ?? metadata.title ?? "");
   if (!title) return null;
   const steps = Array.isArray(metadata.steps)
@@ -8352,11 +9264,16 @@ function parseStructuredDailyItem(dayID: string, rawJSON: string, block: string,
     folderID,
     projectName: resolveDailyProjectTitle(projectID) || undefined,
     folderName: resolveDailyFolderTitle(folderID) || undefined,
-    area: normalizeDailyArea(metadata.area) || inferDailyArea({ title, detailsMarkdown: metadata.detailsMarkdown, projectID, folderID, scopeTags }),
-    scopeTags,
+    area: normalizeDailyArea(metadata.area) || normalizeDailyArea(inheritedArea) || areaFromScopeTags(scopeTags) || inferDailyArea({ title, detailsMarkdown: metadata.detailsMarkdown, projectID, folderID, scopeTags: listScopeTags }),
+    section: normalizeDailySection(metadata.section),
+    tags: normalizeDailyTagLabels(metadata.tags),
+    scopeTags: listScopeTags,
     detailsMarkdown: cleanDailyText(metadata.detailsMarkdown),
     steps,
     links: normalizeDailyLinks(metadata.links),
+    reminderAt: normalizeReminderDate(metadata.reminderAt),
+    reminderTimezone: cleanDailyText(metadata.reminderTimezone) || null,
+    reminderDeliveredAt: normalizeReminderDate(metadata.reminderDeliveredAt),
     createdAt: cleanDailyText(metadata.createdAt) || now,
     updatedAt: cleanDailyText(metadata.updatedAt) || now,
     order: Number.isFinite(Number(metadata.order)) ? Number(metadata.order) : order,
@@ -8372,16 +9289,38 @@ function parseDailyItemsFromMarkdown(dayID: string, markdown: string): DailyItem
   let match: RegExpExecArray | null;
   dailyItemBlockPattern.lastIndex = 0;
   while ((match = dailyItemBlockPattern.exec(source))) {
-    const item = parseStructuredDailyItem(dayID, match[1], match[0], items.length, dailyItemLineNumber(source, match.index));
+    const item = parseStructuredDailyItem(
+      dayID,
+      match[1],
+      match[0],
+      items.length,
+      dailyItemLineNumber(source, match.index),
+      plannerTaskSubheadingAtOffset(source, match.index)
+    );
     if (item) items.push(item);
     blockRanges.push({ start: match.index, end: match.index + match[0].length });
   }
   const isInsideStructuredBlock = (index: number) => blockRanges.some((range) => index >= range.start && index < range.end);
   const linePattern = /^(\s*)[-*]\s+\[([ xX])\]\s+(.+?)\s*$/;
   let offset = 0;
+  let insideTasks = false;
+  let currentSubheading: string | undefined;
   source.split("\n").forEach((line, index) => {
     const start = offset;
     offset += line.length + 1;
+    const heading = line.match(/^##\s+(.+?)\s*$/);
+    if (heading) {
+      insideTasks = cleanDailyText(heading[1]).toLowerCase() === "tasks";
+      currentSubheading = undefined;
+      return;
+    }
+    if (insideTasks) {
+      const subheading = line.match(/^###\s+(.+?)\s*$/);
+      if (subheading) {
+        currentSubheading = normalizeDailyArea(subheading[1]) ?? cleanDailyTagLabel(subheading[1]);
+        return;
+      }
+    }
     if (isInsideStructuredBlock(start)) return;
     const task = line.match(linePattern);
     if (!task) return;
@@ -8389,8 +9328,9 @@ function parseDailyItemsFromMarkdown(dayID: string, markdown: string): DailyItem
     if (!title) return;
     const checked = task[2].toLowerCase() === "x";
     const titleScope = parseDailyTitleScope(title);
-    const projectID = projectIDFromScopeTags(titleScope.scopeTags);
-    const folderID = folderIDFromScopeTags(titleScope.scopeTags);
+    const listScopeTags = plannerListScopeTags(titleScope.scopeTags);
+    const projectID = projectIDFromScopeTags(listScopeTags);
+    const folderID = folderIDFromScopeTags(listScopeTags);
     items.push({
       id: `plain:${index + 1}`,
       dayID,
@@ -8401,11 +9341,16 @@ function parseDailyItemsFromMarkdown(dayID: string, markdown: string): DailyItem
       folderID,
       projectName: resolveDailyProjectTitle(projectID) || undefined,
       folderName: resolveDailyFolderTitle(folderID) || undefined,
-      area: inferDailyArea({ title: titleScope.title, projectID, folderID, scopeTags: titleScope.scopeTags }),
-      scopeTags: titleScope.scopeTags,
+      area: normalizeDailyArea(currentSubheading) || areaFromScopeTags(titleScope.scopeTags) || inferDailyArea({ title: titleScope.title, projectID, folderID, scopeTags: listScopeTags }),
+      section: undefined,
+      tags: [],
+      scopeTags: listScopeTags,
       detailsMarkdown: "",
       steps: [],
       links: [],
+      reminderAt: null,
+      reminderTimezone: null,
+      reminderDeliveredAt: null,
       createdAt: "",
       updatedAt: "",
       order: items.length,
@@ -8421,10 +9366,72 @@ function listDailyItems(dayID?: string): DailyItem[] {
   return parseDailyItemsFromMarkdown(day.id, day.markdown);
 }
 
+function plannerDayFreeTextLines(dayID?: string): string[] {
+  const day = loadPlannerDay(dayID);
+  const source = String(day.markdown ?? "").replace(/\r\n/g, "\n");
+  const structuredItems = parseDailyItemsFromMarkdown(day.id, source);
+  const structuredTitles = new Set(
+    structuredItems.map((item) => cleanDailyText(item.title).toLowerCase()).filter(Boolean)
+  );
+  const blockRanges: Array<{ start: number; end: number }> = [];
+  let match: RegExpExecArray | null;
+  dailyItemBlockPattern.lastIndex = 0;
+  while ((match = dailyItemBlockPattern.exec(source))) {
+    blockRanges.push({ start: match.index, end: match.index + match[0].length });
+  }
+  const isInsideStructuredBlock = (index: number) => blockRanges.some((range) => index >= range.start && index < range.end);
+  const checkboxPattern = /^(\s*)[-*+]\s+\[([ xX])\]\s+(.+?)\s*$/;
+  const lines: string[] = [];
+  let offset = 0;
+  source.split("\n").forEach((line) => {
+    const start = offset;
+    offset += line.length + 1;
+    if (isInsideStructuredBlock(start)) return;
+    const trimmed = line.trim();
+    if (!trimmed) return;
+    if (/^#{1,6}\s/.test(trimmed)) return;
+    if (/^>\s?/.test(trimmed)) return;
+    if (/^<!--/.test(trimmed) || /^<!--[\s\S]*-->$/.test(trimmed)) return;
+    if (checkboxPattern.test(trimmed)) return;
+    const text = trimmed.replace(/<!--[\s\S]*?-->/g, "").trim();
+    if (!text) return;
+    if (structuredTitles.has(text.toLowerCase())) return;
+    lines.push(text);
+  });
+  return lines;
+}
+
+function dailyItemsKnowledgeResult(dayID?: string) {
+  const normalizedDayID = normalizePlannerDayID(dayID);
+  const items = listDailyItems(normalizedDayID);
+  const freeTextItems = plannerDayFreeTextLines(normalizedDayID);
+  const result: { items: DailyItem[]; noteMarkdown?: string; freeTextItems?: string[] } = { items };
+  if (freeTextItems.length) result.freeTextItems = freeTextItems;
+  if (!items.length) {
+    const day = loadPlannerDay(normalizedDayID);
+    result.noteMarkdown = String(day.markdown ?? "").replace(/\r\n/g, "\n");
+  }
+  return result;
+}
+
 function normalizeDailyItemInput(input: unknown, existing?: DailyItem): DailyItem {
   const raw = dailyItemJSON(input);
   const dayID = normalizeDailyItemDayID(cleanDailyText(raw.dayID), existing?.dayID);
-  const checked = raw.checked === true || raw.done === true || existing?.checked === true;
+  // Honor an explicit "uncomplete" intent first. Without this, existing.checked
+  // (or a status that resolves to done) silently overrides an incoming
+  // checked:false / status:"todo", making un-completing a task a no-op.
+  const statusText = String(raw.status ?? "").trim().toLowerCase();
+  const explicitlyUnchecked = raw.checked === false
+    || raw.done === false
+    || statusText === "todo"
+    || statusText === "open"
+    || statusText === "not_done"
+    || statusText === "not done"
+    || statusText === "doing"
+    || statusText === "in_progress"
+    || statusText === "active";
+  const checked = !explicitlyUnchecked
+    && (raw.checked === true || raw.done === true || existing?.checked === true);
   const status = normalizedDailyStatus(raw.status ?? existing?.status, checked);
   const titleScope = parseDailyTitleScope(raw.title ?? existing?.title ?? "");
   const title = titleScope.title;
@@ -8434,41 +9441,99 @@ function normalizeDailyItemInput(input: unknown, existing?: DailyItem): DailyIte
   const hasProjectID = Object.prototype.hasOwnProperty.call(raw, "projectID");
   const hasFolderID = Object.prototype.hasOwnProperty.call(raw, "folderID");
   const hasScopeTags = Object.prototype.hasOwnProperty.call(raw, "scopeTags");
-  const rawProjectID = cleanDailyText(raw.projectID) || undefined;
-  const rawFolderID = cleanDailyText(raw.folderID) || undefined;
+  const shouldClearPlannerList = raw.clearList === true
+    || raw.removeList === true
+    || raw.unassignList === true
+    || raw.listID === null
+    || raw.listId === null
+    || raw.listName === null
+    || raw.list === null
+    || raw.projectID === null
+    || raw.folderID === null
+    || (hasScopeTags && Array.isArray(raw.scopeTags) && raw.scopeTags.length === 0);
+  const listResolution = resolvePlannerListFromDailyInput(raw);
+  // If the caller named a List but it couldn't be resolved to one real List, fail
+  // loud — unless an explicit projectID/folderID already pins the scope. This stops
+  // the item from silently landing under the bare Category while we report success.
+  if ((listResolution.status === "not_found" || listResolution.status === "ambiguous")
+    && !cleanDailyText(raw.projectID) && !cleanDailyText(raw.folderID)) {
+    assertPlannerListResolved(listResolution);
+  }
+  const inputList = listResolution.status === "ok" ? listResolution.list : undefined;
+  const hasList = Boolean(inputList);
+  const rawProjectID = shouldClearPlannerList ? undefined : cleanDailyText(raw.projectID) || (inputList && inputList.kind !== "folder" ? inputList.id : undefined);
+  const rawFolderID = shouldClearPlannerList ? undefined : cleanDailyText(raw.folderID) || (inputList?.kind === "folder" ? inputList.id : undefined);
   const rawScopeTags = normalizeDailyScopeTags(raw.scopeTags);
-  const fieldProjectID = hasProjectID ? rawProjectID : existing?.projectID;
-  const fieldFolderID = hasFolderID ? rawFolderID : existing?.folderID;
+  const fieldProjectID = shouldClearPlannerList ? undefined : hasProjectID || hasList ? rawProjectID : existing?.projectID;
+  const fieldFolderID = shouldClearPlannerList ? undefined : hasFolderID || hasList ? rawFolderID : existing?.folderID;
   const fieldScopeTags = scopeTagsFromDailyFields(fieldProjectID, fieldFolderID);
-  const scopeTags = titleScope.scopeTags.length
-    ? titleScope.scopeTags
+  const titleListScopeTags = plannerListScopeTags(titleScope.scopeTags);
+  const sourceScopeTags = titleScope.scopeTags.length
+    ? (titleListScopeTags.length ? titleScope.scopeTags : fieldScopeTags)
+    : shouldClearPlannerList
+      ? []
     : hasScopeTags
       ? rawScopeTags
       : fieldScopeTags;
-  const projectID = titleScope.scopeTags.length
-    ? projectIDFromScopeTags(scopeTags)
-    : projectIDFromScopeTags(scopeTags) ?? fieldProjectID;
-  const folderID = titleScope.scopeTags.length
-    ? folderIDFromScopeTags(scopeTags)
-    : folderIDFromScopeTags(scopeTags) ?? fieldFolderID;
-  const area = normalizeDailyArea(raw.area)
-    || inferDailyArea({ title, detailsMarkdown: raw.detailsMarkdown ?? existing?.detailsMarkdown, projectID, folderID, scopeTags })
-    || normalizeDailyArea(existing?.area);
+  const scopeTags = plannerListScopeTags(sourceScopeTags);
+  const projectID = projectIDFromScopeTags(scopeTags) ?? fieldProjectID;
+  const folderID = folderIDFromScopeTags(scopeTags) ?? fieldFolderID;
+  // On updates the task's CURRENT category must win over keyword inference —
+  // otherwise an unrelated edit (rename, reminder change) silently re-categorizes
+  // and relocates the task. Inference only fills the gap for new items.
+  const area = areaFromScopeTags(titleScope.scopeTags)
+    || areaFromScopeTags(rawScopeTags)
+    || normalizeDailyArea(raw.area ?? raw.category)
+    || normalizeDailyArea(existing?.area)
+    || inferDailyArea({ title, detailsMarkdown: raw.detailsMarkdown ?? existing?.detailsMarkdown, projectID, folderID, scopeTags });
+  const hasTags = Object.prototype.hasOwnProperty.call(raw, "tags") || Object.prototype.hasOwnProperty.call(raw, "tag");
+  const tags = hasTags
+    ? normalizeDailyTagLabels(raw.tags ?? raw.tag)
+    : normalizeDailyTagLabels(existing?.tags);
+  const hasReminderAt = Object.prototype.hasOwnProperty.call(raw, "reminderAt")
+    || Object.prototype.hasOwnProperty.call(raw, "notifyAt")
+    || Object.prototype.hasOwnProperty.call(raw, "dueAt");
+  const reminderAt = hasReminderAt
+    ? normalizeReminderDate(raw.reminderAt ?? raw.notifyAt ?? raw.dueAt)
+    : existing?.reminderAt ?? null;
+  const hasReminderTimezone = Object.prototype.hasOwnProperty.call(raw, "reminderTimezone")
+    || Object.prototype.hasOwnProperty.call(raw, "timezone")
+    || Object.prototype.hasOwnProperty.call(raw, "timeZone");
+  const reminderTimezone = hasReminderTimezone
+    ? cleanDailyText(raw.reminderTimezone ?? raw.timezone ?? raw.timeZone) || null
+    : existing?.reminderTimezone ?? null;
+  const hasReminderDeliveredAt = Object.prototype.hasOwnProperty.call(raw, "reminderDeliveredAt");
+  const reminderDeliveredAt = (() => {
+    if (!reminderAt) return null;
+    if (hasReminderDeliveredAt) return normalizeReminderDate(raw.reminderDeliveredAt);
+    return reminderAt === (existing?.reminderAt ?? null) ? existing?.reminderDeliveredAt ?? null : null;
+  })();
   return {
-    id: cleanDailyText(raw.id) || (existing?.structured ? existing.id : "") || randomUUID().toLowerCase(),
+    // Never persist a plain-line id ("plain:12") into a structured block: those
+    // are line numbers, and a later delete/move would remove the wrong line.
+    id: (() => {
+      const rawID = cleanDailyText(raw.id);
+      if (rawID && !rawID.startsWith("plain:")) return rawID;
+      return (existing?.structured ? existing.id : "") || randomUUID().toLowerCase();
+    })(),
     dayID,
     title,
     status,
-    checked: raw.checked === true || status === "done",
+    checked: checked || status === "done",
     projectID,
     folderID,
     projectName: resolveDailyProjectTitle(projectID) || undefined,
     folderName: resolveDailyFolderTitle(folderID) || undefined,
     area,
+    section: normalizeDailySection(raw.section ?? raw.grouping) ?? normalizeDailySection(existing?.section),
+    tags,
     scopeTags,
     detailsMarkdown: cleanDailyText(raw.detailsMarkdown ?? existing?.detailsMarkdown ?? ""),
     steps: stepsValue.map((step, index) => normalizeDailyStep(step, index)).filter((step): step is DailyItemStep => Boolean(step)),
     links: normalizeDailyLinks(raw.links ?? existing?.links ?? []),
+    reminderAt,
+    reminderTimezone,
+    reminderDeliveredAt: reminderAt ? reminderDeliveredAt : null,
     createdAt: existing?.createdAt || cleanDailyText(raw.createdAt) || now,
     updatedAt: now,
     order: Number.isFinite(Number(raw.order)) ? Number(raw.order) : existing?.order ?? 0,
@@ -8478,23 +9543,115 @@ function normalizeDailyItemInput(input: unknown, existing?: DailyItem): DailyIte
 
 function replaceStructuredDailyItem(markdown: string, item: DailyItem) {
   let replaced = false;
+  let needsRelocation = false;
   dailyItemBlockPattern.lastIndex = 0;
-  const next = markdown.replace(dailyItemBlockPattern, (block: string, rawJSON: string) => {
+  const next = markdown.replace(dailyItemBlockPattern, (block: string, rawJSON: string, offset: number) => {
     const existing = parseStructuredDailyItem(item.dayID, rawJSON, block, 0, 0);
     if (existing?.id !== item.id) return block;
     replaced = true;
+    // When the category changed, drop the block here and re-append it under the
+    // new ### heading — otherwise the metadata claims the new category while the
+    // visible note still shows the task under the old one.
+    const currentHeading = cleanDailyText(plannerTaskSubheadingAtOffset(markdown, offset)).toLowerCase();
+    const targetHeading = cleanDailyText(item.area).toLowerCase();
+    if (currentHeading !== targetHeading) {
+      needsRelocation = true;
+      return "";
+    }
     return renderDailyItemBlock(item);
   });
+  if (replaced && needsRelocation) {
+    return appendToPlannerSubsection(next.replace(/\n{3,}/g, "\n\n"), "Tasks", item.area, renderDailyItemBlock(item));
+  }
   return replaced ? next : appendToPlannerSubsection(markdown, "Tasks", item.area, renderDailyItemBlock(item));
+}
+
+function renamePlannerCategoryAreaReferences(oldName: string, newName: string) {
+  const previousArea = cleanDailyText(oldName);
+  const nextArea = normalizePlannerCategoryName(newName);
+  if (!previousArea || !nextArea || previousArea.toLowerCase() === nextArea.toLowerCase()) return;
+
+  const { filePath, snapshot } = projectStoreSnapshot();
+  let projectsChanged = false;
+  for (const project of snapshot.projects ?? []) {
+    if (cleanDailyText(project.area).toLowerCase() !== previousArea.toLowerCase()) continue;
+    project.area = nextArea;
+    project.updatedAt = currentSwiftDate();
+    projectsChanged = true;
+  }
+  if (projectsChanged) {
+    saveProjectStoreSnapshot(filePath, snapshot);
+    emitProjectsChanged();
+  }
+
+  const backlog = loadPlannerBacklog();
+  let backlogMarkdown = backlog.markdown;
+  let backlogChanged = false;
+  for (const item of parseDailyItemsFromMarkdown(plannerBacklogID, backlogMarkdown)) {
+    if (!item.structured || cleanDailyText(item.area).toLowerCase() !== previousArea.toLowerCase()) continue;
+    const updated = { ...item, area: nextArea, updatedAt: new Date().toISOString() };
+    const nextMarkdown = replaceStructuredDailyItem(backlogMarkdown, updated);
+    if (nextMarkdown !== backlogMarkdown) {
+      backlogMarkdown = nextMarkdown;
+      backlogChanged = true;
+    }
+  }
+  if (backlogChanged) {
+    savePlannerBacklog(backlogMarkdown);
+    emitPlannerBacklogChanged();
+  }
+
+  const changedDayIDs: string[] = [];
+  for (const day of listPlannerDays(3650, plannerDayID())) {
+    const dayDetail = loadPlannerDay(day.id);
+    let dayMarkdown = dayDetail.markdown;
+    let dayChanged = false;
+    for (const item of parseDailyItemsFromMarkdown(day.id, dayMarkdown)) {
+      if (!item.structured || cleanDailyText(item.area).toLowerCase() !== previousArea.toLowerCase()) continue;
+      const updated = { ...item, area: nextArea, updatedAt: new Date().toISOString() };
+      const nextMarkdown = replaceStructuredDailyItem(dayMarkdown, updated);
+      if (nextMarkdown !== dayMarkdown) {
+        dayMarkdown = nextMarkdown;
+        dayChanged = true;
+      }
+    }
+    if (dayChanged) {
+      savePlannerDay(day.id, dayMarkdown);
+      changedDayIDs.push(day.id);
+    }
+  }
+  for (const dayID of changedDayIDs) {
+    emitPlannerDayChanged(dayID);
+  }
 }
 
 function removePlainDailyItemLine(markdown: string, itemID: string) {
   const lineNumber = Number(itemID.match(/^plain:(\d+)$/)?.[1] ?? 0);
   if (!lineNumber) return markdown;
-  return markdown
-    .split("\n")
-    .filter((_line, index) => index !== lineNumber - 1)
-    .join("\n");
+  const lines = markdown.split("\n");
+  const start = lineNumber - 1;
+  if (!lines[start]) return markdown;
+  let end = start + 1;
+  while (end < lines.length) {
+    const line = lines[end];
+    const trimmed = line.trim();
+    if (!trimmed) {
+      end += 1;
+      continue;
+    }
+    // Plain tasks can still have indented Details/Steps/Links children. When
+    // converting one to a structured item, remove that whole visible block so
+    // the old children do not become orphan bullets above the new task.
+    if (/^\s+/.test(line) && !trimmed.startsWith("<!--")) {
+      end += 1;
+      continue;
+    }
+    break;
+  }
+  return [
+    ...lines.slice(0, start),
+    ...lines.slice(end)
+  ].join("\n").replace(/\n{3,}/g, "\n\n");
 }
 
 function setPlainDailyItemChecked(markdown: string, itemID: string, checked: boolean) {
@@ -8521,19 +9678,29 @@ function removeStructuredDailyItem(markdown: string, itemID: string) {
 // "- [ ]" lines and structured oa-daily-item blocks. Returns the new markdown
 // plus the texts that were actually matched and removed.
 function removePlannerTasksByText(dayID: string, markdown: string, texts: string[]) {
-  const wanted = new Set(texts.map((text) => cleanDailyText(text).toLowerCase()).filter(Boolean));
+  // Count-aware: passing the same title twice removes TWO occurrences, so
+  // duplicate-titled tasks that each moved also each disappear from the source
+  // day instead of one being silently left behind.
+  const wanted = new Map<string, number>();
+  for (const text of texts) {
+    const key = cleanDailyText(text).toLowerCase();
+    if (key) wanted.set(key, (wanted.get(key) ?? 0) + 1);
+  }
   if (!wanted.size) return { markdown, removed: [] as string[] };
   const removed: string[] = [];
   let next = markdown;
   // Re-parse after each removal because plain-line removal shifts line numbers.
-  for (let guard = 0; guard < wanted.size + texts.length + 1; guard += 1) {
+  for (let guard = 0; guard < texts.length + 1; guard += 1) {
     const items = parseDailyItemsFromMarkdown(dayID, next);
-    const target = items.find((item) => wanted.has(dailyItemVisibleTitle(item).toLowerCase())
-      || wanted.has(cleanDailyText(item.title).toLowerCase()));
+    const target = items.find((item) => (wanted.get(dailyItemVisibleTitle(item).toLowerCase()) ?? 0) > 0
+      || (wanted.get(cleanDailyText(item.title).toLowerCase()) ?? 0) > 0);
     if (!target) break;
     removed.push(dailyItemVisibleTitle(target));
-    wanted.delete(dailyItemVisibleTitle(target).toLowerCase());
-    wanted.delete(cleanDailyText(target.title).toLowerCase());
+    const visibleKey = dailyItemVisibleTitle(target).toLowerCase();
+    const matchedKey = (wanted.get(visibleKey) ?? 0) > 0 ? visibleKey : cleanDailyText(target.title).toLowerCase();
+    const remaining = (wanted.get(matchedKey) ?? 0) - 1;
+    if (remaining > 0) wanted.set(matchedKey, remaining);
+    else wanted.delete(matchedKey);
     next = target.id.startsWith("plain:")
       ? removePlainDailyItemLine(next, target.id)
       : removeStructuredDailyItem(next, target.id);
@@ -8556,11 +9723,35 @@ function upsertDailyItem(input: unknown): DailyItemMutationResult {
   const items = parseDailyItemsFromMarkdown(day.id, day.markdown);
   const rawID = cleanDailyText(raw.id);
   const existingByID = items.find((item) => item.id === rawID);
-  const similarExisting = existingByID ? undefined : findSimilarDailyItem(items, raw);
+  // A non-empty id that matches nothing on this day is stale (the task lives on
+  // another day, or the model echoed an old id). Never persist it into a new
+  // block — that would put the same id on two days — treat it as an id-less add
+  // so the similar-item dedupe still applies.
+  const effectiveRaw = rawID && !existingByID ? { ...raw, id: undefined } : raw;
+  const similarExisting = existingByID ? undefined : findSimilarDailyItem(items, effectiveRaw);
   const existing = existingByID ?? similarExisting;
-  const item = normalizeDailyItemInput(similarExisting ? mergedDuplicateDailyInput(raw, similarExisting) : raw, existing);
+  const item = normalizeDailyItemInput(similarExisting ? mergedDuplicateDailyInput(effectiveRaw, similarExisting) : effectiveRaw, existing);
   const sourceMarkdown = existing?.structured === false && existing.id ? removePlainDailyItemLine(day.markdown, existing.id) : day.markdown;
   const savedDay = savePlannerDay(item.dayID, replaceStructuredDailyItem(sourceMarkdown, item));
+  emitPlannerDayChanged(savedDay.id);
+  return dailyMutationResult(savedDay, item);
+}
+
+function appendMovedDailyItemToDay(input: unknown, targetDayID: string): DailyItemMutationResult {
+  const destinationDayID = resolvePlannerDayIDForWrite(targetDayID);
+  const day = loadPlannerDay(destinationDayID);
+  const existingItems = parseDailyItemsFromMarkdown(day.id, day.markdown);
+  const raw = dailyItemJSON(input);
+  const item = normalizeDailyItemInput({
+    ...raw,
+    // Plain item IDs are line-number IDs such as `plain:1`, so they are only
+    // valid inside the source day. Use a fresh structured ID for moves so the
+    // destination day is append-only and an existing target item is never replaced.
+    id: undefined,
+    dayID: destinationDayID,
+    order: existingItems.length
+  });
+  const savedDay = savePlannerDay(destinationDayID, replaceStructuredDailyItem(day.markdown, item));
   emitPlannerDayChanged(savedDay.id);
   return dailyMutationResult(savedDay, item);
 }
@@ -8584,13 +9775,23 @@ function toggleDailyItem(dayID: string | undefined, itemID: string, checked: boo
 // Find a task in a planner day by its visible text. The AI knows the task
 // wording (e.g. "mortgage application"), not the internal id, so we match on
 // the title: first an exact match, then ignoring case, then a "contains" match.
+// The "contains" tier only accepts a UNIQUE match — if the query is a substring
+// of two or more tasks we throw instead of silently mutating/deleting the first,
+// mirroring the unambiguous-match rule used for planner lists.
 function findDailyItemByText(items: DailyItem[], query: string) {
   const wanted = cleanDailyText(query).toLowerCase();
   if (!wanted) return undefined;
   const titleOf = (item: DailyItem) => dailyItemVisibleTitle(item).toLowerCase();
-  return items.find((item) => titleOf(item) === wanted)
-    ?? items.find((item) => cleanDailyText(item.title).toLowerCase() === wanted)
-    ?? items.find((item) => titleOf(item).includes(wanted));
+  const exact = items.find((item) => titleOf(item) === wanted)
+    ?? items.find((item) => cleanDailyText(item.title).toLowerCase() === wanted);
+  if (exact) return exact;
+  const partial = items.filter((item) => titleOf(item).includes(wanted));
+  if (partial.length === 1) return partial[0];
+  if (partial.length > 1) {
+    const names = partial.map((item) => dailyItemVisibleTitle(item)).join("; ");
+    throw new Error(`"${query}" matches more than one task (${names}). Please say the exact task.`);
+  }
+  return undefined;
 }
 
 // Mark a planner task done (or not done) by its text. Applies immediately,
@@ -8608,21 +9809,104 @@ function completeDailyItem(dayID: string | undefined, query: string, checked = t
   return toggleDailyItem(normalizedDayID, match.id, checked);
 }
 
+function updateDailyItemByText(input: unknown): DailyItemMutationResult {
+  const raw = dailyItemJSON(input);
+  const sourceDayID = normalizePlannerDayID(String(raw.dayID ?? raw.date ?? ""));
+  const sourceDay = loadPlannerDay(sourceDayID);
+  const sourceItems = parseDailyItemsFromMarkdown(sourceDay.id, sourceDay.markdown);
+  const itemID = cleanDailyText(raw.itemID ?? raw.dailyItemID ?? raw.id);
+  const matchText = cleanDailyText(raw.query ?? raw.oldTitle ?? raw.currentTitle ?? raw.existingTitle ?? raw.text ?? raw.task);
+  const match = itemID
+    ? sourceItems.find((item) => item.id === itemID)
+    : findDailyItemByText(sourceItems, matchText || String(raw.title ?? ""));
+  if (!match) {
+    const query = cleanDailyText(raw.query ?? raw.oldTitle ?? raw.currentTitle ?? raw.existingTitle ?? raw.text ?? raw.task ?? raw.title ?? itemID);
+    const available = sourceItems.map((item) => dailyItemVisibleTitle(item)).filter(Boolean);
+    throw new Error(`No task matching "${query || itemID}" was found on ${sourceDay.id}. Tasks on that day: ${available.length ? available.join("; ") : "none"}.`);
+  }
+
+  // Strict target resolution: "tomorrow" now works, and an unresolvable date
+  // throws instead of silently coercing the move target to today.
+  const targetDayID = resolvePlannerDayIDForWrite(String(raw.targetDayID ?? raw.newDayID ?? raw.moveToDayID ?? ""), sourceDayID);
+  if (targetDayID === plannerBacklogID) {
+    throw new Error("Use the move-to-backlog tool to send a task to the Backlog.");
+  }
+  const titleValue = cleanDailyText(raw.title);
+  const nextTitle = cleanDailyText(raw.newTitle ?? raw.updatedTitle ?? raw.replacementTitle)
+    || (matchText || itemID ? titleValue : "")
+    || match.title;
+  const resolvedLinks = resolveTaskLinkTargetsFromPayload(raw);
+  const mergedLinks = normalizeDailyLinks([...match.links, ...resolvedLinks]);
+  const rawWithLinks = resolvedLinks.length
+    ? removeLinkedNoteNameListScope({ ...raw, links: mergedLinks }, mergedLinks)
+    : raw;
+  const rawForUpdate = compactLinkedTaskDetails(rawWithLinks, mergedLinks);
+  const item = normalizeDailyItemInput({
+    ...rawForUpdate,
+    id: match.structured ? match.id : undefined,
+    dayID: targetDayID,
+    title: nextTitle
+  }, match);
+
+  if (targetDayID === sourceDayID) {
+    const sourceMarkdown = match.structured
+      ? sourceDay.markdown
+      : removePlainDailyItemLine(sourceDay.markdown, match.id);
+    const savedDay = savePlannerDay(sourceDayID, replaceStructuredDailyItem(sourceMarkdown, item));
+    emitPlannerDayChanged(savedDay.id);
+    return dailyMutationResult(savedDay, item);
+  }
+
+  const targetResult = appendMovedDailyItemToDay(item, targetDayID);
+  const nextSourceMarkdown = match.structured
+    ? removeStructuredDailyItem(sourceDay.markdown, match.id)
+    : removePlainDailyItemLine(sourceDay.markdown, match.id);
+  if (nextSourceMarkdown !== sourceDay.markdown) {
+    savePlannerDay(sourceDayID, nextSourceMarkdown);
+    emitPlannerDayChanged(sourceDayID);
+  }
+  return targetResult;
+}
+
+function moveDailyItemToDay(dayID: string | undefined, itemID: string, targetDayID: string): DailyItemMutationResult {
+  const sourceDayID = normalizePlannerDayID(dayID);
+  const destinationDayID = resolvePlannerDayIDForWrite(targetDayID);
+  if (!itemID.trim()) throw new Error("Daily item was not found.");
+  return updateDailyItemByText({
+    dayID: sourceDayID,
+    itemID,
+    targetDayID: destinationDayID
+  });
+}
+
 function deleteDailyItem(dayID: string | undefined, itemID: string): DailyItemMutationResult {
   const normalizedDayID = normalizePlannerDayID(dayID);
   const day = loadPlannerDay(normalizedDayID);
   const nextMarkdown = itemID.startsWith("plain:")
     ? removePlainDailyItemLine(day.markdown, itemID)
     : removeStructuredDailyItem(day.markdown, itemID);
+  // Don't report success on a no-op delete: if nothing was removed the id/day was
+  // wrong, so surface it instead of telling the model the task was deleted.
+  if (nextMarkdown === day.markdown) {
+    throw new Error(`No task matching "${itemID}" was found on ${day.id}, so nothing was deleted.`);
+  }
   const savedDay = savePlannerDay(normalizedDayID, nextMarkdown);
   emitPlannerDayChanged(savedDay.id);
   return dailyMutationResult(savedDay, null);
 }
 
-function linkDailyItemNote(dayID: string | undefined, itemID: string, target: unknown): DailyItemMutationResult {
-  const normalizedDayID = normalizePlannerDayID(dayID);
+function linkDailyItemNote(dayID: string | undefined, itemID: string, target: unknown): DailyItemMutationResult | BacklogItemMutationResult {
   const link = normalizeNoteLinkTarget(target);
   if (!link) throw new Error("Daily item link target is invalid.");
+  if (String(dayID ?? "").trim().toLowerCase() === plannerBacklogID) {
+    const backlog = loadPlannerBacklog();
+    const existing = parseDailyItemsFromMarkdown(plannerBacklogID, backlog.markdown).find((item) => item.id === itemID);
+    if (!existing) return backlogMutationResult(backlog, null);
+    const links = [...existing.links];
+    if (!links.some((candidate) => noteLinkKey(candidate) === noteLinkKey(link))) links.push(link);
+    return upsertBacklogItem({ ...existing, dayID: plannerBacklogID, links });
+  }
+  const normalizedDayID = normalizePlannerDayID(dayID);
   const day = loadPlannerDay(normalizedDayID);
   const existing = parseDailyItemsFromMarkdown(day.id, day.markdown).find((item) => item.id === itemID);
   if (!existing) return dailyMutationResult(day, null);
@@ -8634,6 +9918,223 @@ function linkDailyItemNote(dayID: string | undefined, itemID: string, target: un
 function listBacklogItems(): DailyItem[] {
   const backlog = loadPlannerBacklog();
   return parseDailyItemsFromMarkdown(plannerBacklogID, backlog.markdown);
+}
+
+const plannerSmartListDefinitions = [
+  {
+    id: "today",
+    title: "Today",
+    subtitle: "Open items due today"
+  },
+  {
+    id: "backlog",
+    title: "Backlog",
+    subtitle: "Open items without a date"
+  },
+  {
+    id: "shopping",
+    title: "Shopping",
+    subtitle: "Items tagged Shopping"
+  },
+  {
+    id: "errands",
+    title: "Errands",
+    subtitle: "Items tagged Errands"
+  },
+  {
+    id: "waiting-for",
+    title: "Waiting For",
+    subtitle: "Items waiting on someone"
+  },
+  {
+    id: "work-follow-ups",
+    title: "Work Follow-ups",
+    subtitle: "Work items tagged Follow-up"
+  }
+] as const;
+
+function plannerSmartListDefinition(id: string) {
+  const key = cleanDailyText(id).toLowerCase();
+  return plannerSmartListDefinitions.find((list) => list.id === key) ?? plannerSmartListDefinitions[0];
+}
+
+function allPlannerSmartListItems() {
+  const seen = new Set<string>();
+  const items: DailyItem[] = [];
+  const add = (item: DailyItem) => {
+    if (item.checked || item.status === "done") return;
+    const key = `${item.dayID}:${item.id}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    items.push(item);
+  };
+  for (const item of listBacklogItems()) add(item);
+  for (const day of listPlannerDays(3650, plannerDayID())) {
+    for (const item of listDailyItems(day.id)) add(item);
+  }
+  return items.sort((left, right) => {
+    const leftDay = left.dayID === plannerBacklogID ? "9999-99-99" : left.dayID;
+    const rightDay = right.dayID === plannerBacklogID ? "9999-99-99" : right.dayID;
+    return leftDay.localeCompare(rightDay) || left.order - right.order || left.title.localeCompare(right.title);
+  });
+}
+
+function itemMatchesPlannerSmartList(item: DailyItem, smartListID: string) {
+  switch (plannerSmartListDefinition(smartListID).id) {
+    case "today":
+      return item.dayID === plannerDayID();
+    case "backlog":
+      return item.dayID === plannerBacklogID;
+    case "shopping":
+      return dailyItemHasFreeTag(item, "Shopping");
+    case "errands":
+      return dailyItemHasFreeTag(item, "Errands");
+    case "waiting-for":
+      return dailyItemHasFreeTag(item, "Waiting For") || dailyItemHasFreeTag(item, "Waiting");
+    case "work-follow-ups": {
+      const isWork = normalizeDailyArea(item.area)?.toLowerCase() === "work";
+      const hasFollowUpTag = dailyItemHasFreeTag(item, "Follow-up") || dailyItemHasFreeTag(item, "Follow-ups");
+      const hasFollowUpSection = dailyFreeTagKey(item.section) === dailyFreeTagKey("Follow-ups");
+      return isWork && (hasFollowUpTag || hasFollowUpSection);
+    }
+    default:
+      return false;
+  }
+}
+
+function listPlannerSmartListItems(smartListID: string) {
+  const definition = plannerSmartListDefinition(smartListID);
+  const items = allPlannerSmartListItems().filter((item) => itemMatchesPlannerSmartList(item, definition.id));
+  return {
+    ...definition,
+    count: items.length,
+    items
+  };
+}
+
+function listPlannerSmartLists(): PlannerSmartListSummary[] {
+  const items = allPlannerSmartListItems();
+  return plannerSmartListDefinitions.map((definition) => ({
+    ...definition,
+    count: items.filter((item) => itemMatchesPlannerSmartList(item, definition.id)).length
+  }));
+}
+
+const plannerReminderScanDays = 45;
+const plannerReminderMaxTimerMs = 60_000;
+let plannerReminderTimer: ReturnType<typeof setTimeout> | null = null;
+let plannerReminderRefreshScheduled = false;
+const plannerReminderInFlight = new Set<string>();
+
+function plannerReminderLedgerPath() {
+  return path.join(supportRoot(), "Planner", "reminder-deliveries.json");
+}
+
+function plannerReminderKey(item: DailyItem) {
+  return `${item.dayID}:${item.id}:${item.reminderAt ?? ""}`;
+}
+
+function readPlannerReminderLedger() {
+  return readJSON<Record<string, string>>(plannerReminderLedgerPath(), {});
+}
+
+function writePlannerReminderLedger(ledger: Record<string, string>) {
+  writeJSON(plannerReminderLedgerPath(), ledger);
+}
+
+function plannerReminderItems() {
+  const items: DailyItem[] = [];
+  for (const item of listBacklogItems()) items.push(item);
+  for (const day of listPlannerDays(plannerReminderScanDays, plannerDayID())) {
+    for (const item of listDailyItems(day.id)) items.push(item);
+  }
+  return items.filter((item) => Boolean(item.reminderAt));
+}
+
+function markPlannerReminderDelivered(item: DailyItem, deliveredAt: string) {
+  const updated = { ...item, reminderDeliveredAt: deliveredAt, updatedAt: deliveredAt };
+  if (item.dayID === plannerBacklogID) {
+    const backlog = loadPlannerBacklog();
+    savePlannerBacklog(replaceStructuredDailyItem(backlog.markdown, updated));
+    emitPlannerBacklogChanged();
+    return;
+  }
+  const day = loadPlannerDay(item.dayID);
+  savePlannerDay(item.dayID, replaceStructuredDailyItem(day.markdown, updated));
+  emitPlannerDayChanged(item.dayID);
+}
+
+function showPlannerReminderNotification(item: DailyItem) {
+  if (!Notification.isSupported()) return false;
+  const due = item.reminderAt ? new Date(item.reminderAt) : null;
+  const dueText = due && Number.isFinite(due.getTime())
+    ? due.toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })
+    : "";
+  const notification = new Notification({
+    title: "OpenAssist reminder",
+    body: [dailyItemVisibleTitle(item), dueText].filter(Boolean).join("\n"),
+    silent: false
+  });
+  notification.on("click", () => {
+    try {
+      app.focus({ steal: true });
+    } catch {
+      app.focus();
+    }
+  });
+  notification.show();
+  return true;
+}
+
+function runPlannerReminderScheduler() {
+  plannerReminderTimer = null;
+  const now = Date.now();
+  const ledger = readPlannerReminderLedger();
+  let ledgerChanged = false;
+  let nextDueAt = Number.POSITIVE_INFINITY;
+
+  for (const item of plannerReminderItems()) {
+    if (!item.reminderAt || item.checked || item.status === "done") continue;
+    const dueAt = Date.parse(item.reminderAt);
+    if (!Number.isFinite(dueAt)) continue;
+    const key = plannerReminderKey(item);
+    if (item.reminderDeliveredAt || ledger[key] || plannerReminderInFlight.has(key)) continue;
+    if (dueAt <= now) {
+      plannerReminderInFlight.add(key);
+      const deliveredAt = new Date().toISOString();
+      try {
+        if (!showPlannerReminderNotification(item)) continue;
+        ledger[key] = deliveredAt;
+        ledgerChanged = true;
+        markPlannerReminderDelivered(item, deliveredAt);
+      } catch (error) {
+        bridgeDebugLog(`Planner reminder notification failed: ${error instanceof Error ? error.message : String(error)}`);
+      } finally {
+        plannerReminderInFlight.delete(key);
+      }
+    } else {
+      nextDueAt = Math.min(nextDueAt, dueAt);
+    }
+  }
+
+  if (ledgerChanged) writePlannerReminderLedger(ledger);
+  const delay = Number.isFinite(nextDueAt)
+    ? Math.max(1_000, Math.min(plannerReminderMaxTimerMs, nextDueAt - Date.now()))
+    : plannerReminderMaxTimerMs;
+  plannerReminderTimer = setTimeout(runPlannerReminderScheduler, delay);
+}
+
+function schedulePlannerReminderRefresh() {
+  if (plannerReminderRefreshScheduled) return;
+  plannerReminderRefreshScheduled = true;
+  setTimeout(() => {
+    plannerReminderRefreshScheduled = false;
+    if (plannerReminderTimer) {
+      clearTimeout(plannerReminderTimer);
+      plannerReminderTimer = null;
+    }
+    runPlannerReminderScheduler();
+  }, 250);
 }
 
 function backlogMutationResult(
@@ -8671,6 +10172,21 @@ function upsertBacklogItem(input: unknown): BacklogItemMutationResult {
   return backlogMutationResult(savedBacklog, item);
 }
 
+function appendMovedDailyItemToBacklog(input: unknown): BacklogItemMutationResult {
+  const backlog = loadPlannerBacklog();
+  const existingItems = parseDailyItemsFromMarkdown(plannerBacklogID, backlog.markdown);
+  const raw = dailyItemJSON(input);
+  const item = normalizeDailyItemInput({
+    ...raw,
+    id: undefined,
+    dayID: plannerBacklogID,
+    order: existingItems.length
+  });
+  const savedBacklog = savePlannerBacklog(replaceStructuredDailyItem(backlog.markdown, item));
+  emitPlannerBacklogChanged();
+  return backlogMutationResult(savedBacklog, item);
+}
+
 function toggleBacklogItem(itemID: string, checked: boolean): BacklogItemMutationResult {
   const backlog = loadPlannerBacklog();
   const existing = parseDailyItemsFromMarkdown(plannerBacklogID, backlog.markdown).find((item) => item.id === itemID);
@@ -8691,6 +10207,10 @@ function deleteBacklogItem(itemID: string): BacklogItemMutationResult {
   const nextMarkdown = itemID.startsWith("plain:")
     ? removePlainDailyItemLine(backlog.markdown, itemID)
     : removeStructuredDailyItem(backlog.markdown, itemID);
+  // Surface a no-op delete instead of reporting success on a wrong/stale id.
+  if (nextMarkdown === backlog.markdown) {
+    throw new Error(`No backlog item matching "${itemID}" was found, so nothing was deleted.`);
+  }
   const savedBacklog = savePlannerBacklog(nextMarkdown);
   emitPlannerBacklogChanged();
   return backlogMutationResult(savedBacklog, null);
@@ -8700,13 +10220,15 @@ function moveDailyItemToBacklog(dayID: string | undefined, itemID: string): Back
   const normalizedDayID = normalizePlannerDayID(dayID);
   const day = loadPlannerDay(normalizedDayID);
   const existing = parseDailyItemsFromMarkdown(day.id, day.markdown).find((item) => item.id === itemID);
-  if (!existing) return backlogMutationResult(loadPlannerBacklog(), null, day, parseDailyItemsFromMarkdown(day.id, day.markdown));
+  if (!existing) {
+    throw new Error(`No task matching "${itemID}" was found on ${day.id}, so nothing was moved to the backlog.`);
+  }
   const title = dailyItemVisibleTitle(existing);
   const carriedDetails = [
     existing.detailsMarkdown,
     existing.checked ? `Follow-up from completed planner item on ${day.id}.` : `Moved from ${day.id}.`
   ].filter(Boolean).join("\n\n");
-  const backlogResult = upsertBacklogItem({
+  const backlogResult = appendMovedDailyItemToBacklog({
     ...existing,
     dayID: plannerBacklogID,
     title,
@@ -8726,18 +10248,36 @@ function moveDailyItemToBacklog(dayID: string | undefined, itemID: string): Back
   };
 }
 
+function scheduledBacklogDetailsForDay(detailsMarkdown: string, targetDayID: string) {
+  const normalizedTarget = normalizePlannerDayID(targetDayID);
+  return String(detailsMarkdown ?? "")
+    .replace(/\r\n/g, "\n")
+    .split("\n")
+    .filter((line) => {
+      const text = cleanDailyText(line);
+      return text !== `Moved from ${normalizedTarget}.`
+        && text !== `Follow-up from completed planner item on ${normalizedTarget}.`;
+    })
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
 function scheduleBacklogItem(itemID: string, targetDayID: string): BacklogItemMutationResult {
-  const normalizedDayID = normalizePlannerDayID(targetDayID);
+  const normalizedDayID = resolvePlannerDayIDForWrite(targetDayID);
   const backlog = loadPlannerBacklog();
   const existing = parseDailyItemsFromMarkdown(plannerBacklogID, backlog.markdown).find((item) => item.id === itemID);
-  if (!existing) return backlogMutationResult(backlog, null);
-  const scheduled = upsertDailyItem({
+  if (!existing) {
+    throw new Error(`No backlog item matching "${itemID}" was found, so nothing was scheduled.`);
+  }
+  const scheduled = appendMovedDailyItemToDay({
     ...existing,
     dayID: normalizedDayID,
     checked: false,
     status: "todo",
-    title: dailyItemVisibleTitle(existing)
-  });
+    title: dailyItemVisibleTitle(existing),
+    detailsMarkdown: scheduledBacklogDetailsForDay(existing.detailsMarkdown, normalizedDayID)
+  }, normalizedDayID);
   const savedBacklog = savePlannerBacklog(
     existing.id.startsWith("plain:")
       ? removePlainDailyItemLine(backlog.markdown, existing.id)
@@ -8793,6 +10333,208 @@ function loadThreadMemory(threadID: string) {
     path: exists ? memoryPath : undefined,
     markdown: [memoryMarkdown, agentFilesSection].filter(Boolean).join("\n\n")
   };
+}
+
+// ---------------------------------------------------------------------------
+// Assistant memory store (global, file-based — modeled on Claude Code's local
+// memory): one durable fact per markdown file with frontmatter, plus a compact
+// MEMORY.md index (one line per memory) that is cheap enough to inject into
+// session-start instructions. Session digests (Codex-style rollout summaries)
+// live under Memory/sessions/. See docs/plan: context diet + memory.
+// ---------------------------------------------------------------------------
+
+const assistantMemoryTypes = ["user", "project", "preference", "reference"] as const;
+type AssistantMemoryType = (typeof assistantMemoryTypes)[number];
+
+function memoryStoreRoot() {
+  return path.join(supportRoot(), "Memory");
+}
+
+function memorySessionsRoot() {
+  return path.join(memoryStoreRoot(), "sessions");
+}
+
+function memoryIndexPath() {
+  return path.join(memoryStoreRoot(), "MEMORY.md");
+}
+
+function memorySlug(name: string) {
+  const slug = name
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 80);
+  return slug || "memory";
+}
+
+function normalizeAssistantMemoryType(value: unknown): AssistantMemoryType {
+  const lowered = String(value ?? "").trim().toLowerCase();
+  return (assistantMemoryTypes as readonly string[]).includes(lowered) ? lowered as AssistantMemoryType : "user";
+}
+
+function memoryFrontmatterEscape(value: string) {
+  return value.replace(/\r?\n/g, " ").replace(/"/g, "'").trim();
+}
+
+function parseAssistantMemoryFile(filePath: string) {
+  const raw = fs.readFileSync(filePath, "utf8").replace(/\r\n/g, "\n");
+  const match = raw.match(/^---\n([\s\S]*?)\n---\n?/);
+  const frontmatter: Record<string, string> = {};
+  if (match) {
+    for (const line of match[1].split("\n")) {
+      const separator = line.indexOf(":");
+      if (separator <= 0) continue;
+      frontmatter[line.slice(0, separator).trim()] = line.slice(separator + 1).trim().replace(/^"|"$/g, "");
+    }
+  }
+  return {
+    slug: path.basename(filePath, ".md"),
+    name: frontmatter.name || path.basename(filePath, ".md"),
+    description: frontmatter.description || "",
+    type: normalizeAssistantMemoryType(frontmatter.type),
+    originThreadID: frontmatter.originThreadID || undefined,
+    updatedAt: frontmatter.updatedAt || undefined,
+    content: match ? raw.slice(match[0].length).trim() : raw.trim()
+  };
+}
+
+function listAssistantMemories() {
+  const root = memoryStoreRoot();
+  if (!fs.existsSync(root)) return [];
+  return fs.readdirSync(root)
+    .filter((entry) => entry.endsWith(".md") && entry !== "MEMORY.md")
+    .map((entry) => {
+      try {
+        return parseAssistantMemoryFile(path.join(root, entry));
+      } catch {
+        return null;
+      }
+    })
+    .filter((memory): memory is NonNullable<typeof memory> => Boolean(memory))
+    .sort((left, right) => String(left.name).localeCompare(String(right.name)));
+}
+
+function rewriteAssistantMemoryIndex() {
+  const memories = listAssistantMemories();
+  const lines = memories.map((memory) =>
+    `- [${memoryFrontmatterEscape(memory.name)}](${memory.slug}.md) — ${memoryFrontmatterEscape(memory.description)}`
+  );
+  fs.mkdirSync(memoryStoreRoot(), { recursive: true });
+  fs.writeFileSync(memoryIndexPath(), lines.length ? `${lines.join("\n")}\n` : "", "utf8");
+  return memories.length;
+}
+
+function saveAssistantMemory(input: {
+  name: string;
+  description: string;
+  content: string;
+  type?: string;
+  originThreadID?: string;
+}) {
+  const name = input.name.trim();
+  const description = input.description.trim();
+  const content = input.content.trim();
+  if (!name) throw new Error("Memory name is required.");
+  if (!description) throw new Error("Memory description is required.");
+  if (!content) throw new Error("Memory content is required.");
+  const slug = memorySlug(name);
+  const filePath = path.join(memoryStoreRoot(), `${slug}.md`);
+  const existed = fs.existsSync(filePath);
+  const existing = existed ? parseAssistantMemoryFile(filePath) : null;
+  const frontmatter = [
+    "---",
+    `name: ${memoryFrontmatterEscape(name)}`,
+    `description: ${memoryFrontmatterEscape(description)}`,
+    `type: ${normalizeAssistantMemoryType(input.type)}`,
+    ...(input.originThreadID?.trim() || existing?.originThreadID
+      ? [`originThreadID: ${input.originThreadID?.trim() || existing?.originThreadID}`]
+      : []),
+    `updatedAt: ${new Date().toISOString()}`,
+    "---"
+  ].join("\n");
+  fs.mkdirSync(memoryStoreRoot(), { recursive: true });
+  fs.writeFileSync(filePath, `${frontmatter}\n\n${content}\n`, "utf8");
+  rewriteAssistantMemoryIndex();
+  return { slug, path: filePath, updated: existed };
+}
+
+function readAssistantMemory(nameOrSlug: string) {
+  const slug = memorySlug(nameOrSlug);
+  const filePath = path.join(memoryStoreRoot(), `${slug}.md`);
+  if (!fs.existsSync(filePath)) return null;
+  return parseAssistantMemoryFile(filePath);
+}
+
+function deleteAssistantMemory(nameOrSlug: string) {
+  const slug = memorySlug(nameOrSlug);
+  const filePath = path.join(memoryStoreRoot(), `${slug}.md`);
+  if (!fs.existsSync(filePath)) return false;
+  fs.rmSync(filePath, { force: true });
+  rewriteAssistantMemoryIndex();
+  return true;
+}
+
+// Compact index for prompt injection. Truncated on a line boundary so a large
+// memory set cannot bloat session-start instructions past ~maxChars.
+function readAssistantMemoryIndex(maxChars = 2000) {
+  const indexPath = memoryIndexPath();
+  if (!fs.existsSync(indexPath)) return "";
+  const raw = fs.readFileSync(indexPath, "utf8").trim();
+  if (raw.length <= maxChars) return raw;
+  const lines = raw.split("\n");
+  const kept: string[] = [];
+  let used = 0;
+  for (const line of lines) {
+    if (used + line.length + 1 > maxChars) break;
+    kept.push(line);
+    used += line.length + 1;
+  }
+  return `${kept.join("\n")}\n…(${lines.length - kept.length} more memories — use oa_memory_list)`;
+}
+
+// Codex-style automatic session summaries, kept deterministic (no model
+// calls): one digest file per thread per day with a one-line entry per turn.
+// Cheap to write, indexed into the recall timeline, and survives thread
+// deletion — "what did we work on Tuesday?" stays answerable.
+const sessionDigestMaxTurnLines = 40;
+
+function compactDigestText(value: string, maxChars: number) {
+  return value.replace(/\s+/g, " ").trim().slice(0, maxChars);
+}
+
+function appendSessionDigest(input: {
+  threadID: string;
+  title: string;
+  backend: string;
+  prompt: string;
+  responseText: string;
+}) {
+  try {
+    const now = new Date();
+    const dayID = plannerDayID();
+    const fileName = `${dayID}-${input.threadID.slice(-8)}.md`;
+    const filePath = path.join(memorySessionsRoot(), fileName);
+    fs.mkdirSync(memorySessionsRoot(), { recursive: true });
+    const header = [
+      `# ${compactDigestText(input.title || "Chat session", 120)}`,
+      "",
+      `Thread: ${input.threadID}`,
+      `Date: ${dayID}`,
+      `Provider: ${input.backend}`,
+      ""
+    ].join("\n");
+    const existing = fs.existsSync(filePath) ? fs.readFileSync(filePath, "utf8") : "";
+    const time = `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
+    const entry = `- ${time} · user: ${compactDigestText(input.prompt, 150)} → assistant: ${compactDigestText(input.responseText, 200)}`;
+    const bodyLines = existing
+      ? existing.split("\n").filter((line) => line.startsWith("- "))
+      : [];
+    bodyLines.push(entry);
+    const kept = bodyLines.slice(-sessionDigestMaxTurnLines);
+    fs.writeFileSync(filePath, `${header}${kept.join("\n")}\n`, "utf8");
+  } catch (error) {
+    bridgeDebugLog(`session digest write failed thread=${input.threadID}: ${error instanceof Error ? error.message : String(error)}`);
+  }
 }
 
 function conversationSnapshotPath(threadID: string) {
@@ -9596,7 +11338,7 @@ function ensureOpenAssistSessionRecord(threadID: string, backend?: AssistantBack
   return updateSession(session);
 }
 
-function updateProviderBinding(threadID: string, backend: AssistantBackend, providerSessionID: string, modelID?: string) {
+function updateProviderBinding(threadID: string, backend: AssistantBackend, providerSessionID: string, modelID?: string, extras?: JsonObject) {
   const session = ensureOpenAssistSessionRecord(threadID, backend, modelID);
   const existing = session.providerBindingsByBackend ?? [];
   const nextBinding = {
@@ -9606,7 +11348,8 @@ function updateProviderBinding(threadID: string, backend: AssistantBackend, prov
     latestModelID: modelID || String((existing.find((binding) => binding.backend === backend) ?? {}).latestModelID ?? ""),
     latestInteractionMode: "agentic",
     latestReasoningEffort: "high",
-    lastConnectedAt: currentSwiftDate()
+    lastConnectedAt: currentSwiftDate(),
+    ...(extras ?? {})
   };
   session.providerBindingsByBackend = [nextBinding, ...existing.filter((binding) => binding.backend !== backend)];
   session.activeProvider = backend;
@@ -9769,6 +11512,15 @@ function loadedProjectItem(projectID: string) {
   return loadProjects().projects.find((project) => project.id.toLowerCase() === projectID.toLowerCase()) ?? null;
 }
 
+function loadedProjectsState() {
+  const loaded = loadProjects();
+  return { projects: loaded.projects, hiddenProjects: loaded.hiddenProjects, plannerLists: loaded.plannerLists };
+}
+
+function emitProjectsChanged() {
+  emitAppStateBackgroundUpdate({ type: "projects", ...loadedProjectsState() });
+}
+
 function renameProject(projectID: string, name: string) {
   const { filePath, snapshot } = projectStoreSnapshot();
   const project = projectRecord(snapshot, projectID);
@@ -9790,6 +11542,94 @@ function updateProjectIcon(projectID: string, symbol?: string | null) {
   project.updatedAt = currentSwiftDate();
   saveProjectStoreSnapshot(filePath, snapshot);
   return loadedProjectItem(projectID);
+}
+
+function updateProjectColorAndArea(projectID: string, area?: string | null, color?: string | null) {
+  const { filePath, snapshot } = projectStoreSnapshot();
+  const project = projectRecord(snapshot, projectID);
+  if (!project) throw new Error("Project was not found.");
+  const normalizedArea = normalizeDailyArea(area);
+  if (normalizedArea) project.area = normalizedArea;
+  else delete project.area;
+  if (color) project.color = color;
+  else delete project.color;
+  project.updatedAt = currentSwiftDate();
+  saveProjectStoreSnapshot(filePath, snapshot);
+  emitProjectsChanged();
+  return loadedProjectItem(projectID);
+}
+
+function updateProjectArea(projectID: string, area?: string | null) {
+  return updateProjectColorAndArea(projectID, area);
+}
+
+function loadedPlannerListItem(projectID: string) {
+  return loadProjects().plannerLists.find((project) => project.id.toLowerCase() === projectID.toLowerCase()) ?? null;
+}
+
+function listPlannerLists() {
+  return loadProjects().plannerLists;
+}
+
+function createPlannerList(input: unknown) {
+  const raw = dailyItemJSON(input);
+  const name = normalizeProjectName(String(raw.name ?? raw.title ?? raw.label ?? ""));
+  if (!name) throw new Error("List name is required.");
+  const { filePath, snapshot } = projectStoreSnapshot();
+  const projects = snapshot.projects ?? [];
+  const projectID = randomUUID().toUpperCase();
+  const now = currentSwiftDate();
+  const area = normalizeDailyArea(raw.area ?? raw.category);
+  const color = typeof raw.color === "string" && raw.color.trim() ? raw.color.trim() : undefined;
+  const project: JsonObject = {
+    id: projectID,
+    kind: "project",
+    name: uniqueProjectName(snapshot, name),
+    isHidden: false,
+    plannerOnly: true,
+    createdAt: now,
+    updatedAt: now,
+    iconSymbolName: "list.bullet"
+  };
+  if (area) project.area = area;
+  if (color) project.color = color;
+  snapshot.version = Math.max(1, Number(snapshot.version ?? 1));
+  snapshot.projects = [...projects, project];
+  snapshot.threadAssignments = snapshot.threadAssignments ?? {};
+  snapshot.brainByProjectID = snapshot.brainByProjectID ?? {};
+  snapshot.brainByProjectID[projectID] = { projectSummary: "", processedThreadIDs: [], threadDigestsByThreadID: {} };
+  saveProjectStoreSnapshot(filePath, snapshot);
+  emitProjectsChanged();
+  const loaded = loadProjects();
+  return {
+    list: loaded.plannerLists.find((item) => item.id.toLowerCase() === projectID.toLowerCase()) ?? projectItemFromSnapshot(project),
+    lists: loaded.plannerLists,
+    projects: loaded.projects,
+    hiddenProjects: loaded.hiddenProjects
+  };
+}
+
+function updatePlannerListColorAndArea(projectID: string, area?: string | null, color?: string | null) {
+  updateProjectColorAndArea(projectID, area, color);
+  const loaded = loadProjects();
+  return {
+    list: loadedPlannerListItem(projectID),
+    lists: loaded.plannerLists,
+    projects: loaded.projects,
+    hiddenProjects: loaded.hiddenProjects
+  };
+}
+
+function hidePlannerList(projectID: string) {
+  const { filePath, snapshot } = projectStoreSnapshot();
+  const project = projectRecord(snapshot, projectID);
+  if (!project) throw new Error("List was not found.");
+  if (!projectRecordPlannerOnly(project)) throw new Error("Only planner-created Lists can be hidden here.");
+  project.isHidden = true;
+  project.updatedAt = currentSwiftDate();
+  saveProjectStoreSnapshot(filePath, snapshot);
+  emitProjectsChanged();
+  return listPlannerLists();
 }
 
 function syncLinkedFolderForProjectSessions(projectID: string, projectName: string, previousFolderPath?: string, nextFolderPath?: string) {
@@ -9949,8 +11789,12 @@ function loadProjectMemory(projectID: string) {
 function projectItemFromSnapshot(project: JsonObject, notes = 0, chats = 0): ProjectItem {
   const id = String(project.id ?? "");
   const kind = String(project.kind ?? "project") as "folder" | "project";
+  const area = normalizeDailyArea(project.area);
+  const plannerOnly = projectRecordPlannerOnly(project);
   const subtitle = kind === "folder"
     ? `${chats} ${chats === 1 ? "chat" : "chats"}`
+    : plannerOnly
+      ? `Planner List${area ? ` · ${area}` : ""}`
     : `${chats ? `${chats} ${chats === 1 ? "chat" : "chats"}` : "No chats yet"}${notes ? ` · ${notes} notes` : ""}`;
   return {
     id,
@@ -9960,6 +11804,9 @@ function projectItemFromSnapshot(project: JsonObject, notes = 0, chats = 0): Pro
     kind,
     parentID: (project.parentID as string | undefined) ?? null,
     linkedFolderPath: (project.linkedFolderPath as string | undefined) ?? null,
+    area,
+    color: (project.color as string | undefined) ?? undefined,
+    plannerOnly,
     hidden: project.isHidden === true
   };
 }
@@ -10125,37 +11972,87 @@ function createOpenAssistThread(projectID?: string, persistEmptyConversation = t
   };
 }
 
+function sessionHasRecordedConversation(session?: SessionSummary | null) {
+  return Boolean(pluginString(session?.latestUserMessage, session?.latestAssistantMessage));
+}
+
+function ensureConversationFromSessionSummary(session: SessionSummary) {
+  const userText = pluginString(session.latestUserMessage);
+  const assistantText = pluginString(session.latestAssistantMessage);
+  if (!userText && !assistantText) return;
+  const snapshot = readConversationSnapshot(session.id);
+  if (conversationHasVisibleMessages(snapshot)) return;
+
+  const backend = normalizeBackend(String(session.activeProvider ?? pluginString(session.providerBackend) ?? "codex"));
+  const modelID = pluginString(session.modelID, session.latestModel) ?? "";
+  const turnID = `recovered-turn-${randomUUID().toLowerCase()}`;
+  const userCreatedAt = currentSwiftDate();
+  const assistantCreatedAt = currentSwiftDate();
+  const timeline = [
+    ...(userText ? [timelineUserMessage(session.id, userText, userCreatedAt)] : []),
+    ...(assistantText ? [timelineAssistantFinal(session.id, assistantText, backend, modelID, turnID, assistantCreatedAt)] : [])
+  ];
+  const transcript = [
+    ...(userText ? [transcriptEntry("user", userText, backend, modelID)] : []),
+    ...(assistantText ? [transcriptEntry("assistant", assistantText, backend, modelID)] : [])
+  ];
+
+  writeConversationSnapshot(session.id, {
+    threadID: session.id,
+    timeline,
+    transcript,
+    turns: assistantText ? [{
+      threadID: session.id,
+      openAssistTurnID: turnID,
+      provider: backend,
+      providerSessionID: session.id,
+      providerTurnID: turnID,
+      messageIDs: timeline.filter((item) => item.kind === "assistantFinal").map((item) => item.id),
+      createdAt: assistantCreatedAt,
+      updatedAt: assistantCreatedAt,
+      checkpointReferences: []
+    }] : [],
+    lastAppliedEventSequence: snapshot.lastAppliedEventSequence ?? 0
+  });
+}
+
 export function destroyTemporaryThread(threadID: string) {
   const session = findSession(threadID);
   const conversationPath = path.join(conversationStoreRoot(), threadID);
-  // Never discard a temporary thread that actually produced a conversation. A
-  // turn promotes the thread (isTemporary -> false) on the backend, but if the
-  // renderer asks to clean up using stale state we must not delete a chat that
-  // has real content (timeline/transcript/turns). This is what caused completed
-  // Computer Use results in temporary chats to vanish on navigation.
-  try {
-    const snapshot = readConversationSnapshot(threadID);
-    const hasContent =
-      (Array.isArray(snapshot.timeline) && snapshot.timeline.length > 0) ||
-      (Array.isArray(snapshot.transcript) && snapshot.transcript.length > 0) ||
-      (Array.isArray(snapshot.turns) && snapshot.turns.length > 0);
-    if (hasContent) {
-      if (session && session.isTemporary === true) promoteTemporarySession(threadID);
-      return { ok: false, kept: true };
-    }
-  } catch {
-    // If we cannot read the snapshot, fall through to the normal logic.
+  // A session that is NOT temporary must never be destroyed through this path —
+  // e.g. the user promoted ("kept") the thread, or the renderer is acting on
+  // stale state. Temporary sessions ARE deleted in full, content included:
+  // that is what "temporary" means. (Turns no longer auto-promote, so reaching
+  // this with content is the normal leave-a-temporary-chat flow.)
+  if (session && session.isTemporary !== true && session.conversationPersistence !== 0) {
+    return { ok: false, kept: true };
   }
-  if (!session || (session.isTemporary !== true && session.conversationPersistence !== 0)) {
-    fs.rmSync(conversationPath, { recursive: true, force: true });
-    removeProjectThreadAssignment(threadID);
-    return { ok: !fs.existsSync(conversationPath) };
+  if (session) {
+    const registry = loadSessionRegistry();
+    saveSessionRegistry(registry.sessions.filter((item) => item.id.toLowerCase() !== threadID.toLowerCase()));
   }
-  const registry = loadSessionRegistry();
-  saveSessionRegistry(registry.sessions.filter((item) => item.id.toLowerCase() !== threadID.toLowerCase()));
   fs.rmSync(conversationPath, { recursive: true, force: true });
   removeProjectThreadAssignment(threadID);
-  return { ok: true };
+  return { ok: !fs.existsSync(conversationPath) };
+}
+
+// Temporary threads that survived a crash/force-quit (their leave-cleanup never
+// ran) must not reappear as saved chats on the next launch.
+export function purgeTemporaryThreadsOnStartup() {
+  const registry = loadSessionRegistry();
+  const temporary = registry.sessions.filter(
+    (session) => session.isTemporary === true || session.conversationPersistence === 0
+  );
+  if (!temporary.length) return { removed: 0 };
+  saveSessionRegistry(registry.sessions.filter(
+    (session) => session.isTemporary !== true && session.conversationPersistence !== 0
+  ));
+  for (const session of temporary) {
+    fs.rmSync(path.join(conversationStoreRoot(), session.id), { recursive: true, force: true });
+    removeProjectThreadAssignment(session.id);
+  }
+  bridgeDebugLog(`Startup: purged ${temporary.length} leftover temporary thread(s).`);
+  return { removed: temporary.length };
 }
 
 function normalizedModelForBackend(backend: AssistantBackend, rawModelID?: unknown) {
@@ -10363,20 +12260,65 @@ function providerLabel(raw: string) {
   return raw.charAt(0).toUpperCase() + raw.slice(1);
 }
 
-function loadNotes(projects: LoadedProjects) {
+function projectListForNote(projects: LoadedProjects, projectID: string) {
+  const key = projectID.toLowerCase();
+  return projects.plannerLists.find((project) => project.id.toLowerCase() === key);
+}
+
+function projectNotesHiddenForList(projects: LoadedProjects, projectID: string) {
+  const project = projectListForNote(projects, projectID);
+  if (project?.plannerOnly) return false;
+  return projects.hiddenProjectIDs.has(projectID.toLowerCase());
+}
+
+function projectNoteMarkdownPath(projectID: string, note: JsonObject, noteID: string) {
+  const fileName = typeof note.fileName === "string" ? note.fileName : `${noteID}.md`;
+  return path.join(noteDirectoryPath(projectID), fileName);
+}
+
+function readProjectNoteMarkdown(projectID: string, note: JsonObject, noteID: string) {
+  const filePath = projectNoteMarkdownPath(projectID, note, noteID);
+  return fs.existsSync(filePath) ? fs.readFileSync(filePath, "utf8").replace(/\r\n/g, "\n") : "";
+}
+
+function noteMetadataFromRecord(note: JsonObject | undefined, projects: LoadedProjects, projectID: string, markdown?: string) {
+  const project = projectListForNote(projects, projectID);
+  const frontmatter = typeof markdown === "string" ? parseFrontmatter(markdown) : {};
+  const area = normalizeDailyArea(note?.area ?? note?.category)
+    || normalizeDailyArea(frontmatter.area ?? frontmatter.category)
+    || normalizeDailyArea(project?.area);
+  const noteTags = normalizeDailyTagLabels(note?.tags ?? note?.tag);
+  const frontmatterTags = normalizeDailyTagLabels(frontmatter.tags ?? frontmatter.tag);
+  return {
+    area,
+    tags: noteTags.length ? noteTags : frontmatterTags
+  };
+}
+
+function projectNoteSearchMetadataText(metadata?: JsonObject) {
+  if (!metadata) return "";
+  const area = cleanDailyText(metadata.area);
+  const tags = normalizeDailyTagLabels(metadata.tags);
+  return [
+    area ? `Category: ${area}` : "",
+    tags.length ? `Tags: ${tags.join(", ")}` : ""
+  ].filter(Boolean).join("\n");
+}
+
+function loadNotes(projects: LoadedProjects, options: { includeArchived?: boolean } = {}) {
   const notes: NoteItem[] = [];
   const noteFolders: NoteFolderItem[] = [];
   const notesRoot = path.join(projectStoreRoot(), "ProjectNotes");
   if (!fs.existsSync(notesRoot)) return { notes, noteFolders };
   for (const projectDir of fs.readdirSync(notesRoot)) {
     const projectID = projectDir.toUpperCase();
-    if (projects.hiddenProjectIDs.has(projectID.toLowerCase())) continue;
+    if (projectNotesHiddenForList(projects, projectID)) continue;
     const projectName = projects.projectNameByID.get(projectID) ?? projects.projectNameByID.get(projectDir) ?? "Project";
     const manifestPath = path.join(notesRoot, projectDir, "notes", "manifest.json");
     const manifest = readJSON<{ notes?: JsonObject[]; folders?: JsonObject[]; selectedNoteID?: string }>(manifestPath, {});
     const folderCounts = new Map<string, number>();
     for (const note of manifest.notes ?? []) {
-      if (note.isArchived === true) continue;
+      if (note.isArchived === true && !options.includeArchived) continue;
       const folderID = typeof note.folderID === "string" ? note.folderID : null;
       if (folderID) folderCounts.set(folderID, (folderCounts.get(folderID) ?? 0) + 1);
     }
@@ -10387,13 +12329,17 @@ function loadNotes(projects: LoadedProjects) {
         id,
         name: normalizeTitle(folder.name, "Folder"),
         projectID,
+        parentFolderID: normalizedNoteFolderParentID(folder.parentFolderID),
         noteCount: folderCounts.get(id) ?? 0
       });
     }
     for (const note of manifest.notes ?? []) {
+      if (note.isArchived === true && !options.includeArchived) continue;
       const id = String(note.id ?? "");
       if (!id) continue;
       const updatedAt = swiftDateToMs(note.updatedAt);
+      const markdown = readProjectNoteMarkdown(projectID, note, id);
+      const metadata = noteMetadataFromRecord(note, projects, projectID, markdown);
       notes.push({
         id,
         projectID,
@@ -10401,6 +12347,8 @@ function loadNotes(projects: LoadedProjects) {
         folderID: typeof note.folderID === "string" ? note.folderID : null,
         title: normalizeTitle(note.title, "Untitled note"),
         subtitle: noteSubtitle(updatedAt),
+        area: metadata.area,
+        tags: metadata.tags,
         updatedAt,
         isArchived: note.isArchived === true,
         archivedAt: storedArchiveDateToMs(note.archivedAt),
@@ -10433,16 +12381,34 @@ function projectNoteRecoveryDirectoryPath(projectID: string, noteID: string) {
   );
 }
 
+// Trailing whitespace/newlines flip back and forth between editor autosaves,
+// so version identity must ignore them — otherwise every autosave looks like
+// a "change" and floods the 50-slot history with copies of the same content.
+function noteHistoryContentKey(markdown: string) {
+  return markdown.replace(/\r\n/g, "\n").replace(/\s+$/g, "");
+}
+
+function noteHistoryContentHash(markdown: string) {
+  return createHash("sha256").update(noteHistoryContentKey(markdown)).digest("hex");
+}
+
 function snapshotProjectNote(projectID: string, noteID: string, note: JsonObject, previousMarkdown: string) {
   if (!previousMarkdown.trim()) return;
-  const snapshotID = randomUUID().toLowerCase();
   const recoveryRoot = projectNoteRecoveryDirectoryPath(projectID, noteID);
+  const indexPath = path.join(recoveryRoot, "index.json");
+  const entries = readJSON<JsonObject[]>(indexPath, []);
+  // Skip if the newest snapshot already holds this exact content.
+  const contentHash = noteHistoryContentHash(previousMarkdown);
+  const latest = entries[0];
+  if (latest && typeof latest.contentFileName === "string" && !latest.contentFileName.includes("/") && !latest.contentFileName.includes("\\")) {
+    const latestPath = path.join(recoveryRoot, latest.contentFileName);
+    if (fs.existsSync(latestPath) && noteHistoryContentHash(fs.readFileSync(latestPath, "utf8")) === contentHash) return;
+  }
+  const snapshotID = randomUUID().toLowerCase();
   const contentFileName = `${snapshotID}.md`;
   const filePath = path.join(recoveryRoot, contentFileName);
   fs.mkdirSync(recoveryRoot, { recursive: true });
   fs.writeFileSync(filePath, previousMarkdown, "utf8");
-  const indexPath = path.join(recoveryRoot, "index.json");
-  const entries = readJSON<JsonObject[]>(indexPath, []);
   const entry: JsonObject = {
     id: snapshotID,
     noteID,
@@ -10451,7 +12417,7 @@ function snapshotProjectNote(projectID: string, noteID: string, note: JsonObject
     title: normalizeTitle(note.title, "Untitled note"),
     fileName: typeof note.fileName === "string" ? note.fileName : `${noteID}.md`,
     contentFileName,
-    contentHash: createHash("sha256").update(previousMarkdown).digest("hex"),
+    contentHash,
     preview: shortSearchText(previousMarkdown, 180),
     createdAt: Number(note.createdAt ?? 0) || currentSwiftDate(),
     updatedAt: Number(note.updatedAt ?? 0) || currentSwiftDate(),
@@ -10508,11 +12474,15 @@ function loadNote(projectID: string, noteID: string): NoteDetail {
     writeNoteManifest(projectID, manifest);
   }
   const filePath = path.join(noteDirectoryPath(projectID), fileName);
+  const markdown = fs.existsSync(filePath) ? fs.readFileSync(filePath, "utf8") : "";
+  const metadata = noteMetadataFromRecord(note, loadProjects(), projectID, markdown);
   return {
     id: noteID,
     title: normalizeTitle(note?.title, "Untitled note"),
-    markdown: fs.existsSync(filePath) ? fs.readFileSync(filePath, "utf8") : "",
-    path: filePath
+    markdown,
+    path: filePath,
+    area: metadata.area,
+    tags: metadata.tags
   };
 }
 
@@ -10522,6 +12492,7 @@ function createProjectNote(projectID: string) {
   const now = currentSwiftDate();
   const loadedProjects = loadProjects();
   const projectName = loadedProjects.projectNameByID.get(projectID) ?? loadedProjects.projectNameByID.get(projectID.toUpperCase());
+  const projectArea = normalizeDailyArea(projectListForNote(loadedProjects, projectID)?.area);
   const note: JsonObject = {
     id: noteID,
     title: "Untitled note",
@@ -10531,6 +12502,7 @@ function createProjectNote(projectID: string) {
     createdAt: now,
     updatedAt: now
   };
+  if (projectArea) note.area = projectArea;
   manifest.notes = [...(manifest.notes ?? []), note];
   manifest.selectedNoteID = noteID;
   writeNoteManifest(projectID, manifest);
@@ -10540,6 +12512,8 @@ function createProjectNote(projectID: string) {
     subtitle: noteSubtitle(Date.now()),
     projectID: projectID.toUpperCase(),
     projectName,
+    area: projectArea,
+    tags: [],
     updatedAt: Date.now(),
     active: true
   };
@@ -10550,9 +12524,30 @@ function createProjectNote(projectID: string) {
       id: noteID,
       title: "Untitled note",
       markdown: "",
-      path: path.join(noteDirectoryPath(projectID), `${noteID}.md`)
+      path: path.join(noteDirectoryPath(projectID), `${noteID}.md`),
+      area: projectArea,
+      tags: []
     } satisfies NoteDetail
   };
+}
+
+function applyProjectNoteMetadataFromMarkdown(note: JsonObject, projectID: string, markdown: string) {
+  const frontmatter = parseFrontmatter(markdown);
+  const hasArea = Object.prototype.hasOwnProperty.call(frontmatter, "area")
+    || Object.prototype.hasOwnProperty.call(frontmatter, "category");
+  if (hasArea) {
+    const area = normalizeDailyArea(frontmatter.area ?? frontmatter.category);
+    if (area) note.area = area;
+    else delete note.area;
+  } else if (!cleanDailyText(note.area)) {
+    const inheritedArea = normalizeDailyArea(projectListForNote(loadProjects(), projectID)?.area);
+    if (inheritedArea) note.area = inheritedArea;
+  }
+  const hasTags = Object.prototype.hasOwnProperty.call(frontmatter, "tags")
+    || Object.prototype.hasOwnProperty.call(frontmatter, "tag");
+  if (hasTags) {
+    note.tags = normalizeDailyTagLabels(frontmatter.tags ?? frontmatter.tag);
+  }
 }
 
 function renameProjectNote(projectID: string, noteID: string, title: string): NoteDetail {
@@ -10574,21 +12569,351 @@ function saveProjectNote(projectID: string, noteID: string, markdown: string): N
   if (!note) throw new Error("Note was not found.");
   const now = currentSwiftDate();
   note.updatedAt = now;
-  manifest.selectedNoteID = noteID;
-  writeNoteManifest(projectID, manifest);
   const fileName = typeof note.fileName === "string" ? note.fileName : `${noteID}.md`;
   const filePath = path.join(noteDirectoryPath(projectID), fileName);
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   const nextMarkdown = markdown.replace(/\r\n/g, "\n");
   const previousMarkdown = fs.existsSync(filePath) ? fs.readFileSync(filePath, "utf8").replace(/\r\n/g, "\n") : "";
-  if (previousMarkdown !== nextMarkdown) snapshotProjectNote(projectID, noteID, note, previousMarkdown);
+  if (noteHistoryContentKey(previousMarkdown) !== noteHistoryContentKey(nextMarkdown)) {
+    snapshotProjectNote(projectID, noteID, note, previousMarkdown);
+  }
+  applyProjectNoteMetadataFromMarkdown(note, projectID, nextMarkdown);
+  manifest.selectedNoteID = noteID;
+  writeNoteManifest(projectID, manifest);
   fs.writeFileSync(filePath, nextMarkdown, "utf8");
   scheduleRemoteAccessBroadcast();
+  const metadata = noteMetadataFromRecord(note, loadProjects(), projectID, nextMarkdown);
   return {
     id: noteID,
     title: normalizeTitle(note.title, "Untitled note"),
     markdown: nextMarkdown,
-    path: filePath
+    path: filePath,
+    area: metadata.area,
+    tags: metadata.tags
+  };
+}
+
+type ReferenceNoteTarget =
+  | { kind: "project"; projectID: string; noteID: string; title: string }
+  | { kind: "thread"; threadID: string; noteID: string; title: string };
+
+function normalizeReferenceNoteTitle(value?: unknown) {
+  return String(value ?? "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+function canonicalReferenceNoteCandidates(primaryTitle: string) {
+  return [
+    primaryTitle,
+    "Reference",
+    "References",
+    "Notes"
+  ]
+    .map((title) => normalizeTitle(title, "Reference"))
+    .filter((title, index, titles) => titles.findIndex((candidate) => normalizeReferenceNoteTitle(candidate) === normalizeReferenceNoteTitle(title)) === index);
+}
+
+function findProjectNoteByTitle(projectID: string, titles: string[]) {
+  const wanted = new Set(titles.map(normalizeReferenceNoteTitle).filter(Boolean));
+  const manifest = readNoteManifest(projectID);
+  return (manifest.notes ?? []).find((note) =>
+    note.isArchived !== true
+    && typeof note.id === "string"
+    && wanted.has(normalizeReferenceNoteTitle(note.title))
+  );
+}
+
+function resolveCanonicalReferenceNote(projectID: string, requestedTitle?: string): ReferenceNoteTarget {
+  const loadedProjects = loadProjects();
+  const project = projectListForNote(loadedProjects, projectID);
+  const canonicalTitle = normalizeTitle(requestedTitle, project?.title || "Reference");
+  const existing = findProjectNoteByTitle(projectID, canonicalReferenceNoteCandidates(canonicalTitle));
+  if (existing?.id) {
+    return {
+      kind: "project",
+      projectID: projectID.toUpperCase(),
+      noteID: String(existing.id),
+      title: normalizeTitle(existing.title, canonicalTitle)
+    };
+  }
+  const created = createProjectNote(projectID);
+  const renamed = renameProjectNote(projectID, created.note.id, canonicalTitle);
+  return {
+    kind: "project",
+    projectID: projectID.toUpperCase(),
+    noteID: created.note.id,
+    title: renamed.title
+  };
+}
+
+function findThreadNoteByTitle(threadID: string, titles: string[]) {
+  const wanted = new Set(titles.map(normalizeReferenceNoteTitle).filter(Boolean));
+  const manifest = readThreadNoteManifest(threadID);
+  return (manifest.notes ?? []).find((note) =>
+    note.isArchived !== true
+    && typeof note.id === "string"
+    && wanted.has(normalizeReferenceNoteTitle(note.title))
+  );
+}
+
+function resolveCanonicalThreadReferenceNote(threadID: string, requestedTitle?: string): ReferenceNoteTarget {
+  const canonicalTitle = normalizeThreadNoteTitle(requestedTitle || "Reference");
+  const existing = findThreadNoteByTitle(threadID, canonicalReferenceNoteCandidates(canonicalTitle));
+  if (existing?.id) {
+    return {
+      kind: "thread",
+      threadID,
+      noteID: String(existing.id),
+      title: normalizeThreadNoteTitle(existing.title)
+    };
+  }
+  const workspace = createThreadNote(threadID, canonicalTitle);
+  const noteID = workspace.selectedNoteID ?? workspace.selectedNote?.id ?? "";
+  if (!noteID) throw new Error("I couldn't create the thread reference note.");
+  return { kind: "thread", threadID, noteID, title: canonicalTitle };
+}
+
+function referenceNoteItemID(target: ReferenceNoteTarget) {
+  return target.kind === "project"
+    ? knowledgeItemID({ ownerKind: "project", ownerId: target.projectID, noteId: target.noteID }, "project_note")
+    : knowledgeItemID({ ownerKind: "thread", ownerId: target.threadID, noteId: target.noteID }, "thread_note");
+}
+
+function referenceLineKey(line: string) {
+  return line
+    .replace(/^\s*[-*]\s+/, "")
+    .replace(/^\s*\d+[.)]\s+/, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+function referenceMarkdownLine(line: string) {
+  const trimmed = line.trim();
+  if (!trimmed) return "";
+  if (/^(#{1,6}\s+|[-*]\s+|\d+[.)]\s+|>\s+|\|)/.test(trimmed)) return trimmed;
+  return `- ${trimmed}`;
+}
+
+function referencePayloadLines(payload: JsonObject) {
+  const title = cleanDailyText(payload.title ?? payload.label ?? payload.name);
+  const text = cleanDailyText(payload.text ?? payload.content ?? payload.note ?? payload.value);
+  const details = cleanDailyText(payload.detailsMarkdown ?? payload.details ?? payload.description);
+  const rawLines = [
+    ...(details ? details.split("\n") : []),
+    ...(!details && text ? text.split("\n") : []),
+    ...(!details && !text && title ? [title] : [])
+  ];
+  const seen = new Set<string>();
+  return rawLines
+    .map(referenceMarkdownLine)
+    .filter((line) => {
+      const key = referenceLineKey(line);
+      if (!key || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+}
+
+function referenceSectionFromPayload(payload: JsonObject) {
+  const explicit = normalizeDailySection(payload.section ?? payload.topic ?? payload.grouping ?? payload.heading);
+  if (explicit) return explicit;
+  const title = normalizeDailySection(payload.title ?? payload.label ?? payload.name);
+  return title || "Reference";
+}
+
+function appendReferenceLinesToMarkdown(markdown: string, section: string, lines: string[]) {
+  const currentSection = markdownSection(markdown, section);
+  const existing = new Set(
+    currentSection
+      .split("\n")
+      .map(referenceLineKey)
+      .filter(Boolean)
+  );
+  const additions = lines.filter((line) => {
+    const key = referenceLineKey(line);
+    return key && !existing.has(key);
+  });
+  if (!additions.length) {
+    return String(markdown ?? "").replace(/\r\n/g, "\n");
+  }
+  const nextSection = [currentSection.trim(), additions.join("\n")]
+    .filter(Boolean)
+    .join("\n");
+  return replaceMarkdownSection(markdown, section, nextSection);
+}
+
+function referenceTargetFromPayload(payload: JsonObject): ReferenceNoteTarget {
+  const parsedItemID = typeof payload.itemID === "string" ? parseKnowledgeItemID(payload.itemID) : null;
+  if (parsedItemID?.target?.ownerKind === "project") {
+    const item = readKnowledgeItem(payload.itemID as string);
+    return {
+      kind: "project",
+      projectID: parsedItemID.target.ownerId.toUpperCase(),
+      noteID: parsedItemID.target.noteId,
+      title: item.title
+    };
+  }
+  if (parsedItemID?.target?.ownerKind === "thread") {
+    const item = readKnowledgeItem(payload.itemID as string);
+    return {
+      kind: "thread",
+      threadID: parsedItemID.target.ownerId,
+      noteID: parsedItemID.target.noteId,
+      title: item.title
+    };
+  }
+
+  const listResolution = resolvePlannerListFromDailyInput(payload);
+  if ((listResolution.status === "not_found" || listResolution.status === "ambiguous")
+    && !cleanDailyText(payload.projectID) && !cleanDailyText(payload.folderID)) {
+    assertPlannerListResolved(listResolution);
+  }
+  const list = listResolution.status === "ok" ? listResolution.list : undefined;
+  const projectID = cleanDailyText(payload.projectID)
+    || cleanDailyText(payload.listProjectID)
+    || (list ? list.id : "");
+  if (projectID) {
+    const loadedProjects = loadProjects();
+    const project = projectListForNote(loadedProjects, projectID);
+    const requestedTitle = cleanDailyText(payload.noteTitle ?? payload.referenceNoteTitle ?? project?.title);
+    return resolveCanonicalReferenceNote(projectID, requestedTitle);
+  }
+
+  const threadID = cleanDailyText(payload.threadID ?? payload.conversationID ?? payload.sessionID);
+  if (threadID) {
+    return resolveCanonicalThreadReferenceNote(threadID, cleanDailyText(payload.noteTitle ?? payload.referenceNoteTitle ?? payload.threadTitle));
+  }
+
+  throw new Error("Which List or note should I save that reference under? Please name an @List or provide a note.");
+}
+
+function resolveExistingReferenceTargetFromPayload(payload: JsonObject): ReferenceNoteTarget | null {
+  const parsedItemID = typeof payload.itemID === "string" ? parseKnowledgeItemID(payload.itemID) : null;
+  if (parsedItemID?.target?.ownerKind === "project") {
+    const item = readKnowledgeItem(payload.itemID as string);
+    return {
+      kind: "project",
+      projectID: parsedItemID.target.ownerId.toUpperCase(),
+      noteID: parsedItemID.target.noteId,
+      title: item.title
+    };
+  }
+  if (parsedItemID?.target?.ownerKind === "thread") {
+    const item = readKnowledgeItem(payload.itemID as string);
+    return {
+      kind: "thread",
+      threadID: parsedItemID.target.ownerId,
+      noteID: parsedItemID.target.noteId,
+      title: item.title
+    };
+  }
+
+  const listResolution = resolvePlannerListFromDailyInput(payload);
+  if ((listResolution.status === "not_found" || listResolution.status === "ambiguous")
+    && !cleanDailyText(payload.projectID) && !cleanDailyText(payload.folderID)) {
+    assertPlannerListResolved(listResolution);
+  }
+  const list = listResolution.status === "ok" ? listResolution.list : undefined;
+  const projectID = cleanDailyText(payload.projectID)
+    || cleanDailyText(payload.listProjectID)
+    || (list ? list.id : "");
+  if (projectID) {
+    const loadedProjects = loadProjects();
+    const project = projectListForNote(loadedProjects, projectID);
+    const requestedTitle = cleanDailyText(payload.noteTitle ?? payload.referenceNoteTitle ?? project?.title);
+    const canonicalTitle = normalizeTitle(requestedTitle, project?.title || "Reference");
+    const existing = findProjectNoteByTitle(projectID, canonicalReferenceNoteCandidates(canonicalTitle));
+    if (!existing?.id) return null;
+    return {
+      kind: "project",
+      projectID: projectID.toUpperCase(),
+      noteID: String(existing.id),
+      title: normalizeTitle(existing.title, canonicalTitle)
+    };
+  }
+
+  const threadID = cleanDailyText(payload.threadID ?? payload.conversationID ?? payload.sessionID);
+  if (threadID) {
+    const canonicalTitle = normalizeThreadNoteTitle(cleanDailyText(payload.noteTitle ?? payload.referenceNoteTitle ?? payload.threadTitle) || "Reference");
+    const existing = findThreadNoteByTitle(threadID, canonicalReferenceNoteCandidates(canonicalTitle));
+    return existing?.id
+      ? { kind: "thread", threadID, noteID: String(existing.id), title: normalizeThreadNoteTitle(existing.title) }
+      : null;
+  }
+
+  throw new Error("Which List or note should I save that reference under? Please name an existing @List or note.");
+}
+
+function referenceCreatePreviewFromPayload(payload: JsonObject, lines: string[]): KnowledgePreview | undefined {
+  const listResolution = resolvePlannerListFromDailyInput(payload);
+  if ((listResolution.status === "not_found" || listResolution.status === "ambiguous")
+    && !cleanDailyText(payload.projectID) && !cleanDailyText(payload.folderID)) {
+    assertPlannerListResolved(listResolution);
+  }
+  const list = listResolution.status === "ok" ? listResolution.list : undefined;
+  const projectID = cleanDailyText(payload.projectID)
+    || cleanDailyText(payload.listProjectID)
+    || (list && list.kind !== "folder" ? list.id : "");
+  const threadID = cleanDailyText(payload.threadID ?? payload.conversationID ?? payload.sessionID);
+  const section = referenceSectionFromPayload(payload);
+  const sectionMarkdown = appendReferenceLinesToMarkdown("", section, lines);
+  if (projectID) {
+    const loadedProjects = loadProjects();
+    const project = projectListForNote(loadedProjects, projectID);
+    const title = normalizeTitle(
+      payload.noteTitle
+        ?? payload.referenceNoteTitle
+        ?? payload.title
+        ?? payload.topic
+        ?? payload.label
+        ?? project?.title,
+      project?.title || "Reference"
+    );
+    return { kind: "reference_note_create", ownerKind: "project", ownerId: projectID.toUpperCase(), title, markdown: sectionMarkdown };
+  }
+  if (threadID) {
+    const title = normalizeThreadNoteTitle(cleanDailyText(payload.noteTitle ?? payload.referenceNoteTitle ?? payload.title ?? payload.topic ?? payload.label ?? payload.threadTitle) || "Reference");
+    return { kind: "reference_note_create", ownerKind: "thread", ownerId: threadID, title, markdown: sectionMarkdown };
+  }
+  return undefined;
+}
+
+function loadThreadReferenceNote(threadID: string, noteID: string) {
+  const workspace = loadThreadNoteWorkspace(threadID);
+  if (workspace.selectedNote?.id === noteID) {
+    return workspace.selectedNote;
+  }
+  const manifest = readThreadNoteManifest(threadID);
+  const note = (manifest.notes ?? []).find((entry) => entry.id === noteID);
+  const fileName = typeof note?.fileName === "string" ? note.fileName : `${noteID}.md`;
+  const filePath = path.join(threadNotesDirectory(threadID), fileName);
+  return {
+    id: noteID,
+    title: normalizeThreadNoteTitle(note?.title),
+    markdown: fs.existsSync(filePath) ? fs.readFileSync(filePath, "utf8").replace(/\r\n/g, "\n") : ""
+  };
+}
+
+function referencePreviewFromPayload(payload: JsonObject): KnowledgePreview | undefined {
+  const lines = referencePayloadLines(payload);
+  if (!lines.length) return undefined;
+  const target = resolveExistingReferenceTargetFromPayload(payload);
+  if (!target) return referenceCreatePreviewFromPayload(payload, lines);
+  const itemID = referenceNoteItemID(target);
+  const current = target.kind === "project"
+    ? loadNote(target.projectID, target.noteID)
+    : loadThreadReferenceNote(target.threadID, target.noteID);
+  const section = referenceSectionFromPayload(payload);
+  const previousMarkdown = String(current.markdown ?? "").replace(/\r\n/g, "\n");
+  return {
+    kind: "replace_markdown",
+    itemID,
+    markdown: appendReferenceLinesToMarkdown(previousMarkdown, section, lines),
+    previousMarkdown,
+    title: current.title
   };
 }
 
@@ -10602,17 +12927,23 @@ function restoreProjectNoteHistory(projectID: string, noteID: string, historyID:
   const filePath = path.join(noteDirectoryPath(projectID), fileName);
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   const previousMarkdown = fs.existsSync(filePath) ? fs.readFileSync(filePath, "utf8").replace(/\r\n/g, "\n") : "";
-  if (previousMarkdown !== historyItem.markdown) snapshotProjectNote(projectID, noteID, note, previousMarkdown);
+  if (noteHistoryContentKey(previousMarkdown) !== noteHistoryContentKey(historyItem.markdown)) {
+    snapshotProjectNote(projectID, noteID, note, previousMarkdown);
+  }
   fs.writeFileSync(filePath, historyItem.markdown, "utf8");
   note.updatedAt = currentSwiftDate();
+  applyProjectNoteMetadataFromMarkdown(note, projectID, historyItem.markdown);
   manifest.selectedNoteID = noteID;
   writeNoteManifest(projectID, manifest);
   scheduleRemoteAccessBroadcast();
+  const metadata = noteMetadataFromRecord(note, loadProjects(), projectID, historyItem.markdown);
   return {
     id: noteID,
     title: normalizeTitle(note.title, "Untitled note"),
     markdown: historyItem.markdown,
-    path: filePath
+    path: filePath,
+    area: metadata.area,
+    tags: metadata.tags
   };
 }
 
@@ -10775,12 +13106,47 @@ async function purgeExpiredArchivedItems(settings: Pick<SettingsSnapshot, "archi
   await purgeExpiredArchivedThreads(settings);
 }
 
+function normalizedNoteFolderParentID(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function sameNoteFolderParent(left: unknown, right: unknown) {
+  return (normalizedNoteFolderParentID(left) ?? "") === (normalizedNoteFolderParentID(right) ?? "");
+}
+
+function noteFolderDescendantIDs(folders: JsonObject[], folderID: string): Set<string> {
+  const descendants = new Set<string>();
+  const visit = (parentID: string) => {
+    for (const folder of folders) {
+      const id = String(folder.id ?? "");
+      if (!id || descendants.has(id)) continue;
+      if (normalizedNoteFolderParentID(folder.parentFolderID) === parentID) {
+        descendants.add(id);
+        visit(id);
+      }
+    }
+  };
+  visit(folderID);
+  return descendants;
+}
+
+function noteFolderNameClash(folders: JsonObject[], input: { folderID?: string; parentFolderID: string | null; name: string }) {
+  const name = input.name.toLowerCase();
+  return folders.some((folder) => {
+    const id = String(folder.id ?? "");
+    if (input.folderID && id === input.folderID) return false;
+    return sameNoteFolderParent(folder.parentFolderID, input.parentFolderID)
+      && normalizeTitle(folder.name, "Folder").toLowerCase() === name;
+  });
+}
+
 function noteFolderItemFromManifest(projectID: string, folder: JsonObject, folderCounts: Map<string, number>): NoteFolderItem {
   const id = String(folder.id ?? "");
   return {
     id,
     name: normalizeTitle(folder.name, "Folder"),
     projectID: projectID.toUpperCase(),
+    parentFolderID: normalizedNoteFolderParentID(folder.parentFolderID),
     noteCount: folderCounts.get(id) ?? 0
   };
 }
@@ -10794,21 +13160,23 @@ function noteFolderCounts(manifest: { notes?: JsonObject[] }): Map<string, numbe
   return counts;
 }
 
-function createProjectNoteFolder(projectID: string, name: string): NoteFolderItem {
+function createProjectNoteFolder(projectID: string, name: string, parentFolderID?: string | null): NoteFolderItem {
   const trimmed = name.trim();
   if (!trimmed) throw new Error("Enter a folder name.");
   const manifest = readNoteManifest(projectID);
   const folders = manifest.folders ?? [];
-  // Match the Swift app: folder names are unique among top-level folders.
-  const clash = folders.some(
-    (folder) => normalizeTitle(folder.name, "Folder").toLowerCase() === trimmed.toLowerCase()
-  );
-  if (clash) throw new Error("A folder with that name already exists.");
+  const normalizedParentID = normalizedNoteFolderParentID(parentFolderID);
+  if (normalizedParentID && !folders.some((folder) => String(folder.id ?? "") === normalizedParentID)) {
+    throw new Error("Parent folder was not found.");
+  }
+  if (noteFolderNameClash(folders, { parentFolderID: normalizedParentID, name: trimmed })) {
+    throw new Error("A folder with that name already exists here.");
+  }
   const now = currentSwiftDate();
   const folder: JsonObject = {
     id: randomUUID().toLowerCase(),
     name: trimmed,
-    parentFolderID: null,
+    parentFolderID: normalizedParentID,
     createdAt: now,
     updatedAt: now
   };
@@ -10824,28 +13192,57 @@ function renameProjectNoteFolder(projectID: string, folderID: string, name: stri
   const folders = manifest.folders ?? [];
   const folder = folders.find((entry) => String(entry.id ?? "") === folderID);
   if (!folder) throw new Error("Folder was not found.");
-  const clash = folders.some(
-    (entry) =>
-      String(entry.id ?? "") !== folderID &&
-      normalizeTitle(entry.name, "Folder").toLowerCase() === trimmed.toLowerCase()
-  );
-  if (clash) throw new Error("A folder with that name already exists.");
+  if (noteFolderNameClash(folders, {
+    folderID,
+    parentFolderID: normalizedNoteFolderParentID(folder.parentFolderID),
+    name: trimmed
+  })) {
+    throw new Error("A folder with that name already exists here.");
+  }
   folder.name = trimmed;
   folder.updatedAt = currentSwiftDate();
   writeNoteManifest(projectID, manifest);
   return noteFolderItemFromManifest(projectID, folder, noteFolderCounts(manifest));
 }
 
-function deleteProjectNoteFolder(projectID: string, folderID: string): { projectID: string; deletedFolderID: string } {
+function deleteProjectNoteFolder(projectID: string, folderID: string): { projectID: string; deletedFolderID: string; deletedFolderIDs: string[] } {
   const manifest = readNoteManifest(projectID);
   const folders = manifest.folders ?? [];
-  manifest.folders = folders.filter((entry) => String(entry.id ?? "") !== folderID);
+  const deletedIDs = new Set([folderID, ...noteFolderDescendantIDs(folders, folderID)]);
+  manifest.folders = folders.filter((entry) => !deletedIDs.has(String(entry.id ?? "")));
   // Detaching notes (rather than deleting them) keeps the notes themselves safe.
   for (const note of manifest.notes ?? []) {
-    if (typeof note.folderID === "string" && note.folderID === folderID) note.folderID = null;
+    if (typeof note.folderID === "string" && deletedIDs.has(note.folderID)) note.folderID = null;
   }
   writeNoteManifest(projectID, manifest);
-  return { projectID: projectID.toUpperCase(), deletedFolderID: folderID };
+  return { projectID: projectID.toUpperCase(), deletedFolderID: folderID, deletedFolderIDs: [...deletedIDs] };
+}
+
+function moveProjectNoteFolder(projectID: string, folderID: string, parentFolderID: string | null): NoteFolderItem {
+  const manifest = readNoteManifest(projectID);
+  const folders = manifest.folders ?? [];
+  const folder = folders.find((entry) => String(entry.id ?? "") === folderID);
+  if (!folder) throw new Error("Folder was not found.");
+  const normalizedParentID = normalizedNoteFolderParentID(parentFolderID);
+  if (normalizedParentID === folderID) throw new Error("A folder cannot be moved inside itself.");
+  const descendants = noteFolderDescendantIDs(folders, folderID);
+  if (normalizedParentID && descendants.has(normalizedParentID)) {
+    throw new Error("A folder cannot be moved inside one of its subfolders.");
+  }
+  if (normalizedParentID && !folders.some((entry) => String(entry.id ?? "") === normalizedParentID)) {
+    throw new Error("Parent folder was not found.");
+  }
+  if (noteFolderNameClash(folders, {
+    folderID,
+    parentFolderID: normalizedParentID,
+    name: normalizeTitle(folder.name, "Folder")
+  })) {
+    throw new Error("A folder with that name already exists there.");
+  }
+  folder.parentFolderID = normalizedParentID;
+  folder.updatedAt = currentSwiftDate();
+  writeNoteManifest(projectID, manifest);
+  return noteFolderItemFromManifest(projectID, folder, noteFolderCounts(manifest));
 }
 
 function moveProjectNoteToFolder(projectID: string, noteID: string, folderID: string | null): { projectID: string; noteID: string; folderID: string | null } {
@@ -10932,16 +13329,16 @@ function scanStoredNoteLinkRecords(currentTarget: NoteLinkTarget, currentMarkdow
   if (fs.existsSync(projectNotesRoot)) {
     for (const projectDir of fs.readdirSync(projectNotesRoot)) {
       const ownerId = projectDir.toUpperCase();
-      if (projects.hiddenProjectIDs.has(ownerId.toLowerCase())) continue;
+      if (projectNotesHiddenForList(projects, ownerId)) continue;
       const sourceLabel = projects.projectNameByID.get(ownerId) ?? projects.projectNameByID.get(projectDir) ?? "Project notes";
       const manifestPath = path.join(projectNotesRoot, projectDir, "notes", "manifest.json");
-      const notesDir = path.dirname(manifestPath);
       const manifest = readJSON<{ notes?: JsonObject[] }>(manifestPath, {});
       for (const note of manifest.notes ?? []) {
         const noteId = String(note.id ?? "");
         if (!noteId) continue;
-        const fileName = typeof note.fileName === "string" ? note.fileName : `${noteId}.md`;
-        const filePath = path.join(notesDir, fileName);
+        const filePath = projectNoteMarkdownPath(ownerId, note, noteId);
+        const markdown = fs.existsSync(filePath) ? fs.readFileSync(filePath, "utf8").replace(/\r\n/g, "\n") : "";
+        const metadata = noteMetadataFromRecord(note, projects, ownerId, markdown);
         addRecord({
           ownerKind: "project",
           ownerId,
@@ -10949,7 +13346,8 @@ function scanStoredNoteLinkRecords(currentTarget: NoteLinkTarget, currentMarkdow
           key: noteLinkKey({ ownerKind: "project", ownerId, noteId }),
           title: normalizeTitle(note.title, "Untitled note"),
           sourceLabel,
-          markdown: fs.existsSync(filePath) ? fs.readFileSync(filePath, "utf8").replace(/\r\n/g, "\n") : ""
+          markdown,
+          metadata
         });
       }
     }
@@ -11106,6 +13504,7 @@ type KnowledgeItem = {
   title: string;
   sourceLabel: string;
   markdown: string;
+  metadata?: JsonObject;
   target?: NoteLinkTarget;
   dailyItems?: DailyItem[];
   path?: string;
@@ -11133,7 +13532,14 @@ const knowledgeTimelineSourceTypes = [
   "realtime_delegation",
   "backlog_item",
   "knowledge_request",
-  "artifact"
+  "artifact",
+  "spark_recall",
+  "assistant_memory",
+  "codex_memory",
+  "codex_session",
+  "claude_memory",
+  "claude_task",
+  "claude_session"
 ] as const;
 
 type KnowledgeTimelineSourceType = typeof knowledgeTimelineSourceTypes[number];
@@ -11173,6 +13579,20 @@ type KnowledgeTimelineSearchResult = {
   metadata?: JsonObject;
 };
 
+type PersonalRecallPhase = "memory" | "chats" | "all";
+
+type PersonalRecallRecord = {
+  id: string;
+  question: string;
+  answer: string;
+  model: string;
+  reasoningEffort: string;
+  status: "completed" | "fallback" | "failed";
+  sources: JsonObject[];
+  createdAt: string;
+  error?: string;
+};
+
 type KnowledgeTaskItem = {
   id: string;
   itemID: string;
@@ -11189,7 +13609,17 @@ type KnowledgePreview =
   | { kind: "planner_move"; fromDayID: string; dayID: string; section: string; content: string; removeTexts: string[] }
   | { kind: "planner_backlog_move"; entries: { dayID: string; text: string }[] }
   | { kind: "daily_item_upsert"; item: DailyItemInput }
+  | {
+      kind: "daily_items_batch";
+      sourceItemID: string;
+      sourceTitle: string;
+      sourceTarget?: NoteLinkTarget;
+      target: "backlog" | "day";
+      dayID?: string;
+      items: DailyItemInput[];
+    }
   | { kind: "daily_item_delete"; dayID: string; itemID: string }
+  | { kind: "reference_note_create"; ownerKind: "project" | "thread"; ownerId: string; title: string; markdown: string }
   | { kind: "replace_markdown"; itemID: string; markdown: string; previousMarkdown?: string; title?: string };
 
 type KnowledgeWriteRequest = {
@@ -11220,6 +13650,43 @@ function knowledgeServerStatePath() {
 
 function knowledgeWriteRequestsPath() {
   return path.join(knowledgeRoot(), "write-requests.json");
+}
+
+function personalRecallRecordsPath() {
+  return path.join(knowledgeRoot(), "personal-recall-results.json");
+}
+
+function readPersonalRecallRecords(): PersonalRecallRecord[] {
+  const records = readJSON<PersonalRecallRecord[]>(personalRecallRecordsPath(), []);
+  if (!Array.isArray(records)) return [];
+  return records
+    .filter((record) =>
+      typeof record?.id === "string"
+      && typeof record.question === "string"
+      && typeof record.answer === "string"
+      && typeof record.createdAt === "string"
+    )
+    .slice(0, sparkRecallResultLimit);
+}
+
+function writePersonalRecallRecords(records: PersonalRecallRecord[]) {
+  writeJSON(personalRecallRecordsPath(), records.slice(0, sparkRecallResultLimit));
+}
+
+function savePersonalRecallRecord(record: Omit<PersonalRecallRecord, "id" | "createdAt"> & { id?: string; createdAt?: string }) {
+  const next: PersonalRecallRecord = {
+    id: record.id || `spark-recall-${Date.now()}-${randomUUID().slice(0, 8)}`,
+    question: record.question,
+    answer: record.answer,
+    model: record.model,
+    reasoningEffort: record.reasoningEffort,
+    status: record.status,
+    sources: record.sources,
+    createdAt: record.createdAt || new Date().toISOString(),
+    error: record.error
+  };
+  writePersonalRecallRecords([next, ...readPersonalRecallRecords().filter((item) => item.id !== next.id)]);
+  return next;
 }
 
 function knowledgeServerURL(port: string | number) {
@@ -11343,6 +13810,7 @@ function knowledgeItems(): KnowledgeItem[] {
       title: record.title,
       sourceLabel: record.sourceLabel,
       markdown: record.markdown,
+      metadata: record.metadata,
       target,
       dailyItems: record.ownerKind === "planner" ? parseDailyItemsFromMarkdown(record.noteId, record.markdown) : undefined,
       path: filePath,
@@ -11384,7 +13852,7 @@ function searchKnowledge(query = "", limit = 20, source?: string): KnowledgeSear
   return knowledgeItems()
     .filter((item) => !source || item.kind === source)
     .map((item) => {
-      const haystack = `${item.title}\n${item.sourceLabel}\n${item.markdown}`.toLowerCase();
+      const haystack = `${item.title}\n${item.sourceLabel}\n${projectNoteSearchMetadataText(item.metadata)}\n${item.markdown}`.toLowerCase();
       const score = terms.length
         ? terms.reduce((total, term) => total + (haystack.includes(term) ? term.length : 0), 0)
         : (item.updatedAt ?? 0) / 1_000_000_000;
@@ -11487,6 +13955,8 @@ function dailyItemSearchText(item: DailyItem) {
     item.area ? `Area: ${item.area}` : "",
     item.projectName ? `Project: ${item.projectName}` : "",
     item.folderName ? `Folder: ${item.folderName}` : "",
+    item.section ? `Section: ${item.section}` : "",
+    item.tags?.length ? `Tags: ${item.tags.join(", ")}` : "",
     item.detailsMarkdown,
     item.steps?.map((step) => `${step.checked ? "Done" : "Open"} step: ${step.text}`).join("\n") ?? "",
     item.scopeTags?.map((tag) => `${tag.marker}${tag.label}`).join(" ") ?? "",
@@ -11598,6 +14068,75 @@ function knowledgeTimelineDocuments(): KnowledgeTimelineDocument[] {
     });
   }
 
+  for (const memory of listAssistantMemories()) {
+    pushKnowledgeTimelineDocument(docs, {
+      id: `assistant_memory:${memory.slug}`,
+      sourceType: "assistant_memory",
+      sourceID: memory.slug,
+      title: memory.name,
+      sourceLabel: "Assistant memory",
+      text: [memory.description, memory.content].filter(Boolean).join("\n"),
+      threadID: memory.originThreadID,
+      updatedAt: memory.updatedAt ? dateStringToMs(memory.updatedAt) : undefined,
+      metadata: { slug: memory.slug, type: memory.type }
+    });
+  }
+
+  // Session digests: automatic per-day summaries of what each chat covered.
+  try {
+    const sessionsRoot = memorySessionsRoot();
+    if (fs.existsSync(sessionsRoot)) {
+      for (const entry of fs.readdirSync(sessionsRoot).filter((name) => name.endsWith(".md"))) {
+        const filePath = path.join(sessionsRoot, entry);
+        try {
+          const raw = fs.readFileSync(filePath, "utf8");
+          const titleLine = raw.split("\n").find((line) => line.startsWith("# "));
+          pushKnowledgeTimelineDocument(docs, {
+            id: `assistant_memory:session:${entry}`,
+            sourceType: "assistant_memory",
+            sourceID: `session:${entry}`,
+            title: titleLine ? titleLine.slice(2).trim() : entry.replace(/\.md$/, ""),
+            sourceLabel: "Session summary",
+            text: raw,
+            path: filePath,
+            updatedAt: fs.statSync(filePath).mtimeMs,
+            metadata: { kind: "session-digest" }
+          });
+        } catch {
+          // One unreadable digest must not break the whole index.
+        }
+      }
+    }
+  } catch {
+    // Digest directory scan is best effort.
+  }
+
+  for (const record of readPersonalRecallRecords()) {
+    const createdAt = dateStringToMs(record.createdAt);
+    pushKnowledgeTimelineDocument(docs, {
+      id: `spark_recall:${record.id}`,
+      sourceType: "spark_recall",
+      sourceID: record.id,
+      title: normalizeTitle(record.question, "Spark recall"),
+      sourceLabel: "Spark recall result",
+      text: [
+        `Question: ${record.question}`,
+        `Answer: ${record.answer}`,
+        record.sources.length ? `Sources: ${JSON.stringify(record.sources)}` : "",
+        record.error ? `Error: ${record.error}` : ""
+      ].filter(Boolean).join("\n"),
+      createdAt,
+      updatedAt: createdAt,
+      metadata: {
+        recordID: record.id,
+        model: record.model,
+        reasoningEffort: record.reasoningEffort,
+        status: record.status,
+        sources: record.sources
+      }
+    });
+  }
+
   const root = conversationStoreRoot();
   if (!fs.existsSync(root)) {
     return dedupeKnowledgeTimelineDocuments(docs);
@@ -11629,6 +14168,7 @@ function knowledgeTimelineDocuments(): KnowledgeTimelineDocument[] {
           const text = normalizeTitle(entry.text, "");
           if (!text) return;
           const role = kind === "userMessage" ? "user" : "assistant";
+          const messageSource = firstRuntimeString(entry.source);
           const createdAt = swiftDateToMs(entry.createdAt);
           const updatedAt = swiftDateToMs(entry.updatedAt) ?? defaultUpdatedAt;
           const artifacts = kind === "userMessage" ? [] : messageArtifactsFromStored(entry.artifacts);
@@ -11637,14 +14177,16 @@ function knowledgeTimelineDocuments(): KnowledgeTimelineDocument[] {
             sourceType: "thread_message",
             sourceID: displayID,
             title: threadTitle,
-            sourceLabel: `${role === "user" ? "User" : "Assistant"} message`,
+            sourceLabel: messageSource === "realtimeVoice"
+              ? `Realtime voice ${role === "user" ? "user" : "assistant"} message`
+              : `${role === "user" ? "User" : "Assistant"} message`,
             text,
             threadID,
             projectID,
             role,
             createdAt,
             updatedAt,
-            metadata: { threadID, timelineID: displayID, timelineKind: kind, index }
+            metadata: { threadID, timelineID: displayID, timelineKind: kind, index, source: messageSource || undefined }
           });
           addArtifactTimelineDocuments(docs, artifacts, {
             threadID,
@@ -11838,13 +14380,22 @@ INSERT OR REPLACE INTO timeline_meta(key, value) VALUES ('version', ${sqliteText
 }
 
 function timelineSearchTokens(query: string) {
+  const stopwords = new Set([
+    "all", "right", "ok", "okay", "please", "can", "could", "would", "will",
+    "you", "your", "my", "me", "i", "we", "us", "if", "have", "has", "had",
+    "anything", "something", "that", "this", "these", "those", "there", "here",
+    "what", "when", "where", "who", "why", "how", "did", "do", "does", "is",
+    "are", "was", "were", "be", "been", "being", "the", "a", "an", "and",
+    "or", "of", "to", "in", "on", "for", "with", "from", "through", "check",
+    "search", "find", "look", "tell", "show"
+  ]);
   return query
     .toLowerCase()
     .replace(/[^\p{L}\p{N}@#._-]+/gu, " ")
     .split(/\s+/)
     .map((token) => token.trim().replace(/^[-_.#@]+|[-_.#@]+$/g, ""))
-    .filter((token) => token.length >= 2)
-    .slice(0, 14);
+    .filter((token) => token.length >= 2 && !stopwords.has(token))
+    .slice(0, 24);
 }
 
 function knowledgeTimelineResultFromRow(row: Record<string, unknown>): KnowledgeTimelineSearchResult {
@@ -12007,14 +14558,871 @@ function readKnowledgeTimelineResult(resultID: string, window = 2) {
   };
 }
 
+const personalRecallMemorySourceTypes = new Set<KnowledgeTimelineSourceType>([
+  "project_note",
+  "thread_note",
+  "planner_day",
+  "journal_day",
+  "backlog_item",
+  "knowledge_request",
+  "assistant_memory",
+  "codex_memory",
+  "claude_memory",
+  "claude_task"
+]);
+
+const personalRecallChatSourceTypes = new Set<KnowledgeTimelineSourceType>([
+  "thread_message",
+  "thread_activity",
+  "realtime_delegation",
+  "artifact",
+  "codex_session",
+  "claude_session"
+]);
+
+type PersonalRecallFileSource = {
+  root: string;
+  sourceType: KnowledgeTimelineSourceType;
+  sourceLabel: string;
+  phase: Exclude<PersonalRecallPhase, "all">;
+  maxDepth: number;
+  maxFiles: number;
+  maxBytes: number;
+  include: (filePath: string) => boolean;
+};
+
+let personalRecallFileCache: { expiresAt: number; docs: KnowledgeTimelineDocument[] } | null = null;
+
+function personalRecallPhase(value: unknown): PersonalRecallPhase {
+  const normalized = String(value ?? "").trim().toLowerCase();
+  if (normalized === "memory" || normalized === "memories") return "memory";
+  if (normalized === "chat" || normalized === "chats" || normalized === "sessions") return "chats";
+  return "all";
+}
+
+function wantsSavedSparkRecallResult(query: string) {
+  const normalized = query.toLowerCase().replace(/\s+/g, " ").trim();
+  return /\b(spark|recall result|recall answer|what did you answer|what did you say|what did it say|previous answer|last answer|earlier answer)\b/.test(normalized);
+}
+
+function personalRecallSourceTypesForPhase(phase: PersonalRecallPhase, query = "") {
+  const memoryTypes = [...personalRecallMemorySourceTypes];
+  if (wantsSavedSparkRecallResult(query)) memoryTypes.push("spark_recall");
+  if (phase === "memory") return memoryTypes;
+  if (phase === "chats") return [...personalRecallChatSourceTypes];
+  return [...memoryTypes, ...personalRecallChatSourceTypes];
+}
+
+function personalRecallNeedsChatSearch(query: string) {
+  const normalized = query.toLowerCase().replace(/\s+/g, " ").trim();
+  return /\b(latest|recent|today|this morning|this afternoon|tonight|conversation|conversations|chat|chats|thread|threads|session|sessions|codex|claude|spark|gemini|agent|what did we talk|what did i ask|what did you say|what did it say)\b/.test(normalized);
+}
+
+function personalRecallRetrievalQuery(question: string, context = "") {
+  const cleanedQuestion = normalizeSearchText(question, 1_500);
+  const cleanedContext = normalizeSearchText(context, 1_500);
+  return cleanedContext ? `${cleanedQuestion}\n\n${cleanedContext}` : cleanedQuestion;
+}
+
+function fileMTimeMs(filePath: string) {
+  try {
+    return fs.statSync(filePath).mtimeMs;
+  } catch {
+    return 0;
+  }
+}
+
+function readFileWindow(filePath: string, maxBytes: number) {
+  try {
+    const stat = fs.statSync(filePath);
+    if (!stat.isFile()) return "";
+    if (stat.size <= maxBytes) return fs.readFileSync(filePath, "utf8");
+    const half = Math.max(1, Math.floor(maxBytes / 2));
+    const fd = fs.openSync(filePath, "r");
+    try {
+      const start = Buffer.alloc(half);
+      const end = Buffer.alloc(half);
+      const startRead = fs.readSync(fd, start, 0, half, 0);
+      const endRead = fs.readSync(fd, end, 0, half, Math.max(0, stat.size - half));
+      return `${start.subarray(0, startRead).toString("utf8")}\n\n...[middle omitted for realtime recall]...\n\n${end.subarray(0, endRead).toString("utf8")}`;
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    return "";
+  }
+}
+
+function shouldSkipRecallDirectory(name: string) {
+  return name === ".git"
+    || name === "node_modules"
+    || name === "cache"
+    || name === "plugins"
+    || name === "backups"
+    || name === "downloads";
+}
+
+function collectPersonalRecallFiles(source: PersonalRecallFileSource) {
+  if (!fs.existsSync(source.root)) return [] as string[];
+  const files: string[] = [];
+  const stack: Array<{ dir: string; depth: number }> = [{ dir: source.root, depth: 0 }];
+  let visited = 0;
+  while (stack.length && visited < 8_000) {
+    const current = stack.pop();
+    if (!current) break;
+    visited += 1;
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(current.dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      const entryPath = path.join(current.dir, entry.name);
+      if (entry.isDirectory()) {
+        if (current.depth < source.maxDepth && !shouldSkipRecallDirectory(entry.name)) {
+          stack.push({ dir: entryPath, depth: current.depth + 1 });
+        }
+        continue;
+      }
+      if (entry.isFile() && source.include(entryPath)) files.push(entryPath);
+    }
+  }
+  return files
+    .sort((a, b) => fileMTimeMs(b) - fileMTimeMs(a))
+    .slice(0, source.maxFiles);
+}
+
+function personalRecallFileSources(): PersonalRecallFileSource[] {
+  const home = os.homedir();
+  const codexMemories = path.join(codexRoot(), "memories");
+  const codexSessions = path.join(codexRoot(), "sessions");
+  const claudeRoot = path.join(home, ".claude");
+  return [
+    {
+      root: codexMemories,
+      sourceType: "codex_memory",
+      sourceLabel: "Codex memory",
+      phase: "memory",
+      maxDepth: 3,
+      maxFiles: 120,
+      maxBytes: personalRecallMaxPreviewBytes,
+      include: (filePath) => /\.(md|json|jsonl|txt)$/i.test(filePath) && !filePath.includes(`${path.sep}.git${path.sep}`)
+    },
+    {
+      root: codexSessions,
+      sourceType: "codex_session",
+      sourceLabel: "Codex session",
+      phase: "chats",
+      maxDepth: 6,
+      maxFiles: 160,
+      maxBytes: personalRecallMaxSessionPreviewBytes,
+      include: (filePath) => /\.jsonl$/i.test(filePath)
+    },
+    {
+      root: claudeRoot,
+      sourceType: "claude_memory",
+      sourceLabel: "Claude Code memory",
+      phase: "memory",
+      maxDepth: 2,
+      maxFiles: 80,
+      maxBytes: personalRecallMaxPreviewBytes,
+      include: (filePath) =>
+        filePath === path.join(claudeRoot, "CLAUDE.md")
+        || filePath.startsWith(path.join(claudeRoot, "plans"))
+          && /\.(md|txt)$/i.test(filePath)
+    },
+    {
+      root: path.join(claudeRoot, "tasks"),
+      sourceType: "claude_task",
+      sourceLabel: "Claude Code task",
+      phase: "memory",
+      maxDepth: 2,
+      maxFiles: 160,
+      maxBytes: 64 * 1024,
+      include: (filePath) => /\.json$/i.test(filePath)
+    },
+    {
+      root: path.join(claudeRoot, "projects"),
+      sourceType: "claude_session",
+      sourceLabel: "Claude Code session",
+      phase: "chats",
+      maxDepth: 3,
+      maxFiles: 220,
+      maxBytes: personalRecallMaxSessionPreviewBytes,
+      include: (filePath) => /\.jsonl$/i.test(filePath)
+    }
+  ];
+}
+
+function personalRecallTitleForPath(filePath: string, source: PersonalRecallFileSource) {
+  const base = path.basename(filePath);
+  const parent = path.basename(path.dirname(filePath));
+  if (source.sourceType === "claude_session" || source.sourceType === "codex_session") {
+    return `${parent.replace(/^-+/, "").replace(/-/g, " ")} / ${base}`;
+  }
+  return base;
+}
+
+function personalRecallFileDocuments() {
+  const now = Date.now();
+  if (personalRecallFileCache && personalRecallFileCache.expiresAt > now) return personalRecallFileCache.docs;
+  const docs: KnowledgeTimelineDocument[] = [];
+  for (const source of personalRecallFileSources()) {
+    for (const filePath of collectPersonalRecallFiles(source)) {
+      const text = readFileWindow(filePath, source.maxBytes);
+      if (!text.trim()) continue;
+      const updatedAt = fileMTimeMs(filePath);
+      pushKnowledgeTimelineDocument(docs, {
+        id: knowledgeTimelineID(source.sourceType, filePath, updatedAt),
+        sourceType: source.sourceType,
+        sourceID: filePath,
+        title: personalRecallTitleForPath(filePath, source),
+        sourceLabel: source.sourceLabel,
+        text,
+        path: filePath,
+        updatedAt,
+        metadata: { path: filePath, phase: source.phase }
+      });
+    }
+  }
+  personalRecallFileCache = { expiresAt: now + personalRecallFileCacheMs, docs };
+  return docs;
+}
+
+function sourceTypeMatchesPersonalRecallPhase(sourceType: KnowledgeTimelineSourceType, phase: PersonalRecallPhase) {
+  if (phase === "all") return true;
+  return phase === "memory" ? personalRecallMemorySourceTypes.has(sourceType) : personalRecallChatSourceTypes.has(sourceType);
+}
+
+function scorePersonalRecallDoc(doc: KnowledgeTimelineDocument, tokens: string[]) {
+  if (!tokens.length) return timelineDocDate(doc) / 1_000_000;
+  const title = doc.title.toLowerCase();
+  const label = doc.sourceLabel.toLowerCase();
+  const body = doc.text.toLowerCase();
+  return tokens.reduce((score, token) => {
+    let next = score;
+    if (title.includes(token)) next += 12;
+    if (label.includes(token)) next += 6;
+    if (body.includes(token)) next += 1;
+    return next;
+  }, 0);
+}
+
+function personalRecallResultFromDoc(doc: KnowledgeTimelineDocument, query: string, score?: number): KnowledgeTimelineSearchResult {
+  return {
+    id: doc.id,
+    sourceType: doc.sourceType,
+    sourceID: doc.sourceID,
+    title: doc.title,
+    sourceLabel: doc.sourceLabel,
+    snippet: knowledgeSnippet(doc.text, query),
+    threadID: doc.threadID,
+    projectID: doc.projectID,
+    dayID: doc.dayID,
+    path: doc.path,
+    role: doc.role,
+    createdAt: doc.createdAt,
+    updatedAt: doc.updatedAt,
+    score,
+    metadata: doc.metadata
+  };
+}
+
+function searchPersonalRecallSources(query = "", options: { phase?: PersonalRecallPhase; limit?: number; fromDate?: string; toDate?: string } = {}) {
+  const phase = options.phase ?? "all";
+  const limit = Math.max(1, Math.min(20, Math.floor(options.limit ?? 8)));
+  const openAssistResults = searchKnowledgeTimeline(query, {
+    sourceTypes: personalRecallSourceTypesForPhase(phase, query),
+    fromDate: options.fromDate,
+    toDate: options.toDate,
+    limit
+  });
+  const tokens = [...new Set(timelineSearchTokens(query))];
+  const fileResults = personalRecallFileDocuments()
+    .filter((doc) => sourceTypeMatchesPersonalRecallPhase(doc.sourceType, phase))
+    .filter((doc) => {
+      const fromMs = dateStringToMs(options.fromDate);
+      const toMs = dateStringToMs(options.toDate, true);
+      return (fromMs === undefined || timelineDocDate(doc) >= fromMs)
+        && (toMs === undefined || timelineDocDate(doc) <= toMs);
+    })
+    .map((doc) => ({ doc, score: scorePersonalRecallDoc(doc, tokens) }))
+    .filter((entry) => tokens.length === 0 || entry.score > 0)
+    .sort((a, b) => b.score - a.score || timelineDocDate(b.doc) - timelineDocDate(a.doc))
+    .slice(0, limit)
+    .map((entry) => personalRecallResultFromDoc(entry.doc, query, entry.score));
+  return [...openAssistResults, ...fileResults]
+    .sort((a, b) => (b.score ?? 0) - (a.score ?? 0) || timelineDocDate(b) - timelineDocDate(a))
+    .slice(0, limit);
+}
+
+function personalRecallSourceFromResult(result: KnowledgeTimelineSearchResult): JsonObject {
+  const source: JsonObject = {
+    id: result.id,
+    title: result.title || result.sourceID || result.id,
+    sourceType: result.sourceType,
+    sourceLabel: result.sourceLabel || result.sourceType
+  };
+  if (result.path) source.path = result.path;
+  if (result.sourceID) source.sourceID = result.sourceID;
+  if (result.updatedAt != null) source.updatedAt = result.updatedAt;
+  return source;
+}
+
+function compactPersonalRecallResultLine(result: KnowledgeTimelineSearchResult, index: number) {
+  const title = cleanDailyText(result.title || result.sourceID || result.id).slice(0, 180);
+  const label = cleanDailyText(result.sourceLabel || result.sourceType);
+  const sourceType = cleanDailyText(result.sourceType);
+  const pathText = cleanDailyText(result.path).slice(0, 240);
+  const snippet = shortSearchText(result.snippet || title, 500);
+  return [
+    `Result ${index + 1}:`,
+    `id: ${result.id}`,
+    `title: ${title}`,
+    `source: ${label}${sourceType ? ` (${sourceType})` : ""}`,
+    pathText ? `path: ${pathText}` : "",
+    `snippet: ${snippet}`
+  ].filter(Boolean).join("\n");
+}
+
+function personalRecallEvidenceRank(result: KnowledgeTimelineSearchResult, preferRecentChats: boolean) {
+  let score = result.score ?? 0;
+  if (preferRecentChats && personalRecallChatSourceTypes.has(result.sourceType)) score += 60;
+  if (preferRecentChats) score += Math.min(30, Math.max(0, (timelineDocDate(result) - (Date.now() - 7 * 24 * 60 * 60 * 1000)) / (24 * 60 * 60 * 1000)));
+  return score;
+}
+
+function retrievePersonalRecallEvidence(question: string, context = "") {
+  const retrievalQuery = personalRecallRetrievalQuery(question, context);
+  const shouldSearchChats = personalRecallNeedsChatSearch(question) || personalRecallNeedsChatSearch(context);
+  const memory = searchPersonalRecallSources(retrievalQuery, { phase: "memory", limit: shouldSearchChats ? 5 : 6 });
+  const chats = shouldSearchChats || memory.length < 2
+    ? searchPersonalRecallSources(retrievalQuery, { phase: "chats", limit: shouldSearchChats ? 6 : 4 })
+    : [];
+  const seen = new Set<string>();
+  const results = [...memory, ...chats].filter((result) => {
+    const key = result.id || result.sourceID || result.path || result.title;
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  })
+    .sort((left, right) =>
+      personalRecallEvidenceRank(right, shouldSearchChats) - personalRecallEvidenceRank(left, shouldSearchChats)
+      || timelineDocDate(right) - timelineDocDate(left)
+    )
+    .slice(0, 8);
+  const retrievalContext = results.length
+    ? [
+      "Fast OpenAssist recall retrieval evidence:",
+      ...results.map(compactPersonalRecallResultLine)
+    ].join("\n\n")
+    : "Fast OpenAssist recall retrieval found no matching memory or chat results.";
+  return {
+    memory,
+    chats,
+    results,
+    context: retrievalContext,
+    sources: results.map(personalRecallSourceFromResult)
+  };
+}
+
+function cleanPersonalRecallSnippetForAnswer(result: KnowledgeTimelineSearchResult) {
+  let snippet = shortSearchText(result.snippet || result.title, 260)
+    .replace(/^Question:\s*.+?\s+Answer:\s*/i, "")
+    .replace(/\bthread id:\s*[a-z0-9- ]{20,}/i, "")
+    .replace(/\brollout path:\s*\S+/i, "")
+    .replace(/\bcwd=\S+/i, "")
+    .replace(/\bupdated at:\s*\d{4}[- T0-9:+]+/i, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  snippet = snippet.replace(/^(Remember for\s+)?/i, "");
+  return snippet;
+}
+
+function personalRecallAnswerResultScore(result: KnowledgeTimelineSearchResult) {
+  const label = cleanDailyText(result.sourceLabel || result.sourceType).toLowerCase();
+  const snippet = cleanPersonalRecallSnippetForAnswer(result).toLowerCase();
+  let score = result.score ?? 0;
+  if (result.sourceType === "spark_recall") score -= 1_000;
+  if (/^(thread id|rollout path|updated at|cwd=)/i.test(snippet)) score -= 100;
+  if (/\bremember for\b|\bcorrect\b|\burl\b|\bstatus\b|\bwebsite\b|\bfacebook\b|\bdashboard\b/i.test(snippet)) score += 20;
+  if (label.includes("codex memory") || label.includes("claude code memory")) score += 8;
+  return score;
+}
+
+function naturalPersonalRecallLead(question: string, results: KnowledgeTimelineSearchResult[] = []) {
+  const normalized = question.toLowerCase().replace(/\s+/g, " ").trim();
+  if (personalRecallNeedsChatSearch(question) || results.some((result) => personalRecallChatSourceTypes.has(result.sourceType))) return "I found this:";
+  if (/\b(any|have|saved)\b.{0,40}\b(memory|memories)\b/.test(normalized)) return "Yes. I found saved memory:";
+  return "I found this in memory:";
+}
+
+function renderRetrievedPersonalRecallAnswer(question: string, results: KnowledgeTimelineSearchResult[]) {
+  const usableResults = results
+    .map((result) => ({ result, snippet: cleanPersonalRecallSnippetForAnswer(result), score: personalRecallAnswerResultScore(result) }))
+    .filter((entry) => entry.snippet && !/^question:\b/i.test(entry.snippet))
+    .sort((left, right) => right.score - left.score || timelineDocDate(right.result) - timelineDocDate(left.result))
+    .slice(0, 3);
+  if (!usableResults.length) return "";
+  const lines = usableResults.map(({ result, snippet }, index) => {
+    const label = cleanDailyText(result.sourceLabel || result.sourceType);
+    return `${index + 1}. ${label}: ${snippet}`;
+  });
+  return [
+    naturalPersonalRecallLead(question, usableResults.map((entry) => entry.result)),
+    ...lines
+  ].join("\n");
+}
+
+function spokenPersonalRecallAnswer(answer: string) {
+  // The lead line may itself start with "Yes. " (see naturalPersonalRecallLead)
+  // — strip it BEFORE the lead phrases, otherwise the lead survives as the
+  // "first item" and the spoken answer becomes "Yes. Yes. I found saved
+  // memory: Also, ...".
+  const clean = normalizeSearchText(answer, 1_200)
+    .replace(/^Yes\.\s*/i, "")
+    .replace(/^I found saved memory for\s+"[^"]+":\s*/i, "")
+    .replace(/^I found saved memory:\s*/i, "")
+    .replace(/^I found this in memory:\s*/i, "")
+    .replace(/^I found this:\s*/i, "")
+    .replace(/\bSpark recall result:\s*/gi, "")
+    .replace(/\bQuestion:\s*.+?\s+Answer:\s*/gi, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!clean) return answer;
+  const firstItems = clean
+    .split(/\s+\d+\.\s+/)
+    .map((item) => item.replace(/^\d+\.\s*/, "").trim())
+    .filter(Boolean)
+    .filter((item) => !/^(yes\.\s*)?i found (saved memory|this in memory|this)[.:]?$/i.test(item))
+    .slice(0, 2)
+    .map((item) => item.replace(/^(Codex memory|Claude Code memory|Planner|Backlog|Knowledge approval):\s*/i, "").trim());
+  if (!firstItems.length) return clean.length > 260 ? `${clean.slice(0, 257).trimEnd()}...` : clean;
+  const sentence = `Yes. ${firstItems.join(" Also, ")}`;
+  return sentence.length > 320 ? `${sentence.slice(0, 317).trimEnd()}...` : sentence;
+}
+
+function readPersonalRecallResult(resultID: string, window = 2) {
+  try {
+    return readKnowledgeTimelineResult(resultID, window);
+  } catch {
+    const doc = personalRecallFileDocuments().find((item) => item.id === resultID || item.sourceID === resultID || item.path === resultID);
+    if (!doc) throw new Error("Personal recall result was not found.");
+    return {
+      item: {
+        ...doc,
+        text: normalizeSearchText(readFileWindow(doc.path || doc.sourceID, personalRecallMaxPreviewBytes), 8_000)
+      },
+      surrounding: [] as JsonObject[]
+    };
+  }
+}
+
+function codexSparkRecallDefaultModel() {
+  const defaultModel = readCodexDefaultModel();
+  return defaultModel.toLowerCase().includes("spark") ? defaultModel : defaultSparkRecallModel;
+}
+
+function normalizeSparkRecallModel(rawModel?: unknown) {
+  const requested = pluginString(rawModel)?.trim() ?? "";
+  const normalized = requested.toLowerCase();
+  if (normalized === "gpt-5.3-spark" || (normalized.includes("spark") && !normalized.includes("codex"))) {
+    return defaultSparkRecallModel;
+  }
+  return codexSafeModel(requested);
+}
+
+async function codexModelIDsForRecall() {
+  const now = Date.now();
+  if (codexModelListCache && codexModelListCache.expiresAt > now) return codexModelListCache.ids;
+  try {
+    const raw = await codexTransport.request("model/list", {}, undefined, 15_000) as JsonObject;
+    const rows = Array.isArray(raw.data)
+      ? raw.data
+      : Array.isArray(raw.models)
+        ? raw.models
+        : Array.isArray(raw)
+          ? raw
+          : [];
+    const ids = rows
+      .map((row) => pluginString(runtimeObject(row)?.id, runtimeObject(row)?.model))
+      .filter((id): id is string => Boolean(id));
+    codexModelListCache = { expiresAt: now + codexModelListCacheMs, ids };
+    return ids;
+  } catch (error) {
+    bridgeDebugLog(`Spark recall model/list probe failed: ${error instanceof Error ? error.message : String(error)}`);
+    return [] as string[];
+  }
+}
+
+async function personalRecallModelID(rawModel?: unknown) {
+  const candidates = [
+    process.env.OPENASSIST_SPARK_RECALL_MODEL,
+    rawModel,
+    codexSparkRecallDefaultModel(),
+    defaultSparkRecallModel
+  ]
+    .map((candidate) => normalizeSparkRecallModel(candidate))
+    .filter(Boolean);
+  const modelIDs = await codexModelIDsForRecall();
+  const available = new Set(modelIDs.map((id) => id.toLowerCase()));
+  if (available.size > 0) {
+    const matchingCandidate = candidates.find((candidate) => available.has(candidate.toLowerCase()));
+    if (matchingCandidate) return matchingCandidate;
+    const listedSpark = modelIDs.find((id) => {
+      const normalized = id.toLowerCase();
+      return normalized.includes("codex") && normalized.includes("spark");
+    });
+    if (listedSpark) return listedSpark;
+  }
+  return candidates[0] || defaultSparkRecallModel;
+}
+
+function personalRecallReasoningEffort(raw?: unknown): CodexReasoningEffort {
+  return normalizeCodexReasoningEffort(typeof raw === "string" ? raw : undefined) ?? "medium";
+}
+
+function compactPersonalRecallSource(result: Partial<KnowledgeTimelineSearchResult>): JsonObject {
+  const source: JsonObject = {
+    id: result.id,
+    title: result.title,
+    sourceType: result.sourceType,
+    sourceLabel: result.sourceLabel
+  };
+  if (result.path) source.path = result.path;
+  if (result.threadID) source.threadID = result.threadID;
+  if (result.projectID) source.projectID = result.projectID;
+  if (result.dayID) source.dayID = result.dayID;
+  if (result.updatedAt || result.createdAt) source.timestamp = new Date(timelineDocDate(result as KnowledgeTimelineSearchResult)).toISOString();
+  return Object.fromEntries(Object.entries(source).filter(([, value]) => value !== undefined && value !== "")) as JsonObject;
+}
+
+function personalRecallSourcesFromValue(value: unknown): JsonObject[] {
+  const raw = Array.isArray(value) ? value : [];
+  return raw
+    .map((entry) => {
+      if (typeof entry === "string") return { title: entry } as JsonObject;
+      const object = runtimeObject(entry);
+      if (!object) return null;
+      const source: JsonObject = {};
+      for (const key of ["id", "title", "sourceType", "sourceLabel", "path", "threadID", "projectID", "dayID", "timestamp", "url"]) {
+        const value = object[key];
+        if (typeof value === "string" && value.trim()) source[key] = value.trim();
+      }
+      return Object.keys(source).length ? source : null;
+    })
+    .filter((entry): entry is JsonObject => Boolean(entry))
+    .slice(0, 12);
+}
+
+function parsePersonalRecallJSON(text: string): JsonObject | null {
+  const trimmed = text.trim();
+  const candidates = [
+    trimmed,
+    trimmed.replace(/^```(?:json)?\s*/i, "").replace(/```$/i, "").trim()
+  ];
+  const firstBrace = trimmed.indexOf("{");
+  const lastBrace = trimmed.lastIndexOf("}");
+  if (firstBrace >= 0 && lastBrace > firstBrace) {
+    candidates.push(trimmed.slice(firstBrace, lastBrace + 1));
+  }
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    try {
+      return jsonObject(JSON.parse(candidate)) ?? null;
+    } catch {
+      // Try the next shape.
+    }
+  }
+  return null;
+}
+
+function personalRecallFailureAnswer(
+  question: string,
+  error: unknown,
+  model: string,
+  reasoningEffort: string
+) {
+  const message = error instanceof Error ? error.message : String(error || "Spark recall was unavailable.");
+  const answer = "I could not find a sourced personal memory answer.";
+  const record = savePersonalRecallRecord({
+    question,
+    answer,
+    model,
+    reasoningEffort,
+    status: "failed",
+    sources: [],
+    error: message
+  });
+  return {
+    ok: false,
+    answer,
+    recordID: record.id,
+    model,
+    reasoningEffort,
+    searched: [],
+    sources: [],
+    sparkUnavailable: true,
+    error: message
+  };
+}
+
+function personalRecallBaseInstructions() {
+  return [
+    "You are OpenAssist Spark Recall, a hidden fast personal memory helper.",
+    "Answer the user's personal recall question using the fastest available memory/search tools.",
+    "Keep the final answer short, factual, and sourced."
+  ].join("\n");
+}
+
+function isWeakPersonalRecallAnswer(answer: string, sources: JsonObject[]) {
+  const normalized = answer.toLowerCase().replace(/\s+/g, " ").trim();
+  if (sources.length) return false;
+  return !normalized
+    || /\b(i could not|could not|couldn't|cannot|can't|did not|didn't)\b.{0,80}\b(find|locate|see)\b/.test(normalized)
+    || /\bno\b.{0,40}\b(clear|saved|matching|relevant)\b.{0,40}\b(answer|memory|result|source|record)\b/.test(normalized)
+    || /\bnothing\b.{0,60}\b(found|saved|matched)\b/.test(normalized);
+}
+
+function personalRecallInstructions() {
+  return [
+    "# OpenAssist Spark Recall",
+    "",
+    "You are the hidden fast personal recall helper for OpenAssist Live Voice.",
+    "Answer questions about past work, previous chats, saved memories, agent results, decisions, plans, and current project status.",
+    "Use your available tools, but choose the fastest read-only memory/search path first. Do not edit files. Do not create tasks. Do not call slow background agents.",
+    "Best tools: OpenAssist personal recall/search tools, especially `oa_personal_recall_search`, `oa_personal_recall_read`, or the same tools under an OpenAssist MCP/tool namespace.",
+    "Do not use commandexecution for memory search unless no fast recall/search tool is visible and the answer would otherwise fail.",
+    "Avoid shell, terminal, rg, grep, cat, Python, Node, broad filesystem reads, web search, and background agents for normal memory recall because they are slower.",
+    "",
+    "Search flow:",
+    "1. Search memory first with the fastest available personal recall/search tool.",
+    "2. If memory is not enough, or the user asks for latest/recent conversations, Codex/Claude/Spark results, chats, threads, or sessions, search chats/sessions with the same fast tool family.",
+    "3. Read only the best 1-3 results with the matching read/open result tool.",
+    "4. Prefer concise answers. Say when evidence is weak or missing.",
+    "",
+    "Return only JSON, no markdown fences:",
+    "{\"answer\":\"short sourced answer\",\"confidence\":\"high|medium|low\",\"searched\":[\"memory\",\"chats\"],\"sources\":[{\"id\":\"result id\",\"title\":\"source title\",\"sourceType\":\"source type\",\"sourceLabel\":\"source label\",\"path\":\"optional path\"}]}"
+  ].join("\n");
+}
+
+function personalRecallOutputSchema(): JsonObject {
+  return {
+    type: "object",
+    properties: {
+      answer: { type: "string" },
+      confidence: { type: "string", enum: ["high", "medium", "low"] },
+      searched: { type: "array", items: { type: "string", enum: ["memory", "chats"] } },
+      sources: {
+        type: "array",
+        items: {
+          type: "object",
+          properties: {
+            id: { type: "string" },
+            title: { type: "string" },
+            sourceType: { type: "string" },
+            sourceLabel: { type: "string" },
+            path: { type: "string" }
+          },
+          required: ["id", "title", "sourceType", "sourceLabel"],
+          additionalProperties: false
+        }
+      }
+    },
+    required: ["answer", "confidence", "searched", "sources"],
+    additionalProperties: false
+  };
+}
+
+async function runSparkPersonalRecall(args: JsonObject) {
+  const question = firstNonEmptyString(args.query, args.question, args.prompt, args.text);
+  if (!question) throw new Error("What should I search personal memory for?");
+  const context = firstNonEmptyString(args.context, args.recentContext, args.liveContext) ?? "";
+  const model = await personalRecallModelID(args.model);
+  const reasoningEffort = personalRecallReasoningEffort(args.reasoningEffort ?? args.reasoning);
+  const startedAt = Date.now();
+  bridgeDebugLog(`Spark recall start model=${model} effort=${reasoningEffort} context=${context ? "yes" : "no"} question=${question.slice(0, 180)}`);
+  const retrieved = retrievePersonalRecallEvidence(question, context);
+  bridgeDebugLog(
+    `Spark recall retrieval memory=${retrieved.memory.length} chats=${retrieved.chats.length} results=${retrieved.results.length} question=${question.slice(0, 140)}`
+  );
+  let providerThreadID = "";
+  let providerTurnID = "";
+  let interruptNeeded = false;
+  try {
+    const started = await codexTransport.request("thread/start", {
+      approvalPolicy: "never",
+      sandbox: "read-only",
+      cwd: openAssistRepoRoot(),
+      model,
+      personality: "friendly",
+      serviceName: "OpenAssist Spark Recall",
+      ephemeral: true,
+      experimentalRawEvents: false,
+      baseInstructions: personalRecallBaseInstructions(),
+      developerInstructions: personalRecallInstructions()
+    }, undefined, 30_000) as JsonObject;
+    bridgeDebugLog(`Spark recall thread ready elapsedMs=${Date.now() - startedAt}`);
+    const thread = runtimeObject(started.thread);
+    providerThreadID = firstRuntimeString(thread?.id);
+    if (!providerThreadID) throw new Error("Spark recall did not return a temporary thread id.");
+
+    let responseText = "";
+    const toolNamesUsed = new Set<string>();
+    const onNotification = (method: string, params: JsonObject) => {
+      const notificationThreadID = firstRuntimeString(params.threadId, params.threadID);
+      if (notificationThreadID && notificationThreadID !== providerThreadID) return;
+      const turn = runtimeObject(params.turn);
+      const notificationTurnID = firstRuntimeString(params.turnId, params.turnID, turn?.id);
+      if (notificationTurnID) providerTurnID = notificationTurnID;
+      if (method === "item/started") {
+        const item = runtimeItemPayload(params);
+        const toolName = firstRuntimeString(item.toolName, item.tool_name, item.name, item.tool, item.type, params.toolName, params.name);
+        if (toolName) {
+          toolNamesUsed.add(toolName);
+          if (/commandexecution|shell|terminal/i.test(toolName)) {
+            bridgeDebugLog(`Spark recall used blocked slow tool=${toolName} question=${question.slice(0, 140)}`);
+          } else if (/oa_personal_recall/i.test(toolName)) {
+            bridgeDebugLog(`Spark recall tool=${toolName}`);
+          }
+        }
+      }
+      if (method === "item/agentMessage/delta" && typeof params.delta === "string") {
+        const channel = String(params.channel ?? "").toLowerCase();
+        if (channel !== "commentary") responseText += params.delta;
+      }
+    };
+    codexTransport.on("notification", onNotification);
+    try {
+      const input: JsonObject[] = [{
+        type: "text",
+        text: [
+          "Use the fast OpenAssist recall retrieval evidence below first.",
+          "If a fast OpenAssist recall tool is visible, you may call it to verify or read one best result.",
+          "Do not use commandexecution for memory search unless no retrieval evidence is supplied and no fast recall/search tool is visible.",
+          "Avoid shell, grep, rg, cat, broad filesystem reads, web, or background agents because they are slower.",
+          "Your answer must cite at least one supplied/called source when any result is available.",
+          retrieved.context,
+          context ? `Recent live context:\n${context}` : "",
+          "Return JSON only.",
+          `Question: ${question}`
+        ].join("\n")
+      }];
+      const turnComplete = waitForCodexThreadTurnComplete(providerThreadID, () => providerTurnID, 120_000);
+      const startedTurn = await codexTransport.request("turn/start", {
+        threadId: providerThreadID,
+        input,
+        approvalPolicy: "never",
+        effort: reasoningEffort,
+        sandboxPolicy: { type: "readOnly", networkAccess: false },
+        outputSchema: personalRecallOutputSchema()
+      }, undefined, 90_000) as JsonObject;
+      const turn = runtimeObject(startedTurn.turn);
+      providerTurnID = firstRuntimeString(turn?.id, providerTurnID);
+      const completed = await turnComplete;
+      if (completed.timedOut) {
+        // Stop the runaway turn so it does not keep burning CPU after the user
+        // already got the fallback answer.
+        interruptNeeded = true;
+      }
+      if (completed.failed) throw new Error(completed.error || "Spark recall failed.");
+    } finally {
+      codexTransport.off("notification", onNotification);
+    }
+
+    const parsed = parsePersonalRecallJSON(responseText);
+    const parsedSources = personalRecallSourcesFromValue(parsed?.sources);
+    let answer = firstNonEmptyString(parsed?.answer, responseText) || "I could not find a clear saved answer.";
+    let sources = parsedSources.length ? parsedSources : retrieved.sources;
+    if (isWeakPersonalRecallAnswer(answer, parsedSources) && retrieved.results.length) {
+      answer = renderRetrievedPersonalRecallAnswer(question, retrieved.results);
+      sources = retrieved.sources;
+    }
+    if (isWeakPersonalRecallAnswer(answer, sources)) {
+      throw new Error("Spark recall returned no sourced answer.");
+    }
+    const record = savePersonalRecallRecord({
+      question,
+      answer,
+      model,
+      reasoningEffort,
+      status: "completed",
+      sources
+    });
+    return {
+      ok: true,
+      answer,
+      spokenAnswer: spokenPersonalRecallAnswer(answer),
+      recordID: record.id,
+      model,
+      reasoningEffort,
+      confidence: firstNonEmptyString(parsed?.confidence) ?? "medium",
+      searched: Array.isArray(parsed?.searched)
+        ? parsed?.searched
+        : retrieved.results.length
+          ? (retrieved.chats.length ? ["memory", "chats"] : ["memory"])
+          : undefined,
+      sources,
+      sparkUnavailable: false
+    };
+  } catch (error) {
+    bridgeDebugLog(`Spark recall failed: ${error instanceof Error ? error.stack ?? error.message : String(error)}`);
+    if (retrieved.results.length) {
+      const answer = renderRetrievedPersonalRecallAnswer(question, retrieved.results);
+      const record = savePersonalRecallRecord({
+        question,
+        answer,
+        model,
+        reasoningEffort,
+        status: "completed",
+        sources: retrieved.sources
+      });
+      bridgeDebugLog(`Spark recall used retrieval-rendered answer results=${retrieved.results.length}`);
+      return {
+        ok: true,
+        answer,
+        spokenAnswer: spokenPersonalRecallAnswer(answer),
+        recordID: record.id,
+        model,
+        reasoningEffort,
+        confidence: "medium",
+        searched: retrieved.chats.length ? ["memory", "chats"] : ["memory"],
+        sources: retrieved.sources,
+        sparkUnavailable: false
+      };
+    }
+    return personalRecallFailureAnswer(question, error, model, reasoningEffort);
+  } finally {
+    // The recall thread is temporary; without this every voice recall leaves
+    // one more Codex session (and its MCP helper process) behind.
+    if (providerThreadID) {
+      const threadID = providerThreadID;
+      const turnID = providerTurnID;
+      const interrupt = interruptNeeded;
+      void (async () => {
+        if (interrupt && turnID) {
+          try {
+            await codexTransport.request("turn/interrupt", { threadId: threadID, turnId: turnID }, undefined, 15_000);
+          } catch (error) {
+            bridgeDebugLog(`Spark recall interrupt failed thread=${threadID}: ${error instanceof Error ? error.message : String(error)}`);
+          }
+        }
+        await deleteCodexProviderThread(threadID);
+      })();
+    }
+  }
+}
+
 function looksLikeSearchEverythingQuestion(prompt: string) {
   const normalized = prompt.toLowerCase().replace(/\s+/g, " ").trim();
   if (!normalized) return false;
-  return /\b(search everything|search all|timeline|history|memory|remember|previous|earlier|last time|old conversation|where did|when did|what did we|what did you|what was the|what were we|find where|mentioned|talked about|discussed|decided|worked on)\b/.test(normalized);
+  return /\b(search everything|search all|timeline|history|memory|remember|previous|earlier|last time|old conversation|where did|when did|where are we|what did we|what did you|what did codex|what did claude|what did spark|what was the|what were we|find where|mentioned|talked about|discussed|decided|worked on)\b/.test(normalized);
 }
 
 function voiceSearchEverythingSummary(prompt: string) {
-  const results = searchKnowledgeTimeline(prompt, { limit: 3 });
+  const memoryResults = searchPersonalRecallSources(prompt, { phase: "memory", limit: 3 });
+  const results = memoryResults.length ? memoryResults : searchPersonalRecallSources(prompt, { phase: "chats", limit: 3 });
   if (!results.length) return "I could not find a matching saved note, planner item, or previous thread.";
   const lines = results.map((result, index) => {
     const label = result.sourceLabel || result.sourceType;
@@ -12029,7 +15437,10 @@ function listOpenKnowledgeTasks(limit = 100): KnowledgeTaskItem[] {
   for (const item of knowledgeItems()) {
     const lines = item.markdown.split(/\n/);
     lines.forEach((line, index) => {
-      const match = line.match(/^\s*[-*]\s+\[\s\]\s+(.+?)\s*$/);
+      // Top-level checkboxes only: indented `- [ ]` lines are STEPS inside a
+      // task block, and treating them as tasks made carry-forward duplicate
+      // every step as its own new task.
+      const match = line.match(/^[-*]\s+\[\s\]\s+(.+?)\s*$/);
       if (!match) return;
       tasks.push({
         id: `${item.id}:line:${index + 1}`,
@@ -12202,12 +15613,39 @@ function plannerAppendPreviewFromPayload(action: string, payload: JsonObject): K
     const title = dailyItemTitleFromPlannerAppend(text);
     if (title) {
       const detailsMarkdown = String(payload.detailsMarkdown ?? payload.details ?? payload.description ?? "").trim();
+      // Mirror request_daily_item: carry the named List, section, tags and scope so
+      // an add via request_add lands in the right place instead of the bare Category.
+      const listResolution = resolvePlannerListFromDailyInput(payload);
+      if ((listResolution.status === "not_found" || listResolution.status === "ambiguous")
+        && !(typeof payload.projectID === "string" && payload.projectID)
+        && !(typeof payload.folderID === "string" && payload.folderID)) {
+        assertPlannerListResolved(listResolution);
+      }
+      const inputList = listResolution.status === "ok" ? listResolution.list : undefined;
+      const projectID = (typeof payload.projectID === "string" && payload.projectID)
+        || (inputList && inputList.kind !== "folder" ? inputList.id : undefined)
+        || undefined;
+      const folderID = (typeof payload.folderID === "string" && payload.folderID)
+        || (inputList?.kind === "folder" ? inputList.id : undefined)
+        || undefined;
+      const scopeTags = Array.isArray(payload.scopeTags) ? payload.scopeTags : undefined;
+      // "Tasks" here is the routing section, not a real grouping — only carry an
+      // explicit grouping if the caller named one other than the routing word.
+      const grouping = normalizeDailySection(payload.section ?? payload.grouping);
+      const itemSection = grouping && grouping.toLowerCase() !== "tasks" ? grouping : undefined;
       return {
         kind: "daily_item_upsert",
         item: {
           dayID,
           title,
-          area: normalizeDailyArea(payload.area) || inferDailyArea({ title, detailsMarkdown }),
+          projectID,
+          folderID,
+          area: normalizeDailyArea(payload.area ?? payload.category) || inferDailyArea({ title, detailsMarkdown, projectID, folderID, scopeTags }),
+          section: itemSection,
+          tags: normalizeDailyTagLabels(payload.tags ?? payload.tag),
+          scopeTags: normalizeDailyScopeTags(scopeTags),
+          reminderAt: normalizeReminderDate(payload.reminderAt ?? payload.notifyAt ?? payload.dueAt),
+          reminderTimezone: cleanDailyText(payload.reminderTimezone ?? payload.timezone ?? payload.timeZone) || null,
           detailsMarkdown,
           steps: Array.isArray(payload.steps) ? payload.steps as DailyItemStep[] : [],
           links: normalizeDailyLinks(payload.links),
@@ -12250,28 +15688,174 @@ function plannerBacklogMoveEntriesFromPayload(payload: JsonObject): { dayID: str
   return entries;
 }
 
+function taskBatchTargetFromPayload(payload: JsonObject): "backlog" | "day" {
+  const rawTarget = cleanDailyText(payload.target ?? payload.destination ?? payload.mode).toLowerCase();
+  if (["day", "today", "planner", "daily", "date", "schedule", "scheduled"].includes(rawTarget)) return "day";
+  if (["backlog", "later", "follow-up", "followup", "unscheduled", "sprint", "sprint planning"].includes(rawTarget)) return "backlog";
+  return cleanDailyText(payload.dayID ?? payload.targetDayID ?? payload.date) ? "day" : "backlog";
+}
+
+function noteTaskBatchItemsFromPayload(payload: JsonObject): unknown[] {
+  if (Array.isArray(payload.items)) return payload.items;
+  if (Array.isArray(payload.tasks)) return payload.tasks;
+  if (Array.isArray(payload.backlogItems)) return payload.backlogItems;
+  return [];
+}
+
+function noteTaskSourceDefaults(source: KnowledgeItem) {
+  const projects = loadProjects();
+  const metadata = dailyItemJSON(source.metadata);
+  const sourceProjectID = source.target?.ownerKind === "project"
+    ? source.target.ownerId
+    : source.target?.ownerKind === "thread"
+      ? projects.threadAssignments[source.target.ownerId]
+      : undefined;
+  const sourceProject = sourceProjectID
+    ? projects.plannerLists.find((project) => project.id.toLowerCase() === sourceProjectID.toLowerCase())
+    : undefined;
+  return {
+    area: normalizeDailyArea(metadata.area ?? metadata.category) || normalizeDailyArea(sourceProject?.area),
+    projectID: sourceProject?.kind === "folder" ? undefined : sourceProjectID,
+    folderID: sourceProject?.kind === "folder" ? sourceProjectID : undefined,
+    tags: normalizeDailyTagLabels(metadata.tags ?? metadata.tag)
+  };
+}
+
+function dailyItemInputFromNoteTask(
+  rawTask: unknown,
+  context: {
+    source: KnowledgeItem;
+    target: "backlog" | "day";
+    dayID?: string;
+    payload: JsonObject;
+  }
+): DailyItemInput | null {
+  const raw = typeof rawTask === "string" ? { title: rawTask } : dailyItemJSON(rawTask);
+  const title = cleanDailyText(raw.title ?? raw.text ?? raw.task ?? raw.label);
+  if (!title) return null;
+  const defaults = noteTaskSourceDefaults(context.source);
+  const listInput = { ...context.payload, ...raw };
+  const listResolution = resolvePlannerListFromDailyInput(listInput);
+  // A named-but-unresolved list must not silently fall back to the source note's
+  // project — surface it so the model fixes the name instead of misfiling the task.
+  if ((listResolution.status === "not_found" || listResolution.status === "ambiguous")
+    && !cleanDailyText(raw.projectID) && !cleanDailyText(raw.folderID)) {
+    assertPlannerListResolved(listResolution);
+  }
+  const rawList = listResolution.status === "ok" ? listResolution.list : undefined;
+  const projectID = cleanDailyText(raw.projectID)
+    || (rawList && rawList.kind !== "folder" ? rawList.id : undefined)
+    || defaults.projectID;
+  const folderID = cleanDailyText(raw.folderID)
+    || (rawList?.kind === "folder" ? rawList.id : undefined)
+    || defaults.folderID;
+  const links = normalizeDailyLinks([
+    ...(Array.isArray(raw.links) ? raw.links : []),
+    ...(context.source.target ? [context.source.target] : [])
+  ]);
+  const tags = Object.prototype.hasOwnProperty.call(raw, "tags") || Object.prototype.hasOwnProperty.call(raw, "tag")
+    ? normalizeDailyTagLabels(raw.tags ?? raw.tag)
+    : defaults.tags;
+  const steps = Array.isArray(raw.steps)
+    ? raw.steps.map((step, index) => normalizeDailyStep(step, index)).filter((step): step is DailyItemStep => Boolean(step))
+    : [];
+  const targetDayID = context.target === "day"
+    ? normalizePlannerDayID(String(raw.dayID ?? raw.targetDayID ?? raw.date ?? context.dayID ?? ""))
+    : plannerBacklogID;
+  return {
+    dayID: targetDayID,
+    title,
+    projectID,
+    folderID,
+    area: normalizeDailyArea(raw.area ?? raw.category) || defaults.area,
+    section: normalizeDailySection(raw.section ?? raw.grouping ?? context.payload.section),
+    tags,
+    detailsMarkdown: cleanDailyText(raw.detailsMarkdown ?? raw.details ?? raw.description),
+    reminderAt: normalizeReminderDate(raw.reminderAt ?? raw.notifyAt ?? raw.dueAt),
+    reminderTimezone: cleanDailyText(raw.reminderTimezone ?? raw.timezone ?? raw.timeZone) || null,
+    steps,
+    links,
+    status: "todo",
+    checked: false
+  };
+}
+
+function noteTaskBatchPreviewFromPayload(payload: JsonObject): KnowledgePreview | undefined {
+  const sourceItemID = cleanDailyText(payload.sourceItemID ?? payload.itemID ?? payload.noteItemID ?? payload.noteID);
+  if (!sourceItemID) return undefined;
+  const source = readKnowledgeItem(sourceItemID);
+  const target = taskBatchTargetFromPayload(payload);
+  const dayID = target === "day"
+    ? normalizePlannerDayID(String(payload.dayID ?? payload.targetDayID ?? payload.date ?? ""))
+    : undefined;
+  const items = noteTaskBatchItemsFromPayload(payload)
+    .map((task) => dailyItemInputFromNoteTask(task, { source, target, dayID, payload }))
+    .filter((item): item is DailyItemInput => Boolean(item));
+  if (!items.length) return undefined;
+  return {
+    kind: "daily_items_batch",
+    sourceItemID,
+    sourceTitle: source.title,
+    sourceTarget: source.target,
+    target,
+    dayID,
+    items
+  };
+}
+
 function knowledgePreviewForRequest(action: string, payload: JsonObject): KnowledgePreview | undefined {
+  if (action === "request_tasks_from_note") {
+    return noteTaskBatchPreviewFromPayload(payload);
+  }
+  if (action === "request_reference") {
+    return referencePreviewFromPayload(payload);
+  }
   if (action === "request_daily_item") {
-    const title = String(payload.title ?? payload.text ?? "").trim();
+    const routedPayload = assertSafeImmediateKnowledgeWrite(withInferredPlannerListForTaskPayload(payload), "request_daily_item");
+    const resolvedLinks = resolveTaskLinkTargetsFromPayload(routedPayload);
+    const preparedPayload = compactLinkedTaskDetails(routedPayload, resolvedLinks);
+    const title = String(preparedPayload.title ?? preparedPayload.text ?? "").trim();
     if (!title) return undefined;
-    const detailsMarkdown = String(payload.detailsMarkdown ?? payload.details ?? payload.description ?? "").trim();
-    const projectID = typeof payload.projectID === "string" ? payload.projectID : undefined;
-    const folderID = typeof payload.folderID === "string" ? payload.folderID : undefined;
-    const scopeTags = Array.isArray(payload.scopeTags) ? payload.scopeTags : undefined;
-    const area = normalizeDailyArea(payload.area)
+    const detailsMarkdown = String(preparedPayload.detailsMarkdown ?? preparedPayload.details ?? preparedPayload.description ?? "").trim();
+    // Resolve a named List (@List / listName / listID) the same way upsert does so the
+    // item actually lands in that List instead of falling back to the bare Category.
+    const listResolution = resolvePlannerListFromDailyInput(preparedPayload);
+    if ((listResolution.status === "not_found" || listResolution.status === "ambiguous")
+      && !(typeof preparedPayload.projectID === "string" && preparedPayload.projectID)
+      && !(typeof preparedPayload.folderID === "string" && preparedPayload.folderID)) {
+      assertPlannerListResolved(listResolution);
+    }
+    const inputList = listResolution.status === "ok" ? listResolution.list : undefined;
+    const projectID = (typeof preparedPayload.projectID === "string" && preparedPayload.projectID)
+      || (inputList && inputList.kind !== "folder" ? inputList.id : undefined)
+      || undefined;
+    const folderID = (typeof preparedPayload.folderID === "string" && preparedPayload.folderID)
+      || (inputList?.kind === "folder" ? inputList.id : undefined)
+      || undefined;
+    const scopeTags = Array.isArray(preparedPayload.scopeTags) ? preparedPayload.scopeTags : undefined;
+    const section = normalizeDailySection(preparedPayload.section ?? preparedPayload.grouping);
+    const tags = normalizeDailyTagLabels(preparedPayload.tags ?? preparedPayload.tag);
+    const area = normalizeDailyArea(preparedPayload.area ?? preparedPayload.category)
       || inferDailyArea({ title, detailsMarkdown, projectID, folderID, scopeTags });
+    // Strict day resolution so "backlog" routes to the backlog and a bad date is
+    // surfaced rather than silently coerced to today.
+    const dayID = resolvePlannerDayIDForWrite(String(preparedPayload.dayID ?? preparedPayload.targetDayID ?? preparedPayload.date ?? ""));
     return {
       kind: "daily_item_upsert",
       item: {
-        dayID: normalizePlannerDayID(String(payload.dayID ?? payload.targetDayID ?? payload.date ?? "")),
+        dayID,
         title,
         projectID,
         folderID,
         area,
+        section,
+        tags,
         scopeTags: normalizeDailyScopeTags(scopeTags),
+        reminderAt: normalizeReminderDate(preparedPayload.reminderAt ?? preparedPayload.notifyAt ?? preparedPayload.dueAt),
+        reminderTimezone: cleanDailyText(preparedPayload.reminderTimezone ?? preparedPayload.timezone ?? preparedPayload.timeZone) || null,
         detailsMarkdown,
-        steps: Array.isArray(payload.steps) ? payload.steps as DailyItemStep[] : [],
-        links: normalizeDailyLinks(payload.links),
+        steps: Array.isArray(preparedPayload.steps) ? preparedPayload.steps as DailyItemStep[] : [],
+        links: resolvedLinks,
         status: "todo",
         checked: false
       }
@@ -12311,12 +15895,26 @@ function knowledgePreviewForRequest(action: string, payload: JsonObject): Knowle
     if (targetRaw.toLowerCase() === plannerBacklogID) {
       throw new Error("Use request_move_to_backlog to move tasks to the Backlog. carry_forward only moves unfinished tasks between planner days.");
     }
-    const fromDayID = normalizePlannerDayID(String(payload.fromDayID ?? payload.dayID ?? plannerDayID()));
-    const targetDayID = normalizePlannerDayID(String(payload.targetDayID ?? payload.toDayID ?? plannerDayOffset(fromDayID, 1)));
+    // Fail loud on unresolvable dates: normalizePlannerDayID silently falls back
+    // to today, which turns a cross-day move into a same-day mass duplicate.
+    const fromDayID = resolvePlannerDayIDForWrite(String(payload.fromDayID ?? payload.dayID ?? ""), plannerDayID());
+    const targetDayID = resolvePlannerDayIDForWrite(String(payload.targetDayID ?? payload.toDayID ?? ""), plannerDayOffset(fromDayID, 1));
+    if (fromDayID === plannerBacklogID || targetDayID === plannerBacklogID) {
+      throw new Error("carry_forward moves tasks between planner days. Use request_move_to_backlog for the Backlog.");
+    }
+    if (fromDayID === targetDayID) {
+      throw new Error(`Source and target are both ${fromDayID}; nothing to move.`);
+    }
+    const seenOpenTexts = new Set<string>();
     const openTexts = listOpenKnowledgeTasks(200)
       .filter((task) => task.dayID === fromDayID)
       .map((task) => cleanDailyText(task.text))
-      .filter(Boolean);
+      .filter((text) => {
+        const key = text.toLowerCase();
+        if (!text || seenOpenTexts.has(key)) return false;
+        seenOpenTexts.add(key);
+        return true;
+      });
     if (!openTexts.length) return undefined;
     const content = openTexts.map((text) => `- [ ] ${text}`).join("\n");
     // A move adds the tasks to the target day AND removes them from the source
@@ -12326,12 +15924,12 @@ function knowledgePreviewForRequest(action: string, payload: JsonObject): Knowle
   return undefined;
 }
 
-// Plain "add" actions do not need approval: adding a brand-new task or daily
-// item cannot overwrite or destroy existing content, so we apply it right away.
-// Anything that moves, organizes, edits, or replaces existing content still
-// goes through the approval inbox.
-function knowledgeActionAppliesWithoutApproval(action: string) {
-  return action === "request_daily_item";
+// Plain "add/capture" actions do not need approval only when they target
+// existing containers. New notes/Lists are approval-first, while moves,
+// organization, edits, and replacements stay in the approval inbox.
+function knowledgeActionAppliesWithoutApproval(action: string, preview?: KnowledgePreview) {
+  if (preview?.kind === "reference_note_create") return false;
+  return action === "request_daily_item" || action === "request_reference";
 }
 
 function createKnowledgeWriteRequest(action: string, payload: JsonObject, source: KnowledgeWriteRequest["source"]) {
@@ -12339,11 +15937,17 @@ function createKnowledgeWriteRequest(action: string, payload: JsonObject, source
   const now = new Date().toISOString();
   const preview = knowledgePreviewForRequest(action, settingsPayload);
   if (!preview) {
-    const isOrganize = action === "request_organize";
+      const isOrganize = action === "request_organize";
+    const isTasksFromNote = action === "request_tasks_from_note";
+      const isReference = action === "request_reference";
     throw new Error(
       isOrganize
         ? "oa_request_organize requires itemID and markdown. Pattern: (1) read the note, (2) call oa_note_style_guide, (3) write exact replacement markdown, (4) call oa_request_organize with itemID and markdown."
-        : "OpenAssist could not create an apply-ready preview. For planner tasks use oa_request_daily_item; for edits use oa_request_add or oa_request_patch with exact markdown."
+          : isTasksFromNote
+            ? "oa_request_tasks_from_note requires sourceItemID and items[]. Pattern: (1) find/read the source note, (2) propose exact task titles, (3) call this tool with sourceItemID, target, optional dayID, and items."
+            : isReference
+              ? "oa_request_reference requires reference text and an existing @List, projectID, threadID, or note itemID so OpenAssist can reuse the correct note."
+              : "OpenAssist could not create an apply-ready preview. For planner tasks use oa_request_daily_item; for edits use oa_request_add or oa_request_patch with exact markdown."
     );
   }
   const request: KnowledgeWriteRequest = {
@@ -12361,10 +15965,13 @@ function createKnowledgeWriteRequest(action: string, payload: JsonObject, source
   requests.push(request);
   writeKnowledgeRequests(requests);
   emitKnowledgeRequestsChanged();
-  if (knowledgeActionAppliesWithoutApproval(action)) {
+  if (knowledgeActionAppliesWithoutApproval(action, preview)) {
     return applyKnowledgePreview(request.id);
   }
-  return request;
+  return {
+    ...request,
+    _system_instruction_for_agent: "This action is PENDING and was placed in the Review Inbox. You MUST tell the user to check their Review Inbox to approve it. DO NOT claim you have already applied, organized, or changed the note."
+  };
 }
 
 const plannerMonthNames: Record<string, number> = {
@@ -12449,6 +16056,20 @@ function parsePlannerTaskTime(prompt: string) {
   return `${hour}:${minute.padStart(2, "0")} ${suffix}`;
 }
 
+function plannerReminderAtFromDayAndTime(dayID: string, timeLabel: string) {
+  const match = timeLabel.match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/i);
+  if (!match) return null;
+  const date = plannerDateFromDayID(dayID);
+  if (!date) return null;
+  let hour = Number(match[1]);
+  const minute = Number(match[2]);
+  const suffix = match[3].toUpperCase();
+  if (suffix === "PM" && hour < 12) hour += 12;
+  if (suffix === "AM" && hour === 12) hour = 0;
+  date.setHours(hour, minute, 0, 0);
+  return date.toISOString();
+}
+
 function stripPlannerDatePhrases(text: string) {
   return text
     .replace(/\b(?:for|on|by|this|next)?\s*(?:today|tomorrow|day after tomorrow|day after today|yesterday)\b/gi, " ")
@@ -12504,17 +16125,30 @@ function directPlannerTaskRequestFromPrompt(prompt: string) {
   const dayID = parsePlannerDayIDFromPrompt(trimmed);
   if (!dayID) return null;
   const timeLabel = parsePlannerTaskTime(trimmed);
-  const title = parsePlannerTaskTitle(trimmed, timeLabel);
+  let title = parsePlannerTaskTitle(trimmed, timeLabel);
   if (!title) return null;
+  // "add buy paint to my home list" — the list phrase belongs in listName, not
+  // inside the task title, and the list's own default category must win over a
+  // premature keyword guess made from the raw sentence.
+  let listName = "";
+  const listPhrase = title.match(/\s+(?:to|in|into|on|under|at)\s+(?:my\s+|the\s+|our\s+)?(.+?)\s+list$/i);
+  if (listPhrase && listPhrase.index !== undefined) {
+    listName = listPhrase[1].trim();
+    title = title.slice(0, listPhrase.index).trim();
+    if (!title) return null;
+  }
 
   const payload: JsonObject = {
     dayID,
     title,
-    area: inferDailyArea({ title }),
     goal: `Add planner task for ${formattedPlannerDay(dayID)}: ${title}`
   };
+  if (listName) payload.listName = listName;
+  else payload.area = inferDailyArea({ title });
   if (timeLabel) {
     payload.detailsMarkdown = `Time: ${timeLabel}`;
+    payload.reminderAt = plannerReminderAtFromDayAndTime(dayID, timeLabel);
+    payload.reminderTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
   }
   return { dayID, title, timeLabel, payload };
 }
@@ -12541,6 +16175,13 @@ function voiceListText(items: DailyItem[], limit = 6) {
   return items
     .slice(0, limit)
     .map((item, index) => `${index + 1}. ${dailyItemVisibleTitle(item)}`)
+    .join("\n");
+}
+
+function voiceFreeTextListText(lines: string[], limit = 6) {
+  return lines
+    .slice(0, limit)
+    .map((line, index) => `${index + 1}. ${line}`)
     .join("\n");
 }
 
@@ -12587,6 +16228,37 @@ function createDirectKnowledgeVoiceResponse(prompt: string, settings: SettingsSn
         responseText: `Added to Backlog: ${dailyItemVisibleTitle(result.item ?? { title: backlogRequest.title } as DailyItem)}.`
       };
     }
+
+    // Local "mark a task done" shortcut. Kept with the other write handlers (above the
+    // read gates) so a phrase like "mark the report done" is never captured by a reader.
+    if (/\b(done|complete|completed|finished|mark)\b/.test(lowered) && /\b(task|item|todo|to-do|reminder)\b/.test(lowered)) {
+      const dayID = parsePlannerDayIDFromPrompt(trimmed) || plannerDayID();
+      const query = stripPlannerDatePhrases(trimmed)
+        .replace(/\b(mark|as|done|complete|completed|finished|task|item|todo|to-do|reminder)\b/gi, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+      if (query) {
+        const result = completeDailyItem(dayID, query, true);
+        return {
+          route: "daily_item_complete",
+          responseText: `Marked done: ${dailyItemVisibleTitle(result.item ?? { title: query } as DailyItem)}.`
+        };
+      }
+    }
+  }
+
+  // If the user clearly wants to CHANGE something (add/create/delete/move/...) but no
+  // write shortcut above matched it, do NOT fall through to a read gate below — defer to
+  // the full agent, which has the proper add/update tools.
+  //
+  // The trap: "add a thing in my home list" contains BOTH a mutation verb ("add") and a
+  // read-gate word ("list"). But "list" / "open" here are NOUNS ("home list"), not a read
+  // intent. So when a mutation verb is present, only treat it as a read if there is an
+  // unambiguous question word — words that can't double as a list noun.
+  const looksLikeMutation = /\b(add|create|put|save|remember|insert|append|delete|remove|move|schedule|rename|update|change|complete|finish|mark|check off|cross off)\b/.test(lowered);
+  if (looksLikeMutation) {
+    const unambiguousReadQuestion = /\b(what|which|show|read|how many|do we have|tell me|list out|list all)\b/.test(lowered);
+    if (!unambiguousReadQuestion) return null;
   }
 
   const mentionsBacklog = /\b(backlog|later|follow-?ups?|someday)\b/.test(lowered);
@@ -12600,15 +16272,26 @@ function createDirectKnowledgeVoiceResponse(prompt: string, settings: SettingsSn
     };
   }
 
-  const mentionsPlannerTasks = /\b(today|tomorrow|yesterday|planner|daily|to-?do|tasks?|items?|reminders?|open)\b/.test(lowered);
+  const mentionsPlannerTasks = /\b(today|tomorrow|yesterday|planner|daily|to-?do|tasks?|items?|reminders?|open|plan|list)\b/.test(lowered);
   if (mentionsPlannerTasks && /\b(what|which|list|show|read|open|unfinished|any|how many|do we have|check)\b/.test(lowered)) {
     const dayID = parsePlannerDayIDFromPrompt(trimmed) || plannerDayID();
     const items = listDailyItems(dayID).filter((item) => !item.checked);
+    if (items.length) {
+      return {
+        route: "daily_items",
+        responseText: `You have ${items.length} open item${items.length === 1 ? "" : "s"} for ${formattedPlannerDay(dayID)}:\n${voiceListText(items)}`
+      };
+    }
+    const freeTextLines = plannerDayFreeTextLines(dayID);
+    if (freeTextLines.length) {
+      return {
+        route: "daily_items",
+        responseText: `Your today note has ${freeTextLines.length} note${freeTextLines.length === 1 ? "" : "s"} for ${formattedPlannerDay(dayID)}:\n${voiceFreeTextListText(freeTextLines)}`
+      };
+    }
     return {
       route: "daily_items",
-      responseText: items.length
-        ? `You have ${items.length} open item${items.length === 1 ? "" : "s"} for ${formattedPlannerDay(dayID)}:\n${voiceListText(items)}`
-        : `You have no open items for ${formattedPlannerDay(dayID)}.`
+      responseText: `You have no open items for ${formattedPlannerDay(dayID)}.`
     };
   }
 
@@ -12617,21 +16300,6 @@ function createDirectKnowledgeVoiceResponse(prompt: string, settings: SettingsSn
       route: "search_everything",
       responseText: voiceSearchEverythingSummary(trimmed)
     };
-  }
-
-  if (allowWrites && /\b(done|complete|completed|finished|mark)\b/.test(lowered) && /\b(task|item|todo|to-do|reminder)\b/.test(lowered)) {
-    const dayID = parsePlannerDayIDFromPrompt(trimmed) || plannerDayID();
-    const query = stripPlannerDatePhrases(trimmed)
-      .replace(/\b(mark|as|done|complete|completed|finished|task|item|todo|to-do|reminder)\b/gi, " ")
-      .replace(/\s+/g, " ")
-      .trim();
-    if (query) {
-      const result = completeDailyItem(dayID, query, true);
-      return {
-        route: "daily_item_complete",
-        responseText: `Marked done: ${dailyItemVisibleTitle(result.item ?? { title: query } as DailyItem)}.`
-      };
-    }
   }
 
   return null;
@@ -12675,19 +16343,22 @@ function relevantKnowledgeContextForPrompt(prompt: string, settings: SettingsSna
       lines.push("For exact details, use the Search Everything read tool when available instead of asking for the whole thread.");
     }
   }
+  // This snapshot is re-generated and re-sent on EVERY turn for stateless
+  // providers — keep the caps tight and the JSON compact (pretty-printing
+  // roughly doubled the size for no benefit to the model).
   const dayID = parsePlannerDayIDFromPrompt(prompt);
   if (dayID && /\b(today|tomorrow|planner|journal|daily|to-?do|tasks?|remind|reminder|reminders)\b/.test(lowered)) {
     try {
       const item = readKnowledgeItem(`planner_day:planner:global:${dayID}`);
       lines.push(`- Planner day ${dayID}:`);
-      lines.push(item.markdown.slice(0, 3500));
+      lines.push(item.markdown.slice(0, 2000));
     } catch {
       lines.push(`- Planner day ${dayID}: no saved planner day found.`);
     }
     try {
       const dailyItems = listDailyItems(dayID);
       if (dailyItems.length) {
-        lines.push(`- Structured items for ${dayID}: ${JSON.stringify(dailyItems.slice(0, 20), null, 2)}`);
+        lines.push(`- Structured items for ${dayID}: ${JSON.stringify(dailyItems.slice(0, 10))}`);
       }
     } catch {
       // Snapshot context is best effort.
@@ -12696,21 +16367,21 @@ function relevantKnowledgeContextForPrompt(prompt: string, settings: SettingsSna
   if (/\b(open tasks?|unfinished|to-?do|todo|tasks?)\b/.test(lowered)) {
     const tasks = listOpenKnowledgeTasks(50);
     if (tasks.length) {
-      lines.push(`- Open tasks: ${JSON.stringify(tasks.slice(0, 30), null, 2)}`);
+      lines.push(`- Open tasks: ${JSON.stringify(tasks.slice(0, 10))}`);
     }
   }
   if (/\b(backlog|follow-?ups?|later)\b/.test(lowered)) {
     const backlogItems = listBacklogItems();
     if (backlogItems.length) {
-      lines.push(`- Backlog items: ${JSON.stringify(backlogItems.slice(0, 30), null, 2)}`);
+      lines.push(`- Backlog items: ${JSON.stringify(backlogItems.slice(0, 10))}`);
     } else {
       lines.push("- Backlog items: none.");
     }
   }
   if (/\b(notes?|search|find)\b/.test(lowered)) {
-    const results = searchKnowledge(prompt, 8);
+    const results = searchKnowledge(prompt, 5);
     if (results.length) {
-      lines.push(`- Related notes/planner results: ${JSON.stringify(results, null, 2)}`);
+      lines.push(`- Related notes/planner results: ${JSON.stringify(results)}`);
     }
   }
   lines.push("Use this snapshot only as context. For edits, say OpenAssist must create or apply a pending approval request.");
@@ -12735,30 +16406,101 @@ function applyKnowledgePreview(requestID: string) {
     );
     changedPlannerDayID = request.preview.dayID;
   } else if (request.preview.kind === "planner_move") {
-    // Add the tasks to the target day...
-    const targetDay = loadPlannerDay(request.preview.dayID);
-    savePlannerDay(
-      request.preview.dayID,
-      appendToPlannerSection(targetDay.markdown, request.preview.section, request.preview.content)
-    );
+    const fromDayID = request.preview.fromDayID;
+    const isCrossDay = Boolean(fromDayID && fromDayID !== request.preview.dayID);
+    // For a cross-day move, carry the full STRUCTURED item (section/tags/details/
+    // steps/links/status) instead of re-adding it as a flat "- [ ] text" line, which
+    // would silently strip everything but the title.
+    const sourceItems = isCrossDay
+      ? parseDailyItemsFromMarkdown(loadPlannerDay(fromDayID).id, loadPlannerDay(fromDayID).markdown)
+      : [];
+    // Collect EVERY open item whose exact title matches a removeText: duplicate
+    // titles move as distinct tasks (instead of the first match moving twice
+    // while the second stays behind), and no fuzzy matching — these texts came
+    // from real titles at preview time.
+    const movedItems = (() => {
+      if (!isCrossDay) return [] as DailyItem[];
+      const wantedKeys = new Set(request.preview.removeTexts.map((text) => cleanDailyText(text).toLowerCase()).filter(Boolean));
+      return sourceItems.filter((item) => !item.checked && (
+        wantedKeys.has(dailyItemVisibleTitle(item).toLowerCase())
+        || wantedKeys.has(cleanDailyText(item.title).toLowerCase())
+      ));
+    })();
+    const movedTitles = new Set(movedItems.map((item) => dailyItemVisibleTitle(item).toLowerCase()));
+    if (movedItems.length) {
+      for (const item of movedItems) {
+        appendMovedDailyItemToDay({
+          ...item,
+          dayID: request.preview.dayID,
+          checked: false,
+          status: item.status === "doing" ? "doing" : "todo",
+          title: dailyItemVisibleTitle(item)
+        }, request.preview.dayID);
+      }
+    }
+    // Any open tasks that had no structured block (plain lines) still move as text.
+    const plainContent = request.preview.removeTexts
+      .filter((text) => !movedTitles.has(cleanDailyText(text).toLowerCase()))
+      .map((text) => `- [ ] ${text}`)
+      .join("\n");
+    if (plainContent.trim()) {
+      const targetDay = loadPlannerDay(request.preview.dayID);
+      savePlannerDay(
+        request.preview.dayID,
+        appendToPlannerSection(targetDay.markdown, request.preview.section, plainContent)
+      );
+    }
     changedPlannerDayID = request.preview.dayID;
     // ...then remove them from the source day so the move is complete.
-    if (request.preview.fromDayID && request.preview.fromDayID !== request.preview.dayID) {
-      const sourceDay = loadPlannerDay(request.preview.fromDayID);
-      const { markdown: nextSourceMarkdown } = removePlannerTasksByText(sourceDay.id, sourceDay.markdown, request.preview.removeTexts);
+    if (isCrossDay) {
+      // One removal per MOVED item (duplicates included) plus the plain-text
+      // leftovers; log when the source removal comes up short so a
+      // copy-instead-of-move is visible instead of silent.
+      const removalTexts = [
+        ...movedItems.map((item) => dailyItemVisibleTitle(item)),
+        ...request.preview.removeTexts.filter((text) => !movedTitles.has(cleanDailyText(text).toLowerCase()))
+      ];
+      const sourceDay = loadPlannerDay(fromDayID);
+      const { markdown: nextSourceMarkdown, removed } = removePlannerTasksByText(sourceDay.id, sourceDay.markdown, removalTexts);
+      if (removed.length < removalTexts.length) {
+        bridgeDebugLog(`planner_move removed ${removed.length}/${removalTexts.length} tasks from ${fromDayID}; some source copies may remain`);
+      }
       if (nextSourceMarkdown !== sourceDay.markdown) {
-        savePlannerDay(request.preview.fromDayID, nextSourceMarkdown);
-        changedSourceDayID = request.preview.fromDayID;
+        savePlannerDay(fromDayID, nextSourceMarkdown);
+        changedSourceDayID = fromDayID;
       }
     }
   } else if (request.preview.kind === "planner_backlog_move") {
-    for (const entry of request.preview.entries) {
-      upsertBacklogItem({
-        title: entry.text,
-        dayID: plannerBacklogID,
-        detailsMarkdown: `Moved from ${entry.dayID}.`
-      });
+    // Resolve every entry BEFORE mutating anything: an ambiguous title throws up
+    // front for the whole request instead of stopping mid-loop with some tasks
+    // already copied to the backlog (a retry would then duplicate them).
+    const resolvedBacklogMoves = request.preview.entries.map((entry) => {
       const day = loadPlannerDay(entry.dayID);
+      const dayItems = parseDailyItemsFromMarkdown(day.id, day.markdown);
+      return { entry, structured: findDailyItemByText(dayItems, entry.text) };
+    });
+    for (const { entry, structured } of resolvedBacklogMoves) {
+      const day = loadPlannerDay(entry.dayID);
+      if (structured) {
+        // Preserve the full item and APPEND the move note rather than replacing details.
+        const carriedDetails = [structured.detailsMarkdown, `Moved from ${entry.dayID}.`]
+          .filter(Boolean)
+          .join("\n\n");
+        appendMovedDailyItemToBacklog({
+          ...structured,
+          dayID: plannerBacklogID,
+          checked: false,
+          status: "todo",
+          title: dailyItemVisibleTitle(structured),
+          detailsMarkdown: carriedDetails
+        });
+      } else {
+        upsertBacklogItem({
+          title: entry.text,
+          dayID: plannerBacklogID,
+          detailsMarkdown: `Moved from ${entry.dayID}.`
+        });
+      }
       const { markdown: nextMarkdown } = removePlannerTasksByText(day.id, day.markdown, [entry.text]);
       if (nextMarkdown !== day.markdown) {
         savePlannerDay(entry.dayID, nextMarkdown);
@@ -12767,15 +16509,48 @@ function applyKnowledgePreview(requestID: string) {
     }
     emitPlannerBacklogChanged();
   } else if (request.preview.kind === "daily_item_upsert") {
-    upsertDailyItem(request.preview.item);
-    changedPlannerDayID = normalizePlannerDayID(String(request.preview.item.dayID ?? ""));
+    // Route to the correct store: a dayID of "backlog" means the backlog, not today.
+    if (String(request.preview.item.dayID ?? "").toLowerCase() === plannerBacklogID) {
+      upsertBacklogItem({ ...request.preview.item, dayID: plannerBacklogID });
+    } else {
+      upsertDailyItem(request.preview.item);
+      changedPlannerDayID = normalizePlannerDayID(String(request.preview.item.dayID ?? ""));
+    }
+  } else if (request.preview.kind === "daily_items_batch") {
+    for (const item of request.preview.items) {
+      const sourceLink = request.preview.sourceTarget;
+      const links = normalizeDailyLinks([
+        ...(Array.isArray(item.links) ? item.links : []),
+        ...(sourceLink ? [sourceLink] : [])
+      ]);
+      if (request.preview.target === "backlog") {
+        upsertBacklogItem({ ...item, dayID: plannerBacklogID, links });
+      } else {
+        const dayID = normalizePlannerDayID(String(item.dayID ?? request.preview.dayID ?? ""));
+        upsertDailyItem({ ...item, dayID, links });
+        changedPlannerDayIDs.add(dayID);
+      }
+    }
   } else if (request.preview.kind === "daily_item_delete") {
     deleteDailyItem(request.preview.dayID, request.preview.itemID);
     changedPlannerDayID = request.preview.dayID;
+  } else if (request.preview.kind === "reference_note_create") {
+    if (request.preview.ownerKind === "project") {
+      const created = createProjectNote(request.preview.ownerId);
+      renameProjectNote(request.preview.ownerId, created.note.id, request.preview.title);
+      saveProjectNote(request.preview.ownerId, created.note.id, request.preview.markdown);
+    } else {
+      const workspace = createThreadNote(request.preview.ownerId, request.preview.title);
+      const noteID = workspace.selectedNoteID ?? workspace.selectedNote?.id ?? "";
+      if (!noteID) throw new Error("I couldn't create the thread reference note.");
+      saveThreadNote(request.preview.ownerId, noteID, request.preview.markdown);
+    }
   } else if (request.preview.kind === "replace_markdown") {
     const item = readKnowledgeItem(request.preview.itemID);
     if (item.kind === "project_note" && item.target) {
       saveProjectNote(item.target.ownerId, item.target.noteId, request.preview.markdown);
+    } else if (item.kind === "thread_note" && item.target) {
+      saveThreadNote(item.target.ownerId, item.target.noteId, request.preview.markdown);
     } else if (item.kind === "planner_day" && item.dayID) {
       savePlannerDay(item.dayID, request.preview.markdown);
       changedPlannerDayID = item.dayID;
@@ -12823,8 +16598,616 @@ function knowledgeBacklinks(itemID: string) {
   return item.target ? loadNoteLinks(item.target, item.markdown) : { outgoingLinks: [], backlinks: [], graph: null };
 }
 
+function inferPlannerListFromTaskText(text: string) {
+  const projects = loadProjects();
+  const normalizedText = normalizePlannerListName(text);
+  if (!normalizedText) return undefined;
+  const paddedText = ` ${normalizedText} `;
+  const matches = projects.plannerLists.filter((list) => {
+    const title = normalizePlannerListName(list.title);
+    if (title.length < 4 || !paddedText.includes(` ${title} `)) return false;
+    // Only infer when the sentence signals placement ("for/to/in/under/at/my
+    // <list>") — a list name merely appearing in the words ("drive home by 5"
+    // with a "Home" list) is not intent to file the task there.
+    const escapedTitle = title.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return new RegExp(`(?:^|\\s)(?:for|to|in|into|under|onto|at|my)\\s+${escapedTitle}(?:\\s|$)`).test(normalizedText);
+  });
+  if (matches.length !== 1) return undefined;
+  const list = matches[0];
+  return { projectID: list.id, listName: list.title, area: list.area };
+}
+
+function payloadHasExplicitPlannerList(payload: JsonObject) {
+  return Boolean(cleanDailyText(payload.listID ?? payload.listId ?? payload.listName ?? payload.list ?? payload.projectID ?? payload.folderID));
+}
+
+function withInferredPlannerListForTaskPayload(payload: JsonObject): JsonObject {
+  if (payloadHasExplicitPlannerList(payload)) return payload;
+  const text = [
+    payload.title,
+    payload.text,
+    payload.task,
+    payload.detailsMarkdown,
+    payload.details,
+    payload.notes
+  ].map((value) => String(value ?? "").trim()).filter(Boolean).join("\n");
+  const inferred = inferPlannerListFromTaskText(text);
+  if (!inferred) return payload;
+  return {
+    ...payload,
+    projectID: inferred.projectID,
+    listName: inferred.listName,
+    area: payload.area ?? payload.category ?? inferred.area
+  };
+}
+
+function noteLinkTargetFromReferenceTarget(target: ReferenceNoteTarget): NoteLinkTarget {
+  return target.kind === "project"
+    ? { ownerKind: "project", ownerId: target.projectID, noteId: target.noteID }
+    : { ownerKind: "thread", ownerId: target.threadID, noteId: target.noteID };
+}
+
+function noteLinkTargetFromKnowledgeItemID(value: unknown): NoteLinkTarget | null {
+  const itemID = cleanDailyText(value);
+  if (!itemID) return null;
+  const parsed = parseKnowledgeItemID(itemID);
+  if (parsed?.target && (parsed.kind === "project_note" || parsed.kind === "thread_note" || parsed.kind === "planner_day")) {
+    return parsed.target;
+  }
+  return null;
+}
+
+function addUniqueNoteLinkTarget(targets: NoteLinkTarget[], target?: NoteLinkTarget | null) {
+  if (!target) return;
+  const key = noteLinkKey(target);
+  if (!targets.some((candidate) => noteLinkKey(candidate) === key)) targets.push(target);
+}
+
+function resolveTaskLinkTargetsFromPayload(payload: JsonObject): NoteLinkTarget[] {
+  const links = normalizeDailyLinks(payload.links);
+  addUniqueNoteLinkTarget(links, normalizeNoteLinkTarget(payload.link));
+  for (const key of ["noteItemID", "noteItemId", "linkedNoteItemID", "linkedNoteID", "referenceItemID", "sourceItemID"]) {
+    addUniqueNoteLinkTarget(links, noteLinkTargetFromKnowledgeItemID(payload[key]));
+  }
+  if (!links.length && noteLinkTargetFromKnowledgeItemID(payload.itemID)) {
+    addUniqueNoteLinkTarget(links, noteLinkTargetFromKnowledgeItemID(payload.itemID));
+  }
+
+  const noteTitle = cleanDailyText(payload.noteTitle ?? payload.linkedNoteTitle ?? payload.referenceTitle ?? payload.referenceNoteTitle)
+    || inferredLinkedTaskNoteTitle(payload);
+  const hasReferenceScope = Boolean(cleanDailyText(payload.listID ?? payload.listName ?? payload.list ?? payload.projectID ?? payload.threadID ?? payload.conversationID ?? payload.sessionID));
+  if (noteTitle && hasReferenceScope) {
+    try {
+      const target = resolveExistingReferenceTargetFromPayload({
+        ...payload,
+        noteTitle: noteTitle || payload.noteTitle || payload.referenceNoteTitle
+      });
+      addUniqueNoteLinkTarget(links, target ? noteLinkTargetFromReferenceTarget(target) : null);
+    } catch {
+      // Fall through to title search below.
+    }
+  }
+
+  if (!links.length && noteTitle) {
+    const match = searchKnowledge(noteTitle, 5)
+      .find((candidate) => (candidate.kind === "project_note" || candidate.kind === "thread_note") && readKnowledgeItem(candidate.id).target);
+    if (match) addUniqueNoteLinkTarget(links, readKnowledgeItem(match.id).target);
+  }
+  return links;
+}
+
+function taskLinkedNoteTitlesFromPayload(payload: JsonObject, links: NoteLinkTarget[]) {
+  const titles = new Set<string>();
+  const addTitle = (value: unknown) => {
+    const title = normalizePlannerListName(cleanDailyText(value));
+    if (title) titles.add(title);
+  };
+  addTitle(payload.noteTitle);
+  addTitle(payload.linkedNoteTitle);
+  addTitle(payload.referenceTitle);
+  addTitle(payload.referenceNoteTitle);
+  for (const key of ["noteItemID", "noteItemId", "linkedNoteItemID", "linkedNoteID", "referenceItemID", "sourceItemID"]) {
+    const itemID = cleanDailyText(payload[key]);
+    if (!itemID) continue;
+    try {
+      const item = readKnowledgeItem(itemID);
+      if (item.kind === "project_note" || item.kind === "thread_note") addTitle(item.title);
+    } catch {
+      // A stale/non-note item id should not block planner writes.
+    }
+  }
+  if (links.length) {
+    const linkKeys = new Set(links.map((link) => noteLinkKey(link)));
+    for (const item of knowledgeItems()) {
+      if (!item.target || (item.kind !== "project_note" && item.kind !== "thread_note")) continue;
+      if (linkKeys.has(noteLinkKey(item.target))) addTitle(item.title);
+    }
+  }
+  return titles;
+}
+
+function removeLinkedNoteNameListScope(payload: JsonObject, links: NoteLinkTarget[]): JsonObject {
+  if (!links.length) return payload;
+  if (cleanDailyText(payload.listID ?? payload.listId ?? payload.projectID ?? payload.folderID)) return payload;
+  const linkedNoteTitles = taskLinkedNoteTitlesFromPayload(payload, links);
+  if (!linkedNoteTitles.size) return payload;
+  const listName = cleanDailyText(payload.listName ?? payload.listTitle ?? payload.listLabel ?? (typeof payload.list === "string" ? payload.list : ""));
+  if (!listName || !linkedNoteTitles.has(normalizePlannerListName(listName))) return payload;
+  const next = { ...payload };
+  delete next.listName;
+  delete next.listTitle;
+  delete next.listLabel;
+  if (typeof next.list === "string") delete next.list;
+  delete next.projectName;
+  return next;
+}
+
+function inferredLinkedTaskNoteTitle(payload: JsonObject) {
+  const listName = cleanDailyText(payload.listName ?? payload.list ?? payload.projectName);
+  if (!listName) return "";
+  const body = [
+    payload.detailsMarkdown,
+    payload.details,
+    payload.description,
+    payload.title,
+    payload.text,
+    payload.query
+  ].map((value) => String(value ?? "").trim()).filter(Boolean).join("\n");
+  if (!body) return "";
+  const lower = body.toLowerCase();
+  const listLower = listName.toLowerCase();
+  if (lower.includes(`${listLower} note`) || /\blink(?:ed)?\b[\s\S]{0,80}\bnote\b/.test(lower)) return listName;
+  const bulletCount = body.split("\n").filter((line) => /^\s*[-*]\s+/.test(line)).length;
+  if (bulletCount >= 3 && /\b(measure|measurement|dimension|width|height|depth|clearance|hookup|outlet|wiring|checklist|fit)\b/i.test(body)) {
+    return listName;
+  }
+  return "";
+}
+
+function taskDetailsLookLikeLinkedNoteBody(detailsMarkdown: string) {
+  if (!detailsMarkdown) return false;
+  const bulletCount = detailsMarkdown.split("\n").filter((line) => /^\s*[-*]\s+/.test(line)).length;
+  return bulletCount >= 3
+    || (detailsMarkdown.length > 260 && /\b(measure|measurement|dimension|width|height|depth|clearance|hookup|outlet|wiring|checklist|spec|reference|fit)\b/i.test(detailsMarkdown));
+}
+
+function linkedNoteLabelForTaskDetails(payload: JsonObject) {
+  const label = cleanDailyText(payload.noteTitle ?? payload.linkedNoteTitle ?? payload.referenceTitle ?? payload.referenceNoteTitle ?? payload.listName ?? payload.list ?? payload.projectName);
+  if (!label) return "linked note";
+  return /\bnote\b/i.test(label) ? label : `${label} note`;
+}
+
+function compactLinkedTaskDetails(payload: JsonObject, links: NoteLinkTarget[]): JsonObject {
+  const detailsMarkdown = cleanDailyText(payload.detailsMarkdown ?? payload.details ?? payload.description);
+  if (!links.length || !taskDetailsLookLikeLinkedNoteBody(detailsMarkdown)) return payload;
+  const linkedNoteLabel = linkedNoteLabelForTaskDetails(payload);
+  const placeContext = /\b(home|house|site|property|on-site|onsite)\b/i.test(detailsMarkdown)
+    ? " at the home/site"
+    : "";
+  return {
+    ...payload,
+    detailsMarkdown: `Use the linked ${linkedNoteLabel}${placeContext} for detailed measurements, checks, and notes.`,
+    detailsMode: "replace",
+    replaceDetails: true
+  };
+}
+
+type KnowledgeWriteIntent = "task" | "reference" | "update" | "note_rewrite" | "mixed" | "unknown";
+type KnowledgeWriteTarget = "today" | "day" | "backlog" | "existing_note" | "existing_task" | "new_note_preview" | "clarification" | "unknown";
+
+type KnowledgeWriteDecision = {
+  intent: KnowledgeWriteIntent;
+  target: KnowledgeWriteTarget;
+  confidence: number;
+  requiresApproval: boolean;
+  reason: string;
+  proposedToolCall?: { name: string; arguments: JsonObject };
+  preparedPayload?: JsonObject;
+  candidates?: Array<{ id?: string; title: string; kind?: string; dayID?: string }>;
+};
+
+function writeRouterText(payload: JsonObject) {
+  return [
+    payload.userRequest,
+    payload.prompt,
+    payload.goal,
+    payload.query,
+    payload.oldTitle,
+    payload.currentTitle,
+    payload.title,
+    payload.text,
+    payload.content,
+    payload.detailsMarkdown,
+    payload.details,
+    payload.notes
+  ].map((value) => String(value ?? "").trim()).filter(Boolean).join("\n");
+}
+
+function classifyKnowledgeWriteIntent(payload: JsonObject, action = ""): KnowledgeWriteIntent {
+  const tool = action.toLowerCase();
+  if (/\b(update|rename|move|change|replace|complete|delete)\b/.test(tool)) return "update";
+  if (/\b(organize|replace_note|note_rewrite)\b/.test(tool)) return "note_rewrite";
+  if (/\b(reference|save_note)\b/.test(tool)) return "reference";
+  const text = writeRouterText(payload).toLowerCase();
+  const updateWords = /\b(update|rename|move|change|replace|rewrite|edit|append|add to existing|same task|old one|previous one)\b/.test(text);
+  if (updateWords) return "update";
+  const actionWords = /\b(call|email|text|message|visit|go|buy|pick up|pay|schedule|book|finish|review|check|follow up|follow-up|send|ask|do|make|add task|remind)\b/.test(text);
+  const referenceWords = /\b(measurement|dimension|width|height|depth|clearance|spec|model|serial|price|quote|link|url|address|phone|email|contact|checklist|notes?|reference|save this|remember this)\b/.test(text)
+    || taskDetailsLookLikeLinkedNoteBody(cleanDailyText(payload.detailsMarkdown ?? payload.details ?? payload.content ?? payload.text));
+  if (actionWords && referenceWords) return "mixed";
+  if (referenceWords && !actionWords) return "reference";
+  if (actionWords || cleanDailyText(payload.title ?? payload.task)) return "task";
+  return "unknown";
+}
+
+function planWriteCandidatesFromListResolution(resolution: PlannerListResolution) {
+  return resolution.status === "ambiguous"
+    ? resolution.candidates.map((list) => ({ id: list.id, title: list.title, kind: list.kind }))
+    : [];
+}
+
+function resolveExistingWriteTarget(intent: KnowledgeWriteIntent, payload: JsonObject, action = ""): KnowledgeWriteDecision | null {
+  const listResolution = resolvePlannerListFromDailyInput(payload);
+  if (listResolution.status === "not_found") {
+    return {
+      intent,
+      target: "clarification",
+      confidence: 0.2,
+      requiresApproval: true,
+      reason: `No existing Planner List matches "${listResolution.query}". New Lists are never created silently; ask the user to choose an existing List or approve creating one.`,
+      candidates: loadProjects().plannerLists.slice(0, 20).map((list) => ({ id: list.id, title: list.title, kind: list.kind }))
+    };
+  }
+  if (listResolution.status === "ambiguous") {
+    return {
+      intent,
+      target: "clarification",
+      confidence: 0.3,
+      requiresApproval: true,
+      reason: `"${listResolution.query}" matches more than one Planner List. Ask the user which existing List to use.`,
+      candidates: planWriteCandidatesFromListResolution(listResolution)
+    };
+  }
+
+  if (intent === "reference") {
+    try {
+      const target = resolveExistingReferenceTargetFromPayload(payload);
+      if (target) {
+        return {
+          intent,
+          target: "existing_note",
+          confidence: 0.9,
+          requiresApproval: false,
+          reason: `Reference content will append to the existing note "${target.title}".`,
+          preparedPayload: payload,
+          proposedToolCall: { name: action.includes("quick") ? "oa_quick_save_note" : "oa_request_reference", arguments: payload }
+        };
+      }
+    } catch (error) {
+      return {
+        intent,
+        target: "clarification",
+        confidence: 0.2,
+        requiresApproval: true,
+        reason: error instanceof Error ? error.message : "Reference target is unclear."
+      };
+    }
+    return {
+      intent,
+      target: "new_note_preview",
+      confidence: 0.65,
+      requiresApproval: true,
+      reason: "This reference needs a new note. New notes are never created silently, so OpenAssist will create a pending approval preview.",
+      proposedToolCall: { name: "oa_request_reference", arguments: payload }
+    };
+  }
+
+  return null;
+}
+
+function prepareSafeKnowledgeWrite(intent: KnowledgeWriteIntent, payload: JsonObject, action = ""): KnowledgeWriteDecision {
+  const explicit = resolveExistingWriteTarget(intent, payload, action);
+  if (explicit) return explicit;
+
+  const resolvedLinks = resolveTaskLinkTargetsFromPayload(payload);
+  const payloadWithoutNoteNameScope = removeLinkedNoteNameListScope(payload, resolvedLinks);
+  const preparedPayload = compactLinkedTaskDetails({ ...payloadWithoutNoteNameScope, links: normalizeDailyLinks([...(Array.isArray(payloadWithoutNoteNameScope.links) ? payloadWithoutNoteNameScope.links : []), ...resolvedLinks]) }, resolvedLinks);
+  const detailsMarkdown = cleanDailyText(preparedPayload.detailsMarkdown ?? preparedPayload.details ?? preparedPayload.description);
+  const wantsNoteLink = Boolean(cleanDailyText(payload.noteTitle ?? payload.linkedNoteTitle ?? payload.referenceNoteTitle ?? payload.noteItemID ?? payload.linkedNoteItemID));
+  if ((wantsNoteLink || taskDetailsLookLikeLinkedNoteBody(detailsMarkdown)) && !resolveTaskLinkTargetsFromPayload(preparedPayload).length) {
+    return {
+      intent: intent === "unknown" ? "mixed" : intent,
+      target: "new_note_preview",
+      confidence: 0.55,
+      requiresApproval: true,
+      reason: wantsNoteLink
+        ? "The task asks for a linked note, but no existing note could be resolved. Save or approve the note first, then link the task."
+        : "The task contains detailed note-like content but no existing linked note could be resolved. Save or approve the note first, then link the task.",
+      proposedToolCall: { name: "oa_request_reference", arguments: { ...payload, text: detailsMarkdown, title: payload.noteTitle ?? payload.title } },
+      preparedPayload
+    };
+  }
+
+  if (intent === "update") {
+    return {
+      intent,
+      target: "existing_task",
+      confidence: 0.75,
+      requiresApproval: false,
+      reason: "This is an update to an existing planner item; it can apply when the item match is unique.",
+      preparedPayload,
+      proposedToolCall: { name: "oa_update_daily_item", arguments: preparedPayload }
+    };
+  }
+
+  const dayID = String(preparedPayload.dayID ?? preparedPayload.targetDayID ?? preparedPayload.date ?? "").trim();
+  const normalizedTarget = (() => {
+    if (String(dayID).toLowerCase() === plannerBacklogID || /^(backlog|later|someday|unscheduled)$/i.test(dayID)) return "backlog";
+    if (dayID) return resolvePlannerDayIDForWrite(dayID) === plannerDayID() ? "today" : "day";
+    return "backlog";
+  })();
+  const targetTool = normalizedTarget === "backlog" ? "oa_request_backlog_item" : "oa_request_daily_item";
+  const targetPayload = {
+    ...preparedPayload,
+    dayID: normalizedTarget === "backlog"
+      ? plannerBacklogID
+      : resolvePlannerDayIDForWrite(dayID || String(preparedPayload.dayID ?? ""))
+  };
+  return {
+    intent: intent === "unknown" ? "task" : intent,
+    target: normalizedTarget,
+    confidence: 0.8,
+    requiresApproval: false,
+    reason: normalizedTarget === "backlog"
+      ? "No planner date was provided, so this routes to Backlog."
+      : "A planner date was provided, so this routes to that day.",
+    preparedPayload: targetPayload,
+    proposedToolCall: { name: targetTool, arguments: targetPayload }
+  };
+}
+
+function planKnowledgeWrite(payload: JsonObject, action = ""): KnowledgeWriteDecision {
+  const intent = classifyKnowledgeWriteIntent(payload, action || cleanDailyText(payload.action ?? payload.tool ?? ""));
+  return prepareSafeKnowledgeWrite(intent, payload, action || cleanDailyText(payload.action ?? payload.tool ?? ""));
+}
+
+function assertSafeImmediateKnowledgeWrite(payload: JsonObject, action: string) {
+  const decision = planKnowledgeWrite(payload, action);
+  if (decision.requiresApproval) {
+    const candidateText = decision.candidates?.length
+      ? ` Candidates: ${decision.candidates.map((candidate) => candidate.title).join(", ")}.`
+      : "";
+    throw new Error(`${decision.reason}${candidateText}`);
+  }
+  return decision.preparedPayload ?? payload;
+}
+
+function directDailyItemUpsertFromPayload(payload: JsonObject) {
+  const preparedPayload = assertSafeImmediateKnowledgeWrite(withInferredPlannerListForTaskPayload(payload), "request_daily_item");
+  const preview = knowledgePreviewForRequest("request_daily_item", preparedPayload);
+  if (!preview || preview.kind !== "daily_item_upsert") {
+    throw new Error("Could not create the planner task. Provide at least a title and a date such as today or tomorrow.");
+  }
+  if (String(preview.item.dayID ?? "").toLowerCase() === plannerBacklogID) {
+    const result = upsertBacklogItem({ ...preview.item, dayID: plannerBacklogID });
+    return { status: "applied", target: "backlog", item: result.item, items: result.items };
+  }
+  const result = upsertDailyItem(preview.item);
+  return { status: "applied", target: "day", dayID: result.day.id, item: result.item, items: result.items };
+}
+
+function quickTaskPayload(args: JsonObject): JsonObject {
+  const title = cleanDailyText(args.title ?? args.text ?? args.task);
+  if (!title) throw new Error("What task should I add?");
+  const when = cleanDailyText(args.when ?? args.dayID ?? args.date ?? args.target);
+  const shouldUseBacklog = !when || /^(backlog|later|someday|no date|none|unscheduled)$/i.test(when);
+  // The tool schema advertises reminderAt/dueAt/notifyAt, so they MUST survive
+  // into the payload — dropping them here is why "remind me at 5" tasks were
+  // saved without any reminder time. Only set the keys when a value was given:
+  // normalizeDailyItemInput treats a present-but-empty reminderAt as "clear".
+  const reminderAt = cleanDailyText(args.reminderAt ?? args.dueAt ?? args.notifyAt);
+  const reminderTimezone = cleanDailyText(args.reminderTimezone ?? args.timezone ?? args.timeZone);
+  return withInferredPlannerListForTaskPayload({
+    ...(reminderAt ? { reminderAt } : {}),
+    ...(reminderAt && reminderTimezone ? { reminderTimezone } : {}),
+    title,
+    dayID: shouldUseBacklog ? plannerBacklogID : when,
+    listID: args.listID,
+    listName: args.listName ?? args.list,
+    projectID: args.projectID,
+    folderID: args.folderID,
+    area: args.area ?? args.category,
+    category: args.category,
+    section: args.section,
+    tags: args.tags,
+    detailsMarkdown: args.detailsMarkdown ?? args.details ?? args.notes,
+    detailsMode: args.detailsMode,
+    replaceDetails: args.replaceDetails,
+    links: args.links,
+    link: args.link,
+    noteItemID: args.noteItemID ?? args.noteItemId,
+    linkedNoteItemID: args.linkedNoteItemID,
+    referenceItemID: args.referenceItemID,
+    noteTitle: args.noteTitle ?? args.linkedNoteTitle ?? args.referenceTitle,
+    referenceNoteTitle: args.referenceNoteTitle,
+    threadID: args.threadID,
+    goal: args.goal ?? `Quick add task: ${title}`
+  });
+}
+
+function quickReadKnowledgeTarget(args: JsonObject) {
+  const target = cleanDailyText(args.target ?? args.query ?? args.text ?? "");
+  const normalized = target.toLowerCase();
+  if (!target || /^(today|today planner|planner today)$/i.test(target)) {
+    return readKnowledgeItem(`planner_day:planner:global:${plannerDayID()}`);
+  }
+  if (/^(tomorrow|tomorrow planner|planner tomorrow)$/i.test(target)) {
+    return readKnowledgeItem(`planner_day:planner:global:${plannerDayOffset(plannerDayID(), 1)}`);
+  }
+  if (/^(backlog|planner backlog)$/i.test(target)) {
+    return { items: listBacklogItems() };
+  }
+  if (/\b(open|unfinished|incomplete)\b/.test(normalized) && /\b(task|tasks|todo|todos|to-do|to-dos)\b/.test(normalized)) {
+    return { tasks: listOpenKnowledgeTasks(Number(args.limit ?? 25)) };
+  }
+  const dayID = (() => {
+    try {
+      return resolvePlannerDayIDForWrite(target);
+    } catch {
+      return null;
+    }
+  })();
+  if (dayID && dayID !== plannerBacklogID) {
+    return readKnowledgeItem(`planner_day:planner:global:${dayID}`);
+  }
+  return { results: searchKnowledge(target, Number(args.limit ?? 8), typeof args.source === "string" ? args.source : undefined) };
+}
+
+function approvalPreviewSummary(preview?: KnowledgePreview) {
+  if (!preview) return undefined;
+  if (preview.kind === "replace_markdown") {
+    return {
+      kind: preview.kind,
+      itemID: preview.itemID,
+      title: preview.title,
+      addedCharacters: Math.max(0, preview.markdown.length - (preview.previousMarkdown?.length ?? 0))
+    };
+  }
+  if (preview.kind === "daily_item_upsert") {
+    return { kind: preview.kind, dayID: preview.item.dayID, title: preview.item.title, area: preview.item.area, section: preview.item.section };
+  }
+  if (preview.kind === "daily_items_batch") {
+    return { kind: preview.kind, sourceTitle: preview.sourceTitle, target: preview.target, dayID: preview.dayID, count: preview.items.length };
+  }
+  if (preview.kind === "reference_note_create") {
+    return { kind: preview.kind, ownerKind: preview.ownerKind, ownerId: preview.ownerId, title: preview.title, characters: preview.markdown.length };
+  }
+  if (preview.kind === "planner_append") {
+    return { kind: preview.kind, dayID: preview.dayID, section: preview.section, characters: preview.content.length };
+  }
+  if (preview.kind === "planner_move") {
+    return { kind: preview.kind, fromDayID: preview.fromDayID, dayID: preview.dayID, count: preview.removeTexts.length };
+  }
+  if (preview.kind === "planner_backlog_move") {
+    return { kind: preview.kind, count: preview.entries.length };
+  }
+  if (preview.kind === "daily_item_delete") {
+    return { kind: preview.kind, dayID: preview.dayID, itemID: preview.itemID };
+  }
+  return undefined;
+}
+
+function knowledgeApprovalResult(request: KnowledgeWriteRequest, includePreview = false) {
+  return {
+    id: request.id,
+    requestID: request.id,
+    action: request.action,
+    source: request.source,
+    status: request.status,
+    goal: request.goal,
+    createdAt: request.createdAt,
+    updatedAt: request.updatedAt,
+    appliedAt: request.appliedAt,
+    rejectedAt: request.rejectedAt,
+    preview: includePreview ? request.preview : approvalPreviewSummary(request.preview)
+  };
+}
+
 function knowledgeToolResult(action: string, args: JsonObject, source: KnowledgeWriteRequest["source"] = "mcp") {
   switch (action) {
+    case "oa_plan_write":
+    case "knowledge_plan_write":
+      return { plan: planKnowledgeWrite(args, cleanDailyText(args.action ?? args.tool ?? action)) };
+    case "oa_quick_add_task":
+    case "knowledge_quick_add_task":
+      return directDailyItemUpsertFromPayload(quickTaskPayload(args));
+    case "oa_quick_save_note":
+    case "knowledge_quick_save_note": {
+      const text = cleanDailyText(args.text ?? args.content ?? args.note ?? args.details);
+      if (!text) throw new Error("What reference note should I save?");
+      return {
+        request: createKnowledgeWriteRequest("request_reference", {
+          title: args.title ?? args.topic ?? args.label,
+          text,
+          listID: args.listID,
+          listName: args.listName ?? args.list,
+          projectID: args.projectID,
+          threadID: args.threadID,
+          itemID: args.itemID,
+          noteTitle: args.noteTitle,
+          section: args.section,
+          goal: args.goal ?? `Quick save reference: ${cleanDailyText(args.title ?? args.topic ?? text).slice(0, 80)}`
+        }, source)
+      };
+    }
+    case "oa_quick_read":
+    case "knowledge_quick_read":
+      return quickReadKnowledgeTarget(args);
+    case "oa_memory_save":
+    case "knowledge_memory_save": {
+      const saved = saveAssistantMemory({
+        name: cleanDailyText(args.name ?? args.title) ?? "",
+        description: cleanDailyText(args.description ?? args.summary) ?? "",
+        content: String(args.content ?? args.text ?? args.markdown ?? "").trim(),
+        type: cleanDailyText(args.type),
+        originThreadID: cleanDailyText(args.threadID)
+      });
+      return {
+        status: "applied",
+        memory: { slug: saved.slug, updated: saved.updated },
+        message: saved.updated ? "Memory updated." : "Memory saved."
+      };
+    }
+    case "oa_memory_list":
+    case "knowledge_memory_list": {
+      const memories = listAssistantMemories();
+      return {
+        count: memories.length,
+        index: readAssistantMemoryIndex(8000),
+        memories: memories.map((memory) => ({
+          name: memory.name,
+          slug: memory.slug,
+          description: memory.description,
+          type: memory.type,
+          updatedAt: memory.updatedAt
+        }))
+      };
+    }
+    case "oa_memory_read":
+    case "knowledge_memory_read": {
+      const requested = cleanDailyText(args.name ?? args.slug);
+      if (!requested) throw new Error("Which memory should I read?");
+      const memory = readAssistantMemory(requested);
+      if (!memory) throw new Error(`No memory named "${requested}". Use oa_memory_list to see saved memories.`);
+      return { memory };
+    }
+    case "oa_memory_delete":
+    case "knowledge_memory_delete": {
+      const requested = cleanDailyText(args.name ?? args.slug);
+      if (!requested) throw new Error("Which memory should I delete?");
+      const deleted = deleteAssistantMemory(requested);
+      return { status: deleted ? "applied" : "not-found", deleted };
+    }
+    case "oa_list_approvals":
+    case "knowledge_list_approvals": {
+      const status = String(args.status ?? "pending").trim() as KnowledgeWriteRequest["status"];
+      const allowedStatuses = new Set<KnowledgeWriteRequest["status"]>(["pending", "applied", "rejected"]);
+      const limit = Math.max(1, Math.min(50, Number(args.limit ?? 10) || 10));
+      const requests = listKnowledgeWriteRequests(allowedStatuses.has(status) ? status : "pending").slice(0, limit);
+      return { approvals: requests.map((request) => knowledgeApprovalResult(request)), count: requests.length };
+    }
+    case "oa_apply_approval":
+    case "knowledge_apply_approval": {
+      const requestID = cleanDailyText(args.requestID ?? args.id);
+      if (!requestID) throw new Error("Which approval should I apply? Provide requestID.");
+      return { approval: knowledgeApprovalResult(applyKnowledgePreview(requestID), true) };
+    }
+    case "oa_reject_approval":
+    case "knowledge_reject_approval": {
+      const requestID = cleanDailyText(args.requestID ?? args.id);
+      if (!requestID) throw new Error("Which approval should I reject? Provide requestID.");
+      return { approval: knowledgeApprovalResult(rejectKnowledgeRequest(requestID), true) };
+    }
     case "oa_search":
     case "knowledge_search":
       return { results: searchKnowledge(String(args.query ?? ""), Number(args.limit ?? 20), typeof args.source === "string" ? args.source : undefined) };
@@ -12838,21 +17221,70 @@ function knowledgeToolResult(action: string, args: JsonObject, source: Knowledge
           limit: Number(args.limit ?? 5)
         })
       };
+    case "oa_personal_recall_search":
+    case "knowledge_personal_recall_search":
+      return {
+        results: searchPersonalRecallSources(String(args.query ?? ""), {
+          phase: personalRecallPhase(args.phase ?? args.sourceGroup ?? args.source),
+          fromDate: typeof args.fromDate === "string" ? args.fromDate : undefined,
+          toDate: typeof args.toDate === "string" ? args.toDate : undefined,
+          limit: Number(args.limit ?? 8)
+        })
+      };
     case "oa_read_search_result":
     case "knowledge_read_search_result":
       return readKnowledgeTimelineResult(String(args.resultID ?? args.id ?? ""), Number(args.window ?? 2));
+    case "oa_personal_recall_read":
+    case "knowledge_personal_recall_read":
+      return readPersonalRecallResult(String(args.resultID ?? args.id ?? ""), Number(args.window ?? 2));
     case "oa_read":
     case "knowledge_read":
       return readKnowledgeItem(String(args.itemID ?? args.id ?? ""));
     case "oa_read_today":
-    case "knowledge_read_today":
-      return readKnowledgeItem(`planner_day:planner:global:${normalizePlannerDayID(String(args.dayID ?? args.date ?? ""))}`);
+    case "knowledge_read_today": {
+      const reqDayID = String(args.dayID ?? args.date ?? "").trim();
+      const actualDayID = reqDayID || plannerDayID();
+      return readKnowledgeItem(`planner_day:planner:global:${normalizePlannerDayID(actualDayID)}`);
+    }
     case "oa_list_daily_items":
     case "knowledge_daily_items":
-      return { items: listDailyItems(normalizePlannerDayID(String(args.dayID ?? args.date ?? ""))) };
+      return dailyItemsKnowledgeResult(String(args.dayID ?? args.date ?? ""));
     case "oa_list_backlog_items":
     case "knowledge_backlog_items":
       return { items: listBacklogItems() };
+    case "oa_list_planner_categories":
+    case "knowledge_planner_categories":
+      return { categories: loadPlannerCategories(), lists: loadProjects().plannerLists.map((project) => ({
+        id: project.id,
+        title: project.title,
+        kind: project.kind,
+        area: project.area,
+        plannerOnly: project.plannerOnly === true
+      })), projects: loadProjects().projects.map((project) => ({
+        id: project.id,
+        title: project.title,
+        kind: project.kind,
+        area: project.area
+      })) };
+    case "oa_list_planner_lists":
+    case "knowledge_planner_lists":
+      return { lists: listPlannerLists() };
+    case "oa_connector_status":
+    case "knowledge_connector_status": {
+      const snapshot = loadConnectorSnapshot();
+      return {
+        gwsStatus: snapshot.gwsStatus,
+        accounts: snapshot.accounts.map((account) => ({
+          id: account.id,
+          provider: account.provider,
+          label: account.label,
+          enabledServiceIDs: account.enabledServiceIDs,
+          lastSyncAt: account.lastSyncAt
+        })),
+        reviewItemCount: snapshot.items.filter((item) => ["candidate", "review", "failed", "conflict"].includes(item.status)).length,
+        services: snapshot.services
+      };
+    }
     case "oa_read_journal":
     case "knowledge_read_journal":
       return readKnowledgeItem(`journal_day:planner:global:${normalizePlannerDayID(String(args.dayID ?? args.date ?? ""))}`);
@@ -12869,25 +17301,36 @@ function knowledgeToolResult(action: string, args: JsonObject, source: Knowledge
       );
       return { item: result.item, checked, dayID: result.day.id };
     }
+    case "oa_update_daily_item":
+    case "knowledge_update_daily_item": {
+      const result = updateDailyItemByText(assertSafeImmediateKnowledgeWrite(args, "oa_update_daily_item"));
+      return { status: "applied", item: result.item, items: result.items, dayID: result.day.id };
+    }
     case "oa_backlinks":
       return knowledgeBacklinks(String(args.itemID ?? args.id ?? ""));
     case "oa_request_backlog_item":
     case "knowledge_request_backlog_item": {
-      const result = upsertBacklogItem({ ...args, dayID: plannerBacklogID });
+      const preparedPayload = assertSafeImmediateKnowledgeWrite({ ...args, dayID: plannerBacklogID }, "request_backlog_item");
+      const result = upsertBacklogItem({ ...preparedPayload, dayID: plannerBacklogID, links: resolveTaskLinkTargetsFromPayload(preparedPayload) });
       return { status: "applied", item: result.item, items: result.items };
     }
+    case "oa_request_daily_item":
+    case "knowledge_request_daily_item":
+      return directDailyItemUpsertFromPayload(args);
     case "oa_note_style_guide":
     case "knowledge_note_style_guide":
       return { guide: openAssistNoteStyleGuide() };
     case "oa_request_add":
+    case "oa_request_reference":
     case "oa_request_patch":
     case "oa_request_organize":
     case "oa_request_carry_forward":
     case "knowledge_request_carry_forward":
     case "oa_request_move_to_backlog":
     case "knowledge_request_move_to_backlog":
-    case "oa_request_daily_item":
-    case "knowledge_request_daily_item":
+    case "oa_request_tasks_from_note":
+    case "knowledge_request_tasks_from_note":
+    case "knowledge_request_reference":
     case "knowledge_request_organize":
       return {
         request: createKnowledgeWriteRequest(
@@ -12895,14 +17338,236 @@ function knowledgeToolResult(action: string, args: JsonObject, source: Knowledge
               : action === "oa_request_patch" ? "request_patch"
               : action === "oa_request_carry_forward" || action === "knowledge_request_carry_forward" ? "request_carry_forward"
                 : action === "oa_request_move_to_backlog" || action === "knowledge_request_move_to_backlog" ? "request_move_to_backlog"
-                : action === "oa_request_daily_item" || action === "knowledge_request_daily_item" ? "request_daily_item"
-                : "request_organize",
+                : action === "oa_request_tasks_from_note" || action === "knowledge_request_tasks_from_note" ? "request_tasks_from_note"
+                  : action === "oa_request_reference" || action === "knowledge_request_reference" ? "request_reference"
+                    : "request_organize",
           args,
           source
         )
       };
     default:
       throw new Error(`Unknown knowledge action: ${action}`);
+  }
+}
+
+function finitePositiveNumber(value: unknown) {
+  const parsed = typeof value === "number" ? value : Number(String(value ?? "").trim());
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
+}
+
+function gmailSyncProgressMessage(accountLabel: string, importedCount: number, reviewCount: number) {
+  if (importedCount > 0) {
+    return `Gmail sync complete for ${accountLabel}. Found ${importedCount} actionable ${importedCount === 1 ? "candidate" : "candidates"}. ${reviewCount} ${reviewCount === 1 ? "item is" : "items are"} waiting in Review Inbox.`;
+  }
+  return `Gmail sync complete for ${accountLabel}. No new actionable email candidates found.`;
+}
+
+function connectorItemTitles(items: ConnectorItem[] | undefined) {
+  return (items ?? [])
+    .slice(0, 3)
+    .map((item) => item.title.trim())
+    .filter(Boolean);
+}
+
+function resolveGmailConnectorAccount(args: JsonObject) {
+  const snapshot = loadConnectorSnapshot();
+  const accountID = String(args.accountID ?? args.accountId ?? "").trim();
+  const accountLabel = String(args.accountLabel ?? args.label ?? "").trim().toLowerCase();
+  return snapshot.accounts.find((candidate) =>
+    candidate.provider === "google"
+    && (candidate.id === accountID || (accountLabel && candidate.label.toLowerCase() === accountLabel))
+  ) ?? snapshot.accounts.find((candidate) => candidate.provider === "google" && candidate.enabledServiceIDs.includes("gmail"));
+}
+
+function connectorGmailResultItems(items: ConnectorItem[]) {
+  return items.map((item) => ({
+    id: item.id,
+    sourceService: item.sourceService,
+    externalId: item.externalId,
+    threadId: item.threadId,
+    title: item.title,
+    kind: item.kind,
+    status: item.status,
+    person: item.person,
+    date: item.date,
+    snippet: item.snippet
+  }));
+}
+
+function connectorMessageResultItems(items: Awaited<ReturnType<typeof searchLocalMessages>>["messages"]) {
+  return items.map((item) => ({
+    id: item.id,
+    guid: item.guid,
+    handle: item.handle,
+    text: item.text,
+    date: item.date,
+    isFromMe: item.isFromMe
+  }));
+}
+
+async function knowledgeToolResultAsync(action: string, args: JsonObject, source: KnowledgeWriteRequest["source"] = "mcp") {
+  switch (action) {
+    case "oa_personal_recall":
+    case "knowledge_personal_recall":
+      return runSparkPersonalRecall(args);
+    case "oa_connector_sync_gmail":
+    case "knowledge_connector_sync_gmail": {
+      const account = resolveGmailConnectorAccount(args);
+      if (!account) throw new Error("No Google Gmail connector account is enabled.");
+      const syncOptions: GmailSyncOptions = {
+        userIntent: String(args.userIntent ?? args.intent ?? args.request ?? "").trim() || undefined,
+        timeframeDays: finitePositiveNumber(args.timeframeDays ?? args.days ?? args.lookbackDays),
+        maxResults: finitePositiveNumber(args.maxResults ?? args.limit)
+      };
+      const progressID = `gmail-sync-${randomUUID()}`;
+      const startedAt = new Date().toISOString();
+      emitConnectorSyncProgress({
+        id: progressID,
+        provider: "google",
+        serviceID: "gmail",
+        accountID: account.id,
+        accountLabel: account.label,
+        status: "running",
+        message: `Syncing Gmail for ${account.label}...`,
+        startedAt
+      });
+      try {
+        const result = await syncGmailMetadataToReviewInbox(account.id, syncOptions);
+        const reviewCount = result.reviewItems.length;
+        emitConnectorSyncProgress({
+          id: progressID,
+          provider: "google",
+          serviceID: "gmail",
+          accountID: account.id,
+          accountLabel: account.label,
+          status: "completed",
+          message: gmailSyncProgressMessage(account.label, result.importedCount, reviewCount),
+          importedCount: result.importedCount,
+          reviewCount,
+          itemTitles: connectorItemTitles(result.reviewItems),
+          startedAt,
+          finishedAt: new Date().toISOString()
+        });
+        return {
+          ok: true,
+          accountID: account.id,
+          accountLabel: account.label,
+          importedCount: result.importedCount,
+          queries: result.queries,
+          reviewItems: connectorGmailResultItems(result.reviewItems)
+        };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        emitConnectorSyncProgress({
+          id: progressID,
+          provider: "google",
+          serviceID: "gmail",
+          accountID: account.id,
+          accountLabel: account.label,
+          status: "failed",
+          message: `Gmail sync failed for ${account.label}: ${message}`,
+          startedAt,
+          finishedAt: new Date().toISOString(),
+          error: message
+        });
+        throw error;
+      }
+    }
+    case "oa_connector_search_gmail":
+    case "knowledge_connector_search_gmail": {
+      const account = resolveGmailConnectorAccount(args);
+      if (!account) throw new Error("No Google Gmail connector account is enabled.");
+      const searchOptions: GmailSearchOptions = {
+        query: String(args.gmailQuery ?? args.query ?? "").trim() || undefined,
+        userIntent: String(args.userIntent ?? args.intent ?? args.request ?? args.query ?? "").trim() || undefined,
+        timeframeDays: finitePositiveNumber(args.timeframeDays ?? args.days ?? args.lookbackDays),
+        maxResults: finitePositiveNumber(args.maxResults ?? args.limit)
+      };
+      const result = await searchGmailMetadata(account.id, searchOptions);
+      return {
+        ok: true,
+        accountID: account.id,
+        accountLabel: account.label,
+        resultCount: result.resultCount,
+        queries: result.queries,
+        messages: connectorGmailResultItems(result.messages)
+      };
+    }
+    case "oa_connector_search_messages":
+    case "knowledge_connector_search_messages": {
+      const searchOptions: LocalMessagesSearchOptions = {
+        query: String(args.query ?? "").trim() || undefined,
+        userIntent: String(args.userIntent ?? args.intent ?? args.request ?? args.query ?? "").trim() || undefined,
+        timeframeDays: finitePositiveNumber(args.timeframeDays ?? args.days ?? args.lookbackDays),
+        maxResults: finitePositiveNumber(args.maxResults ?? args.limit)
+      };
+      const result = await searchLocalMessages(searchOptions);
+      return {
+        ok: true,
+        resultCount: result.resultCount,
+        queryTerms: result.queryTerms,
+        messages: connectorMessageResultItems(result.messages)
+      };
+    }
+    case "oa_apple_add_reminder":
+    case "knowledge_apple_add_reminder": {
+      const title = String(args.title ?? "").trim();
+      if (!title) throw new Error("What should I add to Apple Reminders?");
+      const reminder = await addAppleReminder({
+        title,
+        notes: String(args.notes ?? args.details ?? "").trim() || undefined,
+        dueDate: String(args.dueDate ?? args.due ?? "").trim() || undefined,
+        calendar: String(args.calendar ?? args.list ?? "").trim() || undefined
+      });
+      return { ok: true, status: "applied", reminder };
+    }
+    case "oa_apple_list_reminders":
+    case "knowledge_apple_list_reminders": {
+      const reminders = await listAppleReminders({
+        calendar: String(args.calendar ?? args.list ?? "").trim() || undefined,
+        dueBefore: String(args.dueBefore ?? args.endDate ?? "").trim() || undefined,
+        dueAfter: String(args.dueAfter ?? args.startDate ?? "").trim() || undefined,
+        includeCompleted: args.includeCompleted === true,
+        limit: finitePositiveNumber(args.limit ?? args.maxResults)
+      });
+      return { ok: true, resultCount: reminders.length, reminders };
+    }
+    case "oa_apple_complete_reminder":
+    case "knowledge_apple_complete_reminder": {
+      const id = String(args.id ?? args.reminderID ?? "").trim();
+      if (!id) throw new Error("Which Apple Reminder should I update? List reminders first if you need the ID.");
+      const reminder = await completeAppleReminder(id, args.completed !== false);
+      return { ok: true, status: "applied", reminder };
+    }
+    case "oa_apple_add_event":
+    case "knowledge_apple_add_event": {
+      const title = String(args.title ?? "").trim();
+      const startDate = String(args.startDate ?? args.start ?? "").trim();
+      if (!title) throw new Error("What Apple Calendar event should I create?");
+      if (!startDate) throw new Error("What start date/time should I use for the Apple Calendar event?");
+      const event = await addAppleCalendarEvent({
+        title,
+        startDate,
+        endDate: String(args.endDate ?? args.end ?? "").trim() || undefined,
+        isAllDay: args.isAllDay === true,
+        notes: String(args.notes ?? args.details ?? "").trim() || undefined,
+        location: String(args.location ?? "").trim() || undefined,
+        calendar: String(args.calendar ?? "").trim() || undefined
+      });
+      return { ok: true, status: "applied", event };
+    }
+    case "oa_apple_list_events":
+    case "knowledge_apple_list_events": {
+      const events = await listAppleCalendarEvents({
+        startDate: String(args.startDate ?? args.start ?? "").trim() || undefined,
+        endDate: String(args.endDate ?? args.end ?? "").trim() || undefined,
+        calendar: String(args.calendar ?? "").trim() || undefined,
+        limit: finitePositiveNumber(args.limit ?? args.maxResults)
+      });
+      return { ok: true, resultCount: events.length, events };
+    }
+    default:
+      return knowledgeToolResult(action, args, source);
   }
 }
 
@@ -14192,7 +18857,7 @@ function parseFrontmatter(markdown: string) {
   const result: Record<string, string> = {};
   for (const line of block.split(/\r?\n/)) {
     const match = /^([A-Za-z0-9_-]+):\s*(.*)$/.exec(line);
-    if (match) result[match[1]] = match[2].replace(/^["']|["']$/g, "").trim();
+    if (match) result[match[1].toLowerCase()] = match[2].replace(/^["']|["']$/g, "").trim();
   }
   return result;
 }
@@ -14214,18 +18879,7 @@ function titleFromSkill(id: string, name?: unknown) {
     .join(" ");
 }
 
-type RemoteAccessNetworkMode = "localOnly" | "localNetwork" | "tailscale";
-const tailscaleMacDownloadURL = "https://tailscale.com/download/mac";
-const tailscaleAppCandidates = [
-  "/Applications/Tailscale.app",
-  path.join(os.homedir(), "Applications", "Tailscale.app")
-];
-const tailscaleCLICandidates = [
-  "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
-  path.join(os.homedir(), "Applications", "Tailscale.app", "Contents", "MacOS", "Tailscale"),
-  "/usr/local/bin/tailscale",
-  "/opt/homebrew/bin/tailscale"
-];
+type RemoteAccessNetworkMode = "localOnly" | "localNetwork";
 const systemCloudflaredCandidates = [
   "/opt/homebrew/bin/cloudflared",
   "/usr/local/bin/cloudflared",
@@ -14330,7 +18984,7 @@ async function installCloudflaredHelper() {
 
 function normalizeRemoteAccessNetworkMode(value: unknown): RemoteAccessNetworkMode {
   if (value === "localNetwork" || value === "easyQR") return "localNetwork";
-  return value === "tailscale" ? "tailscale" : "localOnly";
+  return "localOnly";
 }
 
 function normalizedRemoteAccessPort(value: unknown) {
@@ -14357,14 +19011,6 @@ function remoteAccessBaseURLFromHost(rawHost: string, rawPort: unknown) {
   }
 }
 
-function isTailscaleIPv4Address(value: string) {
-  const segments = value.split(".");
-  if (segments.length !== 4) return false;
-  const parts = segments.map((part) => Number(part));
-  if (!parts.every((part) => Number.isInteger(part) && part >= 0 && part <= 255)) return false;
-  return parts[0] === 100 && parts[1] >= 64 && parts[1] <= 127;
-}
-
 function isPrivateIPv4Address(value: string) {
   const segments = value.split(".");
   if (segments.length !== 4) return false;
@@ -14387,63 +19033,42 @@ function detectedLocalNetworkAddress() {
   return "";
 }
 
-function detectedTailscaleNetworkAddress() {
-  for (const entries of Object.values(os.networkInterfaces())) {
-    for (const entry of entries ?? []) {
-      if (entry.family === "IPv4" && !entry.internal && isTailscaleIPv4Address(entry.address)) {
-        return entry.address;
-      }
-    }
-  }
-  return "";
-}
-
 function firstExistingPath(candidates: string[]) {
   return candidates.find((candidate) => fs.existsSync(candidate)) ?? "";
 }
 
-async function detectedTailscaleCLIAddress(cliPath: string) {
-  if (!cliPath) return "";
-  try {
-    const { stdout } = await execFileAsync(cliPath, ["ip", "-4"], { timeout: 1200 });
-    return stdout
-      .split(/\s+/)
-      .map((value) => value.trim())
-      .find(isTailscaleIPv4Address) ?? "";
-  } catch {
-    return "";
-  }
-}
-
-async function remoteAccessTailscaleStatusSnapshot() {
-  const appPath = firstExistingPath(tailscaleAppCandidates);
-  const cliPath = firstExistingPath(tailscaleCLICandidates);
-  const detectedHost = detectedTailscaleNetworkAddress() || await detectedTailscaleCLIAddress(cliPath);
-  const installed = Boolean(appPath || cliPath);
-  const running = Boolean(detectedHost);
-  return {
-    installed,
-    running,
-    appPath,
-    detectedHost,
-    installURL: tailscaleMacDownloadURL,
-    statusMessage: running
-      ? `Connected as ${detectedHost}.`
-      : installed
-        ? "Installed but not connected. Open Tailscale, use Login or Reconnect, then check again."
-        : "Not installed. Install Tailscale, then sign in."
-  };
-}
+const openAssistInfoPlistCacheMs = 5 * 60 * 1000;
+const openAssistInfoPlistCache = new Map<string, { expiresAt: number; value: string }>();
+const openAssistInfoPlistInFlight = new Map<string, Promise<string>>();
 
 async function readOpenAssistInfoPlist(key: string, fallback: string) {
   const plist = path.join(openAssistRepoRoot(), "dist/Open Assist.app/Contents/Info.plist");
-  if (!fs.existsSync(plist)) return fallback;
-  try {
-    const { stdout } = await execFileAsync("/usr/bin/plutil", ["-extract", key, "raw", "-o", "-", plist]);
-    return stdout.trim() || fallback;
-  } catch {
-    return fallback;
-  }
+  const cacheKey = `${plist}:${key}:${fallback}`;
+  const now = Date.now();
+  const cached = openAssistInfoPlistCache.get(cacheKey);
+  if (cached && cached.expiresAt > now) return cached.value;
+  const inFlight = openAssistInfoPlistInFlight.get(cacheKey);
+  if (inFlight) return inFlight;
+
+  const readPromise = (async () => {
+    if (!fs.existsSync(plist)) return fallback;
+    try {
+      const { stdout } = await execFileAsync("/usr/bin/plutil", ["-extract", key, "raw", "-o", "-", plist]);
+      return stdout.trim() || fallback;
+    } catch {
+      return fallback;
+    }
+  })()
+    .then((value) => {
+      openAssistInfoPlistCache.set(cacheKey, { expiresAt: Date.now() + openAssistInfoPlistCacheMs, value });
+      return value;
+    })
+    .finally(() => {
+      openAssistInfoPlistInFlight.delete(cacheKey);
+    });
+
+  openAssistInfoPlistInFlight.set(cacheKey, readPromise);
+  return readPromise;
 }
 
 async function loadSettings(): Promise<SettingsSnapshot> {
@@ -14479,7 +19104,7 @@ async function loadSettings(): Promise<SettingsSnapshot> {
         ? "geminiLive"
         : defaultRealtimeVoiceProvider;
   const assistantPreferredModel = await readDefault("OpenAssist.assistantPreferredModelID", readCodexDefaultModel());
-  const availableAssistantBackends: RuntimeAssistantBackend[] = await selectableAssistantBackends(assistantBackend);
+  const availableAssistantBackends: RuntimeAssistantBackend[] = await cachedSelectableAssistantBackends(assistantBackend);
   const runtimeSetup = await runtimeSetupSnapshot(assistantBackend, availableAssistantBackends);
   const whisperModel = await readDefault("OpenAssist.selectedWhisperModelID", "base.en");
   const whisperInstalledModels = installedWhisperModelIDs();
@@ -14520,12 +19145,9 @@ async function loadSettings(): Promise<SettingsSnapshot> {
   const remoteAccessNetworkMode = normalizeRemoteAccessNetworkMode(
     await readDefault("OpenAssist.remoteAccess.networkMode", "localNetwork")
   );
-  const remoteAccessTailscaleHost = (await readDefault("OpenAssist.remoteAccess.tailscaleHost", "")).trim();
-  const remoteAccessTailscaleStatus = await remoteAccessTailscaleStatusSnapshot();
   const remoteAccessRuntime = remoteAccessServerRuntimeSnapshot({
     port: remoteAccessPort,
     networkMode: remoteAccessNetworkMode,
-    tailscaleHost: remoteAccessTailscaleHost,
     publicURL: easyRemoteTunnel.currentURL()
   });
   return {
@@ -14552,7 +19174,7 @@ async function loadSettings(): Promise<SettingsSnapshot> {
     lightThemeDiffAdded: await readDefault("OpenAssist.lightTheme.diffAdded", "#00a240"),
     lightThemeDiffRemoved: await readDefault("OpenAssist.lightTheme.diffRemoved", "#ba2623"),
     lightThemeSkill: await readDefault("OpenAssist.lightTheme.skill", "#924ff7"),
-    darkThemeAccent: await readDefault("OpenAssist.darkTheme.accent", "#1F6FEB"),
+    darkThemeAccent: await readDefault("OpenAssist.darkTheme.accent", "#F9861A"),
     darkThemeBackground: await readDefault("OpenAssist.darkTheme.background", "#0D1117"),
     darkThemeForeground: await readDefault("OpenAssist.darkTheme.foreground", "#E6EDF3"),
     darkThemeUIFont: await readDefault("OpenAssist.darkTheme.uiFont", "-apple-system, BlinkMacSystemFont, \"SF Pro Text\", \"Helvetica Neue\", Arial, sans-serif"),
@@ -14594,6 +19216,7 @@ async function loadSettings(): Promise<SettingsSnapshot> {
     memoryEnabled: await readBoolDefault("OpenAssist.assistantMemoryEnabled", true),
     knowledgeAccessEnabled,
     knowledgeExternalAccessEnabled: await readBoolDefault("OpenAssist.knowledgeAccess.externalEnabled", false),
+    knowledgeExternalAccessMode: normalizeKnowledgeExternalAccessMode(await readDefault("OpenAssist.knowledgeAccess.externalMode", "simple")),
     knowledgeAgentAccessEnabled: await readBoolDefault("OpenAssist.knowledgeAccess.agentEnabled", true),
     knowledgeRealtimeVoiceAccessEnabled: await readBoolDefault("OpenAssist.knowledgeAccess.realtimeVoiceEnabled", true),
     knowledgeOrganizerEnabled: await readBoolDefault("OpenAssist.knowledgeAccess.organizerEnabled", true),
@@ -14658,20 +19281,20 @@ async function loadSettings(): Promise<SettingsSnapshot> {
     remoteAccessPort,
     remoteAccessPublicURL: normalizeRemoteAccessPublicURL(await readDefault("OpenAssist.remoteAccess.namedTunnelPublicURL", "")),
     remoteAccessNetworkMode,
-    remoteAccessTailscaleHost,
-    remoteAccessLocalNetworkURL: remoteAccessLocalNetworkURL({ port: remoteAccessPort, networkMode: remoteAccessNetworkMode, tailscaleHost: remoteAccessTailscaleHost }),
-    remoteAccessTailscaleURL: remoteAccessRuntime.tailscaleURL,
+    remoteAccessTailscaleHost: "",
+    remoteAccessLocalNetworkURL: remoteAccessLocalNetworkURL({ port: remoteAccessPort, networkMode: remoteAccessNetworkMode }),
+    remoteAccessTailscaleURL: "",
     remoteAccessEasyTunnelURL: remoteAccessRuntime.easyTunnelURL,
     remoteAccessEasyTunnelRunning: remoteAccessRuntime.easyTunnelRunning,
     remoteAccessEasyTunnelStatusMessage: remoteAccessRuntime.easyTunnelStatusMessage,
     remoteAccessTunnelHelperInstalled: remoteAccessRuntime.tunnelHelperInstalled,
     remoteAccessTunnelHelperInstalling: remoteAccessRuntime.tunnelHelperInstalling,
-    remoteAccessTailscaleInstalled: remoteAccessTailscaleStatus.installed,
-    remoteAccessTailscaleRunning: remoteAccessTailscaleStatus.running,
-    remoteAccessDetectedTailscaleHost: remoteAccessTailscaleStatus.detectedHost,
-    remoteAccessTailscaleAppPath: remoteAccessTailscaleStatus.appPath,
-    remoteAccessTailscaleInstallURL: remoteAccessTailscaleStatus.installURL,
-    remoteAccessTailscaleStatusMessage: remoteAccessTailscaleStatus.statusMessage,
+    remoteAccessTailscaleInstalled: false,
+    remoteAccessTailscaleRunning: false,
+    remoteAccessDetectedTailscaleHost: "",
+    remoteAccessTailscaleAppPath: "",
+    remoteAccessTailscaleInstallURL: "",
+    remoteAccessTailscaleStatusMessage: "Disabled.",
     remoteAccessPairingCode: remoteAccessRuntime.pairingCode,
     remoteAccessPairingURL: remoteAccessRuntime.pairingURL,
     remoteAccessPairingExpiresAt: remoteAccessRuntime.pairingExpiresAt,
@@ -14734,6 +19357,7 @@ const writableSettingKeys: Record<SettingsUpdateKey, { defaultsKey: string; type
   memoryEnabled: { defaultsKey: "OpenAssist.assistantMemoryEnabled", type: "bool" },
   knowledgeAccessEnabled: { defaultsKey: "OpenAssist.knowledgeAccess.enabled", type: "bool" },
   knowledgeExternalAccessEnabled: { defaultsKey: "OpenAssist.knowledgeAccess.externalEnabled", type: "bool" },
+  knowledgeExternalAccessMode: { defaultsKey: "OpenAssist.knowledgeAccess.externalMode", type: "string" },
   knowledgeAgentAccessEnabled: { defaultsKey: "OpenAssist.knowledgeAccess.agentEnabled", type: "bool" },
   knowledgeRealtimeVoiceAccessEnabled: { defaultsKey: "OpenAssist.knowledgeAccess.realtimeVoiceEnabled", type: "bool" },
   knowledgeOrganizerEnabled: { defaultsKey: "OpenAssist.knowledgeAccess.organizerEnabled", type: "bool" },
@@ -14743,7 +19367,6 @@ const writableSettingKeys: Record<SettingsUpdateKey, { defaultsKey: string; type
   telegramEnabled: { defaultsKey: "OpenAssist.telegramRemoteEnabled", type: "bool" },
   remoteAccessEnabled: { defaultsKey: "OpenAssist.remoteAccess.enabled", type: "bool" },
   remoteAccessNetworkMode: { defaultsKey: "OpenAssist.remoteAccess.networkMode", type: "string" },
-  remoteAccessTailscaleHost: { defaultsKey: "OpenAssist.remoteAccess.tailscaleHost", type: "string" },
   compactStyle: { defaultsKey: "OpenAssist.assistantCompactPresentationStyle", type: "string" },
   compactEdge: { defaultsKey: "OpenAssist.assistantCompactSidebarEdge", type: "string" },
   assistantBackend: { defaultsKey: "OpenAssist.assistantBackend", type: "string" },
@@ -14934,8 +19557,6 @@ async function writeSettingValue(key: SettingsUpdateKey, value: boolean | string
       await writeStringDefault(setting.defaultsKey, String(port));
     } else if (key === "remoteAccessNetworkMode") {
       await writeStringDefault(setting.defaultsKey, normalizeRemoteAccessNetworkMode(value));
-    } else if (key === "remoteAccessTailscaleHost") {
-      await writeStringDefault(setting.defaultsKey, String(value).trim());
     } else {
       await writeStringDefault(setting.defaultsKey, String(value));
     }
@@ -14960,6 +19581,12 @@ async function finalizeSettingsUpdate(keys: SettingsUpdateKey[]) {
     await ensureRemoteAccessServerForSettings(nextSettings).catch((error) => {
       bridgeDebugLog(`Remote Access restart failed after setting update: ${error instanceof Error ? error.message : String(error)}`);
     });
+    // Turning Remote Access off should also take the public link down and stop
+    // it from auto-restoring on the next launch.
+    if (!nextSettings.remoteAccessEnabled) {
+      easyRemoteTunnel.stop();
+      await writeBoolDefault("OpenAssist.remoteAccess.easyQRActive", false).catch(() => {});
+    }
   }
   return nextSettings;
 }
@@ -15821,6 +20448,9 @@ export async function loadOpenAssistSettingsAppState(): Promise<OpenAssistAppSta
     noteFolders: [],
     plannerDays: [],
     plannerBacklog: null,
+    plannerCategories: loadPlannerCategories(),
+    plannerLists: [],
+    plannerSmartLists: listPlannerSmartLists(),
     backlogItems: [],
     automations: [],
     skills: [],
@@ -15835,7 +20465,7 @@ async function loadOpenAssistAppStateImpl(): Promise<OpenAssistAppState> {
   const _ts = Date.now();
   const _step = (name: string, startedAt: number) => {
     const dt = Date.now() - startedAt;
-    if (dt >= 25) bridgeDebugLog(`loadAppState step ${name}=${dt}ms`);
+    if (dt >= 25) bridgeVerboseLog(`loadAppState step ${name}=${dt}ms`);
     return Date.now();
   };
   let _t = _ts;
@@ -15850,6 +20480,12 @@ async function loadOpenAssistAppStateImpl(): Promise<OpenAssistAppState> {
   void purgeExpiredArchivedItems(settings).catch((error) => {
     bridgeDebugLog(`Archived item cleanup failed: ${error instanceof Error ? error.message : String(error)}`);
   });
+  try {
+    prunePlannerRecoverySnapshots();
+  } catch (error) {
+    bridgeDebugLog(`Planner recovery cleanup failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  schedulePlannerReminderRefresh();
   _t = _step("loadSettings", _t);
 
   const loadedProjects = loadProjects();
@@ -15872,6 +20508,7 @@ async function loadOpenAssistAppStateImpl(): Promise<OpenAssistAppState> {
   _t = _step("listPlannerDays", _t);
   const plannerBacklog = loadPlannerBacklog();
   const backlogItems = parseDailyItemsFromMarkdown(plannerBacklogID, plannerBacklog.markdown);
+  const plannerCategories = loadPlannerCategories();
   _t = _step("loadPlannerBacklog", _t);
 
   const activeThreadID = threads[0]?.id;
@@ -15894,7 +20531,7 @@ async function loadOpenAssistAppStateImpl(): Promise<OpenAssistAppState> {
   // handles it. Return whatever cached snapshot we already have (may be
   // empty on the very first launch).
   const usageByBackend = usageSnapshotsByBackend();
-  bridgeDebugLog(`loadAppState TOTAL=${Date.now() - _ts}ms threads=${threads.length} notes=${notes.length} (background pass scheduled)`);
+  bridgeVerboseLog(`loadAppState TOTAL=${Date.now() - _ts}ms threads=${threads.length} notes=${notes.length} (background pass scheduled)`);
   return {
     projects: loadedProjects.projects,
     hiddenProjects: loadedProjects.hiddenProjects,
@@ -15904,6 +20541,9 @@ async function loadOpenAssistAppStateImpl(): Promise<OpenAssistAppState> {
     noteFolders,
     plannerDays,
     plannerBacklog,
+    plannerCategories,
+    plannerLists: loadedProjects.plannerLists,
+    plannerSmartLists: listPlannerSmartLists(),
     backlogItems,
     // automations + plugins land via the background pass and are merged in
     // the renderer. Returning empty here keeps the schema satisfied and
@@ -15992,10 +20632,13 @@ async function runAppStateBackgroundPass(args: {
 }
 
 type AppStateBackgroundUpdate =
+  | { type: "projects"; projects: ProjectItem[]; hiddenProjects: ProjectItem[]; plannerLists?: ProjectItem[] }
   | { type: "threads"; threads: ThreadItem[] }
   | { type: "automations"; automations: AutomationItem[] }
   | { type: "plugins"; plugins: PluginItem[] }
   | { type: "knowledgeRequests"; requests: KnowledgeWriteRequest[] }
+  | { type: "plannerCategories"; categories: PlannerCategory[] }
+  | { type: "plannerSmartLists"; smartLists: PlannerSmartListSummary[] }
   | { type: "plannerDays"; plannerDays: PlannerDaySummary[]; activeDayID?: string }
   | { type: "plannerDay"; day: PlannerDayDetail; items: DailyItem[] }
   | { type: "plannerBacklog"; backlog: PlannerBacklogDetail; items: DailyItem[] }
@@ -16023,14 +20666,192 @@ function emitPlannerDayChanged(dayID: string) {
   const day = loadPlannerDay(dayID);
   emitAppStateBackgroundUpdate({ type: "plannerDay", day, items: parseDailyItemsFromMarkdown(day.id, day.markdown) });
   emitPlannerDaysChanged(day.id);
+  emitPlannerSmartListsChanged();
+  schedulePlannerReminderRefresh();
 }
 
 function emitPlannerBacklogChanged() {
   const backlog = loadPlannerBacklog();
   emitAppStateBackgroundUpdate({ type: "plannerBacklog", backlog, items: parseDailyItemsFromMarkdown(plannerBacklogID, backlog.markdown) });
+  emitPlannerSmartListsChanged();
+  schedulePlannerReminderRefresh();
+}
+
+function emitPlannerCategoriesChanged() {
+  emitAppStateBackgroundUpdate({ type: "plannerCategories", categories: loadPlannerCategories() });
+}
+
+function emitPlannerSmartListsChanged() {
+  emitAppStateBackgroundUpdate({ type: "plannerSmartLists", smartLists: listPlannerSmartLists() });
 }
 
 const knowledgeMCPTools = [
+  {
+    name: "oa_plan_write",
+    description: "Dry-run OpenAssist's backend write router before mutating planner or notes. Use this before ambiguous adds/edits, mixed task/reference requests, or anything that might need a new List or note. Returns intent, target, confidence, approval requirement, reason, and the recommended tool call.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        action: { type: "string", description: "Optional intended tool/action, such as oa_quick_add_task, oa_request_reference, or oa_update_daily_item." },
+        userRequest: { type: "string", description: "The user's natural-language request." },
+        title: { type: "string" },
+        text: { type: "string" },
+        detailsMarkdown: { type: "string" },
+        dayID: { type: "string" },
+        when: { type: "string" },
+        listName: { type: "string" },
+        listID: { type: "string" },
+        noteTitle: { type: "string" },
+        noteItemID: { type: "string" },
+        itemID: { type: "string" },
+        query: { type: "string" }
+      },
+      required: [],
+      additionalProperties: true
+    }
+  },
+  {
+    name: "oa_quick_add_task",
+    description: "FAST PATH: add one task in one call. Use for simple task/reminder/to-do captures. If `when` is today/tomorrow/weekday/ISO, adds to that planner day; if omitted or backlog/later, adds to Backlog. Planner tasks should be short action pointers; put detailed specs, dimensions, reference facts, and long checklists in a linked note, then pass noteItemID/noteTitle/links. Do not search or list first for simple adds unless you need to find the note to link.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        title: { type: "string", description: "Task text." },
+        when: { type: "string", description: "today, tomorrow, backlog, later, weekday, or YYYY-MM-DD. Omit for backlog." },
+        listName: { type: "string", description: "Optional Planner List name." },
+        category: { type: "string", description: "Optional planner category." },
+        section: { type: "string", description: "Optional grouping inside the List." },
+        reminderAt: { type: "string", description: "ISO datetime for an OpenAssist planner local notification. Use when the user asks to be reminded at a specific time." },
+        reminderTimezone: { type: "string", description: "IANA timezone for reminderAt, if known." },
+        dueAt: { type: "string", description: "Alias for reminderAt." },
+        notifyAt: { type: "string", description: "Alias for reminderAt." },
+        details: { type: "string", description: "Optional short action context only. Do not paste full reference notes, specs, dimensions, or long checklists here; put them in a note and link it." },
+        detailsMode: { type: "string", enum: ["replace", "append"], description: "Use replace only when intentionally updating a duplicate task's details." },
+        replaceDetails: { type: "boolean", description: "True to replace duplicate task details instead of appending." },
+        links: { type: "array", description: "Optional NoteLinkTarget objects to attach to the task." },
+        noteItemID: { type: "string", description: "Knowledge item id for a note to link to this task." },
+        noteTitle: { type: "string", description: "Existing note title to link. Do not also put this note title in listName unless the user explicitly named that planner List." },
+        referenceNoteTitle: { type: "string", description: "Alias for noteTitle." }
+      },
+      required: ["title"],
+      additionalProperties: true
+    }
+  },
+  {
+    name: "oa_quick_save_note",
+    description: "FAST PATH: append one small reference fact/link/spec/measurement/checklist to an existing List or note in one call. Use for information and detailed checklists, not actions, and not for reorganizing/restructuring a whole note. Applies immediately only when the target note already exists; if a new note is needed, OpenAssist creates a pending approval preview. For note cleanup/reorganization/rewrite, read the note, call oa_note_style_guide, then use oa_request_organize with itemID + full replacement markdown.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        text: { type: "string", description: "Reference information, specs, measurements, or detailed checklist content to save." },
+        listName: { type: "string", description: "Planner List name, such as New Home Stuff." },
+        title: { type: "string", description: "Optional topic/title." },
+        section: { type: "string", description: "Optional note section/topic." }
+      },
+      required: ["text"],
+      additionalProperties: true
+    }
+  },
+  {
+    name: "oa_memory_save",
+    description: "Save or update ONE durable memory about the user: a stable fact, preference, correction, or ongoing project context (e.g. 'Prefers metric units', 'Team stand-up is 9:30'). Upserts by name — reuse the existing name to update that memory instead of creating a near-duplicate. Applied immediately, no approval needed. Do NOT save transient task details, one-off reminders, or reference facts that belong in a note (use planner/note tools for those).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Short stable title, e.g. 'Prefers metric units'. Reuse to update." },
+        description: { type: "string", description: "One-line summary shown in the memory index." },
+        content: { type: "string", description: "The memory body in markdown: the fact plus any context needed to apply it later." },
+        type: { type: "string", enum: ["user", "project", "preference", "reference"], description: "Kind of memory. Defaults to user." },
+        threadID: { type: "string", description: "Optional origin thread id." }
+      },
+      required: ["name", "description", "content"],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "oa_memory_list",
+    description: "List all saved assistant memories (the compact index: one line per memory). Use before saving to avoid duplicates, or when the user asks what you remember about them.",
+    inputSchema: {
+      type: "object",
+      properties: {},
+      required: [],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "oa_memory_read",
+    description: "Read one saved assistant memory in full by its name or slug (from oa_memory_list).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Memory name or slug." }
+      },
+      required: ["name"],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "oa_memory_delete",
+    description: "Delete one saved assistant memory by name or slug. Use when the user says a remembered fact is wrong or asks you to forget it.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Memory name or slug." }
+      },
+      required: ["name"],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "oa_list_approvals",
+    description: "List OpenAssist approval previews that are pending, applied, or rejected. Use when the user asks what needs approval or wants to review pending edits without opening the app.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        status: { type: "string", enum: ["pending", "applied", "rejected"], description: "Defaults to pending." },
+        limit: { type: "number", description: "Maximum approvals to return." }
+      },
+      required: [],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "oa_apply_approval",
+    description: "Apply one pending OpenAssist approval preview by requestID. Use only after the user asks to approve/apply it or confirms the exact pending request.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        requestID: { type: "string", description: "Approval/write request id." }
+      },
+      required: ["requestID"],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "oa_reject_approval",
+    description: "Reject one pending OpenAssist approval preview by requestID. Use when the user declines a pending edit/organize/move preview.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        requestID: { type: "string", description: "Approval/write request id." }
+      },
+      required: ["requestID"],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "oa_quick_read",
+    description: "FAST PATH: read common OpenAssist targets in one call. `target` can be today, tomorrow, backlog, open tasks, a date, or a search query.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        target: { type: "string" },
+        limit: { type: "number" }
+      },
+      required: ["target"],
+      additionalProperties: false
+    }
+  },
   {
     name: "oa_search",
     description: "Search OpenAssist notes, Today planner days, and daily journal entries.",
@@ -16078,8 +20899,37 @@ const knowledgeMCPTools = [
     }
   },
   {
+    name: "oa_personal_recall_search",
+    description: "Read-only personal recall search for Spark. Search phase `memory` first for saved memories, notes, planner/backlog, compact Spark results, Codex memories, and Claude Code memories/tasks. Use phase `chats` when memory is not enough or the user asks for latest/recent conversations, Codex/Claude/Spark results, chats, threads, or sessions; it covers OpenAssist chats, realtime turns, Codex sessions, and Claude Code sessions.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string" },
+        phase: { type: "string", enum: ["memory", "chats", "all"], description: "Search memory first, then chats only if needed." },
+        fromDate: { type: "string" },
+        toDate: { type: "string" },
+        limit: { type: "number" }
+      },
+      required: ["query"],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "oa_personal_recall_read",
+    description: "Read one personal recall result by id after oa_personal_recall_search. Returns a bounded snippet/window; do not use it to bulk-load large logs.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        resultID: { type: "string" },
+        window: { type: "number" }
+      },
+      required: ["resultID"],
+      additionalProperties: false
+    }
+  },
+  {
     name: "oa_read",
-    description: "Read a knowledge item by id returned from oa_search.",
+    description: "Read a knowledge item by id returned from oa_search. For note reorganization/rewrite, read the note first, then call oa_note_style_guide and oa_request_organize with itemID + full replacement markdown.",
     inputSchema: {
       type: "object",
       properties: { itemID: { type: "string" } },
@@ -16099,7 +20949,7 @@ const knowledgeMCPTools = [
   },
   {
     name: "oa_list_daily_items",
-    description: "List structured Today/daily items for a planner date, including inline @project and #folder tags, resolved project/folder names, details, steps, and linked notes.",
+    description: "List structured Today/daily items for a planner date, including inline @project and #folder tags, resolved project/folder names, details, steps, and linked notes. When there are no structured items, also returns freeTextItems and noteMarkdown from the planner day so free-text notes are visible.",
     inputSchema: {
       type: "object",
       properties: { dayID: { type: "string" }, date: { type: "string" } },
@@ -16113,6 +20963,199 @@ const knowledgeMCPTools = [
     inputSchema: {
       type: "object",
       properties: {},
+      required: [],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "oa_list_planner_categories",
+    description: "List planner categories and available Planner Lists. Call this before assigning category/list when the user has not named an exact category or list.",
+    inputSchema: {
+      type: "object",
+      properties: {},
+      required: [],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "oa_list_planner_lists",
+    description: "List Planner Lists. These are the same buckets used across Planner, Backlog, Notes, and Threads; planner-created Lists also appear as Thread Projects.",
+    inputSchema: {
+      type: "object",
+      properties: {},
+      required: [],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "oa_connector_status",
+    description: "List configured connector accounts, enabled services, gws status, and Review Inbox count. Use before syncing connector data.",
+    inputSchema: {
+      type: "object",
+      properties: {},
+      required: [],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "oa_connector_sync_gmail",
+    description: "Safely search Gmail for task/follow-up candidates using the user's intent, then place metadata-only candidates in Review Inbox. OpenAssist builds strict Gmail queries internally; do not pass raw broad Gmail searches. Does not fetch full email body and does not send, archive, delete, or label mail.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        accountID: { type: "string" },
+        accountLabel: { type: "string" },
+        userIntent: {
+          type: "string",
+          description: "The user's natural-language request, for example: find email tasks for today, follow-ups from clients, or invoices I need to act on."
+        },
+        timeframeDays: {
+          type: "number",
+          description: "Optional lookback window. Keep small; defaults to 7, today requests use about 2."
+        },
+        maxResults: {
+          type: "number",
+          description: "Optional per-query cap. Keep small; defaults to 8 and is capped by OpenAssist."
+        }
+      },
+      required: [],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "oa_connector_search_gmail",
+    description: "Search Gmail metadata for a specific email or email type and return matching message snippets directly. Use this when the user asks to find/show/search for a particular email. Do not use this to build Review Inbox tasks; use oa_connector_sync_gmail for task/backlog candidates.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        accountID: { type: "string" },
+        accountLabel: { type: "string" },
+        query: {
+          type: "string",
+          description: "Natural-language keywords or Gmail search syntax for the exact email being searched, for example: from:alex invoice, subject:receipt, or Quality Nails invoice."
+        },
+        gmailQuery: {
+          type: "string",
+          description: "Optional exact Gmail query syntax when known. Keep narrow; do not use broad all-mail queries."
+        },
+        userIntent: {
+          type: "string",
+          description: "The user's exact request in natural language."
+        },
+        timeframeDays: {
+          type: "number",
+          description: "Optional lookback window. Defaults to 30 for direct search."
+        },
+        maxResults: {
+          type: "number",
+          description: "Optional result cap. Defaults to 10 and is capped by OpenAssist."
+        }
+      },
+      required: ["query"],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "oa_connector_search_messages",
+    description: "Search local macOS Messages/iMessage text metadata for a specific person, word, appointment, or follow-up. Read-only. Use this when the user asks to check iMessage/Messages/texts.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: {
+          type: "string",
+          description: "Specific person, phone/email, or keywords to search in Messages, for example: Victor roof estimate, appointment tomorrow, or mortgage prepayment."
+        },
+        userIntent: {
+          type: "string",
+          description: "The user's exact request in natural language."
+        },
+        timeframeDays: {
+          type: "number",
+          description: "Optional lookback window. Defaults to 30."
+        },
+        maxResults: {
+          type: "number",
+          description: "Optional result cap. Defaults to 10 and is capped by OpenAssist."
+        }
+      },
+      required: ["query"],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "oa_apple_add_reminder",
+    description: "Create a real Apple Reminders reminder on this Mac. Use only when the user explicitly says Apple Reminders, Reminders app, iCloud reminders, or asks for an Apple reminder. Do not use for OpenAssist planner reminders.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        title: { type: "string" },
+        notes: { type: "string" },
+        dueDate: { type: "string", description: "Optional ISO date or datetime. Use local-date ISO when the user gives a day." },
+        calendar: { type: "string", description: "Optional Apple Reminders list/calendar name." },
+        list: { type: "string", description: "Alias for calendar." }
+      },
+      required: ["title"],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "oa_apple_list_reminders",
+    description: "List real Apple Reminders reminders on this Mac. Read-only. Use when the user asks what is in Apple Reminders or asks about native reminders.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        calendar: { type: "string" },
+        dueBefore: { type: "string" },
+        dueAfter: { type: "string" },
+        includeCompleted: { type: "boolean" },
+        limit: { type: "number" }
+      },
+      required: [],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "oa_apple_complete_reminder",
+    description: "Mark a real Apple Reminders reminder complete or incomplete by ID. List reminders first if you do not know the exact ID.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string" },
+        completed: { type: "boolean" }
+      },
+      required: ["id"],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "oa_apple_add_event",
+    description: "Create a real Apple Calendar event on this Mac. Use only when the user explicitly asks for Apple Calendar, Calendar app, iCloud calendar, or a native calendar event.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        title: { type: "string" },
+        startDate: { type: "string", description: "Required ISO datetime." },
+        endDate: { type: "string", description: "Optional ISO datetime; defaults to one hour after startDate." },
+        isAllDay: { type: "boolean" },
+        notes: { type: "string" },
+        location: { type: "string" },
+        calendar: { type: "string" }
+      },
+      required: ["title", "startDate"],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "oa_apple_list_events",
+    description: "List real Apple Calendar events on this Mac for a date range. Read-only. Use when the user asks about Apple Calendar or native calendar events.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        startDate: { type: "string" },
+        endDate: { type: "string" },
+        calendar: { type: "string" },
+        limit: { type: "number" }
+      },
       required: [],
       additionalProperties: false
     }
@@ -16165,40 +21208,128 @@ const knowledgeMCPTools = [
     }
   },
   {
+    name: "oa_request_reference",
+    description: "Append reference information (dimensions, links, specs, prices, addresses, contact info, model numbers, detailed checklists, or 'save this' facts) to an existing canonical note for a Planner List or thread. This is for small additive information, fit checks, measurements, and checklist work, not top-level planner actions and not full-note reorganization. New Lists and new notes are never created silently; when a note is missing this creates a pending approval preview. If the user asks to reorganize/restructure/clean up/rewrite a note, use oa_request_organize instead.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        title: { type: "string", description: "Short reference title or topic, such as TV dimensions." },
+        text: { type: "string", description: "Reference text to save." },
+        content: { type: "string" },
+        detailsMarkdown: { type: "string", description: "Detailed reference lines, dimensions, specs, or checklist items to append." },
+        listID: { type: "string", description: "Planner List id whose canonical note should receive the reference." },
+        listName: { type: "string", description: "Planner List name, such as New Home Stuff." },
+        projectID: { type: "string" },
+        threadID: { type: "string" },
+        itemID: { type: "string", description: "Existing project_note or thread_note itemID when known." },
+        noteTitle: { type: "string", description: "Optional canonical note title override. Defaults to the List name or Reference." },
+        section: { type: "string", description: "Section/topic inside the note, such as TV, Fridge, Appliances, Contacts, Links, or Measurements." },
+        goal: { type: "string" }
+      },
+      required: [],
+      additionalProperties: true
+    }
+  },
+  {
     name: "oa_request_daily_item",
-    description: "Add one structured planner task, reminder, or to-do. Set area to Work or Personal. Keep title short; put time, date notes, and extra context in detailsMarkdown. Prefer inline @Project and #Folder tags in the title instead of separate project/folder fields. Ask the user if the category is unclear. Adding is applied immediately (no approval needed); the result has status \"applied\".",
+    description: "Add one structured planner task to a DAY (Today or a specific date). Use this ONLY when the user named a date or said today, tonight, tomorrow, or a weekday; if no date was given, use oa_request_backlog_item instead. Use #Category and @List in the title when helpful, or set area/category plus listID/listName. If only @List is used, OpenAssist inherits that List's default Category; explicit #Category wins. Keep planner items short: what to do, where to do it, and a few high-level steps. Put detailed specs, dimensions, reference facts, and long checklists in a note with oa_request_reference/oa_quick_save_note, then link it using noteItemID/noteTitle/links. Adding is applied immediately (no approval needed); the result has status \"applied\".",
     inputSchema: {
       type: "object",
       properties: {
         dayID: { type: "string" },
         title: { type: "string" },
+        listID: { type: "string", description: "Optional Planner List id. This can point to any shared List/Project bucket." },
+        listName: { type: "string", description: "Optional Planner List name, such as Costco or Marketing." },
         projectID: { type: "string" },
         folderID: { type: "string" },
-        area: { type: "string", enum: ["Work", "Personal"] },
+        area: { type: "string", description: "Optional planner category name such as Work, Personal, Business, Home, or another user-created category." },
+        category: { type: "string", description: "Alias for area/category." },
+        section: { type: "string", description: "Optional grouping inside the selected List, such as Food, Household, This week, or Follow-ups." },
+        tags: { type: "array", items: { type: "string" }, description: "Optional cross-category filter tags, such as Shopping, Errands, Waiting For, or Follow-up." },
         scopeTags: { type: "array" },
-        detailsMarkdown: { type: "string" },
-        steps: { type: "array" },
-        links: { type: "array" },
+        reminderAt: { type: "string", description: "ISO datetime for an OpenAssist planner local notification." },
+        reminderTimezone: { type: "string", description: "IANA timezone for reminderAt, if known." },
+        dueAt: { type: "string", description: "Alias for reminderAt." },
+        notifyAt: { type: "string", description: "Alias for reminderAt." },
+        detailsMarkdown: { type: "string", description: "Short action context only. Do not put detailed specs, dimensions, copied note bodies, or long checklists here; link a note instead." },
+        detailsMode: { type: "string", enum: ["replace", "append"], description: "Use replace when changing existing task details; append only for small additive context." },
+        replaceDetails: { type: "boolean", description: "True to replace existing detailsMarkdown instead of appending." },
+        steps: { type: "array", description: "High-level planner steps only, not the full detailed checklist. Detailed checklists belong in the linked note." },
+        links: { type: "array", description: "NoteLinkTarget objects for notes that hold details, dimensions, reference facts, or checklists." },
+        noteItemID: { type: "string", description: "Knowledge item id for a note to link to this task." },
+        noteTitle: { type: "string", description: "Existing note title to link. Do not also put this note title in listName unless the user explicitly named that planner List." },
         goal: { type: "string" }
       },
       required: ["title"],
+      additionalProperties: true
+    }
+  },
+  {
+    name: "oa_update_daily_item",
+    description: "Update an existing planner task by itemID or by its current text. Use this for rename, category/list/section/tag/details/date changes. It replaces the matched old item instead of adding a duplicate. Use area/category for a Category such as Work; use listID/listName only for a real @List. If the user says an item is not for the current List and only gives a Category, set clearList=true. Keep task details short; move detailed specs/dimensions/checklists into a linked note and attach it with noteItemID/noteTitle/links. Call oa_list_daily_items first if unsure of the exact text.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        dayID: { type: "string", description: "Source planner day. Defaults to today." },
+        itemID: { type: "string", description: "Existing planner item id if known." },
+        query: { type: "string", description: "Current task text to match when itemID is unknown." },
+        oldTitle: { type: "string", description: "Alias for query/current task text." },
+        title: { type: "string", description: "Current task text if no query is supplied." },
+        newTitle: { type: "string", description: "Replacement title. Omit to keep the existing title." },
+        targetDayID: { type: "string", description: "Optional new planner day when moving the item." },
+        listID: { type: "string", description: "Optional Planner List id." },
+        listName: { type: "string", description: "Optional Planner List name." },
+        projectID: { type: "string" },
+        folderID: { type: "string" },
+        clearList: { type: "boolean", description: "True to remove the existing @List/project from the task while keeping/setting its category." },
+        area: { type: "string", description: "Optional planner category name." },
+        category: { type: "string", description: "Alias for area/category." },
+        section: { type: "string", description: "Optional grouping inside the selected List." },
+        tags: { type: "array", items: { type: "string" }, description: "Optional replacement free-form tags." },
+        scopeTags: { type: "array" },
+        reminderAt: { type: ["string", "null"], description: "ISO datetime for the OpenAssist planner local notification. Use null to clear it." },
+        reminderTimezone: { type: ["string", "null"], description: "IANA timezone for reminderAt, if known. Use null when clearing." },
+        dueAt: { type: "string", description: "Alias for reminderAt." },
+        notifyAt: { type: "string", description: "Alias for reminderAt." },
+        detailsMarkdown: { type: "string", description: "Short replacement action context only. Do not paste detailed note content here; put it in a linked note." },
+        detailsMode: { type: "string", enum: ["replace", "append"] },
+        replaceDetails: { type: "boolean" },
+        steps: { type: "array", description: "High-level planner steps only; detailed checklists belong in the linked note." },
+        links: { type: "array", description: "NoteLinkTarget objects for notes that hold details, dimensions, reference facts, or checklists." },
+        noteItemID: { type: "string", description: "Knowledge item id for a note to link to this task." },
+        noteTitle: { type: "string", description: "Existing note title to link. Do not also put this note title in listName unless the user explicitly named that planner List." },
+        checked: { type: "boolean" },
+        status: { type: "string" }
+      },
+      required: [],
       additionalProperties: true
     }
   },
   {
     name: "oa_request_backlog_item",
-    description: "Add one task or follow-up to the OpenAssist backlog when the user wants to do it later but has not picked a date. Keep title short; put time, date notes, and extra context in detailsMarkdown. Prefer inline @Project and #Folder tags in the title. Applied immediately, no approval needed.",
+    description: "Add one task or follow-up to the OpenAssist backlog. This is the DEFAULT target for new tasks whenever the user has not picked a date, including plain captures and items aimed at a specific @List. Use #Category and @List in the title when helpful, or set area/category plus listID/listName. If only @List is used, OpenAssist inherits that List's default Category; explicit #Category wins. Keep backlog items short: what to do plus a few high-level steps. Put detailed specs, dimensions, reference facts, and long checklists in a note with oa_request_reference/oa_quick_save_note, then link it using noteItemID/noteTitle/links. Applied immediately, no approval needed.",
     inputSchema: {
       type: "object",
       properties: {
         title: { type: "string" },
+        listID: { type: "string", description: "Optional Planner List id." },
+        listName: { type: "string", description: "Optional Planner List name, such as Costco or Marketing." },
         projectID: { type: "string" },
         folderID: { type: "string" },
-        area: { type: "string", enum: ["Work", "Personal"] },
+        area: { type: "string", description: "Optional planner category name such as Work, Personal, Business, Home, or another user-created category." },
+        category: { type: "string", description: "Alias for area/category." },
+        section: { type: "string", description: "Optional grouping inside the selected List, such as Food, Household, This week, or Follow-ups." },
+        tags: { type: "array", items: { type: "string" }, description: "Optional cross-category filter tags, such as Shopping, Errands, Waiting For, or Follow-up." },
         scopeTags: { type: "array" },
-        detailsMarkdown: { type: "string" },
-        steps: { type: "array" },
-        links: { type: "array" },
+        reminderAt: { type: "string", description: "ISO datetime for an OpenAssist planner local notification. Backlog items can still have reminders." },
+        reminderTimezone: { type: "string", description: "IANA timezone for reminderAt, if known." },
+        dueAt: { type: "string", description: "Alias for reminderAt." },
+        notifyAt: { type: "string", description: "Alias for reminderAt." },
+        detailsMarkdown: { type: "string", description: "Short action context only. Do not put detailed specs, dimensions, copied note bodies, or long checklists here; link a note instead." },
+        steps: { type: "array", description: "High-level planner steps only, not the full detailed checklist. Detailed checklists belong in the linked note." },
+        links: { type: "array", description: "NoteLinkTarget objects for notes that hold details, dimensions, reference facts, or checklists." },
+        noteItemID: { type: "string", description: "Knowledge item id for a note to link to this task." },
+        noteTitle: { type: "string", description: "Existing note title to link. Do not also put this note title in listName unless the user explicitly named that planner List." },
         goal: { type: "string" }
       },
       required: ["title"],
@@ -16206,8 +21337,44 @@ const knowledgeMCPTools = [
     }
   },
   {
+    name: "oa_request_tasks_from_note",
+    description: "Create an approval preview that turns a source note into multiple linked planner tasks. Read the note first with oa_search/oa_read, then call this with sourceItemID and items. Default target should be backlog unless the user gives a date. Do not claim tasks were created until the Review Inbox preview is approved.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        sourceItemID: { type: "string", description: "Knowledge item id for the source note, for example project_note:project:LISTID:NOTEID." },
+        target: { type: "string", enum: ["backlog", "day"], description: "Use backlog unless the user gave a specific planner date." },
+        dayID: { type: "string", description: "Planner day id when target is day." },
+        items: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              title: { type: "string" },
+              detailsMarkdown: { type: "string" },
+              steps: { type: "array" },
+              area: { type: "string" },
+              category: { type: "string" },
+              listID: { type: "string" },
+              listName: { type: "string" },
+              projectID: { type: "string" },
+              folderID: { type: "string" },
+              section: { type: "string" },
+              tags: { type: "array", items: { type: "string" } }
+            },
+            required: ["title"],
+            additionalProperties: true
+          }
+        },
+        goal: { type: "string" }
+      },
+      required: ["sourceItemID", "items"],
+      additionalProperties: true
+    }
+  },
+  {
     name: "oa_note_style_guide",
-    description: "Return the OpenAssist note formatting guide: callout kinds, 2/3-column layouts, images, and when not to use rich blocks. Call this before organizing a note so you can produce apply-ready markdown using the correct OpenAssist syntax.",
+    description: "Return the OpenAssist note formatting guide: callout kinds, collapsible sections, 2/3-column layouts, structuring long multi-area reference notes, images, and when not to use rich blocks. Call this before organizing a note so you can produce apply-ready markdown using the correct OpenAssist syntax.",
     inputSchema: {
       type: "object",
       properties: {},
@@ -16217,7 +21384,7 @@ const knowledgeMCPTools = [
   },
   {
     name: "oa_request_patch",
-    description: "Request a markdown replacement or append preview for a note or planner item. Requires itemID + exact replacement markdown. Call oa_note_style_guide first when organizing for readability. This does not auto-write — it creates an approval preview.",
+    description: "Request an exact markdown replacement preview for a note or planner item. Requires itemID + full replacement markdown. OpenAssist notes are not append-only: safe rewrites are done as approval previews, not silent writes. For note organization/readability, prefer oa_request_organize after oa_read + oa_note_style_guide. This does not auto-write; it creates an approval preview.",
     inputSchema: {
       type: "object",
       properties: {
@@ -16234,7 +21401,7 @@ const knowledgeMCPTools = [
   },
   {
     name: "oa_request_organize",
-    description: "Request a note organization preview. You MUST supply itemID and the full replacement markdown to make this actionable. Pattern: (1) read the note with oa_read, (2) call oa_note_style_guide to learn supported blocks, (3) produce exact replacement markdown, (4) call this tool with itemID + markdown. For planner tasks prefer oa_request_daily_item.",
+    description: "Request a full-note organization/restructure/rewrite preview. OpenAssist notes are NOT append-only: this tool safely replaces the note body after approval, without duplicating content. You MUST supply itemID and the full replacement markdown containing everything that should remain. Pattern: (1) find/read the note with oa_search/oa_read, (2) call oa_note_style_guide to learn supported blocks, (3) produce exact replacement markdown, (4) call this tool with itemID + markdown. Then tell the user it is ready for approval in Review Inbox or via oa_apply_approval. Do not answer that the MCP cannot reorganize a note.",
     inputSchema: {
       type: "object",
       properties: {
@@ -16244,7 +21411,7 @@ const knowledgeMCPTools = [
         scope: { type: "string" },
         query: { type: "string" }
       },
-      required: ["goal"],
+      required: ["goal", "itemID", "markdown"],
       additionalProperties: true
     }
   },
@@ -16293,14 +21460,241 @@ const knowledgeMCPTools = [
   }
 ] as const;
 
+const simpleKnowledgeMCPToolNames = [
+  "oa_plan_write",
+  "oa_quick_add_task",
+  "oa_quick_save_note",
+  "oa_quick_read",
+  "oa_list_approvals",
+  "oa_apply_approval",
+  "oa_reject_approval",
+  "oa_search",
+  "oa_personal_recall_search",
+  "oa_personal_recall_read",
+  "oa_read",
+  "oa_read_today",
+  "oa_list_daily_items",
+  "oa_list_backlog_items",
+  "oa_list_planner_categories",
+  "oa_list_planner_lists",
+  "oa_request_reference",
+  "oa_request_backlog_item",
+  "oa_request_daily_item",
+  "oa_update_daily_item",
+  "oa_complete_daily_item",
+  "oa_memory_save",
+  "oa_memory_list",
+  "oa_memory_read",
+  "oa_memory_delete"
+] as const;
+
+const advancedKnowledgeMCPToolNames = [
+  ...simpleKnowledgeMCPToolNames,
+  "oa_search_everything",
+  "oa_read_search_result",
+  "oa_list_planner_categories",
+  "oa_read_journal",
+  "oa_list_open_tasks",
+  "oa_backlinks",
+  "oa_request_tasks_from_note",
+  "oa_note_style_guide",
+  "oa_request_patch",
+  "oa_request_organize",
+  "oa_request_carry_forward",
+  "oa_request_move_to_backlog",
+  "oa_complete_daily_item"
+] as const;
+
+function knowledgeMCPToolNamesForMode(mode: KnowledgeExternalAccessMode) {
+  if (mode === "full") return new Set<string>(knowledgeMCPTools.map((tool) => tool.name));
+  if (mode === "advanced") return new Set<string>(advancedKnowledgeMCPToolNames);
+  return new Set<string>(simpleKnowledgeMCPToolNames);
+}
+
+function simpleKnowledgeMCPTool(tool: typeof knowledgeMCPTools[number]) {
+  switch (tool.name) {
+    case "oa_request_daily_item":
+      return {
+        ...tool,
+        description: "Add one dated planner task. Keep it short; detailed specs, dimensions, and long checklists belong in a linked note. For fastest external-agent use, prefer oa_quick_add_task.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            title: { type: "string" },
+            dayID: { type: "string", description: "today, tomorrow, weekday, or YYYY-MM-DD." },
+            listName: { type: "string" },
+            category: { type: "string" },
+            detailsMarkdown: { type: "string", description: "Short action context only. Put detailed checklists/specs/dimensions in a linked note." },
+            noteItemID: { type: "string" },
+            noteTitle: { type: "string" },
+            links: { type: "array" }
+          },
+          required: ["title"],
+          additionalProperties: true
+        }
+      };
+    case "oa_request_backlog_item":
+      return {
+        ...tool,
+        description: "Add one undated task to Backlog. Keep it short; detailed specs, dimensions, and long checklists belong in a linked note. For fastest external-agent use, prefer oa_quick_add_task with when=backlog or omitted.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            title: { type: "string" },
+            listName: { type: "string" },
+            category: { type: "string" },
+            section: { type: "string" },
+            detailsMarkdown: { type: "string", description: "Short action context only. Put detailed checklists/specs/dimensions in a linked note." },
+            detailsMode: { type: "string", enum: ["replace", "append"] },
+            replaceDetails: { type: "boolean" },
+            noteItemID: { type: "string" },
+            noteTitle: { type: "string" },
+            links: { type: "array" }
+          },
+          required: ["title"],
+          additionalProperties: true
+        }
+      };
+    case "oa_request_reference":
+      return {
+        ...tool,
+        description: "Save one reference fact/link/spec/measurement or detailed checklist to an existing List or note. Use this for the detailed content that should not clutter Today/Backlog. Missing notes create an approval preview. For fastest external-agent use, prefer oa_quick_save_note.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            text: { type: "string" },
+            listName: { type: "string" },
+            title: { type: "string" },
+            section: { type: "string" }
+          },
+          required: ["text"],
+          additionalProperties: true
+        }
+      };
+    case "oa_update_daily_item":
+      return {
+        ...tool,
+        description: "Update or move one existing planner task by itemID or current text. Keep details short; put detailed specs/dimensions/checklists in a linked note. Use after listing only when the exact item is unclear.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            dayID: { type: "string" },
+            itemID: { type: "string" },
+            query: { type: "string" },
+            title: { type: "string" },
+            targetDayID: { type: "string" },
+            listName: { type: "string" },
+            category: { type: "string" },
+            detailsMarkdown: { type: "string", description: "Short action context only. Put detailed checklists/specs/dimensions in a linked note." },
+            detailsMode: { type: "string", enum: ["replace", "append"] },
+            replaceDetails: { type: "boolean" },
+            noteItemID: { type: "string" },
+            noteTitle: { type: "string" },
+            links: { type: "array" }
+          },
+          required: [],
+          additionalProperties: true
+        }
+      };
+    default:
+      return tool;
+  }
+}
+
+type KnowledgeAccessSettings = Pick<
+  SettingsSnapshot,
+  | "knowledgeAccessEnabled"
+  | "knowledgeExternalAccessEnabled"
+  | "knowledgeExternalAccessMode"
+  | "knowledgeAgentAccessEnabled"
+  | "knowledgeRealtimeVoiceAccessEnabled"
+  | "knowledgeOrganizerEnabled"
+  | "knowledgePendingRequestCount"
+>;
+
+const knowledgeAccessSettingsCacheMs = 3_000;
+const knowledgeMCPToolsCacheMs = 60_000;
+const knowledgeMCPResourcesCacheMs = 30_000;
+const maxKnowledgeMCPRequestBytes = 1024 * 1024;
+let knowledgeAccessSettingsCache: { expiresAt: number; value: KnowledgeAccessSettings } | null = null;
+const knowledgeMCPToolsCache = new Map<KnowledgeExternalAccessMode, { expiresAt: number; value: unknown[] }>();
+let knowledgeMCPResourcesCache: { expiresAt: number; value: unknown[] } | null = null;
+
+async function loadKnowledgeAccessSettings(): Promise<KnowledgeAccessSettings> {
+  const now = Date.now();
+  if (knowledgeAccessSettingsCache && knowledgeAccessSettingsCache.expiresAt > now) {
+    return knowledgeAccessSettingsCache.value;
+  }
+  const value: KnowledgeAccessSettings = {
+    knowledgeAccessEnabled: await readBoolDefault("OpenAssist.knowledgeAccess.enabled", true),
+    knowledgeExternalAccessEnabled: await readBoolDefault("OpenAssist.knowledgeAccess.externalEnabled", false),
+    knowledgeExternalAccessMode: normalizeKnowledgeExternalAccessMode(await readDefault("OpenAssist.knowledgeAccess.externalMode", "simple")),
+    knowledgeAgentAccessEnabled: await readBoolDefault("OpenAssist.knowledgeAccess.agentEnabled", true),
+    knowledgeRealtimeVoiceAccessEnabled: await readBoolDefault("OpenAssist.knowledgeAccess.realtimeVoiceEnabled", true),
+    knowledgeOrganizerEnabled: await readBoolDefault("OpenAssist.knowledgeAccess.organizerEnabled", true),
+    knowledgePendingRequestCount: listKnowledgeWriteRequests("pending").length
+  };
+  knowledgeAccessSettingsCache = { expiresAt: now + knowledgeAccessSettingsCacheMs, value };
+  return value;
+}
+
+function knowledgeMCPToolsForSettings(settings: Pick<SettingsSnapshot, "knowledgeExternalAccessMode">) {
+  const allowed = knowledgeMCPToolNamesForMode(settings.knowledgeExternalAccessMode);
+  const tools = knowledgeMCPTools.filter((tool) => allowed.has(tool.name));
+  return settings.knowledgeExternalAccessMode === "simple" ? tools.map(simpleKnowledgeMCPTool) : tools;
+}
+
+function cachedKnowledgeMCPToolsForSettings(settings: Pick<SettingsSnapshot, "knowledgeExternalAccessMode">) {
+  const now = Date.now();
+  const cached = knowledgeMCPToolsCache.get(settings.knowledgeExternalAccessMode);
+  if (cached && cached.expiresAt > now) return cached.value;
+  const value = knowledgeMCPToolsForSettings(settings);
+  knowledgeMCPToolsCache.set(settings.knowledgeExternalAccessMode, { expiresAt: now + knowledgeMCPToolsCacheMs, value });
+  return value;
+}
+
+function cachedKnowledgeMCPResources() {
+  const now = Date.now();
+  if (knowledgeMCPResourcesCache && knowledgeMCPResourcesCache.expiresAt > now) {
+    return knowledgeMCPResourcesCache.value;
+  }
+  const value = searchKnowledge("", 50).map((item) => ({
+    uri: `openassist://knowledge/${encodeURIComponent(item.id)}`,
+    name: item.title,
+    description: item.sourceLabel,
+    mimeType: "text/markdown"
+  }));
+  knowledgeMCPResourcesCache = { expiresAt: now + knowledgeMCPResourcesCacheMs, value };
+  return value;
+}
+
+function knowledgeMCPToolAllowedForSettings(name: string, settings: Pick<SettingsSnapshot, "knowledgeExternalAccessMode">) {
+  const allowed = knowledgeMCPToolNamesForMode(settings.knowledgeExternalAccessMode);
+  return allowed.has(name) || allowed.has(canonicalOllamaToolName(name));
+}
+
+function knowledgeExternalAccessModeDescription(mode: KnowledgeExternalAccessMode) {
+  if (mode === "full") return "Everything, including MCP resource browsing.";
+  if (mode === "advanced") return "More planner, history, and organization tools; resource browsing hidden.";
+  return "Recommended, focused tools; resource browsing hidden.";
+}
+
 function jsonResponse(res: http.ServerResponse, status: number, body: unknown) {
   res.writeHead(status, { "content-type": "application/json" });
   res.end(JSON.stringify(body));
 }
 
-async function readRequestJSON(req: http.IncomingMessage) {
+async function readRequestJSON(req: http.IncomingMessage, maxBytes = 4 * 1024 * 1024) {
   const chunks: Buffer[] = [];
-  for await (const chunk of req) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  let totalBytes = 0;
+  for await (const chunk of req) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    totalBytes += buffer.byteLength;
+    if (totalBytes > maxBytes) {
+      throw new Error(`Request body is too large. Limit is ${Math.round(maxBytes / 1024)} KB.`);
+    }
+    chunks.push(buffer);
+  }
   const text = Buffer.concat(chunks).toString("utf8").trim();
   if (!text) return {};
   return JSON.parse(text) as unknown;
@@ -16343,7 +21737,6 @@ function knowledgeMCPToolResponse(result: unknown) {
 type RemoteAccessRuntimeSettings = {
   port: string;
   networkMode: RemoteAccessNetworkMode;
-  tailscaleHost: string;
   publicURL?: string;
 };
 
@@ -16351,7 +21744,6 @@ type RemoteAccessServerSettings = {
   remoteAccessEnabled: boolean;
   remoteAccessPort: string;
   remoteAccessNetworkMode: RemoteAccessNetworkMode;
-  remoteAccessTailscaleHost: string;
   remoteAccessPublicURL: string;
 };
 
@@ -16365,11 +21757,13 @@ type RemoteAccessSnapshotSettings = RemoteAccessServerSettings & Partial<Setting
 
 // Snapshot broadcasts run every ~100ms while a phone is connected; backend
 // detection forks a `which` per backend, so cache the result briefly.
+const selectableBackendsCacheMs = 5 * 60 * 1000;
 let selectableBackendsCache: { key: string; expiresAt: number; value: RuntimeAssistantBackend[] } | null = null;
 
 // Same reasoning as the backend cache: model lists (some need network/CLI calls)
 // barely change during a turn, so don't recompute them on every streaming
 // snapshot.
+const providerModelsCacheMs = 5 * 60 * 1000;
 const providerModelsCache = new Map<string, { expiresAt: number; value: ProviderModelOption[] }>();
 
 async function cachedProviderModels(backend: string): Promise<ProviderModelOption[]> {
@@ -16377,7 +21771,7 @@ async function cachedProviderModels(backend: string): Promise<ProviderModelOptio
   const cached = providerModelsCache.get(backend);
   if (cached && cached.expiresAt > now) return cached.value;
   const value = await listProviderModels(backend).catch(() => [] as ProviderModelOption[]);
-  providerModelsCache.set(backend, { expiresAt: now + 60_000, value });
+  providerModelsCache.set(backend, { expiresAt: now + providerModelsCacheMs, value });
   return value;
 }
 
@@ -16387,7 +21781,7 @@ async function cachedSelectableAssistantBackends(preferred: RuntimeAssistantBack
     return selectableBackendsCache.value;
   }
   const value = await selectableAssistantBackends(preferred).catch(() => [preferred]);
-  selectableBackendsCache = { key: preferred, expiresAt: now + 60_000, value };
+  selectableBackendsCache = { key: preferred, expiresAt: now + selectableBackendsCacheMs, value };
   return value;
 }
 
@@ -16412,7 +21806,7 @@ async function loadRemoteAccessSettings(): Promise<RemoteAccessSnapshotSettings>
       await readDefault("OpenAssist.remoteAccess.namedTunnelPublicURL", "")
     ),
     remoteAccessNetworkMode,
-    remoteAccessTailscaleHost: (await readDefault("OpenAssist.remoteAccess.tailscaleHost", "")).trim()
+    remoteAccessTailscaleHost: ""
   };
 }
 
@@ -16490,13 +21884,20 @@ function remoteAccessDailyItem(item: DailyItem) {
     projectName: item.projectName ?? null,
     folderName: item.folderName ?? null,
     area: item.area ?? null,
+    section: item.section ?? null,
+    tags: normalizeDailyTagLabels(item.tags),
     detailsMarkdown: item.detailsMarkdown,
     steps: item.steps.map((step) => ({
       id: step.id,
       text: step.text,
       checked: step.checked
     })),
+    reminderAt: item.reminderAt ?? null,
+    reminderTimezone: item.reminderTimezone ?? null,
+    reminderDeliveredAt: item.reminderDeliveredAt ?? null,
     structured: item.structured === true,
+    createdAt: item.createdAt ?? null,
+    updatedAt: item.updatedAt ?? null,
     order: item.order
   };
 }
@@ -16509,6 +21910,24 @@ function remoteAccessPlannerDayDetail(detail: PlannerDayDetail | PlannerBacklogD
     updatedAt: detail.updatedAt ?? null,
     active,
     markdown: detail.markdown
+  };
+}
+
+function remoteAccessProject(project: ProjectItem, threadCountByProjectID: Map<string, number>, noteCountByProjectID: Map<string, number>) {
+  return {
+    id: project.id,
+    name: project.title,
+    kind: project.kind ?? "project",
+    parentID: project.parentID ?? null,
+    area: project.area ?? null,
+    color: project.color ?? null,
+    plannerOnly: project.plannerOnly === true,
+    sessionCount: threadCountByProjectID.get(project.id) ?? 0,
+    noteCount: noteCountByProjectID.get(project.id) ?? 0,
+    hidden: project.hidden === true,
+    isHidden: project.hidden === true,
+    archived: project.isArchived === true,
+    isArchived: project.isArchived === true
   };
 }
 
@@ -16548,6 +21967,9 @@ function remoteAccessActiveThreadNoteForDevice(deviceID: string | null | undefin
       projectID: thread?.projectID ?? null,
       projectName: thread?.project ?? null,
       updatedAt: swiftDateToMs(note.updatedAt) ?? null,
+      isArchived: note.isArchived === true,
+      archivedAt: note.archivedAt ?? null,
+      autoDeleteAfter: note.autoDeleteAfter ?? null,
       active: true,
       markdown: inlineNoteMarkdownImages(note.markdown, note.path)
     };
@@ -16648,15 +22070,8 @@ function remoteAccessLocalNetworkURL(settings: RemoteAccessRuntimeSettings) {
   return address ? `http://${address}:${normalizedRemoteAccessPort(settings.port)}` : "";
 }
 
-function remoteAccessTailscaleURL(settings: RemoteAccessRuntimeSettings) {
-  return settings.networkMode === "tailscale"
-    ? remoteAccessBaseURLFromHost(settings.tailscaleHost, settings.port)
-    : "";
-}
-
 function remoteAccessPreferredURL(settings: RemoteAccessRuntimeSettings) {
   return String(settings.publicURL ?? "").trim()
-    || remoteAccessTailscaleURL(settings)
     || remoteAccessLocalNetworkURL(settings)
     || remoteAccessLocalURL(settings);
 }
@@ -16664,11 +22079,10 @@ function remoteAccessPreferredURL(settings: RemoteAccessRuntimeSettings) {
 function remoteAccessServerRuntimeSnapshot(settings: RemoteAccessRuntimeSettings) {
   const challenge = remoteAccessServer?.activeChallenge();
   const localNetworkURL = remoteAccessLocalNetworkURL(settings);
-  const tailscaleURL = remoteAccessTailscaleURL(settings);
   const tunnel = easyRemoteTunnel.snapshot();
   return {
     localNetworkURL,
-    tailscaleURL,
+    tailscaleURL: "",
     easyTunnelURL: tunnel.url,
     easyTunnelRunning: tunnel.running,
     easyTunnelStatusMessage: tunnel.statusMessage,
@@ -16713,9 +22127,7 @@ function makeRemoteAccessPairingURL(settings: RemoteAccessRuntimeSettings, code:
   if (String(settings.publicURL ?? "").trim()) {
     url.searchParams.set("connectionMode", "cloudflare");
   }
-  if (settings.networkMode === "tailscale" && remoteAccessTailscaleURL(settings)) {
-    url.searchParams.set("connectionMode", "tailscale");
-  } else if (settings.networkMode === "localNetwork" && remoteAccessLocalNetworkURL(settings)) {
+  if (settings.networkMode === "localNetwork" && remoteAccessLocalNetworkURL(settings)) {
     url.searchParams.set("connectionMode", "local");
   }
   url.searchParams.set("pairingCode", code);
@@ -17011,7 +22423,7 @@ async function makeRemoteAccessSnapshot(deviceID?: string | null) {
   const settings = await loadRemoteAccessSettings();
   const loadedProjects = loadProjects();
   const threads = loadThreads(loadedProjects, { limit: 40 }).filter((thread) => thread.isArchived !== true);
-  const { notes } = loadNotes(loadedProjects);
+  const { notes, noteFolders } = loadNotes(loadedProjects, { includeArchived: true });
   const threadNotes = loadThreadNoteList(threads);
   const plannerSelection = remotePlannerSelectionForDevice(deviceID);
   const todayID = plannerDayID();
@@ -17030,6 +22442,12 @@ async function makeRemoteAccessSnapshot(deviceID?: string | null) {
             projectName: activeNoteSummary.projectName ?? null,
             folderID: activeNoteSummary.folderID ?? null,
             updatedAt: activeNoteSummary.updatedAt ?? null,
+            isArchived: activeNoteSummary.isArchived === true,
+            archivedAt: activeNoteSummary.archivedAt ?? null,
+            autoDeleteAfter: activeNoteSummary.autoDeleteAfter ?? null,
+            area: detail.area ?? null,
+            tags: detail.tags ?? [],
+            history: listProjectNoteHistory(activeNoteSummary.projectID, activeNoteSummary.id),
             active: true,
             markdown: inlineNoteMarkdownImages(detail.markdown, detail.path)
           };
@@ -17074,6 +22492,18 @@ async function makeRemoteAccessSnapshot(deviceID?: string | null) {
   const backlogItems = plannerBacklogDetail
     ? listBacklogItems().map(remoteAccessDailyItem)
     : [];
+  // Every reminder-bearing item in the scan window (backlog + upcoming days).
+  // The phone schedules local notifications from this list; without it the
+  // snapshot only covered the day on screen, so the phone CANCELLED any
+  // reminder set for another day the moment the view changed.
+  const reminderItems = (() => {
+    try {
+      return plannerReminderItems().map(remoteAccessDailyItem);
+    } catch (error) {
+      bridgeDebugLog(`Remote access reminder items snapshot failed: ${error instanceof Error ? error.message : String(error)}`);
+      return [];
+    }
+  })();
   const threadCountByProjectID = new Map<string, number>();
   for (const thread of threads) {
     const projectID = String(thread.projectID ?? "").trim();
@@ -17094,7 +22524,6 @@ async function makeRemoteAccessSnapshot(deviceID?: string | null) {
   const runtimeSettings = {
     port: settings.remoteAccessPort,
     networkMode,
-    tailscaleHost: settings.remoteAccessTailscaleHost,
     publicURL: remotePublicURL
   };
   return {
@@ -17105,7 +22534,7 @@ async function makeRemoteAccessSnapshot(deviceID?: string | null) {
       appVersion: `${settings.appVersion} (${settings.buildNumber})`,
       operatingSystem: `${os.type()} ${os.release()}`,
       localBaseURL: remoteAccessLocalURL(runtimeSettings),
-      tailscaleBaseURL: remoteAccessTailscaleURL(runtimeSettings) || null,
+      tailscaleBaseURL: null,
       publicBaseURL: remotePublicURL || null
     },
     status: {
@@ -17115,9 +22544,7 @@ async function makeRemoteAccessSnapshot(deviceID?: string | null) {
       helperState: remoteAccessServer.isRunning() ? "Running" : settings.remoteAccessEnabled ? "Stopped" : "Disabled",
       helperMessage: easyTunnelURL
         ? "Easy QR is available outside your network."
-        : networkMode === "tailscale"
-          ? "Tailscale Direct is private to your tailnet."
-          : null,
+        : null,
       tunnel: {
         mode: remotePublicURL ? "named" : "disabled",
         transport: "auto",
@@ -17131,9 +22558,7 @@ async function makeRemoteAccessSnapshot(deviceID?: string | null) {
             : "Forwarding through your stable Cloudflare URL."
           : networkMode === "localNetwork"
             ? "Listening for same-Wi-Fi devices."
-            : networkMode === "tailscale"
-              ? "Listening for loopback and Tailscale 100.x.y.z peers."
-              : "Listening on this Mac only."
+            : "Listening on this Mac only."
       },
       usage: null
     },
@@ -17167,16 +22592,28 @@ async function makeRemoteAccessSnapshot(deviceID?: string | null) {
         supportedReasoningEfforts: model.supportedReasoningEfforts ?? []
       })),
     installedPlugins: [],
-    projects: loadedProjects.projects
-      .filter((project) => project.kind !== "folder")
-      .map((project) => ({
-        id: project.id,
-        name: project.title,
-        kind: project.kind ?? "project",
-        parentID: project.parentID ?? null,
-        sessionCount: threadCountByProjectID.get(project.id) ?? 0,
-        noteCount: loadedProjects.projectNotesByID.get(project.id) ?? 0
-      })),
+    plannerCategories: loadPlannerCategories().map((category) => ({
+      id: category.id,
+      name: category.name,
+      color: category.color ?? null,
+      icon: category.icon ?? null,
+      createdAt: category.createdAt,
+      updatedAt: category.updatedAt,
+      order: category.order,
+      hidden: category.hidden === true
+    })),
+    projects: loadedProjects.projects.map((project) =>
+      remoteAccessProject(project, threadCountByProjectID, loadedProjects.projectNotesByID)
+    ),
+    plannerLists: loadedProjects.plannerLists.map((project) =>
+      remoteAccessProject(project, threadCountByProjectID, loadedProjects.projectNotesByID)
+    ),
+    noteFolders: noteFolders.map((folder) => ({
+      id: folder.id,
+      name: folder.name,
+      projectID: folder.projectID,
+      noteCount: folder.noteCount
+    })),
     notes: notes.slice(0, 40).map((note) => ({
       id: note.id,
       title: note.title,
@@ -17185,6 +22622,9 @@ async function makeRemoteAccessSnapshot(deviceID?: string | null) {
       projectName: note.projectName ?? null,
       folderID: note.folderID ?? null,
       updatedAt: note.updatedAt ?? null,
+      isArchived: note.isArchived === true,
+      archivedAt: note.archivedAt ?? null,
+      autoDeleteAfter: note.autoDeleteAfter ?? null,
       active: note.active === true
     })),
     activeNote: activeNoteDetail,
@@ -17215,6 +22655,7 @@ async function makeRemoteAccessSnapshot(deviceID?: string | null) {
     plannerBacklog: plannerBacklogDetail,
     backlogItems,
     dailyItems,
+    reminderItems,
     appearance: remoteAccessAppearanceSnapshot(settings)
   };
 }
@@ -17269,6 +22710,7 @@ function prunedVoicePendingOperations(now: number) {
 const VOICE_DESTRUCTIVE_TOOLS = new Set([
   "delete_note",
   "archive_note",
+  "move_note_to_folder",
   "delete_today_item",
   "delete_planner_item",
   "delete_backlog_item",
@@ -17361,6 +22803,35 @@ function voicePlannerTaskQuery(args: JsonObject) {
   return stripPlannerDatePhrases(rawQuery) || rawQuery;
 }
 
+function voicePlannerItemFields(args: JsonObject) {
+  return {
+    area: args.area ?? args.category,
+    listID: args.listID ?? args.listId,
+    listName: args.listName ?? args.list,
+    projectID: args.projectID,
+    folderID: args.folderID,
+    section: args.section,
+    tags: args.tags ?? args.tag,
+    links: args.links ?? args.link,
+    link: args.link,
+    noteItemID: args.noteItemID ?? args.linkedNoteItemID ?? args.referenceItemID,
+    linkedNoteItemID: args.linkedNoteItemID,
+    referenceItemID: args.referenceItemID,
+    noteTitle: args.noteTitle ?? args.referenceNoteTitle,
+    referenceNoteTitle: args.referenceNoteTitle,
+    threadID: args.threadID,
+    detailsMode: args.detailsMode,
+    replaceDetails: args.replaceDetails,
+    detailsMarkdown: typeof args.detailsMarkdown === "string"
+      ? args.detailsMarkdown
+      : typeof args.details === "string"
+        ? args.details
+        : typeof args.notes === "string"
+          ? args.notes
+          : undefined
+  };
+}
+
 /**
  * Execute one structured tool call sent by the phone's Gemini Live session.
  * The phone owns the voice conversation; this only runs the requested tool against
@@ -17387,16 +22858,29 @@ async function runVoiceTool(device: RemoteAccessPairedDeviceRecord, payload: Jso
       voicePendingOperations.delete(confirmToken);
       return runConfirmedVoiceTool(device, tool, pending.args);
     }
+    const pendingArgs = tool === "delete_note" || tool === "archive_note" || tool === "move_note_to_folder"
+      ? { ...context, ...args }
+      : args;
     const token = randomUUID().toLowerCase();
-    voicePendingOperations.set(token, { deviceID: device.id, tool, args, createdAt: now });
+    voicePendingOperations.set(token, { deviceID: device.id, tool, args: pendingArgs, createdAt: now });
     return {
       tool,
-      spokenAnswer: voiceDestructiveSummary(tool, args),
-      pendingConfirmation: { confirmToken: token, summary: voiceDestructiveSummary(tool, args), tool, args }
+      spokenAnswer: voiceDestructiveSummary(tool, pendingArgs),
+      pendingConfirmation: { confirmToken: token, summary: voiceDestructiveSummary(tool, pendingArgs), tool, args: pendingArgs }
     };
   }
 
   switch (tool) {
+    case "plan_write": {
+      const plan = planKnowledgeWrite({ ...args, userRequest: args.userRequest ?? args.prompt ?? args.text }, cleanDailyText(args.action ?? args.toolName ?? ""));
+      return {
+        tool,
+        spokenAnswer: plan.requiresApproval
+          ? `This needs approval or clarification: ${plan.reason}`
+          : `I can route this as ${plan.intent} to ${plan.target}.`,
+        results: [{ id: "write-plan", kind: "write_plan", title: plan.reason, snippet: JSON.stringify(plan) }]
+      };
+    }
     case "search_notes": {
       const query = String(args.query ?? "").trim();
       const notes = searchKnowledge(query, Number(args.limit ?? 20)).filter((item) => item.kind === "project_note" || item.kind === "thread_note");
@@ -17419,18 +22903,39 @@ async function runVoiceTool(device: RemoteAccessPairedDeviceRecord, payload: Jso
         results: projects.map((project) => ({ id: project.id, kind: "project", title: project.name }))
       };
     }
-    case "search_threads": {
-      const query = String(args.query ?? "").trim();
-      const hits = searchKnowledgeTimeline(query, { sourceTypes: ["thread_message"], limit: Number(args.limit ?? 8) });
-      return {
-        tool,
+	    case "search_threads": {
+	      const query = String(args.query ?? "").trim();
+	      const hits = searchKnowledgeTimeline(query, { sourceTypes: ["thread_message"], limit: Number(args.limit ?? 8) });
+	      return {
+	        tool,
         spokenAnswer: hits.length ? `I found ${voiceCountPhrase(hits.length, "thread message", "thread messages")} about “${query}”.` : `I didn't find any threads about “${query}”.`,
-        results: voiceResultsFromTimeline(hits)
-      };
-    }
-    case "search_everything": {
-      const query = String(args.query ?? "").trim();
-      const hits = searchKnowledgeTimeline(query, {
+	        results: voiceResultsFromTimeline(hits)
+	      };
+	    }
+	    case "personal_recall":
+	    case "recall_memory": {
+	      const query = firstNonEmptyString(args.query, args.question, args.prompt, args.text) ?? "";
+	      const recall = await runSparkPersonalRecall({ ...args, query }) as JsonObject;
+	      const answer = firstNonEmptyString(recall.answer) || "I could not find a clear saved answer.";
+	      const sources = Array.isArray(recall.sources) ? recall.sources : [];
+	      return {
+	        tool,
+	        spokenAnswer: answer,
+	        results: sources.slice(0, 8).map((source) => {
+	          const object = jsonObject(source) ?? {};
+	          return {
+	            id: String(object.id ?? object.path ?? object.title ?? ""),
+	            kind: String(object.sourceType ?? "source"),
+	            title: String(object.title ?? object.path ?? "Source"),
+	            sourceLabel: String(object.sourceLabel ?? object.sourceType ?? "Source"),
+	            snippet: String(object.path ?? object.timestamp ?? "")
+	          };
+	        })
+	      };
+	    }
+	    case "search_everything": {
+	      const query = String(args.query ?? "").trim();
+	      const hits = searchKnowledgeTimeline(query, {
         sourceTypes: sourceTypesFromValue(args.sourceTypes ?? args.sources ?? args.source),
         fromDate: typeof args.fromDate === "string" ? args.fromDate : undefined,
         toDate: typeof args.toDate === "string" ? args.toDate : undefined,
@@ -17454,6 +22959,24 @@ async function runVoiceTool(device: RemoteAccessPairedDeviceRecord, payload: Jso
         remoteSelectedNoteByDeviceID.delete(device.id);
       }
       return { tool, spokenAnswer: "Opening the note.", openTarget: target };
+    }
+    case "read_note": {
+      const target = resolveVoiceNoteTarget(args, context);
+      if (target.kind !== "note") throw new Error("I can only read project notes for voice rewrites right now.");
+      const detail = loadNote(target.projectID, target.noteID);
+      remoteSelectedNoteByDeviceID.set(device.id, { projectID: target.projectID.toUpperCase(), noteID: target.noteID });
+      remoteSelectedThreadNoteByDeviceID.delete(device.id);
+      return {
+        tool,
+        spokenAnswer: `Read the note “${normalizeTitle(detail.title, "Untitled note")}”.`,
+        openTarget: target,
+        results: [{
+          id: knowledgeItemID({ ownerKind: "project", ownerId: target.projectID, noteId: target.noteID }, "project_note"),
+          kind: "project_note",
+          title: normalizeTitle(detail.title, "Untitled note"),
+          snippet: String(detail.markdown ?? "")
+        }]
+      };
     }
     case "open_thread": {
       const sessionID = String(args.threadID ?? args.sessionID ?? args.id ?? context.threadID ?? "").trim();
@@ -17523,15 +23046,20 @@ async function runVoiceTool(device: RemoteAccessPairedDeviceRecord, payload: Jso
       const title = voicePlannerTaskTitle(args);
       if (!title) throw new Error("What should I add?");
       const dayID = voicePlannerDayID(args, rawTitle);
-      const result = upsertDailyItem({ title, dayID, detailsMarkdown: typeof args.detailsMarkdown === "string" ? args.detailsMarkdown : undefined });
-      remoteSelectedPlannerByDeviceID.set(device.id, { view: "day", dayID: result.day.id });
-      const dayLabel = result.day.id === plannerDayID() ? "Today" : result.day.title || result.day.id;
+      const result = directDailyItemUpsertFromPayload({ title, dayID, ...voicePlannerItemFields(args) });
+      const targetDayID = result.target === "day" ? (result.dayID ?? dayID) : plannerDayID();
+      remoteSelectedPlannerByDeviceID.set(device.id, { view: result.target === "backlog" ? "backlog" : "day", dayID: targetDayID });
+      const dayLabel = result.target === "day" && result.dayID === plannerDayID()
+        ? "Today"
+        : result.target === "day"
+          ? formattedPlannerDay(result.dayID ?? dayID)
+          : "Backlog";
       return { tool, spokenAnswer: `Added to ${dayLabel}: ${dailyItemVisibleTitle(result.item ?? { title } as DailyItem)}.` };
     }
     case "add_backlog_item": {
       const title = String(args.title ?? args.text ?? "").trim();
       if (!title) throw new Error("What should I add to the backlog?");
-      const result = upsertBacklogItem({ title, detailsMarkdown: typeof args.detailsMarkdown === "string" ? args.detailsMarkdown : undefined });
+      const result = directDailyItemUpsertFromPayload({ title, dayID: plannerBacklogID, ...voicePlannerItemFields(args) });
       remoteSelectedPlannerByDeviceID.set(device.id, { view: "backlog", dayID: plannerDayID() });
       return { tool, spokenAnswer: `Added to Backlog: ${dailyItemVisibleTitle(result.item ?? { title } as DailyItem)}.` };
     }
@@ -17544,6 +23072,90 @@ async function runVoiceTool(device: RemoteAccessPairedDeviceRecord, payload: Jso
       const result = completeDailyItem(dayID, query, checked);
       remoteSelectedPlannerByDeviceID.set(device.id, { view: "day", dayID: result.day.id });
       return { tool, spokenAnswer: `${checked ? "Marked done" : "Reopened"}: ${dailyItemVisibleTitle(result.item ?? { title: query } as DailyItem)}.` };
+    }
+    case "create_project_note": {
+      if (confirmToken) {
+        const pending = voicePendingOperations.get(confirmToken);
+        if (!pending || pending.deviceID !== device.id || pending.tool !== "create_project_note") {
+          throw new Error("This confirmation expired. Please ask again.");
+        }
+        voicePendingOperations.delete(confirmToken);
+        const projectID = String(pending.args.projectID ?? pending.args.listID ?? "").trim();
+        if (!projectID) throw new Error("Which list should I add the note to?");
+        const created = createProjectNote(projectID);
+        const title = String(pending.args.title ?? pending.args.name ?? "").trim();
+        const markdown = String(pending.args.markdown ?? pending.args.text ?? pending.args.body ?? "").trim();
+        if (title) renameProjectNote(projectID, created.note.id, title);
+        if (markdown) saveProjectNote(projectID, created.note.id, markdown);
+        remoteSelectedNoteByDeviceID.set(device.id, { projectID: projectID.toUpperCase(), noteID: created.note.id });
+        remoteSelectedThreadNoteByDeviceID.delete(device.id);
+        return {
+          tool,
+          spokenAnswer: `Created the note “${title || "Untitled note"}”.`,
+          openTarget: { kind: "note", projectID: projectID.toUpperCase(), noteID: created.note.id }
+        };
+      }
+      const projectID = String(args.projectID ?? args.listID ?? context.projectID ?? "").trim();
+      if (!projectID) throw new Error("Which list should I add the note to?");
+      const title = String(args.title ?? args.name ?? "").trim();
+      const markdown = String(args.markdown ?? args.text ?? args.body ?? "").trim();
+      const token = randomUUID().toLowerCase();
+      voicePendingOperations.set(token, { deviceID: device.id, tool, args: { ...args, projectID, title, markdown }, createdAt: now });
+      return {
+        tool,
+        spokenAnswer: `I can create the note “${title || "Untitled note"}”. Please confirm first.`,
+        pendingConfirmation: { confirmToken: token, summary: `Create note “${title || "Untitled note"}” in this List.`, tool, args: { ...args, projectID, title, markdown } }
+      };
+    }
+    case "create_thread_note": {
+      if (confirmToken) {
+        const pending = voicePendingOperations.get(confirmToken);
+        if (!pending || pending.deviceID !== device.id || pending.tool !== "create_thread_note") {
+          throw new Error("This confirmation expired. Please ask again.");
+        }
+        voicePendingOperations.delete(confirmToken);
+        const threadID = String(pending.args.threadID ?? "").trim();
+        if (!threadID) throw new Error("Which thread should I add the note to?");
+        const title = String(pending.args.title ?? pending.args.name ?? "Untitled note").trim() || "Untitled note";
+        const workspace = createThreadNote(threadID, title);
+        const noteID = workspace.selectedNoteID ?? workspace.selectedNote?.id ?? "";
+        const markdown = String(pending.args.markdown ?? pending.args.text ?? pending.args.body ?? "").trim();
+        if (noteID && markdown) saveThreadNote(threadID, noteID, markdown);
+        if (!noteID) throw new Error("I couldn't create that thread note.");
+        remoteSelectedThreadNoteByDeviceID.set(device.id, { threadID, noteID });
+        remoteSelectedNoteByDeviceID.delete(device.id);
+        return {
+          tool,
+          spokenAnswer: `Created the thread note “${title}”.`,
+          openTarget: { kind: "threadNote", threadID, noteID }
+        };
+      }
+      const threadID = String(args.threadID ?? context.threadID ?? "").trim();
+      if (!threadID) throw new Error("Which thread should I add the note to?");
+      const title = String(args.title ?? args.name ?? "Untitled note").trim() || "Untitled note";
+      const markdown = String(args.markdown ?? args.text ?? args.body ?? "").trim();
+      const token = randomUUID().toLowerCase();
+      voicePendingOperations.set(token, { deviceID: device.id, tool, args: { ...args, threadID, title, markdown }, createdAt: now });
+      return {
+        tool,
+        spokenAnswer: `I can create the thread note “${title}”. Please confirm first.`,
+        pendingConfirmation: { confirmToken: token, summary: `Create thread note “${title}”.`, tool, args: { ...args, threadID, title, markdown } }
+      };
+    }
+    case "rename_note": {
+      const target = resolveVoiceNoteTarget(args, context);
+      const title = String(args.title ?? args.name ?? "").trim();
+      if (!title) throw new Error("What should I rename it to?");
+      if (target.kind === "note") {
+        renameProjectNote(target.projectID, target.noteID, title);
+        remoteSelectedNoteByDeviceID.set(device.id, { projectID: target.projectID.toUpperCase(), noteID: target.noteID });
+        remoteSelectedThreadNoteByDeviceID.delete(device.id);
+      } else {
+        renameThreadNote(target.threadID, target.noteID, title);
+        remoteSelectedThreadNoteByDeviceID.set(device.id, { threadID: target.threadID, noteID: target.noteID });
+        remoteSelectedNoteByDeviceID.delete(device.id);
+      }
+      return { tool, spokenAnswer: `Renamed the note to “${title}”.`, openTarget: target };
     }
     case "append_to_note": {
       // v1: never edit silently — always return a preview the phone confirms.
@@ -17565,6 +23177,29 @@ async function runVoiceTool(device: RemoteAccessPairedDeviceRecord, payload: Jso
         tool,
         spokenAnswer: "Here is what I'll add to the note. Confirm to save it.",
         pendingConfirmation: { confirmToken: token, summary: `Add to note:\n${text}`, tool, args: { ...args, ...target } }
+      };
+    }
+    case "replace_note": {
+      // Never overwrite a note silently — always return a preview the phone confirms.
+      if (confirmToken) {
+        const pending = voicePendingOperations.get(confirmToken);
+        if (!pending || pending.deviceID !== device.id || pending.tool !== "replace_note") {
+          throw new Error("This confirmation expired. Please ask again.");
+        }
+        voicePendingOperations.delete(confirmToken);
+        return applyVoiceReplaceNote(device, pending.args);
+      }
+      const target = resolveVoiceNoteTarget(args, context);
+      if (target.kind !== "note") throw new Error("I can only replace project notes right now.");
+      const markdown = String(args.markdown ?? args.text ?? args.body ?? "").trim();
+      if (!markdown) throw new Error("What should the note contain?");
+      const title = String(args.title ?? args.name ?? "").trim() || "this note";
+      const token = randomUUID().toLowerCase();
+      voicePendingOperations.set(token, { deviceID: device.id, tool, args: { ...args, ...target, markdown }, createdAt: now });
+      return {
+        tool,
+        spokenAnswer: "Here is the replacement note. Confirm to overwrite it.",
+        pendingConfirmation: { confirmToken: token, summary: `Replace ${title} with:\n${markdown}`, tool, args: { ...args, ...target, markdown } }
       };
     }
     case "get_delegated_task_status": {
@@ -17625,6 +23260,15 @@ async function runVoiceTool(device: RemoteAccessPairedDeviceRecord, payload: Jso
       voicePendingOperations.delete(confirmToken);
       return applyVoiceAppendToNote(device, pending.args);
     }
+    case "confirm_replace_note": {
+      if (!confirmToken) throw new Error("This confirmation expired. Please ask again.");
+      const pending = voicePendingOperations.get(confirmToken);
+      if (!pending || pending.deviceID !== device.id || pending.tool !== "replace_note") {
+        throw new Error("This confirmation expired. Please ask again.");
+      }
+      voicePendingOperations.delete(confirmToken);
+      return applyVoiceReplaceNote(device, pending.args);
+    }
     default:
       throw new Error(`I can't do “${tool}” yet.`);
   }
@@ -17637,6 +23281,10 @@ function voiceDestructiveSummary(tool: string, args: JsonObject) {
       return `Delete the note “${label}”? This can't be undone.`;
     case "archive_note":
       return `Archive the note “${label}”?`;
+    case "move_note_to_folder": {
+      const folder = String(args.folderName ?? args.folder ?? args.folderID ?? "the selected folder").trim() || "the selected folder";
+      return `Move the note “${label}” to ${folder}?`;
+    }
     case "delete_today_item":
     case "delete_planner_item":
       return `Delete the planner item “${label}”?`;
@@ -17684,8 +23332,64 @@ function applyVoiceAppendToNote(device: RemoteAccessPairedDeviceRecord, args: Js
   return { tool: "append_to_note", spokenAnswer: "Saved to the note.", openTarget: target };
 }
 
+function applyVoiceReplaceNote(device: RemoteAccessPairedDeviceRecord, args: JsonObject): VoiceCommandResult {
+  const markdown = String(args.markdown ?? args.text ?? args.body ?? "").trim();
+  if (!markdown) throw new Error("What should the note contain?");
+  const target = resolveVoiceNoteTarget(args, args);
+  if (target.kind !== "note") throw new Error("I can only replace project notes right now.");
+  saveProjectNote(target.projectID, target.noteID, markdown);
+  const detail = loadNote(target.projectID, target.noteID);
+  remoteSelectedNoteByDeviceID.set(device.id, { projectID: target.projectID.toUpperCase(), noteID: target.noteID });
+  remoteSelectedThreadNoteByDeviceID.delete(device.id);
+  return {
+    tool: "replace_note",
+    spokenAnswer: `Replaced the note “${normalizeTitle(detail.title, "Untitled note")}”.`,
+    openTarget: target
+  };
+}
+
+function resolveVoiceProjectNoteFolderID(projectID: string, args: JsonObject) {
+  const rawFolderID = String(args.folderID ?? args.folderId ?? "").trim();
+  const rawFolderName = String(args.folderName ?? args.folder ?? "").trim();
+  const detachNames = new Set(["none", "root", "top", "inbox", "no folder"]);
+  if (rawFolderID && detachNames.has(rawFolderID.toLowerCase())) return null;
+  if (rawFolderName && detachNames.has(rawFolderName.toLowerCase())) return null;
+  if (!rawFolderID && !rawFolderName) throw new Error("Which folder should I move it to?");
+
+  const manifest = readNoteManifest(projectID);
+  if (rawFolderID && (manifest.folders ?? []).some((folder) => String(folder.id ?? "") === rawFolderID)) {
+    return rawFolderID;
+  }
+  const folder = (manifest.folders ?? []).find((entry) =>
+    normalizeTitle(entry.name, "Folder").toLowerCase() === (rawFolderName || rawFolderID).toLowerCase()
+  );
+  if (!folder) throw new Error("I couldn't find that note folder.");
+  return String(folder.id ?? "");
+}
+
 function runConfirmedVoiceTool(device: RemoteAccessPairedDeviceRecord, tool: string, args: JsonObject): VoiceCommandResult {
   switch (tool) {
+    case "delete_note":
+    case "archive_note": {
+      const target = resolveVoiceNoteTarget(args, args);
+      if (target.kind === "note") {
+        deleteProjectNote(target.projectID, target.noteID);
+        remoteSelectedNoteByDeviceID.delete(device.id);
+      } else {
+        deleteThreadNote(target.threadID, target.noteID);
+        remoteSelectedThreadNoteByDeviceID.delete(device.id);
+      }
+      return { tool, spokenAnswer: "Archived the note." };
+    }
+    case "move_note_to_folder": {
+      const target = resolveVoiceNoteTarget(args, args);
+      if (target.kind !== "note") throw new Error("Only project notes can move between folders.");
+      const folderID = resolveVoiceProjectNoteFolderID(target.projectID, args);
+      moveProjectNoteToFolder(target.projectID, target.noteID, folderID);
+      remoteSelectedNoteByDeviceID.set(device.id, { projectID: target.projectID.toUpperCase(), noteID: target.noteID });
+      remoteSelectedThreadNoteByDeviceID.delete(device.id);
+      return { tool, spokenAnswer: folderID ? "Moved the note to that folder." : "Moved the note out of its folder.", openTarget: target };
+    }
     case "delete_today_item":
     case "delete_planner_item": {
       const query = voicePlannerTaskQuery(args);
@@ -17730,13 +23434,13 @@ function runConfirmedVoiceTool(device: RemoteAccessPairedDeviceRecord, tool: str
         : query ? findDailyItemByText(sourceItems, query) : undefined;
       if (!existing) throw new Error("I couldn't find that planner item.");
       const title = dailyItemVisibleTitle(existing);
-      upsertDailyItem({
+      appendMovedDailyItemToDay({
         ...existing,
         dayID: targetDayID,
         checked: false,
         status: "todo",
         title
-      });
+      }, targetDayID);
       deleteDailyItem(fromDayID, existing.id);
       remoteSelectedPlannerByDeviceID.set(device.id, { view: "day", dayID: targetDayID });
       return { tool, spokenAnswer: `Moved “${title}” to ${formattedPlannerDay(targetDayID)}.` };
@@ -17759,10 +23463,6 @@ function runConfirmedVoiceTool(device: RemoteAccessPairedDeviceRecord, tool: str
       void deleteSessionPermanently(sessionID).then(() => notifyThreadsChanged());
       return { tool, spokenAnswer: "Deleted the thread." };
     }
-    case "delete_note":
-    case "archive_note":
-      // v1 keeps file-level note delete/archive on the Mac source of truth only.
-      throw new Error("Deleting or archiving notes from voice isn't enabled yet. Please do it on the Mac.");
     default:
       throw new Error(`I can't confirm “${tool}” yet.`);
   }
@@ -17791,7 +23491,6 @@ class OpenAssistRemoteAccessServer {
     const runtimeSettings = {
       port: settings.remoteAccessPort,
       networkMode: normalizeRemoteAccessNetworkMode(settings.remoteAccessNetworkMode),
-      tailscaleHost: settings.remoteAccessTailscaleHost,
       publicURL: easyRemoteTunnel.currentURL() || settings.remoteAccessPublicURL
     };
     const code = remoteAccessSecureToken("oa_pair_", 12);
@@ -17820,7 +23519,6 @@ class OpenAssistRemoteAccessServer {
         baseURL: remoteAccessPreferredURL({
           port: String(port),
           networkMode,
-          tailscaleHost: settings.remoteAccessTailscaleHost,
           publicURL: normalizeRemoteAccessPublicURL(easyRemoteTunnel.currentURL() || settings.remoteAccessPublicURL)
         })
       };
@@ -17843,7 +23541,6 @@ class OpenAssistRemoteAccessServer {
       baseURL: remoteAccessPreferredURL({
         port: String(port),
         networkMode,
-        tailscaleHost: settings.remoteAccessTailscaleHost,
         publicURL: normalizeRemoteAccessPublicURL(easyRemoteTunnel.currentURL() || settings.remoteAccessPublicURL)
       })
     };
@@ -17895,7 +23592,6 @@ class OpenAssistRemoteAccessServer {
     if (isLoopbackAddress(address)) return true;
     const networkMode = normalizeRemoteAccessNetworkMode(settings.remoteAccessNetworkMode);
     if (networkMode === "localNetwork") return isPrivateIPv4Address(address);
-    if (networkMode === "tailscale") return isTailscaleIPv4Address(address);
     return false;
   }
 
@@ -17924,7 +23620,7 @@ class OpenAssistRemoteAccessServer {
       return;
     }
     if (!this.requestAllowed(req, settings)) {
-      jsonResponse(res, 403, { error: "Remote Access only allows this Mac or Tailscale devices." });
+      jsonResponse(res, 403, { error: "Remote Access only allows this Mac or same-Wi-Fi devices." });
       return;
     }
     const url = new URL(req.url ?? "/", `http://${req.headers.host || "127.0.0.1"}`);
@@ -17959,7 +23655,6 @@ class OpenAssistRemoteAccessServer {
       const runtimeSettings = {
         port: settings.remoteAccessPort,
         networkMode: normalizeRemoteAccessNetworkMode(settings.remoteAccessNetworkMode),
-        tailscaleHost: settings.remoteAccessTailscaleHost,
         publicURL: remotePublicURL
       };
       jsonResponse(res, 200, {
@@ -17967,14 +23662,12 @@ class OpenAssistRemoteAccessServer {
         helperState: this.isRunning() ? "Running" : "Stopped",
         helperMessage: easyTunnelURL
           ? "Easy QR is enabled."
-          : settings.remoteAccessNetworkMode === "tailscale"
-            ? "Tailscale Direct is enabled."
-            : null,
+          : null,
         machineID: remoteAccessMachineID(),
         machineName: os.hostname(),
         appVersion: `${settings.appVersion} (${settings.buildNumber})`,
         localBaseURL: remoteAccessLocalURL(runtimeSettings),
-        tailscaleBaseURL: remoteAccessTailscaleURL(runtimeSettings) || null,
+        tailscaleBaseURL: null,
         publicBaseURL: remotePublicURL || null,
         networkMode: settings.remoteAccessNetworkMode,
         tunnelMode: remotePublicURL ? "named" : "disabled",
@@ -18086,11 +23779,132 @@ class OpenAssistRemoteAccessServer {
         loadNote(projectID, noteID);
         remoteSelectedNoteByDeviceID.set(device.id, { projectID: projectID.toUpperCase(), noteID });
         remoteSelectedThreadNoteByDeviceID.delete(device.id);
+      } else if (type === "createProjectNote") {
+        const projectID = String(payload.projectID ?? "").trim();
+        if (!projectID) throw new Error("Choose a list first.");
+        const created = createProjectNote(projectID);
+        const title = String(payload.title ?? "").trim();
+        if (title) renameProjectNote(projectID, created.note.id, title);
+        const markdown = String(payload.markdown ?? "");
+        if (markdown.trim()) saveProjectNote(projectID, created.note.id, markdown);
+        remoteSelectedNoteByDeviceID.set(device.id, { projectID: projectID.toUpperCase(), noteID: created.note.id });
+        remoteSelectedThreadNoteByDeviceID.delete(device.id);
+      } else if (type === "saveProjectNote") {
+        const projectID = String(payload.projectID ?? "").trim();
+        const noteID = String(payload.noteID ?? "").trim();
+        if (!projectID || !noteID) throw new Error("Note was not found.");
+        saveProjectNote(projectID, noteID, String(payload.markdown ?? ""));
+        remoteSelectedNoteByDeviceID.set(device.id, { projectID: projectID.toUpperCase(), noteID });
+        remoteSelectedThreadNoteByDeviceID.delete(device.id);
+      } else if (type === "renameProjectNote") {
+        const projectID = String(payload.projectID ?? "").trim();
+        const noteID = String(payload.noteID ?? "").trim();
+        const title = String(payload.title ?? "").trim();
+        if (!projectID || !noteID) throw new Error("Note was not found.");
+        renameProjectNote(projectID, noteID, title);
+        remoteSelectedNoteByDeviceID.set(device.id, { projectID: projectID.toUpperCase(), noteID });
+        remoteSelectedThreadNoteByDeviceID.delete(device.id);
+      } else if (type === "archiveProjectNote" || type === "deleteProjectNote") {
+        const projectID = String(payload.projectID ?? "").trim();
+        const noteID = String(payload.noteID ?? "").trim();
+        if (!projectID || !noteID) throw new Error("Note was not found.");
+        deleteProjectNote(projectID, noteID);
+        remoteSelectedNoteByDeviceID.delete(device.id);
+      } else if (type === "deleteProjectNotePermanently") {
+        const projectID = String(payload.projectID ?? "").trim();
+        const noteID = String(payload.noteID ?? "").trim();
+        if (!projectID || !noteID) throw new Error("Note was not found.");
+        deleteProjectNotePermanently(projectID, noteID);
+        remoteSelectedNoteByDeviceID.delete(device.id);
+      } else if (type === "restoreProjectNote") {
+        const projectID = String(payload.projectID ?? "").trim();
+        const noteID = String(payload.noteID ?? "").trim();
+        if (!projectID || !noteID) throw new Error("Note was not found.");
+        restoreProjectNote(projectID, noteID);
+        remoteSelectedNoteByDeviceID.set(device.id, { projectID: projectID.toUpperCase(), noteID });
+        remoteSelectedThreadNoteByDeviceID.delete(device.id);
+      } else if (type === "restoreProjectNoteHistory") {
+        const projectID = String(payload.projectID ?? "").trim();
+        const noteID = String(payload.noteID ?? "").trim();
+        const historyID = String(payload.historyID ?? "").trim();
+        if (!projectID || !noteID || !historyID) throw new Error("Saved version was not found.");
+        restoreProjectNoteHistory(projectID, noteID, historyID);
+        remoteSelectedNoteByDeviceID.set(device.id, { projectID: projectID.toUpperCase(), noteID });
+        remoteSelectedThreadNoteByDeviceID.delete(device.id);
+      } else if (type === "moveProjectNoteToFolder") {
+        const projectID = String(payload.projectID ?? "").trim();
+        const noteID = String(payload.noteID ?? "").trim();
+        const folderID = typeof payload.folderID === "string" && payload.folderID.trim() ? payload.folderID.trim() : null;
+        if (!projectID || !noteID) throw new Error("Note was not found.");
+        moveProjectNoteToFolder(projectID, noteID, folderID);
+        remoteSelectedNoteByDeviceID.set(device.id, { projectID: projectID.toUpperCase(), noteID });
+        remoteSelectedThreadNoteByDeviceID.delete(device.id);
+      } else if (type === "createProjectNoteFolder") {
+        const projectID = String(payload.projectID ?? "").trim();
+        const name = String(payload.name ?? "").trim();
+        if (!projectID) throw new Error("Choose a list first.");
+        createProjectNoteFolder(projectID, name);
+      } else if (type === "renameProjectNoteFolder") {
+        const projectID = String(payload.projectID ?? "").trim();
+        const folderID = String(payload.folderID ?? "").trim();
+        const name = String(payload.name ?? "").trim();
+        if (!projectID || !folderID) throw new Error("Folder was not found.");
+        renameProjectNoteFolder(projectID, folderID, name);
+      } else if (type === "deleteProjectNoteFolder") {
+        const projectID = String(payload.projectID ?? "").trim();
+        const folderID = String(payload.folderID ?? "").trim();
+        if (!projectID || !folderID) throw new Error("Folder was not found.");
+        deleteProjectNoteFolder(projectID, folderID);
       } else if (type === "selectThreadNote") {
         const threadID = String(payload.threadID ?? "").trim();
         const noteID = String(payload.noteID ?? "").trim();
         if (!threadID || !noteID) throw new Error("Thread note was not found.");
         selectThreadNote(threadID, noteID);
+        remoteSelectedThreadNoteByDeviceID.set(device.id, { threadID, noteID });
+        remoteSelectedNoteByDeviceID.delete(device.id);
+      } else if (type === "createThreadNote") {
+        const threadID = String(payload.threadID ?? sessionID ?? "").trim();
+        if (!threadID) throw new Error("Thread note was not found.");
+        const workspace = createThreadNote(threadID, String(payload.title ?? "Untitled note"));
+        const noteID = workspace.selectedNoteID ?? workspace.selectedNote?.id ?? "";
+        if (noteID && typeof payload.markdown === "string" && payload.markdown.trim()) {
+          saveThreadNote(threadID, noteID, payload.markdown);
+        }
+        if (noteID) remoteSelectedThreadNoteByDeviceID.set(device.id, { threadID, noteID });
+        remoteSelectedNoteByDeviceID.delete(device.id);
+      } else if (type === "saveThreadNote") {
+        const threadID = String(payload.threadID ?? sessionID ?? "").trim();
+        const noteID = String(payload.noteID ?? "").trim();
+        if (!threadID) throw new Error("Thread note was not found.");
+        const workspace = saveThreadNote(threadID, noteID || undefined, String(payload.markdown ?? ""));
+        const selectedNoteID = workspace.selectedNoteID ?? noteID;
+        if (selectedNoteID) remoteSelectedThreadNoteByDeviceID.set(device.id, { threadID, noteID: selectedNoteID });
+        remoteSelectedNoteByDeviceID.delete(device.id);
+      } else if (type === "renameThreadNote") {
+        const threadID = String(payload.threadID ?? sessionID ?? "").trim();
+        const noteID = String(payload.noteID ?? "").trim();
+        const title = String(payload.title ?? "").trim();
+        if (!threadID || !noteID) throw new Error("Thread note was not found.");
+        renameThreadNote(threadID, noteID, title);
+        remoteSelectedThreadNoteByDeviceID.set(device.id, { threadID, noteID });
+        remoteSelectedNoteByDeviceID.delete(device.id);
+      } else if (type === "archiveThreadNote" || type === "deleteThreadNote") {
+        const threadID = String(payload.threadID ?? sessionID ?? "").trim();
+        const noteID = String(payload.noteID ?? "").trim();
+        if (!threadID || !noteID) throw new Error("Thread note was not found.");
+        deleteThreadNote(threadID, noteID);
+        remoteSelectedThreadNoteByDeviceID.delete(device.id);
+      } else if (type === "deleteThreadNotePermanently") {
+        const threadID = String(payload.threadID ?? sessionID ?? "").trim();
+        const noteID = String(payload.noteID ?? "").trim();
+        if (!threadID || !noteID) throw new Error("Thread note was not found.");
+        deleteThreadNotePermanently(threadID, noteID);
+        remoteSelectedThreadNoteByDeviceID.delete(device.id);
+      } else if (type === "restoreThreadNote") {
+        const threadID = String(payload.threadID ?? sessionID ?? "").trim();
+        const noteID = String(payload.noteID ?? "").trim();
+        if (!threadID || !noteID) throw new Error("Thread note was not found.");
+        restoreThreadNote(threadID, noteID);
         remoteSelectedThreadNoteByDeviceID.set(device.id, { threadID, noteID });
         remoteSelectedNoteByDeviceID.delete(device.id);
       } else if (type === "newSession") {
@@ -18180,6 +23994,24 @@ class OpenAssistRemoteAccessServer {
       } else if (type === "cancelPermission") {
         const requestID = payload.requestID as JsonRequestID | undefined;
         if (requestID !== undefined) await respondToProviderRequest(requestID, { deny: true });
+      } else if (type === "upsertPlannerCategory") {
+        upsertPlannerCategory(dailyItemJSON(payload.category ?? payload));
+      } else if (type === "deletePlannerCategory") {
+        const categoryID = String(payload.categoryID ?? payload.id ?? "").trim();
+        if (!categoryID) throw new Error("Category was not found.");
+        deletePlannerCategory(categoryID);
+      } else if (type === "createPlannerList") {
+        createPlannerList(payload.list ?? payload);
+      } else if (type === "updatePlannerListColorAndArea") {
+        const projectID = String(payload.projectID ?? payload.listID ?? payload.id ?? "").trim();
+        if (!projectID) throw new Error("List was not found.");
+        const area = typeof payload.area === "string" ? payload.area : null;
+        const color = typeof payload.color === "string" ? payload.color : null;
+        updatePlannerListColorAndArea(projectID, area, color);
+      } else if (type === "hidePlannerList") {
+        const projectID = String(payload.projectID ?? payload.listID ?? payload.id ?? "").trim();
+        if (!projectID) throw new Error("List was not found.");
+        hidePlannerList(projectID);
       } else if (type === "selectPlannerDay") {
         const dayID = normalizePlannerDayID(String(payload.dayID ?? ""));
         loadPlannerDay(dayID);
@@ -18232,6 +24064,19 @@ class OpenAssistRemoteAccessServer {
         if (!itemID) throw new Error("Backlog item was not found.");
         scheduleBacklogItem(itemID, targetDayID);
         remoteSelectedPlannerByDeviceID.set(device.id, { view: "day", dayID: targetDayID });
+      } else if (type === "moveDailyItemToBacklog") {
+        const dayID = normalizePlannerDayID(String(payload.dayID ?? ""));
+        const itemID = String(payload.itemID ?? "").trim();
+        if (!itemID) throw new Error("Daily item was not found.");
+        moveDailyItemToBacklog(dayID, itemID);
+        remoteSelectedPlannerByDeviceID.set(device.id, { view: "backlog", dayID: plannerDayID() });
+      } else if (type === "moveDailyItemToDay") {
+        const dayID = normalizePlannerDayID(String(payload.dayID ?? ""));
+        const itemID = String(payload.itemID ?? "").trim();
+        const targetDayID = normalizePlannerDayID(String(payload.targetDayID ?? ""));
+        if (!itemID) throw new Error("Daily item was not found.");
+        moveDailyItemToDay(dayID, itemID, targetDayID);
+        remoteSelectedPlannerByDeviceID.set(device.id, { view: "day", dayID: targetDayID });
       } else if (type === "voiceCommand") {
         const voice = await runVoiceTool(device, payload);
         return { id: String(body.id ?? ""), ok: true, snapshot: await makeRemoteAccessSnapshot(device.id), error: null, voice };
@@ -18279,6 +24124,9 @@ async function startRemoteAccessEasyQR() {
   const tunnelName = String(await readDefault("OpenAssist.remoteAccess.namedTunnelName", "openassist")).trim();
   const credentialsFile = String(await readDefault("OpenAssist.remoteAccess.namedTunnelCredentialsFile", "")).trim();
   await easyRemoteTunnel.start(`http://127.0.0.1:${port}`, { publicURL, tunnelName, credentialsFile });
+  // Remember that the public link was on so it auto-restores on next launch
+  // (the user shouldn't have to re-enable it every time the app opens).
+  await writeBoolDefault("OpenAssist.remoteAccess.easyQRActive", true);
   const nextSettings = await loadRemoteAccessSettings();
   remoteAccessServer.rotatePairingChallenge(nextSettings);
   return loadSettings();
@@ -18286,28 +24134,70 @@ async function startRemoteAccessEasyQR() {
 
 async function stopRemoteAccessEasyQR() {
   easyRemoteTunnel.stop();
+  await writeBoolDefault("OpenAssist.remoteAccess.easyQRActive", false);
   remoteAccessServer.clearPairingChallenge();
   return loadSettings();
 }
 
-async function openTailscaleApp() {
-  const status = await remoteAccessTailscaleStatusSnapshot();
-  if (!status.installed) {
-    return { ok: false, installURL: tailscaleMacDownloadURL, error: "Tailscale is not installed." };
-  }
+// Lightweight live view of the Remote Access runtime (server + Easy QR tunnel +
+// paired devices) for the main window toolbar to poll. The full settings
+// snapshot is loaded once on startup, so without this the toolbar pill would
+// stay on its launch-time value (e.g. "Starting…") even after the startup
+// auto-restore finished bringing the tunnel up.
+async function getRemoteAccessStatus() {
+  const remoteAccessPort = await readDefault("OpenAssist.remoteAccess.port", "45831");
+  const remoteAccessNetworkMode = normalizeRemoteAccessNetworkMode(
+    await readDefault("OpenAssist.remoteAccess.networkMode", "localNetwork")
+  );
+  const remoteAccessRuntime = remoteAccessServerRuntimeSnapshot({
+    port: remoteAccessPort,
+    networkMode: remoteAccessNetworkMode,
+    publicURL: easyRemoteTunnel.currentURL()
+  });
+  return {
+    remoteAccessEnabled: await readBoolDefault("OpenAssist.remoteAccess.enabled", false),
+    remoteAccessEasyTunnelURL: remoteAccessRuntime.easyTunnelURL,
+    remoteAccessEasyTunnelRunning: remoteAccessRuntime.easyTunnelRunning,
+    remoteAccessEasyTunnelStatusMessage: remoteAccessRuntime.easyTunnelStatusMessage,
+    remoteAccessTunnelHelperInstalled: remoteAccessRuntime.tunnelHelperInstalled,
+    remoteAccessTunnelHelperInstalling: remoteAccessRuntime.tunnelHelperInstalling,
+    remoteAccessPairingCode: remoteAccessRuntime.pairingCode,
+    remoteAccessPairingURL: remoteAccessRuntime.pairingURL,
+    remoteAccessPairingExpiresAt: remoteAccessRuntime.pairingExpiresAt,
+    remoteAccessServerRunning: remoteAccessRuntime.serverRunning,
+    remoteAccessDeviceCount: remoteAccessRuntime.deviceCount
+  };
+}
+
+// Re-establishes Remote Access on app launch so a user who left it on does not
+// have to turn it back on manually. The local server already auto-starts from
+// loadOpenAssistAppState; this additionally restores the public Easy QR tunnel
+// (the shareable link) when it was active before the app was last closed.
+let remoteAccessStartupRestoreAttempted = false;
+async function restoreRemoteAccessOnStartup() {
+  if (remoteAccessStartupRestoreAttempted) return;
+  remoteAccessStartupRestoreAttempted = true;
   try {
-    if (status.appPath) {
-      await execFileAsync("/usr/bin/open", [status.appPath], { timeout: 3000 });
-    } else {
-      await execFileAsync("/usr/bin/open", ["-a", "Tailscale"], { timeout: 3000 });
-    }
-    return { ok: true, installURL: tailscaleMacDownloadURL };
+    const enabled = await readBoolDefault("OpenAssist.remoteAccess.enabled", false);
+    if (!enabled) return;
+    const settings = await loadRemoteAccessSettings();
+    await ensureRemoteAccessServerForSettings(settings);
+    if (easyRemoteTunnel.isRunning()) return;
+    const port = normalizedRemoteAccessPort(settings.remoteAccessPort);
+    const publicURL = normalizeRemoteAccessPublicURL(
+      settings.remoteAccessPublicURL || await readDefault("OpenAssist.remoteAccess.namedTunnelPublicURL", "")
+    );
+    // Bring the public link back up if it was on last time (easyQRActive) OR if a
+    // stable named link is already configured ("already has a link to it"), so the
+    // user never has to re-start Easy QR after a relaunch.
+    const easyQRActive = await readBoolDefault("OpenAssist.remoteAccess.easyQRActive", false);
+    if (!easyQRActive && !publicURL) return;
+    const tunnelName = String(await readDefault("OpenAssist.remoteAccess.namedTunnelName", "openassist")).trim();
+    const credentialsFile = String(await readDefault("OpenAssist.remoteAccess.namedTunnelCredentialsFile", "")).trim();
+    await easyRemoteTunnel.start(`http://127.0.0.1:${port}`, { publicURL, tunnelName, credentialsFile });
+    bridgeDebugLog("Remote Access public link restored on startup.");
   } catch (error) {
-    return {
-      ok: false,
-      installURL: tailscaleMacDownloadURL,
-      error: error instanceof Error ? error.message : "Could not open Tailscale."
-    };
+    bridgeDebugLog(`Remote Access startup restore failed: ${error instanceof Error ? error.message : String(error)}`);
   }
 }
 
@@ -18335,6 +24225,10 @@ class OpenAssistKnowledgeServer {
         jsonResponse(res, 500, { error: error instanceof Error ? error.message : "Knowledge Access failed." });
       });
     });
+    server.keepAliveTimeout = 5_000;
+    server.headersTimeout = 6_000;
+    server.requestTimeout = 15_000;
+    server.maxRequestsPerSocket = 100;
     await new Promise<void>((resolve, reject) => {
       server.once("error", reject);
       server.listen(Number.parseInt(port, 10), "127.0.0.1", () => resolve());
@@ -18353,14 +24247,14 @@ class OpenAssistKnowledgeServer {
     this.currentPort = "";
   }
 
-  private async authorize(req: http.IncomingMessage, settings: SettingsSnapshot) {
+  private async authorize(req: http.IncomingMessage, settings: KnowledgeAccessSettings) {
     if (!settings.knowledgeAccessEnabled) return false;
     const token = this.currentToken || ensureKnowledgeAccessToken();
     return Boolean(token && requestBearerToken(req) === token);
   }
 
   private async handle(req: http.IncomingMessage, res: http.ServerResponse) {
-    const settings = await loadSettings();
+    const settings = await loadKnowledgeAccessSettings();
     const url = new URL(req.url ?? "/", `http://${req.headers.host || "127.0.0.1"}`);
     if (url.pathname === "/v1/health") {
       jsonResponse(res, 200, {
@@ -18467,7 +24361,7 @@ class OpenAssistKnowledgeServer {
     jsonResponse(res, 404, { error: "Unknown Knowledge Access endpoint." });
   }
 
-  private async handleMCP(req: http.IncomingMessage, res: http.ServerResponse, settings: SettingsSnapshot) {
+  private async handleMCP(req: http.IncomingMessage, res: http.ServerResponse, settings: KnowledgeAccessSettings) {
     if (!settings.knowledgeAgentAccessEnabled) {
       jsonResponse(res, 403, { error: "Knowledge agent tools are turned off in Settings." });
       return;
@@ -18485,16 +24379,19 @@ class OpenAssistKnowledgeServer {
       jsonResponse(res, 405, { error: "Use POST for MCP JSON-RPC." });
       return;
     }
-    const request = jsonObject(await readRequestJSON(req)) ?? {};
+    const request = jsonObject(await readRequestJSON(req, maxKnowledgeMCPRequestBytes)) ?? {};
     const id = request.id as JsonRequestID | undefined;
     const method = String(request.method ?? "");
     const params = jsonObject(request.params) ?? {};
     const reply = (result: unknown) => jsonResponse(res, 200, { jsonrpc: "2.0", id: id ?? null, result });
     try {
       if (method === "initialize") {
+        const capabilities = settings.knowledgeExternalAccessMode === "full"
+          ? { tools: {}, resources: {} }
+          : { tools: {} };
         reply({
           protocolVersion: "2025-06-18",
-          capabilities: { tools: {}, resources: {} },
+          capabilities,
           serverInfo: { name: "openassist-knowledge", version: "0.1.0" }
         });
         return;
@@ -18504,30 +24401,33 @@ class OpenAssistKnowledgeServer {
         return;
       }
       if (method === "tools/list") {
-        reply({ tools: knowledgeMCPTools });
+        reply({ tools: cachedKnowledgeMCPToolsForSettings(settings) });
         return;
       }
       if (method === "tools/call") {
         const name = String(params.name ?? "");
         const args = jsonObject(params.arguments) ?? {};
+        if (!knowledgeMCPToolAllowedForSettings(name, settings)) {
+          throw new Error(`Tool ${name || "(missing)"} is hidden by the ${settings.knowledgeExternalAccessMode} external access mode.`);
+        }
         if (name.startsWith("oa_request") && !settings.knowledgeOrganizerEnabled) {
           throw new Error("Knowledge organizer requests are turned off in Settings.");
         }
-        reply(knowledgeMCPToolResponse(knowledgeToolResult(name, args, "mcp")));
+        reply(knowledgeMCPToolResponse(await knowledgeToolResultAsync(name, args, "mcp")));
         return;
       }
       if (method === "resources/list") {
-        reply({
-          resources: searchKnowledge("", 50).map((item) => ({
-            uri: `openassist://knowledge/${encodeURIComponent(item.id)}`,
-            name: item.title,
-            description: item.sourceLabel,
-            mimeType: "text/markdown"
-          }))
-        });
+        if (settings.knowledgeExternalAccessMode !== "full") {
+          reply({ resources: [] });
+          return;
+        }
+        reply({ resources: cachedKnowledgeMCPResources() });
         return;
       }
       if (method === "resources/read") {
+        if (settings.knowledgeExternalAccessMode !== "full") {
+          throw new Error("MCP resources are hidden unless External agent mode is Full. Use oa_search and oa_read instead.");
+        }
         const uri = String(params.uri ?? "");
         const match = uri.match(/^openassist:\/\/knowledge\/(.+)$/);
         const item = readKnowledgeItem(decodeURIComponent(match?.[1] ?? ""));
@@ -18595,6 +24495,384 @@ function temporaryKnowledgeMCPConfig(access: KnowledgeRuntimeAccess, prefix: str
         // Temporary file cleanup is best effort.
       }
     }
+  };
+}
+
+const openAssistIntegrationServerName = "openassist_knowledge";
+const openAssistSkillMarkerStart = "<!-- OPENASSIST KNOWLEDGE SKILL START -->";
+const openAssistSkillMarkerEnd = "<!-- OPENASSIST KNOWLEDGE SKILL END -->";
+const openAssistIntegrationTargetIDs = ["cursor", "codex", "claude", "generic"] as const;
+type OpenAssistIntegrationTargetID = typeof openAssistIntegrationTargetIDs[number];
+type OpenAssistIntegrationConfigKind = "json" | "toml" | "copy";
+type OpenAssistIntegrationTarget = {
+  id: OpenAssistIntegrationTargetID;
+  title: string;
+  description: string;
+  configKind: OpenAssistIntegrationConfigKind;
+  configPath?: string;
+  skillPath?: string;
+  skillMode: "cursor-rule" | "codex-agents" | "markdown-copy";
+};
+
+function isOpenAssistIntegrationTargetID(value: unknown): value is OpenAssistIntegrationTargetID {
+  return typeof value === "string" && (openAssistIntegrationTargetIDs as readonly string[]).includes(value);
+}
+
+function openAssistIntegrationTargets(): OpenAssistIntegrationTarget[] {
+  const home = os.homedir();
+  return [
+    {
+      id: "cursor",
+      title: "Cursor",
+      description: "Adds OpenAssist as a global MCP server in Cursor.",
+      configKind: "json",
+      configPath: path.join(home, ".cursor", "mcp.json"),
+      skillPath: path.join(home, ".cursor", "rules", "openassist.mdc"),
+      skillMode: "cursor-rule"
+    },
+    {
+      id: "codex",
+      title: "Codex",
+      description: "Adds OpenAssist to Codex through the bundled local stdio proxy.",
+      configKind: "toml",
+      configPath: path.join(home, ".codex", "config.toml"),
+      skillPath: path.join(home, ".codex", "AGENTS.md"),
+      skillMode: "codex-agents"
+    },
+    {
+      id: "claude",
+      title: "Claude Desktop",
+      description: "Adds OpenAssist to Claude Desktop through mcp-remote.",
+      configKind: "json",
+      configPath: path.join(home, "Library", "Application Support", "Claude", "claude_desktop_config.json"),
+      skillPath: path.join(home, "Library", "Application Support", "Claude", "openassist-knowledge-instructions.md"),
+      skillMode: "markdown-copy"
+    },
+    {
+      id: "generic",
+      title: "Generic MCP Client",
+      description: "Copies the raw HTTP MCP configuration for clients that accept url and headers.",
+      configKind: "copy",
+      skillPath: path.join(supportRoot(), "Knowledge", "openassist-knowledge-skill.md"),
+      skillMode: "markdown-copy"
+    }
+  ];
+}
+
+function openAssistIntegrationTarget(targetID: OpenAssistIntegrationTargetID) {
+  const target = openAssistIntegrationTargets().find((candidate) => candidate.id === targetID);
+  if (!target) throw new Error(`Unsupported OpenAssist integration target: ${targetID}`);
+  return target;
+}
+
+function sanitizeIntegrationTargetID(targetID: unknown) {
+  if (!isOpenAssistIntegrationTargetID(targetID)) {
+    throw new Error("Unsupported OpenAssist integration target.");
+  }
+  return targetID;
+}
+
+function writePrivateFile(filePath: string, content: string) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(filePath, content, { encoding: "utf8", mode: 0o600 });
+  try {
+    fs.chmodSync(filePath, 0o600);
+  } catch {
+    // Best effort. These configs live in the user's home directory.
+  }
+}
+
+function integrationTimestamp() {
+  return new Date().toISOString().replace(/[:.]/g, "-");
+}
+
+function backupFileIfPresent(filePath: string) {
+  if (!fs.existsSync(filePath)) return undefined;
+  const backupPath = `${filePath}.openassist-backup-${integrationTimestamp()}`;
+  fs.copyFileSync(filePath, backupPath);
+  try {
+    fs.chmodSync(backupPath, 0o600);
+  } catch {
+    // Best effort. The original permissions are left untouched.
+  }
+  return backupPath;
+}
+
+function resolveKnowledgeProxyPath() {
+  const resourcesPath = (process as NodeJS.Process & { resourcesPath?: string }).resourcesPath || "";
+  const candidates = [
+    path.join(app.getAppPath(), "bin", "openassist-knowledge.mjs"),
+    path.join(resourcesPath, "app", "bin", "openassist-knowledge.mjs"),
+    path.join(process.cwd(), "bin", "openassist-knowledge.mjs")
+  ].filter(Boolean);
+  const existing = candidates.find((candidate) => fs.existsSync(candidate));
+  return existing || candidates[0];
+}
+
+function jsonIntegrationEntry(targetID: OpenAssistIntegrationTargetID, access: KnowledgeRuntimeAccess) {
+  if (targetID === "claude") {
+    return {
+      command: "npx",
+      args: [
+        "-y",
+        "mcp-remote",
+        `${access.baseURL}/mcp`,
+        "--header",
+        `Authorization: Bearer ${access.token}`
+      ]
+    };
+  }
+  return knowledgeMCPServerConfig(access).mcpServers[openAssistIntegrationServerName];
+}
+
+function tomlString(value: string) {
+  return JSON.stringify(value);
+}
+
+function codexIntegrationTomlBlock() {
+  const proxyPath = resolveKnowledgeProxyPath();
+  return [
+    `[mcp_servers.${openAssistIntegrationServerName}]`,
+    `command = ${tomlString("node")}`,
+    `args = [${tomlString(proxyPath)}, ${tomlString("mcp")}, ${tomlString("--stdio")}]`
+  ].join("\n");
+}
+
+function buildOpenAssistIntegrationConfigText(targetID: OpenAssistIntegrationTargetID, access: KnowledgeRuntimeAccess) {
+  const target = openAssistIntegrationTarget(targetID);
+  if (target.configKind === "toml") return `${codexIntegrationTomlBlock()}\n`;
+  if (target.configKind === "json") {
+    return `${JSON.stringify({
+      mcpServers: {
+        [openAssistIntegrationServerName]: jsonIntegrationEntry(targetID, access)
+      }
+    }, null, 2)}\n`;
+  }
+  return `${JSON.stringify(knowledgeMCPServerConfig(access), null, 2)}\n`;
+}
+
+function mergeJsonIntegrationConfig(filePath: string, targetID: OpenAssistIntegrationTargetID, access: KnowledgeRuntimeAccess) {
+  const raw = fs.existsSync(filePath) ? fs.readFileSync(filePath, "utf8") : "";
+  let parsed: JsonObject = {};
+  if (raw.trim()) {
+    try {
+      const next = JSON.parse(raw);
+      if (next && typeof next === "object" && !Array.isArray(next)) parsed = next as JsonObject;
+    } catch {
+      throw new Error(`Could not parse existing JSON config at ${filePath}.`);
+    }
+  }
+  const servers = parsed.mcpServers && typeof parsed.mcpServers === "object" && !Array.isArray(parsed.mcpServers)
+    ? { ...(parsed.mcpServers as Record<string, unknown>) }
+    : {};
+  servers[openAssistIntegrationServerName] = jsonIntegrationEntry(targetID, access);
+  return `${JSON.stringify({ ...parsed, mcpServers: servers }, null, 2)}\n`;
+}
+
+function mergeTomlIntegrationConfig(filePath: string) {
+  const raw = fs.existsSync(filePath) ? fs.readFileSync(filePath, "utf8") : "";
+  const blockPattern = new RegExp(`\\n?\\[mcp_servers\\.${openAssistIntegrationServerName}\\]\\n[\\s\\S]*?(?=\\n\\[|$)`, "m");
+  const withoutOpenAssist = raw.replace(blockPattern, "").trimEnd();
+  const separator = withoutOpenAssist ? "\n\n" : "";
+  return `${withoutOpenAssist}${separator}${codexIntegrationTomlBlock()}\n`;
+}
+
+function integrationConfigHasOpenAssist(target: OpenAssistIntegrationTarget) {
+  if (!target.configPath || !fs.existsSync(target.configPath)) return false;
+  try {
+    if (target.configKind === "toml") {
+      return new RegExp(`^\\[mcp_servers\\.${openAssistIntegrationServerName}\\]`, "m").test(fs.readFileSync(target.configPath, "utf8"));
+    }
+    const parsed = JSON.parse(fs.readFileSync(target.configPath, "utf8")) as JsonObject;
+    const servers = parsed.mcpServers;
+    return Boolean(servers && typeof servers === "object" && !Array.isArray(servers) && openAssistIntegrationServerName in servers);
+  } catch {
+    return false;
+  }
+}
+
+async function ensureKnowledgeIntegrationAccess() {
+  let settings = await loadSettings();
+  const updates: SettingsUpdatePatch[] = [];
+  if (!settings.knowledgeAccessEnabled) updates.push({ key: "knowledgeAccessEnabled", value: true });
+  if (!settings.knowledgeExternalAccessEnabled) updates.push({ key: "knowledgeExternalAccessEnabled", value: true });
+  if (updates.length) {
+    settings = await updateSettings(updates);
+  }
+  const access = await ensureKnowledgeServerForSettings(settings);
+  if (!access) throw new Error("OpenAssist Knowledge Access is not enabled.");
+  return { settings, access };
+}
+
+async function loadOpenAssistIntegrationStatus() {
+  const targets = openAssistIntegrationTargets();
+  const settings = await loadSettings();
+  const externalMode = settings.knowledgeExternalAccessMode;
+  const toolCount = knowledgeMCPToolsForSettings(settings).length;
+  return {
+    targets: targets.map((target) => ({
+      id: target.id,
+      title: target.title,
+      description: target.description,
+      configPath: target.configPath,
+      skillPath: target.skillPath,
+      detected: Boolean(target.configPath && fs.existsSync(target.configPath)),
+      connected: integrationConfigHasOpenAssist(target),
+      configKind: target.configKind,
+      skillMode: target.skillMode
+    })),
+    proxyPath: resolveKnowledgeProxyPath(),
+    externalMode,
+    exposedToolCount: toolCount,
+    resourcesVisible: externalMode === "full",
+    modeDescription: knowledgeExternalAccessModeDescription(externalMode)
+  };
+}
+
+async function connectOpenAssistIntegration(targetID: unknown) {
+  const target = openAssistIntegrationTarget(sanitizeIntegrationTargetID(targetID));
+  if (!target.configPath) throw new Error("This integration target only supports copying config.");
+  const { access } = await ensureKnowledgeIntegrationAccess();
+  const backupPath = backupFileIfPresent(target.configPath);
+  const nextConfig = target.configKind === "toml"
+    ? mergeTomlIntegrationConfig(target.configPath)
+    : mergeJsonIntegrationConfig(target.configPath, target.id, access);
+  writePrivateFile(target.configPath, nextConfig);
+  return {
+    ok: true,
+    targetID: target.id,
+    action: backupPath ? "written" : "created",
+    configPath: target.configPath,
+    backupPath
+  };
+}
+
+async function openAssistIntegrationConfigText(targetID: unknown) {
+  const { access } = await ensureKnowledgeIntegrationAccess();
+  return buildOpenAssistIntegrationConfigText(sanitizeIntegrationTargetID(targetID), access);
+}
+
+function openAssistIntegrationConfigPath(targetID: unknown) {
+  return openAssistIntegrationTarget(sanitizeIntegrationTargetID(targetID)).configPath;
+}
+
+async function testOpenAssistKnowledgeIntegration() {
+  const { settings, access } = await ensureKnowledgeIntegrationAccess();
+  const response = await fetch(`${access.baseURL}/mcp`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${access.token}`,
+      "content-type": "application/json"
+    },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} })
+  });
+  const payload = await response.json().catch(() => ({})) as JsonObject;
+  if (!response.ok) {
+    throw new Error(typeof payload.error === "string" ? payload.error : `OpenAssist MCP test failed with HTTP ${response.status}.`);
+  }
+  const result = payload.result as JsonObject | undefined;
+  const tools = Array.isArray(result?.tools) ? result.tools : [];
+  return {
+    ok: true,
+    toolCount: tools.length,
+    mcpURL: `${access.baseURL}/mcp`,
+    mode: settings.knowledgeExternalAccessMode,
+    resourcesVisible: settings.knowledgeExternalAccessMode === "full"
+  };
+}
+
+function openAssistIntegrationSkillMarkdown() {
+  return [
+    "# OpenAssist Knowledge Skill",
+    "",
+    "Use the `openassist_knowledge` MCP server when the user wants you to read or update OpenAssist planner, backlog, notes, journal, review inbox, or project knowledge.",
+    "OpenAssist usually exposes a focused Simple tool set to external agents. Do not browse MCP resources by default.",
+    "",
+    "## Fast Path",
+    "- For simple requests, call the direct tool immediately. Do not search, list, or read schemas first unless the user asked you to inspect existing content.",
+    "- Add `call city tomorrow` -> `oa_quick_add_task` with `{ \"title\": \"call city\", \"when\": \"tomorrow\" }`.",
+    "- Add `buy filters` with no date -> `oa_quick_add_task` with `{ \"title\": \"buy filters\" }` so it goes to Backlog.",
+    "- Save a fact/link/spec/measurement or detailed checklist to a List -> `oa_quick_save_note` with `text` and `listName`; it applies immediately for append-style captures.",
+    "- Link an existing note to a task -> pass `noteItemID`, `noteTitle`, or `links` to `oa_quick_add_task`, `oa_request_daily_item`, `oa_request_backlog_item`, or `oa_update_daily_item`; use `listName` only for a real planner List, not as the note name; keep `details`/`detailsMarkdown` short.",
+    "- Read today/tomorrow/backlog/open tasks -> `oa_quick_read` with `target`.",
+    "- Mark a task done -> `oa_complete_daily_item` with `title` and optional `dayID`.",
+    "",
+    "## Tool Routing",
+    "- Simple mode visible tools: `oa_quick_add_task`, `oa_quick_save_note`, `oa_quick_read`, `oa_list_approvals`, `oa_apply_approval`, `oa_reject_approval`, `oa_search`, `oa_personal_recall_search`, `oa_personal_recall_read`, `oa_read`, `oa_read_today`, `oa_list_daily_items`, `oa_list_backlog_items`, `oa_list_planner_categories`, `oa_list_planner_lists`, `oa_request_reference`, `oa_request_backlog_item`, `oa_request_daily_item`, `oa_update_daily_item`, `oa_complete_daily_item`.",
+    "- Use `oa_search` and `oa_read` only when you need to find or inspect a specific existing note, task, thread, list, project, or planner item.",
+    "- Date-less actions go to Backlog; dated actions go to Today or the named date.",
+    "- Facts, dimensions, decisions, links, measurements, specs, prices, addresses, and contact info are reference notes, not tasks.",
+    "- Use Advanced/Full tools for note cleanup, batch tasks from a note, move/carry-forward operations, connectors, Apple Reminders/Calendar, and history search.",
+    "",
+    "## Behavior rules",
+    "- Do not put reference facts into the backlog just because they mention a project or list.",
+    "- Planner items are lightweight execution pointers: what to do, when/where, and a few high-level steps. Notes hold the detailed working material: specs, measurements, reference facts, copied source content, and long checklists.",
+    "- Example: `go to Maryland Ave tomorrow and check TV/laundry fit` should be one short Tomorrow planner task linked to a `New Home Stuff` note. The TV dimensions, LG WashCombo dimensions, and measurement checklist belong inside that linked note, not inside the Tomorrow task.",
+    "- When the user says to link/reference a note from a task, attach the note via `noteItemID`, `noteTitle`, or `links`. Do not paste the full note body into task details.",
+    "- When updating an existing task's details, set `detailsMode: \"replace\"` or `replaceDetails: true` unless the user explicitly asked to append a small note.",
+    "- If the user gives both an action and a fact, split them: create the action as a task and store the fact as reference.",
+    "- Reuse existing notes and canonical reference notes. Do not create duplicate notes for the same list, project, thread, or category.",
+    "- When a tool returns `pending`, tell the user it needs approval and can be handled remotely with `oa_list_approvals`, `oa_apply_approval`, or `oa_reject_approval`. When it returns `applied`, say it was applied.",
+    "- Keep answers concise and mention the OpenAssist location that was updated."
+  ].join("\n");
+}
+
+function openAssistIntegrationSkillContent(target: OpenAssistIntegrationTarget) {
+  const markdown = openAssistIntegrationSkillMarkdown();
+  if (target.skillMode === "cursor-rule") {
+    return [
+      "---",
+      "description: Use OpenAssist Knowledge MCP for planner, backlog, notes, and reference routing.",
+      "alwaysApply: true",
+      "---",
+      "",
+      markdown,
+      ""
+    ].join("\n");
+  }
+  if (target.skillMode === "codex-agents") {
+    return [
+      openAssistSkillMarkerStart,
+      markdown,
+      openAssistSkillMarkerEnd,
+      ""
+    ].join("\n");
+  }
+  return `${markdown}\n`;
+}
+
+function openAssistIntegrationSkillGuide(targetID?: unknown) {
+  const target = targetID === undefined ? openAssistIntegrationTarget("generic") : openAssistIntegrationTarget(sanitizeIntegrationTargetID(targetID));
+  return {
+    title: "OpenAssist Knowledge Skill",
+    markdown: openAssistIntegrationSkillContent(target),
+    targetID: target.id,
+    skillPath: target.skillPath,
+    installMode: target.skillMode
+  };
+}
+
+function installOpenAssistIntegrationSkill(targetID: unknown) {
+  const target = openAssistIntegrationTarget(sanitizeIntegrationTargetID(targetID));
+  if (!target.skillPath) throw new Error("No skill path is available for this target.");
+  const content = openAssistIntegrationSkillContent(target);
+  const backupPath = backupFileIfPresent(target.skillPath);
+  if (target.skillMode === "codex-agents" && fs.existsSync(target.skillPath)) {
+    const existing = fs.readFileSync(target.skillPath, "utf8");
+    const markedPattern = new RegExp(`${openAssistSkillMarkerStart}[\\s\\S]*?${openAssistSkillMarkerEnd}\\n?`, "m");
+    const next = markedPattern.test(existing)
+      ? existing.replace(markedPattern, content)
+      : `${existing.trimEnd()}${existing.trim() ? "\n\n" : ""}${content}`;
+    writePrivateFile(target.skillPath, next);
+  } else {
+    writePrivateFile(target.skillPath, content);
+  }
+  return {
+    ok: true,
+    targetID: target.id,
+    skillPath: target.skillPath,
+    backupPath,
+    action: backupPath ? "written" : "created"
   };
 }
 
@@ -18755,23 +25033,77 @@ function openAssistKnowledgeAgentInstructions(providerName = "the agent") {
     openAssistLocalDateInstructions(),
     `Current local date: ${formattedPlannerDay(today)} (${today}).`,
     `Tomorrow: ${formattedPlannerDay(tomorrow)} (${tomorrow}). Day after tomorrow: ${formattedPlannerDay(dayAfterTomorrow)} (${dayAfterTomorrow}).`,
-    "OpenAssist has an in-app Notes system and a Today planner. This is not Apple Calendar, Apple Reminders, or an external planner app.",
+    "OpenAssist has an in-app Notes system and a Today planner. It can also access Apple Reminders and Apple Calendar only when the user explicitly names Apple Reminders, the Reminders app, Apple Calendar, the Calendar app, iCloud reminders, or iCloud calendar.",
     `When the user asks about "my notes", "Today", "planner", "journal", "tomorrow", "day after tomorrow", "daily to-do list", "tasks", or "reminders", ${providerName} should use the OpenAssist Knowledge tools.`,
-    "Use `oa_read_today` for a planner day, `oa_list_daily_items` for structured Today items, `oa_list_backlog_items` for unscheduled later/follow-up tasks, `oa_search` / `oa_read` for notes, `oa_read_journal` for journal sections, and `oa_list_open_tasks` for unfinished tasks.",
-    "For memory/history questions like `when did we`, `where did I mention`, `what did we decide`, `what happened in an earlier thread`, or `find the previous discussion`, use `oa_search_everything` first. It returns small snippets across threads, realtime turns, notes, planner, backlog, approvals, and artifacts. Use `oa_read_search_result` only for the one result you need.",
-    "If the user asks to add a reminder, task, or to-do inside OpenAssist, create a Today planner request. Do not say you lack planner access.",
-    "For adding a planner task or daily item, use `oa_request_daily_item` with the correct `dayID`. Set `area` to exactly `Work` or `Personal` so the planner separates the task under the right heading.",
-    "If the user wants to do something later, needs follow-up, or has not picked a date, use `oa_request_backlog_item` instead of forcing it into Today.",
+    "Use `oa_read_today` for a planner day, `oa_list_daily_items` for structured Today items, `oa_list_backlog_items` for unscheduled later/follow-up tasks, `oa_list_planner_categories` / `oa_list_planner_lists` for available categories and Lists, `oa_search` / `oa_read` for notes, `oa_read_journal` for journal sections, and `oa_list_open_tasks` for unfinished tasks.",
+    "For questions like today's plan, today's list, or what's on today, call `oa_read_today` first so you see the full planner markdown, including free-text lines under sections like Notes. If `oa_list_daily_items` returns no structured items but freeTextItems or noteMarkdown is present, report those. Never tell the user today is empty based only on an empty `oa_list_daily_items` result.",
+    "For connected services such as Gmail, Messages, Apple Reminders, and Apple Calendar, first call `oa_connector_status`. If the user asks to find/show/search for a specific email or email type, use `oa_connector_search_gmail` with a narrow `query`; it returns metadata snippets directly and must not sync Review Inbox. If the user asks to check iMessage, Messages, texts, or SMS for a person, appointment, or follow-up, use `oa_connector_search_messages` with a narrow `query`; do not ask what they mean by Messages. If the user asks for to-dos, backlog items, follow-ups, waiting-for items, or tasks from Gmail, use `oa_connector_sync_gmail` with `userIntent` set to the user's exact request; it places metadata-only candidates in Review Inbox. Never run a broad Gmail sync for a specific email search. Do not fetch full email bodies, run raw gws commands, or ask for all mail.",
+    "If the user explicitly asks for Apple Reminders or the Reminders app, use `oa_apple_add_reminder`, `oa_apple_list_reminders`, or `oa_apple_complete_reminder`. If the user explicitly asks for Apple Calendar, the Calendar app, iCloud calendar, or a native calendar event, use `oa_apple_add_event` or `oa_apple_list_events`. If macOS access is not granted, tell the user to grant access in Settings instead of silently using the OpenAssist planner.",
+    "For personal memory/history questions like `when did we`, `where did I mention`, `what did we decide`, `what happened in an earlier thread`, `what did Codex/Claude/Spark say`, or `find the previous discussion`, use `oa_personal_recall_search` with phase `memory` first. If memory is not enough, or the user asks for latest/recent conversations, Codex/Claude/Spark results, chats, threads, or sessions, search phase `chats`, then read only the best result with `oa_personal_recall_read`. Use `oa_search_everything` only for older broad OpenAssist-only searches.",
+    "If the user asks to add a reminder, task, or to-do inside OpenAssist, create a planner request. By default it goes to the Backlog: only put it on a planner day (Today or a date) when the user explicitly names a date or says today, tonight, tomorrow, or a specific weekday. If they give an alert time, set `reminderAt` as an ISO datetime and `reminderTimezone` when known; do not store the reminder time only as plain details. If they just say `add X` or `add X to @List` with no timing, use `oa_request_backlog_item`, not `oa_request_daily_item`. Do not say you lack planner access.",
+    "Reference info is NOT a task: measurements/dimensions, links/URLs, model or SKU numbers, prices, addresses, phone/email, specs, product details, realtor info, and `save this` facts must go to the List/thread reference note with `oa_request_reference`, not Today or Backlog.",
+    "Actions are tasks: buy, order, research, decide, schedule, call, message, finish, follow up, or fix. Date-less actions go to `oa_request_backlog_item`; dated actions go to `oa_request_daily_item`.",
+    "Before saving reference info, reuse the existing List/thread note. The `oa_request_reference` tool resolves the canonical note by title, creates one only if missing, and dedupes repeated lines; do not create a second note yourself.",
+    "If the user gives both an action and a fact, handle both intelligently: create the action task and save the concrete reference facts to the note. Example: `buy a 57 inch TV for @New Home Stuff` is a Backlog task plus a 57 inch TV reference.",
+    "If a task should refer to an existing note, pass `noteItemID`, `noteTitle`, or `links` on the task tool. Use `listName` only for a real Planner List, not as the note name. Keep task `detailsMarkdown` to short action context and never paste the full note body into the task.",
+    "If reference-vs-action is ambiguous or the user only gives a `#Category` without a clear `@List`/thread/note, ask one short clarification instead of guessing.",
+    "For adding a task to a specific planner day, use `oa_request_daily_item` with the correct `dayID` ONLY when the user named a date or said today, tonight, tomorrow, or a weekday. Put it under the right category heading by setting `area`/`category` when the user gives or implies one. Also set `listID` or `listName`, `section`, and `tags` when the user gives them. Call `oa_list_planner_categories` or `oa_list_planner_lists` if unsure.",
+    "For changing, renaming, moving, recategorizing, or adding details to an existing planner item, use `oa_update_daily_item` with `itemID` or the current task text in `query`; do not add a new item and leave the old one behind. When replacing task details, set `detailsMode: \"replace\"` or `replaceDetails: true`; append only when the user explicitly asked to add a small note. If the user says it is not for the current `@List` and only names a Category such as Work, set `area`/`category` and `clearList: true`.",
+    "Default date-less ACTIONS to the Backlog with `oa_request_backlog_item` whenever the user has not picked a date. Reference captures use `oa_quick_save_note` or `oa_request_reference` and apply immediately. Never silently add a date-less task to Today. Do not also add Today tasks to Backlog.",
+    "When the user asks to create tasks from a note, split a note into tasks, or do sprint planning from a note, first find/read the full source note with `oa_search`/`oa_read`, then call `oa_request_tasks_from_note` with `sourceItemID` and proposed `items`. Default to `target: \"backlog\"` unless the user gives a date. This creates a Review Inbox preview; do not claim tasks were created until approved.",
     "To mark a task as done (or not done), use `oa_complete_daily_item` with the task text and the `dayID`. It is applied immediately, no approval needed. If unsure of the exact wording, call `oa_list_daily_items` first.",
-    "Work means job, client, coding, project, meeting, ticket, repo, or business tasks. Personal means home, family, errands, appointments, calls, service/repair, bills, or shopping.",
-    "If you are not sure whether a task is Work or Personal, ask one short clarification question before creating the planner request.",
-    "Put project/folder scope in the title with simple inline tags: @Project for projects and #Folder for folders. For example, `title: \"Ask Levi about Darkrunner stuff @OpenAssist\", area: \"Work\"`.",
-    "For notes/planner edits or organizing, create a request/preview with `oa_request_add`, `oa_request_patch`, `oa_request_organize`, `oa_request_daily_item`, `oa_request_carry_forward`, or `oa_request_move_to_backlog`. Do not create organize-only requests that have no exact preview.",
-    "OpenAssist notes support rich formatting blocks beyond plain markdown. When organizing a note for better readability, follow this pattern: (1) read the note with `oa_read`, (2) call `oa_note_style_guide` to learn supported block syntax (callouts, column layouts, etc.), (3) produce exact replacement markdown using those blocks, (4) submit with `oa_request_organize` including `itemID` and the full `markdown`. This creates an approval preview the user can accept.",
-    "Supported note blocks include: callouts (`::: decision`, `::: warning`, `::: info`, `::: success`, `::: next`, `::: comment`) and 2/3-column table layouts. Always call `oa_note_style_guide` before writing organized markdown to get the exact syntax.",
-    "After creating an organize/edit preview, tell the user it is ready in the Knowledge Approval inbox and that they can use Show changes to review the before/after diff before applying it.",
-    "Adding a new task or daily item is applied immediately: when the tool result has status \"applied\", say it was added. When the tool result has status \"pending\" (moves, edits, or organizing), say it is waiting for approval. Never claim something was added while it is still pending.",
-    "Read only what you need. Do not dump all notes into the answer."
+    "Do not assume business-related tasks are Work if a Business category exists; use Business only when `oa_list_planner_categories` shows it, otherwise ask or omit area.",
+    "If you are not sure which category applies, ask one short clarification question before creating the planner request.",
+    "Planner organization is Category -> List -> Section -> Item. The inline shorthand is `#Category` and `@List` in both Today and Backlog. If only `@List` is used, use that List's default Category. Explicit `#Category` wins. Work, Personal, Business, and Home are Categories, not Lists. Use tags only for cross-category filters like Shopping, Errands, Waiting For, or Follow-up. Prefer `listID`/`listName` when a clear List exists.",
+    "For notes/planner edits or organizing, create a request/preview or direct structured edit with `oa_request_add`, `oa_request_reference`, `oa_request_patch`, `oa_request_organize`, `oa_request_daily_item`, `oa_update_daily_item`, `oa_request_carry_forward`, or `oa_request_move_to_backlog`. Do not create organize-only requests that have no exact preview.",
+    "OpenAssist notes are not append-only. Use `oa_quick_save_note`/`oa_request_reference` only for small additive reference captures. When the user asks to reorganize, restructure, clean up, rewrite, format, or make an existing note easier to scan, do NOT say the MCP cannot replace notes; use an approval preview.",
+    "OpenAssist notes support rich formatting blocks beyond plain markdown. When organizing a note for better readability, follow this pattern: (1) find/read the note with `oa_search`/`oa_read`, (2) call `oa_note_style_guide` to learn supported block syntax (callouts, column layouts, etc.), (3) produce exact full replacement markdown containing everything that should remain, (4) submit with `oa_request_organize` including `itemID` and the full `markdown`. This creates an approval preview the user can accept and prevents duplicated appended content.",
+    "Supported note blocks include: callouts (`::: decision`, `::: warning`, `::: info`, `::: success`, `::: next`, `::: comment`), collapsible sections (`## Area <!-- oa:collapsible -->` or `<!-- oa:collapsible title=\"...\" -->...<!-- /oa:collapsible -->`), and 2/3-column table layouts. Always call `oa_note_style_guide` before writing organized markdown to get the exact syntax.",
+    "When a reference note covers multiple areas/items (specs, checklists, option comparisons, on-site references), keep it scannable with a short intro and a clear heading per area. Prefer 2/3-column table layouts to make great use of horizontal space: compare options side by side, or put saved facts next to the fit/decision fields. Keep the interactive checklist at full width, and put derived fields (max-that-fits, final yes/no) in a short decision block. Never put `- [ ]` checkboxes inside table cells. For values the user fills in on-site, use an empty 'Actual'/'Value' table cell (tap to type) and checkboxes for yes/no instead of inline `____` blanks, which are hard to edit on phone. Collapsible sections are optional and only for very long notes.",
+    "After creating an organize/edit preview, tell the user it is ready for approval and can be applied either in Review Inbox or through `oa_apply_approval` after listing it with `oa_list_approvals`. Never claim the note was already organized, changed, or updated.",
+    "Adding a single new task, daily item, backlog item, or reference capture is applied immediately: when the tool result has status \"applied\", say it was added/saved. Batch tasks-from-note, moves, deletes, edits, and organizing are approval previews: when the result has status \"pending\", say it needs approval and can be handled with the MCP approval tools. Never claim something was added, organized, or changed while it is still pending.",
+    "Read only what you need. Do not dump all notes into the answer.",
+    "Durable memory: when the user states a lasting fact, preference, correction, or ongoing project context about themselves (not a task, not reference info for a note), save it with `oa_memory_save` (upserts by name — reuse the name to update). Read one with `oa_memory_read`, list them with `oa_memory_list`, and delete wrong ones with `oa_memory_delete` when asked to forget.",
+    ...assistantMemoryIndexInstructionSection()
+  ].join("\n");
+}
+
+// Saved-memory index for session-start instructions: one line per memory,
+// capped so a big memory set cannot bloat the prompt. Details are fetched on
+// demand with oa_memory_read.
+function assistantMemoryIndexInstructionSection() {
+  try {
+    const index = readAssistantMemoryIndex(2000);
+    if (!index) return [] as string[];
+    return [
+      "## Saved memories (read details with oa_memory_read)",
+      index
+    ];
+  } catch {
+    return [] as string[];
+  }
+}
+
+// Compact per-turn refresher (~1KB) for provider sessions that already
+// received the full knowledge instructions at session start. CLI providers
+// rebuild their system prompt on every invocation, so dropping the block
+// entirely would strip tool guidance — but re-sending the full ~4.3KB block
+// each turn was the single biggest per-turn context cost.
+function openAssistKnowledgeAgentInstructionsCompact(providerName = "the agent") {
+  return [
+    "# OpenAssist Knowledge (quick reference)",
+    openAssistLocalDateInstructions(),
+    `For notes, planner, tasks, journal, or reminders questions, ${providerName} uses the oa_* tools:`,
+    "- oa_read_today / oa_list_daily_items — a planner day (trust oa_read_today's markdown over an empty item list).",
+    "- oa_request_backlog_item / oa_request_daily_item — new tasks: date-less actions go to Backlog, dated ones to the named day.",
+    "- oa_update_daily_item / oa_complete_daily_item — change or check off existing items.",
+    "- oa_quick_save_note / oa_request_reference — reference facts (specs, links, prices, addresses) go to notes, never Today/Backlog.",
+    "- oa_search / oa_read — find and read notes.",
+    "- oa_personal_recall_search / oa_personal_recall_read — earlier chats, decisions, and memories (phase \"memory\" first).",
+    "- oa_memory_save / oa_memory_list / oa_memory_read — durable facts and preferences about the user.",
+    "When the user states a durable fact, preference, or correction about themselves or their projects, save it with oa_memory_save.",
+    "Single adds apply immediately (result status \"applied\"); batch edits/organizes create approval previews (status \"pending\") — never claim a pending change was applied.",
+    "If unsure which Category/List applies, ask one short question instead of guessing."
   ].join("\n");
 }
 
@@ -18779,7 +25111,7 @@ function realtimeKnowledgeProvider(settings: SettingsSnapshot) {
   if (!settings.knowledgeAccessEnabled || !settings.knowledgeRealtimeVoiceAccessEnabled) return undefined;
   return {
     enabled: true,
-    call: async (name: string, args: JsonObject) => knowledgeToolResult(name, args, "voice")
+    call: async (name: string, args: JsonObject) => knowledgeToolResultAsync(name, args, "voice")
   };
 }
 
@@ -18798,10 +25130,12 @@ const codexRealtimeProxy = new CodexRealtimeProxy((message) => bridgeDebugLog(me
 async function configureCodexRealtimeProxy(
   settings?: SettingsSnapshot,
   handoff?: RealtimeProxyConfig["handoff"],
-  delegatedStatus?: RealtimeProxyConfig["delegatedStatus"],
-  directWork?: RealtimeProxyConfig["directWork"],
-  connection?: RealtimeProxyConfig["connection"]
-) {
+	  delegatedStatus?: RealtimeProxyConfig["delegatedStatus"],
+	  directWork?: RealtimeProxyConfig["directWork"],
+	  connection?: RealtimeProxyConfig["connection"],
+	  parallelDelegation?: RealtimeProxyConfig["parallelDelegation"],
+	  codexImageGeneration?: RealtimeProxyConfig["codexImageGeneration"]
+	) {
   const snapshot = settings ?? await loadSettings();
   const provider = snapshot.realtimeVoiceProvider === "geminiLive" ? "geminiLive" : "openaiRealtime";
   const realtimeAPIKey = provider === "geminiLive"
@@ -18822,8 +25156,10 @@ async function configureCodexRealtimeProxy(
     handoff,
     delegatedStatus,
     directWork,
-    connection,
-    knowledge: realtimeKnowledgeProvider(snapshot),
+	    connection,
+	    parallelDelegation,
+	    codexImageGeneration,
+	    knowledge: realtimeKnowledgeProvider(snapshot),
     directKnowledgeRequest: {
       run: async ({ prompt }) => createDirectKnowledgeVoiceResponse(prompt, snapshot, "voice")?.responseText
     },
@@ -18880,12 +25216,13 @@ class CodexAppServerTransport extends EventEmitter {
       "-c",
       "notify=[]"
     ];
-    if (knowledgeAccess && settings.knowledgeAgentAccessEnabled) {
+    if (knowledgeAccess && (settings.knowledgeAgentAccessEnabled || settings.knowledgeRealtimeVoiceAccessEnabled)) {
+      const knowledgeProxyPath = resolveKnowledgeProxyPath();
       appServerArgs.push(
         "-c",
-        `mcp_servers.openassist_knowledge.url=${JSON.stringify(`${knowledgeAccess.baseURL}/mcp`)}`,
+        "mcp_servers.openassist_knowledge.command=\"node\"",
         "-c",
-        "mcp_servers.openassist_knowledge.bearer_token_env_var=\"OPENASSIST_KNOWLEDGE_TOKEN\""
+        `mcp_servers.openassist_knowledge.args=[${JSON.stringify(knowledgeProxyPath)}, "mcp", "--stdio"]`
       );
     }
     const appServerEnv = {
@@ -18926,7 +25263,10 @@ class CodexAppServerTransport extends EventEmitter {
     child.stderr.on("data", (chunk) => {
       const text = String(chunk);
       const trimmed = text.trim();
-      if (trimmed) bridgeDebugLog(`Codex app-server stderr: ${trimmed}`);
+      // Only mirror Codex's own ERROR lines. Its WARN spam (plugin manifest
+      // limits, unknown feature keys, db discrepancy fallbacks) accounted for
+      // most of the debug log and is not actionable for us.
+      if (trimmed && !/"level":"WARN"/.test(trimmed)) bridgeDebugLog(`Codex app-server stderr: ${trimmed}`);
       this.emit("status", text);
     });
     child.on("error", (error) => {
@@ -18976,13 +25316,13 @@ class CodexAppServerTransport extends EventEmitter {
       || method === "thread/realtime/start";
     const startMs = Date.now();
     if (isInterestingMethod) {
-      bridgeDebugLog(`codex request method=${method} id=${id}`);
+      bridgeVerboseLog(`codex request method=${method} id=${id}`);
     }
     const promise = new Promise<unknown>((resolve, reject) => {
       this.pending.set(id, {
         resolve: (value: unknown) => {
           if (isInterestingMethod) {
-            bridgeDebugLog(`codex request resolved method=${method} id=${id} elapsedMs=${Date.now() - startMs}`);
+            bridgeVerboseLog(`codex request resolved method=${method} id=${id} elapsedMs=${Date.now() - startMs}`);
           }
           resolve(value);
         },
@@ -19159,15 +25499,19 @@ async function restartCodexAfterStoppedRunIfNeeded(run: ActiveProviderRun, inter
   // If this run used Computer Use, force-kill any Computer Use helper that may
   // still be alive after the turn was stopped. For Claude/Copilot the helper is
   // a descendant of the killed CLI process and usually dies with the tree, but
-  // it can re-parent to /Applications/Codex.app and survive — this sweep is the
-  // safety net so Stop reliably halts on-screen Computer Use for ALL backends.
-  // We kill regardless of age (unlike the periodic stale cleanup) because the
-  // user explicitly asked to stop.
+  // it can re-parent to launchd and survive — this sweep is the safety net so
+  // Stop reliably halts on-screen Computer Use for ALL backends. We kill
+  // regardless of age (unlike the periodic stale cleanup) because the user
+  // explicitly asked to stop — but still only helpers we own or orphans, never
+  // Codex.app's own sessions (locked use).
   if (shouldPreferCodexComputerUsePlugin(run.pluginIDs)) {
     try {
-      const helpers = (await processSnapshot())
+      const snapshot = await processSnapshot();
+      const snapshotByPID = processSnapshotByPID(snapshot);
+      const helpers = snapshot
         .map((entry) => ({ ...entry, kind: computerUseHelperKind(entry.command) }))
-        .filter((entry) => Boolean(entry.kind));
+        .filter((entry) => Boolean(entry.kind))
+        .filter((entry) => isAutomaticallyKillableComputerUseHelper(entry, snapshotByPID));
       for (const helper of helpers) {
         if (isProcessAlive(helper.pid)) killProcessQuietly(helper.pid, "SIGKILL");
       }
@@ -19396,6 +25740,161 @@ async function stopCodexRealtimeDelegation() {
   }
 }
 
+// Cap on how many voice-delegated tasks can run at the same time. Mirrors the chat
+// UI's MAX_PARALLEL_THREAD_RUNS so the two surfaces share the same concurrency budget.
+const MAX_PARALLEL_REALTIME_DELEGATION = 6;
+
+// Resolve a spoken folder/project name (or id) to a real non-folder project id.
+// Returns undefined when no clear match, so the task falls back to the default project.
+function resolveProjectIDByNameOrID(nameOrID: string | undefined): string | undefined {
+  const query = (nameOrID ?? "").trim();
+  if (!query) return undefined;
+  const lowered = query.toLowerCase();
+  const { projects } = loadProjects();
+  const usable = projects.filter((project) => project.kind !== "folder");
+  const byID = usable.find((project) => project.id.toLowerCase() === lowered);
+  if (byID) return byID.id;
+  const byExactTitle = usable.find((project) => (project.title ?? "").trim().toLowerCase() === lowered);
+  if (byExactTitle) return byExactTitle.id;
+  const byContains = usable.find((project) => (project.title ?? "").trim().toLowerCase().includes(lowered));
+  return byContains?.id;
+}
+
+// Runs several voice-delegated tasks at the same time. Each task gets its OWN child
+// thread (own turn-id, own provider, own working folder), so nothing overlaps. As soon
+// as a task finishes it is reported back through reportTaskResult; the proxy narrates
+// the results one at a time. Uses allSettled so one failure still reports the others.
+async function runRealtimeParallelDelegation(input: {
+  tasks: Array<{ prompt: string; provider?: string; project?: string }>;
+  voiceThreadID: string;
+  providerThreadID: string;
+  defaultBackend: AssistantBackend;
+  options: {
+    interactionMode?: string;
+    permissionMode?: string;
+    reasoningEffort?: string;
+    pluginIDs?: string[];
+    skillIDs?: string[];
+  };
+  eventSink?: (event: { type: string; payload?: unknown }) => void;
+  emitActivity?: (activity: ChatMessage) => void;
+  reportTaskResult: (result: {
+    index: number;
+    label: string;
+    agentLabel: string;
+    provider?: string;
+    project?: string;
+    prompt: string;
+    text: string;
+    failed: boolean;
+  }) => void;
+}): Promise<{ accepted: number; skipped: number; note?: string }> {
+  const { tasks, voiceThreadID, providerThreadID, defaultBackend, options, eventSink, emitActivity, reportTaskResult } = input;
+  const voiceSession = findSession(voiceThreadID);
+  const defaultProjectID = voiceSession?.projectID;
+  const accepted = tasks.slice(0, MAX_PARALLEL_REALTIME_DELEGATION);
+  const skipped = tasks.length - accepted.length;
+  bridgeDebugLog(`[realtime.voice] parallel delegation accepted=${accepted.length} skipped=${skipped}`);
+
+  await Promise.allSettled(
+    accepted.map(async (task, index) => {
+      const label = `Task ${String.fromCharCode(65 + index)}`; // Task A, Task B, ...
+      const backend = normalizeBackend(task.provider ?? String(defaultBackend));
+      const agentLabel = providerLabel(backend);
+      const projectID = task.project ? (resolveProjectIDByNameOrID(task.project) ?? defaultProjectID) : defaultProjectID;
+      const childThreadID = createOpenAssistThread(projectID, true).session.id;
+      try {
+        await setThreadProvider(childThreadID, backend);
+      } catch (error) {
+        bridgeDebugLog(`[realtime.voice] parallel ${label} setThreadProvider failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      const childSession = findSession(childThreadID);
+      const projectName = childSession?.projectName;
+      const runID = `realtime-parallel-${backend}-${index}-${randomUUID().toLowerCase()}`;
+
+      // Each parallel task runs in its OWN child thread, so it gets its own
+      // activeThreadRuns slot and its own timeline in the UI (no clobbering when two
+      // run at once). The prompt is label-prefixed so cards read "Task A - Claude: ...".
+      const where = [agentLabel, projectName].filter(Boolean).join(", ");
+      const displayPrompt = `${label}${where ? ` (${where})` : ""}: ${task.prompt}`;
+      const emitDelegation = (type: string, payload: Record<string, unknown>) => {
+        eventSink?.({
+          type,
+          payload: {
+            threadId: childThreadID,
+            providerThreadId: providerThreadID,
+            providerTurnId: runID,
+            provider: agentLabel,
+            childThreadId: childThreadID,
+            voiceThreadId: voiceThreadID,
+            prompt: displayPrompt,
+            taskLabel: label,
+            taskProvider: agentLabel,
+            taskProject: projectName,
+            ...payload
+          }
+        });
+      };
+
+      const providerEventSink = (providerEvent: ProviderRunEvent) => {
+        if (providerEvent.type === "activity") {
+          upsertRuntimeActivity(childThreadID, providerEvent.activity, runID);
+          emitActivity?.(providerEvent.activity);
+        }
+      };
+
+      emitDelegation("thread/realtime/delegation/started", {});
+      try {
+        const result = await sendCodexMessage(
+          task.prompt,
+          childThreadID,
+          options.pluginIDs ?? [],
+          "",
+          options.reasoningEffort,
+          options.interactionMode,
+          options.permissionMode,
+          options.skillIDs ?? [],
+          runID,
+          undefined,
+          providerEventSink
+        );
+        const text = result?.assistant?.text?.trim() || `${agentLabel} finished the task.`;
+        emitDelegation("thread/realtime/delegation/completed", { failed: false, responseText: text });
+        reportTaskResult({
+          index,
+          label,
+          agentLabel,
+          provider: agentLabel,
+          project: projectName,
+          prompt: task.prompt,
+          text,
+          failed: false
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : `${agentLabel} could not finish the task.`;
+        emitDelegation("thread/realtime/delegation/failed", { failed: true, error: message });
+        reportTaskResult({
+          index,
+          label,
+          agentLabel,
+          provider: agentLabel,
+          project: projectName,
+          prompt: task.prompt,
+          text: message,
+          failed: true
+        });
+      }
+    })
+  );
+
+  return {
+    accepted: accepted.length,
+    skipped,
+    note: skipped > 0 ? `${skipped} task(s) exceeded the parallel limit of ${MAX_PARALLEL_REALTIME_DELEGATION}.` : undefined
+  };
+}
+
+
 async function startCodexRealtimeVoice(
   options: {
     threadID?: string;
@@ -19430,6 +25929,12 @@ async function startCodexRealtimeVoice(
     ? options.threadID
     : createOpenAssistThread(undefined, true).session.id;
   let session = findSession(openAssistThreadID);
+  if (session?.isArchived === true) {
+    bridgeDebugLog(`[realtime.voice] requested archived thread=${openAssistThreadID}; creating a new realtime thread`);
+    const created = createOpenAssistThread(undefined, true).session;
+    openAssistThreadID = created.id;
+    session = created;
+  }
   if (!session) {
     const created = createOpenAssistThread(undefined, true).session;
     openAssistThreadID = created.id;
@@ -19458,10 +25963,11 @@ async function startCodexRealtimeVoice(
 
   await stopActiveRealtimeSession("replaced");
 
-  const modelID = modelForBackend(backend, settings, session);
-  const realtimeCodexModelID = modelForBackend("codex", settings, session);
-  bridgeDebugLog(`[realtime.voice] ensuring Codex realtime transport thread=${openAssistThreadID} provider=${providerDisplayName} model=${realtimeCodexModelID}`);
-  const normalizedToolSelection = await normalizeCodexToolSelection(options.pluginIDs ?? [], options.skillIDs ?? []);
+	  const modelID = modelForBackend(backend, settings, session);
+	  const realtimeCodexModelID = modelForBackend("codex", settings, session);
+	  bridgeDebugLog(`[realtime.voice] ensuring Codex realtime transport thread=${openAssistThreadID} provider=${providerDisplayName} model=${realtimeCodexModelID}`);
+	  const codexImageWorkerSelected = hasCodexImageWorkerSelection(options.pluginIDs ?? [], options.skillIDs ?? [], options.contextHint ?? "");
+	  const normalizedToolSelection = await normalizeCodexToolSelection(options.pluginIDs ?? [], options.skillIDs ?? []);
   const realtimeRuntimeOptions: CodexRuntimeOptions = {
     interactionMode: options.interactionMode ?? session.latestInteractionMode ?? "agentic",
     permissionMode: options.permissionMode ?? session.latestPermissionMode ?? "fullAccess",
@@ -19539,7 +26045,7 @@ async function startCodexRealtimeVoice(
       const prior = itemPhases.get(id);
       itemPhases.set(id, phase);
       if (prior !== phase) {
-        bridgeDebugLog(`codex item phase id=${id} phase=${phase}`);
+        bridgeVerboseLog(`codex item phase id=${id} phase=${phase}`);
       }
     }
   };
@@ -20038,11 +26544,11 @@ async function startCodexRealtimeVoice(
           });
         }
       }
-      eventSink?.({
-        type: work.status === "running"
-          ? "thread/realtime/delegation/started"
-          : work.status === "failed"
-            ? "thread/realtime/delegation/failed"
+	      eventSink?.({
+	        type: work.status === "running"
+	          ? "thread/realtime/delegation/started"
+	          : work.status === "failed"
+	            ? "thread/realtime/delegation/failed"
             : "thread/realtime/delegation/completed",
         payload: {
           threadId: openAssistThreadID,
@@ -20052,11 +26558,32 @@ async function startCodexRealtimeVoice(
           prompt,
           responseText: work.status === "completed" ? detail : "",
           error: work.error || "",
-          realtimeDirectWork: true
-        }
-      });
-    }
-  };
+	          realtimeDirectWork: true
+	        }
+	      });
+	      if ((work.status === "completed" || work.status === "failed") && !completedTurnIDs.has(directTurnID)) {
+	        completedTurnIDs.add(directTurnID);
+	        const finalText = work.status === "failed"
+	          ? (work.error || detail || `${toolLabel} failed.`)
+	          : (detail || `${toolLabel} completed.`);
+	        persistCompletedTurn({
+	          threadID: openAssistThreadID,
+	          backend,
+	          providerSessionID: providerThreadID,
+	          providerTurnID: directTurnID,
+	          modelID,
+	          prompt,
+	          responseText: finalText,
+	          insertedSystemMessage,
+	          userSource: "realtimeVoice",
+	          reasoningEffort: realtimeRuntimeOptions.reasoningEffort,
+	          interactionMode: realtimeRuntimeOptions.interactionMode,
+	          permissionMode: realtimeRuntimeOptions.permissionMode
+	        });
+	        insertedSystemMessage = false;
+	      }
+	    }
+	  };
   const realtimeConnectionEvents: RealtimeProxyConfig["connection"] = {
     onEvent: (connectionEvent) => {
       const reason = connectionEvent.reason || connectionEvent.message || "";
@@ -20103,20 +26630,58 @@ async function startCodexRealtimeVoice(
     }
   };
 
-  try {
-    if (externalRealtimeHandoff) {
-      const proxyURL = await configureCodexRealtimeProxy(settings, externalRealtimeHandoff, realtimeDelegatedStatus, directRealtimeWork, realtimeConnectionEvents);
-      bridgeDebugLog(`[realtime.voice] proxy ready url=${proxyURL} handoff=${providerDisplayName}`);
-    } else {
-      const proxyURL = await configureCodexRealtimeProxy(settings, undefined, realtimeDelegatedStatus, directRealtimeWork, realtimeConnectionEvents);
-      bridgeDebugLog(`[realtime.voice] proxy ready url=${proxyURL} handoff=Codex`);
-    }
-    const realtimeStartPrompt = [
-      `Start a live voice session for this OpenAssist ${providerDisplayName} thread.`,
-      openAssistLocalDateInstructions(),
-      typeof options.contextHint === "string" ? options.contextHint.trim().slice(0, 2400) : "",
-      await pluginSelectionGuidanceText(realtimeRuntimeOptions.pluginIDs ?? [])
-    ].filter(Boolean).join("\n\n");
+	  const realtimeParallelDelegation: RealtimeProxyConfig["parallelDelegation"] = {
+	    maxTasks: MAX_PARALLEL_REALTIME_DELEGATION,
+	    run: ({ tasks, reportTaskResult }) =>
+	      runRealtimeParallelDelegation({
+        tasks,
+        voiceThreadID: openAssistThreadID,
+        providerThreadID,
+        defaultBackend: backend,
+        options: {
+          interactionMode: options.interactionMode,
+          permissionMode: options.permissionMode,
+          reasoningEffort: options.reasoningEffort,
+          pluginIDs: realtimeRuntimeOptions.pluginIDs ?? options.pluginIDs,
+          skillIDs: options.skillIDs
+        },
+        eventSink,
+        emitActivity: emitRealtimeActivity,
+	        reportTaskResult
+	      })
+	  };
+
+	  const realtimeCodexImageGeneration: RealtimeProxyConfig["codexImageGeneration"] = {
+	    run: async ({ callID, args, prompt }) => {
+	      const result = await requestCodexImageGenerationForThread(openAssistThreadID, {
+	        ...args,
+	        prompt: firstRuntimeString(args.prompt, prompt)
+	      }, {
+	        source: "realtimeVoice",
+	        callID,
+	        emitActivity: emitRealtimeActivity
+	      });
+	      return compactCodexImageGenerationResult(result);
+	    }
+	  };
+
+	  try {
+	    if (externalRealtimeHandoff) {
+	      const proxyURL = await configureCodexRealtimeProxy(settings, externalRealtimeHandoff, realtimeDelegatedStatus, directRealtimeWork, realtimeConnectionEvents, realtimeParallelDelegation, realtimeCodexImageGeneration);
+	      bridgeDebugLog(`[realtime.voice] proxy ready url=${proxyURL} handoff=${providerDisplayName}`);
+	    } else {
+	      const proxyURL = await configureCodexRealtimeProxy(settings, undefined, realtimeDelegatedStatus, directRealtimeWork, realtimeConnectionEvents, realtimeParallelDelegation, realtimeCodexImageGeneration);
+	      bridgeDebugLog(`[realtime.voice] proxy ready url=${proxyURL} handoff=Codex`);
+	    }
+	    const realtimeStartPrompt = [
+	      `Start a live voice session for this OpenAssist ${providerDisplayName} thread.`,
+	      openAssistLocalDateInstructions(),
+	      typeof options.contextHint === "string" ? options.contextHint.trim().slice(0, 2400) : "",
+	      codexImageWorkerSelected
+	        ? "Codex Image Worker is selected for this Live session. For image generation or image edits, call request_codex_image_generation directly and do not call background_agent."
+	        : "",
+	      await pluginSelectionGuidanceText(realtimeRuntimeOptions.pluginIDs ?? [])
+	    ].filter(Boolean).join("\n\n");
     bridgeDebugLog(`[realtime.voice] sending thread/realtime/start providerThread=${providerThreadID}`);
     await liveVoiceStartTimeout(Promise.race([
       codexTransport.request("thread/realtime/start", {
@@ -20160,8 +26725,7 @@ async function appendCodexRealtimeAudio(audio: RealtimeAudioChunk) {
   if (!audio?.data || typeof audio.data !== "string") {
     return { ok: false, error: "Realtime audio chunk is empty." };
   }
-  // TEMP DIAGNOSTIC: count + throttled-log forwarded audio so we can verify in
-  // electron-debug.log that mic audio reaches Codex (and the upstream realtime API).
+  // Keep coarse counters for realtime diagnostics without filling the debug log.
   realtimeAudioDiag.sends += 1;
   realtimeAudioDiag.bytes += Math.round((audio.data.length * 3) / 4);
   try {
@@ -20182,7 +26746,7 @@ async function appendCodexRealtimeAudio(audio: RealtimeAudioChunk) {
     throw error;
   } finally {
     const now = Date.now();
-    if (now - realtimeAudioDiag.lastLogAt >= 1000) {
+    if (now - realtimeAudioDiag.lastLogAt >= realtimeAudioDiagLogIntervalMs) {
       bridgeDebugLog(`[realtime.audio-diag] forwarded sends=${realtimeAudioDiag.sends} ok=${realtimeAudioDiag.ok} fail=${realtimeAudioDiag.fail} kb=${Math.round(realtimeAudioDiag.bytes / 1024)} turn=${active.currentTurnID || "none"} transportClosed=${String(Boolean(active.realtimeTransportClosed))}`);
       realtimeAudioDiag.lastLogAt = now;
     }
@@ -20195,6 +26759,10 @@ async function appendCodexRealtimeText(text: string) {
   if (!active) return { ok: false, error: "Realtime Voice is not running." };
   const trimmed = text.trim();
   if (!trimmed) return { ok: false, error: "Realtime text is empty." };
+  bridgeVerboseLog(`[realtime.voice] append text thread=${active.openAssistThreadID} providerThread=${active.providerThreadID} chars=${trimmed.length}`);
+  const proxyResult = await codexRealtimeProxy.appendText(trimmed);
+  if (proxyResult.ok) return proxyResult;
+  bridgeDebugLog(`[realtime.voice] append text proxy fallback: ${proxyResult.error || "unknown error"}`);
   await codexTransport.request("thread/realtime/appendText", {
     threadId: active.providerThreadID,
     text: trimmed
@@ -20425,7 +26993,7 @@ function logCodexToolCallActivity(method: string, params: JsonObject) {
     || status === "canceled";
   if (isStart && !codexToolCallStartTimes.has(callID)) {
     codexToolCallStartTimes.set(callID, { startMs: Date.now(), toolName, args: argsCompact });
-    bridgeDebugLog(`codex tool call start tool="${toolName}" callID=${callID} method=${method} type=${itemType} args=${argsCompact}`);
+    bridgeVerboseLog(`codex tool call start tool="${toolName}" callID=${callID} method=${method} type=${itemType} args=${argsCompact}`);
     if (computerUseTool) {
       activeComputerUseToolCalls.set(callID, { startMs: Date.now(), toolName, args: argsCompact });
       bridgeDebugLog(`Computer Use tool call active callID=${callID} tool="${toolName}" args=${argsCompact}`);
@@ -20437,7 +27005,7 @@ function logCodexToolCallActivity(method: string, params: JsonObject) {
     if (start) {
       const elapsedMs = Date.now() - start.startMs;
       const resolvedStatus = status || (lowerMethod.endsWith("/failed") ? "failed" : "completed");
-      bridgeDebugLog(`codex tool call end tool="${start.toolName}" callID=${callID} status=${resolvedStatus} elapsedMs=${elapsedMs}`);
+      bridgeVerboseLog(`codex tool call end tool="${start.toolName}" callID=${callID} status=${resolvedStatus} elapsedMs=${elapsedMs}`);
       codexToolCallStartTimes.delete(callID);
       if (activeComputerUseToolCalls.delete(callID)) {
         computerUseLongRunningLastLogAt.delete(callID);
@@ -20445,7 +27013,7 @@ function logCodexToolCallActivity(method: string, params: JsonObject) {
       }
     } else if (looksLikeToolCall) {
       const resolvedStatus = status || (lowerMethod.endsWith("/failed") ? "failed" : "completed");
-      bridgeDebugLog(`codex tool call end tool="${toolName}" callID=${callID} method=${method} type=${itemType} status=${resolvedStatus} elapsedMs=unknown`);
+      bridgeVerboseLog(`codex tool call end tool="${toolName}" callID=${callID} method=${method} type=${itemType} status=${resolvedStatus} elapsedMs=unknown`);
       if (activeComputerUseToolCalls.delete(callID)) {
         computerUseLongRunningLastLogAt.delete(callID);
         bridgeDebugLog(`Computer Use tool call cleared callID=${callID} status=${resolvedStatus} elapsedMs=unknown`);
@@ -20530,6 +27098,12 @@ async function selectedSkillPromptItems(skillIDs: string[] = []) {
     .map((skill) => ({ type: "skill", name: skill.title, path: skill.path }) as JsonObject);
 }
 
+function listScreenAnalysisSkills() {
+  return loadSkills()
+    .filter((skill) => Boolean(skill.path))
+    .map((skill) => ({ id: skill.id, title: skill.title, group: skill.group }));
+}
+
 function promptWantsImageGeneration(prompt: string) {
   const text = prompt.toLowerCase();
   const asksForCreation = /\b(generate|create|make|draw|render|design|illustrate|paint|mock\s*up|mockup|turn\s+.*\s+into|convert\s+.*\s+into)\b/.test(text);
@@ -20537,8 +27111,8 @@ function promptWantsImageGeneration(prompt: string) {
   return text.trim().startsWith("/image") || (asksForCreation && asksForImage);
 }
 
-function imageGenerationSkillPromptItems(prompt: string) {
-  if (!promptWantsImageGeneration(prompt)) return [];
+function imageGenerationSkillPromptItems(prompt: string, force = false) {
+  if (!force && !promptWantsImageGeneration(prompt)) return [];
   const skill = loadSkills().find((item) => {
     const normalizedID = normalizedSkillID(item.id);
     const normalizedTitle = normalizedSkillID(item.title);
@@ -20598,6 +27172,10 @@ function assistantPATH() {
   return [process.env.PATH, ...additions].filter(Boolean).join(path.delimiter);
 }
 
+const executablePathCacheMs = 5 * 60 * 1000;
+const executablePathCache = new Map<string, { expiresAt: number; value: string | null }>();
+const executablePathInFlight = new Map<string, Promise<string | null>>();
+
 const antigravityCLIInstallCommand = "curl -fsSL https://antigravity.google/cli/install.sh | bash";
 
 function antigravityCLIExecutableCandidates() {
@@ -20621,18 +27199,38 @@ function executableFileExists(filePath: string) {
 }
 
 async function resolveExecutablePath(executable: string) {
-  if (executable === "agy") {
-    const direct = antigravityCLIExecutableCandidates().find(executableFileExists);
-    if (direct) return direct;
-  }
-  try {
-    const { stdout } = await execFileAsync("/usr/bin/env", ["which", executable], {
-      env: { ...process.env, PATH: assistantPATH() }
+  const searchPath = assistantPATH();
+  const cacheKey = `${executable}:${searchPath}`;
+  const now = Date.now();
+  const cached = executablePathCache.get(cacheKey);
+  if (cached && cached.expiresAt > now) return cached.value;
+  const inFlight = executablePathInFlight.get(cacheKey);
+  if (inFlight) return inFlight;
+
+  const lookupPromise = (async () => {
+    if (executable === "agy") {
+      const direct = antigravityCLIExecutableCandidates().find(executableFileExists);
+      if (direct) return direct;
+    }
+    try {
+      const { stdout } = await execFileAsync("/usr/bin/env", ["which", executable], {
+        env: { ...process.env, PATH: searchPath }
+      });
+      return stdout.trim() || null;
+    } catch {
+      return null;
+    }
+  })()
+    .then((value) => {
+      executablePathCache.set(cacheKey, { expiresAt: Date.now() + executablePathCacheMs, value });
+      return value;
+    })
+    .finally(() => {
+      executablePathInFlight.delete(cacheKey);
     });
-    return stdout.trim() || null;
-  } catch {
-    return null;
-  }
+
+  executablePathInFlight.set(cacheKey, lookupPromise);
+  return lookupPromise;
 }
 
 async function executableExists(executable: string) {
@@ -21148,12 +27746,14 @@ function artifactPathsFromText(value: string) {
   return paths;
 }
 
+const maxInferredArtifactsFromText = 8;
+
 function messageArtifactsFromText(value: string) {
   return uniqueArtifacts(
     artifactPathsFromText(value)
       .map(messageArtifactFromPath)
       .filter((artifact): artifact is MessageArtifact => Boolean(artifact))
-  );
+  ).slice(0, maxInferredArtifactsFromText);
 }
 
 function messageArtifactsFromStored(value: unknown) {
@@ -21181,6 +27781,353 @@ function messageArtifactsFromStored(value: unknown) {
       } satisfies MessageArtifact;
     })
     .filter((artifact): artifact is MessageArtifact => Boolean(artifact)));
+}
+
+type CodexImageReference = {
+  name: string;
+  data: Buffer;
+  mimeType: string;
+  path?: string;
+};
+
+type CodexGeneratedImage = {
+  dataURL: string;
+  mimeType: string;
+  name: string;
+  prompt?: string;
+};
+
+function imageExtensionForMimeType(mimeType?: string) {
+  const normalized = String(mimeType ?? "").toLowerCase();
+  if (normalized.includes("jpeg") || normalized.includes("jpg")) return "jpg";
+  if (normalized.includes("webp")) return "webp";
+  if (normalized.includes("gif")) return "gif";
+  return "png";
+}
+
+function imageBufferFromDataURL(value?: string) {
+  const raw = value?.trim();
+  if (!raw) return null;
+  const match = raw.match(/^data:(image\/[a-zA-Z0-9+.-]+);base64,(.+)$/s);
+  if (!match) return null;
+  try {
+    return {
+      buffer: Buffer.from(match[2].replace(/\s+/g, ""), "base64"),
+      mimeType: match[1]
+    };
+  } catch {
+    return null;
+  }
+}
+
+function safeGeneratedImageBaseName(value?: string) {
+  const slug = String(value ?? "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 48);
+  return slug || "codex-image";
+}
+
+function uniqueGeneratedImagePath(directory: string, baseName: string, extension: string) {
+  const safeBase = safeGeneratedImageBaseName(baseName);
+  const safeExtension = extension.replace(/[^a-z0-9]+/gi, "").toLowerCase() || "png";
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  for (let index = 0; index < 1000; index += 1) {
+    const suffix = index === 0 ? "" : `-${index + 1}`;
+    const candidate = path.join(directory, `${safeBase}-${stamp}${suffix}.${safeExtension}`);
+    if (!fs.existsSync(candidate)) return candidate;
+  }
+  return path.join(directory, `${safeBase}-${stamp}-${randomUUID().toLowerCase()}.${safeExtension}`);
+}
+
+function codexImageWorkerRecordsPath(threadID: string) {
+  return path.join(conversationStoreRoot(), threadID, "codex-image-worker-records.jsonl");
+}
+
+function appendCodexImageWorkerRecord(threadID: string, record: JsonObject) {
+  try {
+    const filePath = codexImageWorkerRecordsPath(threadID);
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    fs.appendFileSync(filePath, `${JSON.stringify({
+      timestamp: new Date().toISOString(),
+      ...record
+    })}\n`, "utf8");
+  } catch (error) {
+    bridgeDebugLog(`Failed to write Codex image worker record: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+function saveCodexGeneratedImageArtifact(threadID: string, image: CodexGeneratedImage, prompt: string): MessageArtifact {
+  const parsed = imageBufferFromDataURL(image.dataURL);
+  if (!parsed?.buffer.length) throw new Error("Codex returned an image result, but OpenAssist could not decode it.");
+  const mimeType = image.mimeType || parsed.mimeType || "image/png";
+  const agentFiles = ensureThreadAgentFilesDirectory(threadID, prompt || "Codex image generation");
+  const directory = path.join(agentFiles.path, "generated-images");
+  fs.mkdirSync(directory, { recursive: true });
+  const baseName = safeGeneratedImageBaseName(image.name || prompt || "codex-image");
+  const filePath = uniqueGeneratedImagePath(directory, baseName, imageExtensionForMimeType(mimeType));
+  fs.writeFileSync(filePath, parsed.buffer);
+  const artifact = messageArtifactFromPath(filePath);
+  if (!artifact) throw new Error("Generated image was saved, but OpenAssist could not load the artifact.");
+  return artifact;
+}
+
+function imageReferenceFromPath(rawPath: string): CodexImageReference | null {
+  const filePath = resolveMovedAgentFilesPath(normalizeArtifactPath(rawPath));
+  if (!fs.existsSync(filePath) || !fs.statSync(filePath).isFile() || !isImageArtifactPath(filePath)) return null;
+  const mimeType = imageMimeTypeFromFile(filePath) || "image/png";
+  return {
+    name: path.basename(filePath),
+    data: fs.readFileSync(filePath),
+    mimeType,
+    path: filePath
+  };
+}
+
+function imageReferenceFromArtifact(artifact: MessageArtifact): CodexImageReference | null {
+  if (artifact.kind !== "image") return null;
+  if (artifact.path) {
+    const fromPath = imageReferenceFromPath(artifact.path);
+    if (fromPath) return fromPath;
+  }
+  const parsed = imageBufferFromDataURL(artifact.dataURL);
+  if (!parsed?.buffer.length) return null;
+  return {
+    name: artifact.name || "reference-image.png",
+    data: parsed.buffer,
+    mimeType: artifact.mimeType || parsed.mimeType || "image/png",
+    path: artifact.path
+  };
+}
+
+function imageReferenceFromComposerAttachment(attachment: ComposerImageAttachment): CodexImageReference | null {
+  if (attachment.kind === "file") return null;
+  if (!attachment.dataURL.toLowerCase().startsWith("data:image/")) return null;
+  const parsed = imageBufferFromDataURL(attachment.dataURL);
+  if (!parsed?.buffer.length) return null;
+  return {
+    name: attachment.name || "attached-image.png",
+    data: parsed.buffer,
+    mimeType: attachment.mimeType || parsed.mimeType || "image/png"
+  };
+}
+
+function imageArtifactsForThread(threadID: string) {
+  const snapshot = readConversationSnapshot(threadID);
+  const rows: Array<{ artifact: MessageArtifact; createdAt: number }> = [];
+  const collect = (entry: unknown) => {
+    const object = runtimeObject(entry);
+    if (!object) return;
+    const createdAt = Number(object.updatedAt ?? object.createdAt ?? 0) || 0;
+    for (const artifact of messageArtifactsFromStored(object.artifacts)) {
+      if (artifact.kind === "image") rows.push({ artifact, createdAt });
+    }
+    const activity = runtimeObject(object.activity);
+    if (activity) {
+      const activityTime = Number(activity.updatedAt ?? activity.createdAt ?? createdAt) || createdAt;
+      for (const artifact of messageArtifactsFromStored(activity.artifacts)) {
+        if (artifact.kind === "image") rows.push({ artifact, createdAt: activityTime });
+      }
+      const imagePath = firstRuntimeString(activity.imagePath, activity.image_path);
+      if (imagePath) {
+        const artifact = messageArtifactFromPath(imagePath);
+        if (artifact?.kind === "image") rows.push({ artifact, createdAt: activityTime });
+      }
+    }
+  };
+  snapshot.timeline?.forEach(collect);
+  snapshot.transcript?.forEach(collect);
+  rows.sort((a, b) => b.createdAt - a.createdAt);
+  return uniqueArtifacts(rows.map((row) => row.artifact));
+}
+
+function normalizeCodexImageGenerationMode(value: unknown): CodexImageGenerationMode {
+  const normalized = String(value ?? "").trim().toLowerCase().replace(/[-\s]+/g, "_");
+  if (normalized === "new_image" || normalized === "edit_reference" || normalized === "auto") return normalized;
+  return "auto";
+}
+
+function stringArrayFromUnknown(value: unknown) {
+  if (!Array.isArray(value)) return [];
+  return value.map((entry) => String(entry ?? "").trim()).filter(Boolean).slice(0, 8);
+}
+
+function normalizeCodexImageGenerationRequest(raw: unknown, fallbackPrompt = ""): CodexImageGenerationRequest {
+  const object = runtimeObject(raw) ?? {};
+  const prompt = firstRuntimeString(object.prompt, object.request, object.text, object.description, fallbackPrompt);
+  return {
+    prompt,
+    mode: normalizeCodexImageGenerationMode(object.mode),
+    referenceArtifactIds: stringArrayFromUnknown(object.referenceArtifactIds ?? object.reference_artifact_ids ?? object.artifactIds ?? object.artifact_ids),
+    referenceImagePaths: stringArrayFromUnknown(object.referenceImagePaths ?? object.reference_image_paths ?? object.imagePaths ?? object.image_paths),
+    useLatestImage: object.useLatestImage === true || object.use_latest_image === true || object.latest === true
+  };
+}
+
+function compactImageArtifactForTool(artifact?: MessageArtifact) {
+  if (!artifact) return undefined;
+  return {
+    id: artifact.id,
+    kind: artifact.kind,
+    name: artifact.name,
+    path: artifact.path,
+    mimeType: artifact.mimeType,
+    size: artifact.size,
+    width: artifact.width,
+    height: artifact.height
+  };
+}
+
+function compactCodexImageGenerationResult(result: CodexImageGenerationResult) {
+  return {
+    ok: result.ok,
+    artifact: compactImageArtifactForTool(result.artifact),
+    revisedPrompt: result.revisedPrompt,
+    summary: result.summary,
+    error: result.error
+  };
+}
+
+function resolveCodexImageReferences(
+  threadID: string,
+  request: CodexImageGenerationRequest,
+  currentAttachments: ComposerImageAttachment[] = []
+) {
+  const references: CodexImageReference[] = [];
+  const seen = new Set<string>();
+  const add = (reference: CodexImageReference | null) => {
+    if (!reference) return;
+    const key = reference.path || `${reference.name}:${reference.mimeType}:${reference.data.length}:${reference.data.subarray(0, 16).toString("base64")}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    references.push(reference);
+  };
+
+  for (const attachment of currentAttachments) add(imageReferenceFromComposerAttachment(attachment));
+  for (const rawPath of request.referenceImagePaths ?? []) add(imageReferenceFromPath(rawPath));
+
+  const threadImages = imageArtifactsForThread(threadID);
+  const wantedIDs = new Set((request.referenceArtifactIds ?? []).map((id) => id.toLowerCase()));
+  if (wantedIDs.size) {
+    for (const artifact of threadImages) {
+      if (wantedIDs.has(artifact.id.toLowerCase())
+          || wantedIDs.has(artifact.path.toLowerCase())
+          || wantedIDs.has(artifact.name.toLowerCase())) {
+        add(imageReferenceFromArtifact(artifact));
+      }
+    }
+  }
+  if ((request.useLatestImage || request.mode === "edit_reference") && !references.length) {
+    const latestArtifact = threadImages[0];
+    if (latestArtifact) add(imageReferenceFromArtifact(latestArtifact));
+  }
+  return references.slice(0, 6);
+}
+
+async function requestCodexImageGenerationForThread(
+  threadID: string,
+  rawRequest: CodexImageGenerationRequest | JsonObject,
+  options: {
+    currentAttachments?: ComposerImageAttachment[];
+    source?: string;
+    callID?: string;
+    turnID?: string;
+    emitActivity?: (activity: ChatMessage) => void;
+  } = {}
+): Promise<CodexImageGenerationResult> {
+  const request = normalizeCodexImageGenerationRequest(rawRequest, "");
+  const prompt = request.prompt?.trim() || "Generate the requested image.";
+  const mode = normalizeCodexImageGenerationMode(request.mode);
+  const activityID = `activity-codex-image-worker-${options.callID || makeID()}`;
+  const activityTurnID = options.turnID || options.callID || activityID;
+  const startedAt = Date.now();
+  const emitActivity = (status: ChatMessage["activityStatus"], detail: string, artifact?: MessageArtifact) => {
+    const activity: ChatMessage = {
+      id: activityID,
+      role: "activity",
+      provider: "Codex",
+      text: detail,
+      turnID: activityTurnID,
+      status: status === "running" ? "running" : "completed",
+      activityTitle: "Codex Image Worker",
+      activityKind: "imageGeneration",
+      activityStatus: status,
+      activityDetail: detail,
+      artifacts: artifact ? [artifact] : undefined,
+      imagePath: artifact?.path,
+      imageDataURL: artifact?.dataURL,
+      imageMimeType: artifact?.mimeType,
+      imageName: artifact?.name,
+      createdAt: startedAt,
+      updatedAt: Date.now()
+    };
+    options.emitActivity?.(activity);
+    upsertRuntimeActivity(threadID, activity, activityTurnID);
+  };
+
+  try {
+    const references = resolveCodexImageReferences(threadID, request, options.currentAttachments ?? []);
+    const workerPrompt = [
+      "# OpenAssist Codex Image Worker",
+      "",
+      "Create the actual image artifact requested below.",
+      "You are hidden from the user. The original provider stays user-facing.",
+      "Do not make a normal assistant thread. Return an image generation result.",
+      "",
+      `Mode: ${mode}`,
+      references.length
+        ? "Reference images are attached. Use them only when helpful or when the request asks to edit/build on them."
+        : "No reference images are attached. Create a new image when the request needs one.",
+      "",
+      `User request: ${prompt}`
+    ].join("\n");
+
+    emitActivity("running", "Generating image with Codex.");
+    const result = await runCodexImageGenerationJob({
+      promptText: workerPrompt,
+      referenceImages: references,
+      serviceName: "OpenAssist Codex Image Worker",
+      callback: (text) => emitActivity("running", compactRuntimeDetail(text, 220) || "Generating image with Codex.")
+    });
+    const image = result.images[0];
+    if (!image) throw new Error("Codex did not return an image artifact.");
+    const artifact = saveCodexGeneratedImageArtifact(threadID, image, prompt);
+    const summary = "Generated image is ready.";
+    emitActivity("completed", summary, artifact);
+    const finalResult: CodexImageGenerationResult = {
+      ok: true,
+      artifact,
+      revisedPrompt: image.prompt,
+      summary
+    };
+    appendCodexImageWorkerRecord(threadID, {
+      source: options.source || "unknown",
+      ok: true,
+      prompt,
+      mode,
+      referenceCount: references.length,
+      artifact: compactImageArtifactForTool(artifact),
+      revisedPrompt: image.prompt,
+      summary
+    });
+    return finalResult;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Codex image generation failed.";
+    emitActivity("failed", message);
+    appendCodexImageWorkerRecord(threadID, {
+      source: options.source || "unknown",
+      ok: false,
+      prompt,
+      mode,
+      error: message
+    });
+    return {
+      ok: false,
+      summary: "Codex image generation failed.",
+      error: message
+    };
+  }
 }
 
 function imageGenerationMessageFields(item: JsonObject): Pick<ChatMessage, "imageDataURL" | "imagePath" | "imagePrompt" | "imageMimeType" | "imageName"> {
@@ -21899,7 +28846,7 @@ function persistCompletedTurn({
   const userCreatedAt = firstActivityCreatedAt ? Math.max(0, firstActivityCreatedAt - 0.000001) : currentSwiftDate();
   const assistantCreatedAt = currentSwiftDate();
   const finalizedTurnActivities = currentTurnActivities.map((entry) => finalizedTimelineActivity(entry, assistantCreatedAt));
-  const userTimeline = timelineUserMessage(threadID, prompt, userCreatedAt, isTransient ? [] : userAttachments, userSource);
+  const userTimeline = timelineUserMessage(threadID, prompt, userCreatedAt, userAttachments, userSource);
   const turnCheckpointReferences = [...checkpointReferences];
   const assistantTimeline = timelineAssistantFinal(
     threadID,
@@ -21929,15 +28876,17 @@ function persistCompletedTurn({
     updatedAt: assistantCreatedAt,
     checkpointReferences: turnCheckpointReferences
   });
-  if (!isTransient) {
-    writeConversationSnapshot(threadID, {
-      threadID,
-      timeline,
-      transcript,
-      turns,
-      lastAppliedEventSequence: snapshot.lastAppliedEventSequence ?? 0
-    });
-  }
+  // Temporary (transient) threads are written too: the renderer reloads the
+  // conversation from disk on refresh, so skipping the write made temporary
+  // chats appear empty mid-session. Their files are removed when the thread is
+  // destroyed on leave, and any leftovers are purged at startup.
+  writeConversationSnapshot(threadID, {
+    threadID,
+    timeline,
+    transcript,
+    turns,
+    lastAppliedEventSequence: snapshot.lastAppliedEventSequence ?? 0
+  });
   const session = ensureOpenAssistSessionRecord(threadID, backend, modelID);
   session.title = isGenericThreadTitle(session.title) ? titleForPrompt(prompt) : session.title;
   session.latestUserMessage = prompt;
@@ -21948,6 +28897,17 @@ function persistCompletedTurn({
   session.latestPermissionMode = normalizeCodexPermissionMode(permissionMode);
   session.activeProvider = backend;
   const updatedSession = updateSession(session);
+  // Automatic session digest — skip temporary chats (destroyed on leave) and
+  // realtime voice logs (they have their own transcript surface).
+  if (!isTransient && userSource !== "realtimeVoice") {
+    appendSessionDigest({
+      threadID,
+      title: String(updatedSession.title ?? ""),
+      backend,
+      prompt,
+      responseText
+    });
+  }
   const thread = threadItemForCompletedSession(updatedSession);
   notifyThreadsChanged();
   return {
@@ -21967,27 +28927,49 @@ function isMissingCodexRolloutError(error: unknown) {
   return /no rollout found for thread id/i.test(message);
 }
 
+function isArchivedCodexSessionError(error: unknown) {
+  const message = errorMessage(error);
+  return /\b(?:session|thread)\b.*\bis archived\b/i.test(message);
+}
+
 async function ensureCodexProviderSession(threadID: string, modelID: string, options: CodexRuntimeOptions = {}) {
   const session = findSession(threadID) ?? ensureOpenAssistSessionRecord(threadID, "codex", modelID);
-  const existing = providerBinding(session, "codex")?.providerSessionID;
+  const binding = providerBinding(session, "codex");
+  const existing = binding?.providerSessionID;
+  // Developer instructions are only transmitted when their content actually
+  // changed (mode switch, edited custom instructions, new memory saved, date
+  // rollover). The Codex session keeps the previously sent copy, so identical
+  // re-sends were pure per-turn bloat.
+  const currentInstructions = buildCodexRuntimeInstructions(session, options);
+  const currentInstructionsHash = currentInstructions ? sha256Hex(currentInstructions) : "";
   const startFreshProviderSession = async () => {
     const started = await codexTransport.request("thread/start", codexThreadStartParams(session, modelID, options)) as JsonObject;
     const thread = started.thread as JsonObject | undefined;
     const providerSessionID = String(thread?.id ?? "");
     if (!providerSessionID) throw new Error("Codex did not return a thread id.");
-    updateProviderBinding(threadID, "codex", providerSessionID, modelID);
+    updateProviderBinding(threadID, "codex", providerSessionID, modelID, { developerInstructionsHash: currentInstructionsHash });
     return { providerSessionID, insertedSystemMessage: true };
   };
   if (typeof existing === "string" && existing.trim()) {
     const existingProviderSessionID = existing.trim();
+    const previousInstructionsHash = String(binding?.developerInstructionsHash ?? "");
+    const instructionsUnchanged = Boolean(currentInstructionsHash) && previousInstructionsHash === currentInstructionsHash;
     try {
-      await codexTransport.request("thread/resume", codexThreadResumeParams(existingProviderSessionID, session, modelID, options));
-      updateProviderBinding(threadID, "codex", existingProviderSessionID, modelID);
+      await codexTransport.request(
+        "thread/resume",
+        codexThreadResumeParams(existingProviderSessionID, session, modelID, options, instructionsUnchanged)
+      );
+      if (!instructionsUnchanged) {
+        bridgeVerboseLog(`[codex.provider] developer instructions re-sent on resume thread=${threadID} (changed or first send)`);
+      }
+      updateProviderBinding(threadID, "codex", existingProviderSessionID, modelID, { developerInstructionsHash: currentInstructionsHash });
       return { providerSessionID: existingProviderSessionID, insertedSystemMessage: false };
     } catch (error) {
-      if (!isMissingCodexRolloutError(error)) throw error;
+      const missingProviderSession = isMissingCodexRolloutError(error);
+      const archivedProviderSession = isArchivedCodexSessionError(error);
+      if (!missingProviderSession && !archivedProviderSession) throw error;
       bridgeDebugLog(
-        `[codex.provider] stale Codex provider thread=${existingProviderSessionID} for OpenAssist thread=${threadID}; starting fresh provider session after resume failed: ${errorMessage(error)}`
+        `[codex.provider] stale Codex provider thread=${existingProviderSessionID} for OpenAssist thread=${threadID}; starting fresh provider session after ${archivedProviderSession ? "archived" : "missing"} resume failed: ${errorMessage(error)}`
       );
     }
   }
@@ -22002,6 +28984,8 @@ type OllamaToolContext = {
   permissionMode?: string;
   activeRun?: ActiveProviderRun;
   emitActivity?: (activity: ChatMessage) => void;
+  imageArtifacts?: MessageArtifact[];
+  currentAttachments?: ComposerImageAttachment[];
 };
 
 type OllamaMessage = {
@@ -22079,6 +29063,30 @@ const ollamaUtilityTools = [
       required: ["reason"],
       additionalProperties: false
     }
+  },
+  {
+    name: "oa_request_codex_image_generation",
+    description: "Ask Codex to create or edit an image and return the saved OpenAssist image artifact. Use this for image/photo/logo/poster/banner/mockup generation instead of delegating.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        prompt: { type: "string", description: "The image request to send to Codex." },
+        mode: { type: "string", enum: ["auto", "new_image", "edit_reference"] },
+        useLatestImage: { type: "boolean", description: "Use the latest image artifact in this thread as a reference." },
+        referenceArtifactIds: {
+          type: "array",
+          items: { type: "string" },
+          description: "Optional image artifact IDs or paths from this thread."
+        },
+        referenceImagePaths: {
+          type: "array",
+          items: { type: "string" },
+          description: "Optional local image paths to use as references."
+        }
+      },
+      required: ["prompt"],
+      additionalProperties: false
+    }
   }
 ] as const;
 
@@ -22089,14 +29097,53 @@ function canonicalOllamaToolName(name: string) {
     case "search_notes":
     case "knowledge_search":
       return "oa_search";
-    case "search_everything":
-    case "search_history":
-    case "search_threads":
-    case "knowledge_search_everything":
-      return "oa_search_everything";
-    case "read_search_result":
-    case "open_search_result":
-      return "oa_read_search_result";
+    case "quick_add_task":
+    case "add_quick_task":
+    case "fast_add_task":
+    case "add_task_fast":
+    case "knowledge_quick_add_task":
+      return "oa_quick_add_task";
+    case "quick_save_note":
+    case "quick_save_reference":
+    case "save_note_fast":
+    case "save_reference_fast":
+    case "knowledge_quick_save_note":
+      return "oa_quick_save_note";
+    case "quick_read":
+    case "fast_read":
+    case "knowledge_quick_read":
+      return "oa_quick_read";
+    case "list_approvals":
+    case "list_approval_requests":
+    case "pending_approvals":
+    case "knowledge_list_approvals":
+      return "oa_list_approvals";
+    case "apply_approval":
+    case "approve_approval":
+    case "approve_request":
+    case "knowledge_apply_approval":
+      return "oa_apply_approval";
+    case "reject_approval":
+    case "decline_approval":
+    case "reject_request":
+    case "knowledge_reject_approval":
+      return "oa_reject_approval";
+	    case "search_everything":
+	    case "search_history":
+	    case "search_threads":
+	    case "knowledge_search_everything":
+	      return "oa_search_everything";
+	    case "personal_recall":
+	    case "recall_memory":
+	    case "personal_recall_search":
+	    case "knowledge_personal_recall_search":
+	      return "oa_personal_recall_search";
+	    case "personal_recall_read":
+	    case "knowledge_personal_recall_read":
+	      return "oa_personal_recall_read";
+	    case "read_search_result":
+	    case "open_search_result":
+	      return "oa_read_search_result";
     case "read":
     case "read_note":
     case "knowledge_read":
@@ -22114,6 +29161,57 @@ function canonicalOllamaToolName(name: string) {
     case "backlog_items":
     case "list_backlog":
       return "oa_list_backlog_items";
+    case "list_planner_categories":
+    case "planner_categories":
+    case "knowledge_planner_categories":
+      return "oa_list_planner_categories";
+    case "list_planner_lists":
+    case "planner_lists":
+    case "knowledge_planner_lists":
+      return "oa_list_planner_lists";
+    case "connector_status":
+    case "connectors_status":
+    case "knowledge_connector_status":
+      return "oa_connector_status";
+    case "connector_sync_gmail":
+    case "sync_gmail_connector":
+    case "knowledge_connector_sync_gmail":
+      return "oa_connector_sync_gmail";
+    case "connector_search_gmail":
+    case "search_gmail_connector":
+    case "gmail_connector_search":
+    case "knowledge_connector_search_gmail":
+      return "oa_connector_search_gmail";
+    case "connector_search_messages":
+    case "search_messages_connector":
+    case "messages_connector_search":
+    case "search_imessage":
+    case "search_messages":
+    case "knowledge_connector_search_messages":
+      return "oa_connector_search_messages";
+    case "apple_add_reminder":
+    case "add_apple_reminder":
+    case "create_apple_reminder":
+    case "knowledge_apple_add_reminder":
+      return "oa_apple_add_reminder";
+    case "apple_list_reminders":
+    case "list_apple_reminders":
+    case "knowledge_apple_list_reminders":
+      return "oa_apple_list_reminders";
+    case "apple_complete_reminder":
+    case "complete_apple_reminder":
+    case "knowledge_apple_complete_reminder":
+      return "oa_apple_complete_reminder";
+    case "apple_add_event":
+    case "add_apple_event":
+    case "create_apple_calendar_event":
+    case "knowledge_apple_add_event":
+      return "oa_apple_add_event";
+    case "apple_list_events":
+    case "list_apple_events":
+    case "list_apple_calendar_events":
+    case "knowledge_apple_list_events":
+      return "oa_apple_list_events";
     case "read_journal":
     case "journal":
       return "oa_read_journal";
@@ -22128,16 +29226,34 @@ function canonicalOllamaToolName(name: string) {
     case "add_note":
     case "add_to_note":
       return "oa_request_add";
+    case "request_reference":
+    case "add_reference":
+    case "save_reference":
+    case "save_to_note":
+    case "append_reference":
+      return "oa_request_reference";
     case "request_daily_item":
     case "add_daily_item":
     case "add_task":
     case "create_task":
     case "create_daily_item":
       return "oa_request_daily_item";
+    case "update_daily_item":
+    case "update_task":
+    case "edit_daily_item":
+    case "edit_task":
+    case "rename_task":
+      return "oa_update_daily_item";
     case "request_backlog_item":
     case "add_backlog_item":
     case "create_backlog_item":
       return "oa_request_backlog_item";
+    case "request_tasks_from_note":
+    case "tasks_from_note":
+    case "create_tasks_from_note":
+    case "split_note_into_tasks":
+    case "sprint_plan_from_note":
+      return "oa_request_tasks_from_note";
     case "request_patch":
     case "patch_note":
     case "update_note":
@@ -22165,11 +29281,18 @@ function canonicalOllamaToolName(name: string) {
     case "terminal":
     case "terminal_execute":
       return "oa_run_shell";
-    case "delegate":
-    case "delegate_to_codex":
-    case "codex_delegate":
-      return "oa_delegate_to_codex";
-    case "agent_files_list":
+	    case "delegate":
+	    case "delegate_to_codex":
+	    case "codex_delegate":
+	      return "oa_delegate_to_codex";
+	    case "request_codex_image_generation":
+	    case "codex_image_generation":
+	    case "image_generation":
+	    case "generate_image":
+	    case "create_image":
+	    case "edit_image":
+	      return "oa_request_codex_image_generation";
+	    case "agent_files_list":
     case "files_list":
     case "list_files":
       return "oa_agent_files_list";
@@ -22190,8 +29313,18 @@ function ollamaToolIsMutating(name: string) {
   const normalizedName = canonicalOllamaToolName(name);
   return normalizedName.startsWith("oa_request")
     || normalizedName.startsWith("knowledge_request")
+    || normalizedName === "oa_quick_add_task"
+    || normalizedName === "oa_quick_save_note"
+    || normalizedName === "oa_update_daily_item"
+    || normalizedName === "knowledge_update_daily_item"
     || normalizedName === "oa_complete_daily_item"
-    || normalizedName === "knowledge_complete_daily_item"
+	    || normalizedName === "knowledge_complete_daily_item"
+	    || normalizedName === "oa_apply_approval"
+	    || normalizedName === "oa_reject_approval"
+	    || normalizedName === "oa_request_codex_image_generation"
+	    || normalizedName === "oa_apple_add_reminder"
+    || normalizedName === "oa_apple_complete_reminder"
+    || normalizedName === "oa_apple_add_event"
     || normalizedName === "oa_agent_files_write"
     || normalizedName === "oa_run_shell";
 }
@@ -22218,6 +29351,23 @@ function stableToolKey(name: string, args: JsonObject) {
       cleanDailyText(args.detailsMarkdown ?? args.details ?? "")
     ].join("|");
   }
+  if (normalizedName === "oa_quick_add_task") {
+    return [
+      normalizedName,
+      dailyItemDedupeCore(args.title ?? args.text ?? args.task ?? ""),
+      cleanDailyText(args.when ?? args.dayID ?? args.date ?? args.target ?? ""),
+      cleanDailyText(args.listName ?? args.list ?? ""),
+      cleanDailyText(args.category ?? args.area ?? "")
+    ].join("|");
+  }
+  if (normalizedName === "oa_quick_save_note") {
+    return [
+      normalizedName,
+      cleanDailyText(args.listName ?? args.list ?? args.projectID ?? args.itemID ?? ""),
+      cleanDailyText(args.title ?? args.topic ?? args.section ?? ""),
+      cleanDailyText(args.text ?? args.content ?? args.note ?? "").slice(0, 240)
+    ].join("|");
+  }
   if (normalizedName === "oa_request_backlog_item" || normalizedName === "knowledge_request_backlog_item") {
     return [
       normalizedName,
@@ -22226,12 +29376,67 @@ function stableToolKey(name: string, args: JsonObject) {
       cleanDailyText(args.detailsMarkdown ?? args.details ?? "")
     ].join("|");
   }
+  if (normalizedName === "oa_apply_approval" || normalizedName === "oa_reject_approval") {
+    return [
+      normalizedName,
+      cleanDailyText(args.requestID ?? args.id ?? "")
+    ].join("|");
+  }
+  if (normalizedName === "oa_request_tasks_from_note" || normalizedName === "knowledge_request_tasks_from_note") {
+    const items = noteTaskBatchItemsFromPayload(args)
+      .map((item) => typeof item === "string" ? item : cleanDailyText(dailyItemJSON(item).title ?? dailyItemJSON(item).text ?? dailyItemJSON(item).task ?? ""))
+      .map(dailyItemDedupeCore)
+      .filter(Boolean)
+      .join(",");
+    return [
+      normalizedName,
+      cleanDailyText(args.sourceItemID ?? args.itemID ?? args.noteItemID ?? ""),
+      cleanDailyText(args.target ?? ""),
+      normalizePlannerDayID(String(args.dayID ?? args.targetDayID ?? args.date ?? "")),
+      items
+    ].join("|");
+  }
   if (normalizedName === "oa_complete_daily_item" || normalizedName === "knowledge_complete_daily_item") {
     return [
       normalizedName,
       normalizePlannerDayID(String(args.dayID ?? args.date ?? "")),
       dailyItemDedupeCore(args.title ?? args.text ?? args.query ?? args.task ?? ""),
       args.checked === false || args.done === false || args.uncheck === true ? "unchecked" : "checked"
+    ].join("|");
+  }
+  if (normalizedName === "oa_update_daily_item" || normalizedName === "knowledge_update_daily_item") {
+    const updateMatchText = cleanDailyText(args.query ?? args.oldTitle ?? args.currentTitle ?? args.existingTitle ?? args.text ?? args.task ?? "");
+    return [
+      normalizedName,
+      normalizePlannerDayID(String(args.dayID ?? args.date ?? "")),
+      cleanDailyText(args.itemID ?? args.dailyItemID ?? ""),
+      dailyItemDedupeCore(updateMatchText || String(args.title ?? "")),
+      dailyItemDedupeCore(args.newTitle ?? args.updatedTitle ?? args.replacementTitle ?? (updateMatchText ? args.title : "") ?? ""),
+      normalizePlannerDayID(String(args.targetDayID ?? args.newDayID ?? args.moveToDayID ?? args.dayID ?? args.date ?? ""))
+    ].join("|");
+  }
+  if (normalizedName === "oa_apple_add_reminder") {
+    return [
+      normalizedName,
+      dailyItemDedupeCore(args.title ?? ""),
+      cleanDailyText(args.dueDate ?? args.due ?? ""),
+      cleanDailyText(args.calendar ?? args.list ?? "")
+    ].join("|");
+  }
+  if (normalizedName === "oa_apple_add_event") {
+    return [
+      normalizedName,
+      dailyItemDedupeCore(args.title ?? ""),
+      cleanDailyText(args.startDate ?? args.start ?? ""),
+      cleanDailyText(args.endDate ?? args.end ?? ""),
+      cleanDailyText(args.calendar ?? "")
+    ].join("|");
+  }
+  if (normalizedName === "oa_apple_complete_reminder") {
+    return [
+      normalizedName,
+      cleanDailyText(args.id ?? args.reminderID ?? ""),
+      args.completed === false ? "incomplete" : "complete"
     ].join("|");
   }
   return `${normalizedName}:${JSON.stringify(stableToolValue(args))}`;
@@ -22255,10 +29460,11 @@ function ollamaToolSpecs(settings: SettingsSnapshot, permissionMode?: string) {
     description: tool.description,
     inputSchema: tool.inputSchema as JsonObject
   })));
-  if (normalizeCodexPermissionMode(permissionMode) === "fullAccess") {
-    tools.push(ollamaUtilityTools[0] as { name: string; description: string; inputSchema: JsonObject });
-  }
-  tools.push(ollamaUtilityTools[1] as { name: string; description: string; inputSchema: JsonObject });
+	  if (normalizeCodexPermissionMode(permissionMode) === "fullAccess") {
+	    tools.push(ollamaUtilityTools[0] as { name: string; description: string; inputSchema: JsonObject });
+	  }
+	  tools.push(ollamaUtilityTools[1] as { name: string; description: string; inputSchema: JsonObject });
+	  tools.push(ollamaUtilityTools[2] as { name: string; description: string; inputSchema: JsonObject });
   return tools.map((tool) => ({
     type: "function",
     function: {
@@ -22287,12 +29493,14 @@ function currentUserTaskText(value: string) {
 function ollamaPromptNeedsTools(prompt: string, settings: SettingsSnapshot, permissionMode?: string) {
   const normalized = prompt.toLowerCase();
   const knowledgeEnabled = settings.knowledgeAccessEnabled && settings.knowledgeAgentAccessEnabled;
-  const mentionsKnowledge = /\b(note|notes|today|planner|journal|backlog|task|todo|reminder|remember|approval|request id|thread|project|when did|where did|what did we|find.*discussion|search.*openassist|mark .*done|complete .*task|carry forward)\b/.test(normalized);
-  const wantsKnowledgeMutation = /\b(add|create|schedule|move|organize|clean up|fix|patch|update|delete|mark|complete|carry forward)\b/.test(normalized)
-    && /\b(note|today|planner|backlog|task|todo|reminder|journal)\b/.test(normalized);
-  const wantsFiles = /\b(agent files|save .*file|write .*file|create .*file|report|dashboard|csv|json|html|artifact|export|downloads?|folder|directory|latest files?|what'?s in|contents?)\b/.test(normalized);
-  const wantsShellOrDelegation = /\b(shell|terminal|command|run |build|test|install|repo|code|browser|computer use|screenshot|edit file|source file|downloads?|folder|directory|latest files?|csv|pdf|png|jpe?g|mp4)\b/.test(normalized);
-  return (knowledgeEnabled && (mentionsKnowledge || wantsKnowledgeMutation)) || wantsFiles || wantsShellOrDelegation || normalizeCodexPermissionMode(permissionMode) === "fullAccess" && /\b(run|command|shell|terminal)\b/.test(normalized);
+  const mentionsKnowledge = /\b(note|notes|today|planner|journal|backlog|task|todo|reminder|reminders app|apple reminders|apple calendar|calendar app|icloud calendar|remember|approval|request id|thread|project|when did|where did|what did we|find.*discussion|search.*openassist|mark .*done|complete .*task|carry forward)\b/.test(normalized);
+	  const wantsKnowledgeMutation = /\b(add|create|schedule|move|organize|clean up|fix|patch|update|delete|mark|complete|carry forward)\b/.test(normalized)
+	    && /\b(note|today|planner|backlog|task|todo|reminder|apple reminders|apple calendar|calendar app|journal)\b/.test(normalized);
+	  const wantsImageGeneration = promptWantsImageGeneration(prompt)
+	    || /\b(use|edit|change|update|improve|build on|work on)\b.{0,80}\b(latest|attached|this|that)\b.{0,80}\b(image|photo|picture|poster|banner|logo|mockup|graphic)\b/i.test(prompt);
+	  const wantsFiles = /\b(agent files|save .*file|write .*file|create .*file|report|dashboard|csv|json|html|artifact|export|downloads?|folder|directory|latest files?|what'?s in|contents?)\b/.test(normalized);
+	  const wantsShellOrDelegation = /\b(shell|terminal|command|run |build|test|install|repo|code|browser|computer use|screenshot|edit file|source file|downloads?|folder|directory|latest files?|csv|pdf|png|jpe?g|mp4)\b/.test(normalized);
+	  return wantsImageGeneration || (knowledgeEnabled && (mentionsKnowledge || wantsKnowledgeMutation)) || wantsFiles || wantsShellOrDelegation || normalizeCodexPermissionMode(permissionMode) === "fullAccess" && /\b(run|command|shell|terminal)\b/.test(normalized);
 }
 
 function ollamaToolName(tool: unknown) {
@@ -22310,19 +29518,29 @@ function filterOllamaToolsForPrompt(
   const names = new Set<string>();
   const add = (...items: string[]) => items.forEach((item) => names.add(item));
 
-  if (/\b(search|find|when did|where did|what did we|remember|decision|discussion|history|earlier|previous|thread|note|notes|project)\b/.test(normalized)) {
-    add("oa_search", "oa_search_everything", "oa_read_search_result", "oa_read", "oa_backlinks");
+  if (/\b(search|find|when did|where did|where are we|what did we|what did codex|what did claude|what did spark|remember|decision|discussion|history|earlier|previous|thread|note|notes|project)\b/.test(normalized)) {
+    add("oa_search", "oa_personal_recall_search", "oa_personal_recall_read", "oa_search_everything", "oa_read_search_result", "oa_read", "oa_backlinks");
   }
   if (/\b(today|planner|journal|daily|task|todo|reminder|backlog|open task|unfinished|done|complete|carry forward)\b/.test(normalized)) {
-    add("oa_read_today", "oa_list_daily_items", "oa_list_backlog_items", "oa_read_journal", "oa_list_open_tasks");
+    add("oa_quick_read", "oa_read_today", "oa_list_daily_items", "oa_list_backlog_items", "oa_list_planner_categories", "oa_list_planner_lists", "oa_read_journal", "oa_list_open_tasks");
   }
   if (/\b(add|create|schedule|move|organize|clean up|fix|patch|update|mark|complete|carry forward)\b/.test(normalized)
       && /\b(note|today|planner|backlog|task|todo|reminder|journal|checkbox|checklist)\b/.test(normalized)) {
-    add("oa_request_add", "oa_request_daily_item", "oa_request_backlog_item", "oa_request_patch", "oa_request_organize", "oa_request_carry_forward", "oa_request_move_to_backlog", "oa_complete_daily_item");
+    add("oa_quick_add_task", "oa_quick_save_note", "oa_request_add", "oa_request_reference", "oa_request_daily_item", "oa_update_daily_item", "oa_request_backlog_item", "oa_request_tasks_from_note", "oa_request_patch", "oa_request_organize", "oa_request_carry_forward", "oa_request_move_to_backlog", "oa_complete_daily_item");
   }
-  if (/\b(agent files|save|write|file|report|dashboard|csv|json|html|artifact|export)\b/.test(normalized)) {
-    add("oa_agent_files_list", "oa_agent_files_read", "oa_agent_files_write");
+  if (/\b(approval|approve|apply|reject|decline|pending|review inbox|preview)\b/.test(normalized)) {
+    add("oa_list_approvals", "oa_apply_approval", "oa_reject_approval");
   }
+  if (/\b(apple reminders|reminders app|icloud reminders|apple calendar|calendar app|icloud calendar|native calendar)\b/.test(normalized)) {
+    add("oa_connector_status", "oa_apple_add_reminder", "oa_apple_list_reminders", "oa_apple_complete_reminder", "oa_apple_add_event", "oa_apple_list_events");
+  }
+	  if (/\b(agent files|save|write|file|report|dashboard|csv|json|html|artifact|export)\b/.test(normalized)) {
+	    add("oa_agent_files_list", "oa_agent_files_read", "oa_agent_files_write");
+	  }
+	  if (promptWantsImageGeneration(prompt)
+	      || /\b(use|edit|change|update|improve|build on|work on)\b.{0,80}\b(latest|attached|this|that)\b.{0,80}\b(image|photo|picture|poster|banner|logo|mockup|graphic)\b/i.test(prompt)) {
+	    add("oa_request_codex_image_generation");
+	  }
   if (/\b(shell|terminal|command|run |build|test|install|downloads?|folder|directory|latest files?|what'?s in|contents?|csv|pdf|png|jpe?g|mp4)\b/.test(normalized) && normalizeCodexPermissionMode(permissionMode) === "fullAccess") {
     add("oa_run_shell");
   }
@@ -22367,6 +29585,116 @@ function safeAgentFilesToolPath(root: string, rawPath: unknown, fallback = ".") 
 function ollamaToolResultText(result: unknown) {
   const text = typeof result === "string" ? result : JSON.stringify(result, null, 2);
   return truncateRuntimeDetailText(text, 12_000);
+}
+
+const openAssistToolCallTagPattern = /<openassist_tool_call>([\s\S]*?)<\/openassist_tool_call>/gi;
+
+function openAssistImageWorkerProtocolInstructions(forceImageWorker = false) {
+  return [
+    "# OpenAssist Image Worker Tool",
+    "",
+    "When the user asks you to create, generate, draw, render, design, edit, or build on an image, do not use background agents or another image API.",
+    forceImageWorker
+      ? "The user explicitly selected @codex-image for this turn. You must request the image worker before giving the final answer."
+      : "",
+    "Ask OpenAssist to run Codex as the hidden image worker by outputting exactly one tool call tag:",
+    "<openassist_tool_call>{\"tool\":\"request_codex_image_generation\",\"prompt\":\"what to generate\",\"mode\":\"auto\"}</openassist_tool_call>",
+    "Use `mode:\"new_image\"` for a fresh image, `mode:\"edit_reference\"` when the user attached an image or says to use the latest image, and `useLatestImage:true` for follow-up edits.",
+    "After OpenAssist returns the tool result, answer the user normally and briefly. Do not show raw JSON or mention hidden threads."
+  ].filter(Boolean).join("\n");
+}
+
+function promptWithOpenAssistImageWorkerProtocol(prompt: string, forceImageWorker = false) {
+  return `${openAssistImageWorkerProtocolInstructions(forceImageWorker)}\n\n${prompt}`;
+}
+
+function stripOpenAssistToolCalls(value: string) {
+  return value.replace(openAssistToolCallTagPattern, "").trim();
+}
+
+function parseOpenAssistToolCallJSON(value: string) {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return undefined;
+  }
+}
+
+function extractOpenAssistToolCalls(value: string) {
+  const calls: JsonObject[] = [];
+  for (const match of value.matchAll(openAssistToolCallTagPattern)) {
+    const parsed = runtimeObject(parseOpenAssistToolCallJSON(match[1].trim()));
+    if (parsed) calls.push(parsed);
+  }
+  return calls;
+}
+
+function openAssistToolCallRequest(call: JsonObject, fallbackPrompt: string) {
+  const tool = firstRuntimeString(call.tool, call.name).trim();
+  if (tool !== "request_codex_image_generation") return null;
+  const args = runtimeObject(call.args)
+    ?? runtimeObject(call.arguments)
+    ?? runtimeObject(call.input)
+    ?? call;
+  return normalizeCodexImageGenerationRequest(args, fallbackPrompt);
+}
+
+function providerImageToolContinuationPrompt(originalPrompt: string, previousResponse: string, results: JsonObject[]) {
+  const previous = stripOpenAssistToolCalls(previousResponse);
+  return [
+    "OpenAssist completed the Codex image worker request.",
+    "Tool result:",
+    JSON.stringify(results, null, 2),
+    "",
+    "Now answer the user as the same assistant.",
+    "Keep it short and natural. If the result has ok=true, say the image is ready. If it failed, say what failed plainly.",
+    "Do not output another <openassist_tool_call> tag unless the user is asking for another separate image.",
+    previous ? `Your earlier draft before the tool result:\n${previous}` : "",
+    "",
+    "Original user task:",
+    currentUserTaskText(originalPrompt)
+  ].filter(Boolean).join("\n\n");
+}
+
+async function runOpenAssistImageToolCallsFromProvider({
+  threadID,
+  providerTurnID,
+  responseText,
+  originalPrompt,
+  currentAttachments = [],
+  source,
+  emitActivity
+}: {
+  threadID: string;
+  providerTurnID: string;
+  responseText: string;
+  originalPrompt: string;
+  currentAttachments?: ComposerImageAttachment[];
+  source: string;
+  emitActivity?: (activity: ChatMessage) => void;
+}) {
+  const calls = extractOpenAssistToolCalls(responseText);
+  const results: JsonObject[] = [];
+  const artifacts: MessageArtifact[] = [];
+  for (const call of calls.slice(0, 3)) {
+    const request = openAssistToolCallRequest(call, currentUserTaskText(originalPrompt));
+    if (!request) continue;
+    const result = await requestCodexImageGenerationForThread(threadID, request, {
+      currentAttachments,
+      source,
+      callID: makeID("image-worker-"),
+      turnID: providerTurnID,
+      emitActivity
+    });
+    if (result.artifact) artifacts.push(result.artifact);
+    results.push(compactCodexImageGenerationResult(result));
+  }
+  return {
+    hadToolCalls: results.length > 0,
+    cleanedText: stripOpenAssistToolCalls(responseText),
+    results,
+    artifacts: uniqueArtifacts(artifacts)
+  };
 }
 
 function ollamaToolActivity(
@@ -22451,8 +29779,9 @@ function ollamaAgentInstructions(settings: SettingsSnapshot, agentFilesPath: str
     "",
     "Use tools when the answer depends on OpenAssist notes, Today, Backlog, saved thread files, or local command output.",
     "Tool names are exact. For shell/local filesystem inspection, call `oa_run_shell` with `{ \"command\": \"...\" }`; do not invent names like `shell_execute`.",
-    "Do not call the same write/add/complete tool twice for one user request. If a tool result says `duplicate_ignored`, stop repeating it and answer from the result you already have.",
-    "For simple planner and backlog tasks, use OpenAssist tools directly instead of delegating to Codex.",
+	    "Do not call the same write/add/complete tool twice for one user request. If a tool result says `duplicate_ignored`, stop repeating it and answer from the result you already have.",
+	    "For image generation or image edits, call `oa_request_codex_image_generation`. Do not delegate image generation to Codex through `oa_delegate_to_codex`.",
+	    "For simple planner and backlog tasks, use OpenAssist tools directly instead of delegating to Codex.",
     "For generated reports, dashboards, CSV, JSON, HTML, notes, or analysis outputs, save them in this thread's Agent Files folder.",
     `Agent Files folder: ${agentFilesPath}`,
     "Linked repos are read/context unless the user clearly asks to change repo files, for example `create docs/summary.md in the repo`.",
@@ -22481,11 +29810,24 @@ async function runOllamaTool(
         message: "This write/add tool already ran for this user request. Do not call it again.",
         tool: normalizedName
       };
-    }
-    executedMutations.add(mutationKey);
-  }
-  if (normalizedName.startsWith("oa_request")
-      || normalizedName.startsWith("knowledge_request")
+	    }
+	    executedMutations.add(mutationKey);
+	  }
+	  if (normalizedName === "oa_request_codex_image_generation") {
+	    const result = await requestCodexImageGenerationForThread(context.threadID, args, {
+	      currentAttachments: context.currentAttachments ?? [],
+	      source: "ollamaLocal",
+	      callID: `${context.providerTurnID}-image`,
+	      turnID: context.providerTurnID,
+	      emitActivity: context.emitActivity
+	    });
+	    if (result.artifact) context.imageArtifacts?.push(result.artifact);
+	    return compactCodexImageGenerationResult(result);
+	  }
+	  if (normalizedName.startsWith("oa_request")
+	      || normalizedName.startsWith("knowledge_request")
+      || normalizedName === "oa_update_daily_item"
+      || normalizedName === "knowledge_update_daily_item"
       || normalizedName === "oa_complete_daily_item"
       || normalizedName === "knowledge_complete_daily_item") {
     if (!context.settings.knowledgeAccessEnabled || !context.settings.knowledgeAgentAccessEnabled) {
@@ -22497,7 +29839,7 @@ async function runOllamaTool(
   }
   if ((normalizedName.startsWith("oa_") && knowledgeMCPTools.some((tool) => tool.name === normalizedName))
       || normalizedName.startsWith("knowledge_")) {
-    return knowledgeToolResult(normalizedName, args, "mcp");
+    return knowledgeToolResultAsync(normalizedName, args, "mcp");
   }
   if (normalizedName === "oa_agent_files_list") {
     const folderPath = safeAgentFilesToolPath(context.agentFilesPath, args.path, ".");
@@ -22779,9 +30121,11 @@ async function sendOllamaMessage(
     permissionMode?: string;
     activeRun?: ActiveProviderRun;
     stopPromise?: Promise<never>;
-    emitActivity?: (activity: ChatMessage) => void;
-    emitDelta?: (delta: string) => void;
-  }
+	    emitActivity?: (activity: ChatMessage) => void;
+	    emitDelta?: (delta: string) => void;
+	    imageArtifacts?: MessageArtifact[];
+	    currentAttachments?: ComposerImageAttachment[];
+	  }
 ) {
   const promptForModel = stripOllamaStoragePrompt(prompt);
   const currentPrompt = currentUserTaskText(promptForModel);
@@ -22804,9 +30148,9 @@ async function sendOllamaMessage(
   const snapshot = readConversationSnapshot(threadID);
   const recentMessages: OllamaMessage[] = (snapshot.transcript ?? [])
     .filter((entry) => entry.role === "user" || entry.role === "assistant")
-    .map((entry): OllamaMessage => ({ role: entry.role === "assistant" ? "assistant" : "user", content: String(entry.text ?? "") }))
+    .map((entry): OllamaMessage => ({ role: entry.role === "assistant" ? "assistant" : "user", content: String(entry.text ?? "").slice(0, ollamaRecentContextMaxCharsPerMessage) }))
     .filter((entry) => entry.content)
-    .slice(-6);
+    .slice(-ollamaRecentContextMaxMessages);
 
   if (!ollamaPromptNeedsTools(currentPrompt, settings, options.permissionMode)) {
     // Normal chat lane: let the model think and stream both the reasoning
@@ -22852,15 +30196,17 @@ async function sendOllamaMessage(
   );
   const executedMutations = new Set<string>();
   let lastText = "";
-  const context: OllamaToolContext = {
-    threadID,
-    providerTurnID: options.providerTurnID,
-    agentFilesPath: options.agentFilesPath,
-    settings,
-    permissionMode: options.permissionMode,
-    activeRun: options.activeRun,
-    emitActivity: options.emitActivity
-  };
+	  const context: OllamaToolContext = {
+	    threadID,
+	    providerTurnID: options.providerTurnID,
+	    agentFilesPath: options.agentFilesPath,
+	    settings,
+	    permissionMode: options.permissionMode,
+	    activeRun: options.activeRun,
+	    emitActivity: options.emitActivity,
+	    imageArtifacts: options.imageArtifacts,
+	    currentAttachments: options.currentAttachments
+	  };
   // Stream the reasoning trace across the whole tool loop. Content is not
   // streamed here because intermediate steps would otherwise concatenate into
   // the final answer; the final text is returned and rendered on completion.
@@ -23188,11 +30534,15 @@ async function sendCopilotMessage(
   modelID: string,
   run?: ActiveProviderRun,
   knowledgeAccess?: KnowledgeRuntimeAccess | null,
-  pluginIDs: string[] = []
+  pluginIDs: string[] = [],
+  isNewSession = true
 ) {
   const wantsComputerUse = shouldPreferCodexComputerUsePlugin(pluginIDs);
+  // Full knowledge instructions only on the session's first turn; resumed
+  // turns get the ~1KB compact refresher (the session transcript already
+  // contains the full block).
   const promptText = knowledgeAccess
-    ? `${openAssistKnowledgeAgentInstructions("Copilot")}\n\nUser task:\n${prompt}`
+    ? `${isNewSession ? openAssistKnowledgeAgentInstructions("Copilot") : openAssistKnowledgeAgentInstructionsCompact("Copilot")}\n\nUser task:\n${prompt}`
     : prompt;
   const args = [
     "--prompt",
@@ -23298,7 +30648,12 @@ async function sendClaudeCodeMessage(
     cleanups.push(() => { try { fs.rmSync(directory, { recursive: true, force: true }); } catch { /* best effort */ } });
     args.push("--mcp-config", mergedConfigPath, "--allowedTools", allowedTools.join(","));
     if (knowledgeAccess) {
-      args.push("--append-system-prompt", openAssistKnowledgeAgentInstructions("Claude"));
+      // Full block on the first turn only; resumed turns get the compact
+      // refresher — the resumed transcript already carries the full rules.
+      args.push(
+        "--append-system-prompt",
+        isNewSession ? openAssistKnowledgeAgentInstructions("Claude") : openAssistKnowledgeAgentInstructionsCompact("Claude")
+      );
     }
     // For Computer Use, use ONLY our MCP config. Claude's own globally-configured
     // MCP servers (e.g. claude.ai / Microsoft 365) flood the tool list, which
@@ -23540,13 +30895,13 @@ function promptWithRecentConversationContext(threadID: string, prompt: string) {
   const snapshot = readConversationSnapshot(threadID);
   const context = (snapshot.transcript ?? [])
     .filter((entry) => entry.role === "user" || entry.role === "assistant")
+    .slice(-recentContextMaxMessages)
     .map((entry) => {
       const role = entry.role === "assistant" ? "Assistant" : "User";
-      const text = String(entry.text ?? "").replace(/\s+/g, " ").trim();
+      const text = compactRuntimeDetail(entry.text, recentContextMaxCharsPerMessage);
       return text ? `${role}: ${text}` : "";
     })
     .filter(Boolean)
-    .slice(-12)
     .join("\n");
   if (!context) return prompt;
   return `Conversation context from this Open Assist chat:\n${context}\n\nCurrent user task:\n${prompt}`;
@@ -23593,7 +30948,7 @@ function antigravityImageQualityGuidance(prompt: string) {
   ].join("\n");
 }
 
-function antigravityPrompt(threadID: string, prompt: string, cwd: string, settings: SettingsSnapshot) {
+function antigravityPrompt(threadID: string, prompt: string, cwd: string, settings: SettingsSnapshot, resumingConversation = false) {
   const currentTask = prompt.trim();
   const imageQualityGuidance = antigravityImageQualityGuidance(currentTask);
   const knowledgeContext = relevantKnowledgeContextForPrompt(currentTask, settings);
@@ -23603,7 +30958,7 @@ function antigravityPrompt(threadID: string, prompt: string, cwd: string, settin
     "Reply only to the current user task.",
     "If the current task is a greeting, reply briefly and ask how you can help.",
     "Do not inspect repo files or run commands unless the current user task clearly asks for that.",
-    knowledgeContext ? openAssistKnowledgeAgentInstructions("Antigravity") : "",
+    knowledgeContext ? openAssistKnowledgeAgentInstructionsCompact("Antigravity") : "",
     knowledgeContext,
     imageQualityGuidance
   ].filter(Boolean).join("\n");
@@ -23612,6 +30967,12 @@ function antigravityPrompt(threadID: string, prompt: string, cwd: string, settin
     return `The user said: ${currentTask}. Respond with one short friendly greeting and ask how you can help.`;
   }
 
+  // When resuming a native agy conversation (--conversation <id>), the CLI
+  // already has the full history — replaying our transcript would duplicate
+  // it and bloat every turn.
+  if (resumingConversation) {
+    return `${header}\n\nCurrent user task:\n${currentTask}`;
+  }
   const withContext = promptWithRecentConversationContext(threadID, currentTask);
   return `${header}\n\n${withContext}`;
 }
@@ -24057,7 +31418,12 @@ async function sendAntigravityMessage(
     throw new Error(`Antigravity CLI is not installed yet. Install it with: ${antigravityCLIInstallCommand}`);
   }
   const cwd = providerWorkingDirectory(session);
-  const promptWithContext = antigravityPrompt(threadID, prompt, cwd, settings);
+  // Native session continuity: agy supports resuming a conversation by id
+  // (--conversation). The first turn creates one (id is captured from the run
+  // log below) and later turns resume it, so the prompt no longer needs the
+  // transcript replay that used to be re-sent on every message.
+  const boundConversationID = String(providerBinding(session, "antigravityCLI")?.providerSessionID ?? "").trim();
+  const resumeConversationID = /^[0-9a-f-]{36}$/i.test(boundConversationID) ? boundConversationID : "";
   const logPath = antigravityProgressLogPath(providerTurnID);
   try {
     fs.rmSync(logPath, { force: true });
@@ -24067,21 +31433,21 @@ async function sendAntigravityMessage(
   const progressWatcher = callbacks
     ? startAntigravityProgressWatcher(threadID, providerTurnID, logPath, callbacks)
     : null;
-  const args = [
-    "--print",
-    promptWithContext,
-    "--dangerously-skip-permissions",
-    "--print-timeout",
-    "20m",
-    "--add-dir",
-    cwd,
-    "--log-file",
-    logPath
-  ];
-  let stdout = "";
-  let stderr = "";
-  try {
-    const result = await execCaptured(
+  const runOnce = async (conversationID: string) => {
+    const promptWithContext = antigravityPrompt(threadID, prompt, cwd, settings, Boolean(conversationID));
+    const args = [
+      "--print",
+      promptWithContext,
+      "--dangerously-skip-permissions",
+      "--print-timeout",
+      "20m",
+      "--add-dir",
+      cwd,
+      "--log-file",
+      logPath,
+      ...(conversationID ? ["--conversation", conversationID] : [])
+    ];
+    return execCaptured(
       executablePath,
       args,
       cwd,
@@ -24092,15 +31458,31 @@ async function sendAntigravityMessage(
         : null,
       () => progressWatcher?.flush()
     );
-    stdout = result.stdout;
-    stderr = result.stderr;
-  } catch (error) {
-    const captured = error as Error & { stdout?: string; stderr?: string };
-    const output = `${captured.stdout ?? ""}\n${captured.stderr ?? ""}\n${captured.message}`;
-    if (antigravityAuthRequired(output)) {
-      throw new Error(antigravityAuthRequiredMessage());
+  };
+  let stdout = "";
+  let stderr = "";
+  try {
+    try {
+      const result = await runOnce(resumeConversationID);
+      stdout = result.stdout;
+      stderr = result.stderr;
+    } catch (error) {
+      const captured = error as Error & { stdout?: string; stderr?: string };
+      const output = `${captured.stdout ?? ""}\n${captured.stderr ?? ""}\n${captured.message}`;
+      if (antigravityAuthRequired(output)) {
+        throw new Error(antigravityAuthRequiredMessage());
+      }
+      // A stale/deleted conversation must not kill the turn: retry once as a
+      // fresh conversation with the transcript replay fallback.
+      if (resumeConversationID && !run?.stopped) {
+        bridgeDebugLog(`[antigravity] resume of conversation=${resumeConversationID} failed; retrying fresh: ${captured.message}`);
+        const retry = await runOnce("");
+        stdout = retry.stdout;
+        stderr = retry.stderr;
+      } else {
+        throw error;
+      }
     }
-    throw error;
   } finally {
     progressWatcher?.stop();
   }
@@ -24109,6 +31491,15 @@ async function sendAntigravityMessage(
     throw new Error(antigravityAuthRequiredMessage());
   }
   const conversationID = progressWatcher?.conversationID() || antigravityConversationIDFromLogFile(logPath);
+  // Bind the conversation to this thread so the next turn resumes it natively
+  // instead of replaying the transcript.
+  if (conversationID && conversationID !== resumeConversationID) {
+    try {
+      updateProviderBinding(threadID, "antigravityCLI", conversationID);
+    } catch (error) {
+      bridgeDebugLog(`[antigravity] failed to store conversation binding thread=${threadID}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
   const responseText = (conversationID ? antigravityFinalResponseFromTranscript(conversationID) : "")
     || providerCLIText(stdout, stderr, "antigravityCLI");
   const artifacts = conversationID ? antigravityArtifactsFromTranscript(conversationID) : messageArtifactsFromText(`${stdout}\n${stderr}`);
@@ -24200,6 +31591,7 @@ export async function sendCodexMessage(
   if (!normalized && !imageAttachments.length) throw new Error("Message is empty.");
   const inlineImageAttachments = composerImageAttachmentsOf(imageAttachments);
   const fileAttachments = composerFileAttachmentsOf(imageAttachments);
+  const codexImageWorkerSelected = hasCodexImageWorkerSelection(pluginIDs, skillIDs, normalized);
   const normalizedToolSelection = await normalizeCodexToolSelection(pluginIDs, skillIDs);
   pluginIDs = normalizedToolSelection.pluginIDs;
   skillIDs = normalizedToolSelection.skillIDs;
@@ -24209,15 +31601,23 @@ export async function sendCodexMessage(
   const visibleUserText = normalized || composerAttachmentSummaryText(imageAttachments);
   const codexReasoningEffort = normalizeCodexReasoningEffort(reasoningEffort);
   const settings = await loadSettings();
-  let openAssistThreadID = threadID?.startsWith("openassist-")
+  const openAssistThreadID = threadID?.startsWith("openassist-")
     ? threadID
     : createOpenAssistThread(undefined, true).session.id;
   let session = findSession(openAssistThreadID);
   if (!session) {
-    const { projectID } = projectContextForThread(openAssistThreadID);
-    session = createOpenAssistThread(projectID, true).session;
-    openAssistThreadID = session.id;
+    // The renderer asked for a specific thread whose registry record is
+    // missing (e.g. the registry was rewritten). Recreate the record under the
+    // SAME id — moving the turn to a brand-new thread silently strands the
+    // user's message in a chat they never opened.
+    session = ensureOpenAssistSessionRecord(openAssistThreadID);
+    bridgeDebugLog(`Recreated missing session record for requested thread=${openAssistThreadID}`);
   }
+  // Temporary threads stay temporary through turns. Their conversation is
+  // written to disk so the UI can reload it mid-session, but the thread is
+  // destroyed when the user leaves it (destroyTemporaryThread) and purged at
+  // startup (purgeTemporaryThreadsOnStartup). Promoting here made every
+  // temporary chat permanent the moment a message ran.
   const backend = normalizeBackend(String(session.activeProvider ?? settings.assistantBackend ?? "codex"));
   const modelID = modelForBackend(backend, settings, session);
   // File attachments are never sent inline to the model, so they are written to
@@ -24288,12 +31688,13 @@ export async function sendCodexMessage(
         threadID: openAssistThreadID,
         title: completedTurn.title,
         thread: completedTurn.thread,
-        user: { id: `user-${Date.now()}`, role: "user", text: visibleUserText, attachments: imageAttachments } satisfies ChatMessage,
+        user: { id: `user-${Date.now()}`, role: "user", text: visibleUserText, attachments: imageAttachments, createdAt: Date.now() } satisfies ChatMessage,
         assistant: {
           id: assistantMessageID,
           role: "assistant",
           text: directKnowledgeRequest.responseText,
           provider: providerLabel(backend),
+          createdAt: Date.now(),
           turnID: providerTurnID
         } satisfies ChatMessage
       };
@@ -24309,26 +31710,48 @@ export async function sendCodexMessage(
     const existing = providerBinding(session, "ollamaLocal")?.providerSessionID;
     updateProviderBinding(openAssistThreadID, "ollamaLocal", openAssistThreadID, modelID);
     await beginTrackedCodeCheckpointIfNeeded(openAssistThreadID, interactionMode, settings);
-    const providerTurnID = `ollama-turn-${randomUUID().toLowerCase()}`;
-    if (activeRun) activeRun.turnID = providerTurnID;
-    let responseText = "";
-    const emitOllamaActivity = (activity: ChatMessage) => {
-      emitRunEvent({ type: "activity", activity });
-    };
-    const emitOllamaDelta = (delta: string) => {
-      emitRunEvent({ type: "assistant-delta", delta });
-    };
-    try {
-      responseText = await sendOllamaMessage(openAssistThreadID, runtimePrompt, modelID, settings, {
-        providerTurnID,
-        agentFilesPath: agentFiles.path,
-        permissionMode,
-        activeRun,
-        stopPromise,
-        emitActivity: emitOllamaActivity,
-        emitDelta: emitOllamaDelta
-      });
-    } catch (error) {
+	    const providerTurnID = `ollama-turn-${randomUUID().toLowerCase()}`;
+	    if (activeRun) activeRun.turnID = providerTurnID;
+	    let responseText = "";
+	    let assistantArtifacts: MessageArtifact[] = [];
+	    const emitOllamaActivity = (activity: ChatMessage) => {
+	      emitRunEvent({ type: "activity", activity });
+	    };
+	    const emitOllamaDelta = (delta: string) => {
+	      emitRunEvent({ type: "assistant-delta", delta });
+	    };
+	    try {
+	      if (codexImageWorkerSelected) {
+	        const imageResult = await requestCodexImageGenerationForThread(openAssistThreadID, {
+	          prompt: currentUserTaskText(runtimePrompt),
+	          mode: inlineImageAttachments.length ? "edit_reference" : "auto",
+	          useLatestImage: !inlineImageAttachments.length
+	        }, {
+	          currentAttachments: imageAttachments,
+	          source: "ollamaLocal",
+	          callID: `${providerTurnID}-image`,
+	          turnID: providerTurnID,
+	          emitActivity: emitOllamaActivity
+	        });
+	        if (imageResult.artifact) assistantArtifacts.push(imageResult.artifact);
+	        responseText = imageResult.ok
+	          ? "Generated image is ready."
+	          : `Codex image generation failed: ${imageResult.error || imageResult.summary}`;
+	      } else {
+	        responseText = await sendOllamaMessage(openAssistThreadID, runtimePrompt, modelID, settings, {
+	          providerTurnID,
+	          agentFilesPath: agentFiles.path,
+	          permissionMode,
+	          activeRun,
+	          stopPromise,
+	          emitActivity: emitOllamaActivity,
+	          emitDelta: emitOllamaDelta,
+	          imageArtifacts: assistantArtifacts,
+	          currentAttachments: imageAttachments
+	        });
+	      }
+	      assistantArtifacts = uniqueArtifacts(assistantArtifacts);
+	    } catch (error) {
       await finalizeTrackedCodeCheckpointIfNeeded({
         threadID: openAssistThreadID,
         turnID: providerTurnID,
@@ -24354,8 +31777,9 @@ export async function sendCodexMessage(
       responseText,
       insertedSystemMessage: !(typeof existing === "string" && existing.trim()),
       assistantMessageID,
-      checkpointReferences: finalizedCheckpoint ? [finalizedCheckpoint.checkpoint.id] : [],
-      userAttachments: imageAttachments,
+	      checkpointReferences: finalizedCheckpoint ? [finalizedCheckpoint.checkpoint.id] : [],
+	      assistantArtifacts,
+	      userAttachments: imageAttachments,
       reasoningEffort: codexReasoningEffort,
       interactionMode,
       permissionMode
@@ -24366,12 +31790,14 @@ export async function sendCodexMessage(
       threadID: openAssistThreadID,
       title: completedTurn.title,
       thread: completedTurn.thread,
-      user: { id: `user-${Date.now()}`, role: "user", text: visibleUserText, attachments: imageAttachments } satisfies ChatMessage,
+      user: { id: `user-${Date.now()}`, role: "user", text: visibleUserText, attachments: imageAttachments, createdAt: Date.now() } satisfies ChatMessage,
       assistant: {
         id: assistantMessageID,
         role: "assistant",
         text: responseText,
+        artifacts: assistantArtifacts,
         provider: providerLabel(backend),
+        createdAt: Date.now(),
         turnID: providerTurnID,
         checkpointInfo: finalizedCheckpoint
           ? checkpointInfoFor(finalizedCheckpoint.checkpoint, finalizedCheckpoint.state)
@@ -24409,36 +31835,87 @@ export async function sendCodexMessage(
         return null;
       })
       : null;
-    try {
-      await beginTrackedCodeCheckpointIfNeeded(openAssistThreadID, interactionMode, settings);
-      if (backend === "copilot") {
-        responseText = await Promise.race([
-          sendCopilotMessage(providerSession.providerSessionID, session, runtimePrompt, modelID, activeRun, cliKnowledgeAccess, pluginIDs),
-          stopPromise
-        ]);
-      } else if (backend === "claudeCode") {
-        responseText = await Promise.race([
-          sendClaudeCodeMessage(providerSession.providerSessionID, session, runtimePrompt, modelID, providerSession.insertedSystemMessage, activeRun, cliKnowledgeAccess, pluginIDs, {
-            emitActivity: (activity) => emitRunEvent({ type: "activity", activity }),
-            emitStatus: (text) => emitRunEvent({ type: "status", text })
-          }),
-          stopPromise
-        ]);
-      } else {
-        const emitAntigravityActivity = (activity: ChatMessage) => {
-          emitRunEvent({ type: "activity", activity });
-        };
-        const antigravityResult = await Promise.race([
-          sendAntigravityMessage(session, openAssistThreadID, runtimePrompt, providerTurnID, settings, activeRun, {
-            emitActivity: emitAntigravityActivity,
-            emitStatus: (text) => emitRunEvent({ type: "status", text })
-          }),
-          stopPromise
-        ]);
-        responseText = antigravityResult.text;
-        assistantArtifacts = antigravityResult.artifacts;
-      }
-    } catch (error) {
+	    try {
+	      await beginTrackedCodeCheckpointIfNeeded(openAssistThreadID, interactionMode, settings);
+	      const runProviderOnce = async (promptText: string, continuation = false): Promise<{ text: string; artifacts: MessageArtifact[] }> => {
+	        if (backend === "copilot") {
+	          const text = await Promise.race([
+	            sendCopilotMessage(providerSession.providerSessionID, session, promptText, modelID, activeRun, cliKnowledgeAccess, pluginIDs, continuation ? false : providerSession.insertedSystemMessage),
+	            stopPromise
+	          ]);
+	          return { text, artifacts: [] };
+	        }
+	        if (backend === "claudeCode") {
+	          const text = await Promise.race([
+	            sendClaudeCodeMessage(providerSession.providerSessionID, session, promptText, modelID, continuation ? false : providerSession.insertedSystemMessage, activeRun, cliKnowledgeAccess, pluginIDs, {
+	              emitActivity: (activity) => emitRunEvent({ type: "activity", activity }),
+	              emitStatus: (text) => emitRunEvent({ type: "status", text })
+	            }),
+	            stopPromise
+	          ]);
+	          return { text, artifacts: [] };
+	        }
+	        const emitAntigravityActivity = (activity: ChatMessage) => {
+	          emitRunEvent({ type: "activity", activity });
+	        };
+	        const antigravityResult = await Promise.race([
+	          sendAntigravityMessage(session, openAssistThreadID, promptText, providerTurnID, settings, activeRun, {
+	            emitActivity: emitAntigravityActivity,
+	            emitStatus: (text) => emitRunEvent({ type: "status", text })
+	          }),
+	          stopPromise
+	        ]);
+	        return {
+	          text: antigravityResult.text,
+	          artifacts: antigravityResult.artifacts
+	        };
+	      };
+
+	      const firstRun = await runProviderOnce(promptWithOpenAssistImageWorkerProtocol(runtimePrompt, codexImageWorkerSelected));
+	      responseText = firstRun.text;
+	      assistantArtifacts = uniqueArtifacts([...assistantArtifacts, ...firstRun.artifacts]);
+
+	      let imageToolRun = await runOpenAssistImageToolCallsFromProvider({
+	        threadID: openAssistThreadID,
+	        providerTurnID,
+	        responseText,
+	        originalPrompt: runtimePrompt,
+	        currentAttachments: imageAttachments,
+	        source: backend,
+	        emitActivity: (activity) => emitRunEvent({ type: "activity", activity })
+	      });
+	      if (!imageToolRun.hadToolCalls && codexImageWorkerSelected) {
+	        const forcedResult = await requestCodexImageGenerationForThread(openAssistThreadID, {
+	          prompt: currentUserTaskText(runtimePrompt),
+	          mode: inlineImageAttachments.length ? "edit_reference" : "auto",
+	          useLatestImage: !inlineImageAttachments.length
+	        }, {
+	          currentAttachments: imageAttachments,
+	          source: backend,
+	          callID: `${providerTurnID}-image`,
+	          turnID: providerTurnID,
+	          emitActivity: (activity) => emitRunEvent({ type: "activity", activity })
+	        });
+	        imageToolRun = {
+	          hadToolCalls: true,
+	          cleanedText: stripOpenAssistToolCalls(responseText),
+	          results: [compactCodexImageGenerationResult(forcedResult)],
+	          artifacts: forcedResult.artifact ? [forcedResult.artifact] : []
+	        };
+	      }
+	      if (imageToolRun.hadToolCalls) {
+	        assistantArtifacts = uniqueArtifacts([...assistantArtifacts, ...imageToolRun.artifacts]);
+	        const continuationPrompt = providerImageToolContinuationPrompt(runtimePrompt, responseText, imageToolRun.results);
+	        const continuationRun = await runProviderOnce(continuationPrompt, true);
+	        assistantArtifacts = uniqueArtifacts([...assistantArtifacts, ...continuationRun.artifacts]);
+	        responseText = stripOpenAssistToolCalls(continuationRun.text)
+	          || imageToolRun.cleanedText
+	          || imageToolRun.results.map((result) => String(result.summary ?? result.error ?? "")).filter(Boolean).join("\n")
+	          || "Codex image worker finished.";
+	      } else {
+	        responseText = imageToolRun.cleanedText || stripOpenAssistToolCalls(responseText);
+	      }
+	    } catch (error) {
       await finalizeTrackedCodeCheckpointIfNeeded({
         threadID: openAssistThreadID,
         turnID: providerTurnID,
@@ -24477,13 +31954,14 @@ export async function sendCodexMessage(
       threadID: openAssistThreadID,
       title: completedTurn.title,
       thread: completedTurn.thread,
-      user: { id: `user-${Date.now()}`, role: "user", text: visibleUserText, attachments: imageAttachments } satisfies ChatMessage,
+      user: { id: `user-${Date.now()}`, role: "user", text: visibleUserText, attachments: imageAttachments, createdAt: Date.now() } satisfies ChatMessage,
       assistant: {
         id: assistantMessageID,
         role: "assistant",
         text: responseText,
         artifacts: assistantArtifacts,
         provider: providerLabel(backend),
+        createdAt: Date.now(),
         turnID: providerTurnID,
         checkpointInfo: finalizedCheckpoint
           ? checkpointInfoFor(finalizedCheckpoint.checkpoint, finalizedCheckpoint.state)
@@ -24548,7 +32026,7 @@ export async function sendCodexMessage(
       const prior = itemPhases.get(id);
       itemPhases.set(id, phase);
       if (prior !== phase) {
-        bridgeDebugLog(`codex item phase id=${id} phase=${phase}`);
+        bridgeVerboseLog(`codex item phase id=${id} phase=${phase}`);
       }
     }
   };
@@ -24664,7 +32142,7 @@ export async function sendCodexMessage(
       ...dedupeInputItems([
         ...(await threadSkillPromptItems(openAssistThreadID)),
         ...(await selectedSkillPromptItems(skillIDs)),
-        ...imageGenerationSkillPromptItems(providerPrompt),
+        ...imageGenerationSkillPromptItems(providerPrompt, codexImageWorkerSelected),
         ...pluginItems
       ]),
       ...composerImageInstructionItems(imageAttachments)
@@ -24744,12 +32222,13 @@ export async function sendCodexMessage(
     threadID: openAssistThreadID,
     title: completedTurn.title,
     thread: completedTurn.thread,
-    user: { id: `user-${Date.now()}`, role: "user", text: visibleUserText, attachments: imageAttachments } satisfies ChatMessage,
+    user: { id: `user-${Date.now()}`, role: "user", text: visibleUserText, attachments: imageAttachments, createdAt: Date.now() } satisfies ChatMessage,
     assistant: {
       id: assistantMessageID,
       role: "assistant",
       text: finalText,
       provider: "Codex",
+      createdAt: Date.now(),
       turnID: providerTurnID,
       checkpointInfo: finalizedCheckpoint
         ? checkpointInfoFor(finalizedCheckpoint.checkpoint, finalizedCheckpoint.state)
@@ -24874,12 +32353,15 @@ function waitForTurnComplete() {
 
 export {
   analyzeScreenWithCodex,
+  promptWantsImageGeneration,
+  listScreenAnalysisSkills,
   archiveProjectNote,
   archiveSession,
   archiveThreadNote,
   assignSessionToProject,
   cleanupNoteWithCodex,
   createOpenAssistThread as createAssistantThread,
+  createPlannerList,
   createProject,
   createProjectFromFolder,
   createProjectNote,
@@ -24890,6 +32372,7 @@ export {
   deleteProjectNote,
   deleteProjectNotePermanently,
   deleteProjectNoteFolder,
+  moveProjectNoteFolder,
   moveProjectNoteToFolder,
   renameProjectNoteFolder,
   deleteSessionPermanently,
@@ -24900,11 +32383,17 @@ export {
   installKokoroVoiceModel,
   importSkillFolder,
   importSkillFromGitHub,
+  installOpenAssistIntegrationSkill,
   loadCodeTrackingState,
   loadKnowledgeStatus,
+  loadOpenAssistIntegrationStatus,
   loadProjectMemory,
   loadPlannerDay,
   loadPlannerBacklog,
+  loadPlannerCategories as listPlannerCategories,
+  listPlannerLists,
+  listPlannerSmartLists,
+  listPlannerSmartListItems,
   listDailyItems,
   listBacklogItems,
   listPlannerDays,
@@ -24921,6 +32410,7 @@ export {
   renameProjectNote,
   renameSession,
   renameThreadNote,
+  connectOpenAssistIntegration,
   openCodeReview,
   createScheduledJob,
   saveThreadNote,
@@ -24928,12 +32418,20 @@ export {
   scheduleSelectionToPlanner,
   startRemoteAccessEasyQR,
   stopRemoteAccessEasyQR,
+  getRemoteAccessStatus,
+  restoreRemoteAccessOnStartup,
   upsertBacklogItem,
   toggleBacklogItem,
   deleteBacklogItem,
   moveDailyItemToBacklog,
+  moveDailyItemToDay,
   scheduleBacklogItem,
+  upsertPlannerCategory,
+  updatePlannerListColorAndArea,
+  hidePlannerList,
+  deletePlannerCategory,
   upsertDailyItem,
+  updateDailyItemByText,
   toggleDailyItem,
   deleteDailyItem,
   linkDailyItemNote,
@@ -24950,7 +32448,9 @@ export {
   clearTelegramBotToken,
   declineTelegramPairing,
   forgetTelegramPairing,
-  openTailscaleApp,
+  openAssistIntegrationConfigPath,
+  openAssistIntegrationConfigText,
+  openAssistIntegrationSkillGuide,
   rotateRemoteAccessPairingCode,
 	  appendCodexRealtimeAudio,
 	  appendCodexRealtimeImages,
@@ -24961,6 +32461,7 @@ export {
   saveRealtimeOpenAIAPIKey,
   saveTelegramBotToken,
   stopCodexRealtimeVoice,
+  testOpenAssistKnowledgeIntegration,
   testTelegramConnection,
   clearRealtimeOpenAIAPIKey,
   classifyLocalVoiceTranscript,
@@ -24987,11 +32488,14 @@ export {
   stopAssistantVoiceOutput,
   stopCodexRealtimeDelegation,
   transcribeAudioFile,
+  prewarmCloudTranscriptionConnection,
   toggleScheduledJob,
   unarchiveSession,
   deleteOllamaModel,
   unloadOllamaModelsUsedThisSession,
 	  updateProjectIcon,
+  updateProjectArea,
+  updateProjectColorAndArea,
 	  updateProjectLinkedFolder,
   updateSetting,
   updateSettings,

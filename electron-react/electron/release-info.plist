@@ -14,5 +14,13 @@
   <string>Open Assist uses the microphone for dictation and realtime voice conversations.</string>
   <key>NSSpeechRecognitionUsageDescription</key>
   <string>Open Assist can use speech recognition when you choose voice input.</string>
+  <key>NSRemindersFullAccessUsageDescription</key>
+  <string>Open Assist uses Reminders access only when you ask it to read or create Apple Reminders.</string>
+  <key>NSCalendarsFullAccessUsageDescription</key>
+  <string>Open Assist uses Calendar access only when you ask it to read or create Apple Calendar events.</string>
+  <key>NSRemindersUsageDescription</key>
+  <string>Open Assist uses Reminders access only when you ask it to read or create Apple Reminders.</string>
+  <key>NSCalendarsUsageDescription</key>
+  <string>Open Assist uses Calendar access only when you ask it to read or create Apple Calendar events.</string>
 </dict>
 </plist>

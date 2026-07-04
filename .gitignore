@@ -12,6 +12,8 @@ build
 build-local.sh
 
 # Dev artifacts
+.chrome-profile/
+meme-assets/
 preview_logo.html
 documentaion/
 Resources/old/
@@ -39,6 +41,8 @@ Resources/markdown-chat.staged-recovery.html
 # Real outputs go to electron-react/dist-*, web/*/dist.
 /*-????????.js
 /*-????????.js.map
+/electron-react/*-????????.js
+/electron-react/*-????????.js.map
 
 # One-off dev screenshots / audit notes left at repo root
 /composer-agent-pulse-style.png
