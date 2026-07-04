@@ -79,7 +79,7 @@ private final class ShortcutMonitor {
 
     private func downPhase(for target: String) -> String {
         switch target {
-        case "holdToTalk", "assistantLiveVoice":
+        case "holdToTalk":
             return "down"
         default:
             return "trigger"
@@ -87,7 +87,7 @@ private final class ShortcutMonitor {
     }
 
     private func emitsUpPhase(_ target: String) -> Bool {
-        target == "holdToTalk" || target == "assistantLiveVoice"
+        target == "holdToTalk"
     }
 
     private func emit(target: String, phase: String) {

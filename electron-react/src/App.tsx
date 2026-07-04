@@ -1,4 +1,4 @@
-import { Component, createContext, memo, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type ComponentType, type CSSProperties, type ChangeEvent, type ErrorInfo, type KeyboardEvent, type MutableRefObject, type PointerEvent as ReactPointerEvent, type ReactNode, type RefObject } from "react";
+import { Component, Fragment, createContext, memo, startTransition, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type AnchorHTMLAttributes, type ComponentType, type CSSProperties, type ChangeEvent, type ErrorInfo, type KeyboardEvent, type MutableRefObject, type PointerEvent as ReactPointerEvent, type ReactNode, type RefObject } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import { Frame as LiquidFrame, Glass as LiquidGlass, GlassContainer as LiquidGlassContainer, Html as LiquidHtml, LiquidCanvas as LiquidCanvasRoot } from "@liquid-dom/react";
 import {
@@ -63,10 +63,12 @@ import {
   Gauge,
   GitBranch,
   GripVertical,
+  Hash,
   Heading1,
   Hammer,
   Heading3,
   Heading2,
+  Inbox,
   ImagePlus,
   Info,
   Italic,
@@ -85,6 +87,7 @@ import {
   Monitor,
   Moon,
   PackageCheck,
+  Palette,
   Paintbrush,
   Pause,
   PanelLeftClose,
@@ -154,10 +157,23 @@ import ollamaMark from "./assets/provider-marks/ollama.svg";
 import appLogo from "../assets/AppLogo.png";
 import { settingsSections } from "./data";
 import type {
+  AppleEventKitStatus,
   AutomationItem,
   BacklogItemMutationResult,
   ChatMessage,
   ComposerImageAttachment,
+  ConnectorAccount,
+  ConnectorItem,
+  ConnectorItemStatus,
+  ConnectorServiceDefinition,
+  ConnectorServiceID,
+  ConnectorSnapshot,
+  ConnectorReviewInboxSnapshot,
+  ConnectorLoginProgress,
+  ConnectorSyncProgress,
+  GoogleConnectorOperation,
+  GoogleCommandPlan,
+  GoogleOAuthSetupStatus,
   DailyItem,
   DailyItemInput,
   DailyItemMutationResult,
@@ -180,10 +196,17 @@ import type {
   OllamaRuntimeUpdateProgress,
   NoteReadAloudState,
   OpenAssistAppState,
+  OpenAssistIntegrationStatus,
+  OpenAssistIntegrationTargetID,
+  OpenAssistIntegrationTargetStatus,
+  KnowledgeExternalAccessMode,
   PlannerBacklogDetail,
+  PlannerCategory,
   PlannerDayDetail,
   PlannerDaySummary,
   PlannerScheduleRequest,
+  PlannerSmartListDetail,
+  PlannerSmartListSummary,
   PluginItem,
   ProviderModelOption,
   ProviderRunEvent,
@@ -205,6 +228,16 @@ import type {
 } from "./types";
 
 type SettingsKey = (typeof settingsSections)[number]["id"];
+const settingsSectionIcons: Record<SettingsKey, ComponentType<{ size?: number | string }>> = {
+  assistant: Bot,
+  voice: Mic,
+  shortcuts: Keyboard,
+  models: Cpu,
+  automation: Zap,
+  connectors: Plug,
+  appearance: Palette,
+  app: Shield
+};
 type SettingsUpdatePatch = {
   key: SettingsUpdateKey;
   value: SettingsUpdateValue;
@@ -481,6 +514,16 @@ const localVoiceMinSpeechMs = 300;
 const localVoiceMaxSpeechMs = 22_000;
 const localVoicePreRollMs = 520;
 
+// Cloud realtime (OpenAI / Gemini) input noise gate. Mic frames quieter than the
+// start threshold are replaced with clean silence before they reach the provider,
+// so background voices don't trigger or extend a turn. Hysteresis (a lower
+// "continue" threshold), a short hangover, and a small pre-roll keep the user's
+// own speech from being clipped at the edges. Balanced defaults.
+const liveVoiceGateStartThreshold = 0.015;
+const liveVoiceGateContinueThreshold = 0.009;
+const liveVoiceGateHangoverMs = 450;
+const liveVoiceGatePreRollFrames = 3;
+
 function openAssistRealtimeAPI() {
   return (window as unknown as { openAssistRealtime?: OpenAssistRealtimeAPI }).openAssistRealtime;
 }
@@ -602,6 +645,37 @@ function glowEnergyFromLevel(level: number) {
   return Math.pow((clamped - floor) / (1 - floor), 0.5);
 }
 
+function liveVoiceOrbEnergy(
+  status: LiveVoiceStatus,
+  inputLevel: number,
+  outputLevel: number,
+  now = performance.now()
+) {
+  if (status === "speaking") {
+    return glowEnergyFromLevel(Math.max(outputLevel * 1.45, inputLevel * 0.18));
+  }
+  if (status === "listening") {
+    return glowEnergyFromLevel(inputLevel);
+  }
+  if (status === "transcribing") {
+    return glowEnergyFromLevel(inputLevel * 0.42);
+  }
+  if (status === "connecting" || status === "delegating") {
+    return 0.09 + 0.05 * Math.sin(now * 0.0046);
+  }
+  return glowEnergyFromLevel(Math.max(inputLevel, outputLevel * 1.2));
+}
+
+function readLiveVoiceOutputLevel(status: LiveVoiceStatus) {
+  const analyser = liveVoiceMeterBus.outputAnalyser;
+  if (!analyser || !(liveVoiceMeterBus.outputPlaying || status === "speaking")) return 0;
+  const samples = new Uint8Array(analyser.frequencyBinCount);
+  analyser.getByteFrequencyData(samples);
+  let sum = 0;
+  for (let index = 0; index < samples.length; index += 1) sum += samples[index];
+  return clampUnitLevel((sum / samples.length) / 255);
+}
+
 const plannerVoiceBarWeights = [0.72, 0.86, 1, 0.86, 0.72];
 const plannerVoiceBarAttackSec = 0.055;
 const plannerVoiceBarReleaseSec = 0.32;
@@ -620,6 +694,10 @@ const liveVoiceMeterBus = {
 const liveVoiceCaptionBus = {
   user: "",
   assistant: "",
+  // Who wrote the assistant caption last. Spoken transcript text always wins
+  // over background work summaries ("Checking memory...") — letting both
+  // write freely made the HUD caption flicker between two different texts.
+  assistantSource: "" as "" | "transcript" | "activity",
   listeners: new Set<() => void>(),
   emit() {
     this.listeners.forEach((listener) => listener());
@@ -630,16 +708,24 @@ const liveVoiceCaptionBus = {
     this.user = next;
     this.emit();
   },
-  setAssistant(text: string) {
+  setAssistant(text: string, source: "transcript" | "activity" = "transcript") {
     const next = text || "";
-    if (next === this.assistant) return;
+    // Work-status updates must not clobber what the assistant is actually
+    // saying; they only fill the caption while nothing is being spoken.
+    if (source === "activity" && this.assistant && this.assistantSource === "transcript") return;
+    if (next === this.assistant) {
+      this.assistantSource = next ? source : "";
+      return;
+    }
     this.assistant = next;
+    this.assistantSource = next ? source : "";
     this.emit();
   },
   clear() {
     if (!this.user && !this.assistant) return;
     this.user = "";
     this.assistant = "";
+    this.assistantSource = "";
     this.emit();
   },
   subscribe(listener: () => void) {
@@ -828,6 +914,75 @@ function noteProjectFilterIDs(projects: ProjectItem[], selectedProjectID?: strin
   return result;
 }
 
+function plannerProjectScopeIDs(projects: ProjectItem[], selectedProjectID?: string) {
+  const selectedKey = normalizedProjectID(selectedProjectID);
+  if (!selectedKey) return null;
+
+  const projectsByID = new Map(projects.map((project) => [normalizedProjectID(project.id), project]));
+  const selectedProject = projectsByID.get(selectedKey);
+  if (!selectedProject) return new Set([selectedKey]);
+  if (selectedProject.kind !== "folder") return new Set([selectedKey]);
+
+  const childrenByParentID = new Map<string, ProjectItem[]>();
+  for (const project of projects) {
+    const parentKey = normalizedProjectID(project.parentID);
+    if (!parentKey) continue;
+    childrenByParentID.set(parentKey, [...(childrenByParentID.get(parentKey) ?? []), project]);
+  }
+
+  const result = new Set<string>([selectedKey]);
+  const visited = new Set<string>();
+  const visit = (projectID: string) => {
+    const key = normalizedProjectID(projectID);
+    if (!key || visited.has(key)) return;
+    visited.add(key);
+    for (const child of childrenByParentID.get(key) ?? []) {
+      result.add(normalizedProjectID(child.id));
+      if (child.kind === "folder") visit(child.id);
+    }
+  };
+  visit(selectedProject.id);
+  return result;
+}
+
+function dailyItemInProjectScope(item: DailyItem, scopeIDs: Set<string> | null, projectByID: Map<string, ProjectItem>) {
+  if (!scopeIDs) return true;
+  const candidates = [
+    normalizedProjectID(item.projectID),
+    normalizedProjectID(item.folderID),
+    ...(item.scopeTags ?? []).flatMap((tag) => [
+      normalizedProjectID(tag.id),
+      normalizedProjectID(projectByID.get(normalizedProjectID(tag.id))?.id),
+      normalizedProjectID(tag.label)
+    ])
+  ].filter(Boolean);
+  if (candidates.some((candidate) => scopeIDs.has(candidate))) return true;
+
+  for (const id of scopeIDs) {
+    const project = projectByID.get(id);
+    if (!project) continue;
+    const title = cleanDailyTagLabel(project.title).toLowerCase();
+    if (!title) continue;
+    if ((item.scopeTags ?? []).some((tag) => cleanDailyTagLabel(tag.label).toLowerCase() === title)) return true;
+  }
+  return false;
+}
+
+function inheritedProjectArea(projects: ProjectItem[], projectID?: string | null) {
+  const projectsByID = new Map(projects.map((project) => [normalizedProjectID(project.id), project]));
+  const visited = new Set<string>();
+  let current = projectsByID.get(normalizedProjectID(projectID));
+  while (current) {
+    const area = cleanDailyTagLabel(current.area);
+    if (area) return area;
+    const parentKey = normalizedProjectID(current.parentID);
+    if (!parentKey || visited.has(parentKey)) return undefined;
+    visited.add(parentKey);
+    current = projectsByID.get(parentKey);
+  }
+  return undefined;
+}
+
 function matchesNoteProjectFilter(projectID: string | undefined, filterIDs: Set<string> | null) {
   if (!filterIDs) return true;
   return filterIDs.has(normalizedProjectID(projectID));
@@ -861,6 +1016,17 @@ function selectedNoteTargetToLinkTarget(target?: SelectedNoteTarget | null): Not
   return { ownerKind: "project", ownerId: target.projectID, noteId: target.noteID };
 }
 
+function selectedNoteTargetToKnowledgeItemID(target?: SelectedNoteTarget | null) {
+  const linkTarget = selectedNoteTargetToLinkTarget(target);
+  if (!linkTarget) return "";
+  const kind = linkTarget.ownerKind === "planner"
+    ? "planner_day"
+    : linkTarget.ownerKind === "thread"
+      ? "thread_note"
+      : "project_note";
+  return `${kind}:${linkTarget.ownerKind}:${linkTarget.ownerId}:${linkTarget.noteId}`;
+}
+
 function buildInternalNoteHref(target: NoteLinkTarget) {
   const params = new URLSearchParams({
     ownerKind: target.ownerKind,
@@ -882,6 +1048,103 @@ function parseInternalNoteHref(href?: string | null): NoteLinkTarget | null {
     return { ownerKind, ownerId, noteId };
   } catch {
     return null;
+  }
+}
+
+function normalizeExternalMarkdownHref(href?: string | null) {
+  const normalized = String(href ?? "").replace(/&amp;/g, "&").trim();
+  if (!/^(https?:\/\/|mailto:|tel:|x-apple\.systempreferences:)/i.test(normalized)) return "";
+  return normalized;
+}
+
+function localFilePathFromMarkdownHref(href?: string | null) {
+  const raw = String(href ?? "").replace(/&amp;/g, "&").trim();
+  if (!raw) return "";
+  if (/^file:\/\//i.test(raw)) {
+    const withoutScheme = raw.replace(/^file:\/\/(localhost)?/i, "");
+    try {
+      return decodeURIComponent(withoutScheme);
+    } catch {
+      return withoutScheme;
+    }
+  }
+  if (raw.startsWith("/") || raw.startsWith("~/")) return raw;
+  return "";
+}
+
+function openExternalMarkdownHref(href?: string | null) {
+  // Provider replies often link to files they saved on disk (generated
+  // images, reports). Those are not web links — open them with the OS.
+  const localPath = localFilePathFromMarkdownHref(href);
+  if (localPath && window.openAssistElectron?.openLocalPath) {
+    window.openAssistElectron.openLocalPath(localPath)
+      .then((result) => {
+        if (!result?.ok) console.error("Could not open local file link", result?.error ?? localPath);
+      })
+      .catch((error) => console.error("Could not open local file link", error));
+    return true;
+  }
+  const normalized = normalizeExternalMarkdownHref(href);
+  if (!normalized) return false;
+  const fallback = () => window.open(normalized, "_blank", "noopener,noreferrer");
+  if (!window.openAssistElectron?.openExternal) {
+    fallback();
+    return true;
+  }
+  window.openAssistElectron.openExternal(normalized).catch((error) => {
+    console.error("Could not open markdown link", error);
+    fallback();
+  });
+  return true;
+}
+
+async function openRelativeLocalFileHref(
+  href: string | null | undefined,
+  baseDirs?: () => Promise<string[]>
+) {
+  const raw = String(href ?? "").replace(/&amp;/g, "&").trim();
+  if (!raw || !baseDirs || !window.openAssistElectron?.openLocalPath) return false;
+  // Only bare/relative file names: anything with a scheme or an absolute
+  // path is handled by openExternalMarkdownHref already.
+  if (/^[a-z][a-z0-9+.-]*:/i.test(raw) || raw.startsWith("/") || raw.startsWith("~")) return false;
+  const name = decodeURIComponentSafe(raw.replace(/^\.\//, ""));
+  if (!name || name.includes("..")) return false;
+  try {
+    for (const dir of await baseDirs()) {
+      if (!dir) continue;
+      const result = await window.openAssistElectron.openLocalPath(`${dir.replace(/\/+$/, "")}/${name}`);
+      if (result?.ok) return true;
+    }
+  } catch (error) {
+    console.error("Could not open relative file link", error);
+  }
+  console.error("Could not find a local file for link", raw);
+  return false;
+}
+
+async function resolveRelativeLocalFileHref(
+  href: string | null | undefined,
+  baseDirs?: () => Promise<string[]>
+) {
+  const raw = String(href ?? "").replace(/&amp;/g, "&").trim();
+  if (!raw || !baseDirs) return "";
+  if (/^[a-z][a-z0-9+.-]*:/i.test(raw) || raw.startsWith("/") || raw.startsWith("~")) return "";
+  const name = decodeURIComponentSafe(raw.replace(/^\.\//, ""));
+  if (!name || name.includes("..")) return "";
+  try {
+    const dirs = await baseDirs();
+    const dir = dirs.find(Boolean);
+    return dir ? `${dir.replace(/\/+$/, "")}/${name}` : "";
+  } catch {
+    return "";
+  }
+}
+
+function decodeURIComponentSafe(value: string) {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
   }
 }
 
@@ -1341,7 +1604,7 @@ function normalizeRendererSettings(settings: SettingsSnapshot): SettingsSnapshot
     geminiTTSModel: settings.geminiTTSModel || "gemini-3.1-flash-tts-preview",
     geminiTTSVoice: settings.geminiTTSVoice || "Aoede",
     uiFontSize: normalizeUIFontSize(settings.uiFontSize),
-    remoteAccessNetworkMode: settings.remoteAccessNetworkMode === "tailscale" || settings.remoteAccessNetworkMode === "localNetwork"
+    remoteAccessNetworkMode: settings.remoteAccessNetworkMode === "localNetwork"
       ? settings.remoteAccessNetworkMode
       : "localOnly",
     remoteAccessTailscaleHost: settings.remoteAccessTailscaleHost ?? "",
@@ -1356,8 +1619,8 @@ function normalizeRendererSettings(settings: SettingsSnapshot): SettingsSnapshot
     remoteAccessTailscaleRunning: Boolean(settings.remoteAccessTailscaleRunning),
     remoteAccessDetectedTailscaleHost: settings.remoteAccessDetectedTailscaleHost ?? "",
     remoteAccessTailscaleAppPath: settings.remoteAccessTailscaleAppPath ?? "",
-    remoteAccessTailscaleInstallURL: settings.remoteAccessTailscaleInstallURL || "https://tailscale.com/download/mac",
-    remoteAccessTailscaleStatusMessage: settings.remoteAccessTailscaleStatusMessage ?? "Not checked.",
+    remoteAccessTailscaleInstallURL: "",
+    remoteAccessTailscaleStatusMessage: settings.remoteAccessTailscaleStatusMessage ?? "Disabled.",
     remoteAccessPairingCode: settings.remoteAccessPairingCode ?? "",
     remoteAccessPairingURL: settings.remoteAccessPairingURL ?? "",
     remoteAccessPairingExpiresAt: settings.remoteAccessPairingExpiresAt ?? null,
@@ -1509,8 +1772,8 @@ const shortcutRows: Array<{
   },
   {
     target: "assistantLiveVoice",
-    label: "Agent voice shortcut",
-    shortLabel: "agent shortcut",
+    label: "Live Voice shortcut",
+    shortLabel: "Live Voice shortcut",
     keyCodeKey: "assistantLiveVoiceShortcutKeyCode",
     modifiersKey: "assistantLiveVoiceShortcutModifiers",
     fallbackKeyCode: 37,
@@ -1545,7 +1808,7 @@ const shortcutSettingGroups: Array<{
   {
     id: "dictation",
     title: "Dictation & Voice",
-    subtitle: "Recording, continuous voice, and agent voice hotkeys.",
+    subtitle: "Recording, continuous voice, and Live Voice hotkeys.",
     targets: ["holdToTalk", "continuousToggle", "assistantLiveVoice"]
   },
   {
@@ -1593,6 +1856,63 @@ function readableProviderError(error: unknown) {
     .replace(/^Error:\s*/i, "")
     .trim();
   return cleaned || "The provider failed before returning a response.";
+}
+
+type GmailSyncResultSummary = {
+  importedCount?: number;
+  reviewItems?: ConnectorItem[];
+  snapshot?: ConnectorSnapshot;
+};
+
+function notifyAppStatus(title: string, body: string) {
+  if (typeof window === "undefined" || !("Notification" in window)) return;
+  const show = () => {
+    try {
+      new Notification(title, { body });
+    } catch {
+      // Native notifications can be unavailable depending on the Electron host.
+    }
+  };
+  try {
+    if (Notification.permission === "granted") {
+      show();
+    } else if (Notification.permission !== "denied") {
+      void Notification.requestPermission().then((permission) => {
+        if (permission === "granted") show();
+      });
+    }
+  } catch {
+    // Permission prompts are best-effort; in-app status still updates.
+  }
+}
+
+function gmailSyncStatusSummary(accountLabel: string, result?: GmailSyncResultSummary | null) {
+  const imported = result?.importedCount ?? 0;
+  const reviewItems = result?.reviewItems ?? result?.snapshot?.items.filter((item) => item.status === "candidate" || item.status === "review" || item.status === "conflict") ?? [];
+  const waiting = reviewItems.length;
+  const examples = reviewItems
+    .slice(0, 3)
+    .map((item) => item.title.trim())
+    .filter(Boolean);
+  const base = imported > 0
+    ? `Gmail sync complete for ${accountLabel}. Found ${imported} actionable ${imported === 1 ? "candidate" : "candidates"}.`
+    : `Gmail sync complete for ${accountLabel}. No new actionable email candidates found.`;
+  const waitingText = waiting > 0 ? ` ${waiting} ${waiting === 1 ? "item is" : "items are"} waiting in Review Inbox.` : "";
+  const examplesText = examples.length ? ` Latest: ${examples.join("; ")}.` : "";
+  return `${base}${waitingText}${examplesText}`;
+}
+
+function connectorSyncIsActive(activity?: ConnectorSyncProgress | null) {
+  return activity?.status === "running";
+}
+
+function connectorSyncShortLabel(activity?: ConnectorSyncProgress | null) {
+  if (!activity) return "";
+  if (activity.status === "running") return activity.accountLabel ? `Syncing ${activity.accountLabel}` : "Syncing Gmail";
+  if (activity.status === "failed") return "Gmail sync failed";
+  return activity.importedCount && activity.importedCount > 0
+    ? `Found ${activity.importedCount} Gmail ${activity.importedCount === 1 ? "item" : "items"}`
+    : "Gmail sync complete";
 }
 
 function eventModifierRaw(event: KeyboardEvent) {
@@ -1966,7 +2286,7 @@ const codexThemeDefaults = {
     semanticColors: { diffAdded: "#00a240", diffRemoved: "#ba2623", skill: "#924ff7" }
   },
   dark: {
-    accent: "#1F6FEB",
+    accent: "#F9861A",
     surface: "#0D1117",
     ink: "#E6EDF3",
     contrast: 89,
@@ -3803,6 +4123,103 @@ function expandCompactOrderedLists(segment: string): string {
     .join("\n");
 }
 
+/*
+  Line-level diff for the note saved-versions preview. Returns a list of rows
+  describing how `base` (current note) becomes `target` (saved version). Unchanged
+  runs longer than NOTE_HISTORY_DIFF_CONTEXT keep collapsed into a single "skipped"
+  marker so the preview stays focused on what a restore would change.
+*/
+type NoteHistoryDiffRow =
+  | { kind: "ctx"; text: string }
+  | { kind: "add"; text: string }
+  | { kind: "del"; text: string }
+  | { kind: "skip"; count: number };
+
+const NOTE_HISTORY_DIFF_CONTEXT = 4;
+const NOTE_HISTORY_DIFF_SKIP_THRESHOLD = NOTE_HISTORY_DIFF_CONTEXT * 2 + 1;
+
+function splitNoteLines(value: string): string[] {
+  return value.replace(/\r\n/g, "\n").replace(/\n+$/g, "").split("\n");
+}
+
+// Stable identity for a note body so two versions that only differ by trailing
+// whitespace/CRLF count as the same (the on-disk save normalizes both away).
+function normalizeNoteHistoryKey(value: string): string {
+  return value.replace(/\r\n/g, "\n").replace(/\s+$/g, "");
+}
+
+function buildNoteDiffRows(base: string, target: string): NoteHistoryDiffRow[] {
+  const baseLines = splitNoteLines(base);
+  const targetLines = splitNoteLines(target);
+  // LCS dynamic-programming table. Notes are short, so O(n*m) is fine here.
+  const baseCount = baseLines.length;
+  const targetCount = targetLines.length;
+  const table: number[][] = Array.from({ length: baseCount + 1 }, () => new Array<number>(targetCount + 1).fill(0));
+  for (let row = baseCount - 1; row >= 0; row -= 1) {
+    for (let col = targetCount - 1; col >= 0; col -= 1) {
+      table[row][col] = baseLines[row] === targetLines[col]
+        ? table[row + 1][col + 1] + 1
+        : Math.max(table[row + 1][col], table[row][col + 1]);
+    }
+  }
+  const merged: NoteHistoryDiffRow[] = [];
+  let row = 0;
+  let col = 0;
+  while (row < baseCount && col < targetCount) {
+    if (baseLines[row] === targetLines[col]) {
+      merged.push({ kind: "ctx", text: baseLines[row] });
+      row += 1;
+      col += 1;
+    } else if (table[row + 1][col] >= table[row][col + 1]) {
+      merged.push({ kind: "del", text: baseLines[row] });
+      row += 1;
+    } else {
+      merged.push({ kind: "add", text: targetLines[col] });
+      col += 1;
+    }
+  }
+  while (row < baseCount) {
+    merged.push({ kind: "del", text: baseLines[row] });
+    row += 1;
+  }
+  while (col < targetCount) {
+    merged.push({ kind: "add", text: targetLines[col] });
+    col += 1;
+  }
+  // Collapse long unchanged runs into a single "skipped N lines" divider while
+  // keeping NOTE_HISTORY_DIFF_CONTEXT lines of context around each change.
+  const collapsed: NoteHistoryDiffRow[] = [];
+  for (let index = 0; index < merged.length; index += 1) {
+    const entry = merged[index];
+    if (entry.kind !== "ctx") {
+      collapsed.push(entry);
+      continue;
+    }
+    let runEnd = index;
+    while (runEnd < merged.length && merged[runEnd].kind === "ctx") runEnd += 1;
+    const runLength = runEnd - index;
+    const isLeading = index === 0;
+    const isTrailing = runEnd === merged.length;
+    const keepHead = isLeading || isTrailing ? 0 : NOTE_HISTORY_DIFF_CONTEXT;
+    const keepTail = isLeading || isTrailing ? NOTE_HISTORY_DIFF_CONTEXT : 0;
+    if (runLength <= keepHead + keepTail + 1) {
+      for (let offset = index; offset < runEnd; offset += 1) {
+        collapsed.push(merged[offset]);
+      }
+    } else {
+      for (let offset = index; offset < index + keepHead; offset += 1) {
+        collapsed.push(merged[offset]);
+      }
+      collapsed.push({ kind: "skip", count: runLength - keepHead - keepTail });
+      for (let offset = runEnd - keepTail; offset < runEnd; offset += 1) {
+        collapsed.push(merged[offset]);
+      }
+    }
+    index = runEnd - 1;
+  }
+  return collapsed;
+}
+
 const MERMAID_VIEWER_MIN_SCALE = 0.3;
 const MERMAID_VIEWER_MAX_SCALE = 3.5;
 const MERMAID_VIEWER_FALLBACK_WIDTH = 960;
@@ -4343,10 +4760,23 @@ function dailyTagDecorationsForDoc(doc: ProseMirrorNode, suggestions: DailyTagSu
         const to = from + token.length;
         if (occupied.some((range) => from < range.to && to > range.from)) continue;
         occupied.push({ from, to });
-        decorations.push(Decoration.inline(from, to, {
-          class: dailyTagDecorationClass(suggestion),
+        const markerMatch = token.match(/^([@#])\s*/);
+        const markerLen = markerMatch ? markerMatch[0].length : 1;
+        decorations.push(Decoration.inline(from, from + markerLen, {
+          class: "daily-scope-chip-marker",
           "data-daily-kind": suggestion.kind
         }));
+        if (from + markerLen < to) {
+          let styleStr: string | undefined;
+          if (suggestion.color) {
+            styleStr = `--category-color: ${suggestion.color}; color: ${suggestion.color}; background: color-mix(in srgb, ${suggestion.color} 14%, transparent); box-shadow: inset 0 0 0 1px color-mix(in srgb, ${suggestion.color} 24%, transparent);`;
+          }
+          decorations.push(Decoration.inline(from + markerLen, to, {
+            class: dailyTagDecorationClass(suggestion),
+            "data-daily-kind": suggestion.kind,
+            style: styleStr
+          }));
+        }
       }
     }
     return false;
@@ -4422,7 +4852,7 @@ function dailyScopeTagsFromText(text: string, suggestions: DailyTagSuggestion[])
     tags.push({
       marker: unknown[2] as "@" | "#",
       label: cleanDailyTagLabel(unknown[3]),
-      kind: "unresolved"
+      kind: unknown[2] === "#" ? "category" : "unresolved"
     });
   }
   const seen = new Set<string>();
@@ -4732,6 +5162,104 @@ class PreviewErrorBoundary extends Component<
   }
 }
 
+class ScreenErrorBoundary extends Component<
+  { children: ReactNode; resetKey: string; screenName: string },
+  { error: Error | null }
+> {
+  state: { error: Error | null } = { error: null };
+
+  static getDerivedStateFromError(error: Error) {
+    return { error };
+  }
+
+  componentDidUpdate(previousProps: { resetKey: string }) {
+    if (previousProps.resetKey !== this.props.resetKey && this.state.error) {
+      this.setState({ error: null });
+    }
+  }
+
+  componentDidCatch(error: Error, info: ErrorInfo) {
+    console.error(`ScreenErrorBoundary caught ${this.props.screenName}:`, error, info.componentStack);
+  }
+
+  render() {
+    if (this.state.error) {
+      return (
+        <main className="feature-main">
+          <div className="screen-error-state">
+            <TriangleAlert size={26} />
+            <h2>This screen hit a problem.</h2>
+            <p>{this.state.error.message || "Open another screen or reload the app."}</p>
+            <button type="button" onClick={() => window.location.reload()}>
+              Reload app
+            </button>
+          </div>
+        </main>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+function MarkdownPreviewLink({
+  href,
+  children,
+  onOpenNoteLink,
+  localFileBaseDirs,
+  ...props
+}: AnchorHTMLAttributes<HTMLAnchorElement> & {
+  onOpenNoteLink?: (target: NoteLinkTarget) => void;
+  localFileBaseDirs?: () => Promise<string[]>;
+}) {
+  const [resolvedLocalPath, setResolvedLocalPath] = useState("");
+  useEffect(() => {
+    let cancelled = false;
+    const directPath = localFilePathFromMarkdownHref(href);
+    if (directPath) {
+      setResolvedLocalPath(directPath);
+      return () => {
+        cancelled = true;
+      };
+    }
+    void resolveRelativeLocalFileHref(href, localFileBaseDirs).then((path) => {
+      if (!cancelled) setResolvedLocalPath(path);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [href, localFileBaseDirs]);
+
+  const noteTarget = parseInternalNoteHref(href);
+  const normalizedExternalHref = normalizeExternalMarkdownHref(href);
+  const title = resolvedLocalPath || normalizedExternalHref || props.title || href;
+  return (
+    <a
+      {...props}
+      href={href}
+      title={title}
+      onClick={(event) => {
+        if (noteTarget) {
+          event.preventDefault();
+          event.stopPropagation();
+          onOpenNoteLink?.(noteTarget);
+          return;
+        }
+        event.preventDefault();
+        if (resolvedLocalPath && window.openAssistElectron?.openLocalPath) {
+          void window.openAssistElectron.openLocalPath(resolvedLocalPath).then((result) => {
+            if (!result?.ok) console.error("Could not open local file link", result?.error ?? resolvedLocalPath);
+          });
+          return;
+        }
+        if (openExternalMarkdownHref(href)) return;
+        void openRelativeLocalFileHref(href, localFileBaseDirs);
+      }}
+    >
+      {children}
+    </a>
+  );
+}
+
 function MarkdownPreview({
   markdown,
   sourcePath,
@@ -4739,7 +5267,8 @@ function MarkdownPreview({
   variant = "note",
   emptyText = "No note content yet.",
   onOpenNoteLink,
-  onToggleTask
+  onToggleTask,
+  localFileBaseDirs
 }: {
   markdown: string;
   sourcePath?: string;
@@ -4748,6 +5277,9 @@ function MarkdownPreview({
   emptyText?: string;
   onOpenNoteLink?: (target: NoteLinkTarget) => void;
   onToggleTask?: MarkdownTaskToggleHandler;
+  // Directories to try when a link is a bare/relative file name (e.g. a
+  // provider reply linking a generated image it saved in the thread folder).
+  localFileBaseDirs?: () => Promise<string[]>;
 }) {
   const normalizedPreviewMarkdown = useMemo(
     () => normalizeNoteMarkdownImagesForPreview(normalizeMarkdownStructure(markdown)),
@@ -4771,23 +5303,14 @@ function MarkdownPreview({
   };
   const components = useMemo<Components>(() => ({
     a: ({ href, children, ...props }) => (
-      <a
+      <MarkdownPreviewLink
         href={href}
-        onClick={(event) => {
-          const noteTarget = parseInternalNoteHref(href);
-          if (noteTarget) {
-            event.preventDefault();
-            event.stopPropagation();
-            onOpenNoteLink?.(noteTarget);
-            return;
-          }
-          event.preventDefault();
-          if (href) window.open(href, "_blank", "noopener,noreferrer");
-        }}
+        onOpenNoteLink={onOpenNoteLink}
+        localFileBaseDirs={localFileBaseDirs}
         {...props}
       >
         {children}
-      </a>
+      </MarkdownPreviewLink>
     ),
     code: ({ className, children, ...props }) => {
       const match = /language-([\w-]+)/.exec(className || "");
@@ -4890,7 +5413,7 @@ function MarkdownPreview({
       }
       return <li {...props} className={cx(!plainText && "markdown-empty-list-item", className)}>{children}</li>;
     }
-  }), [onOpenNoteLink, onToggleTask, sectionStyles, sourcePath]);
+  }), [localFileBaseDirs, onOpenNoteLink, onToggleTask, sectionStyles, sourcePath]);
 
   const renderMarkdown = (source: string, key: string) => (
     <ReactMarkdown key={key} remarkPlugins={markdownRemarkPlugins} components={components}>
@@ -5701,6 +6224,7 @@ function MarkdownEditorSurface({
   plannerSourceKind,
   plannerSourceTitle,
   dailyProjects = [],
+  dailyCategories = [],
   dailyItems = [],
   dailyItemFilter = "all",
   toolbarAccessory,
@@ -5731,6 +6255,7 @@ function MarkdownEditorSurface({
   plannerSourceKind?: "planner" | "note";
   plannerSourceTitle?: string;
   dailyProjects?: ProjectItem[];
+  dailyCategories?: PlannerCategory[];
   dailyItems?: DailyItem[];
   dailyItemFilter?: string;
   toolbarAccessory?: ReactNode;
@@ -5975,8 +6500,8 @@ function MarkdownEditorSurface({
     return groups;
   }, [visibleSlashCommands]);
   const noteDailyTagSuggestions = useMemo(
-    () => plannerSourceKind === "planner" ? dailyTagSuggestionsFromProjects(dailyProjects) : [],
-    [dailyProjects, plannerSourceKind]
+    () => plannerSourceKind === "planner" ? dailyTagSuggestionsFromProjects(dailyProjects, dailyCategories) : [],
+    [dailyCategories, dailyProjects, plannerSourceKind]
   );
   const dailyProjectByID = useMemo(() => new Map(dailyProjects.map((project) => [project.id.toLowerCase(), project])), [dailyProjects]);
   const dailyTaskFilterDecorationState = useMemo<DailyTaskFilterDecorationState>(() => {
@@ -7182,17 +7707,18 @@ function MarkdownEditorSurface({
       window.removeEventListener("resize", rememberAndRefresh);
     };
   }, [mode, richEditor, richLocked]);
-  const openInternalNoteLinkFromTarget = useCallback((eventTarget: EventTarget | null) => {
+  const openNoteLinkFromTarget = useCallback((eventTarget: EventTarget | null) => {
     const target = eventTarget instanceof HTMLElement
       ? eventTarget.closest<HTMLAnchorElement>("a[href]")
       : null;
-    const noteTarget = parseInternalNoteHref(target?.getAttribute("href") ?? target?.href ?? null);
-    if (!noteTarget) return false;
+    const href = target?.getAttribute("href") ?? target?.href ?? null;
+    const noteTarget = parseInternalNoteHref(href);
+    if (!noteTarget) return openExternalMarkdownHref(href);
     onOpenNoteLink?.(noteTarget);
     return true;
   }, [onOpenNoteLink]);
   const handleRichEditorClick = (event: React.MouseEvent<HTMLDivElement>) => {
-    if (!openInternalNoteLinkFromTarget(event.target)) {
+    if (!openNoteLinkFromTarget(event.target)) {
       window.requestAnimationFrame(updateRichDailyTagState);
       return;
     }
@@ -7204,19 +7730,19 @@ function MarkdownEditorSurface({
     if (mode !== "inline") return undefined;
     const root = richEditorBodyRef.current;
     if (!root) return undefined;
-    const stopInternalNoteLink = (event: MouseEvent) => {
-      if (!openInternalNoteLinkFromTarget(event.target)) return;
+    const stopNoteLink = (event: MouseEvent) => {
+      if (!openNoteLinkFromTarget(event.target)) return;
       event.preventDefault();
       event.stopPropagation();
       event.stopImmediatePropagation();
     };
-    root.addEventListener("click", stopInternalNoteLink, true);
-    root.addEventListener("auxclick", stopInternalNoteLink, true);
+    root.addEventListener("click", stopNoteLink, true);
+    root.addEventListener("auxclick", stopNoteLink, true);
     return () => {
-      root.removeEventListener("click", stopInternalNoteLink, true);
-      root.removeEventListener("auxclick", stopInternalNoteLink, true);
+      root.removeEventListener("click", stopNoteLink, true);
+      root.removeEventListener("auxclick", stopNoteLink, true);
     };
-  }, [mode, openInternalNoteLinkFromTarget]);
+  }, [mode, openNoteLinkFromTarget]);
   const insertMermaid = (markdown: string) => {
     if (mode === "inline" && richEditor && !richLocked) {
       (richEditor.chain().focus() as any).insertContent(markdown, { contentType: "markdown" }).run();
@@ -7256,6 +7782,20 @@ function MarkdownEditorSurface({
     const { from, to } = richEditor.state.selection;
     if (from === to) return "";
     return richEditor.state.doc.textBetween(from, to, "\n", "\n");
+  };
+  const selectedRichPlannerMarkdown = () => {
+    if (!richEditor) return "";
+    const { from, to } = richEditor.state.selection;
+    if (from === to) return "";
+    const taskLines: string[] = [];
+    richEditor.state.doc.nodesBetween(from, to, (node) => {
+      if (node.type.name !== "taskItem") return true;
+      const title = node.textBetween(0, node.content.size, "\n", "\n").replace(/\s+/g, " ").trim();
+      if (title) taskLines.push(`- [${node.attrs.checked ? "x" : " "}] ${title}`);
+      return false;
+    });
+    if (taskLines.length) return taskLines.join("\n");
+    return selectedRichText();
   };
   const selectedRichTextForReadAloud = () => {
     const browserSelection = window.getSelection();
@@ -7748,7 +8288,7 @@ function MarkdownEditorSurface({
       { id: "spellcheck-divider", label: "" }
     ];
   };
-  const selectedPlannerText = () => (mode === "inline" ? selectedRichText() : selectedText()).trim();
+  const selectedPlannerText = () => (mode === "inline" ? selectedRichPlannerMarkdown() : selectedText()).trim();
   const removeSelectedPlannerText = () => {
     if (mode === "inline" && richEditor && !richLocked) {
       richEditor.chain().focus().deleteSelection().run();
@@ -7975,6 +8515,7 @@ function MarkdownEditorSurface({
     rememberRichSelection();
     const position = menuPosition(event);
     const text = selectedRichText();
+    const plannerText = selectedRichPlannerMarkdown().trim();
     const spellcheckPoint = { clientX: event.clientX, clientY: event.clientY };
     if (richLocked) {
       setEditorContextMenu({
@@ -8035,7 +8576,7 @@ function MarkdownEditorSurface({
             id: "rich-planner-menu",
             label: "Planner",
             icon: <CalendarClock size={14} />,
-            children: plannerContextMenuItems(text)
+            children: plannerContextMenuItems(plannerText || text)
           }
         ] satisfies SidebarMenuItem[] : []),
         {
@@ -8124,7 +8665,7 @@ function MarkdownEditorSurface({
       ref={dailyTagMenuRef}
       className={cx("daily-tag-suggestions note-daily-tag-suggestions", dailyTagMenuPosition?.placement === "above" && "above")}
       role="listbox"
-      aria-label="Today project tags"
+      aria-label="Today category and list tags"
       style={dailyTagMenuStyle}
     >
       {visibleNoteDailyTagSuggestions.map((suggestion, index) => (
@@ -8137,7 +8678,7 @@ function MarkdownEditorSurface({
         >
           <span>{suggestion.marker}</span>
           <strong>{suggestion.label}</strong>
-          <small>{suggestion.kind === "folder" ? "Folder" : "Project"}</small>
+          <small>{suggestion.kind === "category" ? "Category" : "List"}</small>
         </button>
       ))}
     </div>
@@ -8930,6 +9471,7 @@ const viewItems: Array<{ key: ViewKey | "extensions"; label: string; icon: Sideb
   { key: "today", label: "Today", icon: CalendarClock },
   { key: "notes", label: "Notes", icon: NotebookTabs },
   { key: "threads", label: "Threads", icon: MessageSquare },
+  { key: "reviewInbox", label: "Review Inbox", icon: Inbox },
   { key: "extensions", label: "Extensions", icon: Blocks },
   { key: "automations", label: "Automations", icon: Workflow }
 ];
@@ -9416,7 +9958,7 @@ function appShellStyleForSettings(
 ) {
   const resolvedMode = resolveThemeMode(settings.themeMode, systemThemeMode);
   const prefix = resolvedMode === "light" ? "lightTheme" : "darkTheme";
-  const accent = String(settings[`${prefix}Accent` as keyof SettingsSnapshot] || (resolvedMode === "light" ? "#0169CC" : "#1F6FEB"));
+  const accent = String(settings[`${prefix}Accent` as keyof SettingsSnapshot] || (resolvedMode === "light" ? "#0169CC" : "#F9861A"));
   const background = String(settings[`${prefix}Background` as keyof SettingsSnapshot] || (resolvedMode === "light" ? "#FFFFFF" : "#0D1117"));
   const foreground = String(settings[`${prefix}Foreground` as keyof SettingsSnapshot] || (resolvedMode === "light" ? "#0D0D0D" : "#E6EDF3"));
   const uiFont = normalizeUIFontValue(settings[`${prefix}UIFont` as keyof SettingsSnapshot]);
@@ -9645,6 +10187,36 @@ function liveVoiceProviderLabel(mode?: string, provider?: string) {
   if (mode === "localVoiceAgent") return "Local Voice Agent";
   if (provider === "geminiLive") return "Gemini Live";
   return "OpenAI Realtime";
+}
+
+function liveVoiceFloatingHUDStatus(status: LiveVoiceStatus) {
+  switch (status) {
+    case "connecting":
+      return "live-connecting";
+    case "listening":
+    case "transcribing":
+      return "live-listening";
+    case "speaking":
+      return "live-speaking";
+    case "delegating":
+      return "live-delegating";
+    case "error":
+      return "error";
+    case "idle":
+    default:
+      return "idle";
+  }
+}
+
+function liveVoiceFloatingHUDText(status: LiveVoiceStatus, providerLabel: string, statusText?: string) {
+  const text = statusText?.trim();
+  if (status === "error") return text || "Live Voice needs attention.";
+  if (status === "connecting") return text || `Preparing ${providerLabel}...`;
+  if (status === "speaking") return text || `${providerLabel} speaking`;
+  if (status === "delegating") return text || "Assistant is working";
+  if (status === "transcribing") return text || `${providerLabel} hearing you`;
+  if (status === "listening") return text || `${providerLabel} listening`;
+  return "";
 }
 
 function RealtimeMicMuteButton({
@@ -9939,15 +10511,44 @@ function RealtimeTranscript({
   active,
   status,
   providerLabel,
-  placement = "overlay"
+  placement = "overlay",
+  allowTextInput = false
 }: {
   active: boolean;
   status: LiveVoiceStatus;
   providerLabel: string;
   placement?: "overlay" | "composer";
+  /** When true (cloud Realtime / Gemini Live only), shows a text box so the
+   *  user can type to the assistant — handy when it is too loud to talk or the
+   *  mic is muted. */
+  allowTextInput?: boolean;
 }) {
   const caption = useLiveVoiceCaption();
   const glowPalette = useScreenSnipGlowPalette();
+  const [draft, setDraft] = useState("");
+  const [sendingText, setSendingText] = useState(false);
+  const [textError, setTextError] = useState<string | null>(null);
+  const textInputRef = useRef<HTMLInputElement | null>(null);
+  // The type-to-talk box is hidden by default; the user opens it with the
+  // keyboard toggle. Preference persists across sessions.
+  const [textInputOpen, setTextInputOpen] = useState(() => {
+    try {
+      return window.localStorage.getItem("openassist.captionsTextInputOpen") === "1";
+    } catch {
+      return false;
+    }
+  });
+  const toggleTextInput = () => {
+    setTextInputOpen((prev) => {
+      const next = !prev;
+      try {
+        window.localStorage.setItem("openassist.captionsTextInputOpen", next ? "1" : "0");
+      } catch {
+        /* ignore storage failures */
+      }
+      return next;
+    });
+  };
   const [collapsed, setCollapsed] = useState(() => {
     try {
       return window.localStorage.getItem("openassist.captionsCollapsed") === "1";
@@ -9984,9 +10585,14 @@ function RealtimeTranscript({
   if (gradient) (accentStyle as Record<string, string>)["--transcript-gradient"] = gradient;
   const userText = caption.user.trim();
   const assistantText = caption.assistant.trim();
-  const shouldShow =
-    active && status !== "idle" && status !== "error" && Boolean(userText || assistantText);
-  const [rendered, setRendered] = useState(shouldShow);
+  const sessionLive = active && status !== "idle" && status !== "error";
+  const canType = allowTextInput && sessionLive;
+  const shouldShow = sessionLive && Boolean(userText || assistantText);
+  // The panel stays mounted while the session is live and text input is
+  // available, even before any captions exist, so the user can mute and type
+  // right away.
+  const panelActive = shouldShow || canType;
+  const [rendered, setRendered] = useState(panelActive);
   const [visible, setVisible] = useState(false);
   // Hold the last non-empty lines so the captions fade out gracefully instead
   // of blanking the moment the text clears.
@@ -9995,7 +10601,7 @@ function RealtimeTranscript({
     lastTextRef.current = { user: userText, assistant: assistantText };
   }
   useEffect(() => {
-    if (shouldShow) {
+    if (panelActive) {
       setRendered(true);
       const frame = window.requestAnimationFrame(() => setVisible(true));
       return () => window.cancelAnimationFrame(frame);
@@ -10003,48 +10609,147 @@ function RealtimeTranscript({
     setVisible(false);
     const timeout = window.setTimeout(() => setRendered(false), 380);
     return () => window.clearTimeout(timeout);
-  }, [shouldShow]);
+  }, [panelActive]);
+  // Clear any draft / error once the session ends so it doesn't linger.
+  useEffect(() => {
+    if (!sessionLive) {
+      setDraft("");
+      setTextError(null);
+    }
+  }, [sessionLive]);
+  const showInput = canType && textInputOpen;
+  // Focus the box the moment it is opened so the user can type right away.
+  useEffect(() => {
+    if (showInput) {
+      const frame = window.requestAnimationFrame(() => textInputRef.current?.focus());
+      return () => window.cancelAnimationFrame(frame);
+    }
+    return undefined;
+  }, [showInput]);
+  const submitDraft = async () => {
+    const text = draft.trim();
+    if (!text || sendingText) return;
+    setSendingText(true);
+    setTextError(null);
+    try {
+      const result = await openAssistRealtimeAPI()?.appendText(text);
+      if (result && !result.ok) {
+        setTextError(result.error || "Could not send message.");
+        return;
+      }
+      setDraft("");
+    } catch (error) {
+      setTextError(error instanceof Error ? error.message : "Could not send message.");
+    } finally {
+      setSendingText(false);
+    }
+  };
   if (!rendered) return null;
   const shownUser = shouldShow ? userText : lastTextRef.current.user;
   const shownAssistant = shouldShow ? assistantText : lastTextRef.current.assistant;
+  const hasCaptionContent = Boolean(shownUser || shownAssistant);
+  const showCaptionLines = hasCaptionContent && !collapsed;
+  const barHasContent = showCaptionLines || showInput;
+  // Only style the panel as "collapsed" (vivid handle, no bar) when there is
+  // nothing to show — never while the text box is open.
+  const rootCollapsed = collapsed && !showInput;
   return (
     <div
       className={cx(
         "realtime-transcript",
         placement === "composer" && "is-composer",
         visible && "is-visible",
-        collapsed && "is-collapsed"
+        rootCollapsed && "is-collapsed"
       )}
       style={Object.keys(accentStyle).length ? accentStyle : undefined}
       aria-live="polite"
     >
-      <div className="realtime-transcript-shell" aria-hidden={collapsed}>
-        <div className="realtime-transcript-glow" aria-hidden="true" />
-        <div className="realtime-transcript-bar">
-          {shownUser && (
-            <p className="realtime-transcript-line is-user">
-              <span className="realtime-transcript-role">You</span>
-              <CaptionText text={shownUser} />
-            </p>
-          )}
-          {shownAssistant && (
-            <p className="realtime-transcript-line is-assistant">
-              <span className="realtime-transcript-role">{providerLabel}</span>
-              <CaptionText text={shownAssistant} />
-            </p>
-          )}
+      {barHasContent && (
+        <div className="realtime-transcript-shell">
+          <div className="realtime-transcript-glow" aria-hidden="true" />
+          <div className="realtime-transcript-bar">
+            {showCaptionLines && shownUser && (
+              <p className="realtime-transcript-line is-user">
+                <span className="realtime-transcript-role">You</span>
+                <CaptionText text={shownUser} />
+              </p>
+            )}
+            {showCaptionLines && shownAssistant && (
+              <p className="realtime-transcript-line is-assistant">
+                <span className="realtime-transcript-role">{providerLabel}</span>
+                <CaptionText text={shownAssistant} />
+              </p>
+            )}
+            {showInput && (
+              <form
+                className="realtime-transcript-input-row"
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  void submitDraft();
+                }}
+              >
+                <input
+                  ref={textInputRef}
+                  className="realtime-transcript-input"
+                  type="text"
+                  value={draft}
+                  onChange={(event) => {
+                    setDraft(event.target.value);
+                    if (textError) setTextError(null);
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key === "Escape") toggleTextInput();
+                  }}
+                  placeholder="Type a message to talk without your mic…"
+                  disabled={sendingText}
+                  aria-label="Type a message to the live assistant"
+                  enterKeyHint="send"
+                />
+                <button
+                  type="submit"
+                  className="realtime-transcript-send"
+                  disabled={sendingText || !draft.trim()}
+                  title="Send message"
+                  aria-label="Send message"
+                >
+                  <ArrowUp size={15} />
+                </button>
+              </form>
+            )}
+            {showInput && textError && (
+              <p className="realtime-transcript-input-error" role="alert">
+                {textError}
+              </p>
+            )}
+          </div>
         </div>
+      )}
+      <div className="realtime-transcript-toggles">
+        {canType && (
+          <button
+            type="button"
+            className={cx("realtime-transcript-toggle", "realtime-transcript-keyboard-toggle", textInputOpen && "is-active")}
+            onClick={toggleTextInput}
+            title={textInputOpen ? "Hide message box" : "Type a message"}
+            aria-label={textInputOpen ? "Hide message box" : "Type a message"}
+            aria-pressed={textInputOpen}
+          >
+            <Keyboard size={14} />
+          </button>
+        )}
+        {hasCaptionContent && (
+          <button
+            type="button"
+            className="realtime-transcript-toggle"
+            onClick={toggleCollapsed}
+            title={collapsed ? "Show live captions" : "Hide live captions"}
+            aria-label={collapsed ? "Show live captions" : "Hide live captions"}
+            aria-expanded={!collapsed}
+          >
+            {collapsed ? <ChevronUp size={15} /> : <ChevronDown size={15} />}
+          </button>
+        )}
       </div>
-      <button
-        type="button"
-        className="realtime-transcript-toggle"
-        onClick={toggleCollapsed}
-        title={collapsed ? "Show live captions" : "Hide live captions"}
-        aria-label={collapsed ? "Show live captions" : "Hide live captions"}
-        aria-expanded={!collapsed}
-      >
-        {collapsed ? <ChevronUp size={15} /> : <ChevronDown size={15} />}
-      </button>
     </div>
   );
 }
@@ -10330,6 +11035,8 @@ function ActivityPreviewStrip({
   );
 }
 
+const maxVisibleMessageArtifacts = 6;
+
 function MessageArtifacts({
   artifacts,
   onOpenArtifact
@@ -10339,7 +11046,13 @@ function MessageArtifacts({
 }) {
   const visibleArtifacts = (artifacts ?? []).filter((artifact) => artifact.path || artifact.dataURL);
   const [artifactMenu, setArtifactMenu] = useState<FloatingContextMenuState | null>(null);
+  const [expanded, setExpanded] = useState(false);
   if (!visibleArtifacts.length) return null;
+  const hasOverflow = visibleArtifacts.length > maxVisibleMessageArtifacts;
+  const shownArtifacts = expanded || !hasOverflow
+    ? visibleArtifacts
+    : visibleArtifacts.slice(0, maxVisibleMessageArtifacts);
+  const hiddenArtifactCount = Math.max(0, visibleArtifacts.length - shownArtifacts.length);
   const openArtifact = (artifact: MessageArtifact) => {
     if (onOpenArtifact) {
       onOpenArtifact(artifact);
@@ -10379,6 +11092,18 @@ function MessageArtifacts({
           }
         },
         {
+          id: "copy-image",
+          label: "Copy Image",
+          icon: <Copy size={14} />,
+          disabled: artifact.kind !== "image" || (!artifact.path && !artifact.dataURL),
+          onSelect: () => {
+            void window.openAssistElectron?.copyImageToClipboard?.({
+              filePath: artifact.path || undefined,
+              dataURL: artifact.dataURL || undefined
+            });
+          }
+        },
+        {
           id: "finder",
           label: "Show in Finder",
           icon: <Folder size={14} />,
@@ -10397,7 +11122,7 @@ function MessageArtifacts({
   };
   return (
     <div className="message-artifacts" aria-label="Generated artifacts">
-      {visibleArtifacts.map((artifact) => {
+      {shownArtifacts.map((artifact) => {
         const size = readableFileSize(artifact.size);
         const dimensions = artifact.width && artifact.height ? `${artifact.width} x ${artifact.height}` : "";
         const isSmallImage = artifact.kind === "image" && artifact.width && artifact.height && Math.max(artifact.width, artifact.height) <= 1024;
@@ -10455,6 +11180,22 @@ function MessageArtifacts({
           </div>
         );
       })}
+      {hasOverflow && (
+        <button
+          type="button"
+          className="message-artifact-overflow"
+          onClick={() => setExpanded((current) => !current)}
+        >
+          <span className="message-artifact-file-icon" aria-hidden="true">
+            <FileText size={18} />
+          </span>
+          <span className="message-artifact-overflow-copy">
+            <strong>{expanded ? "Show fewer files" : `${hiddenArtifactCount} more files hidden`}</strong>
+            <span>{expanded ? "Collapse this file list" : "Expand only if you need the full list"}</span>
+          </span>
+          <ChevronDown size={15} className={cx("message-artifact-overflow-chevron", expanded && "expanded")} />
+        </button>
+      )}
       <FloatingContextMenu menu={artifactMenu} onClose={() => setArtifactMenu(null)} />
     </div>
   );
@@ -10477,8 +11218,7 @@ function WorkspaceTargetIcon({ target, size = 20 }: { target?: WorkspaceLaunchTa
 function AppMark() {
   return (
     <div className="app-mark" aria-hidden="true">
-      <span />
-      <Code2 size={16} strokeWidth={2.1} />
+      <img src={appLogo} alt="" draggable={false} />
     </div>
   );
 }
@@ -10636,6 +11376,94 @@ function FloatingContextMenu({
   );
 }
 
+type NoteFolderTreeRow = {
+  folder: NoteFolderItem;
+  depth: number;
+  childCount: number;
+  collapsed: boolean;
+  totalNoteCount: number;
+};
+
+function noteFolderIDKey(id?: string | null) {
+  return String(id ?? "").trim().toLowerCase();
+}
+
+function noteFolderParentKey(folder: Pick<NoteFolderItem, "parentFolderID">) {
+  return noteFolderIDKey(folder.parentFolderID);
+}
+
+function noteFolderChildrenByParent(folders: NoteFolderItem[]) {
+  const byParent = new Map<string, NoteFolderItem[]>();
+  for (const folder of folders) {
+    const parentKey = noteFolderParentKey(folder);
+    byParent.set(parentKey, [...(byParent.get(parentKey) ?? []), folder]);
+  }
+  for (const children of byParent.values()) {
+    children.sort((left, right) => left.name.localeCompare(right.name));
+  }
+  return byParent;
+}
+
+function noteFolderDescendantIDSet(folders: NoteFolderItem[], folderID?: string | null) {
+  const rootKey = noteFolderIDKey(folderID);
+  const descendants = new Set<string>();
+  if (!rootKey) return descendants;
+  const byParent = noteFolderChildrenByParent(folders);
+  const visit = (parentKey: string) => {
+    for (const child of byParent.get(parentKey) ?? []) {
+      const key = noteFolderIDKey(child.id);
+      if (!key || descendants.has(key)) continue;
+      descendants.add(key);
+      visit(key);
+    }
+  };
+  visit(rootKey);
+  return descendants;
+}
+
+function noteFolderVisibleIDSet(folders: NoteFolderItem[], folderID?: string | null) {
+  const key = noteFolderIDKey(folderID);
+  if (!key) return null;
+  return new Set([key, ...noteFolderDescendantIDSet(folders, folderID)]);
+}
+
+function noteFolderTotalNoteCount(folder: NoteFolderItem, folders: NoteFolderItem[]) {
+  const visibleIDs = noteFolderVisibleIDSet(folders, folder.id) ?? new Set<string>();
+  return folders.reduce((sum, item) => sum + (visibleIDs.has(noteFolderIDKey(item.id)) ? item.noteCount : 0), 0);
+}
+
+function noteFolderTreeRows(folders: NoteFolderItem[], collapsedIDs: Set<string>, excludedFolderID?: string | null): NoteFolderTreeRow[] {
+  const excludedIDs = excludedFolderID
+    ? new Set([noteFolderIDKey(excludedFolderID), ...noteFolderDescendantIDSet(folders, excludedFolderID)])
+    : new Set<string>();
+  const byParent = noteFolderChildrenByParent(folders);
+  const rows: NoteFolderTreeRow[] = [];
+  const visited = new Set<string>();
+  const append = (parentKey: string, depth: number) => {
+    for (const folder of byParent.get(parentKey) ?? []) {
+      const key = noteFolderIDKey(folder.id);
+      if (!key || visited.has(key) || excludedIDs.has(key)) continue;
+      visited.add(key);
+      const childCount = (byParent.get(key) ?? []).filter((child) => !excludedIDs.has(noteFolderIDKey(child.id))).length;
+      const collapsed = collapsedIDs.has(key);
+      rows.push({
+        folder,
+        depth,
+        childCount,
+        collapsed,
+        totalNoteCount: noteFolderTotalNoteCount(folder, folders)
+      });
+      if (!collapsed) append(key, depth + 1);
+    }
+  };
+  append("", 0);
+  return rows;
+}
+
+function noteFolderMenuLabel(folder: NoteFolderItem, depth: number) {
+  return `${depth > 0 ? `${"> ".repeat(depth)}` : ""}${folder.name}`;
+}
+
 function NoteRenameDialog({
   target,
   onClose,
@@ -10694,7 +11522,7 @@ function NoteRenameDialog({
         <div className="note-rename-header">
           <div>
             <strong>Rename Note</strong>
-            <span>{target.kind === "thread" ? "Thread note" : "Project note"}</span>
+            <span>{target.kind === "thread" ? "Thread note" : "Note"}</span>
           </div>
           <button type="button" aria-label="Close rename dialog" onClick={onClose}>
             <X size={14} />
@@ -11067,8 +11895,10 @@ function SidebarNotesSection({
   onRestoreThreadNote,
   onDeleteNotePermanently,
   onDeleteThreadNotePermanently,
+  onCreateNoteFolder,
   onRenameNoteFolder,
   onDeleteNoteFolder,
+  onMoveNoteFolder,
   onMoveNoteToFolder
 }: {
   projects: ProjectItem[];
@@ -11091,11 +11921,14 @@ function SidebarNotesSection({
   onRestoreThreadNote: (note: ThreadNoteListItem) => void;
   onDeleteNotePermanently: (note: NoteItem) => void;
   onDeleteThreadNotePermanently: (note: ThreadNoteListItem) => void;
+  onCreateNoteFolder: (parentFolderID?: string | null) => void;
   onRenameNoteFolder: (folder: NoteFolderItem) => void;
   onDeleteNoteFolder: (folder: NoteFolderItem) => void;
+  onMoveNoteFolder: (folder: NoteFolderItem, parentFolderID: string | null) => void;
   onMoveNoteToFolder: (note: NoteItem, folderID: string | null) => void;
 }) {
   const [selectedFolderID, setSelectedFolderID] = useState<string | null>(null);
+  const [collapsedFolderIDs, setCollapsedFolderIDs] = useState<Set<string>>(() => new Set());
   const [noteSearch, setNoteSearch] = useState("");
   const [noteContextMenu, setNoteContextMenu] = useState<FloatingContextMenuState | null>(null);
   const realtimeFocus = useRealtimeVisualFocus();
@@ -11128,6 +11961,14 @@ function SidebarNotesSection({
     ),
     [noteFolders, selectedProject, selectedProjectID]
   );
+  const folderRows = useMemo(
+    () => noteFolderTreeRows(projectFolders, collapsedFolderIDs),
+    [collapsedFolderIDs, projectFolders]
+  );
+  const selectedFolderIDs = useMemo(
+    () => noteFolderVisibleIDSet(projectFolders, selectedFolderID),
+    [projectFolders, selectedFolderID]
+  );
 
   useEffect(() => {
     setSelectedFolderID(null);
@@ -11137,15 +11978,15 @@ function SidebarNotesSection({
   const filteredProjectNotes = useMemo(() => {
     const query = noteSearch.trim().toLowerCase();
     return projectNotes
-      .filter((note) => !selectedFolderID || note.folderID === selectedFolderID)
+      .filter((note) => !selectedFolderIDs || selectedFolderIDs.has(noteFolderIDKey(note.folderID)))
       .filter((note) => {
         if (!query) return true;
-        return [note.title, note.subtitle, note.projectName]
+        return [note.title, note.subtitle, note.projectName, note.area, ...(note.tags ?? [])]
           .filter(Boolean)
           .some((value) => String(value).toLowerCase().includes(query));
       })
       .slice(0, 32);
-  }, [noteSearch, projectNotes, selectedFolderID]);
+  }, [noteSearch, projectNotes, selectedFolderIDs]);
 
   const filteredThreadNotes = useMemo(() => {
     const query = noteSearch.trim().toLowerCase();
@@ -11165,21 +12006,21 @@ function SidebarNotesSection({
   const projectNoteCountLabel = `${projectNotes.length} ${projectNotes.length === 1 ? "note" : "notes"}`;
   const threadNoteCountLabel = `${projectThreadNotes.length} ${projectThreadNotes.length === 1 ? "note" : "notes"}`;
   const activeFolderCountLabel = activeFolder
-    ? `${activeFolder.noteCount} ${activeFolder.noteCount === 1 ? "note" : "notes"}`
+    ? `${noteFolderTotalNoteCount(activeFolder, projectFolders)} ${noteFolderTotalNoteCount(activeFolder, projectFolders) === 1 ? "note" : "notes"}`
     : "";
   const selectedProjectLabel = selectedProject?.kind === "folder" ? `${selectedProject.title} group` : selectedProject?.title;
   const helperText = notesScope === "project"
     ? showArchived
       ? projectNotes.length
-        ? "Archived project notes can be restored or permanently deleted."
-        : "Archived project notes will show here."
+        ? "Archived notes can be restored or permanently deleted."
+        : "Archived notes will show here."
       : selectedProjectLabel
       ? projectNotes.length
-        ? `Shared notes for ${selectedProjectLabel}.`
-        : `Shared notes for ${selectedProjectLabel} will show here.`
+        ? `Notes for ${selectedProjectLabel}.`
+        : `Notes for ${selectedProjectLabel} will show here.`
       : projectNotes.length
-        ? "Showing notes from all projects."
-        : "Project notes will show here."
+        ? "Showing all notes."
+        : "Notes will show here."
     : showArchived
       ? projectThreadNotes.length
         ? "Archived thread notes can be restored or permanently deleted."
@@ -11192,7 +12033,14 @@ function SidebarNotesSection({
         ? "Showing thread notes from all projects."
         : "Thread notes will show here.";
   const showNoteProjectName = !(selectedProjectID && selectedProject?.kind !== "folder");
-  const noteRowContext = (note: NoteItem) => (showNoteProjectName ? note.projectName : undefined);
+  const noteRowContext = (note: NoteItem) => {
+    const parts = [
+      showNoteProjectName ? note.projectName : undefined,
+      note.area,
+      normalizeDailyFreeTags(note.tags).join(", ")
+    ].filter(Boolean);
+    return parts.join(" · ") || undefined;
+  };
   const threadNoteRowContext = (note: ThreadNoteListItem) => {
     if (!showNoteProjectName) return note.subtitle || undefined;
     return [note.projectName, note.subtitle].filter(Boolean).join(" · ") || undefined;
@@ -11201,10 +12049,22 @@ function SidebarNotesSection({
   const foldersForNote = (note: NoteItem) =>
     noteFolders.filter((folder) => sameID(folder.projectID, note.projectID));
 
+  const toggleFolderDisclosure = (folderID: string) => {
+    const key = noteFolderIDKey(folderID);
+    if (!key) return;
+    setCollapsedFolderIDs((current) => {
+      const next = new Set(current);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  };
+
   const openProjectNoteMenu = (event: React.MouseEvent, note: NoteItem) => {
     event.preventDefault();
     event.stopPropagation();
-    const moveTargets = showArchived ? [] : foldersForNote(note).filter((folder) => !(note.folderID && sameID(folder.id, note.folderID)));
+    const noteFolderRows = noteFolderTreeRows(foldersForNote(note), new Set<string>());
+    const moveTargets = showArchived ? [] : noteFolderRows.filter((row) => !(note.folderID && sameID(row.folder.id, note.folderID)));
     const moveItems: SidebarMenuItem[] = [];
     if (!showArchived && note.folderID) {
       moveItems.push({
@@ -11214,10 +12074,10 @@ function SidebarNotesSection({
         onSelect: () => onMoveNoteToFolder(note, null)
       });
     }
-    moveTargets.forEach((folder) => {
+    moveTargets.forEach(({ folder, depth }) => {
       moveItems.push({
         id: `move-note-${folder.id}`,
-        label: `Move to "${folder.name}"`,
+        label: `Move to ${noteFolderMenuLabel(folder, depth)}`,
         icon: <Folder size={14} />,
         onSelect: () => onMoveNoteToFolder(note, folder.id)
       });
@@ -11247,11 +12107,30 @@ function SidebarNotesSection({
   const openFolderMenu = (event: React.MouseEvent, folder: NoteFolderItem) => {
     event.preventDefault();
     event.stopPropagation();
+    const destinationRows = noteFolderTreeRows(projectFolders, new Set<string>(), folder.id);
+    const moveItems: SidebarMenuItem[] = [
+      {
+        id: "move-folder-root",
+        label: "List root",
+        icon: <NotebookTabs size={14} />,
+        disabled: !folder.parentFolderID,
+        onSelect: () => onMoveNoteFolder(folder, null)
+      },
+      ...destinationRows.map(({ folder: destination, depth }) => ({
+        id: `move-folder-${destination.id}`,
+        label: noteFolderMenuLabel(destination, depth),
+        icon: <Folder size={14} />,
+        disabled: folder.parentFolderID ? sameID(folder.parentFolderID, destination.id) : false,
+        onSelect: () => onMoveNoteFolder(folder, destination.id)
+      }))
+    ];
     setNoteContextMenu({
       ...menuPosition(event),
       title: folder.name,
       items: [
+        { id: "new-subfolder", label: "New Subfolder", icon: <FolderPlus size={14} />, onSelect: () => onCreateNoteFolder(folder.id) },
         { id: "rename-folder", label: "Rename Folder", icon: <Pencil size={14} />, onSelect: () => onRenameNoteFolder(folder) },
+        { id: "move-folder", label: "Move to", icon: <Folder size={14} />, children: moveItems },
         { id: "divider-delete-folder", label: "" },
         { id: "delete-folder", label: "Delete Folder", icon: <Trash2 size={14} />, danger: true, onSelect: () => onDeleteNoteFolder(folder) }
       ]
@@ -11291,7 +12170,7 @@ function SidebarNotesSection({
       <p className="sidebar-section-helper">{helperText}</p>
       <div className="sidebar-note-scope segmented">
         <button className={cx(notesScope === "project" && "selected")} onClick={() => onSelectScope("project")}>
-          Project notes
+          Notes
         </button>
         <button className={cx(notesScope === "thread" && "selected")} onClick={() => onSelectScope("thread")}>
           Thread notes
@@ -11311,38 +12190,57 @@ function SidebarNotesSection({
             <button className="note-row" onClick={() => setSelectedFolderID(null)}>
               <NotebookTabs size={16} />
               <span>
-                All project notes
+                All notes
                 <small>{projectNoteCountLabel}</small>
               </span>
             </button>
           )}
-          {activeFolder && (
-            <button
-              className="note-row active"
-              onClick={() => setSelectedFolderID(null)}
-              onContextMenu={(event) => openFolderMenu(event, activeFolder)}
-            >
-              <Folder size={16} />
-              <span>
-                {activeFolder.name}
-                <small>{activeFolderCountLabel}</small>
-              </span>
-            </button>
-          )}
-          {!activeFolder && projectFolders.slice(0, 8).map((folder) => (
+          {folderRows.map(({ folder, depth, childCount, collapsed, totalNoteCount }) => (
             <button
               key={`${folder.projectID}-${folder.id}`}
-              className="note-row"
+              className={cx("note-row", "note-folder-row", selectedFolderID && sameID(folder.id, selectedFolderID) && "active")}
+              style={{ paddingLeft: 8 + depth * 18 }}
               onClick={() => setSelectedFolderID(folder.id)}
               onContextMenu={(event) => openFolderMenu(event, folder)}
             >
+              {childCount > 0 ? (
+                <span
+                  role="button"
+                  tabIndex={0}
+                  className="note-folder-disclosure"
+                  aria-label={collapsed ? `Expand ${folder.name}` : `Collapse ${folder.name}`}
+                  aria-expanded={!collapsed}
+                  onClick={(event) => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    toggleFolderDisclosure(folder.id);
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" || event.key === " ") {
+                      event.preventDefault();
+                      event.stopPropagation();
+                      toggleFolderDisclosure(folder.id);
+                    }
+                  }}
+                >
+                  {collapsed ? <ChevronRight size={13} /> : <ChevronDown size={13} />}
+                </span>
+              ) : (
+                <span className="note-folder-disclosure empty" aria-hidden="true" />
+              )}
               <Folder size={16} />
               <span>
                 {folder.name}
-                <small>{folder.noteCount} notes</small>
+                <small>{totalNoteCount} {totalNoteCount === 1 ? "note" : "notes"}</small>
               </span>
             </button>
           ))}
+          {activeFolder && (
+            <p className="notes-scope-summary">
+              <Folder size={15} />
+              <span>{activeFolder.name} · {activeFolderCountLabel}</span>
+            </p>
+          )}
           {filteredProjectNotes.map((note) => {
             const focusKey = noteTargetKey({ scope: "project", projectID: note.projectID, noteID: note.id });
             const isRealtimeFocused = Boolean(realtimeFocus?.noteTargetKey && focusKey && realtimeFocus.noteTargetKey === focusKey);
@@ -11363,7 +12261,7 @@ function SidebarNotesSection({
             </button>
             );
           })}
-          {filteredProjectNotes.length === 0 && <p className="empty-inline">No project notes match this view.</p>}
+          {filteredProjectNotes.length === 0 && <p className="empty-inline">No notes match this view.</p>}
         </>
       )}
       {notesScope === "thread" && (
@@ -11555,6 +12453,8 @@ function SidebarRemoteAccessNav({
     void (async () => {
       try {
         if (statusTone === "live" || (enabled && tunnelRunning)) {
+          const confirmed = window.confirm("Stop remote access? Any connected browsers will be disconnected.");
+          if (!confirmed) return;
           await onDisableRemoteAccess();
         } else {
           await onEnableRemoteAccess();
@@ -11633,9 +12533,11 @@ function Sidebar({
   onCreateNoteFolder,
   onRenameNoteFolder,
   onDeleteNoteFolder,
+  onMoveNoteFolder,
   onMoveNoteToFolder,
   onToggleArchivedThreads,
   onCreateProject,
+  onCreatePlannerList,
   onOpenProjectFolder,
   onCreateThread,
   onCreateTemporaryThread,
@@ -11711,12 +12613,14 @@ function Sidebar({
   onRestoreThreadNote: (note: ThreadNoteListItem) => void;
   onDeleteNotePermanently: (note: NoteItem) => void;
   onDeleteThreadNotePermanently: (note: ThreadNoteListItem) => void;
-  onCreateNoteFolder: () => void;
+  onCreateNoteFolder: (parentFolderID?: string | null) => void;
   onRenameNoteFolder: (folder: NoteFolderItem) => void;
   onDeleteNoteFolder: (folder: NoteFolderItem) => void;
+  onMoveNoteFolder: (folder: NoteFolderItem, parentFolderID: string | null) => void;
   onMoveNoteToFolder: (note: NoteItem, folderID: string | null) => void;
   onToggleArchivedThreads: () => void;
   onCreateProject: (name: string, kind: "project" | "folder", parentID?: string) => Promise<void>;
+  onCreatePlannerList: (input: { name: string; area?: string }) => Promise<void>;
   onOpenProjectFolder: (parentID?: string | null) => void;
   onCreateThread: () => void;
   onCreateTemporaryThread: () => void;
@@ -11756,6 +12660,7 @@ function Sidebar({
   const [collapsedProjectIDs, setCollapsedProjectIDs] = useState<Set<string>>(() => new Set());
   const [projectDraftKind, setProjectDraftKind] = useState<"project" | "folder">("project");
   const [projectDraftName, setProjectDraftName] = useState("");
+  const [listSearch, setListSearch] = useState("");
   const [contextMenu, setContextMenu] = useState<SidebarContextMenuState | null>(null);
   const visibleThreads = useMemo(() => {
     const firstPage = threads.slice(0, threadLimit);
@@ -11833,10 +12738,25 @@ function Sidebar({
     }
     return rows;
   }, [collapsedProjectIDs, projectChildrenByParentID, projects]);
+  const listSearchQuery = showNotesSection ? listSearch.trim().toLowerCase() : "";
+  const visibleListRows = useMemo(() => {
+    if (!listSearchQuery) return visibleProjectRows;
+    return projects
+      .filter((project) => [project.title, project.subtitle]
+        .filter(Boolean)
+        .some((value) => String(value).toLowerCase().includes(listSearchQuery)))
+      .map((project) => ({
+        project,
+        depth: 0,
+        hasChildren: (projectChildrenByParentID.get(projectIDKey(project.id)) ?? []).length > 0,
+        collapsed: false
+      }));
+  }, [listSearchQuery, projectChildrenByParentID, projects, visibleProjectRows]);
   const saveProjectDraft = async () => {
     const name = projectDraftName.trim();
     if (!name) return;
-    await onCreateProject(name, projectDraftKind, createParentID);
+    if (showNotesSection) await onCreatePlannerList({ name });
+    else await onCreateProject(name, projectDraftKind, createParentID);
     setProjectDraftName("");
     setProjectDraftKind("project");
     setIsCreatingProject(false);
@@ -11871,6 +12791,9 @@ function Sidebar({
     });
   }, [projects, selectedProjectID]);
   useEffect(() => {
+    if (!showNotesSection) setListSearch("");
+  }, [showNotesSection]);
+  useEffect(() => {
     if (!contextMenu) return undefined;
     const close = () => setContextMenu(null);
     const onScroll = (event: Event) => {
@@ -11894,6 +12817,7 @@ function Sidebar({
     };
   }, [contextMenu]);
   const openProjectsContextMenu = (event: React.MouseEvent) => {
+    if (showNotesSection) return;
     event.preventDefault();
     event.stopPropagation();
     setContextMenu({ kind: "projects", ...menuPosition(event) });
@@ -11990,7 +12914,7 @@ function Sidebar({
               aria-expanded={!projectsCollapsed}
               onClick={() => setProjectsCollapsed((value) => !value)}
             >
-              <span>Projects</span>
+              <span>{showNotesSection ? "Lists" : "Projects"}</span>
               {projectsCollapsed ? <ChevronRight size={13} /> : <ChevronDown size={13} />}
             </button>
             <span className="section-heading-spacer" />
@@ -12006,7 +12930,8 @@ function Sidebar({
             )}
             <button
               className="mini-add"
-              aria-label="Create group or project"
+              aria-label={showNotesSection ? "Create List" : "Create group or project"}
+              title={showNotesSection ? "Create List" : "Create group or project"}
               onClick={() => {
                 setProjectsCollapsed(false);
                 setIsCreatingProject((value) => !value);
@@ -12014,7 +12939,7 @@ function Sidebar({
             >
               <FolderPlus size={16} strokeWidth={1.9} />
             </button>
-            {hiddenProjects.length > 0 && (
+            {!showNotesSection && hiddenProjects.length > 0 && (
               <button
                 className="mini-add"
                 aria-label="Show hidden projects"
@@ -12028,79 +12953,106 @@ function Sidebar({
 
             {showNotesSection && (
               <p className="sidebar-section-helper project-helper">
-                {selectedProjectID ? `${selectedProject?.title ?? "Project"} notes` : "All project notes"}
+                {selectedProjectID ? `${selectedProject?.title ?? "List"} notes` : "All notes"}
               </p>
+            )}
+
+            {showNotesSection && !projectsCollapsed && projects.length > 5 && (
+              <label className="search-field sidebar-search-field project-search-field">
+                <Search size={14} />
+                <input
+                  placeholder="Search lists"
+                  value={listSearch}
+                  onChange={(event) => setListSearch(event.target.value)}
+                />
+              </label>
             )}
 
             {!projectsCollapsed && isCreatingProject && (
               <div className="project-create-panel">
-                <div className="segmented compact-segmented">
-                  <button className={cx(projectDraftKind === "project" && "selected")} onClick={() => setProjectDraftKind("project")}>Project</button>
-                  <button className={cx(projectDraftKind === "folder" && "selected")} onClick={() => setProjectDraftKind("folder")}>Group</button>
-                </div>
+                {!showNotesSection && (
+                  <div className="segmented compact-segmented">
+                    <button className={cx(projectDraftKind === "project" && "selected")} onClick={() => setProjectDraftKind("project")}>Project</button>
+                    <button className={cx(projectDraftKind === "folder" && "selected")} onClick={() => setProjectDraftKind("folder")}>Group</button>
+                  </div>
+                )}
                 <input
                   value={projectDraftName}
                   onChange={(event) => setProjectDraftName(event.target.value)}
-                  placeholder={projectDraftKind === "folder" ? "Group name" : "Project name"}
+                  placeholder={showNotesSection ? "List name" : projectDraftKind === "folder" ? "Group name" : "Project name"}
                   onKeyDown={(event) => {
                     if (event.key === "Enter") void saveProjectDraft();
                     if (event.key === "Escape") setIsCreatingProject(false);
                   }}
                 />
-                {createParentID && <small>Inside {selectedProject?.title}</small>}
+                {showNotesSection ? (
+                  <small>Shows in Planner, Backlog, Notes, and Threads.</small>
+                ) : createParentID ? (
+                  <small>Inside {selectedProject?.title}</small>
+                ) : null}
                 <div className="project-create-actions">
                   <button onClick={() => setIsCreatingProject(false)}>Cancel</button>
-                  <button disabled={!projectDraftName.trim()} onClick={() => void saveProjectDraft()}>Create</button>
+                  <button disabled={!projectDraftName.trim()} onClick={() => void saveProjectDraft()}>
+                    {showNotesSection ? "Create List" : "Create"}
+                  </button>
                 </div>
               </div>
             )}
 
             {!projectsCollapsed && (
               <div className="project-list">
-                {visibleProjectRows.map(({ project, depth, hasChildren, collapsed }) => (
-                  <button
-                    key={project.id}
-                    className={cx("project-row", sameID(project.id, selectedProjectID) && "expanded")}
-                    style={{ paddingLeft: 8 + depth * 24 }}
-                    onClick={() => onSelectProject(project.id)}
-                    onContextMenu={(event) => {
-                      event.preventDefault();
-                      event.stopPropagation();
-                      setContextMenu({ kind: "project", projectID: project.id, ...menuPosition(event) });
-                    }}
-                  >
-                    <span className="project-indent">
-                      {hasChildren && (
-                        <span
-                          role="button"
-                          tabIndex={0}
-                          className="project-disclosure"
-                          aria-label={collapsed ? `Expand ${project.title}` : `Collapse ${project.title}`}
-                          aria-expanded={!collapsed}
-                          onClick={(event) => {
-                            event.preventDefault();
-                            event.stopPropagation();
-                            toggleProjectDisclosure(project.id);
-                          }}
-                          onKeyDown={(event) => {
-                            if (event.key === "Enter" || event.key === " ") {
-                              event.preventDefault();
-                              event.stopPropagation();
-                              toggleProjectDisclosure(project.id);
-                            }
-                          }}
-                        >
-                          {collapsed ? <ChevronRight size={14} /> : <ChevronDown size={14} />}
+                {visibleListRows.map(({ project, depth, hasChildren, collapsed }) => {
+                  const selected = sameID(project.id, selectedProjectID);
+                  return (
+                    <Fragment key={project.id}>
+                      <button
+                        className={cx("project-row", selected && "expanded")}
+                        style={{ paddingLeft: 8 + depth * 24 }}
+                        onClick={() => onSelectProject(project.id)}
+                        onContextMenu={(event) => {
+                          if (showNotesSection) return;
+                          event.preventDefault();
+                          event.stopPropagation();
+                          setContextMenu({ kind: "project", projectID: project.id, ...menuPosition(event) });
+                        }}
+                      >
+                        <span className="project-indent">
+                          {hasChildren && (
+                            <span
+                              role="button"
+                              tabIndex={0}
+                              className="project-disclosure"
+                              aria-label={collapsed ? `Expand ${project.title}` : `Collapse ${project.title}`}
+                              aria-expanded={!collapsed}
+                              onClick={(event) => {
+                                event.preventDefault();
+                                event.stopPropagation();
+                                toggleProjectDisclosure(project.id);
+                              }}
+                              onKeyDown={(event) => {
+                                if (event.key === "Enter" || event.key === " ") {
+                                  event.preventDefault();
+                                  event.stopPropagation();
+                                  toggleProjectDisclosure(project.id);
+                                }
+                              }}
+                            >
+                              {collapsed ? <ChevronRight size={14} /> : <ChevronDown size={14} />}
+                            </span>
+                          )}
                         </span>
-                      )}
-                    </span>
-                    <span className="project-icon">{projectIcon(project)}</span>
-                    <span className="project-copy">
-                      <strong>{project.title}</strong>
-                      <small>{projectSidebarSubtitle(project)}</small>
-                    </span>
-                  </button>
-                ))}
+                        <span className="project-icon">{projectIcon(project)}</span>
+                        <span className="project-copy">
+                          <strong>{project.title}</strong>
+                          <small>{projectSidebarSubtitle(project)}</small>
+                        </span>
+                      </button>
+                    </Fragment>
+                  );
+                })}
+                {showNotesSection && listSearchQuery && visibleListRows.length === 0 && (
+                  <p className="empty-inline">No matching lists.</p>
+                )}
               </div>
             )}
           </>
@@ -12152,6 +13104,7 @@ function Sidebar({
                       "thread-row",
                       `thread-row-provider-${runtimeProviderKey(thread.activeProvider)}`,
                       isThreadRunning && "is-running",
+                      !isThreadRunning && thread.hasUnread && "has-unread",
                       isRealtimeVoiceThread && "thread-row-realtime-voice",
                       (selectedThreadID ? thread.id === selectedThreadID : thread.active) && "active"
                     )}
@@ -12164,6 +13117,7 @@ function Sidebar({
                     }}
                   >
                     {isThreadRunning && <span className="thread-running-spinner" aria-hidden="true" />}
+                    {!isThreadRunning && thread.hasUnread && <span className="thread-unread-dot" aria-hidden="true" />}
                     <span className="thread-title">{thread.title}</span>
                     <span className="thread-age">{thread.age}</span>
                     {(thread.isTemporary || thread.project || isThreadRunning || isRealtimeVoiceThread) && (
@@ -12256,8 +13210,10 @@ function Sidebar({
                 onRestoreThreadNote={onRestoreThreadNote}
                 onDeleteNotePermanently={onDeleteNotePermanently}
                 onDeleteThreadNotePermanently={onDeleteThreadNotePermanently}
+                onCreateNoteFolder={onCreateNoteFolder}
                 onRenameNoteFolder={onRenameNoteFolder}
                 onDeleteNoteFolder={onDeleteNoteFolder}
+                onMoveNoteFolder={onMoveNoteFolder}
                 onMoveNoteToFolder={onMoveNoteToFolder}
               />
             )}
@@ -12273,20 +13229,20 @@ function Sidebar({
           onOpenRemoteAccessSettings={onOpenRemoteAccessSettings}
         />
         <button
+          className={cx("sidebar-footer-action", showArchivedThreads && "active")}
+          onClick={onToggleArchivedThreads}
+          data-tooltip={`${activeView === "notes" ? "Archived notes" : "Archived threads"}${archivedCount > 0 ? ` · ${archivedCount}` : ""}`}
+          aria-label={`${activeView === "notes" ? "Archived notes" : "Archived threads"}${archivedCount > 0 ? `: ${archivedCount}` : ""}`}
+        >
+          <Archive size={16} />
+        </button>
+        <button
           className="sidebar-footer-action"
           onClick={onOpenSettings}
           data-tooltip="Settings"
           aria-label="Settings"
         >
           <Settings size={16} />
-        </button>
-        <button
-          className={cx("sidebar-footer-action", showArchivedThreads && "active")}
-          onClick={onToggleArchivedThreads}
-          data-tooltip={`Archived${archivedCount > 0 ? ` · ${archivedCount}` : ""}`}
-          aria-label={`Archived items${archivedCount > 0 ? `: ${archivedCount}` : ""}`}
-        >
-          <Archive size={16} />
         </button>
       </div>
       {!compact && (
@@ -12706,6 +13662,29 @@ function DictationStatusPanel({
   );
 }
 
+function ConnectorSyncActivityPanel({
+  activity,
+  compact = false
+}: {
+  activity?: ConnectorSyncProgress | null;
+  compact?: boolean;
+}) {
+  if (!activity) return null;
+  const isRunning = connectorSyncIsActive(activity);
+  const detail = activity.message || connectorSyncShortLabel(activity);
+  return (
+    <div className={cx("connector-sync-activity-panel", compact && "compact", `state-${activity.status}`)} role="status" title={detail}>
+      <span className="connector-sync-activity-icon" aria-hidden="true">
+        {isRunning ? <RefreshCw size={15} /> : activity.status === "failed" ? <Info size={15} /> : <Check size={15} />}
+      </span>
+      <span className="connector-sync-activity-copy">
+        <span className="connector-sync-activity-label">{connectorSyncShortLabel(activity)}</span>
+        <span className="connector-sync-activity-text">{detail}</span>
+      </span>
+    </div>
+  );
+}
+
 function usageWindowResetText(window: NonNullable<ProviderUsageSnapshot["primary"]>) {
   const resetDate = window.resetsAt ? new Date(window.resetsAt) : null;
   const hasResetDate = resetDate && Number.isFinite(resetDate.getTime());
@@ -13040,7 +14019,7 @@ function InlineReadAloudPlayer({
   );
 }
 
-function MessageBubble({
+function MessageBubbleBase({
   message,
   threadID,
   mentionCatalog,
@@ -13071,10 +14050,21 @@ function MessageBubble({
 }) {
   const isRunningAssistant = message.role === "assistant" && message.status === "running";
   const motionProps = embedded ? {} : messageMotion;
-  const layoutProps = embedded ? {} : { layout: true as const };
+  // Framer Motion `layout` is intentionally OFF for chat rows: with it on,
+  // every height change of the streaming bubble re-measured and re-animated
+  // every sibling row, which made the whole chat feel laggy while responding.
+  const layoutProps = {};
   const [messageContextMenu, setMessageContextMenu] = useState<FloatingContextMenuState | null>(null);
   const [activityExpanded, setActivityExpanded] = useState(false);
   const [voiceLoading, setVoiceLoading] = useState(false);
+  const [imageCopied, setImageCopied] = useState(false);
+  const copyChatImage = (source: { dataURL?: string; filePath?: string }) => {
+    void window.openAssistElectron?.copyImageToClipboard?.(source).then((result) => {
+      if (!result?.ok) return;
+      setImageCopied(true);
+      window.setTimeout(() => setImageCopied(false), 1200);
+    });
+  };
   const [inlineAudio, setInlineAudio] = useState<ReadAloudAudioResult | null>(null);
   useEffect(() => {
     if (message.role === "activity") setActivityExpanded(message.activityStatus === "failed");
@@ -13090,6 +14080,13 @@ function MessageBubble({
   const copyMessage = () => {
     writeTextToClipboard(message.text.replace(/^Command\n/, ""));
   };
+  // Lets bare-filename links in provider replies (a generated image saved in
+  // this thread's Agent Files folder) resolve to a real path on click.
+  const agentFilesBaseDirs = useCallback(async () => {
+    if (!threadID) return [];
+    const result = await window.openAssistElectron?.threadAgentFilesPath?.(threadID);
+    return result?.ok && result.path ? [result.path] : [];
+  }, [threadID]);
   const saveGeneratedImage = () => {
     if (!message.imageDataURL) return;
     void window.openAssistElectron?.saveImage?.(message.imageDataURL, message.imageName || "openassist-generated-image.png");
@@ -13273,6 +14270,16 @@ function MessageBubble({
                 type="button"
                 onClick={(event) => {
                   event.stopPropagation();
+                  copyChatImage({ dataURL: generatedImageURL });
+                }}
+              >
+                <Copy size={13} />
+                {imageCopied ? "Copied" : "Copy"}
+              </button>
+              <button
+                type="button"
+                onClick={(event) => {
+                  event.stopPropagation();
                   saveGeneratedImage();
                 }}
               >
@@ -13324,11 +14331,17 @@ function MessageBubble({
                       key={attachment.id}
                       type="button"
                       className={cx("user-attachment-thumb", isFile && "is-file")}
-                      title={attachment.name}
-                      onDoubleClick={(event) => {
+                      title={isFile ? attachment.name : `${attachment.name} — click to open, right-click to copy image`}
+                      onClick={(event) => {
                         event.preventDefault();
                         event.stopPropagation();
                         if (!isFile) openImagePreviewDataURL(attachment.dataURL);
+                      }}
+                      onContextMenu={(event) => {
+                        if (isFile) return;
+                        event.preventDefault();
+                        event.stopPropagation();
+                        copyChatImage({ dataURL: attachment.dataURL });
                       }}
                     >
                       {isFile ? (
@@ -13374,7 +14387,7 @@ function MessageBubble({
             Completed from realtime voice
           </span>
         )}
-        <MarkdownPreview markdown={message.text} className="assistant-markdown-shell" emptyText="" />
+        <MarkdownPreview markdown={message.text} className="assistant-markdown-shell" emptyText="" localFileBaseDirs={agentFilesBaseDirs} />
         <MessageArtifacts artifacts={message.artifacts} onOpenArtifact={onOpenArtifact} />
         {inlineAudio && (
           <InlineReadAloudPlayer
@@ -13447,6 +14460,58 @@ function buildAssistantReadAloudTextMap(messages: ChatMessage[]) {
   });
   return readAloudByMessageID;
 }
+
+// Memoized chat components. The chat re-renders on EVERY streaming token (the
+// messages array changes), which used to re-render every bubble in the thread
+// and re-parse all their markdown — the main cause of chat lag. Message
+// objects are passed through buildChatTimeline by reference, so comparing
+// them by identity is enough: only the bubble whose message actually changed
+// re-renders. Handler props are intentionally NOT compared — they are stable
+// in behavior (they close over refs/setState) even when their identity churns
+// with parent renders.
+const sameMessageList = (left: ChatMessage[], right: ChatMessage[]) =>
+  left === right || (left.length === right.length && left.every((message, index) => message === right[index]));
+
+const sameTimelineItem = (left: ChatTimelineItem, right: ChatTimelineItem): boolean => {
+  if (left === right) return true;
+  if (left.kind !== right.kind) return false;
+  if (left.kind === "message" && right.kind === "message") return left.message === right.message;
+  if (left.kind === "work" && right.kind === "work") return left.id === right.id && sameMessageList(left.activities, right.activities);
+  if (left.kind === "thinking" && right.kind === "thinking") return left.id === right.id && sameMessageList(left.messages, right.messages);
+  if (left.kind === "delegated" && right.kind === "delegated") return left.id === right.id && left.activity === right.activity;
+  return false;
+};
+
+const sameTimelineItemList = (left: ChatTimelineItem[], right: ChatTimelineItem[]) =>
+  left === right || (left.length === right.length && left.every((item, index) => sameTimelineItem(item, right[index])));
+
+const MessageBubble = memo(MessageBubbleBase, (prev, next) =>
+  prev.message === next.message
+  && prev.threadID === next.threadID
+  && prev.mentionCatalog === next.mentionCatalog
+  && prev.readAloudTextOverride === next.readAloudTextOverride
+  && prev.approvalsEnabled === next.approvalsEnabled
+  && prev.embedded === next.embedded);
+
+const DelegatedTaskCard = memo(DelegatedTaskCardBase, (prev, next) =>
+  prev.activity === next.activity && prev.embedded === next.embedded);
+
+const ThinkingGroup = memo(ThinkingGroupBase, (prev, next) =>
+  sameMessageList(prev.messages, next.messages) && prev.embedded === next.embedded);
+
+const WorkActivityGroup = memo(WorkActivityGroupBase, (prev, next) =>
+  sameMessageList(prev.activities, next.activities)
+  && prev.active === next.active
+  && Boolean(prev.onStopWork) === Boolean(next.onStopWork)
+  && prev.embedded === next.embedded);
+
+const CompletedTurnGroup = memo(CompletedTurnGroupBase, (prev, next) =>
+  sameTimelineItemList(prev.innerItems, next.innerItems)
+  && prev.toolStepCount === next.toolStepCount
+  && prev.source === next.source
+  && prev.threadID === next.threadID
+  && prev.activeWorkGroupID === next.activeWorkGroupID
+  && prev.messageMentionCatalog === next.messageMentionCatalog);
 
 function buildChatTimeline(messages: ChatMessage[]): ChatTimelineItem[] {
   const items: ChatTimelineItem[] = [];
@@ -13971,7 +15036,28 @@ function ApprovalActions({
   );
 }
 
-function knowledgePreviewSummary(preview?: KnowledgeWriteRequest["preview"]) {
+function knowledgePayloadText(payload: Record<string, unknown>, key: string) {
+  const value = payload[key];
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function knowledgeApprovalDestination(request: KnowledgeWriteRequest) {
+  const preview = request.preview;
+  const payload = request.payload ?? {};
+  const listName = knowledgePayloadText(payload, "listName") || knowledgePayloadText(payload, "listTitle");
+  const noteTitle = knowledgePayloadText(payload, "noteTitle") || knowledgePayloadText(payload, "referenceNoteTitle");
+  const threadTitle = knowledgePayloadText(payload, "threadTitle");
+  if (preview?.kind === "reference_note_create") {
+    if (preview.ownerKind === "project") return listName ? `List: ${listName}` : `Project: ${preview.ownerId}`;
+    return threadTitle ? `Thread: ${threadTitle}` : `Thread: ${preview.ownerId}`;
+  }
+  if (preview?.kind === "replace_markdown") return noteTitle || preview.title || preview.itemID;
+  if (listName) return `List: ${listName}`;
+  return "";
+}
+
+function knowledgePreviewSummary(request: KnowledgeWriteRequest) {
+  const preview = request.preview;
   if (!preview) return "Waiting for a preview";
   if (preview.kind === "planner_append") return `Will add to ${preview.dayID} · ${preview.section}`;
   if (preview.kind === "planner_move") {
@@ -13986,7 +15072,16 @@ function knowledgePreviewSummary(preview?: KnowledgeWriteRequest["preview"]) {
     const area = typeof preview.item.area === "string" && preview.item.area.trim() ? `${preview.item.area.trim()} · ` : "";
     return `Will add ${area}Today item · ${preview.item.title ?? "Untitled"}`;
   }
+  if (preview.kind === "daily_items_batch") {
+    const count = preview.items.length;
+    const target = preview.target === "backlog" ? "Backlog" : preview.dayID ?? "planner day";
+    return `Will create ${count} linked task${count === 1 ? "" : "s"} in ${target}`;
+  }
   if (preview.kind === "daily_item_delete") return `Will remove planner task from ${preview.dayID}`;
+  if (preview.kind === "reference_note_create") {
+    const destination = knowledgeApprovalDestination(request);
+    return `Will create note "${preview.title}"${destination ? ` in ${destination}` : ""}`;
+  }
   if (preview.kind === "replace_markdown") return "Will replace markdown after approval";
   return "Preview ready";
 }
@@ -14049,7 +15144,8 @@ function computeLineDiff(previousMarkdown: string, nextMarkdown: string): Knowle
   return diff;
 }
 
-function KnowledgePreviewDetails({ preview }: { preview?: KnowledgeWriteRequest["preview"] }) {
+function KnowledgePreviewDetails({ request }: { request: KnowledgeWriteRequest }) {
+  const preview = request.preview;
   if (!preview) return <p className="knowledge-approval-empty">Preview is still being prepared.</p>;
   if (preview.kind === "replace_markdown") {
     const hasPrevious = typeof preview.previousMarkdown === "string";
@@ -14132,11 +15228,65 @@ function KnowledgePreviewDetails({ preview }: { preview?: KnowledgeWriteRequest[
       </div>
     );
   }
+  if (preview.kind === "daily_items_batch") {
+    const target = preview.target === "backlog" ? "Backlog" : preview.dayID ?? "Planner day";
+    return (
+      <div className="knowledge-approval-diff" aria-label="Tasks from note preview">
+        <strong>Creating {preview.items.length} linked task{preview.items.length === 1 ? "" : "s"} in {target}</strong>
+        <small>Source note: {preview.sourceTitle}</small>
+        <pre>
+          {preview.items.map((item, index) => {
+            const meta = [
+              item.area ? `Category: ${item.area}` : "",
+              item.projectID ? `List: ${item.projectID}` : "",
+              item.folderID ? `List: ${item.folderID}` : "",
+              item.section ? `Section: ${item.section}` : "",
+              Array.isArray(item.tags) && item.tags.length ? `Tags: ${item.tags.join(", ")}` : ""
+            ].filter(Boolean);
+            const steps = Array.isArray(item.steps) && item.steps.length
+              ? item.steps.map((step) => `  - [${step.checked ? "x" : " "}] ${step.text}`).join("\n")
+              : "";
+            const details = [
+              `${index + 1}. ${item.title ?? "Untitled task"}`,
+              meta.length ? `   ${meta.join(" · ")}` : "",
+              item.detailsMarkdown ? `   ${item.detailsMarkdown}` : "",
+              steps
+            ].filter(Boolean).join("\n");
+            return (
+              <span className="knowledge-approval-diff-line added" key={`${item.title ?? "task"}-${index}`}>
+                <span className="knowledge-approval-diff-marker">+</span>
+                <span>{details}</span>
+              </span>
+            );
+          })}
+        </pre>
+      </div>
+    );
+  }
   if (preview.kind === "daily_item_delete") {
     return (
       <div className="knowledge-approval-diff" aria-label="Daily item removal preview">
         <strong>Removing planner task</strong>
         <pre><span className="knowledge-approval-diff-line removed"><span className="knowledge-approval-diff-marker">-</span><span>{preview.itemID} from {preview.dayID}</span></span></pre>
+      </div>
+    );
+  }
+  if (preview.kind === "reference_note_create") {
+    const destination = knowledgeApprovalDestination(request) || `${preview.ownerKind}: ${preview.ownerId}`;
+    const content = preview.markdown.replace(/\r\n/g, "\n").trim();
+    return (
+      <div className="knowledge-approval-diff" aria-label="New reference note preview">
+        <div className="knowledge-approval-meta-grid">
+          <span><small>Action</small><strong>Create new note</strong></span>
+          <span><small>Where</small><strong>{destination}</strong></span>
+          <span><small>Title</small><strong>{preview.title}</strong></span>
+        </div>
+        <pre>
+          <span className="knowledge-approval-diff-line added">
+            <span className="knowledge-approval-diff-marker">+</span>
+            <span>{content || "(empty note)"}</span>
+          </span>
+        </pre>
       </div>
     );
   }
@@ -14155,6 +15305,19 @@ function KnowledgeApprovalInbox({
   onReject: (requestID: string) => void;
 }) {
   const [expandedRequestIDs, setExpandedRequestIDs] = useState<Set<string>>(() => new Set());
+  useEffect(() => {
+    setExpandedRequestIDs((current) => {
+      let changed = false;
+      const next = new Set(current);
+      requests.forEach((request) => {
+        if (request.preview && !next.has(request.id)) {
+          next.add(request.id);
+          changed = true;
+        }
+      });
+      return changed ? next : current;
+    });
+  }, [requests]);
   if (!requests.length && !message) return null;
   const toggleExpanded = (requestID: string) => {
     setExpandedRequestIDs((current) => {
@@ -14186,7 +15349,7 @@ function KnowledgeApprovalInbox({
               <div className="knowledge-approval-card" key={request.id}>
                 <span className="knowledge-approval-copy">
                   <strong>{request.goal || request.action}</strong>
-                  <small>{knowledgePreviewSummary(request.preview)} · {request.source}</small>
+                  <small>{knowledgePreviewSummary(request)} · {request.source}</small>
                   <code>{request.id.slice(0, 8)}</code>
                 </span>
                 <span className="knowledge-approval-buttons">
@@ -14207,7 +15370,7 @@ function KnowledgeApprovalInbox({
                 </span>
                 {isExpanded ? (
                   <div className="knowledge-approval-preview">
-                    <KnowledgePreviewDetails preview={request.preview} />
+                    <KnowledgePreviewDetails request={request} />
                   </div>
                 ) : null}
               </div>
@@ -14423,14 +15586,17 @@ function threadMentionsKnowledgeRequests(messages: ChatMessage[], requests: Know
   });
 }
 
-function DelegatedTaskCard({ activity, embedded = false }: { activity: ChatMessage; embedded?: boolean }) {
+function DelegatedTaskCardBase({ activity, embedded = false }: { activity: ChatMessage; embedded?: boolean }) {
   const status = activity.activityStatus || (activity.status === "running" ? "running" : "completed");
   const isRunning = status === "running" || status === "pending" || status === "waiting";
   const isFailed = status === "failed";
   const statusLabel = isFailed ? "Failed" : isRunning ? "Running" : "Completed";
   const summary = realtimeDelegationSummary(activity);
   const motionProps = embedded ? {} : messageMotion;
-  const layoutProps = embedded ? {} : { layout: true as const };
+  // Framer Motion `layout` is intentionally OFF for chat rows: with it on,
+  // every height change of the streaming bubble re-measured and re-animated
+  // every sibling row, which made the whole chat feel laggy while responding.
+  const layoutProps = {};
 
   return (
     <motion.div
@@ -14512,7 +15678,7 @@ function formatThinkingDuration(ms: number) {
   return remainder ? `${minutes}m ${remainder}s` : `${minutes}m`;
 }
 
-function ThinkingGroup({ messages, embedded = false }: { messages: ChatMessage[]; embedded?: boolean }) {
+function ThinkingGroupBase({ messages, embedded = false }: { messages: ChatMessage[]; embedded?: boolean }) {
   const text = messages
     .map((message) => (message.activityDetail || message.text || "").trim())
     .filter(Boolean)
@@ -14529,7 +15695,10 @@ function ThinkingGroup({ messages, embedded = false }: { messages: ChatMessage[]
   if (!text) return null;
   const provider = messages.find((message) => message.provider)?.provider || "Codex";
   const motionProps = embedded ? {} : messageMotion;
-  const layoutProps = embedded ? {} : { layout: true as const };
+  // Framer Motion `layout` is intentionally OFF for chat rows: with it on,
+  // every height change of the streaming bubble re-measured and re-animated
+  // every sibling row, which made the whole chat feel laggy while responding.
+  const layoutProps = {};
   const startedAt = messages.reduce(
     (min, message) => typeof message.createdAt === "number" ? Math.min(min, message.createdAt) : min,
     Number.POSITIVE_INFINITY
@@ -14581,7 +15750,7 @@ function ThinkingGroup({ messages, embedded = false }: { messages: ChatMessage[]
   );
 }
 
-function WorkActivityGroup({
+function WorkActivityGroupBase({
   activities,
   onRespondToApproval,
   onStopWork,
@@ -14603,7 +15772,14 @@ function WorkActivityGroup({
   const approvalActivity = displayActivities.find(hasPendingApproval);
   const activeApprovalActivity = active ? approvalActivity : undefined;
   const pausedHistory = status === "running" && !active && !activeApprovalActivity;
-  const [expanded, setExpanded] = useState(() => status !== "completed" && !pausedHistory);
+  // Default running work to collapsed so the slim line matches the completed look.
+  // Once the user manually toggles, never auto-collapse out from under them.
+  const [expanded, setExpanded] = useState(false);
+  const userToggledRef = useRef(false);
+  const toggleExpanded = useCallback(() => {
+    userToggledRef.current = true;
+    setExpanded((value) => !value);
+  }, []);
   const previewActivities = displayActivities.filter(activityPreviewURL).slice(-4);
   const statusLabel = status === "failed" ? "Needs review" : activeApprovalActivity ? "Needs approval" : status === "running" ? active ? "Running" : "Paused" : "Done";
   const provider = activities.find((activity) => activity.provider)?.provider;
@@ -14625,92 +15801,59 @@ function WorkActivityGroup({
   const latestSummary = latest ? activityPresentation(latestTitle, latest.activityDetail || latest.text).summary : "";
   const canStopWork = active && status === "running" && Boolean(onStopWork);
   const motionProps = embedded ? {} : messageMotion;
-  const layoutProps = embedded ? {} : { layout: true as const };
+  // Framer Motion `layout` is intentionally OFF for chat rows: with it on,
+  // every height change of the streaming bubble re-measured and re-animated
+  // every sibling row, which made the whole chat feel laggy while responding.
+  const layoutProps = {};
 
   useEffect(() => {
+    if (userToggledRef.current) return;
     if (status === "completed" || pausedHistory) setExpanded(false);
   }, [activities[0]?.id, pausedHistory, status]);
 
-  if (status === "completed" || pausedHistory) {
-    const summaryTitle = pausedHistory
+  const isLive = !(status === "completed" || pausedHistory);
+  const summaryTitle = isLive
+    ? title
+    : pausedHistory
       ? (hasRealtimeDelegation ? "Paused Realtime conversation work" : "Paused tool work")
       : completedWorkTitle(displayActivities);
-    return (
-      <motion.div {...layoutProps} {...motionProps} className={cx("work-summary-line", `work-summary-line-${providerKey(provider)}`, expanded && "expanded")}>
-        <button
-          className="work-summary-toggle"
-          aria-expanded={expanded}
-          disabled={!canExpand}
-          onClick={() => {
-            if (canExpand) setExpanded((value) => !value);
-          }}
-        >
-          <span>{summaryTitle}</span>
-          {hasRealtimeDelegation && <small className="work-source-pill">Realtime conversation</small>}
-          {canExpand && <ChevronRight size={15} />}
-        </button>
-        {!expanded && <ActivityPreviewStrip activities={previewActivities} className="work-summary-preview-strip" />}
-        <AnimatePresence initial={false}>
-          {expanded && canExpand && (
-            <motion.div
-              className="work-summary-details"
-              initial={{ height: 0, opacity: 0 }}
-              animate={{ height: "auto", opacity: 1 }}
-              exit={{ height: 0, opacity: 0 }}
-              transition={{ duration: 0.16, ease: [0.22, 1, 0.36, 1] }}
-            >
-              {displayActivities.map((activity) => (
-                <WorkSummaryStep
-                  key={activity.id}
-                  activity={activity}
-                  onRespondToApproval={onRespondToApproval}
-                  approvalsEnabled={false}
-                />
-              ))}
-            </motion.div>
-          )}
-        </AnimatePresence>
-      </motion.div>
-    );
-  }
-
+  // Both live (running/failed/approval) and completed states share the slim
+  // "work-summary-line" look so the card stays visually consistent before and
+  // after the agent finishes. When live, a modifier class adds the provider
+  // gradient glow so you can still tell the agent is working.
   return (
     <motion.div
       {...layoutProps}
       {...motionProps}
       className={cx(
-        "work-card",
-        "liquid-glass-surface",
-        `work-card-${providerKey(provider)}`,
+        "work-summary-line",
+        `work-summary-line-${providerKey(provider)}`,
         expanded && "expanded",
-        status === "running" && "running",
-        status === "failed" && "failed"
+        isLive && "live",
+        isLive && status === "running" && "running",
+        isLive && status === "failed" && "failed",
+        isLive && activeApprovalActivity && "needs-approval"
       )}
     >
-      <LiquidGlassLayer tone="card" cornerRadius={10} active={status === "running" || Boolean(activeApprovalActivity)} />
+      {isLive && <LiquidGlassLayer tone="card" cornerRadius={8} active={status === "running" || Boolean(activeApprovalActivity)} />}
       <button
-        className="work-card-toggle"
+        className="work-summary-toggle"
         aria-expanded={expanded}
         disabled={!canExpand}
         onClick={() => {
-          if (canExpand) setExpanded((value) => !value);
+          if (canExpand) toggleExpanded();
         }}
       >
-        <span className="work-card-icon">
-          <Workflow size={15} />
-        </span>
-        <span className="work-card-copy">
-          <span className="work-card-head">
-            <strong>{title}</strong>
-            {hasRealtimeDelegation && <span className="work-source-pill">Realtime conversation</span>}
-            <span>{statusLabel}</span>
-          </span>
-          <small>{latestSummary || "Tool calls are hidden here to keep the chat clean."}</small>
-        </span>
-        {canExpand && <ChevronRight className="work-card-chevron" size={16} />}
+        <span>{summaryTitle}</span>
+        {isLive && <span className="work-summary-status">{statusLabel}</span>}
+        {hasRealtimeDelegation && <small className="work-source-pill">Realtime conversation</small>}
+        {canExpand && <ChevronRight size={15} />}
       </button>
-      {!expanded && <ActivityPreviewStrip activities={previewActivities} className="work-card-preview-strip" />}
-      {activeApprovalActivity && !expanded && (
+      {isLive && !expanded && latestSummary && (
+        <small className="work-summary-latest">{latestSummary}</small>
+      )}
+      {!expanded && <ActivityPreviewStrip activities={previewActivities} className="work-summary-preview-strip" />}
+      {isLive && activeApprovalActivity && !expanded && (
         <div className="work-card-approval">
           <ApprovalActions activity={activeApprovalActivity} onRespondToApproval={onRespondToApproval} />
         </div>
@@ -14718,7 +15861,7 @@ function WorkActivityGroup({
       <AnimatePresence initial={false}>
         {expanded && canExpand && (
           <motion.div
-            className="work-card-body"
+            className="work-summary-details"
             initial={{ height: 0, opacity: 0 }}
             animate={{ height: "auto", opacity: 1 }}
             exit={{ height: 0, opacity: 0 }}
@@ -14729,7 +15872,7 @@ function WorkActivityGroup({
                 key={activity.id}
                 activity={activity}
                 onRespondToApproval={onRespondToApproval}
-                approvalsEnabled={active && hasPendingApproval(activity)}
+                approvalsEnabled={isLive && active && hasPendingApproval(activity)}
               />
             ))}
           </motion.div>
@@ -14775,7 +15918,7 @@ function RealtimeApprovalSurface({
   );
 }
 
-function CompletedTurnGroup({
+function CompletedTurnGroupBase({
   innerItems,
   toolStepCount,
   source,
@@ -14903,6 +16046,27 @@ type ComposerMentionSection = {
   items: ComposerMentionEntry[];
 };
 
+const codexImageWorkerMentionID = "openassist:codex-image-worker";
+const codexImageWorkerMentionSlugs = ["codex-image", "imagegen", "codex-image-worker"];
+const codexImageWorkerMentionEntry: ComposerMentionEntry = {
+  id: codexImageWorkerMentionID,
+  kind: "skill",
+  slug: "codex-image",
+  label: "Codex Image",
+  description: "Generate or edit an image through Codex as a hidden worker.",
+  iconPath: null,
+  insertText: "@codex-image "
+};
+
+function addBuiltInComposerMentions(catalog: Record<string, ComposerMentionEntry>) {
+  for (const slug of codexImageWorkerMentionSlugs) {
+    catalog[slug] = {
+      ...codexImageWorkerMentionEntry,
+      slug
+    };
+  }
+}
+
 const CatalogIcon = memo(function CatalogIcon({
   src,
   kind,
@@ -14963,6 +16127,7 @@ function composerMentionSkills(plugins: PluginItem[], skills: SkillItem[]) {
 
 function buildComposerMentionCatalog(plugins: PluginItem[], skills: SkillItem[]) {
   const catalog: Record<string, ComposerMentionEntry> = {};
+  addBuiltInComposerMentions(catalog);
   plugins
     .filter((plugin) => plugin.status === "Installed")
     .forEach((plugin) => {
@@ -15029,6 +16194,14 @@ function buildComposerMentionSections(
   skills: SkillItem[]
 ): ComposerMentionSection[] {
   if (query === null) return [];
+  const builtInItems = mentionMatches([
+    codexImageWorkerMentionEntry.slug,
+    codexImageWorkerMentionEntry.label,
+    codexImageWorkerMentionEntry.description,
+    ...codexImageWorkerMentionSlugs
+  ], query)
+    ? [codexImageWorkerMentionEntry]
+    : [];
   const pluginItems = plugins
     .filter((plugin) => plugin.status === "Installed")
     .map((plugin) => {
@@ -15063,9 +16236,10 @@ function buildComposerMentionSections(
     .filter((item): item is ComposerMentionEntry => Boolean(item))
     .slice(0, 8);
   return [
+    { label: "Built in", items: builtInItems },
     { label: "Plugins", items: pluginItems },
     { label: "Skills", items: skillItems }
-  ];
+  ].filter((section) => section.items.length);
 }
 
 function composerMentionEntries(sections: ComposerMentionSection[]) {
@@ -15395,6 +16569,7 @@ function Composer({
   voiceStatus,
   voiceStatusText,
   voiceError,
+  connectorSyncActivity,
   dictationEngine,
   dictationProvider,
   dictationReady,
@@ -15447,6 +16622,7 @@ function Composer({
   voiceStatus: VoiceInputStatus;
   voiceStatusText?: string;
   voiceError?: string;
+  connectorSyncActivity?: ConnectorSyncProgress | null;
   dictationEngine: string;
   dictationProvider: string;
   dictationReady: boolean;
@@ -15607,9 +16783,8 @@ function Composer({
   const hasText = value.trim().length > 0;
   const hasAttachments = attachments.length > 0;
   const hasContent = hasText || hasAttachments;
-  // Codex gets all plugins. Copilot/Claude can use Computer Use only, routed
-  // through the codex mcp-server proxy (see docs/computer-use-troubleshooting.md),
-  // so we expose just the computer-use plugin for those backends.
+  // Codex gets all plugin/skill mentions. Copilot/Claude expose Computer Use
+  // only as an explicit mention, routed through the codex mcp-server proxy.
   const mentionPlugins = useMemo(() => {
     if (activeProviderKey === "codex") return plugins;
     if (activeProviderKey === "copilot" || activeProviderKey === "claudeCode") {
@@ -15778,12 +16953,24 @@ function Composer({
               />
             </motion.div>
           )}
+          {connectorSyncActivity && (
+            <motion.div
+              className="connector-sync-activity-panel-motion"
+              initial={{ opacity: 0, y: 6 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: 4 }}
+              transition={{ duration: 0.16, ease: [0.22, 1, 0.36, 1] }}
+            >
+              <ConnectorSyncActivityPanel activity={connectorSyncActivity} />
+            </motion.div>
+          )}
         </AnimatePresence>
         <RealtimeTranscript
           placement="composer"
           active={liveVoiceStatus !== "idle" && liveVoiceStatus !== "error"}
           status={liveVoiceStatus}
           providerLabel="Assistant"
+          allowTextInput={liveVoiceMode !== "localVoiceAgent"}
         />
       <input
         ref={imageInputRef}
@@ -16293,6 +17480,7 @@ function ThreadsView({
   composerAttachments,
   composerAttachmentError,
   isSending,
+  connectorSyncActivity,
   voiceStatus,
   voiceStatusText,
   voiceError,
@@ -16367,6 +17555,7 @@ function ThreadsView({
   composerAttachments: ComposerImageAttachment[];
   composerAttachmentError?: string | null;
   isSending: boolean;
+  connectorSyncActivity?: ConnectorSyncProgress | null;
   voiceStatus: VoiceInputStatus;
   voiceStatusText?: string;
   voiceError?: string;
@@ -16533,17 +17722,22 @@ function ThreadsView({
     const snapshot = olderMessageLoadSnapshotRef.current;
     if (!snapshot) return;
     if (isLoadingOlderMessages && messages.length === snapshot.messageCount) return;
+    olderMessageLoadSnapshotRef.current = null;
     const element = chatScrollRef.current;
-    if (!element) {
-      olderMessageLoadSnapshotRef.current = null;
-      return;
+    if (!element) return;
+    // Compensate for the prepended page BEFORE paint and RELATIVE to where
+    // the user is now — they may have kept scrolling while the page loaded.
+    // The old restore ran a frame after paint and snapped back to the stale
+    // snapshot position, which read as a jump into the middle of the chat.
+    const delta = Math.max(0, element.scrollHeight - snapshot.scrollHeight);
+    if (delta > 0) {
+      // scrollTo with "instant" bypasses the container's CSS
+      // scroll-behavior: smooth — a plain scrollTop assignment would ANIMATE
+      // the compensation, visibly gliding the view through the chat.
+      element.scrollTo({ top: element.scrollTop + delta, behavior: "instant" });
+      lastChatScrollTopRef.current = element.scrollTop;
     }
-    window.requestAnimationFrame(() => {
-      const delta = Math.max(0, element.scrollHeight - snapshot.scrollHeight);
-      element.scrollTop = snapshot.scrollTop + delta;
-      olderMessageLoadSnapshotRef.current = null;
-      updateScrollToLatestButton();
-    });
+    window.requestAnimationFrame(updateScrollToLatestButton);
   }, [isLoadingOlderMessages, messages.length]);
 
   useEffect(() => {
@@ -16559,22 +17753,29 @@ function ThreadsView({
     scrollToLatest("auto");
   }, [isSending, messages]);
 
+  // All scroll work (layout reads included) is coalesced into one frame per
+  // scroll burst. Reading scrollHeight/scrollTop on every scroll event forced
+  // synchronous layout dozens of times a second and made scrolling feel heavy.
   const handleChatScroll = () => {
-    const element = chatScrollRef.current;
-    if (!element) return;
-    const previousScrollTop = lastChatScrollTopRef.current;
-    const nextScrollTop = element.scrollTop;
-    lastChatScrollTopRef.current = nextScrollTop;
-    const isScrollingTowardOlderMessages = nextScrollTop < previousScrollTop;
-    const distanceFromBottom = readDistanceFromBottom();
-    scheduleScrollToLatestButton(distanceFromBottom);
-    if (programmaticChatScrollRef.current) return;
-    const hasScrollableHistory = element.scrollHeight > element.clientHeight + 320;
-    const isReadingOlderHistory = distanceFromBottom > 320;
-    if (isScrollingTowardOlderMessages && hasScrollableHistory && isReadingOlderHistory && nextScrollTop <= 160) {
-      requestOlderMessages();
-    }
-    if (stickToLatestRef.current && distanceFromBottom > 160) stickToLatestRef.current = false;
+    if (scrollStateFrameRef.current !== null) return;
+    scrollStateFrameRef.current = window.requestAnimationFrame(() => {
+      scrollStateFrameRef.current = null;
+      const element = chatScrollRef.current;
+      if (!element) return;
+      const previousScrollTop = lastChatScrollTopRef.current;
+      const nextScrollTop = element.scrollTop;
+      lastChatScrollTopRef.current = nextScrollTop;
+      const isScrollingTowardOlderMessages = nextScrollTop < previousScrollTop;
+      const distanceFromBottom = element.scrollHeight - nextScrollTop - element.clientHeight;
+      commitScrollToLatestButton(distanceFromBottom);
+      if (programmaticChatScrollRef.current) return;
+      const hasScrollableHistory = element.scrollHeight > element.clientHeight + 320;
+      const isReadingOlderHistory = distanceFromBottom > 320;
+      if (isScrollingTowardOlderMessages && hasScrollableHistory && isReadingOlderHistory && nextScrollTop <= 160) {
+        requestOlderMessages();
+      }
+      if (stickToLatestRef.current && distanceFromBottom > 160) stickToLatestRef.current = false;
+    });
   };
 
   const jumpToLatest = () => {
@@ -16718,6 +17919,7 @@ function ThreadsView({
               active={liveVoiceSessionActive}
               status={liveVoiceStatus}
               providerLabel="Assistant"
+              allowTextInput={liveVoiceMode !== "localVoiceAgent"}
             />
             <div className="realtime-voice-composer-lock liquid-glass-surface">
               <LiquidGlassLayer tone="composer" cornerRadius={24} active={liveVoiceSessionActive} />
@@ -16771,6 +17973,7 @@ function ThreadsView({
         liveVoiceProvider={liveVoiceProvider}
         attachments={composerAttachments}
         attachmentError={composerAttachmentError}
+        connectorSyncActivity={connectorSyncActivity}
         plugins={plugins}
         skills={skills}
         onChange={onComposerDraft ?? onComposerText}
@@ -17022,39 +18225,43 @@ function NotesEmptyState({
   selectedProject,
   projectNoteCount,
   threadNoteCount,
-  onCreateNote
+  listSelected,
+  onCreateNote,
+  onCreateFolder
 }: {
   notesScope: NotesScope;
   selectedProject?: ProjectItem;
   projectNoteCount: number;
   threadNoteCount: number;
+  listSelected: boolean;
   onCreateNote: () => void;
+  onCreateFolder: () => void;
 }) {
   const isProjectScope = notesScope === "project";
   const noteCount = isProjectScope ? projectNoteCount : threadNoteCount;
   const hasProject = Boolean(selectedProject);
-  const canCreate = hasProject && isProjectScope;
+  const canCreate = listSelected && hasProject && isProjectScope;
 
   let eyebrow = "Notes";
-  let title = "Choose a project";
-  let copy = "Select a project in the sidebar to browse its notes and thread side notes.";
+  let title = "Choose a List";
+  let copy = "Select a List in the sidebar to browse its notes and thread side notes.";
   const hints = [
-    "Project notes live with the project.",
+    "Notes live with a List.",
     "Thread notes stay attached to individual chats."
   ];
 
   if (hasProject) {
-    eyebrow = selectedProject?.title ?? "Project";
+    eyebrow = selectedProject?.title ?? "List";
     if (noteCount === 0) {
-      title = isProjectScope ? "No project notes yet" : "No thread notes yet";
+      title = isProjectScope ? "No notes yet" : "No thread notes yet";
       copy = isProjectScope
-        ? "Create the first note for this project. It will show up in the note list on the left."
-        : "Thread notes appear here when you add side notes to chats in this project.";
+        ? "Create the first note for this List. It will show up in the note list on the left."
+        : "Thread notes appear here when you add side notes to chats in this List.";
     } else {
-      title = isProjectScope ? "Select a project note" : "Select a thread note";
+      title = isProjectScope ? "Select a note" : "Select a thread note";
       copy = isProjectScope
-        ? `This project has ${noteCount} ${noteCount === 1 ? "note" : "notes"}. Pick one from the list on the left to start reading or editing.`
-        : `This project has ${noteCount} thread ${noteCount === 1 ? "note" : "notes"}. Pick one from the list on the left to open it here.`;
+        ? `This List has ${noteCount} ${noteCount === 1 ? "note" : "notes"}. Pick one from the list on the left to start reading or editing.`
+        : `This List has ${noteCount} thread ${noteCount === 1 ? "note" : "notes"}. Pick one from the list on the left to open it here.`;
     }
   }
 
@@ -17071,7 +18278,11 @@ function NotesEmptyState({
           <div className="notes-empty-actions">
             <button type="button" className="gold-action" onClick={onCreateNote}>
               <FilePlus2 size={15} />
-              New project note
+              New note
+            </button>
+            <button type="button" className="planner-empty-secondary" onClick={onCreateFolder}>
+              <FolderPlus size={15} />
+              New folder
             </button>
           </div>
         ) : null}
@@ -17188,11 +18399,18 @@ function NotesView({
   noteLinks,
   noteSaveStatus,
   liveVoiceStatus,
+  liveVoiceStatusText,
+  liveVoiceMuted,
+  liveVoiceMode,
+  liveVoiceProvider,
+  onLiveVoice,
+  onToggleLiveVoiceMuted,
   onSelectProject,
   onSelectScope,
   onSelectNote,
   onSelectThreadNoteItem,
   onCreateNote,
+  onCreateNoteFolder,
   onNoteDraft,
   onSaveNote,
   onApplyNoteCleanup,
@@ -17226,11 +18444,18 @@ function NotesView({
   noteLinks?: NoteLinksSnapshot | null;
   noteSaveStatus: NoteSaveStatus;
   liveVoiceStatus: LiveVoiceStatus;
+  liveVoiceStatusText?: string;
+  liveVoiceMuted: boolean;
+  liveVoiceMode: string;
+  liveVoiceProvider: string;
+  onLiveVoice: () => void;
+  onToggleLiveVoiceMuted: () => void;
   onSelectProject: (projectID: string) => void;
   onSelectScope: (scope: NotesScope) => void;
   onSelectNote: (note: NoteItem) => void;
   onSelectThreadNoteItem: (note: ThreadNoteListItem) => void;
   onCreateNote: () => void;
+  onCreateNoteFolder: (parentFolderID?: string | null) => void;
   onNoteDraft: (value: string) => void;
   onSaveNote: () => void;
   onApplyNoteCleanup: (markdown: string, options?: NoteCleanupApplyOptions) => Promise<void>;
@@ -17250,6 +18475,7 @@ function NotesView({
   const [noteHistoryLoading, setNoteHistoryLoading] = useState(false);
   const [noteHistoryMessage, setNoteHistoryMessage] = useState<string | null>(null);
   const [previewHistoryID, setPreviewHistoryID] = useState<string | null>(null);
+  const [noteHistoryView, setNoteHistoryView] = useState<"rich" | "changes">("rich");
   const [restoringHistoryID, setRestoringHistoryID] = useState<string | null>(null);
   const [noteToolbarMoreOpen, setNoteToolbarMoreOpen] = useState(false);
   const noteTextareaRef = useRef<HTMLTextAreaElement | null>(null);
@@ -17260,6 +18486,9 @@ function NotesView({
   const selectedProject =
     visibleProjects.find((project) => sameID(project.id, selectedProjectID))
     ?? visibleProjects[0];
+  const selectedLeafList = selectedProjectID
+    ? visibleProjects.find((project) => sameID(project.id, selectedProjectID))
+    : undefined;
   const projectNotes = useMemo(
     () => notes.filter((note) => selectedProject && sameID(note.projectID, selectedProject.id)),
     [notes, selectedProject]
@@ -17274,6 +18503,15 @@ function NotesView({
   );
   const activeNoteLinkTarget = useMemo(() => selectedNoteTargetToLinkTarget(activeNoteTarget), [activeNoteTarget]);
   const realtimeFocus = useRealtimeVisualFocus();
+  const liveVoiceSessionActive = liveVoiceStatus !== "idle" && liveVoiceStatus !== "error";
+  const liveVoiceConnected = liveVoiceSessionActive && liveVoiceStatus !== "connecting";
+  const liveVoiceActionTitle = liveVoiceStatus === "error"
+    ? liveVoiceStatusText || "Live Voice needs attention"
+    : liveVoiceStatus === "connecting"
+      ? "Connecting Live Voice"
+      : liveVoiceSessionActive
+        ? "Stop Live Voice"
+        : "Start Live Voice";
   const editorRealtimeFocused = Boolean(
     realtimeFocus?.noteTargetKey && activeNoteTarget && realtimeFocus.noteTargetKey === noteTargetKey(activeNoteTarget)
   );
@@ -17289,14 +18527,14 @@ function NotesView({
     : undefined;
   const documentSourceLabel = activeNoteTarget?.scope === "thread"
     ? activeThreadNote?.threadTitle ?? "Thread note"
-    : activeProjectNote?.projectName ?? selectedProject?.title ?? "Project note";
+    : activeProjectNote?.projectName ?? selectedProject?.title ?? "Note";
   const noteLinkOptions = useMemo<NoteLinkOption[]>(() => [
     ...notes.map((note) => ({
       ownerKind: "project" as const,
       ownerId: note.projectID,
       noteId: note.id,
       title: note.title,
-      sourceLabel: note.projectName ?? "Project note"
+      sourceLabel: note.projectName ?? "Note"
     })),
     ...threadNotes.map((note) => ({
       ownerKind: "thread" as const,
@@ -17313,6 +18551,7 @@ function NotesView({
       sourceLabel: "Planner"
     }))
   ], [notes, plannerDays, threadNotes]);
+  const canCreateProjectNote = notesScope === "project" && Boolean(selectedLeafList);
   useEffect(() => {
     setSelectedFolderID(null);
   }, [selectedProject?.id, notesScope]);
@@ -17331,29 +18570,38 @@ function NotesView({
       );
       const nextItems = items ?? [];
       setNoteHistoryItems(nextItems);
-      setPreviewHistoryID((current) =>
-        current && nextItems.some((item) => item.id === current)
-          ? current
-          : nextItems[0]?.id ?? null
-      );
+      // Prefer a saved version that actually differs from the current note so
+      // the Changes view has something to show by default (and especially after
+      // a restore, where the restored version now equals the live note).
+      const currentKey = normalizeNoteHistoryKey(noteDraft ?? "");
+      setPreviewHistoryID((current) => {
+        const stillPresent = current && nextItems.some((item) => item.id === current);
+        if (stillPresent) return current;
+        const firstDifferent = nextItems.find((item) => normalizeNoteHistoryKey(item.markdown ?? "") !== currentKey);
+        return (firstDifferent ?? nextItems[0])?.id ?? null;
+      });
     } catch (error) {
       setNoteHistoryMessage(error instanceof Error ? error.message : "Could not load note history.");
       setNoteHistoryItems([]);
     } finally {
       setNoteHistoryLoading(false);
     }
-  }, [activeProjectHistoryTarget?.noteID, activeProjectHistoryTarget?.projectID]);
+  }, [activeProjectHistoryTarget?.noteID, activeProjectHistoryTarget?.projectID, noteDraft]);
   useEffect(() => {
     setNoteHistoryOpen(false);
     setNoteHistoryItems([]);
     setNoteHistoryMessage(null);
     setPreviewHistoryID(null);
+    setNoteHistoryView("rich");
     setRestoringHistoryID(null);
   }, [activeProjectHistoryTarget?.noteID, activeProjectHistoryTarget?.projectID]);
   const toggleNoteHistory = () => {
     const nextOpen = !noteHistoryOpen;
     setNoteHistoryOpen(nextOpen);
-    if (nextOpen) void loadActiveNoteHistory();
+    if (nextOpen) {
+      setNoteHistoryView("rich");
+      void loadActiveNoteHistory();
+    }
   };
   const restoreNoteHistoryItem = async (item: NoteHistoryItem) => {
     if (!activeProjectHistoryTarget) return;
@@ -17377,6 +18625,15 @@ function NotesView({
   const previewHistoryItem = previewHistoryID
     ? noteHistoryItems.find((item) => item.id === previewHistoryID) ?? null
     : null;
+  const currentNoteKey = useMemo(() => normalizeNoteHistoryKey(noteDraft ?? ""), [noteDraft]);
+  const previewIsCurrent = previewHistoryItem
+    ? normalizeNoteHistoryKey(previewHistoryItem.markdown ?? "") === currentNoteKey
+    : false;
+  const previewDiffRows = useMemo<NoteHistoryDiffRow[]>(() => {
+    if (!previewHistoryItem) return [];
+    return buildNoteDiffRows(noteDraft ?? "", previewHistoryItem.markdown ?? "");
+  }, [previewHistoryItem, noteDraft]);
+  const previewDiffChanged = previewDiffRows.some((row) => row.kind === "add" || row.kind === "del");
   const filteredProjectNotes = useMemo(() => {
     const query = noteSearch.trim().toLowerCase();
     return projectNotes
@@ -17402,9 +18659,9 @@ function NotesView({
   }, [noteSearch, projectThreadNotes]);
   const saveStatusLabel =
     pendingMarkdownImport
-      ? noteSaveStatus.kind === "saving" ? "Saving to project..."
-        : noteSaveStatus.kind === "error" ? noteSaveStatus.message ?? "Could not save to project"
-          : "Not saved to project"
+        ? noteSaveStatus.kind === "saving" ? "Saving to List..."
+        : noteSaveStatus.kind === "error" ? noteSaveStatus.message ?? "Could not save to List"
+          : "Not saved to List"
       : noteSaveStatus.kind === "saving" ? "Saving..."
       : noteSaveStatus.kind === "dirty" ? "Unsaved"
         : noteSaveStatus.kind === "error" ? noteSaveStatus.message ?? "Not saved"
@@ -17439,6 +18696,40 @@ function NotesView({
             </IconButton>
           </div>
         )}
+        actionsAccessory={(
+          <>
+            {canCreateProjectNote && (
+              <>
+                <button type="button" className="soft-button" onClick={onCreateNote}>
+                  <FilePlus2 size={14} />
+                  New note
+                </button>
+                <button type="button" className="soft-button" onClick={() => onCreateNoteFolder(null)}>
+                  <FolderPlus size={14} />
+                  New folder
+                </button>
+              </>
+            )}
+            <RealtimeMicMuteButton status={liveVoiceStatus} muted={liveVoiceMuted} onToggle={onToggleLiveVoiceMuted} />
+            <button
+              type="button"
+              className={cx(
+                "planner-live-voice-button",
+                liveVoiceSessionActive && "active",
+                liveVoiceConnected && "is-voice-metered",
+                liveVoiceSessionActive && `state-${liveVoiceStatus}`,
+                liveVoiceStatus === "error" && "state-error"
+              )}
+              onClick={onLiveVoice}
+              title={liveVoiceProviderLabel(liveVoiceMode, liveVoiceProvider)}
+              aria-label={liveVoiceActionTitle}
+              aria-pressed={liveVoiceSessionActive}
+            >
+              <RealtimeVoiceMark size={15} active={liveVoiceConnected} />
+              <span>{liveVoiceStatus === "connecting" ? "Connecting" : "Live"}</span>
+            </button>
+          </>
+        )}
         showAssistantActions={false}
         compact={compact}
         onToggleCompact={onToggleCompact}
@@ -17459,14 +18750,14 @@ function NotesView({
                 textareaRef={noteTextareaRef}
                 value={noteDraft}
                 onChange={onNoteDraft}
-                placeholder={notesScope === "project" ? "Write your project note..." : "Write your thread note..."}
+                placeholder={notesScope === "project" ? "Write your note..." : "Write your thread note..."}
                 initialMode="inline"
                 sourcePath={noteDetail.path}
                 saveStatusLabel={saveStatusLabel}
                 saveStatusKind={pendingMarkdownImport ? "dirty" : noteSaveStatus.kind}
                 onSave={onSaveNote}
                 showSaveButton={!pendingMarkdownImport && (noteSaveStatus.kind === "dirty" || noteSaveStatus.kind === "error")}
-                saveToProjectLabel={pendingMarkdownImport ? (noteSaveStatus.kind === "saving" ? "Saving..." : "Save to project") : undefined}
+                saveToProjectLabel={pendingMarkdownImport ? (noteSaveStatus.kind === "saving" ? "Saving..." : "Save to List") : undefined}
                 onSaveToProject={pendingMarkdownImport ? onSaveMarkdownImport : undefined}
                 saveToProjectDisabled={noteSaveStatus.kind === "saving"}
                 noteLinkOptions={noteLinkOptions}
@@ -17500,10 +18791,34 @@ function NotesView({
                   {noteHistoryOpen ? (
                     <aside className="note-history-panel" aria-label="Note history">
                       <div className="note-history-panel-head">
-                        <strong>Saved versions</strong>
-                        <button type="button" onClick={() => void loadActiveNoteHistory()} disabled={noteHistoryLoading}>
-                          {noteHistoryLoading ? "Loading..." : "Refresh"}
-                        </button>
+                        <div className="note-history-panel-title">
+                          <HistoryIcon size={15} />
+                          <strong>Version history</strong>
+                          {noteHistoryItems.length > 0 ? (
+                            <span className="note-history-count">{noteHistoryItems.length}</span>
+                          ) : null}
+                        </div>
+                        <div className="note-history-panel-head-actions">
+                          <button
+                            type="button"
+                            className="note-history-icon-button"
+                            onClick={() => void loadActiveNoteHistory()}
+                            disabled={noteHistoryLoading}
+                            aria-label="Refresh history"
+                            title="Refresh"
+                          >
+                            <RefreshCw size={13} className={noteHistoryLoading ? "note-history-refresh-spin" : undefined} />
+                          </button>
+                          <button
+                            type="button"
+                            className="note-history-icon-button"
+                            onClick={() => setNoteHistoryOpen(false)}
+                            aria-label="Close history"
+                            title="Close"
+                          >
+                            <X size={14} />
+                          </button>
+                        </div>
                       </div>
                       {noteHistoryMessage ? <p className="note-history-message">{noteHistoryMessage}</p> : null}
                       <div className="note-history-panel-body">
@@ -17511,47 +18826,26 @@ function NotesView({
                           <p className="note-history-empty">Loading history...</p>
                         ) : noteHistoryItems.length ? (
                           <div className="note-history-list">
-                            {noteHistoryItems.map((item) => (
-                              <article
-                                className={cx("note-history-card", previewHistoryID === item.id && "active")}
+                            {noteHistoryItems.map((item) => {
+                              const itemIsCurrent = normalizeNoteHistoryKey(item.markdown ?? "") === currentNoteKey;
+                              return (
+                              <button
+                                type="button"
+                                className={cx("note-history-card", previewHistoryID === item.id && "active", itemIsCurrent && "is-current")}
                                 key={item.id}
-                                role="button"
-                                tabIndex={0}
                                 onClick={() => setPreviewHistoryID(item.id)}
-                                onKeyDown={(event) => {
-                                  if (event.key === "Enter" || event.key === " ") {
-                                    event.preventDefault();
-                                    setPreviewHistoryID(item.id);
-                                  }
-                                }}
                               >
-                                <div>
-                                  <strong>{item.savedAtLabel}</strong>
-                                  <p>{item.preview || "No preview available."}</p>
-                                </div>
-                                <div className="note-history-card-actions">
-                                  <button
-                                    type="button"
-                                    onClick={(event) => {
-                                      event.stopPropagation();
-                                      setPreviewHistoryID(item.id);
-                                    }}
-                                  >
-                                    Preview
-                                  </button>
-                                  <button
-                                    type="button"
-                                    disabled={Boolean(restoringHistoryID)}
-                                    onClick={(event) => {
-                                      event.stopPropagation();
-                                      void restoreNoteHistoryItem(item);
-                                    }}
-                                  >
-                                    {restoringHistoryID === item.id ? "Restoring..." : "Restore"}
-                                  </button>
-                                </div>
-                              </article>
-                            ))}
+                                <span className="note-history-card-marker" aria-hidden="true" />
+                                <span className="note-history-card-body">
+                                  <span className="note-history-card-top">
+                                    <strong>{item.savedAtLabel}</strong>
+                                    {itemIsCurrent ? <span className="note-history-current-badge">Current</span> : null}
+                                  </span>
+                                  <span className="note-history-card-snippet">{item.preview || "No preview available."}</span>
+                                </span>
+                              </button>
+                              );
+                            })}
                           </div>
                         ) : (
                           <p className="note-history-empty">No saved versions yet.</p>
@@ -17559,11 +18853,93 @@ function NotesView({
                         <section className="note-history-preview" aria-label="Saved version preview">
                           <div className="note-history-preview-head">
                             <div>
-                              <strong>Preview</strong>
-                              <span>{previewHistoryItem?.savedAtLabel ?? "Select a saved version"}</span>
+                              <strong>{previewHistoryItem?.savedAtLabel ?? "Select a saved version"}</strong>
+                              <span>
+                                {previewHistoryItem
+                                  ? previewIsCurrent
+                                    ? "Current note — no changes"
+                                    : previewDiffChanged
+                                      ? `${previewDiffRows.filter((row) => row.kind === "add").length} added · ${previewDiffRows.filter((row) => row.kind === "del").length} removed vs current`
+                                      : "No changes from the current note"
+                                  : "Preview of the selected saved version"}
+                              </span>
                             </div>
+                            {previewHistoryItem ? (
+                              <>
+                                <div className="note-history-view-toggle" role="tablist" aria-label="Saved version view">
+                                  <button
+                                    type="button"
+                                    role="tab"
+                                    aria-selected={noteHistoryView === "rich"}
+                                    className={cx(noteHistoryView === "rich" && "active")}
+                                    onClick={() => setNoteHistoryView("rich")}
+                                  >
+                                    Preview
+                                  </button>
+                                  <button
+                                    type="button"
+                                    role="tab"
+                                    aria-selected={noteHistoryView === "changes"}
+                                    className={cx(noteHistoryView === "changes" && "active")}
+                                    onClick={() => setNoteHistoryView("changes")}
+                                  >
+                                    Changes
+                                  </button>
+                                </div>
+                                <button
+                                  type="button"
+                                  className="note-history-preview-restore"
+                                  disabled={Boolean(restoringHistoryID)}
+                                  onClick={() => { if (previewHistoryItem) void restoreNoteHistoryItem(previewHistoryItem); }}
+                                >
+                                  {restoringHistoryID === previewHistoryItem.id ? "Restoring..." : "Restore"}
+                                </button>
+                              </>
+                            ) : null}
                           </div>
-                          <pre>{previewHistoryItem ? previewHistoryItem.markdown || "This saved version is empty." : "Select a saved version to preview it here."}</pre>
+                          <div className="note-history-preview-body">
+                            {previewHistoryItem ? (
+                              noteHistoryView === "rich" ? (
+                                <div className="markdown-preview-surface markdown-preview-rich note-history-markdown">
+                                  {previewHistoryItem.markdown.trim() ? (
+                                    <ReactMarkdown remarkPlugins={markdownRemarkPlugins}>
+                                      {previewHistoryItem.markdown}
+                                    </ReactMarkdown>
+                                  ) : (
+                                    <p className="empty-inline">This saved version is empty.</p>
+                                  )}
+                                </div>
+                              ) : previewDiffChanged ? (
+                                <div className="note-history-diff" aria-label="Changes versus current note">
+                                  {previewDiffRows.map((row, index) => {
+                                    if (row.kind === "skip") {
+                                      return (
+                                        <div className="note-history-diff-hunk-divider" key={`skip-${index}`}>
+                                          <span>··· {row.count} unchanged line{row.count === 1 ? "" : "s"} hidden ···</span>
+                                        </div>
+                                      );
+                                    }
+                                    return (
+                                      <div className={`note-history-diff-row ${row.kind}`} key={`row-${index}`}>
+                                        <span className="note-history-diff-gutter" aria-hidden="true">
+                                          {row.kind === "add" ? "+" : row.kind === "del" ? "−" : " "}
+                                        </span>
+                                        <span className="note-history-diff-text">{row.text || " "}</span>
+                                      </div>
+                                    );
+                                  })}
+                                </div>
+                              ) : previewIsCurrent ? (
+                                <div className="note-history-diff" aria-label="Saved version content">
+                                  <p className="note-history-diff-empty">This is the current note — no changes to restore.</p>
+                                </div>
+                              ) : (
+                                <p className="note-history-diff-empty">No changes from the current note.</p>
+                              )
+                            ) : (
+                              <p className="note-history-diff-empty">Select a saved version to preview it here.</p>
+                            )}
+                          </div>
                         </section>
                       </div>
                     </aside>
@@ -17577,7 +18953,9 @@ function NotesView({
               selectedProject={selectedProject}
               projectNoteCount={projectNotes.length}
               threadNoteCount={projectThreadNotes.length}
+              listSelected={Boolean(selectedLeafList)}
               onCreateNote={onCreateNote}
+              onCreateFolder={() => onCreateNoteFolder(null)}
             />
           )}
         </section>
@@ -17588,9 +18966,10 @@ function NotesView({
 
 type DailyTagSuggestion = {
   marker: "@" | "#";
-  kind: "project" | "folder";
+  kind: "category" | "project" | "folder";
   id: string;
   label: string;
+  color?: string;
 };
 
 type DailyTagInputRange = {
@@ -17624,27 +19003,67 @@ function dailyTagFilterID(tag: DailyItemScopeTag) {
   return `tag:${dailyScopeTagKey(tag)}`;
 }
 
-function dailyTagSuggestionsFromProjects(projects: ProjectItem[]): DailyTagSuggestion[] {
-  return projects
+function dailyFreeTagKey(value?: string | null) {
+  return cleanDailyTagLabel(value).toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
+function dailyFreeTagFilterID(tag: string) {
+  return `free-tag:${dailyFreeTagKey(tag)}`;
+}
+
+function normalizeDailyFreeTags(value: unknown): string[] {
+  const rawValues = Array.isArray(value)
+    ? value
+    : typeof value === "string"
+      ? value.split(/[,\n]/)
+      : [];
+  const seen = new Set<string>();
+  const tags: string[] = [];
+  for (const raw of rawValues) {
+    const label = cleanDailyTagLabel(raw);
+    if (!label) continue;
+    const key = label.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    tags.push(label);
+  }
+  return tags;
+}
+
+function dailyTagSuggestionsFromProjects(projects: ProjectItem[], categories: PlannerCategory[] = []): DailyTagSuggestion[] {
+  const categorySuggestions = categories
+    .filter((category) => category.hidden !== true && cleanDailyTagLabel(category.name))
+    .map((category) => ({
+      marker: "@" as const,
+      kind: "category" as const,
+      id: category.id,
+      label: cleanDailyTagLabel(category.name),
+      color: category.color
+    }));
+  const listSuggestions = projects
     .filter((project) => project.title.trim())
     .map((project) => {
       const kind = project.kind === "folder" ? "folder" as const : "project" as const;
+      const categoryColor = project.area ? categories.find(c => cleanDailyTagLabel(c.name).toLowerCase() === cleanDailyTagLabel(project.area!).toLowerCase())?.color : undefined;
       return {
-        marker: kind === "folder" ? "#" as const : "@" as const,
+        marker: "#" as const,
         kind,
         id: project.id,
-        label: cleanDailyTagLabel(project.title)
+        label: cleanDailyTagLabel(project.title),
+        color: project.color || categoryColor
       };
     });
+  return [...categorySuggestions, ...listSuggestions]
+    .sort((left, right) => right.label.length - left.label.length || left.label.localeCompare(right.label));
 }
 
 function dailyItemScopeTags(item: DailyItem, projectByID: Map<string, ProjectItem>): DailyItemScopeTag[] {
-  const tags = item.scopeTags?.filter((tag) => tag.label.trim()) ?? [];
+  const tags = item.scopeTags?.filter((tag) => tag.label.trim() && tag.kind !== "category") ?? [];
   if (tags.length) return tags;
   const fallback: DailyItemScopeTag[] = [];
   if (item.projectID) {
     const project = projectByID.get(item.projectID.toLowerCase());
-    fallback.push({ marker: "@", label: project?.title ?? item.projectID, kind: "project", id: item.projectID });
+    fallback.push({ marker: "#", label: project?.title ?? item.projectID, kind: "project", id: item.projectID });
   }
   if (item.folderID) {
     const folder = projectByID.get(item.folderID.toLowerCase());
@@ -17658,22 +19077,203 @@ function dailyItemTitleWithTags(item: DailyItem, projectByID: Map<string, Projec
   return [item.title, tagText].filter(Boolean).join(" ");
 }
 
-function dailyItemFilterOptions(items: DailyItem[], projectByID: Map<string, ProjectItem>) {
-  const options = new Map<string, string>([["all", "All"]]);
+function dailyItemListID(item: Pick<DailyItem, "projectID" | "folderID" | "scopeTags">) {
+  const projectID = cleanDailyTagLabel(item.projectID);
+  if (projectID) return projectID;
+  const folderID = cleanDailyTagLabel(item.folderID);
+  if (folderID) return folderID;
+  const scoped = (item.scopeTags ?? []).find((tag) => tag.id && (tag.kind === "project" || tag.kind === "folder"));
+  return scoped?.id ?? "";
+}
+
+function dailyListScopePatch(listID: string, projects: ProjectItem[]): Pick<DailyItemInput, "projectID" | "folderID" | "scopeTags"> {
+  const project = projects.find((item) => sameID(item.id, listID));
+  if (!project) return { projectID: undefined, folderID: undefined, scopeTags: [] };
+  if (project.kind === "folder") return { folderID: project.id, projectID: undefined, scopeTags: [] };
+  return { projectID: project.id, folderID: undefined, scopeTags: [] };
+}
+
+function dailyItemListLabel(item: DailyItem, projectByID: Map<string, ProjectItem>) {
+  const listID = dailyItemListID(item);
+  if (listID) return projectByID.get(listID.toLowerCase())?.title ?? listID;
+  const firstTag = dailyItemScopeTags(item, projectByID)[0];
+  return firstTag?.label || "No List";
+}
+
+function dailyItemSectionLabel(item: DailyItem) {
+  return cleanDailyTagLabel(item.section) || "General";
+}
+
+function datetimeLocalValueFromISO(value?: string | null) {
+  if (!value) return "";
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return "";
+  const local = new Date(date.getTime() - date.getTimezoneOffset() * 60_000);
+  return local.toISOString().slice(0, 16);
+}
+
+function isoFromDatetimeLocalValue(value: string) {
+  if (!value) return null;
+  const date = new Date(value);
+  return Number.isFinite(date.getTime()) ? date.toISOString() : null;
+}
+
+function reminderTimeLabel(value?: string | null) {
+  if (!value) return "";
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return "";
+  return date.toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+}
+
+function dailyCategoryKey(area?: string) {
+  return cleanDailyTagLabel(area).toLowerCase();
+}
+
+function dailyCategoryFilterID(area: string) {
+  return `area:${dailyCategoryKey(area)}`;
+}
+
+function plannerCategoryColor(categories: PlannerCategory[], area?: string) {
+  const name = cleanDailyTagLabel(area);
+  if (!name) return undefined;
+  return categories.find((category) => category.name.toLowerCase() === name.toLowerCase())?.color;
+}
+
+function clampColorChannel(value: number) {
+  return Math.max(0, Math.min(255, Math.round(value)));
+}
+
+function normalizeHexColor(value?: string | null) {
+  const text = String(value ?? "").trim();
+  const short = text.match(/^#?([a-f\d])([a-f\d])([a-f\d])$/i);
+  if (short) return `#${short[1]}${short[1]}${short[2]}${short[2]}${short[3]}${short[3]}`.toUpperCase();
+  const full = text.match(/^#?([a-f\d]{6})$/i);
+  return full ? `#${full[1]}`.toUpperCase() : undefined;
+}
+
+function hexToRgb(value?: string | null) {
+  const hex = normalizeHexColor(value);
+  if (!hex) return null;
+  const raw = Number.parseInt(hex.slice(1), 16);
+  return {
+    r: (raw >> 16) & 255,
+    g: (raw >> 8) & 255,
+    b: raw & 255
+  };
+}
+
+function rgbToHex(input: { r: number; g: number; b: number }) {
+  const value = (clampColorChannel(input.r) << 16) + (clampColorChannel(input.g) << 8) + clampColorChannel(input.b);
+  return `#${value.toString(16).padStart(6, "0").toUpperCase()}`;
+}
+
+function rgbToHsl(input: { r: number; g: number; b: number }) {
+  const r = input.r / 255;
+  const g = input.g / 255;
+  const b = input.b / 255;
+  const max = Math.max(r, g, b);
+  const min = Math.min(r, g, b);
+  const lightness = (max + min) / 2;
+  if (max === min) return { h: 0, s: 0, l: lightness };
+  const delta = max - min;
+  const saturation = lightness > 0.5 ? delta / (2 - max - min) : delta / (max + min);
+  const hue = max === r
+    ? (g - b) / delta + (g < b ? 6 : 0)
+    : max === g
+      ? (b - r) / delta + 2
+      : (r - g) / delta + 4;
+  return { h: hue / 6, s: saturation, l: lightness };
+}
+
+function hslToRgb(input: { h: number; s: number; l: number }) {
+  const hueToRgb = (p: number, q: number, t: number) => {
+    let next = t;
+    if (next < 0) next += 1;
+    if (next > 1) next -= 1;
+    if (next < 1 / 6) return p + (q - p) * 6 * next;
+    if (next < 1 / 2) return q;
+    if (next < 2 / 3) return p + (q - p) * (2 / 3 - next) * 6;
+    return p;
+  };
+  const h = ((input.h % 1) + 1) % 1;
+  const s = Math.max(0, Math.min(1, input.s));
+  const l = Math.max(0, Math.min(1, input.l));
+  if (s === 0) {
+    const gray = l * 255;
+    return { r: gray, g: gray, b: gray };
+  }
+  const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
+  const p = 2 * l - q;
+  return {
+    r: hueToRgb(p, q, h + 1 / 3) * 255,
+    g: hueToRgb(p, q, h) * 255,
+    b: hueToRgb(p, q, h - 1 / 3) * 255
+  };
+}
+
+function plannerListColorVariants(categoryColor?: string) {
+  const rgb = hexToRgb(categoryColor);
+  if (!rgb) return [];
+  const hsl = rgbToHsl(rgb);
+  const variant = (id: string, label: string, saturationDelta: number, lightnessDelta: number) => ({
+    id,
+    label,
+    color: rgbToHex(hslToRgb({
+      h: hsl.h,
+      s: hsl.s + saturationDelta,
+      l: hsl.l + lightnessDelta
+    }))
+  });
+  return [
+    variant("soft", "Soft", -0.08, 0.14),
+    variant("base", "Base", 0, 0),
+    variant("bright", "Bright", 0.08, 0.08),
+    variant("radiant", "Radiant", 0.16, 0.15),
+    variant("deep", "Deep", 0.10, -0.16)
+  ];
+}
+
+function dailyCategoryChipStyle(color?: string): React.CSSProperties | undefined {
+  if (!color) return undefined;
+  return {
+    ["--category-color" as string]: color,
+    color,
+    background: `color-mix(in srgb, ${color} 14%, transparent)`,
+    boxShadow: `inset 0 0 0 1px color-mix(in srgb, ${color} 24%, transparent)`
+  };
+}
+
+function dailyItemFilterOptions(items: DailyItem[], projectByID: Map<string, ProjectItem>, categories: PlannerCategory[] = []) {
+  const options = new Map<string, { label: string; color?: string }>([["all", { label: "All" }]]);
+  for (const category of categories.filter((item) => item.hidden !== true && item.name.trim())) {
+    options.set(dailyCategoryFilterID(category.name), { label: category.name, color: category.color });
+  }
   let hasUntagged = false;
   for (const item of items) {
+    if (item.area?.trim()) {
+      const area = item.area.trim();
+      options.set(dailyCategoryFilterID(area), {
+        label: area,
+        color: plannerCategoryColor(categories, area)
+      });
+    }
     const tags = dailyItemScopeTags(item, projectByID);
-    if (!tags.length) hasUntagged = true;
-    for (const tag of tags) options.set(dailyTagFilterID(tag), `${tag.marker}${tag.label}`);
+    const freeTags = normalizeDailyFreeTags(item.tags);
+    if (!tags.length && !freeTags.length) hasUntagged = true;
+    for (const tag of tags) options.set(dailyTagFilterID(tag), { label: `${tag.marker}${tag.label}` });
+    for (const tag of freeTags) options.set(dailyFreeTagFilterID(tag), { label: tag });
   }
-  if (hasUntagged) options.set("untagged", "Untagged");
-  return [...options.entries()].map(([id, label]) => ({ id, label }));
+  if (hasUntagged) options.set("untagged", { label: "Untagged" });
+  return [...options.entries()].map(([id, option]) => ({ id, ...option }));
 }
 
 function dailyItemMatchesFilter(item: DailyItem, projectByID: Map<string, ProjectItem>, filter: string) {
   if (filter === "all") return true;
+  if (filter.startsWith("area:")) return dailyCategoryFilterID(item.area ?? "") === filter;
   const tags = dailyItemScopeTags(item, projectByID);
-  if (filter === "untagged") return tags.length === 0;
+  const freeTags = normalizeDailyFreeTags(item.tags);
+  if (filter === "untagged") return tags.length === 0 && freeTags.length === 0;
+  if (filter.startsWith("free-tag:")) return freeTags.some((tag) => dailyFreeTagFilterID(tag) === filter);
   if (!filter.startsWith("tag:")) return true;
   return tags.some((tag) => dailyTagFilterID(tag) === filter);
 }
@@ -17710,10 +19310,143 @@ function replaceActiveDailyTag(value: string, suggestion: DailyTagSuggestion, po
   return value.replace(/(?:^|\s)([@#])([^\s@#]*)$/, (match) => `${match.startsWith(" ") ? " " : ""}${token}`);
 }
 
+function replaceDailyTagToken(value: string, range: DailyTagInputRange, suggestion: DailyTagSuggestion) {
+  const token = `${suggestion.marker}${suggestion.label}`;
+  const before = value.slice(0, range.from);
+  const after = value.slice(range.to);
+  const spacer = after && !after.startsWith(" ") ? " " : "";
+  return `${before}${token}${spacer}${after}`;
+}
+
+function groupBacklogItemsByArea(items: DailyItem[], categories: PlannerCategory[]) {
+  const categoryOrder = new Map(
+    categories.filter((category) => category.hidden !== true).map((category, index) => [category.name.toLowerCase(), category.order ?? index])
+  );
+  const groups = new Map<string, { label: string; color?: string; items: DailyItem[] }>();
+  for (const item of items) {
+    const area = item.area?.trim() || "";
+    const key = area ? dailyCategoryFilterID(area) : "uncategorized";
+    const label = area || "Uncategorized";
+    const color = area ? plannerCategoryColor(categories, area) : undefined;
+    const existing = groups.get(key);
+    if (existing) existing.items.push(item);
+    else groups.set(key, { label, color, items: [item] });
+  }
+  return [...groups.entries()]
+    .map(([key, group]) => ({ key, ...group }))
+    .sort((left, right) => {
+      if (left.key === "uncategorized") return 1;
+      if (right.key === "uncategorized") return -1;
+      const leftOrder = categoryOrder.get(left.label.toLowerCase()) ?? 999;
+      const rightOrder = categoryOrder.get(right.label.toLowerCase()) ?? 999;
+      return leftOrder - rightOrder || left.label.localeCompare(right.label);
+    });
+}
+
+type DailyOrganizationGroup = {
+  key: string;
+  label: string;
+  color?: string;
+  icon?: string;
+  lists: Array<{
+    key: string;
+    label: string;
+    color?: string;
+    icon?: string;
+    projectID?: string;
+    sections: Array<{
+      key: string;
+      label: string;
+      items: DailyItem[];
+    }>;
+  }>;
+};
+
+function groupDailyItemsByOrganization(
+  items: DailyItem[],
+  categories: PlannerCategory[],
+  projectByID: Map<string, ProjectItem>
+): DailyOrganizationGroup[] {
+  const categoryOrder = new Map(
+    categories.filter((category) => category.hidden !== true).map((category, index) => [category.name.toLowerCase(), category.order ?? index])
+  );
+  const categoryByName = new Map(categories.map((category) => [category.name.toLowerCase(), category]));
+  const groups = new Map<string, DailyOrganizationGroup>();
+  for (const item of items) {
+    const categoryLabel = cleanDailyTagLabel(item.area) || "Uncategorized";
+    const categoryKey = categoryLabel === "Uncategorized" ? "uncategorized" : dailyCategoryFilterID(categoryLabel);
+    let category = groups.get(categoryKey);
+    if (!category) {
+      const matched = categoryLabel === "Uncategorized" ? undefined : categoryByName.get(categoryLabel.toLowerCase());
+      category = {
+        key: categoryKey,
+        label: categoryLabel,
+        color: matched?.color ?? plannerCategoryColor(categories, categoryLabel),
+        icon: matched?.icon,
+        lists: []
+      };
+      groups.set(categoryKey, category);
+    }
+
+    const listLabel = dailyItemListLabel(item, projectByID);
+    const listID = dailyItemListID(item);
+    const listKey = listID || `list:${listLabel.toLowerCase()}`;
+    let list = category.lists.find((entry) => entry.key === listKey);
+    if (!list) {
+      const matchedProject = listID ? projectByID.get(listID.toLowerCase()) : undefined;
+      list = {
+        key: listKey,
+        label: listLabel,
+        projectID: matchedProject?.id,
+        color: matchedProject?.color ?? category.color,
+        icon: matchedProject?.icon,
+        sections: []
+      };
+      category.lists.push(list);
+    }
+
+    const sectionLabel = dailyItemSectionLabel(item);
+    const sectionKey = `section:${sectionLabel.toLowerCase()}`;
+    let section = list.sections.find((entry) => entry.key === sectionKey);
+    if (!section) {
+      section = { key: sectionKey, label: sectionLabel, items: [] };
+      list.sections.push(section);
+    }
+    section.items.push(item);
+  }
+
+  return [...groups.values()]
+    .sort((left, right) => {
+      if (left.key === "uncategorized") return 1;
+      if (right.key === "uncategorized") return -1;
+      const leftOrder = categoryOrder.get(left.label.toLowerCase()) ?? 999;
+      const rightOrder = categoryOrder.get(right.label.toLowerCase()) ?? 999;
+      return leftOrder - rightOrder || left.label.localeCompare(right.label);
+    })
+    .map((category) => ({
+      ...category,
+      lists: [...category.lists]
+        .sort((left, right) => {
+          if (left.label === "No List") return 1;
+          if (right.label === "No List") return -1;
+          return left.label.localeCompare(right.label);
+        })
+        .map((list) => ({
+          ...list,
+          sections: [...list.sections].sort((left, right) => {
+            if (left.label === "General") return -1;
+            if (right.label === "General") return 1;
+            return left.label.localeCompare(right.label);
+          })
+        }))
+    }));
+}
+
 function DailyItemsPanel({
   dayID,
   items,
   projects,
+  categories,
   noteLinkOptions,
   filter,
   onFilterChange,
@@ -17723,12 +19456,14 @@ function DailyItemsPanel({
   onLinkItemNote,
   onOpenNoteLink,
   variant = "daily",
+  inline = false,
   onMoveItemToBacklog,
   onScheduleBacklogItem
 }: {
   dayID: string;
   items: DailyItem[];
   projects: ProjectItem[];
+  categories: PlannerCategory[];
   noteLinkOptions: NoteLinkOption[];
   filter: string;
   onFilterChange: (filter: string) => void;
@@ -17738,25 +19473,90 @@ function DailyItemsPanel({
   onLinkItemNote: (dayID: string, itemID: string, target: NoteLinkTarget) => Promise<void>;
   onOpenNoteLink: (target: NoteLinkTarget) => void;
   variant?: "daily" | "backlog";
+  inline?: boolean;
   onMoveItemToBacklog?: (dayID: string, itemID: string) => Promise<void>;
   onScheduleBacklogItem?: (itemID: string, targetDayID: string) => Promise<void>;
 }) {
   const isBacklog = variant === "backlog";
+  const inlinePanel = inline || isBacklog;
   const realtimeFocus = useRealtimeVisualFocus();
   const dailyListRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     scrollFocusTargetIntoView(dailyListRef.current, "data-daily-item-id", realtimeFocus?.itemID);
   }, [realtimeFocus?.id, realtimeFocus?.itemID]);
   const [quickTitle, setQuickTitle] = useState("");
+  const [quickArea, setQuickArea] = useState("");
+  const [quickListID, setQuickListID] = useState("");
+  const [quickSection, setQuickSection] = useState("");
+  const [quickTags, setQuickTags] = useState("");
+  const [quickReminderAt, setQuickReminderAt] = useState("");
+  const [quickOrganizeOpen, setQuickOrganizeOpen] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const [tagMenuOpen, setTagMenuOpen] = useState(false);
   const [expandedID, setExpandedID] = useState<string | null>(null);
   const [editDraft, setEditDraft] = useState<DailyItem | null>(null);
+  const [editTagRange, setEditTagRange] = useState<DailyTagInputRange | null>(null);
+  const [noteLinkPickerItemID, setNoteLinkPickerItemID] = useState<string | null>(null);
+  const [noteLinkSearch, setNoteLinkSearch] = useState("");
+  const [noteLinkShowAll, setNoteLinkShowAll] = useState(false);
   const [showDoneBacklog, setShowDoneBacklog] = useState(false);
   const [backlogQuery, setBacklogQuery] = useState("");
   const [backlogSortOldest, setBacklogSortOldest] = useState(false);
+  const [backlogScopeID, setBacklogScopeID] = useState("");
+  const [backlogCollapseOverrides, setBacklogCollapseOverrides] = useState<Map<string, boolean>>(() => new Map());
+  const isBacklogGroupCollapsed = (key: string) => backlogCollapseOverrides.get(key) ?? false;
+  const toggleBacklogGroup = (key: string) =>
+    setBacklogCollapseOverrides((current) => {
+      const next = new Map(current);
+      next.set(key, !isBacklogGroupCollapsed(key));
+      return next;
+    });
+  const setAllBacklogGroups = (keys: string[], collapsed: boolean) =>
+    setBacklogCollapseOverrides(() => new Map(keys.map((key) => [key, collapsed])));
+  const [todayCollapseOverrides, setTodayCollapseOverrides] = useState<Map<string, boolean>>(() => new Map());
+  const isTodayGroupCollapsed = (key: string) => todayCollapseOverrides.get(key) ?? false;
+  const toggleTodayGroup = (key: string) =>
+    setTodayCollapseOverrides((current) => {
+      const next = new Map(current);
+      next.set(key, !isTodayGroupCollapsed(key));
+      return next;
+    });
+  const setAllTodayGroups = (keys: string[], collapsed: boolean) =>
+    setTodayCollapseOverrides(() => new Map(keys.map((key) => [key, collapsed])));
   const projectByID = useMemo(() => new Map(projects.map((project) => [project.id.toLowerCase(), project])), [projects]);
-  const tagSuggestions = useMemo(() => dailyTagSuggestionsFromProjects(projects), [projects]);
+  const tagSuggestions = useMemo(() => dailyTagSuggestionsFromProjects(projects, categories), [categories, projects]);
+  const backlogScopeProject = useMemo(
+    () => projects.find((project) => sameID(project.id, backlogScopeID)),
+    [backlogScopeID, projects]
+  );
+  const backlogScopeIDs = useMemo(
+    () => isBacklog && backlogScopeID ? plannerProjectScopeIDs(projects, backlogScopeID) : null,
+    [backlogScopeID, isBacklog, projects]
+  );
+  const categoryOptions = useMemo(() => {
+    const names = new Set(categories.filter((category) => category.hidden !== true).map((category) => category.name.trim()).filter(Boolean));
+    for (const item of items) if (item.area?.trim()) names.add(item.area.trim());
+    return [...names].sort((left, right) => left.localeCompare(right));
+  }, [categories, items]);
+  const listOptions = useMemo(
+    () => projects.filter((project) => project.title.trim()).sort((left, right) => left.title.localeCompare(right.title)),
+    [projects]
+  );
+  const sectionOptions = useMemo(() => {
+    const names = new Set<string>();
+    for (const item of items) {
+      const section = cleanDailyTagLabel(item.section);
+      if (section) names.add(section);
+    }
+    return [...names].sort((left, right) => left.localeCompare(right));
+  }, [items]);
+  const tagOptions = useMemo(() => {
+    const names = new Set<string>();
+    for (const item of items) {
+      for (const tag of normalizeDailyFreeTags(item.tags)) names.add(tag);
+    }
+    return [...names].sort((left, right) => left.localeCompare(right));
+  }, [items]);
   const noteLinkOptionByKey = useMemo(
     () => new Map(noteLinkOptions.map((option) => [noteLinkTargetKey(option) ?? "", option])),
     [noteLinkOptions]
@@ -17773,34 +19573,90 @@ function DailyItemsPanel({
       })
       .slice(0, 8);
   }, [activeTag, tagSuggestions]);
-  const filterOptions = useMemo(() => dailyItemFilterOptions(items, projectByID), [items, projectByID]);
+  const visibleEditTagSuggestions = useMemo(() => {
+    if (!editTagRange) return [];
+    return tagSuggestions
+      .filter((suggestion) => suggestion.marker === editTagRange.marker)
+      .filter((suggestion) => {
+        if (!editTagRange.query) return true;
+        const normalized = cleanDailyTagLabel(suggestion.label).toLowerCase();
+        return normalized.startsWith(editTagRange.query) || normalized.includes(editTagRange.query);
+      })
+      .slice(0, 8);
+  }, [editTagRange, tagSuggestions]);
+  const filterOptions = useMemo(() => dailyItemFilterOptions(items, projectByID, categories), [categories, items, projectByID]);
   const filteredItems = useMemo(() => {
     return items.filter((item) => dailyItemMatchesFilter(item, projectByID, filter));
   }, [filter, items, projectByID]);
+  const scopedItems = useMemo(() => {
+    if (!isBacklog || !backlogScopeIDs) return filteredItems;
+    return filteredItems.filter((item) => dailyItemInProjectScope(item, backlogScopeIDs, projectByID));
+  }, [backlogScopeIDs, filteredItems, isBacklog, projectByID]);
   const normalizedBacklogQuery = backlogQuery.trim().toLowerCase();
   const matchesBacklogQuery = (item: DailyItem) => {
     if (!normalizedBacklogQuery) return true;
-    return `${item.title} ${item.detailsMarkdown}`.toLowerCase().includes(normalizedBacklogQuery);
+    return [
+      item.title,
+      item.detailsMarkdown,
+      item.area,
+      dailyItemListLabel(item, projectByID),
+      item.section,
+      normalizeDailyFreeTags(item.tags).join(" ")
+    ].filter(Boolean).join(" ").toLowerCase().includes(normalizedBacklogQuery);
   };
   const sortBacklog = (list: DailyItem[]) => {
     if (!backlogSortOldest) return list;
     return [...list].sort((a, b) => (a.createdAt ?? "").localeCompare(b.createdAt ?? ""));
   };
-  const backlogVisibleItems = isBacklog ? filteredItems.filter(matchesBacklogQuery) : filteredItems;
-  const openItems = isBacklog ? sortBacklog(backlogVisibleItems.filter((item) => !item.checked)) : filteredItems;
+  const backlogVisibleItems = isBacklog ? scopedItems.filter(matchesBacklogQuery) : scopedItems;
+  const openItems = isBacklog ? sortBacklog(backlogVisibleItems.filter((item) => !item.checked)) : scopedItems;
   const doneItems = isBacklog ? sortBacklog(backlogVisibleItems.filter((item) => item.checked)) : [];
   const backlogQueryActive = isBacklog && normalizedBacklogQuery.length > 0;
   const submitQuickItem = async () => {
     const title = quickTitle.trim();
     if (!title) return;
-    await onUpsertItem({
+    const scopeTags = dailyScopeTagsFromText(title, tagSuggestions);
+    const categoryTag = scopeTags.find((tag) => tag.kind === "category");
+    const listScopeTags = scopeTags.filter((tag) => tag.kind === "project" || tag.kind === "folder");
+    const listTag = listScopeTags.find((tag) => tag.id);
+    const scopedProjectArea = backlogScopeProject ? inheritedProjectArea(projects, backlogScopeProject.id) : undefined;
+    const nextItem: DailyItemInput = {
       dayID: isBacklog ? "backlog" : dayID,
       title,
+      area: categoryTag?.label || quickArea || undefined,
+      section: quickSection.trim() || undefined,
+      tags: normalizeDailyFreeTags(quickTags),
+      reminderAt: isoFromDatetimeLocalValue(quickReminderAt),
+      reminderTimezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
       checked: false,
       status: "todo"
-    });
+    };
+    if (listTag?.kind === "folder") {
+      nextItem.folderID = listTag.id;
+      nextItem.projectID = undefined;
+      nextItem.scopeTags = listScopeTags;
+      if (!nextItem.area) nextItem.area = inheritedProjectArea(projects, listTag.id);
+    } else if (listTag?.kind === "project") {
+      nextItem.projectID = listTag.id;
+      nextItem.folderID = undefined;
+      nextItem.scopeTags = listScopeTags;
+      if (!nextItem.area) nextItem.area = inheritedProjectArea(projects, listTag.id);
+    } else if (quickListID) {
+      Object.assign(nextItem, dailyListScopePatch(quickListID, projects));
+      if (!nextItem.area) nextItem.area = inheritedProjectArea(projects, quickListID);
+    } else if (isBacklog && backlogScopeProject && listScopeTags.length === 0) {
+      if (backlogScopeProject.kind === "folder") nextItem.folderID = backlogScopeProject.id;
+      else nextItem.projectID = backlogScopeProject.id;
+      if (!nextItem.area && scopedProjectArea) nextItem.area = scopedProjectArea;
+    }
+    await onUpsertItem(nextItem);
     setQuickTitle("");
+    setQuickArea("");
+    setQuickSection("");
+    setQuickTags("");
+    setQuickReminderAt("");
     setTagMenuOpen(false);
+    if (isBacklog) setQuickOrganizeOpen(false);
     setMenuOpen(true);
   };
   const insertTagSuggestion = (suggestion: DailyTagSuggestion) => {
@@ -17810,9 +19666,13 @@ function DailyItemsPanel({
   };
   const beginEditing = (item: DailyItem) => {
     setExpandedID((current) => current === item.id ? null : item.id);
+    setEditTagRange(null);
+    setNoteLinkPickerItemID(null);
+    setNoteLinkSearch("");
+    setNoteLinkShowAll(false);
     setEditDraft({
       ...item,
-      title: dailyItemTitleWithTags(item, projectByID),
+      title: item.title,
       steps: item.steps.map((step) => ({ ...step })),
       links: item.links.map((link) => ({ ...link }))
     });
@@ -17820,16 +19680,40 @@ function DailyItemsPanel({
   const updateDraft = (patch: Partial<DailyItem>) => {
     setEditDraft((current) => current ? { ...current, ...patch } : current);
   };
-  const draftInputForSave = (draft: DailyItem, targetDayID = draft.dayID): DailyItemInput => ({
-    ...draft,
-    dayID: isBacklog ? "backlog" : targetDayID,
-    projectID: "",
-    folderID: "",
-    scopeTags: []
-  });
+  const updateDraftTitle = (event: ChangeEvent<HTMLInputElement>) => {
+    const value = event.target.value;
+    updateDraft({ title: value });
+    setEditTagRange(detectDailyTagToken(value, event.target.selectionStart ?? value.length));
+  };
+  const insertEditTagSuggestion = (suggestion: DailyTagSuggestion) => {
+    if (!editTagRange) return;
+    setEditDraft((current) => {
+      if (!current) return current;
+      return { ...current, title: replaceDailyTagToken(current.title, editTagRange, suggestion) };
+    });
+    setEditTagRange(null);
+  };
+  const draftInputForSave = (draft: DailyItem, targetDayID = draft.dayID): DailyItemInput => {
+    const scopeTags = dailyScopeTagsFromText(draft.title, tagSuggestions);
+    const categoryTag = scopeTags.find((tag) => tag.kind === "category");
+    const listScopeTags = scopeTags.filter((tag) => tag.kind === "project" || tag.kind === "folder");
+    const projectID = listScopeTags.find((tag) => tag.kind === "project" && tag.id)?.id ?? draft.projectID ?? "";
+    const folderID = listScopeTags.find((tag) => tag.kind === "folder" && tag.id)?.id ?? draft.folderID ?? "";
+    return {
+      ...draft,
+      dayID: isBacklog ? "backlog" : targetDayID,
+      area: categoryTag?.label || draft.area,
+      projectID,
+      folderID,
+      section: cleanDailyTagLabel(draft.section) || undefined,
+      tags: normalizeDailyFreeTags(draft.tags),
+      scopeTags: listScopeTags.length ? listScopeTags : (draft.scopeTags ?? []).filter((tag) => tag.kind !== "category")
+    };
+  };
   const saveDraft = async () => {
     if (!editDraft) return;
     await onUpsertItem(draftInputForSave(editDraft));
+    setEditTagRange(null);
   };
   const saveMovedDraft = async (targetDayID: string) => {
     if (!editDraft || !targetDayID) return;
@@ -17839,13 +19723,407 @@ function DailyItemsPanel({
       return;
     }
     await onUpsertItem(draftInputForSave(editDraft, targetDayID));
-    if (targetDayID !== dayID) await onDeleteItem(dayID, editDraft.id);
+    if (targetDayID !== editDraft.dayID) await onDeleteItem(editDraft.dayID, editDraft.id);
   };
   const renderItemCard = (item: DailyItem) => {
     const tags = dailyItemScopeTags(item, projectByID);
+    const freeTags = normalizeDailyFreeTags(item.tags);
+    const itemDayID = item.dayID || dayID;
+    const listLabel = dailyItemListLabel(item, projectByID);
+    const sectionLabel = dailyItemSectionLabel(item);
     const expanded = expandedID === item.id;
     const draft = expanded && editDraft?.id === item.id ? editDraft : item;
     const isRealtimeFocused = Boolean(realtimeFocus?.itemID && sameID(realtimeFocus.itemID, item.id));
+    const categoryColor = plannerCategoryColor(categories, item.area);
+    const reminderLabel = reminderTimeLabel(item.reminderAt);
+    const backlogMeta = [
+      listLabel !== "No List" ? listLabel : "",
+      sectionLabel !== "General" ? sectionLabel : "",
+      freeTags.length ? freeTags.join(", ") : "",
+      item.links.length > 0 ? `${item.links.length} linked` : ""
+    ].filter(Boolean);
+    const noteLinkPickerOpen = noteLinkPickerItemID === item.id;
+    const linkedNoteKeys = new Set(draft.links.map((link) => noteLinkTargetKey(link)).filter(Boolean));
+    const itemListID = dailyItemListID(draft);
+    const itemArea = cleanDailyTagLabel(draft.area) || inheritedProjectArea(projects, itemListID);
+    const normalizedNoteLinkSearch = noteLinkSearch.trim().toLowerCase();
+    const unlinkedNoteLinkOptions = noteLinkOptions.filter((option) => !linkedNoteKeys.has(noteLinkTargetKey(option)));
+    const relatedNoteLinkOptions = unlinkedNoteLinkOptions.filter((option) => {
+      if (option.ownerKind !== "project") return false;
+      if (itemListID && sameID(option.ownerId, itemListID)) return true;
+      const optionArea = inheritedProjectArea(projects, option.ownerId);
+      return Boolean(itemArea && optionArea && cleanDailyTagLabel(optionArea).toLowerCase() === itemArea.toLowerCase());
+    });
+    const browseAllNoteLinks = noteLinkShowAll || Boolean(normalizedNoteLinkSearch);
+    const visibleNoteLinkOptions = noteLinkOptions
+      .filter((option) => !linkedNoteKeys.has(noteLinkTargetKey(option)))
+      .filter((option) => browseAllNoteLinks || relatedNoteLinkOptions.some((related) => noteLinkTargetKey(related) === noteLinkTargetKey(option)))
+      .filter((option) => {
+        if (!normalizedNoteLinkSearch) return true;
+        return [option.title, option.sourceLabel]
+          .some((value) => value.toLowerCase().includes(normalizedNoteLinkSearch));
+      })
+      .sort((left, right) => {
+        const leftPreferred = itemListID && left.ownerKind === "project" && sameID(left.ownerId, itemListID) ? 0 : 1;
+        const rightPreferred = itemListID && right.ownerKind === "project" && sameID(right.ownerId, itemListID) ? 0 : 1;
+        return leftPreferred - rightPreferred || left.title.localeCompare(right.title);
+      })
+      .slice(0, 12);
+    const linkNoteToDraft = async (option: NoteLinkOption) => {
+      const linkKey = noteLinkTargetKey(option);
+      if (!linkKey || linkedNoteKeys.has(linkKey)) {
+        setNoteLinkPickerItemID(null);
+        return;
+      }
+      await onUpsertItem(draftInputForSave(draft));
+      await onLinkItemNote(isBacklog ? "backlog" : itemDayID, item.id, option);
+      updateDraft({ links: [...draft.links, { ownerKind: option.ownerKind, ownerId: option.ownerId, noteId: option.noteId }] });
+      setNoteLinkPickerItemID(null);
+      setNoteLinkSearch("");
+      setNoteLinkShowAll(false);
+    };
+    const renderNoteLinkPicker = () => (
+      <div className="daily-note-link-picker">
+        <div className="daily-note-link-search">
+          <Search size={13} />
+          <input
+            autoFocus
+            value={noteLinkSearch}
+            onChange={(event) => setNoteLinkSearch(event.target.value)}
+            placeholder="Search notes to link"
+          />
+        </div>
+        <div className="daily-note-link-results">
+          {visibleNoteLinkOptions.length ? visibleNoteLinkOptions.map((option) => (
+            <button key={noteLinkTargetKey(option)} type="button" onClick={() => void linkNoteToDraft(option)}>
+              <NotePage size={14} />
+              <span>
+                <strong>{option.title}</strong>
+                <small>{option.sourceLabel}</small>
+              </span>
+            </button>
+          )) : (
+            <p>
+              {noteLinkOptions.length
+                ? browseAllNoteLinks
+                  ? "No matching unlinked notes."
+                  : "No related notes yet. Search or show all notes to link something else."
+                : "Create a note in a List first, then link it here."}
+            </p>
+          )}
+          {!browseAllNoteLinks && unlinkedNoteLinkOptions.length > relatedNoteLinkOptions.length && (
+            <button type="button" className="daily-note-link-show-all" onClick={() => setNoteLinkShowAll(true)}>
+              <Search size={14} />
+              <span>
+                <strong>Show all notes</strong>
+                <small>Search and link from outside this List or category</small>
+              </span>
+            </button>
+          )}
+        </div>
+      </div>
+    );
+    const renderLinkedNotes = (mode: "detail" | "inline") => {
+      const inlineMode = mode === "inline";
+      if (inlineMode && !draft.links.length && !noteLinkPickerOpen) {
+        return (
+          <div className="daily-inline-linked-notes empty">
+            <button
+              type="button"
+              className="daily-inline-link-add"
+              onClick={() => {
+                setNoteLinkPickerItemID(item.id);
+                setNoteLinkSearch("");
+                setNoteLinkShowAll(false);
+              }}
+            >
+              <Link2 size={13} /> Link note
+            </button>
+          </div>
+        );
+      }
+      return (
+        <div className={cx("daily-linked-notes", inlineMode && "daily-inline-linked-notes")}>
+          {!inlineMode && (
+            <div className="daily-linked-notes-head">
+              <strong>Linked notes</strong>
+              <button
+                type="button"
+                onClick={() => {
+                  setNoteLinkPickerItemID((current) => current === item.id ? null : item.id);
+                  setNoteLinkSearch("");
+                  setNoteLinkShowAll(false);
+                }}
+              >
+                <Plus size={13} /> Link note
+              </button>
+            </div>
+          )}
+          <div className="daily-link-chips">
+            {draft.links.length ? draft.links.map((link) => {
+              const option = noteLinkOptionByKey.get(noteLinkTargetKey(link) ?? "");
+              return (
+                <button key={noteLinkTargetKey(link)} type="button" onClick={() => onOpenNoteLink(link)}>
+                  <Link2 size={13} /> {option?.title ?? "Linked note"}
+                </button>
+              );
+            }) : inlineMode ? null : <span>No linked notes yet.</span>}
+            {inlineMode && (
+              <button
+                type="button"
+                className="daily-inline-link-add"
+                onClick={() => {
+                  setNoteLinkPickerItemID((current) => current === item.id ? null : item.id);
+                  setNoteLinkSearch("");
+                  setNoteLinkShowAll(false);
+                }}
+              >
+                <Plus size={13} /> Link note
+              </button>
+            )}
+          </div>
+          {noteLinkPickerOpen && renderNoteLinkPicker()}
+        </div>
+      );
+    };
+    const details = expanded ? (
+      <div className="daily-item-details">
+        <div className="daily-detail-section">
+          <label>
+            Title
+            <div className="daily-edit-title-wrap">
+              <input
+                autoFocus
+                value={draft.title}
+                onChange={updateDraftTitle}
+                onFocus={(event) => setEditTagRange(detectDailyTagToken(event.currentTarget.value, event.currentTarget.selectionStart ?? event.currentTarget.value.length))}
+                onKeyUp={(event) => setEditTagRange(detectDailyTagToken(event.currentTarget.value, event.currentTarget.selectionStart ?? event.currentTarget.value.length))}
+                onBlur={() => window.setTimeout(() => setEditTagRange(null), 120)}
+                placeholder="What needs to get done?"
+              />
+              {editTagRange && visibleEditTagSuggestions.length > 0 && (
+                <div className="daily-tag-suggestions daily-edit-tag-suggestions" role="listbox" aria-label="Category and list suggestions">
+                  {visibleEditTagSuggestions.map((suggestion) => (
+                    <button
+                      key={`${suggestion.marker}:${suggestion.id}`}
+                      type="button"
+                      onMouseDown={(event) => {
+                        event.preventDefault();
+                        insertEditTagSuggestion(suggestion);
+                      }}
+                    >
+                      <span>{suggestion.marker}</span>
+                      <strong>{suggestion.label}</strong>
+                      <small>{suggestion.kind === "category" ? "Category" : "List"}</small>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          </label>
+          <div className="daily-detail-grid">
+            <label>
+              Category
+              <input
+                list="daily-category-options"
+                value={draft.area ?? ""}
+                onChange={(event) => updateDraft({ area: event.target.value || undefined })}
+                placeholder="Choose or type a category"
+              />
+            </label>
+            <label>
+              List
+              <select
+                value={dailyItemListID(draft)}
+                onChange={(event) => {
+                  const patch = dailyListScopePatch(event.target.value, projects);
+                  updateDraft({ ...patch, scopeTags: [] });
+                }}
+              >
+                <option value="">No List</option>
+                {listOptions.map((project) => (
+                  <option key={project.id} value={project.id}>
+                    {project.title}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label>
+              Section
+              <input
+                list="daily-section-options"
+                value={draft.section ?? ""}
+                onChange={(event) => updateDraft({ section: event.target.value })}
+                placeholder="Optional grouping within the list"
+              />
+            </label>
+            <label>
+              Tags
+              <input
+                list="daily-tag-options"
+                value={normalizeDailyFreeTags(draft.tags).join(", ")}
+                onChange={(event) => updateDraft({ tags: normalizeDailyFreeTags(event.target.value) })}
+                placeholder="Comma-separated tags"
+              />
+            </label>
+            <label>
+              Reminder
+              <div className="daily-reminder-edit">
+                <input
+                  type="datetime-local"
+                  value={datetimeLocalValueFromISO(draft.reminderAt)}
+                  onChange={(event) => updateDraft({
+                    reminderAt: isoFromDatetimeLocalValue(event.target.value),
+                    reminderTimezone: event.target.value ? Intl.DateTimeFormat().resolvedOptions().timeZone : null,
+                    reminderDeliveredAt: null
+                  })}
+                />
+                {draft.reminderAt && (
+                  <button
+                    type="button"
+                    onClick={() => updateDraft({ reminderAt: null, reminderTimezone: null, reminderDeliveredAt: null })}
+                  >
+                    Clear
+                  </button>
+                )}
+              </div>
+            </label>
+            <label>
+              {isBacklog ? "Schedule for" : "Move to"}
+              <input type="date" defaultValue={isBacklog ? plannerDayID() : dayID} onChange={(event) => event.target.value && void saveMovedDraft(event.target.value)} />
+            </label>
+          </div>
+        </div>
+        <datalist id="daily-category-options">
+          {categoryOptions.map((category) => <option key={category} value={category} />)}
+        </datalist>
+        <datalist id="daily-section-options">
+          {sectionOptions.map((section) => <option key={section} value={section} />)}
+        </datalist>
+        <datalist id="daily-tag-options">
+          {tagOptions.map((tag) => <option key={tag} value={tag} />)}
+        </datalist>
+        <div className="daily-detail-section daily-detail-section-notes">
+          <label>
+            What / how to do it
+            <textarea
+              value={draft.detailsMarkdown}
+              onChange={(event) => updateDraft({ detailsMarkdown: event.target.value })}
+              placeholder="Add context, notes, or how you'll approach this…"
+            />
+          </label>
+        </div>
+        <div className="daily-detail-section daily-detail-section-steps">
+          <label>
+            Steps
+            <textarea
+              value={draft.steps.map((step) => `${step.checked ? "[x]" : "[ ]"} ${step.text}`).join("\n")}
+              onChange={(event) => updateDraft({
+                steps: event.target.value
+                  .split("\n")
+                  .map((line, index) => {
+                    const match = line.match(/^\s*\[([ xX])\]\s*(.+?)\s*$/);
+                    const text = (match?.[2] ?? line).trim();
+                    return text ? { id: draft.steps[index]?.id ?? `step-${index + 1}`, text, checked: match?.[1]?.toLowerCase() === "x" } : null;
+                  })
+                  .filter((step): step is DailyItem["steps"][number] => Boolean(step))
+              })}
+              placeholder={"[ ] First step\n[ ] Next step"}
+            />
+          </label>
+        </div>
+        <div className="daily-detail-section daily-detail-section-links">
+          {renderLinkedNotes("detail")}
+        </div>
+        <div className="daily-detail-actions">
+          {!isBacklog && itemDayID !== "backlog" && onMoveItemToBacklog && (
+            <button type="button" onClick={() => {
+              void onMoveItemToBacklog(itemDayID, item.id).then(() => setExpandedID(null));
+            }}>
+              <Archive size={14} /> Move to backlog
+            </button>
+          )}
+          <button type="button" onClick={() => setExpandedID(null)}>Close</button>
+          <button type="button" onClick={() => void saveDraft()} disabled={!draft.title.trim()}>
+            <Save size={14} /> Save item
+          </button>
+        </div>
+      </div>
+    ) : null;
+
+    if (isBacklog) {
+      return (
+        <article
+          key={item.id}
+          data-daily-item-id={item.id}
+          className={cx("daily-backlog-row", item.checked && "done", expanded && "expanded", isRealtimeFocused && "realtime-focus-flash")}
+          style={{
+            ...(isRealtimeFocused && realtimeFocus ? realtimeFocusVarStyle(realtimeFocus.color) : undefined),
+            ...(categoryColor ? { ["--backlog-row-accent" as string]: categoryColor } as React.CSSProperties : undefined)
+          }}
+        >
+          <div className="daily-backlog-row-main">
+            <button
+              type="button"
+              className="daily-check"
+              aria-label={item.checked ? "Mark not done" : "Mark done"}
+              onClick={() => void onToggleItem(itemDayID, item.id, !item.checked)}
+            >
+              {item.checked && <Check size={14} />}
+            </button>
+            <button type="button" className="daily-backlog-title" onClick={() => beginEditing(item)}>
+              <strong>{item.title}</strong>
+              {(backlogMeta.length > 0 || reminderLabel) && (
+                <span className="daily-backlog-meta">
+                  {[...backlogMeta, reminderLabel ? `Reminds ${reminderLabel}` : ""].filter(Boolean).join(" · ")}
+                </span>
+              )}
+            </button>
+            <span className="daily-backlog-category">
+              {item.area ? (
+                <>
+                  <span className="daily-backlog-category-dot" style={{ background: categoryColor ?? "var(--muted)" }} />
+                  <span>{item.area}</span>
+                </>
+              ) : null}
+            </span>
+            <button type="button" className="daily-icon-button" aria-label="Delete backlog item" onClick={() => void onDeleteItem(itemDayID, item.id)}>
+              <Trash2 size={14} />
+            </button>
+          </div>
+          {expanded && details && createPortal(
+            <div
+              className="daily-item-slideover-overlay"
+              role="presentation"
+              onMouseDown={() => setExpandedID(null)}
+            >
+              <aside
+                className="daily-item-slideover"
+                role="dialog"
+                aria-modal="true"
+                aria-label="Edit backlog item"
+                onMouseDown={(event) => event.stopPropagation()}
+              >
+                <header className="daily-item-slideover-head">
+                  <div className="daily-item-slideover-title">
+                    <span className="daily-item-slideover-eyebrow">Backlog item</span>
+                    <strong>{item.title || "Untitled item"}</strong>
+                  </div>
+                  <button type="button" aria-label="Close editor" onClick={() => setExpandedID(null)}>
+                    <X size={15} />
+                  </button>
+                </header>
+                <div className="daily-item-slideover-body">
+                  {details}
+                </div>
+              </aside>
+            </div>,
+            document.querySelector(".app-shell") ?? document.body
+          )}
+        </article>
+      );
+    }
+
     return (
       <article
         key={item.id}
@@ -17858,96 +20136,321 @@ function DailyItemsPanel({
             type="button"
             className="daily-check"
             aria-label={item.checked ? "Mark not done" : "Mark done"}
-            onClick={() => void onToggleItem(dayID, item.id, !item.checked)}
+            onClick={() => void onToggleItem(itemDayID, item.id, !item.checked)}
           >
             {item.checked && <Check size={14} />}
           </button>
           <button type="button" className="daily-item-title" onClick={() => beginEditing(item)}>
             <strong>{item.title}</strong>
             <span>
-              {tags.map((tag) => (
-                <em key={dailyScopeTagKey(tag)} className={`daily-scope-tag kind-${tag.kind}`}>
-                  {tag.marker}{tag.label}
+              {tags.map((tag) => {
+                const project = tag.kind === "project" || tag.kind === "folder" ? projectByID.get(tag.id ?? "") : undefined;
+                const area = tag.kind === "category" ? tag.label : project?.area;
+                const color = project?.color || (area ? plannerCategoryColor(categories, area) : undefined);
+                return (
+                  <em
+                    key={dailyScopeTagKey(tag)}
+                    className={`daily-scope-tag kind-${tag.kind}`}
+                    style={dailyCategoryChipStyle(color)}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      setDailyItemFilter(dailyTaskFilterID(tag));
+                    }}
+                  >
+                    <span className="daily-tag-marker">{tag.marker}</span>{tag.label}
+                  </em>
+                );
+              })}
+              {item.area && (
+                <em
+                  className="daily-scope-tag category"
+                  style={dailyCategoryChipStyle(plannerCategoryColor(categories, item.area))}
+                >
+                  {item.area}
+                </em>
+              )}
+              <em className="daily-scope-tag list">{listLabel}</em>
+              <em className="daily-scope-tag section">{sectionLabel}</em>
+              {reminderLabel && <em className="daily-scope-tag reminder">Reminds {reminderLabel}</em>}
+              {freeTags.map((tag) => (
+                <em key={tag} className="daily-scope-tag free-tag">
+                  <span className="daily-tag-marker">{tag[0]}</span>{tag.slice(1)}
                 </em>
               ))}
-              {item.area && <em className="daily-scope-tag legacy">{item.area}</em>}
-              {item.links.length > 0 && <em>{item.links.length} linked</em>}
             </span>
           </button>
-          <button type="button" className="daily-icon-button" aria-label="Delete daily item" onClick={() => void onDeleteItem(dayID, item.id)}>
+          <button type="button" className="daily-icon-button" aria-label="Delete daily item" onClick={() => void onDeleteItem(itemDayID, item.id)}>
             <Trash2 size={14} />
           </button>
         </div>
-        {expanded && (
-          <div className="daily-item-details">
-            <label>
-              Title
-              <input
-                value={draft.title}
-                onChange={(event) => updateDraft({ title: event.target.value })}
-                placeholder="Task text @Project or #Folder"
-              />
-            </label>
-            <div className="daily-detail-grid">
-              <label>
-                {isBacklog ? "Schedule for" : "Move to"}
-                <input type="date" defaultValue={isBacklog ? plannerDayID() : dayID} onChange={(event) => event.target.value && void saveMovedDraft(event.target.value)} />
-              </label>
-            </div>
-            <label>
-              What / how to do it
-              <textarea value={draft.detailsMarkdown} onChange={(event) => updateDraft({ detailsMarkdown: event.target.value })} />
-            </label>
-            <label>
-              Steps
-              <textarea
-                value={draft.steps.map((step) => `${step.checked ? "[x]" : "[ ]"} ${step.text}`).join("\n")}
-                onChange={(event) => updateDraft({
-                  steps: event.target.value
-                    .split("\n")
-                    .map((line, index) => {
-                      const match = line.match(/^\s*\[([ xX])\]\s*(.+?)\s*$/);
-                      const text = (match?.[2] ?? line).trim();
-                      return text ? { id: draft.steps[index]?.id ?? `step-${index + 1}`, text, checked: match?.[1]?.toLowerCase() === "x" } : null;
-                    })
-                    .filter((step): step is DailyItem["steps"][number] => Boolean(step))
-                })}
-                placeholder={"[ ] First step\n[ ] Second step"}
-              />
-            </label>
-            <div className="daily-linked-notes">
-              <strong>Linked notes</strong>
-              <div className="daily-link-chips">
-                {draft.links.length ? draft.links.map((link) => {
-                  const option = noteLinkOptionByKey.get(noteLinkTargetKey(link) ?? "");
-                  return (
-                    <button key={noteLinkTargetKey(link)} type="button" onClick={() => onOpenNoteLink(link)}>
-                      <Link2 size={13} /> {option?.title ?? "Linked note"}
-                    </button>
-                  );
-                }) : <span>No linked notes yet.</span>}
-              </div>
-            </div>
-            <div className="daily-detail-actions">
-              {!isBacklog && onMoveItemToBacklog && (
-                <button type="button" onClick={() => {
-                  void onMoveItemToBacklog(dayID, item.id).then(() => setExpandedID(null));
-                }}>
-                  <Archive size={14} /> Move to backlog
-                </button>
-              )}
-              <button type="button" onClick={() => setExpandedID(null)}>Close</button>
-              <button type="button" onClick={() => void saveDraft()} disabled={!draft.title.trim()}>
-                <Save size={14} /> Save item
-              </button>
-            </div>
-          </div>
-        )}
+        {!expanded && renderLinkedNotes("inline")}
+        {details}
       </article>
     );
   };
+  const renderBacklogRows = (list: DailyItem[]) => list.map(renderItemCard);
+  const renderOrganizationGroups = (list: DailyItem[]) => {
+    const groups = groupDailyItemsByOrganization(list, categories, projectByID);
+    const listItemsOf = (listGroup: DailyOrganizationGroup["lists"][number]) =>
+      listGroup.sections.flatMap((section) => section.items);
+    const categoryCountOf = (category: DailyOrganizationGroup) =>
+      category.lists.reduce((total, listGroup) => total + listItemsOf(listGroup).length, 0);
+    const allKeys: string[] = [];
+    for (const category of groups) {
+      allKeys.push(category.key);
+      if (category.lists.length > 1) {
+        for (const listGroup of category.lists) allKeys.push(`${category.key}::${listGroup.key}`);
+      }
+    }
+    const anyExpanded = groups.some((category) => !isTodayGroupCollapsed(category.key));
+    return (
+      <div className="daily-org-groups">
+        {allKeys.length > 1 && (
+          <div className="daily-org-grouptools">
+            <button
+              type="button"
+              className="daily-org-collapse-all"
+              onClick={() => setAllTodayGroups(allKeys, anyExpanded)}
+            >
+              {anyExpanded ? <ChevronRight size={13} /> : <ChevronDown size={13} />}
+              {anyExpanded ? "Collapse all" : "Expand all"}
+            </button>
+          </div>
+        )}
+        {groups.map((category) => {
+          const categoryCount = categoryCountOf(category);
+          const collapsed = isTodayGroupCollapsed(category.key);
+          const multipleLists = category.lists.length > 1;
+          return (
+            <section
+              key={category.key}
+              className={cx("daily-org-category", collapsed && "collapsed")}
+              style={category.color ? ({ ["--org-accent" as string]: category.color } as React.CSSProperties) : undefined}
+            >
+              <button
+                type="button"
+                className="daily-org-category-head"
+                aria-expanded={!collapsed}
+                onClick={() => toggleTodayGroup(category.key)}
+              >
+                <ChevronDown size={14} className="daily-org-chevron" />
+                <span className="daily-backlog-group-dot" style={{ background: category.color ?? "var(--muted)" }} />
+                <strong>{category.label}</strong>
+                {multipleLists && <span className="daily-org-meta">{category.lists.length} lists</span>}
+                <span className="daily-org-count">{categoryCount}</span>
+              </button>
+              {!collapsed && (
+                <div className="daily-org-category-body">
+                  {category.lists.map((listGroup) => {
+                    const items = listItemsOf(listGroup);
+                    if (!items.length) return null;
+                    // A lone "No List" with no siblings renders its rows directly, no sub-header.
+                    if (!multipleLists && listGroup.label === "No List") {
+                      return (
+                        <div key={listGroup.key} className="daily-org-flat">
+                          {renderBacklogRows(items)}
+                        </div>
+                      );
+                    }
+                    const listKey = `${category.key}::${listGroup.key}`;
+                    const listCollapsed = isTodayGroupCollapsed(listKey);
+                    const listProject = listGroup.projectID ? projectByID.get(listGroup.projectID.toLowerCase()) : undefined;
+                    const accent = listGroup.color ?? category.color;
+                    return (
+                      <section
+                        key={listGroup.key}
+                        className={cx("daily-org-list", listCollapsed && "collapsed")}
+                        style={accent ? ({ ["--org-accent" as string]: accent } as React.CSSProperties) : undefined}
+                      >
+                        <button
+                          type="button"
+                          className="daily-org-list-head"
+                          aria-expanded={!listCollapsed}
+                          onClick={() => toggleTodayGroup(listKey)}
+                        >
+                          <ChevronDown size={12} className="daily-org-chevron" />
+                          <span className="daily-org-type-icon">{listProject ? projectIcon(listProject) : <Folder size={14} />}</span>
+                          {accent && <span className="daily-backlog-group-dot" style={{ background: accent }} />}
+                          <span className="daily-org-list-label">{listGroup.label}</span>
+                          <span className="daily-org-list-count">{items.length}</span>
+                        </button>
+                        {!listCollapsed && (
+                          <div className="daily-org-list-body">
+                            {listGroup.sections.map((section) => {
+                              const onlyGeneral = section.label === "General" && listGroup.sections.length === 1;
+                              return (
+                                <section key={section.key} className="daily-org-section">
+                                  {!onlyGeneral && (
+                                    <header className="daily-org-section-head">
+                                      <span className="daily-org-section-icon"><Hash size={11} /></span>
+                                      <span>{section.label}</span>
+                                      <small>{section.items.length}</small>
+                                    </header>
+                                  )}
+                                  {renderBacklogRows(section.items)}
+                                </section>
+                              );
+                            })}
+                          </div>
+                        )}
+                      </section>
+                    );
+                  })}
+                </div>
+              )}
+            </section>
+          );
+        })}
+      </div>
+    );
+  };
+  const renderBacklogOpenList = () => {
+    if (!openItems.length) {
+      return !doneItems.length ? (
+        <p className="daily-empty">{backlogQueryActive ? "No matching items." : "Nothing here yet."}</p>
+      ) : null;
+    }
+    const groups = groupDailyItemsByOrganization(openItems, categories, projectByID);
+    const listItemsOf = (list: DailyOrganizationGroup["lists"][number]) =>
+      list.sections.flatMap((section) => section.items);
+    const categoryCountOf = (category: DailyOrganizationGroup) =>
+      category.lists.reduce((total, list) => total + listItemsOf(list).length, 0);
+    if (groups.length === 1 && groups[0].lists.length <= 1) {
+      return (
+        <div className="daily-backlog-table">
+          {renderBacklogRows(openItems)}
+        </div>
+      );
+    }
+    const allKeys: string[] = [];
+    for (const category of groups) {
+      allKeys.push(category.key);
+      if (category.lists.length > 1) {
+        for (const list of category.lists) allKeys.push(`${category.key}::${list.key}`);
+      }
+    }
+    const anyExpanded = groups.some((category) => !isBacklogGroupCollapsed(category.key));
+    return (
+      <div className="daily-backlog-groups">
+        <div className="daily-backlog-grouptools">
+          <button
+            type="button"
+            className="daily-backlog-collapse-all"
+            onClick={() => setAllBacklogGroups(allKeys, anyExpanded)}
+          >
+            {anyExpanded ? <ChevronRight size={13} /> : <ChevronDown size={13} />}
+            {anyExpanded ? "Collapse all" : "Expand all"}
+          </button>
+        </div>
+        {groups.map((category) => {
+          const categoryCount = categoryCountOf(category);
+          const collapsed = isBacklogGroupCollapsed(category.key);
+          const multipleLists = category.lists.length > 1;
+          return (
+            <section
+              key={category.key}
+              className={cx("daily-backlog-group-card", collapsed && "collapsed")}
+              style={category.color ? ({ ["--backlog-group-accent" as string]: category.color } as React.CSSProperties) : undefined}
+            >
+              <button
+                type="button"
+                className="daily-backlog-group-header"
+                aria-expanded={!collapsed}
+                onClick={() => toggleBacklogGroup(category.key)}
+              >
+                <ChevronDown size={14} className="daily-backlog-group-chevron" />
+                <span className="daily-backlog-group-dot" style={{ background: category.color ?? "var(--muted)" }} />
+                <strong>{category.label}</strong>
+                {multipleLists && <span className="daily-backlog-group-meta">{category.lists.length} lists</span>}
+                <span className="daily-backlog-group-count">{categoryCount}</span>
+              </button>
+              {!collapsed && (
+                <div className="daily-backlog-group-body">
+                  {category.lists.map((list) => {
+                    const items = listItemsOf(list);
+                    if (!items.length) return null;
+                    if (!multipleLists && list.label === "No List") {
+                      return (
+                        <div key={list.key} className="daily-backlog-table">
+                          {renderBacklogRows(items)}
+                        </div>
+                      );
+                    }
+                    const listKey = `${category.key}::${list.key}`;
+                    const listCollapsed = isBacklogGroupCollapsed(listKey);
+                    return (
+                      <div key={list.key} className={cx("daily-backlog-sublist", listCollapsed && "collapsed")}>
+                        <button
+                          type="button"
+                          className="daily-backlog-sublist-header"
+                          aria-expanded={!listCollapsed}
+                          onClick={() => toggleBacklogGroup(listKey)}
+                        >
+                          <ChevronDown size={12} className="daily-backlog-sublist-chevron" />
+                          <span className="daily-backlog-sublist-label">{list.label}</span>
+                          <span className="daily-backlog-sublist-count">{items.length}</span>
+                        </button>
+                        {!listCollapsed && (
+                          <div className="daily-backlog-table">
+                            {renderBacklogRows(items)}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </section>
+          );
+        })}
+      </div>
+    );
+  };
+  const quickOrganizationFields = (
+    <>
+      <input
+        className="daily-quick-category"
+        list="daily-quick-category-options"
+        value={quickArea}
+        onChange={(event) => setQuickArea(event.target.value)}
+        placeholder="Category"
+        aria-label="Task category"
+      />
+      <select className="daily-quick-list" value={quickListID} onChange={(event) => setQuickListID(event.target.value)} aria-label="Task list">
+        <option value="">No List</option>
+        {listOptions.map((project) => (
+          <option key={project.id} value={project.id}>
+            {project.title}
+          </option>
+        ))}
+      </select>
+      <input
+        className="daily-quick-section"
+        list="daily-quick-section-options"
+        value={quickSection}
+        onChange={(event) => setQuickSection(event.target.value)}
+        placeholder="Section"
+        aria-label="Task section"
+      />
+      <input
+        className="daily-quick-tags"
+        list="daily-quick-tag-options"
+        value={quickTags}
+        onChange={(event) => setQuickTags(event.target.value)}
+        placeholder="Tags"
+        aria-label="Task tags"
+      />
+      <input
+        className="daily-quick-reminder"
+        type="datetime-local"
+        value={quickReminderAt}
+        onChange={(event) => setQuickReminderAt(event.target.value)}
+        aria-label="Reminder time"
+      />
+    </>
+  );
   const quickAdd = (
-    <div className="daily-quick-add">
+    <div className={cx("daily-quick-add", "daily-quick-add-backlog", quickOrganizeOpen && "organization-open")}>
       <div className="daily-quick-input-wrap">
         <input
           value={quickTitle}
@@ -17960,10 +20463,10 @@ function DailyItemsPanel({
           onKeyDown={(event) => {
             if (event.key === "Enter") void submitQuickItem();
           }}
-          placeholder={isBacklog ? "Add later item or follow-up... use @Project or #Folder" : "Add task... use @Project or #Folder"}
+          placeholder={isBacklog ? "Add later item or follow-up..." : "Add task..."}
         />
         {tagMenuOpen && activeTag && visibleTagSuggestions.length > 0 && (
-          <div className="daily-tag-suggestions" role="listbox" aria-label="Project and folder suggestions">
+          <div className="daily-tag-suggestions" role="listbox" aria-label="Category and list suggestions">
             {visibleTagSuggestions.map((suggestion) => (
               <button
                 key={`${suggestion.marker}:${suggestion.id}`}
@@ -17975,15 +20478,33 @@ function DailyItemsPanel({
               >
                 <span>{suggestion.marker}</span>
                 <strong>{suggestion.label}</strong>
-                <small>{suggestion.kind === "folder" ? "Folder" : "Project"}</small>
+                <small>{suggestion.kind === "category" ? "Category" : "List"}</small>
               </button>
             ))}
           </div>
         )}
       </div>
-      <button type="button" onClick={() => void submitQuickItem()} disabled={!quickTitle.trim()}>
+      <button
+        type="button"
+        className={cx("daily-quick-options-toggle", quickOrganizeOpen && "active")}
+        aria-expanded={quickOrganizeOpen}
+        onClick={() => setQuickOrganizeOpen((current) => !current)}
+      >
+        <Settings size={14} /> Organize
+      </button>
+      <button type="button" className={cx(isBacklog ? "daily-backlog-add" : "daily-quick-add-submit")} onClick={() => void submitQuickItem()} disabled={!quickTitle.trim()}>
         <Plus size={15} /> Add
       </button>
+      {quickOrganizeOpen && <div className="daily-backlog-quick-options">{quickOrganizationFields}</div>}
+      <datalist id="daily-quick-section-options">
+        {sectionOptions.map((section) => <option key={section} value={section} />)}
+      </datalist>
+      <datalist id="daily-quick-category-options">
+        {categoryOptions.map((category) => <option key={category} value={category} />)}
+      </datalist>
+      <datalist id="daily-quick-tag-options">
+        {tagOptions.map((tag) => <option key={tag} value={tag} />)}
+      </datalist>
     </div>
   );
   const panel = items.length === 0 ? (
@@ -18000,50 +20521,82 @@ function DailyItemsPanel({
         <span>{items.length} {items.length === 1 ? "item" : "items"}</span>
       </div>
       {quickAdd}
-      {isBacklog && (
-        <div className="daily-backlog-controls">
-          <div className="daily-backlog-search">
-            <Search size={14} />
-            <input
-              value={backlogQuery}
-              onChange={(event) => setBacklogQuery(event.target.value)}
-              placeholder="Search backlog"
-              aria-label="Search backlog"
-            />
-            {backlogQuery && (
-              <button type="button" aria-label="Clear search" onClick={() => setBacklogQuery("")}>
-                <X size={13} />
-              </button>
-            )}
+      {isBacklog ? (
+        <div className="daily-backlog-toolbar">
+          <div className="daily-backlog-controls">
+            <div className="daily-backlog-search">
+              <Search size={14} />
+              <input
+                value={backlogQuery}
+                onChange={(event) => setBacklogQuery(event.target.value)}
+                placeholder="Search backlog"
+                aria-label="Search backlog"
+              />
+              {backlogQuery && (
+                <button type="button" aria-label="Clear search" onClick={() => setBacklogQuery("")}>
+                  <X size={13} />
+                </button>
+              )}
+            </div>
+            <select
+              className="daily-backlog-scope"
+              value={backlogScopeID}
+              onChange={(event) => setBacklogScopeID(event.target.value)}
+              aria-label="Backlog list scope"
+            >
+              <option value="">All Lists</option>
+              {projects.filter((project) => project.title.trim()).map((project) => (
+                <option key={project.id} value={project.id}>
+                  @{project.title}
+                </option>
+              ))}
+            </select>
+            <select
+              className="daily-backlog-filter-select"
+              value={filter}
+              onChange={(event) => onFilterChange(event.target.value)}
+              aria-label="Backlog filter"
+            >
+              {filterOptions.map((option) => (
+                <option key={option.id} value={option.id}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+            <button
+              type="button"
+              className={cx("daily-backlog-sort", backlogSortOldest && "active")}
+              aria-pressed={backlogSortOldest}
+              onClick={() => setBacklogSortOldest((current) => !current)}
+              title={backlogSortOldest ? "Showing oldest first" : "Sort by oldest first"}
+            >
+              <ArrowDownUp size={13} /> Oldest
+            </button>
           </div>
-          <button
-            type="button"
-            className={cx("daily-backlog-sort", backlogSortOldest && "active")}
-            aria-pressed={backlogSortOldest}
-            onClick={() => setBacklogSortOldest((current) => !current)}
-            title={backlogSortOldest ? "Showing oldest first" : "Sort by oldest first"}
-          >
-            <ArrowDownUp size={13} /> Oldest
-          </button>
         </div>
-      )}
-      <div className="daily-filter-row">
-        {filterOptions.map((option) => (
+      ) : (
+        <div className="daily-filter-row">
+          {filterOptions.map((option) => (
             <button
               key={option.id}
               type="button"
-              className={cx(filter === option.id && "active")}
+              className={cx("daily-filter-chip", filter === option.id && "active", option.color && "has-color")}
+              style={option.color ? { ["--category-color" as string]: option.color } as React.CSSProperties : undefined}
               onClick={() => onFilterChange(option.id)}
             >
+              {option.color && <span className="daily-filter-chip-dot" style={{ background: option.color }} />}
               {option.label}
             </button>
-        ))}
-      </div>
-      <div className="daily-item-list" ref={dailyListRef}>
-        {openItems.length ? openItems.map(renderItemCard) : (
-          !doneItems.length ? (
-            <p className="daily-empty">{backlogQueryActive ? "No matching items." : "Nothing here yet."}</p>
-          ) : null
+          ))}
+        </div>
+      )}
+      <div className={cx("daily-item-list", isBacklog && "daily-backlog-list")} ref={dailyListRef}>
+        {isBacklog ? renderBacklogOpenList() : (
+          openItems.length ? renderOrganizationGroups(openItems) : (
+            !doneItems.length ? (
+              <p className="daily-empty">{backlogQueryActive ? "No matching items." : "Nothing here yet."}</p>
+            ) : null
+          )
         )}
       </div>
       {isBacklog && doneItems.length > 0 && (
@@ -18058,15 +20611,15 @@ function DailyItemsPanel({
             <span>Done ({doneItems.length})</span>
           </button>
           {showDoneBacklog && (
-            <div className="daily-item-list daily-done-list">
-              {doneItems.map(renderItemCard)}
+            <div className="daily-backlog-table daily-done-list">
+              {renderBacklogRows(doneItems)}
             </div>
           )}
         </div>
       )}
     </section>
   );
-  if (isBacklog) {
+  if (inlinePanel) {
     return <div className="daily-items-inline">{panel}</div>;
   }
   return (
@@ -18089,6 +20642,344 @@ function DailyItemsPanel({
   );
 }
 
+function PlannerCategoryManager({
+  categories,
+  projects,
+  onClose,
+  onUpsertCategory,
+  onDeleteCategory,
+  onCreatePlannerList,
+  onUpdatePlannerListColorAndArea,
+  onHidePlannerList
+}: {
+  categories: PlannerCategory[];
+  projects: ProjectItem[];
+  onClose: () => void;
+  onUpsertCategory: (category: Partial<PlannerCategory> & { name?: string }) => Promise<void>;
+  onDeleteCategory: (categoryID: string) => Promise<void>;
+  onCreatePlannerList: (input: { name: string; area?: string; color?: string }) => Promise<void>;
+  onUpdatePlannerListColorAndArea: (projectID: string, area?: string | null, color?: string | null) => Promise<void>;
+  onHidePlannerList: (projectID: string) => Promise<void>;
+}) {
+  const [draftName, setDraftName] = useState("");
+  const [draftColor, setDraftColor] = useState("#8BB7FF");
+  const [listDraftName, setListDraftName] = useState("");
+  const [listDraftArea, setListDraftArea] = useState("");
+  const [openShadePicker, setOpenShadePicker] = useState<string | null>(null);
+  const [editingID, setEditingID] = useState<string | null>(null);
+  const [editingName, setEditingName] = useState("");
+  const renameInputRef = useRef<HTMLInputElement | null>(null);
+  const visibleCategories = categories.filter((category) => category.hidden !== true);
+  const lists = projects.filter((project) => project.title.trim());
+
+  useEffect(() => {
+    if (!editingID) return;
+    renameInputRef.current?.focus();
+    renameInputRef.current?.select();
+  }, [editingID]);
+
+  const submitCategory = async () => {
+    const name = draftName.trim();
+    if (!name) return;
+    await onUpsertCategory({ name, color: draftColor });
+    setDraftName("");
+  };
+
+  const submitPlannerList = async () => {
+    const name = listDraftName.trim();
+    if (!name) return;
+    const area = listDraftArea || undefined;
+    await onCreatePlannerList({ name, area, color: area ? plannerCategoryColor(categories, area) : undefined });
+    setListDraftName("");
+  };
+
+  const beginRename = (category: PlannerCategory) => {
+    setEditingID(category.id);
+    setEditingName(category.name);
+  };
+
+  const cancelRename = () => {
+    setEditingID(null);
+    setEditingName("");
+  };
+
+  const saveRename = async (category: PlannerCategory) => {
+    const name = editingName.trim();
+    if (!name) return;
+    if (name === category.name) {
+      cancelRename();
+      return;
+    }
+    await onUpsertCategory({ ...category, name });
+    cancelRename();
+  };
+
+  const unassignedListCount = lists.filter((p) => !p.area).length;
+
+  return (
+    <section className="planner-category-manager" aria-label="Planner organization">
+      <header className="planner-category-manager-head">
+        <div className="planner-category-manager-copy">
+          <h2>Organization</h2>
+          <p>Categories are big areas. Lists are shared by Today, Backlog, Notes, and Threads.</p>
+        </div>
+        <button type="button" className="planner-category-done" onClick={onClose}>
+          Done
+        </button>
+      </header>
+
+      <div className="planner-org-stat-strip">
+        <div className="planner-org-stat">
+          <span className="planner-org-stat-value">{visibleCategories.length}</span>
+          <span className="planner-org-stat-label">Categories</span>
+        </div>
+        <div className="planner-org-stat lists">
+          <span className="planner-org-stat-value">{lists.length}</span>
+          <span className="planner-org-stat-label">Lists</span>
+        </div>
+        <div className="planner-org-stat unassigned">
+          <span className="planner-org-stat-value">{unassignedListCount}</span>
+          <span className="planner-org-stat-label">Unassigned</span>
+        </div>
+      </div>
+
+      <div className="planner-category-panel">
+        <div className="planner-org-column">
+        <section className="planner-category-section">
+          <h3>New Category</h3>
+          <div className="planner-create-panel">
+            <div className="planner-category-create">
+              <input
+                value={draftName}
+                onChange={(event) => setDraftName(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") void submitCategory();
+                }}
+                placeholder="Category name"
+                aria-label="New category name"
+              />
+              <label className="planner-category-swatch" style={{ backgroundColor: draftColor }} title="Color">
+                <input type="color" value={draftColor} onChange={(event) => setDraftColor(event.target.value)} aria-label="New category color" />
+              </label>
+              <button type="button" className="planner-category-add" disabled={!draftName.trim()} onClick={() => void submitCategory()}>
+                Add
+              </button>
+            </div>
+          </div>
+        </section>
+
+        <section className="planner-category-section">
+          <div className="planner-category-section-head">
+            <h3>Categories</h3>
+            <span>{visibleCategories.length}</span>
+          </div>
+          {visibleCategories.length ? (
+            <div className="planner-category-table" role="list">
+              <div className="planner-category-table-head" aria-hidden="true">
+                <span />
+                <span>Name</span>
+                <span>Actions</span>
+              </div>
+              {visibleCategories.map((category) => {
+                const color = category.color || "#8BB7FF";
+                const isEditing = editingID === category.id;
+                return (
+                  <div className="planner-category-row" key={category.id} role="listitem">
+                    <label className="planner-category-swatch" style={{ backgroundColor: color }} title={`${category.name} color`}>
+                      <input
+                        type="color"
+                        value={color}
+                        onChange={(event) => void onUpsertCategory({ ...category, color: event.target.value })}
+                        aria-label={`${category.name} color`}
+                      />
+                    </label>
+                    <div className="planner-category-row-copy">
+                      {isEditing ? (
+                        <input
+                          ref={renameInputRef}
+                          className="planner-category-rename-input"
+                          value={editingName}
+                          onChange={(event) => setEditingName(event.target.value)}
+                          onKeyDown={(event) => {
+                            if (event.key === "Enter") void saveRename(category);
+                            if (event.key === "Escape") cancelRename();
+                          }}
+                          aria-label={`Rename ${category.name}`}
+                        />
+                      ) : (
+                        <strong>{category.name}</strong>
+                      )}
+                    </div>
+                    <div className="planner-category-row-actions">
+                      {isEditing ? (
+                        <>
+                          <button type="button" className="planner-category-action" onClick={() => void saveRename(category)} disabled={!editingName.trim()}>
+                            Save
+                          </button>
+                          <button type="button" className="planner-category-action muted" onClick={cancelRename}>
+                            Cancel
+                          </button>
+                        </>
+                      ) : (
+                        <>
+                          <button type="button" className="planner-category-action muted" onClick={() => beginRename(category)}>
+                            Rename
+                          </button>
+                          <button type="button" className="planner-category-action muted danger" onClick={() => void onDeleteCategory(category.id)}>
+                            Hide
+                          </button>
+                        </>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          ) : (
+            <p className="planner-category-empty">No categories yet.</p>
+          )}
+        </section>
+        </div>
+
+        <div className="planner-org-column">
+        <section className="planner-category-section">
+          <h3>New List</h3>
+          <div className="planner-create-panel">
+            <p className="planner-create-panel-note">Lists also appear as Projects in Threads — chats, tasks, and notes stay together.</p>
+            <div className="planner-list-create">
+              <input
+                value={listDraftName}
+                onChange={(event) => setListDraftName(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") void submitPlannerList();
+                }}
+                placeholder="List name"
+                aria-label="New Planner List name"
+              />
+              <select value={listDraftArea} onChange={(event) => setListDraftArea(event.target.value)} aria-label="Default category">
+                <option value="">No category</option>
+                {visibleCategories.map((category) => (
+                  <option key={category.id} value={category.name}>{category.name}</option>
+                ))}
+              </select>
+              <button type="button" className="planner-category-add" disabled={!listDraftName.trim()} onClick={() => void submitPlannerList()}>
+                Add List
+              </button>
+            </div>
+          </div>
+        </section>
+
+        {lists.length > 0 && (
+          <section className="planner-category-section">
+            <h3>Lists</h3>
+            <div className="planner-category-table planner-project-table">
+              <div className="planner-category-table-head" aria-hidden="true">
+                <span />
+                <span>List</span>
+                <span>Category</span>
+                <span />
+              </div>
+              {lists.map((project) => {
+                const categoryColor = plannerCategoryColor(categories, project.area);
+                const colorVariants = plannerListColorVariants(categoryColor);
+                const projectColor = normalizeHexColor(project.color);
+                const color = colorVariants.some((variant) => normalizeHexColor(variant.color) === projectColor)
+                  ? projectColor
+                  : normalizeHexColor(categoryColor);
+                const isShadePickerOpen = openShadePicker === project.id;
+                return (
+                <div key={project.id} className="planner-project-default-row">
+                  <div
+                    className="planner-list-shade-picker"
+                    style={{ position: "relative" }}
+                    onBlur={(e) => {
+                      if (!e.currentTarget.contains(e.relatedTarget)) {
+                        setOpenShadePicker(null);
+                      }
+                    }}
+                  >
+                    <button
+                      type="button"
+                      className={cx("planner-category-swatch", !color && "muted")}
+                      style={color ? { backgroundColor: color } : undefined}
+                      title={categoryColor ? `${project.title} shade` : "Choose a category first"}
+                      onClick={() => {
+                        if (!categoryColor) return;
+                        setOpenShadePicker(isShadePickerOpen ? null : project.id);
+                      }}
+                    />
+                    {isShadePickerOpen && categoryColor && (
+                      <div
+                        className="planner-list-shade-options"
+                        style={{
+                          position: "absolute",
+                          top: "calc(100% + 8px)",
+                          left: "-6px",
+                          zIndex: 100,
+                          background: "#181a1f",
+                          padding: "6px",
+                          borderRadius: "10px",
+                          border: "1px solid rgba(255, 255, 255, 0.08)",
+                          boxShadow: "0 4px 20px rgba(0, 0, 0, 0.4)",
+                          gap: "6px"
+                        }}
+                      >
+                        {colorVariants.map((variant) => {
+                          const active = normalizeHexColor(variant.color) === normalizeHexColor(color);
+                          return (
+                            <button
+                              key={variant.id}
+                              type="button"
+                              className={cx("planner-list-shade-option", active && "active")}
+                              style={{ ["--list-shade-color" as string]: variant.color }}
+                              title={`${variant.label} ${project.area}`}
+                              aria-label={`${variant.label} shade for ${project.title}`}
+                              onClick={() => {
+                                void onUpdatePlannerListColorAndArea(project.id, project.area, variant.color);
+                                setOpenShadePicker(null);
+                              }}
+                            >
+                              <span />
+                            </button>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                  <span className="planner-project-default-label">
+                    <span className="planner-project-default-prefix">#</span>
+                    {project.title}
+                  </span>
+                  <select
+                    value={project.area ?? ""}
+                    onChange={(event) => {
+                      const area = event.target.value || null;
+                      void onUpdatePlannerListColorAndArea(project.id, area, area ? plannerCategoryColor(categories, area) ?? null : null);
+                    }}
+                  >
+                    <option value="">None</option>
+                    {visibleCategories.map((category) => (
+                      <option key={category.id} value={category.name}>{category.name}</option>
+                    ))}
+                  </select>
+                  {project.plannerOnly ? (
+                    <button type="button" className="planner-category-action muted danger" onClick={() => void onHidePlannerList(project.id)}>
+                      Hide
+                    </button>
+                  ) : (
+                    <span className="planner-list-origin">Full Project</span>
+                  )}
+                </div>
+              )})}
+            </div>
+          </section>
+        )}
+        </div>
+      </div>
+    </section>
+  );
+}
+
 function PlannerView({
   compact,
   compactSurface = "sidebar",
@@ -18102,6 +20993,7 @@ function PlannerView({
   backlogOpen,
   backlogItems,
   projects,
+  categories,
   dailyItems,
   noteDetail,
   noteDraft,
@@ -18116,6 +21008,11 @@ function PlannerView({
   onApplyNoteCleanup,
   onOpenNoteLink,
   onScheduleSelectionToPlanner,
+  onUpsertPlannerCategory,
+  onDeletePlannerCategory,
+  onCreatePlannerList,
+  onUpdatePlannerListColorAndArea,
+  onHidePlannerList,
   onUpsertDailyItem,
   onToggleDailyItem,
   onDeleteDailyItem,
@@ -18147,6 +21044,7 @@ function PlannerView({
   backlogOpen: boolean;
   backlogItems: DailyItem[];
   projects: ProjectItem[];
+  categories: PlannerCategory[];
   dailyItems: DailyItem[];
   noteDetail?: NoteDetail | PlannerDayDetail | null;
   noteDraft: string;
@@ -18161,6 +21059,11 @@ function PlannerView({
   onApplyNoteCleanup: (markdown: string, options?: NoteCleanupApplyOptions) => Promise<void>;
   onOpenNoteLink: (target: NoteLinkTarget) => void;
   onScheduleSelectionToPlanner: (request: PlannerScheduleRequest) => void;
+  onUpsertPlannerCategory: (category: Partial<PlannerCategory> & { name?: string }) => Promise<void>;
+  onDeletePlannerCategory: (categoryID: string) => Promise<void>;
+  onCreatePlannerList: (input: { name: string; area?: string; color?: string }) => Promise<void>;
+  onUpdatePlannerListColorAndArea: (projectID: string, area?: string | null, color?: string | null) => Promise<void>;
+  onHidePlannerList: (projectID: string) => Promise<void>;
   onUpsertDailyItem: (item: DailyItemInput) => Promise<void>;
   onToggleDailyItem: (dayID: string, itemID: string, checked: boolean) => Promise<void>;
   onDeleteDailyItem: (dayID: string, itemID: string) => Promise<void>;
@@ -18185,6 +21088,7 @@ function PlannerView({
   const plannerVoiceBarLevelsRef = useRef([0.16, 0.16, 0.16, 0.16, 0.16]);
   const plannerVoiceOutputSamplesRef = useRef<Uint8Array | null>(null);
   const [dailyItemFilter, setDailyItemFilter] = useState("all");
+  const [categoryManagerOpen, setCategoryManagerOpen] = useState(false);
   const todayID = plannerDayID();
   const currentDayID = selectedDayID || todayID;
   const visibleDays = useMemo(
@@ -18205,7 +21109,7 @@ function PlannerView({
       ownerId: note.projectID,
       noteId: note.id,
       title: note.title,
-      sourceLabel: note.projectName ?? "Project note"
+      sourceLabel: note.projectName ?? "Note"
     })),
     ...threadNotes.map((note) => ({
       ownerKind: "thread" as const,
@@ -18224,7 +21128,7 @@ function PlannerView({
   ], [notes, threadNotes, visibleDays]);
   const visiblePlannerItems = backlogOpen ? backlogItems : dailyItems;
   const dailyProjectByID = useMemo(() => new Map(projects.map((project) => [project.id.toLowerCase(), project])), [projects]);
-  const dailyFilterOptions = useMemo(() => dailyItemFilterOptions(visiblePlannerItems, dailyProjectByID), [visiblePlannerItems, dailyProjectByID]);
+  const dailyFilterOptions = useMemo(() => dailyItemFilterOptions(visiblePlannerItems, dailyProjectByID, categories), [categories, visiblePlannerItems, dailyProjectByID]);
   useEffect(() => {
     if (dailyFilterOptions.some((option) => option.id === dailyItemFilter)) return;
     setDailyItemFilter("all");
@@ -18235,7 +21139,9 @@ function PlannerView({
         : noteSaveStatus.kind === "error" ? noteSaveStatus.message ?? "Not saved"
           : noteSaveStatus.kind === "saved" ? "Saved"
             : "";
-  const moveDay = (offset: number) => onSelectDay(plannerDayOffset(currentDayID, offset));
+  const selectPlannerDay = (dayID: string) => onSelectDay(dayID);
+  const selectPlannerBacklog = () => onSelectBacklog();
+  const moveDay = (offset: number) => selectPlannerDay(plannerDayOffset(currentDayID, offset));
   const liveVoiceActive = liveVoiceStatus !== "idle" && liveVoiceStatus !== "error";
   const liveVoiceConnected = liveVoiceActive && liveVoiceStatus !== "connecting";
   const liveVoiceTitle = liveVoiceStatus === "error"
@@ -18358,10 +21264,33 @@ function PlannerView({
     };
   }, [liveVoiceActive, liveVoiceStatus]);
 
+  const plannerDayDiff = Math.round((Date.parse(currentDayID) - Date.parse(todayID)) / 86400000);
+  const plannerRelativeDayLabel = backlogOpen || !Number.isFinite(plannerDayDiff) || plannerDayDiff === 0
+    ? ""
+    : plannerDayDiff === -1
+      ? "Yesterday"
+      : plannerDayDiff === 1
+        ? "Tomorrow"
+        : plannerDayDiff < 0
+          ? `${-plannerDayDiff} days ago`
+          : `In ${plannerDayDiff} days`;
+  const plannerScopeItems = backlogOpen ? backlogItems : dailyItems;
+  const plannerOpenCount = plannerScopeItems.filter((item) => !item.checked).length;
+  const plannerDoneCount = plannerScopeItems.length - plannerOpenCount;
+  const plannerTaskSummary = backlogOpen
+    ? `${plannerOpenCount} open · ${plannerDoneCount} done`
+    : plannerScopeItems.length === 0
+      ? "No tasks yet"
+      : plannerOpenCount === 0
+        ? `All ${plannerDoneCount} tasks done`
+        : `${plannerDoneCount} of ${plannerScopeItems.length} tasks done`;
+  const plannerSubtitle = [plannerRelativeDayLabel, plannerTaskSummary].filter(Boolean).join(" · ");
+
   return (
     <main className="feature-main planner-main">
       <TopBar
         title={backlogOpen ? "Backlog" : currentDayID === todayID ? "Today" : plannerReadableDate(currentDayID)}
+        subtitle={plannerSubtitle}
         centerTitle
         workspaceRootPath={backlogOpen ? workspaceRootPath : noteDetail?.path ?? workspaceRootPath}
         openTargetLabel={backlogOpen ? "planner backlog" : noteDetail?.path ? "planner day" : "planner"}
@@ -18369,24 +21298,56 @@ function PlannerView({
         compactSurface={compactSurface}
         leadingAccessory={(
           <div className="planner-date-controls" aria-label="Planner date controls">
-            <button type="button" className={cx(backlogOpen && "active")} onClick={onSelectBacklog}>Backlog</button>
-            <button type="button" className={cx(!backlogOpen && currentDayID === todayID && "active")} onClick={() => onSelectDay(todayID)}>Today</button>
-            <IconButton label="Previous day" className="note-history-button" onClick={() => moveDay(-1)}>
-              <ChevronLeft size={16} />
-            </IconButton>
-            <input
-              type="date"
-              value={currentDayID}
-              onChange={(event) => event.target.value && onSelectDay(event.target.value)}
-              aria-label="Planner date"
-            />
-            <IconButton label="Next day" className="note-history-button" onClick={() => moveDay(1)}>
-              <ChevronRight size={16} />
-            </IconButton>
+            <div className="planner-scope-switch" role="tablist" aria-label="Planner scope">
+              <button
+                type="button"
+                role="tab"
+                aria-selected={backlogOpen}
+                className={cx(backlogOpen && "active")}
+                onClick={selectPlannerBacklog}
+              >
+                <Inbox size={13} />
+                <span>Backlog</span>
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={!backlogOpen && currentDayID === todayID}
+                className={cx(!backlogOpen && currentDayID === todayID && "active")}
+                onClick={() => selectPlannerDay(todayID)}
+              >
+                <Sun size={13} />
+                <span>Today</span>
+              </button>
+            </div>
+            <div className="planner-day-stepper" aria-label="Planner day">
+              <IconButton label="Previous day" onClick={() => moveDay(-1)}>
+                <ChevronLeft size={15} />
+              </IconButton>
+              <input
+                type="date"
+                value={currentDayID}
+                onChange={(event) => event.target.value && selectPlannerDay(event.target.value)}
+                aria-label="Planner date"
+              />
+              <IconButton label="Next day" onClick={() => moveDay(1)}>
+                <ChevronRight size={15} />
+              </IconButton>
+            </div>
           </div>
         )}
         actionsAccessory={(
           <div className="planner-live-actions">
+            <button
+              type="button"
+              className={cx("planner-category-button", categoryManagerOpen && "active")}
+              onClick={() => setCategoryManagerOpen((current) => !current)}
+              aria-pressed={categoryManagerOpen}
+              title="Planner organization"
+            >
+              <Layers3 size={13} />
+              <span>Organization</span>
+            </button>
             {showWakeWordChip && (
               <span
                 className={cx("planner-wake-word-chip", `state-${wakeWordState}`)}
@@ -18426,6 +21387,18 @@ function PlannerView({
         onOpenMemory={onOpenMemory}
       />
       <RealtimeVoiceGlow active={liveVoiceActive} status={liveVoiceStatus} />
+      {categoryManagerOpen && (
+        <PlannerCategoryManager
+          categories={categories}
+          projects={projects}
+          onClose={() => setCategoryManagerOpen(false)}
+          onUpsertCategory={onUpsertPlannerCategory}
+          onDeleteCategory={onDeletePlannerCategory}
+          onCreatePlannerList={onCreatePlannerList}
+          onUpdatePlannerListColorAndArea={onUpdatePlannerListColorAndArea}
+          onHidePlannerList={onHidePlannerList}
+        />
+      )}
       <div className="planner-layout">
         <section className={cx("note-editor planner-editor", !backlogOpen && !noteDetail && "planner-editor-empty")}>
           {backlogOpen ? (
@@ -18434,19 +21407,49 @@ function PlannerView({
               style={backlogRealtimeFocused && realtimeFocus ? realtimeFocusVarStyle(realtimeFocus.color) : undefined}
             >
               <header className="planner-backlog-head">
-                <Archive size={22} />
+                <span className="planner-backlog-head-icon" aria-hidden="true">
+                  <Inbox size={17} />
+                </span>
                 <div>
                   <h2>Backlog</h2>
-                  <p>Later tasks and follow-ups with no date yet.</p>
+                  <p>Tasks without a scheduled date.</p>
                 </div>
-                <span className="planner-backlog-count">
-                  {visiblePlannerItems.length} {visiblePlannerItems.length === 1 ? "item" : "items"}
-                </span>
               </header>
+              {(() => {
+                const totalOpen = backlogItems.filter((item) => !item.checked).length;
+                const totalDone = backlogItems.filter((item) => item.checked).length;
+                const total = backlogItems.length;
+                const pct = total > 0 ? Math.round((totalDone / total) * 100) : 0;
+                const catCount = groupBacklogItemsByArea(backlogItems.filter((item) => !item.checked), categories).filter((g) => g.key !== "uncategorized").length;
+                return (
+                  <div className="planner-backlog-stat-strip">
+                    <div className="planner-backlog-stat open">
+                      <span className="planner-backlog-stat-label"><ListTodo size={12} /><span>Open</span></span>
+                      <span className="planner-backlog-stat-value">{totalOpen}</span>
+                    </div>
+                    <div className="planner-backlog-stat done">
+                      <span className="planner-backlog-stat-label"><Check size={12} /><span>Done</span></span>
+                      <span className="planner-backlog-stat-value">{totalDone}</span>
+                    </div>
+                    <div className="planner-backlog-stat categories">
+                      <span className="planner-backlog-stat-label"><Layers3 size={12} /><span>Categories</span></span>
+                      <span className="planner-backlog-stat-value">{catCount}</span>
+                    </div>
+                    <div className="planner-backlog-stat progress-stat">
+                      <span className="planner-backlog-stat-label"><Target size={12} /><span>Completion</span></span>
+                      <span className="planner-backlog-stat-value">{pct}%</span>
+                      <div className="planner-backlog-stat-bar">
+                        <div className="planner-backlog-stat-bar-fill" style={{ width: `${pct}%` }} />
+                      </div>
+                    </div>
+                  </div>
+                );
+              })()}
               <DailyItemsPanel
                 dayID="backlog"
                 items={visiblePlannerItems}
                 projects={projects}
+                categories={categories}
                 noteLinkOptions={noteLinkOptions}
                 filter={dailyItemFilter}
                 onFilterChange={setDailyItemFilter}
@@ -18489,6 +21492,7 @@ function PlannerView({
                 plannerSourceKind="planner"
                 plannerSourceTitle={plannerReadableDate(currentDayID)}
                 dailyProjects={projects}
+                dailyCategories={categories}
                 dailyItems={dailyItems}
                 dailyItemFilter={dailyItemFilter}
                 toolbarAccessory={(
@@ -18497,6 +21501,7 @@ function PlannerView({
                       dayID={currentDayID}
                       items={dailyItems}
                       projects={projects}
+                      categories={categories}
                       noteLinkOptions={noteLinkOptions}
                       filter={dailyItemFilter}
                       onFilterChange={setDailyItemFilter}
@@ -18786,6 +21791,395 @@ function TranscriptHistoryWindowInner() {
         <TranscriptHistoryView />
       </div>
     </LiquidGlassRuntimeContext.Provider>
+  );
+}
+
+const REVIEW_INBOX_PAGE_SIZE = 24;
+
+function connectorReviewDate(value?: string) {
+  if (!value) return "";
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return value;
+  return date.toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+}
+
+const ReviewInboxCard = memo(function ReviewInboxCard({
+  item,
+  serviceLabel,
+  accountLabel,
+  busyID,
+  onSave,
+  onIgnore
+}: {
+  item: ConnectorItem;
+  serviceLabel: string;
+  accountLabel?: string;
+  busyID?: string;
+  onSave: (item: ConnectorItem) => void;
+  onIgnore: (item: ConnectorItem) => void;
+}) {
+  return (
+    <article className={cx("connector-review-item review-inbox-card", item.status === "conflict" && "conflict")}>
+      <header>
+        <span>{serviceLabel}</span>
+        <b>{item.kind}</b>
+        {item.status !== "candidate" && item.status !== "review" && (
+          <b>{item.status}</b>
+        )}
+      </header>
+      <strong>{item.title}</strong>
+      <p>{item.snippet}</p>
+      <small>
+        {[accountLabel, item.person, connectorReviewDate(item.date)]
+          .filter(Boolean)
+          .join(" · ")}
+      </small>
+      <div className="connector-review-actions">
+        <button
+          className="gold-action"
+          disabled={busyID === `backlog:${item.id}`}
+          onClick={() => { onSave(item); }}
+        >
+          {busyID === `backlog:${item.id}` ? "Saving..." : "Save to Backlog"}
+        </button>
+        <button
+          disabled={busyID === `ignore:${item.id}`}
+          onClick={() => { onIgnore(item); }}
+        >
+          {busyID === `ignore:${item.id}` ? "Ignoring..." : "Ignore"}
+        </button>
+      </div>
+    </article>
+  );
+});
+
+function ConnectorReviewInboxView() {
+  const [snapshot, setSnapshot] = useState<ConnectorReviewInboxSnapshot | null>(null);
+  const [oauthStatusByAccount, setOAuthStatusByAccount] = useState<Record<string, GoogleOAuthSetupStatus>>({});
+  const [busyID, setBusyID] = useState<string | undefined>(undefined);
+  const [message, setMessage] = useState("");
+  const [accountFilter, setAccountFilter] = useState<"all" | string>("all");
+  const [visibleCount, setVisibleCount] = useState(REVIEW_INBOX_PAGE_SIZE);
+  const [isLoading, setIsLoading] = useState(true);
+  const loadMoreRef = useRef<HTMLDivElement | null>(null);
+  const reviewItems = snapshot?.items ?? [];
+  const googleAccounts = snapshot?.accounts.filter((account) => account.provider === "google") ?? [];
+  const gmailAccounts = googleAccounts.filter((account) => account.enabledServiceIDs.includes("gmail"));
+  const serviceByID = useMemo(
+    () => new Map((snapshot?.services ?? []).map((service) => [service.id, service])),
+    [snapshot?.services]
+  );
+  const accountByID = useMemo(
+    () => new Map((snapshot?.accounts ?? []).map((account) => [account.id, account])),
+    [snapshot?.accounts]
+  );
+  const accountFilterOptions = useMemo(() => {
+    const accountIDsWithItems = new Set(reviewItems.map((item) => item.accountId));
+    const relevantAccounts = (snapshot?.accounts ?? []).filter(
+      (account) => accountIDsWithItems.has(account.id)
+        || (account.provider === "google" && account.enabledServiceIDs.includes("gmail"))
+    );
+    return [
+      { id: "all", label: "All accounts", count: reviewItems.length },
+      ...relevantAccounts.map((account) => ({
+        id: account.id,
+        label: account.label,
+        count: reviewItems.filter((item) => item.accountId === account.id).length
+      }))
+    ];
+  }, [reviewItems, snapshot?.accounts]);
+  const filteredReviewItems = useMemo(
+    () => (accountFilter === "all"
+      ? reviewItems
+      : reviewItems.filter((item) => item.accountId === accountFilter)),
+    [accountFilter, reviewItems]
+  );
+  const visibleReviewItems = useMemo(
+    () => filteredReviewItems.slice(0, visibleCount),
+    [filteredReviewItems, visibleCount]
+  );
+  const loggedInGmailAccounts = gmailAccounts.filter((account) => oauthStatusByAccount[account.id]?.isLoggedIn);
+  const needsLogin = gmailAccounts.some((account) => {
+    const status = oauthStatusByAccount[account.id];
+    return status?.hasClientSecret && !status.isLoggedIn;
+  });
+  const hasLoggedInGmail = loggedInGmailAccounts.length > 0;
+
+  const loadOAuthStatuses = useCallback(async (accounts: ConnectorAccount[]) => {
+    const googleOnly = accounts.filter((account) => account.provider === "google");
+    if (googleOnly.length === 0) return;
+    const googleStatuses = await Promise.all(
+      googleOnly.map(async (account) => window.openAssistElectron?.googleConnectorOAuthStatus?.(account.id).catch(() => undefined))
+    );
+    setOAuthStatusByAccount(Object.fromEntries(
+      googleStatuses
+        .filter((status): status is GoogleOAuthSetupStatus => Boolean(status?.accountID))
+        .map((status) => [status.accountID, status])
+    ));
+  }, []);
+
+  const applyInboxSnapshot = useCallback((next: ConnectorReviewInboxSnapshot) => {
+    startTransition(() => {
+      setSnapshot(next);
+    });
+  }, []);
+
+  const refresh = useCallback(async (options?: { deferOAuth?: boolean }) => {
+    setIsLoading(true);
+    try {
+      const next = await window.openAssistElectron?.loadConnectorReviewInbox?.();
+      if (next) {
+        applyInboxSnapshot(next);
+        if (options?.deferOAuth) {
+          window.setTimeout(() => { void loadOAuthStatuses(next.accounts); }, 0);
+        } else {
+          void loadOAuthStatuses(next.accounts);
+        }
+      }
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Could not load Review Inbox.");
+    } finally {
+      setIsLoading(false);
+    }
+  }, [applyInboxSnapshot, loadOAuthStatuses]);
+
+  useEffect(() => {
+    void refresh({ deferOAuth: true });
+  }, [refresh]);
+
+  useEffect(() => {
+    setVisibleCount(REVIEW_INBOX_PAGE_SIZE);
+  }, [accountFilter, filteredReviewItems.length]);
+
+  useEffect(() => {
+    const node = loadMoreRef.current;
+    const root = node?.parentElement;
+    if (!node || !root) return;
+    const observer = new IntersectionObserver((entries) => {
+      if (!entries.some((entry) => entry.isIntersecting)) return;
+      setVisibleCount((current) => {
+        if (current >= filteredReviewItems.length) return current;
+        return Math.min(current + REVIEW_INBOX_PAGE_SIZE, filteredReviewItems.length);
+      });
+    }, { root, rootMargin: "240px" });
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [filteredReviewItems.length, visibleCount]);
+
+  const saveToBacklog = async (item: ConnectorItem) => {
+    setBusyID(`backlog:${item.id}`);
+    try {
+      const result = await window.openAssistElectron?.saveConnectorItemToBacklog?.(item.id);
+      if (result?.snapshot) {
+        startTransition(() => {
+          setSnapshot((current) => current ? {
+            ...current,
+            items: current.items.filter((candidate) => candidate.id !== item.id),
+            updatedAt: result.snapshot.updatedAt
+          } : current);
+        });
+      }
+      setMessage("Saved to Backlog.");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Could not save to Backlog.");
+    } finally {
+      setBusyID(undefined);
+    }
+  };
+
+  const ignoreItem = async (item: ConnectorItem) => {
+    setBusyID(`ignore:${item.id}`);
+    startTransition(() => {
+      setSnapshot((current) => current ? {
+        ...current,
+        items: current.items.filter((candidate) => candidate.id !== item.id)
+      } : current);
+    });
+    try {
+      await window.openAssistElectron?.markConnectorItem?.(item.id, "ignored");
+      setMessage("Review item ignored.");
+    } catch (error) {
+      void refresh({ deferOAuth: true });
+      setMessage(error instanceof Error ? error.message : "Could not ignore item.");
+    } finally {
+      setBusyID(undefined);
+    }
+  };
+
+  const ignoreAllVisible = async () => {
+    if (filteredReviewItems.length === 0) return;
+    const scopeLabel = accountFilter === "all"
+      ? `${filteredReviewItems.length} review items`
+      : `${filteredReviewItems.length} items for ${accountByID.get(accountFilter)?.label ?? "this account"}`;
+    if (!window.confirm(`Ignore ${scopeLabel}?`)) return;
+    setBusyID("ignore-all");
+    try {
+      const result = await window.openAssistElectron?.ignoreConnectorReviewItems?.(
+        accountFilter === "all" ? undefined : accountFilter
+      );
+      if (result?.snapshot) applyInboxSnapshot(result.snapshot);
+      setMessage(`Ignored ${result?.count ?? 0} review items.`);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Could not ignore review items.");
+    } finally {
+      setBusyID(undefined);
+    }
+  };
+
+  const syncGmail = async (account: ConnectorAccount) => {
+    setBusyID(`sync:${account.id}`);
+    const startMessage = `Syncing Gmail for ${account.label}...`;
+    setMessage(startMessage);
+    try {
+      const result = await window.openAssistElectron?.syncGmailConnector?.(account.id);
+      const next = await window.openAssistElectron?.loadConnectorReviewInbox?.();
+      if (next) applyInboxSnapshot(next);
+      const doneMessage = gmailSyncStatusSummary(account.label, result);
+      setMessage(doneMessage);
+    } catch (error) {
+      const errorMessage = `Gmail sync failed for ${account.label}: ${readableProviderError(error)}`;
+      setMessage(errorMessage);
+    } finally {
+      setBusyID(undefined);
+    }
+  };
+
+  return (
+    <main className="feature-main review-inbox-view">
+      <section className="review-inbox-shell">
+        <div className="review-inbox-header">
+          <div className="feature-title-row">
+            <div className="feature-glyph gold">
+              <Inbox size={24} />
+            </div>
+            <div>
+              <h1>Review Inbox</h1>
+              <p>Gmail and other connectors place task candidates here before they go to Today or Backlog.</p>
+            </div>
+          </div>
+          <div className="review-inbox-toolbar">
+            <div className="review-inbox-status-strip">
+              <span>
+                <strong>{filteredReviewItems.length}</strong>
+                Waiting
+              </span>
+              <span>
+                <strong>{gmailAccounts.length}</strong>
+                Gmail accounts
+              </span>
+              <span className={hasLoggedInGmail ? "ready" : "attention"}>
+                <strong>{loggedInGmailAccounts.length}</strong>
+                Ready to sync
+              </span>
+              {isLoading && <small>Loading...</small>}
+            </div>
+            <div className="review-inbox-toolbar-actions">
+              {gmailAccounts.length > 0 && (
+                <details className="review-inbox-sync-menu">
+                  <summary>Sync Gmail</summary>
+                  <div>
+                    {gmailAccounts.map((account) => {
+                      const status = oauthStatusByAccount[account.id];
+                      return (
+                        <button
+                          key={account.id}
+                          disabled={!status?.isLoggedIn || busyID === `sync:${account.id}`}
+                          title={status?.isLoggedIn ? `Sync ${account.label}` : "Run Login in Connector Settings first."}
+                          onClick={() => { void syncGmail(account); }}
+                        >
+                          <span>{account.label}</span>
+                          <small>{status?.isLoggedIn ? "Ready" : "Needs login"}</small>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </details>
+              )}
+              {filteredReviewItems.length > 0 && (
+                <button
+                  className="review-inbox-ignore-all"
+                  disabled={busyID === "ignore-all"}
+                  onClick={() => { void ignoreAllVisible(); }}
+                >
+                  {busyID === "ignore-all" ? "Ignoring..." : accountFilter === "all" ? "Ignore All" : "Ignore Visible"}
+                </button>
+              )}
+              <IconButton label="Refresh Review Inbox" tone="subtle" onClick={() => { void refresh(); }}>
+                <RefreshCw size={17} />
+              </IconButton>
+              <IconButton label="Open Connector Settings" tone="subtle" onClick={() => { void window.openAssistElectron?.openSettingsWindow?.("connectors"); }}>
+                <Settings size={17} />
+              </IconButton>
+            </div>
+          </div>
+        </div>
+        {accountFilterOptions.length > 1 && (
+          <div className="review-inbox-account-filters">
+            {accountFilterOptions.map((option) => (
+              <button
+                key={option.id}
+                className={cx(accountFilter === option.id && "active")}
+                onClick={() => setAccountFilter(option.id)}
+              >
+                {option.label} ({option.count})
+              </button>
+            ))}
+          </div>
+        )}
+        {message && <p className="ready-line">{message}</p>}
+        <div className="review-inbox-list">
+          {visibleReviewItems.map((item) => (
+            <ReviewInboxCard
+              key={item.id}
+              item={item}
+              serviceLabel={serviceByID.get(item.sourceService)?.displayName ?? item.sourceService}
+              accountLabel={accountByID.get(item.accountId)?.label}
+              busyID={busyID}
+              onSave={(entry) => { void saveToBacklog(entry); }}
+              onIgnore={(entry) => { void ignoreItem(entry); }}
+            />
+          ))}
+          {filteredReviewItems.length > visibleCount && (
+            <div className="review-inbox-load-more" ref={loadMoreRef}>
+              Showing {visibleCount} of {filteredReviewItems.length}
+            </div>
+          )}
+          {filteredReviewItems.length === 0 && !isLoading && (
+            <div className="review-inbox-empty-note">
+              <Inbox size={30} />
+              <strong>No connector review items yet.</strong>
+              <span>
+                {accountFilter !== "all"
+                  ? "Nothing for this account. Try All accounts or sync Gmail again."
+                  : gmailAccounts.length === 0
+                    ? "Turn on Gmail in Connector Settings first."
+                    : needsLogin
+                      ? "Client secret is ready, but Google login is not complete. Run Login in Connector Settings."
+                      : hasLoggedInGmail
+                        ? "Click Sync Gmail to bring in email task candidates."
+                        : "Finish connector setup, then sync Gmail."}
+              </span>
+              {hasLoggedInGmail ? (
+                <button
+                  className="gold-action"
+                  disabled={loggedInGmailAccounts.some((account) => busyID === `sync:${account.id}`)}
+                  onClick={() => { void syncGmail(loggedInGmailAccounts[0]); }}
+                >
+                  {busyID?.startsWith("sync:") ? "Syncing..." : `Sync ${loggedInGmailAccounts[0]?.label ?? "Gmail"}`}
+                </button>
+              ) : (
+                <button
+                  className="gold-action"
+                  onClick={() => { void window.openAssistElectron?.openSettingsWindow?.("connectors"); }}
+                >
+                  Open Connector Settings
+                </button>
+              )}
+            </div>
+          )}
+        </div>
+      </section>
+    </main>
   );
 }
 
@@ -19350,14 +22744,25 @@ function SettingsView({
 }) {
   const [section, setSection] = useState<SettingsKey>(initialSection ?? "assistant");
   const [settingsSearch, setSettingsSearch] = useState("");
+  // Briefly marks the section the user just picked via search so it gets an
+  // emphasis pulse in the nav after the list returns to its full view.
+  const [justSelectedSection, setJustSelectedSection] = useState<string | null>(null);
+  const activeNavRef = useRef<HTMLButtonElement | null>(null);
   useEffect(() => {
     if (initialSection) setSection(initialSection);
   }, [initialSection]);
+  // When the active section changes (including after a search jump), scroll it
+  // into view inside the sidebar so the user sees where it sits in the list.
+  useEffect(() => {
+    activeNavRef.current?.scrollIntoView({ block: "nearest" });
+  }, [section, settingsSearch]);
   const filteredSections = useMemo(() => {
     const query = settingsSearch.trim().toLowerCase();
     if (!query) return settingsSections;
     return settingsSections.filter((item) =>
-      [item.title, item.subtitle].some((value) => value.toLowerCase().includes(query))
+      [item.title, item.subtitle, ...(item.keywords ?? [])].some((value) =>
+        value.toLowerCase().includes(query)
+      )
     );
   }, [settingsSearch]);
   const current = settingsSections.find((item) => item.id === section) ?? settingsSections[0];
@@ -19384,11 +22789,33 @@ function SettingsView({
           />
         </label>
         <nav className="settings-nav">
-          {filteredSections.map((item) => (
-            <button key={item.id} className={cx(section === item.id && "active")} onClick={() => setSection(item.id)}>
-              {item.title}
-            </button>
-          ))}
+          {filteredSections.map((item) => {
+            const SectionIcon = settingsSectionIcons[item.id];
+            const isActive = section === item.id;
+            return (
+              <button
+                key={item.id}
+                ref={isActive ? activeNavRef : undefined}
+                className={cx(isActive && "active", justSelectedSection === item.id && "just-selected")}
+                onClick={() => {
+                  setSection(item.id);
+                  // Clear the search so the full section list returns, letting
+                  // the user see the selected section highlighted in context.
+                  const fromSearch = Boolean(settingsSearch);
+                  if (fromSearch) setSettingsSearch("");
+                  if (fromSearch) {
+                    setJustSelectedSection(item.id);
+                    window.setTimeout(() => {
+                      setJustSelectedSection((current) => (current === item.id ? null : current));
+                    }, 1600);
+                  }
+                }}
+              >
+                {SectionIcon && <SectionIcon size={16} />}
+                <span>{item.title}</span>
+              </button>
+            );
+          })}
           {filteredSections.length === 0 && <span className="settings-empty">No settings match</span>}
         </nav>
         <div className="status-card settings-update">
@@ -19402,7 +22829,13 @@ function SettingsView({
       </aside>
       <section className="settings-content">
         <header>
-          <h1>{current.title}</h1>
+          <h1>
+            {(() => {
+              const HeaderIcon = settingsSectionIcons[current.id];
+              return HeaderIcon ? <HeaderIcon size={26} /> : null;
+            })()}
+            <span>{current.title}</span>
+          </h1>
           <p>{current.subtitle}</p>
         </header>
         <SettingsContent
@@ -19442,6 +22875,20 @@ function SettingsView({
 }
 
 const OLLAMA_CUSTOM_MODEL_VALUE = "__custom__";
+
+const knowledgeExternalAccessModeOptions: Array<{
+  id: KnowledgeExternalAccessMode;
+  label: string;
+  detail: string;
+}> = [
+  { id: "simple", label: "Simple", detail: "Recommended, focused tools" },
+  { id: "advanced", label: "Advanced", detail: "More planner/history tools" },
+  { id: "full", label: "Full", detail: "Everything, noisy" }
+];
+
+function knowledgeExternalAccessModeLabel(mode?: string) {
+  return knowledgeExternalAccessModeOptions.find((option) => option.id === mode)?.label ?? "Simple";
+}
 
 function formatOllamaCatalogOptionLabel(option: OllamaCatalogModelOption): string {
   const parts = [
@@ -19534,6 +22981,19 @@ function SettingsContent({
   const [screenSnipTheme, setScreenSnipTheme] = useState<string>("prism");
   const [knowledgeRequests, setKnowledgeRequests] = useState<KnowledgeWriteRequest[]>([]);
   const [knowledgeActionMessage, setKnowledgeActionMessage] = useState<string | undefined>(undefined);
+  const [integrationStatus, setIntegrationStatus] = useState<OpenAssistIntegrationStatus | null>(null);
+  const [integrationActionMessage, setIntegrationActionMessage] = useState<string | undefined>(undefined);
+  const [integrationBusyID, setIntegrationBusyID] = useState<string | undefined>(undefined);
+  const [connectorSnapshot, setConnectorSnapshot] = useState<ConnectorSnapshot | null>(null);
+  const [appleEventKitStatus, setAppleEventKitStatus] = useState<AppleEventKitStatus | null>(null);
+  const [connectorActionMessage, setConnectorActionMessage] = useState<string | undefined>(undefined);
+  const [connectorAccountLabel, setConnectorAccountLabel] = useState("");
+  const [selectedGoogleAccountID, setSelectedGoogleAccountID] = useState<string | undefined>(undefined);
+  const [connectorBusyID, setConnectorBusyID] = useState<string | undefined>(undefined);
+  const [connectorLoginOutputByAccount, setConnectorLoginOutputByAccount] = useState<Record<string, string>>({});
+  const [connectorLoginSessionByAccount, setConnectorLoginSessionByAccount] = useState<Record<string, string>>({});
+  const [connectorTerminalInputByAccount, setConnectorTerminalInputByAccount] = useState<Record<string, string>>({});
+  const [googleOAuthStatusByAccount, setGoogleOAuthStatusByAccount] = useState<Record<string, GoogleOAuthSetupStatus>>({});
   const [ollamaModels, setOllamaModels] = useState<ProviderModelOption[]>([]);
   const [ollamaModelsLoaded, setOllamaModelsLoaded] = useState(false);
   const [ollamaModelsLoading, setOllamaModelsLoading] = useState(false);
@@ -19607,11 +23067,23 @@ function SettingsContent({
     setAppearanceStatus("");
     setAssistantVoiceActionMessage(undefined);
     setKnowledgeActionMessage(undefined);
+    setIntegrationActionMessage(undefined);
     if (section !== "app") {
       setPendingColorTheme(null);
       onPreviewColorTheme?.(null);
     }
   }, [section]);
+
+  const refreshIntegrationStatus = useCallback(async () => {
+    try {
+      const status = await window.openAssistElectron?.integrationStatus?.();
+      if (status) setIntegrationStatus(status);
+      return status;
+    } catch (error) {
+      setIntegrationActionMessage(error instanceof Error ? error.message : "Could not load integrations.");
+      return undefined;
+    }
+  }, []);
 
   useEffect(() => {
     if (section !== "assistant") return;
@@ -19625,6 +23097,105 @@ function SettingsContent({
       });
     return () => { cancelled = true; };
   }, [section, settings?.knowledgePendingRequestCount]);
+
+  useEffect(() => {
+    if (section !== "assistant") return;
+    let cancelled = false;
+    window.openAssistElectron?.integrationStatus?.()
+      .then((status) => {
+        if (!cancelled && status) setIntegrationStatus(status);
+      })
+      .catch((error) => {
+        if (!cancelled) setIntegrationActionMessage(error instanceof Error ? error.message : "Could not load integrations.");
+      });
+    return () => { cancelled = true; };
+  }, [section, settings?.knowledgeAccessEnabled, settings?.knowledgeExternalAccessEnabled, settings?.knowledgeExternalAccessMode]);
+
+  const refreshConnectorSnapshot = useCallback(async () => {
+    try {
+      const snapshot = await window.openAssistElectron?.loadConnectorSnapshot?.();
+      if (snapshot) setConnectorSnapshot(snapshot);
+    } catch (error) {
+      setConnectorActionMessage(error instanceof Error ? error.message : "Could not load connectors.");
+    }
+  }, []);
+
+  const refreshAppleEventKitStatus = useCallback(async () => {
+    try {
+      const status = await window.openAssistElectron?.appleEventKitStatus?.();
+      if (status) setAppleEventKitStatus(status);
+      await refreshConnectorSnapshot();
+      return status;
+    } catch (error) {
+      setConnectorActionMessage(error instanceof Error ? error.message : "Could not check Apple Reminders/Calendar access.");
+      return undefined;
+    }
+  }, [refreshConnectorSnapshot]);
+
+  const refreshGoogleOAuthStatus = useCallback(async (accountID: string) => {
+    try {
+      const status = await window.openAssistElectron?.googleConnectorOAuthStatus?.(accountID);
+      if (status) {
+        setGoogleOAuthStatusByAccount((current) => ({
+          ...current,
+          [accountID]: status
+        }));
+      }
+      return status;
+    } catch (error) {
+      setConnectorActionMessage(error instanceof Error ? error.message : "Could not check Google OAuth setup.");
+      return undefined;
+    }
+  }, []);
+
+  useEffect(() => {
+    if (section !== "connectors") return;
+    void refreshConnectorSnapshot();
+    void refreshAppleEventKitStatus();
+  }, [refreshAppleEventKitStatus, refreshConnectorSnapshot, section]);
+
+  useEffect(() => {
+    if (section !== "connectors" || !connectorSnapshot) return;
+    const googleAccountIDs = connectorSnapshot.accounts
+      .filter((account) => account.provider === "google")
+      .map((account) => account.id);
+    if (!selectedGoogleAccountID || !googleAccountIDs.includes(selectedGoogleAccountID)) {
+      setSelectedGoogleAccountID(googleAccountIDs[0]);
+    }
+    for (const accountID of googleAccountIDs) {
+      void refreshGoogleOAuthStatus(accountID);
+    }
+  }, [connectorSnapshot?.accounts, refreshGoogleOAuthStatus, section, selectedGoogleAccountID]);
+
+  useEffect(() => {
+    return window.openAssistElectron?.onConnectorLoginProgress?.((payload: ConnectorLoginProgress) => {
+      if (!payload?.accountID) return;
+      if (payload.sessionID) {
+        setConnectorLoginSessionByAccount((current) => ({
+          ...current,
+          [payload.accountID]: payload.sessionID
+        }));
+      }
+      if (payload.text) {
+        setConnectorLoginOutputByAccount((current) => ({
+          ...current,
+          [payload.accountID]: `${current[payload.accountID] ?? ""}${payload.text}`
+        }));
+        if (payload.text.includes("OAuth client creation requires manual setup")) {
+          setConnectorActionMessage("Google needs a Desktop OAuth client. Use the Google setup steps, import the JSON, then run login.");
+        }
+      }
+      if (payload.type === "close" || payload.type === "error") {
+        setConnectorBusyID((current) =>
+          current === `login:${payload.accountID}` || current === `setup:${payload.accountID}`
+            ? undefined
+            : current
+        );
+        void refreshGoogleOAuthStatus(payload.accountID);
+        void refreshConnectorSnapshot();
+      }
+    });
+  }, [refreshConnectorSnapshot, refreshGoogleOAuthStatus]);
 
   const refreshOllamaModels = useCallback(async () => {
     setOllamaModelsLoading(true);
@@ -19940,6 +23511,135 @@ function SettingsContent({
     }
   };
 
+  const connectIntegrationTarget = async (target: OpenAssistIntegrationTargetStatus) => {
+    if (target.id === "generic") return;
+    const confirmed = window.confirm(
+      `Connect OpenAssist to ${target.title}?\n\nOpenAssist will update ${target.configPath || "the client config"} and save a timestamped backup first.`
+    );
+    if (!confirmed) return;
+    setIntegrationBusyID(`connect:${target.id}`);
+    setIntegrationActionMessage(`Connecting ${target.title}...`);
+    try {
+      const result = await window.openAssistElectron?.connectIntegration?.(target.id);
+      await refreshIntegrationStatus();
+      setIntegrationActionMessage(
+        result?.backupPath
+          ? `${target.title} connected. Backup saved at ${result.backupPath}.`
+          : `${target.title} connected.`
+      );
+      onRefresh();
+    } catch (error) {
+      setIntegrationActionMessage(error instanceof Error ? error.message : `Could not connect ${target.title}.`);
+    } finally {
+      setIntegrationBusyID(undefined);
+    }
+  };
+
+  const copyIntegrationConfig = async (targetID: OpenAssistIntegrationTargetID) => {
+    setIntegrationBusyID(`copy-config:${targetID}`);
+    setIntegrationActionMessage("Copying MCP config...");
+    try {
+      await window.openAssistElectron?.copyIntegrationConfig?.(targetID);
+      setIntegrationActionMessage("MCP config copied to clipboard.");
+      await refreshIntegrationStatus();
+    } catch (error) {
+      setIntegrationActionMessage(error instanceof Error ? error.message : "Could not copy MCP config.");
+    } finally {
+      setIntegrationBusyID(undefined);
+    }
+  };
+
+  const revealIntegrationConfig = async (targetID: OpenAssistIntegrationTargetID) => {
+    setIntegrationBusyID(`reveal-config:${targetID}`);
+    try {
+      const result = await window.openAssistElectron?.revealIntegrationConfig?.(targetID);
+      setIntegrationActionMessage(result?.ok ? "Opened the config location." : result?.error || "Could not open config location.");
+    } catch (error) {
+      setIntegrationActionMessage(error instanceof Error ? error.message : "Could not open config location.");
+    } finally {
+      setIntegrationBusyID(undefined);
+    }
+  };
+
+  const testIntegrationConnection = async () => {
+    setIntegrationBusyID("test");
+    setIntegrationActionMessage("Testing OpenAssist MCP...");
+    try {
+      const result = await window.openAssistElectron?.testIntegrationConnection?.();
+      const modeLabel = knowledgeExternalAccessModeLabel(result?.mode);
+      setIntegrationActionMessage(
+        `OpenAssist MCP is reachable in ${modeLabel} mode with ${result?.toolCount ?? 0} tools. Resources ${result?.resourcesVisible ? "visible" : "hidden"}.`
+      );
+    } catch (error) {
+      setIntegrationActionMessage(error instanceof Error ? error.message : "OpenAssist MCP test failed.");
+    } finally {
+      setIntegrationBusyID(undefined);
+    }
+  };
+
+  const updateIntegrationMode = async (mode: KnowledgeExternalAccessMode) => {
+    if ((settings?.knowledgeExternalAccessMode ?? "simple") === mode) return;
+    setIntegrationBusyID(`mode:${mode}`);
+    setIntegrationActionMessage(`Switching external agents to ${knowledgeExternalAccessModeLabel(mode)} mode...`);
+    try {
+      await onUpdateSetting("knowledgeExternalAccessMode", mode);
+      await refreshIntegrationStatus();
+      setIntegrationActionMessage(`${knowledgeExternalAccessModeLabel(mode)} mode selected for external MCP clients.`);
+      onRefresh();
+    } catch (error) {
+      setIntegrationActionMessage(error instanceof Error ? error.message : "Could not update external agent mode.");
+    } finally {
+      setIntegrationBusyID(undefined);
+    }
+  };
+
+  const copyIntegrationSkill = async (targetID?: OpenAssistIntegrationTargetID) => {
+    setIntegrationBusyID(`copy-skill:${targetID || "generic"}`);
+    try {
+      await window.openAssistElectron?.copyIntegrationSkill?.(targetID);
+      setIntegrationActionMessage("OpenAssist skill copied to clipboard.");
+    } catch (error) {
+      setIntegrationActionMessage(error instanceof Error ? error.message : "Could not copy OpenAssist skill.");
+    } finally {
+      setIntegrationBusyID(undefined);
+    }
+  };
+
+  const installIntegrationSkill = async (target: OpenAssistIntegrationTargetStatus) => {
+    if (!target.skillPath) return;
+    const confirmed = window.confirm(
+      `Install the OpenAssist skill for ${target.title}?\n\nOpenAssist will update ${target.skillPath} and save a timestamped backup if it already exists.`
+    );
+    if (!confirmed) return;
+    setIntegrationBusyID(`install-skill:${target.id}`);
+    setIntegrationActionMessage(`Installing ${target.title} skill...`);
+    try {
+      const result = await window.openAssistElectron?.installIntegrationSkill?.(target.id);
+      await refreshIntegrationStatus();
+      setIntegrationActionMessage(
+        result?.backupPath
+          ? `${target.title} skill installed. Backup saved at ${result.backupPath}.`
+          : `${target.title} skill installed.`
+      );
+    } catch (error) {
+      setIntegrationActionMessage(error instanceof Error ? error.message : `Could not install ${target.title} skill.`);
+    } finally {
+      setIntegrationBusyID(undefined);
+    }
+  };
+
+  const revealIntegrationSkill = async (targetID?: OpenAssistIntegrationTargetID) => {
+    setIntegrationBusyID(`reveal-skill:${targetID || "generic"}`);
+    try {
+      const result = await window.openAssistElectron?.revealIntegrationSkill?.(targetID);
+      setIntegrationActionMessage(result?.ok ? "Opened the skill location." : result?.error || "Could not open skill location.");
+    } catch (error) {
+      setIntegrationActionMessage(error instanceof Error ? error.message : "Could not open skill location.");
+    } finally {
+      setIntegrationBusyID(undefined);
+    }
+  };
+
   const testAssistantVoiceOutput = async () => {
     setAssistantVoiceActionMessage("Testing assistant voice output...");
     try {
@@ -19965,6 +23665,268 @@ function SettingsContent({
     }
   };
 
+  const createConnectorAccount = async () => {
+    const label = connectorAccountLabel.trim();
+    if (!label) {
+      setConnectorActionMessage("Enter a label first.");
+      return;
+    }
+    setConnectorBusyID("create-google-account");
+    try {
+      const snapshot = await window.openAssistElectron?.createGoogleConnectorAccount?.(label);
+      if (snapshot) {
+        setConnectorSnapshot(snapshot);
+        const createdAccount = [...snapshot.accounts].reverse().find((account) => account.provider === "google" && account.label === label);
+        if (createdAccount) setSelectedGoogleAccountID(createdAccount.id);
+      }
+      setConnectorAccountLabel("");
+      setConnectorActionMessage(`${label} profile created.`);
+    } catch (error) {
+      setConnectorActionMessage(error instanceof Error ? error.message : "Could not create account profile.");
+    } finally {
+      setConnectorBusyID(undefined);
+    }
+  };
+
+  const installGws = async () => {
+    setConnectorBusyID("install-gws");
+    setConnectorActionMessage("Installing pinned gws...");
+    try {
+      const result = await window.openAssistElectron?.installGoogleWorkspaceCLI?.();
+      if (result?.snapshot) setConnectorSnapshot(result.snapshot);
+      setConnectorActionMessage("Pinned gws installed.");
+    } catch (error) {
+      setConnectorActionMessage(error instanceof Error ? error.message : "Could not install gws.");
+    } finally {
+      setConnectorBusyID(undefined);
+    }
+  };
+
+  const googleLoginCommand = async (account: ConnectorAccount) => {
+    try {
+      const operation: GoogleConnectorOperation = { kind: "authLogin", scopes: ["gmail", "calendar", "tasks", "drive", "people"] };
+      const plan = await window.openAssistElectron?.googleConnectorCommandPlan?.(account.id, operation);
+      if (!plan) return;
+      const envPrefix = Object.entries(plan.environment)
+        .map(([key, value]) => `${key}=${JSON.stringify(value)}`)
+        .join(" ");
+      const command = `${envPrefix} ${plan.displayCommand}`;
+      writeTextToClipboard(command);
+      setConnectorActionMessage(`Login command copied for ${account.label}.`);
+    } catch (error) {
+      setConnectorActionMessage(error instanceof Error ? error.message : "Could not build login command.");
+    }
+  };
+
+  const googleSetupCommand = async (account: ConnectorAccount) => {
+    try {
+      const operation: GoogleConnectorOperation = { kind: "authSetup" };
+      const plan = await window.openAssistElectron?.googleConnectorCommandPlan?.(account.id, operation);
+      if (!plan) return;
+      const envPrefix = Object.entries(plan.environment)
+        .map(([key, value]) => `${key}=${JSON.stringify(value)}`)
+        .join(" ");
+      const command = `${envPrefix} ${plan.displayCommand}`;
+      writeTextToClipboard(command);
+      setConnectorActionMessage(`Setup command copied for ${account.label}.`);
+    } catch (error) {
+      setConnectorActionMessage(error instanceof Error ? error.message : "Could not build setup command.");
+    }
+  };
+
+  const runGoogleSetupInApp = async (account: ConnectorAccount) => {
+    setConnectorBusyID(`setup:${account.id}`);
+    setConnectorActionMessage(`Starting Google setup for ${account.label}...`);
+    setConnectorLoginOutputByAccount((current) => ({
+      ...current,
+      [account.id]: ""
+    }));
+    try {
+      const result = await window.openAssistElectron?.runGoogleConnectorSetup?.(account.id);
+      if (result?.sessionID) {
+        setConnectorLoginSessionByAccount((current) => ({
+          ...current,
+          [account.id]: result.sessionID
+        }));
+      }
+      setConnectorActionMessage("Setup started. Follow the prompts below.");
+    } catch (error) {
+      setConnectorBusyID(undefined);
+      setConnectorActionMessage(error instanceof Error ? error.message : "Could not start setup.");
+    }
+  };
+
+  const runGoogleLoginInApp = async (account: ConnectorAccount) => {
+    setConnectorBusyID(`login:${account.id}`);
+    setConnectorActionMessage(`Starting Google login for ${account.label}...`);
+    setConnectorLoginOutputByAccount((current) => ({
+      ...current,
+      [account.id]: ""
+    }));
+    try {
+      const result = await window.openAssistElectron?.runGoogleConnectorLogin?.(account.id);
+      if (result?.sessionID) {
+        setConnectorLoginSessionByAccount((current) => ({
+          ...current,
+          [account.id]: result.sessionID
+        }));
+      }
+      setConnectorActionMessage("Login started. Finish the browser approval window.");
+    } catch (error) {
+      setConnectorBusyID(undefined);
+      setConnectorActionMessage(error instanceof Error ? error.message : "Could not start login.");
+    }
+  };
+
+  const sendConnectorTerminalInput = async (account: ConnectorAccount) => {
+    const sessionID = connectorLoginSessionByAccount[account.id];
+    const input = connectorTerminalInputByAccount[account.id] ?? "";
+    if (!sessionID || !input.trim()) return;
+    setConnectorLoginOutputByAccount((current) => ({
+      ...current,
+      [account.id]: `${current[account.id] ?? ""}> [input sent]\n`
+    }));
+    setConnectorTerminalInputByAccount((current) => ({
+      ...current,
+      [account.id]: ""
+    }));
+    try {
+      await window.openAssistElectron?.sendConnectorTerminalInput?.(sessionID, input);
+    } catch (error) {
+      setConnectorActionMessage(error instanceof Error ? error.message : "Could not send input.");
+    }
+  };
+
+  const stopConnectorTerminal = async (account: ConnectorAccount) => {
+    const sessionID = connectorLoginSessionByAccount[account.id];
+    if (!sessionID) return;
+    try {
+      await window.openAssistElectron?.stopConnectorTerminal?.(sessionID);
+      setConnectorBusyID((current) =>
+        current === `login:${account.id}` || current === `setup:${account.id}` ? undefined : current
+      );
+      setConnectorActionMessage(`Stopped connector command for ${account.label}.`);
+    } catch (error) {
+      setConnectorActionMessage(error instanceof Error ? error.message : "Could not stop connector command.");
+    }
+  };
+
+  const openGoogleOAuthPage = async (account: ConnectorAccount, page: "consent" | "credentials" | "apiLibrary") => {
+    try {
+      const result = await window.openAssistElectron?.openGoogleConnectorOAuthPage?.(account.id, page);
+      if (result?.status) {
+        setGoogleOAuthStatusByAccount((current) => ({
+          ...current,
+          [account.id]: result.status
+        }));
+      }
+      setConnectorActionMessage(
+        page === "consent"
+          ? "Opened Google consent screen."
+          : page === "credentials"
+            ? "Opened Google OAuth client page."
+            : "Opened Google API library."
+      );
+    } catch (error) {
+      setConnectorActionMessage(error instanceof Error ? error.message : "Could not open Google setup page.");
+    }
+  };
+
+  const importGoogleClientSecret = async (account: ConnectorAccount) => {
+    setConnectorBusyID(`import-secret:${account.id}`);
+    try {
+      const result = await window.openAssistElectron?.importGoogleConnectorClientSecret?.(account.id);
+      if (result?.status) {
+        setGoogleOAuthStatusByAccount((current) => ({
+          ...current,
+          [account.id]: result.status
+        }));
+      }
+      setConnectorActionMessage(result?.cancelled ? "Client secret import cancelled." : "Client secret imported. You can run login now.");
+    } catch (error) {
+      setConnectorActionMessage(error instanceof Error ? error.message : "Could not import client secret.");
+    } finally {
+      setConnectorBusyID(undefined);
+    }
+  };
+
+  const reuseGoogleClientSecret = async (account: ConnectorAccount) => {
+    setConnectorBusyID(`reuse-secret:${account.id}`);
+    try {
+      const result = await window.openAssistElectron?.reuseGoogleConnectorClientSecret?.(account.id);
+      if (result?.status) {
+        setGoogleOAuthStatusByAccount((current) => ({
+          ...current,
+          [account.id]: result.status
+        }));
+      }
+      setConnectorActionMessage("Shared OAuth JSON copied. You can run login now.");
+    } catch (error) {
+      setConnectorActionMessage(error instanceof Error ? error.message : "Could not reuse the shared OAuth JSON.");
+    } finally {
+      setConnectorBusyID(undefined);
+    }
+  };
+
+  const openGoogleConfigFolder = async (account: ConnectorAccount) => {
+    try {
+      const result = await window.openAssistElectron?.openGoogleConnectorConfigFolder?.(account.id);
+      if (result?.status) {
+        setGoogleOAuthStatusByAccount((current) => ({
+          ...current,
+          [account.id]: result.status
+        }));
+      }
+      setConnectorActionMessage(result?.ok ? "Opened connector folder." : result?.error || "Could not open connector folder.");
+    } catch (error) {
+      setConnectorActionMessage(error instanceof Error ? error.message : "Could not open connector folder.");
+    }
+  };
+
+  const toggleConnectorService = async (account: ConnectorAccount, serviceID: ConnectorServiceID) => {
+    const enabled = !account.enabledServiceIDs.includes(serviceID);
+    setConnectorBusyID(`${account.id}:${serviceID}`);
+    try {
+      const snapshot = await window.openAssistElectron?.setConnectorServiceEnabled?.(account.id, serviceID, enabled);
+      if (snapshot) setConnectorSnapshot(snapshot);
+      setConnectorActionMessage(`${enabled ? "Enabled" : "Disabled"} ${serviceID}.`);
+    } catch (error) {
+      setConnectorActionMessage(error instanceof Error ? error.message : "Could not update connector.");
+    } finally {
+      setConnectorBusyID(undefined);
+    }
+  };
+
+  const removeConnectorAccount = async (account: ConnectorAccount) => {
+    setConnectorBusyID(`remove:${account.id}`);
+    try {
+      const snapshot = await window.openAssistElectron?.removeGoogleConnectorAccount?.(account.id);
+      if (snapshot) setConnectorSnapshot(snapshot);
+      setConnectorActionMessage(`${account.label} removed.`);
+    } catch (error) {
+      setConnectorActionMessage(error instanceof Error ? error.message : "Could not remove account.");
+    } finally {
+      setConnectorBusyID(undefined);
+    }
+  };
+
+  const syncGmailConnector = async (account: ConnectorAccount) => {
+    setConnectorBusyID(`sync:${account.id}`);
+    const startMessage = `Syncing Gmail for ${account.label}...`;
+    setConnectorActionMessage(startMessage);
+    try {
+      const result = await window.openAssistElectron?.syncGmailConnector?.(account.id);
+      if (result?.snapshot) setConnectorSnapshot(result.snapshot);
+      const doneMessage = gmailSyncStatusSummary(account.label, result);
+      setConnectorActionMessage(doneMessage);
+    } catch (error) {
+      const errorMessage = `Gmail sync failed for ${account.label}: ${readableProviderError(error)}`;
+      setConnectorActionMessage(errorMessage);
+    } finally {
+      setConnectorBusyID(undefined);
+    }
+  };
+
   if (!settingsLoaded) {
     return (
       <div className="settings-stack single" key={`${section}-loading`}>
@@ -19982,9 +23944,21 @@ function SettingsContent({
   }
 
   if (section === "assistant") {
+    const externalAccessMode = (settings?.knowledgeExternalAccessMode ?? integrationStatus?.externalMode ?? "simple") as KnowledgeExternalAccessMode;
+    const exposedToolCount = integrationStatus?.exposedToolCount ?? (externalAccessMode === "full" ? undefined : externalAccessMode === "advanced" ? 26 : 15);
+    const exposedToolSummary = exposedToolCount ? `${exposedToolCount} tools` : "all tools";
+    const resourcesVisible = integrationStatus?.resourcesVisible ?? externalAccessMode === "full";
     return (
       <div className="settings-stack single" key="assistant">
-        <div className="settings-card">
+        <SettingsSectionTabs
+          tabs={[
+            { id: "assistant-status", label: "Status" },
+            { id: "assistant-window", label: "Window" },
+            { id: "assistant-knowledge", label: "Knowledge" },
+            { id: "assistant-integrations", label: "Integrations" }
+          ]}
+        />
+        <div className="settings-card" id="assistant-status">
           <div className="card-heading">
             <Bot size={22} />
             <span>
@@ -20005,7 +23979,7 @@ function SettingsContent({
           </button>
         </div>
 
-        <div className="settings-card">
+        <div className="settings-card" id="assistant-window">
           <div className="card-heading">
             <PanelLeftClose size={22} />
             <span>
@@ -20032,7 +24006,7 @@ function SettingsContent({
           )}
         </div>
 
-        <div className="settings-card">
+        <div className="settings-card compact" id="assistant-code">
           <div className="card-heading">
             <GitBranch size={22} />
             <span>
@@ -20047,7 +24021,7 @@ function SettingsContent({
           />
         </div>
 
-        <div className="settings-card">
+        <div className="settings-card" id="assistant-knowledge">
           <div className="card-heading">
             <Brain size={22} />
             <span>
@@ -20112,6 +24086,154 @@ function SettingsContent({
           )}
           {knowledgeActionMessage ? <p className="ready-line">{knowledgeActionMessage}</p> : null}
         </div>
+
+        <div className="settings-card expanded" id="assistant-integrations">
+          <div className="card-heading">
+            <Plug size={22} />
+            <span>
+              <strong>External Agent Integrations</strong>
+              <small>Connect Cursor, Codex, Claude Desktop, or another MCP client to OpenAssist Knowledge.</small>
+            </span>
+          </div>
+          <div className="integration-toolbar">
+            <p className="settings-helper-line">
+              One-click setup writes the MCP config with a backup. Add the behavior skill so external agents route tasks to backlog and references to notes.
+            </p>
+            <div className="integration-mode-panel">
+              <span>
+                <strong>External agent mode</strong>
+                <small>
+                  {knowledgeExternalAccessModeLabel(externalAccessMode)} exposes {exposedToolSummary} and {resourcesVisible ? "allows resource browsing." : "hides resource browsing."}
+                </small>
+              </span>
+              <div className="segmented integration-mode-segmented">
+                {knowledgeExternalAccessModeOptions.map((option) => (
+                  <button
+                    key={option.id}
+                    className={cx(externalAccessMode === option.id && "selected")}
+                    disabled={integrationBusyID === `mode:${option.id}`}
+                    title={option.detail}
+                    onClick={() => void updateIntegrationMode(option.id)}
+                  >
+                    {option.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <div className="integration-fast-path-panel">
+              <strong>Common fast actions</strong>
+              <div>
+                <span><b>Add tomorrow</b><small>`oa_quick_add_task` with `when: "tomorrow"`</small></span>
+                <span><b>Add later</b><small>`oa_quick_add_task` with no `when`</small></span>
+                <span><b>Save a fact</b><small>`oa_quick_save_note` with `text` and `listName`</small></span>
+                <span><b>Read today</b><small>`oa_quick_read` with `target: "today"`</small></span>
+                <span><b>Mark done</b><small>`oa_complete_daily_item` with task text</small></span>
+              </div>
+            </div>
+            <div className="inline-actions integration-toolbar-actions">
+              <button
+                disabled={integrationBusyID === "test"}
+                onClick={() => void testIntegrationConnection()}
+              >
+                {integrationBusyID === "test" ? "Testing..." : "Test MCP"}
+              </button>
+              <button
+                disabled={integrationBusyID === "copy-skill:generic"}
+                onClick={() => void copyIntegrationSkill()}
+              >
+                Copy Skill
+              </button>
+              <button
+                disabled={integrationBusyID === "reveal-skill:generic"}
+                onClick={() => void revealIntegrationSkill()}
+              >
+                Reveal Skill
+              </button>
+            </div>
+          </div>
+          <div className="integration-target-list">
+            {(integrationStatus?.targets ?? []).map((target) => {
+              const statusLabel = target.id === "generic"
+                ? "Manual setup"
+                : target.connected
+                  ? "Connected"
+                  : target.detected
+                    ? "Needs setup"
+                    : "Not connected";
+              const statusTone = target.connected
+                ? "connected"
+                : target.id === "generic"
+                  ? "manual"
+                  : target.detected
+                    ? "detected"
+                    : "missing";
+              const connectBusy = integrationBusyID === `connect:${target.id}`;
+              const copyConfigBusy = integrationBusyID === `copy-config:${target.id}`;
+              const revealConfigBusy = integrationBusyID === `reveal-config:${target.id}`;
+              const installSkillBusy = integrationBusyID === `install-skill:${target.id}`;
+              return (
+                <div className={cx("integration-target-row", target.connected && "connected")} key={target.id}>
+                  <div className="integration-target-main">
+                    <div className="integration-target-title-line">
+                      <strong>{target.title}</strong>
+                      <span className={`integration-status-pill ${statusTone}`}>{statusLabel}</span>
+                    </div>
+                    <small>{target.description}</small>
+                    {target.skillPath ? (
+                      <button
+                        type="button"
+                        className="integration-text-link"
+                        disabled={installSkillBusy}
+                        onClick={() => void installIntegrationSkill(target)}
+                      >
+                        {installSkillBusy ? "Installing skill..." : "Install behavior skill"}
+                      </button>
+                    ) : null}
+                  </div>
+                  <div className="inline-actions integration-target-actions">
+                    {target.configPath ? (
+                      <button
+                        className="gold-action"
+                        disabled={connectBusy}
+                        onClick={() => void connectIntegrationTarget(target)}
+                      >
+                        {connectBusy ? "Connecting..." : target.connected ? "Reconnect" : "Connect"}
+                      </button>
+                    ) : (
+                      <button
+                        className="gold-action"
+                        disabled={copyConfigBusy}
+                        onClick={() => void copyIntegrationConfig(target.id)}
+                      >
+                        {copyConfigBusy ? "Copying..." : "Copy Config"}
+                      </button>
+                    )}
+                    {target.configPath ? (
+                      <>
+                        <button
+                          disabled={copyConfigBusy}
+                          onClick={() => void copyIntegrationConfig(target.id)}
+                        >
+                          {copyConfigBusy ? "Copying..." : "Copy"}
+                        </button>
+                        <button
+                          className="integration-icon-button"
+                          title="Reveal config in Finder"
+                          aria-label={`Reveal ${target.title} config`}
+                          disabled={revealConfigBusy}
+                          onClick={() => void revealIntegrationConfig(target.id)}
+                        >
+                          <Folder size={14} />
+                        </button>
+                      </>
+                    ) : null}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+          {integrationActionMessage ? <p className="ready-line">{integrationActionMessage}</p> : null}
+        </div>
       </div>
     );
   }
@@ -20156,12 +24278,23 @@ function SettingsContent({
     const wakeWordStatusMessage = todayWakeWordStatus?.error
       || todayWakeWordStatus?.message
       || (wakeWordEnabled
-        ? "Wake word is paused so the microphone stays off. Use the Realtime button or a voice shortcut to listen."
+        ? "Wake word is paused so the microphone stays off. Use the Realtime button or the Live Voice shortcut to listen."
         : "Wake word is off.");
 
     return (
       <div className="settings-stack single" key="voice">
-        <div className="settings-card">
+        <SettingsSectionTabs
+          tabs={[
+            { id: "voice-microphone", label: "Microphone" },
+            { id: "voice-live", label: "Live Voice" },
+            { id: "voice-wake", label: "Wake Word" },
+            { id: "voice-feedback", label: "Feedback" },
+            { id: "voice-transcription", label: "Transcription" },
+            { id: "voice-correction", label: "Correction" },
+            { id: "voice-reply", label: "Reply" }
+          ]}
+        />
+        <div className="settings-card" id="voice-microphone">
           <div className="card-heading">
             <Mic size={22} />
             <span>
@@ -20193,7 +24326,7 @@ function SettingsContent({
           />
         </div>
 
-        <div className="settings-card">
+        <div className="settings-card" id="voice-live">
           <div className="card-heading">
             <RealtimeVoiceMark size={23} />
             <span>
@@ -20361,7 +24494,7 @@ function SettingsContent({
           )}
         </div>
 
-        <div className="settings-card">
+        <div className="settings-card" id="voice-wake">
           <div className="card-heading">
             <RealtimeVoiceMark size={23} />
             <span>
@@ -20384,11 +24517,11 @@ function SettingsContent({
             <span>{wakeWordStatusLabel}</span>
             <small>{wakeWordStatusMessage}</small>
           </div>
-          <small>Does not keep the microphone open in the background. Use Realtime or a voice shortcut to start listening.</small>
+          <small>Does not keep the microphone open in the background. Use Realtime or the Live Voice shortcut to start listening.</small>
           {wakeWordWarning && <p className="warning-line">{wakeWordWarning}</p>}
         </div>
 
-        <div className="settings-card">
+        <div className="settings-card" id="voice-feedback">
           <div className="card-heading">
             <Volume2 size={22} />
             <span>
@@ -20416,7 +24549,7 @@ function SettingsContent({
           />
         </div>
 
-        <div className="settings-card">
+        <div className="settings-card" id="voice-transcription">
           <div className="card-heading">
             <WandSparkles size={22} />
             <span>
@@ -20567,7 +24700,7 @@ function SettingsContent({
           )}
         </div>
 
-        <div className="settings-card">
+        <div className="settings-card" id="voice-correction">
           <div className="card-heading">
             <WandSparkles size={22} />
             <span>
@@ -20577,9 +24710,10 @@ function SettingsContent({
           </div>
           <Checkbox checked label="Clean up filler words" />
           <Checkbox checked label="Learn adaptive corrections" />
+          <p className="settings-helper-line">These options are on by default and managed by native OpenAssist settings.</p>
         </div>
 
-        <div className="settings-card">
+        <div className="settings-card" id="voice-reply">
           <div className="card-heading">
             <Volume2 size={22} />
             <span>
@@ -20789,7 +24923,15 @@ function SettingsContent({
       : "Status unknown";
     return (
       <div className="settings-stack single" key="models">
-        <div className="settings-card">
+        <SettingsSectionTabs
+          tabs={[
+            { id: "models-runtime", label: "Runtime" },
+            { id: "models-ollama", label: "Ollama" },
+            { id: "models-note", label: "Note AI" },
+            { id: "models-rewrite", label: "Prompt Rewrite" }
+          ]}
+        />
+        <div className="settings-card" id="models-runtime">
           <div className="card-heading">
             <Cpu size={22} />
             <span>
@@ -20810,7 +24952,7 @@ function SettingsContent({
           <SelectRow label="Available runtimes" value={availableRuntimeProviderOptions(settings).map((option) => option.label).join(", ")} />
           <SelectRow label="Active chat model" value={settings?.model || "Default model"} />
           <SelectRow label="Sub-agent model" value={settings?.subAgentModel || "Same as main model"} />
-          <div className="ollama-model-manager">
+          <div className="ollama-model-manager" id="models-ollama">
             <div className="ollama-model-manager-head">
               <span>
                 <strong>Ollama local models</strong>
@@ -21021,7 +25163,7 @@ function SettingsContent({
           </div>
         </div>
 
-        <div className="settings-card">
+        <div className="settings-card" id="models-note">
           <div className="card-heading">
             <Cpu size={22} />
             <span>
@@ -21047,7 +25189,7 @@ function SettingsContent({
           </p>
         </div>
 
-        <div className="settings-card">
+        <div className="settings-card" id="models-rewrite">
           <div className="card-heading">
             <PackageCheck size={22} />
             <span>
@@ -21123,6 +25265,450 @@ function SettingsContent({
     );
   }
 
+  if (section === "connectors") {
+    const snapshot = connectorSnapshot;
+    const services = snapshot?.services ?? [];
+    const googleAccounts = snapshot?.accounts.filter((account) => account.provider === "google") ?? [];
+    const appleAccount = snapshot?.accounts.find((account) => account.provider === "apple");
+    const localAccount = snapshot?.accounts.find((account) => account.provider === "local");
+    const reviewItems = snapshot?.items.filter((item) => ["candidate", "review", "failed", "conflict"].includes(item.status)) ?? [];
+    const googleServices = services.filter((service) => service.provider === "google");
+    const appleServices = services.filter((service) => service.provider === "apple");
+    const localServices = services.filter((service) => service.provider === "local");
+    const gwsStatus = snapshot?.gwsStatus;
+    const localAccessByServiceID = new Map((snapshot?.localAccessStatuses ?? []).map((status) => [status.serviceID, status]));
+    const selectedGoogleAccount = googleAccounts.find((account) => account.id === selectedGoogleAccountID) ?? googleAccounts[0];
+    const reusableGoogleSecretReady = googleAccounts.some((account) => Boolean(googleOAuthStatusByAccount[account.id]?.hasClientSecret));
+    const loggedInGoogleCount = googleAccounts.filter((account) => Boolean(googleOAuthStatusByAccount[account.id]?.isLoggedIn)).length;
+    const needsAttentionGoogleCount = googleAccounts.filter((account) => !googleOAuthStatusByAccount[account.id]?.isLoggedIn).length;
+    const openLocalConnectorPermission = async (kind: "fullDiskAccess" = "fullDiskAccess") => {
+      try {
+        const result = await window.openAssistElectron?.requestMacOSPermission?.(kind);
+        setConnectorActionMessage(
+          result?.opened
+            ? "Opened macOS Full Disk Access. Turn on Open Assist, then restart the app."
+            : result?.error || "Could not open macOS privacy settings."
+        );
+      } catch (error) {
+        setConnectorActionMessage(error instanceof Error ? error.message : "Could not open macOS privacy settings.");
+      }
+    };
+
+    const requestAppleAccess = async (service: "reminders" | "calendar") => {
+      setConnectorBusyID(`apple-access:${service}`);
+      try {
+        const status = await window.openAssistElectron?.requestAppleEventKitAccess?.(service);
+        if (status) setAppleEventKitStatus(status);
+        await refreshConnectorSnapshot();
+        setConnectorActionMessage(
+          service === "reminders"
+            ? "Checked Apple Reminders access."
+            : "Checked Apple Calendar access."
+        );
+      } catch (error) {
+        setConnectorActionMessage(error instanceof Error ? error.message : "Could not request Apple access.");
+      } finally {
+        setConnectorBusyID(undefined);
+      }
+    };
+
+    const renderServiceToggle = (account: ConnectorAccount | undefined, service: ConnectorServiceDefinition) => {
+      if (!account) return null;
+      const checked = account.enabledServiceIDs.includes(service.id);
+      const busy = connectorBusyID === `${account.id}:${service.id}`;
+      const appleStatus = service.id === "appleReminders"
+        ? appleEventKitStatus?.reminders ?? localAccessByServiceID.get(service.id)
+        : service.id === "appleCalendar"
+          ? appleEventKitStatus?.calendar ?? localAccessByServiceID.get(service.id)
+          : undefined;
+      const accessStatus = service.provider === "local" ? localAccessByServiceID.get(service.id) : appleStatus;
+      const showAccessProblem = checked && accessStatus && accessStatus.status !== "granted";
+      return (
+        <div className={cx("connector-service-row", showAccessProblem && "needs-access")} key={`${account.id}:${service.id}`}>
+          <div>
+            <span className="connector-service-title-line">
+              <strong>{service.displayName}</strong>
+              {accessStatus && checked && (
+                <b className={cx("connector-access-pill", accessStatus.status)}>
+                  {accessStatus.label}
+                </b>
+              )}
+            </span>
+            <small>{service.purpose}</small>
+            <span>{service.syncMode}</span>
+            {showAccessProblem && (
+              <div className="connector-access-callout">
+                <span>{accessStatus.detail}</span>
+                {accessStatus.permissionKind === "fullDiskAccess" && (
+                  <button type="button" onClick={() => { void openLocalConnectorPermission(accessStatus.permissionKind); }}>
+                    Open Full Disk Access
+                  </button>
+                )}
+                {accessStatus.permissionKind === "appleEventKit" && (service.id === "appleReminders" || service.id === "appleCalendar") && (
+                  <button
+                    type="button"
+                    disabled={connectorBusyID === `apple-access:${service.id === "appleReminders" ? "reminders" : "calendar"}`}
+                    onClick={() => { void requestAppleAccess(service.id === "appleReminders" ? "reminders" : "calendar"); }}
+                  >
+                    {connectorBusyID === `apple-access:${service.id === "appleReminders" ? "reminders" : "calendar"}` ? "Requesting..." : "Grant Access"}
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
+          <button
+            className={cx("connector-toggle", checked && "active")}
+            disabled={busy}
+            onClick={() => { void toggleConnectorService(account, service.id); }}
+          >
+            {checked ? "On" : "Off"}
+          </button>
+        </div>
+      );
+    };
+
+    return (
+      <div className="settings-stack single connectors" key="connectors">
+        <SettingsSectionTabs
+          tabs={[
+            { id: "connectors-system", label: "System" },
+            { id: "connectors-google", label: "Google" },
+            { id: "connectors-apple", label: "Apple & Local" },
+            { id: "connectors-review", label: "Review" }
+          ]}
+        />
+        <div className="settings-card expanded" id="connectors-system">
+          <div className="card-heading">
+            <Blocks size={22} />
+            <span>
+              <strong>Connector System</strong>
+              <small>Google uses gws. Apple and local sources use this Mac.</small>
+            </span>
+          </div>
+          <div className="connector-status-grid">
+            <SelectRow label="gws version" value={gwsStatus?.version || "Not installed"} />
+            <SelectRow label="Pinned version" value={gwsStatus?.pinnedVersion || "0.22.5"} />
+            <SelectRow label="Binary" value={gwsStatus?.resolvedExecutable || gwsStatus?.bundledPath || "Missing"} />
+            <SelectRow label="Google accounts" value={String(googleAccounts.length)} />
+          </div>
+          <div className="inline-actions">
+            <button onClick={() => { void refreshAppleEventKitStatus(); }}>
+              Refresh
+            </button>
+            <button className="gold-action" disabled={connectorBusyID === "install-gws"} onClick={() => { void installGws(); }}>
+              {connectorBusyID === "install-gws" ? "Installing..." : "Install gws"}
+            </button>
+            {gwsStatus?.installCommand && (
+              <button
+                onClick={() => {
+                  writeTextToClipboard(gwsStatus.installCommand);
+                  setConnectorActionMessage("Install command copied.");
+                }}
+              >
+                Copy Install Command
+              </button>
+            )}
+          </div>
+          {connectorActionMessage && <p className="ready-line">{connectorActionMessage}</p>}
+        </div>
+
+        <div className="settings-card" id="connectors-google">
+          <div className="card-heading">
+            <UserCircle size={22} />
+            <span>
+              <strong>Google Accounts</strong>
+              <small>Each account gets its own gws config folder.</small>
+            </span>
+          </div>
+          <div className="connector-add-account-bar">
+            <label className="field-label">
+              <span>Account label</span>
+              <input
+                value={connectorAccountLabel}
+                onChange={(event) => setConnectorAccountLabel(event.target.value)}
+                placeholder="Personal Gmail"
+              />
+            </label>
+            <button className="gold-action" disabled={connectorBusyID === "create-google-account"} onClick={() => { void createConnectorAccount(); }}>
+              Add Google Account
+            </button>
+          </div>
+          <div className="connector-account-overview">
+            <div>
+              <span>Accounts</span>
+              <strong>{googleAccounts.length}</strong>
+            </div>
+            <div>
+              <span>Logged in</span>
+              <strong>{loggedInGoogleCount}</strong>
+            </div>
+            <div>
+              <span>Need attention</span>
+              <strong>{needsAttentionGoogleCount}</strong>
+            </div>
+            <div>
+              <span>Shared OAuth</span>
+              <strong>{reusableGoogleSecretReady ? "Ready" : "Missing"}</strong>
+            </div>
+          </div>
+          <div className="connector-accounts-workspace">
+            <div className="connector-account-picker" role="listbox" aria-label="Google accounts">
+              {googleAccounts.map((account) => {
+                const oauthStatus = googleOAuthStatusByAccount[account.id];
+                const googleLoginReady = Boolean(oauthStatus?.isLoggedIn);
+                const googleSecretReady = Boolean(oauthStatus?.hasClientSecret);
+                const selected = selectedGoogleAccount?.id === account.id;
+                const enabledGoogleServiceCount = account.enabledServiceIDs.filter((serviceID) => googleServices.some((service) => service.id === serviceID)).length;
+                const accountStatusTone = googleLoginReady ? "ready" : googleSecretReady ? "attention" : "setup";
+                const accountStatusLabel = googleLoginReady ? "Logged in" : googleSecretReady ? "Login needed" : "Setup needed";
+                return (
+                  <button
+                    aria-selected={selected}
+                    className={cx("connector-account-picker-row", selected && "selected")}
+                    key={account.id}
+                    onClick={() => setSelectedGoogleAccountID(account.id)}
+                    role="option"
+                    type="button"
+                  >
+                    <span>
+                      <strong>{account.label}</strong>
+                      <small>{enabledGoogleServiceCount} services on</small>
+                    </span>
+                    <b className={cx("connector-mini-status", accountStatusTone)}>{accountStatusLabel}</b>
+                  </button>
+                );
+              })}
+              {googleAccounts.length === 0 && <p className="empty-inline">No Google accounts yet.</p>}
+            </div>
+            <div className="connector-account-detail">
+              {selectedGoogleAccount ? (() => {
+                const account = selectedGoogleAccount;
+                const isTerminalActive = connectorBusyID === `setup:${account.id}` || connectorBusyID === `login:${account.id}`;
+                const isAnyTerminalActive = connectorBusyID?.startsWith("setup:") || connectorBusyID?.startsWith("login:");
+                const terminalInput = connectorTerminalInputByAccount[account.id] ?? "";
+                const oauthStatus = googleOAuthStatusByAccount[account.id];
+                const googleLoginReady = Boolean(oauthStatus?.isLoggedIn);
+                const googleSecretReady = Boolean(oauthStatus?.hasClientSecret);
+                const enabledGoogleServiceCount = account.enabledServiceIDs.filter((serviceID) => googleServices.some((service) => service.id === serviceID)).length;
+                const accountStatusTone = googleLoginReady ? "ready" : googleSecretReady ? "attention" : "setup";
+                const accountStatusLabel = googleLoginReady ? "Logged in" : googleSecretReady ? "Login needed" : "Setup needed";
+                const accountStatusDetail = googleLoginReady
+                  ? "Ready to sync enabled Google services."
+                  : googleSecretReady
+                    ? "Client secret is installed. Run Login to finish."
+                    : reusableGoogleSecretReady
+                      ? "Use the shared OAuth JSON, then run login."
+                      : "Create or import the Desktop OAuth JSON first.";
+                const oauthClientLabel = oauthStatus?.clientID ? `${oauthStatus.clientID.slice(0, 10)}...` : googleSecretReady ? "Ready" : "Missing";
+                return (
+                  <div className="connector-account-row" key={account.id}>
+                  <header className="connector-account-header">
+                    <div className="connector-account-main">
+                      <span className="connector-account-title-line">
+                        <strong>{account.label}</strong>
+                        <span className={cx("connector-status-pill", accountStatusTone)}>
+                          {googleLoginReady ? <CheckCircle2 size={14} /> : <TriangleAlert size={14} />}
+                          {accountStatusLabel}
+                        </span>
+                      </span>
+                      <small>{accountStatusDetail}</small>
+                    </div>
+                    <div className="connector-primary-actions">
+                      {!googleSecretReady && (
+                        reusableGoogleSecretReady ? (
+                          <button
+                            className="gold-action"
+                            disabled={connectorBusyID === `reuse-secret:${account.id}`}
+                            type="button"
+                            onClick={() => { void reuseGoogleClientSecret(account); }}
+                          >
+                            {connectorBusyID === `reuse-secret:${account.id}` ? "Copying..." : "Use Shared OAuth"}
+                          </button>
+                        ) : (
+                          <button
+                            className="gold-action"
+                            disabled={connectorBusyID === `import-secret:${account.id}`}
+                            type="button"
+                            onClick={() => { void importGoogleClientSecret(account); }}
+                          >
+                            {connectorBusyID === `import-secret:${account.id}` ? "Importing..." : "Import OAuth JSON"}
+                          </button>
+                        )
+                      )}
+                      {googleSecretReady && !googleLoginReady && (
+                        <button
+                          className="gold-action"
+                          disabled={Boolean(isAnyTerminalActive)}
+                          title="Run Google account login."
+                          onClick={() => { void runGoogleLoginInApp(account); }}
+                        >
+                          {connectorBusyID === `login:${account.id}` ? "Login Running..." : "Run Login"}
+                        </button>
+                      )}
+                      {googleLoginReady && account.enabledServiceIDs.includes("gmail") && (
+                        <button className="gold-action" disabled={connectorBusyID === `sync:${account.id}`} onClick={() => { void syncGmailConnector(account); }}>
+                          {connectorBusyID === `sync:${account.id}` ? "Syncing..." : "Sync Gmail"}
+                        </button>
+                      )}
+                    </div>
+                  </header>
+                  {!googleLoginReady && (
+                    <div className="connector-next-step">
+                      <span>
+                        <strong>{googleSecretReady ? "Finish account login" : "OAuth setup needed"}</strong>
+                        <small>{googleSecretReady ? "Approve this Gmail account in the browser." : reusableGoogleSecretReady ? "Use the shared OAuth file, then log in." : "Import the Desktop OAuth JSON once."}</small>
+                      </span>
+                    </div>
+                  )}
+                  <div className="connector-service-list connector-service-list-compact">
+                    {googleServices.map((service) => renderServiceToggle(account, service))}
+                  </div>
+                  <details className="connector-advanced-panel">
+                    <summary>Advanced</summary>
+                    <div className="connector-account-summary-grid">
+                      <div>
+                        <span>Project</span>
+                        <strong>{oauthStatus?.projectID || "Not detected"}</strong>
+                      </div>
+                      <div>
+                        <span>OAuth client</span>
+                        <strong title={oauthStatus?.clientID}>{oauthClientLabel}</strong>
+                      </div>
+                      <div>
+                        <span>Services on</span>
+                        <strong>{enabledGoogleServiceCount} of {googleServices.length}</strong>
+                      </div>
+                      <div>
+                        <span>Config folder</span>
+                        <strong title={account.configPath}>{account.configPath}</strong>
+                      </div>
+                    </div>
+                    <div className="connector-oauth-actions">
+                      <button type="button" onClick={() => { void refreshGoogleOAuthStatus(account.id); }}>
+                        Check Status
+                      </button>
+                      <button type="button" onClick={() => { void openGoogleOAuthPage(account, "consent"); }}>
+                        Consent
+                      </button>
+                      <button type="button" onClick={() => { void openGoogleOAuthPage(account, "apiLibrary"); }}>
+                        APIs
+                      </button>
+                      <button type="button" onClick={() => { void openGoogleOAuthPage(account, "credentials"); }}>
+                        OAuth Client
+                      </button>
+                      {googleSecretReady && (
+                        <button
+                          className="gold-action"
+                          disabled={connectorBusyID === `import-secret:${account.id}`}
+                          type="button"
+                          onClick={() => { void importGoogleClientSecret(account); }}
+                        >
+                          Replace JSON
+                        </button>
+                      )}
+                      {!googleSecretReady && reusableGoogleSecretReady && (
+                        <button
+                          className="gold-action"
+                          disabled={connectorBusyID === `reuse-secret:${account.id}`}
+                          type="button"
+                          onClick={() => { void reuseGoogleClientSecret(account); }}
+                        >
+                          Use Shared OAuth
+                        </button>
+                      )}
+                      <button disabled={Boolean(isAnyTerminalActive)} onClick={() => { void runGoogleSetupInApp(account); }}>
+                        {connectorBusyID === `setup:${account.id}` ? "Setup Running..." : "Run Setup"}
+                      </button>
+                      <button onClick={() => { void googleSetupCommand(account); }}>
+                        Copy Setup
+                      </button>
+                      <button onClick={() => { void googleLoginCommand(account); }}>
+                        Copy Login
+                      </button>
+                      <button type="button" onClick={() => { void openGoogleConfigFolder(account); }}>
+                        Folder
+                      </button>
+                      <button disabled={connectorBusyID === `remove:${account.id}`} onClick={() => { void removeConnectorAccount(account); }}>
+                        Remove
+                      </button>
+                    </div>
+                  </details>
+                  {(connectorLoginOutputByAccount[account.id] || connectorLoginSessionByAccount[account.id]) && (
+                    <div className="connector-terminal-panel">
+                      <pre className="connector-login-output">
+                        {connectorLoginOutputByAccount[account.id] || "Starting command..."}
+                      </pre>
+                      <form
+                        className="connector-terminal-input"
+                        onSubmit={(event) => {
+                          event.preventDefault();
+                          void sendConnectorTerminalInput(account);
+                        }}
+                      >
+                        <input
+                          value={terminalInput}
+                          disabled={!isTerminalActive}
+                          onChange={(event) => setConnectorTerminalInputByAccount((current) => ({
+                            ...current,
+                            [account.id]: event.target.value
+                          }))}
+                          placeholder={isTerminalActive ? "Type an answer for setup/login prompts" : "Command is not running"}
+                        />
+                        <button disabled={!isTerminalActive || !terminalInput.trim()} type="submit">
+                          Send
+                        </button>
+                        <button disabled={!isTerminalActive} type="button" onClick={() => { void stopConnectorTerminal(account); }}>
+                          Stop
+                        </button>
+                      </form>
+                    </div>
+                  )}
+                  </div>
+                );
+              })() : (
+                <div className="connector-account-empty">
+                  <strong>No Google account selected.</strong>
+                  <span>Add a Google account to configure Gmail, Calendar, Tasks, Drive, and People.</span>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+
+        <div className="settings-card" id="connectors-apple">
+          <div className="card-heading">
+            <Monitor size={22} />
+            <span>
+              <strong>Apple & Local Sources</strong>
+              <small>These use macOS permissions and local access.</small>
+            </span>
+          </div>
+          <div className="connector-service-list">
+            {appleServices.map((service) => renderServiceToggle(appleAccount, service))}
+            {localServices.map((service) => renderServiceToggle(localAccount, service))}
+          </div>
+        </div>
+
+        <div className="settings-card expanded" id="connectors-review">
+          <div className="card-heading">
+            <ListTodo size={22} />
+            <span>
+              <strong>Review Inbox</strong>
+              <small>Review connector items from the sidebar.</small>
+            </span>
+          </div>
+          <div className="connector-review-summary">
+            <div>
+              <span>Waiting for review</span>
+              <strong>{reviewItems.length}</strong>
+            </div>
+            <p>{reviewItems.length === 1 ? "1 item is" : `${reviewItems.length} items are`} in Review Inbox.</p>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   if (section === "automation") {
     const hasTelegramOwner = Boolean(settings?.telegramOwnerUserID?.trim() && settings.telegramOwnerChatID?.trim());
     const hasTelegramPending = Boolean(settings?.telegramPendingUserID?.trim() && settings.telegramPendingChatID?.trim());
@@ -21131,7 +25717,15 @@ function SettingsContent({
       : undefined;
     return (
       <div className="settings-stack single" key="automation">
-        <div className="settings-card">
+        <SettingsSectionTabs
+          tabs={[
+            { id: "automation-computer-use", label: "Computer Use" },
+            { id: "automation-api", label: "API Helper" },
+            { id: "automation-telegram", label: "Telegram" },
+            { id: "automation-remote", label: "Remote" }
+          ]}
+        />
+        <div className="settings-card" id="automation-computer-use">
           <div className="card-heading">
             <Workflow size={22} />
             <span>
@@ -21149,7 +25743,7 @@ function SettingsContent({
 
         <ComputerUseActivityCard />
 
-        <div className="settings-card">
+        <div className="settings-card" id="automation-api">
           <div className="card-heading">
             <Bot size={22} />
             <span>
@@ -21163,7 +25757,7 @@ function SettingsContent({
           </button>
         </div>
 
-        <div className="settings-card">
+        <div className="settings-card" id="automation-telegram">
           <div className="card-heading">
             <Send size={22} />
             <span>
@@ -21262,7 +25856,7 @@ function SettingsContent({
           {telegramActionMessage && <p className="ready-line">{telegramActionMessage}</p>}
         </div>
 
-        <div className="settings-card">
+        <div className="settings-card" id="automation-remote">
           <div className="card-heading">
             <ExternalLink size={22} />
             <span>
@@ -21354,7 +25948,7 @@ function SettingsContent({
     );
   }
 
-  if (section === "app") {
+  if (section === "appearance") {
     const themeMode = settings?.themeMode || "System";
     const savedColorTheme = settings?.colorTheme || "Ocean";
     const colorTheme = pendingColorTheme ?? savedColorTheme;
@@ -21420,13 +26014,23 @@ function SettingsContent({
     };
     const versionLabel = `Version ${settings?.appVersion || "1.0.7"} (${settings?.buildNumber || "69"})`;
     return (
-      <div className="settings-stack single" key="app">
-        <div className="settings-card expanded">
+      <div className="settings-stack single" key="appearance">
+        <SettingsSectionTabs
+          tabs={[
+            { id: "appearance-theme", label: "Theme" },
+            { id: "appearance-colors", label: "Colors" },
+            { id: "appearance-custom", label: "Custom" },
+            { id: "appearance-fonts", label: "Fonts" },
+            { id: "appearance-effects", label: "Effects" }
+          ]}
+        />
+
+        <div className="settings-card" id="appearance-theme">
           <div className="card-heading">
             <Paintbrush size={22} />
             <span>
-              <strong>Appearance & Visual Feedback</strong>
-              <small>Theme mode, interface style, fonts, and motion.</small>
+              <strong>Theme</strong>
+              <small>Light, dark, interface style, and motion.</small>
             </span>
           </div>
           <ThemeSegmentedControl
@@ -21459,26 +26063,24 @@ function SettingsContent({
             options={reduceMotionOptions}
             onChange={(value) => updateAppearanceSetting("reduceMotionMode", value, `Reduce motion changed to ${value}.`)}
           />
-          <ThemeRangeRow
-            label="UI font size"
-            value={settings?.uiFontSize || "14"}
-            min={12}
-            max={18}
-            onChange={(value) => updateAppearanceSetting("uiFontSize", value)}
-          />
-          <ThemeRangeRow
-            label="Code font size"
-            value={settings?.codeFontSize || "12"}
-            min={11}
-            max={16}
-            onChange={(value) => updateAppearanceSetting("codeFontSize", value)}
+          <SettingsSelect
+            label="Interface Style"
+            value={appChromeStyle}
+            options={appChromeStyleOptions}
+            onChange={(value) => onUpdateSetting("appChromeStyle", value)}
           />
           {appearanceStatus && <p className="theme-status-line appearance-status-line">{appearanceStatus}</p>}
-          <div className="theme-picker">
-            <div className="theme-picker-head">
+        </div>
+
+        <div className="settings-card" id="appearance-colors">
+          <div className="card-heading">
+            <Palette size={22} />
+            <span>
               <strong>Color Theme</strong>
               <small>{activeThemeMeta.description}</small>
-            </div>
+            </span>
+          </div>
+          <div className="theme-picker">
             <div className="theme-swatch-grid" aria-label="Color theme options">
               {colorThemeOptions.map((theme) => {
                 const meta = colorThemeMeta[theme] ?? colorThemeMeta.Ocean;
@@ -21528,12 +26130,48 @@ function SettingsContent({
               </span>
             </div>
           </div>
-          <SettingsSelect
-            label="Interface Style"
-            value={appChromeStyle}
-            options={appChromeStyleOptions}
-            onChange={(value) => onUpdateSetting("appChromeStyle", value)}
+        </div>
+
+        <div id="appearance-custom">
+          <CustomThemeDisclosure
+            resolvedAppearanceTone={resolvedAppearanceTone}
+            appearanceSettings={appearanceSettings}
+            onUpdateSetting={onUpdateSetting}
           />
+        </div>
+
+        <div className="settings-card" id="appearance-fonts">
+          <div className="card-heading">
+            <Type size={22} />
+            <span>
+              <strong>Fonts & Sizing</strong>
+              <small>Adjust interface and code text size.</small>
+            </span>
+          </div>
+          <ThemeRangeRow
+            label="UI font size"
+            value={settings?.uiFontSize || "14"}
+            min={12}
+            max={18}
+            onChange={(value) => updateAppearanceSetting("uiFontSize", value)}
+          />
+          <ThemeRangeRow
+            label="Code font size"
+            value={settings?.codeFontSize || "12"}
+            min={11}
+            max={16}
+            onChange={(value) => updateAppearanceSetting("codeFontSize", value)}
+          />
+        </div>
+
+        <div className="settings-card" id="appearance-effects">
+          <div className="card-heading">
+            <Wind size={22} />
+            <span>
+              <strong>Visual Effects</strong>
+              <small>Waveform style and glow colors for realtime & screen snips.</small>
+            </span>
+          </div>
           <SettingsSelect
             label="Waveform Theme"
             value={waveformTheme}
@@ -21591,16 +26229,26 @@ function SettingsContent({
             </>
           )}
         </div>
+      </div>
+    );
+  }
 
-        <CustomThemeDisclosure
-          resolvedAppearanceTone={resolvedAppearanceTone}
-          appearanceSettings={appearanceSettings}
-          onUpdateSetting={onUpdateSetting}
+  if (section === "app") {
+    const versionLabel = `Version ${settings?.appVersion || "1.0.7"} (${settings?.buildNumber || "69"})`;
+    return (
+      <div className="settings-stack single" key="app">
+        <SettingsSectionTabs
+          tabs={[
+            { id: "app-permissions", label: "Permissions" },
+            { id: "app-diagnostics", label: "Diagnostics" },
+            { id: "app-about", label: "About" }
+          ]}
         />
+        <div id="app-permissions">
+          <MacOSPermissionsCard />
+        </div>
 
-        <MacOSPermissionsCard />
-
-        <div className="settings-card">
+        <div className="settings-card" id="app-diagnostics">
           <div className="card-heading">
             <Terminal size={22} />
             <span>
@@ -21616,7 +26264,7 @@ function SettingsContent({
           </div>
         </div>
 
-        <div className="settings-card">
+        <div className="settings-card" id="app-about">
           <div className="card-heading">
             <RefreshCw size={22} />
             <span>
@@ -21665,6 +26313,101 @@ function Subnav({
           onClick={() => onSelect?.(index)}
         >
           {item}
+        </button>
+      ))}
+    </nav>
+  );
+}
+
+/**
+ * Sticky horizontal tab bar that lets users jump between card groups within a
+ * settings section instead of scrolling. Each tab targets a card by its DOM id.
+ * The active tab follows the scroll position (the last card whose top has
+ * scrolled past the tab bar); clicking a tab smooth-scrolls the card into view.
+ */
+function SettingsSectionTabs({ tabs }: { tabs: Array<{ id: string; label: string }> }) {
+  const [activeID, setActiveID] = useState<string>(tabs[0]?.id ?? "");
+  const navRef = useRef<HTMLElement | null>(null);
+  // While a smooth-scroll from a tab click is in flight, suppress scroll-driven
+  // active updates so the clicked tab stays highlighted until scrolling settles.
+  const suppressScrollRef = useRef(false);
+
+  useEffect(() => {
+    // Find the nearest scroll container (the settings-content pane) and resolve
+    // each tab's target card so we can compute the active tab on scroll.
+    const container = navRef.current?.closest<HTMLElement>(".settings-content");
+    if (!container) return;
+
+    const resolveCards = () =>
+      tabs
+        .map((tab) => document.getElementById(tab.id))
+        .filter((node): node is HTMLElement => Boolean(node));
+
+    const update = () => {
+      if (suppressScrollRef.current) return;
+      const cards = resolveCards();
+      if (!cards.length) return;
+      // A card is "active" once its top edge has scrolled up past the tab bar.
+      // Using the container as the reference keeps this correct regardless of
+      // window chrome. The offset (~150px) accounts for the sticky tab bar.
+      const offset = 150;
+      let current = cards[0];
+      for (const card of cards) {
+        const cardTop = card.getBoundingClientRect().top - container.getBoundingClientRect().top;
+        if (cardTop - offset <= 0) {
+          current = card;
+        } else {
+          break;
+        }
+      }
+      // Special-case the bottom: if the scroll area is at (or near) its end,
+      // force the last card active so it's always reachable from the tabs.
+      const atBottom = container.scrollTop + container.clientHeight >= container.scrollHeight - 4;
+      if (atBottom) {
+        current = cards[cards.length - 1];
+      }
+      setActiveID(current.id);
+    };
+
+    update();
+    container.addEventListener("scroll", update, { passive: true });
+    const resizeObserver = new ResizeObserver(update);
+    resizeObserver.observe(container);
+    return () => {
+      container.removeEventListener("scroll", update);
+      resizeObserver.disconnect();
+    };
+  }, [tabs]);
+
+  const handleSelect = (id: string) => {
+    setActiveID(id);
+    const target = document.getElementById(id);
+    const container = navRef.current?.closest<HTMLElement>(".settings-content");
+    if (!target || !container) return;
+    // Suppress scroll-driven updates during the smooth scroll so the clicked
+    // tab stays active until the scroll animation finishes.
+    suppressScrollRef.current = true;
+    target.scrollIntoView({ behavior: "smooth", block: "start" });
+    const finish = () => {
+      suppressScrollRef.current = false;
+      container.removeEventListener("scrollend", finish);
+      clearTimeout(fallback);
+    };
+    container.addEventListener("scrollend", finish);
+    // Safari has no scrollend; fall back to a timeout.
+    const fallback = window.setTimeout(finish, 900);
+  };
+
+  return (
+    <nav className="settings-section-tabs" ref={navRef as any} aria-label="Section contents">
+      {tabs.map((tab) => (
+        <button
+          key={tab.id}
+          type="button"
+          className={cx(tab.id === activeID && "active")}
+          onClick={() => handleSelect(tab.id)}
+        >
+          {tab.label}
         </button>
       ))}
     </nav>
@@ -22233,7 +26976,7 @@ function SelectRow({
   return (
     <label id={id} className="select-row">
       <span>{label}</span>
-      <span className={cx("select-value", tone !== "default" && `select-value-${tone}`)}>{value}</span>
+      <span className={cx("select-value", tone !== "default" && `select-value-${tone}`)} title={value}>{value}</span>
     </label>
   );
 }
@@ -22629,11 +27372,257 @@ function compactSurfaceMode(raw: unknown): CompactSurfaceMode {
   return raw === "notch" ? "notch" : "sidebar";
 }
 
+function ProjectPlannerView({
+  compact,
+  compactSurface = "sidebar",
+  onToggleCompact,
+  onHideWindow,
+  onOpenInstructions,
+  onOpenMemory,
+  workspaceRootPath,
+  project,
+  projects,
+  categories,
+  tab,
+  onSelectTab,
+  onOpenChat,
+  backlogItems,
+  initialDailyItems,
+  notes,
+  threadNotes,
+  onUpsertBacklogItem,
+  onToggleBacklogItem,
+  onDeleteBacklogItem,
+  onScheduleBacklogItem,
+  onUpsertDailyItem,
+  onToggleDailyItem,
+  onDeleteDailyItem,
+  onLinkDailyItemNote,
+  onOpenNoteLink
+}: {
+  compact: boolean;
+  compactSurface?: CompactSurfaceMode;
+  onToggleCompact: () => void;
+  onHideWindow: () => void;
+  onOpenInstructions: () => void;
+  onOpenMemory: () => void;
+  workspaceRootPath?: string | null;
+  project: ProjectItem;
+  projects: ProjectItem[];
+  categories: PlannerCategory[];
+  tab: "backlog" | "today";
+  onSelectTab: (tab: "backlog" | "today") => void;
+  onOpenChat: () => void;
+  backlogItems: DailyItem[];
+  initialDailyItems: DailyItem[];
+  notes: NoteItem[];
+  threadNotes: ThreadNoteListItem[];
+  onUpsertBacklogItem: (item: DailyItemInput) => Promise<void>;
+  onToggleBacklogItem: (itemID: string, checked: boolean) => Promise<void>;
+  onDeleteBacklogItem: (itemID: string) => Promise<void>;
+  onScheduleBacklogItem: (itemID: string, targetDayID: string) => Promise<void>;
+  onUpsertDailyItem: (item: DailyItemInput) => Promise<void>;
+  onToggleDailyItem: (dayID: string, itemID: string, checked: boolean) => Promise<void>;
+  onDeleteDailyItem: (dayID: string, itemID: string) => Promise<void>;
+  onLinkDailyItemNote: (dayID: string, itemID: string, target: NoteLinkTarget) => Promise<void>;
+  onOpenNoteLink: (target: NoteLinkTarget) => void;
+}) {
+  const todayID = plannerDayID();
+  const [todayItems, setTodayItems] = useState<DailyItem[]>(initialDailyItems);
+  const [filter, setFilter] = useState("all");
+  const projectByID = useMemo(
+    () => new Map(projects.map((item) => [normalizedProjectID(item.id), item])),
+    [projects]
+  );
+  const scopeIDs = useMemo(() => plannerProjectScopeIDs(projects, project.id), [project.id, projects]);
+  const inheritedArea = useMemo(() => inheritedProjectArea(projects, project.id), [project.id, projects]);
+  const noteLinkOptions = useMemo<NoteLinkOption[]>(() => [
+    ...notes.map((note) => ({
+      ownerKind: "project" as const,
+      ownerId: note.projectID,
+      noteId: note.id,
+      title: note.title,
+      sourceLabel: note.projectName ?? "Note"
+    })),
+    ...threadNotes.map((note) => ({
+      ownerKind: "thread" as const,
+      ownerId: note.threadID,
+      noteId: note.id,
+      title: note.title,
+      sourceLabel: note.threadTitle
+    }))
+  ], [notes, threadNotes]);
+
+  const loadTodayItems = useCallback(async () => {
+    const items = await window.openAssistElectron?.listDailyItems?.(todayID);
+    setTodayItems(items ?? []);
+  }, [todayID]);
+
+  useEffect(() => {
+    if (tab !== "today") return;
+    let cancelled = false;
+    void window.openAssistElectron?.listDailyItems?.(todayID).then((items) => {
+      if (!cancelled) setTodayItems(items ?? []);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [tab, todayID]);
+
+  useEffect(() => {
+    if (tab === "today") return;
+    setTodayItems(initialDailyItems);
+  }, [initialDailyItems, tab]);
+
+  const scopedInput = useCallback((input: DailyItemInput): DailyItemInput => {
+    const scopeTags = Array.isArray(input.scopeTags) ? input.scopeTags : [];
+    const hasExplicitScope = Boolean(
+      cleanDailyTagLabel(input.projectID)
+      || cleanDailyTagLabel(input.folderID)
+      || scopeTags.length
+    );
+    const next: DailyItemInput = { ...input };
+    if (!hasExplicitScope) {
+      if (project.kind === "folder") next.folderID = project.id;
+      else next.projectID = project.id;
+    }
+    if (!cleanDailyTagLabel(next.area) && inheritedArea) next.area = inheritedArea;
+    return next;
+  }, [inheritedArea, project]);
+
+  const filteredBacklogItems = useMemo(
+    () => backlogItems.filter((item) => dailyItemInProjectScope(item, scopeIDs, projectByID)),
+    [backlogItems, projectByID, scopeIDs]
+  );
+  const filteredTodayItems = useMemo(
+    () => todayItems.filter((item) => dailyItemInProjectScope(item, scopeIDs, projectByID)),
+    [projectByID, scopeIDs, todayItems]
+  );
+
+  useEffect(() => {
+    setFilter("all");
+  }, [project.id, tab]);
+
+  const upsertScopedBacklogItem = async (item: DailyItemInput) => {
+    await onUpsertBacklogItem(scopedInput({ ...item, dayID: "backlog" }));
+  };
+  const upsertScopedDailyItem = async (item: DailyItemInput) => {
+    await onUpsertDailyItem(scopedInput({ ...item, dayID: todayID }));
+    await loadTodayItems();
+  };
+  const toggleScopedDailyItem = async (dayID: string, itemID: string, checked: boolean) => {
+    await onToggleDailyItem(dayID, itemID, checked);
+    await loadTodayItems();
+  };
+  const deleteScopedDailyItem = async (dayID: string, itemID: string) => {
+    await onDeleteDailyItem(dayID, itemID);
+    await loadTodayItems();
+  };
+  const linkScopedDailyItemNote = async (dayID: string, itemID: string, target: NoteLinkTarget) => {
+    await onLinkDailyItemNote(dayID, itemID, target);
+    await loadTodayItems();
+  };
+  const scheduleBacklogItem = async (itemID: string, targetDayID: string) => {
+    await onScheduleBacklogItem(itemID, targetDayID);
+    if (targetDayID === todayID) await loadTodayItems();
+  };
+
+  const visibleItems = tab === "backlog" ? filteredBacklogItems : filteredTodayItems;
+  const projectLabel = project.kind === "folder" ? "Group" : "Project";
+
+  return (
+    <main className="feature-main project-planner-main">
+      <TopBar
+        title={project.title}
+        centerTitle
+        workspaceRootPath={workspaceRootPath ?? undefined}
+        openTargetLabel={project.kind === "folder" ? "project group" : "project"}
+        openTargetKind="workspace"
+        compactSurface={compactSurface}
+        leadingAccessory={(
+          <div className="project-planner-context">
+            <span>{projectLabel}</span>
+            {inheritedArea && <em>{inheritedArea}</em>}
+          </div>
+        )}
+        actionsAccessory={(
+          <div className="project-planner-actions">
+            <div className="project-planner-tabs" role="tablist" aria-label={`${project.title} planner`}>
+              <button
+                type="button"
+                className={cx(tab === "backlog" && "active")}
+                role="tab"
+                aria-selected={tab === "backlog"}
+                onClick={() => onSelectTab("backlog")}
+              >
+                Backlog
+              </button>
+              <button
+                type="button"
+                className={cx(tab === "today" && "active")}
+                role="tab"
+                aria-selected={tab === "today"}
+                onClick={() => onSelectTab("today")}
+              >
+                Today
+              </button>
+            </div>
+            <button type="button" className="project-planner-chat-button" onClick={onOpenChat}>
+              Chat
+            </button>
+          </div>
+        )}
+        showAssistantActions={false}
+        compact={compact}
+        onToggleCompact={onToggleCompact}
+        onHideWindow={onHideWindow}
+        onOpenInstructions={onOpenInstructions}
+        onOpenMemory={onOpenMemory}
+      />
+      <section className="project-planner-shell">
+        <header className="project-planner-head">
+          <div>
+            <h2>{tab === "backlog" ? "Backlog" : "Today"}</h2>
+            <p>
+              {tab === "backlog"
+                ? `Unscheduled tasks scoped to ${project.title}.`
+                : `Tasks scheduled for today and scoped to ${project.title}.`}
+            </p>
+          </div>
+          <span className="project-planner-count">{visibleItems.length}</span>
+        </header>
+        <DailyItemsPanel
+          dayID={tab === "backlog" ? "backlog" : todayID}
+          items={visibleItems}
+          projects={projects}
+          categories={categories}
+          noteLinkOptions={noteLinkOptions}
+          filter={filter}
+          onFilterChange={setFilter}
+          onUpsertItem={tab === "backlog" ? upsertScopedBacklogItem : upsertScopedDailyItem}
+          onToggleItem={tab === "backlog"
+            ? async (_dayID, itemID, checked) => onToggleBacklogItem(itemID, checked)
+            : toggleScopedDailyItem}
+          onDeleteItem={tab === "backlog"
+            ? async (_dayID, itemID) => onDeleteBacklogItem(itemID)
+            : deleteScopedDailyItem}
+          onLinkItemNote={tab === "backlog" ? onLinkDailyItemNote : linkScopedDailyItemNote}
+          onOpenNoteLink={onOpenNoteLink}
+          variant={tab === "backlog" ? "backlog" : "daily"}
+          inline
+          onScheduleBacklogItem={scheduleBacklogItem}
+        />
+      </section>
+    </main>
+  );
+}
+
 function NotchDock({
   expanded,
   revealed,
   providerName,
   isWorking,
+  connectorSyncActivity,
   onReveal,
   onOpen,
   onCollapse,
@@ -22643,6 +27632,7 @@ function NotchDock({
   revealed: boolean;
   providerName: string;
   isWorking: boolean;
+  connectorSyncActivity?: ConnectorSyncProgress | null;
   onReveal: () => void;
   onOpen: () => void;
   onCollapse: () => void;
@@ -22677,12 +27667,15 @@ function NotchDock({
     }
     return clearHideTimer;
   }, [expanded, revealed]);
+  const syncWorking = connectorSyncIsActive(connectorSyncActivity);
+  const activeWorking = isWorking || syncWorking;
+  const statusLabel = syncWorking ? connectorSyncShortLabel(connectorSyncActivity) : isWorking ? "Working" : providerName;
 
   if (!revealed && !expanded) {
     return (
       <button
         type="button"
-        className={cx("notch-dock", "notch-dock-hidden", isWorking && "is-working")}
+        className={cx("notch-dock", "notch-dock-hidden", activeWorking && "is-working")}
         onMouseEnter={onReveal}
         onFocus={onReveal}
         onClick={onReveal}
@@ -22701,11 +27694,11 @@ function NotchDock({
       aria-label="Assistant notch controls"
     >
       <button type="button" className="notch-dock-main" onClick={expanded ? undefined : onOpen}>
-        <span className={cx("notch-status-dot", isWorking && "active")} aria-hidden="true" />
+        <span className={cx("notch-status-dot", activeWorking && "active")} aria-hidden="true" />
         <img src={appLogo} alt="" draggable={false} />
         <span className="notch-dock-copy">
           <strong>Open Assist</strong>
-          <small>{isWorking ? "Working" : providerName}</small>
+          <small>{statusLabel}</small>
         </span>
         {!expanded && <ChevronDown size={15} aria-hidden="true" />}
       </button>
@@ -22735,6 +27728,7 @@ function NotchMiniTray({
   providerName,
   providerStatus,
   isWorking,
+  connectorSyncActivity,
   composerText,
   onComposerText,
   onSend,
@@ -22750,6 +27744,7 @@ function NotchMiniTray({
   providerName: string;
   providerStatus: string;
   isWorking: boolean;
+  connectorSyncActivity?: ConnectorSyncProgress | null;
   composerText: string;
   onComposerText: (value: string) => void;
   onSend: () => void | Promise<unknown>;
@@ -22764,11 +27759,13 @@ function NotchMiniTray({
     .filter((message) => message.role === "activity")
     .slice(-4)
     .reverse();
-  const statusText = isWorking ? "Working" : providerStatus || "Ready";
+  const syncWorking = connectorSyncIsActive(connectorSyncActivity);
+  const activeWorking = isWorking || syncWorking;
+  const statusText = syncWorking ? connectorSyncShortLabel(connectorSyncActivity) : isWorking ? "Working" : providerStatus || "Ready";
   const assistantPreview = compactNotchText(
     latestAssistant?.text,
     220
-  ) || (isWorking ? "Waiting for the next update from the agent." : "No recent answer in this chat.");
+  ) || (activeWorking ? "Waiting for the next update from the agent." : "No recent answer in this chat.");
   const canSend = composerText.trim().length > 0;
 
   return (
@@ -22776,7 +27773,7 @@ function NotchMiniTray({
       <div className="notch-mini-card">
         <div className="notch-mini-card-header">
           <div className="notch-mini-status-card">
-            <div className={cx("notch-mini-status-dot", isWorking && "active")} aria-hidden="true" />
+              <div className={cx("notch-mini-status-dot", activeWorking && "active")} aria-hidden="true" />
             <div>
               <strong>{selectedThreadTitle || "New Assistant Session"}</strong>
               <small>{providerName} · {statusText}</small>
@@ -22814,7 +27811,9 @@ function NotchMiniTray({
         </div>
 
         <div className="notch-mini-body">
-          {recentActivities.length > 0 ? (
+          {connectorSyncActivity ? (
+            <ConnectorSyncActivityPanel activity={connectorSyncActivity} compact />
+          ) : recentActivities.length > 0 ? (
             <div className="notch-mini-activity-list">
               {recentActivities.map((activity) => (
                 <div className="notch-mini-activity" key={activity.id}>
@@ -22895,6 +27894,7 @@ function FeatureRouter({
   composerAttachments,
   composerAttachmentError,
   isSending,
+  connectorSyncActivity,
   interactionMode,
   permissionMode,
   reasoningEffort,
@@ -22940,6 +27940,7 @@ function FeatureRouter({
   onSelectPlannerDay,
   onSelectPlannerBacklog,
   onCreateNote,
+  onCreateNoteFolder,
   onNoteDraft,
   onSaveNote,
   onApplyNoteCleanup,
@@ -22953,6 +27954,11 @@ function FeatureRouter({
   onGoForwardNote,
   onOpenNoteLink,
   onScheduleSelectionToPlanner,
+  onUpsertPlannerCategory,
+  onDeletePlannerCategory,
+  onCreatePlannerList,
+  onUpdatePlannerListArea,
+  onHidePlannerList,
   onUpsertDailyItem,
   onToggleDailyItem,
   onDeleteDailyItem,
@@ -23016,6 +28022,7 @@ function FeatureRouter({
   composerAttachments: ComposerImageAttachment[];
   composerAttachmentError?: string | null;
   isSending: boolean;
+  connectorSyncActivity?: ConnectorSyncProgress | null;
   interactionMode: string;
   permissionMode: CodexPermissionMode;
   reasoningEffort: string;
@@ -23061,6 +28068,7 @@ function FeatureRouter({
   onSelectPlannerDay: (dayID: string) => void;
   onSelectPlannerBacklog: () => void;
   onCreateNote: () => void;
+  onCreateNoteFolder: (parentFolderID?: string | null) => void;
   onNoteDraft: (value: string) => void;
   onSaveNote: () => void;
   onApplyNoteCleanup: (markdown: string, options?: NoteCleanupApplyOptions) => Promise<void>;
@@ -23074,6 +28082,11 @@ function FeatureRouter({
   onGoForwardNote: () => void;
   onOpenNoteLink: (target: NoteLinkTarget) => void;
   onScheduleSelectionToPlanner: (request: PlannerScheduleRequest) => void;
+  onUpsertPlannerCategory: (category: Partial<PlannerCategory> & { name?: string }) => Promise<void>;
+  onDeletePlannerCategory: (categoryID: string) => Promise<void>;
+  onCreatePlannerList: (input: { name: string; area?: string }) => Promise<void>;
+  onUpdatePlannerListArea: (projectID: string, area?: string | null) => Promise<void>;
+  onHidePlannerList: (projectID: string) => Promise<void>;
   onUpsertDailyItem: (item: DailyItemInput) => Promise<void>;
   onToggleDailyItem: (dayID: string, itemID: string, checked: boolean) => Promise<void>;
   onDeleteDailyItem: (dayID: string, itemID: string) => Promise<void>;
@@ -23103,6 +28116,9 @@ function FeatureRouter({
 }) {
   const providerOptions = availableRuntimeProviderOptions(appState.settings);
   const selectedThread = appState.threads.find((thread) => thread.id === selectedThreadID);
+  const selectedProject = selectedProjectID
+    ? appState.projects.find((project) => sameID(project.id, selectedProjectID))
+    : undefined;
   const activeProviderKey = runtimeProviderKey(selectedThread?.activeProvider || appState.settings.assistantBackend || "codex");
   const activeProviderName = providerLabel(activeProviderKey);
   const activeModelOptions = providerModelOptionsByBackend[activeProviderKey];
@@ -23135,6 +28151,7 @@ function FeatureRouter({
   const isPlannerNoteActive = selectedNoteTarget?.scope === "planner";
   const plannerNoteDetail = isPlannerNoteActive ? noteDetail : null;
   const plannerNoteDraft = isPlannerNoteActive ? noteDraft : "";
+  const plannerLists = appState.plannerLists?.length ? appState.plannerLists : appState.projects;
   switch (activeView) {
     case "today":
       return (
@@ -23150,7 +28167,8 @@ function FeatureRouter({
           selectedDayID={selectedPlannerDayID}
           backlogOpen={plannerBacklogOpen}
           backlogItems={backlogItems}
-          projects={appState.projects}
+          projects={plannerLists}
+          categories={appState.plannerCategories ?? []}
           dailyItems={dailyItems}
           noteDetail={plannerNoteDetail}
           noteDraft={plannerNoteDraft}
@@ -23165,6 +28183,11 @@ function FeatureRouter({
           onApplyNoteCleanup={onApplyNoteCleanup}
           onOpenNoteLink={onOpenNoteLink}
           onScheduleSelectionToPlanner={onScheduleSelectionToPlanner}
+          onUpsertPlannerCategory={onUpsertPlannerCategory}
+          onDeletePlannerCategory={onDeletePlannerCategory}
+          onCreatePlannerList={onCreatePlannerList}
+          onUpdatePlannerListArea={onUpdatePlannerListArea}
+          onHidePlannerList={onHidePlannerList}
           onUpsertDailyItem={onUpsertDailyItem}
           onToggleDailyItem={onToggleDailyItem}
           onDeleteDailyItem={onDeleteDailyItem}
@@ -23195,7 +28218,7 @@ function FeatureRouter({
           onOpenInstructions={onOpenInstructions}
           onOpenMemory={onOpenMemory}
           workspaceRootPath={activeNotesWorkspacePath}
-          projects={appState.projects}
+          projects={plannerLists}
           selectedProjectID={selectedProjectID}
           notesScope={notesScope}
           notes={appState.notes}
@@ -23211,11 +28234,18 @@ function FeatureRouter({
           noteLinks={noteLinks}
           noteSaveStatus={noteSaveStatus}
           liveVoiceStatus={liveVoiceStatus}
+          liveVoiceStatusText={liveVoiceStatusText}
+          liveVoiceMuted={liveVoiceMuted}
+          liveVoiceMode={activeLiveVoiceMode}
+          liveVoiceProvider={liveVoiceCloudProvider}
+          onLiveVoice={onLiveVoice}
+          onToggleLiveVoiceMuted={onToggleLiveVoiceMuted}
           onSelectProject={onSelectNotesProject}
           onSelectScope={onSelectNotesScope}
           onSelectNote={onSelectNote}
           onSelectThreadNoteItem={onSelectThreadNoteItem}
           onCreateNote={onCreateNote}
+          onCreateNoteFolder={onCreateNoteFolder}
           onNoteDraft={onNoteDraft}
           onSaveNote={onSaveNote}
           onApplyNoteCleanup={onApplyNoteCleanup}
@@ -23231,6 +28261,8 @@ function FeatureRouter({
       );
     case "history":
       return <TranscriptHistoryView />;
+    case "reviewInbox":
+      return <ConnectorReviewInboxView />;
     case "automations":
       return <AutomationsView automations={appState.automations} onToggle={onToggleAutomation} onCreate={onCreateAutomation} />;
     case "skills":
@@ -23324,6 +28356,7 @@ function FeatureRouter({
           composerAttachments={composerAttachments}
           composerAttachmentError={composerAttachmentError}
           isSending={isSending}
+          connectorSyncActivity={connectorSyncActivity}
 	          voiceStatus={voiceStatus}
 	          voiceStatusText={voiceStatusText}
 		          voiceError={voiceError}
@@ -23454,7 +28487,9 @@ export function App() {
   if (standaloneWindow === "history") return <TranscriptHistoryWindow />;
   return (
     <AppearanceSettingsProvider>
-      <AppInner />
+      <ScreenErrorBoundary resetKey={standaloneWindow ?? "main"} screenName="app">
+        <AppInner />
+      </ScreenErrorBoundary>
     </AppearanceSettingsProvider>
   );
 }
@@ -23480,6 +28515,8 @@ function AppInner() {
     () => typeof window !== "undefined" && window.localStorage.getItem(SIDEBAR_HIDDEN_KEY) === "1"
   );
   const [systemThemeMode, setSystemThemeMode] = useState<"dark" | "light">(readSystemThemeMode);
+  const [connectorSyncActivity, setConnectorSyncActivity] = useState<ConnectorSyncProgress | null>(null);
+  const connectorSyncClearTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     window.localStorage.setItem(SIDEBAR_WIDTH_KEY, String(sidebarWidth));
@@ -23499,6 +28536,36 @@ function AppInner() {
   }, []);
 
   useEffect(() => {
+    const clearTimer = () => {
+      if (connectorSyncClearTimerRef.current) {
+        clearTimeout(connectorSyncClearTimerRef.current);
+        connectorSyncClearTimerRef.current = null;
+      }
+    };
+    const unsubscribe = window.openAssistElectron?.onConnectorSyncProgress?.((progress) => {
+      clearTimer();
+      setConnectorSyncActivity(progress);
+      if (progress.status === "running") {
+        notifyAppStatus("Gmail sync started", progress.message);
+      } else if (progress.status === "completed") {
+        notifyAppStatus("Gmail sync complete", progress.message);
+      } else if (progress.status === "failed") {
+        notifyAppStatus("Gmail sync failed", progress.message);
+      }
+      if (progress.status !== "running") {
+        connectorSyncClearTimerRef.current = setTimeout(() => {
+          setConnectorSyncActivity((current) => current?.id === progress.id ? null : current);
+          connectorSyncClearTimerRef.current = null;
+        }, progress.status === "failed" ? 10_000 : 7_000);
+      }
+    });
+    return () => {
+      clearTimer();
+      unsubscribe?.();
+    };
+  }, []);
+
+  useEffect(() => {
     if (typeof window === "undefined" || typeof window.matchMedia !== "function") return undefined;
     const query = window.matchMedia("(prefers-color-scheme: dark)");
     const onChange = () => setSystemThemeMode(query.matches ? "dark" : "light");
@@ -23515,6 +28582,9 @@ function AppInner() {
       noteFolders: [],
       plannerDays: [],
       plannerBacklog: null,
+      plannerCategories: [],
+      plannerLists: [],
+      plannerSmartLists: [],
       backlogItems: [],
       automations: [],
     skills: [],
@@ -23549,7 +28619,7 @@ function AppInner() {
       lightThemeDiffAdded: "#00a240",
       lightThemeDiffRemoved: "#ba2623",
       lightThemeSkill: "#924ff7",
-      darkThemeAccent: "#1F6FEB",
+      darkThemeAccent: "#F9861A",
       darkThemeBackground: "#0D1117",
       darkThemeForeground: "#E6EDF3",
       darkThemeUIFont: systemUIFontStack,
@@ -23591,6 +28661,7 @@ function AppInner() {
       memoryEnabled: true,
       knowledgeAccessEnabled: true,
       knowledgeExternalAccessEnabled: false,
+      knowledgeExternalAccessMode: "simple",
       knowledgeAgentAccessEnabled: true,
       knowledgeRealtimeVoiceAccessEnabled: true,
       knowledgeOrganizerEnabled: true,
@@ -23662,8 +28733,8 @@ function AppInner() {
       remoteAccessTailscaleRunning: false,
       remoteAccessDetectedTailscaleHost: "",
       remoteAccessTailscaleAppPath: "",
-      remoteAccessTailscaleInstallURL: "https://tailscale.com/download/mac",
-      remoteAccessTailscaleStatusMessage: "Not checked.",
+      remoteAccessTailscaleInstallURL: "",
+      remoteAccessTailscaleStatusMessage: "Disabled.",
       remoteAccessPairingCode: "",
       remoteAccessPairingURL: "",
       remoteAccessPairingExpiresAt: null,
@@ -23753,6 +28824,7 @@ function AppInner() {
   const [activeThreadRuns, setActiveThreadRuns] = useState<Record<string, ActiveThreadRun>>({});
   const [activeRunClock, setActiveRunClock] = useState(() => Date.now());
   const activeThreadRunsRef = useRef<Record<string, ActiveThreadRun>>({});
+  const temporaryThreadsWithStartedWorkRef = useRef<Set<string>>(new Set());
   const [interactionMode, setInteractionMode] = useState("Agentic");
   const [permissionMode, setPermissionMode] = useState<CodexPermissionMode>("fullAccess");
   const [reasoningEffort, setReasoningEffort] = useState("High");
@@ -23802,6 +28874,14 @@ function AppInner() {
   const liveVoiceSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const liveVoiceChunkTimerRef = useRef<number | null>(null);
   const liveVoiceInputChunksRef = useRef<Float32Array[]>([]);
+  // Cloud realtime input noise gate state: tracks whether the user is currently
+  // speaking, when they last did, and a tiny ring buffer of recent frames used as
+  // pre-roll so the onset of speech isn't clipped.
+  const liveVoiceGateRef = useRef<{ speaking: boolean; lastSpeechAt: number; preRoll: Float32Array[] }>({
+    speaking: false,
+    lastSpeechAt: 0,
+    preRoll: []
+  });
   // TEMP DIAGNOSTIC (realtime audio-flow debugging): tracks mic chunks sent to the
   // realtime session so we can confirm audio is actually leaving the renderer.
   const liveVoiceAudioDiagRef = useRef({ sends: 0, ok: 0, fail: 0, bytes: 0, peakRms: 0, lastLogAt: 0, firstLogged: false });
@@ -23810,6 +28890,7 @@ function AppInner() {
   const liveVoiceMicrophoneReadyRef = useRef(false);
   const liveVoiceStatusRef = useRef<LiveVoiceStatus>("idle");
   const liveVoiceExpectedStopRef = useRef(false);
+  const liveVoiceStartTokenRef = useRef(0);
   const startTodayLiveVoiceFromWakeWordRef = useRef<() => void>(() => {});
   const todayWakeWordDetectionRef = useRef(0);
   const wakeWordStartingTodayLiveRef = useRef(false);
@@ -23843,6 +28924,56 @@ function AppInner() {
   const lastNoteMouseNavigationRef = useRef<{ button: number; at: number } | null>(null);
   const activeViewRef = useRef<ViewKey>(activeView);
   const selectedThreadIDRef = useRef<string | undefined>(undefined);
+  // Threads whose latest turn finished while the user was looking elsewhere.
+  // Shown as a dot in the sidebar; cleared when the thread is opened.
+  const [unreadThreadIDs, setUnreadThreadIDs] = useState<string[]>(() => {
+    try {
+      const raw = window.localStorage.getItem("openassist.unreadThreadIDs");
+      const parsed = raw ? JSON.parse(raw) : [];
+      return Array.isArray(parsed) ? parsed.filter((id): id is string => typeof id === "string").slice(-100) : [];
+    } catch {
+      return [];
+    }
+  });
+  useEffect(() => {
+    try {
+      window.localStorage.setItem("openassist.unreadThreadIDs", JSON.stringify(unreadThreadIDs.slice(-100)));
+    } catch {
+      // Persistence is best-effort.
+    }
+  }, [unreadThreadIDs]);
+  const markThreadUnread = (threadID?: string) => {
+    if (!usableOpenAssistThreadID(threadID)) return;
+    setUnreadThreadIDs((current) => current.some((id) => sameID(id, threadID)) ? current : [...current, threadID as string]);
+  };
+  const clearThreadUnread = (threadID?: string) => {
+    if (!threadID) return;
+    setUnreadThreadIDs((current) => current.some((id) => sameID(id, threadID)) ? current.filter((id) => !sameID(id, threadID)) : current);
+  };
+  // True when a completion in this thread was seen live: the thread is open
+  // AND the app window is focused. Anything else counts as unread.
+  const isThreadVisibleToUser = (threadID: string) =>
+    sameID(selectedThreadIDRef.current, threadID) && document.hasFocus();
+  // Mirror live app status (running chats, unread replies) to the menu bar
+  // popover so it never shows stale information.
+  const menuBarStateSignatureRef = useRef("");
+  useEffect(() => {
+    if (!window.openAssistElectron?.setMenuBarState) return;
+    const runs = Object.values(activeThreadRuns).slice(0, 6).map((run) => ({
+      title: run.title
+        || appState.threads.find((thread) => sameID(thread.id, run.threadID))?.title
+        || "New chat",
+      provider: run.provider || "",
+      statusText: run.statusText || "",
+      startedAt: run.startedAt
+    }));
+    const unreadCount = unreadThreadIDs.filter((id) => appState.threads.some((thread) => sameID(thread.id, id))).length;
+    const snapshot = { runs, unreadCount, threadCount: appState.threads.length };
+    const signature = JSON.stringify(snapshot);
+    if (signature === menuBarStateSignatureRef.current) return;
+    menuBarStateSignatureRef.current = signature;
+    window.openAssistElectron.setMenuBarState(snapshot);
+  }, [activeThreadRuns, unreadThreadIDs, appState.threads]);
   const olderThreadMessagesLoadingRef = useRef(false);
   const filePreviewRequestRef = useRef(0);
   const noteAutosaveTimerRef = useRef<number | null>(null);
@@ -24447,14 +29578,14 @@ function AppInner() {
         }
       } else {
         const savedDetail = await window.openAssistElectron?.saveNote(target.projectID, target.noteID, draft);
-        if (!savedDetail) throw new Error("Project note did not save.");
+        if (!savedDetail) throw new Error("Note did not save.");
         if (isCurrentTarget()) {
           setNoteDetail(savedDetail);
           setAppState((current) => ({
             ...current,
             notes: current.notes.map((item) =>
               sameID(item.id, savedDetail.id) && sameID(item.projectID, target.projectID)
-                ? { ...item, subtitle: formatNoteAge(Date.now()), updatedAt: Date.now() }
+                ? { ...item, subtitle: formatNoteAge(Date.now()), updatedAt: Date.now(), area: savedDetail.area, tags: savedDetail.tags }
                 : item
             )
           }));
@@ -24558,7 +29689,7 @@ function AppInner() {
   const [settingsHydrated, setSettingsHydrated] = useState(false);
   useEffect(() => {
     if (!isSettingsWindow && !appReady) return undefined;
-    return dismissInitialSplash(isSettingsWindow ? 180 : 650);
+    return dismissInitialSplash(isSettingsWindow ? 180 : 260);
   }, [appReady, isSettingsWindow]);
 
   useEffect(() => {
@@ -24575,14 +29706,20 @@ function AppInner() {
       setSelectedProjectID(undefined);
       setSelectedPluginID(normalizedState.plugins[0]?.id);
       if (isSettingsWindow) return;
+      // Reveal the UI as soon as the core state is in. The active thread's
+      // messages and the active note's body stream in just below — keeping
+      // the splash up while they loaded serially made startup feel slow.
+      setAppReady(true);
       const threadID = normalizedState.activeThreadID ?? normalizedState.threads[0]?.id;
-      if (threadID) {
+      const threadLoad = (async () => {
+        if (!threadID) return;
         setSelectedThreadID(threadID);
         const detail = await window.openAssistElectron?.loadThread(threadID);
         if (!cancelled && detail) setThreadDetail(detail);
-      }
+      })();
       const note = normalizedState.notes.find((item) => item.id === normalizedState.activeNoteID) ?? normalizedState.notes[0];
-      if (note) {
+      const noteLoad = (async () => {
+        if (!note) return;
         const initialNoteTarget: SelectedNoteTarget = {
           scope: "project",
           projectID: note.projectID,
@@ -24598,7 +29735,8 @@ function AppInner() {
           setNoteDetail(detail);
           setNoteDraft(detail.markdown);
         }
-      }
+      })();
+      await Promise.all([threadLoad, noteLoad]);
     }
     load()
       .catch(console.error)
@@ -24659,7 +29797,19 @@ function AppInner() {
         ]
       }
       : normalizedState;
-    setAppState(visibleState);
+    // A thread whose first turn is still running may not be in the backend
+    // list yet (it was inserted optimistically when the run adopted its real
+    // id). Keep those entries so a refresh doesn't drop them mid-run.
+    const runningThreadIDs = Object.keys(activeThreadRunsRef.current).filter((id) => !id.startsWith("pending-thread-"));
+    const missingRunningThreads = runningThreadIDs.length
+      ? appState.threads.filter((thread) =>
+        runningThreadIDs.some((id) => sameID(id, thread.id))
+        && !visibleState.threads.some((existing) => sameID(existing.id, thread.id)))
+      : [];
+    const mergedVisibleState = missingRunningThreads.length
+      ? { ...visibleState, threads: [...missingRunningThreads, ...visibleState.threads] }
+      : visibleState;
+    setAppState(mergedVisibleState);
     setSettingsHydrated(true);
     setSelectedProjectID((current) =>
       current && visibleState.projects.some((project) => sameID(project.id, current)) ? current : undefined
@@ -24672,11 +29822,24 @@ function AppInner() {
     const selectedVisibleThreadID = currentSelectedThreadID && visibleThreads.some((thread) => sameID(thread.id, currentSelectedThreadID))
       ? currentSelectedThreadID
       : undefined;
+    // The user may be sitting in a thread that is momentarily absent from the
+    // refreshed list (a fresh temporary thread, a registry write race, an
+    // in-flight send). Yanking the selection to the top of the list here is
+    // what made messages land in the wrong thread — keep them where they are.
+    const stayOnCurrentThreadID = !selectedVisibleThreadID && currentSelectedThreadID
+      && (Boolean(activeThreadRunsRef.current[currentSelectedThreadID])
+        || sameID(threadDetail?.threadID, currentSelectedThreadID))
+      ? currentSelectedThreadID
+      : undefined;
     const activeVisibleThreadID = visibleState.activeThreadID && visibleThreads.some((thread) => sameID(thread.id, visibleState.activeThreadID))
       ? visibleState.activeThreadID
       : undefined;
-    const threadID = selectedVisibleThreadID ?? activeVisibleThreadID ?? visibleThreads[0]?.id;
-    if (threadID) {
+    const threadID = selectedVisibleThreadID ?? stayOnCurrentThreadID ?? activeVisibleThreadID ?? visibleThreads[0]?.id;
+    if (threadID && threadID === stayOnCurrentThreadID) {
+      // Keep the current selection and the in-memory messages untouched.
+      selectedThreadIDRef.current = threadID;
+      setSelectedThreadID(threadID);
+    } else if (threadID) {
       selectedThreadIDRef.current = threadID;
       setSelectedThreadID(threadID);
       const detail = await window.openAssistElectron?.loadThread(threadID);
@@ -24840,6 +30003,14 @@ function AppInner() {
   };
 
   const currentThreadID = () => usableOpenAssistThreadID(threadDetail?.threadID ?? selectedThreadIDRef.current ?? selectedThreadID);
+  const isArchivedThreadID = (threadID?: string | null) => {
+    const id = usableOpenAssistThreadID(threadID);
+    return Boolean(id && appState.threads.some((thread) => sameID(thread.id, id) && thread.isArchived));
+  };
+  const currentLiveVoiceThreadID = () => {
+    const threadID = currentThreadID();
+    return isArchivedThreadID(threadID) ? undefined : threadID;
+  };
 
   const liveVoiceImageKey = (attachment: ComposerImageAttachment) =>
     `${attachment.id}:${attachment.name}:${attachment.size ?? attachment.dataURL.length}`;
@@ -25089,6 +30260,8 @@ function AppInner() {
   }) => {
     if (!appState.settings.assistantFloatingHUDEnabled) return;
     const isCaptureHUD = payload.status === "listening" || payload.status === "processing";
+    const liveVoiceActive = liveVoiceStatusRef.current !== "idle" && liveVoiceStatusRef.current !== "error";
+    if (liveVoiceActive && isCaptureHUD) return;
     if (appWindowFocused && !isCaptureHUD) {
       hideFloatingVoiceHUDForAppFocus();
       return;
@@ -25156,11 +30329,9 @@ function AppInner() {
         nativeVoiceStopAfterStartRef.current = false;
         if (result?.text?.trim()) {
           const transcript = result.text.trim();
-          try {
-            await window.openAssistElectron?.addTranscriptHistory?.(transcript);
-          } catch (error) {
-            console.error("Could not save transcript history", error);
-          }
+          // Fire-and-forget: saving history must not delay the paste.
+          void Promise.resolve(window.openAssistElectron?.addTranscriptHistory?.(transcript))
+            .catch((error) => console.error("Could not save transcript history", error));
           if (insertTranscriptIntoCurrentNote(transcript)) {
             playDictationSound("pasted");
             setVoiceError(undefined);
@@ -25318,6 +30489,15 @@ function AppInner() {
       showVoiceHUDImmediately({ status: "error", text: "Voice task entry is turned off in Settings." });
       return;
     }
+    const liveVoiceActive = liveVoiceStatusRef.current !== "idle" && liveVoiceStatusRef.current !== "error";
+    if (liveVoiceActive && !liveVoiceMutedRef.current) {
+      const message = "Stop Live Voice or mute its microphone before starting dictation.";
+      setVoiceStatus("error");
+      setVoiceError(message);
+      setVoiceStatusText(undefined);
+      showVoiceHUDImmediately({ status: "error", text: message });
+      return;
+    }
     if (mode !== "hold") nativeVoiceStopAfterStartRef.current = false;
 
     if (window.openAssistElectron?.platform === "darwin" && window.openAssistElectron.startVoiceInput) {
@@ -25440,7 +30620,7 @@ function AppInner() {
     liveVoiceMeterBus.outputPlaying = liveVoiceOutputSourcesRef.current.size > 0;
   };
 
-  const setLiveVoiceListeningStatus = (text = "Realtime conversation listening", preserveHeard = true) => {
+  const setLiveVoiceListeningStatus = (text = `${liveVoiceProviderLabel(appState.settings.liveVoiceMode, appState.settings.realtimeVoiceProvider)} listening`, preserveHeard = true) => {
     if (!liveVoiceMicrophoneReadyRef.current) {
       if (liveVoiceStatusRef.current !== "idle") setLiveVoiceStatus("connecting");
       setLiveVoiceStatusText((current) => current || "Opening microphone...");
@@ -25499,7 +30679,12 @@ function AppInner() {
     liveVoicePlaybackTimeRef.current = context ? context.currentTime : 0;
   };
 
-  const stopLiveVoice = async (nextStatus: LiveVoiceStatus = "idle", nextText?: string) => {
+  const stopLiveVoice = async (
+    nextStatus: LiveVoiceStatus = "idle",
+    nextText?: string,
+    options: { cancelPendingStart?: boolean; stopDelegation?: boolean } = {}
+  ) => {
+    if (options.cancelPendingStart !== false) liveVoiceStartTokenRef.current += 1;
     liveVoiceExpectedStopRef.current = nextStatus !== "error";
     const clearExpectedStop = () => {
       window.setTimeout(() => {
@@ -25555,9 +30740,14 @@ function AppInner() {
       clearExpectedStop();
       return;
     }
+    const shouldStopDelegation = options.stopDelegation ?? (liveVoiceStatusRef.current === "delegating" || hasActiveRealtimeDelegationRun());
     try {
-      const result = await openAssistRealtimeAPI()?.stop();
-      if (result && !result.ok && nextStatus !== "error") {
+      const api = openAssistRealtimeAPI();
+      const result = await api?.stop();
+      if (shouldStopDelegation) {
+        await api?.stopDelegation?.().catch(() => undefined);
+      }
+      if (result && !result.ok && nextStatus !== "error" && !isRealtimeNotRunningError(result.error || "")) {
         setLiveVoiceStatus("error");
         setLiveVoiceStatusText(result.error || "Realtime conversation stopped with an error.");
         clearExpectedStop();
@@ -25565,8 +30755,15 @@ function AppInner() {
       }
     } catch (error) {
       if (nextStatus !== "error") {
+        const message = error instanceof Error ? error.message : "Could not stop Realtime conversation.";
+        if (isRealtimeNotRunningError(message)) {
+          setLiveVoiceStatus(nextStatus);
+          setLiveVoiceStatusText(nextText);
+          clearExpectedStop();
+          return;
+        }
         setLiveVoiceStatus("error");
-        setLiveVoiceStatusText(error instanceof Error ? error.message : "Could not stop Realtime conversation.");
+        setLiveVoiceStatusText(message);
         clearExpectedStop();
         return;
       }
@@ -25583,6 +30780,7 @@ function AppInner() {
       liveVoiceMutedRef.current = next;
       liveVoiceInputChunksRef.current = [];
       liveVoiceMeterBus.inputLevel = 0;
+      liveVoiceGateRef.current = { speaking: false, lastSpeechAt: 0, preRoll: [] };
       if (next) {
         localVoiceCaptureRef.current = {
           speaking: false,
@@ -25595,7 +30793,7 @@ function AppInner() {
         setLiveVoiceStatusText("Microphone muted");
       } else if (liveVoiceStatusRef.current === "listening" || liveVoiceStatusRef.current === "transcribing") {
         setLiveVoiceStatus("listening");
-        setLiveVoiceStatusText(localVoiceModeActiveRef.current ? "Ready for your voice" : "Realtime conversation listening");
+        setLiveVoiceListeningStatus(localVoiceModeActiveRef.current ? "Ready for your voice" : undefined);
       }
       return next;
     });
@@ -25904,7 +31102,9 @@ function AppInner() {
     });
     if (nativeVoiceActiveRef.current) await stopVoiceInput();
     recognitionRef.current?.abort();
-    await stopLiveVoice("connecting", "Starting Local Voice Agent...");
+    await stopLiveVoice("connecting", "Starting Local Voice Agent...", { cancelPendingStart: false });
+    const startToken = ++liveVoiceStartTokenRef.current;
+    const startStillCurrent = () => liveVoiceStartTokenRef.current === startToken;
     setLiveVoiceStatus("connecting");
     setLiveVoiceStatusText("Opening microphone...");
     try {
@@ -25927,6 +31127,10 @@ function AppInner() {
           throw new Error(mediaErrorMessage(fallbackError));
         });
       }
+      if (!startStillCurrent()) {
+        stream.getTracks().forEach((track) => track.stop());
+        return;
+      }
       const context = new AudioContext();
       const source = context.createMediaStreamSource(stream);
       const processor = context.createScriptProcessor(4096, 1, 1);
@@ -25939,6 +31143,13 @@ function AppInner() {
         liveVoiceMeterBus.inputLevel = rmsForFloatChunk(channel);
         handleLocalVoiceAudioChunk(new Float32Array(channel), context.sampleRate);
       };
+      if (!startStillCurrent()) {
+        try { processor.disconnect(); } catch { /* not connected */ }
+        try { source.disconnect(); } catch { /* not connected */ }
+        stream.getTracks().forEach((track) => track.stop());
+        void context.close();
+        return;
+      }
       source.connect(processor);
       processor.connect(context.destination);
       liveVoiceStreamRef.current = stream;
@@ -25965,10 +31176,39 @@ function AppInner() {
       setLiveVoiceStatus("listening");
       setLiveVoiceStatusText("Ready for your voice");
     } catch (error) {
+      if (!startStillCurrent()) return;
       const message = error instanceof Error ? error.message : "Could not start Local Voice Agent.";
       console.error("[OpenAssist Local Voice] start failed", error);
       await stopLiveVoice("error", message);
     }
+  };
+
+  const activeNoteLiveVoiceContextHint = () => {
+    const target = selectedNoteTargetRef.current;
+    const detail = noteDetailRef.current;
+    if (activeViewRef.current !== "notes" || !target || !detail) return "";
+    const sourceItemID = selectedNoteTargetToKnowledgeItemID(target);
+    if (!sourceItemID) return "";
+    const projectByID = new Map(appState.projects.map((project) => [project.id.toLowerCase(), project]));
+    const threadProjectID = target.scope === "thread"
+      ? target.projectID ?? appState.threads.find((thread) => sameID(thread.id, target.threadID))?.projectID
+      : undefined;
+    const listProjectID = target.scope === "project" ? target.projectID : threadProjectID;
+    const listProject = listProjectID ? projectByID.get(listProjectID.toLowerCase()) : undefined;
+    const category = cleanDailyTagLabel(detail.area) || cleanDailyTagLabel(listProject?.area);
+    const tags = (detail.tags ?? []).map(cleanDailyTagLabel).filter(Boolean);
+    const excerpt = (noteDraftRef.current || detail.markdown || "").trim().replace(/\s+/g, " ").slice(0, 1600);
+    return [
+      "This live voice session was started while a note is selected in OpenAssist Notes.",
+      `Active source note itemID: ${sourceItemID}.`,
+      `Active note title: ${detail.title || "Untitled note"}.`,
+      listProject?.title ? `Active note List/Project: ${listProject.title}.` : "",
+      category ? `Active note Category: ${category}.` : "",
+      tags.length ? `Active note Tags: ${tags.join(", ")}.` : "",
+      "If the user says this note, from this note, split this note into tasks, or sprint planning, use this sourceItemID with knowledge_request_tasks_from_note after reading the full note.",
+      "Create a Review Inbox preview first; do not say tasks were created until the user approves.",
+      excerpt ? `Active note excerpt: ${excerpt}` : ""
+    ].filter(Boolean).join("\n");
   };
 
   const startLiveVoice = async (options: LiveVoiceStartOptions = {}) => {
@@ -26006,13 +31246,19 @@ function AppInner() {
     }
     if (nativeVoiceActiveRef.current) await stopVoiceInput();
     recognitionRef.current?.abort();
-    await stopLiveVoice("connecting", "Connecting Realtime conversation...");
+    await stopLiveVoice("connecting", "Connecting Live Voice...", { cancelPendingStart: false });
+    const startToken = ++liveVoiceStartTokenRef.current;
+    const startStillCurrent = () => liveVoiceStartTokenRef.current === startToken;
     liveVoiceSharedImageKeysRef.current.clear();
     liveVoiceMicrophoneReadyRef.current = false;
     setLiveVoiceStatus("connecting");
     setLiveVoiceStatusText(`Connecting to ${options.statusLabel || realtimeProviderName}...`);
     try {
-      const targetThreadID = usableOpenAssistThreadID(options.threadID) ?? currentThreadID();
+      const requestedThreadID = usableOpenAssistThreadID(options.threadID);
+      const targetThreadID = requestedThreadID && !isArchivedThreadID(requestedThreadID)
+        ? requestedThreadID
+        : currentLiveVoiceThreadID();
+      const selectedThreadForFallback = selectedThread?.isArchived ? undefined : selectedThread;
       const startProvider = options.provider ?? activeProviderKey;
       const startInteractionMode = options.interactionMode ?? interactionMode;
       const startPermissionMode = options.permissionMode ?? permissionMode;
@@ -26020,6 +31266,7 @@ function AppInner() {
       const composerMentions = composerMentionIDs(composerTextRef.current, appState.plugins, appState.skills);
       const liveVoicePluginIDs = options.pluginIDs ?? Array.from(new Set([...selectedPluginIDs, ...composerMentions.pluginIDs]));
       const liveVoiceSkillIDs = options.skillIDs ?? composerMentions.skillIDs;
+      const contextHint = options.contextHint || activeNoteLiveVoiceContextHint();
       console.debug("[OpenAssist Realtime conversation] start requested", {
         threadId: targetThreadID,
         provider: startProvider,
@@ -26034,11 +31281,15 @@ function AppInner() {
           reasoningEffort: startReasoningEffort,
           pluginIDs: liveVoicePluginIDs,
           skillIDs: liveVoiceSkillIDs,
-          contextHint: options.contextHint
+          contextHint
         }),
         liveVoiceConnectTimeoutMs,
         `Realtime conversation did not connect. Check the ${realtimeProviderName} API key and realtime model in Settings.`
       );
+      if (!startStillCurrent()) {
+        await api.stop().catch(() => undefined);
+        return;
+      }
       console.debug("[OpenAssist Realtime conversation] start result", result);
       if (!result) throw new Error("Realtime conversation is not ready in this build.");
       if (!result.ok) throw new Error(result.error || "Could not start Realtime conversation.");
@@ -26047,11 +31298,11 @@ function AppInner() {
         const existingThread = appState.threads.find((thread) => sameID(thread.id, liveThreadID));
         const fallbackThread: ThreadItem = {
           id: liveThreadID,
-          title: result.thread?.title || existingThread?.title || selectedThread?.title || DEFAULT_THREAD_TITLE,
-          projectID: result.thread?.projectID ?? existingThread?.projectID ?? selectedThread?.projectID ?? selectedProjectID,
-          project: result.thread?.project ?? existingThread?.project ?? selectedThread?.project,
+          title: result.thread?.title || existingThread?.title || selectedThreadForFallback?.title || DEFAULT_THREAD_TITLE,
+          projectID: result.thread?.projectID ?? existingThread?.projectID ?? selectedThreadForFallback?.projectID ?? selectedProjectID,
+          project: result.thread?.project ?? existingThread?.project ?? selectedThreadForFallback?.project,
           activeProvider: result.thread?.activeProvider ?? existingThread?.activeProvider ?? startProvider,
-          modelID: result.thread?.modelID ?? existingThread?.modelID ?? selectedThread?.modelID ?? options.modelID ?? appState.settings.model,
+          modelID: result.thread?.modelID ?? existingThread?.modelID ?? selectedThreadForFallback?.modelID ?? options.modelID ?? appState.settings.model,
           age: result.thread?.age ?? existingThread?.age ?? "1m",
           updatedAt: result.thread?.updatedAt ?? existingThread?.updatedAt ?? Date.now(),
           isArchived: result.thread?.isArchived ?? existingThread?.isArchived,
@@ -26117,20 +31368,66 @@ function AppInner() {
           throw new Error(mediaErrorMessage(fallbackError));
         });
       }
+      if (!startStillCurrent()) {
+        stream.getTracks().forEach((track) => track.stop());
+        await api.stop().catch(() => undefined);
+        return;
+      }
       const context = new AudioContext();
       const source = context.createMediaStreamSource(stream);
       const processor = context.createScriptProcessor(4096, 1, 1);
       processor.onaudioprocess = (event) => {
         if (!liveVoiceActiveRef.current) return;
+        const gate = liveVoiceGateRef.current;
         if (liveVoiceMutedRef.current) {
           liveVoiceInputChunksRef.current = [];
           liveVoiceMeterBus.inputLevel = 0;
+          gate.speaking = false;
+          gate.preRoll = [];
           return;
         }
         const channel = event.inputBuffer.getChannelData(0);
-        liveVoiceMeterBus.inputLevel = rmsForFloatChunk(channel);
-        liveVoiceInputChunksRef.current.push(new Float32Array(channel));
+        const frame = new Float32Array(channel);
+        const rms = rmsForFloatChunk(channel);
+        const now = performance.now();
+        const threshold = gate.speaking ? liveVoiceGateContinueThreshold : liveVoiceGateStartThreshold;
+        if (rms >= threshold) {
+          if (!gate.speaking) {
+            // Speech onset: flush the buffered pre-roll so the first word isn't clipped.
+            for (const preRollFrame of gate.preRoll) {
+              liveVoiceInputChunksRef.current.push(preRollFrame);
+            }
+            gate.preRoll = [];
+            gate.speaking = true;
+          }
+          gate.lastSpeechAt = now;
+        }
+        if (gate.speaking) {
+          liveVoiceMeterBus.inputLevel = rms;
+          liveVoiceInputChunksRef.current.push(frame);
+          // Keep passing real audio through a short hangover so trailing words and
+          // brief pauses survive; then close the gate.
+          if (now - gate.lastSpeechAt > liveVoiceGateHangoverMs) {
+            gate.speaking = false;
+          }
+        } else {
+          // Below threshold: stash recent frames for pre-roll and stream clean
+          // silence so the provider's VAD sees a real pause (and ends the turn)
+          // instead of the background noise that's actually in the room.
+          gate.preRoll.push(frame);
+          if (gate.preRoll.length > liveVoiceGatePreRollFrames) gate.preRoll.shift();
+          liveVoiceMeterBus.inputLevel = 0;
+          liveVoiceInputChunksRef.current.push(new Float32Array(channel.length));
+        }
       };
+      if (!startStillCurrent()) {
+        try { processor.disconnect(); } catch { /* not connected */ }
+        try { source.disconnect(); } catch { /* not connected */ }
+        stream.getTracks().forEach((track) => track.stop());
+        void context.close();
+        await api.stop().catch(() => undefined);
+        return;
+      }
       source.connect(processor);
       processor.connect(context.destination);
       liveVoiceStreamRef.current = stream;
@@ -26138,14 +31435,16 @@ function AppInner() {
       liveVoiceSourceRef.current = source;
       liveVoiceProcessorRef.current = processor;
       liveVoiceInputChunksRef.current = [];
+      liveVoiceGateRef.current = { speaking: false, lastSpeechAt: 0, preRoll: [] };
       liveVoiceAudioDiagRef.current = { sends: 0, ok: 0, fail: 0, bytes: 0, peakRms: 0, lastLogAt: 0, firstLogged: false };
       liveVoiceMicrophoneReadyRef.current = true;
       liveVoiceActiveRef.current = true;
       liveVoicePlaybackTimeRef.current = 0;
       liveVoiceChunkTimerRef.current = window.setInterval(flushLiveVoiceChunk, 100);
       setLiveVoiceStatus("listening");
-      setLiveVoiceStatusText("Realtime conversation listening");
+      setLiveVoiceStatusText(`${realtimeProviderName} listening`);
     } catch (error) {
+      if (!startStillCurrent()) return;
       const message = error instanceof Error ? error.message : "Could not start Realtime conversation.";
       console.error("[OpenAssist Realtime conversation] start failed", error);
       await stopLiveVoice("error", message);
@@ -26153,12 +31452,30 @@ function AppInner() {
   };
 
   const toggleLiveVoice = (options?: LiveVoiceStartOptions) => {
-    if (liveVoiceActiveRef.current || liveVoiceStatus === "connecting") {
-      void stopLiveVoice("idle", undefined);
+    if (liveVoiceStatusRef.current !== "idle" && liveVoiceStatusRef.current !== "error") {
+      void stopLiveVoice("idle", undefined, { stopDelegation: true });
       return;
     }
     void startLiveVoice(options);
   };
+  useEffect(() => {
+    return window.openAssistElectron?.onLiveVoiceHUDAction?.((action) => {
+      if (action === "toggleMute") {
+        toggleLiveVoiceMuted();
+        return;
+      }
+      if (action === "stop") {
+        void stopLiveVoice("idle", undefined, { stopDelegation: true });
+        return;
+      }
+      if (action === "approveRequest" || action === "rejectRequest") {
+        const request = knowledgeApprovalRequests[0];
+        if (!request) return;
+        if (action === "approveRequest") void applyKnowledgeApprovalRequest(request.id);
+        else void rejectKnowledgeApprovalRequest(request.id);
+      }
+    });
+  });
 
   const readTodayLiveVoiceThreadID = () => {
     if (typeof window === "undefined") return undefined;
@@ -26186,6 +31503,10 @@ function AppInner() {
     const modelID = defaultModelForProvider("codex", appState.settings, codexModels);
     let threadID = readTodayLiveVoiceThreadID();
     let thread = threadID ? appState.threads.find((item) => sameID(item.id, threadID)) : undefined;
+    if (thread?.isArchived) {
+      threadID = undefined;
+      thread = undefined;
+    }
     if (!threadID) {
       const created = await electron.createThread(undefined, false);
       threadID = created.thread.id;
@@ -26246,8 +31567,8 @@ function AppInner() {
   };
 
   const toggleTodayLiveVoice = async () => {
-    if (liveVoiceActiveRef.current || liveVoiceStatus === "connecting") {
-      void stopLiveVoice("idle", undefined);
+    if (liveVoiceStatusRef.current !== "idle" && liveVoiceStatusRef.current !== "error") {
+      void stopLiveVoice("idle", undefined, { stopDelegation: true });
       return;
     }
     try {
@@ -26336,6 +31657,22 @@ function AppInner() {
           const delegatedProvider = typeof payload.provider === "string" && payload.provider.trim()
             ? payload.provider.trim()
             : activity.provider || "Assistant";
+          if (isRealtimeDelegationActivity(activity)) {
+            const detail = realtimeDelegationSummary(activity);
+            if (detail) {
+              if (activity.activityStatus === "failed") {
+                setLiveVoiceStatus("error");
+                setLiveVoiceStatusText(detail);
+              } else if (activity.activityStatus === "completed") {
+                setLiveVoiceStatus((current) => current === "idle" ? "idle" : "listening");
+                setLiveVoiceStatusText(detail);
+              } else {
+                setLiveVoiceStatus("delegating");
+                setLiveVoiceStatusText(detail);
+              }
+              liveVoiceCaptionBus.setAssistant(detail, "activity");
+            }
+          }
           if (providerTurnID) {
             upsertRealtimeDelegationRun(delegatedThreadID, providerTurnID, delegatedProvider, prompt, activity);
           }
@@ -26463,17 +31800,17 @@ function AppInner() {
         interruptLiveVoicePlayback();
         // A new utterance begins a fresh turn — drop the previous captions.
         liveVoiceCaptionBus.clear();
-        setLiveVoiceListeningStatus("Realtime conversation listening");
+        setLiveVoiceListeningStatus();
         return;
       }
       if (isRealtimeAudioPlaybackClearEvent(event, lowerType)) {
         interruptLiveVoicePlayback();
-        setLiveVoiceListeningStatus("Realtime conversation listening");
+        setLiveVoiceListeningStatus();
         return;
       }
       if (isRealtimeOutputAudioDeltaEvent(type, lowerType)) {
         setLiveVoiceStatus("speaking");
-        setLiveVoiceStatusText((current) => current && /^heard:/i.test(current) ? current : "Realtime conversation speaking");
+        setLiveVoiceStatusText((current) => current && /^heard:/i.test(current) ? current : `${liveVoiceProviderLabel(appState.settings.liveVoiceMode, appState.settings.realtimeVoiceProvider)} speaking`);
         void playRealtimeAudio(event.payload).catch((error) => {
           setLiveVoiceStatus("error");
           setLiveVoiceStatusText(error instanceof Error ? error.message : "Could not play Realtime conversation audio.");
@@ -26558,7 +31895,7 @@ function AppInner() {
         }
         if (isBenignRealtimeCancelError(message)) {
           if (liveVoiceActiveRef.current) {
-            setLiveVoiceListeningStatus("Realtime conversation listening", false);
+            setLiveVoiceListeningStatus(undefined, false);
           }
           return;
         }
@@ -26567,7 +31904,7 @@ function AppInner() {
       }
       if (lowerType.includes("done") || lowerType.includes("completed")) {
         if (hasActiveRealtimeDelegationRun() || liveVoiceStatusRef.current === "delegating") return;
-        setLiveVoiceListeningStatus("Realtime conversation listening");
+        setLiveVoiceListeningStatus();
       }
     });
   }, [selectedThreadID]);
@@ -26583,6 +31920,7 @@ function AppInner() {
   }, [activeProviderKey, selectedThreadID]);
 
   useEffect(() => {
+    if (liveVoiceStatus !== "idle" && liveVoiceStatus !== "error") return;
     const voiceHUDStateActive = (
       voiceStatus === "listening"
       || voiceStatus === "processing"
@@ -26611,9 +31949,82 @@ function AppInner() {
     appState.settings.colorTheme,
     appState.settings.waveformTheme,
     appWindowFocused,
+    liveVoiceStatus,
     voiceError,
     voiceStatus,
     voiceStatusText
+  ]);
+
+  useEffect(() => {
+    const providerLabel = liveVoiceProviderLabel(appState.settings.liveVoiceMode, appState.settings.realtimeVoiceProvider);
+    const liveVoiceAgentWorkActive = liveVoiceStatus !== "idle"
+      && liveVoiceStatus !== "error"
+      && (hasActiveRealtimeDelegationRun() || activeRunCount > 0);
+    const hudStatus = liveVoiceAgentWorkActive ? "live-delegating" : liveVoiceFloatingHUDStatus(liveVoiceStatus);
+    const liveVoiceHUDVisible = appState.settings.assistantFloatingHUDEnabled
+      && hudStatus !== "idle";
+    const updateLiveVoiceHUD = () => {
+      if (!liveVoiceHUDVisible) {
+        if (voiceStatus === "idle") {
+          void window.openAssistElectron?.updateVoiceHUD?.({ visible: false, status: "idle" });
+        }
+        return;
+      }
+      const inputLevel = clampUnitLevel(liveVoiceMeterBus.inputLevel);
+      const outputLevel = readLiveVoiceOutputLevel(liveVoiceStatus);
+      const level = liveVoiceOrbEnergy(liveVoiceStatus, inputLevel, outputLevel, performance.now());
+      const statusText = liveVoiceAgentWorkActive
+        ? (liveVoiceStatusText && !/^(preparing|connecting|opening|ready|waiting)/i.test(liveVoiceStatusText)
+          ? liveVoiceStatusText
+          : "Agent is working")
+        : liveVoiceFloatingHUDText(liveVoiceStatus, providerLabel, liveVoiceStatusText);
+      // Surface the newest pending knowledge approval inside the HUD so the
+      // user can approve/deny mid-conversation without opening the app.
+      const pendingApproval = knowledgeApprovalRequests[0];
+      // Spoken words and agent-work status go to SEPARATE HUD containers so
+      // they can never race each other for the same caption.
+      const spokenAssistant = liveVoiceCaptionBus.assistantSource === "transcript" ? liveVoiceCaptionBus.assistant : "";
+      const activityCaption = liveVoiceCaptionBus.assistantSource === "activity" ? liveVoiceCaptionBus.assistant : "";
+      void window.openAssistElectron?.updateVoiceHUD?.({
+        visible: true,
+        status: hudStatus,
+        text: statusText,
+        providerLabel,
+        userText: liveVoiceCaptionBus.user,
+        assistantText: spokenAssistant,
+        workText: activityCaption || (liveVoiceAgentWorkActive ? (statusText || "Agent is working") : ""),
+        muted: liveVoiceMuted,
+        theme: appState.settings.waveformTheme,
+        colorTheme: appState.settings.colorTheme,
+        chromeStyle: appState.settings.appChromeStyle,
+        level,
+        tone: liveVoiceStatus === "error" ? "error" : "success",
+        approval: pendingApproval
+          ? { requestID: pendingApproval.id, summary: pendingApproval.goal || pendingApproval.action }
+          : null,
+        // The main window already shows the Live Voice state; don't float a
+        // duplicate HUD over it while the user is looking at the app.
+        suppressForAppFocus: appWindowFocused
+      });
+    };
+    updateLiveVoiceHUD();
+    if (!liveVoiceHUDVisible || liveVoiceStatus === "error") return;
+    const timer = window.setInterval(updateLiveVoiceHUD, 120);
+    return () => window.clearInterval(timer);
+  }, [
+    appState.settings.appChromeStyle,
+    appState.settings.assistantFloatingHUDEnabled,
+    appState.settings.colorTheme,
+    appState.settings.liveVoiceMode,
+    appState.settings.realtimeVoiceProvider,
+    appState.settings.waveformTheme,
+    activeRunCount,
+    appWindowFocused,
+    knowledgeApprovalRequests,
+    liveVoiceStatus,
+    liveVoiceStatusText,
+    liveVoiceMuted,
+    voiceStatus
   ]);
 
   useEffect(() => {
@@ -26682,10 +32093,13 @@ function AppInner() {
   useEffect(() => {
     const handler = (raw: unknown) => {
       const update = raw as
+        | { type: "projects"; projects: OpenAssistAppState["projects"]; hiddenProjects: OpenAssistAppState["hiddenProjects"]; plannerLists?: OpenAssistAppState["plannerLists"] }
         | { type: "threads"; threads: OpenAssistAppState["threads"] }
         | { type: "automations"; automations: OpenAssistAppState["automations"] }
         | { type: "plugins"; plugins: OpenAssistAppState["plugins"] }
         | { type: "knowledgeRequests"; requests: KnowledgeWriteRequest[] }
+        | { type: "plannerCategories"; categories: NonNullable<OpenAssistAppState["plannerCategories"]> }
+        | { type: "plannerSmartLists"; smartLists: NonNullable<OpenAssistAppState["plannerSmartLists"]> }
         | { type: "plannerDays"; plannerDays: PlannerDaySummary[]; activeDayID?: string }
         | { type: "plannerDay"; day: PlannerDayDetail; items: DailyItem[] }
         | { type: "plannerBacklog"; backlog: PlannerBacklogDetail; items: DailyItem[] }
@@ -26694,6 +32108,13 @@ function AppInner() {
       if (!update || typeof update.type !== "string") return;
       if (update.type === "threads") {
         setAppState((current) => ({ ...current, threads: update.threads }));
+      } else if (update.type === "projects") {
+        setAppState((current) => ({
+          ...current,
+          projects: update.projects,
+          hiddenProjects: update.hiddenProjects,
+          plannerLists: update.plannerLists ?? current.plannerLists
+        }));
       } else if (update.type === "automations") {
         setAppState((current) => ({ ...current, automations: update.automations }));
       } else if (update.type === "plugins") {
@@ -26751,6 +32172,16 @@ function AppInner() {
           plannerBacklog: update.backlog,
           backlogItems: update.items
         }));
+      } else if (update.type === "plannerCategories") {
+        setAppState((current) => ({
+          ...current,
+          plannerCategories: update.categories
+        }));
+      } else if (update.type === "plannerSmartLists") {
+        setAppState((current) => ({
+          ...current,
+          plannerSmartLists: update.smartLists
+        }));
       } else if (update.type === "usage") {
         setAppState((current) => ({
           ...current,
@@ -26762,6 +32193,35 @@ function AppInner() {
     const unsubscribe = window.openAssistElectron?.onAppStateBackgroundUpdate?.(handler);
     return () => {
       unsubscribe?.();
+    };
+  }, []);
+
+  // The full app state (and its remote-access fields) only loads once on launch,
+  // so the sidebar Remote pill would otherwise stay on its launch-time value
+  // (e.g. "Starting…") even after the startup auto-restore finishes bringing the
+  // tunnel up. Poll the lightweight remote-access status so the pill, server
+  // state and paired-device count stay live.
+  useEffect(() => {
+    const fetchStatus = window.openAssistElectron?.getRemoteAccessStatus;
+    if (typeof fetchStatus !== "function") return;
+    let cancelled = false;
+    const refresh = async () => {
+      try {
+        const status = await fetchStatus();
+        if (cancelled || !status) return;
+        setAppState((current) => ({
+          ...current,
+          settings: { ...current.settings, ...status }
+        }));
+      } catch {
+        // Ignore transient failures; the next tick will retry.
+      }
+    };
+    void refresh();
+    const timer = window.setInterval(() => void refresh(), 4000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
     };
   }, []);
   // Mirror changes from the AppearanceSettingsProvider into local appState.
@@ -26794,10 +32254,12 @@ function AppInner() {
     return window.openAssistElectron?.onVoiceShortcut?.((target, phase: ShortcutPhase = "trigger") => {
       if (target === "assistantCompact") return;
       if (target === "assistantLiveVoice") {
+        if (phase === "up") return;
         setActiveView("threads");
-        if (compact && !sidebarOpen) openSidebarAssistant();
+        void toggleTodayLiveVoice();
+        return;
       }
-      const isHoldStyleShortcut = target === "holdToTalk" || target === "assistantLiveVoice";
+      const isHoldStyleShortcut = target === "holdToTalk";
       if (isHoldStyleShortcut && phase === "down") {
         nativeVoiceStopAfterStartRef.current = false;
         if (!recognitionRef.current && !nativeVoiceActiveRef.current) void startVoiceInput("hold");
@@ -26811,9 +32273,6 @@ function AppInner() {
       toggleVoiceInput();
     });
   }, [
-    compact,
-    sidebarOpen,
-    appState.settings.compactEdge,
     appState.settings.transcriptionEngine,
     appState.settings.cloudTranscriptionProvider,
     appState.settings.voiceEnabled,
@@ -26830,6 +32289,16 @@ function AppInner() {
     return window.openAssistElectron?.onMenuBarCommand?.((command) => {
       if (command === "open-assistant") {
         openAssistant();
+        return;
+      }
+      if (command === "new-chat") {
+        openAssistant();
+        void createThread();
+        return;
+      }
+      if (command === "open-today") {
+        openFullAssistant();
+        void openPlannerDay(selectedPlannerDayID || plannerDayID());
         return;
       }
       if (command === "open-history") {
@@ -26886,7 +32355,17 @@ function AppInner() {
     // navigation would delete a completed conversation the user wanted to keep.
     const hasRun = Boolean(activeThreadRunsRef.current[threadID]);
     const isRunning = thread.isRunning === true;
-    if (hasRun || isRunning) {
+    const hasStartedWork = temporaryThreadsWithStartedWorkRef.current.has(threadID);
+    if (hasRun || isRunning || hasStartedWork) {
+      if (!hasRun && !isRunning) {
+        const updated = await window.openAssistElectron?.promoteTemporarySession(threadID);
+        if (updated) {
+          setAppState((current) => ({
+            ...current,
+            threads: current.threads.map((item) => item.id === updated.id ? { ...item, ...updated, isTemporary: false } : item)
+          }));
+        }
+      }
       return;
     }
     // The backend refuses to delete a temp thread that has real conversation
@@ -26908,6 +32387,7 @@ function AppInner() {
     if (selectedThreadID && selectedThreadID !== threadID) {
       await cleanupTemporaryThread(selectedThreadID);
     }
+    clearThreadUnread(threadID);
     setSelectedThreadID(threadID);
     const thread = appState.threads.find((item) => item.id === threadID);
     if (options.syncProjectFilter === true && thread?.projectID) setSelectedProjectID(thread.projectID);
@@ -26922,6 +32402,24 @@ function AppInner() {
       });
     }
   };
+
+  // Keep the currently open thread while the user is present: seeing the
+  // completion (refocusing the window with the thread open, or clicking the
+  // notification) marks it read.
+  const selectThreadRef = useRef(selectThread);
+  selectThreadRef.current = selectThread;
+  useEffect(() => {
+    const onFocus = () => clearThreadUnread(selectedThreadIDRef.current);
+    window.addEventListener("focus", onFocus);
+    const unsubscribeOpenThread = window.openAssistElectron?.onOpenThread?.((threadID) => {
+      if (usableOpenAssistThreadID(threadID)) void selectThreadRef.current(threadID);
+    });
+    return () => {
+      window.removeEventListener("focus", onFocus);
+      unsubscribeOpenThread?.();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const clearProjectFilter = async () => {
     const currentThread = appState.threads.find((item) => item.id === selectedThreadID);
@@ -27327,6 +32825,57 @@ function AppInner() {
     applyDailyItemMutationResult(result);
   };
 
+  const upsertPlannerCategory = async (category: Partial<PlannerCategory> & { name?: string }) => {
+    const result = await window.openAssistElectron?.upsertPlannerCategory?.(category);
+    if (result?.categories) {
+      setAppState((current) => ({ ...current, plannerCategories: result.categories }));
+    }
+  };
+
+  const deletePlannerCategory = async (categoryID: string) => {
+    const categories = await window.openAssistElectron?.deletePlannerCategory?.(categoryID);
+    if (categories) {
+      setAppState((current) => ({ ...current, plannerCategories: categories }));
+    }
+  };
+
+  const createPlannerList = async (input: { name: string; area?: string }) => {
+    const result = await window.openAssistElectron?.createPlannerList?.(input);
+    if (result?.lists) {
+      setAppState((current) => {
+        const nextProjects = result.projects
+          ?? (result.list
+            ? [...current.projects.filter((item) => !sameID(item.id, result.list.id)), result.list]
+            : current.projects);
+        return {
+          ...current,
+          plannerLists: result.lists,
+          projects: nextProjects,
+          hiddenProjects: result.hiddenProjects ?? current.hiddenProjects
+        };
+      });
+    }
+  };
+
+  const updatePlannerListColorAndArea = async (projectID: string, area?: string | null, color?: string | null) => {
+    const result = await window.openAssistElectron?.updatePlannerListColorAndArea?.(projectID, area, color);
+    if (!result?.lists) return;
+    setAppState((current) => ({
+      ...current,
+      plannerLists: result.lists,
+      projects: result.projects
+        ?? (result.list
+          ? current.projects.map((item) => sameID(item.id, result.list?.id) ? result.list as ProjectItem : item)
+          : current.projects),
+      hiddenProjects: result.hiddenProjects ?? current.hiddenProjects
+    }));
+  };
+
+  const hidePlannerList = async (projectID: string) => {
+    const lists = await window.openAssistElectron?.hidePlannerList?.(projectID);
+    if (lists) setAppState((current) => ({ ...current, plannerLists: lists }));
+  };
+
   const toggleDailyItem = async (dayID: string, itemID: string, checked: boolean) => {
     await flushNoteDraftBeforeNavigation();
     const result = await window.openAssistElectron?.toggleDailyItem?.(dayID, itemID, checked);
@@ -27342,7 +32891,11 @@ function AppInner() {
   const linkDailyItemNote = async (dayID: string, itemID: string, target: NoteLinkTarget) => {
     await flushNoteDraftBeforeNavigation();
     const result = await window.openAssistElectron?.linkDailyItemNote?.(dayID, itemID, target);
-    applyDailyItemMutationResult(result);
+    if (String(dayID ?? "").toLowerCase() === "backlog" && result && "backlog" in result) {
+      applyBacklogItemMutationResult(result);
+    } else {
+      applyDailyItemMutationResult(result as DailyItemMutationResult | undefined);
+    }
   };
 
   const upsertBacklogItem = async (item: DailyItemInput) => {
@@ -27520,15 +33073,17 @@ function AppInner() {
     setNoteDraft("");
   };
 
+  const noteListProjects = () => appState.plannerLists?.length ? appState.plannerLists : appState.projects;
+
   const firstProjectNoteForFilter = (projectID?: string) => {
-    const filterIDs = noteProjectFilterIDs(appState.projects, projectID);
+    const filterIDs = noteProjectFilterIDs(noteListProjects(), projectID);
     return appState.notes.find((note) =>
       matchesNoteProjectFilter(note.projectID, filterIDs) && Boolean(note.isArchived) === showArchivedThreads
     );
   };
 
   const firstThreadNoteForFilter = (projectID?: string) => {
-    const filterIDs = noteProjectFilterIDs(appState.projects, projectID);
+    const filterIDs = noteProjectFilterIDs(noteListProjects(), projectID);
     return appState.threadNotes.find((note) =>
       matchesNoteProjectFilter(note.projectID, filterIDs) && Boolean(note.isArchived) === showArchivedThreads
     );
@@ -27552,7 +33107,8 @@ function AppInner() {
       await clearNotesProjectFilter();
       return;
     }
-    const selectedProject = appState.projects.find((project) => sameID(project.id, projectID));
+    const projects = noteListProjects();
+    const selectedProject = projects.find((project) => sameID(project.id, projectID));
     setSelectedProjectID(projectID);
     setShowArchivedThreads(false);
     setActiveView("notes");
@@ -27599,11 +33155,12 @@ function AppInner() {
   const createNote = async () => {
     await flushNoteDraftBeforeNavigation();
     setPendingMarkdownImport(null);
-    const selectedProject = appState.projects.find((project) => selectedProjectID && sameID(project.id, selectedProjectID));
-    const selectedFilterIDs = selectedProject?.kind === "folder" ? noteProjectFilterIDs(appState.projects, selectedProjectID) : null;
+    const projects = noteListProjects();
+    const selectedProject = projects.find((project) => selectedProjectID && sameID(project.id, selectedProjectID));
+    const selectedFilterIDs = selectedProject?.kind === "folder" ? noteProjectFilterIDs(projects, selectedProjectID) : null;
     const projectID = selectedProject?.kind === "folder"
-      ? appState.projects.find((project) => project.kind !== "folder" && matchesNoteProjectFilter(project.id, selectedFilterIDs))?.id
-      : selectedProjectID ?? appState.activeProjectID ?? appState.projects.find((project) => project.kind !== "folder")?.id;
+      ? projects.find((project) => project.kind !== "folder" && matchesNoteProjectFilter(project.id, selectedFilterIDs))?.id
+      : selectedProjectID ?? appState.activeProjectID ?? projects.find((project) => project.kind !== "folder")?.id;
     if (!projectID) return;
     const result = await window.openAssistElectron?.createNote(projectID);
     if (!result) return;
@@ -27621,28 +33178,31 @@ function AppInner() {
     }));
   };
 
-  // Note folders live under a real (leaf) project, never a "folder"-kind
-  // project group. This resolves which leaf project a new folder belongs to,
-  // mirroring how createNote picks its target project.
+  // Note folders live under one leaf List. This resolves which List a new
+  // folder belongs to, mirroring how createNote picks its target List.
   const resolveNoteFolderProjectID = (): string | undefined => {
-    const selectedProject = appState.projects.find((project) => selectedProjectID && sameID(project.id, selectedProjectID));
-    const selectedFilterIDs = selectedProject?.kind === "folder" ? noteProjectFilterIDs(appState.projects, selectedProjectID) : null;
+    const projects = noteListProjects();
+    const selectedProject = projects.find((project) => selectedProjectID && sameID(project.id, selectedProjectID));
+    const selectedFilterIDs = selectedProject?.kind === "folder" ? noteProjectFilterIDs(projects, selectedProjectID) : null;
     return selectedProject?.kind === "folder"
-      ? appState.projects.find((project) => project.kind !== "folder" && matchesNoteProjectFilter(project.id, selectedFilterIDs))?.id
-      : selectedProjectID ?? appState.activeProjectID ?? appState.projects.find((project) => project.kind !== "folder")?.id;
+      ? projects.find((project) => project.kind !== "folder" && matchesNoteProjectFilter(project.id, selectedFilterIDs))?.id
+      : selectedProjectID ?? appState.activeProjectID ?? projects.find((project) => project.kind !== "folder")?.id;
   };
 
-  const createNoteFolder = async () => {
+  const createNoteFolder = async (parentFolderID?: string | null) => {
     const projectID = resolveNoteFolderProjectID();
     if (!projectID) {
-      window.alert("Select a project first, then add a folder.");
+      window.alert("Select a List first, then add a folder.");
       return;
     }
-    const name = window.prompt("New folder name")?.trim();
+    const parentFolder = parentFolderID
+      ? appState.noteFolders.find((folder) => sameID(folder.projectID, projectID) && sameID(folder.id, parentFolderID))
+      : undefined;
+    const name = window.prompt(parentFolder ? `New folder inside "${parentFolder.name}"` : "New folder name")?.trim();
     if (!name) return;
     let folder: NoteFolderItem | undefined;
     try {
-      folder = await window.openAssistElectron?.createNoteFolder(projectID, name);
+      folder = await window.openAssistElectron?.createNoteFolder(projectID, name, parentFolderID ?? null);
     } catch (error) {
       window.alert(error instanceof Error ? error.message : "Could not create the folder.");
       return;
@@ -27674,21 +33234,46 @@ function AppInner() {
   };
 
   const deleteNoteFolderFromMenu = async (folder: NoteFolderItem) => {
-    const confirmed = window.confirm(`Delete the folder "${folder.name}"? The notes inside it are kept and moved out of the folder.`);
+    const descendantIDs = noteFolderDescendantIDSet(
+      appState.noteFolders.filter((item) => sameID(item.projectID, folder.projectID)),
+      folder.id
+    );
+    const affectedIDs = new Set([noteFolderIDKey(folder.id), ...descendantIDs]);
+    const confirmed = window.confirm(`Delete the folder "${folder.name}" and its subfolders? The notes inside them are kept and moved out of folders.`);
     if (!confirmed) return;
+    let deletedFolderIDs = [...affectedIDs];
     try {
-      await window.openAssistElectron?.deleteNoteFolder(folder.projectID, folder.id);
+      const result = await window.openAssistElectron?.deleteNoteFolder(folder.projectID, folder.id);
+      if (result?.deletedFolderIDs?.length) deletedFolderIDs = result.deletedFolderIDs.map(noteFolderIDKey);
     } catch (error) {
       window.alert(error instanceof Error ? error.message : "Could not delete the folder.");
       return;
     }
+    const deletedSet = new Set(deletedFolderIDs);
     setAppState((current) => ({
       ...current,
-      noteFolders: current.noteFolders.filter((item) => !(sameID(item.id, folder.id) && sameID(item.projectID, folder.projectID))),
+      noteFolders: current.noteFolders.filter((item) => !(sameID(item.projectID, folder.projectID) && deletedSet.has(noteFolderIDKey(item.id)))),
       notes: current.notes.map((note) =>
-        sameID(note.projectID, folder.projectID) && note.folderID && sameID(note.folderID, folder.id)
+        sameID(note.projectID, folder.projectID) && note.folderID && deletedSet.has(noteFolderIDKey(note.folderID))
           ? { ...note, folderID: null }
           : note
+      )
+    }));
+  };
+
+  const moveNoteFolderFromMenu = async (folder: NoteFolderItem, parentFolderID: string | null) => {
+    let updated: NoteFolderItem | undefined;
+    try {
+      updated = await window.openAssistElectron?.moveNoteFolder(folder.projectID, folder.id, parentFolderID);
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : "Could not move the folder.");
+      return;
+    }
+    if (!updated) return;
+    setAppState((current) => ({
+      ...current,
+      noteFolders: current.noteFolders.map((item) =>
+        sameID(item.id, updated!.id) && sameID(item.projectID, updated!.projectID) ? updated! : item
       )
     }));
   };
@@ -27702,6 +33287,16 @@ function AppInner() {
     }
     setAppState((current) => ({
       ...current,
+      noteFolders: current.noteFolders.map((folder) => {
+        if (!sameID(folder.projectID, note.projectID)) return folder;
+        if (note.folderID && sameID(folder.id, note.folderID)) {
+          return { ...folder, noteCount: Math.max(0, folder.noteCount - 1) };
+        }
+        if (folderID && sameID(folder.id, folderID)) {
+          return { ...folder, noteCount: folder.noteCount + 1 };
+        }
+        return folder;
+      }),
       notes: current.notes.map((item) =>
         sameID(item.id, note.id) && sameID(item.projectID, note.projectID) ? { ...item, folderID } : item
       )
@@ -27712,11 +33307,12 @@ function AppInner() {
     // Resolve a target leaf project the same way New note / New folder do, so
     // importing still works from the "All notes" view (no project selected).
     const targetProjectID = resolveNoteFolderProjectID();
+    const projects = noteListProjects();
     const targetProject = targetProjectID
-      ? appState.projects.find((project) => sameID(project.id, targetProjectID) && project.kind !== "folder")
+      ? projects.find((project) => sameID(project.id, targetProjectID) && project.kind !== "folder")
       : undefined;
     if (!targetProject) {
-      window.alert("Create a project first, then import the Markdown file into it.");
+      window.alert("Create a List first, then import the Markdown file into it.");
       return;
     }
     await flushNoteDraftBeforeNavigation();
@@ -27751,28 +33347,30 @@ function AppInner() {
   const savePendingMarkdownImport = async () => {
     const pending = pendingMarkdownImport;
     if (!pending) return;
-    const project = appState.projects.find((item) => sameID(item.id, pending.projectID) && item.kind !== "folder");
+    const project = noteListProjects().find((item) => sameID(item.id, pending.projectID) && item.kind !== "folder");
     if (!project) {
-      window.alert("That project is no longer available.");
+      window.alert("That List is no longer available.");
       return;
     }
     clearNoteAutosaveTimer();
     const draft = noteDraftRef.current.replace(/\r\n/g, "\n");
     const requestID = ++noteSaveRequestRef.current;
-    setNoteSaveStatus({ kind: "saving", message: "Saving to project..." });
+    setNoteSaveStatus({ kind: "saving", message: "Saving to List..." });
     try {
       const result = await window.openAssistElectron?.createNote(pending.projectID);
-      if (!result) throw new Error("Could not create the project note.");
+      if (!result) throw new Error("Could not create the note.");
       const renamedDetail = await window.openAssistElectron?.renameNote(pending.projectID, result.note.id, pending.title);
-      if (!renamedDetail) throw new Error("Could not name the project note.");
+      if (!renamedDetail) throw new Error("Could not name the note.");
       const savedDetail = await window.openAssistElectron?.saveNote(pending.projectID, result.note.id, draft);
-      if (!savedDetail) throw new Error("Could not save the Markdown file into the project.");
+      if (!savedDetail) throw new Error("Could not save the Markdown file into the List.");
       const target: SelectedNoteTarget = { scope: "project", projectID: pending.projectID, noteID: result.note.id };
       const savedAt = Date.now();
       const savedNote: NoteItem = {
         ...result.note,
         title: savedDetail.title,
         subtitle: formatNoteAge(savedAt),
+        area: savedDetail.area,
+        tags: savedDetail.tags,
         updatedAt: savedAt,
         active: true
       };
@@ -27803,7 +33401,7 @@ function AppInner() {
       if (requestID === noteSaveRequestRef.current) {
         setNoteSaveStatus({
           kind: "error",
-          message: error instanceof Error ? error.message : "Could not save to project"
+          message: error instanceof Error ? error.message : "Could not save to List"
         });
       }
     }
@@ -27842,7 +33440,7 @@ function AppInner() {
         ...current,
         notes: current.notes.map((item) =>
           sameID(item.id, target.noteID) && sameID(item.projectID, target.projectID)
-            ? { ...item, subtitle: formatNoteAge(Date.now()), updatedAt: Date.now(), active: true }
+            ? { ...item, subtitle: formatNoteAge(Date.now()), updatedAt: Date.now(), area: detail.area, tags: detail.tags, active: true }
             : item
         ),
         activeProjectID: target.projectID,
@@ -28240,21 +33838,36 @@ function AppInner() {
     if (selectedThreadID === updated.id) setSelectedProjectID(updated.projectID);
   };
 
+  // Archive/unarchive/delete patch the thread list in place instead of doing
+  // a full refreshAppState: the refresh re-reads every conversation file from
+  // disk right after the registry write, and files caught mid-write get
+  // silently skipped — the sidebar briefly rendered a half-empty thread list
+  // until the next periodic refresh filled it back in.
+  const patchThreadInAppState = (updated: ThreadItem) => {
+    setAppState((current) => ({
+      ...current,
+      threads: current.threads.map((item) => sameID(item.id, updated.id) ? { ...item, ...updated } : item)
+    }));
+  };
+
   const archiveThreadFromMenu = async (thread: ThreadItem) => {
     const wasSelected = sameID(selectedThreadIDRef.current ?? selectedThreadID, thread.id);
     const updated = await window.openAssistElectron?.archiveSession(thread.id);
     if (!updated) return;
+    patchThreadInAppState({ ...updated, isArchived: true });
     if (wasSelected) {
       selectedThreadIDRef.current = undefined;
       setSelectedThreadID(undefined);
       setThreadDetail(null);
+      const nextThread = appState.threads.find((item) =>
+        !item.isArchived && !item.isTemporary && !sameID(item.id, thread.id));
+      if (nextThread) await selectThread(nextThread.id, { syncProjectFilter: false });
     }
-    await refreshAppState();
   };
 
   const unarchiveThreadFromMenu = async (thread: ThreadItem) => {
-    await window.openAssistElectron?.unarchiveSession(thread.id);
-    await refreshAppState();
+    const updated = await window.openAssistElectron?.unarchiveSession(thread.id);
+    if (updated) patchThreadInAppState({ ...updated, isArchived: false });
   };
 
   const deleteThreadPermanentlyFromMenu = async (thread: ThreadItem) => {
@@ -28267,7 +33880,10 @@ function AppInner() {
       setSelectedThreadID(undefined);
       setThreadDetail(null);
     }
-    await refreshAppState();
+    setAppState((current) => ({
+      ...current,
+      threads: current.threads.filter((item) => !sameID(item.id, thread.id))
+    }));
   };
 
   const attachSkillToNewChat = async (skill: SkillItem) => {
@@ -28367,7 +33983,7 @@ function AppInner() {
         ...result.status,
         phrase: settingsSnapshot.todayWakeWordPhrase || result.status.phrase,
         message: enabled
-          ? "Wake word is paused so the microphone stays off. Use Realtime or a voice shortcut to listen."
+          ? "Wake word is paused so the microphone stays off. Use Realtime or the Live Voice shortcut to listen."
           : result.status.message
       });
     }
@@ -28887,11 +34503,56 @@ function AppInner() {
     const turnStartedAt = Date.now();
     const providerRunID = `provider-run-${turnStartedAt}-${Math.random().toString(16).slice(2)}`;
     const runThreadID = targetThreadID ?? `pending-thread-${providerRunID}`;
+    // A brand-new chat has no thread id yet, so its run is tracked under a
+    // pending placeholder that the sidebar (built from appState.threads)
+    // cannot show. As soon as a provider event reports the real thread id,
+    // re-key the run and insert an optimistic sidebar entry so the thread
+    // shows up while it is still working instead of only after completion.
+    let liveRunThreadID = runThreadID;
+    const adoptRealRunThreadID = (reportedThreadID?: string) => {
+      const realThreadID = usableOpenAssistThreadID(reportedThreadID);
+      if (!realThreadID || targetThreadID || sameID(liveRunThreadID, realThreadID)) return;
+      const pendingRunThreadID = liveRunThreadID;
+      liveRunThreadID = realThreadID;
+      setActiveThreadRuns((current) => {
+        const existing = current[pendingRunThreadID];
+        if (!existing || existing.runID !== providerRunID || current[realThreadID]) return current;
+        const next = { ...current, [realThreadID]: { ...existing, threadID: realThreadID } };
+        delete next[pendingRunThreadID];
+        activeThreadRunsRef.current = next;
+        return next;
+      });
+      setAppState((current) => current.threads.some((thread) => sameID(thread.id, realThreadID))
+        ? current
+        : {
+          ...current,
+          threads: [{
+            id: realThreadID,
+            title: optimisticTitle,
+            projectID: selectedProjectID,
+            project: fallbackProject?.title,
+            activeProvider: activeProviderKey,
+            modelID: current.settings.model,
+            age: "now",
+            updatedAt: turnStartedAt,
+            active: false
+          }, ...current.threads]
+        });
+      // The user launched this chat from the empty "new chat" surface, so
+      // nothing is selected yet. Select the adopted thread so the sidebar
+      // highlights it and a background refresh cannot yank the view away.
+      if (!override?.keepCurrentSurface && !selectedThreadIDRef.current && !originSelectedThreadID) {
+        selectedThreadIDRef.current = realThreadID;
+        setSelectedThreadID(realThreadID);
+      }
+    };
     const optimisticUser: ChatMessage = {
       id: `local-user-${turnStartedAt}`,
       role: "user",
       text: prompt || (turnAttachments.length === 1 ? "Attached image" : `${turnAttachments.length} attached images`),
-      attachments: turnAttachments
+      attachments: turnAttachments,
+      createdAt: turnStartedAt,
+      updatedAt: turnStartedAt
     };
     const pendingAssistant: ChatMessage = {
       id: `local-assistant-streaming-${turnStartedAt}`,
@@ -28923,6 +34584,9 @@ function AppInner() {
       if (override?.keepCurrentSurface) return shouldRenderRunThread(threadID);
       if (targetThreadID) return shouldRenderRunThread(threadID);
       const currentThreadID = selectedThreadIDRef.current ?? selectedThreadID;
+      // The adopted new thread selects itself mid-run; if the user is looking
+      // at the thread this turn belongs to, always render its completion.
+      if (currentThreadID && sameID(currentThreadID, threadID)) return true;
       if (!currentThreadID && !originSelectedThreadID) return true;
       return Boolean(currentThreadID && originSelectedThreadID && sameID(currentThreadID, originSelectedThreadID));
     };
@@ -28930,6 +34594,9 @@ function AppInner() {
       setComposerText("");
       setComposerAttachments([]);
       setComposerAttachmentError(null);
+    }
+    if (targetThreadID && targetThread?.isTemporary) {
+      temporaryThreadsWithStartedWorkRef.current.add(targetThreadID);
     }
     const nextActiveRuns = {
       ...activeThreadRunsRef.current,
@@ -28969,6 +34636,21 @@ function AppInner() {
       removeOptimisticTurn(messages).filter((message) => !isCurrentTurnActivity(message));
     const activeTurnActivities = (messages: ChatMessage[]) =>
       removeOptimisticTurn(messages).filter(isCurrentTurnActivity);
+    // Replace this turn's optimistic messages AT THEIR ORIGINAL POSITION.
+    // Appending the finished turn to the end instead re-ordered the chat when
+    // anything else (a newer message, a background run's activity) arrived
+    // while the turn was still streaming.
+    const replaceCurrentTurnInPlace = (messages: ChatMessage[], replacement: ChatMessage[]) => {
+      const kept = messagesWithoutCurrentTurn(messages);
+      const anchorIndex = messages.findIndex((message) => message.id === optimisticUser.id);
+      if (anchorIndex < 0) return [...kept, ...replacement];
+      const keptIDs = new Set(kept.map((message) => message.id));
+      let insertAt = 0;
+      for (let index = 0; index < anchorIndex; index += 1) {
+        if (keptIDs.has(messages[index].id)) insertAt += 1;
+      }
+      return [...kept.slice(0, insertAt), ...replacement, ...kept.slice(insertAt)];
+    };
     const finalizedActiveTurnActivities = (
       messages: ChatMessage[],
       finalStatus: ChatMessage["activityStatus"] = "completed"
@@ -29024,8 +34706,8 @@ function AppInner() {
       return pending ? [...nextBase, pending] : nextBase;
     };
     const updateRunMessages = (updater: (messages: ChatMessage[]) => ChatMessage[]) => {
-      const currentMessages = activeThreadRunsRef.current[runThreadID]?.messages ?? [optimisticUser, pendingAssistant];
-      updateActiveThreadRun(runThreadID, providerRunID, { messages: updater(currentMessages) });
+      const currentMessages = activeThreadRunsRef.current[liveRunThreadID]?.messages ?? [optimisticUser, pendingAssistant];
+      updateActiveThreadRun(liveRunThreadID, providerRunID, { messages: updater(currentMessages) });
     };
     const appendAssistantDelta = (messages: ChatMessage[], provider: string, delta: string) => {
       const pending = messages.find((message) => message.id === pendingAssistant.id) ?? pendingAssistant;
@@ -29050,8 +34732,9 @@ function AppInner() {
     ];
     const unsubscribeProviderEvents = window.openAssistElectron?.onProviderEvent?.((event: ProviderRunEvent) => {
       if (event.runID !== providerRunID) return;
+      adoptRealRunThreadID(event.threadID);
       if (event.type === "status") {
-        updateActiveThreadRun(runThreadID, providerRunID, { statusText: event.text });
+        updateActiveThreadRun(liveRunThreadID, providerRunID, { statusText: event.text });
         if (shouldRenderRunThread(event.threadID)) setProviderStatus(event.text);
         return;
       }
@@ -29081,10 +34764,10 @@ function AppInner() {
       }
       if (event.type === "failed") {
         const message = readableProviderError(event.error);
-        updateActiveThreadRun(runThreadID, providerRunID, {
+        updateActiveThreadRun(liveRunThreadID, providerRunID, {
           statusText: `${event.provider} failed`,
           messages: replacePendingWithFailure(
-            activeThreadRunsRef.current[runThreadID]?.messages ?? [optimisticUser, pendingAssistant],
+            activeThreadRunsRef.current[liveRunThreadID]?.messages ?? [optimisticUser, pendingAssistant],
             event.provider,
             message
           )
@@ -29103,7 +34786,7 @@ function AppInner() {
         return;
       }
       if (event.type === "completed") {
-        updateActiveThreadRun(runThreadID, providerRunID, { statusText: `${event.provider} completed` });
+        updateActiveThreadRun(liveRunThreadID, providerRunID, { statusText: `${event.provider} completed` });
         if (shouldRenderRunThread(event.threadID)) {
           setProviderStatus(`${event.provider} completed`);
           window.setTimeout(() => setProviderStatus((current) => current === `${event.provider} completed` ? null : current), 1500);
@@ -29133,11 +34816,24 @@ function AppInner() {
         turnAttachments
       );
       if (result) {
+        adoptRealRunThreadID(result.threadID);
         const completedTitle =
           usableThreadTitle(result.thread?.title) ??
           usableThreadTitle(result.title) ??
           optimisticTitle;
         const completedAt = Date.now();
+        if (isThreadVisibleToUser(result.threadID)) {
+          clearThreadUnread(result.threadID);
+        } else {
+          // The user is in another thread, another app, or the window is
+          // hidden: mark the thread unread and raise a native notification.
+          markThreadUnread(result.threadID);
+          void window.openAssistElectron?.notifyThreadComplete?.({
+            threadID: result.threadID,
+            title: completedTitle || "Chat finished",
+            body: (result.assistant?.text || "").trim().slice(0, 200) || "The response is ready."
+          });
+        }
         if (shouldShowCompletedThread(result.threadID)) {
           selectedThreadIDRef.current = result.threadID;
           setSelectedThreadID(result.threadID);
@@ -29147,12 +34843,13 @@ function AppInner() {
 	              ...(current ?? {}),
 	              threadID: result.threadID,
 	              title: completedTitle,
-	              messages: [
-                ...(targetThreadID ? messagesWithoutCurrentTurn(currentMessages) : []),
-                result.user,
-                ...finalizedActiveTurnActivities(currentMessages),
-                result.assistant
-              ]
+	              messages: targetThreadID
+                ? replaceCurrentTurnInPlace(currentMessages, [
+                  result.user,
+                  ...finalizedActiveTurnActivities(currentMessages),
+                  result.assistant
+                ])
+                : [result.user, ...finalizedActiveTurnActivities(currentMessages), result.assistant]
             };
           });
         }
@@ -29196,10 +34893,18 @@ function AppInner() {
     } catch (error) {
       const message = readableProviderError(error);
       const provider = activeProviderName;
-      const wasStopped = activeThreadRunsRef.current[runThreadID]?.stopRequested || /stopp?ed|cancelled|canceled|interrupt/i.test(message);
-      updateActiveThreadRun(runThreadID, providerRunID, {
+      const wasStopped = activeThreadRunsRef.current[liveRunThreadID]?.stopRequested || /stopp?ed|cancelled|canceled|interrupt/i.test(message);
+      updateActiveThreadRun(liveRunThreadID, providerRunID, {
         statusText: wasStopped ? `${provider} stopped` : `${provider} failed`
       });
+      if (targetThreadID && !wasStopped && !isThreadVisibleToUser(targetThreadID)) {
+        markThreadUnread(targetThreadID);
+        void window.openAssistElectron?.notifyThreadComplete?.({
+          threadID: targetThreadID,
+          title: optimisticTitle || "Chat needs attention",
+          body: `${provider} could not finish this turn.`
+        });
+      }
       if (shouldRenderRunThread(targetThreadID)) {
 	        setThreadDetail((current) => {
 	          const currentMessages = current?.messages ?? [];
@@ -29207,23 +34912,25 @@ function AppInner() {
 	            ...(current ?? {}),
 	            threadID: targetThreadID ?? "new",
 	            title: titleForDetail(current),
-	            messages: [
-              ...(targetThreadID ? messagesWithoutCurrentTurn(currentMessages) : []),
-              optimisticUser,
-              ...finalizedActiveTurnActivities(currentMessages, wasStopped ? "completed" : "failed"),
-              {
-                id: `assistant-error-${Date.now()}`,
-                role: "assistant",
-                provider,
-                text: wasStopped ? `${provider} was stopped.` : `${provider} could not finish this turn: ${message}`
-              }
-            ]
+	            messages: (() => {
+              const replacement: ChatMessage[] = [
+                optimisticUser,
+                ...finalizedActiveTurnActivities(currentMessages, wasStopped ? "completed" : "failed"),
+                {
+                  id: `assistant-error-${Date.now()}`,
+                  role: "assistant",
+                  provider,
+                  text: wasStopped ? `${provider} was stopped.` : `${provider} could not finish this turn: ${message}`
+                }
+              ];
+              return targetThreadID ? replaceCurrentTurnInPlace(currentMessages, replacement) : replacement;
+            })()
           };
         });
       }
     } finally {
       unsubscribeProviderEvents?.();
-      clearActiveThreadRun(runThreadID, providerRunID);
+      clearActiveThreadRun(liveRunThreadID, providerRunID);
     }
     return undefined;
   };
@@ -29298,6 +35005,7 @@ function AppInner() {
 		            revealed={sidebarOpen || notchDockRevealed}
 		            providerName={activeProviderName}
 		            isWorking={isSending || liveVoiceStatus === "delegating"}
+                connectorSyncActivity={connectorSyncActivity}
 		            onReveal={revealNotchDock}
 		            onOpen={openSidebarAssistant}
 		            onCollapse={collapseSidebar}
@@ -29340,9 +35048,10 @@ function AppInner() {
   }
 
   const isLeftSidebar = compact && appState.settings.compactEdge === "left";
-  const archivedCount = appState.threads.filter((thread) => thread.isArchived).length
-    + appState.notes.filter((note) => note.isArchived).length
-    + appState.threadNotes.filter((note) => note.isArchived).length;
+  const archivedCount = activeView === "notes"
+    ? appState.notes.filter((note) => note.isArchived).length
+      + appState.threadNotes.filter((note) => note.isArchived).length
+    : appState.threads.filter((thread) => thread.isArchived).length;
   const sidebarThreads = appState.threads.filter((thread) => {
     if (Boolean(thread.isArchived) !== showArchivedThreads) return false;
     if (!selectedProjectID) return true;
@@ -29354,18 +35063,20 @@ function AppInner() {
     const runElapsedText = run
       ? formatWorkingElapsed(Math.max(0, Math.floor((activeRunClock - run.startedAt) / 1000)))
       : "";
-    return run
-      ? {
-          ...thread,
-          isRunning: true,
-          runStatusText: [
-            run.statusText || `${run.provider} is working`,
-            runElapsedText
-          ].filter(Boolean).join(" · "),
-          runElapsedText,
-          updatedAt: Math.max(thread.updatedAt ?? 0, run.startedAt)
-        }
-      : thread;
+    if (run) {
+      return {
+        ...thread,
+        isRunning: true,
+        runStatusText: [
+          run.statusText || `${run.provider} is working`,
+          runElapsedText
+        ].filter(Boolean).join(" · "),
+        runElapsedText,
+        updatedAt: Math.max(thread.updatedAt ?? 0, run.startedAt)
+      };
+    }
+    const hasUnread = unreadThreadIDs.some((id) => sameID(id, thread.id));
+    return hasUnread ? { ...thread, hasUnread } : thread;
   }).sort((left, right) => (right.updatedAt ?? 0) - (left.updatedAt ?? 0));
   const notchTrayThreads = selectedThread && !sidebarThreads.some((thread) => sameID(thread.id, selectedThread.id))
     ? [selectedThread, ...sidebarThreads]
@@ -29395,6 +35106,7 @@ function AppInner() {
     : isLeftSidebar
       ? <ChevronRight size={19} strokeWidth={2.15} />
       : <ChevronLeft size={19} strokeWidth={2.15} />;
+  const plannerLists = appState.plannerLists?.length ? appState.plannerLists : appState.projects;
 
   return (
 	    <LiquidGlassRuntimeContext.Provider value={liquidGlassRuntime}>
@@ -29406,6 +35118,7 @@ function AppInner() {
 		          revealed={sidebarOpen || notchDockRevealed}
 		          providerName={activeProviderName}
 		          isWorking={isSending || liveVoiceStatus === "delegating"}
+              connectorSyncActivity={connectorSyncActivity}
 		          onReveal={revealNotchDock}
 		          onOpen={openSidebarAssistant}
 		          onCollapse={collapseSidebar}
@@ -29425,7 +35138,7 @@ function AppInner() {
         onOpenKnowledgeApprovals={() => { void refreshKnowledgeApprovals(); }}
         compact={compact}
         onCollapseSidebar={collapseSidebar}
-        projects={appState.projects}
+        projects={activeView === "notes" ? plannerLists : appState.projects}
         hiddenProjects={appState.hiddenProjects ?? []}
         threads={sidebarThreads}
         notes={appState.notes}
@@ -29467,12 +35180,14 @@ function AppInner() {
         onRestoreThreadNote={(note) => { void restoreThreadNoteFromMenu(note); }}
         onDeleteNotePermanently={(note) => { void deleteNotePermanentlyFromMenu(note); }}
         onDeleteThreadNotePermanently={(note) => { void deleteThreadNotePermanentlyFromMenu(note); }}
-        onCreateNoteFolder={() => { void createNoteFolder(); }}
+        onCreateNoteFolder={(parentFolderID) => { void createNoteFolder(parentFolderID); }}
         onRenameNoteFolder={(folder) => { void renameNoteFolderFromMenu(folder); }}
         onDeleteNoteFolder={(folder) => { void deleteNoteFolderFromMenu(folder); }}
+        onMoveNoteFolder={(folder, parentFolderID) => { void moveNoteFolderFromMenu(folder, parentFolderID); }}
         onMoveNoteToFolder={(note, folderID) => { void moveNoteToFolderFromMenu(note, folderID); }}
         onToggleArchivedThreads={toggleArchivedThreads}
         onCreateProject={createProject}
+        onCreatePlannerList={createPlannerList}
         onOpenProjectFolder={(parentID) => { void openProjectFolderFromMenu(parentID); }}
         onCreateThread={createThread}
         onCreateTemporaryThread={createTemporaryThread}
@@ -29552,6 +35267,11 @@ function AppInner() {
           </button>
         </div>
       )}
+      {connectorSyncActivity && activeView !== "threads" && !showNotchMiniTray && (
+        <div className="connector-sync-floating-status">
+          <ConnectorSyncActivityPanel activity={connectorSyncActivity} compact />
+        </div>
+      )}
       {showNotchMiniTray ? (
         <NotchMiniTray
           threads={notchTrayThreads}
@@ -29561,6 +35281,7 @@ function AppInner() {
           providerName={activeProviderName}
           providerStatus={visibleProviderStatus}
           isWorking={isSending || liveVoiceStatus === "delegating"}
+          connectorSyncActivity={connectorSyncActivity}
           composerText={composerText}
           onComposerText={setComposerText}
           onSend={sendMessage}
@@ -29570,11 +35291,12 @@ function AppInner() {
           onOpenFull={openFullAssistant}
         />
       ) : (
-      <FeatureRouter
-        activeView={activeView}
-        settingsInitialSection={settingsInitialSection}
-        settingsLoaded={settingsHydrated}
-        compact={compact}
+      <ScreenErrorBoundary resetKey={activeView} screenName={activeView}>
+        <FeatureRouter
+          activeView={activeView}
+          settingsInitialSection={settingsInitialSection}
+          settingsLoaded={settingsHydrated}
+          compact={compact}
         onToggleCompact={toggleCompact}
         onHideWindow={compact ? collapseSidebar : hideWindow}
         onOpenThreadNote={openThreadNote}
@@ -29607,6 +35329,7 @@ function AppInner() {
         composerAttachments={composerAttachments}
         composerAttachmentError={composerAttachmentError}
         isSending={isSending}
+        connectorSyncActivity={connectorSyncActivity}
         interactionMode={interactionMode}
         permissionMode={permissionMode}
         reasoningEffort={reasoningEffort}
@@ -29652,6 +35375,7 @@ function AppInner() {
         onSelectPlannerDay={(dayID) => { void openPlannerDay(dayID); }}
         onSelectPlannerBacklog={() => { void openPlannerBacklog(); }}
         onCreateNote={createNote}
+        onCreateNoteFolder={(parentFolderID) => { void createNoteFolder(parentFolderID); }}
         onNoteDraft={setNoteDraft}
         onSaveNote={saveNote}
         onApplyNoteCleanup={applyNoteCleanup}
@@ -29665,6 +35389,11 @@ function AppInner() {
         onGoForwardNote={() => { void goForwardNote(); }}
         onOpenNoteLink={(target) => { void openNoteLink(target); }}
         onScheduleSelectionToPlanner={(request) => { void scheduleSelectionToPlanner(request); }}
+        onUpsertPlannerCategory={upsertPlannerCategory}
+        onDeletePlannerCategory={deletePlannerCategory}
+        onCreatePlannerList={createPlannerList}
+        onUpdatePlannerListColorAndArea={updatePlannerListColorAndArea}
+        onHidePlannerList={hidePlannerList}
         onUpsertDailyItem={upsertDailyItem}
         onToggleDailyItem={toggleDailyItem}
         onDeleteDailyItem={deleteDailyItem}
@@ -29690,14 +35419,16 @@ function AppInner() {
         onPreviewColorTheme={previewColorThemeEverywhere}
         onSelectPlugin={setSelectedPluginID}
         onTogglePluginUse={attachPluginToNewChat}
-        onUseStarterPrompt={useStarterPrompt}
-      />
-	      )}
+          onUseStarterPrompt={useStarterPrompt}
+        />
+      </ScreenErrorBoundary>
+      )}
 	      {!showNotchMiniTray && activeView !== "threads" && (
 	        <RealtimeTranscript
 	          active={liveVoiceStatus !== "idle" && liveVoiceStatus !== "error"}
 	          status={liveVoiceStatus}
 	          providerLabel="Assistant"
+	          allowTextInput={(appState.settings.liveVoiceMode || "openaiRealtime") !== "localVoiceAgent"}
 	        />
 	      )}
 	      {!showNotchMiniTray && shouldShowRealtimeApprovalSurface && realtimeApprovalRun && (

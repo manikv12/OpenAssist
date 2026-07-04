@@ -1,9 +1,35 @@
-import { app, BrowserWindow, clipboard, dialog, globalShortcut, ipcMain, Menu, nativeImage, nativeTheme, screen, session, shell, systemPreferences, Tray, type ContextMenuParams, type OpenDialogOptions, type WebContents } from "electron";
+import { app, BrowserWindow, clipboard, dialog, globalShortcut, ipcMain, Menu, nativeImage, nativeTheme, Notification, screen, session, shell, systemPreferences, Tray, type ContextMenuParams, type OpenDialogOptions, type WebContents } from "electron";
 import fs from "node:fs";
 import { execFileSync, spawn, execFile, type ChildProcess } from "node:child_process";
 import path from "node:path";
 import os from "node:os";
+import { randomUUID } from "node:crypto";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import {
+  appleEventKitStatus,
+  buildGoogleCommandPlan,
+  connectorSkillGuide,
+  createGoogleConnectorAccount,
+  googleOAuthSetupStatus,
+  importGoogleClientSecret,
+  installPinnedGoogleCLI,
+  loadConnectorSnapshot,
+  loadConnectorReviewInbox,
+  markConnectorItem,
+  ignoreConnectorReviewItems,
+  removeGoogleConnectorAccount,
+  requestAppleEventKitAccess,
+  reuseGoogleClientSecret,
+  saveConnectorItemToBacklogInput,
+  setConnectorServiceEnabled,
+  setAppleEventKitCommandRunner,
+  syncGmailMetadataToReviewInbox,
+  type ConnectorItem,
+  type ConnectorItemStatus,
+  type ConnectorServiceID,
+  type GmailSyncOptions,
+  type GoogleConnectorOperation
+} from "./connectors.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -35,7 +61,11 @@ let menuBarPopoverBlurTimer: NodeJS.Timeout | null = null;
 let menuBarPopoverContentReady = false;
 let menuBarPopoverAppearanceSignature = "";
 let menuBarPopoverWarmed = false;
+// Real height of the popover card, reported by the page so the window hugs
+// its content (the content varies with live activity cards).
+let menuBarPopoverContentHeight = 0;
 let isQuitting = false;
+const connectorTerminalSessions = new Map<string, ChildProcess>();
 let ollamaQuitCleanupStarted = false;
 let ollamaQuitCleanupFinished = false;
 let voiceHUDReady = false;
@@ -44,6 +74,16 @@ let voiceHUDLevelTimer: NodeJS.Timeout | null = null;
 let voiceHUDLevelMtime = 0;
 let smoothedVoiceLevel = 0;
 let voiceHUDAutoHideTimer: NodeJS.Timeout | null = null;
+// Status|size of the currently presented HUD window; used to skip redundant
+// setBounds/showInactive calls on the 120ms live-voice update stream.
+let voiceHUDPresentationKey = "";
+// Last interactivity applied to the HUD window (null = unknown/new window).
+let voiceHUDInteractiveApplied: boolean | null = null;
+// Debounce for hiding the LIVE HUD: transient idle/focus blips between turns
+// were hiding + re-showing the window in a visible loop. A hide only lands if
+// no live payload arrives within the grace window.
+let voiceHUDLiveHideTimer: NodeJS.Timeout | null = null;
+let lastLiveVoiceHUDSnapshot: VoiceHUDPayload | null = null;
 let voiceCaptureHUDKeepAliveTimer: NodeJS.Timeout | null = null;
 
 type SpellcheckContextPayload = {
@@ -80,6 +120,33 @@ function broadcastRealtimeEvent(payload: unknown, sender?: WebContents) {
     }
   });
   targets.forEach((target) => safeSendWebContents(target, "openassist:realtime-event", payload));
+}
+
+type ConnectorSyncProgress = {
+  id: string;
+  provider: "google" | "apple" | "local";
+  serviceID: string;
+  accountID?: string;
+  accountLabel?: string;
+  status: "running" | "completed" | "failed";
+  message: string;
+  importedCount?: number;
+  reviewCount?: number;
+  itemTitles?: string[];
+  startedAt?: string;
+  finishedAt?: string;
+  error?: string;
+};
+
+function broadcastConnectorSyncProgress(payload: ConnectorSyncProgress, sender?: WebContents) {
+  const targets = new Set<WebContents>();
+  if (sender && !sender.isDestroyed()) targets.add(sender);
+  BrowserWindow.getAllWindows().forEach((window) => {
+    if (!window.isDestroyed() && !window.webContents.isDestroyed()) {
+      targets.add(window.webContents);
+    }
+  });
+  targets.forEach((target) => safeSendWebContents(target, "openassist:connector-sync-progress", payload));
 }
 
 function normalizeSpellcheckContext(params: ContextMenuParams): SpellcheckContextPayload | null {
@@ -134,7 +201,10 @@ let lastVoiceHUDAppearance: Pick<VoiceHUDPayload, "theme" | "colorTheme" | "chro
   chromeStyle: "Liquid Glass"
 };
 let frontmostTrackerTimer: NodeJS.Timeout | null = null;
+let frontmostSnapshotInFlight: Promise<FrontmostApplicationSnapshot | null> | null = null;
 let lastExternalApplication: FrontmostApplicationSnapshot | null = null;
+let lastFrontmostSnapshot: FrontmostApplicationSnapshot | null = null;
+const frontmostTrackerIntervalMs = 5_000;
 type AssistantWindowMode = "full" | "sidebar" | "notch";
 
 let currentWindowMode: AssistantWindowMode = "full";
@@ -145,9 +215,12 @@ let sidebarPinnedPreference = true;
 let sidebarScreenFollowTimer: NodeJS.Timeout | null = null;
 let menuBarIconTimer: NodeJS.Timeout | null = null;
 let menuBarIconPhase = 0;
-let menuBarVoiceStatus: "idle" | "listening" | "processing" | "error" = "idle";
+let menuBarVoiceStatus: "idle" | "listening" | "processing" | "connecting" | "speaking" | "delegating" | "error" = "idle";
 let menuBarVoiceLevel = 0;
 let menuBarVoiceText = "";
+// Live snapshot of what the renderer is doing (running chats, unread replies),
+// reported over IPC so the menu bar popover never shows stale information.
+let menuBarAppState: MenuBarAppStateSnapshot = { runs: [], unreadCount: 0, threadCount: 0, updatedAt: 0 };
 let voiceCapture: {
   sessionDirectory: string;
   appPath: string;
@@ -222,7 +295,7 @@ type ScreenRect = {
 };
 type VoiceHUDPayload = {
   visible?: boolean;
-  status?: "idle" | "listening" | "processing" | "unsupported" | "error" | "message" | "correction" | "analyzing" | "analysis-result" | "analyzing-input";
+  status?: "idle" | "listening" | "processing" | "unsupported" | "error" | "message" | "correction" | "analyzing" | "analysis-result" | "analyzing-input" | "live-connecting" | "live-listening" | "live-speaking" | "live-delegating";
   text?: string;
   theme?: string;
   colorTheme?: string;
@@ -233,6 +306,20 @@ type VoiceHUDPayload = {
   replacement?: string;
   previewDataURL?: string;
   suppressForAppFocus?: boolean;
+  providerLabel?: string;
+  userText?: string;
+  assistantText?: string;
+  // Agent/tool work status; rendered in its own small chip so it never
+  // competes with the spoken caption.
+  workText?: string;
+  muted?: boolean;
+  // Pending knowledge approval surfaced in the Live Voice HUD so the user can
+  // approve/deny by click without opening the main window.
+  approval?: { requestID: string; summary?: string } | null;
+  // When Live Voice is muted, dictation capture stacks a small strip above the
+  // orb instead of replacing the live HUD in the shared floating window.
+  dictationCapture?: boolean;
+  dictationLevel?: number;
 };
 type ScreenAnalysisGeneratedImage = {
   dataURL: string;
@@ -242,12 +329,26 @@ type ScreenAnalysisGeneratedImage = {
 };
 type MenuBarCommand =
   | "open-assistant"
+  | "new-chat"
   | "speak-assistant-task"
   | "toggle-dictation"
   | "open-history"
+  | "open-today"
   | "open-models"
   | "open-settings";
 type MenuBarAction = MenuBarCommand | "paste-last-transcript" | "quit";
+type MenuBarAssistantRun = {
+  title: string;
+  provider: string;
+  statusText: string;
+  startedAt: number;
+};
+type MenuBarAppStateSnapshot = {
+  runs: MenuBarAssistantRun[];
+  unreadCount: number;
+  threadCount: number;
+  updatedAt: number;
+};
 type TranscriptHistoryEntry = {
   id: string;
   text: string;
@@ -454,6 +555,13 @@ function debugLog(message: string) {
   }
 }
 
+// High-volume, only-useful-when-debugging tracing. Off unless
+// OPENASSIST_VERBOSE_LOG=1. Errors and lifecycle events use debugLog directly.
+const verboseMainLoggingEnabled = process.env.OPENASSIST_VERBOSE_LOG === "1";
+function verboseLog(message: string) {
+  if (verboseMainLoggingEnabled) debugLog(message);
+}
+
 function maybeOpenDevTools(window: BrowserWindow, label: string) {
   if (!autoOpenDevTools) return;
   const open = () => {
@@ -545,7 +653,7 @@ function initialAppearanceSettings() {
     lightThemeDiffAdded: readNativeDefaultSync("OpenAssist.lightTheme.diffAdded", "#00a240"),
     lightThemeDiffRemoved: readNativeDefaultSync("OpenAssist.lightTheme.diffRemoved", "#ba2623"),
     lightThemeSkill: readNativeDefaultSync("OpenAssist.lightTheme.skill", "#924ff7"),
-    darkThemeAccent: readNativeDefaultSync("OpenAssist.darkTheme.accent", "#1F6FEB"),
+    darkThemeAccent: readNativeDefaultSync("OpenAssist.darkTheme.accent", "#F9861A"),
     darkThemeBackground: readNativeDefaultSync("OpenAssist.darkTheme.background", "#0D1117"),
     darkThemeForeground: readNativeDefaultSync("OpenAssist.darkTheme.foreground", "#E6EDF3"),
     darkThemeUIFont: readNativeDefaultSync("OpenAssist.darkTheme.uiFont", "-apple-system, BlinkMacSystemFont, \"SF Pro Text\", \"Helvetica Neue\", Arial, sans-serif"),
@@ -888,6 +996,21 @@ function stopMenuBarIconAnimationIfIdle() {
   menuBarIconPhase = 0;
 }
 
+function isLiveVoiceHUDStatus(status: VoiceHUDPayload["status"] | undefined) {
+  return status === "live-connecting"
+    || status === "live-listening"
+    || status === "live-speaking"
+    || status === "live-delegating";
+}
+
+function liveVoiceHUDSessionActive() {
+  return isLiveVoiceHUDStatus(pendingVoiceHUDPayload?.status);
+}
+
+function liveVoiceHUDMuted() {
+  return pendingVoiceHUDPayload?.muted === true;
+}
+
 function updateMenuBarVoiceStatus(payload: VoiceHUDPayload) {
   const previousStatus = menuBarVoiceStatus;
   const previousText = menuBarVoiceText;
@@ -899,6 +1022,23 @@ function updateMenuBarVoiceStatus(payload: VoiceHUDPayload) {
     menuBarVoiceLevel = 0;
     menuBarVoiceText = "";
     stopMenuBarIconAnimationIfIdle();
+    updateMenuBarIcon();
+    if (previousStatus !== menuBarVoiceStatus || previousText !== menuBarVoiceText) refreshMenuBarPopoverIfVisible();
+    return;
+  }
+  if (isLiveVoiceHUDStatus(payload.status)) {
+    menuBarVoiceStatus = payload.status === "live-listening"
+      ? "listening"
+      : payload.status === "live-connecting"
+        ? "connecting"
+        : payload.status === "live-speaking"
+          ? "speaking"
+          : "delegating";
+    if (menuBarVoiceStatus === "listening") {
+      startMenuBarIconAnimation();
+    } else {
+      stopMenuBarIconAnimationIfIdle();
+    }
     updateMenuBarIcon();
     if (previousStatus !== menuBarVoiceStatus || previousText !== menuBarVoiceText) refreshMenuBarPopoverIfVisible();
     return;
@@ -929,20 +1069,41 @@ function updateMenuBarVoiceStatus(payload: VoiceHUDPayload) {
 
 function menuBarHeaderStatusLabel() {
   switch (menuBarVoiceStatus) {
+    case "connecting":
+      return "Connecting…";
     case "listening":
-      return "Listening...";
+      return "Listening…";
+    case "speaking":
+      return "Speaking…";
+    case "delegating":
+      return "Working…";
     case "processing":
-      return "Finalizing...";
+      return "Finalizing…";
     case "error":
       return "Needs attention";
     case "idle":
-    default:
-      return "Permissions ready";
+    default: {
+      const running = menuBarAppState.runs.length;
+      if (running === 1) return "1 task running";
+      if (running > 1) return `${running} tasks running`;
+      if (menuBarAppState.unreadCount > 0) {
+        return menuBarAppState.unreadCount === 1 ? "1 unread reply" : `${menuBarAppState.unreadCount} unread replies`;
+      }
+      return "Ready";
+    }
   }
 }
 
+// "busy" drives the pulsing status dot; "attention" the amber one.
+function menuBarHeaderStatusTone(): "ready" | "busy" | "attention" {
+  if (menuBarVoiceStatus === "error") return "attention";
+  if (menuBarVoiceStatus !== "idle" || menuBarAppState.runs.length > 0) return "busy";
+  if (menuBarAppState.unreadCount > 0) return "attention";
+  return "ready";
+}
+
 function menuBarActivityDetail() {
-  if (menuBarVoiceStatus !== "listening" && menuBarVoiceStatus !== "processing" && menuBarVoiceStatus !== "error") return "";
+  if (menuBarVoiceStatus === "idle") return "";
   return menuBarVoiceText;
 }
 
@@ -983,19 +1144,58 @@ function menuBarPopoverAppearanceSignatureValue() {
   return [appearance.mode, appearance.accent, appearance.skill, appearance.background, appearance.foreground].join("|");
 }
 
+function menuBarRelativeTimeLabel(timestamp: number) {
+  if (!Number.isFinite(timestamp)) return "";
+  const seconds = Math.max(0, Math.round((Date.now() - timestamp) / 1000));
+  if (seconds < 60) return "just now";
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  return `${Math.round(hours / 24)}d ago`;
+}
+
+function menuBarLastTranscriptDetail() {
+  const entry = readTranscriptHistory()[0];
+  if (!entry) return "No transcripts yet";
+  const snippet = entry.text.length > 44 ? `${entry.text.slice(0, 44).trimEnd()}…` : entry.text;
+  const when = menuBarRelativeTimeLabel(Date.parse(entry.createdAt));
+  return when ? `“${snippet}” · ${when}` : `“${snippet}”`;
+}
+
+function menuBarAssistantRowDetail() {
+  const unread = menuBarAppState.unreadCount;
+  if (unread === 1) return "1 reply waiting for you";
+  if (unread > 1) return `${unread} replies waiting for you`;
+  return "";
+}
+
 // Builds a tiny script that refreshes only the dynamic bits of an already
 // loaded popover, so opening it never has to reload the whole document.
 function menuBarPopoverDynamicScript() {
   const statusLabel = menuBarHeaderStatusLabel();
-  const dictationLabel = menuBarVoiceStatus === "listening" ? "Stop Dictation" : "Start Dictation";
+  const statusTone = menuBarHeaderStatusTone();
+  const dictationLabel = pendingVoiceHUDPayload?.status === "listening" ? "Stop Dictation" : "Start Dictation";
   const activityHTML = menuBarActivityHTML();
+  const transcriptDetail = menuBarLastTranscriptDetail();
+  const assistantDetail = menuBarAssistantRowDetail();
   return `(() => {
     const status = document.getElementById("oa-status-label");
     if (status) status.textContent = ${JSON.stringify(statusLabel)};
+    const pill = document.getElementById("oa-status-pill");
+    if (pill) pill.dataset.tone = ${JSON.stringify(statusTone)};
     const dictation = document.getElementById("oa-dictation-label");
     if (dictation) dictation.textContent = ${JSON.stringify(dictationLabel)};
     const activity = document.getElementById("oa-activity");
     if (activity) activity.innerHTML = ${JSON.stringify(activityHTML)};
+    const transcript = document.getElementById("oa-transcript-detail");
+    if (transcript) transcript.textContent = ${JSON.stringify(transcriptDetail)};
+    const assistant = document.getElementById("oa-assistant-detail");
+    if (assistant) {
+      assistant.textContent = ${JSON.stringify(assistantDetail)};
+      assistant.style.display = ${JSON.stringify(assistantDetail)} ? "" : "none";
+    }
+    if (typeof window.__oaTickElapsed === "function") window.__oaTickElapsed();
   })();`;
 }
 
@@ -1006,10 +1206,11 @@ function refreshMenuBarPopoverDynamicState() {
 }
 
 function menuBarPopoverHTML() {
-  const dictationLabel = menuBarVoiceStatus === "listening" ? "Stop Dictation" : "Start Dictation";
+  const dictationLabel = pendingVoiceHUDPayload?.status === "listening" ? "Stop Dictation" : "Start Dictation";
   const popoverAppearance = menuBarPopoverAppearance();
   const popoverTheme = popoverAppearance.mode;
   const logoDataURL = assetDataURL("assets/AppLogo.png", "image/png");
+  const appVersion = app.getVersion();
   return `<!doctype html>
 <html>
 <head>
@@ -1024,11 +1225,10 @@ function menuBarPopoverHTML() {
   }
   html, body {
     width: 100%;
-    height: 100%;
     margin: 0;
     overflow: hidden;
     background: transparent;
-    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Inter", sans-serif;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", sans-serif;
     letter-spacing: 0;
   }
   * { box-sizing: border-box; user-select: none; }
@@ -1036,98 +1236,146 @@ function menuBarPopoverHTML() {
   .popover {
     position: relative;
     width: 100%;
-    height: 100%;
-    padding: 10px;
+    padding: 8px;
     color: color-mix(in srgb, var(--menu-fg) 94%, white 6%);
     background:
-      linear-gradient(180deg, color-mix(in srgb, var(--menu-fg) 7%, transparent), color-mix(in srgb, var(--menu-fg) 1.5%, transparent) 58%),
-      radial-gradient(120% 70% at 12% -6%, color-mix(in srgb, var(--menu-accent) 17%, transparent), transparent 58%),
-      radial-gradient(110% 80% at 100% 12%, color-mix(in srgb, var(--menu-skill) 9%, transparent), transparent 62%),
-      color-mix(in srgb, var(--menu-bg) 90%, transparent);
-    border: 0.5px solid color-mix(in srgb, var(--menu-fg) 14%, transparent);
-    border-radius: 16px;
+      linear-gradient(180deg, color-mix(in srgb, white 8%, transparent), color-mix(in srgb, white 2%, transparent) 46%),
+      radial-gradient(130% 64% at 14% -10%, color-mix(in srgb, var(--menu-accent) 11%, transparent), transparent 58%),
+      radial-gradient(120% 76% at 102% 8%, color-mix(in srgb, var(--menu-skill) 6%, transparent), transparent 60%),
+      color-mix(in srgb, var(--menu-bg) 78%, transparent);
+    border: 0.5px solid color-mix(in srgb, white 20%, transparent);
+    border-radius: 18px;
     box-shadow:
-      0 16px 44px rgba(0, 0, 0, 0.32),
-      0 1px 3px rgba(0, 0, 0, 0.20),
-      inset 0 0.5px 0 color-mix(in srgb, var(--menu-fg) 18%, transparent);
-    backdrop-filter: blur(28px) saturate(1.7);
-    -webkit-backdrop-filter: blur(28px) saturate(1.7);
+      0 20px 52px rgba(0, 0, 0, 0.36),
+      0 2px 6px rgba(0, 0, 0, 0.22),
+      inset 0 1px 0 color-mix(in srgb, white 22%, transparent),
+      inset 0 -0.5px 0 color-mix(in srgb, white 6%, transparent);
+    backdrop-filter: blur(40px) saturate(1.85);
+    -webkit-backdrop-filter: blur(40px) saturate(1.85);
   }
-  .popover::after {
+  .popover::before {
     position: absolute;
     inset: 0;
     border-radius: inherit;
     pointer-events: none;
-    box-shadow: inset 0 0 0 0.5px color-mix(in srgb, var(--menu-fg) 8%, transparent);
-    background: color-mix(in srgb, var(--menu-fg) 5%, transparent);
+    background: linear-gradient(168deg, color-mix(in srgb, white 6%, transparent), transparent 40%);
     content: "";
   }
   .inner { position: relative; z-index: 1; }
   .header {
     display: grid;
-    grid-template-columns: 34px 1fr;
+    grid-template-columns: 36px 1fr;
     align-items: center;
-    gap: 12px;
-    padding: 10px 10px 12px;
+    gap: 11px;
+    padding: 9px 10px 11px;
   }
   .header-copy { min-width: 0; }
   .logo {
-    width: 34px;
-    height: 34px;
+    width: 36px;
+    height: 36px;
     display: grid;
     place-items: center;
-    border-radius: 999px;
+    border-radius: 10px;
     overflow: hidden;
-    border: 1px solid color-mix(in srgb, var(--menu-accent) 72%, rgba(255,255,255,0.12));
+    border: 0.5px solid color-mix(in srgb, white 26%, transparent);
     color: color-mix(in srgb, var(--menu-accent) 88%, white 12%);
-    box-shadow: 0 0 18px color-mix(in srgb, var(--menu-accent) 18%, transparent);
+    box-shadow:
+      0 5px 14px rgba(0, 0, 0, 0.30),
+      inset 0 0.5px 0 color-mix(in srgb, white 28%, transparent);
   }
   .logo img { width: 100%; height: 100%; display: block; object-fit: cover; }
   .logo svg { width: 21px; height: 21px; }
   .title {
     margin: 0;
-    font-size: 15px;
+    font-size: 14px;
     line-height: 1.1;
     font-weight: 650;
+    letter-spacing: -0.1px;
     color: color-mix(in srgb, var(--menu-fg) 95%, white 5%);
   }
-  .status-line {
-    display: grid;
-    grid-template-columns: minmax(0, max-content) auto;
-    align-items: baseline;
-    gap: 7px;
-    margin-top: 3px;
-    color: color-mix(in srgb, var(--menu-fg) 66%, transparent);
-    font-size: 11px;
-    font-weight: 560;
+  .status-line { margin-top: 4px; }
+  .status-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    max-width: 100%;
+    padding: 2.5px 9px 2.5px 7px;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--menu-fg) 7%, transparent);
+    box-shadow: inset 0 0 0 0.5px color-mix(in srgb, var(--menu-fg) 11%, transparent);
+    color: color-mix(in srgb, var(--menu-fg) 74%, transparent);
+    font-size: 10.5px;
+    font-weight: 600;
   }
-  .status-line span:first-child {
-    min-width: 0;
-    max-width: 120px;
+  .status-pill span:last-child {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  .status-line span:last-child {
-    font-size: 10px;
-    font-weight: 650;
-    color: color-mix(in srgb, var(--menu-fg) 54%, transparent);
-    white-space: nowrap;
+  .status-dot {
+    flex: 0 0 auto;
+    width: 6px;
+    height: 6px;
+    border-radius: 999px;
+    background: #34c759;
+    box-shadow: 0 0 6px rgba(52, 199, 89, 0.72);
   }
+  .status-pill[data-tone="busy"] .status-dot {
+    background: color-mix(in srgb, var(--menu-accent) 92%, white 8%);
+    box-shadow: 0 0 7px color-mix(in srgb, var(--menu-accent) 66%, transparent);
+    animation: statusPulse 1.4s ease-in-out infinite;
+  }
+  .status-pill[data-tone="attention"] .status-dot {
+    background: #ff9f0a;
+    box-shadow: 0 0 6px rgba(255, 159, 10, 0.72);
+  }
+  @keyframes statusPulse {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.45; transform: scale(0.78); }
+  }
+  #oa-activity {
+    display: grid;
+    gap: 6px;
+    margin: 0 8px 10px;
+  }
+  #oa-activity:empty { display: none; margin: 0; }
   .activity-card {
     display: grid;
-    grid-template-columns: 26px minmax(0, 1fr);
+    grid-template-columns: 24px minmax(0, 1fr);
     align-items: center;
-    gap: 12px;
-    min-height: 56px;
-    margin: 0 10px 10px;
-    padding: 10px 14px;
-    border-radius: 12px;
+    gap: 11px;
+    width: 100%;
+    padding: 9px 12px;
+    border-radius: 11px;
     background:
       linear-gradient(180deg, rgba(255,255,255,0.070), rgba(255,255,255,0.014)),
       rgba(229, 67, 54, 0.070);
-    box-shadow: inset 0 0 0 0.5px rgba(229, 67, 54, 0.16);
+    box-shadow:
+      inset 0 0 0 0.5px rgba(229, 67, 54, 0.18),
+      inset 0 0.5px 0 rgba(255, 255, 255, 0.08);
   }
+  .activity-card.working {
+    background:
+      linear-gradient(180deg, rgba(255,255,255,0.060), rgba(255,255,255,0.012)),
+      color-mix(in srgb, var(--menu-accent) 9%, transparent);
+    box-shadow:
+      inset 0 0 0 0.5px color-mix(in srgb, var(--menu-accent) 22%, transparent),
+      inset 0 0.5px 0 rgba(255, 255, 255, 0.08);
+  }
+  button.activity-card.working:hover {
+    background:
+      linear-gradient(180deg, rgba(255,255,255,0.075), rgba(255,255,255,0.02)),
+      color-mix(in srgb, var(--menu-accent) 14%, transparent);
+  }
+  .activity-card.working .activity-label { color: color-mix(in srgb, var(--menu-fg) 92%, white 8%); }
+  .activity-card.working .activity-detail { color: color-mix(in srgb, var(--menu-accent) 62%, var(--menu-fg) 24%); }
+  .activity-more {
+    padding: 0 4px;
+    color: color-mix(in srgb, var(--menu-fg) 46%, transparent);
+    font-size: 10px;
+    font-weight: 560;
+  }
+  .oa-elapsed { font-variant-numeric: tabular-nums; }
   .recording-dot {
     position: relative;
     width: 24px;
@@ -1178,8 +1426,8 @@ function menuBarPopoverHTML() {
     height: 19px;
     flex: 0 0 auto;
     border-radius: 999px;
-    border: 2px solid rgba(231, 151, 74, 0.22);
-    border-top-color: rgba(231, 151, 74, 0.96);
+    border: 2px solid color-mix(in srgb, var(--menu-accent) 24%, transparent);
+    border-top-color: color-mix(in srgb, var(--menu-accent) 94%, white 6%);
     animation: spin 820ms linear infinite;
   }
   .activity-card.finalizing {
@@ -1196,47 +1444,51 @@ function menuBarPopoverHTML() {
   @keyframes spin {
     to { transform: rotate(360deg); }
   }
-  .divider {
-    height: 1px;
-    margin: 0 -12px 8px;
-    background: color-mix(in srgb, var(--menu-fg) 10%, transparent);
-  }
   .section-title {
-    margin: 9px 0 4px;
-    padding: 0 6px;
-    color: color-mix(in srgb, var(--menu-fg) 58%, transparent);
+    margin: 8px 0 3px;
+    padding: 0 10px;
+    color: color-mix(in srgb, var(--menu-fg) 46%, transparent);
     font-size: 10px;
     font-weight: 650;
+    letter-spacing: 0.55px;
+    text-transform: uppercase;
   }
   .menu-row {
     width: 100%;
-    min-height: 38px;
+    min-height: 36px;
     display: grid;
-    grid-template-columns: 22px minmax(0, 1fr) auto;
+    grid-template-columns: 24px minmax(0, 1fr) auto;
     align-items: center;
-    gap: 12px;
-    padding: 8px 10px;
-    border-radius: 7px;
+    gap: 10px;
+    padding: 7px 10px;
+    border-radius: 9px;
+    transition: background 80ms ease;
   }
-  .menu-row:hover { background: color-mix(in srgb, var(--menu-accent) 12%, transparent); }
+  .menu-row:hover {
+    background: color-mix(in srgb, var(--menu-accent) 14%, transparent);
+    box-shadow: inset 0 0 0 0.5px color-mix(in srgb, var(--menu-accent) 12%, transparent);
+  }
+  .menu-row:active { background: color-mix(in srgb, var(--menu-accent) 20%, transparent); }
   .menu-icon {
-    width: 22px;
-    height: 22px;
+    width: 24px;
+    height: 24px;
     display: grid;
     place-items: center;
     border-radius: 7px;
     color: color-mix(in srgb, var(--menu-accent) 90%, white 10%);
     background:
-      linear-gradient(180deg, color-mix(in srgb, var(--menu-fg) 7%, transparent), color-mix(in srgb, var(--menu-fg) 1%, transparent)),
-      color-mix(in srgb, var(--menu-accent) 22%, transparent);
-    box-shadow: inset 0 0 0 0.5px color-mix(in srgb, var(--menu-fg) 8%, transparent);
+      linear-gradient(180deg, color-mix(in srgb, white 8%, transparent), color-mix(in srgb, white 1%, transparent)),
+      color-mix(in srgb, var(--menu-accent) 20%, transparent);
+    box-shadow:
+      inset 0 0 0 0.5px color-mix(in srgb, var(--menu-fg) 9%, transparent),
+      inset 0 0.5px 0 color-mix(in srgb, white 14%, transparent);
   }
   .tone-ai { color: color-mix(in srgb, var(--menu-accent) 82%, white 18%); background-color: color-mix(in srgb, var(--menu-accent) 24%, transparent); }
   .tone-accent { color: color-mix(in srgb, var(--menu-accent) 92%, white 8%); background-color: color-mix(in srgb, var(--menu-accent) 22%, transparent); }
   .tone-history { color: color-mix(in srgb, var(--menu-skill) 82%, white 18%); background-color: color-mix(in srgb, var(--menu-skill) 20%, transparent); }
   .tone-settings { color: color-mix(in srgb, var(--menu-accent) 86%, white 14%); background-color: color-mix(in srgb, var(--menu-accent) 19%, transparent); }
   .tone-neutral { color: color-mix(in srgb, var(--menu-fg) 72%, transparent); background-color: color-mix(in srgb, var(--menu-fg) 7%, transparent); }
-  .menu-icon svg { width: 12px; height: 12px; stroke-width: 2.15; }
+  .menu-icon svg { width: 12.5px; height: 12.5px; stroke-width: 2; }
   .row-text {
     display: grid;
     gap: 1px;
@@ -1249,7 +1501,7 @@ function menuBarPopoverHTML() {
     line-height: 1.16;
   }
   .row-detail {
-    max-width: 190px;
+    max-width: 208px;
     overflow: hidden;
     color: color-mix(in srgb, var(--menu-fg) 48%, transparent);
     font-size: 10px;
@@ -1259,44 +1511,88 @@ function menuBarPopoverHTML() {
     white-space: nowrap;
   }
   .shortcut {
-    color: color-mix(in srgb, var(--menu-fg) 58%, transparent);
+    color: color-mix(in srgb, var(--menu-fg) 52%, transparent);
     font-family: ui-monospace, "SF Mono", Menlo, monospace;
-    font-size: 11px;
+    font-size: 10.5px;
     font-weight: 450;
   }
-  .row-spacer { height: 1px; margin: 8px 0; background: color-mix(in srgb, var(--menu-fg) 10%, transparent); }
+  .row-spacer { height: 1px; margin: 7px 10px; background: color-mix(in srgb, var(--menu-fg) 9%, transparent); }
+  .footer {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin-top: 7px;
+    padding: 8px 10px 3px;
+    border-top: 0.5px solid color-mix(in srgb, var(--menu-fg) 10%, transparent);
+  }
+  .footer-note {
+    overflow: hidden;
+    color: color-mix(in srgb, var(--menu-fg) 42%, transparent);
+    font-size: 10px;
+    font-weight: 540;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .quit-button {
+    flex: 0 0 auto;
+    padding: 4px 11px;
+    border-radius: 7px;
+    background: color-mix(in srgb, var(--menu-fg) 6%, transparent);
+    box-shadow: inset 0 0 0 0.5px color-mix(in srgb, var(--menu-fg) 10%, transparent);
+    color: color-mix(in srgb, var(--menu-fg) 72%, transparent);
+    font-size: 11px;
+    font-weight: 580;
+    transition: background 80ms ease, color 80ms ease;
+  }
+  .quit-button:hover {
+    background: rgba(255, 69, 58, 0.16);
+    box-shadow: inset 0 0 0 0.5px rgba(255, 69, 58, 0.30);
+    color: #ff6f64;
+  }
   body[data-theme="light"] .popover {
     color: color-mix(in srgb, var(--menu-fg) 94%, black 6%);
     background:
-      linear-gradient(180deg, rgba(255,255,255,0.76), rgba(255,255,255,0.36) 58%),
-      radial-gradient(110% 90% at 6% 0%, color-mix(in srgb, var(--menu-accent) 20%, transparent), transparent 62%),
-      radial-gradient(94% 90% at 100% 18%, color-mix(in srgb, var(--menu-skill) 13%, transparent), transparent 66%),
-      color-mix(in srgb, var(--menu-bg) 78%, transparent);
-    border-color: color-mix(in srgb, var(--menu-accent) 18%, rgba(44, 56, 74, 0.12));
-    box-shadow: 0 22px 48px rgba(48, 60, 78, 0.20), inset 0 1px 0 rgba(255,255,255,0.74);
+      linear-gradient(180deg, rgba(255,255,255,0.72), rgba(255,255,255,0.30) 54%),
+      radial-gradient(110% 90% at 6% 0%, color-mix(in srgb, var(--menu-accent) 14%, transparent), transparent 62%),
+      radial-gradient(94% 90% at 100% 18%, color-mix(in srgb, var(--menu-skill) 9%, transparent), transparent 66%),
+      color-mix(in srgb, var(--menu-bg) 66%, transparent);
+    border-color: rgba(44, 56, 74, 0.16);
+    box-shadow:
+      0 22px 48px rgba(48, 60, 78, 0.22),
+      0 2px 6px rgba(48, 60, 78, 0.12),
+      inset 0 1px 0 rgba(255, 255, 255, 0.80);
   }
+  body[data-theme="light"] .popover::before { background: linear-gradient(168deg, rgba(255,255,255,0.35), transparent 42%); }
   body[data-theme="light"] .title { color: color-mix(in srgb, var(--menu-fg) 94%, black 6%); }
-  body[data-theme="light"] .status-line,
+  body[data-theme="light"] .logo { border-color: rgba(44, 56, 74, 0.14); box-shadow: 0 4px 12px rgba(48, 60, 78, 0.18); }
+  body[data-theme="light"] .status-pill {
+    background: rgba(44, 56, 74, 0.06);
+    box-shadow: inset 0 0 0 0.5px rgba(44, 56, 74, 0.12);
+    color: color-mix(in srgb, var(--menu-fg) 70%, transparent);
+  }
   body[data-theme="light"] .section-title,
-  body[data-theme="light"] .shortcut {
-    color: color-mix(in srgb, var(--menu-fg) 66%, transparent);
+  body[data-theme="light"] .shortcut,
+  body[data-theme="light"] .footer-note {
+    color: color-mix(in srgb, var(--menu-fg) 60%, transparent);
   }
-  body[data-theme="light"] .divider,
-  body[data-theme="light"] .row-spacer {
-    background: color-mix(in srgb, var(--menu-fg) 13%, transparent);
-  }
+  body[data-theme="light"] .row-spacer { background: color-mix(in srgb, var(--menu-fg) 13%, transparent); }
+  body[data-theme="light"] .footer { border-top-color: color-mix(in srgb, var(--menu-fg) 13%, transparent); }
   body[data-theme="light"] .activity-card {
     background:
       linear-gradient(180deg, rgba(255,255,255,0.66), rgba(255,255,255,0.14)),
       rgba(229, 67, 54, 0.080);
     box-shadow: inset 0 0 0 0.5px rgba(176, 55, 43, 0.16);
   }
-  body[data-theme="light"] .activity-card.finalizing {
+  body[data-theme="light"] .activity-card.finalizing,
+  body[data-theme="light"] .activity-card.working {
     background:
       linear-gradient(180deg, rgba(255,255,255,0.66), rgba(255,255,255,0.14)),
       color-mix(in srgb, var(--menu-accent) 11%, transparent);
     box-shadow: inset 0 0 0 0.5px color-mix(in srgb, var(--menu-accent) 16%, transparent);
   }
+  body[data-theme="light"] .activity-card.working .activity-label { color: color-mix(in srgb, var(--menu-fg) 92%, black 8%); }
+  body[data-theme="light"] .activity-card.working .activity-detail { color: color-mix(in srgb, var(--menu-accent) 64%, var(--menu-fg) 26%); }
   body[data-theme="light"] .menu-row:hover { background: color-mix(in srgb, var(--menu-accent) 9%, transparent); }
   body[data-theme="light"] .menu-icon {
     color: color-mix(in srgb, var(--menu-accent) 82%, black 18%);
@@ -1306,6 +1602,16 @@ function menuBarPopoverHTML() {
   body[data-theme="light"] .tone-neutral { color: color-mix(in srgb, var(--menu-fg) 70%, transparent); background-color: color-mix(in srgb, var(--menu-fg) 7%, transparent); }
   body[data-theme="light"] .row-label { color: color-mix(in srgb, var(--menu-fg) 92%, black 8%); }
   body[data-theme="light"] .row-detail { color: color-mix(in srgb, var(--menu-fg) 52%, transparent); }
+  body[data-theme="light"] .quit-button {
+    background: rgba(44, 56, 74, 0.06);
+    box-shadow: inset 0 0 0 0.5px rgba(44, 56, 74, 0.12);
+    color: color-mix(in srgb, var(--menu-fg) 72%, transparent);
+  }
+  body[data-theme="light"] .quit-button:hover {
+    background: rgba(215, 45, 35, 0.10);
+    box-shadow: inset 0 0 0 0.5px rgba(215, 45, 35, 0.28);
+    color: #c93028;
+  }
 </style>
 </head>
 <body data-theme="${popoverTheme}">
@@ -1317,34 +1623,39 @@ function menuBarPopoverHTML() {
         </div>
         <div class="header-copy">
           <h1 class="title">Open Assist</h1>
-          <div class="status-line"><span id="oa-status-label">${escapeHTML(menuBarHeaderStatusLabel())}</span><span>Quick Controls</span></div>
+          <div class="status-line">
+            <span class="status-pill" id="oa-status-pill" data-tone="${menuBarHeaderStatusTone()}">
+              <span class="status-dot" aria-hidden="true"></span>
+              <span id="oa-status-label">${escapeHTML(menuBarHeaderStatusLabel())}</span>
+            </span>
+          </div>
         </div>
       </header>
       <div id="oa-activity">${menuBarActivityHTML()}</div>
-      <div class="divider"></div>
       <section>
         <div class="section-title">Assistant</div>
-        ${menuBarRow("open-assistant", "Open Assistant", "", "sparkles", "", "ai")}
-        ${menuBarRow("speak-assistant-task", "Speak Assistant Task", "", "wave", "", "accent")}
+        ${menuBarRow("open-assistant", "Open Assistant", menuBarAssistantRowDetail(), "sparkles", "", "ai", "", "oa-assistant-detail")}
+        ${menuBarRow("new-chat", "New Chat", "", "plus", "", "accent")}
+        ${menuBarRow("speak-assistant-task", "Speak a Task", "", "wave", "", "accent")}
       </section>
       <div class="row-spacer"></div>
       <section>
         <div class="section-title">Voice & Dictation</div>
         ${menuBarRow("toggle-dictation", dictationLabel, "", "mic", "", "accent", "oa-dictation-label")}
-        ${menuBarRow("paste-last-transcript", "Paste Last Transcript", "", "clipboard", "⌘⌥V", "accent")}
+        ${menuBarRow("paste-last-transcript", "Paste Last Transcript", menuBarLastTranscriptDetail(), "clipboard", "⌘⌥V", "accent", "", "oa-transcript-detail")}
       </section>
       <div class="row-spacer"></div>
       <section>
-        <div class="section-title">Open</div>
-        ${menuBarRow("open-history", "History", "", "history", "", "history")}
+        <div class="section-title">Go To</div>
+        ${menuBarRow("open-today", "Today's Planner", "", "calendar", "", "history")}
+        ${menuBarRow("open-history", "Dictation History", "", "history", "", "history")}
         ${menuBarRow("open-models", "Models & Connections", "", "brain", "", "ai")}
         ${menuBarRow("open-settings", "Settings", "", "gear", "⌘,", "settings")}
       </section>
-      <div class="row-spacer"></div>
-      <section>
-        <div class="section-title">System</div>
-        ${menuBarRow("quit", "Quit Open Assist", "", "power", "", "neutral")}
-      </section>
+      <footer class="footer">
+        <span class="footer-note">Open Assist · v${escapeHTML(appVersion)}</span>
+        <button class="quit-button" data-action="quit">Quit</button>
+      </footer>
     </div>
   </main>
   <script>
@@ -1353,37 +1664,89 @@ function menuBarPopoverHTML() {
       if (!button || !window.openAssistElectron) return;
       window.openAssistElectron.menuBarAction(button.dataset.action);
     });
+    // Live "elapsed" counters for running assistant tasks.
+    window.__oaTickElapsed = () => {
+      const now = Date.now();
+      document.querySelectorAll(".oa-elapsed").forEach((node) => {
+        const started = Number(node.dataset.startedAt || 0);
+        if (!Number.isFinite(started) || started <= 0) { node.textContent = ""; return; }
+        const total = Math.max(0, Math.floor((now - started) / 1000));
+        const hours = Math.floor(total / 3600);
+        const minutes = Math.floor((total % 3600) / 60);
+        const seconds = total % 60;
+        node.textContent = " · " + (hours ? hours + "h " + minutes + "m" : minutes ? minutes + "m " + seconds + "s" : seconds + "s");
+      });
+    };
+    setInterval(window.__oaTickElapsed, 1000);
+    window.__oaTickElapsed();
+    // The card hugs its content; tell the main process the real height so the
+    // window can shrink/grow with it.
+    const oaCard = document.querySelector(".popover");
+    const oaReportHeight = () => {
+      if (!oaCard || !window.openAssistElectron || typeof window.openAssistElectron.menuBarReportHeight !== "function") return;
+      window.openAssistElectron.menuBarReportHeight(Math.ceil(oaCard.getBoundingClientRect().height));
+    };
+    if (oaCard && typeof ResizeObserver === "function") {
+      new ResizeObserver(oaReportHeight).observe(oaCard);
+    }
+    oaReportHeight();
   </script>
 </body>
 </html>`;
 }
 
 function menuBarActivityHTML() {
+  const cards: string[] = [];
   if (menuBarVoiceStatus === "listening") {
     const detail = menuBarActivityDetail();
-    return `<div class="activity-card recording">
+    const label = pendingVoiceHUDPayload?.status === "live-listening" ? "Live Voice listening" : "Listening…";
+    cards.push(`<div class="activity-card recording">
       <span class="recording-dot" aria-hidden="true"></span>
       <span class="activity-text">
-        <span class="activity-label">Listening...</span>
+        <span class="activity-label">${escapeHTML(label)}</span>
         ${detail ? `<span class="activity-detail">${escapeHTML(detail)}</span>` : ""}
       </span>
-    </div>`;
-  }
-  if (menuBarVoiceStatus === "processing") {
+    </div>`);
+  } else if (
+    menuBarVoiceStatus === "processing"
+    || menuBarVoiceStatus === "connecting"
+    || menuBarVoiceStatus === "speaking"
+    || menuBarVoiceStatus === "delegating"
+  ) {
     const detail = menuBarActivityDetail();
-    return `<div class="activity-card finalizing">
+    cards.push(`<div class="activity-card finalizing">
       <span class="finalizing-spinner" aria-hidden="true"></span>
       <span class="activity-text">
         <span class="activity-label">${escapeHTML(menuBarHeaderStatusLabel())}</span>
         ${detail ? `<span class="activity-detail">${escapeHTML(detail)}</span>` : ""}
       </span>
-    </div>`;
+    </div>`);
   }
-  return "";
+  // One card per running assistant task, reported live by the renderer.
+  // Clicking a card jumps into the app.
+  const runs = menuBarAppState.runs;
+  for (const run of runs.slice(0, 3)) {
+    const status = run.statusText || (run.provider ? `${run.provider} is working` : "Working");
+    cards.push(`<button class="activity-card working" data-action="open-assistant">
+      <span class="finalizing-spinner" aria-hidden="true"></span>
+      <span class="activity-text">
+        <span class="activity-label">${escapeHTML(run.title)}</span>
+        <span class="activity-detail">${escapeHTML(status)}<span class="oa-elapsed" data-started-at="${Math.round(run.startedAt)}"></span></span>
+      </span>
+    </button>`);
+  }
+  if (runs.length > 3) {
+    cards.push(`<div class="activity-more">+${runs.length - 3} more running</div>`);
+  }
+  return cards.join("");
 }
 
-function menuBarIconSVG(name: "sparkles" | "wave" | "mic" | "clipboard" | "history" | "brain" | "gear" | "power") {
+function menuBarIconSVG(name: "sparkles" | "plus" | "wave" | "mic" | "clipboard" | "history" | "calendar" | "brain" | "gear" | "power") {
   switch (name) {
+    case "plus":
+      return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M12 5v14"/><path d="M5 12h14"/></svg>';
+    case "calendar":
+      return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M8 3v4"/><path d="M16 3v4"/><path d="M3 10h18"/><path d="M8 15h.01M12 15h.01M16 15h.01"/></svg>';
     case "sparkles":
       return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="m12 3 1.7 4.3L18 9l-4.3 1.7L12 15l-1.7-4.3L6 9l4.3-1.7L12 3Z"/><path d="M19 14l.9 2.1L22 17l-2.1.9L19 20l-.9-2.1L16 17l2.1-.9L19 14Z"/></svg>';
     case "wave":
@@ -1412,12 +1775,20 @@ function menuBarRow(
   icon: Parameters<typeof menuBarIconSVG>[0],
   shortcut = "",
   tone: MenuBarIconTone = "accent",
-  labelId = ""
+  labelId = "",
+  detailId = ""
 ) {
   const labelIdAttr = labelId ? ` id="${labelId}"` : "";
+  // A row with a detailId keeps its detail span in the DOM even when empty, so
+  // the dynamic refresh script can fill it in later without a full reload.
+  const detailSpan = detailId
+    ? `<span class="row-detail" id="${detailId}"${detail ? "" : ' style="display:none"'}>${escapeHTML(detail)}</span>`
+    : detail
+      ? `<span class="row-detail">${escapeHTML(detail)}</span>`
+      : "";
   return `<button class="menu-row" data-action="${action}">
     <span class="menu-icon tone-${tone}">${menuBarIconSVG(icon)}</span>
-    <span class="row-text"><span class="row-label"${labelIdAttr}>${escapeHTML(label)}</span>${detail ? `<span class="row-detail">${escapeHTML(detail)}</span>` : ""}</span>
+    <span class="row-text"><span class="row-label"${labelIdAttr}>${escapeHTML(label)}</span>${detailSpan}</span>
     ${shortcut ? `<span class="shortcut">${escapeHTML(shortcut)}</span>` : ""}
   </button>`;
 }
@@ -1425,7 +1796,7 @@ function menuBarRow(
 function positionMenuBarPopoverWindow(window: BrowserWindow) {
   const bounds = menuBarTray?.getBounds();
   if (!bounds) return;
-  const size = menuBarPopoverSize;
+  const size = { width: menuBarPopoverSize.width, height: menuBarPopoverContentHeight || menuBarPopoverSize.height };
   const display = screen.getDisplayNearestPoint({ x: bounds.x + bounds.width / 2, y: bounds.y + bounds.height / 2 });
   const workArea = display.workArea;
   const x = Math.round(Math.max(workArea.x + 8, Math.min(bounds.x + bounds.width / 2 - size.width / 2, workArea.x + workArea.width - size.width - 8)));
@@ -1553,7 +1924,7 @@ function showMenuBarPopover() {
     if (window.isDestroyed()) return;
     menuBarPopoverShownAt = Date.now();
     positionMenuBarPopoverWindow(window);
-    window.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+    window.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true, skipTransformProcessType: true });
     window.show();
     // The popover must become the key window, otherwise macOS never fires the
     // "blur" event when the user clicks another app/the desktop and it would
@@ -1866,7 +2237,7 @@ function applyWindowMode(
     const keepOnTop = !sidebarOpen || sidebarPinnedPreference;
     window.setAlwaysOnTop(keepOnTop, "floating");
     if (!window.isVisibleOnAllWorkspaces()) {
-      window.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+      window.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true, skipTransformProcessType: true });
     }
     window.setHasShadow(sidebarOpen);
     window.setBackgroundColor("#00000000");
@@ -1922,7 +2293,7 @@ function applyWindowMode(
     window.setFocusable(sidebarOpen);
     window.setAlwaysOnTop(true, "floating");
     if (!window.isVisibleOnAllWorkspaces()) {
-      window.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+      window.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true, skipTransformProcessType: true });
     }
     window.setHasShadow(sidebarOpen || isDockRevealed);
     window.setBackgroundColor("#00000000");
@@ -2091,10 +2462,14 @@ function voiceHUDHTML() {
   }
   html[data-chrome-style="liquid-glass"][data-status="analysis-result"] .hud,
   html[data-chrome-style="liquid-glass"][data-status="analyzing-input"] .hud {
+    /* This HUD floats in its own transparent window, so backdrop-filter can't
+       blur the app behind it (only same-page content). The frosted look must
+       come from opacity: keep it near-opaque like the chat top bar's blur
+       band, otherwise the chat text stays readable through the composer. */
     background:
       linear-gradient(180deg, rgba(255,255,255,0.11), rgba(255,255,255,0.020) 64%),
-      radial-gradient(110% 90% at 10% 0%, rgba(120, 151, 220, 0.18), transparent 62%),
-      rgba(18, 21, 28, 0.76);
+      radial-gradient(110% 90% at 10% 0%, rgba(120, 151, 220, 0.16), transparent 62%),
+      rgba(17, 19, 25, 0.96);
     backdrop-filter: blur(28px) saturate(1.18);
     -webkit-backdrop-filter: blur(28px) saturate(1.18);
   }
@@ -2145,6 +2520,307 @@ function voiceHUDHTML() {
     border-top-color: rgba(255, 255, 255, 0.78);
     animation: hud-spin 820ms linear infinite;
     flex-shrink: 0;
+  }
+  .hud-live-orb {
+    width: 40px;
+    height: 40px;
+    flex: 0 0 40px;
+    border-radius: 999px;
+    position: relative;
+    transform: scale(calc(0.92 + var(--hud-energy, 0) * 0.14));
+    transition: transform 90ms ease-out;
+  }
+  /* Soft Siri-style halo that breathes behind the orb. Colors come from the
+     user's selected waveform theme via --orb-c1..c4 (set in JS). */
+  .hud-live-orb::before {
+    content: "";
+    position: absolute;
+    inset: -10px;
+    border-radius: 999px;
+    background: conic-gradient(from 0deg, var(--orb-c1, #6f9dff), var(--orb-c2, #5ee0ae), var(--orb-c3, #e9c76e), var(--orb-c4, #ff8bd2), var(--orb-c1, #6f9dff));
+    filter: blur(12px);
+    opacity: calc(0.18 + var(--hud-energy, 0) * 0.52);
+    transition: opacity 90ms ease-out;
+    animation: hud-live-orb-spin 6.5s linear infinite;
+  }
+  /* Voice energy brightens the orb body as well as the outer halo. */
+  .hud-live-orb::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    border-radius: 999px;
+    background:
+      radial-gradient(circle at 34% 28%, rgba(255, 255, 255, 0.95) 0 14%, transparent 30%),
+      conic-gradient(from 215deg, var(--orb-c1, #6f9dff), var(--orb-c2, #5ee0ae), var(--orb-c3, #e9c76e), var(--orb-c4, #ff8bd2), var(--orb-c1, #6f9dff));
+    opacity: calc(0.72 + var(--hud-energy, 0) * 0.20);
+    box-shadow:
+      inset 0 0 0 1px rgba(255, 255, 255, 0.30),
+      0 0 calc(6px + var(--hud-energy, 0) * 16px) rgba(111, 157, 255, 0.34);
+    transition: opacity 90ms ease-out, box-shadow 90ms ease-out;
+  }
+  html[data-live-phase="connecting"] .hud-live-orb::before,
+  html[data-live-phase="delegating"] .hud-live-orb::before {
+    animation-duration: 1.6s;
+  }
+  html[data-live-phase="speaking"] .hud-live-orb::before {
+    animation-duration: 3s;
+  }
+  /* Live layout: no pill. The orb floats free, the message is its own bubble
+     above it, and the controls are a small detached cluster to the right. */
+  html[data-status="live"] .hud {
+    flex-direction: column;
+    /* Anchor the orb row to the bottom: bubbles appear ABOVE it and the orb
+       never moves. Centering made the orb jump every time a bubble toggled. */
+    justify-content: flex-end;
+    align-items: stretch;
+    gap: 10px;
+    padding: 0 0 6px;
+    background: none;
+    border: none;
+    border-radius: 0;
+    box-shadow: none;
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+  }
+  .hud-live-main {
+    display: grid;
+    grid-template-columns: 1fr auto 1fr;
+    align-items: center;
+    gap: 9px;
+    min-width: 0;
+    width: 100%;
+  }
+  .hud-live-spacer {
+    justify-self: start;
+    /* Mirrors the control cluster width so the orb stays dead-center. */
+    width: 62px;
+  }
+  .hud-live-main .hud-live-controls {
+    justify-self: end;
+  }
+  .hud-live-controls {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    flex: 0 0 auto;
+    min-width: 0;
+    padding: 3px;
+    border-radius: 999px;
+    background: rgba(17, 19, 25, 0.90);
+    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.10);
+  }
+  .hud-live-control {
+    width: 24px;
+    height: 24px;
+    padding: 0;
+    margin: 0;
+    line-height: 0;
+    border-radius: 999px;
+    border: 1px solid rgba(255, 255, 255, 0.13);
+    background: rgba(255, 255, 255, 0.06);
+    color: rgba(248, 250, 255, 0.82);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    pointer-events: auto;
+    -webkit-app-region: no-drag;
+  }
+  .hud-live-control:hover {
+    background: rgba(255, 255, 255, 0.12);
+    color: rgba(255, 255, 255, 0.96);
+  }
+  .hud-live-control.is-muted {
+    color: #ffcf70;
+    border-color: rgba(255, 207, 112, 0.30);
+    background: rgba(255, 207, 112, 0.10);
+  }
+  .hud-live-control.is-stop {
+    color: #ff8b95;
+    border-color: rgba(255, 139, 149, 0.24);
+  }
+  .hud-live-control svg {
+    width: 11px;
+    height: 11px;
+    stroke-width: 2;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+  }
+  .hud-live-text {
+    flex: 1 1 auto;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    padding: 0 2px;
+  }
+  .hud-live-caption {
+    align-self: center;
+    max-width: 100%;
+    padding: 7px 15px;
+    border-radius: 999px;
+    background: rgba(17, 19, 25, 0.92);
+    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.10);
+    color: rgba(250, 251, 255, 0.97);
+    font-size: 12.5px;
+    font-weight: 650;
+    letter-spacing: 0.005em;
+    line-height: 1.3;
+    text-align: center;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  /* No message yet — show just the floating orb, no empty bubble and no
+     "Provider listening" filler text. */
+  .hud-live-caption.is-empty {
+    display: none;
+  }
+  /* Small professional status chip for agent/tool work — separate from the
+     spoken caption so the two never race. */
+  .hud-live-work {
+    display: none;
+    align-self: center;
+    align-items: center;
+    gap: 6px;
+    max-width: 100%;
+    padding: 4px 11px;
+    border-radius: 999px;
+    background: rgba(17, 19, 25, 0.85);
+    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.08);
+    color: rgba(235, 240, 250, 0.74);
+    font-size: 10.5px;
+    font-weight: 640;
+    letter-spacing: 0.015em;
+    line-height: 1.25;
+  }
+  .hud-live-work.is-visible {
+    display: inline-flex;
+  }
+  .hud-live-work-dot {
+    width: 5px;
+    height: 5px;
+    flex: 0 0 5px;
+    border-radius: 999px;
+    background: var(--orb-c1, #6f9dff);
+  }
+  .hud-live-work-text {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .hud-live-dictation {
+    display: none;
+    align-self: center;
+    align-items: center;
+    gap: 7px;
+    padding: 5px 12px;
+    border-radius: 999px;
+    background: rgba(17, 19, 25, 0.90);
+    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.10);
+  }
+  .hud-live-dictation.is-visible {
+    display: flex;
+  }
+  .hud-live-dictation-dot {
+    width: 7px;
+    height: 7px;
+    flex: 0 0 7px;
+    border-radius: 999px;
+    background: #ff3b30;
+    box-shadow: 0 0 calc(4px + var(--hud-dictation-energy, 0) * 10px) rgba(255, 59, 48, 0.55);
+    transform: scale(calc(0.90 + var(--hud-dictation-energy, 0) * 0.38));
+  }
+  .hud-live-dictation-label {
+    color: rgba(248, 250, 255, 0.78);
+    font-size: 10px;
+    font-weight: 720;
+    letter-spacing: 0.02em;
+    white-space: nowrap;
+  }
+  .hud-live-meta {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    min-width: 0;
+    color: rgba(235, 240, 250, 0.52);
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    line-height: 1.2;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .hud-live-approval {
+    display: none;
+    width: 100%;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 10px;
+    border-radius: 14px;
+    background: rgba(17, 19, 25, 0.92);
+    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.10);
+    pointer-events: auto;
+    -webkit-app-region: no-drag;
+  }
+  .hud-live-approval.is-visible {
+    display: flex;
+  }
+  .hud-live-approval-summary {
+    flex: 1 1 auto;
+    min-width: 0;
+    color: rgba(248, 250, 255, 0.90);
+    font-size: 11px;
+    font-weight: 620;
+    line-height: 1.3;
+    overflow: hidden;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+  }
+  .hud-live-approval button {
+    flex: 0 0 auto;
+    min-height: 24px;
+    padding: 0 11px;
+    border: none;
+    border-radius: 999px;
+    font-size: 10.5px;
+    font-weight: 720;
+    cursor: pointer;
+    pointer-events: auto;
+    -webkit-app-region: no-drag;
+  }
+  .hud-live-approval-approve {
+    color: #08110b;
+    background: linear-gradient(180deg, #7ce8a8, #4ecd84);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.35);
+  }
+  .hud-live-approval-approve:hover {
+    background: linear-gradient(180deg, #8cf0b4, #5ad892);
+  }
+  .hud-live-approval-deny {
+    color: rgba(255, 190, 196, 0.95);
+    background: rgba(255, 139, 149, 0.12);
+    box-shadow: inset 0 0 0 1px rgba(255, 139, 149, 0.26);
+  }
+  .hud-live-approval-deny:hover {
+    background: rgba(255, 139, 149, 0.2);
+  }
+  .hud-live-meta-dot {
+    width: 2.5px;
+    height: 2.5px;
+    flex: 0 0 2.5px;
+    border-radius: 999px;
+    background: rgba(235, 240, 250, 0.40);
+  }
+  .hud-live-meta .hud-live-phase {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .hud-symbol {
     width: 13px;
@@ -2222,6 +2898,13 @@ function voiceHUDHTML() {
   @keyframes hud-spin {
     to { transform: rotate(360deg); }
   }
+  @keyframes hud-live-orb-pulse {
+    0%, 100% { transform: scale(0.94); filter: brightness(0.96); }
+    50% { transform: scale(1.04); filter: brightness(1.14); }
+  }
+  @keyframes hud-live-orb-spin {
+    to { transform: rotate(360deg); }
+  }
   @keyframes hud-analysis-glow {
     0%, 100% {
       box-shadow:
@@ -2275,6 +2958,10 @@ function voiceHUDHTML() {
 	  let currentLevel = 0;
 	  let waveformLoopActive = false;
 	  let lastFrameTime = 0;
+	  let orbEnergyState = 0;
+	  let dictationCurrentLevel = 0;
+	  let dictationEnergyState = 0;
+  let lastLiveHUDAction = { action: "", at: 0 };
   let activeScreenSubmit = null;
   let activeScreenCancel = null;
   window.__openAssistScreenPromptValue = () => "";
@@ -2285,7 +2972,10 @@ function voiceHUDHTML() {
     success: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M4.5 12.5 10 18l9.5-12"/></svg>',
     warning: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M12 8v5"/><path d="M12 17h.01"/><path d="m10.3 4.2-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.7-2.8l-8-14a2 2 0 0 0-3.4 0Z"/></svg>',
     info: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><circle cx="12" cy="12" r="9"/><path d="M12 11v5"/><path d="M12 8h.01"/></svg>',
-    correction: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M21 7v6h-6"/><path d="M3 17v-6h6"/><path d="M7 7a7 7 0 0 1 11 2"/><path d="M17 17a7 7 0 0 1-11-2"/></svg>'
+    correction: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M21 7v6h-6"/><path d="M3 17v-6h6"/><path d="M7 7a7 7 0 0 1 11 2"/><path d="M17 17a7 7 0 0 1-11-2"/></svg>',
+    mic: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M12 3a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><path d="M12 19v3"/></svg>',
+    micOff: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="m2 2 20 20"/><path d="M9 9v3a3 3 0 0 0 5.1 2.1"/><path d="M15 9.3V6a3 3 0 0 0-5.1-2.1"/><path d="M19 10v2a7 7 0 0 1-.7 3"/><path d="M5 10v2a7 7 0 0 0 10 6.3"/><path d="M12 19v3"/></svg>',
+    stop: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><rect x="7" y="7" width="10" height="10" rx="2"/></svg>'
   };
   function clampLevel(value) {
     const level = Number(value);
@@ -2302,23 +2992,27 @@ function voiceHUDHTML() {
 	    return palettes[theme] || palettes["vibrant-spectrum"];
 	  }
 	  function voiceEnergy(level) {
-	    const floor = 0.06;
+	    // Low floor + strong expansion so normal conversational volume drives
+	    // the bars well past half height instead of only reacting to loud speech.
+	    const floor = 0.02;
 	    if (level <= floor) return 0;
-	    return Math.pow(Math.min(1, (level - floor) / (1 - floor)), 0.68);
+	    return Math.pow(Math.min(1, (level - floor) / (1 - floor)), 0.60);
 	  }
 	  const MIN_BAR_HEIGHT = 3;
 	  const MAX_BAR_HEIGHT = 20;
 	  // Asymmetric attack/decay measured in seconds — bars rise fast (attack)
 	  // and fall slow (release), like a VU meter / classic audio-level visualizer.
-	  const BAR_ATTACK = 0.06;
-	  const BAR_RELEASE = 0.34;
+	  // Release is short enough that individual syllables stay visible instead
+	  // of blurring into one sustained wave.
+	  const BAR_ATTACK = 0.05;
+	  const BAR_RELEASE = 0.20;
 	  function paintBar(node, value) {
 	    const clamped = Math.max(0, Math.min(1, value));
 	    node.style.height = (MIN_BAR_HEIGHT + clamped * (MAX_BAR_HEIGHT - MIN_BAR_HEIGHT)).toFixed(2) + "px";
 	    node.style.opacity = (0.88 + clamped * 0.12).toFixed(3);
 	  }
 	  function tickWaveform(now) {
-	    if (!waveformLoopActive || !barNodes.length) {
+	    if (!waveformLoopActive) {
 	      waveformLoopActive = false;
 	      return;
 	    }
@@ -2326,6 +3020,20 @@ function voiceHUDHTML() {
 	    lastFrameTime = now;
 	    const energy = voiceEnergy(currentLevel);
 	    let stillMoving = energy > 0.001;
+	    // The live orb halo breathes with the same smoothed energy so it reads
+	    // as a Siri-style glowing orb instead of a static badge. The waveform
+	    // bars below are skipped when no meter is mounted (e.g. the live HUD).
+	    const orbRate = energy > orbEnergyState ? BAR_ATTACK : BAR_RELEASE;
+	    const orbK = 1 - Math.exp(-dt / Math.max(0.001, orbRate));
+	    orbEnergyState += (energy - orbEnergyState) * orbK;
+	    if (Math.abs(energy - orbEnergyState) > 0.002) stillMoving = true;
+	    document.documentElement.style.setProperty("--hud-energy", orbEnergyState.toFixed(3));
+	    const dictationEnergy = voiceEnergy(dictationCurrentLevel);
+	    const dictationRate = dictationEnergy > dictationEnergyState ? BAR_ATTACK : BAR_RELEASE;
+	    const dictationK = 1 - Math.exp(-dt / Math.max(0.001, dictationRate));
+	    dictationEnergyState += (dictationEnergy - dictationEnergyState) * dictationK;
+	    if (Math.abs(dictationEnergy - dictationEnergyState) > 0.002) stillMoving = true;
+	    document.documentElement.style.setProperty("--hud-dictation-energy", dictationEnergyState.toFixed(3));
 	    for (let i = 0; i < barNodes.length; i++) {
 	      // Per-bar slow phase modulation so bars don't move in perfect lockstep,
 	      // and a tiny stochastic flutter so it feels organic instead of mechanical.
@@ -2344,6 +3052,8 @@ function voiceHUDHTML() {
 	    } else {
 	      waveformLoopActive = false;
 	      lastFrameTime = 0;
+	      document.documentElement.style.setProperty("--hud-energy", "0");
+	      document.documentElement.style.setProperty("--hud-dictation-energy", "0");
 	    }
 	  }
 	  function ensureWaveformLoop() {
@@ -2373,6 +3083,97 @@ function voiceHUDHTML() {
 	    currentLevel = level;
 	    ensureWaveformLoop();
 	  }
+  function oneLine(value) {
+    return String(value || "").replace(/\\s+/g, " ").trim();
+  }
+  function livePhaseLabel(phase) {
+    if (phase === "connecting") return "Preparing";
+    if (phase === "speaking") return "Speaking";
+    if (phase === "delegating") return "Agent working";
+    return "Listening";
+  }
+  function liveCaptionFallback(phase, statusText, muted) {
+    if (muted) return "Microphone muted";
+    if (phase === "speaking") return "Assistant is speaking";
+    if (phase === "delegating") return "Agent is working";
+    if (phase === "connecting") return statusText || "Starting session";
+    return "Listening for your voice";
+  }
+  function sendLiveHUDAction(action, event) {
+    if (event) {
+      event.preventDefault();
+      event.stopPropagation();
+    }
+    const now = Date.now();
+    if (lastLiveHUDAction.action === action && now - lastLiveHUDAction.at < 220) return;
+    lastLiveHUDAction = { action, at: now };
+    if (!window.openAssistElectron || !window.openAssistElectron.liveVoiceHUDAction) return;
+    window.openAssistElectron.liveVoiceHUDAction(action).catch(() => {});
+  }
+  function wireLiveHUDButton(button, action) {
+    const handler = (event) => sendLiveHUDAction(action, event);
+    button.onclick = handler;
+    button.onmousedown = handler;
+    button.onpointerdown = handler;
+  }
+  function updateLiveHUDContent(payload, phase, container) {
+    // Tint the orb with the user's "Realtime & Snip Glow Color" preset
+    // (sent by the main process); fall back to the waveform theme palette.
+    const orbColors = (payload && Array.isArray(payload.glowColors) && payload.glowColors.length ? payload.glowColors : waveformPalette(document.documentElement.dataset.theme)) || [];
+    const rootStyle = document.documentElement.style;
+    rootStyle.setProperty("--orb-c1", orbColors[0] || "#6f9dff");
+    rootStyle.setProperty("--orb-c2", orbColors[1] || orbColors[0] || "#5ee0ae");
+    rootStyle.setProperty("--orb-c3", orbColors[2] || orbColors[0] || "#e9c76e");
+    rootStyle.setProperty("--orb-c4", orbColors[3] || orbColors[1] || "#ff8bd2");
+    const provider = oneLine(payload && payload.providerLabel) || "Live Voice";
+    const statusText = oneLine(payload && payload.text) || livePhaseLabel(phase);
+    const userText = oneLine(payload && payload.userText);
+    const assistantText = oneLine(payload && payload.assistantText);
+    const muted = Boolean(payload && payload.muted);
+    const scope = container || root;
+    const captionNode = scope.querySelector(".hud-live-caption");
+    const providerNode = scope.querySelector(".hud-live-provider");
+    const phaseNode = scope.querySelector(".hud-live-phase");
+    const muteButton = scope.querySelector(".hud-live-control.is-mute");
+    const phaseLabel = muted ? "Muted" : livePhaseLabel(phase);
+    if (providerNode) providerNode.textContent = provider;
+    if (phaseNode) phaseNode.textContent = phaseLabel;
+    if (captionNode) {
+      // Spoken words only — agent/tool status lives in its own chip below,
+      // so the two can never race for this bubble.
+      const caption = assistantText || userText;
+      if (caption) captionNode.textContent = caption;
+      captionNode.classList.toggle("is-empty", !caption);
+    }
+    const workNode = scope.querySelector(".hud-live-work");
+    if (workNode) {
+      const workText = oneLine(payload && payload.workText);
+      workNode.classList.toggle("is-visible", Boolean(workText));
+      const workTextNode = workNode.querySelector(".hud-live-work-text");
+      if (workText && workTextNode) workTextNode.textContent = workText;
+    }
+    if (muteButton) {
+      muteButton.classList.toggle("is-muted", muted);
+      muteButton.title = muted ? "Unmute microphone" : "Mute microphone";
+      muteButton.setAttribute("aria-label", muted ? "Unmute microphone" : "Mute microphone");
+      muteButton.setAttribute("aria-pressed", muted ? "true" : "false");
+      muteButton.innerHTML = muted ? icons.micOff : icons.mic;
+    }
+    const approvalRow = scope.querySelector(".hud-live-approval");
+    if (approvalRow) {
+      const approval = payload && payload.approval;
+      const hasApproval = Boolean(approval && approval.requestID);
+      approvalRow.classList.toggle("is-visible", hasApproval);
+      const summaryNode = approvalRow.querySelector(".hud-live-approval-summary");
+      if (hasApproval && summaryNode) {
+        summaryNode.textContent = oneLine(approval.summary) || "Approve this pending change?";
+      }
+    }
+    const dictationStrip = scope.querySelector(".hud-live-dictation");
+    if (dictationStrip) {
+      dictationStrip.classList.toggle("is-visible", Boolean(payload && payload.dictationCapture));
+    }
+  }
 
   window.closeHUD = function() {
     if (window.openAssistElectron && window.openAssistElectron.stopAssistantVoiceOutput) {
@@ -2410,6 +3211,15 @@ function voiceHUDHTML() {
 
   window.updateOpenAssistVoiceHUD = function(payload) {
     const rawStatus = payload && payload.status;
+    const livePhase = rawStatus === "live-connecting"
+      ? "connecting"
+      : rawStatus === "live-listening"
+        ? "listening"
+        : rawStatus === "live-speaking"
+          ? "speaking"
+          : rawStatus === "live-delegating"
+            ? "delegating"
+            : "";
     const status = rawStatus === "processing"
       ? "processing"
       : rawStatus === "analyzing"
@@ -2422,17 +3232,28 @@ function voiceHUDHTML() {
               ? "toast"
               : rawStatus === "correction"
                 ? "correction"
-                : "listening";
+                : livePhase
+                  ? "live"
+                  : "listening";
     const tone = rawStatus === "error" || rawStatus === "unsupported" ? "error" : (payload && payload.tone) || "success";
     const level = clampLevel(payload && payload.level);
+    dictationCurrentLevel = Boolean(payload && payload.dictationCapture)
+      ? clampLevel(payload && payload.dictationLevel)
+      : 0;
     document.documentElement.dataset.status = status;
     document.documentElement.dataset.tone = tone;
     document.documentElement.dataset.theme = themeKey(payload && payload.theme);
     document.documentElement.dataset.colorTheme = optionKey(payload && payload.colorTheme);
     document.documentElement.dataset.chromeStyle = optionKey(payload && payload.chromeStyle);
+    document.documentElement.dataset.livePhase = livePhase;
 	    document.documentElement.dataset.speaking = level > 0.10 ? "true" : "false";
     if (status === "listening" && renderedStatus === "listening" && renderedTheme === document.documentElement.dataset.theme && root.firstChild) {
       applyWaveformLevel(level);
+      return;
+    }
+    if (status === "live" && renderedStatus === "live" && renderedTheme === document.documentElement.dataset.theme && root.firstChild) {
+      applyWaveformLevel(level);
+      updateLiveHUDContent(payload, livePhase, root.firstChild);
       return;
     }
     if (status === "processing" && renderedStatus === "processing" && root.firstChild) {
@@ -2474,7 +3295,7 @@ function voiceHUDHTML() {
       spark.style.color = "#7897dc";
       spark.style.display = "flex";
       spark.style.alignItems = "center";
-      spark.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width: 14px; height: 14px;"><path d="m12 3-1.912 5.813a2 2 0 0 1-1.275 1.275L3 12l5.813 1.912a2 2 0 0 1 1.275 1.275L12 21l1.912-5.813a2 2 0 0 1 1.275-1.275L21 12l-5.813-1.912a2 2 0 0 1-1.275-1.275L12 3Z"/></svg>';
+      spark.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" style="width: 14px; height: 14px;"><path d="M4 8V6a2 2 0 0 1 2-2h2"/><path d="M16 4h2a2 2 0 0 1 2 2v2"/><path d="M20 16v2a2 2 0 0 1-2 2h-2"/><path d="M8 20H6a2 2 0 0 1-2-2v-2"/><path d="M12 8.2 13 11l2.8 1-2.8 1-1 2.8-1-2.8L8.2 12l2.8-1 1-2.8z"/></svg>';
 
       const title = document.createElement("span");
       title.style.fontSize = "11.5px";
@@ -2660,6 +3481,78 @@ function voiceHUDHTML() {
       setTimeout(() => {
         input.focus();
       }, 50);
+    } else if (status === "live") {
+      const orb = document.createElement("span");
+      orb.className = "hud-live-orb";
+
+      const caption = document.createElement("span");
+      caption.className = "hud-live-caption";
+
+      const controls = document.createElement("div");
+      controls.className = "hud-live-controls";
+      const mute = document.createElement("button");
+      mute.type = "button";
+      mute.className = "hud-live-control is-mute";
+      wireLiveHUDButton(mute, "toggleMute");
+      const stop = document.createElement("button");
+      stop.type = "button";
+      stop.className = "hud-live-control is-stop";
+      stop.title = "Stop Live Voice";
+      stop.setAttribute("aria-label", "Stop Live Voice");
+      stop.innerHTML = icons.stop;
+      wireLiveHUDButton(stop, "stop");
+      controls.append(mute, stop);
+
+      // Message bubble on top; the orb floats alone in the center with the
+      // control cluster detached to its right. No provider/status label.
+      const mainRow = document.createElement("div");
+      mainRow.className = "hud-live-main";
+      const spacer = document.createElement("span");
+      spacer.className = "hud-live-spacer";
+      mainRow.append(spacer, orb, controls);
+
+      const approvalRow = document.createElement("div");
+      approvalRow.className = "hud-live-approval";
+      const approvalSummary = document.createElement("span");
+      approvalSummary.className = "hud-live-approval-summary";
+      const approvalDeny = document.createElement("button");
+      approvalDeny.type = "button";
+      approvalDeny.className = "hud-live-approval-deny";
+      approvalDeny.textContent = "Deny";
+      wireLiveHUDButton(approvalDeny, "rejectRequest");
+      const approvalApprove = document.createElement("button");
+      approvalApprove.type = "button";
+      approvalApprove.className = "hud-live-approval-approve";
+      approvalApprove.textContent = "Approve";
+      wireLiveHUDButton(approvalApprove, "approveRequest");
+      approvalRow.append(approvalSummary, approvalDeny, approvalApprove);
+
+      const dictationStrip = document.createElement("div");
+      dictationStrip.className = "hud-live-dictation";
+      const dictationDot = document.createElement("span");
+      dictationDot.className = "hud-live-dictation-dot";
+      const dictationLabel = document.createElement("span");
+      dictationLabel.className = "hud-live-dictation-label";
+      dictationLabel.textContent = "Dictating";
+      dictationStrip.append(dictationDot, dictationLabel);
+
+      // Agent/tool work status chip — its own container, so it never fights
+      // the spoken caption for the same spot.
+      const workChip = document.createElement("div");
+      workChip.className = "hud-live-work";
+      const workDot = document.createElement("span");
+      workDot.className = "hud-live-work-dot";
+      const workLabel = document.createElement("span");
+      workLabel.className = "hud-live-work-text";
+      workChip.append(workDot, workLabel);
+
+      // mainRow (the orb) stays LAST so it is pinned at the window bottom;
+      // approval and text bubbles stack above it without moving the orb.
+      hud.append(dictationStrip, caption, workChip, approvalRow, mainRow);
+      updateLiveHUDContent(payload, livePhase, hud);
+      barNodes = [];
+      barStates = [];
+      applyWaveformLevel(level);
     } else if (status === "analysis-result") {
       const header = document.createElement("div");
       header.style.display = "flex";
@@ -2680,7 +3573,7 @@ function voiceHUDHTML() {
       spark.style.color = "#7897dc";
       spark.style.display = "flex";
       spark.style.alignItems = "center";
-      spark.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width: 14px; height: 14px;"><path d="m12 3-1.912 5.813a2 2 0 0 1-1.275 1.275L3 12l5.813 1.912a2 2 0 0 1 1.275 1.275L12 21l1.912-5.813a2 2 0 0 1 1.275-1.275L21 12l-5.813-1.912a2 2 0 0 1-1.275-1.275L12 3Z"/></svg>';
+      spark.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" style="width: 14px; height: 14px;"><path d="M4 8V6a2 2 0 0 1 2-2h2"/><path d="M16 4h2a2 2 0 0 1 2 2v2"/><path d="M20 16v2a2 2 0 0 1-2 2h-2"/><path d="M8 20H6a2 2 0 0 1-2-2v-2"/><path d="M12 8.2 13 11l2.8 1-2.8 1-1 2.8-1-2.8L8.2 12l2.8-1 1-2.8z"/></svg>';
 
       const title = document.createElement("span");
       title.style.fontSize = "12px";
@@ -2784,6 +3677,17 @@ function voiceHUDSize(payload: VoiceHUDPayload) {
     const width = Math.max(300, Math.min(460, textWidth + 200));
     return { width, height: HUD_WAVEFORM_HEIGHT };
   }
+  if (isLiveVoiceHUDStatus(payload.status)) {
+    // Detached layout: message bubble on top, floating orb + control cluster
+    // below; taller again when a pending approval row is shown.
+    const base = payload.approval?.requestID
+      ? { width: 380, height: 186 }
+      : { width: 318, height: 122 };
+    if (payload.dictationCapture) {
+      return { width: base.width, height: base.height + 40 };
+    }
+    return base;
+  }
   if (payload.status === "error" || payload.status === "unsupported" || payload.status === "message") {
     const text = String(payload.text ?? "Voice input failed").trim();
     const textWidth = Math.ceil(text.length * 6.5);
@@ -2799,11 +3703,16 @@ function voiceHUDSize(payload: VoiceHUDPayload) {
 function positionVoiceHUDWindow(window: BrowserWindow, payload: VoiceHUDPayload) {
   const size = voiceHUDSize(payload);
   const display = screen.getDisplayNearestPoint(screen.getCursorScreenPoint());
-  const { bounds } = display;
-  const y = bounds.y + bounds.height - HUD_DOCK_RESERVE - size.height;
+  const bounds = display.workArea || display.bounds;
+  const margin = 16;
+  const maxX = bounds.x + bounds.width - size.width - margin;
+  const minX = bounds.x + margin;
+  const centeredX = bounds.x + (bounds.width - size.width) / 2;
+  const x = Math.max(minX, Math.min(maxX, centeredX));
+  const y = Math.max(bounds.y + margin, bounds.y + bounds.height - HUD_DOCK_RESERVE - size.height);
   const useAnim = process.platform === "darwin" && (payload.status === "analysis-result" || payload.status === "analyzing");
   window.setBounds({
-    x: Math.round(bounds.x + (bounds.width - size.width) / 2),
+    x: Math.round(x),
     y: Math.round(y),
     width: size.width,
     height: size.height
@@ -2813,6 +3722,8 @@ function positionVoiceHUDWindow(window: BrowserWindow, payload: VoiceHUDPayload)
 function ensureVoiceHUDWindow() {
   if (voiceHUDWindow && !voiceHUDWindow.isDestroyed()) return voiceHUDWindow;
   voiceHUDReady = false;
+  voiceHUDInteractiveApplied = null;
+  voiceHUDPresentationKey = "";
   const window = new BrowserWindow({
     width: 100,
     height: 34,
@@ -2838,9 +3749,9 @@ function ensureVoiceHUDWindow() {
     }
   });
   window.setIgnoreMouseEvents(false);
-  window.setAlwaysOnTop(true, "status");
+  window.setAlwaysOnTop(true, "screen-saver");
   if (process.platform === "darwin") {
-    window.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+    window.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true, skipTransformProcessType: true });
   }
   window.on("closed", () => {
     if (voiceHUDWindow === window) voiceHUDWindow = null;
@@ -2925,14 +3836,78 @@ function scheduleVoiceHUDAutoHide(payload: VoiceHUDPayload) {
   if (status !== "error" && status !== "unsupported" && status !== "message") return;
   voiceHUDAutoHideTimer = setTimeout(() => {
     pendingVoiceHUDPayload = null;
+    lastLiveVoiceHUDSnapshot = null;
     voiceHUDWindow?.hide();
+    voiceHUDPresentationKey = "";
     voiceHUDAutoHideTimer = null;
   }, status === "message" ? 2400 : 4200);
 }
 
 function storedVoiceHUDPayload(payload: VoiceHUDPayload) {
   const { suppressForAppFocus: _suppressForAppFocus, ...storedPayload } = payload;
+  if (!voiceCapture) {
+    storedPayload.dictationCapture = false;
+    storedPayload.dictationLevel = 0;
+  }
   return storedPayload;
+}
+
+function rememberLiveVoiceHUDSnapshot(payload: VoiceHUDPayload) {
+  if (!isLiveVoiceHUDStatus(payload.status)) return;
+  lastLiveVoiceHUDSnapshot = storedVoiceHUDPayload({
+    ...payload,
+    dictationCapture: false,
+    dictationLevel: 0
+  });
+}
+
+function applyLiveVoiceDictationOverlay(nextPayload: VoiceHUDPayload, incoming: VoiceHUDPayload) {
+  if (voiceCapture && liveVoiceHUDSessionActive() && liveVoiceHUDMuted()) {
+    const liveBase = isLiveVoiceHUDStatus(pendingVoiceHUDPayload?.status)
+      ? pendingVoiceHUDPayload
+      : isLiveVoiceHUDStatus(lastLiveVoiceHUDSnapshot?.status)
+        ? lastLiveVoiceHUDSnapshot
+        : null;
+    if (!liveBase) return;
+    const overlay = activeVoiceCaptureHUDPayload();
+    nextPayload.status = liveBase.status;
+    nextPayload.visible = true;
+    nextPayload.muted = true;
+    nextPayload.dictationCapture = overlay?.dictationCapture ?? false;
+    nextPayload.dictationLevel = overlay?.dictationLevel ?? 0;
+    if (!isLiveVoiceHUDStatus(incoming.status)) {
+      nextPayload.providerLabel = liveBase.providerLabel ?? nextPayload.providerLabel;
+      nextPayload.userText = liveBase.userText ?? nextPayload.userText;
+      nextPayload.assistantText = liveBase.assistantText ?? nextPayload.assistantText;
+      nextPayload.text = liveBase.text ?? nextPayload.text;
+      nextPayload.level = liveBase.level ?? nextPayload.level;
+      nextPayload.approval = liveBase.approval ?? nextPayload.approval;
+    }
+    return;
+  }
+  if (!voiceCapture && isLiveVoiceHUDStatus(nextPayload.status)) {
+    nextPayload.dictationCapture = false;
+    nextPayload.dictationLevel = 0;
+  }
+}
+
+function refreshLiveVoiceDictationOverlay() {
+  if (!voiceCapture || !liveVoiceHUDSessionActive() || !liveVoiceHUDMuted()) return;
+  showActiveVoiceCaptureHUD();
+}
+
+function restoreLiveVoiceHUDAfterCaptureEnd() {
+  stopVoiceCaptureHUDKeepAlive();
+  const livePayload = isLiveVoiceHUDStatus(pendingVoiceHUDPayload?.status)
+    ? pendingVoiceHUDPayload
+    : lastLiveVoiceHUDSnapshot;
+  if (!livePayload || !isLiveVoiceHUDStatus(livePayload.status)) return;
+  void updateVoiceHUD({
+    ...livePayload,
+    visible: true,
+    dictationCapture: false,
+    dictationLevel: 0
+  });
 }
 
 function shouldSuppressFloatingVoiceHUD(payload: VoiceHUDPayload) {
@@ -2941,19 +3916,40 @@ function shouldSuppressFloatingVoiceHUD(payload: VoiceHUDPayload) {
 }
 
 function isInteractiveVoiceHUDStatus(status: VoiceHUDPayload["status"]) {
-  return status === "correction" || status === "analysis-result" || status === "analyzing-input";
+  return status === "correction" || status === "analysis-result" || status === "analyzing-input" || isLiveVoiceHUDStatus(status);
 }
 
 function activeVoiceCaptureHUDPayload(): VoiceHUDPayload | null {
   if (!voiceCapture) return null;
   if (voiceCapture.voiceOptions?.floatingHUDEnabled === false) return null;
+  const appearance = {
+    theme: voiceCapture.voiceOptions?.waveformTheme ?? lastVoiceHUDAppearance.theme,
+    colorTheme: voiceCapture.voiceOptions?.colorTheme ?? lastVoiceHUDAppearance.colorTheme,
+    chromeStyle: voiceCapture.voiceOptions?.appChromeStyle ?? lastVoiceHUDAppearance.chromeStyle
+  };
+  // Live Voice keeps the orb on screen; when muted, stack dictation above it
+  // instead of replacing the HUD with the dictation pill at the same spot.
+  if (liveVoiceHUDSessionActive() && liveVoiceHUDMuted() && pendingVoiceHUDPayload) {
+    return {
+      visible: true,
+      status: pendingVoiceHUDPayload.status,
+      level: pendingVoiceHUDPayload.level,
+      text: pendingVoiceHUDPayload.text,
+      providerLabel: pendingVoiceHUDPayload.providerLabel,
+      userText: pendingVoiceHUDPayload.userText,
+      assistantText: pendingVoiceHUDPayload.assistantText,
+      muted: true,
+      approval: pendingVoiceHUDPayload.approval ?? null,
+      dictationCapture: !voiceCapture.processing,
+      dictationLevel: voiceCapture.processing ? undefined : menuBarVoiceLevel,
+      ...appearance
+    };
+  }
   return {
     visible: true,
     status: voiceCapture.processing ? "processing" : "listening",
     level: voiceCapture.processing ? undefined : menuBarVoiceLevel,
-    theme: voiceCapture.voiceOptions?.waveformTheme ?? lastVoiceHUDAppearance.theme,
-    colorTheme: voiceCapture.voiceOptions?.colorTheme ?? lastVoiceHUDAppearance.colorTheme,
-    chromeStyle: voiceCapture.voiceOptions?.appChromeStyle ?? lastVoiceHUDAppearance.chromeStyle
+    ...appearance
   };
 }
 
@@ -2993,7 +3989,7 @@ function stopVoiceCaptureHUDKeepAlive() {
 
 async function updateVoiceHUD(payload: VoiceHUDPayload) {
   rememberVoiceHUDAppearance(payload);
-  const isLevelOnlyUpdate = payload.level !== undefined
+  const isLevelOnlyUpdate = (payload.level !== undefined || payload.dictationLevel !== undefined)
     && payload.visible === undefined
     && payload.status === undefined
     && payload.text === undefined
@@ -3003,6 +3999,30 @@ async function updateVoiceHUD(payload: VoiceHUDPayload) {
     && payload.tone === undefined
     && payload.source === undefined
     && payload.replacement === undefined;
+  // A live payload without focus-suppression cancels any pending live hide.
+  if (voiceHUDLiveHideTimer && isLiveVoiceHUDStatus(payload.status) && !payload.suppressForAppFocus) {
+    clearTimeout(voiceHUDLiveHideTimer);
+    voiceHUDLiveHideTimer = null;
+  }
+  // Debounced hide while a live HUD is on screen: transient idle blips
+  // between turns must not flap the window in and out.
+  const liveHUDOnScreen = isLiveVoiceHUDStatus(pendingVoiceHUDPayload?.status)
+    && Boolean(voiceHUDWindow && !voiceHUDWindow.isDestroyed() && voiceHUDWindow.isVisible());
+  if ((payload.visible === false || payload.status === "idle") && liveHUDOnScreen && !activeVoiceCaptureHUDPayload()) {
+    if (!voiceHUDLiveHideTimer) {
+      voiceHUDLiveHideTimer = setTimeout(() => {
+        voiceHUDLiveHideTimer = null;
+        clearVoiceHUDAutoHide();
+        pendingVoiceHUDPayload = null;
+        lastLiveVoiceHUDSnapshot = null;
+        voiceHUDWindow?.hide();
+        voiceHUDPresentationKey = "";
+        updateMenuBarVoiceStatus({ visible: false, status: "idle" });
+      }, 450);
+      voiceHUDLiveHideTimer.unref?.();
+    }
+    return { ok: true, visible: true };
+  }
   if (payload.visible === false || payload.status === "idle") {
     const activeCapturePayload = activeVoiceCaptureHUDPayload();
     if (activeCapturePayload) {
@@ -3011,6 +4031,7 @@ async function updateVoiceHUD(payload: VoiceHUDPayload) {
         clearVoiceHUDAutoHide();
         pendingVoiceHUDPayload = storedVoiceHUDPayload(activeCapturePayload);
         voiceHUDWindow?.hide();
+    voiceHUDPresentationKey = "";
         return { ok: true, visible: false };
       }
       debugLog("voice HUD hide ignored while native capture is active");
@@ -3018,7 +4039,9 @@ async function updateVoiceHUD(payload: VoiceHUDPayload) {
     }
     clearVoiceHUDAutoHide();
     pendingVoiceHUDPayload = null;
+    lastLiveVoiceHUDSnapshot = null;
     voiceHUDWindow?.hide();
+    voiceHUDPresentationKey = "";
     updateMenuBarVoiceStatus(payload);
     return { ok: true, visible: false };
   }
@@ -3028,6 +4051,18 @@ async function updateVoiceHUD(payload: VoiceHUDPayload) {
     ...(pendingVoiceHUDPayload ?? {}),
     ...payload
   };
+  applyLiveVoiceDictationOverlay(nextPayload, payload);
+  // Dictation must not replace an active, unmuted Live Voice HUD in the shared
+  // floating window — that was hiding the dictation pill behind the live orb.
+  if (
+    (nextPayload.status === "listening" || nextPayload.status === "processing")
+    && liveVoiceHUDSessionActive()
+    && !liveVoiceHUDMuted()
+    && pendingVoiceHUDPayload
+    && isLiveVoiceHUDStatus(pendingVoiceHUDPayload.status)
+  ) {
+    return updateVoiceHUD({ ...pendingVoiceHUDPayload, visible: true });
+  }
   const shouldShow = nextPayload.visible !== false
     && (
       nextPayload.status === "listening"
@@ -3039,6 +4074,7 @@ async function updateVoiceHUD(payload: VoiceHUDPayload) {
       || nextPayload.status === "analyzing"
       || nextPayload.status === "analysis-result"
       || nextPayload.status === "analyzing-input"
+      || isLiveVoiceHUDStatus(nextPayload.status)
     );
   if (!shouldShow) {
     const activeCapturePayload = activeVoiceCaptureHUDPayload();
@@ -3047,7 +4083,9 @@ async function updateVoiceHUD(payload: VoiceHUDPayload) {
       return updateVoiceHUD(activeCapturePayload);
     }
     pendingVoiceHUDPayload = null;
+    lastLiveVoiceHUDSnapshot = null;
     voiceHUDWindow?.hide();
+    voiceHUDPresentationKey = "";
     updateMenuBarVoiceStatus({ visible: false, status: "idle" });
     return { ok: true, visible: false };
   }
@@ -3057,26 +4095,61 @@ async function updateVoiceHUD(payload: VoiceHUDPayload) {
       debugLog("voice HUD app-focus suppression ignored while native capture is active");
       return updateVoiceHUD(activeCapturePayload);
     }
+    // Focus flaps during live sessions get the same debounce as idle blips.
+    if (liveHUDOnScreen && isLiveVoiceHUDStatus(nextPayload.status)) {
+      pendingVoiceHUDPayload = storedVoiceHUDPayload(nextPayload);
+      if (!voiceHUDLiveHideTimer) {
+        voiceHUDLiveHideTimer = setTimeout(() => {
+          voiceHUDLiveHideTimer = null;
+          clearVoiceHUDAutoHide();
+          voiceHUDWindow?.hide();
+          voiceHUDPresentationKey = "";
+        }, 450);
+        voiceHUDLiveHideTimer.unref?.();
+      }
+      updateMenuBarVoiceStatus(nextPayload);
+      return { ok: true, visible: false };
+    }
     clearVoiceHUDAutoHide();
     pendingVoiceHUDPayload = storedVoiceHUDPayload(nextPayload);
     voiceHUDWindow?.hide();
+    voiceHUDPresentationKey = "";
     updateMenuBarVoiceStatus(nextPayload);
     return { ok: true, visible: false };
   }
   const window = ensureVoiceHUDWindow();
   pendingVoiceHUDPayload = storedVoiceHUDPayload(nextPayload);
+  rememberLiveVoiceHUDSnapshot(nextPayload);
   updateMenuBarVoiceStatus(nextPayload);
   if (!isLevelOnlyUpdate) {
-    positionVoiceHUDWindow(window, nextPayload);
-    const interactiveHUD = isInteractiveVoiceHUDStatus(nextPayload.status);
-    window.setIgnoreMouseEvents(!interactiveHUD);
-    window.setFocusable(interactiveHUD);
-    if (nextPayload.status === "analyzing-input") {
-      window.show();
-      window.focus();
-      window.moveTop();
-    } else {
-      window.showInactive();
+    // Only re-position / re-show when the status or panel size actually
+    // changed. Live Voice pushes a full payload every ~120ms; calling
+    // setBounds + showInactive on every tick made the HUD visibly glitch
+    // while the assistant was talking.
+    const size = voiceHUDSize(nextPayload);
+    // Key on size + interactivity, NOT raw status: live-listening and
+    // live-speaking flip every turn and must not trigger a re-present.
+    const presentationKey = `${isInteractiveVoiceHUDStatus(nextPayload.status) ? "i" : "p"}|${nextPayload.status === "analyzing-input" ? "focus" : "plain"}|${nextPayload.dictationCapture ? "dict" : "plain"}|${size.width}x${size.height}`;
+    const alreadyPresented = window.isVisible() && voiceHUDPresentationKey === presentationKey;
+    if (!alreadyPresented) {
+      voiceHUDPresentationKey = presentationKey;
+      positionVoiceHUDWindow(window, nextPayload);
+      // setFocusable/setIgnoreMouseEvents rebuild the NSPanel style mask on
+      // macOS, which makes the window blink out and back in. Only touch them
+      // when interactivity actually changes.
+      const interactiveHUD = isInteractiveVoiceHUDStatus(nextPayload.status);
+      if (voiceHUDInteractiveApplied !== interactiveHUD) {
+        voiceHUDInteractiveApplied = interactiveHUD;
+        window.setIgnoreMouseEvents(!interactiveHUD);
+        window.setFocusable(interactiveHUD);
+      }
+      if (nextPayload.status === "analyzing-input") {
+        window.show();
+        window.focus();
+        window.moveTop();
+      } else if (!window.isVisible()) {
+        window.showInactive();
+      }
     }
   }
   if (!voiceHUDReady) return { ok: true, visible: true, pending: true };
@@ -3091,10 +4164,21 @@ async function updateVoiceHUD(payload: VoiceHUDPayload) {
       tone: nextPayload.tone ?? (nextPayload.status === "error" || nextPayload.status === "unsupported" ? "error" : "success"),
       source: nextPayload.source ?? "",
       replacement: nextPayload.replacement ?? "",
-      previewDataURL: nextPayload.previewDataURL ?? ""
+      previewDataURL: nextPayload.previewDataURL ?? "",
+      providerLabel: nextPayload.providerLabel ?? "",
+      userText: nextPayload.userText ?? "",
+      assistantText: nextPayload.assistantText ?? "",
+      workText: nextPayload.workText ?? "",
+      muted: nextPayload.muted === true,
+      approval: nextPayload.approval ?? null,
+      dictationCapture: nextPayload.dictationCapture === true,
+      dictationLevel: nextPayload.dictationLevel ?? 0,
+      // The orb follows the user's "Realtime & Snip Glow Color" preset.
+      glowColors: screenAnalysisPalette()
     })})`
   );
-  if (!isLevelOnlyUpdate && isInteractiveVoiceHUDStatus(nextPayload.status)) {
+  if (!isLevelOnlyUpdate && isInteractiveVoiceHUDStatus(nextPayload.status) && voiceHUDInteractiveApplied !== true) {
+    voiceHUDInteractiveApplied = true;
     window.setIgnoreMouseEvents(false);
     window.setFocusable(true);
   }
@@ -3218,16 +4302,6 @@ function shortcutBindingsForSettings(settings: ShortcutSettingsSnapshot) {
   ] satisfies Array<{ target: ShortcutTarget; keyCode: number; modifiers: number }>;
 }
 
-function showAssistantForVoiceShortcut() {
-  const window = mainWindow;
-  if (!window) {
-    createMainWindow();
-    return;
-  }
-  if (!window.isVisible()) window.show();
-  window.focus();
-}
-
 function handleConfiguredShortcut(target: ShortcutTarget, phase: ShortcutPhase = "trigger") {
   if (target === "screenAnalysis") {
     if (phase !== "up") void triggerScreenAnalysis();
@@ -3239,10 +4313,8 @@ function handleConfiguredShortcut(target: ShortcutTarget, phase: ShortcutPhase =
   }
   const isVoiceTranscriptionShortcut = target === "holdToTalk" || target === "continuousToggle";
   const hadMainWindow = Boolean(mainWindow && !mainWindow.isDestroyed());
-  if (target === "assistantLiveVoice") {
-    showAssistantForVoiceShortcut();
-  } else if (!mainWindow) {
-    createMainWindow({ initiallyHidden: isVoiceTranscriptionShortcut });
+  if (!mainWindow) {
+    createMainWindow({ initiallyHidden: isVoiceTranscriptionShortcut || target === "assistantLiveVoice" });
   }
   const window = mainWindow;
   if (!window || window.isDestroyed()) return;
@@ -3262,6 +4334,9 @@ function handleConfiguredShortcut(target: ShortcutTarget, phase: ShortcutPhase =
     && hadMainWindow
     && !window.webContents.isLoading()
     && !shouldSuppressFloatingVoiceHUD({ status: "listening" })
+    // Respect the floating HUD setting: without this the pill flashes for a
+    // second and is then hidden by the renderer when the HUD is disabled.
+    && readNativeBoolDefaultSync("OpenAssist.assistantFloatingHUDEnabled", true)
   ) {
     void updateVoiceHUD({ visible: true, status: "listening", ...lastVoiceHUDAppearance });
   }
@@ -3420,6 +4495,30 @@ let lastCapturedImageBuffer: Buffer | null = null;
 let lastCapturedScreenRect: ScreenRect | null = null;
 let lastCapturedPreviewDataURL = "";
 let lastScreenAnalysisReferenceImages: Array<{ name: string; data: Buffer; mimeType: string; previewDataURL: string }> = [];
+// Conversation turns for the current capture: the user can keep asking
+// follow-up questions about the same screenshot until the HUD is closed.
+let screenAnalysisConversation: Array<{ role: "user" | "assistant"; text: string }> = [];
+// Images generated during this capture's conversation, carried into follow-up
+// turns as references so the user can iterate ("make the background darker").
+let screenAnalysisGeneratedImageRefs: Array<{ name: string; data: Buffer; mimeType: string }> = [];
+// Set when the user drags/resizes the HUD panel; status changes then keep its
+// position/size instead of snapping back next to the capture rect.
+let screenAnalysisUserMovedPanel = false;
+let screenAnalysisUserResizedPanel = false;
+// Skills the user attached via the "+" menu for this capture's conversation.
+let screenAnalysisSelectedSkills: Array<{ id: string; title: string }> = [];
+
+function screenAnalysisGeneratedRefsFromImages(images: ScreenAnalysisGeneratedImage[]) {
+  return images.slice(-2).flatMap((image, index) => {
+    const match = /^data:(.+?);base64,(.+)$/.exec(image?.dataURL ?? "");
+    if (!match) return [];
+    return [{
+      name: image.name || `Generated image ${index + 1}`,
+      data: Buffer.from(match[2], "base64"),
+      mimeType: match[1] || "image/png"
+    }];
+  });
+}
 let screenAnalysisBufferEvictionTimer: NodeJS.Timeout | null = null;
 
 // A 4K screenshot is ~10-20 MB and reference images stack up to 4. They live
@@ -3446,6 +4545,8 @@ function scheduleScreenAnalysisBufferEviction() {
     lastCapturedScreenRect = null;
     lastCapturedPreviewDataURL = "";
     lastScreenAnalysisReferenceImages = [];
+    screenAnalysisConversation = [];
+    screenAnalysisGeneratedImageRefs = [];
   }, 30_000);
   screenAnalysisBufferEvictionTimer.unref?.();
 }
@@ -3730,27 +4831,34 @@ body {
   top: 20px;
   left: 50%;
   transform: translateX(-50%);
-  padding: 8px 12px;
+  padding: 9px 16px;
   border-radius: 999px;
-  background: rgba(17, 20, 26, 0.86);
-  border: 1px solid rgba(255,255,255,0.12);
-  color: rgba(255,255,255,0.86);
+  background:
+    linear-gradient(155deg, rgba(255,255,255,0.10), rgba(255,255,255,0.02) 55%),
+    rgba(15, 18, 24, 0.82);
+  border: 1px solid rgba(255,255,255,0.16);
+  color: rgba(255,255,255,0.90);
   font-size: 12px;
   font-weight: 720;
-  box-shadow: 0 14px 34px rgba(0,0,0,0.32);
+  letter-spacing: 0.01em;
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,0.16),
+    0 14px 34px rgba(0,0,0,0.34);
   pointer-events: none;
 }
 .box {
   position: fixed;
   display: none;
   border-radius: 12px;
-  border: 1px solid color-mix(in srgb, var(--c1) 55%, white 10%);
-  background: transparent;
+  border: 1px solid color-mix(in srgb, var(--c1) 60%, white 16%);
+  background: linear-gradient(155deg, rgba(255,255,255,0.05), transparent 45%);
   pointer-events: none;
   box-shadow:
-    0 0 0 9999px rgba(0, 0, 0, 0.11),
-    0 0 6px color-mix(in srgb, var(--c1) 18%, transparent),
-    0 0 14px color-mix(in srgb, var(--c2) 10%, transparent);
+    0 0 0 9999px rgba(0, 0, 0, 0.16),
+    inset 0 1px 0 rgba(255,255,255,0.18),
+    inset 0 0 0 1px rgba(255,255,255,0.05),
+    0 0 10px color-mix(in srgb, var(--c1) 22%, transparent),
+    0 0 20px color-mix(in srgb, var(--c2) 12%, transparent);
 }
 </style>
 </head>
@@ -3830,22 +4938,30 @@ html, body, #root {
   position: absolute;
   width: 540px;
   min-height: 140px;
-  max-height: 380px;
-  border-radius: 16px;
+  /* The BrowserWindow is sized per status (380 for text results, 470 with
+     generated images) — track it instead of hard-coding one height. */
+  max-height: calc(100vh - 4px);
+  border-radius: 18px;
+  /* Glass look via specular highlights on a near-opaque base. Electron
+     transparent windows cannot backdrop-blur the desktop behind them, so any
+     real see-through shows sharp desktop content and hurts readability —
+     keep the base ~solid and let the sheen sell the glass. */
   background:
-    linear-gradient(180deg, rgba(255,255,255,0.045), rgba(255,255,255,0.012) 64%),
-    color-mix(in srgb, var(--theme-base) 91%, #10131a 9%);
-  border: 1px solid color-mix(in srgb, var(--theme-accent) 16%, rgba(255,255,255,0.13));
+    linear-gradient(155deg, rgba(255,255,255,0.10), rgba(255,255,255,0.028) 34%, rgba(255,255,255,0.0) 58%, rgba(255,255,255,0.035)),
+    radial-gradient(140% 90% at 50% -20%, color-mix(in srgb, var(--theme-accent) 7%, transparent), transparent 60%),
+    color-mix(in srgb, var(--theme-base) 97%, transparent);
+  border: 1px solid rgba(255,255,255,0.15);
   box-shadow:
-    inset 0 1px 0 rgba(255,255,255,0.08),
-    inset 0 0 0 1px rgba(255,255,255,0.035);
+    inset 0 1px 0 rgba(255,255,255,0.20),
+    inset 0 -1px 0 rgba(255,255,255,0.045),
+    inset 0 0 0 1px rgba(255,255,255,0.03);
   padding: 12px 12px 10px;
   display: flex;
   flex-direction: column;
   gap: 10px;
   -webkit-font-smoothing: antialiased;
-  backdrop-filter: blur(8px) saturate(1.03);
-  -webkit-backdrop-filter: blur(8px) saturate(1.03);
+  backdrop-filter: blur(28px) saturate(1.3);
+  -webkit-backdrop-filter: blur(28px) saturate(1.3);
 }
 ::-webkit-scrollbar {
   width: 8px;
@@ -3965,11 +5081,109 @@ html, body, #root {
   pointer-events: none;
 }
 .composer-col {
+  position: relative;
   flex: 1 1 auto;
   min-width: 0;
   display: flex;
   flex-direction: column;
   gap: 8px;
+}
+.attach-menu {
+  position: absolute;
+  top: 44px;
+  left: 0;
+  z-index: 30;
+  min-width: 220px;
+  max-height: 180px;
+  overflow: auto;
+  padding: 5px;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--theme-base) 97%, transparent);
+  border: 1px solid rgba(255,255,255,0.14);
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,0.10),
+    0 16px 40px rgba(0,0,0,0.45);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.attach-menu.skill-list {
+  min-width: 320px;
+  max-height: 400px;
+  overflow: hidden;
+}
+.attach-menu .menu-search {
+  flex: 0 0 auto;
+  width: 100%;
+  box-sizing: border-box;
+  margin-bottom: 4px;
+  padding: 7px 10px;
+  font-size: 12px;
+  color: #ffffff;
+  background: rgba(255,255,255,0.08);
+  border: 1px solid rgba(255,255,255,0.14);
+  border-radius: 8px;
+  outline: none;
+}
+.attach-menu .menu-search::placeholder {
+  color: rgba(255,255,255,0.42);
+}
+.attach-menu .menu-search:focus {
+  border-color: color-mix(in srgb, var(--theme-accent) 55%, transparent);
+}
+.attach-menu .menu-options {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  overflow: auto;
+  min-height: 0;
+  flex: 1 1 auto;
+}
+.attach-menu button {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 30px;
+  padding: 0 9px;
+  border: none;
+  border-radius: 7px;
+  background: transparent;
+  color: rgba(255,255,255,0.85);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  text-align: left;
+}
+.attach-menu button:hover {
+  background: rgba(255,255,255,0.08);
+}
+.attach-menu button.selected {
+  color: var(--theme-accent);
+}
+.attach-menu button svg {
+  width: 13px;
+  height: 13px;
+  flex: 0 0 13px;
+  stroke-width: 2;
+}
+.attach-menu .menu-note {
+  padding: 6px 9px;
+  color: rgba(255,255,255,0.4);
+  font-size: 11px;
+}
+.reference-chip.skill-chip {
+  padding-left: 7px;
+  color: color-mix(in srgb, var(--theme-accent) 62%, white 38%);
+}
+.skill-chip-icon {
+  display: inline-flex;
+  align-items: center;
+  color: var(--theme-accent);
+}
+.skill-chip-icon svg {
+  width: 12px;
+  height: 12px;
+  stroke-width: 2;
 }
 .close-btn {
   width: 22px;
@@ -3997,27 +5211,22 @@ html, body, #root {
   align-items: center;
   gap: 0;
   background:
-    linear-gradient(
-      180deg,
-      color-mix(in srgb, var(--theme-accent) 9%, rgba(255,255,255,0.055)),
-      color-mix(in srgb, var(--theme-base) 86%, rgba(255,255,255,0.035))
-    );
-  border: 1px solid color-mix(in srgb, var(--theme-accent) 24%, rgba(255,255,255,0.12));
+    linear-gradient(180deg, rgba(255,255,255,0.085), rgba(255,255,255,0.03));
+  border: 1px solid rgba(255,255,255,0.14);
   border-radius: 12px;
   padding: 4px 4px 4px 6px;
-  transition: border-color 0.15s ease, background 0.15s ease;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.10);
+  transition: border-color 0.15s ease, background 0.15s ease, box-shadow 0.15s ease;
   backdrop-filter: none;
   -webkit-backdrop-filter: none;
 }
 .composer:focus-within {
-  border-color: color-mix(in srgb, var(--theme-accent) 45%, white 10%);
+  border-color: color-mix(in srgb, var(--theme-accent) 46%, rgba(255,255,255,0.18));
   background:
-    linear-gradient(
-      180deg,
-      color-mix(in srgb, var(--theme-accent) 14%, rgba(255,255,255,0.065)),
-      color-mix(in srgb, var(--theme-base) 82%, rgba(255,255,255,0.045))
-    );
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--theme-accent) 26%, transparent);
+    linear-gradient(180deg, rgba(255,255,255,0.10), color-mix(in srgb, var(--theme-accent) 6%, rgba(255,255,255,0.035)));
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,0.12),
+    0 0 0 3px color-mix(in srgb, var(--theme-accent) 14%, transparent);
 }
 .composer input {
   flex: 1 1 auto;
@@ -4247,7 +5456,7 @@ button.legacy-btn.danger {
   position: absolute;
   inset: 0;
   background: rgba(8, 10, 14, 0.96);
-  border-radius: 16px;
+  border-radius: 18px;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -4273,7 +5482,41 @@ button.legacy-btn.danger {
   font-size: 13px;
   color: rgba(246,248,252,0.88);
   max-height: 290px;
+  flex: 0 1 auto;
+  min-height: 0;
   padding-right: 4px;
+}
+.follow-up-composer {
+  flex: 0 0 auto;
+  margin-top: 2px;
+}
+.follow-up-composer.thinking {
+  opacity: 0.8;
+}
+.follow-up-composer .spinner {
+  width: 13px;
+  height: 13px;
+}
+.image-gen-placeholder {
+  height: 56px;
+  margin-top: 10px;
+  border-radius: 10px;
+  background: linear-gradient(100deg, rgba(255,255,255,0.05) 30%, rgba(255,255,255,0.13) 50%, rgba(255,255,255,0.05) 70%);
+  background-size: 200% 100%;
+  animation: image-gen-shimmer 1.4s ease-in-out infinite;
+  box-shadow: inset 0 0 0 1px rgba(255,255,255,0.07);
+}
+@keyframes image-gen-shimmer {
+  0% { background-position: 180% 0; }
+  100% { background-position: -80% 0; }
+}
+/* Result view fills the window so user resizing gives the text more room. */
+.panel.status-result {
+  height: calc(100vh - 4px);
+}
+.panel.status-result .result {
+  max-height: none;
+  flex: 1 1 auto;
 }
 .result p {
   margin: 0 0 10px;
@@ -4356,17 +5599,50 @@ function update(payload) {
   root.style.setProperty("--theme-base", themeColors[2] || "#0b0c0e");
   const status = payload.status || "prompt";
   if (status === "prompt") submitted = false;
+  // Follow-up turns: keep the existing result view (size, position, previous
+  // answer) and just show a thinking state + stream the new answer in place.
+  if (payload.inline && status === "analyzing") {
+    const existingPanel = root.querySelector(".panel");
+    const existingResult = existingPanel ? existingPanel.querySelector(".result") : null;
+    if (existingPanel && existingResult) {
+      const followWrap = existingPanel.querySelector(".follow-up-composer");
+      if (followWrap && !followWrap.classList.contains("thinking")) {
+        followWrap.classList.add("thinking");
+        const followInput = followWrap.querySelector("input");
+        const followBtn = followWrap.querySelector("button");
+        if (followInput) {
+          followInput.disabled = true;
+          followInput.value = "";
+          followInput.placeholder = payload.text || "Thinking...";
+        }
+        if (followBtn) {
+          followBtn.disabled = true;
+          followBtn.innerHTML = '<span class="spinner"></span>';
+        }
+      }
+      if (payload.resultText) {
+        existingResult.innerHTML = renderReadableText(payload.resultText);
+      }
+      if (payload.mode === "image" && !existingResult.querySelector(".image-gen-placeholder")) {
+        const shimmer = document.createElement("div");
+        shimmer.className = "image-gen-placeholder";
+        existingResult.append(shimmer);
+      }
+      return;
+    }
+  }
   root.innerHTML = "";
   const card = document.createElement("div");
-  card.className = "panel";
+  card.className = "panel status-" + status;
   card.style.left = panel.x + "px";
   card.style.top = panel.y + "px";
-  card.style.width = (panel.width || 520) + "px";
+  // Track the window instead of a fixed pixel width so user resizes apply.
+  card.style.width = "100%";
   const header = document.createElement("div");
   header.className = "header";
   const spark = document.createElement("span");
   spark.className = "spark";
-  spark.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 14 9l6 2-6 2-2 6-2-6-6-2 6-2 2-6z"/></svg>';
+  spark.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 8V6a2 2 0 0 1 2-2h2"/><path d="M16 4h2a2 2 0 0 1 2 2v2"/><path d="M20 16v2a2 2 0 0 1-2 2h-2"/><path d="M8 20H6a2 2 0 0 1-2-2v-2"/><path d="M12 8.2 13 11l2.8 1-2.8 1-1 2.8-1-2.8L8.2 12l2.8-1 1-2.8z"/></svg>';
 const titleText = document.createElement("span");
 titleText.className = "title-text";
 titleText.textContent = status === "result" ? "Screen Analysis" : status === "analyzing" ? "Analyzing screenshot" : "Ask about screenshot";
@@ -4415,6 +5691,18 @@ header.append(spark, titleText);
     });
     headerActions.append(restart, frameToggle, collapse);
   }
+  const copyCapture = makeHeaderButton("Copy screenshot to clipboard", '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>');
+  copyCapture.addEventListener("click", () => {
+    window.openAssistElectron.copyScreenAnalysisCapture().then((response) => {
+      copyCapture.title = response && response.ok ? "Copied!" : (response && response.error) || "Copy failed";
+      copyCapture.classList.add("accent");
+      setTimeout(() => {
+        copyCapture.classList.remove("accent");
+        copyCapture.title = "Copy screenshot to clipboard";
+      }, 1100);
+    }).catch(() => {});
+  });
+  headerActions.append(copyCapture);
   const headerClose = makeHeaderButton("Close", '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M6 6 18 18M18 6 6 18"/></svg>');
   headerClose.addEventListener("pointerdown", (event) => { event.preventDefault(); window.openAssistElectron.cancelScreenAnalysis(); });
   headerClose.addEventListener("click", () => window.openAssistElectron.cancelScreenAnalysis());
@@ -4447,7 +5735,7 @@ header.append(spark, titleText);
     const addImage = document.createElement("button");
     addImage.className = "icon-btn";
     addImage.type = "button";
-    addImage.title = "Attach reference image";
+    addImage.title = "Attach reference image or skill";
     addImage.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg>';
     const input = document.createElement("input");
     input.placeholder = "What should I do with this screenshot?";
@@ -4476,9 +5764,11 @@ header.append(spark, titleText);
     hint.className = "hint";
     hint.textContent = "Press Enter to send";
 
-    function renderReferences(items) {
+    let currentAttachments = [];
+    let currentSkills = [];
+    function renderChips() {
       referenceRow.innerHTML = "";
-      (items || []).forEach((item, index) => {
+      currentAttachments.forEach((item, index) => {
         const chip = document.createElement("div");
         chip.className = "reference-chip";
         const imageBtn = document.createElement("button");
@@ -4511,10 +5801,42 @@ header.append(spark, titleText);
         chip.append(imageBtn, label, remove);
         referenceRow.append(chip);
       });
-      hint.textContent = items && items.length
-        ? "Reference image added. Press Enter to send."
+      currentSkills.forEach((skill) => {
+        const chip = document.createElement("div");
+        chip.className = "reference-chip skill-chip";
+        const icon = document.createElement("span");
+        icon.className = "skill-chip-icon";
+        icon.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 14 9l6 2-6 2-2 6-2-6-6-2 6-2 2-6z"/></svg>';
+        const label = document.createElement("span");
+        label.textContent = skill.title || skill.id;
+        const remove = document.createElement("button");
+        remove.type = "button";
+        remove.className = "reference-chip-remove";
+        remove.title = "Remove skill";
+        remove.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M6 6 18 18M18 6 6 18"/></svg>';
+        remove.addEventListener("click", (event) => {
+          event.stopPropagation();
+          window.openAssistElectron.toggleScreenAnalysisSkill(skill.id, skill.title).then((response) => {
+            if (response && response.ok) {
+              currentSkills = response.skills || [];
+              renderChips();
+            }
+          }).catch(() => {});
+        });
+        chip.append(icon, label, remove);
+        referenceRow.append(chip);
+      });
+      const hasAny = currentAttachments.length || currentSkills.length;
+      hint.textContent = hasAny
+        ? (currentSkills.length && !currentAttachments.length
+          ? "Skill attached. Press Enter to send."
+          : "Attachment added. Press Enter to send.")
         : "Press Enter to send";
       hint.style.color = "rgba(255,255,255,0.40)";
+    }
+    function renderReferences(items) {
+      currentAttachments = items || [];
+      renderChips();
     }
     voiceToggle.addEventListener("click", () => {
       const nextEnabled = voiceToggle.dataset.enabled !== "true";
@@ -4529,7 +5851,17 @@ header.append(spark, titleText);
       hint.textContent = message;
       hint.style.color = "rgba(255,120,129,0.82)";
     }
-    addImage.addEventListener("click", () => {
+    const attachMenu = document.createElement("div");
+    attachMenu.className = "attach-menu";
+    attachMenu.style.display = "none";
+    let attachMenuOpen = false;
+    function closeAttachMenu() {
+      attachMenuOpen = false;
+      attachMenu.style.display = "none";
+      attachMenu.classList.remove("skill-list");
+      window.openAssistElectron.setScreenAnalysisMenuExpanded(false).catch(function() {});
+    }
+    function chooseImages() {
       addImage.disabled = true;
       window.openAssistElectron.chooseScreenAnalysisReferenceImages().then((response) => {
         if (response && response.ok) {
@@ -4544,6 +5876,108 @@ header.append(spark, titleText);
       }).finally(() => {
         addImage.disabled = false;
       });
+    }
+    function showSkillList() {
+      // The skill list needs real estate: mark the menu tall and grow the
+      // window while it is open (it is clipped at the window edge otherwise).
+      attachMenu.classList.add("skill-list");
+      window.openAssistElectron.setScreenAnalysisMenuExpanded(true).catch(function() {});
+      attachMenu.innerHTML = '<div class="menu-note">Loading skills...</div>';
+      window.openAssistElectron.listScreenAnalysisSkills().then((response) => {
+        attachMenu.innerHTML = "";
+        const skills = (response && response.skills) || [];
+        if (!response || !response.ok || !skills.length) {
+          attachMenu.innerHTML = '<div class="menu-note">' + ((response && response.error) || "No skills found.") + '</div>';
+          return;
+        }
+        const search = document.createElement("input");
+        search.type = "text";
+        search.className = "menu-search";
+        search.placeholder = "Search skills...";
+        const list = document.createElement("div");
+        list.className = "menu-options";
+        const renderOptions = (filterText) => {
+          list.innerHTML = "";
+          const query = String(filterText || "").trim().toLowerCase();
+          const visible = query
+            ? skills.filter((skill) => String(skill.title || skill.id).toLowerCase().includes(query))
+            : skills;
+          if (!visible.length) {
+            const note = document.createElement("div");
+            note.className = "menu-note";
+            note.textContent = "No matching skills.";
+            list.append(note);
+            return;
+          }
+          visible.forEach((skill) => {
+            const option = document.createElement("button");
+            option.type = "button";
+            const isSelected = currentSkills.some((item) => item.id === skill.id);
+            if (isSelected) option.className = "selected";
+            option.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 14 9l6 2-6 2-2 6-2-6-6-2 6-2 2-6z"/></svg>';
+            const optionLabel = document.createElement("span");
+            optionLabel.textContent = skill.title || skill.id;
+            option.append(optionLabel);
+            option.addEventListener("click", () => {
+              window.openAssistElectron.toggleScreenAnalysisSkill(skill.id, skill.title).then((result) => {
+                if (result && result.ok) {
+                  currentSkills = result.skills || [];
+                  renderChips();
+                }
+                closeAttachMenu();
+              }).catch(() => closeAttachMenu());
+            });
+            list.append(option);
+          });
+        };
+        search.addEventListener("input", () => renderOptions(search.value));
+        search.addEventListener("keydown", (event) => {
+          if (event.key === "Escape") {
+            event.preventDefault();
+            event.stopPropagation();
+            closeAttachMenu();
+          }
+        });
+        renderOptions("");
+        attachMenu.append(search, list);
+        search.focus();
+      }).catch(() => {
+        attachMenu.innerHTML = '<div class="menu-note">Could not load skills.</div>';
+      });
+    }
+    function openAttachMenuRoot() {
+      attachMenu.innerHTML = "";
+      const imageOption = document.createElement("button");
+      imageOption.type = "button";
+      imageOption.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.5-3.5L9 20"/></svg>';
+      const imageLabel = document.createElement("span");
+      imageLabel.textContent = "Reference image...";
+      imageOption.append(imageLabel);
+      imageOption.addEventListener("click", () => {
+        closeAttachMenu();
+        chooseImages();
+      });
+      const skillOption = document.createElement("button");
+      skillOption.type = "button";
+      skillOption.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 14 9l6 2-6 2-2 6-2-6-6-2 6-2 2-6z"/></svg>';
+      const skillLabel = document.createElement("span");
+      skillLabel.textContent = "Skill...";
+      skillOption.append(skillLabel);
+      skillOption.addEventListener("click", () => {
+        showSkillList();
+      });
+      attachMenu.append(imageOption, skillOption);
+      attachMenu.style.display = "flex";
+      attachMenuOpen = true;
+    }
+    addImage.addEventListener("click", () => {
+      if (attachMenuOpen) closeAttachMenu();
+      else openAttachMenuRoot();
+    });
+    document.addEventListener("pointerdown", (event) => {
+      if (!attachMenuOpen) return;
+      if (attachMenu.contains(event.target) || addImage.contains(event.target)) return;
+      closeAttachMenu();
     });
     function submit() {
       if (submitted) return;
@@ -4609,7 +6043,7 @@ header.append(spark, titleText);
         }
       }
     });
-    composerCol.append(composer, referenceRow, hint);
+    composerCol.append(composer, attachMenu, referenceRow, hint);
     bodyRow.append(preview, composerCol);
     card.append(bodyRow);
     setTimeout(() => input.focus(), 40);
@@ -4627,6 +6061,11 @@ header.append(spark, titleText);
       result.className = "result";
       result.innerHTML = renderReadableText(payload.resultText);
       card.append(result);
+    }
+    if (payload.mode === "image") {
+      const shimmer = document.createElement("div");
+      shimmer.className = "image-gen-placeholder";
+      card.append(shimmer);
     }
   } else {
     const result = document.createElement("div");
@@ -4729,6 +6168,47 @@ header.append(spark, titleText);
       actions.append(insert, readAloud);
     }
     card.append(result, actions);
+    if (payload.tone !== "error") {
+      const followComposer = document.createElement("div");
+      followComposer.className = "composer follow-up-composer";
+      const followInput = document.createElement("input");
+      followInput.type = "text";
+      followInput.placeholder = "Ask a follow-up about this capture...";
+      const followSend = document.createElement("button");
+      followSend.type = "button";
+      followSend.className = "icon-btn send-btn";
+      followSend.title = "Send follow-up";
+      followSend.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5"></path><path d="M5 12l7-7 7 7"></path></svg>';
+      let followSubmitted = false;
+      function submitFollowUp() {
+        const value = (followInput.value || "").trim();
+        if (!value || followSubmitted) return;
+        followSubmitted = true;
+        followInput.disabled = true;
+        followSend.disabled = true;
+        window.openAssistElectron.submitScreenAnalysis(value, { readback: false }).catch((error) => {
+          followSubmitted = false;
+          followInput.disabled = false;
+          followSend.disabled = false;
+          followInput.value = value;
+          followInput.placeholder = error && error.message ? error.message : "Follow-up failed. Try again.";
+        });
+      }
+      followSend.addEventListener("pointerdown", (event) => { event.preventDefault(); submitFollowUp(); });
+      followSend.addEventListener("click", submitFollowUp);
+      followInput.addEventListener("keydown", (event) => {
+        if (event.key === "Enter") {
+          event.preventDefault();
+          submitFollowUp();
+        } else if (event.key === "Escape") {
+          event.preventDefault();
+          window.openAssistElectron.cancelScreenAnalysis();
+        }
+      });
+      followComposer.append(followInput, followSend);
+      card.append(followComposer);
+      setTimeout(() => followInput.focus(), 60);
+    }
   }
   root.append(card);
 }
@@ -5025,13 +6505,16 @@ function ensureScreenAnalysisWindow() {
   if (screenAnalysisWindow && !screenAnalysisWindow.isDestroyed()) return screenAnalysisWindow;
   screenAnalysisWindowReady = false;
   const window = new BrowserWindow({
+    type: "panel",
     width: 520,
     height: 150,
     frame: false,
     transparent: true,
     backgroundColor: "#00000000",
     hasShadow: false,
-    resizable: false,
+    resizable: true,
+    minWidth: 420,
+    minHeight: 160,
     movable: true,
     focusable: true,
     acceptFirstMouse: true,
@@ -5047,21 +6530,24 @@ function ensureScreenAnalysisWindow() {
       backgroundThrottling: true
     }
   });
-  window.setAlwaysOnTop(true, "status");
+  window.setAlwaysOnTop(true, "pop-up-menu");
   if (process.platform === "darwin") {
-    window.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+    window.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true, skipTransformProcessType: true });
   }
+  window.on("moved", () => {
+    screenAnalysisUserMovedPanel = true;
+  });
+  window.on("resized", () => {
+    screenAnalysisUserResizedPanel = true;
+  });
   window.on("closed", () => {
     if (screenAnalysisWindow === window) screenAnalysisWindow = null;
     screenAnalysisWindowReady = false;
     stopAssistantVoiceOutputForSessionEnd("screen analysis HUD closed");
-    if (screenAnalysisStatus === "result") {
-      screenAnalysisStatus = "idle";
-      discardScreenAnalysisMainWindowRestore("screen analysis result HUD closed");
-    } else {
-      screenAnalysisStatus = "idle";
-      restoreMainWindowAfterScreenAnalysis("screen analysis HUD closed");
-    }
+    screenAnalysisStatus = "idle";
+    // Closing the HUD should never pop the assistant window over whatever
+    // app the user is working in.
+    discardScreenAnalysisMainWindowRestore("screen analysis HUD closed");
     scheduleScreenAnalysisBufferEviction();
   });
   window.webContents.once("did-finish-load", () => {
@@ -5077,6 +6563,7 @@ function ensureScreenAnalysisFrameWindow() {
   if (screenAnalysisFrameWindow && !screenAnalysisFrameWindow.isDestroyed()) return screenAnalysisFrameWindow;
   screenAnalysisFrameWindowReady = false;
   const window = new BrowserWindow({
+    type: "panel",
     width: 220,
     height: 140,
     frame: false,
@@ -5099,9 +6586,9 @@ function ensureScreenAnalysisFrameWindow() {
     }
   });
   window.setIgnoreMouseEvents(true, { forward: true });
-  window.setAlwaysOnTop(true, "status");
+  window.setAlwaysOnTop(true, "pop-up-menu");
   if (process.platform === "darwin") {
-    window.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+    window.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true, skipTransformProcessType: true });
   }
   window.on("closed", () => {
     if (screenAnalysisFrameWindow === window) screenAnalysisFrameWindow = null;
@@ -5138,6 +6625,10 @@ async function updateScreenAnalysisOverlay(payload: {
   resultText?: string;
   images?: ScreenAnalysisGeneratedImage[];
   tone?: "error" | "success";
+  // Follow-up turn: keep the panel where it is (no resize/reposition) and let
+  // the HUD update the existing result view in place instead of rebuilding.
+  inline?: boolean;
+  mode?: "image" | "text";
 }) {
   screenAnalysisStatus = payload.status;
   // Any non-idle status means we still want the captured buffers around.
@@ -5179,25 +6670,37 @@ async function updateScreenAnalysisOverlay(payload: {
   const hasGeneratedImages = Boolean(payload.images?.length);
   const panelHeight = payload.status === "result" ? (hasGeneratedImages ? 470 : 380) : payload.status === "analyzing" ? 120 : 158;
   const panelWidth = payload.status === "result" ? (hasGeneratedImages ? 620 : 560) : 540;
-  const panel = screenAnalysisPanel(payload.rect, panelWidth, panelHeight, payload.status);
-  debugLog(`screen analysis overlay status=${payload.status} rect=${JSON.stringify(payload.rect)} frame=${JSON.stringify(frameBounds)} panel=${JSON.stringify(panel)} preview=${lastCapturedPreviewDataURL ? "yes" : "no"}`);
-  window.setBounds(panel, false);
-  screenAnalysisPanelExpandedHeight = panel.height;
+  const inlineUpdate = Boolean(payload.inline) && window.isVisible();
+  let panel = screenAnalysisPanel(payload.rect, panelWidth, panelHeight, payload.status);
+  // If the user dragged/resized the panel, respect that geometry instead of
+  // snapping it back next to the capture rect on every status change.
+  if ((screenAnalysisUserMovedPanel || screenAnalysisUserResizedPanel) && window.isVisible()) {
+    const currentBounds = window.getBounds();
+    if (screenAnalysisUserMovedPanel) panel = { ...panel, x: currentBounds.x, y: currentBounds.y };
+    if (screenAnalysisUserResizedPanel) panel = { ...panel, width: currentBounds.width, height: currentBounds.height };
+  }
+  debugLog(`screen analysis overlay status=${payload.status} inline=${inlineUpdate} rect=${JSON.stringify(payload.rect)} frame=${JSON.stringify(frameBounds)} panel=${JSON.stringify(panel)} preview=${lastCapturedPreviewDataURL ? "yes" : "no"}`);
+  if (!inlineUpdate) {
+    window.setBounds(panel, false);
+    screenAnalysisPanelExpandedHeight = panel.height;
+  }
   const viewPayload = {
     ...payload,
-    panel: { x: 0, y: 0, width: panel.width },
+    panel: { x: 0, y: 0, width: inlineUpdate ? window.getBounds().width : panel.width },
     colors,
     themeColors
   };
-  if (!window.isVisible()) {
-    window.show();
+  if (!inlineUpdate) {
+    if (!window.isVisible()) {
+      window.show();
+    }
+    if (payload.status === "prompt") {
+      window.focus();
+    } else {
+      window.showInactive();
+    }
+    window.moveTop();
   }
-  if (payload.status === "prompt") {
-    window.focus();
-  } else {
-    window.showInactive();
-  }
-  window.moveTop();
   await waitForScreenAnalysisWindow(window);
   let didUpdatePanel = await updateScreenAnalysisPanelView(window, viewPayload);
   if (!didUpdatePanel && !window.isDestroyed()) {
@@ -5220,6 +6723,7 @@ function selectScreenRect(): Promise<ScreenRect> {
     pendingScreenSelectionResolve = resolve;
     pendingScreenSelectionReject = reject;
     const window = new BrowserWindow({
+      type: "panel",
       ...bounds,
       frame: false,
       transparent: true,
@@ -5241,9 +6745,9 @@ function selectScreenRect(): Promise<ScreenRect> {
         backgroundThrottling: true
       }
     });
-    window.setAlwaysOnTop(true, "screen-saver");
+    window.setAlwaysOnTop(true, "pop-up-menu");
     if (process.platform === "darwin") {
-      window.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+      window.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true, skipTransformProcessType: true });
     }
     window.on("closed", () => {
       if (screenSelectionWindow === window) screenSelectionWindow = null;
@@ -5270,11 +6774,14 @@ async function runScreenAnalysis(imageBuffer: Buffer, instruction: string, optio
   const runID = ++screenAnalysisRunID;
   const bridge = await openAssistBridge();
   const rect = lastCapturedScreenRect;
-  const referenceImages = lastScreenAnalysisReferenceImages.map((image) => ({
-    name: image.name,
-    data: image.data,
-    mimeType: image.mimeType
-  }));
+  const referenceImages = [
+    ...lastScreenAnalysisReferenceImages.map((image) => ({
+      name: image.name,
+      data: image.data,
+      mimeType: image.mimeType
+    })),
+    ...screenAnalysisGeneratedImageRefs
+  ];
   let accumulatedText = "";
   let generatedImages: ScreenAnalysisGeneratedImage[] = [];
   const showResult = async (text: string, images: ScreenAnalysisGeneratedImage[] = []) => {
@@ -5289,32 +6796,68 @@ async function runScreenAnalysis(imageBuffer: Buffer, instruction: string, optio
     }
   };
 
+  const conversationHistory = screenAnalysisConversation.slice(-12);
+  // Follow-up turns update the existing panel in place (inline) so the window
+  // keeps its size and position and the previous answer stays visible.
+  const isFollowUp = conversationHistory.length > 0;
+  const wantsImageGeneration = Boolean(bridge.promptWantsImageGeneration?.(instruction || ""));
+  const analyzingText = wantsImageGeneration ? "Generating image..." : "Analyzing the selected area...";
+
   if (rect) {
+    // No previewDataURL here: the analyzing view never renders it, and the
+    // multi-MB base64 string would be re-serialized into executeJavaScript
+    // on every update, freezing the HUD renderer (beachball, undraggable).
     void updateScreenAnalysisOverlay({
       status: "analyzing",
       rect,
-      previewDataURL: lastCapturedPreviewDataURL,
-      text: "Analyzing the selected area..."
+      text: analyzingText,
+      inline: isFollowUp,
+      mode: wantsImageGeneration ? "image" : "text"
     });
   }
 
+  // Throttle streamed-text updates: each one rebuilds the panel DOM, so
+  // per-token updates flood the window and stall it.
+  let streamUpdateTimer: NodeJS.Timeout | null = null;
+  let streamDone = false;
+  const flushStreamUpdate = () => {
+    streamUpdateTimer = null;
+    if (streamDone || runID !== screenAnalysisRunID || !rect || !accumulatedText.trim()) return;
+    void updateScreenAnalysisOverlay({
+      status: "analyzing",
+      rect,
+      text: analyzingText,
+      resultText: accumulatedText,
+      inline: isFollowUp,
+      mode: wantsImageGeneration ? "image" : "text"
+    });
+  };
   try {
     const finalResult = await bridge.analyzeScreenWithCodex(imageBuffer, instruction, referenceImages, (text) => {
       accumulatedText = text;
       if (!text.trim()) return;
-      if (rect) {
-        void updateScreenAnalysisOverlay({
-          status: "analyzing",
-          rect,
-          previewDataURL: lastCapturedPreviewDataURL,
-          text: "Analyzing the selected area...",
-          resultText: text
-        });
-      }
-    });
+      if (!streamUpdateTimer) streamUpdateTimer = setTimeout(flushStreamUpdate, 200);
+    }, conversationHistory, screenAnalysisSelectedSkills.map((skill) => skill.id));
+    streamDone = true;
+    if (streamUpdateTimer) {
+      clearTimeout(streamUpdateTimer);
+      streamUpdateTimer = null;
+    }
     accumulatedText = accumulatedText || finalResult.text;
     generatedImages = finalResult.images || [];
     if (accumulatedText.trim() || generatedImages.length) {
+      if (runID === screenAnalysisRunID) {
+        screenAnalysisConversation.push({
+          role: "user",
+          text: instruction.trim() || "Explain what is on my screen."
+        });
+        if (accumulatedText.trim()) {
+          screenAnalysisConversation.push({ role: "assistant", text: accumulatedText.trim() });
+        }
+        if (generatedImages.length) {
+          screenAnalysisGeneratedImageRefs = screenAnalysisGeneratedRefsFromImages(generatedImages);
+        }
+      }
       await showResult(accumulatedText, generatedImages);
       if (options.readback && accumulatedText.trim()) {
         void bridge.speakAssistantResponse(accumulatedText, { force: true }).catch((speechError: unknown) => {
@@ -5332,6 +6875,11 @@ async function runScreenAnalysis(imageBuffer: Buffer, instruction: string, optio
       }
     }
   } catch (error) {
+    streamDone = true;
+    if (streamUpdateTimer) {
+      clearTimeout(streamUpdateTimer);
+      streamUpdateTimer = null;
+    }
     debugLog(`Screen analysis stream error: ${error instanceof Error ? error.stack ?? error.message : String(error)}`);
     if (rect) {
       await updateScreenAnalysisOverlay({
@@ -5482,7 +7030,10 @@ async function saveImageDataURL(dataURL: string, defaultName = "openassist-image
 }
 
 async function openLocalPath(filePath: string) {
-  const targetPath = String(filePath ?? "").trim();
+  const rawPath = String(filePath ?? "").trim();
+  const targetPath = rawPath.startsWith("~")
+    ? path.join(app.getPath("home"), rawPath.slice(1))
+    : rawPath;
   if (!targetPath || !fs.existsSync(targetPath)) return { ok: false, error: "File was not found." };
   const openError = await shell.openPath(targetPath);
   return openError ? { ok: false, error: openError, path: targetPath } : { ok: true, path: targetPath };
@@ -5617,6 +7168,32 @@ function setScreenAnalysisFrameVisible(visible: boolean) {
   return { ok: true };
 }
 
+// The prompt card window is only ~158px tall, so the attach/skill dropdown
+// was clipped at the window edge after two items. While the skill list is
+// open the window temporarily grows to fit it, then snaps back.
+let screenAnalysisMenuBaseHeight = 0;
+function setScreenAnalysisMenuExpanded(expanded: boolean) {
+  if (!screenAnalysisWindow || screenAnalysisWindow.isDestroyed()) {
+    return { ok: false };
+  }
+  const bounds = screenAnalysisWindow.getBounds();
+  if (expanded) {
+    if (!screenAnalysisMenuBaseHeight) screenAnalysisMenuBaseHeight = bounds.height;
+    screenAnalysisWindow.setBounds({
+      ...bounds,
+      height: Math.max(bounds.height, screenAnalysisMenuBaseHeight + 330)
+    }, false);
+    screenAnalysisWindow.moveTop();
+  } else if (screenAnalysisMenuBaseHeight) {
+    screenAnalysisWindow.setBounds({
+      ...bounds,
+      height: screenAnalysisMenuBaseHeight
+    }, false);
+    screenAnalysisMenuBaseHeight = 0;
+  }
+  return { ok: true };
+}
+
 function setScreenAnalysisPanelCollapsed(collapsed: boolean) {
   if (!screenAnalysisWindow || screenAnalysisWindow.isDestroyed()) {
     return { ok: false };
@@ -5663,9 +7240,9 @@ async function submitScreenAnalysisPrompt(instruction: string, options: { readba
   if (!lastCapturedImageBuffer || !lastCapturedScreenRect) {
     throw new Error("No screen capture found to analyze.");
   }
-  const imageBuffer = lastCapturedImageBuffer;
-  lastCapturedImageBuffer = null;
-  await runScreenAnalysis(imageBuffer, instruction, options);
+  // Keep the capture in memory so the user can ask follow-up questions about
+  // the same screenshot; it is released on cancel/close or buffer eviction.
+  await runScreenAnalysis(lastCapturedImageBuffer, instruction, options);
   return { ok: true };
 }
 
@@ -5682,6 +7259,11 @@ async function cancelScreenAnalysisPrompt() {
   lastCapturedScreenRect = null;
   lastCapturedPreviewDataURL = "";
   lastScreenAnalysisReferenceImages = [];
+  screenAnalysisConversation = [];
+  screenAnalysisGeneratedImageRefs = [];
+  screenAnalysisUserMovedPanel = false;
+  screenAnalysisUserResizedPanel = false;
+  screenAnalysisSelectedSkills = [];
   screenAnalysisFrameVisible = true;
   screenSelectionWindow?.close();
   screenSelectionWindow = null;
@@ -5689,11 +7271,11 @@ async function cancelScreenAnalysisPrompt() {
   screenAnalysisWindow?.hide();
   screenAnalysisStatus = "idle";
   scheduleScreenAnalysisBufferEviction();
-  if (shouldRestoreMainWindow) {
-    restoreMainWindowAfterScreenAnalysis("screen analysis cancelled");
-  } else {
-    discardScreenAnalysisMainWindowRestore("screen analysis result closed");
-  }
+  // Never bring the assistant window back to front on cancel/escape — the
+  // user is in another app; popping the main window over it is intrusive.
+  discardScreenAnalysisMainWindowRestore(
+    shouldRestoreMainWindow ? "screen analysis cancelled" : "screen analysis result closed"
+  );
   return { ok: true };
 }
 
@@ -5714,12 +7296,19 @@ async function triggerScreenAnalysis() {
     lastCapturedScreenRect = rect;
     lastCapturedPreviewDataURL = `data:image/png;base64,${imageBuffer.toString("base64")}`;
     lastScreenAnalysisReferenceImages = [];
+    screenAnalysisConversation = [];
+    screenAnalysisGeneratedImageRefs = [];
+    screenAnalysisUserMovedPanel = false;
+    screenAnalysisUserResizedPanel = false;
+    screenAnalysisSelectedSkills = [];
   } catch (error) {
     debugLog(`Screen analysis capture error: ${error}`);
-    restoreMainWindowAfterScreenAnalysis("screen analysis capture failed");
     if (error instanceof Error && error.message === "Screen analysis cancelled.") {
+      // Escape during the snip: leave every window exactly where it was.
+      discardScreenAnalysisMainWindowRestore("screen selection cancelled");
       return;
     }
+    restoreMainWindowAfterScreenAnalysis("screen analysis capture failed");
     await updateVoiceHUD({
       visible: true,
       status: "error",
@@ -5830,7 +7419,26 @@ function createMainWindow(options: { initiallyHidden?: boolean } = {}) {
   window.webContents.on("render-process-gone", (_event, details) => {
     debugLog(`render-process-gone reason=${details.reason} exitCode=${details.exitCode}`);
   });
-  setTimeout(showWindow, 2500);
+  // Single-parameter listener on purpose: declaring the legacy positional
+  // params (level, message, line, sourceId) makes Electron emit its
+  // "'console-message' arguments are deprecated" warning. The modern event
+  // object carries the same fields.
+  window.webContents.on("console-message", (event) => {
+    const details = event as unknown as { level?: unknown; message?: unknown; lineNumber?: unknown; sourceId?: unknown };
+    const level = String(details.level ?? "");
+    // Only mirror real errors. Warnings (level 2) are almost entirely React
+    // key / CSP noise from rendered artifacts and flooded the debug log with
+    // thousands of duplicate lines.
+    if (!["error", "3"].includes(level)) return;
+    const message = String(details.message ?? "").slice(0, 1200);
+    const source = String(details.sourceId ?? "");
+    const line = String(details.lineNumber ?? "");
+    debugLog(`renderer-console level=${level} source=${source}:${line} message=${message}`);
+  });
+  // Safety net only: ready-to-show is the normal path. At 2500ms this fired
+  // before the renderer's first paint (dev builds take ~3s), so the user saw
+  // a blank window for close to a second.
+  setTimeout(showWindow, 5000);
   window.on("close", (event) => {
     if (process.platform !== "darwin" || isQuitting) return;
     event.preventDefault();
@@ -6123,11 +7731,29 @@ end tell
 }
 
 async function refreshFrontmostApplicationSnapshot() {
-  const snapshot = await currentFrontmostApplicationSnapshot();
-  if (snapshot && !isOwnApplicationSnapshot(snapshot)) {
-    lastExternalApplication = snapshot;
+  if (frontmostSnapshotInFlight) return frontmostSnapshotInFlight;
+  frontmostSnapshotInFlight = currentFrontmostApplicationSnapshot()
+    .then((snapshot) => {
+      if (snapshot) lastFrontmostSnapshot = snapshot;
+      if (snapshot && !isOwnApplicationSnapshot(snapshot)) {
+        lastExternalApplication = snapshot;
+      }
+      return snapshot;
+    })
+    .finally(() => {
+      frontmostSnapshotInFlight = null;
+    });
+  return frontmostSnapshotInFlight;
+}
+
+// Returns a recent frontmost snapshot without paying a fresh ~100-400ms
+// osascript round-trip when one was captured moments ago (e.g. at dictation
+// stop, while the transcription request was still in flight).
+async function frontmostApplicationSnapshotWithMaxAge(maxAgeMs: number) {
+  if (lastFrontmostSnapshot && Date.now() - lastFrontmostSnapshot.capturedAt <= maxAgeMs) {
+    return lastFrontmostSnapshot;
   }
-  return snapshot;
+  return refreshFrontmostApplicationSnapshot();
 }
 
 function startFrontmostApplicationTracker() {
@@ -6155,7 +7781,7 @@ function syncFrontmostApplicationTracker() {
     void refreshFrontmostApplicationSnapshot();
     frontmostTrackerTimer = setInterval(() => {
       void refreshFrontmostApplicationSnapshot();
-    }, 1200);
+    }, frontmostTrackerIntervalMs);
   } else if (frontmostTrackerTimer) {
     clearInterval(frontmostTrackerTimer);
     frontmostTrackerTimer = null;
@@ -6369,15 +7995,45 @@ async function pasteTextWithTransientClipboard(text: string, target: FrontmostAp
   return { ok: didPaste, method: "electron-transient-clipboard" };
 }
 
+// Shown when an assistant turn finishes while the user is elsewhere (another
+// thread, another app, or the window is hidden). Clicking it brings the app
+// forward and opens the finished thread.
+function showThreadCompletionNotification(payload: { threadID?: string; title?: string; body?: string }) {
+  if (!Notification.isSupported()) return { ok: false };
+  const threadID = String(payload.threadID ?? "").trim();
+  const notification = new Notification({
+    title: payload.title?.trim() || "Chat finished",
+    body: (payload.body ?? "").trim().slice(0, 220) || "The response is ready.",
+    silent: false
+  });
+  notification.on("click", () => {
+    try {
+      app.focus({ steal: true });
+    } catch {
+      app.focus();
+    }
+    mainWindow?.show();
+    mainWindow?.focus();
+    if (threadID) mainWindow?.webContents.send("openassist:open-thread", threadID);
+  });
+  notification.show();
+  return { ok: true };
+}
+
 async function insertTranscriptText(text: string): Promise<TranscriptInsertionResult> {
   const trimmed = typeof text === "string" ? text.trim() : "";
   if (!trimmed) return { ok: false, result: "empty" };
 
-  const frontmost = await refreshFrontmostApplicationSnapshot();
+  // Reuse the snapshot captured when dictation stopped (fired in
+  // stopConfiguredVoiceInput) instead of paying another osascript round-trip.
+  const frontmost = await frontmostApplicationSnapshotWithMaxAge(2_500);
   const target = frontmost && !isOwnApplicationSnapshot(frontmost) ? frontmost : lastExternalApplication;
   const resultTarget = target ?? undefined;
 
-  if (target) {
+  // Only re-activate (and pay the 180ms settle delay) when the target is NOT
+  // already the frontmost app. In the normal dictation flow the user never
+  // left the target app, so this whole step is skipped.
+  if (target && target.pid !== frontmost?.pid) {
     const activated = await activateApplicationSnapshot(target);
     if (activated) await delay(180);
   }
@@ -6760,6 +8416,107 @@ function appleSpeechHelperInfoPlistPath() {
   return candidates.find((candidate) => fs.existsSync(candidate));
 }
 
+function appleEventKitHelperSourcePath() {
+  const candidates = [
+    path.join(app.getAppPath(), "electron", "helpers", "apple-eventkit-helper.swift"),
+    path.join(process.cwd(), "electron", "helpers", "apple-eventkit-helper.swift"),
+    path.join(openAssistRepoRoot(), "electron-react", "electron", "helpers", "apple-eventkit-helper.swift")
+  ];
+  return candidates.find((candidate) => fs.existsSync(candidate));
+}
+
+function appleEventKitHelperInfoPlistPath() {
+  const candidates = [
+    path.join(app.getAppPath(), "electron", "helpers", "apple-eventkit-helper-info.plist"),
+    path.join(process.cwd(), "electron", "helpers", "apple-eventkit-helper-info.plist"),
+    path.join(openAssistRepoRoot(), "electron-react", "electron", "helpers", "apple-eventkit-helper-info.plist")
+  ];
+  return candidates.find((candidate) => fs.existsSync(candidate));
+}
+
+async function ensureAppleEventKitHelper() {
+  const sourcePath = appleEventKitHelperSourcePath();
+  if (!sourcePath) throw new Error("Apple EventKit helper source was not found.");
+  const infoPlistPath = appleEventKitHelperInfoPlistPath();
+  if (!infoPlistPath) throw new Error("Apple EventKit helper Info.plist was not found.");
+  const helperBuildVersion = "2026-06-21-eventkit-helper-v1";
+  const helperBundleIdentifier = "com.developingadventures.OpenAssist.ElectronAppleEventKitHelper";
+  const helperDirectory = path.join(app.getPath("userData"), "helpers");
+  fs.mkdirSync(helperDirectory, { recursive: true });
+  const helperAppPath = path.join(helperDirectory, "Open Assist Apple EventKit Helper.app");
+  const contentsPath = path.join(helperAppPath, "Contents");
+  const macOSPath = path.join(contentsPath, "MacOS");
+  const infoPlistOutputPath = path.join(contentsPath, "Info.plist");
+  const buildMarkerPath = path.join(helperDirectory, ".openassist-apple-eventkit-helper-build");
+  const helperPath = path.join(macOSPath, "apple-eventkit-helper");
+  const sourceStat = fs.statSync(sourcePath);
+  const plistStat = fs.statSync(infoPlistPath);
+  const helperStat = fs.existsSync(helperPath) ? fs.statSync(helperPath) : null;
+  const plistOutputStat = fs.existsSync(infoPlistOutputPath) ? fs.statSync(infoPlistOutputPath) : null;
+  const buildMarker = fs.existsSync(buildMarkerPath) ? fs.readFileSync(buildMarkerPath, "utf8").trim() : "";
+  if (
+    !helperStat ||
+    !plistOutputStat ||
+    helperStat.mtimeMs < sourceStat.mtimeMs ||
+    plistOutputStat.mtimeMs < plistStat.mtimeMs ||
+    buildMarker !== helperBuildVersion
+  ) {
+    fs.mkdirSync(macOSPath, { recursive: true });
+    fs.copyFileSync(infoPlistPath, infoPlistOutputPath);
+    await runProcess("/usr/bin/swiftc", [
+      "-target",
+      "arm64-apple-macos26.0",
+      "-framework",
+      "EventKit",
+      "-Xlinker",
+      "-sectcreate",
+      "-Xlinker",
+      "__TEXT",
+      "-Xlinker",
+      "__info_plist",
+      "-Xlinker",
+      infoPlistPath,
+      sourcePath,
+      "-o",
+      helperPath
+    ]);
+    fs.chmodSync(helperPath, 0o755);
+    await runProcess("/usr/bin/codesign", [
+      "--force",
+      "--sign",
+      "-",
+      "--identifier",
+      helperBundleIdentifier,
+      helperAppPath
+    ]);
+    fs.writeFileSync(buildMarkerPath, helperBuildVersion, "utf8");
+  }
+  return helperAppPath;
+}
+
+async function runAppleEventKitCommand(command: Record<string, unknown>) {
+  if (process.platform !== "darwin") {
+    throw new Error("Apple Reminders and Apple Calendar integration is only available on macOS.");
+  }
+  const helperAppPath = await ensureAppleEventKitHelper();
+  const helperPath = path.join(helperAppPath, "Contents", "MacOS", "apple-eventkit-helper");
+  const { stdout } = await runProcessWithOutput(helperPath, ["--json", JSON.stringify(command)], 90_000);
+  const line = stdout.trim().split(/\r?\n/).filter(Boolean).pop();
+  if (!line) throw new Error("Apple EventKit helper did not return a response.");
+  let parsed: any;
+  try {
+    parsed = JSON.parse(line);
+  } catch {
+    throw new Error(`Apple EventKit helper returned invalid JSON: ${line}`);
+  }
+  if (parsed?.ok !== true) {
+    throw new Error(String(parsed?.error ?? "Apple EventKit helper failed."));
+  }
+  return parsed.data;
+}
+
+setAppleEventKitCommandRunner(runAppleEventKitCommand);
+
 async function ensureAppleSpeechHelper() {
   const sourcePath = appleSpeechHelperSourcePath();
   if (!sourcePath) throw new Error("Apple Speech helper source was not found.");
@@ -6963,19 +8720,25 @@ function waitForVoiceFile(sessionDirectory: string, names: string[], timeoutMs: 
   });
 }
 
+// Keep this stage light: the HUD's waveform applies its own noise floor and
+// per-bar attack/release envelope. Stacking a high floor + heavy compression
+// + slow EMA here crushed normal speech to ~25% bar height and smeared
+// syllables — the "doesn't react to my voice" complaint.
 function normalizedVoiceLevel(value: unknown) {
   const level = Number(value);
   if (!Number.isFinite(level)) return null;
   const clamped = Math.max(0, Math.min(1, level));
-  const noiseFloor = 0.15;
+  const noiseFloor = 0.06;
   if (clamped <= noiseFloor) return 0;
-  return Math.pow((clamped - noiseFloor) / (1 - noiseFloor), 0.78);
+  return Math.pow((clamped - noiseFloor) / (1 - noiseFloor), 0.85);
 }
 
 function smoothedVoiceHUDLevel(level: number) {
-  const smoothing = level > smoothedVoiceLevel ? 0.45 : 0.14;
+  // De-jitter only (the file sampling is ~20 Hz); the visual envelope lives
+  // in the HUD's per-bar attack/release.
+  const smoothing = level > smoothedVoiceLevel ? 0.75 : 0.35;
   smoothedVoiceLevel += (level - smoothedVoiceLevel) * smoothing;
-  if (smoothedVoiceLevel < 0.03) return 0;
+  if (smoothedVoiceLevel < 0.02) return 0;
   return Math.max(0, Math.min(1, smoothedVoiceLevel));
 }
 
@@ -7066,7 +8829,7 @@ async function listAppleSpeechHelperProcesses() {
       .filter((item): item is { pid: number; ageMs: number; command: string } => Boolean(item))
       .filter((item) => item.command.includes("apple-speech-helper") && item.command.includes("Open Assist Speech Helper.app"));
   } catch (error) {
-    debugLog(`voice helper process scan failed: ${error instanceof Error ? error.message : String(error)}`);
+    verboseLog(`voice helper process scan failed: ${error instanceof Error ? error.message : String(error)}`);
     return [];
   }
 }
@@ -7532,13 +9295,17 @@ function startVoiceLevelPolling(sessionDirectory: string) {
       const level = smoothedVoiceHUDLevel(rawLevel);
       if (pendingVoiceHUDPayload?.status === "listening") {
         void updateVoiceHUD({ level });
+      } else if (liveVoiceHUDSessionActive() && liveVoiceHUDMuted() && voiceCapture) {
+        void updateVoiceHUD({ dictationLevel: level, dictationCapture: true });
       } else {
         updateMenuBarVoiceStatus({ visible: true, status: "listening", level });
       }
     } catch {
       // The helper creates this file only after the microphone starts producing samples.
     }
-  }, 45);
+    // 30ms poll against the helper's ~50ms writes: mtime-gated, so this only
+    // shaves sampling latency, it doesn't add extra HUD updates.
+  }, 30);
 }
 
 function scheduleProcessingFeedbackSound(captureState: NonNullable<typeof voiceCapture>, delayMs = 180) {
@@ -7598,6 +9365,7 @@ async function stopAppleVoiceInput() {
   if (captureState.engine !== "appleSpeech") return { ok: false, text: "", error: "Apple Speech voice input is not running." };
   if (captureState.processing) return { ok: false, text: "", error: "Voice transcription is already processing." };
   captureState.processing = true;
+  refreshLiveVoiceDictationOverlay();
   const stopStartedAt = Date.now();
   debugLog(`Apple Speech stop requested pid=${captureState.helperPid ?? "unknown"} session=${captureState.sessionDirectory}`);
   playDictationFeedbackSound("stopListening", captureState.voiceOptions);
@@ -7619,6 +9387,7 @@ async function stopAppleVoiceInput() {
     terminateVoiceHelperCapture(captureState, "Apple Speech stop cleanup");
     if (voiceCapture === captureState) voiceCapture = null;
     stopVoiceLevelPolling();
+    restoreLiveVoiceHUDAfterCaptureEnd();
     updateMenuBarVoiceStatus({ visible: false, status: "idle" });
     setTimeout(() => {
       if (voiceCapture) return;
@@ -7632,7 +9401,15 @@ async function stopAppleVoiceInput() {
 
 function prewarmCloudVoiceTranscription(configuration?: VoiceStartOptions) {
   const provider = configuration?.cloudTranscriptionProvider || "OpenAI";
-  if (provider !== "ChatGPT / Codex Session") return;
+  if (provider !== "ChatGPT / Codex Session") {
+    // Open the provider TLS connection while the user is still recording.
+    void openAssistBridge()
+      .then((bridge) => bridge.prewarmCloudTranscriptionConnection())
+      .catch((error) => {
+        debugLog(`cloud transcription connection prewarm failed: ${error instanceof Error ? error.message : String(error)}`);
+      });
+    return;
+  }
   void openAssistBridge()
     .then((bridge) => bridge.prewarmCodexTranscriptionAuthContext())
     .then(() => debugLog("cloud voice transcription auth prewarmed"))
@@ -7699,6 +9476,7 @@ async function stopCloudVoiceInput() {
   if (captureState.engine !== "cloudProviders") return { ok: false, text: "", error: "Cloud voice input is not running." };
   if (captureState.processing) return { ok: false, text: "", error: "Voice transcription is already processing." };
   captureState.processing = true;
+  refreshLiveVoiceDictationOverlay();
   const stopStartedAt = Date.now();
   debugLog(`cloud voice stop requested provider=${captureState.voiceOptions?.cloudTranscriptionProvider ?? "unknown"} pid=${captureState.helperPid ?? "unknown"} session=${captureState.sessionDirectory}`);
   playDictationFeedbackSound("stopListening", captureState.voiceOptions);
@@ -7732,6 +9510,7 @@ async function stopCloudVoiceInput() {
     terminateVoiceHelperCapture(captureState, "cloud voice stop cleanup");
     if (voiceCapture === captureState) voiceCapture = null;
     stopVoiceLevelPolling();
+    restoreLiveVoiceHUDAfterCaptureEnd();
     updateMenuBarVoiceStatus({ visible: false, status: "idle" });
   }
 }
@@ -7929,6 +9708,7 @@ async function stopWhisperVoiceInput() {
   if (captureState.engine !== "whisperCpp") return { ok: false, text: "", error: "whisper.cpp voice input is not running." };
   if (captureState.processing) return { ok: false, text: "", error: "Voice transcription is already processing." };
   captureState.processing = true;
+  refreshLiveVoiceDictationOverlay();
   const stopStartedAt = Date.now();
   debugLog(`whisper voice stop requested model=${captureState.whisperModelID ?? "unknown"} pid=${captureState.helperPid ?? "unknown"} session=${captureState.sessionDirectory}`);
   playDictationFeedbackSound("stopListening", captureState.voiceOptions);
@@ -7962,11 +9742,18 @@ async function stopWhisperVoiceInput() {
     terminateVoiceHelperCapture(captureState, "whisper voice stop cleanup");
     if (voiceCapture === captureState) voiceCapture = null;
     stopVoiceLevelPolling();
+    restoreLiveVoiceHUDAfterCaptureEnd();
     updateMenuBarVoiceStatus({ visible: false, status: "idle" });
   }
 }
 
 async function startConfiguredVoiceInput(options?: VoiceStartOptions) {
+  if (liveVoiceHUDSessionActive() && !liveVoiceHUDMuted()) {
+    return {
+      ok: false,
+      error: "Stop Live Voice or mute its microphone before starting dictation."
+    };
+  }
   void refreshFrontmostApplicationSnapshot();
   const configuration = options?.transcriptionEngine
     ? options
@@ -7978,6 +9765,19 @@ async function startConfiguredVoiceInput(options?: VoiceStartOptions) {
 }
 
 async function stopConfiguredVoiceInput() {
+  // Overlap slow side-work with transcription instead of paying for it later:
+  // - capture the frontmost app NOW (it is the paste target) so the insert
+  //   step doesn't need its own ~100-400ms osascript round-trip;
+  // - open the TLS connection to the cloud transcription provider so the
+  //   upload that follows reuses it instead of doing a cold handshake.
+  void refreshFrontmostApplicationSnapshot();
+  if (voiceCapture?.engine === "cloudProviders") {
+    void openAssistBridge()
+      .then((bridge) => bridge.prewarmCloudTranscriptionConnection())
+      .catch((error) => {
+        debugLog(`cloud transcription connection prewarm failed: ${error instanceof Error ? error.message : String(error)}`);
+      });
+  }
   if (voiceCapture?.engine === "whisperCpp") return stopWhisperVoiceInput();
   if (voiceCapture?.engine === "cloudProviders") return stopCloudVoiceInput();
   return stopAppleVoiceInput();
@@ -8026,6 +9826,16 @@ app.whenReady().then(() => {
     .catch((error) => {
       debugLog(`startup Computer Use cleanup failed: ${error instanceof Error ? error.message : String(error)}`);
     });
+  // Temporary threads left behind by a crash/force-quit must not come back as
+  // saved chats.
+  void openAssistBridge()
+    .then((bridge) => bridge.purgeTemporaryThreadsOnStartup())
+    .then((result) => {
+      if (result.removed) debugLog(`startup: purged ${result.removed} leftover temporary thread(s)`);
+    })
+    .catch((error) => {
+      debugLog(`startup temporary thread purge failed: ${error instanceof Error ? error.message : String(error)}`);
+    });
   if (process.platform === "darwin") {
     ensureRegularDockPresence("app ready");
     try {
@@ -8066,10 +9876,18 @@ app.whenReady().then(() => {
     .then((bridge) => {
       bridge.setThreadsChangedListener(broadcastThreadsUpdated);
       bridge.setAppStateBackgroundUpdateListener(broadcastAppStateBackgroundUpdate);
+      bridge.setConnectorSyncProgressListener((progress) => broadcastConnectorSyncProgress(progress));
       return bridge.prewarmAssistantVoiceOutput();
     })
     .catch((error) => {
       debugLog(`assistant voice prewarm failed: ${error instanceof Error ? error.message : String(error)}`);
+    });
+  // Restore Remote Access (local server + public Easy QR link) if the user left
+  // it on, so they don't have to re-enable it after every launch.
+  void openAssistBridge()
+    .then((bridge) => bridge.restoreRemoteAccessOnStartup())
+    .catch((error) => {
+      debugLog(`Remote Access startup restore failed: ${error instanceof Error ? error.message : String(error)}`);
     });
   session.defaultSession.setPermissionRequestHandler((_webContents, permission, callback, details) => {
     const requestDetails = details as { mediaTypes?: string[] };
@@ -8078,7 +9896,7 @@ app.whenReady().then(() => {
   });
 
   ipcMain.handle("open-external", async (_event, url: string) => {
-    if (typeof url === "string" && /^(https?:\/\/|x-apple\.systempreferences:)/.test(url)) {
+    if (typeof url === "string" && /^(https?:\/\/|mailto:|tel:|x-apple\.systempreferences:)/i.test(url)) {
       await shell.openExternal(url);
     }
   });
@@ -8202,6 +10020,12 @@ app.whenReady().then(() => {
         );
         return { ok: true, opened: true };
       }
+      case "fullDiskAccess": {
+        await shell.openExternal(
+          "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"
+        );
+        return { ok: true, opened: true };
+      }
       default:
         return { ok: false, opened: false, error: `Unknown permission kind: ${kind}` };
     }
@@ -8228,6 +10052,24 @@ app.whenReady().then(() => {
     clipboard.writeText(String(text ?? ""));
     return { ok: true };
   });
+  // Copy a chat image (generated artifact, attachment, inline image) to the
+  // system clipboard as an actual image. Prefers the file on disk (full
+  // resolution) over the preview data URL.
+  ipcMain.handle("openassist:copy-image-to-clipboard", async (_event, source: { dataURL?: string; filePath?: string }) => {
+    try {
+      const fromPath = source?.filePath && fs.existsSync(source.filePath)
+        ? nativeImage.createFromPath(source.filePath)
+        : null;
+      const image = fromPath && !fromPath.isEmpty()
+        ? fromPath
+        : nativeImage.createFromDataURL(String(source?.dataURL ?? ""));
+      if (!image || image.isEmpty()) return { ok: false, error: "Image could not be read." };
+      clipboard.writeImage(image);
+      return { ok: true };
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  });
   ipcMain.handle("openassist:get-spellcheck-context", async (event) => {
     const payload = spellcheckContextByWebContentsID.get(event.sender.id);
     if (!payload || Date.now() - payload.createdAt > 4000) return null;
@@ -8245,6 +10087,9 @@ app.whenReady().then(() => {
     }
   });
   ipcMain.handle("openassist:insert-transcript-text", async (_event, text: string) => insertTranscriptText(text));
+  ipcMain.handle("openassist:notify-thread-complete", (_event, payload: { threadID?: string; title?: string; body?: string }) => {
+    return showThreadCompletionNotification(payload ?? {});
+  });
   ipcMain.handle("openassist:add-transcript-history", async (_event, text: string) => addTranscriptHistory(text));
   ipcMain.handle("openassist:load-transcript-history", async () => readTranscriptHistory());
   ipcMain.handle("openassist:delete-transcript-history-entry", async (_event, id: string) => deleteTranscriptHistoryEntry(id));
@@ -8260,6 +10105,35 @@ app.whenReady().then(() => {
   ipcMain.handle("openassist:open-transcript-history-window", async () => showTranscriptHistoryWindow());
   ipcMain.handle("openassist:open-settings-window", async (_event, section?: string) => showSettingsWindow(section));
   ipcMain.handle("openassist:menu-bar-action", async (_event, action: MenuBarAction) => handleMenuBarAction(action));
+  // Live app status pushed by the renderer (running chats, unread replies) so
+  // the menu bar popover shows current information instead of a stale snapshot.
+  ipcMain.on("openassist:menu-bar-state", (_event, snapshot: unknown) => {
+    const raw = (snapshot ?? {}) as Partial<MenuBarAppStateSnapshot>;
+    const cleanLine = (value: unknown, max: number) => String(value ?? "").replace(/\s+/g, " ").trim().slice(0, max);
+    const runs = Array.isArray(raw.runs)
+      ? raw.runs.slice(0, 6).map((run) => ({
+          title: cleanLine(run?.title, 80) || "Untitled chat",
+          provider: cleanLine(run?.provider, 40),
+          statusText: cleanLine(run?.statusText, 120),
+          startedAt: Number(run?.startedAt) || Date.now()
+        }))
+      : [];
+    menuBarAppState = {
+      runs,
+      unreadCount: Math.max(0, Math.min(99, Math.round(Number(raw.unreadCount) || 0))),
+      threadCount: Math.max(0, Math.round(Number(raw.threadCount) || 0)),
+      updatedAt: Date.now()
+    };
+    refreshMenuBarPopoverIfVisible();
+  });
+  ipcMain.on("openassist:menu-bar-report-height", (event, height: unknown) => {
+    const window = menuBarPopoverWindow;
+    if (!window || window.isDestroyed() || event.sender !== window.webContents) return;
+    const next = Math.max(240, Math.min(760, Math.round(Number(height) || 0)));
+    if (!next || Math.abs(next - menuBarPopoverContentHeight) < 2) return;
+    menuBarPopoverContentHeight = next;
+    if (window.isVisible()) positionMenuBarPopoverWindow(window);
+  });
   ipcMain.handle("openassist:open-target", async (_event, target: string, workspaceRootPath?: string | null) => {
     if (target.startsWith("workspace:")) {
       return openWorkspaceLaunchTarget(target.slice("workspace:".length), workspaceRootPath);
@@ -8285,6 +10159,283 @@ app.whenReady().then(() => {
   });
   ipcMain.handle("openassist:load-app-state", async () => (await openAssistBridge()).loadOpenAssistAppState());
   ipcMain.handle("openassist:load-settings-app-state", async () => (await openAssistBridge()).loadOpenAssistSettingsAppState());
+  ipcMain.handle("openassist:connectors-load", async () => loadConnectorSnapshot());
+  ipcMain.handle("openassist:connectors-load-review-inbox", async () => loadConnectorReviewInbox());
+  ipcMain.handle("openassist:apple-eventkit-status", async () => appleEventKitStatus());
+  ipcMain.handle("openassist:apple-eventkit-request-access", async (_event, service: string) =>
+    requestAppleEventKitAccess(service === "calendar" ? "calendar" : "reminders")
+  );
+  ipcMain.handle("openassist:connectors-create-google-account", async (_event, label: string) =>
+    createGoogleConnectorAccount(label)
+  );
+  ipcMain.handle("openassist:connectors-remove-google-account", async (_event, accountID: string) =>
+    removeGoogleConnectorAccount(accountID)
+  );
+  ipcMain.handle("openassist:connectors-set-service-enabled", async (_event, accountID: string, serviceID: ConnectorServiceID, enabled: boolean) =>
+    setConnectorServiceEnabled(accountID, serviceID, enabled)
+  );
+  ipcMain.handle("openassist:connectors-install-gws", async () => installPinnedGoogleCLI());
+  ipcMain.handle("openassist:connectors-google-command-plan", async (_event, accountID: string, operation: GoogleConnectorOperation, approved?: boolean) =>
+    buildGoogleCommandPlan(accountID, operation, approved === true)
+  );
+  ipcMain.handle("openassist:connectors-google-oauth-status", async (_event, accountID: string) =>
+    googleOAuthSetupStatus(accountID)
+  );
+  ipcMain.handle("openassist:connectors-open-google-oauth-page", async (_event, accountID: string, page: string) => {
+    const status = googleOAuthSetupStatus(accountID);
+    const url = page === "credentials"
+      ? status.credentialsURL
+      : page === "apiLibrary"
+        ? status.apiLibraryURL
+        : status.consentURL;
+    await shell.openExternal(url);
+    return { ok: true, status };
+  });
+  ipcMain.handle("openassist:connectors-import-google-client-secret", async (event, accountID: string) => {
+    const owner = BrowserWindow.fromWebContents(event.sender) ?? settingsWindow ?? mainWindow;
+    const dialogOptions: Electron.OpenDialogOptions = {
+      title: "Choose Google Desktop OAuth client JSON",
+      properties: ["openFile"],
+      filters: [
+        { name: "Google OAuth Client JSON", extensions: ["json"] }
+      ]
+    };
+    const result = owner
+      ? await dialog.showOpenDialog(owner, dialogOptions)
+      : await dialog.showOpenDialog(dialogOptions);
+    if (result.canceled || !result.filePaths[0]) {
+      return { ok: false, cancelled: true, status: googleOAuthSetupStatus(accountID) };
+    }
+    const status = importGoogleClientSecret(accountID, result.filePaths[0]);
+    return { ok: true, status };
+  });
+  ipcMain.handle("openassist:connectors-reuse-google-client-secret", async (_event, accountID: string) => {
+    const status = reuseGoogleClientSecret(accountID);
+    return { ok: true, status };
+  });
+  ipcMain.handle("openassist:connectors-open-google-config-folder", async (_event, accountID: string) => {
+    const status = googleOAuthSetupStatus(accountID);
+    fs.mkdirSync(status.configPath, { recursive: true });
+    const error = await shell.openPath(status.configPath);
+    return { ok: !error, error, status };
+  });
+  const runGoogleConnectorTerminalCommand = (
+    event: { sender: WebContents },
+    accountID: string,
+    operation: GoogleConnectorOperation
+  ) => {
+    const sessionID = `gws-${operation.kind}-${randomUUID()}`;
+    const commandLabel = operation.kind === "authSetup" ? "setup" : "login";
+    const plan = buildGoogleCommandPlan(accountID, operation);
+    const env = { ...process.env, ...plan.environment };
+    const child = spawn(plan.executablePath, plan.arguments, {
+      env,
+      stdio: ["pipe", "pipe", "pipe"]
+    });
+    connectorTerminalSessions.set(sessionID, child);
+    const sendProgress = (payload: Record<string, unknown>) => {
+      safeSendWebContents(event.sender, "openassist:connector-login-progress", {
+        sessionID,
+        accountID,
+        ...payload
+      });
+    };
+    const openURLs = new Set<string>();
+    const shouldAutoOpenURL = (url: string) => {
+      if (operation.kind !== "authLogin") return false;
+      try {
+        const parsed = new URL(url);
+        return parsed.hostname === "accounts.google.com" || parsed.hostname.endsWith(".googleusercontent.com");
+      } catch {
+        return false;
+      }
+    };
+    const handleOutput = (stream: "stdout" | "stderr", chunk: Buffer) => {
+      const text = chunk.toString("utf8");
+      sendProgress({ type: stream, text });
+      const urls = text.match(/https?:\/\/[^\s"'<>]+/g) ?? [];
+      for (const rawURL of urls) {
+        const url = rawURL.replace(/[),.]+$/g, "");
+        if (!shouldAutoOpenURL(url)) continue;
+        if (openURLs.has(url)) continue;
+        openURLs.add(url);
+        shell.openExternal(url).catch((error) => {
+          sendProgress({
+            type: "stderr",
+            text: `Could not open URL: ${error instanceof Error ? error.message : String(error)}\n`
+          });
+        });
+      }
+    };
+    child.stdout?.on("data", (chunk) => handleOutput("stdout", chunk));
+    child.stderr?.on("data", (chunk) => handleOutput("stderr", chunk));
+    child.on("error", (error) => {
+      connectorTerminalSessions.delete(sessionID);
+      sendProgress({
+        type: "error",
+        text: error instanceof Error ? error.message : String(error)
+      });
+    });
+    child.on("close", (code, signal) => {
+      connectorTerminalSessions.delete(sessionID);
+      sendProgress({
+        type: "close",
+        code,
+        signal,
+        text: code === 0
+          ? `Google ${commandLabel} completed.\n`
+          : `Google ${commandLabel} exited with code ${code ?? "unknown"}.\n`
+      });
+    });
+    sendProgress({
+      type: "start",
+      text: operation.kind === "authSetup"
+        ? `Running ${plan.displayCommand}\nSetup may print Google Cloud links. OpenAssist will show them here, not open them automatically.\n`
+        : `Running ${plan.displayCommand}\n`
+    });
+    return { ok: true, sessionID };
+  };
+  ipcMain.handle("openassist:connectors-run-google-setup", async (event, accountID: string) =>
+    runGoogleConnectorTerminalCommand(event, accountID, { kind: "authSetup" })
+  );
+  ipcMain.handle("openassist:connectors-run-google-login", async (event, accountID: string) =>
+    runGoogleConnectorTerminalCommand(event, accountID, {
+      kind: "authLogin",
+      scopes: ["gmail", "calendar", "tasks", "drive", "people"]
+    })
+  );
+  ipcMain.handle("openassist:connectors-send-terminal-input", async (_event, sessionID: string, input: string) => {
+    const child = connectorTerminalSessions.get(sessionID);
+    if (!child || child.exitCode !== null || child.killed) {
+      throw new Error("Connector terminal session is not running.");
+    }
+    const text = String(input ?? "");
+    if (!text) return { ok: true };
+    child.stdin?.write(text.endsWith("\n") ? text : `${text}\n`);
+    return { ok: true };
+  });
+  ipcMain.handle("openassist:connectors-stop-terminal", async (_event, sessionID: string) => {
+    const child = connectorTerminalSessions.get(sessionID);
+    if (!child || child.exitCode !== null || child.killed) return { ok: true, stopped: false };
+    child.kill("SIGTERM");
+    connectorTerminalSessions.delete(sessionID);
+    return { ok: true, stopped: true };
+  });
+  const gmailSyncProgressMessage = (accountLabel: string, importedCount: number, reviewCount: number) => {
+    if (importedCount > 0) {
+      return `Gmail sync complete for ${accountLabel}. Found ${importedCount} actionable ${importedCount === 1 ? "candidate" : "candidates"}. ${reviewCount} ${reviewCount === 1 ? "item is" : "items are"} waiting in Review Inbox.`;
+    }
+    return `Gmail sync complete for ${accountLabel}. No new actionable email candidates found.`;
+  };
+  const connectorItemTitles = (items: ConnectorItem[] | undefined) => (items ?? [])
+    .slice(0, 3)
+    .map((item) => item.title.trim())
+    .filter(Boolean);
+  ipcMain.handle("openassist:connectors-sync-gmail", async (event, accountID: string, options?: GmailSyncOptions) => {
+    const account = loadConnectorSnapshot().accounts.find((candidate) => candidate.id === accountID && candidate.provider === "google");
+    const accountLabel = account?.label || "Gmail";
+    const progressID = `gmail-sync-${randomUUID()}`;
+    const startedAt = new Date().toISOString();
+    broadcastConnectorSyncProgress({
+      id: progressID,
+      provider: "google",
+      serviceID: "gmail",
+      accountID,
+      accountLabel,
+      status: "running",
+      message: `Syncing Gmail for ${accountLabel}...`,
+      startedAt
+    }, event.sender);
+    try {
+      const result = await syncGmailMetadataToReviewInbox(accountID, options ?? {});
+      const reviewCount = result.reviewItems.length;
+      broadcastConnectorSyncProgress({
+        id: progressID,
+        provider: "google",
+        serviceID: "gmail",
+        accountID,
+        accountLabel,
+        status: "completed",
+        message: gmailSyncProgressMessage(accountLabel, result.importedCount, reviewCount),
+        importedCount: result.importedCount,
+        reviewCount,
+        itemTitles: connectorItemTitles(result.reviewItems),
+        startedAt,
+        finishedAt: new Date().toISOString()
+      }, event.sender);
+      return result;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      broadcastConnectorSyncProgress({
+        id: progressID,
+        provider: "google",
+        serviceID: "gmail",
+        accountID,
+        accountLabel,
+        status: "failed",
+        message: `Gmail sync failed for ${accountLabel}: ${message}`,
+        startedAt,
+        finishedAt: new Date().toISOString(),
+        error: message
+      }, event.sender);
+      throw error;
+    }
+  });
+  ipcMain.handle("openassist:connectors-mark-item", async (_event, itemID: string, status: ConnectorItemStatus) =>
+    markConnectorItem(itemID, status)
+  );
+  ipcMain.handle("openassist:connectors-ignore-review-items", async (_event, accountID?: string) =>
+    ignoreConnectorReviewItems(accountID?.trim() || undefined)
+  );
+  ipcMain.handle("openassist:connectors-save-item-to-backlog", async (_event, itemID: string) => {
+    const result = await (await openAssistBridge()).upsertBacklogItem(saveConnectorItemToBacklogInput(itemID) as any);
+    markConnectorItem(itemID, "approved");
+    return { ok: true, result, snapshot: loadConnectorSnapshot() };
+  });
+  ipcMain.handle("openassist:connectors-skill-guide", async () => connectorSkillGuide());
+  ipcMain.handle("openassist:integrations-status", async () => (await openAssistBridge()).loadOpenAssistIntegrationStatus());
+  ipcMain.handle("openassist:integrations-connect", async (_event, targetID: string) =>
+    (await openAssistBridge()).connectOpenAssistIntegration(targetID)
+  );
+  ipcMain.handle("openassist:integrations-copy-config", async (_event, targetID: string) => {
+    const text = await (await openAssistBridge()).openAssistIntegrationConfigText(targetID);
+    clipboard.writeText(text);
+    return { ok: true };
+  });
+  ipcMain.handle("openassist:integrations-reveal-config", async (_event, targetID: string) => {
+    const configPath = (await openAssistBridge()).openAssistIntegrationConfigPath(targetID);
+    if (!configPath) return { ok: false, error: "This target does not have a config file path." };
+    if (fs.existsSync(configPath)) {
+      shell.showItemInFolder(configPath);
+      return { ok: true, path: configPath };
+    }
+    fs.mkdirSync(path.dirname(configPath), { recursive: true });
+    const error = await shell.openPath(path.dirname(configPath));
+    return error ? { ok: false, error, path: configPath } : { ok: true, path: configPath };
+  });
+  ipcMain.handle("openassist:integrations-test", async () => (await openAssistBridge()).testOpenAssistKnowledgeIntegration());
+  ipcMain.handle("openassist:integrations-skill", async (_event, targetID?: string) =>
+    (await openAssistBridge()).openAssistIntegrationSkillGuide(targetID)
+  );
+  ipcMain.handle("openassist:integrations-copy-skill", async (_event, targetID?: string) => {
+    const guide = (await openAssistBridge()).openAssistIntegrationSkillGuide(targetID);
+    clipboard.writeText(guide.markdown);
+    return { ok: true, skillPath: guide.skillPath };
+  });
+  ipcMain.handle("openassist:integrations-install-skill", async (_event, targetID: string) =>
+    (await openAssistBridge()).installOpenAssistIntegrationSkill(targetID)
+  );
+  ipcMain.handle("openassist:integrations-reveal-skill", async (_event, targetID?: string) => {
+    const guide = (await openAssistBridge()).openAssistIntegrationSkillGuide(targetID);
+    if (!guide.skillPath) return { ok: false, error: "This skill has no file path." };
+    if (fs.existsSync(guide.skillPath)) {
+      shell.showItemInFolder(guide.skillPath);
+      return { ok: true, path: guide.skillPath };
+    }
+    fs.mkdirSync(path.dirname(guide.skillPath), { recursive: true });
+    const error = await shell.openPath(path.dirname(guide.skillPath));
+    return error ? { ok: false, error, path: guide.skillPath } : { ok: true, path: guide.skillPath };
+  });
   ipcMain.handle("openassist:list-provider-models", async (_event, backend: string) => (await openAssistBridge()).listProviderModels(backend));
   ipcMain.handle("openassist:list-ollama-catalog-models", async () => (await openAssistBridge()).listOllamaCatalogModels());
   ipcMain.handle("openassist:refresh-ollama-website-catalog", async () => (await openAssistBridge()).refreshOllamaWebsiteCatalog());
@@ -8341,6 +10492,33 @@ app.whenReady().then(() => {
   );
   ipcMain.handle("openassist:list-planner-days", async (_event, limit?: number, activeDayID?: string) =>
     (await openAssistBridge()).listPlannerDays(limit, activeDayID)
+  );
+  ipcMain.handle("openassist:list-planner-categories", async () =>
+    (await openAssistBridge()).listPlannerCategories()
+  );
+  ipcMain.handle("openassist:list-planner-lists", async () =>
+    (await openAssistBridge()).listPlannerLists()
+  );
+  ipcMain.handle("openassist:create-planner-list", async (_event, input: unknown) =>
+    (await openAssistBridge()).createPlannerList(input as any)
+  );
+  ipcMain.handle("openassist:update-planner-list-color-and-area", async (_event, projectID: string, area?: string | null, color?: string | null) =>
+    (await openAssistBridge()).updatePlannerListColorAndArea(projectID, area, color)
+  );
+  ipcMain.handle("openassist:hide-planner-list", async (_event, projectID: string) =>
+    (await openAssistBridge()).hidePlannerList(projectID)
+  );
+  ipcMain.handle("openassist:list-planner-smart-lists", async () =>
+    (await openAssistBridge()).listPlannerSmartLists()
+  );
+  ipcMain.handle("openassist:list-planner-smart-list-items", async (_event, smartListID: string) =>
+    (await openAssistBridge()).listPlannerSmartListItems(smartListID)
+  );
+  ipcMain.handle("openassist:upsert-planner-category", async (_event, category: unknown) =>
+    (await openAssistBridge()).upsertPlannerCategory(category as any)
+  );
+  ipcMain.handle("openassist:delete-planner-category", async (_event, categoryID: string) =>
+    (await openAssistBridge()).deletePlannerCategory(categoryID)
   );
   ipcMain.handle("openassist:save-planner-day", async (_event, dayID: string | undefined, markdown: string) =>
     (await openAssistBridge()).savePlannerDay(dayID, markdown)
@@ -8399,6 +10577,9 @@ app.whenReady().then(() => {
   );
   ipcMain.handle("openassist:update-project-icon", async (_event, projectID: string, symbol?: string | null) =>
     (await openAssistBridge()).updateProjectIcon(projectID, symbol)
+  );
+  ipcMain.handle("openassist:update-project-area", async (_event, projectID: string, area?: string | null) =>
+    (await openAssistBridge()).updateProjectColorAndArea(projectID, area)
   );
   ipcMain.handle("openassist:choose-project-folder", async (_event, projectID: string) => {
     const owner = BrowserWindow.fromWebContents(_event.sender) ?? mainWindow;
@@ -8515,14 +10696,17 @@ app.whenReady().then(() => {
   ipcMain.handle("openassist:delete-note-permanently", async (_event, projectID: string, noteID: string) =>
     (await openAssistBridge()).deleteProjectNotePermanently(projectID, noteID)
   );
-  ipcMain.handle("openassist:create-note-folder", async (_event, projectID: string, name: string) =>
-    (await openAssistBridge()).createProjectNoteFolder(projectID, name)
+  ipcMain.handle("openassist:create-note-folder", async (_event, projectID: string, name: string, parentFolderID?: string | null) =>
+    (await openAssistBridge()).createProjectNoteFolder(projectID, name, parentFolderID ?? null)
   );
   ipcMain.handle("openassist:rename-note-folder", async (_event, projectID: string, folderID: string, name: string) =>
     (await openAssistBridge()).renameProjectNoteFolder(projectID, folderID, name)
   );
   ipcMain.handle("openassist:delete-note-folder", async (_event, projectID: string, folderID: string) =>
     (await openAssistBridge()).deleteProjectNoteFolder(projectID, folderID)
+  );
+  ipcMain.handle("openassist:move-note-folder", async (_event, projectID: string, folderID: string, parentFolderID: string | null) =>
+    (await openAssistBridge()).moveProjectNoteFolder(projectID, folderID, parentFolderID)
   );
   ipcMain.handle("openassist:move-note-to-folder", async (_event, projectID: string, noteID: string, folderID: string | null) =>
     (await openAssistBridge()).moveProjectNoteToFolder(projectID, noteID, folderID)
@@ -8615,6 +10799,30 @@ app.whenReady().then(() => {
     submitScreenAnalysisPrompt(instruction, options)
   );
   ipcMain.handle("openassist:cancel-screen-analysis", async () => cancelScreenAnalysisPrompt());
+  ipcMain.handle("openassist:copy-screen-analysis-capture", async () => {
+    if (!lastCapturedImageBuffer) return { ok: false, error: "No capture available to copy." };
+    clipboard.writeImage(nativeImage.createFromBuffer(lastCapturedImageBuffer));
+    return { ok: true };
+  });
+  ipcMain.handle("openassist:list-screen-analysis-skills", async () => {
+    try {
+      const skills = (await openAssistBridge()).listScreenAnalysisSkills() as Array<{ id: string; title: string; group?: string }>;
+      return { ok: true, skills, selected: screenAnalysisSelectedSkills };
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  });
+  ipcMain.handle("openassist:toggle-screen-analysis-skill", async (_event, id: string, title: string) => {
+    const skillID = String(id ?? "").trim();
+    if (!skillID) return { ok: false, error: "Missing skill id.", skills: screenAnalysisSelectedSkills };
+    const existingIndex = screenAnalysisSelectedSkills.findIndex((skill) => skill.id === skillID);
+    if (existingIndex >= 0) {
+      screenAnalysisSelectedSkills.splice(existingIndex, 1);
+    } else {
+      screenAnalysisSelectedSkills.push({ id: skillID, title: String(title ?? skillID) });
+    }
+    return { ok: true, skills: screenAnalysisSelectedSkills };
+  });
   ipcMain.handle("openassist:add-screen-analysis-reference-from-data-url", async (_event, dataURL: string, name?: string) =>
     addScreenAnalysisReferenceFromDataURL(dataURL, name)
   );
@@ -8638,6 +10846,9 @@ app.whenReady().then(() => {
   );
   ipcMain.handle("openassist:set-screen-analysis-frame-visible", async (_event, visible: boolean) =>
     setScreenAnalysisFrameVisible(visible)
+  );
+  ipcMain.handle("openassist:set-screen-analysis-menu-expanded", async (_event, expanded: boolean) =>
+    setScreenAnalysisMenuExpanded(expanded)
   );
   ipcMain.handle("openassist:set-screen-analysis-panel-collapsed", async (_event, collapsed: boolean) =>
     setScreenAnalysisPanelCollapsed(collapsed)
@@ -8773,14 +10984,14 @@ app.whenReady().then(() => {
   ipcMain.handle("openassist:clear-remote-access-pairing-code", async () =>
     (await openAssistBridge()).clearRemoteAccessPairingCode()
   );
-  ipcMain.handle("openassist:open-tailscale-app", async () =>
-    (await openAssistBridge()).openTailscaleApp()
-  );
   ipcMain.handle("openassist:start-remote-access-easy-qr", async () =>
     (await openAssistBridge()).startRemoteAccessEasyQR()
   );
   ipcMain.handle("openassist:stop-remote-access-easy-qr", async () =>
     (await openAssistBridge()).stopRemoteAccessEasyQR()
+  );
+  ipcMain.handle("openassist:get-remote-access-status", async () =>
+    (await openAssistBridge()).getRemoteAccessStatus()
   );
   ipcMain.handle("openassist:send-message", async (
     event,
@@ -8936,6 +11147,14 @@ app.whenReady().then(() => {
     (await openAssistBridge()).listCodexRealtimeVoices()
   );
   ipcMain.handle("openassist:update-voice-hud", async (_event, payload: VoiceHUDPayload) => updateVoiceHUD(payload ?? { visible: false }));
+  ipcMain.handle("openassist:live-voice-hud-action", async (_event, action: "toggleMute" | "stop" | "approveRequest" | "rejectRequest") => {
+    if (action !== "toggleMute" && action !== "stop") return { ok: false };
+    BrowserWindow.getAllWindows().forEach((window) => {
+      if (window === voiceHUDWindow) return;
+      safeSendWindow(window, "openassist:live-voice-hud-action", action);
+    });
+    return { ok: true };
+  });
   ipcMain.handle("openassist:set-window-mode", async (
     _event,
     mode: AssistantWindowMode,

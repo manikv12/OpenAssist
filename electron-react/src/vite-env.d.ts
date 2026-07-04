@@ -42,7 +42,7 @@ interface Window {
       microphone: "granted" | "denied" | "not-determined" | "unknown";
     }>;
     requestMacOSPermission: (
-      kind: "accessibility" | "screenRecording" | "microphone" | "speechRecognition" | "automation"
+      kind: "accessibility" | "screenRecording" | "microphone" | "speechRecognition" | "automation" | "fullDiskAccess"
     ) => Promise<{ ok: boolean; opened: boolean; error?: string }>;
     getComputerUseActivity: () => Promise<{
       active: boolean;
@@ -67,6 +67,7 @@ interface Window {
     }>>;
     readClipboardText: () => Promise<string>;
     writeClipboardText: (text: string) => Promise<{ ok: boolean }>;
+    copyImageToClipboard: (source: { dataURL?: string; filePath?: string }) => Promise<{ ok: boolean; error?: string }>;
     getSpellcheckContext: () => Promise<{
       misspelledWord: string;
       suggestions: string[];
@@ -93,6 +94,8 @@ interface Window {
         capturedAt: number;
       };
     }>;
+    notifyThreadComplete: (payload: { threadID: string; title: string; body?: string }) => Promise<{ ok: boolean }>;
+    onOpenThread: (callback: (threadID: string) => void) => (() => void);
     addTranscriptHistory: (text: string) => Promise<import("./types").TranscriptHistoryEntry[]>;
     loadTranscriptHistory: () => Promise<import("./types").TranscriptHistoryEntry[]>;
     deleteTranscriptHistoryEntry: (id: string) => Promise<import("./types").TranscriptHistoryEntry[]>;
@@ -113,6 +116,98 @@ interface Window {
     menuBarAction: (action: string) => Promise<{ ok: boolean }>;
     loadAppState: () => Promise<import("./types").OpenAssistAppState>;
     loadSettingsAppState: () => Promise<import("./types").OpenAssistAppState>;
+    loadConnectorSnapshot: () => Promise<import("./types").ConnectorSnapshot>;
+    loadConnectorReviewInbox: () => Promise<import("./types").ConnectorReviewInboxSnapshot>;
+    appleEventKitStatus: () => Promise<import("./types").AppleEventKitStatus>;
+    requestAppleEventKitAccess: (service: "reminders" | "calendar") => Promise<import("./types").AppleEventKitStatus>;
+    createGoogleConnectorAccount: (label: string) => Promise<import("./types").ConnectorSnapshot>;
+    removeGoogleConnectorAccount: (accountID: string) => Promise<import("./types").ConnectorSnapshot>;
+    setConnectorServiceEnabled: (
+      accountID: string,
+      serviceID: import("./types").ConnectorServiceID,
+      enabled: boolean
+    ) => Promise<import("./types").ConnectorSnapshot>;
+    installGoogleWorkspaceCLI: () => Promise<{
+      ok: boolean;
+      output: string;
+      snapshot: import("./types").ConnectorSnapshot;
+    }>;
+    googleConnectorCommandPlan: (
+      accountID: string,
+      operation: import("./types").GoogleConnectorOperation,
+      approved?: boolean
+    ) => Promise<import("./types").GoogleCommandPlan>;
+    googleConnectorOAuthStatus: (accountID: string) => Promise<import("./types").GoogleOAuthSetupStatus>;
+    openGoogleConnectorOAuthPage: (
+      accountID: string,
+      page: "consent" | "credentials" | "apiLibrary"
+    ) => Promise<{ ok: boolean; status: import("./types").GoogleOAuthSetupStatus }>;
+    importGoogleConnectorClientSecret: (accountID: string) => Promise<{
+      ok: boolean;
+      cancelled?: boolean;
+      status: import("./types").GoogleOAuthSetupStatus;
+    }>;
+    reuseGoogleConnectorClientSecret: (accountID: string) => Promise<{
+      ok: boolean;
+      status: import("./types").GoogleOAuthSetupStatus;
+    }>;
+    openGoogleConnectorConfigFolder: (accountID: string) => Promise<{
+      ok: boolean;
+      error?: string;
+      status: import("./types").GoogleOAuthSetupStatus;
+    }>;
+    runGoogleConnectorSetup: (accountID: string) => Promise<{ ok: boolean; sessionID: string }>;
+    runGoogleConnectorLogin: (accountID: string) => Promise<{ ok: boolean; sessionID: string }>;
+    sendConnectorTerminalInput: (sessionID: string, input: string) => Promise<{ ok: boolean }>;
+    stopConnectorTerminal: (sessionID: string) => Promise<{ ok: boolean; stopped: boolean }>;
+    onConnectorLoginProgress: (
+      callback: (payload: import("./types").ConnectorLoginProgress) => void
+    ) => () => void;
+    onConnectorSyncProgress: (
+      callback: (payload: import("./types").ConnectorSyncProgress) => void
+    ) => () => void;
+    syncGmailConnector: (accountID: string, options?: import("./types").GmailSyncOptions) => Promise<{
+      ok: boolean;
+      importedCount: number;
+      queries?: string[];
+      reviewItems: import("./types").ConnectorItem[];
+      snapshot: import("./types").ConnectorSnapshot;
+    }>;
+    markConnectorItem: (
+      itemID: string,
+      status: import("./types").ConnectorItemStatus
+    ) => Promise<import("./types").ConnectorSnapshot>;
+    ignoreConnectorReviewItems: (accountID?: string) => Promise<{
+      count: number;
+      snapshot: import("./types").ConnectorReviewInboxSnapshot;
+    }>;
+    saveConnectorItemToBacklog: (itemID: string) => Promise<{
+      ok: boolean;
+      result: import("./types").BacklogItemMutationResult;
+      snapshot: import("./types").ConnectorSnapshot;
+    }>;
+    connectorSkillGuide: () => Promise<Array<{ id: import("./types").ConnectorServiceID; title: string; rules: string[] }>>;
+    integrationStatus: () => Promise<import("./types").OpenAssistIntegrationStatus>;
+    connectIntegration: (
+      targetID: import("./types").OpenAssistIntegrationTargetID
+    ) => Promise<import("./types").OpenAssistIntegrationConnectResult>;
+    copyIntegrationConfig: (targetID: import("./types").OpenAssistIntegrationTargetID) => Promise<{ ok: boolean }>;
+    revealIntegrationConfig: (targetID: import("./types").OpenAssistIntegrationTargetID) => Promise<{ ok: boolean; path?: string; error?: string }>;
+    testIntegrationConnection: () => Promise<{
+      ok: boolean;
+      toolCount: number;
+      mcpURL: string;
+      mode: import("./types").KnowledgeExternalAccessMode;
+      resourcesVisible: boolean;
+    }>;
+    integrationSkillGuide: (
+      targetID?: import("./types").OpenAssistIntegrationTargetID
+    ) => Promise<import("./types").OpenAssistIntegrationSkillGuide>;
+    copyIntegrationSkill: (targetID?: import("./types").OpenAssistIntegrationTargetID) => Promise<{ ok: boolean; skillPath?: string }>;
+    installIntegrationSkill: (
+      targetID: import("./types").OpenAssistIntegrationTargetID
+    ) => Promise<import("./types").OpenAssistIntegrationSkillInstallResult>;
+    revealIntegrationSkill: (targetID?: import("./types").OpenAssistIntegrationTargetID) => Promise<{ ok: boolean; path?: string; error?: string }>;
     listProviderModels: (backend: string) => Promise<import("./types").ProviderModelOption[]>;
     listOllamaCatalogModels: () => Promise<import("./types").OllamaCatalogModelOption[]>;
     refreshOllamaWebsiteCatalog: () => Promise<{
@@ -161,6 +256,7 @@ interface Window {
     ) => Promise<import("./types").ProjectItem>;
     renameProject: (projectID: string, name: string) => Promise<import("./types").ProjectItem | null>;
     updateProjectIcon: (projectID: string, symbol?: string | null) => Promise<import("./types").ProjectItem | null>;
+    updateProjectArea: (projectID: string, area?: string | null) => Promise<import("./types").ProjectItem | null>;
     chooseProjectFolder: (projectID: string) => Promise<import("./types").ProjectItem | null>;
     openProjectFolder: (parentID?: string | null) => Promise<import("./types").ProjectItem | null>;
     removeProjectFolderLink: (projectID: string) => Promise<import("./types").ProjectItem | null>;
@@ -191,6 +287,28 @@ interface Window {
     loadPlannerDay: (dayID?: string) => Promise<import("./types").PlannerDayDetail>;
     loadPlannerBacklog: () => Promise<import("./types").PlannerBacklogDetail>;
     listPlannerDays: (limit?: number, activeDayID?: string) => Promise<import("./types").PlannerDaySummary[]>;
+    listPlannerCategories: () => Promise<import("./types").PlannerCategory[]>;
+    listPlannerLists: () => Promise<import("./types").ProjectItem[]>;
+    createPlannerList: (input: { name?: string; title?: string; area?: string; category?: string }) => Promise<{
+      list: import("./types").ProjectItem;
+      lists: import("./types").ProjectItem[];
+      projects?: import("./types").ProjectItem[];
+      hiddenProjects?: import("./types").ProjectItem[];
+    }>;
+    updatePlannerListColorAndArea: (projectID: string, area?: string | null, color?: string | null) => Promise<{
+      list: import("./types").ProjectItem | null;
+      lists: import("./types").ProjectItem[];
+      projects?: import("./types").ProjectItem[];
+      hiddenProjects?: import("./types").ProjectItem[];
+    }>;
+    hidePlannerList: (projectID: string) => Promise<import("./types").ProjectItem[]>;
+    listPlannerSmartLists: () => Promise<import("./types").PlannerSmartListSummary[]>;
+    listPlannerSmartListItems: (smartListID: string) => Promise<import("./types").PlannerSmartListDetail>;
+    upsertPlannerCategory: (category: Partial<import("./types").PlannerCategory> & { name?: string }) => Promise<{
+      category: import("./types").PlannerCategory;
+      categories: import("./types").PlannerCategory[];
+    }>;
+    deletePlannerCategory: (categoryID: string) => Promise<import("./types").PlannerCategory[]>;
     savePlannerDay: (dayID: string | undefined, markdown: string) => Promise<import("./types").PlannerDayDetail>;
     scheduleSelectionToPlanner: (request: import("./types").PlannerScheduleRequest) => Promise<import("./types").PlannerDayDetail>;
     listDailyItems: (dayID?: string) => Promise<import("./types").DailyItem[]>;
@@ -202,7 +320,7 @@ interface Window {
       dayID: string | undefined,
       itemID: string,
       target: import("./types").NoteLinkTarget
-    ) => Promise<import("./types").DailyItemMutationResult>;
+    ) => Promise<import("./types").DailyItemMutationResult | import("./types").BacklogItemMutationResult>;
     upsertBacklogItem: (item: import("./types").DailyItemInput) => Promise<import("./types").BacklogItemMutationResult>;
     toggleBacklogItem: (itemID: string, checked: boolean) => Promise<import("./types").BacklogItemMutationResult>;
     deleteBacklogItem: (itemID: string) => Promise<import("./types").BacklogItemMutationResult>;
@@ -232,9 +350,10 @@ interface Window {
 	    archiveNote: (projectID: string, noteID: string) => Promise<{ projectID: string; archivedNoteID: string }>;
 	    restoreNote: (projectID: string, noteID: string) => Promise<{ projectID: string; restoredNoteID: string }>;
 	    deleteNotePermanently: (projectID: string, noteID: string) => Promise<{ projectID: string; deletedNoteID: string }>;
-	    createNoteFolder: (projectID: string, name: string) => Promise<import("./types").NoteFolderItem>;
+	    createNoteFolder: (projectID: string, name: string, parentFolderID?: string | null) => Promise<import("./types").NoteFolderItem>;
 	    renameNoteFolder: (projectID: string, folderID: string, name: string) => Promise<import("./types").NoteFolderItem>;
-	    deleteNoteFolder: (projectID: string, folderID: string) => Promise<{ projectID: string; deletedFolderID: string }>;
+	    deleteNoteFolder: (projectID: string, folderID: string) => Promise<{ projectID: string; deletedFolderID: string; deletedFolderIDs?: string[] }>;
+	    moveNoteFolder: (projectID: string, folderID: string, parentFolderID: string | null) => Promise<import("./types").NoteFolderItem>;
 	    moveNoteToFolder: (projectID: string, noteID: string, folderID: string | null) => Promise<{ projectID: string; noteID: string; folderID: string | null }>;
 	    deleteThreadNote: (threadID: string, noteID: string) => Promise<import("./types").ThreadNoteWorkspace>;
 	    archiveThreadNote: (threadID: string, noteID: string) => Promise<import("./types").ThreadNoteWorkspace>;
@@ -288,9 +407,9 @@ interface Window {
     testTelegramConnection: (token?: string) => Promise<{ ok: boolean; username?: string; message: string }>;
     rotateRemoteAccessPairingCode: () => Promise<import("./types").SettingsSnapshot>;
     clearRemoteAccessPairingCode: () => Promise<import("./types").SettingsSnapshot>;
-    openTailscaleApp: () => Promise<{ ok: boolean; installURL: string; error?: string }>;
     startRemoteAccessEasyQR: () => Promise<import("./types").SettingsSnapshot>;
     stopRemoteAccessEasyQR: () => Promise<import("./types").SettingsSnapshot>;
+    getRemoteAccessStatus: () => Promise<Partial<import("./types").SettingsSnapshot>>;
     sendMessage: (
       prompt: string,
       threadID?: string,
@@ -433,7 +552,7 @@ interface Window {
     }>;
     updateVoiceHUD: (payload: {
       visible?: boolean;
-      status?: "idle" | "listening" | "processing" | "unsupported" | "error" | "message" | "correction" | "analyzing" | "analysis-result" | "analyzing-input";
+      status?: "idle" | "listening" | "processing" | "unsupported" | "error" | "message" | "correction" | "analyzing" | "analysis-result" | "analyzing-input" | "live-connecting" | "live-listening" | "live-speaking" | "live-delegating";
       text?: string;
       theme?: string;
       colorTheme?: string;
@@ -444,7 +563,15 @@ interface Window {
       replacement?: string;
       previewDataURL?: string;
       suppressForAppFocus?: boolean;
+      providerLabel?: string;
+      userText?: string;
+      assistantText?: string;
+      workText?: string;
+      muted?: boolean;
+      approval?: { requestID: string; summary?: string } | null;
     }) => Promise<{ ok: boolean; visible: boolean; pending?: boolean }>;
+    liveVoiceHUDAction: (action: "toggleMute" | "stop" | "approveRequest" | "rejectRequest") => Promise<{ ok: boolean }>;
+    onLiveVoiceHUDAction: (callback: (action: "toggleMute" | "stop" | "approveRequest" | "rejectRequest") => void) => (() => void);
     submitScreenAnalysis: (instruction: string, options?: { readback?: boolean }) => Promise<{ ok: boolean }>;
     cancelScreenAnalysis: () => Promise<{ ok: boolean }>;
     chooseScreenAnalysisReferenceImages: () => Promise<{
@@ -493,9 +620,15 @@ interface Window {
     onNavigationCommand: (callback: (direction: "back" | "forward") => void) => () => void;
     onMenuBarCommand: (
       callback: (
-        command: "open-assistant" | "speak-assistant-task" | "toggle-dictation" | "open-history" | "open-models" | "open-settings"
+        command: "open-assistant" | "new-chat" | "speak-assistant-task" | "toggle-dictation" | "open-history" | "open-today" | "open-models" | "open-settings"
       ) => void
     ) => () => void;
+    setMenuBarState?: (state: {
+      runs: Array<{ title: string; provider: string; statusText: string; startedAt: number }>;
+      unreadCount: number;
+      threadCount: number;
+    }) => void;
+    menuBarReportHeight?: (height: number) => void;
     onThreadsUpdated: (callback: () => void) => () => void;
     onSettingsUpdated: (callback: (settings: unknown) => void) => () => void;
     onColorThemePreview: (callback: (theme: string | null) => void) => () => void;

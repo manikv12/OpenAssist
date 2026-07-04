@@ -1,4 +1,4 @@
-export type ViewKey = "threads" | "today" | "notes" | "history" | "automations" | "skills" | "plugins" | "settings";
+export type ViewKey = "threads" | "today" | "notes" | "reviewInbox" | "history" | "automations" | "skills" | "plugins" | "settings";
 
 export type ProjectItem = {
   id: string;
@@ -8,6 +8,9 @@ export type ProjectItem = {
   kind?: "folder" | "project";
   parentID?: string | null;
   linkedFolderPath?: string | null;
+  area?: string;
+  color?: string;
+  plannerOnly?: boolean;
   hidden?: boolean;
   active?: boolean;
 };
@@ -28,6 +31,7 @@ export type ThreadItem = {
   isRunning?: boolean;
   runStatusText?: string;
   runElapsedText?: string;
+  hasUnread?: boolean;
   active?: boolean;
 };
 
@@ -224,6 +228,8 @@ export type NoteItem = {
   projectID: string;
   projectName?: string;
   folderID?: string | null;
+  area?: string;
+  tags?: string[];
   updatedAt?: number;
   isArchived?: boolean;
   archivedAt?: number;
@@ -250,6 +256,7 @@ export type NoteFolderItem = {
   id: string;
   name: string;
   projectID: string;
+  parentFolderID: string | null;
   noteCount: number;
 };
 
@@ -258,6 +265,8 @@ export type NoteDetail = {
   title: string;
   markdown: string;
   path?: string;
+  area?: string;
+  tags?: string[];
 };
 
 export type NoteHistoryItem = {
@@ -361,6 +370,17 @@ export type PlannerBacklogDetail = PlannerDaySummary & {
   markdown: string;
 };
 
+export type PlannerCategory = {
+  id: string;
+  name: string;
+  color?: string;
+  icon?: string;
+  createdAt: string;
+  updatedAt: string;
+  order: number;
+  hidden?: boolean;
+};
+
 export type DailyItemStatus = "todo" | "doing" | "done";
 
 export type DailyItemStep = {
@@ -372,8 +392,9 @@ export type DailyItemStep = {
 export type DailyItemScopeTag = {
   marker: "@" | "#";
   label: string;
-  kind: "project" | "folder" | "unresolved";
+  kind: "category" | "project" | "folder" | "unresolved";
   id?: string;
+  color?: string;
 };
 
 export type DailyItem = {
@@ -387,10 +408,15 @@ export type DailyItem = {
   projectName?: string;
   folderName?: string;
   area?: string;
+  section?: string;
+  tags?: string[];
   scopeTags?: DailyItemScopeTag[];
   detailsMarkdown: string;
   steps: DailyItemStep[];
   links: NoteLinkTarget[];
+  reminderAt?: string | null;
+  reminderTimezone?: string | null;
+  reminderDeliveredAt?: string | null;
   createdAt: string;
   updatedAt: string;
   order: number;
@@ -416,6 +442,17 @@ export type BacklogItemMutationResult = {
   item?: DailyItem | null;
   scheduledDay?: PlannerDayDetail;
   scheduledItems?: DailyItem[];
+};
+
+export type PlannerSmartListSummary = {
+  id: string;
+  title: string;
+  subtitle: string;
+  count: number;
+};
+
+export type PlannerSmartListDetail = PlannerSmartListSummary & {
+  items: DailyItem[];
 };
 
 export type PlannerScheduleRequest = {
@@ -641,6 +678,7 @@ export type SettingsSnapshot = {
   memoryEnabled: boolean;
   knowledgeAccessEnabled: boolean;
   knowledgeExternalAccessEnabled: boolean;
+  knowledgeExternalAccessMode: "simple" | "advanced" | "full";
   knowledgeAgentAccessEnabled: boolean;
   knowledgeRealtimeVoiceAccessEnabled: boolean;
   knowledgeOrganizerEnabled: boolean;
@@ -702,7 +740,7 @@ export type SettingsSnapshot = {
   remoteAccessEnabled: boolean;
   remoteAccessPort: string;
   remoteAccessPublicURL: string;
-  remoteAccessNetworkMode: "localOnly" | "localNetwork" | "tailscale";
+  remoteAccessNetworkMode: "localOnly" | "localNetwork";
   remoteAccessTailscaleHost: string;
   remoteAccessLocalNetworkURL: string;
   remoteAccessTailscaleURL: string;
@@ -802,6 +840,55 @@ export type ThreadMemorySnapshot = {
   markdown: string;
 };
 
+export type KnowledgeExternalAccessMode = "simple" | "advanced" | "full";
+
+export type OpenAssistIntegrationTargetID = "cursor" | "codex" | "claude" | "generic";
+
+export type OpenAssistIntegrationTargetStatus = {
+  id: OpenAssistIntegrationTargetID;
+  title: string;
+  description: string;
+  configPath?: string;
+  skillPath?: string;
+  detected: boolean;
+  connected: boolean;
+  configKind: "json" | "toml" | "copy";
+  skillMode: "cursor-rule" | "codex-agents" | "markdown-copy";
+};
+
+export type OpenAssistIntegrationStatus = {
+  targets: OpenAssistIntegrationTargetStatus[];
+  proxyPath: string;
+  externalMode: KnowledgeExternalAccessMode;
+  exposedToolCount: number;
+  resourcesVisible: boolean;
+  modeDescription: string;
+};
+
+export type OpenAssistIntegrationConnectResult = {
+  ok: boolean;
+  targetID: OpenAssistIntegrationTargetID;
+  action: "written" | "created";
+  configPath: string;
+  backupPath?: string;
+};
+
+export type OpenAssistIntegrationSkillGuide = {
+  title: string;
+  markdown: string;
+  targetID: OpenAssistIntegrationTargetID;
+  skillPath?: string;
+  installMode: "cursor-rule" | "codex-agents" | "markdown-copy";
+};
+
+export type OpenAssistIntegrationSkillInstallResult = {
+  ok: boolean;
+  targetID: OpenAssistIntegrationTargetID;
+  skillPath: string;
+  backupPath?: string;
+  action: "written" | "created";
+};
+
 export type OpenAssistAppState = {
   projects: ProjectItem[];
   hiddenProjects: ProjectItem[];
@@ -811,6 +898,9 @@ export type OpenAssistAppState = {
   noteFolders: NoteFolderItem[];
   plannerDays: PlannerDaySummary[];
   plannerBacklog?: PlannerBacklogDetail | null;
+  plannerCategories?: PlannerCategory[];
+  plannerLists?: ProjectItem[];
+  plannerSmartLists?: PlannerSmartListSummary[];
   backlogItems?: DailyItem[];
   automations: AutomationItem[];
   skills: SkillItem[];
@@ -821,6 +911,229 @@ export type OpenAssistAppState = {
   activeThreadID?: string;
   activeProjectID?: string;
   activeNoteID?: string;
+};
+
+export type ConnectorProvider = "google" | "apple" | "local";
+
+export type ConnectorServiceID =
+  | "gmail"
+  | "googleCalendar"
+  | "googleTasks"
+  | "googleDriveDocs"
+  | "googlePeople"
+  | "appleReminders"
+  | "appleCalendar"
+  | "appleContacts"
+  | "appleNotes"
+  | "messages";
+
+export type ConnectorItemKind =
+  | "task"
+  | "backlog"
+  | "followUp"
+  | "waitingFor"
+  | "replyDraft"
+  | "event"
+  | "file"
+  | "document"
+  | "person"
+  | "note"
+  | "message"
+  | "projectHint";
+
+export type ConnectorItemStatus = "candidate" | "review" | "approved" | "ignored" | "synced" | "failed" | "conflict";
+export type ConnectorSyncState = "externalOnly" | "localOnly" | "synced" | "pendingWrite" | "writePreview" | "failed" | "conflict";
+
+export type ConnectorServiceDefinition = {
+  id: ConnectorServiceID;
+  provider: ConnectorProvider;
+  displayName: string;
+  purpose: string;
+  syncMode: string;
+};
+
+export type ConnectorAccount = {
+  id: string;
+  provider: ConnectorProvider;
+  label: string;
+  configPath?: string;
+  enabledServiceIDs: ConnectorServiceID[];
+  syncCursors: Record<string, string>;
+  createdAt: string;
+  updatedAt: string;
+  lastSyncAt?: string;
+};
+
+export type ConnectorItem = {
+  id: string;
+  sourceService: ConnectorServiceID;
+  accountId: string;
+  externalId: string;
+  threadId?: string;
+  kind: ConnectorItemKind;
+  title: string;
+  snippet: string;
+  date: string;
+  status: ConnectorItemStatus;
+  dueDate?: string;
+  person?: string;
+  projectHint?: string;
+  syncState: ConnectorSyncState;
+  lastExternalVersion?: string;
+  lastLocalVersion?: string;
+  fullBodyFetched: boolean;
+  rawMetadata: Record<string, string>;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type ConnectorConflictRecord = {
+  id: string;
+  itemId: string;
+  sourceService: ConnectorServiceID;
+  accountId: string;
+  externalSummary: string;
+  localSummary: string;
+  externalVersion?: string;
+  localVersion?: string;
+  detectedAt: string;
+  resolvedAt?: string;
+};
+
+export type ConnectorMutationRequest = {
+  id: string;
+  operation: string;
+  serviceId: ConnectorServiceID;
+  accountId: string;
+  externalId?: string;
+  title: string;
+  preview: string;
+  approved: boolean;
+  createdAt: string;
+};
+
+export type GoogleCLIStatus = {
+  pinnedVersion: string;
+  bundledPath: string;
+  pathExecutable?: string;
+  resolvedExecutable?: string;
+  version?: string;
+  supported: boolean;
+  installCommand: string;
+  setupCommand: string;
+};
+
+export type ConnectorReviewInboxSnapshot = {
+  version: 1;
+  services: ConnectorServiceDefinition[];
+  accounts: ConnectorAccount[];
+  items: ConnectorItem[];
+  updatedAt: string;
+};
+
+export type ConnectorAccessStatus = {
+  serviceID: ConnectorServiceID;
+  status: "granted" | "blocked" | "notSupported" | "unknown";
+  label: string;
+  detail: string;
+  permissionKind?: "fullDiskAccess" | "appleEventKit";
+};
+
+export type AppleEventKitStatus = {
+  reminders: ConnectorAccessStatus;
+  calendar: ConnectorAccessStatus;
+};
+
+export type ConnectorSnapshot = {
+  version: 1;
+  services: ConnectorServiceDefinition[];
+  accounts: ConnectorAccount[];
+  localAccessStatuses: ConnectorAccessStatus[];
+  items: ConnectorItem[];
+  conflicts: ConnectorConflictRecord[];
+  mutationRequests: ConnectorMutationRequest[];
+  gwsStatus: GoogleCLIStatus;
+  updatedAt: string;
+};
+
+export type ConnectorSyncProgress = {
+  id: string;
+  provider: ConnectorProvider;
+  serviceID: ConnectorServiceID;
+  accountID?: string;
+  accountLabel?: string;
+  status: "running" | "completed" | "failed";
+  message: string;
+  importedCount?: number;
+  reviewCount?: number;
+  itemTitles?: string[];
+  startedAt?: string;
+  finishedAt?: string;
+  error?: string;
+};
+
+export type GoogleConnectorOperation =
+  | { kind: "authSetup" }
+  | { kind: "authLogin"; scopes?: string[] }
+  | { kind: "authStatus" }
+  | { kind: "gmailSearchMetadata"; query: string; maxResults?: number }
+  | { kind: "gmailFetchMetadata"; messageId: string }
+  | { kind: "gmailFetchBody"; messageId: string }
+  | { kind: "calendarList"; timeMin: string; timeMax: string }
+  | { kind: "calendarAgenda" }
+  | { kind: "tasksList" }
+  | { kind: "driveSearch"; query: string; pageSize?: number }
+  | { kind: "peopleSearch"; query: string; pageSize?: number }
+  | { kind: "applyGmailLabel"; messageId: string; labelName: string }
+  | { kind: "sendEmail"; to: string; subject: string; body: string }
+  | { kind: "archiveEmail"; messageId: string }
+  | { kind: "deleteEmail"; messageId: string }
+  | { kind: "createTask"; title: string; notes?: string; dueDate?: string }
+  | { kind: "updateTask"; taskListId: string; taskId: string; title?: string; notes?: string }
+  | { kind: "markTaskDone"; taskListId: string; taskId: string }
+  | { kind: "deleteTask"; taskListId: string; taskId: string }
+  | { kind: "createCalendarEvent"; summary: string; start: string; end: string }
+  | { kind: "updateCalendarEvent"; calendarId: string; eventId: string; summary?: string }
+  | { kind: "deleteCalendarEvent"; calendarId: string; eventId: string };
+
+export type GmailSyncOptions = {
+  userIntent?: string;
+  query?: string;
+  timeframeDays?: number;
+  maxResults?: number;
+};
+
+export type GoogleCommandPlan = {
+  executablePath: string;
+  arguments: string[];
+  environment: Record<string, string>;
+  requiresApproval: boolean;
+  displayCommand: string;
+};
+
+export type GoogleOAuthSetupStatus = {
+  accountID: string;
+  accountLabel: string;
+  configPath: string;
+  clientSecretPath: string;
+  hasClientSecret: boolean;
+  isLoggedIn: boolean;
+  authMethod?: string;
+  credentialStorage?: string;
+  clientID?: string;
+  projectID?: string;
+  consentURL: string;
+  credentialsURL: string;
+  apiLibraryURL: string;
+};
+
+export type ConnectorLoginProgress = {
+  sessionID: string;
+  accountID: string;
+  type: "start" | "stdout" | "stderr" | "error" | "close";
+  text?: string;
+  code?: number | null;
+  signal?: string | null;
 };
 
 export type SettingsUpdateKey =
@@ -844,6 +1157,7 @@ export type SettingsUpdateKey =
   | "memoryEnabled"
   | "knowledgeAccessEnabled"
   | "knowledgeExternalAccessEnabled"
+  | "knowledgeExternalAccessMode"
   | "knowledgeAgentAccessEnabled"
   | "knowledgeRealtimeVoiceAccessEnabled"
   | "knowledgeOrganizerEnabled"
@@ -853,7 +1167,6 @@ export type SettingsUpdateKey =
   | "telegramEnabled"
   | "remoteAccessEnabled"
   | "remoteAccessNetworkMode"
-  | "remoteAccessTailscaleHost"
   | "compactStyle"
   | "compactEdge"
   | "assistantBackend"
@@ -923,7 +1236,17 @@ export type KnowledgePreview =
   | { kind: "planner_move"; fromDayID: string; dayID: string; section: string; content: string; removeTexts: string[] }
   | { kind: "planner_backlog_move"; entries: { dayID: string; text: string }[] }
   | { kind: "daily_item_upsert"; item: DailyItemInput }
+  | {
+      kind: "daily_items_batch";
+      sourceItemID: string;
+      sourceTitle: string;
+      sourceTarget?: NoteLinkTarget;
+      target: "backlog" | "day";
+      dayID?: string;
+      items: DailyItemInput[];
+    }
   | { kind: "daily_item_delete"; dayID: string; itemID: string }
+  | { kind: "reference_note_create"; ownerKind: "project" | "thread"; ownerId: string; title: string; markdown: string }
   | { kind: "replace_markdown"; itemID: string; markdown: string; previousMarkdown?: string; title?: string };
 
 export type KnowledgeWriteRequest = {

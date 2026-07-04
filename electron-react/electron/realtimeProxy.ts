@@ -49,13 +49,36 @@ export type RealtimeProxyConfig = {
     agentLabel: string;
     run: (request: { callID: string; prompt: string; replyMode: RealtimeHandoffReplyMode }) => Promise<string>;
   };
-  knowledge?: {
-    enabled: boolean;
-    call: (name: string, args: JsonObject) => Promise<unknown>;
+  // Runs several delegated tasks at once, each in its own thread / provider / folder,
+  // and reports back one result per task as soon as that task finishes. The proxy
+  // narrates the results one at a time (never overlapping) via reportTaskResult.
+  parallelDelegation?: {
+    maxTasks: number;
+    run: (request: {
+      callID: string;
+      tasks: Array<{ prompt: string; provider?: string; project?: string }>;
+      reportTaskResult: (result: {
+        index: number;
+        label: string;
+        agentLabel: string;
+        provider?: string;
+        project?: string;
+        prompt: string;
+        text: string;
+        failed: boolean;
+      }) => void;
+    }) => Promise<{ accepted: number; skipped: number; note?: string }>;
   };
-  directKnowledgeRequest?: {
-    run: (request: { callID: string; prompt: string; replyMode: RealtimeHandoffReplyMode }) => Promise<string | undefined | null>;
-  };
+	  knowledge?: {
+	    enabled: boolean;
+	    call: (name: string, args: JsonObject) => Promise<unknown>;
+	  };
+	  codexImageGeneration?: {
+	    run: (request: { callID: string; args: JsonObject; prompt: string }) => Promise<unknown>;
+	  };
+	  directKnowledgeRequest?: {
+	    run: (request: { callID: string; prompt: string; replyMode: RealtimeHandoffReplyMode }) => Promise<string | undefined | null>;
+	  };
   directWork?: {
     onEvent: (event: {
       callID: string;
@@ -98,6 +121,12 @@ type PendingHandoff = {
   lastActivity: string;
 };
 
+type PersonalRecallCacheEntry = {
+  promise?: Promise<unknown>;
+  result?: unknown;
+  updatedAt: number;
+};
+
 type GeminiLiveSession = {
   sendRealtimeInput: (input: unknown) => void;
   sendToolResponse: (response: unknown) => void;
@@ -118,14 +147,22 @@ const upstreamKeepAliveIntervalMs = 15_000;
 const upstreamReconnectBaseDelayMs = 400;
 const upstreamReconnectMaxDelayMs = 5_000;
 const maxUpstreamReconnectAttempts = 5;
-// How eagerly OpenAI's semantic VAD decides the user has started speaking (for
-// barge-in). "medium" balances fast cut-in against false triggers from noise.
-const realtimeVADEagerness = "medium";
+// How eagerly OpenAI's semantic VAD decides the user has started speaking.
+// Keep this conservative: the app already sends gated mic audio, and false
+// speech-starts cut off spoken replies.
+const realtimeVADEagerness = "low";
 // Safety net: max time we keep believing a response is "active" without a
 // response.done before we force-clear the flag so the assistant is never stuck mute.
 // Kept short for fast recovery; the watchdog re-arms instead of firing while audio
 // is still actively streaming, so it never cuts a long but legitimate spoken answer.
 const openAIResponseWatchdogMs = 5_000;
+const openAIDirectResultAudioRetryMs = 9_000;
+const personalRecallResultCacheMs = 5 * 60_000;
+
+function unrefTimer(timer: ReturnType<typeof setTimeout> | ReturnType<typeof setInterval>) {
+  const maybeTimer = timer as { unref?: () => void };
+  if (typeof maybeTimer.unref === "function") maybeTimer.unref();
+}
 
 function makeShortRealtimeID(prefix: string, sequence = 0) {
   const safePrefix = prefix.replace(/[^a-z0-9_]/gi, "").slice(0, 10) || "oa";
@@ -307,22 +344,133 @@ function isExplicitRealtimeRerunRequest(text: string) {
     || /\b(again|one more time|another time)\b.{0,80}\b(check|search|find|run|do|try|look|scan|open|inspect)\b/.test(text);
 }
 
-function isConversationRecallQuestion(text: string) {
+type ConversationRecallRoute = "none" | "personal" | "current" | "clarify";
+
+function currentConversationRecallText() {
+  return "Answer from this current thread or live conversation only. Do not search saved memory or start a background task.";
+}
+
+function recallScopeClarificationText() {
+  return "Do you mean this thread, or should I search all saved memory?";
+}
+
+function notPersonalRecallToolText() {
+  return "This is not a memory recall request. Use the correct realtime tool or background_agent for the user's actual task instead of knowledge_personal_recall.";
+}
+
+function realtimePromptWantsImageGeneration(text: string) {
   const normalized = normalizeRealtimeIntent(text);
-  if (!normalized) return false;
+  const asksForCreation = /\b(generate|create|make|draw|render|design|illustrate|paint|mock up|mockup|turn|convert)\b/.test(normalized);
+  const asksForImage = /\b(image|picture|photo|logo|icon|illustration|mockup|poster|banner|cover|thumbnail|wallpaper|avatar|sticker|graphic|visual)\b/.test(normalized);
+  const editsReferenceImage = /\b(use|edit|change|update|improve|build on|work on)\b.{0,80}\b(latest|attached|this|that)\b.{0,80}\b(image|photo|picture|poster|banner|logo|mockup|graphic)\b/.test(normalized);
+  return (asksForCreation && asksForImage) || editsReferenceImage;
+}
+
+function hasCurrentConversationScope(normalized: string) {
+  return /\b(this|current|same)\s+(thread|chat|conversation|session|live)\b/.test(normalized)
+    || /\b(in|from|inside)\s+(this|current)\s+(thread|chat|conversation|session|live)\b/.test(normalized)
+    || /\bthis thread itself\b/.test(normalized)
+    || /\bin here\b/.test(normalized);
+}
+
+function hasPersonalRecallSourceScope(normalized: string) {
+  return /\b(memory|memories|saved|history|timeline|previous|earlier|last time|old conversation|past conversation|conversation we had|conversations we had|chat we had|chat that we had|saved chats?|saved conversations?|all chats?|all threads?|all sessions?|codex thread|claude code|sessions?|transcript)\b/.test(normalized);
+}
+
+function hasAgentRecallSubject(normalized: string) {
+  if (!/\b(codex|claude|spark|gemini|chatgpt|agent|assistant)\b/.test(normalized)) return false;
+  return /\b(what did|where did|when did|did we|did you|have we|have you)\b.{0,90}\b(say|answer|respond|tell|find|decide|talk|discuss|work|do|check)\b/.test(normalized)
+    || /\b(said|answered|responded|told|found|decided|talked|discussed|worked on|previous|earlier|last time|memory|remember)\b/.test(normalized);
+}
+
+function looksLikeExternalLookupTask(normalized: string) {
+  return /\b(prompt|ask|tell)?\b.{0,30}\b(check|search|find|look up|look|browse|open|inspect)\b.{0,80}\b(online|on ine|web|internet|website|site|google|current|latest|live)\b/.test(normalized)
+    || /\b(check|search|find|look up|look|browse|open|inspect)\b.{0,80}\b(online|on ine|web|internet|website|site|google|current|latest|live)\b/.test(normalized);
+}
+
+function asksForPastLookupResult(normalized: string) {
+  return /\b(previous|earlier|last|old|saved)\b.{0,90}\b(search|searched|lookup|looked up|online|web|internet|result|answer|response)\b/.test(normalized)
+    || /\bwhat did\b.{0,80}\b(you|we|the agent|codex|claude|spark|gemini|chatgpt|assistant)\b.{0,80}\b(find|say|answer|respond)\b.{0,80}\b(online|web|internet|search|searched|lookup)\b/.test(normalized);
+}
+
+function hasExplicitRecallSubject(normalized: string) {
+  const blockedFirstWords = new Set([
+    "this",
+    "current",
+    "same",
+    "that",
+    "it",
+    "here",
+    "today",
+    "yesterday",
+    "tomorrow",
+    "last",
+    "earlier",
+    "previous",
+    "the",
+    "a",
+    "an",
+    "my",
+    "your",
+    "our"
+  ]);
+  const subjectPattern = /\b(on|about|for|with|inside)\s+((?:the\s+)?[a-z0-9][a-z0-9'/-]+(?:\s+(?!on\b|about\b|for\b|with\b|inside\b|today\b|yesterday\b|tomorrow\b|last\b|earlier\b|previous\b)[a-z0-9][a-z0-9'/-]+){0,5})/g;
+  for (const match of normalized.matchAll(subjectPattern)) {
+    const phrase = String(match[2] || "").replace(/^the\s+/, "").trim();
+    const words = phrase.split(/\s+/).filter(Boolean);
+    if (!words.length || blockedFirstWords.has(words[0])) continue;
+    if (words.length >= 2) return true;
+    if (/\b(openassist|atoms|rapid|widgtimator|tax-claim-it|taxclaim|amwins|qualitynails)\b/.test(phrase)) return true;
+  }
+  return false;
+}
+
+function isBroadWorkHistoryQuestion(normalized: string) {
+  return /\bwhat did\b.{0,30}\b(you|we|the agent|codex|claude|spark|gemini|chatgpt|assistant)\b.{0,60}\b(work|worked|working|do|doing)\b.{0,50}\b(today|yesterday|tomorrow|last night|last week|this week|earlier|previously)\b/.test(normalized)
+    || /\bwhat (are|were)\b.{0,30}\b(you|we|the agent|codex|claude|spark|gemini|chatgpt|assistant)\b.{0,60}\b(work|worked|working|do|doing)\b.{0,50}\b(today|yesterday|tomorrow|last night|last week|this week|earlier|previously)\b/.test(normalized)
+    || /\b(did|have|had)\b.{0,30}\b(you|we|i|the agent|codex|claude|spark|gemini|chatgpt|assistant)\b.{0,70}\b(work|worked|working|do|done|doing|anything)\b/.test(normalized);
+}
+
+function conversationRecallRoute(text: string): ConversationRecallRoute {
+  const normalized = normalizeRealtimeIntent(text);
+  if (!normalized) return "none";
+  if (hasCurrentConversationScope(normalized)) return "current";
+
+  const hasRecallSource = hasPersonalRecallSourceScope(normalized);
+  if (looksLikeExternalLookupTask(normalized) && !asksForPastLookupResult(normalized)) return "none";
 
   const asksWhetherAlready =
     /\b(wants?|asked|asks?|wondering)\b.{0,80}\b(if|whether)\b.{0,80}\balready\b/.test(normalized)
     || /\b(did|have|had|were|was)\b.{0,20}\b(you|we|the agent|codex|claude|assistant)\b.{0,100}\balready\b/.test(normalized);
-  if (asksWhetherAlready) return true;
+  if (asksWhetherAlready) return "personal";
+  if (isExplicitRealtimeRerunRequest(normalized)) return "none";
 
-  if (isExplicitRealtimeRerunRequest(normalized)) return false;
+  if (isBroadWorkHistoryQuestion(normalized)) {
+    if (hasPersonalRecallSourceScope(normalized) || hasAgentRecallSubject(normalized) || hasExplicitRecallSubject(normalized)) return "personal";
+    return "clarify";
+  }
 
-  return /\balready\b.{0,60}\b(found|find|figured|figure|checked|searched|ran|did|done|finished|answered|responded|looked)\b/.test(normalized)
+  if (hasRecallSource && (
+    /\b(check|search|look|look into|find|read|scan)\b.{0,50}\b(memory|memories|saved|history|timeline|previous|earlier|all chats?|all threads?|all sessions?)\b/.test(normalized)
+    || /\b(memory|memories|saved|history|timeline|previous|earlier|all chats?|all threads?|all sessions?|chat|conversation|thread|session|transcript)\b.{0,70}\b(check|search|look|look into|find|read|scan|had|talked|discussed)\b/.test(normalized)
+    || /\b(check|search|look|look into|find|read|scan)\b.{0,70}\b(chat|conversation|thread|session|transcript)\b.{0,50}\b(had|talked|discussed|yesterday|today|earlier|previous)\b/.test(normalized)
+    || /\b(do you|can you)\b.{0,30}\bremember\b/.test(normalized)
+  )) return "personal";
+  if (/\bwhere (are|were)\b.{0,80}\b(we|i|you)\b.{0,80}\b(on|with|in|at)\b/.test(normalized)) {
+    return hasExplicitRecallSubject(normalized) ? "personal" : "clarify";
+  }
+
+  const isRecall = /\balready\b.{0,60}\b(found|find|figured|figure|checked|searched|ran|did|done|finished|answered|responded|looked)\b/.test(normalized)
     || /\b(previous|last|earlier)\b.{0,80}\b(turn|message|answer|response|task|result|conversation|thing)\b/.test(normalized)
-    || /\bwhat did\b.{0,30}\b(you|we|the agent|codex|claude|assistant)\b.{0,50}\b(find|say|do|answer|respond|figure out|check)\b/.test(normalized)
-    || /\bwhat (was|were)\b.{0,50}\b(result|answer|last thing|previous thing)\b/.test(normalized)
+    || /\bwhat did\b.{0,30}\b(you|we|the agent|codex|claude|spark|gemini|chatgpt|assistant)\b.{0,60}\b(find|say|do|answer|respond|figure out|check)\b/.test(normalized)
+    || /\bwhat (was|were)\b.{0,70}\b(result|answer|plan|decision|status|state|process|last thing|previous thing)\b/.test(normalized)
+    || /\bdid (we|i|you)\b.{0,80}\b(talk|discuss|decide|plan|ask|mention)\b/.test(normalized)
     || /\b(do you|can you)\b.{0,30}\bremember\b/.test(normalized);
+  return isRecall ? "personal" : "none";
+}
+
+function isConversationRecallQuestion(text: string) {
+  return conversationRecallRoute(text) !== "none";
 }
 
 function isCasualRealtimeQuestion(text: string) {
@@ -514,8 +662,52 @@ function formatAgentResultForRealtime(output: string, agentLabel: string) {
     "[Agent task finished]",
     cleanOutput,
     "",
-    `Speak only the ${label} answer above. Do not add new facts or contradict it.`
+    `Speak only the ${label} answer above. Keep it short and natural. Do not restate the user's question, add commentary, or mention hidden tools.`
   ].join("\n");
+}
+
+function directSpeechInstructions(output: string, agentLabel: string) {
+  const label = agentLabel.trim() || "OpenAssist";
+  const cleanOutput = compactRealtimeStatusText(String(output || "").trim() || `${label} finished the task.`, 1_600);
+  return [
+    `Answer the user with this ${label} result now.`,
+    "Keep it short and natural, usually one or two sentences.",
+    "Do not restate the user's question. Do not add extra commentary.",
+    "Do not mention hidden tools, internal routing, Spark, or source labels unless the result itself says to.",
+    "Do not read markdown symbols, backticks, or brackets out loud.",
+    "",
+    cleanOutput
+  ].join("\n");
+}
+
+function personalRecallAnswerFromResult(result: unknown) {
+  const object = jsonObject(result);
+  return stringValue(object?.spokenAnswer, object?.answer, object?.summary, object?.output, object?.text);
+}
+
+function personalRecallRunningDetail(argsOrPrompt?: JsonObject | string) {
+  const prompt = typeof argsOrPrompt === "string"
+    ? argsOrPrompt
+    : stringValue(argsOrPrompt?.query, argsOrPrompt?.question, argsOrPrompt?.prompt, argsOrPrompt?.text);
+  const normalized = normalizeRealtimeIntent(prompt);
+  const wantsMemory = /\b(memory|memories|saved)\b/.test(normalized);
+  const wantsChats = /\b(chat|chats|conversation|conversations|thread|threads|session|sessions|transcript|codex|claude|spark|gemini|recent|latest|yesterday|today)\b/.test(normalized);
+  if (wantsMemory && wantsChats) return "Checking memory and saved conversations.";
+  if (wantsChats) return "Checking saved conversations.";
+  if (wantsMemory) return "Checking memory.";
+  return "Checking saved context.";
+}
+
+function isFailedPersonalRecallResult(result: unknown) {
+  const object = jsonObject(result);
+  return !!object && object.ok === false;
+}
+
+function knowledgeCompletionDetail(name: string, result: unknown) {
+  if (name === "knowledge_personal_recall") {
+    return personalRecallAnswerFromResult(result) || "Completed personal recall.";
+  }
+  return `Completed ${name.replace(/^knowledge_/, "").replace(/_/g, " ")}.`;
 }
 
 function contextualizeRealtimeDelegationPrompt(prompt: string, lastDelegationPrompt: string) {
@@ -542,6 +734,9 @@ function decideRealtimeDelegation(
   const normalizedPrompt = normalizeRealtimeIntent(repairedPrompt);
   const normalizedRawPrompt = normalizeRealtimeIntent(repairRealtimeDelegationText(prompt));
   const blockRealtimeKnowledgeTasks = options.blockRealtimeKnowledgeTasks !== false;
+  const recallRoute = conversationRecallRoute(normalizedRawPrompt) !== "none"
+    ? conversationRecallRoute(normalizedRawPrompt)
+    : conversationRecallRoute(normalizedPrompt);
 
   if (!normalizedPrompt) {
     return {
@@ -552,7 +747,7 @@ function decideRealtimeDelegation(
     };
   }
 
-  if (isVagueRealtimeFollowupTask(normalizedRawPrompt) && !lastDelegationPrompt.trim()) {
+  if (recallRoute === "none" && isVagueRealtimeFollowupTask(normalizedRawPrompt) && !lastDelegationPrompt.trim()) {
     return {
       allow: false,
       output: "This follow-up is too vague without a previous delegated task. Ask one short clarification question.",
@@ -599,12 +794,36 @@ function decideRealtimeDelegation(
     };
   }
 
-  if (isConversationRecallQuestion(normalizedRawPrompt) || isConversationRecallQuestion(normalizedPrompt)) {
+  if (recallRoute !== "none") {
+    if (recallRoute === "current") {
+      return {
+        allow: false,
+        output: currentConversationRecallText(),
+        createResponse: true,
+        reason: "current conversation recall"
+      };
+    }
+    if (recallRoute === "clarify") {
+      return {
+        allow: false,
+        output: recallScopeClarificationText(),
+        createResponse: true,
+        reason: "ambiguous recall scope"
+      };
+    }
     return {
       allow: false,
-      output: "This is a question about the existing conversation or previous task result. Answer from the conversation context. Do not start the agent or repeat the task unless the user explicitly asks to run it again.",
+      output: "This is a personal recall question. Use knowledge_personal_recall if knowledge tools are available. Do not start background_agent or repeat the task unless the user explicitly asks to run it again.",
       createResponse: true,
       reason: "conversation recall"
+    };
+  }
+
+  if (lastDelegationPrompt.trim() && looksLikeExternalLookupTask(normalizedRawPrompt)) {
+    return {
+      allow: true,
+      prompt: repairedPrompt,
+      normalizedPrompt
     };
   }
 
@@ -655,6 +874,59 @@ function decideRealtimeDelegation(
   }
 
   return { allow: true, prompt: repairedPrompt, normalizedPrompt };
+}
+
+type RealtimeParallelTask = { prompt: string; provider?: string; project?: string };
+
+type ParallelDelegationRoute =
+  | { action: "proceed"; tasks: RealtimeParallelTask[] }
+  | { action: "image"; prompt: string; reason: string }
+  | { action: "recall"; query: string; reason: string }
+  | { action: "output"; output: string; reason: string };
+
+// delegate_parallel_tasks must not be an unguarded side door around the
+// background_agent router: a trigger-happy voice model (Gemini Live especially)
+// can wrap a memory question or a lone vague task in it. A single task goes
+// through the same router background_agent uses; a multi-task call where every
+// entry is really a recall question gets rerouted to personal recall.
+function routeParallelDelegation(
+  tasks: RealtimeParallelTask[],
+  hasActiveHandoff: boolean,
+  lastDelegationPrompt = "",
+  options: { blockRealtimeKnowledgeTasks?: boolean } = {}
+): ParallelDelegationRoute {
+  if (!tasks.length) {
+    return { action: "output", output: "No tasks were provided. Ask the user what to run.", reason: "no tasks" };
+  }
+  if (tasks.length === 1) {
+    const prompt = tasks[0].prompt;
+    if (realtimePromptWantsImageGeneration(prompt)) {
+      return { action: "image", prompt, reason: "image generation" };
+    }
+    const decision = decideRealtimeDelegation(prompt, hasActiveHandoff, lastDelegationPrompt, options);
+    if (decision.allow) {
+      return { action: "proceed", tasks: [{ ...tasks[0], prompt: decision.prompt || prompt }] };
+    }
+    if (decision.reason === "conversation recall") {
+      return { action: "recall", query: prompt, reason: decision.reason };
+    }
+    return {
+      action: "output",
+      output: decision.output || "This is not a clear delegated task. Answer directly if helpful, otherwise wait.",
+      reason: decision.reason || "blocked"
+    };
+  }
+  const routes = tasks.map((task) => conversationRecallRoute(task.prompt));
+  if (routes.every((route) => route !== "none")) {
+    if (routes.includes("clarify")) {
+      return { action: "output", output: recallScopeClarificationText(), reason: "ambiguous recall scope" };
+    }
+    if (routes.every((route) => route === "current")) {
+      return { action: "output", output: currentConversationRecallText(), reason: "current conversation recall" };
+    }
+    return { action: "recall", query: tasks.map((task) => task.prompt).join("\n"), reason: "conversation recall" };
+  }
+  return { action: "proceed", tasks };
 }
 
 function isHighConfidenceRealtimeDelegation(prompt: string, _source: RealtimeDelegationRouteSource) {
@@ -779,6 +1051,73 @@ function realtimeBackgroundAgentToolSpec(agentLabel: string): RealtimeVoiceToolS
   };
 }
 
+const realtimeCodexImageGenerationToolSpec: RealtimeVoiceToolSpec = {
+  name: "request_codex_image_generation",
+  description: "Create or edit an image through Codex as the hidden OpenAssist image worker. Use this for image, photo, poster, banner, logo, mockup, or graphic generation.",
+  geminiBehavior: "BLOCKING",
+  parameters: {
+    type: "object",
+    properties: {
+      prompt: { type: "string", description: "The image request to send to Codex." },
+      mode: { type: "string", enum: ["auto", "new_image", "edit_reference"] },
+      referenceArtifactIds: {
+        type: "array",
+        items: { type: "string" },
+        description: "Optional image artifact IDs or paths from this thread."
+      },
+      referenceImagePaths: {
+        type: "array",
+        items: { type: "string" },
+        description: "Optional local image paths to use as references."
+      },
+      useLatestImage: { type: "boolean", description: "Use the latest image artifact in this thread as a reference." }
+    },
+    required: ["prompt"],
+    additionalProperties: false
+  }
+};
+
+function realtimeParallelDelegationToolSpec(agentLabel: string): RealtimeVoiceToolSpec {
+  return {
+    name: "delegate_parallel_tasks",
+    description:
+      `Hand TWO OR MORE separate tasks to ${agentLabel} so they run AT THE SAME TIME, each in its own chat. ` +
+      "Use this only when the user clearly asks for multiple distinct tasks at once (for example \"do A and B at the same time\"). " +
+      "For a single task use background_agent instead. " +
+      "Split the user's request into one entry per task. Set provider only if the user names a model for that task (for example claude, codex, copilot, antigravity, ollama); otherwise leave it empty to use the current assistant. " +
+      "Set project only if the user names a folder or project for that task; otherwise leave it empty to use the current project.",
+    geminiBehavior: "NON_BLOCKING",
+    parameters: {
+      type: "object",
+      properties: {
+        tasks: {
+          type: "array",
+          description: "The list of separate tasks to run in parallel. Provide at least two.",
+          minItems: 2,
+          items: {
+            type: "object",
+            properties: {
+              prompt: { type: "string", description: "The exact task to perform." },
+              provider: {
+                type: "string",
+                description: "Optional model/provider for this task: claude, codex, copilot, antigravity, or ollama. Leave empty to use the current assistant."
+              },
+              project: {
+                type: "string",
+                description: "Optional folder or project name for this task. Leave empty to use the current project."
+              }
+            },
+            required: ["prompt"],
+            additionalProperties: false
+          }
+        }
+      },
+      required: ["tasks"],
+      additionalProperties: false
+    }
+  };
+}
+
 function realtimeDelegatedStatusToolSpec(agentLabel: string): RealtimeVoiceToolSpec {
   const label = agentLabel.trim() || "Agent";
   return {
@@ -834,6 +1173,20 @@ const realtimeDailyLinksSchema: JsonObject = {
 
 const realtimeVoiceKnowledgeToolSpecs: RealtimeVoiceToolSpec[] = [
   {
+    name: "knowledge_personal_recall",
+    description: "Fast personal recall lane using hidden Spark. Use only when the user clearly asks about saved memory, previous chats, past work, earlier decisions/plans, or what Codex/Claude/Spark/Gemini previously said/found. Do not use it for new/current work, online/web/public-data checks, browsing, files, planner edits, or vague 'check it' follow-ups. The user does not need to say 'check Codex thread' when the intent is clearly recall.",
+    parameters: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "The user's exact memory or past-work question." },
+        fromDate: { type: "string" },
+        toDate: { type: "string" }
+      },
+      required: ["query"],
+      additionalProperties: false
+    }
+  },
+  {
     name: "knowledge_search",
     description: "Search the user's OpenAssist notes, Today planner, backlog, and daily journal.",
     parameters: {
@@ -868,7 +1221,13 @@ const realtimeVoiceKnowledgeToolSpecs: RealtimeVoiceToolSpec[] = [
               "realtime_delegation",
               "backlog_item",
               "knowledge_request",
-              "artifact"
+              "artifact",
+              "spark_recall",
+              "codex_memory",
+              "codex_session",
+              "claude_memory",
+              "claude_task",
+              "claude_session"
             ]
           }
         },
@@ -917,7 +1276,7 @@ const realtimeVoiceKnowledgeToolSpecs: RealtimeVoiceToolSpec[] = [
   },
   {
     name: "knowledge_daily_items",
-    description: "List structured Today/daily items for a date, including project, area, details, steps, and linked notes.",
+    description: "List structured Today/daily items for a date, including category, list, section, tags, details, steps, and linked notes. When there are no structured items, also returns freeTextItems and noteMarkdown from the planner day so free-text notes are visible.",
     parameters: {
       type: "object",
       properties: { dayID: { type: "string" }, date: { type: "string" } },
@@ -929,6 +1288,306 @@ const realtimeVoiceKnowledgeToolSpecs: RealtimeVoiceToolSpec[] = [
     name: "knowledge_backlog_items",
     description: "List unscheduled backlog items and follow-ups that do not have a planner date yet.",
     parameters: { type: "object", properties: {}, required: [], additionalProperties: false }
+  },
+  {
+    name: "knowledge_planner_categories",
+    description: "List planner categories and available Planner Lists. Call this before assigning category/list when the user has not named an exact category or list.",
+    parameters: { type: "object", properties: {}, required: [], additionalProperties: false }
+  },
+  {
+    name: "knowledge_planner_lists",
+    description: "List Planner Lists. These are the same buckets used across Planner, Backlog, Notes, and Threads; planner-created Lists also appear as Thread Projects.",
+    parameters: { type: "object", properties: {}, required: [], additionalProperties: false }
+  },
+  {
+    name: "knowledge_plan_write",
+    description: "Dry-run OpenAssist's backend write router before mutating planner or notes. Use before ambiguous adds/edits, mixed task/reference requests, or anything that might need a new List or note. Returns intent, target, confidence, approval requirement, reason, and the recommended tool call.",
+    parameters: {
+      type: "object",
+      properties: {
+        action: { type: "string" },
+        userRequest: { type: "string" },
+        title: { type: "string" },
+        text: { type: "string" },
+        detailsMarkdown: { type: "string" },
+        dayID: { type: "string" },
+        when: { type: "string" },
+        listName: { type: "string" },
+        listID: { type: "string" },
+        noteTitle: { type: "string" },
+        noteItemID: { type: "string" },
+        itemID: { type: "string" },
+        query: { type: "string" }
+      },
+      required: [],
+      additionalProperties: true
+    }
+  },
+  {
+    name: "knowledge_quick_add_task",
+    description: "FAST PATH: add one OpenAssist planner task in one call. Use for simple task/reminder/to-do captures. If `when` is today, tomorrow, a weekday, or YYYY-MM-DD, adds to that planner day; if omitted/backlog/later, adds to Backlog. Planner tasks should be short action pointers; put detailed specs, dimensions, reference facts, and long checklists in a linked note, then pass noteItemID/noteTitle/links. Set listName/category/section/tags only when clear; do not infer a List from old note content.",
+    parameters: {
+      type: "object",
+      properties: {
+        title: { type: "string" },
+        when: { type: "string", description: "today, tomorrow, backlog, later, weekday, or YYYY-MM-DD. Omit for Backlog." },
+        listID: { type: "string" },
+        listName: { type: "string" },
+        projectID: { type: "string" },
+        category: { type: "string" },
+        section: { type: "string" },
+        tags: { type: "array", items: { type: "string" } },
+        reminderAt: { type: "string", description: "ISO datetime for an OpenAssist planner local notification." },
+        reminderTimezone: { type: "string", description: "IANA timezone for reminderAt, if known." },
+        dueAt: { type: "string", description: "Alias for reminderAt." },
+        notifyAt: { type: "string", description: "Alias for reminderAt." },
+        details: { type: "string", description: "Short action context only. Do not paste full reference notes, specs, dimensions, or long checklists here; put them in a note and link it." },
+        detailsMode: { type: "string", enum: ["replace", "append"] },
+        replaceDetails: { type: "boolean" },
+        links: realtimeDailyLinksSchema,
+        noteItemID: { type: "string", description: "Knowledge item id for a note to link to this task." },
+        noteTitle: { type: "string", description: "Existing note title to link. Do not also put this note title in listName unless the user explicitly named that planner List." },
+        referenceNoteTitle: { type: "string" }
+      },
+      required: ["title"],
+      additionalProperties: true
+    }
+  },
+  {
+    name: "knowledge_quick_save_note",
+    description: "FAST PATH: save one piece of reference information or detailed checklist to an existing OpenAssist List/thread note. Use for facts, links, specs, dimensions, contacts, prices, fit checks, and other non-task information. Applies immediately only when the target note already exists; missing notes create a pending approval preview.",
+    parameters: {
+      type: "object",
+      properties: {
+        text: { type: "string" },
+        title: { type: "string" },
+        listID: { type: "string" },
+        listName: { type: "string" },
+        projectID: { type: "string" },
+        threadID: { type: "string" },
+        section: { type: "string" }
+      },
+      required: ["text"],
+      additionalProperties: true
+    }
+  },
+  {
+    name: "knowledge_list_approvals",
+    description: "List OpenAssist approval previews that are pending, applied, or rejected. Use when the user asks what needs approval or wants to review pending edits without opening the app.",
+    parameters: {
+      type: "object",
+      properties: {
+        status: { type: "string", enum: ["pending", "applied", "rejected"] },
+        limit: { type: "number" }
+      },
+      required: [],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "knowledge_apply_approval",
+    description: "Apply one pending OpenAssist approval preview by requestID after the user confirms it.",
+    parameters: {
+      type: "object",
+      properties: {
+        requestID: { type: "string" }
+      },
+      required: ["requestID"],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "knowledge_reject_approval",
+    description: "Reject one pending OpenAssist approval preview by requestID after the user declines it.",
+    parameters: {
+      type: "object",
+      properties: {
+        requestID: { type: "string" }
+      },
+      required: ["requestID"],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "knowledge_quick_read",
+    description: "FAST PATH: read a common OpenAssist target such as today, tomorrow, backlog, open tasks, or a short search query.",
+    parameters: {
+      type: "object",
+      properties: {
+        target: { type: "string" },
+        limit: { type: "number" }
+      },
+      required: ["target"],
+      additionalProperties: true
+    }
+  },
+  {
+    name: "knowledge_connector_status",
+    description: "List configured connector accounts, enabled services, gws status, and Review Inbox count. Use before syncing connector data.",
+    parameters: { type: "object", properties: {}, required: [], additionalProperties: false }
+  },
+  {
+    name: "knowledge_connector_sync_gmail",
+    description: "Safely search Gmail for task/follow-up candidates using the user's intent, then place metadata-only candidates in Review Inbox. OpenAssist builds strict Gmail queries internally; do not pass raw broad Gmail searches. Does not fetch full email body and does not send, archive, delete, or label mail.",
+    parameters: {
+      type: "object",
+      properties: {
+        accountID: { type: "string" },
+        accountLabel: { type: "string" },
+        userIntent: {
+          type: "string",
+          description: "The user's natural-language request, for example: find email tasks for today, follow-ups from clients, or invoices I need to act on."
+        },
+        timeframeDays: {
+          type: "number",
+          description: "Optional lookback window. Keep small; defaults to 7, today requests use about 2."
+        },
+        maxResults: {
+          type: "number",
+          description: "Optional per-query cap. Keep small; defaults to 8 and is capped by OpenAssist."
+        }
+      },
+      required: [],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "knowledge_connector_search_gmail",
+    description: "Search Gmail metadata for a specific email or email type and return matching snippets directly. Use this when the user asks to find/show/search for a particular email. Do not sync Review Inbox for direct email search.",
+    parameters: {
+      type: "object",
+      properties: {
+        accountID: { type: "string" },
+        accountLabel: { type: "string" },
+        query: {
+          type: "string",
+          description: "Natural-language keywords or Gmail search syntax for the exact email being searched."
+        },
+        gmailQuery: {
+          type: "string",
+          description: "Optional exact Gmail query syntax when known. Keep narrow; do not use broad all-mail queries."
+        },
+        userIntent: {
+          type: "string",
+          description: "The user's exact request in natural language."
+        },
+        timeframeDays: {
+          type: "number",
+          description: "Optional lookback window. Defaults to 30 for direct search."
+        },
+        maxResults: {
+          type: "number",
+          description: "Optional result cap. Defaults to 10 and is capped by OpenAssist."
+        }
+      },
+      required: ["query"],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "knowledge_connector_search_messages",
+    description: "Search local macOS Messages/iMessage text metadata for a specific person, word, appointment, or follow-up. Read-only. Use this when the user asks to check iMessage/Messages/texts.",
+    parameters: {
+      type: "object",
+      properties: {
+        query: {
+          type: "string",
+          description: "Specific person, phone/email, or keywords to search in Messages."
+        },
+        userIntent: {
+          type: "string",
+          description: "The user's exact request in natural language."
+        },
+        timeframeDays: {
+          type: "number",
+          description: "Optional lookback window. Defaults to 30."
+        },
+        maxResults: {
+          type: "number",
+          description: "Optional result cap. Defaults to 10 and is capped by OpenAssist."
+        }
+      },
+      required: ["query"],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "knowledge_apple_add_reminder",
+    description: "Create a real Apple Reminders reminder on this Mac. Use only when the user explicitly asks for Apple Reminders or the Reminders app.",
+    parameters: {
+      type: "object",
+      properties: {
+        title: { type: "string" },
+        notes: { type: "string" },
+        dueDate: { type: "string" },
+        calendar: { type: "string" },
+        list: { type: "string" }
+      },
+      required: ["title"],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "knowledge_apple_list_reminders",
+    description: "List real Apple Reminders reminders on this Mac.",
+    parameters: {
+      type: "object",
+      properties: {
+        calendar: { type: "string" },
+        dueBefore: { type: "string" },
+        dueAfter: { type: "string" },
+        includeCompleted: { type: "boolean" },
+        limit: { type: "number" }
+      },
+      required: [],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "knowledge_apple_complete_reminder",
+    description: "Mark a real Apple Reminders reminder complete or incomplete by ID. List reminders first if you need the ID.",
+    parameters: {
+      type: "object",
+      properties: {
+        id: { type: "string" },
+        completed: { type: "boolean" }
+      },
+      required: ["id"],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "knowledge_apple_add_event",
+    description: "Create a real Apple Calendar event on this Mac. Use only when the user explicitly asks for Apple Calendar or the Calendar app.",
+    parameters: {
+      type: "object",
+      properties: {
+        title: { type: "string" },
+        startDate: { type: "string" },
+        endDate: { type: "string" },
+        isAllDay: { type: "boolean" },
+        notes: { type: "string" },
+        location: { type: "string" },
+        calendar: { type: "string" }
+      },
+      required: ["title", "startDate"],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "knowledge_apple_list_events",
+    description: "List real Apple Calendar events on this Mac for a date range.",
+    parameters: {
+      type: "object",
+      properties: {
+        startDate: { type: "string" },
+        endDate: { type: "string" },
+        calendar: { type: "string" },
+        limit: { type: "number" }
+      },
+      required: [],
+      additionalProperties: false
+    }
   },
   {
     name: "knowledge_read_journal",
@@ -951,20 +1610,56 @@ const realtimeVoiceKnowledgeToolSpecs: RealtimeVoiceToolSpec[] = [
     }
   },
   {
+    name: "knowledge_request_reference",
+    description: "Append small reference information (dimensions, links, specs, prices, addresses, contact info, model numbers, detailed checklists, or 'save this' facts) to an existing canonical note for a Planner List or thread. This is for additive information, fit checks, measurements, and checklist work, not top-level planner actions and not full-note reorganization. New Lists and new notes are never created silently; missing notes create a pending approval preview. For cleanup/restructure/rewrite, use knowledge_request_organize.",
+    parameters: {
+      type: "object",
+      properties: {
+        title: { type: "string", description: "Short reference title or topic, such as TV dimensions." },
+        text: { type: "string", description: "Reference text to save." },
+        content: { type: "string" },
+        detailsMarkdown: { type: "string", description: "Detailed reference lines, dimensions, specs, or checklist items to append." },
+        listID: { type: "string" },
+        listName: { type: "string" },
+        projectID: { type: "string" },
+        threadID: { type: "string" },
+        itemID: { type: "string", description: "Existing project_note or thread_note itemID when known." },
+        noteTitle: { type: "string", description: "Optional canonical note title override. Defaults to the List name or Reference." },
+        section: { type: "string", description: "Section/topic inside the note, such as TV, Fridge, Appliances, Contacts, Links, or Measurements." },
+        goal: { type: "string" }
+      },
+      required: [],
+      additionalProperties: true
+    }
+  },
+  {
     name: "knowledge_request_daily_item",
-    description: "Add one structured daily item. Set area to Work or Personal. Keep title short; put time and extra context in detailsMarkdown. Put project/folder scope in the title with @Project or #Folder when known. Ask if the category is unclear. Adding is applied immediately (no approval needed).",
+    description: "Add one structured task to a planner DAY (Today or a specific date). Use this ONLY when the user named a date or said today, tonight, tomorrow, or a weekday. If the user did not pick a date, use knowledge_request_backlog_item instead. Planner tasks should be short: what to do, where to do it, and a few high-level steps. Put detailed specs, dimensions, reference facts, and long checklists in a linked note, then pass noteItemID/noteTitle/links. Use Category -> List -> Section -> Item. Adding is applied immediately.",
     parameters: {
       type: "object",
       properties: {
         dayID: { type: "string" },
         title: { type: "string" },
+        listID: { type: "string" },
+        listName: { type: "string" },
         projectID: { type: "string" },
         folderID: { type: "string" },
-        area: { type: "string", enum: ["Work", "Personal"] },
+        area: { type: "string", description: "Optional planner category name such as Work, Personal, Business, Home, or another user-created category." },
+        category: { type: "string", description: "Alias for area/category." },
+        section: { type: "string", description: "Optional grouping inside the selected List, such as Food, Household, This week, or Follow-ups." },
+        tags: { type: "array", items: { type: "string" }, description: "Optional cross-category filter tags, such as Shopping, Errands, Waiting For, or Follow-up." },
         scopeTags: realtimeScopeTagsSchema,
-        detailsMarkdown: { type: "string" },
-        steps: realtimeDailyStepsSchema,
-        links: realtimeDailyLinksSchema,
+        reminderAt: { type: "string", description: "ISO datetime for an OpenAssist planner local notification." },
+        reminderTimezone: { type: "string", description: "IANA timezone for reminderAt, if known." },
+        dueAt: { type: "string", description: "Alias for reminderAt." },
+        notifyAt: { type: "string", description: "Alias for reminderAt." },
+        detailsMarkdown: { type: "string", description: "Short action context only. Do not put detailed specs, dimensions, copied note bodies, or long checklists here; link a note instead." },
+        detailsMode: { type: "string", enum: ["replace", "append"] },
+        replaceDetails: { type: "boolean" },
+        steps: { ...realtimeDailyStepsSchema, description: "High-level planner steps only; detailed checklists belong in the linked note." },
+        links: { ...realtimeDailyLinksSchema, description: "Notes that hold details, dimensions, reference facts, or checklists." },
+        noteItemID: { type: "string" },
+        noteTitle: { type: "string" },
         goal: { type: "string" }
       },
       required: ["title"],
@@ -972,22 +1667,110 @@ const realtimeVoiceKnowledgeToolSpecs: RealtimeVoiceToolSpec[] = [
     }
   },
   {
+    name: "knowledge_update_daily_item",
+    description: "Update an existing planner task by itemID or current task text. Use this for rename, category/list/section/tag/details/date changes. It replaces the matched old item instead of adding a duplicate. Use area/category for a Category such as Work; use listID/listName only for a real @List. If the user says an item is not for the current List and only gives a Category, set clearList=true. Keep task details short; move detailed specs/dimensions/checklists into a linked note and attach it with noteItemID/noteTitle/links. Call knowledge_daily_items first if unsure of the exact text.",
+    parameters: {
+      type: "object",
+      properties: {
+        dayID: { type: "string" },
+        itemID: { type: "string" },
+        query: { type: "string", description: "Current task text to match when itemID is unknown." },
+        oldTitle: { type: "string", description: "Alias for query/current task text." },
+        title: { type: "string", description: "Current task text if no query is supplied." },
+        newTitle: { type: "string", description: "Replacement title. Omit to keep the existing title." },
+        targetDayID: { type: "string", description: "Optional new planner day when moving the item." },
+        listID: { type: "string" },
+        listName: { type: "string" },
+        projectID: { type: "string" },
+        folderID: { type: "string" },
+        clearList: { type: "boolean", description: "True to remove the existing @List/project from the task while keeping/setting its category." },
+        area: { type: "string", description: "Optional planner category name such as Work, Personal, Business, Home, or another user-created category." },
+        category: { type: "string", description: "Alias for area/category." },
+        section: { type: "string", description: "Optional grouping inside the selected List." },
+        tags: { type: "array", items: { type: "string" }, description: "Optional replacement free-form tags." },
+        scopeTags: realtimeScopeTagsSchema,
+        reminderAt: { type: "string", description: "ISO datetime for the OpenAssist planner local notification. Pass empty/null to clear when supported." },
+        reminderTimezone: { type: "string", description: "IANA timezone for reminderAt, if known." },
+        dueAt: { type: "string", description: "Alias for reminderAt." },
+        notifyAt: { type: "string", description: "Alias for reminderAt." },
+        detailsMarkdown: { type: "string", description: "Short replacement action context only. Do not paste detailed note content here; put it in a linked note." },
+        detailsMode: { type: "string", enum: ["replace", "append"] },
+        replaceDetails: { type: "boolean" },
+        steps: { ...realtimeDailyStepsSchema, description: "High-level planner steps only; detailed checklists belong in the linked note." },
+        links: { ...realtimeDailyLinksSchema, description: "Notes that hold details, dimensions, reference facts, or checklists." },
+        noteItemID: { type: "string" },
+        noteTitle: { type: "string" },
+        checked: { type: "boolean" },
+        status: { type: "string" }
+      },
+      required: [],
+      additionalProperties: true
+    }
+  },
+  {
     name: "knowledge_request_backlog_item",
-    description: "Add one task or follow-up to the OpenAssist backlog when the user wants to do it later but has not picked a date. Applied immediately, no approval needed.",
+    description: "Add one task or follow-up to the OpenAssist backlog. This is the DEFAULT target for new tasks whenever the user has not picked a date, including plain captures and items aimed at a specific @List. Keep backlog items short: what to do plus a few high-level steps. Put detailed specs, dimensions, reference facts, and long checklists in a linked note, then pass noteItemID/noteTitle/links. Applied immediately.",
     parameters: {
       type: "object",
       properties: {
         title: { type: "string" },
+        listID: { type: "string" },
+        listName: { type: "string" },
         projectID: { type: "string" },
         folderID: { type: "string" },
-        area: { type: "string", enum: ["Work", "Personal"] },
+        area: { type: "string", description: "Optional planner category name such as Work, Personal, Business, Home, or another user-created category." },
+        category: { type: "string", description: "Alias for area/category." },
+        section: { type: "string", description: "Optional grouping inside the selected List, such as Food, Household, This week, or Follow-ups." },
+        tags: { type: "array", items: { type: "string" }, description: "Optional cross-category filter tags, such as Shopping, Errands, Waiting For, or Follow-up." },
         scopeTags: realtimeScopeTagsSchema,
-        detailsMarkdown: { type: "string" },
-        steps: realtimeDailyStepsSchema,
-        links: realtimeDailyLinksSchema,
+        reminderAt: { type: "string", description: "ISO datetime for an OpenAssist planner local notification. Backlog items can still have reminders." },
+        reminderTimezone: { type: "string", description: "IANA timezone for reminderAt, if known." },
+        dueAt: { type: "string", description: "Alias for reminderAt." },
+        notifyAt: { type: "string", description: "Alias for reminderAt." },
+        detailsMarkdown: { type: "string", description: "Short action context only. Do not put detailed specs, dimensions, copied note bodies, or long checklists here; link a note instead." },
+        steps: { ...realtimeDailyStepsSchema, description: "High-level planner steps only; detailed checklists belong in the linked note." },
+        links: { ...realtimeDailyLinksSchema, description: "Notes that hold details, dimensions, reference facts, or checklists." },
+        noteItemID: { type: "string" },
+        noteTitle: { type: "string" },
         goal: { type: "string" }
       },
       required: ["title"],
+      additionalProperties: true
+    }
+  },
+  {
+    name: "knowledge_request_tasks_from_note",
+    description: "Create a Review Inbox preview that turns a source note into multiple linked Backlog or planner-day tasks. Read the full note first, then call this with sourceItemID and proposed items. Default target is backlog unless the user gave a date. Do not claim tasks were created until approved.",
+    parameters: {
+      type: "object",
+      properties: {
+        sourceItemID: { type: "string" },
+        target: { type: "string", enum: ["backlog", "day"] },
+        dayID: { type: "string" },
+        items: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              title: { type: "string" },
+              detailsMarkdown: { type: "string" },
+              steps: realtimeDailyStepsSchema,
+              area: { type: "string" },
+              category: { type: "string" },
+              listID: { type: "string" },
+              listName: { type: "string" },
+              projectID: { type: "string" },
+              folderID: { type: "string" },
+              section: { type: "string" },
+              tags: { type: "array", items: { type: "string" } }
+            },
+            required: ["title"],
+            additionalProperties: true
+          }
+        },
+        goal: { type: "string" }
+      },
+      required: ["sourceItemID", "items"],
       additionalProperties: true
     }
   },
@@ -1036,7 +1819,7 @@ const realtimeVoiceKnowledgeToolSpecs: RealtimeVoiceToolSpec[] = [
   },
   {
     name: "knowledge_note_style_guide",
-    description: "Return the OpenAssist note formatting guide covering callout kinds (decision, warning, info, success, next, comment), 2-column and 3-column table layouts, and when not to use rich blocks. Call this before organizing a note so you produce exact replacement markdown with correct OpenAssist syntax.",
+    description: "Return the OpenAssist note formatting guide covering callout kinds (decision, warning, info, success, next, comment), collapsible sections, 2-column and 3-column table layouts, how to structure long multi-area reference notes, and when not to use rich blocks. Call this before organizing/restructuring/replacing a note so you produce exact replacement markdown with correct OpenAssist syntax.",
     parameters: {
       type: "object",
       properties: {},
@@ -1046,7 +1829,7 @@ const realtimeVoiceKnowledgeToolSpecs: RealtimeVoiceToolSpec[] = [
   },
   {
     name: "knowledge_request_organize",
-    description: "Request a note organization preview. You MUST supply itemID and the full replacement markdown to make this actionable. Pattern: (1) read the note with knowledge_search or equivalent, (2) call knowledge_note_style_guide, (3) produce exact replacement markdown using OpenAssist blocks, (4) call this tool with itemID + markdown. For planner tasks use knowledge_request_daily_item.",
+    description: "Request a full-note organization/restructure/rewrite preview. OpenAssist notes are NOT append-only: this tool safely replaces the note body after approval, without duplicating content. You MUST supply itemID and the full replacement markdown containing everything that should remain. Pattern: (1) find/read the note with knowledge_search/knowledge_read, (2) call knowledge_note_style_guide, (3) produce exact replacement markdown using OpenAssist blocks, (4) call this tool with itemID + markdown. Then tell the user it is ready for approval. Do not answer that the MCP cannot reorganize a note.",
     parameters: {
       type: "object",
       properties: {
@@ -1056,17 +1839,19 @@ const realtimeVoiceKnowledgeToolSpecs: RealtimeVoiceToolSpec[] = [
         scope: { type: "string" },
         query: { type: "string" }
       },
-      required: ["goal"],
+      required: ["goal", "itemID", "markdown"],
       additionalProperties: true
     }
   }
 ];
 
 function realtimeVoiceToolSpecs(knowledgeEnabled: boolean, agentLabel: string) {
-  return [
-    ...realtimeVoiceControlToolSpecs,
-    realtimeDelegatedStatusToolSpec(agentLabel),
-    realtimeBackgroundAgentToolSpec(agentLabel),
+	  return [
+	    ...realtimeVoiceControlToolSpecs,
+	    realtimeDelegatedStatusToolSpec(agentLabel),
+	    realtimeCodexImageGenerationToolSpec,
+	    realtimeBackgroundAgentToolSpec(agentLabel),
+    realtimeParallelDelegationToolSpec(agentLabel),
     ...(knowledgeEnabled ? realtimeVoiceKnowledgeToolSpecs : [])
   ];
 }
@@ -1092,6 +1877,9 @@ function geminiSchemaFromJSONSchema(schema: unknown): unknown {
   let schemaType = "";
   for (const [key, value] of Object.entries(object)) {
     if (key === "additionalProperties") continue;
+    // The Live API schema parser is stricter than JSON Schema; size constraints
+    // are enforced at runtime in routeParallelDelegation instead.
+    if (key === "minItems" || key === "maxItems") continue;
     if (key === "type" && typeof value === "string") {
       schemaType = value.toUpperCase();
       next.type = schemaType;
@@ -1155,12 +1943,19 @@ function realtimeInstructions(codexInstructions: string, knowledgeEnabled: boole
     "If the user's audio is unclear, ask one short clarification question.",
     "Do not call tools, guess codebase details, or give a preamble when the audio is unclear.",
     "",
-    "# Tools",
-    "Use direct OpenAssist knowledge tools before calling background_agent.",
+	    "# Tools",
+	    "Use direct OpenAssist knowledge tools before calling background_agent.",
+	    "For image/photo/logo/poster/banner/mockup/graphic generation or edits, call request_codex_image_generation. Do not call background_agent for image generation.",
+	    "When request_codex_image_generation takes more than a moment, say one short natural line like \"I'll generate that with Codex.\" Then wait for the tool result and answer briefly.",
+	    "Use knowledge_personal_recall only when the user clearly asks about saved memory, previous chats, past work, earlier decisions/plans, or what Codex/Claude/Spark/Gemini previously said or found. The user does not need to say 'check Codex thread' when the intent is clearly recall.",
+    "Do not use knowledge_personal_recall for new/current work, online/web/public-data checks, browsing, files, planner edits, or vague 'check it' follow-ups. Use the correct direct tool or background_agent for those.",
     `If the user asks for status, progress, why the task is stuck, what ${label} is doing, or where the delegated task is at, call get_delegated_task_status and answer from that result.`,
     "Do not call background_agent for status checks about the task that is already running.",
     "Before calling background_agent for hard work that may take noticeable time, say one short preamble immediately, then call the tool.",
     "If the user request is agentic and no direct realtime tool can handle it, call background_agent instead of doing it yourself.",
+    "If the user clearly asks for TWO OR MORE separate tasks to run at the same time (for example \"do A and B at the same time\", \"run these in parallel\", or two clearly different jobs in one breath), call delegate_parallel_tasks with one entry per task instead of background_agent. Use background_agent for a single task.",
+    "When using delegate_parallel_tasks, only set a task's provider if the user names a model for that specific task (claude, codex, copilot, antigravity, ollama), and only set a task's project if the user names a folder or project for it; otherwise leave them empty.",
+    "After calling delegate_parallel_tasks, say one short preamble like \"Starting both now\" and then stay quiet. Each task will report its own result when it finishes; speak each result as it arrives, one at a time, without interrupting yourself.",
     "Agentic means the request needs tools, files, code changes, terminal commands, browser/computer use, website/app inspection, account data, current/live information, or multi-step work.",
     "For coding, codebase, repo, app, terminal, debugging, install, file, browser, computer, desktop app, website, current/live data, or configuration work, call background_agent with the user's exact request.",
     `Only call background_agent when the user gives a clear task that needs ${label} or provider tools.`,
@@ -1180,26 +1975,46 @@ function realtimeInstructions(codexInstructions: string, knowledgeEnabled: boole
       ? [
         "",
         "# OpenAssist Knowledge",
-      "For quick questions about the user's notes, Today planner, Backlog, journal, or open tasks, use the knowledge tools.",
-      "Use knowledge tools only when the user asks for personal OpenAssist knowledge. Do not read all notes into the voice prompt.",
+	      "For quick questions about the user's notes, Today planner, Backlog, journal, or open tasks, use the knowledge tools.",
+	      "Use knowledge tools only when the user asks for personal OpenAssist knowledge. Do not read all notes into the voice prompt.",
+		      "For connected Gmail/Google/Messages data, call knowledge_connector_status first. If the user asks to find/show/search for a specific email or email type, call knowledge_connector_search_gmail with a narrow query and do not sync Review Inbox. If the user asks to check iMessage, Messages, texts, or SMS for a person, appointment, or follow-up, call knowledge_connector_search_messages with a narrow query and do not ask what they mean by Messages. If the user asks for Gmail to-dos, backlog items, follow-ups, waiting-for items, or task candidates, call knowledge_connector_sync_gmail with userIntent set to the user's exact request. Do not fetch full email bodies or ask for all mail in realtime.",
       "For greetings and small talk like 'hello', 'hi', 'hey', 'ei', 'how are you', or 'good morning', just reply naturally in one short sentence. Do NOT call knowledge_daily_items or any tool for a greeting.",
       "Only call a knowledge tool when the user actually asks about their tasks, notes, planner, backlog, or journal. A greeting alone is not such a request.",
-	      "Use knowledge_daily_items or knowledge_open_tasks for questions like 'what tasks are open today' or 'do I have anything today'. Do not call background_agent for those.",
+      "For questions like 'what's on today', 'today's plan', 'today's list', or 'today's note', call knowledge_read_today first so you see the full planner markdown, including free-text lines. ALWAYS pass the Selected planner day ID from your context as the `dayID` argument so you read the exact note the user is viewing. If you omit it, you might read the wrong day.",
+      "Use knowledge_daily_items for structured checkbox/planner items with categories, lists, and tags. If it returns no structured items but freeTextItems or noteMarkdown is present, read those and report them. Never tell the user today is empty based only on an empty knowledge_daily_items result.",
+      "Use knowledge_open_tasks for unfinished checkbox tasks across notes and planner days.",
 	      "Use knowledge_backlog_items for backlog or later/follow-up questions.",
-	      "For memory/history questions like 'when did we', 'where did I mention', 'what did we decide', or 'find the earlier discussion', call knowledge_search_everything first. If one hit matters, call knowledge_read_search_result. Do not call background_agent for simple recall.",
-	      "If the user asks to add a reminder, task, or to-do in OpenAssist, treat it as a Today planner item, not as Apple Calendar or Apple Reminders.",
-	      "If the user asks to add a later/follow-up item without a date, use knowledge_request_backlog_item.",
-	      "When you create a Today planner item, set area to exactly Work or Personal. Work means job, client, coding, project, meeting, ticket, repo, or business tasks. Personal means home, family, errands, appointments, calls, service/repair, bills, or shopping.",
-	      "If you are not sure whether the task is Work or Personal, ask one short clarification question before creating it.",
+		      "Use knowledge_planner_categories or knowledge_planner_lists to see available Categories and Lists before assigning them when the user has not named an exact match.",
+		      "For clear memory/history questions like 'when did we', 'where did I mention', 'what did we decide', 'what did Codex or Claude say', 'did we work on anything for Quality Nails', or 'find the earlier discussion', call knowledge_personal_recall. It searches the right saved memory/chat/session sources automatically, including Codex and Claude Code. Do not make the user ask for a specific Codex thread. Do not call background_agent for clear recall.",
+		      "If the user asks to check/search something now, check online, browse a site, inspect files, update tasks/notes, or use an agent/tool for a new task, do not call knowledge_personal_recall.",
+	      "If the user asks to add a reminder, task, or to-do in OpenAssist, treat it as an OpenAssist planner item, not as Apple Calendar or Apple Reminders. For simple adds, use knowledge_quick_add_task first. By default it goes to the Backlog: only set `when` to a planner day when the user explicitly names a date or says today, tonight, tomorrow, or a specific weekday. If they give an alert time, set `reminderAt` as an ISO datetime and `reminderTimezone` when known; do not store the reminder time only as plain details. If they just say 'add X' or 'add X to @List' with no timing, leave `when` empty or set it to backlog.",
+	      "Reference info is NOT a task: measurements/dimensions, links/URLs, model or SKU numbers, prices, addresses, phone/email, specs, product details, realtor info, and 'save this' facts must go to the existing List/thread reference note with knowledge_quick_save_note or knowledge_request_reference, not Today or Backlog. Reference captures apply immediately only when the target note already exists.",
+	      "Actions are tasks: buy, order, research, decide, schedule, call, message, finish, follow up, or fix. Use knowledge_quick_add_task for a single action. Date-less actions go to Backlog; dated actions go to the named day.",
+	      "Before saving reference info, reuse the existing List/thread note. New Lists and new notes are never created silently: call knowledge_plan_write for uncertain cases, and if the router says approval is required, tell the user the pending preview needs approval.",
+	      "Call knowledge_plan_write before ambiguous adds/edits, mixed task/reference requests, unknown Lists, possible duplicate/update cases, or anything that might need a new note/List.",
+	      "If the user gives both an action and a fact, handle both intelligently: create the action task and save the concrete reference facts to the note. Example: 'buy a 57 inch TV for @New Home Stuff' is a Backlog task plus a 57 inch TV reference.",
+	      "Planner items are lightweight execution pointers: what to do, when/where, and a few high-level steps. Notes hold detailed working material such as specs, dimensions, copied source content, and long checklists. Example: 'go to Maryland Ave tomorrow and check TV/laundry fit' is one short Tomorrow task linked to New Home Stuff; the TV dimensions, LG WashCombo dimensions, and measurement checklist belong inside the linked note.",
+	      "If a task should refer to a note, attach it with noteItemID, noteTitle, or links on knowledge_quick_add_task, knowledge_request_daily_item, knowledge_request_backlog_item, or knowledge_update_daily_item. Use listName only for a real planner List, not as the note name. Keep details/detailsMarkdown short and never paste the full note body into the task.",
+	      "If reference-vs-action is ambiguous or the user only gives a #Category without a clear @List/thread/note, ask one short clarification instead of guessing.",
+	      "When you create a Today item, put it under the right category heading by setting area/category when the user gives or implies one.",
+	      "Use knowledge_quick_add_task for simple Today/Backlog/date adds. Use knowledge_request_daily_item or knowledge_request_backlog_item only when you need the fuller schema. For date-less ACTIONS, including plain actionable captures aimed at a specific @List, default to Backlog. Reference captures use knowledge_quick_save_note or knowledge_request_reference; they apply immediately only for existing notes and otherwise create a pending approval preview. Never silently add a date-less task to Today. Do not also add Today items to Backlog.",
+	      "When the user asks to create tasks from a note, split a note into tasks, or do sprint planning from a note, first find/read the full source note with knowledge_search/knowledge_read, then call knowledge_request_tasks_from_note with sourceItemID and proposed items. Default to target backlog unless the user gives a date. This creates a Review Inbox preview; do not claim tasks were created until approved.",
+	      "If the user asks to change, rename, move, recategorize, or add details to an existing planner item, use knowledge_update_daily_item with itemID or the current task text in query. Do not use knowledge_request_daily_item for edits, because that creates a duplicate. When replacing task details, set detailsMode='replace' or replaceDetails=true; append only when the user explicitly asks to add a small note. If they say it is not for the current @List and only name a Category such as Work, set area/category and clearList=true.",
+	      "When you create a Today or Backlog item, use Category -> List -> Section -> Item. The inline shorthand is #Category and @List. If only @List is used, use that List's default Category. Explicit #Category wins. Work, Personal, Business, and Home are Categories, not Lists. Set area/category, listID or listName, section, and tags when the user gives them. If the user names a project/context phrase but not an exact List, call knowledge_planner_lists; if no exact match is clear, omit the List or ask one short clarification. Do not use broad note history to guess the List.",
+	      "Use tags only for cross-category filters such as Shopping, Errands, Waiting For, or Follow-up.",
+	      "Do not assume business-related tasks are Work if a Business category exists; use Business only when knowledge_planner_categories shows it, otherwise ask or omit area.",
 	      "If the user says a task is done, finished, or completed, call knowledge_complete_daily_item with the task text. It is applied immediately, so say it was marked done.",
 	      "To move unfinished or older planner tasks into the Backlog, use knowledge_request_move_to_backlog.",
 	      "To move unfinished tasks from one planner day to another planner day, use knowledge_request_carry_forward.",
 	      "For organizing, correcting, or changing planner content, use knowledge_request_carry_forward or a direct knowledge request only when the source, target, and exact preview are clear; otherwise ask a short question or call background_agent for complex work.",
-	      `For substantial note organization, restructuring, cleanup, rewriting, or styling requests, call background_agent with the user's exact request so ${label} can read the full note, use OpenAssist note style tools, and create an approval preview. Do not try to do heavy note rewriting in realtime voice.`,
-	      "Use realtime knowledge tools for quick note reads/searches, small exact note edits, simple Today/Backlog adds, mark-done actions, and planner moves. Delegate full-note organization/restructure/cleanup tasks.",
-	      "Do not claim a note was organized until a tool or delegated agent result says an approval preview was created.",
-	      "knowledge_request_organize creates a preview that needs the user's approval. After calling it, tell the user the organized version is ready for approval. Do not claim the note was already changed.",
-	      "OpenAssist notes support rich blocks: callouts (::: decision, ::: warning, ::: info, ::: success, ::: next, ::: comment) and 2/3-column table layouts. Always use knowledge_note_style_guide before writing organized markdown so the output uses valid OpenAssist syntax.",
+	      "OpenAssist notes are not append-only. Use knowledge_quick_save_note/knowledge_request_reference only for small additive reference captures. For reorganize, restructure, cleanup, rewrite, formatting, or make-it-easier-to-scan requests, the safe path is a full replacement approval preview with knowledge_request_organize after reading the note and calling knowledge_note_style_guide.",
+	      `For substantial note organization, restructuring, cleanup, rewriting, or styling requests, call background_agent with the user's exact request so ${label} can read the full note, use OpenAssist note style tools, and create that approval preview. Do not try to do heavy note rewriting in realtime voice, and do not say the MCP can only append.`,
+	      "Use realtime knowledge tools for quick note reads/searches, reference captures, small exact note edits, simple Today/Backlog adds, small tasks-from-note previews, planner item updates, mark-done actions, and planner moves. Delegate full-note organization/restructure/cleanup tasks or large sprint-planning notes.",
+	      "Do not claim a note was organized, changed, or updated until a tool or delegated agent result confirms an approval preview was created.",
+	      "knowledge_request_organize creates a full-note replacement preview that needs the user's approval. After calling it, tell the user the organized version is ready for approval and can be applied in Review Inbox or through knowledge_apply_approval after listing it with knowledge_list_approvals. Do not claim the note was already changed.",
+	      "If background_agent is handling organize, stay quiet until [Agent task finished] or [Codex task finished], then report only what that result says. If the result says a preview is pending, tell the user it is ready for approval in Review Inbox.",
+	      "OpenAssist notes support rich blocks: callouts (::: decision, ::: warning, ::: info, ::: success, ::: next, ::: comment), collapsible sections (## Area <!-- oa:collapsible -->), and 2/3-column table layouts. Always use knowledge_note_style_guide before writing organized markdown so the output uses valid OpenAssist syntax.",
+	      "When a reference note covers multiple areas/items (specs, checklists, option comparisons, on-site references), keep it scannable: short intro and a clear heading per area, then prefer 2/3-column layouts to use horizontal space (compare options side by side, or put saved facts next to the fit/decision fields), the interactive checklist at full width, and derived fields (max-that-fits, final yes/no) in a short decision block. Do not put checkbox items inside table cells. For values the user fills in on-site, use an empty 'Actual'/'Value' table cell (tap to type) and checkboxes for yes/no instead of inline '____' blanks, which are hard to edit on phone. Collapsible sections are optional and only for very long notes.",
 	      `Complex multi-step work should go to background_agent; ${label} can use the same knowledge access.`
       ].join("\n")
       : "",
@@ -1255,9 +2070,14 @@ function geminiLiveSessionConfig(Modality: { AUDIO: unknown }, config: RealtimeP
     outputAudioTranscription: {},
     realtimeInputConfig: {
       automaticActivityDetection: {
-        startOfSpeechSensitivity: "START_SENSITIVITY_HIGH",
+        // LOW start sensitivity requires clearer/louder speech to open a turn,
+        // so faint background voices no longer trigger Gemini. Paired with the
+        // client-side noise gate that replaces background with clean silence.
+        startOfSpeechSensitivity: "START_SENSITIVITY_LOW",
         endOfSpeechSensitivity: "END_SENSITIVITY_HIGH",
-        silenceDurationMs: 600
+        // Slightly longer trailing silence so a brief pause mid-thought does not
+        // cut the user off, while clean gated silence still ends the turn.
+        silenceDurationMs: 800
       },
       activityHandling: "START_OF_ACTIVITY_INTERRUPTS",
       turnCoverage: "TURN_INCLUDES_ONLY_ACTIVITY"
@@ -1312,17 +2132,36 @@ class RealtimeProxySession {
   private geminiAudioItemID = "";
   private geminiFailureMessage = "";
   private openAIResponseActive = false;
-  private openAIResponseCreatePending = false;
+  private openAIResponseCreatePending: { reason: string; response: JsonObject } | null = null;
   // Watchdog: if a response we believe is active never reports response.done (e.g. it
   // was cancelled by a barge-in, or the server/proxy state desynced), force-clear the
   // flag so the assistant can speak again instead of going permanently silent.
   private openAIResponseWatchdog?: NodeJS.Timeout;
+  private openAIDirectResultAudioRetry?: NodeJS.Timeout;
   private pendingHandoffs = new Map<string, PendingHandoff>();
+  // Results from parallel-delegated tasks waiting to be spoken. They are narrated
+  // strictly one at a time (FIFO): the next one only starts once the current spoken
+  // response has finished, so two tasks finishing close together never overlap.
+  private parallelResultQueue: Array<{ text: string; agentLabel: string }> = [];
+  private parallelResultSpeaking = false;
+  private activeParallelDelegations = 0;
+  // Gemini Live sends generationComplete and turnComplete as separate messages
+  // for the same turn; finishGeminiTurn must only run once per turn.
+  private geminiTurnFinished = false;
+  // True while a delegation decision (router call) is being awaited, so the
+  // auto-handoff timer and an explicit background_agent tool call cannot both
+  // pass their "nothing running" checks and start the same task twice.
+  private delegationStartInFlight = false;
   private handledCalls = new Set<string>();
   private handledKnowledgePrompts = new Map<string, number>();
+  private personalRecallCache = new Map<string, PersonalRecallCacheEntry>();
   private localMessageHandoffCallIDs = new Set<string>();
   private lastUserUtterance = "";
+  private recentUserUtterances: string[] = [];
   private lastDelegationPrompt = "";
+  // Set while a personal recall is running; used to defer parallel
+  // model-initiated knowledge searches that would answer with stale queries.
+  private personalRecallInFlightSince: number | null = null;
   private lastDelegationResult = "";
   private lastAutoHandoffNormalizedPrompt = "";
   private autoHandoffTimer?: NodeJS.Timeout;
@@ -1366,6 +2205,128 @@ class RealtimeProxySession {
     return true;
   }
 
+  private rememberRecentUserUtterance(text: string) {
+    const prompt = String(text || "").replace(/\s+/g, " ").trim();
+    if (!prompt || isBackendProgressMessage(prompt) || isCodexFinalResultMessage(prompt)) return;
+    const normalized = normalizeRealtimeIntent(prompt);
+    const previous = this.recentUserUtterances[this.recentUserUtterances.length - 1] || "";
+    if (normalized && normalizeRealtimeIntent(previous) === normalized) return;
+    this.recentUserUtterances.push(prompt);
+    if (this.recentUserUtterances.length > 8) this.recentUserUtterances.splice(0, this.recentUserUtterances.length - 8);
+  }
+
+  private recentRecallContext(query: string) {
+    const normalizedQuery = normalizeRealtimeIntent(query);
+    if (!normalizedQuery) return "";
+    const needsContext = /\b(it|that|this|they|them|latest|recent|conversation|conversations|chat|chats|thread|threads|session|sessions|codex|claude|spark|gemini|agent)\b/.test(normalizedQuery);
+    if (!needsContext) return "";
+    const recent = this.recentUserUtterances
+      .filter((item) => normalizeRealtimeIntent(item) !== normalizedQuery)
+      .slice(-5);
+    if (!recent.length) return "";
+    return [
+      "Recent live user context:",
+      ...recent.map((item) => `- ${item}`)
+    ].join("\n");
+  }
+
+	  private personalRecallArgs(args: JsonObject, fallback?: string): JsonObject {
+	    const query = stringValue(args.query, args.question, args.prompt, args.text, fallback, this.lastUserUtterance);
+	    const context = this.recentRecallContext(query);
+	    return {
+      ...args,
+      query,
+	      ...(context ? { context } : {})
+	    };
+	  }
+
+	  private codexImageGenerationArgs(args: JsonObject, fallback?: string): JsonObject {
+	    const prompt = stringValue(args.prompt, args.request, args.text, args.description, fallback, this.lastUserUtterance);
+	    return {
+	      ...args,
+	      prompt: prompt || "Generate the requested image."
+	    };
+	  }
+
+	  private async codexImageGenerationToolOutput(callID: string, args: JsonObject, fallback?: string) {
+	    const worker = this.configProvider().codexImageGeneration;
+	    const effectiveArgs = this.codexImageGenerationArgs(args, fallback);
+	    const prompt = stringValue(effectiveArgs.prompt, fallback, this.lastUserUtterance);
+	    if (!worker) {
+	      const result = {
+	        ok: false,
+	        summary: "Codex image generation is not available in this Live session.",
+	        error: "Codex image generation is not configured."
+	      };
+	      this.notifyDirectWork(callID, "request_codex_image_generation", "failed", result.summary, result.error, { args: effectiveArgs, result });
+	      return JSON.stringify(result, null, 2);
+	    }
+	    try {
+	      const result = await worker.run({ callID, args: effectiveArgs, prompt });
+	      return JSON.stringify(result, null, 2);
+	    } catch (error) {
+	      const message = error instanceof Error ? error.message : "Codex image generation failed.";
+	      const result = {
+	        ok: false,
+	        summary: "Codex image generation failed.",
+	        error: message
+	      };
+	      this.notifyDirectWork(callID, "request_codex_image_generation", "failed", message, message, { args: effectiveArgs, result });
+	      return JSON.stringify(result, null, 2);
+	    }
+	  }
+
+	  async appendUserText(text: string) {
+    const prompt = String(text || "").trim();
+    if (!prompt) return false;
+    this.rememberRecentUserUtterance(prompt);
+    this.lastUserUtterance = prompt;
+    this.log(`[realtime.proxy] typed text received: ${prompt.slice(0, 160)}`);
+    this.sendToCodex({ type: "conversation.input_transcript.delta", delta: prompt });
+    this.sendToCodex({
+      type: "conversation.item.input_audio_transcription.completed",
+      item_id: makeShortRealtimeID("itemtxt"),
+      content_index: 0,
+      transcript: prompt
+    });
+    if (this.handleStopCommand(prompt)) return true;
+
+    const recallRoute = conversationRecallRoute(prompt);
+    if (recallRoute === "personal") {
+      const callID = makeShortRealtimeID("callrec", ++this.autoHandoffSequence);
+      void this.tryPersonalRecallRequest(callID, prompt, "message");
+      return true;
+    }
+    if (recallRoute === "clarify") {
+      void this.speakDirectText(recallScopeClarificationText());
+      return true;
+    }
+
+    this.scheduleAutoHandoff(prompt);
+    if (this.isGeminiLive()) {
+      return this.sendGeminiText(prompt);
+    }
+
+    const upstream = await this.ensureUpstream();
+    if (!upstream) return false;
+    this.sendUpstream({
+      type: "conversation.item.create",
+      item: {
+        type: "message",
+        role: "user",
+        content: [
+          {
+            type: "input_text",
+            text: prompt
+          }
+        ]
+      }
+    });
+    this.requestOpenAIResponseCreate("agent result");
+    this.scheduleOpenAIDirectResultAudioRetry("agent result");
+    return true;
+  }
+
   private pruneHandledKnowledgePrompts() {
     const cutoff = Date.now() - 90_000;
     for (const [prompt, timestamp] of this.handledKnowledgePrompts) {
@@ -1391,7 +2352,10 @@ class RealtimeProxySession {
   private knowledgeDedupeKeys(name: string, args: JsonObject) {
     const keys = new Set<string>();
     const utterance = this.lastUserUtterance.trim();
-    if (utterance) keys.add(`utterance ${utterance}`);
+    // Scope the utterance key by tool name: one spoken sentence legitimately
+    // triggers multi-step flows (read_today then daily_items, search then read),
+    // so only the SAME tool repeating for the same utterance is a duplicate.
+    if (utterance) keys.add(`${name} utterance ${utterance}`);
     const primaryText = stringValue(
       args.title,
       args.text,
@@ -1417,6 +2381,92 @@ class RealtimeProxySession {
     }
   }
 
+  private personalRecallCacheKey(args: JsonObject) {
+    const primaryText = stringValue(
+      args.query,
+      args.question,
+      args.prompt,
+      args.text,
+      this.lastUserUtterance,
+      JSON.stringify(args)
+    );
+    const context = stringValue(args.context, args.recentContext, args.liveContext);
+    return normalizeRealtimeIntent(`knowledge_personal_recall ${primaryText}\n${context}`);
+  }
+
+  private prunePersonalRecallCache() {
+    const cutoff = Date.now() - personalRecallResultCacheMs;
+    for (const [key, entry] of this.personalRecallCache) {
+      if (entry.updatedAt < cutoff) this.personalRecallCache.delete(key);
+    }
+  }
+
+  private async existingPersonalRecallResult(args: JsonObject) {
+    this.prunePersonalRecallCache();
+    const key = this.personalRecallCacheKey(args);
+    if (!key) return undefined;
+    const existing = this.personalRecallCache.get(key);
+    if (!existing) return undefined;
+    if (existing.result !== undefined) return existing.result;
+    // Callers await this outside their try/catch; a rejected in-flight recall
+    // must resolve to undefined so they fall through to a fresh run instead of
+    // leaving the tool call without any output.
+    if (existing.promise) return existing.promise.catch(() => undefined);
+    return undefined;
+  }
+
+  private async runPersonalRecall(
+    args: JsonObject,
+    run: () => Promise<unknown>
+  ) {
+    this.prunePersonalRecallCache();
+    const key = this.personalRecallCacheKey(args);
+    // While a recall actually runs, concurrent model-initiated knowledge
+    // searches are deferred (see the personalRecallInFlight guard) so the
+    // model cannot narrate a contradictory "found nothing" from a stale
+    // parallel search. Cache hits are instant and skip the flag.
+    if (!key) {
+      this.personalRecallInFlightSince = Date.now();
+      return run().finally(() => {
+        this.personalRecallInFlightSince = null;
+      });
+    }
+    const existing = this.personalRecallCache.get(key);
+    if (existing?.result !== undefined) {
+      this.log(`[realtime.proxy] reused completed personal recall result key=${key.slice(0, 120)}`);
+      return existing.result;
+    }
+    if (existing?.promise) {
+      this.log(`[realtime.proxy] joined active personal recall result key=${key.slice(0, 120)}`);
+      return existing.promise;
+    }
+    const entry: PersonalRecallCacheEntry = { updatedAt: Date.now() };
+    this.personalRecallInFlightSince = Date.now();
+    entry.promise = run()
+      .finally(() => {
+        this.personalRecallInFlightSince = null;
+      })
+      .then((result) => {
+        if (isFailedPersonalRecallResult(result)) {
+          // Do not replay a failed recall (Spark down, no sourced answer) for
+          // 5 minutes; the next ask should retry fresh.
+          this.personalRecallCache.delete(key);
+          entry.promise = undefined;
+          return result;
+        }
+        entry.result = result;
+        entry.promise = undefined;
+        entry.updatedAt = Date.now();
+        return result;
+      })
+      .catch((error) => {
+        this.personalRecallCache.delete(key);
+        throw error;
+      });
+    this.personalRecallCache.set(key, entry);
+    return entry.promise;
+  }
+
   private notifyDirectWork(
     callID: string,
     toolName: string,
@@ -1438,6 +2488,39 @@ class RealtimeProxySession {
     });
   }
 
+  private startDirectWorkProgress(
+    callID: string,
+    toolName: string,
+    args?: JsonObject
+  ) {
+    const label = toolName.replace(/^knowledge_/, "").replace(/_/g, " ");
+    const messages = toolName === "knowledge_personal_recall"
+      ? [
+        personalRecallRunningDetail(args),
+        "Still checking saved context...",
+        "Waiting for Spark recall to finish..."
+      ]
+      : [
+        `Still running ${label}...`,
+        `Waiting for ${label} to finish...`
+      ];
+    let index = 0;
+    const sendProgress = () => {
+      const detail = messages[Math.min(index, messages.length - 1)] || `Still running ${label}...`;
+      index += 1;
+      this.notifyDirectWork(callID, toolName, "running", detail, undefined, { args });
+      this.log(`[realtime.proxy] direct work progress tool=${toolName} call_id=${callID} detail=${detail}`);
+    };
+    const first = setTimeout(sendProgress, 1_200);
+    const interval = setInterval(sendProgress, 4_500);
+    unrefTimer(first);
+    unrefTimer(interval);
+    return () => {
+      clearTimeout(first);
+      clearInterval(interval);
+    };
+  }
+
   private realtimeProvider() {
     return this.configProvider().provider || "openaiRealtime";
   }
@@ -1448,7 +2531,7 @@ class RealtimeProxySession {
 
   private currentVoiceState(): RealtimeDelegationRouteInput["voiceState"] {
     if (this.quiet) return "quiet";
-    if (this.pendingHandoffs.size > 0) return "delegating";
+    if (this.pendingHandoffs.size > 0 || this.activeParallelDelegations > 0) return "delegating";
     if (this.openAIResponseActive || this.geminiAudioItemID) return "speaking";
     return "listening";
   }
@@ -1563,7 +2646,28 @@ class RealtimeProxySession {
     }
   }
 
+  // A delegated run that dies without ever sending its "background agent
+  // finished" message would otherwise gate delegation forever ("already
+  // working"). Treat a handoff with no progress for 10 minutes as dead.
+  private evictStaleHandoffs() {
+    const staleAfterMs = 10 * 60_000;
+    const now = Date.now();
+    for (const [callID, handoff] of this.pendingHandoffs) {
+      const idleMs = now - Math.max(handoff.startedAt, handoff.updatedAt);
+      if (idleMs < staleAfterMs) continue;
+      this.pendingHandoffs.delete(callID);
+      this.log(`[realtime.proxy] evicted stale delegated task call_id=${callID} idleMinutes=${Math.round(idleMs / 60_000)} prompt=${handoff.prompt.slice(0, 120)}`);
+    }
+  }
+
   private async delegatedTaskStatusText() {
+    this.evictStaleHandoffs();
+    if (this.activeParallelDelegations > 0 && this.pendingHandoffs.size === 0) {
+      const count = this.activeParallelDelegations;
+      return count === 1
+        ? "One parallel task is still running. Its result will be spoken when it finishes."
+        : `${count} parallel tasks are still running. Each result will be spoken as it finishes.`;
+    }
     const statusProvider = this.configProvider().delegatedStatus;
     if (statusProvider?.current) {
       try {
@@ -1656,6 +2760,9 @@ class RealtimeProxySession {
           if (!connectedSession || this.geminiSession === connectedSession) {
             this.geminiSession = undefined;
             this.upstreamReady = undefined;
+            // The socket can drop mid-answer; end the audio turn so the voice
+            // state is not stuck "speaking" and queued results are not blocked.
+            this.finishGeminiAudio("connection-closed");
           }
           if (reason !== "no reason" && isFatalGeminiLiveCloseReason(reason)) {
             this.geminiFailureMessage = `Gemini Live connection failed: ${reason}`;
@@ -1768,6 +2875,8 @@ class RealtimeProxySession {
       });
 
       this.updateOpenAISession();
+      // Speak any task results that queued up while the socket was down.
+      this.drainParallelResults();
       return ws;
     })().catch((error) => {
       this.upstreamReady = undefined;
@@ -1985,6 +3094,7 @@ class RealtimeProxySession {
     const inputTranscript = stringValue(inputTranscription?.text);
     if (inputTranscript) {
       this.geminiInputTranscript = appendTranscriptChunk(this.geminiInputTranscript, inputTranscript);
+      this.log(`[realtime.proxy] Gemini transcript completed: ${this.geminiInputTranscript.slice(0, 180)}`);
       if (!this.handleStopCommand(this.geminiInputTranscript)) this.scheduleAutoHandoff(this.geminiInputTranscript);
       this.sendToCodex({
         type: "conversation.item.input_audio_transcription.completed",
@@ -2002,6 +3112,7 @@ class RealtimeProxySession {
 
     const modelTurn = jsonObject(content.modelTurn);
     const parts = Array.isArray(modelTurn?.parts) ? modelTurn.parts : [];
+    if (parts.length) this.geminiTurnFinished = false;
     for (const rawPart of parts) {
       const part = jsonObject(rawPart);
       if (!part) continue;
@@ -2016,7 +3127,8 @@ class RealtimeProxySession {
       }
     }
 
-    if (content.turnComplete || content.generationComplete) {
+    if ((content.turnComplete || content.generationComplete) && !this.geminiTurnFinished) {
+      this.geminiTurnFinished = true;
       this.finishGeminiTurn();
     }
   }
@@ -2039,15 +3151,32 @@ class RealtimeProxySession {
         const mode = stringValue(args.mode, args.state).toLowerCase();
         this.quiet = /quiet|mute|pause|stop|off|not.listening/.test(mode);
         responses.push({ id: callID, name, response: { output: this.quiet ? "Quiet mode is on." : "Listening mode is on." } });
+        if (this.quiet) {
+          // Cut any answer that is currently playing and clear the renderer's
+          // audio buffer so going quiet takes effect immediately.
+          this.finishGeminiAudio("quiet");
+          this.sendToCodex({ type: "output_audio_buffer.cleared" });
+        } else {
+          this.drainParallelResults();
+        }
         continue;
       }
 
-      if (name === "get_delegated_task_status") {
-        responses.push({ id: callID, name, response: { output: await this.delegatedTaskStatusText() } });
-        continue;
-      }
+	      if (name === "get_delegated_task_status") {
+	        responses.push({ id: callID, name, response: { output: await this.delegatedTaskStatusText() } });
+	        continue;
+	      }
 
-      if (name.startsWith("knowledge_")) {
+	      if (name === "request_codex_image_generation") {
+	        responses.push({
+	          id: callID,
+	          name,
+	          response: { output: await this.codexImageGenerationToolOutput(callID, args, this.geminiInputTranscript || this.lastUserUtterance) }
+	        });
+	        continue;
+	      }
+
+	      if (name.startsWith("knowledge_")) {
         if (isCasualRealtimeGreeting(this.geminiInputTranscript || this.lastUserUtterance)) {
           responses.push({ id: callID, name, response: { output: "The user only greeted you. Reply naturally in one short sentence. Do not use knowledge tools for this." } });
           continue;
@@ -2057,28 +3186,90 @@ class RealtimeProxySession {
           responses.push({ id: callID, name, response: { output: "OpenAssist Knowledge access is off in Settings." } });
           continue;
         }
+        const effectiveArgs = name === "knowledge_personal_recall"
+          ? this.personalRecallArgs(args, this.geminiInputTranscript || this.lastUserUtterance)
+          : args;
         const promptSnippet = this.geminiInputTranscript || this.lastUserUtterance || JSON.stringify(args);
-        if (this.wasKnowledgeRequestHandled(name, args)) {
-          this.log(`[realtime.proxy] ignored duplicate Gemini knowledge ${name} prompt=${promptSnippet.slice(0, 160)}`);
+        // A memory recall is already running for this turn: a parallel search
+        // (often carrying the PREVIOUS utterance's query) must not race it and
+        // narrate a contradictory "found nothing" before the recall answers.
+        if (
+          name === "knowledge_search_everything"
+          && this.personalRecallInFlightSince
+          && Date.now() - this.personalRecallInFlightSince < 30_000
+        ) {
+          this.log(`[realtime.proxy] deferred ${name} while personal recall in flight prompt=${promptSnippet.slice(0, 160)}`);
           responses.push({
             id: callID,
             name,
-            response: { output: "That realtime knowledge request was already handled a moment ago. Do not repeat it unless the user asks again." }
+            response: { output: "A saved-memory recall for this request is already running. Wait for its result and answer only from it. Do not tell the user nothing was found." }
           });
           continue;
         }
-        this.notifyDirectWork(callID, name, "running", `Running ${name.replace(/^knowledge_/, "").replace(/_/g, " ")}.`, undefined, { args });
+        if (this.wasKnowledgeRequestHandled(name, effectiveArgs)) {
+          if (name === "knowledge_personal_recall") {
+            const cachedResult = await this.existingPersonalRecallResult(effectiveArgs);
+            if (cachedResult !== undefined) {
+              this.log(`[realtime.proxy] reused duplicate Gemini personal recall prompt=${promptSnippet.slice(0, 160)}`);
+              this.notifyDirectWork(callID, name, "completed", knowledgeCompletionDetail(name, cachedResult), undefined, { args: effectiveArgs, result: cachedResult });
+              responses.push({ id: callID, name, response: { output: JSON.stringify(cachedResult, null, 2) } });
+              continue;
+            }
+            this.log(`[realtime.proxy] stale Gemini personal recall dedupe; running recall prompt=${promptSnippet.slice(0, 160)}`);
+          } else {
+            this.log(`[realtime.proxy] ignored duplicate Gemini knowledge ${name} prompt=${promptSnippet.slice(0, 160)}`);
+            responses.push({
+              id: callID,
+              name,
+              response: {
+                output: "That realtime knowledge request was already handled a moment ago. Do not repeat it unless the user asks again."
+              }
+            });
+            continue;
+          }
+        }
+        if (name === "knowledge_personal_recall") {
+          const query = stringValue(effectiveArgs.query, effectiveArgs.question, effectiveArgs.prompt, effectiveArgs.text, this.geminiInputTranscript, this.lastUserUtterance);
+          const recallRoute = conversationRecallRoute(query);
+          if (recallRoute === "none") {
+            responses.push({ id: callID, name, response: { output: notPersonalRecallToolText() } });
+            continue;
+          }
+          if (recallRoute === "clarify") {
+            responses.push({ id: callID, name, response: { output: recallScopeClarificationText() } });
+            continue;
+          }
+          if (recallRoute === "current") {
+            responses.push({ id: callID, name, response: { output: currentConversationRecallText() } });
+            continue;
+          }
+        }
+        const runningDetail = name === "knowledge_personal_recall"
+          ? personalRecallRunningDetail(effectiveArgs)
+          : `Running ${name.replace(/^knowledge_/, "").replace(/_/g, " ")}.`;
+        this.notifyDirectWork(callID, name, "running", runningDetail, undefined, { args: effectiveArgs });
+        const stopProgress = this.startDirectWorkProgress(callID, name, effectiveArgs);
         try {
-          const result = await knowledge.call(name, args);
+          const result = name === "knowledge_personal_recall"
+            ? await this.runPersonalRecall(effectiveArgs, () => knowledge.call(name, effectiveArgs))
+            : await knowledge.call(name, effectiveArgs);
           this.clearAutoHandoff();
-          this.rememberKnowledgeRequestHandled(name, args, name);
-          this.notifyDirectWork(callID, name, "completed", `Completed ${name.replace(/^knowledge_/, "").replace(/_/g, " ")}.`, undefined, { args, result });
+          this.rememberKnowledgeRequestHandled(name, effectiveArgs, name);
+          this.notifyDirectWork(callID, name, "completed", knowledgeCompletionDetail(name, result), undefined, { args: effectiveArgs, result });
           responses.push({ id: callID, name, response: { output: JSON.stringify(result, null, 2) } });
         } catch (error) {
           const message = error instanceof Error ? error.message : "Knowledge access failed.";
           this.notifyDirectWork(callID, name, "failed", message, message);
           responses.push({ id: callID, name, response: { output: message } });
+        } finally {
+          stopProgress();
         }
+        continue;
+      }
+
+      if (name === "delegate_parallel_tasks") {
+        const ack = await this.startParallelDelegation(callID, args);
+        responses.push({ id: callID, name, response: { output: ack } });
         continue;
       }
 
@@ -2087,11 +3278,60 @@ class RealtimeProxySession {
         continue;
       }
 
-      const rawPrompt = stringValue(args.prompt, args.task, this.geminiInputTranscript) || "Continue the user's requested task.";
-      if (this.pendingHandoffs.size > 0 && isDelegatedStatusQuestion(rawPrompt)) {
+	      const rawPrompt = stringValue(args.prompt, args.task, this.geminiInputTranscript) || "Continue the user's requested task.";
+	      if (realtimePromptWantsImageGeneration(rawPrompt)) {
+	        responses.push({
+	          id: callID,
+	          name,
+	          response: {
+	            output: await this.codexImageGenerationToolOutput(callID, { ...args, prompt: rawPrompt }, rawPrompt)
+	          }
+	        });
+	        continue;
+	      }
+	      if (this.pendingHandoffs.size > 0 && isDelegatedStatusQuestion(rawPrompt)) {
         responses.push({ id: callID, name, response: { output: await this.delegatedTaskStatusText() } });
         continue;
       }
+      const recallRoute = conversationRecallRoute(rawPrompt);
+      if (recallRoute !== "none") {
+        if (recallRoute === "clarify") {
+          responses.push({ id: callID, name, response: { output: recallScopeClarificationText() } });
+          continue;
+        }
+        if (recallRoute === "current") {
+          responses.push({ id: callID, name, response: { output: currentConversationRecallText() } });
+          continue;
+        }
+        const knowledge = this.configProvider().knowledge;
+        if (!knowledge?.enabled) {
+          responses.push({
+            id: callID,
+            name,
+            response: { output: "This is a personal recall question, not a background task. Knowledge access is off, so answer from the current conversation if possible." }
+          });
+          continue;
+        }
+        const recallArgs = this.personalRecallArgs({ query: rawPrompt }, rawPrompt);
+        this.notifyDirectWork(callID, "knowledge_personal_recall", "running", personalRecallRunningDetail(recallArgs), undefined, { args: recallArgs });
+        const stopProgress = this.startDirectWorkProgress(callID, "knowledge_personal_recall", recallArgs);
+        try {
+          const result = await this.runPersonalRecall(recallArgs, () => knowledge.call("knowledge_personal_recall", recallArgs));
+          this.clearAutoHandoff();
+          this.rememberKnowledgeRequestHandled("knowledge_personal_recall", recallArgs, "knowledge_personal_recall");
+          this.notifyDirectWork(callID, "knowledge_personal_recall", "completed", knowledgeCompletionDetail("knowledge_personal_recall", result), undefined, { args: recallArgs, result });
+          this.log(`[realtime.proxy] Gemini recall background_agent rerouted to knowledge_personal_recall call_id=${callID}`);
+          responses.push({ id: callID, name, response: { output: JSON.stringify(result, null, 2) } });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : "Personal recall failed.";
+          this.notifyDirectWork(callID, "knowledge_personal_recall", "failed", message, message, { args: recallArgs });
+          responses.push({ id: callID, name, response: { output: message } });
+        } finally {
+          stopProgress();
+        }
+        continue;
+      }
+      this.evictStaleHandoffs();
       if (this.pendingHandoffs.size > 0) {
         const agentLabel = this.configProvider().handoff?.agentLabel || "Agent";
         responses.push({
@@ -2103,27 +3343,40 @@ class RealtimeProxySession {
         });
         continue;
       }
-
-      const decision = await this.routeRealtimeDelegation(rawPrompt, "tool_call");
-      if (!decision.allow) {
+      if (this.delegationStartInFlight) {
         responses.push({
           id: callID,
           name,
-          response: { output: decision.output }
+          response: { output: "A delegated task is already starting. Do not start another." }
         });
         continue;
       }
 
-      if (await this.tryDirectKnowledgeRequest(callID, decision.prompt, "message")) continue;
-      this.log(`[realtime.proxy] Gemini Live background_agent routed call_id=${callID}`);
-      this.startCodexHandoff(callID, decision.prompt, "message");
-      responses.push({
-        id: callID,
-        name,
-        response: {
-          output: `${this.configProvider().handoff?.agentLabel || "Agent"} is handling this request. Wait for the final result before giving task details.`
+      this.delegationStartInFlight = true;
+      try {
+        const decision = await this.routeRealtimeDelegation(rawPrompt, "tool_call");
+        if (!decision.allow) {
+          responses.push({
+            id: callID,
+            name,
+            response: { output: decision.output }
+          });
+          continue;
         }
-      });
+
+        if (await this.tryDirectKnowledgeRequest(callID, decision.prompt, "message")) continue;
+        this.log(`[realtime.proxy] Gemini Live background_agent routed call_id=${callID}`);
+        this.startCodexHandoff(callID, decision.prompt, "message");
+        responses.push({
+          id: callID,
+          name,
+          response: {
+            output: `${this.configProvider().handoff?.agentLabel || "Agent"} is handling this request. Wait for the final result before giving task details.`
+          }
+        });
+      } finally {
+        this.delegationStartInFlight = false;
+      }
     }
 
     if (responses.length) {
@@ -2133,6 +3386,10 @@ class RealtimeProxySession {
 
   private sendGeminiAudioDelta(audio: Buffer) {
     if (!audio.length) return;
+    // Quiet mode: Gemini Live has no server-side "don't auto-reply" switch like
+    // OpenAI's create_response flag, so the mic keeps streaming (the model must
+    // still hear "start listening again") but its spoken output is dropped here.
+    if (this.quiet) return;
     if (!this.geminiAudioItemID) {
       this.geminiAudioItemID = `item_gemini_audio_${Date.now()}`;
       this.markOpenAIResponseActive();
@@ -2176,6 +3433,14 @@ class RealtimeProxySession {
     this.geminiAudioItemID = "";
     this.clearOpenAIResponseActive();
     this.flushOpenAIResponseCreate();
+    if (reason === "turn-complete") {
+      this.onParallelNarrationEnded();
+    } else {
+      // Stop, interrupt, quiet, or connection loss must not immediately start
+      // narrating the next queued result over the user; just unblock the queue
+      // so it drains at the next natural pause (turn complete / unmute).
+      this.parallelResultSpeaking = false;
+    }
   }
 
   private async sendGeminiText(text: string) {
@@ -2269,7 +3534,7 @@ class RealtimeProxySession {
         // we stop sending premature response.create calls. The pending one will be
         // flushed when the active response's response.done arrives (or the watchdog).
         this.markOpenAIResponseActive();
-        this.openAIResponseCreatePending = true;
+        this.openAIResponseCreatePending ??= { reason: "active-response error", response: {} };
         this.log(`[realtime.proxy] delayed response.create after active-response error: ${messageText}`);
         return;
       }
@@ -2287,16 +3552,21 @@ class RealtimeProxySession {
     }
 
     if (event.type === "input_audio_buffer.speech_started") {
-      // TEMP DIAGNOSTIC: confirm OpenAI's barge-in VAD is firing while the assistant
-      // is speaking (responseActive=true means we just cut off a live response).
-      this.log(`[realtime.audio-diag] speech_started -> truncate (responseActive=${String(this.openAIResponseActive)})`);
-      this.truncateOpenAIAudio();
-      this.sendToCodex(event);
+      const hasAssistantAudio = Boolean(this.audioItemID);
+      this.log(
+        `[realtime.audio-diag] speech_started ${hasAssistantAudio ? "interrupt" : "ignored"} ` +
+        `(responseActive=${String(this.openAIResponseActive)} audioItem=${hasAssistantAudio ? this.audioItemID : "none"})`
+      );
+      if (hasAssistantAudio) {
+        this.truncateOpenAIAudio();
+        this.sendToCodex(event);
+      }
       return;
     }
 
     if (event.type === "conversation.item.input_audio_transcription.completed") {
       const transcript = stringValue(event.transcript, event.text);
+      if (transcript) this.log(`[realtime.proxy] OpenAI transcript completed: ${transcript.slice(0, 180)}`);
       if (transcript && (isBackendProgressMessage(transcript) || isCodexFinalResultMessage(transcript))) {
         this.log(`[realtime.proxy] ignored backend transcript from OpenAI: ${transcript.slice(0, 160)}`);
       } else if (transcript && this.handleStopCommand(transcript)) {
@@ -2312,6 +3582,7 @@ class RealtimeProxySession {
       const delta = stringValue(event.delta);
       const itemID = stringValue(event.item_id, this.audioItemID) || `item_openai_audio_${Date.now()}`;
       const audio = delta ? Buffer.from(delta, "base64") : Buffer.alloc(0);
+      if (audio.length) this.clearOpenAIDirectResultAudioRetry();
       if (this.audioItemID !== itemID) {
         this.audioItemID = itemID;
         this.audioMs = 0;
@@ -2363,6 +3634,7 @@ class RealtimeProxySession {
         if (object?.type === "function_call") await this.handleFunctionCall(object);
       }
       this.flushOpenAIResponseCreate();
+      this.onParallelNarrationEnded();
       return;
     }
 
@@ -2394,12 +3666,26 @@ class RealtimeProxySession {
       this.quiet = /quiet|mute|pause|stop|off|not.listening/.test(mode);
       this.sendFunctionOutput(callID, this.quiet ? "Quiet mode is on." : "Listening mode is on.", !this.quiet);
       this.updateOpenAISession();
+      // Coming out of quiet mode: speak any parallel-task results that finished while
+      // we were muted, so they are not lost.
+      if (!this.quiet) this.drainParallelResults();
       return;
     }
 
-    if (name === "get_delegated_task_status") {
-      this.sendFunctionOutput(callID, await this.delegatedTaskStatusText(), true);
-      return;
+	    if (name === "get_delegated_task_status") {
+	      this.sendFunctionOutput(callID, await this.delegatedTaskStatusText(), true);
+	      return;
+	    }
+
+	    if (name === "request_codex_image_generation") {
+	      const args = jsonObject(parseJSON(stringValue(item.arguments))) ?? {};
+	      this.sendFunctionOutput(callID, await this.codexImageGenerationToolOutput(callID, args, this.lastUserUtterance), true);
+	      return;
+	    }
+
+	    if (name === "delegate_parallel_tasks") {
+	      await this.handleParallelDelegation(callID, item);
+	      return;
     }
 
     if (name.startsWith("knowledge_")) {
@@ -2413,61 +3699,158 @@ class RealtimeProxySession {
         return;
       }
       const args = jsonObject(parseJSON(stringValue(item.arguments))) ?? {};
-      if (this.wasKnowledgeRequestHandled(name, args)) {
-        this.log(`[realtime.proxy] ignored duplicate knowledge ${name} prompt=${(this.lastUserUtterance || JSON.stringify(args)).slice(0, 160)}`);
-        this.sendFunctionOutput(callID, "That realtime knowledge request was already handled a moment ago. Do not repeat it unless the user asks again.", true);
+      const effectiveArgs = name === "knowledge_personal_recall"
+        ? this.personalRecallArgs(args, this.lastUserUtterance)
+        : args;
+      if (
+        name === "knowledge_search_everything"
+        && this.personalRecallInFlightSince
+        && Date.now() - this.personalRecallInFlightSince < 30_000
+      ) {
+        this.log(`[realtime.proxy] deferred ${name} while personal recall in flight prompt=${(this.lastUserUtterance || JSON.stringify(args)).slice(0, 160)}`);
+        this.sendFunctionOutput(callID, "A saved-memory recall for this request is already running. Wait for its result and answer only from it. Do not tell the user nothing was found.", true);
         return;
       }
-      this.notifyDirectWork(callID, name, "running", `Running ${name.replace(/^knowledge_/, "").replace(/_/g, " ")}.`, undefined, { args });
+      if (this.wasKnowledgeRequestHandled(name, effectiveArgs)) {
+        if (name === "knowledge_personal_recall") {
+          const cachedResult = await this.existingPersonalRecallResult(effectiveArgs);
+          if (cachedResult !== undefined) {
+            this.log(`[realtime.proxy] reused duplicate personal recall prompt=${(this.lastUserUtterance || JSON.stringify(args)).slice(0, 160)}`);
+            this.notifyDirectWork(callID, name, "completed", knowledgeCompletionDetail(name, cachedResult), undefined, { args: effectiveArgs, result: cachedResult });
+            this.sendFunctionOutput(callID, JSON.stringify(cachedResult, null, 2), true);
+            return;
+          }
+          this.log(`[realtime.proxy] stale personal recall dedupe; running recall prompt=${(this.lastUserUtterance || JSON.stringify(args)).slice(0, 160)}`);
+        } else {
+          this.log(`[realtime.proxy] ignored duplicate knowledge ${name} prompt=${(this.lastUserUtterance || JSON.stringify(args)).slice(0, 160)}`);
+          this.sendFunctionOutput(callID, "That realtime knowledge request was already handled a moment ago. Do not repeat it unless the user asks again.", true);
+          return;
+        }
+      }
+      if (name === "knowledge_personal_recall") {
+        const query = stringValue(effectiveArgs.query, effectiveArgs.question, effectiveArgs.prompt, effectiveArgs.text, this.lastUserUtterance);
+        const recallRoute = conversationRecallRoute(query);
+        if (recallRoute === "none") {
+          this.sendFunctionOutput(callID, notPersonalRecallToolText(), true);
+          return;
+        }
+        if (recallRoute === "clarify") {
+          this.sendFunctionOutput(callID, recallScopeClarificationText(), true);
+          return;
+        }
+        if (recallRoute === "current") {
+          this.sendFunctionOutput(callID, currentConversationRecallText(), true);
+          return;
+        }
+      }
+      const runningDetail = name === "knowledge_personal_recall"
+        ? personalRecallRunningDetail(effectiveArgs)
+        : `Running ${name.replace(/^knowledge_/, "").replace(/_/g, " ")}.`;
+      this.notifyDirectWork(callID, name, "running", runningDetail, undefined, { args: effectiveArgs });
+      const stopProgress = this.startDirectWorkProgress(callID, name, effectiveArgs);
       try {
-        const result = await knowledge.call(name, args);
+        const result = name === "knowledge_personal_recall"
+          ? await this.runPersonalRecall(effectiveArgs, () => knowledge.call(name, effectiveArgs))
+          : await knowledge.call(name, effectiveArgs);
         this.clearAutoHandoff();
-        this.rememberKnowledgeRequestHandled(name, args, name);
-        this.notifyDirectWork(callID, name, "completed", `Completed ${name.replace(/^knowledge_/, "").replace(/_/g, " ")}.`, undefined, { args, result });
+        this.rememberKnowledgeRequestHandled(name, effectiveArgs, name);
+        this.notifyDirectWork(callID, name, "completed", knowledgeCompletionDetail(name, result), undefined, { args: effectiveArgs, result });
         this.log(`[realtime.audio-diag] knowledge ${name} result sent; requesting spoken reply (active=${String(this.openAIResponseActive)})`);
         this.sendFunctionOutput(callID, JSON.stringify(result, null, 2), true);
       } catch (error) {
         const message = error instanceof Error ? error.message : "Knowledge access failed.";
         this.notifyDirectWork(callID, name, "failed", message, message);
         this.sendFunctionOutput(callID, message, true);
+      } finally {
+        stopProgress();
       }
       return;
     }
 
     if (name !== "background_agent") return;
 
-    this.clearAutoHandoff();
-    const args = jsonObject(parseJSON(stringValue(item.arguments))) ?? {};
-    const rawPrompt = stringValue(args.prompt, args.task, item.arguments) || "Continue the user's requested task.";
-    if (this.pendingHandoffs.size > 0 && isDelegatedStatusQuestion(rawPrompt)) {
+	    this.clearAutoHandoff();
+	    const args = jsonObject(parseJSON(stringValue(item.arguments))) ?? {};
+	    const rawPrompt = stringValue(args.prompt, args.task, item.arguments) || "Continue the user's requested task.";
+	    if (realtimePromptWantsImageGeneration(rawPrompt)) {
+	      this.sendFunctionOutput(callID, await this.codexImageGenerationToolOutput(callID, { ...args, prompt: rawPrompt }, rawPrompt), true);
+	      return;
+	    }
+	    if (this.pendingHandoffs.size > 0 && isDelegatedStatusQuestion(rawPrompt)) {
       this.sendFunctionOutput(callID, await this.delegatedTaskStatusText(), true);
       return;
     }
+    const recallRoute = conversationRecallRoute(rawPrompt);
+    if (recallRoute !== "none") {
+      if (recallRoute === "clarify") {
+        this.sendFunctionOutput(callID, recallScopeClarificationText(), true);
+        return;
+      }
+      if (recallRoute === "current") {
+        this.sendFunctionOutput(callID, currentConversationRecallText(), true);
+        return;
+      }
+      const knowledge = this.configProvider().knowledge;
+      if (!knowledge?.enabled) {
+        this.log(`[realtime.proxy] blocked recall background_agent without knowledge: ${rawPrompt.slice(0, 160)}`);
+        this.sendFunctionOutput(callID, "This is a personal recall question, not a background task. Knowledge access is off, so answer from the current conversation if possible.", true);
+        return;
+      }
+      const recallArgs = this.personalRecallArgs({ query: rawPrompt }, rawPrompt);
+      this.notifyDirectWork(callID, "knowledge_personal_recall", "running", personalRecallRunningDetail(recallArgs), undefined, { args: recallArgs });
+      const stopProgress = this.startDirectWorkProgress(callID, "knowledge_personal_recall", recallArgs);
+      try {
+        const result = await this.runPersonalRecall(recallArgs, () => knowledge.call("knowledge_personal_recall", recallArgs));
+        this.clearAutoHandoff();
+        this.rememberKnowledgeRequestHandled("knowledge_personal_recall", recallArgs, "knowledge_personal_recall");
+        this.notifyDirectWork(callID, "knowledge_personal_recall", "completed", knowledgeCompletionDetail("knowledge_personal_recall", result), undefined, { args: recallArgs, result });
+        this.log(`[realtime.proxy] rerouted recall background_agent to knowledge_personal_recall call_id=${callID}`);
+        this.sendFunctionOutput(callID, JSON.stringify(result, null, 2), true);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Personal recall failed.";
+        this.notifyDirectWork(callID, "knowledge_personal_recall", "failed", message, message, { args: recallArgs });
+        this.sendFunctionOutput(callID, message, true);
+      } finally {
+        stopProgress();
+      }
+      return;
+    }
+    this.evictStaleHandoffs();
     if (this.pendingHandoffs.size > 0) {
       const agentLabel = this.configProvider().handoff?.agentLabel || "Codex";
       this.log(`[realtime.proxy] ignored background_agent while ${agentLabel} task is already running: ${rawPrompt.slice(0, 160)}`);
       this.sendFunctionOutput(callID, `${agentLabel} is already working on the delegated task. Stay quiet about progress and wait for the final result.`, false);
       return;
     }
-    const decision = await this.routeRealtimeDelegation(rawPrompt, "tool_call");
-    if (!decision.allow) {
-      this.log(`[realtime.proxy] ignored background_agent (${decision.reason}): ${rawPrompt.slice(0, 160)}`);
-      this.sendFunctionOutput(callID, decision.output, decision.createResponse);
+    if (this.delegationStartInFlight) {
+      this.log(`[realtime.proxy] ignored background_agent while another delegation is starting: ${rawPrompt.slice(0, 160)}`);
+      this.sendFunctionOutput(callID, "A delegated task is already starting. Do not start another.", false);
       return;
     }
+    this.delegationStartInFlight = true;
+    try {
+      const decision = await this.routeRealtimeDelegation(rawPrompt, "tool_call");
+      if (!decision.allow) {
+        this.log(`[realtime.proxy] ignored background_agent (${decision.reason}): ${rawPrompt.slice(0, 160)}`);
+        this.sendFunctionOutput(callID, decision.output, decision.createResponse);
+        return;
+      }
 
-    const duplicatePrompt = Array.from(this.pendingHandoffs.values()).some(
-      (handoff) => normalizeRealtimeIntent(handoff.prompt) === decision.normalizedPrompt
-    );
-    if (duplicatePrompt) {
-      this.log(`[realtime.proxy] ignored duplicate background_agent: ${decision.prompt.slice(0, 160)}`);
-      const agentLabel = this.configProvider().handoff?.agentLabel || "Codex";
-      this.sendFunctionOutput(callID, `That ${agentLabel} task is already running. Do not start a duplicate.`, false);
-      return;
+      const duplicatePrompt = Array.from(this.pendingHandoffs.values()).some(
+        (handoff) => normalizeRealtimeIntent(handoff.prompt) === decision.normalizedPrompt
+      );
+      if (duplicatePrompt) {
+        this.log(`[realtime.proxy] ignored duplicate background_agent: ${decision.prompt.slice(0, 160)}`);
+        const agentLabel = this.configProvider().handoff?.agentLabel || "Codex";
+        this.sendFunctionOutput(callID, `That ${agentLabel} task is already running. Do not start a duplicate.`, false);
+        return;
+      }
+
+      if (await this.tryDirectKnowledgeRequest(callID, decision.prompt, "function")) return;
+      this.startCodexHandoff(callID, decision.prompt, "function");
+    } finally {
+      this.delegationStartInFlight = false;
     }
-
-    if (await this.tryDirectKnowledgeRequest(callID, decision.prompt, "function")) return;
-    this.startCodexHandoff(callID, decision.prompt, "function");
   }
 
   // Returns true when the transcript is a stop/interrupt phrase. Immediately
@@ -2488,7 +3871,7 @@ class RealtimeProxySession {
       this.sendUpstream({ type: "response.cancel" });
       this.clearOpenAIResponseActive();
     }
-    this.openAIResponseCreatePending = false;
+    this.openAIResponseCreatePending = null;
     this.truncateOpenAIAudio();
     this.sendToCodex({ type: "output_audio_buffer.cleared" });
     return true;
@@ -2496,14 +3879,29 @@ class RealtimeProxySession {
 
   private scheduleAutoHandoff(transcript: string) {
     if (this.quiet) return;
+    this.evictStaleHandoffs();
     if (this.pendingHandoffs.size > 0) return;
-    this.lastUserUtterance = transcript;
-    if (this.wasKnowledgeHandled(transcript)) return;
-    const delegationMode = this.configProvider().delegationMode || "autoHardTasksOnly";
+	    this.rememberRecentUserUtterance(transcript);
+	    this.lastUserUtterance = transcript;
+	    if (this.wasKnowledgeHandled(transcript)) return;
+	    if (realtimePromptWantsImageGeneration(transcript)) return;
+	    const delegationMode = this.configProvider().delegationMode || "autoHardTasksOnly";
     const decision = decideRealtimeDelegation(transcript, this.pendingHandoffs.size > 0, this.lastDelegationPrompt, {
       blockRealtimeKnowledgeTasks: delegationMode !== "alwaysDelegate"
     });
-    if (!decision.allow) return;
+    this.log(
+      `[realtime.proxy] auto route decision allow=${String(decision.allow)} ` +
+      `reason=${decision.allow ? "delegate" : decision.reason} prompt=${transcript.slice(0, 180)}`
+    );
+    if (!decision.allow) {
+      if (decision.reason === "conversation recall") {
+        const callID = makeShortRealtimeID("callrec", ++this.autoHandoffSequence);
+        void this.tryPersonalRecallRequest(callID, transcript, "message");
+      } else if (decision.reason === "ambiguous recall scope") {
+        void this.speakDirectText(recallScopeClarificationText());
+      }
+      return;
+    }
     if (decision.normalizedPrompt === this.lastAutoHandoffNormalizedPrompt) return;
     this.clearAutoHandoff();
     this.autoHandoffTimer = setTimeout(() => {
@@ -2513,24 +3911,35 @@ class RealtimeProxySession {
 
   private async runAutoHandoff(transcript: string) {
     this.autoHandoffTimer = undefined;
+    this.evictStaleHandoffs();
     if (this.pendingHandoffs.size > 0) return;
+    if (this.delegationStartInFlight) return;
     if (this.wasKnowledgeHandled(transcript)) return;
-    const decision = await this.routeRealtimeDelegation(transcript, "auto_transcript");
-    if (!decision.allow) return;
-    const duplicatePrompt = Array.from(this.pendingHandoffs.values()).some(
-      (handoff) => normalizeRealtimeIntent(handoff.prompt) === decision.normalizedPrompt
-    );
-    if (duplicatePrompt || decision.normalizedPrompt === this.lastAutoHandoffNormalizedPrompt) return;
-    this.lastAutoHandoffNormalizedPrompt = decision.normalizedPrompt;
-    if (this.openAIResponseActive) {
-      this.sendUpstream({ type: "response.cancel" });
-      this.clearOpenAIResponseActive();
+    if (realtimePromptWantsImageGeneration(transcript)) return;
+    this.delegationStartInFlight = true;
+    try {
+      const decision = await this.routeRealtimeDelegation(transcript, "auto_transcript");
+      if (!decision.allow) return;
+      // An explicit background_agent tool call may have started a task while the
+      // router call above was in flight; never double-delegate the utterance.
+      if (this.pendingHandoffs.size > 0) return;
+      const duplicatePrompt = Array.from(this.pendingHandoffs.values()).some(
+        (handoff) => normalizeRealtimeIntent(handoff.prompt) === decision.normalizedPrompt
+      );
+      if (duplicatePrompt || decision.normalizedPrompt === this.lastAutoHandoffNormalizedPrompt) return;
+      this.lastAutoHandoffNormalizedPrompt = decision.normalizedPrompt;
+      if (this.openAIResponseActive) {
+        this.sendUpstream({ type: "response.cancel" });
+        this.clearOpenAIResponseActive();
+      }
+      this.truncateOpenAIAudio();
+      const callID = makeShortRealtimeID("calloa", ++this.autoHandoffSequence);
+      this.log(`[realtime.proxy] auto background_agent: ${decision.prompt.slice(0, 160)}`);
+      if (await this.tryDirectKnowledgeRequest(callID, decision.prompt, "message")) return;
+      this.startCodexHandoff(callID, decision.prompt, "message");
+    } finally {
+      this.delegationStartInFlight = false;
     }
-    this.truncateOpenAIAudio();
-    const callID = makeShortRealtimeID("calloa", ++this.autoHandoffSequence);
-    this.log(`[realtime.proxy] auto background_agent: ${decision.prompt.slice(0, 160)}`);
-    if (await this.tryDirectKnowledgeRequest(callID, decision.prompt, "message")) return;
-    this.startCodexHandoff(callID, decision.prompt, "message");
   }
 
   private rememberLocalMessageHandoffCallID(callID: string) {
@@ -2637,6 +4046,60 @@ class RealtimeProxySession {
     }
   }
 
+  private async tryPersonalRecallRequest(
+    callID: string,
+    prompt: string,
+    replyMode: PendingHandoff["replyMode"]
+  ) {
+    const knowledge = this.configProvider().knowledge;
+    if (!knowledge?.enabled) {
+      const output = "Personal memory access is off, so I cannot search saved memories right now.";
+      if (replyMode === "message") {
+        await this.ensureUpstream();
+        this.sendAgentResultMessage(output, "OpenAssist");
+      } else {
+        this.sendFunctionOutput(callID, output, true);
+      }
+      return true;
+    }
+    const args = this.personalRecallArgs({ query: prompt }, prompt);
+    this.rememberKnowledgeHandled(prompt, "knowledge_personal_recall_pending");
+    this.rememberKnowledgeRequestHandled("knowledge_personal_recall", args, "knowledge_personal_recall_pending");
+    this.notifyDirectWork(callID, "knowledge_personal_recall", "running", personalRecallRunningDetail(args), undefined, { args });
+    const stopProgress = this.startDirectWorkProgress(callID, "knowledge_personal_recall", args);
+    try {
+      const result = await this.runPersonalRecall(args, () => knowledge.call("knowledge_personal_recall", args));
+      this.clearAutoHandoff();
+      this.rememberKnowledgeRequestHandled("knowledge_personal_recall", args, "knowledge_personal_recall");
+      const answer = knowledgeCompletionDetail("knowledge_personal_recall", result);
+      this.notifyDirectWork(callID, "knowledge_personal_recall", "completed", answer, undefined, { args, result });
+      this.lastDelegationPrompt = prompt;
+      this.lastDelegationResult = answer.slice(0, 2_000);
+      this.log(`[realtime.proxy] personal recall handled directly call_id=${callID}`);
+      if (replyMode === "message") {
+        await this.ensureUpstream();
+        this.cancelOpenAIResponseBeforeDirectResult("personal recall completed");
+        this.sendAgentResultMessage(answer, "OpenAssist Spark Recall");
+      } else {
+        this.sendFunctionOutput(callID, JSON.stringify(result, null, 2), true);
+      }
+      return true;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Personal recall failed.";
+      this.notifyDirectWork(callID, "knowledge_personal_recall", "failed", message, message, { args });
+      if (replyMode === "message") {
+        await this.ensureUpstream();
+        this.cancelOpenAIResponseBeforeDirectResult("personal recall failed");
+        this.sendAgentResultMessage(message, "OpenAssist Spark Recall");
+      } else {
+        this.sendFunctionOutput(callID, message, true);
+      }
+      return true;
+    } finally {
+      stopProgress();
+    }
+  }
+
   private startCodexHandoff(callID: string, prompt: string, replyMode: PendingHandoff["replyMode"]) {
     const externalHandoff = this.configProvider().handoff;
     if (externalHandoff) {
@@ -2714,6 +4177,178 @@ class RealtimeProxySession {
     })();
   }
 
+  // OpenAI Realtime entry: parse the tool args, start the parallel run, and send a
+  // short function_call_output ack. The real results arrive later via the narration
+  // queue (reportTaskResult -> enqueueParallelResult), one spoken reply per task.
+  private async handleParallelDelegation(callID: string, item: JsonObject) {
+    const args = jsonObject(parseJSON(stringValue(item.arguments))) ?? {};
+    const ack = await this.startParallelDelegation(callID, args);
+    this.sendFunctionOutput(callID, ack, true);
+  }
+
+  // Shared logic for both OpenAI and Gemini paths. Returns the immediate ack text
+  // the model should say; queues each task's result as it finishes.
+  private async startParallelDelegation(callID: string, args: JsonObject): Promise<string> {
+    const config = this.configProvider();
+    const agentLabel = config.handoff?.agentLabel || "Codex";
+    const parallel = config.parallelDelegation;
+    const delegationMode = config.delegationMode || "autoHardTasksOnly";
+    const route = routeParallelDelegation(
+      this.parseParallelTasks(args),
+      this.pendingHandoffs.size > 0,
+      this.lastDelegationPrompt,
+      { blockRealtimeKnowledgeTasks: delegationMode !== "alwaysDelegate" }
+    );
+    if (route.action !== "proceed") {
+      this.log(`[realtime.proxy] delegate_parallel_tasks guarded call_id=${callID} reason=${route.reason}`);
+      if (route.action === "image") {
+        return this.codexImageGenerationToolOutput(callID, { prompt: route.prompt }, route.prompt);
+      }
+      if (route.action === "recall") {
+        return this.personalRecallRerouteOutput(callID, route.query, "delegate_parallel_tasks");
+      }
+      if (route.reason === "delegated status question") {
+        return this.delegatedTaskStatusText();
+      }
+      return route.output;
+    }
+    const tasks = route.tasks;
+    if (!parallel) {
+      // No multi-task backend wired (e.g. raw Codex backend) — fall back to running
+      // the tasks one after another through the normal single-task handoff so the
+      // user still gets their work done.
+      for (const task of tasks) {
+        const subCallID = makeShortRealtimeID("callpar", ++this.autoHandoffSequence);
+        this.startCodexHandoff(subCallID, task.prompt, "message");
+      }
+      return `Running ${tasks.length} ${tasks.length === 1 ? "task" : "tasks"} with ${agentLabel}. Say a short acknowledgement, then wait for each result.`;
+    }
+
+    this.clearAutoHandoff();
+    this.activeParallelDelegations += tasks.length;
+    this.log(`[realtime.proxy] delegate_parallel_tasks call_id=${callID} count=${tasks.length}`);
+
+    void (async () => {
+      try {
+        const summary = await parallel.run({
+          callID,
+          tasks,
+          reportTaskResult: (result) => {
+            const failLabel = result.failed ? " (failed)" : "";
+            const where = [result.provider, result.project].filter(Boolean).join(", ");
+            const heading = where
+              ? `${result.label} — ${where}${failLabel}`
+              : `${result.label}${failLabel}`;
+            const body = [heading, result.text].filter(Boolean).join("\n");
+            this.enqueueParallelResult(body, result.agentLabel || agentLabel);
+          }
+        });
+        if (summary.note) this.log(`[realtime.proxy] parallel delegation note: ${summary.note}`);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Parallel tasks could not be started.";
+        this.log(`[realtime.proxy] delegate_parallel_tasks failed: ${message}`);
+        this.enqueueParallelResult(`The parallel tasks could not start: ${message}`, agentLabel);
+      } finally {
+        this.activeParallelDelegations = Math.max(0, this.activeParallelDelegations - tasks.length);
+      }
+    })();
+
+    const max = Math.max(1, parallel.maxTasks || 6);
+    const note = tasks.length > max
+      ? ` Only the first ${max} will run at once because that is the limit.`
+      : "";
+    return `Starting ${tasks.length} ${tasks.length === 1 ? "task" : "tasks"} in parallel with ${agentLabel}.${note} Say a short acknowledgement like "Starting now", then wait. Speak each result as it arrives, one at a time.`;
+  }
+
+  // Run a misrouted recall question through Spark personal recall and return the
+  // tool output text, mirroring the background_agent recall reroute.
+  private async personalRecallRerouteOutput(callID: string, query: string, sourceTool: string): Promise<string> {
+    const knowledge = this.configProvider().knowledge;
+    if (!knowledge?.enabled) {
+      this.log(`[realtime.proxy] blocked recall ${sourceTool} without knowledge: ${query.slice(0, 160)}`);
+      return "This is a personal recall question, not a background task. Knowledge access is off, so answer from the current conversation if possible.";
+    }
+    const recallArgs = this.personalRecallArgs({ query }, query);
+    this.notifyDirectWork(callID, "knowledge_personal_recall", "running", personalRecallRunningDetail(recallArgs), undefined, { args: recallArgs });
+    const stopProgress = this.startDirectWorkProgress(callID, "knowledge_personal_recall", recallArgs);
+    try {
+      const result = await this.runPersonalRecall(recallArgs, () => knowledge.call("knowledge_personal_recall", recallArgs));
+      this.clearAutoHandoff();
+      this.rememberKnowledgeRequestHandled("knowledge_personal_recall", recallArgs, "knowledge_personal_recall");
+      this.notifyDirectWork(callID, "knowledge_personal_recall", "completed", knowledgeCompletionDetail("knowledge_personal_recall", result), undefined, { args: recallArgs, result });
+      this.log(`[realtime.proxy] rerouted recall ${sourceTool} to knowledge_personal_recall call_id=${callID}`);
+      return JSON.stringify(result, null, 2);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Personal recall failed.";
+      this.notifyDirectWork(callID, "knowledge_personal_recall", "failed", message, message, { args: recallArgs });
+      return message;
+    } finally {
+      stopProgress();
+    }
+  }
+
+  private parseParallelTasks(args: JsonObject): Array<{ prompt: string; provider?: string; project?: string }> {
+    const rawList = Array.isArray(args.tasks) ? args.tasks : [];
+    const tasks: Array<{ prompt: string; provider?: string; project?: string }> = [];
+    for (const raw of rawList) {
+      const entry = jsonObject(raw);
+      if (!entry) continue;
+      const prompt = stringValue(entry.prompt, entry.task).trim();
+      if (!prompt) continue;
+      const provider = stringValue(entry.provider, entry.model).trim();
+      const project = stringValue(entry.project, entry.folder, entry.group).trim();
+      tasks.push({
+        prompt,
+        provider: provider || undefined,
+        project: project || undefined
+      });
+    }
+    return tasks;
+  }
+
+  // Queue a finished-task result for narration. Speaks immediately if nothing is
+  // currently being spoken; otherwise it waits its turn so two results never overlap.
+  private enqueueParallelResult(text: string, agentLabel: string) {
+    this.parallelResultQueue.push({ text, agentLabel });
+    this.drainParallelResults();
+  }
+
+  // Speak the next queued result only when the channel is free: not in quiet mode,
+  // no active spoken response, and not already mid-narration of a previous result.
+  private drainParallelResults() {
+    if (this.parallelResultSpeaking) return;
+    if (this.quiet) return;
+    if (this.openAIResponseActive || this.geminiAudioItemID) return;
+    // A reconnecting OpenAI socket silently swallows response.create; leave the
+    // queue intact and retry after the reconnect (ensureUpstream drains again).
+    if (!this.isGeminiLive() && this.upstream?.readyState !== WebSocket.OPEN) return;
+    const next = this.parallelResultQueue.shift();
+    if (!next) return;
+    this.parallelResultSpeaking = true;
+    void this.sendAgentResultMessage(next.text, next.agentLabel).then((sent) => {
+      if (!sent) {
+        // Gemini session unavailable; put the result back and retry at the next
+        // drain trigger instead of wedging the queue with speaking=true forever.
+        this.parallelResultQueue.unshift(next);
+        this.parallelResultSpeaking = false;
+      }
+    });
+    // sendAgentResultMessage requests a spoken response; the speaking flag is cleared
+    // and the next item drained when that response ends (response.done / Gemini audio
+    // done) via onParallelNarrationEnded().
+  }
+
+  // Called when a spoken response finishes, so the next queued parallel result (if any)
+  // can start. Hooked from response.done and finishGeminiAudio.
+  private onParallelNarrationEnded() {
+    if (this.parallelResultSpeaking) {
+      this.parallelResultSpeaking = false;
+    }
+    if (this.parallelResultQueue.length) {
+      this.drainParallelResults();
+    }
+  }
+
   private async completeHandoff(callID: string, fallbackOutput = "") {
     const handoff = this.pendingHandoffs.get(callID);
     if (!handoff) {
@@ -2730,33 +4365,58 @@ class RealtimeProxySession {
       || `${handoff.agentLabel || "Agent"} finished the task.`;
     this.lastDelegationResult = text.slice(0, 2_000);
     this.pendingHandoffs.delete(callID);
+    // Allow the same request to be delegated again after this one finished.
+    this.lastAutoHandoffNormalizedPrompt = "";
     await this.ensureUpstream();
     if (handoff.replyMode === "message") {
-      this.sendAgentResultMessage(text, handoff.agentLabel);
+      // Route through the narration queue: it survives quiet mode (results are
+      // spoken after unmute instead of dropped) and never overlaps other results.
+      this.enqueueParallelResult(text, handoff.agentLabel);
     } else {
       this.sendFunctionOutput(callID, text, true, { agentResult: true, agentLabel: handoff.agentLabel });
     }
   }
 
-  private sendAgentResultMessage(output: string, agentLabel: string) {
+  private async sendAgentResultMessage(output: string, agentLabel: string): Promise<boolean> {
     if (this.isGeminiLive()) {
-      void this.sendGeminiText(formatAgentResultForRealtime(output, agentLabel));
-      return;
+      return this.sendGeminiText(formatAgentResultForRealtime(output, agentLabel));
     }
-    this.sendUpstream({
-      type: "conversation.item.create",
-      item: {
-        type: "message",
-        role: "user",
-        content: [
-          {
-            type: "input_text",
-            text: formatAgentResultForRealtime(output, agentLabel)
-          }
-        ]
-      }
-    });
-    this.requestOpenAIResponseCreate();
+    const response: JsonObject = {
+      instructions: directSpeechInstructions(output, agentLabel),
+      input: []
+    };
+    this.requestOpenAIResponseCreate("agent result", response);
+    this.scheduleOpenAIDirectResultAudioRetry("agent result", response);
+    return true;
+  }
+
+  private cancelOpenAIResponseBeforeDirectResult(reason: string) {
+    if (this.isGeminiLive()) return;
+    if (!this.openAIResponseActive && !this.audioItemID) return;
+    this.log(`[realtime.proxy] cancelling active OpenAI response before direct result: ${reason}`);
+    if (this.openAIResponseActive) this.sendUpstream({ type: "response.cancel" });
+    this.openAIResponseCreatePending = null;
+    this.clearOpenAIResponseActive();
+    this.truncateOpenAIAudio();
+    this.sendToCodex({ type: "output_audio_buffer.cleared" });
+  }
+
+  private async speakDirectText(text: string) {
+    const cleanText = compactRealtimeStatusText(text, 500);
+    if (!cleanText) return false;
+    const instruction = `Say exactly this to the user, and do not add anything else:\n${cleanText}`;
+    if (this.isGeminiLive()) {
+      return this.sendGeminiText(instruction);
+    }
+    const upstream = await this.ensureUpstream();
+    if (!upstream) return false;
+    const response: JsonObject = {
+      instructions: instruction,
+      input: []
+    };
+    this.requestOpenAIResponseCreate("direct text", response);
+    this.scheduleOpenAIDirectResultAudioRetry("direct text", response);
+    return true;
   }
 
   private sendFunctionOutput(
@@ -2788,7 +4448,7 @@ class RealtimeProxySession {
       }
     });
     if (createResponse && !this.quiet) {
-      this.requestOpenAIResponseCreate();
+      this.requestOpenAIResponseCreate("function output");
     }
   }
 
@@ -2813,6 +4473,7 @@ class RealtimeProxySession {
       this.log("[realtime.proxy] response watchdog fired; clearing stuck active-response flag");
       this.clearOpenAIResponseActive();
       this.flushOpenAIResponseCreate();
+      this.onParallelNarrationEnded();
     }, openAIResponseWatchdogMs);
     if (typeof this.openAIResponseWatchdog.unref === "function") this.openAIResponseWatchdog.unref();
   }
@@ -2825,26 +4486,50 @@ class RealtimeProxySession {
     }
   }
 
-  private requestOpenAIResponseCreate() {
+  private clearOpenAIDirectResultAudioRetry() {
+    if (!this.openAIDirectResultAudioRetry) return;
+    clearTimeout(this.openAIDirectResultAudioRetry);
+    this.openAIDirectResultAudioRetry = undefined;
+  }
+
+  private scheduleOpenAIDirectResultAudioRetry(reason: string, response: JsonObject = {}) {
+    if (this.isGeminiLive() || this.quiet) return;
+    this.clearOpenAIDirectResultAudioRetry();
+    this.openAIDirectResultAudioRetry = setTimeout(() => {
+      this.openAIDirectResultAudioRetry = undefined;
+      if (this.closed || this.quiet || this.isGeminiLive()) return;
+      if (this.audioItemID) return;
+      this.log(`[realtime.proxy] retrying OpenAI spoken direct result; no audio started reason=${reason}`);
+      this.sendUpstream({ type: "response.cancel" });
+      this.clearOpenAIResponseActive();
+      this.openAIResponseCreatePending = null;
+      this.requestOpenAIResponseCreate(`${reason} retry`, response);
+    }, openAIDirectResultAudioRetryMs);
+    unrefTimer(this.openAIDirectResultAudioRetry);
+  }
+
+  private requestOpenAIResponseCreate(reason = "response", response: JsonObject = {}) {
     if (this.quiet) return;
     if (this.isGeminiLive()) return;
     if (this.openAIResponseActive) {
-      this.openAIResponseCreatePending = true;
-      this.log("[realtime.proxy] delayed response.create because OpenAI response is still active.");
+      this.openAIResponseCreatePending = { reason, response };
+      this.log(`[realtime.proxy] delayed response.create because OpenAI response is still active reason=${reason}.`);
       return;
     }
     this.markOpenAIResponseActive();
+    this.log(`[realtime.proxy] sending response.create reason=${reason}`);
     this.sendUpstream({
       type: "response.create",
-      response: { output_modalities: ["audio"] }
+      response: { output_modalities: ["audio"], ...response }
     });
   }
 
   private flushOpenAIResponseCreate() {
-    if (!this.openAIResponseCreatePending) return;
-    this.openAIResponseCreatePending = false;
+    const pending = this.openAIResponseCreatePending;
+    if (!pending) return;
+    this.openAIResponseCreatePending = null;
     this.log(`[realtime.audio-diag] flushing queued response.create (active=${String(this.openAIResponseActive)})`);
-    this.requestOpenAIResponseCreate();
+    this.requestOpenAIResponseCreate(pending.reason || "queued response", pending.response || {});
   }
 
   private truncateOpenAIAudio() {
@@ -2853,11 +4538,15 @@ class RealtimeProxySession {
       return;
     }
     if (!this.audioItemID) return;
+    const itemID = this.audioItemID;
+    const audioEndMs = Math.max(0, Math.round(this.audioMs));
+    this.audioItemID = "";
+    this.audioMs = 0;
     this.sendUpstream({
       type: "conversation.item.truncate",
-      item_id: this.audioItemID,
+      item_id: itemID,
       content_index: 0,
-      audio_end_ms: Math.max(0, Math.round(this.audioMs))
+      audio_end_ms: audioEndMs
     });
   }
 
@@ -2873,7 +4562,7 @@ class RealtimeProxySession {
     }
     this.pendingHandoffs.clear();
     this.clearOpenAIResponseActive();
-    this.openAIResponseCreatePending = false;
+    this.openAIResponseCreatePending = null;
     if (this.upstream?.readyState === WebSocket.OPEN || this.upstream?.readyState === WebSocket.CONNECTING) {
       this.upstream.close();
     }
@@ -2898,7 +4587,8 @@ export const __realtimeRouterTestHooks = {
   decideRealtimeDelegation,
   isHighConfidenceRealtimeDelegation,
   normalizeRealtimeIntent,
-  realtimeVoiceKnowledgeToolSpecs
+  realtimeVoiceKnowledgeToolSpecs,
+  routeParallelDelegation
 };
 
 export class CodexRealtimeProxy extends EventEmitter {
@@ -2979,6 +4669,15 @@ export class CodexRealtimeProxy extends EventEmitter {
     return sent > 0
       ? { ok: true, sent }
       : { ok: false, error: "Could not send image context to Live Voice." };
+  }
+
+  async appendText(text: string) {
+    if (!this.sessions.size) return { ok: false, error: "Live Voice is not running." };
+    const results = await Promise.all(Array.from(this.sessions).map((session) => session.appendUserText(text)));
+    const sent = results.filter(Boolean).length;
+    return sent > 0
+      ? { ok: true, sent }
+      : { ok: false, error: "Could not send text to Live Voice." };
   }
 
   async stop() {

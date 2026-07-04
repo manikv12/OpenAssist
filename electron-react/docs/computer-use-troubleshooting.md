@@ -67,6 +67,40 @@ In `electron/openassistBridge.ts`:
   tripped the killer on the next turn. Do **not** re-add a probe that launches a
   second helper.
 
+## The second bug: killing Codex.app's own helpers (July 2026)
+
+The same helper binaries (`SkyComputerUseClient` / `SkyComputerUseService`) are
+also spawned by the **standalone Codex.app** for its own Computer Use sessions —
+including "locked use", which keeps a helper attached for hours. OpenAssist's
+cleanup matched helpers **by name only**, so:
+
+- `cleanupOrphanedComputerUseHelpersOnStartup` killed **every** helper on the
+  Mac at app launch (no age or ownership check).
+- `cleanupStaleComputerUseHelpers` killed any helper older than 60–180s that
+  wasn't a child of OpenAssist's own app-server — which describes **all** of
+  Codex.app's helpers.
+
+Result: Codex.app's locked use died with `Transport closed` whenever OpenAssist
+started or ran its periodic cleanup, even though the toggle was on.
+
+### The fix
+
+`classifyComputerUseHelperOwnership` walks each helper's parent chain in the
+process snapshot:
+
+- reaches this OpenAssist process → **ours** (killable per the usual age rules);
+- topmost living ancestor below launchd is itself a helper or a
+  `codex app-server` → **orphaned** (its owning app died; killable);
+- anything else (Codex.app, VS Code extension, …) → **foreign** (never touched).
+
+All automatic kill paths (startup cleanup, stale cleanup, post-Stop sweep) go
+through `isAutomaticallyKillableComputerUseHelper`, which also **never** kills
+the shared `SkyComputerUseService` (an on-demand service reused by Codex.app —
+it idles cheaply and relaunches when needed). `getComputerUseActivity` excludes
+foreign helpers so the Settings "Force stop" can't kill them either.
+
+Guarded by `npm run verify:computer-use-ownership`.
+
 ## If Computer Use stops working again — diagnosis checklist
 
 1. **Read the debug log** (most important):

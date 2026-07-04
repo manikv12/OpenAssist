@@ -3,7 +3,10 @@ import Foundation
 
 let eventPostDelay: useconds_t = 1_500
 let finalDeliveryDelay: useconds_t = 30_000
-let clipboardRestoreDelay: useconds_t = 450_000
+// 250ms is enough for the target app to consume the pasteboard after Cmd+V is
+// delivered; the previous 450ms made every dictation feel slower because the
+// helper (and the caller awaiting it) blocked on this before reporting done.
+let clipboardRestoreDelay: useconds_t = 250_000
 let transientPasteboardTypes: [NSPasteboard.PasteboardType] = [
     NSPasteboard.PasteboardType("org.nspasteboard.TransientType"),
     NSPasteboard.PasteboardType("org.nspasteboard.ConcealedType"),
