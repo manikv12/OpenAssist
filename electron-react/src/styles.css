@@ -17618,6 +17618,78 @@ mark.find-highlight.find-active {
   background: color-mix(in srgb, var(--theme-foreground, #e6edf3) 11%, transparent);
 }
 
+.thread-folder-warning-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 85;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 18px;
+  background: rgba(0, 0, 0, 0.34);
+  -webkit-backdrop-filter: blur(4px);
+  backdrop-filter: blur(4px);
+}
+
+.thread-folder-warning-dialog {
+  width: min(520px, 100%);
+  display: grid;
+  gap: 14px;
+  padding: 18px;
+  border: 1px solid color-mix(in srgb, var(--theme-foreground, #e6edf3) 12%, transparent);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--theme-background, #0d1117) 96%, #111318);
+  box-shadow: 0 24px 70px rgba(0, 0, 0, 0.45);
+}
+
+.thread-folder-warning-dialog header,
+.thread-folder-warning-dialog footer {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.thread-folder-warning-dialog header > div {
+  min-width: 0;
+  flex: 1;
+  display: grid;
+  gap: 3px;
+}
+
+.thread-folder-warning-dialog strong {
+  color: var(--text);
+  font-size: 15px;
+}
+
+.thread-folder-warning-dialog small,
+.thread-folder-warning-dialog p {
+  margin: 0;
+  color: var(--muted);
+}
+
+.thread-folder-warning-dialog code {
+  display: block;
+  max-height: 90px;
+  overflow: auto;
+  padding: 10px;
+  border-radius: 8px;
+  border: 1px solid color-mix(in srgb, var(--theme-foreground, #e6edf3) 10%, transparent);
+  color: var(--text);
+  background: color-mix(in srgb, var(--theme-foreground, #e6edf3) 5%, transparent);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.thread-folder-warning-icon,
+.thread-folder-warning-dialog header > button {
+  flex: 0 0 auto;
+}
+
+.thread-folder-warning-dialog footer {
+  justify-content: flex-end;
+  flex-wrap: wrap;
+}
+
 .daily-item-slideover-body {
   flex: 1 1 auto;
   min-height: 0;
@@ -22553,6 +22625,39 @@ mark.find-highlight.find-active {
 .telegram-pairing-box small,
 .telegram-pairing-box span {
   color: var(--muted);
+}
+
+.settings-divider {
+  height: 1px;
+  margin: 14px 0;
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.card-heading.compact {
+  margin-top: 4px;
+}
+
+.remote-peer-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+}
+
+.remote-peer-row > span {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.remote-peer-row .inline-actions {
+  margin-top: 0;
+}
+
+@media (max-width: 760px) {
+  .remote-peer-row {
+    grid-template-columns: 1fr;
+  }
 }
 
 .secure-field {

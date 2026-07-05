@@ -292,6 +292,11 @@ contextBridge.exposeInMainWorld("openAssistElectron", {
   startRemoteAccessEasyQR: () => ipcRenderer.invoke("openassist:start-remote-access-easy-qr"),
   stopRemoteAccessEasyQR: () => ipcRenderer.invoke("openassist:stop-remote-access-easy-qr"),
   getRemoteAccessStatus: () => ipcRenderer.invoke("openassist:get-remote-access-status"),
+  pairMacSyncPeer: (pairingURL: string) => ipcRenderer.invoke("openassist:pair-mac-sync-peer", pairingURL),
+  getMacSyncStatus: () => ipcRenderer.invoke("openassist:get-mac-sync-status"),
+  syncMacSyncPeer: (peerID: string) => ipcRenderer.invoke("openassist:sync-mac-sync-peer", peerID),
+  syncAllMacSyncPeers: () => ipcRenderer.invoke("openassist:sync-all-mac-sync-peers"),
+  revokeMacSyncPeer: (peerID: string) => ipcRenderer.invoke("openassist:revoke-mac-sync-peer", peerID),
   sendMessage: (prompt: string, threadID?: string, pluginIDs?: string[], sessionInstructions?: string, reasoningEffort?: string, interactionMode?: string, permissionMode?: string, skillIDs?: string[], clientRunID?: string, attachments?: unknown[]) =>
     ipcRenderer.invoke("openassist:send-message", prompt, threadID, pluginIDs, sessionInstructions, reasoningEffort, interactionMode, permissionMode, skillIDs, clientRunID, attachments),
   codexRuntimeParityProbe: (options?: unknown) => ipcRenderer.invoke("openassist:codex-runtime-parity-probe", options),

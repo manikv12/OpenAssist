@@ -465,6 +465,7 @@ type ProjectItem = {
   kind?: "folder" | "project";
   parentID?: string | null;
   linkedFolderPath?: string | null;
+  peerLinkedFolders?: Array<{ machineID?: string; machineName?: string; path?: string }>;
   area?: string;
   color?: string;
   plannerOnly?: boolean;
@@ -852,6 +853,8 @@ type SettingsSnapshot = {
   remoteAccessPairingExpiresAt: number | null;
   remoteAccessServerRunning: boolean;
   remoteAccessDeviceCount: number;
+  remoteAccessSyncPeerCount: number;
+  remoteAccessSyncPeers: MacSyncPeerStatus[];
   localAIRuntimeVersion: string;
   promptRewriteProvider: string;
   promptRewriteModel: string;
@@ -11519,6 +11522,7 @@ function loadedProjectsState() {
 
 function emitProjectsChanged() {
   emitAppStateBackgroundUpdate({ type: "projects", ...loadedProjectsState() });
+  scheduleMacSyncSoon();
 }
 
 function renameProject(projectID: string, name: string) {
@@ -11530,6 +11534,7 @@ function renameProject(projectID: string, name: string) {
   project.name = nextName;
   project.updatedAt = currentSwiftDate();
   saveProjectStoreSnapshot(filePath, snapshot);
+  scheduleMacSyncSoon();
   return loadedProjectItem(projectID);
 }
 
@@ -11541,6 +11546,7 @@ function updateProjectIcon(projectID: string, symbol?: string | null) {
   else delete project.iconSymbolName;
   project.updatedAt = currentSwiftDate();
   saveProjectStoreSnapshot(filePath, snapshot);
+  scheduleMacSyncSoon();
   return loadedProjectItem(projectID);
 }
 
@@ -11671,6 +11677,7 @@ function updateProjectLinkedFolder(projectID: string, folderPath?: string | null
     previousFolderPath,
     normalized
   );
+  scheduleMacSyncSoon();
   return loadedProjectItem(projectID);
 }
 
@@ -11688,6 +11695,7 @@ function moveProjectToFolder(projectID: string, folderID?: string | null) {
   }
   project.updatedAt = currentSwiftDate();
   saveProjectStoreSnapshot(filePath, snapshot);
+  scheduleMacSyncSoon();
   return loadedProjectItem(projectID);
 }
 
@@ -11698,6 +11706,7 @@ function hideProject(projectID: string) {
   project.isHidden = true;
   project.updatedAt = currentSwiftDate();
   saveProjectStoreSnapshot(filePath, snapshot);
+  scheduleMacSyncSoon();
   return { ok: true };
 }
 
@@ -11708,6 +11717,7 @@ function unhideProject(projectID: string) {
   project.isHidden = false;
   project.updatedAt = currentSwiftDate();
   saveProjectStoreSnapshot(filePath, snapshot);
+  scheduleMacSyncSoon();
   return loadedProjectItem(projectID);
 }
 
@@ -11745,6 +11755,8 @@ function deleteProject(projectID: string) {
     if (projectIDsToDelete.has(projectKey.trim().toLowerCase())) delete snapshot.brainByProjectID?.[projectKey];
   }
   saveProjectStoreSnapshot(filePath, snapshot);
+  for (const deletedProjectID of projectIDsToDelete) recordMacSyncTombstone("project", deletedProjectID.toUpperCase());
+  scheduleMacSyncSoon();
   return { ok: true };
 }
 
@@ -11804,6 +11816,16 @@ function projectItemFromSnapshot(project: JsonObject, notes = 0, chats = 0): Pro
     kind,
     parentID: (project.parentID as string | undefined) ?? null,
     linkedFolderPath: (project.linkedFolderPath as string | undefined) ?? null,
+    peerLinkedFolders: Array.isArray(project.peerLinkedFolders)
+      ? project.peerLinkedFolders
+        .map((entry) => jsonObject(entry))
+        .filter((entry): entry is JsonObject => Boolean(entry))
+        .map((entry) => ({
+          machineID: String(entry.machineID ?? "").trim() || undefined,
+          machineName: String(entry.machineName ?? "").trim() || undefined,
+          path: String(entry.path ?? "").trim() || undefined
+        }))
+      : undefined,
     area,
     color: (project.color as string | undefined) ?? undefined,
     plannerOnly,
@@ -11854,6 +11876,7 @@ function createProject(name: string, kind: "project" | "folder" = "project", par
     snapshot.brainByProjectID[projectID] = { projectSummary: "", processedThreadIDs: [], threadDigestsByThreadID: {} };
   }
   writeJSON(filePath, snapshot);
+  scheduleMacSyncSoon();
   return projectItemFromSnapshot(project);
 }
 
@@ -11882,6 +11905,7 @@ function createProjectFromFolder(folderPath: string, parentID?: string | null) {
       previousFolderPath,
       linkedFolderPath
     );
+    scheduleMacSyncSoon();
     return loadedProjectItem(String(existingProject.id ?? ""));
   }
 
@@ -11904,6 +11928,7 @@ function createProjectFromFolder(folderPath: string, parentID?: string | null) {
   snapshot.brainByProjectID = snapshot.brainByProjectID ?? {};
   snapshot.brainByProjectID[projectID] = { projectSummary: "", processedThreadIDs: [], threadDigestsByThreadID: {} };
   saveProjectStoreSnapshot(filePath, snapshot);
+  scheduleMacSyncSoon();
   return projectItemFromSnapshot(project);
 }
 
@@ -12272,7 +12297,7 @@ function projectNotesHiddenForList(projects: LoadedProjects, projectID: string) 
 }
 
 function projectNoteMarkdownPath(projectID: string, note: JsonObject, noteID: string) {
-  const fileName = typeof note.fileName === "string" ? note.fileName : `${noteID}.md`;
+  const fileName = macSyncSafeNoteFileName(note.fileName, noteID);
   return path.join(noteDirectoryPath(projectID), fileName);
 }
 
@@ -12468,7 +12493,7 @@ function writeNoteManifest(projectID: string, manifest: { version?: number; sele
 function loadNote(projectID: string, noteID: string): NoteDetail {
   const manifest = readNoteManifest(projectID);
   const note = (manifest.notes ?? []).find((entry) => entry.id === noteID);
-  const fileName = typeof note?.fileName === "string" ? note.fileName : `${noteID}.md`;
+  const fileName = macSyncSafeNoteFileName(note?.fileName, noteID);
   if (note && manifest.selectedNoteID !== noteID) {
     manifest.selectedNoteID = noteID;
     writeNoteManifest(projectID, manifest);
@@ -12997,7 +13022,7 @@ function deleteProjectNotePermanently(projectID: string, noteID: string): { proj
   const target = (manifest.notes ?? []).find((entry) => entry.id === noteID);
   if (!target) return { projectID: projectID.toUpperCase(), deletedNoteID: noteID };
   const remaining = (manifest.notes ?? []).filter((entry) => entry.id !== noteID);
-  const fileName = typeof target.fileName === "string" ? target.fileName : `${noteID}.md`;
+  const fileName = macSyncSafeNoteFileName(target.fileName, noteID);
   const filePath = path.join(noteDirectoryPath(projectID), fileName);
   try {
     if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
@@ -13009,6 +13034,7 @@ function deleteProjectNotePermanently(projectID: string, noteID: string): { proj
   }
   manifest.notes = remaining;
   writeNoteManifest(projectID, manifest);
+  recordMacSyncTombstone("note", noteID, projectID.toUpperCase());
   scheduleRemoteAccessBroadcast();
   return { projectID: projectID.toUpperCase(), deletedNoteID: noteID };
 }
@@ -13030,10 +13056,12 @@ function purgeExpiredArchivedProjectNotes(settings: Pick<SettingsSnapshot, "arch
     const remaining: JsonObject[] = [];
     for (const entry of manifest.notes ?? []) {
       if (shouldAutoDeleteArchivedRecord(entry, settings, now)) {
-        const fileName = typeof entry.fileName === "string" ? entry.fileName : "";
+        const noteID = String(entry.id ?? "").trim();
+        const fileName = noteID ? macSyncSafeNoteFileName(entry.fileName, noteID) : "";
         if (fileName) {
           try { fs.unlinkSync(path.join(noteDirectoryPath(projectID), fileName)); } catch {}
         }
+        if (noteID) recordMacSyncTombstone("note", noteID, projectID.toUpperCase());
         changed = true;
         continue;
       }
@@ -13182,6 +13210,7 @@ function createProjectNoteFolder(projectID: string, name: string, parentFolderID
   };
   manifest.folders = [...folders, folder];
   writeNoteManifest(projectID, manifest);
+  scheduleRemoteAccessBroadcast();
   return noteFolderItemFromManifest(projectID, folder, noteFolderCounts(manifest));
 }
 
@@ -13202,6 +13231,7 @@ function renameProjectNoteFolder(projectID: string, folderID: string, name: stri
   folder.name = trimmed;
   folder.updatedAt = currentSwiftDate();
   writeNoteManifest(projectID, manifest);
+  scheduleRemoteAccessBroadcast();
   return noteFolderItemFromManifest(projectID, folder, noteFolderCounts(manifest));
 }
 
@@ -13215,6 +13245,8 @@ function deleteProjectNoteFolder(projectID: string, folderID: string): { project
     if (typeof note.folderID === "string" && deletedIDs.has(note.folderID)) note.folderID = null;
   }
   writeNoteManifest(projectID, manifest);
+  for (const deletedID of deletedIDs) recordMacSyncTombstone("noteFolder", deletedID, projectID.toUpperCase());
+  scheduleRemoteAccessBroadcast();
   return { projectID: projectID.toUpperCase(), deletedFolderID: folderID, deletedFolderIDs: [...deletedIDs] };
 }
 
@@ -13242,6 +13274,7 @@ function moveProjectNoteFolder(projectID: string, folderID: string, parentFolder
   folder.parentFolderID = normalizedParentID;
   folder.updatedAt = currentSwiftDate();
   writeNoteManifest(projectID, manifest);
+  scheduleRemoteAccessBroadcast();
   return noteFolderItemFromManifest(projectID, folder, noteFolderCounts(manifest));
 }
 
@@ -13255,6 +13288,7 @@ function moveProjectNoteToFolder(projectID: string, noteID: string, folderID: st
   note.folderID = folderID;
   note.updatedAt = currentSwiftDate();
   writeNoteManifest(projectID, manifest);
+  scheduleRemoteAccessBroadcast();
   return { projectID: projectID.toUpperCase(), noteID, folderID };
 }
 
@@ -19300,6 +19334,8 @@ async function loadSettings(): Promise<SettingsSnapshot> {
     remoteAccessPairingExpiresAt: remoteAccessRuntime.pairingExpiresAt,
     remoteAccessServerRunning: remoteAccessRuntime.serverRunning,
     remoteAccessDeviceCount: remoteAccessRuntime.deviceCount,
+    remoteAccessSyncPeerCount: readMacSyncPeers().length,
+    remoteAccessSyncPeers: macSyncPeerStatuses(),
     localAIRuntimeVersion: await readDefault("OpenAssist.localAIRuntimeVersion", "Unknown"),
     promptRewriteProvider,
     promptRewriteModel,
@@ -20668,6 +20704,7 @@ function emitPlannerDayChanged(dayID: string) {
   emitPlannerDaysChanged(day.id);
   emitPlannerSmartListsChanged();
   schedulePlannerReminderRefresh();
+  scheduleMacSyncSoon();
 }
 
 function emitPlannerBacklogChanged() {
@@ -20675,10 +20712,12 @@ function emitPlannerBacklogChanged() {
   emitAppStateBackgroundUpdate({ type: "plannerBacklog", backlog, items: parseDailyItemsFromMarkdown(plannerBacklogID, backlog.markdown) });
   emitPlannerSmartListsChanged();
   schedulePlannerReminderRefresh();
+  scheduleMacSyncSoon();
 }
 
 function emitPlannerCategoriesChanged() {
   emitAppStateBackgroundUpdate({ type: "plannerCategories", categories: loadPlannerCategories() });
+  scheduleMacSyncSoon();
 }
 
 function emitPlannerSmartListsChanged() {
@@ -21817,6 +21856,73 @@ type RemoteAccessPairedDeviceRecord = {
   createdAt: string;
   lastSeenAt?: string;
   userAgent?: string;
+  kind?: "mobile" | "peer-mac";
+  machineID?: string;
+  localBaseURL?: string | null;
+  publicBaseURL?: string | null;
+};
+
+type MacSyncPeerRecord = {
+  id: string;
+  machineID: string;
+  name: string;
+  token: string;
+  localBaseURL?: string;
+  tunnelBaseURL?: string;
+  lastSuccessfulBaseURL?: string;
+  lastRemoteCursor?: string;
+  lastLocalCursor?: string;
+  lastSyncedAt?: string;
+  lastError?: string;
+  syncing?: boolean;
+  createdAt: string;
+  updatedAt: string;
+};
+
+type MacSyncPeerStatus = {
+  id: string;
+  machineID: string;
+  name: string;
+  localBaseURL?: string;
+  tunnelBaseURL?: string;
+  lastSuccessfulBaseURL?: string;
+  lastRemoteCursor?: string;
+  lastLocalCursor?: string;
+  lastSyncedAt?: string;
+  lastError?: string;
+  syncing: boolean;
+};
+
+type MacSyncTombstoneKind = "project" | "note" | "noteFolder";
+type MacSyncTombstoneRecord = {
+  kind: MacSyncTombstoneKind;
+  id: string;
+  projectID?: string;
+  deletedAt: number;
+  machineID: string;
+};
+
+type MacSyncItemKind =
+  | "project"
+  | "note"
+  | "noteFolder"
+  | "plannerDay"
+  | "plannerBacklog"
+  | "plannerCategories";
+
+type MacSyncItem = {
+  kind: MacSyncItemKind;
+  id: string;
+  updatedAt: number;
+  baseUpdatedAt?: number;
+  data: JsonObject;
+};
+
+type MacSyncApplyResult = {
+  kind: MacSyncItemKind | MacSyncTombstoneKind;
+  id: string;
+  status: "applied" | "skipped" | "stale" | "conflict" | "deleted";
+  message?: string;
 };
 
 function normalizedRemoteAccessDeviceKey(device: Pick<RemoteAccessPairedDeviceRecord, "name">) {
@@ -21865,6 +21971,7 @@ const remoteSelectedThreadNoteByDeviceID = new Map<string, { threadID: string; n
 type RemotePlannerSelection = { view: "day" | "backlog"; dayID: string };
 const remoteSelectedPlannerByDeviceID = new Map<string, RemotePlannerSelection>();
 let remoteAccessBroadcastHook: (() => void) | null = null;
+const macSyncPeerLocks = new Set<string>();
 
 function remotePlannerSelectionForDevice(deviceID?: string | null): RemotePlannerSelection {
   const today = plannerDayID();
@@ -21933,6 +22040,7 @@ function remoteAccessProject(project: ProjectItem, threadCountByProjectID: Map<s
 
 function scheduleRemoteAccessBroadcast() {
   remoteAccessBroadcastHook?.();
+  scheduleMacSyncSoon();
 }
 
 function remoteAccessActiveNoteForDevice(deviceID: string | null | undefined, notes: NoteItem[]) {
@@ -22022,6 +22130,180 @@ function remoteAccessMachineID() {
   return machineID;
 }
 
+function macSyncPeersPath() {
+  return path.join(remoteAccessRoot(), "SyncPeers.json");
+}
+
+function macSyncTombstonesPath() {
+  return path.join(remoteAccessRoot(), "SyncTombstones.json");
+}
+
+function normalizeMacSyncBaseURL(value: unknown) {
+  const raw = String(value ?? "").trim();
+  if (!raw) return "";
+  try {
+    const url = new URL(raw);
+    url.pathname = url.pathname.replace(/\/+$/, "");
+    url.search = "";
+    url.hash = "";
+    return url.toString().replace(/\/+$/, "");
+  } catch {
+    return "";
+  }
+}
+
+function macSyncPeerStatus(peer: MacSyncPeerRecord): MacSyncPeerStatus {
+  return {
+    id: peer.id,
+    machineID: peer.machineID,
+    name: peer.name,
+    localBaseURL: peer.localBaseURL,
+    tunnelBaseURL: peer.tunnelBaseURL,
+    lastSuccessfulBaseURL: peer.lastSuccessfulBaseURL,
+    lastRemoteCursor: peer.lastRemoteCursor,
+    lastLocalCursor: peer.lastLocalCursor,
+    lastSyncedAt: peer.lastSyncedAt,
+    lastError: peer.lastError,
+    syncing: macSyncPeerLocks.has(peer.id)
+  };
+}
+
+function readMacSyncPeers() {
+  const stored = readJSON<MacSyncPeerRecord[]>(macSyncPeersPath(), []);
+  const seen = new Set<string>();
+  const peers = stored
+    .map((peer): MacSyncPeerRecord | null => {
+      const machineID = String(peer.machineID ?? "").trim().toLowerCase();
+      const token = String(peer.token ?? "").trim();
+      if (!machineID || !token || seen.has(machineID)) return null;
+      seen.add(machineID);
+      return {
+        id: String(peer.id ?? machineID).trim() || machineID,
+        machineID,
+        name: String(peer.name ?? "Peer Mac").trim() || "Peer Mac",
+        token,
+        localBaseURL: normalizeMacSyncBaseURL(peer.localBaseURL) || undefined,
+        tunnelBaseURL: normalizeMacSyncBaseURL(peer.tunnelBaseURL) || undefined,
+        lastSuccessfulBaseURL: normalizeMacSyncBaseURL(peer.lastSuccessfulBaseURL) || undefined,
+        lastRemoteCursor: String(peer.lastRemoteCursor ?? "").trim() || undefined,
+        lastLocalCursor: String(peer.lastLocalCursor ?? "").trim() || undefined,
+        lastSyncedAt: String(peer.lastSyncedAt ?? "").trim() || undefined,
+        lastError: String(peer.lastError ?? "").trim() || undefined,
+        createdAt: String(peer.createdAt ?? new Date().toISOString()),
+        updatedAt: String(peer.updatedAt ?? new Date().toISOString())
+      };
+    })
+    .filter((peer): peer is MacSyncPeerRecord => Boolean(peer));
+  if (JSON.stringify(peers) !== JSON.stringify(stored)) writeMacSyncPeers(peers);
+  return peers;
+}
+
+function writeMacSyncPeers(peers: MacSyncPeerRecord[]) {
+  writeJSON(macSyncPeersPath(), peers.map((peer) => ({
+    ...peer,
+    syncing: undefined
+  })));
+}
+
+function upsertMacSyncPeer(input: {
+  machineID: string;
+  name: string;
+  token: string;
+  localBaseURL?: string | null;
+  tunnelBaseURL?: string | null;
+  lastSuccessfulBaseURL?: string | null;
+}) {
+  const machineID = input.machineID.trim().toLowerCase();
+  if (!machineID) throw new Error("Peer machine ID is required.");
+  if (machineID === remoteAccessMachineID()) throw new Error("Cannot pair this Mac with itself.");
+  const now = new Date().toISOString();
+  const peers = readMacSyncPeers();
+  const existing = peers.find((peer) => peer.machineID === machineID);
+  const next: MacSyncPeerRecord = {
+    id: existing?.id ?? randomUUID().toLowerCase(),
+    machineID,
+    name: input.name.trim() || existing?.name || "Peer Mac",
+    token: input.token.trim() || existing?.token || "",
+    localBaseURL: normalizeMacSyncBaseURL(input.localBaseURL) || existing?.localBaseURL,
+    tunnelBaseURL: normalizeMacSyncBaseURL(input.tunnelBaseURL) || existing?.tunnelBaseURL,
+    lastSuccessfulBaseURL: normalizeMacSyncBaseURL(input.lastSuccessfulBaseURL) || existing?.lastSuccessfulBaseURL,
+    lastRemoteCursor: existing?.lastRemoteCursor,
+    lastLocalCursor: existing?.lastLocalCursor,
+    lastSyncedAt: existing?.lastSyncedAt,
+    lastError: undefined,
+    createdAt: existing?.createdAt ?? now,
+    updatedAt: now
+  };
+  if (!next.token) throw new Error("Peer token is required.");
+  writeMacSyncPeers([next, ...peers.filter((peer) => peer.machineID !== machineID)]);
+  return next;
+}
+
+function updateMacSyncPeer(peerID: string, patch: Partial<MacSyncPeerRecord>) {
+  const peers = readMacSyncPeers();
+  const index = peers.findIndex((peer) => peer.id === peerID || peer.machineID === peerID);
+  if (index < 0) return null;
+  const next = {
+    ...peers[index],
+    ...patch,
+    localBaseURL: patch.localBaseURL !== undefined ? normalizeMacSyncBaseURL(patch.localBaseURL) || undefined : peers[index].localBaseURL,
+    tunnelBaseURL: patch.tunnelBaseURL !== undefined ? normalizeMacSyncBaseURL(patch.tunnelBaseURL) || undefined : peers[index].tunnelBaseURL,
+    lastSuccessfulBaseURL: patch.lastSuccessfulBaseURL !== undefined ? normalizeMacSyncBaseURL(patch.lastSuccessfulBaseURL) || undefined : peers[index].lastSuccessfulBaseURL,
+    updatedAt: new Date().toISOString()
+  };
+  peers[index] = next;
+  writeMacSyncPeers(peers);
+  return next;
+}
+
+function removeMacSyncPeer(peerID: string) {
+  const peers = readMacSyncPeers();
+  const removed = peers.filter((peer) => peer.id === peerID || peer.machineID === peerID);
+  const next = peers.filter((peer) => peer.id !== peerID && peer.machineID !== peerID);
+  writeMacSyncPeers(next);
+  return { ok: true, removed };
+}
+
+function removeRemoteAccessPeerDevice(machineID: string) {
+  const normalized = machineID.trim().toLowerCase();
+  if (!normalized) return;
+  writeRemoteAccessDevices(readRemoteAccessDevices().filter((device) =>
+    !(device.kind === "peer-mac" && String(device.machineID ?? "").trim().toLowerCase() === normalized)
+  ));
+}
+
+function readMacSyncTombstones() {
+  const cutoff = Date.now() - 90 * 24 * 60 * 60 * 1000;
+  const stored = readJSON<MacSyncTombstoneRecord[]>(macSyncTombstonesPath(), []);
+  const tombstones = stored.filter((entry) =>
+    (entry.kind === "project" || entry.kind === "note" || entry.kind === "noteFolder")
+    && String(entry.id ?? "").trim()
+    && Number(entry.deletedAt ?? 0) >= cutoff
+  );
+  if (JSON.stringify(tombstones) !== JSON.stringify(stored)) writeJSON(macSyncTombstonesPath(), tombstones);
+  return tombstones;
+}
+
+function recordMacSyncTombstone(kind: MacSyncTombstoneKind, id: string, projectID?: string) {
+  const normalizedID = id.trim();
+  if (!normalizedID) return;
+  upsertMacSyncTombstone({
+    kind,
+    id: normalizedID,
+    projectID: projectID?.trim() || undefined,
+    deletedAt: Date.now(),
+    machineID: remoteAccessMachineID()
+  });
+}
+
+function upsertMacSyncTombstone(tombstone: MacSyncTombstoneRecord) {
+  const key = `${tombstone.kind}:${String(tombstone.projectID ?? "").toLowerCase()}:${tombstone.id.toLowerCase()}`;
+  const existing = readMacSyncTombstones().filter((entry) =>
+    `${entry.kind}:${String(entry.projectID ?? "").toLowerCase()}:${entry.id.toLowerCase()}` !== key
+  );
+  writeJSON(macSyncTombstonesPath(), [tombstone, ...existing]);
+}
+
 function readRemoteAccessDevices() {
   const storedDevices = readJSON<RemoteAccessPairedDeviceRecord[]>(remoteAccessDevicesPath(), []);
   const devices = dedupeRemoteAccessDevices(storedDevices);
@@ -22033,6 +22315,34 @@ function readRemoteAccessDevices() {
 
 function writeRemoteAccessDevices(devices: RemoteAccessPairedDeviceRecord[]) {
   writeJSON(remoteAccessDevicesPath(), dedupeRemoteAccessDevices(devices));
+}
+
+function upsertRemoteAccessPeerDevice(input: {
+  machineID: string;
+  name: string;
+  token: string;
+  localBaseURL?: string | null;
+  publicBaseURL?: string | null;
+}) {
+  const machineID = input.machineID.trim().toLowerCase();
+  const token = input.token.trim();
+  if (!machineID || !token) return;
+  const now = new Date().toISOString();
+  const devices = readRemoteAccessDevices();
+  const existing = devices.find((device) => String(device.machineID ?? "").trim().toLowerCase() === machineID);
+  const next: RemoteAccessPairedDeviceRecord = {
+    id: existing?.id ?? randomUUID().toLowerCase(),
+    name: input.name.trim() || existing?.name || "Peer Mac",
+    tokenHash: sha256Hex(token),
+    createdAt: existing?.createdAt ?? now,
+    lastSeenAt: existing?.lastSeenAt,
+    userAgent: existing?.userAgent,
+    kind: "peer-mac",
+    machineID,
+    localBaseURL: normalizeMacSyncBaseURL(input.localBaseURL) || null,
+    publicBaseURL: normalizeMacSyncBaseURL(input.publicBaseURL) || null
+  };
+  writeRemoteAccessDevices([next, ...devices.filter((device) => device.id !== next.id)]);
 }
 
 function sha256Hex(value: string) {
@@ -22094,6 +22404,935 @@ function remoteAccessServerRuntimeSnapshot(settings: RemoteAccessRuntimeSettings
     serverRunning: remoteAccessServer?.isRunning() ?? false,
     deviceCount: readRemoteAccessDevices().length
   };
+}
+
+function macSyncCursorNumber(value: unknown) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+}
+
+function macSyncMsToSwiftDate(value: number) {
+  return value / 1000 - macAbsoluteEpochOffset;
+}
+
+function macSyncSwiftDateToMs(value: unknown, fallback = 0) {
+  return swiftDateToMs(value) ?? fallback;
+}
+
+function macSyncFileUpdatedAt(filePath: string) {
+  try {
+    return fs.statSync(filePath).mtimeMs;
+  } catch {
+    return 0;
+  }
+}
+
+function macSyncAtomicWriteFile(filePath: string, content: string | Buffer) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  const tempPath = path.join(path.dirname(filePath), `.${path.basename(filePath)}.${process.pid}.${Date.now()}.tmp`);
+  fs.writeFileSync(tempPath, content);
+  fs.renameSync(tempPath, filePath);
+}
+
+function macSyncAtomicWriteJSON(filePath: string, value: unknown) {
+  macSyncAtomicWriteFile(filePath, `${JSON.stringify(value, null, 2)}\n`);
+}
+
+function macSyncSetFileMtime(filePath: string, updatedAt: number) {
+  if (!Number.isFinite(updatedAt) || updatedAt <= 0) return;
+  try {
+    const date = new Date(updatedAt);
+    fs.utimesSync(filePath, date, date);
+  } catch {
+    // Best effort only. The content is still written safely.
+  }
+}
+
+function macSyncItemVersionFromProject(project: JsonObject, fallbackFilePath: string) {
+  return macSyncSwiftDateToMs(project.updatedAt, macSyncFileUpdatedAt(fallbackFilePath));
+}
+
+function macSyncProjectData(project: JsonObject) {
+  const copy: JsonObject = {};
+  for (const key of ["id", "kind", "name", "iconSymbolName", "parentID", "isHidden", "hidden", "plannerOnly", "area", "color", "createdAt", "updatedAt", "removedOnPeer", "removedOnPeerAt"]) {
+    if (Object.prototype.hasOwnProperty.call(project, key)) copy[key] = project[key];
+  }
+  const linkedFolderPath = normalizeLinkedFolderPath(String(project.linkedFolderPath ?? ""));
+  const hints = Array.isArray(project.peerLinkedFolders) ? project.peerLinkedFolders.filter((entry) => jsonObject(entry)) : [];
+  if (linkedFolderPath) {
+    hints.push({
+      machineID: remoteAccessMachineID(),
+      machineName: os.hostname(),
+      path: linkedFolderPath
+    });
+  }
+  copy.peerLinkedFolders = hints;
+  return copy;
+}
+
+function macSyncSafeRelativePath(value: unknown) {
+  const raw = String(value ?? "").trim().replace(/\\/g, "/");
+  if (!raw || raw.startsWith("/") || raw.includes("\0")) return "";
+  const normalized = path.posix.normalize(raw);
+  if (!normalized || normalized === "." || normalized.startsWith("../") || normalized === "..") return "";
+  return normalized;
+}
+
+function macSyncSafeID(value: unknown) {
+  const raw = String(value ?? "").trim();
+  return /^[A-Za-z0-9_-]{1,128}$/.test(raw) ? raw : "";
+}
+
+function macSyncSafeNoteFileName(value: unknown, fallbackID: string) {
+  const safePath = macSyncSafeRelativePath(value);
+  const safeFallbackID = macSyncSafeID(fallbackID) || randomUUID().toLowerCase();
+  const fallback = `${safeFallbackID}.md`;
+  if (!safePath || safePath.includes("/")) return fallback;
+  return safePath.endsWith(".md") ? safePath : fallback;
+}
+
+function macSyncListAssetFiles(root: string, base = root): Array<{ relativePath: string; filePath: string }> {
+  if (!fs.existsSync(root)) return [];
+  const entries: Array<{ relativePath: string; filePath: string }> = [];
+  for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
+    const filePath = path.join(root, entry.name);
+    if (entry.isDirectory()) {
+      entries.push(...macSyncListAssetFiles(filePath, base));
+    } else if (entry.isFile()) {
+      entries.push({
+        relativePath: path.relative(base, filePath).replace(/\\/g, "/"),
+        filePath
+      });
+    }
+  }
+  return entries;
+}
+
+function macSyncNoteAssets(projectID: string) {
+  const assetsRoot = path.join(noteDirectoryPath(projectID), ".assets");
+  return macSyncListAssetFiles(assetsRoot)
+    .map((asset) => {
+      try {
+        return {
+          path: asset.relativePath,
+          data: fs.readFileSync(asset.filePath).toString("base64")
+        };
+      } catch {
+        return null;
+      }
+    })
+    .filter((asset): asset is { path: string; data: string } => Boolean(asset));
+}
+
+function macSyncCollectPlannerDayItems(since: number): MacSyncItem[] {
+  const items: MacSyncItem[] = [];
+  ensurePlannerScaffold();
+  const root = plannerDailyRoot();
+  if (!fs.existsSync(root)) return items;
+  for (const year of fs.readdirSync(root)) {
+    const yearRoot = path.join(root, year);
+    if (!fs.existsSync(yearRoot) || !fs.statSync(yearRoot).isDirectory()) continue;
+    for (const month of fs.readdirSync(yearRoot)) {
+      const monthRoot = path.join(yearRoot, month);
+      if (!fs.existsSync(monthRoot) || !fs.statSync(monthRoot).isDirectory()) continue;
+      for (const fileName of fs.readdirSync(monthRoot)) {
+        const match = fileName.match(/^(\d{4}-\d{2}-\d{2})\.md$/);
+        if (!match) continue;
+        const dayID = match[1];
+        const filePath = path.join(monthRoot, fileName);
+        const updatedAt = macSyncFileUpdatedAt(filePath);
+        if (updatedAt <= since) continue;
+        items.push({
+          kind: "plannerDay",
+          id: dayID,
+          updatedAt,
+          data: {
+            dayID,
+            markdown: fs.readFileSync(filePath, "utf8").replace(/\r\n/g, "\n")
+          }
+        });
+      }
+    }
+  }
+  return items;
+}
+
+function macSyncCollectChanges(sinceRaw: unknown) {
+  const snapshotStartedAt = Date.now();
+  const since = macSyncCursorNumber(sinceRaw);
+  const items: MacSyncItem[] = [];
+  const { filePath: projectsPath, snapshot } = projectStoreSnapshot();
+  for (const project of snapshot.projects ?? []) {
+    const id = String(project.id ?? "").trim();
+    if (!id) continue;
+    const updatedAt = macSyncItemVersionFromProject(project, projectsPath);
+    if (updatedAt <= since) continue;
+    items.push({
+      kind: "project",
+      id: id.toUpperCase(),
+      updatedAt,
+      data: macSyncProjectData(project)
+    });
+  }
+
+  const notesRoot = path.join(projectStoreRoot(), "ProjectNotes");
+  if (fs.existsSync(notesRoot)) {
+    for (const projectDir of fs.readdirSync(notesRoot)) {
+      const projectID = macSyncSafeID(projectDir.toUpperCase());
+      if (!projectID) continue;
+      const manifestPath = noteManifestPath(projectID);
+      const manifestUpdatedAt = macSyncFileUpdatedAt(manifestPath);
+      const manifest = readNoteManifest(projectID);
+      for (const folder of manifest.folders ?? []) {
+        const id = String(folder.id ?? "").trim();
+        if (!id) continue;
+        const updatedAt = macSyncSwiftDateToMs(folder.updatedAt, manifestUpdatedAt);
+        if (updatedAt <= since) continue;
+        items.push({
+          kind: "noteFolder",
+          id: `${projectID}:${id}`,
+          updatedAt,
+          data: {
+            projectID,
+            folder: { ...folder, updatedAt: macSyncMsToSwiftDate(updatedAt) }
+          }
+        });
+      }
+      for (const note of manifest.notes ?? []) {
+        const id = String(note.id ?? "").trim();
+        if (!id) continue;
+        const updatedAt = macSyncSwiftDateToMs(note.updatedAt, manifestUpdatedAt);
+        if (updatedAt <= since) continue;
+        const markdown = readProjectNoteMarkdown(projectID, note, id);
+        items.push({
+          kind: "note",
+          id: `${projectID}:${id}`,
+          updatedAt,
+          data: {
+            projectID,
+            note: { ...note, updatedAt: macSyncMsToSwiftDate(updatedAt) },
+            markdown,
+            assets: macSyncNoteAssets(projectID)
+          }
+        });
+      }
+    }
+  }
+
+  items.push(...macSyncCollectPlannerDayItems(since));
+
+  const backlogPath = plannerBacklogPath();
+  if (fs.existsSync(backlogPath)) {
+    const updatedAt = macSyncFileUpdatedAt(backlogPath);
+    if (updatedAt > since) {
+      items.push({
+        kind: "plannerBacklog",
+        id: plannerBacklogID,
+        updatedAt,
+        data: {
+          markdown: fs.readFileSync(backlogPath, "utf8").replace(/\r\n/g, "\n")
+        }
+      });
+    }
+  }
+
+  const categoriesPath = plannerCategoriesPath();
+  if (fs.existsSync(categoriesPath)) {
+    const updatedAt = macSyncFileUpdatedAt(categoriesPath);
+    if (updatedAt > since) {
+      items.push({
+        kind: "plannerCategories",
+        id: "plannerCategories",
+        updatedAt,
+        data: {
+          categories: loadPlannerCategories(true)
+        }
+      });
+    }
+  }
+
+  const tombstones = readMacSyncTombstones().filter((entry) => entry.deletedAt > since);
+  const maxItemUpdatedAt = items.reduce((max, item) => Math.max(max, item.updatedAt), snapshotStartedAt);
+  const maxTombstoneUpdatedAt = tombstones.reduce((max, item) => Math.max(max, item.deletedAt), maxItemUpdatedAt);
+  return {
+    ok: true,
+    machineID: remoteAccessMachineID(),
+    machineName: os.hostname(),
+    cursor: String(Math.ceil(Math.max(snapshotStartedAt, maxTombstoneUpdatedAt))),
+    items,
+    tombstones
+  };
+}
+
+function macSyncCurrentProjectUpdatedAt(projectID: string) {
+  const { filePath, snapshot } = projectStoreSnapshot();
+  const project = projectRecord(snapshot, projectID);
+  return project ? macSyncItemVersionFromProject(project, filePath) : 0;
+}
+
+function macSyncCurrentNoteUpdatedAt(projectID: string, noteID: string) {
+  const manifestPath = noteManifestPath(projectID);
+  const manifest = readNoteManifest(projectID);
+  const note = (manifest.notes ?? []).find((entry) => String(entry.id ?? "") === noteID);
+  return note ? macSyncSwiftDateToMs(note.updatedAt, macSyncFileUpdatedAt(manifestPath)) : 0;
+}
+
+function macSyncCurrentNoteFolderUpdatedAt(projectID: string, folderID: string) {
+  const manifestPath = noteManifestPath(projectID);
+  const manifest = readNoteManifest(projectID);
+  const folder = (manifest.folders ?? []).find((entry) => String(entry.id ?? "") === folderID);
+  return folder ? macSyncSwiftDateToMs(folder.updatedAt, macSyncFileUpdatedAt(manifestPath)) : 0;
+}
+
+function macSyncCurrentPlannerUpdatedAt(kind: "plannerDay" | "plannerBacklog" | "plannerCategories", id: string) {
+  if (kind === "plannerDay") return macSyncFileUpdatedAt(plannerDayPath(id));
+  if (kind === "plannerBacklog") return macSyncFileUpdatedAt(plannerBacklogPath());
+  return macSyncFileUpdatedAt(plannerCategoriesPath());
+}
+
+function macSyncShouldRejectStale(localUpdatedAt: number, item: MacSyncItem) {
+  const baseUpdatedAt = macSyncCursorNumber(item.baseUpdatedAt);
+  return localUpdatedAt > baseUpdatedAt && item.updatedAt <= localUpdatedAt;
+}
+
+function applyMacSyncProject(item: MacSyncItem): MacSyncApplyResult {
+  const incoming = jsonObject(item.data) ?? {};
+  const projectID = String(incoming.id ?? item.id).trim().toUpperCase();
+  if (!projectID) return { kind: item.kind, id: item.id, status: "skipped", message: "Missing project ID." };
+  const localUpdatedAt = macSyncCurrentProjectUpdatedAt(projectID);
+  if (macSyncShouldRejectStale(localUpdatedAt, item)) return { kind: item.kind, id: item.id, status: "stale" };
+  const { filePath, snapshot } = projectStoreSnapshot();
+  const projects = snapshot.projects ?? [];
+  let project = projectRecord(snapshot, projectID);
+  if (!project) {
+    project = {
+      id: projectID,
+      kind: String(incoming.kind ?? "project") === "folder" ? "folder" : "project",
+      name: normalizeTitle(incoming.name, "Project"),
+      createdAt: macSyncMsToSwiftDate(item.updatedAt),
+      updatedAt: macSyncMsToSwiftDate(item.updatedAt)
+    };
+    projects.push(project);
+    snapshot.projects = projects;
+  }
+  const linkedFolderPath = project.linkedFolderPath;
+  for (const key of ["kind", "name", "iconSymbolName", "parentID", "isHidden", "hidden", "plannerOnly", "area", "color", "removedOnPeer", "removedOnPeerAt"]) {
+    if (Object.prototype.hasOwnProperty.call(incoming, key)) project[key] = incoming[key];
+    else if (key !== "kind" && key !== "name") delete project[key];
+  }
+  project.id = projectID;
+  project.updatedAt = macSyncMsToSwiftDate(item.updatedAt);
+  if (linkedFolderPath) project.linkedFolderPath = linkedFolderPath;
+  else delete project.linkedFolderPath;
+  const incomingHints = Array.isArray(incoming.peerLinkedFolders) ? incoming.peerLinkedFolders.filter((entry) => jsonObject(entry)) : [];
+  const localHints = Array.isArray(project.peerLinkedFolders) ? project.peerLinkedFolders.filter((entry) => jsonObject(entry)) : [];
+  const hintsByMachine = new Map<string, unknown>();
+  for (const hint of [...localHints, ...incomingHints]) {
+    const object = jsonObject(hint);
+    const machineID = String(object?.machineID ?? "").trim().toLowerCase();
+    if (machineID && machineID !== remoteAccessMachineID()) hintsByMachine.set(machineID, hint);
+  }
+  project.peerLinkedFolders = [...hintsByMachine.values()];
+  snapshot.threadAssignments = snapshot.threadAssignments ?? {};
+  snapshot.brainByProjectID = snapshot.brainByProjectID ?? {};
+  if (!snapshot.brainByProjectID[projectID]) {
+    snapshot.brainByProjectID[projectID] = { projectSummary: "", processedThreadIDs: [], threadDigestsByThreadID: {} };
+  }
+  saveProjectStoreSnapshot(filePath, snapshot);
+  emitProjectsChanged();
+  return { kind: item.kind, id: projectID, status: "applied" };
+}
+
+function applyMacSyncNoteFolder(item: MacSyncItem): MacSyncApplyResult {
+  const projectID = macSyncSafeID(String(item.data.projectID ?? "").trim().toUpperCase());
+  const folder = jsonObject(item.data.folder) ?? {};
+  const folderID = macSyncSafeID(folder.id);
+  if (!projectID || !folderID) return { kind: item.kind, id: item.id, status: "skipped", message: "Missing folder ID." };
+  const localUpdatedAt = macSyncCurrentNoteFolderUpdatedAt(projectID, folderID);
+  if (macSyncShouldRejectStale(localUpdatedAt, item)) return { kind: item.kind, id: item.id, status: "stale" };
+  const manifest = readNoteManifest(projectID);
+  const folders = manifest.folders ?? [];
+  const index = folders.findIndex((entry) => String(entry.id ?? "") === folderID);
+  const next = {
+    ...folder,
+    id: folderID,
+    name: normalizeTitle(folder.name, "Folder"),
+    parentFolderID: normalizedNoteFolderParentID(folder.parentFolderID),
+    updatedAt: macSyncMsToSwiftDate(item.updatedAt)
+  };
+  if (index >= 0) folders[index] = { ...folders[index], ...next };
+  else folders.push(next);
+  manifest.folders = folders;
+  writeNoteManifest(projectID, manifest);
+  return { kind: item.kind, id: item.id, status: "applied" };
+}
+
+function macSyncConflictTitle(title: string, peerName: string) {
+  const date = new Date().toLocaleDateString(undefined, { month: "short", day: "numeric" });
+  return `${normalizeTitle(title, "Untitled note")} (conflict from ${peerName || "peer Mac"}, ${date})`;
+}
+
+function createMacSyncConflictNote(projectID: string, sourceNote: JsonObject, markdown: string, peerName: string, updatedAt: number) {
+  const manifest = readNoteManifest(projectID);
+  const noteID = randomUUID().toLowerCase();
+  const note: JsonObject = {
+    ...sourceNote,
+    id: noteID,
+    title: macSyncConflictTitle(String(sourceNote.title ?? "Untitled note"), peerName),
+    fileName: `${noteID}.md`,
+    createdAt: macSyncMsToSwiftDate(Date.now()),
+    updatedAt: macSyncMsToSwiftDate(Math.max(Date.now(), updatedAt)),
+    order: (manifest.notes ?? []).length
+  };
+  manifest.notes = [...(manifest.notes ?? []), note];
+  writeNoteManifest(projectID, manifest);
+  macSyncAtomicWriteFile(path.join(noteDirectoryPath(projectID), `${noteID}.md`), markdown.replace(/\r\n/g, "\n"));
+  return noteID;
+}
+
+function applyMacSyncNoteAssets(projectID: string, assets: unknown) {
+  if (!Array.isArray(assets)) return;
+  const assetsRoot = path.join(noteDirectoryPath(projectID), ".assets");
+  for (const asset of assets) {
+    const object = jsonObject(asset);
+    const relativePath = macSyncSafeRelativePath(object?.path);
+    const data = typeof object?.data === "string" ? object.data : "";
+    if (!relativePath || !data) continue;
+    try {
+      macSyncAtomicWriteFile(path.join(assetsRoot, relativePath), Buffer.from(data, "base64"));
+    } catch (error) {
+      bridgeDebugLog(`Mac sync asset apply failed path=${relativePath} error=${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+}
+
+function applyMacSyncNote(item: MacSyncItem, peerName: string): MacSyncApplyResult {
+  const projectID = macSyncSafeID(String(item.data.projectID ?? "").trim().toUpperCase());
+  const incomingNote = jsonObject(item.data.note) ?? {};
+  const noteID = macSyncSafeID(incomingNote.id);
+  const markdown = String(item.data.markdown ?? "").replace(/\r\n/g, "\n");
+  if (!projectID || !noteID) return { kind: item.kind, id: item.id, status: "skipped", message: "Missing note ID." };
+  const manifest = readNoteManifest(projectID);
+  const notes = manifest.notes ?? [];
+  const index = notes.findIndex((entry) => String(entry.id ?? "") === noteID);
+  const localUpdatedAt = macSyncCurrentNoteUpdatedAt(projectID, noteID);
+  const localMarkdown = index >= 0 ? readProjectNoteMarkdown(projectID, notes[index], noteID) : "";
+  const baseUpdatedAt = macSyncCursorNumber(item.baseUpdatedAt);
+  const hasSharedBase = baseUpdatedAt > 0;
+  const bothChanged = index >= 0
+    && hasSharedBase
+    && localUpdatedAt > baseUpdatedAt
+    && item.updatedAt > baseUpdatedAt
+    && noteHistoryContentKey(localMarkdown) !== noteHistoryContentKey(markdown);
+  if (!hasSharedBase && index >= 0 && noteHistoryContentKey(localMarkdown) === noteHistoryContentKey(markdown)) {
+    notes[index] = {
+      ...notes[index],
+      ...incomingNote,
+      id: noteID,
+      title: normalizeTitle(incomingNote.title, "Untitled note"),
+      fileName: macSyncSafeNoteFileName(incomingNote.fileName, noteID),
+      updatedAt: macSyncMsToSwiftDate(Math.max(localUpdatedAt, item.updatedAt))
+    };
+    manifest.notes = notes;
+    writeNoteManifest(projectID, manifest);
+    return { kind: item.kind, id: item.id, status: "skipped", message: "Same note content already exists." };
+  }
+  if (bothChanged && item.updatedAt <= localUpdatedAt) {
+    createMacSyncConflictNote(projectID, incomingNote, markdown, peerName, item.updatedAt);
+    return { kind: item.kind, id: item.id, status: "conflict", message: "Kept local note and saved peer copy." };
+  }
+  let workingManifest = manifest;
+  let workingNotes = notes;
+  if (bothChanged && item.updatedAt > localUpdatedAt) {
+    createMacSyncConflictNote(projectID, notes[index], localMarkdown, os.hostname(), localUpdatedAt);
+    workingManifest = readNoteManifest(projectID);
+    workingNotes = workingManifest.notes ?? [];
+  } else if (macSyncShouldRejectStale(localUpdatedAt, item)) {
+    return { kind: item.kind, id: item.id, status: "stale" };
+  }
+  const fileName = macSyncSafeNoteFileName(incomingNote.fileName, noteID);
+  const nextIndex = workingNotes.findIndex((entry) => String(entry.id ?? "") === noteID);
+  const nextNote: JsonObject = {
+    ...incomingNote,
+    id: noteID,
+    title: normalizeTitle(incomingNote.title, "Untitled note"),
+    fileName,
+    updatedAt: macSyncMsToSwiftDate(item.updatedAt)
+  };
+  if (nextIndex >= 0) workingNotes[nextIndex] = { ...workingNotes[nextIndex], ...nextNote };
+  else workingNotes.push(nextNote);
+  workingManifest.notes = workingNotes;
+  writeNoteManifest(projectID, workingManifest);
+  macSyncAtomicWriteFile(path.join(noteDirectoryPath(projectID), fileName), markdown);
+  applyMacSyncNoteAssets(projectID, item.data.assets);
+  return { kind: item.kind, id: item.id, status: bothChanged ? "conflict" : "applied" };
+}
+
+function macSyncPlannerLineKey(line: string) {
+  return line
+    .replace(/\r/g, "")
+    .replace(/<!--[\s\S]*?-->/g, "")
+    .replace(/^\s*[-*]\s+\[[ xX]\]\s+/, "- [ ] ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+function macSyncLineIsInsideStructuredBlock(line: string, inside: boolean) {
+  if (/<!--\s*oa-daily-item\s+/.test(line)) return true;
+  if (/<!--\s*\/oa-daily-item\s*-->/.test(line)) return false;
+  return inside;
+}
+
+function macSyncMergePlannerMarkdown(localMarkdown: string, incomingMarkdown: string, dayID: string) {
+  let merged = localMarkdown.replace(/\r\n/g, "\n");
+  const incoming = incomingMarkdown.replace(/\r\n/g, "\n");
+  if (!merged.trim()) return incoming;
+  if (!incoming.trim()) return merged;
+  if (noteHistoryContentKey(merged) === noteHistoryContentKey(incoming)) return merged;
+
+  const localStructured = new Map(parseDailyItemsFromMarkdown(dayID, merged)
+    .filter((item) => item.structured === true && !item.id.startsWith("plain:"))
+    .map((item) => [item.id, item]));
+  const incomingStructured = parseDailyItemsFromMarkdown(dayID, incoming)
+    .filter((item) => item.structured === true && !item.id.startsWith("plain:"));
+  for (const incomingItem of incomingStructured) {
+    const localItem = localStructured.get(incomingItem.id);
+    if (!localItem) {
+      merged = `${merged.trimEnd()}\n\n${renderDailyItemBlock(incomingItem)}\n`;
+      localStructured.set(incomingItem.id, incomingItem);
+      continue;
+    }
+    const incomingUpdatedAt = Date.parse(incomingItem.updatedAt);
+    const localUpdatedAt = Date.parse(localItem.updatedAt);
+    if (Number.isFinite(incomingUpdatedAt) && (!Number.isFinite(localUpdatedAt) || incomingUpdatedAt > localUpdatedAt)) {
+      merged = replaceStructuredDailyItem(merged, incomingItem);
+      localStructured.set(incomingItem.id, incomingItem);
+    }
+  }
+
+  const existingKeys = new Set(merged.split("\n").map(macSyncPlannerLineKey).filter(Boolean));
+  const extraLines: string[] = [];
+  let insideStructured = false;
+  for (const line of incoming.split("\n")) {
+    const nextInside = macSyncLineIsInsideStructuredBlock(line, insideStructured);
+    const key = macSyncPlannerLineKey(line);
+    if (!nextInside && key && !existingKeys.has(key)) {
+      extraLines.push(line);
+      existingKeys.add(key);
+    }
+    insideStructured = nextInside;
+  }
+  if (extraLines.length) merged = `${merged.trimEnd()}\n\n${extraLines.join("\n")}\n`;
+  return merged;
+}
+
+function applyMacSyncPlannerItem(item: MacSyncItem): MacSyncApplyResult {
+  const localUpdatedAt = macSyncCurrentPlannerUpdatedAt(item.kind as "plannerDay" | "plannerBacklog" | "plannerCategories", item.id);
+  if (item.kind === "plannerDay") {
+    const dayID = normalizePlannerDayID(String(item.data.dayID ?? item.id));
+    const filePath = plannerDayPath(dayID);
+    const incomingMarkdown = String(item.data.markdown ?? "").replace(/\r\n/g, "\n");
+    const localMarkdown = fs.existsSync(filePath) ? fs.readFileSync(filePath, "utf8").replace(/\r\n/g, "\n") : "";
+    const shouldMerge = localMarkdown.trim() && noteHistoryContentKey(localMarkdown) !== noteHistoryContentKey(incomingMarkdown);
+    if (!shouldMerge && macSyncShouldRejectStale(localUpdatedAt, item)) return { kind: item.kind, id: item.id, status: "stale" };
+    macSyncAtomicWriteFile(filePath, shouldMerge ? macSyncMergePlannerMarkdown(localMarkdown, incomingMarkdown, dayID) : incomingMarkdown);
+    macSyncSetFileMtime(filePath, shouldMerge ? Math.max(Date.now(), localUpdatedAt, item.updatedAt) : item.updatedAt);
+    emitPlannerDayChanged(dayID);
+    return { kind: item.kind, id: dayID, status: "applied" };
+  }
+  if (item.kind === "plannerBacklog") {
+    const filePath = plannerBacklogPath();
+    const incomingMarkdown = String(item.data.markdown ?? defaultPlannerBacklog).replace(/\r\n/g, "\n");
+    const localMarkdown = fs.existsSync(filePath) ? fs.readFileSync(filePath, "utf8").replace(/\r\n/g, "\n") : "";
+    const shouldMerge = localMarkdown.trim() && noteHistoryContentKey(localMarkdown) !== noteHistoryContentKey(incomingMarkdown);
+    if (!shouldMerge && macSyncShouldRejectStale(localUpdatedAt, item)) return { kind: item.kind, id: item.id, status: "stale" };
+    macSyncAtomicWriteFile(filePath, shouldMerge ? macSyncMergePlannerMarkdown(localMarkdown, incomingMarkdown, plannerBacklogID) : incomingMarkdown);
+    macSyncSetFileMtime(filePath, shouldMerge ? Math.max(Date.now(), localUpdatedAt, item.updatedAt) : item.updatedAt);
+    emitPlannerBacklogChanged();
+    return { kind: item.kind, id: plannerBacklogID, status: "applied" };
+  }
+  if (macSyncShouldRejectStale(localUpdatedAt, item)) return { kind: item.kind, id: item.id, status: "stale" };
+  const categories = Array.isArray(item.data.categories) ? item.data.categories : [];
+  macSyncAtomicWriteJSON(plannerCategoriesPath(), { version: 1, categories: normalizePlannerCategories(categories) });
+  macSyncSetFileMtime(plannerCategoriesPath(), item.updatedAt);
+  emitPlannerCategoriesChanged();
+  return { kind: item.kind, id: item.id, status: "applied" };
+}
+
+function applyMacSyncTombstone(tombstone: MacSyncTombstoneRecord): MacSyncApplyResult {
+  if (tombstone.machineID === remoteAccessMachineID()) {
+    return { kind: tombstone.kind, id: tombstone.id, status: "skipped" };
+  }
+  upsertMacSyncTombstone(tombstone);
+  if (tombstone.kind === "project") {
+    const { filePath, snapshot } = projectStoreSnapshot();
+    const project = projectRecord(snapshot, tombstone.id);
+    if (project) {
+      project.isHidden = true;
+      project.removedOnPeer = true;
+      project.removedOnPeerAt = macSyncMsToSwiftDate(tombstone.deletedAt);
+      project.updatedAt = macSyncMsToSwiftDate(tombstone.deletedAt);
+      saveProjectStoreSnapshot(filePath, snapshot);
+      emitProjectsChanged();
+    }
+    return { kind: tombstone.kind, id: tombstone.id, status: "deleted" };
+  }
+  if (tombstone.kind === "note") {
+    const projectID = macSyncSafeID(String(tombstone.projectID ?? "").trim().toUpperCase());
+    if (projectID) {
+      const manifest = readNoteManifest(projectID);
+      const note = (manifest.notes ?? []).find((entry) => String(entry.id ?? "") === tombstone.id);
+      const localUpdatedAt = macSyncCurrentNoteUpdatedAt(projectID, tombstone.id);
+      if (note && localUpdatedAt > tombstone.deletedAt) {
+        return { kind: tombstone.kind, id: tombstone.id, status: "conflict", message: "Kept local note because it is newer than the peer delete." };
+      }
+      manifest.notes = (manifest.notes ?? []).filter((entry) => String(entry.id ?? "") !== tombstone.id);
+      if (note) {
+        const fileName = macSyncSafeNoteFileName(note.fileName, tombstone.id);
+        try { fs.rmSync(path.join(noteDirectoryPath(projectID), fileName), { force: true }); } catch {}
+      }
+      writeNoteManifest(projectID, manifest);
+    }
+    return { kind: tombstone.kind, id: tombstone.id, status: "deleted" };
+  }
+  if (tombstone.kind === "noteFolder") {
+    const projectID = macSyncSafeID(String(tombstone.projectID ?? "").trim().toUpperCase());
+    if (projectID) {
+      const manifest = readNoteManifest(projectID);
+      const folders = manifest.folders ?? [];
+      const deletedIDs = new Set([tombstone.id, ...noteFolderDescendantIDs(folders, tombstone.id)]);
+      manifest.folders = folders.filter((entry) => !deletedIDs.has(String(entry.id ?? "")));
+      for (const note of manifest.notes ?? []) {
+        if (typeof note.folderID === "string" && deletedIDs.has(note.folderID)) note.folderID = null;
+      }
+      writeNoteManifest(projectID, manifest);
+    }
+    return { kind: tombstone.kind, id: tombstone.id, status: "deleted" };
+  }
+  return { kind: tombstone.kind, id: tombstone.id, status: "skipped" };
+}
+
+function applyMacSyncItems(items: unknown, tombstones: unknown, peerName = "peer Mac") {
+  const rawItems = Array.isArray(items) ? items : [];
+  const parsedItems = rawItems
+    .map((entry) => jsonObject(entry))
+    .filter((entry): entry is JsonObject => Boolean(entry))
+    .map((entry): MacSyncItem => ({
+      kind: String(entry.kind ?? "") as MacSyncItemKind,
+      id: String(entry.id ?? ""),
+      updatedAt: macSyncCursorNumber(entry.updatedAt),
+      baseUpdatedAt: macSyncCursorNumber(entry.baseUpdatedAt),
+      data: jsonObject(entry.data) ?? {}
+    }))
+    .filter((item) => item.id && item.updatedAt > 0);
+  const order: Record<MacSyncItemKind, number> = {
+    project: 0,
+    noteFolder: 1,
+    note: 2,
+    plannerCategories: 3,
+    plannerBacklog: 4,
+    plannerDay: 5
+  };
+  parsedItems.sort((left, right) => (order[left.kind] ?? 99) - (order[right.kind] ?? 99));
+  const results: MacSyncApplyResult[] = [];
+  for (const item of parsedItems) {
+    try {
+      if (item.kind === "project") results.push(applyMacSyncProject(item));
+      else if (item.kind === "noteFolder") results.push(applyMacSyncNoteFolder(item));
+      else if (item.kind === "note") results.push(applyMacSyncNote(item, peerName));
+      else if (item.kind === "plannerDay" || item.kind === "plannerBacklog" || item.kind === "plannerCategories") results.push(applyMacSyncPlannerItem(item));
+      else results.push({ kind: item.kind, id: item.id, status: "skipped", message: "Unknown sync item kind." });
+    } catch (error) {
+      results.push({ kind: item.kind, id: item.id, status: "skipped", message: error instanceof Error ? error.message : String(error) });
+    }
+  }
+  const rawTombstones = Array.isArray(tombstones) ? tombstones : [];
+  for (const entry of rawTombstones) {
+    const object = jsonObject(entry);
+    if (!object) continue;
+    const tombstone: MacSyncTombstoneRecord = {
+      kind: String(object.kind ?? "") as MacSyncTombstoneKind,
+      id: macSyncSafeID(object.id),
+      projectID: macSyncSafeID(object.projectID) || undefined,
+      deletedAt: macSyncCursorNumber(object.deletedAt),
+      machineID: String(object.machineID ?? "").trim().toLowerCase()
+    };
+    if (!tombstone.id || !tombstone.deletedAt || !tombstone.machineID) continue;
+    try {
+      results.push(applyMacSyncTombstone(tombstone));
+    } catch (error) {
+      results.push({ kind: tombstone.kind, id: tombstone.id, status: "skipped", message: error instanceof Error ? error.message : String(error) });
+    }
+  }
+  return {
+    ok: true,
+    results,
+    staleCount: results.filter((result) => result.status === "stale").length,
+    conflictCount: results.filter((result) => result.status === "conflict").length,
+    cursor: String(Math.ceil(Date.now()))
+  };
+}
+
+function macSyncPeerStatuses() {
+  return readMacSyncPeers().map(macSyncPeerStatus);
+}
+
+async function currentMacSyncBaseURLs() {
+  const settings = await loadRemoteAccessSettings();
+  const runtimeSettings = {
+    port: settings.remoteAccessPort,
+    networkMode: settings.remoteAccessNetworkMode,
+    publicURL: easyRemoteTunnel.currentURL() || settings.remoteAccessPublicURL
+  };
+  return {
+    localBaseURL: remoteAccessLocalNetworkURL(runtimeSettings) || remoteAccessLocalURL(runtimeSettings),
+    publicBaseURL: normalizeMacSyncBaseURL(easyRemoteTunnel.currentURL() || settings.remoteAccessPublicURL)
+  };
+}
+
+function macSyncURL(baseURL: string, endpoint: string) {
+  const base = normalizeMacSyncBaseURL(baseURL);
+  const url = new URL(endpoint, `${base}/`);
+  return url.toString();
+}
+
+async function macSyncFetchJSON(
+  baseURL: string,
+  endpoint: string,
+  options: {
+    token?: string;
+    pairingCode?: string;
+    method?: "GET" | "POST";
+    body?: unknown;
+    timeoutMs?: number;
+  } = {}
+) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), options.timeoutMs ?? 12_000);
+  try {
+    const headers: Record<string, string> = { accept: "application/json" };
+    if (options.token) headers.authorization = `Bearer ${options.token}`;
+    if (options.pairingCode) headers["x-openassist-pairing-code"] = options.pairingCode;
+    const init: RequestInit = {
+      method: options.method ?? (options.body === undefined ? "GET" : "POST"),
+      headers,
+      signal: controller.signal
+    };
+    if (options.body !== undefined) {
+      headers["content-type"] = "application/json";
+      init.body = JSON.stringify(options.body);
+    }
+    const response = await fetch(macSyncURL(baseURL, endpoint), init);
+    const text = await response.text();
+    const payload = text ? JSON.parse(text) : {};
+    if (!response.ok) {
+      const object = jsonObject(payload);
+      throw new Error(String(object?.error ?? `Request failed with ${response.status}.`));
+    }
+    return payload as unknown;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function macSyncConnectionCandidates(peer: MacSyncPeerRecord) {
+  return Array.from(new Set([
+    peer.lastSuccessfulBaseURL,
+    peer.localBaseURL,
+    peer.tunnelBaseURL
+  ].map(normalizeMacSyncBaseURL).filter(Boolean)));
+}
+
+function macSyncAssertClockClose(health: JsonObject, peerName: string) {
+  const peerTime = macSyncCursorNumber(health.serverTime ?? health.currentTime);
+  if (!peerTime) return;
+  const driftMs = Math.abs(Date.now() - peerTime);
+  if (driftMs > 2 * 60 * 1000) {
+    throw new Error(`Clock difference with ${peerName || "peer Mac"} is too large. Fix the Mac clocks, then sync again.`);
+  }
+}
+
+async function connectMacSyncPeer(peer: MacSyncPeerRecord) {
+  const candidates = macSyncConnectionCandidates(peer);
+  let lastError = "No saved URL for this peer.";
+  for (const baseURL of candidates) {
+    try {
+      const health = jsonObject(await macSyncFetchJSON(baseURL, "/remote/v1/health", { token: peer.token })) ?? {};
+      const machineID = String(health.machineID ?? "").trim().toLowerCase();
+      if (machineID !== peer.machineID) {
+        lastError = `Saved peer ID does not match ${baseURL}.`;
+        continue;
+      }
+      macSyncAssertClockClose(health, peer.name);
+      const publicBaseURL = normalizeMacSyncBaseURL(health.publicBaseURL);
+      const localNetworkBaseURL = normalizeMacSyncBaseURL(health.localNetworkBaseURL ?? health.localBaseURL);
+      const isTunnel = baseURL.includes("trycloudflare.com") || baseURL.startsWith("https://");
+      const patch: Partial<MacSyncPeerRecord> = {
+        name: String(health.machineName ?? peer.name).trim() || peer.name,
+        lastSuccessfulBaseURL: baseURL,
+        lastError: undefined
+      };
+      if (publicBaseURL) patch.tunnelBaseURL = publicBaseURL;
+      if (localNetworkBaseURL && !localNetworkBaseURL.includes("127.0.0.1")) patch.localBaseURL = localNetworkBaseURL;
+      if (isTunnel && !patch.tunnelBaseURL) patch.tunnelBaseURL = baseURL;
+      if (!isTunnel) patch.localBaseURL = baseURL;
+      const updatedPeer = updateMacSyncPeer(peer.id, patch) ?? peer;
+      return { baseURL, peer: updatedPeer, health };
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : String(error);
+    }
+  }
+  updateMacSyncPeer(peer.id, { lastError });
+  throw new Error(lastError);
+}
+
+async function pairMacSyncPeer(pairingURL: string) {
+  const baseURL = normalizeMacSyncBaseURL(pairingURL);
+  if (!baseURL) throw new Error("Paste a valid pairing URL from the other Mac.");
+  const url = new URL(pairingURL);
+  const pairingCode = String(url.searchParams.get("pairingCode") ?? "").trim();
+  if (!pairingCode) throw new Error("That URL does not include a pairing code.");
+  const health = jsonObject(await macSyncFetchJSON(baseURL, "/remote/v1/health", { pairingCode })) ?? {};
+  macSyncAssertClockClose(health, "the other Mac");
+  const peerMachineID = String(health.machineID ?? "").trim().toLowerCase();
+  if (!peerMachineID) throw new Error("The other Mac did not return a machine ID.");
+  if (peerMachineID === remoteAccessMachineID()) throw new Error("That pairing URL belongs to this Mac.");
+  const callbackToken = `oa_dev_${randomUUID().toLowerCase()}`;
+  const localURLs = await currentMacSyncBaseURLs();
+  const body = {
+    code: pairingCode,
+    deviceKind: "peer-mac",
+    deviceName: os.hostname(),
+    machineID: remoteAccessMachineID(),
+    peerCallbackToken: callbackToken,
+    peerLocalBaseURL: localURLs.localBaseURL,
+    peerPublicBaseURL: localURLs.publicBaseURL
+  };
+  const claim = jsonObject(await macSyncFetchJSON(baseURL, "/remote/v1/pair/claim", { method: "POST", body, timeoutMs: 15_000 })) ?? {};
+  if (claim.ok === false) throw new Error(String(claim.error ?? "Pairing failed."));
+  const token = String(claim.deviceToken ?? "").trim();
+  if (!token) throw new Error("The other Mac did not return a sync token.");
+  const peerName = String(claim.machineName ?? health.machineName ?? "Peer Mac").trim() || "Peer Mac";
+  const localBaseURL = baseURL.includes("trycloudflare.com") || baseURL.startsWith("https://")
+    ? normalizeMacSyncBaseURL(health.localNetworkBaseURL)
+    : baseURL;
+  const tunnelBaseURL = normalizeMacSyncBaseURL(health.publicBaseURL) || (baseURL.includes("trycloudflare.com") || baseURL.startsWith("https://") ? baseURL : "");
+  const peer = upsertMacSyncPeer({
+    machineID: peerMachineID,
+    name: peerName,
+    token,
+    localBaseURL,
+    tunnelBaseURL,
+    lastSuccessfulBaseURL: baseURL
+  });
+  upsertRemoteAccessPeerDevice({
+    machineID: peerMachineID,
+    name: peerName,
+    token: callbackToken,
+    localBaseURL,
+    publicBaseURL: tunnelBaseURL
+  });
+  ensureMacSyncScheduler();
+  scheduleMacSyncSoon(1_000);
+  return { ok: true, peer: macSyncPeerStatus(peer), peers: macSyncPeerStatuses() };
+}
+
+async function syncMacSyncPeer(peerID: string) {
+  const peer = readMacSyncPeers().find((entry) => entry.id === peerID || entry.machineID === peerID);
+  if (!peer) throw new Error("Peer Mac was not found.");
+  if (macSyncPeerLocks.has(peer.id)) return { ok: true, skipped: true, reason: "Sync already running.", peer: macSyncPeerStatus(peer) };
+  macSyncPeerLocks.add(peer.id);
+  updateMacSyncPeer(peer.id, { lastError: undefined });
+  try {
+    const previousRemoteCursor = peer.lastRemoteCursor ?? "0";
+    const previousLocalCursor = peer.lastLocalCursor ?? "0";
+    const connection = await connectMacSyncPeer(peer);
+    const remoteChanges = jsonObject(await macSyncFetchJSON(
+      connection.baseURL,
+      `/remote/v1/sync/changes?since=${encodeURIComponent(previousRemoteCursor)}`,
+      { token: connection.peer.token, timeoutMs: 30_000 }
+    )) ?? {};
+    applyMacSyncItems(remoteChanges.items, remoteChanges.tombstones, connection.peer.name);
+    const localChanges = macSyncCollectChanges(previousLocalCursor);
+    const pushItems = localChanges.items.map((item) => ({
+      ...item,
+      baseUpdatedAt: macSyncCursorNumber(previousRemoteCursor)
+    }));
+    const pushResult = jsonObject(await macSyncFetchJSON(connection.baseURL, "/remote/v1/sync/push", {
+      token: connection.peer.token,
+      method: "POST",
+      body: {
+        peerName: os.hostname(),
+        items: pushItems,
+        tombstones: localChanges.tombstones
+      },
+      timeoutMs: 60_000
+    })) ?? {};
+    const syncedAt = new Date().toISOString();
+    const updatedPeer = updateMacSyncPeer(peer.id, {
+      lastRemoteCursor: String(remoteChanges.cursor ?? previousRemoteCursor),
+      lastLocalCursor: String(localChanges.cursor),
+      lastSyncedAt: syncedAt,
+      lastError: Number(pushResult.staleCount ?? 0) > 0
+        ? `${pushResult.staleCount} stale item(s) were skipped.`
+        : undefined
+    }) ?? peer;
+    return {
+      ok: true,
+      peer: macSyncPeerStatus(updatedPeer),
+      pulled: Array.isArray(remoteChanges.items) ? remoteChanges.items.length : 0,
+      pushed: pushItems.length,
+      staleCount: Number(pushResult.staleCount ?? 0),
+      conflictCount: Number(pushResult.conflictCount ?? 0)
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const updatedPeer = updateMacSyncPeer(peer.id, { lastError: message }) ?? peer;
+    return { ok: false, peer: macSyncPeerStatus(updatedPeer), error: message };
+  } finally {
+    macSyncPeerLocks.delete(peer.id);
+  }
+}
+
+async function syncAllMacSyncPeers() {
+  const peers = readMacSyncPeers();
+  const results = [];
+  for (const peer of peers) {
+    results.push(await syncMacSyncPeer(peer.id));
+  }
+  return { ok: true, peers: macSyncPeerStatuses(), results };
+}
+
+let macSyncSchedulerStarted = false;
+let macSyncDebounceTimer: NodeJS.Timeout | null = null;
+
+function ensureMacSyncScheduler() {
+  if (macSyncSchedulerStarted) return;
+  macSyncSchedulerStarted = true;
+  setInterval(() => {
+    if (readMacSyncPeers().length) void syncAllMacSyncPeers();
+  }, 5 * 60 * 1000);
+}
+
+function scheduleMacSyncSoon(delayMs = 2_500) {
+  if (!readMacSyncPeers().length) return;
+  ensureMacSyncScheduler();
+  if (macSyncDebounceTimer) clearTimeout(macSyncDebounceTimer);
+  macSyncDebounceTimer = setTimeout(() => {
+    macSyncDebounceTimer = null;
+    void syncAllMacSyncPeers();
+  }, delayMs);
+}
+
+function getMacSyncStatus() {
+  return { ok: true, peers: macSyncPeerStatuses() };
+}
+
+function revokeMacSyncPeer(peerID: string) {
+  const result = removeMacSyncPeer(peerID);
+  for (const peer of result.removed) removeRemoteAccessPeerDevice(peer.machineID);
+  return getMacSyncStatus();
 }
 
 function remoteAccessAppearanceSnapshot(settings: Partial<SettingsSnapshot>) {
@@ -23657,6 +24896,7 @@ class OpenAssistRemoteAccessServer {
         networkMode: normalizeRemoteAccessNetworkMode(settings.remoteAccessNetworkMode),
         publicURL: remotePublicURL
       };
+      const localNetworkBaseURL = remoteAccessLocalNetworkURL(runtimeSettings);
       jsonResponse(res, 200, {
         ok: true,
         helperState: this.isRunning() ? "Running" : "Stopped",
@@ -23665,8 +24905,10 @@ class OpenAssistRemoteAccessServer {
           : null,
         machineID: remoteAccessMachineID(),
         machineName: os.hostname(),
+        serverTime: Date.now(),
         appVersion: `${settings.appVersion} (${settings.buildNumber})`,
         localBaseURL: remoteAccessLocalURL(runtimeSettings),
+        localNetworkBaseURL: localNetworkBaseURL || null,
         tailscaleBaseURL: null,
         publicBaseURL: remotePublicURL || null,
         networkMode: settings.remoteAccessNetworkMode,
@@ -23694,6 +24936,11 @@ class OpenAssistRemoteAccessServer {
         jsonResponse(res, 200, { ok: false, error: "That pairing code is invalid. Scan the latest QR from the Mac." });
         return;
       }
+      const deviceKind = String(body.deviceKind ?? body.kind ?? "").trim() === "peer-mac" ? "peer-mac" : "mobile";
+      const peerMachineID = String(body.machineID ?? "").trim().toLowerCase();
+      const peerCallbackToken = String(body.peerCallbackToken ?? "").trim();
+      const peerLocalBaseURL = normalizeMacSyncBaseURL(body.peerLocalBaseURL);
+      const peerPublicBaseURL = normalizeMacSyncBaseURL(body.peerPublicBaseURL);
       const deviceToken = `oa_dev_${randomUUID().toLowerCase()}`;
       const device: RemoteAccessPairedDeviceRecord = {
         id: randomUUID().toLowerCase(),
@@ -23701,14 +24948,33 @@ class OpenAssistRemoteAccessServer {
         tokenHash: sha256Hex(deviceToken),
         createdAt: new Date().toISOString(),
         lastSeenAt: new Date().toISOString(),
-        userAgent: String(req.headers["user-agent"] ?? "").trim() || undefined
+        userAgent: String(req.headers["user-agent"] ?? "").trim() || undefined,
+        kind: deviceKind,
+        machineID: peerMachineID || undefined,
+        localBaseURL: peerLocalBaseURL || null,
+        publicBaseURL: peerPublicBaseURL || null
       };
       writeRemoteAccessDevices([device, ...readRemoteAccessDevices().filter((entry) => entry.id !== device.id)]);
+      if (deviceKind === "peer-mac" && peerMachineID && peerCallbackToken) {
+        upsertMacSyncPeer({
+          machineID: peerMachineID,
+          name: device.name,
+          token: peerCallbackToken,
+          localBaseURL: peerLocalBaseURL,
+          tunnelBaseURL: peerPublicBaseURL,
+          lastSuccessfulBaseURL: peerPublicBaseURL || peerLocalBaseURL
+        });
+        ensureMacSyncScheduler();
+      }
       this.clearPairingChallenge();
       const snapshot = await makeRemoteAccessSnapshot(device.id);
+      const runtimeBaseURLs = await currentMacSyncBaseURLs();
       jsonResponse(res, 200, {
         ok: true,
         machineID: remoteAccessMachineID(),
+        machineName: os.hostname(),
+        localBaseURL: runtimeBaseURLs.localBaseURL,
+        publicBaseURL: runtimeBaseURLs.publicBaseURL || null,
         deviceToken,
         snapshot,
         error: null
@@ -23727,6 +24993,26 @@ class OpenAssistRemoteAccessServer {
     }
     if (req.method === "GET" && url.pathname === "/remote/v1/events") {
       this.addSubscriber(device, res);
+      return;
+    }
+    if (req.method === "GET" && url.pathname === "/remote/v1/sync/changes") {
+      if (device.kind !== "peer-mac") {
+        jsonResponse(res, 403, { error: "Mac sync requires a peer Mac token." });
+        return;
+      }
+      const since = url.searchParams.get("since") ?? "0";
+      jsonResponse(res, 200, macSyncCollectChanges(since));
+      return;
+    }
+    if (req.method === "POST" && url.pathname === "/remote/v1/sync/push") {
+      if (device.kind !== "peer-mac") {
+        jsonResponse(res, 403, { error: "Mac sync requires a peer Mac token." });
+        return;
+      }
+      const body = jsonObject(await readRequestJSON(req, 96 * 1024 * 1024)) ?? {};
+      const response = applyMacSyncItems(body.items, body.tombstones, String(body.peerName ?? device.name ?? "peer Mac"));
+      jsonResponse(res, 200, response);
+      this.broadcastSoon();
       return;
     }
     if (req.method === "POST" && url.pathname === "/remote/v1/actions") {
@@ -24165,7 +25451,9 @@ async function getRemoteAccessStatus() {
     remoteAccessPairingURL: remoteAccessRuntime.pairingURL,
     remoteAccessPairingExpiresAt: remoteAccessRuntime.pairingExpiresAt,
     remoteAccessServerRunning: remoteAccessRuntime.serverRunning,
-    remoteAccessDeviceCount: remoteAccessRuntime.deviceCount
+    remoteAccessDeviceCount: remoteAccessRuntime.deviceCount,
+    remoteAccessSyncPeerCount: readMacSyncPeers().length,
+    remoteAccessSyncPeers: macSyncPeerStatuses()
   };
 }
 
@@ -24177,12 +25465,19 @@ let remoteAccessStartupRestoreAttempted = false;
 async function restoreRemoteAccessOnStartup() {
   if (remoteAccessStartupRestoreAttempted) return;
   remoteAccessStartupRestoreAttempted = true;
+  ensureMacSyncScheduler();
   try {
     const enabled = await readBoolDefault("OpenAssist.remoteAccess.enabled", false);
-    if (!enabled) return;
+    if (!enabled) {
+      scheduleMacSyncSoon(4_000);
+      return;
+    }
     const settings = await loadRemoteAccessSettings();
     await ensureRemoteAccessServerForSettings(settings);
-    if (easyRemoteTunnel.isRunning()) return;
+    if (easyRemoteTunnel.isRunning()) {
+      scheduleMacSyncSoon(4_000);
+      return;
+    }
     const port = normalizedRemoteAccessPort(settings.remoteAccessPort);
     const publicURL = normalizeRemoteAccessPublicURL(
       settings.remoteAccessPublicURL || await readDefault("OpenAssist.remoteAccess.namedTunnelPublicURL", "")
@@ -24191,11 +25486,15 @@ async function restoreRemoteAccessOnStartup() {
     // stable named link is already configured ("already has a link to it"), so the
     // user never has to re-start Easy QR after a relaunch.
     const easyQRActive = await readBoolDefault("OpenAssist.remoteAccess.easyQRActive", false);
-    if (!easyQRActive && !publicURL) return;
+    if (!easyQRActive && !publicURL) {
+      scheduleMacSyncSoon(4_000);
+      return;
+    }
     const tunnelName = String(await readDefault("OpenAssist.remoteAccess.namedTunnelName", "openassist")).trim();
     const credentialsFile = String(await readDefault("OpenAssist.remoteAccess.namedTunnelCredentialsFile", "")).trim();
     await easyRemoteTunnel.start(`http://127.0.0.1:${port}`, { publicURL, tunnelName, credentialsFile });
     bridgeDebugLog("Remote Access public link restored on startup.");
+    scheduleMacSyncSoon(4_000);
   } catch (error) {
     bridgeDebugLog(`Remote Access startup restore failed: ${error instanceof Error ? error.message : String(error)}`);
   }
@@ -32442,6 +33741,7 @@ export {
   rejectKnowledgeRequest,
   approveTelegramPairing,
   clearRemoteAccessPairingCode,
+  getMacSyncStatus,
   clearCloudTranscriptionAPIKey,
   clearPromptRewriteAPIKey,
   clearRealtimeGeminiAPIKey,
@@ -32451,7 +33751,9 @@ export {
   openAssistIntegrationConfigPath,
   openAssistIntegrationConfigText,
   openAssistIntegrationSkillGuide,
+  pairMacSyncPeer,
   rotateRemoteAccessPairingCode,
+  revokeMacSyncPeer,
 	  appendCodexRealtimeAudio,
 	  appendCodexRealtimeImages,
 	  appendCodexRealtimeText,
@@ -32487,6 +33789,8 @@ export {
   startCodexRealtimeVoice,
   stopAssistantVoiceOutput,
   stopCodexRealtimeDelegation,
+  syncAllMacSyncPeers,
+  syncMacSyncPeer,
   transcribeAudioFile,
   prewarmCloudTranscriptionConnection,
   toggleScheduledJob,
