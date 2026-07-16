@@ -1,266 +1,131 @@
-# Open Assist
+# OpenAssist
 
-A macOS AI assistant with chat, voice, local or cloud models, and approved automation.
+OpenAssist is a voice-first personal AI assistant for macOS and iPhone. It keeps daily tasks, reminders, notes, projects, and AI agent work in one place.
 
+> **Primary app:** The supported desktop app is now the React + Electron app in [`apps/desktop`](apps/desktop). The old Swift app is archived in [`legacy/swift`](legacy/swift).
 
+## Why I Built It
 
----
+Life moves fast. I had too many things to do, lost track of why decisions were made, and sometimes forgot work that had already happened.
 
-## Product Preview
+I built OpenAssist as a daily organizer that I can talk to. It can remember useful context, keep projects organized, manage tasks and reminders, and hand real computer work to an AI agent when a simple answer is not enough.
 
+## What Makes It Different
 
+- **Live Voice coordinator:** Talk naturally through OpenAI Realtime or Gemini Live.
+- **Real agent delegation:** Browser, CLI, repository, logs, and computer tasks can be handed to Codex, Claude, or another selected worker.
+- **Conversation during work:** Voice chat stays available while delegated tasks run in the background.
+- **Reliable results:** OpenAssist tracks each task, reports progress, returns the final answer, and avoids duplicate work.
+- **Personal Knowledge:** Search notes, planner items, reminders, saved memory, and project history when Knowledge access is enabled.
+- **Daily organization:** Manage Today, backlog, categories, projects, tasks, due dates, and timed reminders.
+- **Notes and project continuity:** Keep long-running work connected to the right project and continue from earlier context.
+- **Approval controls:** Important writes and computer actions still use the existing approval rules.
+- **Global Live Voice:** A macOS shortcut can start the floating Live Voice HUD from any app.
+- **Phone companion:** The iPhone app can view and update the same planner, notes, reminders, and voice workflows through the desktop bridge.
 
-The main assistant workspace with projects, threads, and the floating HUD.
+## GPT-5.6 Build Week Work
 
+The desktop app includes **GPT-5.6 Sol**, **GPT-5.6 Terra**, and **GPT-5.6 Luna** as agent model choices.
 
+The GPT-5.6 implementation work in this build includes:
 
-Settings and AI Studio for providers, models, memory, and advanced controls.
+- the Live Voice coordinator and one-owner voice turn routing
+- reliable background delegation with one shared task registry
+- progress, cancellation, final-result delivery, and duplicate protection
+- same-thread Live Voice continuity without saving raw audio
+- Knowledge routing for notes, reminders, planner data, and memory
+- agent routing for browser, CLI, code, logs, and computer work
+- project creation, note updates, reminders, and mobile parity improvements
+- the professional Live Voice HUD, task cards, provider labels, and completion notifications
 
+OpenAI Realtime or Gemini Live handles the low-latency speech connection. GPT-5.6 is the work agent that can reason over the request and complete delegated tasks.
 
+## How Live Voice Works
 
-The voice HUD for dictation, push-to-talk, and voice-first tasks.
+```text
+Your voice
+  -> OpenAI Realtime or Gemini Live
+  -> OpenAssist coordinator
+       -> direct conversation
+       -> OpenAssist Knowledge
+       -> delegated GPT-5.6 / Codex / Claude task
+  -> one clear result in Today Live Voice
+```
 
-## What It Does
-
-Open Assist is a personal assistant for macOS. You can type, speak, run local or cloud models, and let the assistant take actions on your Mac after approval.
-
-Main things it can do:
-
-- chat in a full assistant workspace with projects and threads
-- use voice for dictation, push-to-talk, or live voice conversations
-- connect local or cloud AI providers
-- run approved actions in browsers and supported macOS apps
-- save thread notes, checkpoints, and memory
-- schedule recurring tasks
-- control the assistant remotely from Telegram
-- generate images from the assistant
-
-## Main Features
-
-### Assistant workspace
-
-- project-based conversations
-- thread notes and checkpoints
-- attachments, tool activity, and progress in one place
-- plan mode and agentic mode
-
-### Voice and dictation
-
-- hold-to-talk and continuous dictation
-- Apple Speech, `whisper.cpp`, or cloud speech providers
-- live voice conversations with the assistant
-- transcript history and quick paste of the last transcript
-
-### AI providers
-
-- local models
-- OpenAI
-- Anthropic
-- Gemini
-- Groq
-- OpenRouter
-- Ollama
-- GitHub Copilot backend support
-
-### Automation
-
-- browser control with your real signed-in browser profile
-- screenshot-based computer use
-- direct app actions in Finder, Terminal, Calendar, System Settings, Reminders, Contacts, Notes, and Messages
-- approval flow before important actions
-
-### Extra tools
-
-- custom and imported skills
-- image generation
-- scheduled jobs
-- Telegram remote control
-- Sparkle app updates
+Stopping Live Voice closes the microphone and realtime connection. Background work can finish safely, save one result, and notify you without creating extra visible threads.
 
 ## Quick Start
 
-1. Download the latest release from [GitHub Releases](https://github.com/manikv12/OpenAssist/releases).
-2. Open `Open Assist.app`.
-3. Open **Settings -> AI & Models -> AI Studio**.
-4. Connect a provider or set up local AI.
-5. Open the assistant and try a prompt.
-
-Example prompts:
-
-- `Help me write a short update for my team.`
-- `Summarize these notes.`
-- `Open Bluetooth settings.`
-
-## Setup Guide
-
-### 1. Assistant setup
-
-1. Open **Settings -> AI & Models**.
-2. Open **AI Studio**.
-3. Choose a local or cloud provider.
-4. Pick a model.
-5. Save your API key or finish sign-in if needed.
-
-### 2. Voice setup
-
-1. Grant **Microphone** access.
-2. Grant **Speech Recognition** if you use Apple Speech.
-3. Grant **Accessibility** if you want reliable shortcuts and text insertion.
-4. Open **Settings -> Speech & Input** and choose a speech engine.
-
-### 3. Automation setup
-
-1. Open **Settings -> Automation**.
-2. Allow **Automation / Apple Events** when macOS asks.
-3. Grant **Screen Recording** for screenshot-based computer use.
-4. Choose a browser profile if you want browser automation.
-
-### 4. Optional setup
-
-- **Skills**: add built-in, local, or GitHub-based skills per thread
-- **Scheduled Jobs**: run recurring prompts on a cron schedule
-- **Telegram**: pair a bot to use Open Assist from your phone
-
-## Default Shortcuts
-
-
-| Action                      | Default shortcut                     |
-| --------------------------- | ------------------------------------ |
-| Hold-to-talk                | `Option + Command + Space`           |
-| Toggle continuous dictation | `Control + Option + Command + Space` |
-| Paste last transcript       | `Option + Command + V`               |
-
-
-You can change these in Settings.
-
-## Requirements And Permissions
-
-### System requirements
+Requirements:
 
 - macOS 13.3 or newer
-- Xcode 15+ if you want to build from source
+- Node.js 22 or newer
+- Xcode Command Line Tools for the small macOS helper binaries
 
-### Permissions
+From the repository root:
 
-- **Microphone**: voice input
-- **Speech Recognition**: Apple Speech engine
-- **Accessibility**: global shortcuts and direct text insertion
-- **Screen Recording**: screenshot-based automation
-- **Automation / Apple Events**: browser and app actions
+```bash
+npm run setup
+npm run dev
+```
+
+Build the desktop app:
+
+```bash
+npm run build
+```
+
+Package a macOS app:
+
+```bash
+npm run package:mac
+```
+
+## Verify Live Voice
+
+Run the complete Live Voice regression set:
+
+```bash
+npm run verify:live-voice
+```
+
+Run the desktop build and the Live Voice checks together:
+
+```bash
+npm run verify
+```
+
+The checks cover routing, delegation, task limits, progress, cancellation, continuity, recall, echo protection, provider protocol behavior, and final-result narration.
+
+## Repository Layout
+
+```text
+apps/desktop/                                  Primary React + Electron macOS app
+companion-projects/OpenAssist-Mobile-Remote/   iPhone companion app
+legacy/swift/                                  Deprecated Swift implementation
+```
+
+Start with:
+
+- [`apps/desktop/src/App.tsx`](apps/desktop/src/App.tsx) for the React interface
+- [`apps/desktop/electron/main.ts`](apps/desktop/electron/main.ts) for Electron and macOS integration
+- [`apps/desktop/electron/openassistBridge.ts`](apps/desktop/electron/openassistBridge.ts) for app data and agent workers
+- [`apps/desktop/electron/realtimeProxy.ts`](apps/desktop/electron/realtimeProxy.ts) for Live Voice coordination
+- [`apps/desktop/electron/realtimeTaskCoordinator.ts`](apps/desktop/electron/realtimeTaskCoordinator.ts) for delegated-task tracking
+- [`apps/desktop/docs/live-voice-architecture-plan.md`](apps/desktop/docs/live-voice-architecture-plan.md) for the architecture plan
 
 ## Privacy
 
-- local use does not require an account
-- no telemetry is enabled by default
-- API keys and OAuth sessions are stored in macOS Keychain
-- local settings, transcript history, and memory stay on your Mac
-- if you use a cloud provider, your text or audio is sent to that provider
+- OpenAssist does not save raw Live Voice audio.
+- Completed voice text is stored in the existing `Today Live Voice` log.
+- Knowledge access remains permission-controlled and is never enabled silently.
+- API keys and provider sessions use the existing macOS Keychain paths.
+- Local data stays under `~/Library/Application Support/OpenAssist` unless a cloud provider is selected.
 
-## Build From Source
+## Repository Media
 
-### Build the app
+Generated screenshots, capture folders, and submission videos are intentionally ignored by Git. Required app icons, provider marks, and runtime UI assets remain tracked so a fresh clone still builds.
 
-```bash
-./build.sh
-```
+## Deprecated Swift App
 
-This creates:
-
-- `dist/Open Assist.app`
-
-Run it with:
-
-```bash
-open "dist/Open Assist.app"
-```
-
-### Useful build options
-
-```bash
-./build.sh --install
-./build.sh --make-dmg
-```
-
-- `--install` copies the app to `/Applications/Open Assist.app`
-- `--make-dmg` also creates `dist/Open Assist.dmg`
-
-### Signed distribution build
-
-```bash
-export DEVELOPER_ID="Your Name (TEAMID)"
-./build.sh --make-dmg
-Scripts/notarize.sh
-```
-
-`Scripts/notarize.sh` expects:
-
-- `APPLE_ID`
-- `APPLE_TEAM_ID`
-- `APPLE_APP_PASSWORD`
-
-## Tests
-
-Run package tests:
-
-```bash
-swift test
-```
-
-Run smoke and regression scripts:
-
-```bash
-Scripts/run-tests.sh
-```
-
-Run insertion reliability checks:
-
-```bash
-Scripts/run-insertion-reliability.sh --regression
-```
-
-## Troubleshooting
-
-If text insertion is not working as expected:
-
-- turn on insertion diagnostics in app settings, or set `OPENASSIST_INSERTION_DIAGNOSTICS=1`
-- default log path: `/tmp/openassist-insertion-diagnostics.log`
-- optional custom log path: `OPENASSIST_INSERTION_DIAGNOSTICS_PATH`
-
-Crash logs, when present:
-
-- `~/Library/Logs/OpenAssist/crash.log`
-
-Helpful docs:
-
-- [User Guide](Docs/User-Guide.md)
-- [Quick Start Wiki](Wiki/Quick-Start.md)
-- [Troubleshooting Wiki](Wiki/Troubleshooting.md)
-
-## Repo Layout
-
-```text
-Sources/OpenAssist/              Main app code
-Sources/OpenAssistObjCInterop/   Objective-C interop helpers
-Resources/                       Icons, plist, entitlements, assets
-Scripts/                         Build, test, release, and helper scripts
-Tests/OpenAssistTests/           XCTest coverage
-Docs/                            User-facing docs
-Wiki/                            Product and setup notes
-Vendor/Whisper/                  Bundled whisper.cpp XCFramework
-web/chat/                        React chat UI inside the assistant window
-web/remote/                      React remote-access web UI served by the local helper
-```
-
-Good places to start:
-
-- `Sources/OpenAssist/App.swift`
-- `Sources/OpenAssist/Services/`
-- `Sources/OpenAssist/Views/`
-- `Sources/OpenAssist/Assistant/`
-
-## More Docs
-
-- [User Guide](Docs/User-Guide.md)
-- [Wiki Home](Wiki/Home.md)
-- [Why Open Assist](Wiki/Why-OpenAssist.md)
-- [Privacy-First Design](Wiki/Privacy-First-Design.md)
+The Swift implementation is kept only as historical reference. It is not built by the main release workflow and should not be used for judging or new feature work. See [`legacy/swift/README.md`](legacy/swift/README.md).

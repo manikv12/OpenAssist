@@ -1,0 +1,16 @@
+{
+  "name": "openassist",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Voice-first personal assistant for macOS and iPhone.",
+  "scripts": {
+    "setup": "npm --prefix apps/desktop install",
+    "dev": "npm --prefix apps/desktop run dev",
+    "build": "npm --prefix apps/desktop run build",
+    "start": "npm --prefix apps/desktop run start",
+    "package:mac": "npm --prefix apps/desktop run package:mac",
+    "release:mac": "npm --prefix apps/desktop run release:mac",
+    "verify:live-voice": "npm --prefix apps/desktop run verify:realtime-protocol && npm --prefix apps/desktop run verify:realtime-router && npm --prefix apps/desktop run verify:realtime-tool-gate && npm --prefix apps/desktop run verify:realtime-handoff-narration && npm --prefix apps/desktop run verify:voice-routing && npm --prefix apps/desktop run verify:live-voice-echo-guard && npm --prefix apps/desktop run verify:live-voice-continuity && npm --prefix apps/desktop run verify:parallel-delegation && npm --prefix apps/desktop run verify:realtime-voice-guards && npm --prefix apps/desktop run verify:recall-route && npm --prefix apps/desktop run verify:live-voice-orchestration",
+    "verify": "npm run build && npm run verify:live-voice"
+  }
+}

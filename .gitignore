@@ -1,11 +1,16 @@
 /.build
 /.build-*/
 /.swiftpm
+/legacy/swift/.build/
+/legacy/swift/.build-*/
+/legacy/swift/.swiftpm/
 .DS_Store
 .claude/
 KeyScribe.app/
 dist/
 Vendor/Whisper/
+/legacy/swift/Vendor/
+/legacy/swift/dist/
 
 # Local build scripts
 build
@@ -38,11 +43,11 @@ Resources/markdown-chat.*-backup.html
 Resources/markdown-chat.staged-recovery.html
 
 # Stray Vite chunks accidentally written to repo root.
-# Real outputs go to electron-react/dist-*, web/*/dist.
+# Real desktop outputs go to apps/desktop/dist-*.
 /*-????????.js
 /*-????????.js.map
-/electron-react/*-????????.js
-/electron-react/*-????????.js.map
+/apps/desktop/*-????????.js
+/apps/desktop/*-????????.js.map
 
 # One-off dev screenshots / audit notes left at repo root
 /composer-agent-pulse-style.png
@@ -51,3 +56,16 @@ Resources/markdown-chat.staged-recovery.html
 /working-status-agent-pulse-style.png
 /openassist-electron-react-audit-snapshot.md
 /provider-dropdown-audit.md
+
+# Local screenshots, submission media, and generated captures
+/screenshots/
+/captures/
+/submission-media/
+/apps/desktop/verification/
+/apps/desktop/screenshots/
+/apps/desktop/captures/
+/legacy/swift/Assets/README/
+/CleanShot*.png
+/Screenshot*.png
+/codex-clipboard-*.png
+/OpenAssist-demo.mp4
